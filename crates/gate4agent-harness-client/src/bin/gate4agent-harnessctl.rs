@@ -44,7 +44,8 @@ fn usage() -> &'static str {
      \x20 observe-context RUN_ID\n\
      \x20 transfers RUN_ID\n\
      \x20 runtime-inventory [--after NODE_ID] [--limit N]\n\
-     \x20 monitor RUN_ID"
+     \x20 monitor RUN_ID\n\
+     \x20 workspace inspect NODE_ID WORKSPACE_ID"
 }
 
 #[derive(Debug)]
@@ -87,6 +88,7 @@ enum Command {
     Transfers { run_id: HarnessRunId },
     RuntimeInventory { after: Option<String>, limit: u16 },
     Monitor { run_id: HarnessRunId },
+    WorkspaceInspect { node_id: String, workspace_id: String },
 }
 
 enum Verb {
@@ -104,6 +106,7 @@ enum Verb {
     Transfers,
     RuntimeInventory,
     Monitor,
+    WorkspaceInspect,
 }
 
 fn resolve_verb(args: &[String]) -> Result<(Verb, usize), String> {
@@ -125,6 +128,9 @@ fn resolve_verb(args: &[String]) -> Result<(Verb, usize), String> {
         Some("transfers") => Ok((Verb::Transfers, 1)),
         Some("runtime-inventory") => Ok((Verb::RuntimeInventory, 1)),
         Some("monitor") => Ok((Verb::Monitor, 1)),
+        Some("workspace") if args.get(2).map(String::as_str) == Some("inspect") => {
+            Ok((Verb::WorkspaceInspect, 2))
+        }
         _ => Err(usage().to_owned()),
     }
 }
@@ -185,6 +191,18 @@ fn expect_single_positional(positionals: &mut Vec<String>, label: &str) -> Resul
         return Err(format!("expected exactly one <{label}> argument"));
     }
     Ok(positionals.remove(0))
+}
+
+fn expect_two_positionals(
+    positionals: &mut Vec<String>,
+    labels: (&str, &str),
+) -> Result<(String, String), String> {
+    if positionals.len() != 2 {
+        return Err(format!("expected exactly two <{}> <{}> arguments", labels.0, labels.1));
+    }
+    let second = positionals.remove(1);
+    let first = positionals.remove(0);
+    Ok((first, second))
 }
 
 fn parse_task_id(value: String) -> Result<HarnessTaskId, String> {
@@ -312,6 +330,11 @@ fn build_command(
         Verb::Monitor => {
             let run_id = expect_single_positional(positionals, "run-id").and_then(parse_run_id)?;
             Ok(Command::Monitor { run_id })
+        }
+        Verb::WorkspaceInspect => {
+            let (node_id, workspace_id) =
+                expect_two_positionals(positionals, ("node-id", "workspace-id"))?;
+            Ok(Command::WorkspaceInspect { node_id, workspace_id })
         }
     }
 }
@@ -589,6 +612,12 @@ fn execute(invocation: Invocation) -> Result<String, String> {
         Command::Monitor { run_id } => {
             let monitor = client.monitor_get(run_id).map_err(|error| error.to_string())?;
             render(&monitor)
+        }
+        Command::WorkspaceInspect { node_id, workspace_id } => {
+            let inspection = client
+                .inspect_node_workspace(node_id, workspace_id)
+                .map_err(|error| error.to_string())?;
+            render(&inspection)
         }
     }
 }
@@ -952,6 +981,36 @@ mod tests {
         assert_eq!(second.len(), 24);
         assert!(first.bytes().all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')));
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn workspace_inspect_requires_exactly_two_positionals() {
+        let error = parse(
+            &["gate4agent-harnessctl", "workspace", "inspect", "node-a", "--harness-operator", "127.0.0.1:18080"],
+            &[(HARNESS_OPERATOR_TOKEN_ENV, &token())],
+        )
+        .unwrap_err();
+        assert_eq!(error, "expected exactly two <node-id> <workspace-id> arguments");
+
+        let outcome = parse(
+            &[
+                "gate4agent-harnessctl",
+                "workspace",
+                "inspect",
+                "node-a",
+                "workspace-a",
+                "--harness-operator",
+                "127.0.0.1:18080",
+            ],
+            &[(HARNESS_OPERATOR_TOKEN_ENV, &token())],
+        )
+        .unwrap();
+        let ParseOutcome::Run(invocation) = outcome else { panic!("expected run") };
+        assert!(matches!(
+            invocation.command,
+            Command::WorkspaceInspect { node_id, workspace_id }
+                if node_id == "node-a" && workspace_id == "workspace-a"
+        ));
     }
 
     #[test]

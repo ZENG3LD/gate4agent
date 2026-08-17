@@ -22,6 +22,8 @@ use gate4agent_harness_api::{
     HarnessRepositoryPathV1, HarnessRunGitDiffV1, HarnessRunGitHistoryPageV1,
     HarnessRunWorkspaceFileV1, HarnessRunWorkspaceInspectionV1,
     HarnessRunWorkspaceOriginV1, HarnessWorkspaceEntryKindV1,
+    HarnessNodeGitDiffV1, HarnessNodeGitHistoryPageV1,
+    HarnessNodeWorkspaceFileV1, HarnessNodeWorkspaceInspectionV1, HarnessNodeWorkspaceOriginV1,
     HarnessWorkspaceFileContentV1, HarnessWorkspaceFileRevisionV1,
     HarnessWorkspaceTreeEntryV1, HARNESS_GIT_COMMIT_PARENTS_MAX,
     HARNESS_GIT_DIFF_MAX_BYTES, HARNESS_GIT_HISTORY_LIMIT_MAX,
@@ -482,6 +484,25 @@ impl HarnessC2Adapter {
         let pending = self.control.start_request(prepared.route.clone(), wire_request)
             .map_err(HarnessC2Error::RunReadEnqueue)?;
         Ok(PendingRunRead {
+            prepared,
+            started_at: Instant::now(),
+            pending: Some(pending),
+        })
+    }
+
+    /// Node-scoped sibling of `start_prepared_run_read`: the route was
+    /// already resolved live in `PreparedNodeWorkspaceRead::from_operator_request`
+    /// (`exact_route`), so this re-check only guards the enqueue-time gap
+    /// between that lookup and this call.
+    pub(crate) fn start_prepared_node_workspace_read(
+        &self,
+        prepared: PreparedNodeWorkspaceRead,
+    ) -> Result<PendingNodeWorkspaceRead, HarnessC2Error> {
+        self.ensure_current_incarnation(&prepared.route)?;
+        let wire_request = prepared.wire_request();
+        let pending = self.control.start_request(prepared.route.clone(), wire_request)
+            .map_err(HarnessC2Error::NodeWorkspaceReadEnqueue)?;
+        Ok(PendingNodeWorkspaceRead {
             prepared,
             started_at: Instant::now(),
             pending: Some(pending),
@@ -1721,6 +1742,49 @@ fn correlate_run_context_source_response(
     })
 }
 
+/// What to read from a workspace, independent of how the route and
+/// workspace ID it targets were resolved. Shared between `PreparedRunRead`
+/// (route sealed to a stored run binding) and `PreparedNodeWorkspaceRead`
+/// (route resolved live from a node ID, no run involved).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum WorkspaceReadKind {
+    InspectWorkspace,
+    ReadWorkspaceFile { path: RepositoryPath },
+    ReadGitHistory {
+        path: Option<RepositoryPath>,
+        before: Option<GitObjectId>,
+        limit: u16,
+    },
+    ReadGitDiff { request: GitDiffRequest },
+}
+
+fn workspace_read_wire_request(
+    workspace_id: &WorkspaceId,
+    kind: &WorkspaceReadKind,
+) -> NodeRequest {
+    match kind {
+        WorkspaceReadKind::InspectWorkspace => NodeRequest::InspectWorkspace {
+            workspace_id: workspace_id.clone(),
+        },
+        WorkspaceReadKind::ReadWorkspaceFile { path } => NodeRequest::ReadWorkspaceFile {
+            workspace_id: workspace_id.clone(),
+            path: path.clone(),
+        },
+        WorkspaceReadKind::ReadGitHistory { path, before, limit } => {
+            NodeRequest::ReadGitHistory {
+                workspace_id: workspace_id.clone(),
+                path: path.clone(),
+                before: before.clone(),
+                limit: *limit,
+            }
+        }
+        WorkspaceReadKind::ReadGitDiff { request } => NodeRequest::ReadGitDiff {
+            workspace_id: workspace_id.clone(),
+            request: request.clone(),
+        },
+    }
+}
+
 /// Sealed authority for one read rooted exclusively in a stored run binding.
 ///
 /// The operator request contributes only the run ID and read selector. The
@@ -1732,19 +1796,7 @@ pub(crate) struct PreparedRunRead {
     binding: HarnessSessionBindingV1,
     route: NodeRoute,
     workspace_id: WorkspaceId,
-    kind: PreparedRunReadKind,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum PreparedRunReadKind {
-    InspectWorkspace,
-    ReadWorkspaceFile { path: RepositoryPath },
-    ReadGitHistory {
-        path: Option<RepositoryPath>,
-        before: Option<GitObjectId>,
-        limit: u16,
-    },
-    ReadGitDiff { request: GitDiffRequest },
+    kind: WorkspaceReadKind,
 }
 
 impl PreparedRunRead {
@@ -1755,11 +1807,11 @@ impl PreparedRunRead {
         request.validate().map_err(|_| HarnessC2Error::InvalidRunReadRequest)?;
         let (request_run_id, kind) = match request {
             HarnessOperatorRequestV1::InspectRunWorkspace { run_id } => {
-                (run_id, PreparedRunReadKind::InspectWorkspace)
+                (run_id, WorkspaceReadKind::InspectWorkspace)
             }
             HarnessOperatorRequestV1::ReadRunWorkspaceFile { run_id, path } => (
                 run_id,
-                PreparedRunReadKind::ReadWorkspaceFile {
+                WorkspaceReadKind::ReadWorkspaceFile {
                     path: repository_path_from_api(&path)?,
                 },
             ),
@@ -1770,7 +1822,7 @@ impl PreparedRunRead {
                 limit,
             } => (
                 run_id,
-                PreparedRunReadKind::ReadGitHistory {
+                WorkspaceReadKind::ReadGitHistory {
                     path: path.as_ref().map(repository_path_from_api).transpose()?,
                     before: before.as_ref().map(git_object_id_from_api).transpose()?,
                     limit,
@@ -1778,7 +1830,7 @@ impl PreparedRunRead {
             ),
             HarnessOperatorRequestV1::ReadRunGitDiff { run_id, mode, path } => (
                 run_id,
-                PreparedRunReadKind::ReadGitDiff {
+                WorkspaceReadKind::ReadGitDiff {
                     request: GitDiffRequest {
                         mode: git_diff_mode_from_api(&mode)?,
                         path: path.as_ref().map(repository_path_from_api).transpose()?,
@@ -1802,7 +1854,7 @@ impl PreparedRunRead {
     /// git-facts capture sweep (`reconcile_run_git_facts_capture`).
     pub(crate) fn for_run(
         run: &HarnessRunV1,
-        kind: PreparedRunReadKind,
+        kind: WorkspaceReadKind,
     ) -> Result<Self, HarnessC2Error> {
         let binding = run.binding.clone().ok_or(HarnessC2Error::RunReadUnbound)?;
         binding.validate().map_err(|_| HarnessC2Error::InvalidRunReadBinding)?;
@@ -1829,29 +1881,7 @@ impl PreparedRunRead {
     pub(crate) fn binding(&self) -> &HarnessSessionBindingV1 { &self.binding }
 
     fn wire_request(&self) -> NodeRequest {
-        match &self.kind {
-            PreparedRunReadKind::InspectWorkspace => NodeRequest::InspectWorkspace {
-                workspace_id: self.workspace_id.clone(),
-            },
-            PreparedRunReadKind::ReadWorkspaceFile { path } => {
-                NodeRequest::ReadWorkspaceFile {
-                    workspace_id: self.workspace_id.clone(),
-                    path: path.clone(),
-                }
-            }
-            PreparedRunReadKind::ReadGitHistory { path, before, limit } => {
-                NodeRequest::ReadGitHistory {
-                    workspace_id: self.workspace_id.clone(),
-                    path: path.clone(),
-                    before: before.clone(),
-                    limit: *limit,
-                }
-            }
-            PreparedRunReadKind::ReadGitDiff { request } => NodeRequest::ReadGitDiff {
-                workspace_id: self.workspace_id.clone(),
-                request: request.clone(),
-            },
-        }
+        workspace_read_wire_request(&self.workspace_id, &self.kind)
     }
 
     fn origin(&self) -> Result<HarnessRunWorkspaceOriginV1, HarnessC2Error> {
@@ -1923,6 +1953,154 @@ fn run_read_response_route_matches(
         && incarnation_id == prepared.route.expected_incarnation_id
 }
 
+/// Sealed authority for one read routed directly from a node/workspace pair,
+/// with no run binding involved: the operator-facing sibling of
+/// `PreparedRunRead` for the sidebar Files/Git reads that have no run in
+/// flight. The route is resolved live via `HarnessC2Adapter::exact_route`
+/// (mirrors `preflight_spawn_profile`'s live lookup) — there is no stored
+/// binding to seal it from.
+pub(crate) struct PreparedNodeWorkspaceRead {
+    route: NodeRoute,
+    workspace_id: WorkspaceId,
+    kind: WorkspaceReadKind,
+}
+
+impl PreparedNodeWorkspaceRead {
+    pub(crate) fn from_operator_request(
+        adapter: &HarnessC2Adapter,
+        request: HarnessOperatorRequestV1,
+    ) -> Result<Self, HarnessC2Error> {
+        request.validate().map_err(|_| HarnessC2Error::InvalidNodeWorkspaceReadRequest)?;
+        let (node_id, workspace_id, kind) = match request {
+            HarnessOperatorRequestV1::InspectNodeWorkspace { node_id, workspace_id } => {
+                (node_id, workspace_id, WorkspaceReadKind::InspectWorkspace)
+            }
+            HarnessOperatorRequestV1::ReadNodeWorkspaceFile { node_id, workspace_id, path } => (
+                node_id,
+                workspace_id,
+                WorkspaceReadKind::ReadWorkspaceFile {
+                    path: node_repository_path_from_api(&path)?,
+                },
+            ),
+            HarnessOperatorRequestV1::ReadNodeGitHistory {
+                node_id,
+                workspace_id,
+                path,
+                before,
+                limit,
+            } => (
+                node_id,
+                workspace_id,
+                WorkspaceReadKind::ReadGitHistory {
+                    path: path.as_ref().map(node_repository_path_from_api).transpose()?,
+                    before: before.as_ref().map(node_git_object_id_from_api).transpose()?,
+                    limit,
+                },
+            ),
+            HarnessOperatorRequestV1::ReadNodeGitDiff { node_id, workspace_id, mode, path } => (
+                node_id,
+                workspace_id,
+                WorkspaceReadKind::ReadGitDiff {
+                    request: GitDiffRequest {
+                        mode: node_git_diff_mode_from_api(&mode)?,
+                        path: path.as_ref().map(node_repository_path_from_api).transpose()?,
+                    },
+                },
+            ),
+            _ => return Err(HarnessC2Error::InvalidNodeWorkspaceReadRequest),
+        };
+        let node_id = NodeId::new(node_id)
+            .map_err(|_| HarnessC2Error::InvalidNodeWorkspaceReadRequest)?;
+        let workspace_id = WorkspaceId::new(workspace_id)
+            .map_err(|_| HarnessC2Error::InvalidNodeWorkspaceReadRequest)?;
+        let route = adapter.exact_route(&node_id)?;
+        Ok(Self { route, workspace_id, kind })
+    }
+
+    fn wire_request(&self) -> NodeRequest {
+        workspace_read_wire_request(&self.workspace_id, &self.kind)
+    }
+
+    fn origin(&self) -> HarnessNodeWorkspaceOriginV1 {
+        HarnessNodeWorkspaceOriginV1 {
+            node_id: self.route.node_id.as_str().to_owned(),
+            node_incarnation_id: self.route.expected_incarnation_id.to_string(),
+            workspace_id: self.workspace_id.as_str().to_owned(),
+        }
+    }
+}
+
+pub(crate) struct PendingNodeWorkspaceRead {
+    prepared: PreparedNodeWorkspaceRead,
+    started_at: Instant,
+    pending: Option<C2PendingRequest>,
+}
+
+impl PendingNodeWorkspaceRead {
+    /// Unlike `PendingRunRead::finish`, this returns the operator reply
+    /// directly rather than a `*Completion` wrapper: the only consumer is
+    /// the live operator waiter (no background sweep re-reads a node
+    /// workspace the way `reconcile_run_git_facts_capture` re-reads a run
+    /// workspace), so there is no second caller that needs `prepared` back.
+    pub(crate) async fn finish(mut self) -> Result<HarnessOperatorResponseV1, HarnessC2Error> {
+        let pending = self.pending.take()
+            .expect("pending node workspace read owns exactly one C2 waiter");
+        match pending.finish().await {
+            Err(C2ControlError::Closed)
+                if self.started_at.elapsed() >= RUN_READ_TIMEOUT_FLOOR => {
+                    Err(HarnessC2Error::NodeWorkspaceReadDeadline)
+                }
+            Err(error) => Err(HarnessC2Error::NodeWorkspaceReadTransport(error)),
+            Ok(routed) if !node_workspace_read_response_route_matches(
+                &self.prepared,
+                &routed.node_id,
+                routed.incarnation_id,
+            ) => {
+                    Err(HarnessC2Error::NodeWorkspaceReadRouteMismatch)
+                }
+            Ok(routed) => match routed.response {
+                Err(failure) => Err(HarnessC2Error::NodeWorkspaceReadRejected { code: failure.code }),
+                Ok(response) => correlate_node_workspace_read_response(&self.prepared, response),
+            },
+        }
+    }
+}
+
+fn node_workspace_read_response_route_matches(
+    prepared: &PreparedNodeWorkspaceRead,
+    node_id: &NodeId,
+    incarnation_id: gate4agent_node_protocol::NodeIncarnationId,
+) -> bool {
+    node_id == &prepared.route.node_id
+        && incarnation_id == prepared.route.expected_incarnation_id
+}
+
+fn node_repository_path_from_api(
+    path: &HarnessRepositoryPathV1,
+) -> Result<RepositoryPath, HarnessC2Error> {
+    RepositoryPath::utf8(path.as_str().to_owned())
+        .map_err(|_| HarnessC2Error::InvalidNodeWorkspaceReadRequest)
+}
+
+fn node_git_object_id_from_api(
+    object_id: &HarnessGitObjectIdV1,
+) -> Result<GitObjectId, HarnessC2Error> {
+    GitObjectId::new(object_id.as_str().to_owned())
+        .map_err(|_| HarnessC2Error::InvalidNodeWorkspaceReadRequest)
+}
+
+fn node_git_diff_mode_from_api(
+    mode: &HarnessGitDiffModeV1,
+) -> Result<GitDiffMode, HarnessC2Error> {
+    Ok(match mode {
+        HarnessGitDiffModeV1::Working => GitDiffMode::Working,
+        HarnessGitDiffModeV1::Staged => GitDiffMode::Staged,
+        HarnessGitDiffModeV1::Commit { revision } => GitDiffMode::Commit {
+            revision: node_git_object_id_from_api(revision)?,
+        },
+    })
+}
+
 fn repository_path_from_api(
     path: &HarnessRepositoryPathV1,
 ) -> Result<RepositoryPath, HarnessC2Error> {
@@ -1955,7 +2133,7 @@ fn correlate_run_read_response(
 ) -> Result<HarnessOperatorResponseV1, HarnessC2Error> {
     let response = match (&prepared.kind, response) {
         (
-            PreparedRunReadKind::InspectWorkspace,
+            WorkspaceReadKind::InspectWorkspace,
             C2NodeResponse::WorkspaceInspected { inspection },
         ) if inspection.workspace_id == prepared.workspace_id => {
             HarnessOperatorResponseV1::RunWorkspaceInspected(
@@ -1963,7 +2141,7 @@ fn correlate_run_read_response(
             )
         }
         (
-            PreparedRunReadKind::ReadWorkspaceFile { path },
+            WorkspaceReadKind::ReadWorkspaceFile { path },
             C2NodeResponse::WorkspaceFileRead { file },
         ) if file.workspace_id == prepared.workspace_id && &file.path == path => {
             HarnessOperatorResponseV1::RunWorkspaceFileRead(
@@ -1971,7 +2149,7 @@ fn correlate_run_read_response(
             )
         }
         (
-            PreparedRunReadKind::ReadGitHistory { path, limit, .. },
+            WorkspaceReadKind::ReadGitHistory { path, limit, .. },
             C2NodeResponse::GitHistoryRead { workspace_id, page },
         ) if workspace_id == prepared.workspace_id
             && page.commits.len() <= usize::from(*limit) => {
@@ -1980,7 +2158,7 @@ fn correlate_run_read_response(
             )
         }
         (
-            PreparedRunReadKind::ReadGitDiff { request },
+            WorkspaceReadKind::ReadGitDiff { request },
             C2NodeResponse::GitDiffRead { workspace_id, diff },
         ) if workspace_id == prepared.workspace_id
             && diff.mode == request.mode
@@ -2194,6 +2372,173 @@ fn project_git_diff_mode(
             revision: HarnessGitObjectIdV1::new(revision.as_str())
                 .map_err(|_| HarnessC2Error::RunReadProjection)?,
         },
+    })
+}
+
+/// Node-scoped sibling of `correlate_run_read_response`. Shares every
+/// per-field projection helper (`project_repository_path`,
+/// `project_git_status_entry`, `project_git_commit`, `project_git_diff_mode`)
+/// with the run-scoped family — only the top-level origin and response
+/// variant differ.
+fn correlate_node_workspace_read_response(
+    prepared: &PreparedNodeWorkspaceRead,
+    response: C2NodeResponse,
+) -> Result<HarnessOperatorResponseV1, HarnessC2Error> {
+    let response = match (&prepared.kind, response) {
+        (
+            WorkspaceReadKind::InspectWorkspace,
+            C2NodeResponse::WorkspaceInspected { inspection },
+        ) if inspection.workspace_id == prepared.workspace_id => {
+            HarnessOperatorResponseV1::NodeWorkspaceInspected(
+                project_node_workspace_inspection(prepared, inspection)?,
+            )
+        }
+        (
+            WorkspaceReadKind::ReadWorkspaceFile { path },
+            C2NodeResponse::WorkspaceFileRead { file },
+        ) if file.workspace_id == prepared.workspace_id && &file.path == path => {
+            HarnessOperatorResponseV1::NodeWorkspaceFileRead(
+                project_node_workspace_file(prepared, file)?,
+            )
+        }
+        (
+            WorkspaceReadKind::ReadGitHistory { path, limit, .. },
+            C2NodeResponse::GitHistoryRead { workspace_id, page },
+        ) if workspace_id == prepared.workspace_id
+            && page.commits.len() <= usize::from(*limit) => {
+            HarnessOperatorResponseV1::NodeGitHistoryRead(
+                project_node_git_history(prepared, path, page)?,
+            )
+        }
+        (
+            WorkspaceReadKind::ReadGitDiff { request },
+            C2NodeResponse::GitDiffRead { workspace_id, diff },
+        ) if workspace_id == prepared.workspace_id
+            && diff.mode == request.mode
+            && diff.path == request.path => {
+            HarnessOperatorResponseV1::NodeGitDiffRead(
+                project_node_git_diff(prepared, diff)?,
+            )
+        }
+        _ => return Err(HarnessC2Error::NodeWorkspaceReadCorrelationMismatch),
+    };
+    response.validate().map_err(|_| HarnessC2Error::NodeWorkspaceReadProjection)?;
+    Ok(response)
+}
+
+fn project_node_workspace_inspection(
+    prepared: &PreparedNodeWorkspaceRead,
+    inspection: C2WorkspaceInspection,
+) -> Result<HarnessNodeWorkspaceInspectionV1, HarnessC2Error> {
+    let entries_truncated = inspection.entries.len() > HARNESS_WORKSPACE_TREE_ENTRIES_MAX;
+    let entries = inspection.entries.into_iter()
+        .take(HARNESS_WORKSPACE_TREE_ENTRIES_MAX)
+        .map(|entry| Ok(HarnessWorkspaceTreeEntryV1 {
+            relative_path: project_repository_path(&entry.relative_path)?,
+            kind: match entry.kind {
+                WorkspaceEntryKind::File => HarnessWorkspaceEntryKindV1::File,
+                WorkspaceEntryKind::Directory => HarnessWorkspaceEntryKindV1::Directory,
+            },
+        }))
+        .collect::<Result<Vec<_>, HarnessC2Error>>()?;
+    let status_truncated = inspection.git.status.len() > HARNESS_GIT_STATUS_ENTRIES_MAX;
+    let mut status = inspection.git.status.into_iter()
+        .take(HARNESS_GIT_STATUS_ENTRIES_MAX)
+        .map(project_git_status_entry)
+        .collect::<Result<Vec<_>, HarnessC2Error>>()?;
+    status.sort_by(|left, right| left.path.cmp(&right.path));
+    let commits_truncated = inspection.git.recent_commits.len()
+        > HARNESS_GIT_RECENT_COMMITS_MAX;
+    let recent_commits = inspection.git.recent_commits.into_iter()
+        .take(HARNESS_GIT_RECENT_COMMITS_MAX)
+        .map(|commit| Ok(HarnessGitCommitSummaryV1 {
+            id: HarnessGitObjectIdV1::new(commit.id)
+                .map_err(|_| HarnessC2Error::NodeWorkspaceReadProjection)?,
+            summary: commit.summary,
+        }))
+        .collect::<Result<Vec<_>, HarnessC2Error>>()?;
+    Ok(HarnessNodeWorkspaceInspectionV1 {
+        origin: prepared.origin(),
+        entries,
+        tree_truncated: inspection.tree_truncated || entries_truncated,
+        git: HarnessGitSummaryV1 {
+            is_repository: inspection.git.is_repository,
+            branch: inspection.git.branch,
+            status,
+            recent_commits,
+            truncated: inspection.git.truncated || status_truncated || commits_truncated,
+        },
+    })
+}
+
+fn project_node_workspace_file(
+    prepared: &PreparedNodeWorkspaceRead,
+    file: WorkspaceFileRead,
+) -> Result<HarnessNodeWorkspaceFileV1, HarnessC2Error> {
+    let content = match file.content {
+        WorkspaceFileContent::Utf8 { text, byte_len } => {
+            if text.len() > HARNESS_WORKSPACE_FILE_MAX_BYTES {
+                return Err(HarnessC2Error::NodeWorkspaceReadTooLarge);
+            }
+            HarnessWorkspaceFileContentV1::Utf8 { text, byte_len }
+        }
+        WorkspaceFileContent::NonUtf8 { byte_len } => {
+            HarnessWorkspaceFileContentV1::NonUtf8 { byte_len }
+        }
+        WorkspaceFileContent::TooLarge { limit_bytes } => {
+            HarnessWorkspaceFileContentV1::TooLarge { limit_bytes }
+        }
+    };
+    Ok(HarnessNodeWorkspaceFileV1 {
+        origin: prepared.origin(),
+        path: project_repository_path(&file.path)?,
+        content,
+        revision: file.revision.map(|revision| {
+            HarnessWorkspaceFileRevisionV1::new(revision.as_str())
+                .map_err(|_| HarnessC2Error::NodeWorkspaceReadProjection)
+        }).transpose()?,
+    })
+}
+
+fn project_node_git_history(
+    prepared: &PreparedNodeWorkspaceRead,
+    path: &Option<RepositoryPath>,
+    page: GitHistoryPage,
+) -> Result<HarnessNodeGitHistoryPageV1, HarnessC2Error> {
+    if page.commits.len() > usize::from(HARNESS_GIT_HISTORY_LIMIT_MAX) {
+        return Err(HarnessC2Error::NodeWorkspaceReadCorrelationMismatch);
+    }
+    let truncated = page.truncated;
+    Ok(HarnessNodeGitHistoryPageV1 {
+        origin: prepared.origin(),
+        path: path.as_ref().map(project_repository_path).transpose()?,
+        commits: page.commits.into_iter()
+            .map(project_git_commit)
+            .collect::<Result<Vec<_>, HarnessC2Error>>()?,
+        next_before: page.next_before.map(|object_id| {
+            HarnessGitObjectIdV1::new(object_id.as_str())
+                .map_err(|_| HarnessC2Error::NodeWorkspaceReadProjection)
+        }).transpose()?,
+        truncated,
+    })
+}
+
+fn project_node_git_diff(
+    prepared: &PreparedNodeWorkspaceRead,
+    diff: GitDiff,
+) -> Result<HarnessNodeGitDiffV1, HarnessC2Error> {
+    let mode = project_git_diff_mode(&diff.mode)?;
+    let path = diff.path.as_ref().map(project_repository_path).transpose()?;
+    let (text, truncated_at_api_cap) = truncate_utf8_at_byte_boundary(
+        diff.text,
+        HARNESS_GIT_DIFF_MAX_BYTES,
+    );
+    Ok(HarnessNodeGitDiffV1 {
+        origin: prepared.origin(),
+        mode,
+        path,
+        text,
+        truncated: diff.truncated || truncated_at_api_cap,
     })
 }
 
@@ -3889,6 +4234,24 @@ pub enum HarnessC2Error {
     RunReadTooLarge,
     #[error("Node rejected run workspace read with {code:?}")]
     RunReadRejected { code: NodeFailureCode },
+    #[error("node workspace read request is invalid")]
+    InvalidNodeWorkspaceReadRequest,
+    #[error("node workspace read was not enqueued: {0}")]
+    NodeWorkspaceReadEnqueue(C2ControlError),
+    #[error("node workspace read transport failed: {0}")]
+    NodeWorkspaceReadTransport(C2ControlError),
+    #[error("node workspace read deadline elapsed")]
+    NodeWorkspaceReadDeadline,
+    #[error("node workspace response route or incarnation does not match")]
+    NodeWorkspaceReadRouteMismatch,
+    #[error("node workspace response does not exactly correlate with the request")]
+    NodeWorkspaceReadCorrelationMismatch,
+    #[error("node workspace response cannot be projected into the bounded harness API")]
+    NodeWorkspaceReadProjection,
+    #[error("node workspace response exceeds the bounded harness API")]
+    NodeWorkspaceReadTooLarge,
+    #[error("Node rejected node workspace read with {code:?}")]
+    NodeWorkspaceReadRejected { code: NodeFailureCode },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5657,6 +6020,164 @@ mod tests {
             NodeIncarnationId::from_bytes([8; 16]),
         ));
         assert!(!run_read_response_route_matches(
+            &prepared,
+            &NodeId::new("node-b").unwrap(),
+            NodeIncarnationId::from_bytes([7; 16]),
+        ));
+    }
+
+    /// `PreparedNodeWorkspaceRead` has no adapter-free constructor —
+    /// `from_operator_request` resolves its route live via
+    /// `HarnessC2Adapter::exact_route`, which needs a live C2 connection and
+    /// so is exercised only by integration tests, not this unit-test module
+    /// (same reason no other `HarnessC2Adapter` method has a unit test here).
+    /// This fixture builds the struct directly — its fields are private but
+    /// this module owns the type — to unit-test everything downstream of
+    /// route resolution: request-to-wire relay and response projection.
+    fn node_workspace_read_fixture(kind: WorkspaceReadKind) -> PreparedNodeWorkspaceRead {
+        PreparedNodeWorkspaceRead {
+            route: NodeRoute {
+                node_id: NodeId::new("node-a").unwrap(),
+                expected_incarnation_id: NodeIncarnationId::from_bytes([7; 16]),
+            },
+            workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+            kind,
+        }
+    }
+
+    #[test]
+    fn node_workspace_read_relays_the_exact_route_and_kind_to_the_wire() {
+        let inspect = node_workspace_read_fixture(WorkspaceReadKind::InspectWorkspace);
+        assert!(matches!(
+            inspect.wire_request(),
+            NodeRequest::InspectWorkspace { workspace_id }
+                if workspace_id.as_str() == "workspace-a"
+        ));
+        let origin = inspect.origin();
+        assert_eq!(origin.node_id, "node-a");
+        assert_eq!(origin.node_incarnation_id, "07".repeat(16));
+        assert_eq!(origin.workspace_id, "workspace-a");
+
+        let path = RepositoryPath::utf8("src/lib.rs".to_owned()).unwrap();
+        let file = node_workspace_read_fixture(WorkspaceReadKind::ReadWorkspaceFile {
+            path: path.clone(),
+        });
+        assert!(matches!(
+            file.wire_request(),
+            NodeRequest::ReadWorkspaceFile { workspace_id, path: wire_path }
+                if workspace_id.as_str() == "workspace-a" && wire_path == path
+        ));
+
+        let history = node_workspace_read_fixture(WorkspaceReadKind::ReadGitHistory {
+            path: None,
+            before: None,
+            limit: 10,
+        });
+        assert!(matches!(
+            history.wire_request(),
+            NodeRequest::ReadGitHistory { workspace_id, limit: 10, .. }
+                if workspace_id.as_str() == "workspace-a"
+        ));
+
+        let diff = node_workspace_read_fixture(WorkspaceReadKind::ReadGitDiff {
+            request: GitDiffRequest { mode: GitDiffMode::Working, path: None },
+        });
+        assert!(matches!(
+            diff.wire_request(),
+            NodeRequest::ReadGitDiff { workspace_id, request }
+                if workspace_id.as_str() == "workspace-a" && request.mode == GitDiffMode::Working
+        ));
+    }
+
+    #[test]
+    fn node_workspace_read_projects_matching_response_and_rejects_mismatch() {
+        let prepared = node_workspace_read_fixture(WorkspaceReadKind::InspectWorkspace);
+        let inspection = C2WorkspaceInspection {
+            workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+            entries: vec![gate4agent_node_protocol::WorkspaceEntry {
+                relative_path: RepositoryPath::utf8("src/lib.rs".to_owned()).unwrap(),
+                kind: WorkspaceEntryKind::File,
+            }],
+            tree_truncated: false,
+            git: gate4agent_c2_protocol::C2GitSnapshot {
+                is_repository: true,
+                branch: Some("main".to_owned()),
+                status: Vec::new(),
+                recent_commits: Vec::new(),
+                worktrees: Vec::new(),
+                managed_worktree: None,
+                truncated: false,
+                diagnostic_present: false,
+            },
+        };
+        let response = correlate_node_workspace_read_response(
+            &prepared,
+            C2NodeResponse::WorkspaceInspected { inspection },
+        ).unwrap();
+        let HarnessOperatorResponseV1::NodeWorkspaceInspected(projected) = &response else {
+            panic!("workspace inspection projected another response");
+        };
+        assert_eq!(projected.origin.node_id, "node-a");
+        assert_eq!(projected.origin.workspace_id, "workspace-a");
+        assert_eq!(projected.entries.len(), 1);
+        assert!(projected.git.is_repository);
+        response.validate().expect("projected node workspace inspection is bounded");
+
+        let wrong_workspace = C2NodeResponse::WorkspaceInspected {
+            inspection: C2WorkspaceInspection {
+                workspace_id: WorkspaceId::new("workspace-b").unwrap(),
+                entries: Vec::new(),
+                tree_truncated: false,
+                git: gate4agent_c2_protocol::C2GitSnapshot {
+                    is_repository: false,
+                    branch: None,
+                    status: Vec::new(),
+                    recent_commits: Vec::new(),
+                    worktrees: Vec::new(),
+                    managed_worktree: None,
+                    truncated: false,
+                    diagnostic_present: false,
+                },
+            },
+        };
+        assert!(matches!(
+            correlate_node_workspace_read_response(&prepared, wrong_workspace),
+            Err(HarnessC2Error::NodeWorkspaceReadCorrelationMismatch),
+        ));
+
+        let diff_prepared = node_workspace_read_fixture(WorkspaceReadKind::ReadGitDiff {
+            request: GitDiffRequest { mode: GitDiffMode::Working, path: None },
+        });
+        let staged_instead = C2NodeResponse::GitDiffRead {
+            workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+            diff: GitDiff {
+                mode: GitDiffMode::Staged,
+                path: None,
+                text: String::new(),
+                truncated: false,
+            },
+        };
+        assert!(matches!(
+            correlate_node_workspace_read_response(&diff_prepared, staged_instead),
+            Err(HarnessC2Error::NodeWorkspaceReadCorrelationMismatch),
+        ));
+    }
+
+    #[test]
+    fn node_workspace_read_stale_response_route_is_rejected() {
+        let prepared = node_workspace_read_fixture(WorkspaceReadKind::InspectWorkspace);
+        let node_id = NodeId::new("node-a").unwrap();
+        assert!(node_workspace_read_response_route_matches(
+            &prepared,
+            &node_id,
+            NodeIncarnationId::from_bytes([7; 16]),
+        ));
+        assert!(!node_workspace_read_response_route_matches(
+            &prepared,
+            &node_id,
+            NodeIncarnationId::from_bytes([8; 16]),
+        ));
+        assert!(!node_workspace_read_response_route_matches(
             &prepared,
             &NodeId::new("node-b").unwrap(),
             NodeIncarnationId::from_bytes([7; 16]),

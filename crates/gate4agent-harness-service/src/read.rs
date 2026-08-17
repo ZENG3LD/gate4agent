@@ -284,20 +284,26 @@ fn context(
         .then_some(projection)
         .flatten()
         .and_then(|projection| projection.history.as_ref());
+    let task_visible = visibility.task_visible(&run.task_id);
+    let (task, sibling_runs) = task_visible
+        .then(|| task_and_sibling_runs(engine, run, visibility))
+        .unwrap_or_default();
     Ok(HarnessReadResponseV1::Context(SessionContextV1 {
         grant_id: grant.grant_id.clone(),
         grant_revision: grant.revision,
         actor_run: CallerRunV1 {
             run_id: run.run_id.clone(),
-            task_id: visibility.task_visible(&run.task_id).then(|| run.task_id.clone()),
+            task_id: task_visible.then(|| run.task_id.clone()),
             parent_run_id: run.parent_run_id.as_ref()
                 .filter(|run_id| visibility.run_visible(run_id)).cloned(),
             lifecycle: run.lifecycle,
-            references_redacted: !visibility.task_visible(&run.task_id)
+            references_redacted: !task_visible
                 || run.parent_run_id.as_ref().is_some_and(|run_id| {
                     !visibility.run_visible(run_id)
                 }),
         },
+        task,
+        sibling_runs,
         read_permissions: grant.read_permissions.clone(),
         monitoring_visibility: grant.monitoring_visibility,
         maximum_child_count: grant.maximum_child_count,
@@ -307,6 +313,30 @@ fn context(
         completed_turn_count: history.and_then(|history| history.completed_turn_count),
         total_tokens: history.and_then(|history| history.total_tokens),
     }))
+}
+
+/// The calling run's own task plus every OTHER run recorded against that same
+/// task ("what previous sessions did on it"), gated solely by whether the
+/// grant can see the task itself (same predicate as `actor_run.task_id`).
+/// Deliberately independent of the grant's `runs` read scope: that scope
+/// governs the general run-browsing tools (`g4a_runs_get`/`g4a_runs_list`),
+/// not what a session can see about the one task it is attached to. Siblings
+/// come from the task's own canonical `run_ids`, never from a scan, so no
+/// other task's runs can surface here.
+fn task_and_sibling_runs(
+    engine: &gate4agent_harness_engine::HarnessEngine,
+    run: &gate4agent_harness_protocol::HarnessRunV1,
+    visibility: &HarnessReadVisibilityV1,
+) -> (Option<RedactedTaskV1>, Vec<RedactedRunV1>) {
+    let Some(task) = engine.task(&run.task_id) else {
+        return (None, Vec::new());
+    };
+    let sibling_runs = task.run_ids.iter()
+        .filter(|sibling_id| **sibling_id != run.run_id)
+        .filter_map(|sibling_id| engine.run(sibling_id))
+        .map(|sibling| redact_run(sibling, visibility))
+        .collect();
+    (Some(redact_task(task, visibility)), sibling_runs)
 }
 
 fn authorized_monitor_run(
@@ -1192,6 +1222,385 @@ mod tests {
         }
         assert_eq!(authorize_request(&grant, &HarnessReadRequestV1::ContextGet), Ok(()));
         assert!(allowed_tool_ids(&grant).contains(&"g4a_context_get".to_owned()));
+    }
+
+    fn task_id_a() -> HarnessTaskId {
+        HarnessTaskId::new(format!("htask_{}", "a".repeat(24))).unwrap()
+    }
+
+    fn task_id_b() -> HarnessTaskId {
+        HarnessTaskId::new(format!("htask_{}", "b".repeat(24))).unwrap()
+    }
+
+    fn run_id_1() -> HarnessRunId {
+        HarnessRunId::new(format!("hrun_{}", "a".repeat(24))).unwrap()
+    }
+
+    fn run_id_2() -> HarnessRunId {
+        HarnessRunId::new(format!("hrun_{}", "b".repeat(24))).unwrap()
+    }
+
+    fn run_id_3() -> HarnessRunId {
+        HarnessRunId::new(format!("hrun_{}", "c".repeat(24))).unwrap()
+    }
+
+    fn run_id_4() -> HarnessRunId {
+        HarnessRunId::new(format!("hrun_{}", "d".repeat(24))).unwrap()
+    }
+
+    fn operation_id_2() -> HarnessOperationId {
+        HarnessOperationId::new(format!("hop_{}", "b".repeat(24))).unwrap()
+    }
+
+    fn operation_id_3() -> HarnessOperationId {
+        HarnessOperationId::new(format!("hop_{}", "c".repeat(24))).unwrap()
+    }
+
+    fn operation_id_4() -> HarnessOperationId {
+        HarnessOperationId::new(format!("hop_{}", "d".repeat(24))).unwrap()
+    }
+
+    /// Task A owns three runs: the actor's own (`run_id_1`, unchanged from
+    /// `credential::tests::engine`), a completed sibling with a context-pack
+    /// receipt and git facts (`run_id_2`), and a failed sibling whose parent
+    /// points at a run of an unrelated task (`run_id_3` -> `run_id_4`). Task
+    /// A also depends on decoy task B, whose only run (`run_id_4`) must never
+    /// surface through task A's grant. The grant's `runs`/`operations` read
+    /// scopes stay `None`, to prove `sibling_runs` is populated from task
+    /// visibility alone, not from those unrelated scopes.
+    fn task_with_siblings_engine() -> gate4agent_harness_engine::HarnessEngine {
+        let mut checkpoint = crate::credential::tests::engine(
+            1,
+            SessionGrantStateV1::Active,
+            1,
+            HarnessRunLifecycleV1::Running,
+        ).checkpoint();
+
+        let node_incarnation = checkpoint.runs[0].binding.as_ref()
+            .expect("actor run is bound in the credential fixture")
+            .node_incarnation.clone();
+
+        checkpoint.tasks[0].dependencies = vec![task_id_b()];
+        checkpoint.tasks[0].run_ids = vec![run_id_1(), run_id_2(), run_id_3()];
+        checkpoint.tasks[0].result_refs = vec![HarnessResultRef::for_run(&run_id_2())];
+
+        checkpoint.grants[0].read_permissions = HarnessReadPermissionsV1 {
+            tasks: HarnessEntityReadScopeV1::SelfOnly,
+            runs: HarnessEntityReadScopeV1::None,
+            operations: HarnessEntityReadScopeV1::None,
+        };
+
+        checkpoint.runs.push(HarnessRunV1 {
+            run_id: run_id_2(),
+            revision: HarnessRevision::new(1).unwrap(),
+            parent_run_id: None,
+            task_id: task_id_a(),
+            operation_id: operation_id_2(),
+            intent: HarnessRunIntentV1 {
+                node_id: selector("node-a"),
+                workspace_id: selector("workspace-a"),
+                worktree: HarnessWorktreeIntentV1::Existing,
+                provider_profile: selector("claude-default"),
+                mode: HarnessExecutionModeV1::Pty,
+                delivery_bundle: None,
+                continuation: None,
+            },
+            delivery_receipt: None,
+            continuation_receipt: None,
+            context_pack: Some(HarnessResolvedContextPackReceiptV1 {
+                id: selector("context-sibling-b"),
+                digest: format!("sha256:{}", "b".repeat(64)),
+                lineage: HarnessContextPackLineageV1 {
+                    source_node_id: selector("node-a"),
+                    source_workspace_id: selector("workspace-a"),
+                    source_instance_id: 7,
+                    source_generation: 1,
+                    source_provider: selector("claude-default"),
+                },
+                source_message_count: 3,
+                retained_message_count: 3,
+                byte_len: 100,
+                truncated: false,
+            }),
+            git_facts: Some(HarnessRunGitFactsV1 {
+                captured_at_unix_ms: 15,
+                outcome: HarnessRunGitFactsOutcomeV1::Unavailable,
+            }),
+            binding: Some(HarnessSessionBindingV1 {
+                node_id: selector("node-a"),
+                node_incarnation: node_incarnation.clone(),
+                workspace_id: selector("workspace-a"),
+                session: HarnessSessionIdentityV1::Managed {
+                    record_id: selector("record-b"),
+                    active_session: None,
+                },
+            }),
+            lifecycle: HarnessRunLifecycleV1::Completed,
+            result_disposition: Some(HarnessResultDispositionV1::Succeeded),
+            failure: None,
+            created_at_unix_ms: 10,
+            updated_at_unix_ms: 12,
+        });
+        checkpoint.operations.push(HarnessOperationV1 {
+            operation_id: operation_id_2(),
+            revision: HarnessRevision::new(1).unwrap(),
+            actor: HarnessActorV1::User { actor_id: selector("operator") },
+            kind: HarnessOperationKindV1::CreateRun,
+            state: HarnessOperationStateV1::Succeeded,
+            task_id: Some(task_id_a()),
+            run_id: Some(run_id_2()),
+            grant_id: None,
+            reconciles_operation_id: None,
+            expected_revision: Some(HarnessRevision::new(1).unwrap()),
+            request_digest: HarnessRequestDigest::new("b".repeat(64)).unwrap(),
+            idempotency_ref: HarnessIdempotencyRef::new(
+                format!("hidem_{}", "b".repeat(24)),
+            ).unwrap(),
+            failure: None,
+            outcome_unknown_reason: None,
+            reconciliation_outcome: None,
+            created_at_unix_ms: 10,
+            updated_at_unix_ms: 12,
+            dispatched_at_unix_ms: Some(10),
+            finished_at_unix_ms: Some(12),
+        });
+
+        checkpoint.runs.push(HarnessRunV1 {
+            run_id: run_id_3(),
+            revision: HarnessRevision::new(1).unwrap(),
+            parent_run_id: Some(run_id_4()),
+            task_id: task_id_a(),
+            operation_id: operation_id_3(),
+            intent: HarnessRunIntentV1 {
+                node_id: selector("node-a"),
+                workspace_id: selector("workspace-a"),
+                worktree: HarnessWorktreeIntentV1::Existing,
+                provider_profile: selector("claude-default"),
+                mode: HarnessExecutionModeV1::Pty,
+                delivery_bundle: None,
+                continuation: None,
+            },
+            delivery_receipt: None,
+            continuation_receipt: None,
+            context_pack: None,
+            git_facts: None,
+            binding: None,
+            lifecycle: HarnessRunLifecycleV1::Failed,
+            result_disposition: Some(HarnessResultDispositionV1::Failed),
+            failure: Some(HarnessFailureV1 {
+                category: HarnessFailureCategoryV1::Internal,
+                retryable: false,
+            }),
+            created_at_unix_ms: 10,
+            updated_at_unix_ms: 14,
+        });
+        checkpoint.operations.push(HarnessOperationV1 {
+            operation_id: operation_id_3(),
+            revision: HarnessRevision::new(1).unwrap(),
+            actor: HarnessActorV1::User { actor_id: selector("operator") },
+            kind: HarnessOperationKindV1::CreateRun,
+            state: HarnessOperationStateV1::Failed,
+            task_id: Some(task_id_a()),
+            run_id: Some(run_id_3()),
+            grant_id: None,
+            reconciles_operation_id: None,
+            expected_revision: Some(HarnessRevision::new(1).unwrap()),
+            request_digest: HarnessRequestDigest::new("c".repeat(64)).unwrap(),
+            idempotency_ref: HarnessIdempotencyRef::new(
+                format!("hidem_{}", "c".repeat(24)),
+            ).unwrap(),
+            failure: Some(HarnessFailureV1 {
+                category: HarnessFailureCategoryV1::Internal,
+                retryable: false,
+            }),
+            outcome_unknown_reason: None,
+            reconciliation_outcome: None,
+            created_at_unix_ms: 10,
+            updated_at_unix_ms: 14,
+            dispatched_at_unix_ms: Some(10),
+            finished_at_unix_ms: Some(14),
+        });
+
+        // Decoy task B and its run: reachable only through task B's own
+        // grant, never through task A's.
+        checkpoint.tasks.push(HarnessTaskV1 {
+            task_id: task_id_b(),
+            revision: HarnessRevision::new(1).unwrap(),
+            title: "decoy task".to_owned(),
+            body: "decoy body".to_owned(),
+            creator: HarnessActorV1::User { actor_id: selector("operator") },
+            parent_task_id: None,
+            dependencies: Vec::new(),
+            state: HarnessTaskStateV1::Running,
+            run_ids: vec![run_id_4()],
+            result_refs: Vec::new(),
+            artifact_refs: Vec::new(),
+            created_at_unix_ms: 10,
+            updated_at_unix_ms: 10,
+        });
+        checkpoint.runs.push(HarnessRunV1 {
+            run_id: run_id_4(),
+            revision: HarnessRevision::new(1).unwrap(),
+            parent_run_id: None,
+            task_id: task_id_b(),
+            operation_id: operation_id_4(),
+            intent: HarnessRunIntentV1 {
+                node_id: selector("node-a"),
+                workspace_id: selector("workspace-a"),
+                worktree: HarnessWorktreeIntentV1::Existing,
+                provider_profile: selector("claude-default"),
+                mode: HarnessExecutionModeV1::Pty,
+                delivery_bundle: None,
+                continuation: None,
+            },
+            delivery_receipt: None,
+            continuation_receipt: None,
+            context_pack: None,
+            git_facts: None,
+            binding: Some(HarnessSessionBindingV1 {
+                node_id: selector("node-a"),
+                node_incarnation,
+                workspace_id: selector("workspace-a"),
+                session: HarnessSessionIdentityV1::Managed {
+                    record_id: selector("record-d"),
+                    active_session: Some(HarnessRuntimeIdentityV1 { instance_id: 9, generation: 1 }),
+                },
+            }),
+            lifecycle: HarnessRunLifecycleV1::Running,
+            result_disposition: None,
+            failure: None,
+            created_at_unix_ms: 10,
+            updated_at_unix_ms: 10,
+        });
+        checkpoint.operations.push(HarnessOperationV1 {
+            operation_id: operation_id_4(),
+            revision: HarnessRevision::new(1).unwrap(),
+            actor: HarnessActorV1::User { actor_id: selector("operator") },
+            kind: HarnessOperationKindV1::CreateRun,
+            state: HarnessOperationStateV1::Succeeded,
+            task_id: Some(task_id_b()),
+            run_id: Some(run_id_4()),
+            grant_id: None,
+            reconciles_operation_id: None,
+            expected_revision: Some(HarnessRevision::new(1).unwrap()),
+            request_digest: HarnessRequestDigest::new("d".repeat(64)).unwrap(),
+            idempotency_ref: HarnessIdempotencyRef::new(
+                format!("hidem_{}", "d".repeat(24)),
+            ).unwrap(),
+            failure: None,
+            outcome_unknown_reason: None,
+            reconciliation_outcome: None,
+            created_at_unix_ms: 10,
+            updated_at_unix_ms: 10,
+            dispatched_at_unix_ms: Some(10),
+            finished_at_unix_ms: Some(10),
+        });
+
+        gate4agent_harness_engine::HarnessEngine::restore(checkpoint).unwrap()
+    }
+
+    #[test]
+    fn context_task_and_sibling_runs_are_scoped_to_the_actor_task_and_never_cross_tasks() {
+        let path = observation_path("context-task-siblings");
+        let harness = HarnessService::from_engine_for_test(task_with_siblings_engine());
+        let observation = ObservationService::open(&path).unwrap();
+        let binding = crate::credential::tests::binding(1, 1);
+        let support = ObservationSupportRegistry::default();
+
+        let HarnessReadResponseV1::Context(context) = execute_exact_binding_read(
+            &harness,
+            &observation,
+            &support,
+            &binding,
+            HarnessReadRequestV1::ContextGet,
+        ).unwrap() else {
+            panic!("context response");
+        };
+        context.validate().unwrap();
+
+        let task = context.task.as_ref().expect("own task is visible under a SelfOnly task scope");
+        assert_eq!(task.task_id, task_id_a());
+        assert_eq!(task.title, "credential fixture");
+        assert_eq!(task.state, HarnessTaskStateV1::Running);
+        assert_eq!(task.result_refs, vec![HarnessResultRef::for_run(&run_id_2())]);
+        // Task B is a real dependency, but it sits outside this grant's task
+        // scope, so the reference is stripped rather than exposed.
+        assert!(task.dependency_ids.is_empty());
+        // The embedded task's own `run_ids` stays gated by the (unrelated)
+        // `runs` read scope, which this grant sets to `None` -- it comes
+        // back empty even though `sibling_runs` below is fully populated.
+        assert!(task.run_ids.is_empty());
+        assert!(task.references_redacted);
+
+        assert_eq!(context.sibling_runs.len(), 2);
+        let completed = context.sibling_runs.iter().find(|run| run.run_id == run_id_2())
+            .expect("completed sibling run is present");
+        assert_eq!(completed.lifecycle, HarnessRunLifecycleV1::Completed);
+        assert_eq!(completed.result_disposition, Some(HarnessResultDispositionV1::Succeeded));
+        assert!(completed.failure_category.is_none());
+        assert_eq!(
+            completed.context_pack.as_ref().map(|pack| pack.digest.clone()),
+            Some(format!("sha256:{}", "b".repeat(64))),
+        );
+        assert!(completed.git_facts.is_some());
+        assert_eq!(completed.task_id, Some(task_id_a()));
+
+        let failed = context.sibling_runs.iter().find(|run| run.run_id == run_id_3())
+            .expect("failed sibling run is present");
+        assert_eq!(failed.lifecycle, HarnessRunLifecycleV1::Failed);
+        assert_eq!(failed.result_disposition, Some(HarnessResultDispositionV1::Failed));
+        assert_eq!(failed.failure_category, Some(HarnessFailureCategoryV1::Internal));
+        // Its parent is task B's run: outside the grant's run scope, so the
+        // reference is stripped the same way `redact_run` already strips any
+        // other out-of-scope cross-reference.
+        assert!(failed.parent_run_id.is_none());
+        assert!(failed.operation_id.is_none());
+        assert!(failed.references_redacted);
+
+        assert!(context.sibling_runs.iter().all(|run| run.run_id != run_id_1()));
+        assert!(context.sibling_runs.iter().all(|run| run.run_id != run_id_4()));
+
+        let encoded = serde_json::to_string(&context).unwrap();
+        for forbidden in [
+            task_id_b().to_string(),
+            run_id_4().to_string(),
+            "record-d".to_owned(),
+            "decoy".to_owned(),
+        ] {
+            assert!(!encoded.contains(&forbidden), "task-scoped context leaked {forbidden}");
+        }
+        close_observation(observation, &path);
+    }
+
+    #[test]
+    fn context_hides_task_and_sibling_runs_when_grant_denies_task_reads() {
+        let path = observation_path("context-task-siblings-denied");
+        let harness = HarnessService::from_engine_for_test(
+            crate::credential::tests::engine(
+                1,
+                SessionGrantStateV1::Active,
+                1,
+                HarnessRunLifecycleV1::Running,
+            ),
+        );
+        let observation = ObservationService::open(&path).unwrap();
+        let binding = crate::credential::tests::binding(1, 1);
+        let support = ObservationSupportRegistry::default();
+
+        let HarnessReadResponseV1::Context(context) = execute_exact_binding_read(
+            &harness,
+            &observation,
+            &support,
+            &binding,
+            HarnessReadRequestV1::ContextGet,
+        ).unwrap() else {
+            panic!("context response");
+        };
+        context.validate().unwrap();
+        assert!(context.actor_run.task_id.is_none());
+        assert!(context.task.is_none());
+        assert!(context.sibling_runs.is_empty());
+        close_observation(observation, &path);
     }
 
     #[test]

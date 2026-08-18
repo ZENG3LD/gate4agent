@@ -2,7 +2,7 @@
 
 gate4agent is an agent workbench, not just a transport library: a
 node/c2/harness/TUI stack for running, observing, and orchestrating CLI
-coding-agent sessions (Claude Code, Codex, Kimi Code) on top of a provider
+coding-agent sessions (first tier: Claude Code, Codex, Kimi, Grok) on top of a provider
 transport core. A node wraps one machine's providers (PTY/inline sessions, the
 file browser, local git, worktrees); c2 relays any number of nodes to their
 clients; a harness — light or full — is the one stateful backend a client app
@@ -18,8 +18,8 @@ rest of the stack builds on; see [Transport core](#transport-core) below.
 One direction of wrapping: providers → node → c2 → harness → client app. All
 crate names below are prefixed `gate4agent-` (e.g. `-node` = `gate4agent-node`).
 
-- **Providers** — blackbox vendor CLIs (Claude Code, Codex, Kimi Code) wrapped
-  by the transport core: root crate `gate4agent` (`src/`),
+- **Providers** — blackbox vendor CLIs (Claude Code, Codex, Kimi, Grok,
+  qwen-code) wrapped by the transport core: root crate `gate4agent` (`src/`),
   `vendor/portable-pty`, `-types`, `-adapters`, `-provider-ports`, `-catalog`,
   `-engine`, `-kernel`, `-handle`, `-tool-protocol`, `-tool-engine`,
   `-shell-history`, `-shell-capabilities`, `-shell-hooks`,
@@ -107,11 +107,14 @@ API — usable on its own, with no node/c2/harness in the loop.
 | **Codex CLI** | Structured inline + PTY | current `exec --json` | not in default catalog | current `exec resume` | Inline and Windows PTY verified on 0.144.6; inline defaults to read-only |
 | **Kimi Code** | Structured inline + raw PTY | current `stream-json` | unsupported | active adapter `--session <id>`; legacy `PipeSession` `-r <id>` | Version 0.31.1 exposes `--session`; the latest PTY canary exited before readiness with a local provider `EPERM`, so current PTY lifecycle is not claimed |
 
-The separate `agent` module also carries a 33-entry Orca-derived reference
-registry from an earlier grounding cycle; those entries are transitional code
-debt, not support claims — the table above is the active support matrix.
-Gemini, OpenCode, and the other reference entries are outside the current
-product target.
+The table above is the transport core's own verified matrix. Grok and
+qwen-code ride the modern adapter registry (`gate4agent-adapters`) used by the
+node stack: Grok is a first-tier provider (a known resume gap is tracked);
+qwen-code is wired but unverified. The separate `agent` module also carries a
+33-entry Orca-derived reference registry from an earlier grounding cycle;
+those entries are transitional code debt, not support claims. Gemini,
+OpenCode, and the other reference entries were last live-verified in the
+0.2.5–0.2.6 era and are outside the current product target.
 
 ### Quick start
 

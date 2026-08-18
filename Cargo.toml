@@ -2,7 +2,7 @@
 name = "gate4agent"
 version = "0.3.0"
 edition = "2021"
-description = "Universal transport library for CLI AI agents (Claude Code, Codex, Gemini, OpenCode). Pipe, PTY, ACP (Agent Client Protocol), and Daemon transports."
+description = "Transport library for CLI AI agents — first tier: Claude Code, Codex, Kimi, Grok. Pipe, PTY, ACP (Agent Client Protocol), and Daemon transports."
 license = "MIT"
 repository = "https://github.com/ZENG3LD/gate4agent"
 readme = "README.md"

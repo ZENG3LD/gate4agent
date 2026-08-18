@@ -42,6 +42,7 @@ use gate4agent_types::{
 };
 use gate4agent_harness_client::{
     FeatureObservationStateV1, HarnessRunContextSourceObservationV1,
+    HarnessExecutionModeV1,
     HarnessExpectedExecutionSpecRevisionV1,
     HarnessGitObjectIdV1,
     HarnessOperatorMutationOutcomeV1,
@@ -70,7 +71,7 @@ use gate4agent_harness_client::{
     HarnessIssuedExecutionSpecSummaryV1, HarnessManagedWorktreeProfileOptionV1,
     HarnessManagedWorktreeRetentionV1, HarnessOrdinaryLaunchPlanOptionV1,
     HarnessTaskLaunchIssuanceId,
-    HarnessDispatchIntentV1, HarnessExecutionModeV1, HarnessExecutionSpecId,
+    HarnessDispatchIntentV1, HarnessExecutionSpecId,
     HarnessIdempotencyRef, HarnessLaunchPlanRefV1,
     HarnessManagedRunSessionV1, HarnessOperationId,
     HarnessRunIntentV1,
@@ -2286,6 +2287,35 @@ pub enum AppAction {
     HarnessOpenTerminal {
         session: HarnessRuntimeSessionAddressV1,
         after_sequence: Option<u64>,
+    },
+    // Typed harness-operator siblings of `SpawnSpec`/`Input`/`Resize`/`Stop`,
+    // rewritten in from those direct-mode shapes by
+    // `App::route_harness_session_verb` (see its doc comment) rather than
+    // built directly -- `build_launch_action` and the terminal input/resize/
+    // stop key handlers stay mode-agnostic.
+    HarnessSpawnSession {
+        token: u64,
+        node_id: String,
+        workspace_id: String,
+        provider: String,
+        provider_profile: String,
+        mode: HarnessExecutionModeV1,
+        rows: u16,
+        cols: u16,
+    },
+    HarnessWriteSessionInput {
+        session: HarnessRuntimeSessionAddressV1,
+        text: String,
+    },
+    HarnessResizeSession {
+        session: HarnessRuntimeSessionAddressV1,
+        rows: u16,
+        cols: u16,
+    },
+    HarnessStopSession {
+        token: u64,
+        session: HarnessRuntimeSessionAddressV1,
+        force: bool,
     },
     HarnessLoadTaskCorrelations {
         task: HarnessTaskRef,
@@ -5880,7 +5910,7 @@ impl App {
             .min(HarnessKanbanColumn::ALL.len().saturating_sub(1));
     }
 
-    fn request_harness_refresh(&mut self) -> AppAction {
+    pub(crate) fn request_harness_refresh(&mut self) -> AppAction {
         if !self.harness_kanban.enabled || self.harness_kanban.pending_refresh.is_some() {
             return AppAction::None;
         }
@@ -5895,6 +5925,82 @@ impl App {
         self.native_catalog_token = token;
         self.begin_harness_refresh(token);
         token
+    }
+
+    /// Rewrites the direct-mode launch/session-control actions into their
+    /// typed harness-operator siblings when running in harness-only mode
+    /// (direct-C2 light-TUI mode leaves `harness_only` false, so this is a
+    /// no-op passthrough there). `build_launch_action` and the terminal
+    /// input/resize/stop key handlers stay mode-agnostic and keep building
+    /// the same `SpawnSpec`/`Input`/`Resize`/`Stop` actions either way; only
+    /// this dispatch-time rewrite changes what actually gets sent. Lives
+    /// here (not `client.rs`) because it needs `begin_harness_mutation_
+    /// refresh`: `HarnessSpawnSession`/`HarnessStopSession` follow up with a
+    /// snapshot refresh on success (`publish_harness_snapshot` in
+    /// `client.rs`, the same pattern `harness_schedule_next` already uses),
+    /// which needs the same `harness_kanban.pending_refresh` token gate
+    /// every other harness mutation arms first.
+    /// `HarnessWriteSessionInput`/`HarnessResizeSession` carry no token:
+    /// they are fire-and-forget (no kanban-visible state change on
+    /// success), so arming that gate on every keystroke would be wrong.
+    pub fn route_harness_session_verb(&mut self, harness_only: bool, action: AppAction) -> AppAction {
+        if !harness_only {
+            return action;
+        }
+        match action {
+            AppAction::SpawnSpec { node_id, workspace_id, provider, rows, cols, profile_id, .. } => {
+                let token = self.begin_harness_mutation_refresh();
+                AppAction::HarnessSpawnSession {
+                    token,
+                    node_id,
+                    workspace_id,
+                    provider: provider.as_str().to_owned(),
+                    provider_profile: profile_id,
+                    mode: HarnessExecutionModeV1::Pty,
+                    rows,
+                    cols,
+                }
+            }
+            AppAction::Input { address, text } => match self.harness_session_address(&address) {
+                Some(session) => AppAction::HarnessWriteSessionInput { session, text },
+                None => AppAction::None,
+            },
+            AppAction::Resize { address, rows, cols } => match self.harness_session_address(&address) {
+                Some(session) => AppAction::HarnessResizeSession { session, rows, cols },
+                None => AppAction::None,
+            },
+            AppAction::Stop { address, force } => match self.harness_session_address(&address) {
+                Some(session) => {
+                    let token = self.begin_harness_mutation_refresh();
+                    AppAction::HarnessStopSession { token, session, force }
+                }
+                None => AppAction::None,
+            },
+            other => other,
+        }
+    }
+
+    /// Resolves the node's current incarnation (needed for the harness wire
+    /// address's `incarnation_id`, which the direct-mode `SessionAddress`
+    /// this crate uses does not carry) from `self.nodes` -- the same lookup
+    /// `HarnessOpenTerminal`'s own construction uses in `client.rs`'s poll
+    /// loop. `None` if the node isn't (yet) in the harness runtime
+    /// inventory, which drops the action via `route_harness_session_verb`'s
+    /// `None` arms rather than sending a request the host cannot route.
+    fn harness_session_address(
+        &self,
+        address: &SessionAddress,
+    ) -> Option<HarnessRuntimeSessionAddressV1> {
+        let incarnation_id = self.nodes.iter()
+            .find(|node| node.node_id == address.node_id)
+            .and_then(|node| node.incarnation_id)?;
+        Some(HarnessRuntimeSessionAddressV1 {
+            node_id: address.node_id.clone(),
+            incarnation_id: incarnation_id.to_string(),
+            workspace_id: address.workspace_id.clone(),
+            instance_id: address.instance_id,
+            generation: address.generation,
+        })
     }
 
     pub fn harness_move_selected(&mut self, state: HarnessTaskStateV1) -> AppAction {
@@ -8019,6 +8125,32 @@ impl App {
         self.reconcile_agent_menu();
         self.reconcile_native_session_menu();
         self.reconcile_agent_board();
+    }
+
+    /// The harness runtime inventory carries no terminal state — its session
+    /// entries are stubs with empty terminal buffers. Upserting them verbatim
+    /// would wipe the live PTY frames the harness terminal poll has already
+    /// applied, blanking every open panel for a beat on each periodic
+    /// snapshot. Carry the known per-session terminal state across before the
+    /// upsert. (The light/C2 path never needs this: its snapshots ride the
+    /// terminal watermark preservation in `C2ApplyState`.)
+    pub fn preserve_known_session_terminal_state(&self, node: &mut NodeView) {
+        for workspace in &mut node.workspaces {
+            for session in &mut workspace.sessions {
+                if let Some(existing) = self.find_session(&session.address) {
+                    session.terminal_formatted = existing.terminal_formatted.clone();
+                    session.terminal_scrollback = existing.terminal_scrollback.clone();
+                    session.terminal_alternate_screen = existing.terminal_alternate_screen;
+                    session.terminal_mouse_protocol_enabled =
+                        existing.terminal_mouse_protocol_enabled;
+                    session.terminal_mouse_protocol_encoding =
+                        existing.terminal_mouse_protocol_encoding;
+                    session.terminal_cursor = existing.terminal_cursor;
+                    session.attention = existing.attention;
+                    session.progress = existing.progress.clone();
+                }
+            }
+        }
     }
 
     pub fn request_open(&mut self, address: SessionAddress) {

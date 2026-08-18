@@ -70,7 +70,7 @@ use gate4agent_harness_client::{
     HarnessRuntimeManagedStateV1, HarnessRuntimeNodeInventoryV1,
     HarnessRuntimeMouseProtocolEncodingV1, HarnessRuntimeSessionAddressV1,
     HarnessRuntimeSessionStatusV1, HarnessRuntimeSessionV1, HarnessRuntimeTerminalFrameV1,
-    HarnessRuntimeTerminalPageV1, HarnessRuntimeTransportV1,
+    HarnessRuntimeTerminalPageV1, HarnessRuntimeTerminalSizeV1, HarnessRuntimeTransportV1,
     HarnessRuntimeLaunchInventoryV1,
     HarnessNodeWorkspaceFileV1, HarnessNodeWorkspaceInspectionV1,
     HarnessNodeGitDiffV1, HarnessNodeGitHistoryPageV1,
@@ -123,6 +123,11 @@ const HARNESS_HISTORY_COMMAND_ROUTE: &str = "\0harness-history";
 const HARNESS_DETAIL_COMMAND_ROUTE: &str = "\0harness-detail";
 const RECONNECT_DELAY: Duration = Duration::from_millis(500);
 const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(250);
+/// The harness read surface is poll-only (no event push yet): without a
+/// periodic snapshot cadence the roster/kanban only converge after an
+/// operator mutation, so sessions spawned moments ago (or by any other
+/// client of the same harness) never appear until a manual refresh.
+const HARNESS_SNAPSHOT_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const RAW_INPUT_COALESCE: Duration = Duration::from_millis(12);
 const INSPECTION_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const HARNESS_TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -388,6 +393,13 @@ enum WorkerUpdate {
         node_id: String,
         endpoint: String,
         state: ConnectionState,
+    },
+    /// A typed harness SpawnSession succeeded: the app opens (or queues via
+    /// `pending_open`) the PTY tab for the returned address — light-mode
+    /// spawn parity, where the session panel appears without any manual
+    /// roster interaction.
+    HarnessSessionSpawned {
+        address: SessionAddress,
     },
     RelayRoute {
         node_id: String,
@@ -1288,6 +1300,7 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
     let mut next_auto_inspection = Instant::now();
     let mut harness_terminal_poll_address: Option<SessionAddress> = None;
     let mut next_harness_terminal_poll = Instant::now();
+    let mut next_harness_snapshot_refresh = Instant::now();
     let mut preferred_color_mode = initial_preferences.color_mode;
     let mut observed_app_color_mode = app.color_mode;
     let mut observed_preferences = preferences_for_save(&app, preferred_color_mode);
@@ -1347,6 +1360,20 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
             );
             next_auto_inspection = now + INSPECTION_REFRESH_INTERVAL;
             state_changed = true;
+        }
+        if selected_backend.harness_worker && now >= next_harness_snapshot_refresh {
+            let action = app.request_harness_refresh();
+            if !matches!(action, AppAction::None) {
+                queue_action(
+                    &mut app,
+                    &commands,
+                    &inspection_commands,
+                    &mut pending_raw,
+                    action,
+                );
+                state_changed = true;
+            }
+            next_harness_snapshot_refresh = now + HARNESS_SNAPSHOT_REFRESH_INTERVAL;
         }
         let focused_harness_terminal = if selected_backend.harness_worker {
             app.focused_address().cloned()
@@ -1627,6 +1654,7 @@ fn send_operator_action(
         && !commands.contains_key(C2_COMMAND_ROUTE)
         && commands.len() == 3;
     let action = harness_route_workspace_read(harness_only, action);
+    let action = app.route_harness_session_verb(harness_only, action);
     let Some(node_id) = action_node_id(&action).map(str::to_owned) else {
         return;
     };
@@ -2015,7 +2043,11 @@ fn action_node_id(action: &AppAction) -> Option<&str> {
         | AppAction::HarnessOpenMonitor { .. }
         | AppAction::HarnessLoadTaskCorrelations { .. }
         | AppAction::HarnessSaveTaskLaunchSpec { .. }
-        | AppAction::HarnessStartTaskV2 { .. } => Some(HARNESS_COMMAND_ROUTE),
+        | AppAction::HarnessStartTaskV2 { .. }
+        | AppAction::HarnessSpawnSession { .. }
+        | AppAction::HarnessWriteSessionInput { .. }
+        | AppAction::HarnessResizeSession { .. }
+        | AppAction::HarnessStopSession { .. } => Some(HARNESS_COMMAND_ROUTE),
         AppAction::HarnessOpenTerminal { .. }
         | AppAction::HarnessLoadTaskLaunchOptions { .. }
         | AppAction::HarnessLoadRunTransfer { .. }
@@ -2464,6 +2496,79 @@ fn harness_operator_worker(
                     &runtime_inventory,
                     false,
                 );
+            }
+            AppAction::HarnessSpawnSession {
+                token,
+                node_id,
+                workspace_id,
+                provider,
+                provider_profile,
+                mode,
+                rows,
+                cols,
+            } => {
+                let result = client.spawn_session(
+                    node_id,
+                    workspace_id,
+                    provider,
+                    provider_profile,
+                    mode,
+                    HarnessRuntimeTerminalSizeV1 { rows, columns: cols },
+                );
+                match result {
+                    // `require_inventory_change: true` mirrors
+                    // `harness_schedule_next`: the mutation just happened,
+                    // so a retry-until-changed snapshot is worth the extra
+                    // round trips (the runtime inventory should now include
+                    // the new session).
+                    Ok(session) => {
+                        let _ = updates.blocking_send(WorkerUpdate::HarnessSessionSpawned {
+                            address: SessionAddress {
+                                node_id: session.node_id,
+                                workspace_id: session.workspace_id,
+                                instance_id: session.instance_id,
+                                generation: session.generation,
+                            },
+                        });
+                        publish_harness_snapshot(
+                            &client,
+                            token,
+                            &updates,
+                            &runtime_inventory,
+                            true,
+                        );
+                    }
+                    Err(error) => publish_harness_failure(token, error.to_string(), &updates),
+                }
+            }
+            AppAction::HarnessWriteSessionInput { session, text } => {
+                if let Err(error) = client.write_session_input(session, text) {
+                    let _ = updates.blocking_send(WorkerUpdate::Notice(format!(
+                        "harness session input failed: {error}"
+                    )));
+                }
+            }
+            AppAction::HarnessResizeSession { session, rows, cols } => {
+                if let Err(error) = client.resize_session(
+                    session,
+                    HarnessRuntimeTerminalSizeV1 { rows, columns: cols },
+                ) {
+                    let _ = updates.blocking_send(WorkerUpdate::Notice(format!(
+                        "harness session resize failed: {error}"
+                    )));
+                }
+            }
+            AppAction::HarnessStopSession { token, session, force } => {
+                match client.stop_session(session, force) {
+                    Ok(()) => publish_harness_snapshot(
+                        &client,
+                        token,
+                        &updates,
+                        &runtime_inventory,
+                        true,
+                    ),
+                    Err(error) => publish_harness_failure(token, error.to_string(), &updates),
+                }
             }
             AppAction::HarnessCreateTask {
                 token,
@@ -3241,6 +3346,7 @@ fn project_harness_read_failure(error: HarnessOperatorClientError) -> HarnessRea
             HarnessOperatorHostErrorV1::Deadline => "deadline",
             HarnessOperatorHostErrorV1::Busy => "busy",
             HarnessOperatorHostErrorV1::Unavailable => "unavailable",
+            HarnessOperatorHostErrorV1::OutcomeUnknown => "outcome-unknown",
             HarnessOperatorHostErrorV1::Internal => "internal",
         },
         HarnessOperatorClientError::Api(_) => "validation",
@@ -6265,7 +6371,11 @@ fn action_to_request(action: AppAction) -> Option<NodeRequest> {
         | AppAction::HarnessInspectNodeWorkspace { .. }
         | AppAction::HarnessReadNodeWorkspaceFile { .. }
         | AppAction::HarnessReadNodeGitHistory { .. }
-        | AppAction::HarnessReadNodeGitDiff { .. } => None,
+        | AppAction::HarnessReadNodeGitDiff { .. }
+        | AppAction::HarnessSpawnSession { .. }
+        | AppAction::HarnessWriteSessionInput { .. }
+        | AppAction::HarnessResizeSession { .. }
+        | AppAction::HarnessStopSession { .. } => None,
     }
 }
 
@@ -7398,6 +7508,9 @@ fn apply_update(app: &mut App, c2: &mut C2ApplyState, update: WorkerUpdate) -> A
             app.apply_managed_worktree_removed(lease_id.clone());
             app.notice = Some(format!("managed worktree {lease_id} removed"));
         }
+        WorkerUpdate::HarnessSessionSpawned { address } => {
+            app.request_open(address);
+        }
         WorkerUpdate::HarnessSnapshot { token, tasks, runs, nodes } => {
             let retained = nodes.iter().map(|node| node.node_id.clone()).collect::<BTreeSet<_>>();
             let removed = app.nodes.iter()
@@ -7407,7 +7520,8 @@ fn apply_update(app: &mut App, c2: &mut C2ApplyState, update: WorkerUpdate) -> A
             for node_id in removed {
                 app.remove_topology_node(&node_id);
             }
-            for node in nodes {
+            for mut node in nodes {
+                app.preserve_known_session_terminal_state(&mut node);
                 app.upsert_node(node);
             }
             app.apply_harness_snapshot(token, tasks, runs);

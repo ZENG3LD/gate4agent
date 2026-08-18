@@ -579,7 +579,7 @@ impl HarnessLaunchCatalog {
     }
 }
 
-fn execution_mode(mode: HarnessExecutionModeV1) -> SessionMode {
+pub(crate) fn execution_mode(mode: HarnessExecutionModeV1) -> SessionMode {
     match mode {
         HarnessExecutionModeV1::Pty => SessionMode::Pty,
         HarnessExecutionModeV1::Inline => SessionMode::Inline,

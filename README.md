@@ -47,6 +47,29 @@ crate names below are prefixed `gate4agent-` (e.g. `-node` = `gate4agent-node`).
 - **Testing** — `gate4agent-testkit`: authentication-free provider fixtures
   and the Windows headless test supervisor.
 
+## Provider tiers
+
+| Provider | Tier | Support path |
+|---|---|---|
+| **Claude Code** | first tier | full workbench: PTY sessions, native history, hooks, spawn/observe through node → harness; transport core verified on 2.1.224 |
+| **Codex CLI** | first tier | full workbench; transport core verified on 0.144.6 |
+| **Kimi Code** | first tier | full workbench via the adapter registry; current transport-core PTY canary is failing (see the matrix below) |
+| **Grok CLI** | first tier | full workbench via the adapter registry (`gate4agent-adapters`): PTY sessions, native history (`~/.grok/sessions`), hooks; a resume gap is tracked |
+| qwen-code | wired, unverified | adapter registry entry exists; no verification claim |
+| Gemini, OpenCode | legacy | transport-core paths last live-verified in the 0.2.5–0.2.6 era; outside the product target |
+
+## Repository layout: `src/` vs `crates/`
+
+The root `src/` tree is the **transport core** — the original library this
+repo started as, still published as the `gate4agent` crate and still the
+substrate the node embeds for spawning/streaming provider processes. It is
+maintained, not legacy — but it is no longer where the product grows.
+
+Everything else lives in `crates/`: the workbench layers (node, c2, harness,
+TUI), the engine substrate under them, and `gate4agent-pty` (the in-house
+PTY backend). **All new development happens in `crates/`**; the root library
+changes only when the transport core itself does.
+
 ## Local endpoints
 
 | Layer | Local pipe | API |
@@ -211,9 +234,19 @@ install them.
 | Claude Code | `npm install -g @anthropic-ai/claude-code` |
 | Codex | `npm install -g @openai/codex` |
 | Kimi Code | `npm install -g @moonshot-ai/kimi-code` |
+| Grok CLI / qwen-code | per their vendors' instructions |
 
 ## Versioning
 
+- **0.3.0** — **the workspace era.** The repo is an agent workbench
+  (node / c2 / harness / TUI over the transport core), not a single-crate
+  library; the vendored `portable-pty` fork is replaced by the in-house
+  `gate4agent-pty` (std-only, zero external PTY dependencies: Windows
+  ConPTY + a unix macOS/Linux backend, verified on all three OSes); first
+  crates.io wave published at 0.3.0: `gate4agent-pty`, `gate4agent-types`,
+  `gate4agent-adapters`, `gate4agent-catalog`, `gate4agent`, `g4a` (the
+  remaining workbench crates publish after the planned crate
+  consolidation).
 - **0.1.x** — original 3-CLI library (Claude, Codex, Gemini)
 - **0.2.0** — breaking: 6 CLIs, `TransportSession`, `AgentEvent` renamed, `PipeSession` removed, OpenClaw fantasy transport
 - **0.2.1** — cleanup: OpenClaw removed (was never functional), `PipeSession` restored for 0.1.x compatibility, `TransportSession` is now a thin router over `PipeSession`

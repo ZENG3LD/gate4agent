@@ -6,8 +6,9 @@ use crate::{
         HarnessC2Error, HarnessC2EventReceiver,
         HarnessObservationResync, PendingNativeHistoryRequest, PendingNodeWorkspaceRead,
         PendingRunRead,
-        PendingRunContextSourceObservation, PreparedRunContextSourceObservation,
-        PreparedNodeWorkspaceRead, PreparedRunRead, RunContextSourceObservationCompletion,
+        PendingRunContextSourceObservation, PendingSessionControl, PreparedRunContextSourceObservation,
+        PreparedNodeWorkspaceRead, PreparedRunRead, PreparedSessionControl, PreparedSessionSpawn,
+        RunContextSourceObservationCompletion,
         RunContextSourceProjection, RunReadCompletion, WorkspaceReadKind,
         ManagedWorktreeSpawnDispatchOutcome, PendingManagedWorktreeSpawnDispatch,
         SpawnDispatchOutcome, SpawnProfileRevisionProof,
@@ -119,6 +120,17 @@ const HOST_DEADLINE: Duration = Duration::from_secs(3);
 const HOST_NATIVE_HISTORY_RESPONSE_DEADLINE: Duration = Duration::from_secs(40);
 const HOST_RUN_READ_RESPONSE_DEADLINE: Duration = Duration::from_secs(12);
 const HOST_RUN_CONTEXT_SOURCE_RESPONSE_DEADLINE: Duration = Duration::from_secs(12);
+// `NodeRequest::Input`/`Resize` fall into c2-client's default 10s relay
+// deadline, `Stop` gets an explicit 15s; both get `RELAY_REPLY_HEADROOM`
+// (5s) on top (`control_request_deadline`, gate4agent-c2-client/runtime.rs).
+// This outer bound stays above the worst case (Stop, 20s) with margin, per
+// the "outer bound never below inner timeout" discipline the other harness
+// read families already follow above.
+const HOST_SESSION_CONTROL_RESPONSE_DEADLINE: Duration = Duration::from_secs(22);
+// `NodeRequest::SpawnSpec`'s relay deadline is the spec's own
+// `deadline_ms` (`SESSION_SPAWN_DEADLINE_MS` in c2.rs, 20s) plus the same 5s
+// `RELAY_REPLY_HEADROOM` -- 25s inner. This outer bound stays above that.
+const HOST_SESSION_SPAWN_RESPONSE_DEADLINE: Duration = Duration::from_secs(28);
 const HOST_CONNECTION_DEADLINE: Duration = Duration::from_secs(45);
 const OBSERVATION_RECOVERY_RETRY: Duration = Duration::from_secs(1);
 const OBSERVATION_RECOVERY_MAX_IN_FLIGHT: usize = 8;
@@ -135,6 +147,11 @@ const RUN_READ_WORKERS_MAX: usize = 8;
 // never be able to starve a live operator's run-scoped
 // `InspectRunWorkspace` by soaking up the shared pool.
 const NODE_WORKSPACE_READ_WORKERS_MAX: usize = 8;
+// Own pools, not shared with `NODE_WORKSPACE_READ_WORKERS_MAX`: a burst of
+// session-control traffic (keystrokes, resizes) must never be able to starve
+// a concurrent node-workspace read or vice versa.
+const SESSION_SPAWN_WORKERS_MAX: usize = 8;
+const SESSION_CONTROL_WORKERS_MAX: usize = 8;
 const RUN_CONTEXT_SOURCE_WORKERS_MAX: usize = 8;
 // Deliberately separate from `RUN_READ_WORKERS_MAX`, not shared: background
 // git-facts capture must never be able to starve a live operator's own
@@ -154,6 +171,16 @@ const OPERATOR_INTENT_IDEMPOTENCY_REF_DOMAIN: &[u8] =
     b"gate4agent-harness-operator-intent-idempotency-ref-v1";
 const OPERATOR_INTENT_TASK_ID_DOMAIN: &[u8] =
     b"gate4agent-harness-operator-intent-task-id-v1";
+// A direct `SpawnSession` has no CAS/replay layer (see the doc comment on
+// `HarnessOperatorRequestV1::SpawnSession`): these domains mint a fresh,
+// host-local nonce pair per dispatch purely to satisfy
+// `PreparedSpawnDispatch::new`'s wire-correlation identity, never to derive
+// a stable id a resubmission could reproduce -- see
+// `mint_session_spawn_ids`.
+const SESSION_SPAWN_OPERATION_ID_DOMAIN: &[u8] =
+    b"gate4agent-harness-session-spawn-operation-id-v1";
+const SESSION_SPAWN_IDEMPOTENCY_REF_DOMAIN: &[u8] =
+    b"gate4agent-harness-session-spawn-idempotency-ref-v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HarnessHostEndpoint(SocketAddr);
@@ -258,11 +285,13 @@ enum HostCommand {
         reply: oneshot::Sender<HarnessOperatorReplyV1>,
         /// Signals when `handle_connection`'s own `response_deadline` fires
         /// before a reply arrives. Only ever populated for a node-workspace
-        /// read request (see `start_node_workspace_read_worker`); every
-        /// other request kind leaves this `None` and the worker that
-        /// eventually handles it ignores it. `None` on the two constructed-
-        /// in-tests call sites means "behaves exactly as before this field
-        /// existed" — no cancellation available, not an error.
+        /// read, session-spawn, or session-control request (see
+        /// `start_node_workspace_read_worker`/`start_session_spawn_worker`/
+        /// `start_session_control_worker`); every other request kind leaves
+        /// this `None` and the worker that eventually handles it ignores it.
+        /// `None` on the two constructed-in-tests call sites means "behaves
+        /// exactly as before this field existed" — no cancellation
+        /// available, not an error.
         cancel: Option<oneshot::Receiver<()>>,
     },
     ApplyHarnessMutation {
@@ -329,6 +358,17 @@ enum HostCommand {
     },
     NodeWorkspaceReadFinished {
         result: Result<HarnessOperatorResponseV1, HarnessC2Error>,
+        reply: oneshot::Sender<HarnessOperatorReplyV1>,
+        identity: OperatorRequestLogIdentity,
+    },
+    SessionSpawnFinished {
+        route: NodeRoute,
+        result: Result<SpawnDispatchOutcome, HarnessC2Error>,
+        reply: oneshot::Sender<HarnessOperatorReplyV1>,
+        identity: OperatorRequestLogIdentity,
+    },
+    SessionControlFinished {
+        result: Result<(), HarnessC2Error>,
         reply: oneshot::Sender<HarnessOperatorReplyV1>,
         identity: OperatorRequestLogIdentity,
     },
@@ -506,6 +546,16 @@ struct NodeWorkspaceReadWorkerRegistry {
 }
 
 #[derive(Default)]
+struct SessionSpawnWorkerRegistry {
+    in_flight: usize,
+}
+
+#[derive(Default)]
+struct SessionControlWorkerRegistry {
+    in_flight: usize,
+}
+
+#[derive(Default)]
 struct RunGitFactsWorkerRegistry {
     in_flight: usize,
 }
@@ -549,6 +599,30 @@ impl RunReadWorkerRegistry {
 impl NodeWorkspaceReadWorkerRegistry {
     fn try_start(&mut self) -> bool {
         if self.in_flight >= NODE_WORKSPACE_READ_WORKERS_MAX { return false; }
+        self.in_flight += 1;
+        true
+    }
+
+    fn finish(&mut self) {
+        self.in_flight = self.in_flight.saturating_sub(1);
+    }
+}
+
+impl SessionSpawnWorkerRegistry {
+    fn try_start(&mut self) -> bool {
+        if self.in_flight >= SESSION_SPAWN_WORKERS_MAX { return false; }
+        self.in_flight += 1;
+        true
+    }
+
+    fn finish(&mut self) {
+        self.in_flight = self.in_flight.saturating_sub(1);
+    }
+}
+
+impl SessionControlWorkerRegistry {
+    fn try_start(&mut self) -> bool {
+        if self.in_flight >= SESSION_CONTROL_WORKERS_MAX { return false; }
         self.in_flight += 1;
         true
     }
@@ -1485,6 +1559,86 @@ fn start_node_workspace_read_worker(
     });
 }
 
+/// Direct operator `SpawnSession`: unlike `start_node_workspace_read_worker`
+/// (which only awaits an already-enqueued round trip), the whole dispatch --
+/// preflight, build, enqueue, await -- runs inside this task, because
+/// preflight itself is an async C2 round trip (`preflight_spawn_profile`)
+/// that cannot run inline in the synchronous host select loop. Races against
+/// `cancel` the same way, for the same reason (see the doc comment on
+/// `HostCommand::Operator::cancel`).
+fn start_session_spawn_worker(
+    adapter: HarnessC2Adapter,
+    prepared: PreparedSessionSpawn,
+    operation_id: HarnessOperationId,
+    idempotency_ref: HarnessIdempotencyRef,
+    commands: mpsc::Sender<HostCommand>,
+    reply: oneshot::Sender<HarnessOperatorReplyV1>,
+    identity: OperatorRequestLogIdentity,
+    cancel: Option<oneshot::Receiver<()>>,
+) {
+    let route = prepared.route().clone();
+    tokio::spawn(async move {
+        let dispatch = adapter.dispatch_session_spawn(prepared, operation_id, idempotency_ref);
+        let result = match cancel {
+            Some(cancel) => {
+                tokio::select! {
+                    result = dispatch => result,
+                    _ = cancel => {
+                        tracing::warn!(
+                            operation = %identity.operation,
+                            node_id = identity.node_id(),
+                            workspace_id = identity.workspace_id(),
+                            provider = identity.provider(),
+                            provider_profile = identity.provider_profile(),
+                            "session spawn worker cancelled: the operator connection's own deadline fired before the node replied",
+                        );
+                        Err(HarnessC2Error::SessionSpawnCancelled)
+                    }
+                }
+            }
+            None => dispatch.await,
+        };
+        let _ = commands
+            .send(HostCommand::SessionSpawnFinished { route, result, reply, identity })
+            .await;
+    });
+}
+
+/// Node-scoped sibling of `start_node_workspace_read_worker`: the request is
+/// already enqueued (`adapter.start_prepared_session_control`), this only
+/// awaits the reply and races the same cooperative cancel.
+fn start_session_control_worker(
+    pending: PendingSessionControl,
+    commands: mpsc::Sender<HostCommand>,
+    reply: oneshot::Sender<HarnessOperatorReplyV1>,
+    identity: OperatorRequestLogIdentity,
+    cancel: Option<oneshot::Receiver<()>>,
+) {
+    tokio::spawn(async move {
+        let result = match cancel {
+            Some(cancel) => {
+                tokio::select! {
+                    result = pending.finish() => result,
+                    _ = cancel => {
+                        tracing::warn!(
+                            operation = %identity.operation,
+                            node_id = identity.node_id(),
+                            workspace_id = identity.workspace_id(),
+                            session_id = identity.session_id(),
+                            "session control worker cancelled: the operator connection's own deadline fired before the node replied",
+                        );
+                        Err(HarnessC2Error::SessionControlCancelled)
+                    }
+                }
+            }
+            None => pending.finish().await,
+        };
+        let _ = commands
+            .send(HostCommand::SessionControlFinished { result, reply, identity })
+            .await;
+    });
+}
+
 /// Background twin of `start_run_read_worker`: no live client is waiting,
 /// so there is no `reply` sender — the completion travels back into the
 /// host loop as a plain `HostCommand` for `finish_run_git_facts_capture` to
@@ -1677,6 +1831,86 @@ fn map_node_workspace_read_error(error: HarnessC2Error) -> HarnessOperatorHostEr
     }
 }
 
+/// Maps everything `HarnessC2Adapter::dispatch_session_spawn` can return
+/// before or around the C2 round trip. A `SpawnDispatchOutcome::Rejected`/
+/// `OutcomeUnknown` reply (the round trip actually happened) is handled
+/// separately by `map_session_spawn_node_failure`/the `OutcomeUnknown`
+/// host error, not here -- this only covers the `Err(HarnessC2Error)` path.
+fn map_session_spawn_error(error: HarnessC2Error) -> HarnessOperatorHostErrorV1 {
+    match error {
+        HarnessC2Error::InvalidSessionSpawnRequest => HarnessOperatorHostErrorV1::InvalidRequest,
+        HarnessC2Error::UnknownNode(_)
+        | HarnessC2Error::NodeOffline(_)
+        | HarnessC2Error::MissingIncarnation(_) => HarnessOperatorHostErrorV1::Unavailable,
+        HarnessC2Error::IncarnationChanged { .. } => HarnessOperatorHostErrorV1::Conflict,
+        HarnessC2Error::SpawnProfileUnavailable(_) => HarnessOperatorHostErrorV1::NotFound,
+        HarnessC2Error::SpawnEnqueue(gate4agent_c2_client::C2ControlError::QueueFull) => {
+            HarnessOperatorHostErrorV1::Busy
+        }
+        HarnessC2Error::SpawnEnqueue(_) => HarnessOperatorHostErrorV1::Unavailable,
+        HarnessC2Error::SessionSpawnCancelled => HarnessOperatorHostErrorV1::Deadline,
+        _ => HarnessOperatorHostErrorV1::Internal,
+    }
+}
+
+/// `NodeFailureCode` branch for a spawn actually rejected by the Node (a
+/// `SpawnDispatchOutcome::Rejected{code}` reply, not a transport failure).
+fn map_session_spawn_node_failure(code: NodeFailureCode) -> HarnessOperatorHostErrorV1 {
+    match code {
+        NodeFailureCode::InvalidRequest => HarnessOperatorHostErrorV1::InvalidRequest,
+        NodeFailureCode::UnknownWorkspace => HarnessOperatorHostErrorV1::NotFound,
+        NodeFailureCode::SpawnProfileRevisionMismatch
+        | NodeFailureCode::BindingMismatch
+        | NodeFailureCode::StaleGeneration => HarnessOperatorHostErrorV1::Conflict,
+        NodeFailureCode::ControllerBusy
+        | NodeFailureCode::WorkspaceBusy
+        | NodeFailureCode::BackendBusy => HarnessOperatorHostErrorV1::Busy,
+        NodeFailureCode::SpawnDeadlineExceeded => HarnessOperatorHostErrorV1::Deadline,
+        NodeFailureCode::UnsupportedCapability
+        | NodeFailureCode::BackendDisconnected
+        | NodeFailureCode::BackendOperationFailed
+        | NodeFailureCode::ShuttingDown => HarnessOperatorHostErrorV1::Unavailable,
+        _ => HarnessOperatorHostErrorV1::Internal,
+    }
+}
+
+/// `WriteSessionInput`/`ResizeSession`/`StopSession` share one C2 relay
+/// shape (`PreparedSessionControl`/`PendingSessionControl::finish`), so one
+/// mapper covers all three -- unlike spawn, none of these carries a
+/// multi-outcome transport ambiguity worth its own host error (DECISIONS:
+/// "naturally idempotent-enough", no dedup, no `OutcomeUnknown` case here).
+fn map_session_control_error(error: HarnessC2Error) -> HarnessOperatorHostErrorV1 {
+    match error {
+        HarnessC2Error::InvalidSessionControlRequest => HarnessOperatorHostErrorV1::InvalidRequest,
+        HarnessC2Error::SessionControlEnqueue(gate4agent_c2_client::C2ControlError::QueueFull) => {
+            HarnessOperatorHostErrorV1::Busy
+        }
+        HarnessC2Error::SessionControlEnqueue(_)
+        | HarnessC2Error::SessionControlTransport(_)
+        | HarnessC2Error::UnknownNode(_)
+        | HarnessC2Error::NodeOffline(_)
+        | HarnessC2Error::MissingIncarnation(_) => HarnessOperatorHostErrorV1::Unavailable,
+        HarnessC2Error::IncarnationChanged { .. }
+        | HarnessC2Error::SessionControlRouteMismatch => HarnessOperatorHostErrorV1::Conflict,
+        HarnessC2Error::SessionControlCancelled => HarnessOperatorHostErrorV1::Deadline,
+        HarnessC2Error::SessionControlRejected { code } => match code {
+            NodeFailureCode::InvalidRequest => HarnessOperatorHostErrorV1::InvalidRequest,
+            NodeFailureCode::BindingMismatch | NodeFailureCode::StaleGeneration => {
+                HarnessOperatorHostErrorV1::Conflict
+            }
+            NodeFailureCode::ControllerBusy
+            | NodeFailureCode::WorkspaceBusy
+            | NodeFailureCode::BackendBusy => HarnessOperatorHostErrorV1::Busy,
+            NodeFailureCode::UnsupportedCapability
+            | NodeFailureCode::BackendDisconnected
+            | NodeFailureCode::BackendOperationFailed
+            | NodeFailureCode::ShuttingDown => HarnessOperatorHostErrorV1::Unavailable,
+            _ => HarnessOperatorHostErrorV1::Internal,
+        },
+        _ => HarnessOperatorHostErrorV1::Internal,
+    }
+}
+
 fn map_native_history_error(error: HarnessC2Error) -> HarnessOperatorHostErrorV1 {
     match error {
         HarnessC2Error::InvalidNativeHistoryRequest => {
@@ -1751,6 +1985,23 @@ fn is_run_context_source_request(request: &HarnessOperatorRequestV1) -> bool {
     matches!(request, HarnessOperatorRequestV1::ObserveRunContextSource { .. })
 }
 
+/// Direct operator spawn: no Task/Run/plan, see
+/// `HarnessOperatorRequestV1::SpawnSession`'s doc comment.
+fn is_session_spawn_request(request: &HarnessOperatorRequestV1) -> bool {
+    matches!(request, HarnessOperatorRequestV1::SpawnSession { .. })
+}
+
+/// The three thin session-control verbs sharing one C2 relay shape --
+/// `PreparedSessionControl`/`PendingSessionControl` in `c2.rs`.
+fn is_session_control_request(request: &HarnessOperatorRequestV1) -> bool {
+    matches!(
+        request,
+        HarnessOperatorRequestV1::WriteSessionInput { .. }
+            | HarnessOperatorRequestV1::ResizeSession { .. }
+            | HarnessOperatorRequestV1::StopSession { .. }
+    )
+}
+
 /// Best-effort, log-only identity of an operator request: which operation it
 /// is plus whichever of node id / workspace id / run id applies. Captured
 /// from `&HarnessOperatorRequestV1` before the request is moved into the
@@ -1769,18 +2020,29 @@ struct OperatorRequestLogIdentity {
     node_id: Option<String>,
     workspace_id: Option<String>,
     run_id: Option<String>,
+    session_id: Option<String>,
+    provider: Option<String>,
+    provider_profile: Option<String>,
 }
 
 impl OperatorRequestLogIdentity {
     fn describe(request: &HarnessOperatorRequestV1) -> Self {
-        let (node_id, workspace_id) = match request {
+        let (node_id, workspace_id, session_id) = match request {
             HarnessOperatorRequestV1::InspectNodeWorkspace { node_id, workspace_id }
             | HarnessOperatorRequestV1::ReadNodeWorkspaceFile { node_id, workspace_id, .. }
             | HarnessOperatorRequestV1::ReadNodeGitHistory { node_id, workspace_id, .. }
-            | HarnessOperatorRequestV1::ReadNodeGitDiff { node_id, workspace_id, .. } => {
-                (Some(node_id.clone()), Some(workspace_id.clone()))
+            | HarnessOperatorRequestV1::ReadNodeGitDiff { node_id, workspace_id, .. }
+            | HarnessOperatorRequestV1::SpawnSession { node_id, workspace_id, .. } => {
+                (Some(node_id.clone()), Some(workspace_id.clone()), None)
             }
-            _ => (None, None),
+            HarnessOperatorRequestV1::WriteSessionInput { session, .. }
+            | HarnessOperatorRequestV1::ResizeSession { session, .. }
+            | HarnessOperatorRequestV1::StopSession { session, .. } => (
+                Some(session.node_id.clone()),
+                Some(session.workspace_id.clone()),
+                Some(format!("{}/{}", session.instance_id, session.generation)),
+            ),
+            _ => (None, None, None),
         };
         let run_id = match request {
             HarnessOperatorRequestV1::InspectRunWorkspace { run_id }
@@ -1791,13 +2053,19 @@ impl OperatorRequestLogIdentity {
             }
             _ => None,
         };
+        let (provider, provider_profile) = match request {
+            HarnessOperatorRequestV1::SpawnSession { provider, provider_profile, .. } => {
+                (Some(provider.clone()), Some(provider_profile.clone()))
+            }
+            _ => (None, None),
+        };
         let operation = serde_json::to_value(request)
             .ok()
             .and_then(|value| {
                 value.get("kind").and_then(|kind| kind.as_str().map(str::to_owned))
             })
             .unwrap_or_else(|| "unknown".to_owned());
-        Self { operation, node_id, workspace_id, run_id }
+        Self { operation, node_id, workspace_id, run_id, session_id, provider, provider_profile }
     }
 
     fn node_id(&self) -> &str {
@@ -1811,6 +2079,18 @@ impl OperatorRequestLogIdentity {
     fn run_id(&self) -> &str {
         self.run_id.as_deref().unwrap_or("")
     }
+
+    fn session_id(&self) -> &str {
+        self.session_id.as_deref().unwrap_or("")
+    }
+
+    fn provider(&self) -> &str {
+        self.provider.as_deref().unwrap_or("")
+    }
+
+    fn provider_profile(&self) -> &str {
+        self.provider_profile.as_deref().unwrap_or("")
+    }
 }
 
 fn operator_response_deadline(request: &HarnessOperatorRequestV1) -> Duration {
@@ -1820,9 +2100,99 @@ fn operator_response_deadline(request: &HarnessOperatorRequestV1) -> Duration {
         HOST_RUN_CONTEXT_SOURCE_RESPONSE_DEADLINE
     } else if is_run_read_request(request) || is_node_workspace_read_request(request) {
         HOST_RUN_READ_RESPONSE_DEADLINE
+    } else if is_session_spawn_request(request) {
+        HOST_SESSION_SPAWN_RESPONSE_DEADLINE
+    } else if is_session_control_request(request) {
+        HOST_SESSION_CONTROL_RESPONSE_DEADLINE
     } else {
         HOST_DEADLINE
     }
+}
+
+/// Builds the operator-visible session address from a route already sealed
+/// live (`adapter.exact_route`) plus the C2-authoritative session address a
+/// spawn accepted. Unlike `terminal_session_key` (the read-side sibling that
+/// parses a client-supplied address), the route half here is never
+/// client-controlled -- it is exactly the route `dispatch_session_spawn`
+/// dispatched against.
+fn session_address_from_receipt(
+    route: &NodeRoute,
+    session: &SessionAddress,
+) -> HarnessRuntimeSessionAddressV1 {
+    HarnessRuntimeSessionAddressV1 {
+        node_id: route.node_id.as_str().to_owned(),
+        incarnation_id: route.expected_incarnation_id.to_string(),
+        workspace_id: session.workspace_id.as_str().to_owned(),
+        instance_id: session.session.instance_id.0,
+        generation: session.session.generation.0,
+    }
+}
+
+/// Picks the right unit response for a completed `SessionControlFinished`.
+/// The three verbs share one C2 relay path and `PendingSessionControl`
+/// deliberately only returns `Result<(), _>` (see its doc comment), so the
+/// wire `kind` tag in `identity.operation` -- never hand-guessed, read the
+/// same way `OperatorRequestLogIdentity::describe` reads it -- is what picks
+/// the reply shape back apart.
+fn session_control_response(identity: &OperatorRequestLogIdentity) -> HarnessOperatorResponseV1 {
+    match identity.operation.as_str() {
+        "write-session-input" => HarnessOperatorResponseV1::SessionInputWritten,
+        "resize-session" => HarnessOperatorResponseV1::SessionResized,
+        "stop-session" => HarnessOperatorResponseV1::SessionStopped,
+        other => {
+            tracing::error!(operation = other, "unexpected session control operation label");
+            HarnessOperatorResponseV1::SessionInputWritten
+        }
+    }
+}
+
+/// Mints a fresh, host-local `(operation_id, idempotency_ref)` pair for one
+/// direct `SpawnSession` dispatch. Unlike `authorize_operator_intent`'s HMAC
+/// derivation (deterministic over a client-supplied `request_ref`, so a
+/// resubmission replays instead of double-spawning), a direct spawn has no
+/// CAS/replay layer to key -- see `HarnessOperatorRequestV1::SpawnSession`'s
+/// doc comment and DECISIONS: the TUI sends it once, no auto-retry. `nonce`
+/// is a plain per-host monotonic counter (see its call site in the select
+/// loop); it only needs to make each dispatch's ids visibly distinct in
+/// tracing output, not to be unpredictable -- nothing looks these ids up.
+fn mint_session_spawn_ids(
+    nonce: u64,
+) -> Result<(HarnessOperationId, HarnessIdempotencyRef), HarnessOperatorHostErrorV1> {
+    let material = nonce.to_le_bytes();
+    let operation_id = session_spawn_nonce_id(
+        HarnessOperationId::PREFIX,
+        SESSION_SPAWN_OPERATION_ID_DOMAIN,
+        &material,
+        HarnessOperationId::new,
+    )?;
+    let idempotency_ref = session_spawn_nonce_id(
+        HarnessIdempotencyRef::PREFIX,
+        SESSION_SPAWN_IDEMPOTENCY_REF_DOMAIN,
+        &material,
+        HarnessIdempotencyRef::new,
+    )?;
+    Ok((operation_id, idempotency_ref))
+}
+
+fn session_spawn_nonce_id<T>(
+    prefix: &str,
+    domain: &[u8],
+    material: &[u8],
+    constructor: impl FnOnce(String) -> Result<T, gate4agent_harness_protocol::HarnessValidationError>,
+) -> Result<T, HarnessOperatorHostErrorV1> {
+    let digest = local_hmac_sha256(domain, material).map_err(|cause| {
+        tracing::error!(cause = %cause, "session spawn nonce derivation failed");
+        HarnessOperatorHostErrorV1::Internal
+    })?;
+    let mut nonce = String::with_capacity(24);
+    for byte in &digest[..12] {
+        use std::fmt::Write as _;
+        let _ = write!(&mut nonce, "{byte:02x}");
+    }
+    constructor(format!("{prefix}{nonce}")).map_err(|cause| {
+        tracing::error!(cause = %cause, "session spawn nonce identity construction failed");
+        HarnessOperatorHostErrorV1::Internal
+    })
 }
 
 fn run_context_source_run_id(
@@ -2584,6 +2954,11 @@ pub async fn start_harness_host_with_operator_and_catalogs(
         let mut native_history_workers = NativeHistoryWorkerRegistry::default();
         let mut run_read_workers = RunReadWorkerRegistry::default();
         let mut node_workspace_read_workers = NodeWorkspaceReadWorkerRegistry::default();
+        let mut session_spawn_workers = SessionSpawnWorkerRegistry::default();
+        let mut session_control_workers = SessionControlWorkerRegistry::default();
+        // Host-local nonce for `mint_session_spawn_ids` -- see its doc
+        // comment for why this only needs to be distinct, not unpredictable.
+        let mut session_spawn_nonce: u64 = 0;
         let mut run_git_facts_workers = RunGitFactsWorkerRegistry::default();
         let mut run_context_source_workers = RunContextSourceWorkerRegistry::default();
         let mut pending_run_context_sources = Vec::new();
@@ -2851,6 +3226,138 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                         );
                                         let _ = reply.send(HarnessOperatorReplyV1::Error {
                                             error: map_node_workspace_read_error(cause),
+                                        });
+                                    }
+                                }
+                                continue;
+                            }
+                            if is_session_spawn_request(&request) {
+                                let identity = OperatorRequestLogIdentity::describe(&request);
+                                let prepared = PreparedSessionSpawn::from_operator_request(
+                                    &adapter,
+                                    request,
+                                );
+                                let prepared = match prepared {
+                                    Ok(prepared) => prepared,
+                                    Err(cause) => {
+                                        tracing::warn!(
+                                            operation = %identity.operation,
+                                            node_id = identity.node_id(),
+                                            workspace_id = identity.workspace_id(),
+                                            provider = identity.provider(),
+                                            provider_profile = identity.provider_profile(),
+                                            cause = %cause,
+                                            "session spawn request rejected before C2 dispatch",
+                                        );
+                                        let _ = reply.send(HarnessOperatorReplyV1::Error {
+                                            error: map_session_spawn_error(cause),
+                                        });
+                                        continue;
+                                    }
+                                };
+                                if !session_spawn_workers.try_start() {
+                                    tracing::warn!(
+                                        operation = %identity.operation,
+                                        node_id = identity.node_id(),
+                                        workspace_id = identity.workspace_id(),
+                                        provider = identity.provider(),
+                                        provider_profile = identity.provider_profile(),
+                                        limit = SESSION_SPAWN_WORKERS_MAX,
+                                        "session spawn rejected: harness-side worker capacity is busy",
+                                    );
+                                    let _ = reply.send(HarnessOperatorReplyV1::Error {
+                                        error: HarnessOperatorHostErrorV1::Busy,
+                                    });
+                                    continue;
+                                }
+                                session_spawn_nonce = session_spawn_nonce.wrapping_add(1).max(1);
+                                let (operation_id, idempotency_ref) = match mint_session_spawn_ids(
+                                    session_spawn_nonce,
+                                ) {
+                                    Ok(ids) => ids,
+                                    Err(error) => {
+                                        session_spawn_workers.finish();
+                                        tracing::warn!(
+                                            operation = %identity.operation,
+                                            node_id = identity.node_id(),
+                                            workspace_id = identity.workspace_id(),
+                                            provider = identity.provider(),
+                                            provider_profile = identity.provider_profile(),
+                                            "session spawn rejected: local operation identity minting failed",
+                                        );
+                                        let _ = reply.send(HarnessOperatorReplyV1::Error { error });
+                                        continue;
+                                    }
+                                };
+                                start_session_spawn_worker(
+                                    adapter.clone(),
+                                    prepared,
+                                    operation_id,
+                                    idempotency_ref,
+                                    commands.clone(),
+                                    reply,
+                                    identity,
+                                    cancel,
+                                );
+                                continue;
+                            }
+                            if is_session_control_request(&request) {
+                                let identity = OperatorRequestLogIdentity::describe(&request);
+                                let prepared = PreparedSessionControl::from_operator_request(
+                                    &adapter,
+                                    request,
+                                );
+                                let prepared = match prepared {
+                                    Ok(prepared) => prepared,
+                                    Err(cause) => {
+                                        tracing::warn!(
+                                            operation = %identity.operation,
+                                            node_id = identity.node_id(),
+                                            workspace_id = identity.workspace_id(),
+                                            session_id = identity.session_id(),
+                                            cause = %cause,
+                                            "session control request rejected before C2 dispatch",
+                                        );
+                                        let _ = reply.send(HarnessOperatorReplyV1::Error {
+                                            error: map_session_control_error(cause),
+                                        });
+                                        continue;
+                                    }
+                                };
+                                if !session_control_workers.try_start() {
+                                    tracing::warn!(
+                                        operation = %identity.operation,
+                                        node_id = identity.node_id(),
+                                        workspace_id = identity.workspace_id(),
+                                        session_id = identity.session_id(),
+                                        limit = SESSION_CONTROL_WORKERS_MAX,
+                                        "session control rejected: harness-side worker capacity is busy",
+                                    );
+                                    let _ = reply.send(HarnessOperatorReplyV1::Error {
+                                        error: HarnessOperatorHostErrorV1::Busy,
+                                    });
+                                    continue;
+                                }
+                                match adapter.start_prepared_session_control(prepared) {
+                                    Ok(pending) => start_session_control_worker(
+                                        pending,
+                                        commands.clone(),
+                                        reply,
+                                        identity,
+                                        cancel,
+                                    ),
+                                    Err(cause) => {
+                                        session_control_workers.finish();
+                                        tracing::warn!(
+                                            operation = %identity.operation,
+                                            node_id = identity.node_id(),
+                                            workspace_id = identity.workspace_id(),
+                                            session_id = identity.session_id(),
+                                            cause = %cause,
+                                            "session control rejected: could not start the C2 dispatch",
+                                        );
+                                        let _ = reply.send(HarnessOperatorReplyV1::Error {
+                                            error: map_session_control_error(cause),
                                         });
                                     }
                                 }
@@ -3655,6 +4162,92 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                     );
                                     HarnessOperatorReplyV1::Error {
                                         error: map_node_workspace_read_error(cause),
+                                    }
+                                }
+                            };
+                            let _ = reply.send(reply_value);
+                        }
+                        Some(HostCommand::SessionSpawnFinished { route, result, reply, identity }) => {
+                            session_spawn_workers.finish();
+                            let reply_value = match result {
+                                Ok(SpawnDispatchOutcome::Accepted(receipt)) => {
+                                    tracing::info!(
+                                        operation = %identity.operation,
+                                        node_id = identity.node_id(),
+                                        workspace_id = identity.workspace_id(),
+                                        provider = identity.provider(),
+                                        provider_profile = identity.provider_profile(),
+                                        session = ?receipt.session(),
+                                        "session spawn accepted by the node",
+                                    );
+                                    HarnessOperatorReplyV1::Ok {
+                                        response: HarnessOperatorResponseV1::SessionSpawned(
+                                            session_address_from_receipt(&route, receipt.session()),
+                                        ),
+                                    }
+                                }
+                                Ok(SpawnDispatchOutcome::Rejected { code }) => {
+                                    tracing::warn!(
+                                        operation = %identity.operation,
+                                        node_id = identity.node_id(),
+                                        workspace_id = identity.workspace_id(),
+                                        provider = identity.provider(),
+                                        provider_profile = identity.provider_profile(),
+                                        cause = ?code,
+                                        "session spawn rejected by the node",
+                                    );
+                                    HarnessOperatorReplyV1::Error {
+                                        error: map_session_spawn_node_failure(code),
+                                    }
+                                }
+                                Ok(SpawnDispatchOutcome::OutcomeUnknown { reason }) => {
+                                    tracing::warn!(
+                                        operation = %identity.operation,
+                                        node_id = identity.node_id(),
+                                        workspace_id = identity.workspace_id(),
+                                        provider = identity.provider(),
+                                        provider_profile = identity.provider_profile(),
+                                        reason = ?reason,
+                                        "session spawn outcome unknown after its C2 round trip",
+                                    );
+                                    HarnessOperatorReplyV1::Error {
+                                        error: HarnessOperatorHostErrorV1::OutcomeUnknown,
+                                    }
+                                }
+                                Err(cause) => {
+                                    tracing::warn!(
+                                        operation = %identity.operation,
+                                        node_id = identity.node_id(),
+                                        workspace_id = identity.workspace_id(),
+                                        provider = identity.provider(),
+                                        provider_profile = identity.provider_profile(),
+                                        cause = %cause,
+                                        "session spawn C2 dispatch failed",
+                                    );
+                                    HarnessOperatorReplyV1::Error {
+                                        error: map_session_spawn_error(cause),
+                                    }
+                                }
+                            };
+                            let _ = reply.send(reply_value);
+                        }
+                        Some(HostCommand::SessionControlFinished { result, reply, identity }) => {
+                            session_control_workers.finish();
+                            let reply_value = match result {
+                                Ok(()) => HarnessOperatorReplyV1::Ok {
+                                    response: session_control_response(&identity),
+                                },
+                                Err(cause) => {
+                                    tracing::warn!(
+                                        operation = %identity.operation,
+                                        node_id = identity.node_id(),
+                                        workspace_id = identity.workspace_id(),
+                                        session_id = identity.session_id(),
+                                        cause = %cause,
+                                        "session control request rejected after its C2 round trip",
+                                    );
+                                    HarnessOperatorReplyV1::Error {
+                                        error: map_session_control_error(cause),
                                     }
                                 }
                             };
@@ -5470,6 +6063,18 @@ fn execute_operator_request(
                     .map_err(map_operator_service_error)?,
             )
         }
+        // Unreachable in production: the host select loop intercepts these
+        // four verbs above this function (see `is_session_spawn_request`/
+        // `is_session_control_request` in the `HostCommand::Operator` arm) —
+        // this function is synchronous with no C2/adapter handle in scope,
+        // so it cannot dispatch a spawn or session-control round trip
+        // itself. The arms exist only so this match stays exhaustive.
+        HarnessOperatorRequestV1::SpawnSession { .. }
+        | HarnessOperatorRequestV1::WriteSessionInput { .. }
+        | HarnessOperatorRequestV1::ResizeSession { .. }
+        | HarnessOperatorRequestV1::StopSession { .. } => {
+            return Err(HarnessOperatorHostErrorV1::Internal);
+        }
         HarnessOperatorRequestV1::SubmitIntent { .. } => {
             return Err(HarnessOperatorHostErrorV1::Internal);
         }
@@ -5782,16 +6387,20 @@ async fn handle_connection(
                 ).await?;
                 return Ok(());
             }
-            // Only a node-workspace-read request gets a cancel signal: it is
-            // the one request family whose worker can run an unbounded C2
-            // round trip behind it (see `start_node_workspace_read_worker`).
-            // `cancel_tx` fires explicitly on the deadline branch below, and
-            // is also dropped (equivalent to firing) on every other early
-            // return past this point, including the outer
-            // `HOST_CONNECTION_DEADLINE` cutoff wrapping this whole block.
-            let is_node_workspace_read = is_node_workspace_read_request(&request);
+            // A node-workspace-read, session-spawn, or session-control
+            // request gets a cancel signal: these are the request families
+            // whose worker can run an unbounded C2 round trip behind it (see
+            // `start_node_workspace_read_worker`/`start_session_spawn_worker`/
+            // `start_session_control_worker`). `cancel_tx` fires explicitly
+            // on the deadline branch below, and is also dropped (equivalent
+            // to firing) on every other early return past this point,
+            // including the outer `HOST_CONNECTION_DEADLINE` cutoff wrapping
+            // this whole block.
+            let needs_cancel_signal = is_node_workspace_read_request(&request)
+                || is_session_spawn_request(&request)
+                || is_session_control_request(&request);
             let mut cancel_tx = None;
-            let cancel_rx = if is_node_workspace_read {
+            let cancel_rx = if needs_cancel_signal {
                 let (tx, rx) = oneshot::channel();
                 cancel_tx = Some(tx);
                 Some(rx)
@@ -9846,6 +10455,138 @@ mod tests {
             }),
             HarnessOperatorHostErrorV1::TooLarge,
         );
+    }
+
+    /// Sibling of `node_workspace_read_worker_cap_deadline_and_failure_mapping_are_typed`
+    /// for the direct-spawn family: worker cap, outer response deadline, the
+    /// `HarnessC2Error`/`NodeFailureCode` mappings, and the pure
+    /// route+receipt-to-wire-address projection.
+    #[test]
+    fn session_spawn_worker_cap_deadline_and_failure_mapping_are_typed() {
+        let mut workers = SessionSpawnWorkerRegistry::default();
+        for _ in 0..SESSION_SPAWN_WORKERS_MAX { assert!(workers.try_start()); }
+        assert!(!workers.try_start());
+        workers.finish();
+        assert!(workers.try_start());
+
+        let request = HarnessOperatorRequestV1::SpawnSession {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            provider: "claude".to_owned(),
+            provider_profile: "claude-default".to_owned(),
+            mode: HarnessExecutionModeV1::Pty,
+            terminal_size: HarnessRuntimeTerminalSizeV1 { rows: 40, columns: 120 },
+        };
+        assert_eq!(operator_response_deadline(&request), HOST_SESSION_SPAWN_RESPONSE_DEADLINE);
+
+        assert_eq!(
+            map_session_spawn_error(HarnessC2Error::SpawnEnqueue(
+                gate4agent_c2_client::C2ControlError::QueueFull,
+            )),
+            HarnessOperatorHostErrorV1::Busy,
+        );
+        assert_eq!(
+            map_session_spawn_error(HarnessC2Error::SpawnProfileUnavailable(
+                gate4agent_node_protocol::SpawnProfileId::new("claude-default").unwrap(),
+            )),
+            HarnessOperatorHostErrorV1::NotFound,
+        );
+        assert_eq!(
+            map_session_spawn_error(HarnessC2Error::SessionSpawnCancelled),
+            HarnessOperatorHostErrorV1::Deadline,
+        );
+        assert_eq!(
+            map_session_spawn_node_failure(NodeFailureCode::ControllerBusy),
+            HarnessOperatorHostErrorV1::Busy,
+        );
+        assert_eq!(
+            map_session_spawn_node_failure(NodeFailureCode::UnknownWorkspace),
+            HarnessOperatorHostErrorV1::NotFound,
+        );
+
+        let route = NodeRoute {
+            node_id: gate4agent_node_protocol::NodeId::new("node-a").unwrap(),
+            expected_incarnation_id: "1".repeat(32).parse().unwrap(),
+        };
+        let session = SessionAddress {
+            workspace_id: gate4agent_node_protocol::WorkspaceId::new("workspace-a").unwrap(),
+            session: gate4agent_node_protocol::SessionKey {
+                instance_id: gate4agent_types::AgentInstanceId(41),
+                generation: gate4agent_types::SessionGeneration(3),
+            },
+        };
+        let address = session_address_from_receipt(&route, &session);
+        assert_eq!(address.node_id, "node-a");
+        assert_eq!(address.workspace_id, "workspace-a");
+        assert_eq!(address.instance_id, 41);
+        assert_eq!(address.generation, 3);
+        address.validate().unwrap();
+    }
+
+    /// Sibling of `session_spawn_worker_cap_deadline_and_failure_mapping_are_typed`
+    /// for the three thin session-control verbs: worker cap, outer response
+    /// deadline, the `HarnessC2Error`/`NodeFailureCode` mappings, and the
+    /// wire-`kind`-tag-driven response projection (`session_control_response`).
+    #[test]
+    fn session_control_worker_cap_deadline_and_failure_mapping_are_typed() {
+        let mut workers = SessionControlWorkerRegistry::default();
+        for _ in 0..SESSION_CONTROL_WORKERS_MAX { assert!(workers.try_start()); }
+        assert!(!workers.try_start());
+        workers.finish();
+        assert!(workers.try_start());
+
+        let session = HarnessRuntimeSessionAddressV1 {
+            node_id: "node-a".to_owned(),
+            incarnation_id: "1".repeat(32),
+            workspace_id: "workspace-a".to_owned(),
+            instance_id: 41,
+            generation: 3,
+        };
+        let resize_request = HarnessOperatorRequestV1::ResizeSession {
+            session: session.clone(),
+            terminal_size: HarnessRuntimeTerminalSizeV1 { rows: 40, columns: 120 },
+        };
+        assert_eq!(
+            operator_response_deadline(&resize_request),
+            HOST_SESSION_CONTROL_RESPONSE_DEADLINE,
+        );
+
+        assert_eq!(
+            map_session_control_error(HarnessC2Error::SessionControlEnqueue(
+                gate4agent_c2_client::C2ControlError::QueueFull,
+            )),
+            HarnessOperatorHostErrorV1::Busy,
+        );
+        assert_eq!(
+            map_session_control_error(HarnessC2Error::SessionControlCancelled),
+            HarnessOperatorHostErrorV1::Deadline,
+        );
+        assert_eq!(
+            map_session_control_error(HarnessC2Error::SessionControlRejected {
+                code: NodeFailureCode::WorkspaceBusy,
+            }),
+            HarnessOperatorHostErrorV1::Busy,
+        );
+
+        let input_identity = OperatorRequestLogIdentity::describe(
+            &HarnessOperatorRequestV1::WriteSessionInput {
+                session: session.clone(),
+                text: "hi".to_owned(),
+            },
+        );
+        assert_eq!(input_identity.node_id(), "node-a");
+        assert_eq!(input_identity.session_id(), "41/3");
+        assert!(matches!(
+            session_control_response(&input_identity),
+            HarnessOperatorResponseV1::SessionInputWritten,
+        ));
+        let stop_identity = OperatorRequestLogIdentity::describe(
+            &HarnessOperatorRequestV1::StopSession { session, force: true },
+        );
+        assert!(matches!(
+            session_control_response(&stop_identity),
+            HarnessOperatorResponseV1::SessionStopped,
+        ));
     }
 
     #[test]

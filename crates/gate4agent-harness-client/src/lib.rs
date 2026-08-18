@@ -18,6 +18,13 @@ pub const HARNESS_OPERATOR_DEADLINE: Duration = Duration::from_secs(3);
 pub const HARNESS_RUN_WORKSPACE_READ_DEADLINE: Duration = Duration::from_secs(14);
 pub const HARNESS_NATIVE_HISTORY_DEADLINE: Duration = Duration::from_secs(42);
 pub const HARNESS_CONTEXT_SOURCE_OBSERVATION_DEADLINE: Duration = Duration::from_secs(14);
+// Client-side outer bounds for the four direct session verbs. Both stay
+// above the host's own `HOST_SESSION_SPAWN_RESPONSE_DEADLINE`/
+// `HOST_SESSION_CONTROL_RESPONSE_DEADLINE` (gate4agent-harness-service/
+// runtime.rs) with the same ~2s margin the other extended-deadline
+// verbs below already use.
+pub const HARNESS_SESSION_SPAWN_DEADLINE: Duration = Duration::from_secs(30);
+pub const HARNESS_SESSION_CONTROL_DEADLINE: Duration = Duration::from_secs(24);
 
 #[derive(Clone, Debug)]
 pub struct HarnessReadClient {
@@ -230,6 +237,66 @@ impl HarnessOperatorClient {
                 value.validate_for(&expected_session)?;
                 Ok(value)
             }
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Direct operator spawn: no launch-plan catalog, no Task/Run. See the
+    /// doc comment on `HarnessOperatorRequestV1::SpawnSession`. Returns the
+    /// spawned session's identity exactly as C2 reports it.
+    pub fn spawn_session(
+        &self,
+        node_id: String,
+        workspace_id: String,
+        provider: String,
+        provider_profile: String,
+        mode: HarnessExecutionModeV1,
+        terminal_size: HarnessRuntimeTerminalSizeV1,
+    ) -> Result<HarnessRuntimeSessionAddressV1, HarnessOperatorClientError> {
+        match self.send(HarnessOperatorRequestV1::SpawnSession {
+            node_id,
+            workspace_id,
+            provider,
+            provider_profile,
+            mode,
+            terminal_size,
+        })? {
+            HarnessOperatorResponseV1::SessionSpawned(session) => Ok(session),
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Typed text send to an already-live session -- relays to the same C2
+    /// `NodeRequest::Input` verb the light TUI already uses.
+    pub fn write_session_input(
+        &self,
+        session: HarnessRuntimeSessionAddressV1,
+        text: String,
+    ) -> Result<(), HarnessOperatorClientError> {
+        match self.send(HarnessOperatorRequestV1::WriteSessionInput { session, text })? {
+            HarnessOperatorResponseV1::SessionInputWritten => Ok(()),
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
+    pub fn resize_session(
+        &self,
+        session: HarnessRuntimeSessionAddressV1,
+        terminal_size: HarnessRuntimeTerminalSizeV1,
+    ) -> Result<(), HarnessOperatorClientError> {
+        match self.send(HarnessOperatorRequestV1::ResizeSession { session, terminal_size })? {
+            HarnessOperatorResponseV1::SessionResized => Ok(()),
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
+    pub fn stop_session(
+        &self,
+        session: HarnessRuntimeSessionAddressV1,
+        force: bool,
+    ) -> Result<(), HarnessOperatorClientError> {
+        match self.send(HarnessOperatorRequestV1::StopSession { session, force })? {
+            HarnessOperatorResponseV1::SessionStopped => Ok(()),
             _ => Err(HarnessOperatorClientError::UnexpectedResponse),
         }
     }
@@ -764,6 +831,15 @@ impl HarnessOperatorClient {
                 | HarnessOperatorRequestV1::ReadNodeGitDiff { .. }
         ) {
             HARNESS_RUN_WORKSPACE_READ_DEADLINE
+        } else if matches!(&request, HarnessOperatorRequestV1::SpawnSession { .. }) {
+            HARNESS_SESSION_SPAWN_DEADLINE
+        } else if matches!(
+            &request,
+            HarnessOperatorRequestV1::WriteSessionInput { .. }
+                | HarnessOperatorRequestV1::ResizeSession { .. }
+                | HarnessOperatorRequestV1::StopSession { .. }
+        ) {
+            HARNESS_SESSION_CONTROL_DEADLINE
         } else {
             self.deadline
         };
@@ -1770,6 +1846,7 @@ mod tests {
                 kind: HarnessWorkspaceEntryKindV1::File,
             }],
             tree_truncated: false,
+            truncation: None,
             git: HarnessGitSummaryV1 {
                 is_repository: false,
                 branch: None,
@@ -1902,6 +1979,7 @@ mod tests {
                 kind: HarnessWorkspaceEntryKindV1::File,
             }],
             tree_truncated: false,
+            truncation: None,
             git: HarnessGitSummaryV1 {
                 is_repository: false,
                 branch: None,

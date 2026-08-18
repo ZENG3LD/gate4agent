@@ -66,6 +66,7 @@ pub const HARNESS_OPERATOR_WIRE_VERSION_V6: u16 = 6;
 pub const HARNESS_OPERATOR_WIRE_VERSION_V7: u16 = 7;
 pub const HARNESS_OPERATOR_WIRE_VERSION_V8: u16 = 8;
 pub const HARNESS_OPERATOR_WIRE_VERSION_V9: u16 = 9;
+pub const HARNESS_OPERATOR_WIRE_VERSION_V10: u16 = 10;
 pub const HARNESS_OPERATOR_REQUEST_MAX_BYTES: usize = 64 * 1024;
 pub const HARNESS_OPERATOR_RESPONSE_MAX_BYTES: usize = 1024 * 1024;
 pub const HARNESS_OPERATOR_CREDENTIAL_MAX_BYTES: usize = 256;
@@ -98,6 +99,11 @@ pub const HARNESS_TERMINAL_SCROLLBACK_LINES_MAX: usize = 512;
 // headroom so validate() never rejects a legitimate frame while still bounding a
 // malformed one.
 pub const HARNESS_TERMINAL_FRAME_MAX_BYTES: usize = 2 * 1_024 * 1_024;
+// Matches the node's own `MAX_NODE_TEXT_BYTES` (gate4agent-node-protocol):
+// this crate has no dependency on that crate, so the bound is mirrored here
+// as the wire-level ceiling `WriteSessionInput` is rejected above; the node
+// re-checks the same limit authoritatively on its own side regardless.
+pub const HARNESS_SESSION_INPUT_MAX_BYTES: usize = 32 * 1_024;
 
 pub const HARNESS_READ_TOOL_IDS: [&str; 8] = [
     "g4a_context_get",
@@ -200,6 +206,7 @@ impl HarnessOperatorEnvelopeV1 {
                 | HARNESS_OPERATOR_WIRE_VERSION_V7
                 | HARNESS_OPERATOR_WIRE_VERSION_V8
                 | HARNESS_OPERATOR_WIRE_VERSION_V9
+                | HARNESS_OPERATOR_WIRE_VERSION_V10
         ) || self.version < self.request.minimum_wire_version()
         {
             return Err(HarnessOperatorApiError::UnsupportedVersion);
@@ -1812,6 +1819,33 @@ pub enum HarnessOperatorRequestV1 {
         after_sequence: Option<u64>,
         limit: u16,
     },
+    // Direct operator session verbs: unlike the CAS/task-mutation family
+    // below (`CreateTask`..`StartTaskV2`, closed-set `HarnessOperatorActionV1`
+    // shape), a session spawn/write/resize/stop has no task to CAS against --
+    // it relays straight to C2 the same way `TerminalRead` reads straight
+    // from C2, just as a write instead of a read. See the harness-service
+    // host's async select loop (not `execute_operator_request`, which is
+    // synchronous with no C2 handle in scope) for the dispatch.
+    SpawnSession {
+        node_id: String,
+        workspace_id: String,
+        provider: String,
+        provider_profile: String,
+        mode: HarnessExecutionModeV1,
+        terminal_size: HarnessRuntimeTerminalSizeV1,
+    },
+    WriteSessionInput {
+        session: HarnessRuntimeSessionAddressV1,
+        text: String,
+    },
+    ResizeSession {
+        session: HarnessRuntimeSessionAddressV1,
+        terminal_size: HarnessRuntimeTerminalSizeV1,
+    },
+    StopSession {
+        session: HarnessRuntimeSessionAddressV1,
+        force: bool,
+    },
     CatalogNativeSessions {
         route: HarnessNativeSessionRouteV1,
         limit: u16,
@@ -1951,6 +1985,31 @@ impl HarnessOperatorRequestV1 {
                 session.validate()?;
                 validate_operator_terminal_limit(*limit)
             }
+            Self::SpawnSession { node_id, workspace_id, provider, provider_profile, terminal_size, .. } => {
+                validate_node_workspace_route(node_id, workspace_id)?;
+                if !valid_runtime_id(provider, 128) || !valid_runtime_id(provider_profile, 128) {
+                    return Err(HarnessOperatorApiError::InvalidSessionSpawn);
+                }
+                if terminal_size.rows == 0 || terminal_size.columns == 0 {
+                    return Err(HarnessOperatorApiError::InvalidSessionSpawn);
+                }
+                Ok(())
+            }
+            Self::WriteSessionInput { session, text } => {
+                session.validate()?;
+                if text.len() > HARNESS_SESSION_INPUT_MAX_BYTES {
+                    return Err(HarnessOperatorApiError::InvalidSessionControl);
+                }
+                Ok(())
+            }
+            Self::ResizeSession { session, terminal_size } => {
+                session.validate()?;
+                if terminal_size.rows == 0 || terminal_size.columns == 0 {
+                    return Err(HarnessOperatorApiError::InvalidSessionControl);
+                }
+                Ok(())
+            }
+            Self::StopSession { session, .. } => session.validate(),
             Self::CatalogNativeSessions { route, limit } => {
                 route.validate()?;
                 validate_native_session_catalog_limit(*limit)
@@ -2068,8 +2127,20 @@ impl HarnessOperatorRequestV1 {
         )
     }
 
+    pub fn requires_v10(&self) -> bool {
+        matches!(
+            self,
+            Self::SpawnSession { .. }
+                | Self::WriteSessionInput { .. }
+                | Self::ResizeSession { .. }
+                | Self::StopSession { .. }
+        )
+    }
+
     pub fn minimum_wire_version(&self) -> u16 {
-        if self.requires_v9() {
+        if self.requires_v10() {
+            HARNESS_OPERATOR_WIRE_VERSION_V10
+        } else if self.requires_v9() {
             HARNESS_OPERATOR_WIRE_VERSION_V9
         } else if self.requires_v8() {
             HARNESS_OPERATOR_WIRE_VERSION_V8
@@ -2131,6 +2202,10 @@ pub enum HarnessOperatorResponseV1 {
     TaskLaunchOptions(HarnessTaskLaunchOptionsV1),
     RuntimeInventory(HarnessRuntimeInventoryPageV1),
     TerminalRead(HarnessRuntimeTerminalPageV1),
+    SessionSpawned(HarnessRuntimeSessionAddressV1),
+    SessionInputWritten,
+    SessionResized,
+    SessionStopped,
     NativeSessionsCataloged(HarnessNativeSessionsCatalogedV1),
     NativeSessionsPaged(HarnessNativeSessionsPagedV1),
     NativeSessionPreviewed(HarnessNativeSessionPreviewedV1),
@@ -2171,6 +2246,8 @@ impl HarnessOperatorResponseV1 {
             Self::TaskLaunchOptions(value) => value.validate(),
             Self::RuntimeInventory(value) => value.validate(),
             Self::TerminalRead(value) => value.validate(),
+            Self::SessionSpawned(value) => value.validate(),
+            Self::SessionInputWritten | Self::SessionResized | Self::SessionStopped => Ok(()),
             Self::NativeSessionsCataloged(value) => value.validate(),
             Self::NativeSessionsPaged(value) => value.validate(),
             Self::NativeSessionPreviewed(value) => value.validate(),
@@ -3365,6 +3442,12 @@ pub enum HarnessOperatorHostErrorV1 {
     Deadline,
     Busy,
     Unavailable,
+    // Distinct from `Deadline`: a read timing out has no side effect, so
+    // "safe to retry" is implicit. A `SpawnSession` whose C2/Node round trip
+    // is lost after being accepted carries no such guarantee -- the session
+    // may or may not exist. This case exists to tell the operator "check the
+    // runtime inventory before retrying", not "retry freely".
+    OutcomeUnknown,
     Internal,
 }
 
@@ -4299,6 +4382,10 @@ pub enum HarnessOperatorApiError {
     InvalidNativeHistory,
     #[error("harness terminal page is invalid")]
     InvalidTerminalPage,
+    #[error("harness session spawn request is invalid")]
+    InvalidSessionSpawn,
+    #[error("harness session control request is invalid")]
+    InvalidSessionControl,
     #[error("harness operator response is invalid")]
     Read(#[source] HarnessReadApiError),
     #[error("harness protocol value is invalid: {0}")]
@@ -6739,5 +6826,151 @@ mod tests {
             observed.validate_for(&other_run_id),
             Err(HarnessOperatorApiError::InvalidRunContextSourceObservation),
         ));
+    }
+
+    fn session_address(instance_id: u64, generation: u64) -> HarnessRuntimeSessionAddressV1 {
+        HarnessRuntimeSessionAddressV1 {
+            node_id: "node-a".to_owned(),
+            incarnation_id: "07".repeat(16),
+            workspace_id: "workspace-a".to_owned(),
+            instance_id,
+            generation,
+        }
+    }
+
+    #[test]
+    fn operator_v10_session_verbs_are_exact_round_trips_and_fail_closed_on_v9() {
+        let session = session_address(41, 3);
+        let requests = vec![
+            HarnessOperatorRequestV1::SpawnSession {
+                node_id: "node-a".to_owned(),
+                workspace_id: "workspace-a".to_owned(),
+                provider: "claude".to_owned(),
+                provider_profile: "claude-default".to_owned(),
+                mode: HarnessExecutionModeV1::Pty,
+                terminal_size: HarnessRuntimeTerminalSizeV1 { rows: 40, columns: 120 },
+            },
+            HarnessOperatorRequestV1::WriteSessionInput {
+                session: session.clone(),
+                text: "echo hi\n".to_owned(),
+            },
+            HarnessOperatorRequestV1::ResizeSession {
+                session: session.clone(),
+                terminal_size: HarnessRuntimeTerminalSizeV1 { rows: 50, columns: 160 },
+            },
+            HarnessOperatorRequestV1::StopSession {
+                session: session.clone(),
+                force: true,
+            },
+        ];
+        let credential = HarnessOperatorCredential::parse(format!(
+            "g4aho_{}",
+            "a".repeat(64),
+        )).unwrap();
+        for request in requests {
+            request.validate().expect("valid V10 session verb request");
+            assert_eq!(request.minimum_wire_version(), HARNESS_OPERATOR_WIRE_VERSION_V10);
+            let encoded = serde_json::to_string(&request).unwrap();
+            let decoded: HarnessOperatorRequestV1 = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, request);
+            assert!(matches!(
+                HarnessOperatorEnvelopeV1 {
+                    version: HARNESS_OPERATOR_WIRE_VERSION_V9,
+                    credential: credential.clone(),
+                    request: request.clone(),
+                }.validate(),
+                Err(HarnessOperatorApiError::UnsupportedVersion),
+            ));
+            HarnessOperatorEnvelopeV1 {
+                version: HARNESS_OPERATOR_WIRE_VERSION_V10,
+                credential: credential.clone(),
+                request,
+            }.validate().unwrap();
+        }
+
+        let responses = vec![
+            HarnessOperatorResponseV1::SessionSpawned(session.clone()),
+            HarnessOperatorResponseV1::SessionInputWritten,
+            HarnessOperatorResponseV1::SessionResized,
+            HarnessOperatorResponseV1::SessionStopped,
+        ];
+        for response in responses {
+            response.validate().expect("valid V10 session verb response");
+            let encoded = serde_json::to_string(&response).unwrap();
+            let decoded: HarnessOperatorResponseV1 = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, response);
+        }
+    }
+
+    #[test]
+    fn session_spawn_and_control_requests_reject_malformed_fields() {
+        let session = session_address(41, 3);
+        let valid_spawn = HarnessOperatorRequestV1::SpawnSession {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            provider: "claude".to_owned(),
+            provider_profile: "claude-default".to_owned(),
+            mode: HarnessExecutionModeV1::Pty,
+            terminal_size: HarnessRuntimeTerminalSizeV1 { rows: 40, columns: 120 },
+        };
+        valid_spawn.validate().unwrap();
+
+        let mut empty_node = valid_spawn.clone();
+        if let HarnessOperatorRequestV1::SpawnSession { node_id, .. } = &mut empty_node {
+            *node_id = String::new();
+        }
+        assert!(matches!(
+            empty_node.validate(),
+            Err(HarnessOperatorApiError::InvalidWorkspaceOrigin),
+        ));
+
+        let mut bad_provider = valid_spawn.clone();
+        if let HarnessOperatorRequestV1::SpawnSession { provider, .. } = &mut bad_provider {
+            *provider = "not a provider id!".to_owned();
+        }
+        assert!(matches!(
+            bad_provider.validate(),
+            Err(HarnessOperatorApiError::InvalidSessionSpawn),
+        ));
+
+        let mut zero_rows = valid_spawn.clone();
+        if let HarnessOperatorRequestV1::SpawnSession { terminal_size, .. } = &mut zero_rows {
+            terminal_size.rows = 0;
+        }
+        assert!(matches!(
+            zero_rows.validate(),
+            Err(HarnessOperatorApiError::InvalidSessionSpawn),
+        ));
+
+        let oversized_input = HarnessOperatorRequestV1::WriteSessionInput {
+            session: session.clone(),
+            text: "x".repeat(HARNESS_SESSION_INPUT_MAX_BYTES + 1),
+        };
+        assert!(matches!(
+            oversized_input.validate(),
+            Err(HarnessOperatorApiError::InvalidSessionControl),
+        ));
+        let bounded_input = HarnessOperatorRequestV1::WriteSessionInput {
+            session: session.clone(),
+            text: "x".repeat(HARNESS_SESSION_INPUT_MAX_BYTES),
+        };
+        bounded_input.validate().unwrap();
+
+        let zero_resize = HarnessOperatorRequestV1::ResizeSession {
+            session: session.clone(),
+            terminal_size: HarnessRuntimeTerminalSizeV1 { rows: 24, columns: 0 },
+        };
+        assert!(matches!(
+            zero_resize.validate(),
+            Err(HarnessOperatorApiError::InvalidSessionControl),
+        ));
+
+        let mut malformed_session = session.clone();
+        malformed_session.instance_id = 0;
+        let bad_stop = HarnessOperatorRequestV1::StopSession {
+            session: malformed_session,
+            force: false,
+        };
+        assert!(bad_stop.validate().is_err());
     }
 }

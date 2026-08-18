@@ -32,34 +32,36 @@ use gate4agent_harness_api::{
     HARNESS_WORKSPACE_FILE_MAX_BYTES, HARNESS_WORKSPACE_TREE_ENTRIES_MAX,
 };
 use gate4agent_node_protocol::{
-    DeliveryBlobChunkHexV1, DeliveryBlobDigestV1, DeliveryBundleManifestV2,
+    CapabilityId, DeliveryBlobChunkHexV1, DeliveryBlobDigestV1, DeliveryBundleManifestV2,
     DeliveryCommitReceiptV1, DeliveryStageId, HarnessMcpActivationDigest,
     HarnessMcpCallId, HarnessMcpRejectReasonV1, HarnessMcpReplyChunkHexV1,
     HarnessMcpReservationId, ManagedWorktreeLeaseId, ManagedWorktreeLeaseSnapshot,
     ManagedWorktreeLeaseState,
-    ManagedWorktreeSpawnRequestV2, NodeFailureCode, NodeId, NodeRequest,
+    ManagedWorktreeSpawnRequestV2, NodeFailureCode, NodeId, NodeIncarnationId, NodeRequest,
     ResolvedBundleReceipt, ResolvedContextPackReceipt, ResolvedEnvironmentProfileReceipt,
     ResolvedHarnessMcpProxyReceiptV1,
     ResolvedSpawnReceipt, ResolvedSpawnSpec,
     GitDiff, GitDiffMode, GitDiffRequest, GitHistoryPage, GitObjectId,
     GitSignatureStatus, RepositoryPath, WorkspaceEntryKind, WorkspaceFileContent,
     WorkspaceFileRead,
-    SessionAddress, SessionMode,
-    SessionRecordId, SpawnFieldProvenance, SpawnOverride, SpawnProfileRevision,
-    SpawnProfileId,
+    SessionAddress, SessionKey, SessionMode,
+    SessionRecordId, SpawnFieldProvenance, SpawnDeadlineMs, SpawnIdempotencyKey,
+    SpawnOverride, SpawnOverrides, SpawnProfileRevision,
+    SpawnProfileId, SpawnRequiredCapabilities, SpawnTarget,
     SpawnPromptMetadata, SpawnResolutionProvenance, SpawnSpec, WorkspaceId,
     WorktreeProfileId, WorktreeProfileRevision,
     NativeSessionCatalogRoute, NativeSessionSelection,
-    MAX_DELIVERY_CHUNK_RAW_BYTES,
+    MAX_DELIVERY_CHUNK_RAW_BYTES, SPAWN_RUNTIME_RAW_PTY_LIFECYCLE,
 };
 use gate4agent_harness_protocol::{
-    HarnessContinuationRef, HarnessContinuationStateV1, HarnessIdempotencyRef,
+    HarnessContinuationRef, HarnessContinuationStateV1, HarnessExecutionModeV1,
+    HarnessIdempotencyRef,
     HarnessOperationId, HarnessRequestDigest, HarnessResolvedContextPackReceiptV1,
     HarnessRunId, HarnessRunV1,
     HarnessSelectorV1, HarnessSessionBindingV1, HarnessSessionIdentityV1,
 };
 use gate4agent_node_wire::local_hmac_sha256;
-use gate4agent_types::AgentId;
+use gate4agent_types::{AgentId, AgentInstanceId, SessionGeneration, TerminalSize};
 use thiserror::Error;
 use std::{sync::Arc, time::{Duration, Instant}};
 
@@ -67,6 +69,10 @@ const NATIVE_HISTORY_TIMEOUT_FLOOR: Duration = Duration::from_secs(34);
 const RUN_READ_TIMEOUT_FLOOR: Duration = Duration::from_secs(4);
 const RUN_CONTEXT_SOURCE_C2_DEADLINE: Duration = Duration::from_secs(10);
 const RUN_CONTEXT_SOURCE_MESSAGE_LIMIT: u16 = 1;
+// Matches the light TUI's own direct `spawn_spec()` (client.rs) node-local
+// processing budget for a launch-dialog spawn -- see
+// `HarnessC2Adapter::dispatch_session_spawn`.
+const SESSION_SPAWN_DEADLINE_MS: u64 = 20_000;
 
 #[derive(Clone)]
 pub struct HarnessC2Adapter {
@@ -224,6 +230,77 @@ impl HarnessC2Adapter {
             },
             pending: Some(pending),
         })
+    }
+
+    /// Direct operator `SpawnSession`: no Task/Run/plan, no CAS/replay layer
+    /// (see `HarnessOperatorRequestV1::SpawnSession`'s doc comment). Unlike
+    /// `start_prepared_spawn`, this owns the whole round trip -- preflight,
+    /// build, dispatch, await -- because there is no durable lease to split
+    /// the "prepare" step out of the way `issue_spawn_lease` does for the
+    /// Task/Run path. `operation_id`/`idempotency_ref` exist only to satisfy
+    /// `PreparedSpawnDispatch`'s wire-correlation identity; the caller mints
+    /// a fresh pair per call (see `mint_session_spawn_ids` in `runtime.rs`),
+    /// never derives them from anything a replayed client request could
+    /// reproduce.
+    pub(crate) async fn dispatch_session_spawn(
+        &self,
+        prepared: PreparedSessionSpawn,
+        operation_id: HarnessOperationId,
+        idempotency_ref: HarnessIdempotencyRef,
+    ) -> Result<SpawnDispatchOutcome, HarnessC2Error> {
+        let PreparedSessionSpawn { route, workspace_id, provider, profile_id, mode, terminal_size } = prepared;
+        let profile = self.preflight_spawn_profile(&route, &profile_id).await?;
+        let required_capabilities = match mode {
+            HarnessExecutionModeV1::Pty => SpawnRequiredCapabilities::new([
+                CapabilityId::new(SPAWN_RUNTIME_RAW_PTY_LIFECYCLE)
+                    .map_err(|_| HarnessC2Error::InvalidSessionSpawnRequest)?,
+            ]).map_err(|_| HarnessC2Error::InvalidSessionSpawnRequest)?,
+            HarnessExecutionModeV1::Inline => SpawnRequiredCapabilities::default(),
+        };
+        let spec = SpawnSpec {
+            target: SpawnTarget {
+                node_id: route.node_id.clone(),
+                workspace_id,
+                worktree_id: None,
+            },
+            profile_id: profile_id.clone(),
+            expected_profile_revision: profile.revision().clone(),
+            overrides: SpawnOverrides {
+                provider: SpawnOverride::Set { value: provider },
+                mode: SpawnOverride::Set { value: crate::dispatch::execution_mode(mode) },
+                terminal_size: SpawnOverride::Set { value: terminal_size },
+                prompt: SpawnOverride::Clear,
+                bundle_id: SpawnOverride::Clear,
+                context_id: SpawnOverride::Clear,
+                environment_profile_id: SpawnOverride::Clear,
+            },
+            deadline_ms: SpawnDeadlineMs::new(SESSION_SPAWN_DEADLINE_MS)
+                .map_err(|_| HarnessC2Error::InvalidSessionSpawnRequest)?,
+            idempotency_key: SpawnIdempotencyKey::new(idempotency_ref.as_str())
+                .map_err(|_| HarnessC2Error::InvalidSessionSpawnRequest)?,
+            required_capabilities,
+        };
+        let spec = profile.bind_spec(spec)?;
+        let fingerprint = spawn_spec_fingerprint(&spec)?;
+        let prepared = PreparedSpawnDispatch::new(route, operation_id, idempotency_ref, spec, fingerprint)?;
+        let pending = self.start_prepared_spawn(prepared, profile)?;
+        pending.finish().await
+    }
+
+    /// Enqueues one `Input`/`Resize`/`Stop` verb against an already-live
+    /// session. No controller-lease handling: C2 acquires and holds the
+    /// per-node controller lease itself for the life of the connection (see
+    /// the doctrine note on `HarnessOperatorRequestV1::WriteSessionInput`),
+    /// so neither this adapter nor the harness operator ever negotiates one.
+    pub(crate) fn start_prepared_session_control(
+        &self,
+        prepared: PreparedSessionControl,
+    ) -> Result<PendingSessionControl, HarnessC2Error> {
+        self.ensure_current_incarnation(&prepared.route)?;
+        let wire_request = prepared.wire_request();
+        let pending = self.control.start_request(prepared.route.clone(), wire_request)
+            .map_err(HarnessC2Error::SessionControlEnqueue)?;
+        Ok(PendingSessionControl { prepared, pending: Some(pending) })
     }
 
     pub(crate) fn start_prepared_managed_worktree_spawn(
@@ -2062,6 +2139,155 @@ impl PendingNodeWorkspaceRead {
             Ok(routed) => match routed.response {
                 Err(failure) => Err(HarnessC2Error::NodeWorkspaceReadRejected { code: failure.code }),
                 Ok(response) => correlate_node_workspace_read_response(&self.prepared, response),
+            },
+        }
+    }
+}
+
+/// Node-scoped sibling of `PreparedNodeWorkspaceRead` for a direct operator
+/// `SpawnSession`: the route is resolved live via `exact_route`, same as a
+/// node-workspace read -- there is no stored binding to seal it from, and no
+/// launch-plan catalog resolution (the plan-based spawn path stays entirely
+/// separate, see `HarnessLaunchPlanV1::spawn_spec` in `dispatch.rs`).
+pub(crate) struct PreparedSessionSpawn {
+    route: NodeRoute,
+    workspace_id: WorkspaceId,
+    provider: AgentId,
+    profile_id: SpawnProfileId,
+    mode: HarnessExecutionModeV1,
+    terminal_size: TerminalSize,
+}
+
+impl PreparedSessionSpawn {
+    pub(crate) fn from_operator_request(
+        adapter: &HarnessC2Adapter,
+        request: HarnessOperatorRequestV1,
+    ) -> Result<Self, HarnessC2Error> {
+        request.validate().map_err(|_| HarnessC2Error::InvalidSessionSpawnRequest)?;
+        let HarnessOperatorRequestV1::SpawnSession {
+            node_id, workspace_id, provider, provider_profile, mode, terminal_size,
+        } = request else {
+            return Err(HarnessC2Error::InvalidSessionSpawnRequest);
+        };
+        let node_id = NodeId::new(node_id)
+            .map_err(|_| HarnessC2Error::InvalidSessionSpawnRequest)?;
+        let workspace_id = WorkspaceId::new(workspace_id)
+            .map_err(|_| HarnessC2Error::InvalidSessionSpawnRequest)?;
+        let provider = AgentId::new(provider)
+            .map_err(|_| HarnessC2Error::InvalidSessionSpawnRequest)?;
+        let profile_id = SpawnProfileId::new(provider_profile)
+            .map_err(|_| HarnessC2Error::InvalidSessionSpawnRequest)?;
+        let route = adapter.exact_route(&node_id)?;
+        Ok(Self {
+            route,
+            workspace_id,
+            provider,
+            profile_id,
+            mode,
+            terminal_size: TerminalSize { rows: terminal_size.rows, columns: terminal_size.columns },
+        })
+    }
+
+    pub(crate) fn route(&self) -> &NodeRoute { &self.route }
+}
+
+/// The three thin session-control verbs (`WriteSessionInput`/
+/// `ResizeSession`/`StopSession`) relay straight to the same C2 wire verbs
+/// the light TUI already uses (`NodeRequest::Input`/`Resize`/`Stop`) -- there
+/// is no CAS/replay layer and no multi-outcome transport ambiguity worth
+/// surfacing separately the way a spawn's `SpawnDispatchOutcome` is (see
+/// `dispatch_session_spawn`), so one enum covers all three shapes.
+pub(crate) enum SessionControlKind {
+    Input { text: String },
+    Resize { size: TerminalSize },
+    Stop { force: bool },
+}
+
+pub(crate) struct PreparedSessionControl {
+    route: NodeRoute,
+    session: SessionAddress,
+    kind: SessionControlKind,
+}
+
+impl PreparedSessionControl {
+    pub(crate) fn from_operator_request(
+        adapter: &HarnessC2Adapter,
+        request: HarnessOperatorRequestV1,
+    ) -> Result<Self, HarnessC2Error> {
+        request.validate().map_err(|_| HarnessC2Error::InvalidSessionControlRequest)?;
+        let (session_address, kind) = match request {
+            HarnessOperatorRequestV1::WriteSessionInput { session, text } => {
+                (session, SessionControlKind::Input { text })
+            }
+            HarnessOperatorRequestV1::ResizeSession { session, terminal_size } => (
+                session,
+                SessionControlKind::Resize {
+                    size: TerminalSize { rows: terminal_size.rows, columns: terminal_size.columns },
+                },
+            ),
+            HarnessOperatorRequestV1::StopSession { session, force } => {
+                (session, SessionControlKind::Stop { force })
+            }
+            _ => return Err(HarnessC2Error::InvalidSessionControlRequest),
+        };
+        let node_id = NodeId::new(session_address.node_id.as_str())
+            .map_err(|_| HarnessC2Error::InvalidSessionControlRequest)?;
+        let workspace_id = WorkspaceId::new(session_address.workspace_id.as_str())
+            .map_err(|_| HarnessC2Error::InvalidSessionControlRequest)?;
+        let incarnation_id: NodeIncarnationId = session_address.incarnation_id.parse()
+            .map_err(|_| HarnessC2Error::InvalidSessionControlRequest)?;
+        let route = adapter.exact_route(&node_id)?;
+        if route.expected_incarnation_id != incarnation_id {
+            return Err(HarnessC2Error::IncarnationChanged { node_id: route.node_id.clone() });
+        }
+        let session = SessionAddress {
+            workspace_id,
+            session: SessionKey {
+                instance_id: AgentInstanceId(session_address.instance_id),
+                generation: SessionGeneration(session_address.generation),
+            },
+        };
+        Ok(Self { route, session, kind })
+    }
+
+    fn wire_request(&self) -> NodeRequest {
+        match &self.kind {
+            SessionControlKind::Input { text } => NodeRequest::Input {
+                session: self.session.clone(),
+                text: text.clone(),
+            },
+            SessionControlKind::Resize { size } => NodeRequest::Resize {
+                session: self.session.clone(),
+                size: *size,
+            },
+            SessionControlKind::Stop { force } => NodeRequest::Stop {
+                session: self.session.clone(),
+                force: *force,
+            },
+        }
+    }
+}
+
+pub(crate) struct PendingSessionControl {
+    prepared: PreparedSessionControl,
+    pending: Option<C2PendingRequest>,
+}
+
+impl PendingSessionControl {
+    pub(crate) async fn finish(mut self) -> Result<(), HarnessC2Error> {
+        let pending = self.pending.take()
+            .expect("pending session control owns exactly one C2 waiter");
+        match pending.finish().await {
+            Err(error) => Err(HarnessC2Error::SessionControlTransport(error)),
+            Ok(routed) if routed.node_id != self.prepared.route.node_id
+                || routed.incarnation_id != self.prepared.route.expected_incarnation_id =>
+            {
+                Err(HarnessC2Error::SessionControlRouteMismatch)
+            }
+            Ok(routed) => match routed.response {
+                Ok(C2NodeResponse::Accepted) => Ok(()),
+                Ok(_) => Err(HarnessC2Error::UnexpectedSessionControlResponse),
+                Err(failure) => Err(HarnessC2Error::SessionControlRejected { code: failure.code }),
             },
         }
     }
@@ -4273,6 +4499,24 @@ pub enum HarnessC2Error {
     NodeWorkspaceReadTooLarge,
     #[error("Node rejected node workspace read with {code:?}")]
     NodeWorkspaceReadRejected { code: NodeFailureCode },
+    #[error("session spawn request is invalid")]
+    InvalidSessionSpawnRequest,
+    #[error("session spawn was cancelled after the harness operator connection's own deadline fired first")]
+    SessionSpawnCancelled,
+    #[error("session control request is invalid")]
+    InvalidSessionControlRequest,
+    #[error("session control request was not enqueued: {0}")]
+    SessionControlEnqueue(C2ControlError),
+    #[error("session control transport failed: {0}")]
+    SessionControlTransport(C2ControlError),
+    #[error("session control response route or incarnation does not match")]
+    SessionControlRouteMismatch,
+    #[error("C2 returned an unexpected session control response")]
+    UnexpectedSessionControlResponse,
+    #[error("session control request was cancelled after the harness operator connection's own deadline fired first")]
+    SessionControlCancelled,
+    #[error("Node rejected the session control request with {code:?}")]
+    SessionControlRejected { code: NodeFailureCode },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

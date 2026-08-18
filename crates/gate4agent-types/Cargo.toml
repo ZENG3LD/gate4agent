@@ -1,6 +1,6 @@
 [package]
 name = "gate4agent-types"
-version = "0.2.37"
+version = "0.3.0"
 edition = "2021"
 description = "Pure data contracts for gate4agent backends and shells"
 license = "MIT"

@@ -127,6 +127,7 @@ API — usable on its own, with no node/c2/harness in the loop.
 | **Claude Code** | Structured inline + PTY | current `stream-json` | not in default catalog | current `--resume <id>` | Full native Windows PTY lifecycle verified on 2.1.224 |
 | **Codex CLI** | Structured inline + PTY | current `exec --json` | not in default catalog | current `exec resume` | Inline and Windows PTY verified on 0.144.6; inline defaults to read-only |
 | **Kimi Code** | Structured inline + raw PTY | current `stream-json` | unsupported | active adapter `--session <id>`; legacy `PipeSession` `-r <id>` | Version 0.31.1 exposes `--session`; the latest PTY canary exited before readiness with a local provider `EPERM`, so current PTY lifecycle is not claimed |
+| **Grok CLI** | PTY via the adapter registry (workbench path) | — (no transport-core pipe client) | not active | resume gap tracked | First-tier through `gate4agent-adapters`, not this table's transport-core clients: PTY sessions, native history, hooks |
 
 The table above is the transport core's own verified matrix. Grok and
 qwen-code ride the modern adapter registry (`gate4agent-adapters`) used by the
@@ -219,6 +220,7 @@ to a shell. Unix uses direct process execution.
 | **Claude Code 2.1.224** | fresh observed; current resume canary failed | full lifecycle verified | not active | Current PTY: initial/follow-up prompt, resize, in-flight interrupt, recovery, and teardown live-verified |
 | **Codex 0.144.6** | fresh/resume verified | live | not active | Initial/follow-up, resize, in-flight interrupt, recovery, cleanup |
 | **Kimi Code 0.31.1** | current canary exited before completion | current canary failed before readiness | unsupported | Local provider state reported `EPERM`; no current PTY lifecycle claim |
+| **Grok CLI** | — (adapter-registry path, not a transport-core pipe client) | live through the workbench (node adapter registry) | not active | Live-verified in the workbench stack 2026-08-19: operator spawn/observe/stop through harness → c2 → node; resume gap tracked |
 
 Vendor-live inline/PTY tests are opt-in (`--ignored`) — they need an
 installed, authenticated CLI and network access. Plain `cargo test` is

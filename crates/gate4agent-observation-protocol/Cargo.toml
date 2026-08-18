@@ -2,6 +2,7 @@
 name = "gate4agent-observation-protocol"
 version = "0.2.37"
 edition = "2021"
+description = "Dependency-light, versioned observation wire contract for gate4agent provider-session monitoring"
 publish = false
 
 [lib]

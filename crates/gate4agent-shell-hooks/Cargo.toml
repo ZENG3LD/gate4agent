@@ -2,6 +2,7 @@
 name = "gate4agent-shell-hooks"
 version = "0.2.37"
 edition = "2021"
+description = "Loopback-only native listener for raw gate4agent provider Hook ingress"
 publish = false
 
 [dependencies]

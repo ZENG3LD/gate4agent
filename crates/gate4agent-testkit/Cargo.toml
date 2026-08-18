@@ -2,6 +2,7 @@
 name = "gate4agent-testkit"
 version = "0.2.37"
 edition = "2021"
+description = "Authentication-free provider fixtures and the Windows headless test supervisor for gate4agent"
 publish = false
 
 [dependencies]

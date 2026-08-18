@@ -1,15 +1,105 @@
 # gate4agent
 
-Slim Rust transport library for Claude Code, Codex CLI, and Kimi Code. Spawn,
-stream, resume, and own interactive terminal processes through one API.
+gate4agent is an agent workbench, not just a transport library: a
+node/c2/harness/TUI stack for running, observing, and orchestrating CLI
+coding-agent sessions (Claude Code, Codex, Kimi Code) on top of a provider
+transport core. A node wraps one machine's providers (PTY/inline sessions, the
+file browser, local git, worktrees); c2 relays any number of nodes to their
+clients; a harness — light or full — is the one stateful backend a client app
+talks to, behind a single app-facing protocol, adding task kanban, session
+context, and delivery on top of the c2 transport; the TUI is the current
+client, running in harness mode or in a direct-c2 light mode. The library that
+started this repo — spawn, stream, resume CLI-agent subprocesses through one
+API — is still here, still usable standalone, and is now the substrate the
+rest of the stack builds on; see [Transport core](#transport-core) below.
 
-**Not a harness. Not a sandbox.** The root crate remains the transport layer
-between a Rust application and CLI-agent subprocesses: spawn, write typed
-input, read structured events, and resume by session id. The workspace also
-contains an optional backend control plane for consumers that need one
-deterministic owner for session lifecycle and host-capability authority.
+## Layers
 
-## Supported CLI tools
+One direction of wrapping: providers → node → c2 → harness → client app. All
+crate names below are prefixed `gate4agent-` (e.g. `-node` = `gate4agent-node`).
+
+- **Providers** — blackbox vendor CLIs (Claude Code, Codex, Kimi Code) wrapped
+  by the transport core: root crate `gate4agent` (`src/`),
+  `vendor/portable-pty`, `-types`, `-adapters`, `-provider-ports`, `-catalog`,
+  `-engine`, `-kernel`, `-handle`, `-tool-protocol`, `-tool-engine`,
+  `-shell-history`, `-shell-capabilities`, `-shell-hooks`,
+  `-shell-managed-hooks`, `-shell-one-shot`, `-shell-native`,
+  `-runtime-native`.
+- **Observation** — read-only monitoring facts projected from provider
+  sessions, never prompts/transcripts/credentials: `-observation-protocol`,
+  `-observation-api`, `-observation-engine`, `-observation-store`,
+  `-observation-service`.
+- **Node** — wraps providers on one machine: PTY/inline sessions, the file
+  browser, local git, worktrees: `-node-protocol`, `-node-wire`, `-node`
+  (bin `gate4agent-node`).
+- **C2** — relays any number of nodes to their clients and routes commands
+  (spawn, session control) down to nodes: `-c2-protocol`, `-c2-client`
+  (bin `gate4agent-c2ctl`), `-c2` (bin `gate4agent-c2`).
+- **Harness** — the stateful backend behind one app-facing protocol: task
+  kanban over SQLite, session extraction/continuation, delivery of
+  skills/plugins/MCP config, an operator surface: `-harness-protocol`,
+  `-harness-engine`, `-harness-service` (bin `gate4agent-harness`),
+  `-harness-api`, `-harness-client` (bin `gate4agent-harnessctl`),
+  `-harness-mcp` (bin `gate4agent-harness-mcp`), `-harness-delivery`.
+- **Client** — `crates/gate4agent-tui`, its own nested cargo workspace: bins
+  `gate4agent-tui` (harness mode) and `gate4agent-tui-light` (direct-c2 light
+  mode).
+- **Testing** — `gate4agent-testkit`: authentication-free provider fixtures
+  and the Windows headless test supervisor.
+
+## Local endpoints
+
+| Layer | Local pipe | API |
+|---|---|---|
+| Node | `\\.\pipe\gate4agent-node` (Unix: local socket) | `127.0.0.1:18310` |
+| C2 | `\\.\pipe\gate4agent-c2` (Unix: local socket) | `127.0.0.1:18320` |
+| Harness | — | operator surface on `127.0.0.1:18330` |
+
+All three are loopback/local-only; nothing here is reachable off the host by
+default.
+
+## Credentials
+
+Env vars only — never pass a token as argv, never commit a value:
+
+- `GATE4AGENT_NODE_TOKEN`, or `GATE4AGENT_NODE_TOKEN_<NORMALIZED_ID>` for a
+  per-node override (id uppercased, non-alphanumeric characters replaced with
+  `_`)
+- `GATE4AGENT_C2_TOKEN`
+- `GATE4AGENT_HARNESS_OPERATOR_TOKEN`
+
+## Tests
+
+Windows PTY/session-touching tests run only through the headless test
+supervisor (`gate4agent-testkit`'s `windows-headless-supervisor` binary) — it
+suppresses Windows fault dialogs and enforces a hard per-test timeout that
+plain `cargo test` cannot:
+
+```
+target\release\windows-headless-supervisor.exe <timeout_ms> <ABS path to test exe> --exact <test_fn>
+```
+
+Parallel test arcs build against isolated `--target-dir` values
+(`target-<scenario>`) instead of sharing `target/`, so independent runs never
+collide on Cargo's build lock. Tests gated by
+`require_windows_headless_supervisor_for_test()` reject themselves outright if
+run any other way.
+
+## The TUI's uzor dependency
+
+`crates/gate4agent-tui` carries a path dependency on `../../../uzor/uzor-tui`,
+a sibling repo that lives outside this one. A fresh clone of this repo alone
+cannot build the TUI (`gate4agent-tui` / `gate4agent-tui-light`) until that
+sibling checkout is present alongside it; every other crate in the workspace
+builds standalone.
+
+## Transport core
+
+The root `gate4agent` crate is a standalone Rust library for spawning,
+streaming, resuming, and owning interactive CLI-agent subprocesses through one
+API — usable on its own, with no node/c2/harness in the loop.
+
+### Supported CLI tools
 
 | Tool | Transport | Pipe mode | ACP | Resume | Notes |
 |---|---|---|---|---|---|
@@ -17,104 +107,13 @@ deterministic owner for session lifecycle and host-capability authority.
 | **Codex CLI** | Structured inline + PTY | current `exec --json` | not in default catalog | current `exec resume` | Inline and Windows PTY verified on 0.144.6; inline defaults to read-only |
 | **Kimi Code** | Structured inline + raw PTY | current `stream-json` | unsupported | active adapter `--session <id>`; legacy `PipeSession` `-r <id>` | Version 0.31.1 exposes `--session`; the latest PTY canary exited before readiness with a local provider `EPERM`, so current PTY lifecycle is not claimed |
 
-### Transitional reference registry
+The separate `agent` module also carries a 33-entry Orca-derived reference
+registry from an earlier grounding cycle; those entries are transitional code
+debt, not support claims — the table above is the active support matrix.
+Gemini, OpenCode, and the other reference entries are outside the current
+product target.
 
-The table above is the active product-support matrix. The separate `agent`
-module still contains the 33-entry Orca-derived reference inventory from the
-earlier grounding cycle. Those dormant entries are transitional code debt, not
-support claims. Qwen Code is deferred until vendor-owned subscription access is
-available; Gemini, OpenCode, and the other reference entries are outside the
-current product target.
-
-The launch entries are marked `SpecVerification::Reference`: their interactive
-launch shape is pinned to a reviewed source snapshot but still requires
-provider/version verification before a product presents it as fully supported.
-
-```rust
-use gate4agent::{builtin_registry, plan_launch, LaunchRequest};
-
-let grok = builtin_registry().get_by_id("grok").unwrap();
-let plan = plan_launch(
-    grok,
-    LaunchRequest {
-        prompt: Some("--version".into()),
-        ..LaunchRequest::default()
-    },
-)?;
-
-assert_eq!(plan.program.to_string_lossy(), "grok");
-let args: Vec<_> = plan.args.iter().map(|arg| arg.to_string_lossy()).collect();
-assert_eq!(args, ["--", "--version"]);
-```
-
-`LaunchPlan` contains an executable plus argument vector; it never concatenates
-the prompt into a shell command. `PtySession::spawn_agent()` consumes the plan.
-Agents such as Kimi retain a one-shot `followup_prompt`, which can be submitted
-only with an opaque permit issued by `ReadinessTracker` after the expected
-foreground/readiness evidence succeeds.
-
-The same module separates prompt, draft, agent-command, shell-command, terminal
-text, and terminal-control actions. `prepare_input()` produces bounded,
-UTF-8-safe writes; bracketed paste neutralizes embedded terminal control
-sequences and keeps submission as a separate final write.
-
-`PtySession::spawn_agent_draft()` keeps reviewable drafts distinct from
-auto-submitted prompts. Claude and OpenClaude reference specs use native
-`--prefill`; other agents retain a one-shot post-readiness draft. On Windows,
-unsafe or oversized inline drafts automatically use the post-readiness path.
-
-Declared slash-command capability is target-bound to the readiness permit.
-Command bodies and prompt bodies use a separate Enter write after the pinned
-500 ms TUI settle delay; controls/newlines in inline command arguments are
-rejected. Specs without the capability fail explicitly.
-
-The sequenced PTY event stream (`subscribe_events` / `attach_events`) reports
-subscriber and replay gaps explicitly, keeps a bounded 64 KiB raw-output tail,
-and supports atomic replay plus future subscription. Terminal snapshots are
-pinned to the last incorporated sequence. PTY output is drained before the
-ordered exit event. The producer-side reader queue applies byte-based 256 KiB /
-32 KiB high/low watermarks, so backpressure is independent of read chunking.
-Event envelopes, replay cursors, and terminal snapshots pin the agent-spec plus
-PTY protocol revision; attach rejects a revision mismatch. Fresh foreground
-observations and snapshot availability are part of the same ordered sequence.
-
-`PtySession::observe_foreground()` performs a fresh, time- and size-bounded OS
-process-table observation using the real PTY root PID. On POSIX it also uses the
-kernel foreground process group; on Windows it prefers a hidden CIM probe and
-falls back to native Toolhelp/GetProcessTimes identity data when WMI is blocked.
-Expected agent wrappers outrank deeper tool children during readiness checks.
-
-`terminate_tree()` snapshots descendants before killing the root process handle.
-POSIX force escalation revalidates PID, process group, and start identity;
-Windows descendants are revalidated against CIM or native creation identity.
-Consuming `shutdown()` joins both the ordered Tokio consumer and the OS reader
-thread within a bounded deadline and returns an explicit root-only degradation
-report when process inspection was unavailable.
-Generic registry sessions remain raw-only; semantic adapters are not selected
-from an `AgentId` supplied by a custom specification. The legacy `CliTool`
-constructor remains a compatibility surface and is not the active product
-support matrix.
-
-`PtyColdRestoreCheckpoint` is a bounded, serde-compatible terminal checkpoint.
-It reconstructs a checkpoint plus a contiguous event tail and rejects gaps,
-identity/revision changes, invalid resize data, and oversized payloads. Storage,
-current-CWD capture, and process restart policy remain owned by the embedding
-shell or daemon.
-
-The PTY transport never auto-accepts workspace trust/safety prompts or update
-menus. Those remain visible for operator input.
-
-Active transport classes:
-
-- **Structured inline**: spawn one owned vendor child, read JSONL, then create a
-  new child with the provider session ID to resume;
-- **PTY**: own the interactive terminal process, ordered bytes, VT state,
-  bounded replay, input, resize, interrupt, and teardown.
-
-ACP and daemon modules remain compatibility code but are not enabled by the
-default Claude/Codex/Kimi catalog or part of the current product target.
-
-## Quick start
+### Quick start
 
 ```rust
 use gate4agent::{CliTool, SessionConfig, AgentEvent, PipeSession, PipeProcessOptions};
@@ -141,209 +140,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### Resume an existing session
+Resume an existing session with
+`SpawnOptions { resume_session_id: Some("abc-123-session".into()), ..opts }`;
+each active adapter handles it in its own way (Codex `exec resume`, Claude
+`--resume <id>`, Kimi `--session <id>`) behind that one field.
 
-```rust
-let opts = SpawnOptions {
-    resume_session_id: Some("abc-123-session".into()),
-    ..opts
-};
-```
+### Transport classes
 
-Each active catalog adapter handles resume in its own way: Codex uses the
-current `exec resume` shape, Claude uses `--resume <id>`, and Kimi uses
-`--session <id>`. The backwards-compatible `PipeSession` Kimi builder still
-emits the legacy `-r <id>` shape; it is a separate compatibility surface, not
-evidence for the active adapter. Gate4Agent hides the active-adapter difference
-behind `SpawnOptions::resume_session_id`.
+- **Structured inline** — spawn one owned vendor child, read JSONL, then
+  create a new child with the provider session id to resume.
+- **PTY** — own the interactive terminal process: ordered bytes, VT100 state,
+  bounded replay, input, resize, interrupt, teardown. Never auto-accepts
+  workspace-trust or update prompts; those stay visible for the operator.
+- **ACP** and **daemon** modules are compatibility surfaces, not part of the
+  current product target (`acp::AcpSession`, `daemon::DaemonSession`).
 
-### Using PipeSession directly (backwards-compatible API)
+`LaunchPlan` (via `plan_launch`) always produces an executable plus an
+argument vector — it never concatenates a prompt into a shell command.
+`prepare_input()` produces bounded, UTF-8-safe writes with bracketed-paste
+neutralization of embedded terminal control sequences.
 
-```rust
-use gate4agent::{PipeSession, PipeProcessOptions, ClaudeOptions, SessionConfig, CliTool};
-
-let config = SessionConfig {
-    tool: CliTool::ClaudeCode,
-    working_dir: std::env::current_dir()?,
-    env_vars: vec![],
-    name: None,
-};
-let opts = PipeProcessOptions {
-    claude: ClaudeOptions { model: Some("claude-opus-4".into()), ..Default::default() },
-    ..Default::default()
-};
-let session = PipeSession::spawn(config, "hello", opts).await?;
-```
-
-### Legacy ACP compatibility surface
-
-```rust
-use gate4agent::acp::{AcpSession, AcpSessionOptions};
-use gate4agent::{CliTool, AgentEvent};
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let session = AcpSession::spawn(
-        CliTool::Gemini,
-        &std::env::current_dir()?,
-        AcpSessionOptions::default(),
-    ).await?;
-
-    let mut rx = session.subscribe();
-
-    session.prompt("Say hello in 3 words").await?;
-
-    while let Ok(event) = rx.recv().await {
-        match event {
-            AgentEvent::Text { text, .. } => print!("{text}"),
-            AgentEvent::TurnComplete { .. } => break,
-            _ => {}
-        }
-    }
-
-    session.kill().await?;
-    Ok(())
-}
-```
-
-ACP provides multi-turn sessions — call `prompt()` repeatedly without respawning the agent process. Agent-to-host filesystem, terminal, and permission requests are advertised as unavailable and denied by default; raw MCP server injection is not exposed by `AcpSessionOptions`.
-
-### Backend control plane (workspace crates)
-
-Control protocol v26 is reduced by a single-writer kernel. It combines session
-lifecycle with a separate, bounded capability engine for exact request,
-approval, cancellation, and completion correlation. Consumer handles inject
-their private consumer/actor identity, expose scoped snapshots, and disconnect
-slow subscribers instead of silently dropping ordered results.
-
-The capability engine is policy and lifecycle infrastructure, not a second
-agent loop. It does not execute filesystem, shell, MCP, or browser operations.
-Host-owned executors attach through bounded provider-runtime handles. The
-in-process handle authority reserves a monotonic binding identity; the kernel
-validates and canonicalizes it, requires every request, effect, and observation
-to match that exact binding, and fences stale work across detach and rebind. An
-executor receives opaque `ProviderInvocation` tickets and sends typed
-completion observations; a separate correlated receipt reports whether the
-canonical reducer applied, ignored, or rejected the observation.
-
-Cancellation is operation-scoped. The invocation token is switched before the
-matching `ProviderWork::Cancel` becomes observable, while provider work or
-receipt channel loss, runtime teardown, or port disconnection fences the
-entire binding. An engine-side failure to enqueue a cancel remains an explicit
-unconfirmed cancellation disposition. The token therefore proves local
-cancellation delivery only: physical subprocess or browser termination remains
-unconfirmed until a concrete provider supervisor reports it. Provider
-availability and the immutable backend snapshot are published atomically, so a
-client cannot dispatch through a restored or foreign binding with no local
-executor. The current ACP adapter remains fail-closed until a reviewed
-host-owned runtime is connected through this boundary.
-
-This is an in-process authority boundary. `BackendIngress` and `KernelStep`
-remain trusted low-level integration APIs; a future IPC/WebSocket shell must
-authenticate a connection, mint its identities, enforce frame limits before
-deserialization, and map only validated messages into these contracts.
-
-No browser or remote delivery layer is included yet. A future browser shell
-will talk to a user-approved local backend; gate4agent will not collect vendor
-API keys or proxy CLI authentication through a hosted middleware service.
-
-### Legacy daemon skeleton
-
-`DaemonSession` connects to long-running HTTP/WebSocket agent daemons (OpenCode `serve`, OpenClaw). Not yet functional — API surface documented for future implementation.
-
-## Active backend features
-
-- Claude, Codex, and Kimi structured inline fresh/resume with provider-native
-  session identity;
-- one process owner per session and explicit caller-owned fan-out, without a
-  Gate4Agent swarm scheduler;
-- observable PTY lifecycle: ordered bytes, bounded replay and gaps,
-  sequence-pinned snapshots, resize, interrupt, exit ordering, and process-tree
-  teardown;
-- typed terminal input with UTF-8-safe chunks and readiness-gated submission;
-- transport-neutral structured events without inventing vendor data that is
-  absent from the current stream;
-- no Git/worktree isolation, task policy, vendor credential proxy, or
-  Gate4Agent-owned RAG/AST/tool domain.
-
-The 33-entry Orca registry, ACP, daemon, cure, broad history readers, and old
-capability/policy crates are transitional compatibility debt. They are visible
-in the source tree but are not active support claims.
-
-## Architecture
+### Source layout
 
 ```
-gate4agent/
-├── src/
-│   ├── lib.rs           — Library root, re-exports
-│   ├── agent/           — AgentId, registry, built-in specs, argv planner, typed input preparation
-│   ├── core/            — AgentEvent, CliTool, SessionConfig, AgentError
-│   ├── transport/       — TransportSession (thin router over PipeSession), SpawnOptions
-│   ├── pipe/            — PipeSession, PipeProcess, per-CLI NDJSON parsers + command builders
-│   │   └── cli/         — claude.rs, codex.rs, gemini.rs, opencode.rs
-│   ├── pty/             — PtyWrapper, PtySession, VTE/screen parsers, per-CLI PTY parsers
-│   │   └── cli/         — Per-CLI PTY output parsers
-│   ├── acp/             — ACP transport: AcpSession, protocol types, reader loop, host handler
-│   │   ├── session.rs   — AcpSession::spawn(), prompt(), cancel(), kill()
-│   │   ├── protocol.rs  — ACP wire types (InitializeParams, SessionUpdate, ContentBlock)
-│   │   ├── reader.rs    — Blocking JSON-RPC reader loop
-│   │   ├── host.rs      — Private fail-closed ACP host adapter and test-only legacy fixtures
-│   │   └── spawn.rs     — AcpProcess + per-CLI spawn specs
-│   ├── rpc/             — Shared JSON-RPC 2.0 primitives (message, pending, handler, id)
-│   │                      Used internally by acp/. Not a standalone transport.
-│   ├── probe/          — probe_all(), ProbeResult, CliProbe, cache logic
-│   ├── context/        — ContextTracker, TurnCompleteData
-│   ├── cure/           — Runtime model discovery (OpenCode cache → OpenRouter → hardcoded)
-│   ├── daemon/         — DaemonSession, per-daemon adapters [skeleton]
-│   ├── history/         — Session history readers (per-CLI format)
-│   │   ├── claude.rs    — JSONL from ~/.claude/projects/{cwd}/
-│   │   ├── codex.rs     — JSONL from ~/.codex/sessions/ (event_msg format)
-│   │   ├── gemini.rs    — JSON from ~/.gemini/tmp/{slug}/chats/
-│   │   └── opencode.rs  — SQLite from ~/.local/share/opencode/opencode.db
-│   └── utils.rs         — String utilities
-└── crates/
-    ├── gate4agent-types          — Control protocol v26 contracts
-    ├── gate4agent-engine         — Deterministic session lifecycle reducer
-    ├── gate4agent-tool-protocol  — Capability request/effect/result contracts
-    ├── gate4agent-tool-engine    — Bounded policy, approval, and correlation reducer
-    ├── gate4agent-kernel         — Unified backend tick and atomic snapshot
-    ├── gate4agent-handle         — Bounded trusted/scoped process-local ports
-    └── gate4agent-runtime-native — Native effect execution adapter
+src/
+├── lib.rs      — library root, re-exports
+├── agent/      — AgentId, registry, built-in specs, argv planner, typed input preparation
+├── core/       — AgentEvent, CliTool, SessionConfig, AgentError
+├── transport/  — TransportSession (thin router over PipeSession), SpawnOptions
+├── pipe/       — PipeSession, per-CLI NDJSON parsers + command builders
+├── pty/        — PtyWrapper, PtySession, VTE/screen parsers, per-CLI PTY parsers
+├── acp/        — Agent Client Protocol transport (compatibility surface)
+├── rpc/        — shared JSON-RPC 2.0 primitives, used internally by acp/
+├── probe/      — probe_all(), CliProbe, cache logic
+├── context/    — ContextTracker, TurnCompleteData
+├── cure/       — runtime model discovery (OpenCode cache → OpenRouter → hardcoded)
+├── daemon/     — DaemonSession, per-daemon adapters [skeleton, not functional]
+└── history/    — per-CLI session history readers (Claude, Codex, Gemini, OpenCode)
 ```
 
-## Current live testing status
+### Windows spawn strategy
+
+Reviewed Claude, Codex, and Kimi npm installations resolve to their direct
+executable or JavaScript entrypoint, so prompts stay real argv/stdin data
+instead of being reparsed by a `.cmd` shim. Unknown legacy wrappers fall back
+to a shell. Unix uses direct process execution.
+
+### Current live testing status
 
 | Tool | Pipe | PTY | ACP | Notes |
 |---|---|---|---|---|
-| **Claude Code 2.1.224** | fresh observed; current resume canary failed | ✓ full lifecycle | not active | Current PTY: initial/follow-up prompt, resize, in-flight interrupt, recovery, and teardown live-verified |
-| **Codex 0.144.6** | ✓ fresh/resume | ✓ live | not active | Initial/follow-up, resize, in-flight interrupt, recovery, cleanup |
+| **Claude Code 2.1.224** | fresh observed; current resume canary failed | full lifecycle verified | not active | Current PTY: initial/follow-up prompt, resize, in-flight interrupt, recovery, and teardown live-verified |
+| **Codex 0.144.6** | fresh/resume verified | live | not active | Initial/follow-up, resize, in-flight interrupt, recovery, cleanup |
 | **Kimi Code 0.31.1** | current canary exited before completion | current canary failed before readiness | unsupported | Local provider state reported `EPERM`; no current PTY lifecycle claim |
 
-Vendor-live inline and PTY cases are opt-in because they require installed,
-authenticated CLIs and network access. Run them with `--ignored`; ordinary
-`cargo test` is hermetic and does not contact provider accounts.
-
-Runtime readiness matching is not yet gated by the resolved vendor CLI version.
-The versioned vendor-contract lab is development-only; it records evidence but
-does not yet make an unknown runtime version fail closed. Its report is
-transport-scoped. The lab resolves the first `.cmd` or `.exe` launcher from the
-inherited Windows `PATH` and never rewrites `PATH` for a canary. PTY receives
-that exact launcher path; structured inline only confirms that its inherited
-`PATH` resolves the same file. A `.cmd` proves a stable shim, not its downstream
-native/Node entrypoint chain, so passing behavior remains non-selectable with
-the `launcher-chain-not-pinned` reason. An exact `.exe` can satisfy the launcher
-chain gate where the transport accepts exact launch injection.
-
-## Windows spawn strategy
-
-On Windows, reviewed Claude, Codex, and Kimi npm installations are resolved to
-their direct executable or JavaScript entrypoint. Prompts therefore remain real
-argv/stdin data and are not reparsed by a `.cmd` shim. Unknown legacy wrappers
-retain a shell fallback. Unix uses direct process execution.
+Vendor-live inline/PTY tests are opt-in (`--ignored`) — they need an
+installed, authenticated CLI and network access. Plain `cargo test` is
+hermetic and never touches a provider account.
 
 ## Prerequisites
 
-At least one CLI agent must be installed on the host. gate4agent does not install them.
+At least one CLI agent must be installed on the host. gate4agent does not
+install them.
 
 | CLI | Install |
 |---|---|

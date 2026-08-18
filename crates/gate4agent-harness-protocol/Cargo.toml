@@ -2,6 +2,7 @@
 name = "gate4agent-harness-protocol"
 version = "0.2.37"
 edition = "2021"
+description = "Bounded, privacy-minimized domain contract (tasks, runs, deliveries) for the gate4agent harness kernel"
 publish = false
 
 [lib]

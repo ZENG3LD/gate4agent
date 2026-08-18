@@ -2,6 +2,7 @@
 name = "gate4agent-runtime-native"
 version = "0.2.37"
 edition = "2021"
+description = "Tick-driven native runtime that embeds the gate4agent provider stack in an owning app core"
 publish = false
 
 [dependencies]

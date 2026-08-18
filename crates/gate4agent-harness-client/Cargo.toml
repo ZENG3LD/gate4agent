@@ -2,6 +2,7 @@
 name = "gate4agent-harness-client"
 version = "0.2.37"
 edition = "2021"
+description = "Typed localhost client and CLI (gate4agent-harnessctl) for the gate4agent harness read and operator hosts"
 publish = false
 
 [lib]

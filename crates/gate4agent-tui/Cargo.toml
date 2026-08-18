@@ -2,6 +2,7 @@
 name = "gate4agent-tui"
 version = "0.1.0"
 edition = "2021"
+description = "Terminal client for gate4agent: gate4agent-tui (harness mode) and gate4agent-tui-light (direct-C2 light mode)"
 publish = false
 
 [dependencies]
@@ -16,7 +17,7 @@ gate4agent-observation-engine = { path = "../gate4agent-observation-engine" }
 gate4agent-observation-service = { path = "../gate4agent-observation-service" }
 gate4agent-types = { path = "../gate4agent-types" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
-uzor-tui = { path = "../../../uzor/uzor-tui" }
+uzor-tui = "1.5.1"
 vt100 = "0.16"
 
 [target.'cfg(windows)'.dependencies]

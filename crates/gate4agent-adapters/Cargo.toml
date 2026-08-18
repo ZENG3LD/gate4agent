@@ -4,7 +4,6 @@ version = "0.3.0"
 edition = "2021"
 description = "Pure revisioned provider adapter registry and implementations for gate4agent"
 license = "MIT"
-publish = false
 
 [lib]
 name = "gate4agent_adapters"

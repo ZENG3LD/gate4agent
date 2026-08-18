@@ -20378,8 +20378,8 @@ mod tests {
             session_records: Vec::new(),
             workspaces: vec![WorkspaceView {
                 workspace_id: "workspace-a".to_owned(),
-                label: "nemo".to_owned(),
-                canonical_root: host_path(r"C:\work\nemo"),
+                label: "acme".to_owned(),
+                canonical_root: host_path(r"C:\work\acme"),
                 providers: fixture_providers()
                     .into_iter()
                     .map(|provider| ProviderInventory { provider, enabled: true })
@@ -20955,7 +20955,7 @@ mod tests {
             mode: SessionMode::Pty,
             state: ManagedSessionState::Dormant,
             workspace_id: "workspace-a".to_owned(),
-            canonical_root: Some(host_path(r"C:\work\nemo")),
+            canonical_root: Some(host_path(r"C:\work\acme")),
             has_provider_session_identity: true,
             bundle: None,
             context_id: None,
@@ -22477,7 +22477,7 @@ mod tests {
             mode: SessionMode::Pty,
             state,
             workspace_id: "workspace-a".to_owned(),
-            canonical_root: Some(host_path(r"C:\work\nemo")),
+            canonical_root: Some(host_path(r"C:\work\acme")),
             has_provider_session_identity: has_identity,
             bundle: None,
             context_id: None,
@@ -22695,7 +22695,7 @@ mod tests {
         HistoryDialog {
             source: app.nodes[0].workspaces[0].sessions[0].address.clone(),
             source_provider: provider("codex"),
-            source_workspace_root: host_path(r"C:\work\nemo"),
+            source_workspace_root: host_path(r"C:\work\acme"),
             candidates: vec![HistoryCandidateSummary {
                 id: "candidate-a".to_owned(),
                 session_id_hint: "native-session-a".to_owned(),
@@ -24350,10 +24350,10 @@ mod tests {
         second.workspaces.clear();
         app.nodes.push(second);
         assert_eq!(app.begin_add_space_on_node("node-a".to_owned()), AppAction::None);
-        let root = host_path(r"C:\work\nemo");
+        let root = host_path(r"C:\work\acme");
         {
             let dialog = app.add_space.as_mut().unwrap();
-            dialog.root = r"C:\work\nemo".to_owned();
+            dialog.root = r"C:\work\acme".to_owned();
             dialog.original_root = Some(root);
         }
 
@@ -26401,7 +26401,7 @@ mod tests {
         };
         assert_eq!(opened_drive, drive);
 
-        let repository = host_path(r"C:\work\nemo");
+        let repository = host_path(r"C:\work\acme");
         app.apply_host_directories(
             "node-a".to_owned(),
             drive_token,
@@ -26444,7 +26444,7 @@ mod tests {
         assert_eq!(app.focus, Focus::AddSpace);
         let add_space = app.add_space.as_ref().unwrap();
         assert_eq!(add_space.original_root.as_ref(), Some(&repository));
-        assert_eq!(add_space.root, r"C:\work\nemo");
+        assert_eq!(add_space.root, r"C:\work\acme");
         assert!(!add_space.root_edited);
     }
 

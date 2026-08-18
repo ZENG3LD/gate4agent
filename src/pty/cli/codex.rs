@@ -1340,7 +1340,7 @@ Context window: 100% left (7.49K used / 272K)"#;
 │ >_ OpenAI Codex (v0.87.0)                         │
 │                                                   │
 │ model:     gpt-5.2-codex   /model to change       │
-│ directory: ~\CODING\ML_TRADING\nemo\…\crates\core │
+│ directory: ~\CODING\WORKSPACES\acme\…\crates\core │
 ╰───────────────────────────────────────────────────╯
 100% context left"#;
 

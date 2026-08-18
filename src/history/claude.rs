@@ -4,7 +4,7 @@
 //!   {workdir}/.claude/projects/{mangled-cwd}/{session-uuid}.jsonl
 //!
 //! `mangled-cwd` is the absolute workdir path with `\` and `/` and `:` replaced by `-`,
-//! and a leading `-` prefix. Example: `c:\Users\VA PC\foo` -> `-c--Users-VA-PC-foo`.
+//! and a leading `-` prefix. Example: `c:\Users\dev name\foo` -> `-c--Users-dev-name-foo`.
 //!
 //! Each .jsonl line is one event with `type` field: "user", "assistant", "summary", etc.
 //! User messages contain `message.content` (string or array of {type:"text", text}).

@@ -439,10 +439,10 @@ mod tests {
     #[cfg(windows)]
     fn env_lookup_is_case_insensitive() {
         let mut cmd = CommandBuilder::new("dummy");
-        cmd.env("Cargo_Pkg_Authors", "Nemo");
+        cmd.env("Cargo_Pkg_Authors", "Dev");
         assert_eq!(
             cmd.get_env("cargo_pkg_authors"),
-            Some(OsStr::new("Nemo"))
+            Some(OsStr::new("Dev"))
         );
         cmd.env_remove("cARGO_pKG_aUTHORS");
         assert!(cmd.get_env("CARGO_PKG_AUTHORS").is_none());

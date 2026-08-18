@@ -109,8 +109,10 @@ The table above is the transport core's own verified matrix. Grok and
 qwen-code ride the modern adapter registry (`gate4agent-adapters`) used by the
 node stack: Grok is a first-tier provider (a known resume gap is tracked);
 qwen-code is wired but unverified. The separate `agent` module also carries a
-33-entry Orca-derived reference registry from an earlier grounding cycle;
-those entries are transitional code debt, not support claims. Gemini,
+33-entry reference registry of CLI interop metadata derived from the Orca
+project's public tool descriptions (pinned by revision in
+`gate4agent-catalog`; credit to Orca for the original grounding); those
+entries are transitional code debt, not support claims. Gemini,
 OpenCode, and the other reference entries were last live-verified in the
 0.2.5–0.2.6 era and are outside the current product target.
 

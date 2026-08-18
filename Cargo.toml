@@ -60,7 +60,7 @@ cure-network = ["dep:reqwest"]
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 
-# Internal workspace; still independent from the parent NEMO workspace.
+# Internal workspace; independent from any parent workspace.
 [workspace]
 members = [
     "crates/g4a",

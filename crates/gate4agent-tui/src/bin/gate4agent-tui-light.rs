@@ -196,7 +196,7 @@ mod tests {
                 "--startup-node",
                 "desk-a",
                 "--workspace",
-                "nemo",
+                "acme",
                 "--agent",
                 "claude",
                 "--style",
@@ -209,7 +209,7 @@ mod tests {
         assert_eq!(endpoint.token, "c2-token");
         let startup = options.startup.as_ref().unwrap();
         assert_eq!(startup.node_id.as_str(), "desk-a");
-        assert_eq!(startup.workspace_id.as_str(), "nemo");
+        assert_eq!(startup.workspace_id.as_str(), "acme");
         assert_eq!(startup.provider.as_str(), "claude");
         assert_eq!(options.color_mode_override, Some(PtyColorMode::GateOverride));
     }

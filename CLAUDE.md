@@ -2,9 +2,8 @@
 
 Node (owns PTY/processes/workspaces/worktrees) + C2 (relay) + Harness
 (task kernel, SQLite SWC) + TUI (`gate4agent-tui` harness mode,
-`gate4agent-tui-light` direct-C2). Plans/handoffs/audits live in
-`nemo/docs/gate4agent/`; the doctrine plan is
-`gate4agent-shared-workflow-harness-doctrine-and-plan-2026-08-17.md`.
+`gate4agent-tui-light` direct-C2). Plans/handoffs/audits live in the
+owner's private workspace documentation tree, not in this repository.
 
 ## Local endpoints & credentials
 

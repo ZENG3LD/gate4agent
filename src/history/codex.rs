@@ -479,8 +479,8 @@ mod tests {
     #[test]
     fn paths_match_case_insensitive() {
         assert!(paths_match(
-            r"C:\Users\VA PC\CODING\ML_TRADING\nemo",
-            Path::new(r"c:\users\va pc\coding\ml_trading\nemo"),
+            r"C:\Users\Dev Name\CODING\PROJECTS\acme",
+            Path::new(r"c:\users\dev name\coding\projects\acme"),
         ));
         assert!(paths_match(
             "/home/user/project",

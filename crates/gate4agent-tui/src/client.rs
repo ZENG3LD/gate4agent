@@ -9621,8 +9621,8 @@ mod tests {
             providers: Vec::new(),
             workspaces: vec![WorkspaceView {
                 workspace_id: "workspace-a".to_owned(),
-                label: "nemo".to_owned(),
-                canonical_root: host_path(r"C:\work\nemo"),
+                label: "acme".to_owned(),
+                canonical_root: host_path(r"C:\work\acme"),
                 providers: Vec::new(),
                 sessions: vec![SessionView {
                     address: address.clone(),
@@ -9734,7 +9734,7 @@ mod tests {
             provider_runtime_statuses: Default::default(),
             workspaces: vec![gate4agent_node_protocol::WorkspaceSnapshot {
                 workspace_id: WorkspaceId::new("workspace-a").unwrap(),
-                canonical_root: host_path(r"C:\work\nemo"),
+                canonical_root: host_path(r"C:\work\acme"),
                 sessions: Vec::new(),
                 worktree_service_mode: None,
                 managed_worktree_profiles: Some(worktree_profiles.clone()),
@@ -9814,7 +9814,7 @@ mod tests {
             provider_runtime_statuses: Default::default(),
             workspaces: vec![gate4agent_node_protocol::WorkspaceSnapshot {
                 workspace_id: address.workspace_id.clone(),
-                canonical_root: host_path(r"C:\work\nemo"),
+                canonical_root: host_path(r"C:\work\acme"),
                 sessions: vec![session],
                 worktree_service_mode: None,
                 managed_worktree_profiles: None,
@@ -10848,7 +10848,7 @@ mod tests {
         app.history = Some(crate::app::HistoryDialog {
             source: source.clone(),
             source_provider: provider("codex"),
-            source_workspace_root: host_path(r"C:\work\nemo"),
+            source_workspace_root: host_path(r"C:\work\acme"),
             candidates: Vec::new(),
             selected: 0,
             loaded: None,
@@ -11023,7 +11023,7 @@ mod tests {
             mode: SessionMode::Pty,
             state: gate4agent_node_protocol::ManagedSessionState::Dormant,
             workspace_id: WorkspaceId::new("workspace-a").unwrap(),
-            canonical_root: host_path(r"C:\work\nemo"),
+            canonical_root: host_path(r"C:\work\acme"),
             provider_session: None,
             active_session: None,
             environment_profile: None,

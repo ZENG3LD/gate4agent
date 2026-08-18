@@ -11497,8 +11497,8 @@ mod tests {
             providers: vec![ProviderInventory { provider: provider("kimi"), enabled: true }],
             workspaces: vec![WorkspaceView {
                 workspace_id: "workspace-a".to_owned(),
-                label: "nemo".to_owned(),
-                canonical_root: host_path(r"C:\work\nemo"),
+                label: "acme".to_owned(),
+                canonical_root: host_path(r"C:\work\acme"),
                 providers: vec![ProviderInventory { provider: provider("kimi"), enabled: true }],
                 worktree_service_mode: Some(gate4agent_node_protocol::WorktreeServiceMode::Manual),
                 managed_worktree_profiles: None,
@@ -13735,7 +13735,7 @@ mod tests {
                 generation: 2,
             },
             source_provider: provider("codex"),
-            source_workspace_root: host_path(r"C:\work\nemo"),
+            source_workspace_root: host_path(r"C:\work\acme"),
             candidates: Vec::new(),
             selected: 0,
             loaded: None,
@@ -13972,7 +13972,7 @@ mod tests {
                 generation: 2,
             },
             source_provider: provider("codex"),
-            source_workspace_root: host_path(r"C:\work\nemo"),
+            source_workspace_root: host_path(r"C:\work\acme"),
             candidates: vec![HistoryCandidateSummary {
                 id: "candidate-17".to_owned(),
                 session_id_hint: "native-session-hint".to_owned(),
@@ -13994,7 +13994,7 @@ mod tests {
 
         let text = buffer_text(&buf);
         assert!(text.contains("source provider=codex address=node-a/workspace-a #11:2"));
-        assert!(text.contains(r"source workspace=C:\work\nemo"));
+        assert!(text.contains(r"source workspace=C:\work\acme"));
         assert!(text.contains("id=candidate-17 | hint=native-session-hint | modified_unix_ms=1765432100000"));
         assert!(text.contains("loaded native_session_id=native-session-17 message_count=12 completed_turn_count=5"));
         assert!(text.contains("exported context_id=context-a"));
@@ -14016,7 +14016,7 @@ mod tests {
             mode: SessionMode::Inline,
             state: ManagedSessionState::Dormant,
             workspace_id: "workspace-a".to_owned(),
-            canonical_root: Some(host_path(r"C:\work\nemo")),
+            canonical_root: Some(host_path(r"C:\work\acme")),
             has_provider_session_identity: true,
             bundle: receipt.bundle,
             context_id: receipt.context_id,
@@ -14159,7 +14159,7 @@ mod tests {
                 mode: SessionMode::Pty,
                 state,
                 workspace_id: "workspace-a".to_owned(),
-                canonical_root: Some(host_path(r"C:\work\nemo")),
+                canonical_root: Some(host_path(r"C:\work\acme")),
                 has_provider_session_identity: state != ManagedSessionState::IdentityPending,
                 bundle: None,
                 context_id: None,
@@ -14261,15 +14261,15 @@ mod tests {
             directory: Some(host_path(r"C:\work")),
             parent: Some(host_path(r"C:\")),
             entries: vec![HostDirectoryEntry {
-                path: host_path(r"C:\work\nemo"),
-                display_name: "nemo".to_owned(),
+                path: host_path(r"C:\work\acme"),
+                display_name: "acme".to_owned(),
                 is_link: false,
             }],
-            next_after: Some(host_path(r"C:\work\nemo")),
+            next_after: Some(host_path(r"C:\work\acme")),
             incomplete: false,
             selected: 0,
             scroll: 0,
-            filter: "nem".to_owned(),
+            filter: "acm".to_owned(),
             field: FolderBrowserField::Entries,
             pending: false,
             append_pending: false,
@@ -14283,7 +14283,7 @@ mod tests {
 
         assert!(text.contains("browse directories on node"));
         assert!(text.contains("node=node-a"));
-        assert!(text.contains("nemo"));
+        assert!(text.contains("acme"));
         for target in [
             HitTarget::FolderBrowserDrag,
             HitTarget::FolderBrowserParent,

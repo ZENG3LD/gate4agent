@@ -13,8 +13,9 @@ categories = ["development-tools", "command-line-utilities"]
 gate4agent-types = { path = "crates/gate4agent-types", version = "0.3.0" }
 gate4agent-catalog = { path = "crates/gate4agent-catalog", version = "0.3.0" }
 
-# PTY creation and cross-platform ConPTY support
-portable-pty = { package = "gate4agent-portable-pty", version = "=0.8.1-gate4agent.1", path = "vendor/portable-pty-0.8.1-gate4agent" }
+# PTY creation and cross-platform ConPTY support (in-house: ConPTY on
+# Windows, posix_openpt/fork+exec on unix; std-only, no external deps)
+gate4agent-pty = { path = "crates/gate4agent-pty", version = "0.3.0" }
 
 # ANSI escape sequence stripping (VteParser)
 vte = "0.13"
@@ -98,9 +99,9 @@ members = [
     "crates/gate4agent-c2-client",
     "crates/gate4agent-c2",
     "crates/gate4agent-testkit",
+    "crates/gate4agent-pty",
 ]
 exclude = [
-    "vendor/portable-pty-0.8.1-gate4agent",
     "crates/gate4agent-tui",
 ]
 resolver = "2"

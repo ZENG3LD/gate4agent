@@ -1,6 +1,6 @@
 //! PTY wrapper for cross-platform terminal emulation.
 
-use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
+use gate4agent_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::io::Write;

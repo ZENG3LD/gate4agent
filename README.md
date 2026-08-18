@@ -20,7 +20,7 @@ crate names below are prefixed `gate4agent-` (e.g. `-node` = `gate4agent-node`).
 
 - **Providers** — blackbox vendor CLIs (Claude Code, Codex, Kimi, Grok,
   qwen-code) wrapped by the transport core: root crate `gate4agent` (`src/`),
-  `vendor/portable-pty`, `-types`, `-adapters`, `-provider-ports`, `-catalog`,
+  `-pty`, `-types`, `-adapters`, `-provider-ports`, `-catalog`,
   `-engine`, `-kernel`, `-handle`, `-tool-protocol`, `-tool-engine`,
   `-shell-history`, `-shell-capabilities`, `-shell-hooks`,
   `-shell-managed-hooks`, `-shell-one-shot`, `-shell-native`,
@@ -87,11 +87,9 @@ run any other way.
 
 ## The TUI's uzor dependency
 
-`crates/gate4agent-tui` carries a path dependency on `../../../uzor/uzor-tui`,
-a sibling repo that lives outside this one. A fresh clone of this repo alone
-cannot build the TUI (`gate4agent-tui` / `gate4agent-tui-light`) until that
-sibling checkout is present alongside it; every other crate in the workspace
-builds standalone.
+`crates/gate4agent-tui` depends on the `uzor-tui` crate from crates.io (the
+uzor UI framework, maintained by the same owner). A fresh clone of this repo
+builds every crate, the TUI included, with no sibling checkouts.
 
 ## Transport core
 

@@ -21,7 +21,7 @@ fn suppress_fault_dialogs() {
 
 #[cfg(windows)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+    use gate4agent_pty::{native_pty_system, CommandBuilder, PtySize};
     use std::io::{Read, Write};
 
     suppress_fault_dialogs();

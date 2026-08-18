@@ -2,6 +2,8 @@
 
 Running list of known issues, gotchas, and diagnostic recipes per CLI. Updated as problems are hit and fixed.
 
+Most of this file covers the root `gate4agent` transport crate (per-CLI parsing, spawn, PTY). For the node/c2/harness/observation layers (see [README.md](README.md#layers)), see [Node / C2 / Harness](#node--c2--harness) below.
+
 ## General diagnostic flow
 
 If a session produces no events:
@@ -62,6 +64,30 @@ If a session produces no events:
 - Reader thread blocks on `child.stdout.read_line()`. If the CLI never closes stdout and never exits, the thread hangs forever. Kill the session via `TransportSession::kill()` or `PipeSession::kill()` to force cleanup.
 - On kill, gate4agent drops the stdin handle first (which usually causes the CLI to exit cleanly), then waits up to 2s, then `child.kill()` if needed.
 
+## Node / C2 / Harness
+
+The node, c2, harness, and observation crates are newer than the notes above
+and mostly untested by the per-CLI recipes in this file. Two things carry
+over from the transport core and two are specific to these layers:
+
+- **Tracing**: `gate4agent-node` and `gate4agent-harness-service` (bin
+  `gate4agent-harness`) both use `tracing` + `tracing-subscriber`. Run either
+  binary with `RUST_LOG=info` (or a per-crate filter, e.g.
+  `RUST_LOG=gate4agent_node=debug`) for connection lifecycle, spawn/session
+  dispatch, and store errors on stderr.
+- **Windows E2E tests run only through the headless supervisor** — see
+  [Test runner](#test-runner) below. A test gated by
+  `require_windows_headless_supervisor_for_test()`
+  (`gate4agent-testkit`) fails immediately under plain `cargo test`.
+- **Credentials are env-only** — `GATE4AGENT_NODE_TOKEN[_<ID>]`,
+  `GATE4AGENT_C2_TOKEN`, `GATE4AGENT_HARNESS_OPERATOR_TOKEN` (see
+  [README.md](README.md#credentials)). A rejected connection with no other
+  symptom is usually a missing or stale token in the environment the service
+  was started from, not a code bug.
+- **Rejections are logged with a typed cause** on the node and harness hosts —
+  check the service's own stderr (via `RUST_LOG=info`) before assuming a
+  request is malformed.
+
 ## Test runner
 
 ```bash
@@ -76,6 +102,17 @@ cargo test --test pipe_live -- --ignored --nocapture
 
 # SessionEnd synthesis unit tests
 cargo test --lib pipe::session::tests
+```
+
+Node/c2/harness/observation Windows E2E tests do not run under plain
+`cargo test`. They build to an isolated `--target-dir` (so parallel test runs
+never collide on Cargo's build lock) and execute through the headless
+supervisor binary, which suppresses Windows fault dialogs and enforces a hard
+per-test timeout:
+
+```
+cargo build --release -p <crate> --test <test_file> --target-dir target-<scenario>
+target-<scenario>\release\windows-headless-supervisor.exe <timeout_ms> <ABS path to test exe> --exact <test_fn>
 ```
 
 If any test fails on a clean checkout with a released version, file an issue with:

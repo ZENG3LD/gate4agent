@@ -2,6 +2,7 @@
 name = "gate4agent-observation-engine"
 version = "0.2.37"
 edition = "2021"
+description = "Bounded in-memory reducer projecting gate4agent observation ingress into session state"
 publish = false
 
 [lib]

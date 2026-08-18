@@ -2,6 +2,7 @@
 name = "gate4agent-harness-mcp"
 version = "0.2.37"
 edition = "2021"
+description = "MCP stdio adapter exposing the grant-filtered gate4agent harness read API to MCP clients"
 publish = false
 
 [lib]

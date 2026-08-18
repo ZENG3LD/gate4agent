@@ -12,3 +12,6 @@ Cargo.lock
 # Local planning and research — not part of the crate release
 /docs/plans/
 /docs/research/
+
+# Live-stack run directories (logs, per-run sqlite, tokens, screenshots)
+/.run/

@@ -687,6 +687,8 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 [[package]]
 name = "uzor-tui"
 version = "1.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "87638cd4f08642ad00361b891841c3f072ff87549b4b50d6951a04b52f71263d"
 dependencies = [
  "bitflags",
  "compact_str",

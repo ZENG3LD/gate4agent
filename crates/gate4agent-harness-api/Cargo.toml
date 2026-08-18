@@ -2,6 +2,7 @@
 name = "gate4agent-harness-api"
 version = "0.2.37"
 edition = "2021"
+description = "Read and operator wire contract for the gate4agent harness localhost hosts: grant-filtered reads plus the operator credential/action/session-verb set"
 publish = false
 
 [lib]

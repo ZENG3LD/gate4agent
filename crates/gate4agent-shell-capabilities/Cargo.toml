@@ -2,6 +2,7 @@
 name = "gate4agent-shell-capabilities"
 version = "0.2.37"
 edition = "2021"
+description = "Native, bounded execution authority for gate4agent capability-probe plans"
 publish = false
 
 [dependencies]

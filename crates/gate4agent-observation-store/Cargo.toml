@@ -2,6 +2,7 @@
 name = "gate4agent-observation-store"
 version = "0.2.37"
 edition = "2021"
+description = "SQLite durability for validated, monitoring-only gate4agent observation operations"
 publish = false
 
 [lib]

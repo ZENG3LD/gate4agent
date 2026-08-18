@@ -2,6 +2,7 @@
 name = "gate4agent-node-wire"
 version = "0.2.37"
 edition = "2021"
+description = "Reusable local wire client, transport, and authentication primitives for gate4agent nodes"
 publish = false
 
 [lib]

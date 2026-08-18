@@ -2,6 +2,7 @@
 name = "gate4agent-observation-api"
 version = "0.2.37"
 edition = "2021"
+description = "Read-only monitoring domain contract built from bounded gate4agent observation facts"
 publish = false
 
 [lib]

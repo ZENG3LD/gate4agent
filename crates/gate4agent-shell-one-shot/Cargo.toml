@@ -2,6 +2,7 @@
 name = "gate4agent-shell-one-shot"
 version = "0.2.37"
 edition = "2021"
+description = "Bounded native process authority for provider-owned gate4agent one-shot runs"
 publish = false
 
 [dependencies]

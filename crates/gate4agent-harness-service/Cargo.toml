@@ -2,6 +2,7 @@
 name = "gate4agent-harness-service"
 version = "0.2.37"
 edition = "2021"
+description = "Single-writer SQLite authority and operator host for the gate4agent harness kernel (bin gate4agent-harness)"
 publish = false
 
 [lib]

@@ -2,6 +2,7 @@
 name = "gate4agent-shell-native"
 version = "0.2.37"
 edition = "2021"
+description = "Native effect execution (PTY, pipe, ACP) for gate4agent control-plane sessions"
 publish = false
 
 [dependencies]

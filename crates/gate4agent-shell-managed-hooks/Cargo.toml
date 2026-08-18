@@ -2,6 +2,7 @@
 name = "gate4agent-shell-managed-hooks"
 version = "0.2.37"
 edition = "2021"
+description = "Explicit, reversible native authority for gate4agent-managed provider Hook configuration"
 publish = false
 
 [dependencies]

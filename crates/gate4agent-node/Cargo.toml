@@ -2,6 +2,7 @@
 name = "gate4agent-node"
 version = "0.2.37"
 edition = "2021"
+description = "Native gate4agent node server: wraps providers and owns PTY/inline sessions, the file browser, local git, and worktrees for its machine"
 publish = false
 
 [lib]

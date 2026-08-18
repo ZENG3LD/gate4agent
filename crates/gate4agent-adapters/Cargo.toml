@@ -1,6 +1,6 @@
 [package]
 name = "gate4agent-adapters"
-version = "0.2.37"
+version = "0.3.0"
 edition = "2021"
 description = "Pure revisioned provider adapter registry and implementations for gate4agent"
 license = "MIT"
@@ -10,6 +10,6 @@ publish = false
 name = "gate4agent_adapters"
 
 [dependencies]
-gate4agent-types = { path = "../gate4agent-types" }
+gate4agent-types = { path = "../gate4agent-types", version = "0.3.0" }
 serde_json = "1"
 thiserror = "2"

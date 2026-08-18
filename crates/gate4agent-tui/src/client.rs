@@ -3441,11 +3441,21 @@ fn project_harness_node_workspace_inspection(
         truncated: inspection.git.truncated,
         diagnostic: None,
     };
+    let truncation = inspection.truncation.map(|truncation| {
+        gate4agent_node_protocol::WorkspaceInspectionTruncationV1 {
+            walk_time_budget_exceeded: truncation.walk_time_budget_exceeded,
+            walk_entry_cap_exceeded: truncation.walk_entry_cap_exceeded,
+            git_time_budget_exceeded: truncation.git_time_budget_exceeded,
+            entries_visited: truncation.entries_visited,
+            elapsed_ms: truncation.elapsed_ms,
+        }
+    });
     Ok((node_id, gate4agent_node_protocol::WorkspaceInspection {
         workspace_id,
         entries,
         tree_truncated: inspection.tree_truncated,
         git,
+        truncation,
     }))
 }
 
@@ -8436,6 +8446,7 @@ fn project_c2_workspace_inspection(
             diagnostic: inspection.git.diagnostic_present
                 .then(|| "git inspection unavailable".to_owned()),
         },
+        truncation: inspection.truncation,
     }
 }
 
@@ -9434,6 +9445,7 @@ mod tests {
                 truncated: false,
                 diagnostic_present: false,
             },
+            truncation: None,
         });
         assert_eq!(projected.git.managed_worktree, Some(scope));
     }
@@ -11641,6 +11653,7 @@ mod tests {
                 recent_commits: Vec::new(),
                 truncated: false,
             },
+            truncation: None,
         };
         let follow_up = apply_update(
             &mut app,
@@ -11677,6 +11690,7 @@ mod tests {
                 recent_commits: Vec::new(),
                 truncated: false,
             },
+            truncation: None,
         };
         apply_update(
             &mut app,

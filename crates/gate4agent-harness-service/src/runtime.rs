@@ -256,6 +256,14 @@ enum HostCommand {
     Operator {
         request: HarnessOperatorRequestV1,
         reply: oneshot::Sender<HarnessOperatorReplyV1>,
+        /// Signals when `handle_connection`'s own `response_deadline` fires
+        /// before a reply arrives. Only ever populated for a node-workspace
+        /// read request (see `start_node_workspace_read_worker`); every
+        /// other request kind leaves this `None` and the worker that
+        /// eventually handles it ignores it. `None` on the two constructed-
+        /// in-tests call sites means "behaves exactly as before this field
+        /// existed" — no cancellation available, not an error.
+        cancel: Option<oneshot::Receiver<()>>,
     },
     ApplyHarnessMutation {
         mutation: HarnessMutationV1,
@@ -322,6 +330,7 @@ enum HostCommand {
     NodeWorkspaceReadFinished {
         result: Result<HarnessOperatorResponseV1, HarnessC2Error>,
         reply: oneshot::Sender<HarnessOperatorReplyV1>,
+        identity: OperatorRequestLogIdentity,
     },
     RunGitFactsCaptureFinished {
         run_id: gate4agent_harness_protocol::HarnessRunId,
@@ -1434,14 +1443,45 @@ fn start_run_read_worker(
 /// re-check is needed on the way back: unlike a run's binding, a node route
 /// cannot drift out from under an in-flight read — `PendingNodeWorkspaceRead::
 /// finish` already rejects a response whose route or incarnation changed.
+/// Spawns the node round trip and, unlike `start_run_read_worker`, races it
+/// against `cancel` (populated only when the operator connection handler
+/// created one — see `HostCommand::Operator::cancel`). When `cancel`
+/// resolves first, this stops awaiting `pending.finish()` immediately
+/// instead of running it to completion in the background: the harness-side
+/// worker slot (`node_workspace_read_workers`, distinct from the node's own
+/// `inspection_slots`) is released as soon as the cancel fires rather than
+/// whenever the abandoned c2 round trip eventually settles on its own. The
+/// node-side inspection budget (`GATE4AGENT_NODE_WORKSPACE_INSPECTION_
+/// BUDGET_MS`) is what actually frees the *node's* permit; this only stops
+/// the harness host from accumulating zombie awaits on its own side.
 fn start_node_workspace_read_worker(
     pending: PendingNodeWorkspaceRead,
     commands: mpsc::Sender<HostCommand>,
     reply: oneshot::Sender<HarnessOperatorReplyV1>,
+    identity: OperatorRequestLogIdentity,
+    cancel: Option<oneshot::Receiver<()>>,
 ) {
     tokio::spawn(async move {
-        let result = pending.finish().await;
-        let _ = commands.send(HostCommand::NodeWorkspaceReadFinished { result, reply }).await;
+        let result = match cancel {
+            Some(cancel) => {
+                tokio::select! {
+                    result = pending.finish() => result,
+                    _ = cancel => {
+                        tracing::warn!(
+                            operation = %identity.operation,
+                            node_id = identity.node_id(),
+                            workspace_id = identity.workspace_id(),
+                            "node workspace read worker cancelled: the operator connection's own deadline fired before the node replied",
+                        );
+                        Err(HarnessC2Error::NodeWorkspaceReadCancelled)
+                    }
+                }
+            }
+            None => pending.finish().await,
+        };
+        let _ = commands
+            .send(HostCommand::NodeWorkspaceReadFinished { result, reply, identity })
+            .await;
     });
 }
 
@@ -1594,7 +1634,8 @@ fn map_node_workspace_read_error(error: HarnessC2Error) -> HarnessOperatorHostEr
         | HarnessC2Error::MissingIncarnation(_) => HarnessOperatorHostErrorV1::Unavailable,
         HarnessC2Error::IncarnationChanged { .. }
         | HarnessC2Error::NodeWorkspaceReadRouteMismatch => HarnessOperatorHostErrorV1::Conflict,
-        HarnessC2Error::NodeWorkspaceReadDeadline => HarnessOperatorHostErrorV1::Deadline,
+        HarnessC2Error::NodeWorkspaceReadDeadline
+        | HarnessC2Error::NodeWorkspaceReadCancelled => HarnessOperatorHostErrorV1::Deadline,
         HarnessC2Error::NodeWorkspaceReadTooLarge => HarnessOperatorHostErrorV1::TooLarge,
         HarnessC2Error::NodeWorkspaceReadRejected { code } => match code {
             NodeFailureCode::InvalidRequest
@@ -1708,6 +1749,68 @@ fn is_node_workspace_read_request(request: &HarnessOperatorRequestV1) -> bool {
 
 fn is_run_context_source_request(request: &HarnessOperatorRequestV1) -> bool {
     matches!(request, HarnessOperatorRequestV1::ObserveRunContextSource { .. })
+}
+
+/// Best-effort, log-only identity of an operator request: which operation it
+/// is plus whichever of node id / workspace id / run id applies. Captured
+/// from `&HarnessOperatorRequestV1` before the request is moved into the
+/// host command queue, so every rejection site downstream (queued-request
+/// validation failure, harness-side worker-capacity busy, C2 dispatch
+/// failure, the deadline branch in `handle_connection`) can log a
+/// self-contained line without re-deriving identity from whatever is left
+/// of the request at that point (which, past several of these sites, is
+/// nothing — the request has already been consumed). `operation` is read
+/// from the request's own serde `kind` tag rather than hand-matched, so it
+/// can never drift from the wire discriminant as request variants are
+/// added.
+#[derive(Clone, Debug)]
+struct OperatorRequestLogIdentity {
+    operation: String,
+    node_id: Option<String>,
+    workspace_id: Option<String>,
+    run_id: Option<String>,
+}
+
+impl OperatorRequestLogIdentity {
+    fn describe(request: &HarnessOperatorRequestV1) -> Self {
+        let (node_id, workspace_id) = match request {
+            HarnessOperatorRequestV1::InspectNodeWorkspace { node_id, workspace_id }
+            | HarnessOperatorRequestV1::ReadNodeWorkspaceFile { node_id, workspace_id, .. }
+            | HarnessOperatorRequestV1::ReadNodeGitHistory { node_id, workspace_id, .. }
+            | HarnessOperatorRequestV1::ReadNodeGitDiff { node_id, workspace_id, .. } => {
+                (Some(node_id.clone()), Some(workspace_id.clone()))
+            }
+            _ => (None, None),
+        };
+        let run_id = match request {
+            HarnessOperatorRequestV1::InspectRunWorkspace { run_id }
+            | HarnessOperatorRequestV1::ReadRunWorkspaceFile { run_id, .. }
+            | HarnessOperatorRequestV1::ReadRunGitHistory { run_id, .. }
+            | HarnessOperatorRequestV1::ReadRunGitDiff { run_id, .. } => {
+                Some(run_id.as_str().to_owned())
+            }
+            _ => None,
+        };
+        let operation = serde_json::to_value(request)
+            .ok()
+            .and_then(|value| {
+                value.get("kind").and_then(|kind| kind.as_str().map(str::to_owned))
+            })
+            .unwrap_or_else(|| "unknown".to_owned());
+        Self { operation, node_id, workspace_id, run_id }
+    }
+
+    fn node_id(&self) -> &str {
+        self.node_id.as_deref().unwrap_or("")
+    }
+
+    fn workspace_id(&self) -> &str {
+        self.workspace_id.as_deref().unwrap_or("")
+    }
+
+    fn run_id(&self) -> &str {
+        self.run_id.as_deref().unwrap_or("")
+    }
 }
 
 fn operator_response_deadline(request: &HarnessOperatorRequestV1) -> Duration {
@@ -2601,7 +2704,7 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                             };
                             let _ = reply.send(reply_value);
                         }
-                        Some(HostCommand::Operator { request, reply }) => {
+                        Some(HostCommand::Operator { request, reply, cancel }) => {
                             if is_run_context_source_request(&request) {
                                 let prepared = run_context_source_run_id(&request)
                                     .ok_or(HarnessOperatorHostErrorV1::InvalidRequest)
@@ -2695,18 +2798,35 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                 continue;
                             }
                             if is_node_workspace_read_request(&request) {
+                                let identity = OperatorRequestLogIdentity::describe(&request);
                                 let prepared = PreparedNodeWorkspaceRead::from_operator_request(
                                     &adapter,
                                     request,
-                                ).map_err(map_node_workspace_read_error);
+                                );
                                 let prepared = match prepared {
                                     Ok(prepared) => prepared,
-                                    Err(error) => {
-                                        let _ = reply.send(HarnessOperatorReplyV1::Error { error });
+                                    Err(cause) => {
+                                        tracing::warn!(
+                                            operation = %identity.operation,
+                                            node_id = identity.node_id(),
+                                            workspace_id = identity.workspace_id(),
+                                            cause = %cause,
+                                            "node workspace read request rejected before C2 dispatch",
+                                        );
+                                        let _ = reply.send(HarnessOperatorReplyV1::Error {
+                                            error: map_node_workspace_read_error(cause),
+                                        });
                                         continue;
                                     }
                                 };
                                 if !node_workspace_read_workers.try_start() {
+                                    tracing::warn!(
+                                        operation = %identity.operation,
+                                        node_id = identity.node_id(),
+                                        workspace_id = identity.workspace_id(),
+                                        limit = NODE_WORKSPACE_READ_WORKERS_MAX,
+                                        "node workspace read rejected: harness-side worker capacity is busy",
+                                    );
                                     let _ = reply.send(HarnessOperatorReplyV1::Error {
                                         error: HarnessOperatorHostErrorV1::Busy,
                                     });
@@ -2717,11 +2837,20 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                         pending,
                                         commands.clone(),
                                         reply,
+                                        identity,
+                                        cancel,
                                     ),
-                                    Err(error) => {
+                                    Err(cause) => {
                                         node_workspace_read_workers.finish();
+                                        tracing::warn!(
+                                            operation = %identity.operation,
+                                            node_id = identity.node_id(),
+                                            workspace_id = identity.workspace_id(),
+                                            cause = %cause,
+                                            "node workspace read rejected: could not start the C2 dispatch",
+                                        );
                                         let _ = reply.send(HarnessOperatorReplyV1::Error {
-                                            error: map_node_workspace_read_error(error),
+                                            error: map_node_workspace_read_error(cause),
                                         });
                                     }
                                 }
@@ -3512,13 +3641,22 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                             };
                             let _ = reply.send(reply_value);
                         }
-                        Some(HostCommand::NodeWorkspaceReadFinished { result, reply }) => {
+                        Some(HostCommand::NodeWorkspaceReadFinished { result, reply, identity }) => {
                             node_workspace_read_workers.finish();
                             let reply_value = match result {
                                 Ok(response) => HarnessOperatorReplyV1::Ok { response },
-                                Err(error) => HarnessOperatorReplyV1::Error {
-                                    error: map_node_workspace_read_error(error),
-                                },
+                                Err(cause) => {
+                                    tracing::warn!(
+                                        operation = %identity.operation,
+                                        node_id = identity.node_id(),
+                                        workspace_id = identity.workspace_id(),
+                                        cause = %cause,
+                                        "node workspace read rejected after its C2 round trip",
+                                    );
+                                    HarnessOperatorReplyV1::Error {
+                                        error: map_node_workspace_read_error(cause),
+                                    }
+                                }
                             };
                             let _ = reply.send(reply_value);
                         }
@@ -5629,6 +5767,7 @@ async fn handle_connection(
                 ..
             } = envelope;
             let response_deadline = operator_response_deadline(&request);
+            let identity = OperatorRequestLogIdentity::describe(&request);
             let authorized = match operator_authority.as_ref() {
                 Some(authority) => authority.verify(&credential)?,
                 None => false,
@@ -5643,15 +5782,43 @@ async fn handle_connection(
                 ).await?;
                 return Ok(());
             }
+            // Only a node-workspace-read request gets a cancel signal: it is
+            // the one request family whose worker can run an unbounded C2
+            // round trip behind it (see `start_node_workspace_read_worker`).
+            // `cancel_tx` fires explicitly on the deadline branch below, and
+            // is also dropped (equivalent to firing) on every other early
+            // return past this point, including the outer
+            // `HOST_CONNECTION_DEADLINE` cutoff wrapping this whole block.
+            let is_node_workspace_read = is_node_workspace_read_request(&request);
+            let mut cancel_tx = None;
+            let cancel_rx = if is_node_workspace_read {
+                let (tx, rx) = oneshot::channel();
+                cancel_tx = Some(tx);
+                Some(rx)
+            } else {
+                None
+            };
             let (reply, receive) = oneshot::channel();
             commands.send(HostCommand::Operator {
                 request,
                 reply,
+                cancel: cancel_rx,
             }).await.map_err(|_| HarnessRuntimeError::HostStopped)?;
             let reply = match timeout(response_deadline, receive).await {
                 Ok(Ok(reply)) => reply,
                 Ok(Err(_)) => return Err(HarnessRuntimeError::HostStopped),
                 Err(_) => {
+                    if let Some(cancel_tx) = cancel_tx {
+                        let _ = cancel_tx.send(());
+                    }
+                    tracing::warn!(
+                        operation = %identity.operation,
+                        node_id = identity.node_id(),
+                        workspace_id = identity.workspace_id(),
+                        run_id = identity.run_id(),
+                        deadline_ms = response_deadline.as_millis() as u64,
+                        "operator request exceeded its response deadline",
+                    );
                     write_operator_reply(
                         &mut stream,
                         HarnessOperatorReplyV1::Error {
@@ -9802,6 +9969,7 @@ mod tests {
                 request: operator_create_request(),
             },
             reply,
+            cancel: None,
         }).await.unwrap();
         assert!(matches!(
             timeout(Duration::from_millis(50), command_rx.recv()).await.unwrap(),
@@ -10006,6 +10174,7 @@ mod tests {
                 request: operator_create_request(),
             },
             reply,
+            cancel: None,
         }).await.unwrap();
         assert!(matches!(
             timeout(Duration::from_millis(50), receive.recv()).await.unwrap(),

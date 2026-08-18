@@ -14,6 +14,12 @@ const NODE_TOKEN_ENV: &str = "GATE4AGENT_NODE_TOKEN";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
     let mut endpoint = default_node_endpoint()
         .and_then(|path| {
             path.into_os_string().into_string().map_err(|_| {

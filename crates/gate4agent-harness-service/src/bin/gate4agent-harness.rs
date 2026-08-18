@@ -24,6 +24,12 @@ const USAGE: &str = "usage: gate4agent-harness --harness-db ABSOLUTE_PATH --obse
 
 #[tokio::main]
 async fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
     let arguments = env::args().skip(1).collect::<Vec<_>>();
     if arguments.iter().any(|argument| argument == "--help" || argument == "-h") {
         println!("{USAGE}");

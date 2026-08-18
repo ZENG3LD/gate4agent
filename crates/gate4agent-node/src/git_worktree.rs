@@ -457,7 +457,7 @@ pub(crate) async fn list_worktrees(
     list_worktrees_with_deadline(root, Instant::now() + Duration::from_millis(GIT_READ_TIMEOUT_MS * 2)).await
 }
 
-async fn list_worktrees_with_deadline(
+pub(crate) async fn list_worktrees_with_deadline(
     root: &str,
     deadline: Instant,
 ) -> Result<Vec<NativeGitWorktreeSnapshot>, GitWorktreeError> {

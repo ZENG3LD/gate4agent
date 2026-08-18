@@ -4039,12 +4039,48 @@ impl GitSnapshot {
     }
 }
 
+/// Additive: records why (if at all) a `WorkspaceInspection` was cut short
+/// by the node's own inner walk+git time/entry budget
+/// (`GATE4AGENT_NODE_WORKSPACE_INSPECTION_BUDGET_MS` /
+/// `GATE4AGENT_NODE_WORKSPACE_INSPECTION_ENTRY_CAP`) — distinct from
+/// `tree_truncated`, which only reflects the walk's fixed per-response caps
+/// (`WORKSPACE_TREE_MAX_ENTRIES` / `WORKSPACE_TREE_MAX_DEPTH`). Every field
+/// is `#[serde(default)]` and the field itself is optional on
+/// `WorkspaceInspection`, so payloads produced before this field existed
+/// still parse.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceInspectionTruncationV1 {
+    /// The directory walk stopped early because the shared walk+git time
+    /// budget elapsed while entries were still being visited.
+    #[serde(default)]
+    pub walk_time_budget_exceeded: bool,
+    /// The directory walk stopped early because it visited the configured
+    /// entry cap's worth of directory entries.
+    #[serde(default)]
+    pub walk_entry_cap_exceeded: bool,
+    /// The git phase (branch/status/log/worktree probes) was skipped or cut
+    /// short because the shared time budget was already spent by the walk;
+    /// see `GitSnapshot::diagnostic` for which probes ran.
+    #[serde(default)]
+    pub git_time_budget_exceeded: bool,
+    /// Total directory entries the walk visited (pushed to `entries` or
+    /// not) before it stopped, for operator/log correlation.
+    #[serde(default)]
+    pub entries_visited: u64,
+    /// Milliseconds actually spent inside the shared walk+git budget
+    /// window before the response was returned.
+    #[serde(default)]
+    pub elapsed_ms: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct WorkspaceInspection {
     pub workspace_id: WorkspaceId,
     pub entries: Vec<WorkspaceEntry>,
     pub tree_truncated: bool,
     pub git: GitSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncation: Option<WorkspaceInspectionTruncationV1>,
 }
 
 impl<'de> Deserialize<'de> for WorkspaceInspection {
@@ -4058,6 +4094,8 @@ impl<'de> Deserialize<'de> for WorkspaceInspection {
             entries: Vec<WorkspaceEntry>,
             tree_truncated: bool,
             git: GitSnapshot,
+            #[serde(default)]
+            truncation: Option<WorkspaceInspectionTruncationV1>,
         }
 
         let wire = WireInspection::deserialize(deserializer)?;
@@ -4071,6 +4109,7 @@ impl<'de> Deserialize<'de> for WorkspaceInspection {
             entries: wire.entries,
             tree_truncated: wire.tree_truncated,
             git: wire.git,
+            truncation: wire.truncation,
         })
     }
 }
@@ -6940,11 +6979,12 @@ mod tests {
     }
 
     #[test]
-    fn legacy_hello_json_remains_exactly_protocol_v9() {
+    fn legacy_hello_json_remains_exact_at_the_current_protocol_version() {
+        assert_eq!(NODE_PROTOCOL_VERSION, 11);
         let client = ClientHello::new(ClientRole::Observer, [0; NODE_AUTH_NONCE_BYTES]);
         assert_eq!(
             serde_json::to_string(&client).unwrap(),
-            r#"{"protocol_version":9,"role":"observer","client_nonce":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}"#,
+            r#"{"protocol_version":11,"role":"observer","client_nonce":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}"#,
         );
 
         let challenge = ServerChallenge {
@@ -7237,6 +7277,7 @@ mod tests {
             .capabilities
             .contains(&capability));
         let mut support = portable_node_support();
+        support.protocol_versions = ProtocolRange::new(7, NODE_PROTOCOL_VERSION).unwrap();
         support.capabilities = vec![capability.clone()];
         let offer = ClientCompatibilityOffer {
             protocol_versions: ProtocolRange::exact(NODE_PROTOCOL_VERSION).unwrap(),
@@ -7380,7 +7421,7 @@ mod tests {
     #[test]
     fn compatibility_negotiation_keeps_the_active_wire_and_selects_highest_state_schema() {
         let offer = ClientCompatibilityOffer {
-            protocol_versions: ProtocolRange::new(8, 10).unwrap(),
+            protocol_versions: ProtocolRange::new(8, NODE_PROTOCOL_VERSION).unwrap(),
             capabilities: vec![
                 CapabilityId::new("session.spawn").unwrap(),
                 CapabilityId::new("unknown.future").unwrap(),
@@ -7396,9 +7437,9 @@ mod tests {
         );
         assert_eq!(hello.compatibility, Some(offer.clone()));
 
-        let negotiated = portable_node_support()
-            .negotiate(NODE_PROTOCOL_VERSION, &offer)
-            .unwrap();
+        let mut support = portable_node_support();
+        support.protocol_versions = ProtocolRange::new(7, NODE_PROTOCOL_VERSION).unwrap();
+        let negotiated = support.negotiate(NODE_PROTOCOL_VERSION, &offer).unwrap();
         assert_eq!(negotiated.protocol_version, NODE_PROTOCOL_VERSION);
         assert_eq!(negotiated.state_schema_version, Some(5));
         assert_eq!(
@@ -7430,28 +7471,33 @@ mod tests {
 
     #[test]
     fn compatibility_auth_binding_has_an_exact_bounded_encoding() {
+        assert_eq!(NODE_PROTOCOL_VERSION, 11);
         let offer = ClientCompatibilityOffer {
-            protocol_versions: ProtocolRange::new(8, 10).unwrap(),
+            protocol_versions: ProtocolRange::new(8, NODE_PROTOCOL_VERSION).unwrap(),
             capabilities: vec![CapabilityId::new("session.spawn").unwrap()],
             state_schema: Some(StateSchemaSupport {
                 versions: ProtocolRange::new(4, 6).unwrap(),
             }),
         };
-        let selected = portable_node_support()
+        let mut support = portable_node_support();
+        support.protocol_versions = ProtocolRange::new(7, NODE_PROTOCOL_VERSION).unwrap();
+        let selected = support
             .negotiate(NODE_PROTOCOL_VERSION, &offer)
             .unwrap();
         let encoded = encode_node_compatibility_auth_binding(&offer, &selected).unwrap();
         assert_eq!(
             String::from_utf8(encoded).unwrap(),
-            r#"{"offer":{"protocol_versions":{"minimum":8,"maximum":10},"capabilities":["session.spawn"],"state_schema":{"versions":{"minimum":4,"maximum":6}}},"selected":{"protocol_version":9,"capabilities":["session.spawn"],"host":{"operating_system":"windows","architecture":"x86_64"},"path_semantics":{"style":"windows","encoding":"utf8"},"local_transport":"windows-named-pipe","state_schema_version":5,"provider_contracts":[]}}"#,
+            r#"{"offer":{"protocol_versions":{"minimum":8,"maximum":11},"capabilities":["session.spawn"],"state_schema":{"versions":{"minimum":4,"maximum":6}}},"selected":{"protocol_version":11,"capabilities":["session.spawn"],"host":{"operating_system":"windows","architecture":"x86_64"},"path_semantics":{"style":"windows","encoding":"utf8"},"local_transport":"windows-named-pipe","state_schema_version":5,"provider_contracts":[]}}"#,
         );
     }
 
     #[test]
     fn provider_contract_manifest_is_capability_gated_and_auth_bound_exactly() {
+        assert_eq!(NODE_PROTOCOL_VERSION, 11);
         let manifest_capability =
             CapabilityId::new(NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY).unwrap();
         let mut support = portable_node_support();
+        support.protocol_versions = ProtocolRange::new(7, NODE_PROTOCOL_VERSION).unwrap();
         support.capabilities.push(manifest_capability.clone());
         let offer = ClientCompatibilityOffer {
             protocol_versions: ProtocolRange::exact(NODE_PROTOCOL_VERSION).unwrap(),
@@ -7470,16 +7516,18 @@ mod tests {
         let encoded = encode_node_compatibility_auth_binding(&offer, &selected).unwrap();
         assert_eq!(
             String::from_utf8(encoded).unwrap(),
-            r#"{"offer":{"protocol_versions":{"minimum":9,"maximum":9},"capabilities":["provider-contract-manifest-v1"]},"selected":{"protocol_version":9,"capabilities":["provider-contract-manifest-v1"],"host":{"operating_system":"windows","architecture":"x86_64"},"path_semantics":{"style":"windows","encoding":"utf8"},"local_transport":"windows-named-pipe","provider_contracts":[{"provider":"codex","revision":"codex.2026-08"}],"provider_adapter_contracts":[{"provider":"codex","family":"pty-semantic","adapter_id":"codex-cli","revision":"pty-semantic-v1"}]}}"#,
+            r#"{"offer":{"protocol_versions":{"minimum":11,"maximum":11},"capabilities":["provider-contract-manifest-v1"]},"selected":{"protocol_version":11,"capabilities":["provider-contract-manifest-v1"],"host":{"operating_system":"windows","architecture":"x86_64"},"path_semantics":{"style":"windows","encoding":"utf8"},"local_transport":"windows-named-pipe","provider_contracts":[{"provider":"codex","revision":"codex.2026-08"}],"provider_adapter_contracts":[{"provider":"codex","family":"pty-semantic","adapter_id":"codex-cli","revision":"pty-semantic-v1"}]}}"#,
         );
     }
 
     #[test]
     fn open_provider_capability_and_manifest_are_auth_bound_exactly() {
+        assert_eq!(NODE_PROTOCOL_VERSION, 11);
         let manifest_capability =
             CapabilityId::new(NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY).unwrap();
         let open_capability = CapabilityId::new(NODE_PROVIDER_ID_OPEN_CAPABILITY).unwrap();
         let mut support = portable_node_support();
+        support.protocol_versions = ProtocolRange::new(7, NODE_PROTOCOL_VERSION).unwrap();
         support.capabilities = vec![manifest_capability.clone(), open_capability.clone()];
         support.provider_contracts = vec![ProviderContractSupport {
             provider: agent("qwen"),
@@ -7497,7 +7545,7 @@ mod tests {
         let encoded = encode_node_compatibility_auth_binding(&offer, &selected).unwrap();
         assert_eq!(
             String::from_utf8(encoded).unwrap(),
-            r#"{"offer":{"protocol_versions":{"minimum":9,"maximum":9},"capabilities":["provider-contract-manifest-v1","provider-id.open-v1"]},"selected":{"protocol_version":9,"capabilities":["provider-contract-manifest-v1","provider-id.open-v1"],"host":{"operating_system":"windows","architecture":"x86_64"},"path_semantics":{"style":"windows","encoding":"utf8"},"local_transport":"windows-named-pipe","provider_contracts":[{"provider":"qwen","revision":"qwen.2026-08"}]}}"#,
+            r#"{"offer":{"protocol_versions":{"minimum":11,"maximum":11},"capabilities":["provider-contract-manifest-v1","provider-id.open-v1"]},"selected":{"protocol_version":11,"capabilities":["provider-contract-manifest-v1","provider-id.open-v1"],"host":{"operating_system":"windows","architecture":"x86_64"},"path_semantics":{"style":"windows","encoding":"utf8"},"local_transport":"windows-named-pipe","provider_contracts":[{"provider":"qwen","revision":"qwen.2026-08"}]}}"#,
         );
     }
 
@@ -7622,6 +7670,7 @@ mod tests {
         let manifest_capability =
             CapabilityId::new(NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY).unwrap();
         let mut support = portable_node_support();
+        support.protocol_versions = ProtocolRange::new(7, NODE_PROTOCOL_VERSION).unwrap();
         support.capabilities.push(manifest_capability.clone());
         support.provider_contracts = provider_contracts;
         support.provider_adapter_contracts = provider_adapter_contracts;
@@ -7646,6 +7695,7 @@ mod tests {
             .map(|index| agent(&format!("provider-{index}")))
             .collect::<Vec<_>>();
         let mut support = portable_node_support();
+        support.protocol_versions = ProtocolRange::new(7, NODE_PROTOCOL_VERSION).unwrap();
         support.capabilities.extend([
             CapabilityId::new(NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY).unwrap(),
             CapabilityId::new(NODE_PROVIDER_ID_OPEN_CAPABILITY).unwrap(),
@@ -8082,6 +8132,7 @@ mod tests {
             .capabilities
             .contains(&capability));
         let mut support = portable_node_support();
+        support.protocol_versions = ProtocolRange::new(7, NODE_PROTOCOL_VERSION).unwrap();
         support.capabilities = vec![capability.clone()];
         let offer = ClientCompatibilityOffer {
             protocol_versions: ProtocolRange::exact(NODE_PROTOCOL_VERSION).unwrap(),
@@ -8607,7 +8658,8 @@ mod tests {
     }
 
     #[test]
-    fn node_hello_v8_carries_the_incarnation_sequence_domain() {
+    fn node_hello_carries_the_incarnation_sequence_domain_at_the_current_protocol_version() {
+        assert_eq!(NODE_PROTOCOL_VERSION, 11);
         let hello = NodeHello {
             protocol_version: NODE_PROTOCOL_VERSION,
             incarnation_id: NodeIncarnationId::from_bytes([0; NODE_INCARNATION_ID_BYTES]),
@@ -8630,7 +8682,7 @@ mod tests {
         let json = serde_json::to_string(&hello).unwrap();
         assert_eq!(
             json,
-            r#"{"protocol_version":9,"incarnation_id":"00000000000000000000000000000000","connection_id":42,"role":"observer","event_sequence":9,"controller":null,"snapshot":{"node_id":"fixture-node","enabled_providers":[],"workspaces":[],"session_records":[]}}"#,
+            r#"{"protocol_version":11,"incarnation_id":"00000000000000000000000000000000","connection_id":42,"role":"observer","event_sequence":9,"controller":null,"snapshot":{"node_id":"fixture-node","enabled_providers":[],"workspaces":[],"session_records":[]}}"#,
         );
         assert_eq!(serde_json::from_str::<NodeHello>(&json).unwrap(), hello);
     }
@@ -9110,6 +9162,7 @@ mod tests {
 
     #[test]
     fn terminal_frame_events_capability_is_optional_and_auth_bound_exactly() {
+        assert_eq!(NODE_PROTOCOL_VERSION, 11);
         assert_eq!(
             NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
             "terminal-frame-events-v1",
@@ -9121,6 +9174,7 @@ mod tests {
 
         let capability = CapabilityId::new(NODE_TERMINAL_FRAME_EVENTS_CAPABILITY).unwrap();
         let mut support = portable_node_support();
+        support.protocol_versions = ProtocolRange::new(7, NODE_PROTOCOL_VERSION).unwrap();
         support.capabilities = vec![capability.clone()];
         let legacy = ClientCompatibilityOffer::exact(NODE_PROTOCOL_VERSION).unwrap();
         assert!(support
@@ -9143,7 +9197,7 @@ mod tests {
                 encode_node_compatibility_auth_binding(&offer, &selected).unwrap(),
             )
             .unwrap(),
-            r#"{"offer":{"protocol_versions":{"minimum":9,"maximum":9},"capabilities":["terminal-frame-events-v1"]},"selected":{"protocol_version":9,"capabilities":["terminal-frame-events-v1"],"host":{"operating_system":"windows","architecture":"x86_64"},"path_semantics":{"style":"windows","encoding":"utf8"},"local_transport":"windows-named-pipe","provider_contracts":[]}}"#,
+            r#"{"offer":{"protocol_versions":{"minimum":11,"maximum":11},"capabilities":["terminal-frame-events-v1"]},"selected":{"protocol_version":11,"capabilities":["terminal-frame-events-v1"],"host":{"operating_system":"windows","architecture":"x86_64"},"path_semantics":{"style":"windows","encoding":"utf8"},"local_transport":"windows-named-pipe","provider_contracts":[]}}"#,
         );
     }
 
@@ -9163,6 +9217,7 @@ mod tests {
         let capability =
             CapabilityId::new(NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY).unwrap();
         let mut support = portable_node_support();
+        support.protocol_versions = ProtocolRange::new(7, NODE_PROTOCOL_VERSION).unwrap();
         support.capabilities = vec![capability.clone()];
         let legacy = ClientCompatibilityOffer::exact(NODE_PROTOCOL_VERSION).unwrap();
         assert!(support
@@ -9190,6 +9245,7 @@ mod tests {
 
     #[test]
     fn worktree_selection_capability_is_optional_and_auth_bound_exactly() {
+        assert_eq!(NODE_PROTOCOL_VERSION, 11);
         assert_eq!(NODE_WORKTREE_SELECTION_CAPABILITY, "worktree-selection-v1");
         assert!(production_node_client_compatibility_offer()
             .capabilities
@@ -9198,6 +9254,7 @@ mod tests {
 
         let capability = CapabilityId::new(NODE_WORKTREE_SELECTION_CAPABILITY).unwrap();
         let mut support = portable_node_support();
+        support.protocol_versions = ProtocolRange::new(7, NODE_PROTOCOL_VERSION).unwrap();
         support.capabilities = vec![capability.clone()];
         let legacy = ClientCompatibilityOffer::exact(NODE_PROTOCOL_VERSION).unwrap();
         assert!(support
@@ -9218,7 +9275,7 @@ mod tests {
                 encode_node_compatibility_auth_binding(&offer, &selected).unwrap(),
             )
             .unwrap(),
-            r#"{"offer":{"protocol_versions":{"minimum":9,"maximum":9},"capabilities":["worktree-selection-v1"]},"selected":{"protocol_version":9,"capabilities":["worktree-selection-v1"],"host":{"operating_system":"windows","architecture":"x86_64"},"path_semantics":{"style":"windows","encoding":"utf8"},"local_transport":"windows-named-pipe","provider_contracts":[]}}"#,
+            r#"{"offer":{"protocol_versions":{"minimum":11,"maximum":11},"capabilities":["worktree-selection-v1"]},"selected":{"protocol_version":11,"capabilities":["worktree-selection-v1"],"host":{"operating_system":"windows","architecture":"x86_64"},"path_semantics":{"style":"windows","encoding":"utf8"},"local_transport":"windows-named-pipe","provider_contracts":[]}}"#,
         );
     }
 
@@ -9362,11 +9419,61 @@ mod tests {
                     truncated: false,
                     diagnostic: None,
                 },
+                truncation: None,
             },
         };
         let response_json = serde_json::to_string(&response).unwrap();
         assert!(!response_json.contains("managed_worktree"));
+        assert!(!response_json.contains("truncation"));
         assert_eq!(serde_json::from_str::<NodeResponse>(&response_json).unwrap(), response);
+    }
+
+    #[test]
+    fn workspace_inspection_truncation_is_additive_and_defaults_on_old_payloads() {
+        let workspace_id = WorkspaceId::new("primary").unwrap();
+        let old_payload = serde_json::json!({
+            "workspace_id": workspace_id.as_str(),
+            "entries": [],
+            "tree_truncated": false,
+            "git": {
+                "is_repository": false,
+                "branch": null,
+                "status": [],
+                "recent_commits": [],
+                "worktrees": [],
+                "truncated": false,
+                "diagnostic": null,
+            },
+        });
+        let parsed: WorkspaceInspection = serde_json::from_value(old_payload).unwrap();
+        assert_eq!(parsed.truncation, None);
+
+        let truncated = WorkspaceInspectionTruncationV1 {
+            walk_time_budget_exceeded: true,
+            walk_entry_cap_exceeded: false,
+            git_time_budget_exceeded: true,
+            entries_visited: 50_000,
+            elapsed_ms: 8_000,
+        };
+        let inspection = WorkspaceInspection {
+            workspace_id,
+            entries: Vec::new(),
+            tree_truncated: true,
+            git: GitSnapshot {
+                is_repository: false,
+                branch: None,
+                status: Vec::new(),
+                recent_commits: Vec::new(),
+                worktrees: Vec::new(),
+                managed_worktree: None,
+                truncated: true,
+                diagnostic: Some("git inspection skipped: workspace inspection time budget exhausted".to_owned()),
+            },
+            truncation: Some(truncated),
+        };
+        let json = serde_json::to_string(&inspection).unwrap();
+        let round_tripped: WorkspaceInspection = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_tripped.truncation, Some(truncated));
     }
 
     #[test]

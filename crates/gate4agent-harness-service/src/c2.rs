@@ -25,6 +25,7 @@ use gate4agent_harness_api::{
     HarnessNodeGitDiffV1, HarnessNodeGitHistoryPageV1,
     HarnessNodeWorkspaceFileV1, HarnessNodeWorkspaceInspectionV1, HarnessNodeWorkspaceOriginV1,
     HarnessWorkspaceFileContentV1, HarnessWorkspaceFileRevisionV1,
+    HarnessWorkspaceInspectionTruncationV1,
     HarnessWorkspaceTreeEntryV1, HARNESS_GIT_COMMIT_PARENTS_MAX,
     HARNESS_GIT_DIFF_MAX_BYTES, HARNESS_GIT_HISTORY_LIMIT_MAX,
     HARNESS_GIT_RECENT_COMMITS_MAX, HARNESS_GIT_STATUS_ENTRIES_MAX,
@@ -2173,6 +2174,22 @@ fn correlate_run_read_response(
     Ok(response)
 }
 
+/// Shared by `project_run_workspace_inspection` and
+/// `project_node_workspace_inspection`: mirrors the node-protocol/c2-protocol
+/// truncation marker onto the harness-api leaf type field-for-field. Every
+/// field is a plain count/bool, so this can never fail.
+fn project_workspace_inspection_truncation(
+    truncation: Option<gate4agent_node_protocol::WorkspaceInspectionTruncationV1>,
+) -> Option<HarnessWorkspaceInspectionTruncationV1> {
+    truncation.map(|truncation| HarnessWorkspaceInspectionTruncationV1 {
+        walk_time_budget_exceeded: truncation.walk_time_budget_exceeded,
+        walk_entry_cap_exceeded: truncation.walk_entry_cap_exceeded,
+        git_time_budget_exceeded: truncation.git_time_budget_exceeded,
+        entries_visited: truncation.entries_visited,
+        elapsed_ms: truncation.elapsed_ms,
+    })
+}
+
 fn project_run_workspace_inspection(
     prepared: &PreparedRunRead,
     inspection: C2WorkspaceInspection,
@@ -2215,6 +2232,7 @@ fn project_run_workspace_inspection(
             recent_commits,
             truncated: inspection.git.truncated || status_truncated || commits_truncated,
         },
+        truncation: project_workspace_inspection_truncation(inspection.truncation),
     })
 }
 
@@ -2468,6 +2486,7 @@ fn project_node_workspace_inspection(
             recent_commits,
             truncated: inspection.git.truncated || status_truncated || commits_truncated,
         },
+        truncation: project_workspace_inspection_truncation(inspection.truncation),
     })
 }
 
@@ -4242,6 +4261,8 @@ pub enum HarnessC2Error {
     NodeWorkspaceReadTransport(C2ControlError),
     #[error("node workspace read deadline elapsed")]
     NodeWorkspaceReadDeadline,
+    #[error("node workspace read was cancelled after the harness operator connection's own deadline fired first")]
+    NodeWorkspaceReadCancelled,
     #[error("node workspace response route or incarnation does not match")]
     NodeWorkspaceReadRouteMismatch,
     #[error("node workspace response does not exactly correlate with the request")]
@@ -5930,6 +5951,7 @@ mod tests {
                 truncated: false,
                 diagnostic_present: true,
             },
+            truncation: None,
         };
         let response = correlate_run_read_response(
             &prepared,
@@ -6109,6 +6131,7 @@ mod tests {
                 truncated: false,
                 diagnostic_present: false,
             },
+            truncation: None,
         };
         let response = correlate_node_workspace_read_response(
             &prepared,
@@ -6138,6 +6161,7 @@ mod tests {
                     truncated: false,
                     diagnostic_present: false,
                 },
+                truncation: None,
             },
         };
         assert!(matches!(

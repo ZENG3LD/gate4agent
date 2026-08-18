@@ -2,6 +2,7 @@ use crate::git_worktree::{
     create_worktree as create_git_worktree,
     create_worktree_with_timeout as create_git_worktree_with_timeout,
     list_worktrees as list_git_worktrees,
+    list_worktrees_with_deadline as list_git_worktrees_with_deadline,
     paths_equal as worktree_paths_equal, remove_worktree as remove_git_worktree,
     removal_lookup_path as normalize_worktree_removal_target,
     resolve_base_commit_with_timeout,
@@ -107,7 +108,8 @@ use crate::protocol::{
     SpawnContextId, SpawnEnvironmentProfileId, SpawnIdempotencyKey,
     SpawnProfileDefaults, SpawnRequiredCapabilities, SpawnSpec, SpawnSpecResolveError,
     WorkspaceFileContent, WorkspaceFileRevision,
-    WorkspaceFileRead, WorkspaceId, WorkspaceInspection, WorkspaceSnapshot,
+    WorkspaceFileRead, WorkspaceId, WorkspaceInspection, WorkspaceInspectionTruncationV1,
+    WorkspaceSnapshot,
     WorktreeServiceMode,
     LaunchInventory, ManagedWorktreeProfileSummary, SpawnProfileSummary,
     WorktreeProfileInventory, MAX_MANAGED_WORKTREE_PROFILES_PER_WORKSPACE,
@@ -226,6 +228,20 @@ const HOST_DIRECTORY_BROWSE_TIMEOUT_MS: u64 = 2_000;
 const NATIVE_SESSION_CATALOG_TIMEOUT_MS: u64 = 30_000;
 const WORKSPACE_TREE_MAX_DEPTH: usize = 6;
 const WORKSPACE_TREE_MAX_ENTRIES: usize = 512;
+/// Default total wall-clock budget for `inspect_workspace`'s walk+git
+/// chain, overridable via `GATE4AGENT_NODE_WORKSPACE_INSPECTION_BUDGET_MS`.
+const WORKSPACE_INSPECTION_TIME_BUDGET_MS_DEFAULT: u64 = 8_000;
+/// The harness relay enforces its own flat response deadline
+/// (`HOST_RUN_READ_RESPONSE_DEADLINE`, `gate4agent-harness-service::runtime`,
+/// 12s) above this node-side budget. The two constants live in different
+/// crates with no shared definition, so clamp any override here comfortably
+/// below that external ceiling — a misconfigured value above it would
+/// reopen the exact deadline race this budget exists to close.
+const WORKSPACE_INSPECTION_TIME_BUDGET_MS_MAX: u64 = 11_000;
+/// Default cap on directory entries visited (not just returned) by one
+/// walk, overridable via `GATE4AGENT_NODE_WORKSPACE_INSPECTION_ENTRY_CAP`.
+const WORKSPACE_INSPECTION_ENTRY_CAP_DEFAULT: usize = 50_000;
+const WORKSPACE_INSPECTION_ENTRY_CAP_MAX: usize = 1_000_000;
 const GIT_STATUS_MAX_ENTRIES: usize = 128;
 const GIT_COMMIT_MAX_ENTRIES: usize = 12;
 const GIT_OUTPUT_MAX_BYTES: usize = 64 * 1_024;
@@ -7249,24 +7265,45 @@ impl NodeShared {
             .clone()
             .try_acquire_owned()
             .map_err(|_| {
+                tracing::warn!(
+                    workspace_id = %workspace_id,
+                    "workspace inspection rejected: inspection capacity is busy",
+                );
                 failure(
                     NodeFailureCode::BackendBusy,
                     "workspace inspection capacity is busy",
                 )
             })?;
-        let canonical_root = self.workspace_root(&workspace_id)?;
+        let canonical_root = self.workspace_root(&workspace_id).map_err(|error| {
+            tracing::warn!(
+                workspace_id = %workspace_id,
+                code = ?error.code,
+                "workspace inspection rejected: workspace is not registered",
+            );
+            error
+        })?;
         let tree_root = canonical_root.clone();
-        let (entries, tree_truncated) = tokio::task::spawn_blocking(move || {
-            collect_workspace_entries(Path::new(&tree_root))
+        let started_at = Instant::now();
+        let time_budget_ms = workspace_inspection_time_budget_ms();
+        let entry_cap = workspace_inspection_entry_cap();
+        let deadline = started_at + Duration::from_millis(time_budget_ms);
+        let (entries, tree_truncated, walk_budget) = tokio::task::spawn_blocking(move || {
+            collect_workspace_entries(Path::new(&tree_root), deadline, entry_cap)
         })
         .await
         .map_err(|error| {
+            tracing::warn!(
+                workspace_id = %workspace_id,
+                error = %error,
+                "workspace inspection rejected: walk task failed",
+            );
             failure(
                 NodeFailureCode::BackendOperationFailed,
                 &format!("workspace inspection task failed: {error}"),
             )
         })?;
-        let mut git = inspect_git_workspace(&canonical_root).await;
+        let (mut git, git_time_budget_exceeded) =
+            inspect_git_workspace(&canonical_root, deadline).await;
         if !git.worktrees.is_empty() {
             let registered = self
                 .workspaces
@@ -7291,11 +7328,28 @@ impl NodeShared {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .git_scope(&workspace_id, git.branch.as_deref());
         }
+        let truncation = workspace_inspection_truncation(
+            &walk_budget,
+            git_time_budget_exceeded,
+            started_at.elapsed(),
+        );
+        if let Some(truncation) = &truncation {
+            tracing::info!(
+                workspace_id = %workspace_id,
+                walk_time_budget_exceeded = truncation.walk_time_budget_exceeded,
+                walk_entry_cap_exceeded = truncation.walk_entry_cap_exceeded,
+                git_time_budget_exceeded = truncation.git_time_budget_exceeded,
+                entries_visited = truncation.entries_visited,
+                elapsed_ms = truncation.elapsed_ms,
+                "workspace inspection truncated by its inner budget",
+            );
+        }
         Ok(WorkspaceInspection {
             workspace_id,
             entries,
             tree_truncated,
             git,
+            truncation,
         })
     }
 
@@ -12821,11 +12875,114 @@ impl Drop for AbortTaskOnDrop {
     }
 }
 
-fn collect_workspace_entries(root: &Path) -> (Vec<WorkspaceEntry>, bool) {
+/// Reads an unsigned env-config override, following the pattern of every
+/// other bounded knob in this module: missing/unparsable/zero falls back to
+/// `default`, and the resolved value is always clamped to `max` so a bad
+/// override cannot reopen a bound this budget exists to enforce.
+fn env_config_bounded(name: &str, default: u64, max: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+        .min(max)
+}
+
+fn workspace_inspection_time_budget_ms() -> u64 {
+    env_config_bounded(
+        "GATE4AGENT_NODE_WORKSPACE_INSPECTION_BUDGET_MS",
+        WORKSPACE_INSPECTION_TIME_BUDGET_MS_DEFAULT,
+        WORKSPACE_INSPECTION_TIME_BUDGET_MS_MAX,
+    )
+}
+
+fn workspace_inspection_entry_cap() -> usize {
+    env_config_bounded(
+        "GATE4AGENT_NODE_WORKSPACE_INSPECTION_ENTRY_CAP",
+        WORKSPACE_INSPECTION_ENTRY_CAP_DEFAULT as u64,
+        WORKSPACE_INSPECTION_ENTRY_CAP_MAX as u64,
+    ) as usize
+}
+
+/// Tracks the shared walk-side budget across the whole recursive walk: a
+/// wall-clock deadline (shared with the git phase that runs after the walk)
+/// and a cap on directory entries visited, whether or not they were pushed
+/// to the response. Cheap to check per entry — one `Instant::now()` and one
+/// integer compare.
+struct WorkspaceWalkBudget {
+    deadline: Instant,
+    entry_cap: usize,
+    entries_visited: u64,
+    time_budget_exceeded: bool,
+    entry_cap_exceeded: bool,
+}
+
+impl WorkspaceWalkBudget {
+    fn new(deadline: Instant, entry_cap: usize) -> Self {
+        Self {
+            deadline,
+            entry_cap,
+            entries_visited: 0,
+            time_budget_exceeded: false,
+            entry_cap_exceeded: false,
+        }
+    }
+
+    fn is_exhausted(&self) -> bool {
+        self.time_budget_exceeded || self.entry_cap_exceeded
+    }
+
+    /// Records one visited directory entry (pushed to the response or not)
+    /// and reports whether the walk must stop now.
+    fn record_visit(&mut self) -> bool {
+        self.entries_visited += 1;
+        if self.entries_visited as usize >= self.entry_cap {
+            self.entry_cap_exceeded = true;
+        }
+        if Instant::now() >= self.deadline {
+            self.time_budget_exceeded = true;
+        }
+        self.is_exhausted()
+    }
+}
+
+fn collect_workspace_entries(
+    root: &Path,
+    deadline: Instant,
+    entry_cap: usize,
+) -> (Vec<WorkspaceEntry>, bool, WorkspaceWalkBudget) {
     let mut entries = Vec::new();
     let mut truncated = false;
-    walk_workspace_directory(root, None, 0, &mut entries, &mut truncated);
-    (entries, truncated)
+    let mut budget = WorkspaceWalkBudget::new(deadline, entry_cap);
+    walk_workspace_directory(root, None, 0, &mut entries, &mut truncated, &mut budget);
+    // DFS pre-order emits `x/child` between prefix-named siblings `x` and
+    // `x-y` ('-' sorts below '/'), while the bounded operator projections
+    // require strict global byte order over relative paths.
+    entries.sort_by(|left, right| left.relative_path.as_utf8().cmp(&right.relative_path.as_utf8()));
+    (entries, truncated, budget)
+}
+
+/// Builds the additive `WorkspaceInspectionTruncationV1` for an
+/// `inspect_workspace` response — `None` once the walk and git phase both
+/// completed inside their shared budget.
+fn workspace_inspection_truncation(
+    walk_budget: &WorkspaceWalkBudget,
+    git_time_budget_exceeded: bool,
+    elapsed: Duration,
+) -> Option<WorkspaceInspectionTruncationV1> {
+    if !walk_budget.time_budget_exceeded
+        && !walk_budget.entry_cap_exceeded
+        && !git_time_budget_exceeded
+    {
+        return None;
+    }
+    Some(WorkspaceInspectionTruncationV1 {
+        walk_time_budget_exceeded: walk_budget.time_budget_exceeded,
+        walk_entry_cap_exceeded: walk_budget.entry_cap_exceeded,
+        git_time_budget_exceeded,
+        entries_visited: walk_budget.entries_visited,
+        elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+    })
 }
 
 fn walk_workspace_directory(
@@ -12834,7 +12991,12 @@ fn walk_workspace_directory(
     depth: usize,
     entries: &mut Vec<WorkspaceEntry>,
     truncated: &mut bool,
+    budget: &mut WorkspaceWalkBudget,
 ) {
+    if budget.is_exhausted() {
+        *truncated = true;
+        return;
+    }
     let read_dir = match std::fs::read_dir(directory) {
         Ok(read_dir) => read_dir,
         Err(_) => {
@@ -12851,6 +13013,10 @@ fn walk_workspace_directory(
     }
     children.sort_by_key(|child| child.file_name());
     for child in children {
+        if budget.record_visit() {
+            *truncated = true;
+            return;
+        }
         if entries.len() >= WORKSPACE_TREE_MAX_ENTRIES {
             *truncated = true;
             return;
@@ -12872,7 +13038,7 @@ fn walk_workspace_directory(
                 continue;
             }
         };
-        if file_type.is_dir() && is_skipped_workspace_directory(&name) {
+        if file_type.is_dir() && is_skipped_workspace_directory(&name, &child.path()) {
             continue;
         }
         let relative_path = match relative_directory {
@@ -12904,6 +13070,7 @@ fn walk_workspace_directory(
                     depth + 1,
                     entries,
                     truncated,
+                    budget,
                 );
             } else {
                 *truncated = true;
@@ -12923,10 +13090,22 @@ fn windows_repository_path_from_bytes(value: &[u8]) -> Option<RepositoryPath> {
     windows_repository_path(std::str::from_utf8(value).ok()?.to_owned())
 }
 
-fn is_skipped_workspace_directory(name: &str) -> bool {
-    name.eq_ignore_ascii_case(".git")
+/// Excludes a directory from the workspace tree walk. The three literal
+/// names are the common convention-based cases; the `CACHEDIR.TAG` check
+/// beneath them catches every build-output directory regardless of name
+/// (cargo writes `CACHEDIR.TAG` into every `--target-dir` it creates, so
+/// this covers `target-a2`, `target-a2-tui`, and any future renamed build
+/// directory without maintaining a name heuristic list). The name check
+/// runs first and returns early so a directory rejected by name never pays
+/// for the extra `CACHEDIR.TAG` stat.
+fn is_skipped_workspace_directory(name: &str, path: &Path) -> bool {
+    if name.eq_ignore_ascii_case(".git")
         || name.eq_ignore_ascii_case("target")
         || name.eq_ignore_ascii_case("node_modules")
+    {
+        return true;
+    }
+    path.join("CACHEDIR.TAG").is_file()
 }
 
 fn context_pack_source_status_is_usable(status: &SessionStatus) -> bool {
@@ -12966,7 +13145,52 @@ fn stable_context_pack_repository(
     ))
 }
 
-async fn inspect_git_workspace(root: &str) -> GitSnapshot {
+/// Appends a "skipped: budget exhausted" diagnostic and returns `true` once
+/// (and only once) the shared walk+git `deadline` has already passed. Every
+/// remaining phase in `inspect_git_workspace` checks this immediately
+/// before issuing its own git call, so a budget spent by the walk (or by an
+/// earlier git call) skips the rest of the chain instead of paying for it
+/// anyway.
+fn git_budget_exhausted(snapshot: &mut GitSnapshot, deadline: Instant, stage: &str) -> bool {
+    if Instant::now() < deadline {
+        return false;
+    }
+    append_git_diagnostic(
+        snapshot,
+        &format!("{stage} skipped: workspace inspection time budget exhausted"),
+    );
+    true
+}
+
+/// Deadline-aware sibling of `run_git_bounded`, used only by
+/// `inspect_git_workspace`'s six-call chain: caps the per-call timeout to
+/// whatever remains of the shared `deadline` (never more than
+/// `GIT_COMMAND_TIMEOUT_MS`), so a slow walk phase that already spent most
+/// of the budget cannot still hand a full per-call timeout to every git
+/// probe behind it. `inspect_git_workspace` already guards each call site
+/// with `git_budget_exhausted`, so `deadline` is guaranteed not to have
+/// passed yet here.
+async fn run_git_bounded_with_deadline(
+    root: &str,
+    arguments: &[&str],
+    output_limit: usize,
+    deadline: Instant,
+) -> io::Result<GitCommandOutput> {
+    let remaining = deadline.checked_duration_since(Instant::now());
+    let timeout_ms = remaining
+        .and_then(|remaining| u64::try_from(remaining.as_millis()).ok())
+        .unwrap_or(0)
+        .clamp(1, GIT_COMMAND_TIMEOUT_MS);
+    run_git_read_bounded(root, arguments, output_limit, timeout_ms).await
+}
+
+/// Runs the bounded six-call git probe chain used by `inspect_workspace`.
+/// `deadline` is the same absolute instant the preceding directory walk was
+/// bounded by, so time already spent walking counts against what remains
+/// for git enrichment. Returns the resulting `GitSnapshot` plus whether the
+/// shared budget (not an individual per-call timeout) is what cut the git
+/// phase short.
+async fn inspect_git_workspace(root: &str, deadline: Instant) -> (GitSnapshot, bool) {
     let mut snapshot = GitSnapshot {
         is_repository: false,
         branch: None,
@@ -12977,10 +13201,14 @@ async fn inspect_git_workspace(root: &str) -> GitSnapshot {
         truncated: false,
         diagnostic: None,
     };
-    let repository = match run_git_bounded(
+    if git_budget_exhausted(&mut snapshot, deadline, "git repository probe") {
+        return (snapshot, true);
+    }
+    let repository = match run_git_bounded_with_deadline(
         root,
         &["rev-parse", "--is-inside-work-tree"],
         4 * 1_024,
+        deadline,
     )
     .await
     {
@@ -12990,13 +13218,13 @@ async fn inspect_git_workspace(root: &str) -> GitSnapshot {
                 &mut snapshot,
                 &format!("git inspection unavailable: {error}"),
             );
-            return snapshot;
+            return (snapshot, false);
         }
     };
     snapshot.truncated |= repository.truncated;
     if repository.timed_out {
         append_git_diagnostic(&mut snapshot, "git repository probe timed out");
-        return snapshot;
+        return (snapshot, false);
     }
     if !repository.success
         || String::from_utf8_lossy(&repository.stdout).trim() != "true"
@@ -13005,11 +13233,14 @@ async fn inspect_git_workspace(root: &str) -> GitSnapshot {
         if !stderr.to_ascii_lowercase().contains("not a git repository") {
             append_git_diagnostic(&mut snapshot, stderr.trim());
         }
-        return snapshot;
+        return (snapshot, false);
     }
     snapshot.is_repository = true;
 
-    match run_git_bounded(root, &["branch", "--show-current"], 4 * 1_024).await {
+    if git_budget_exhausted(&mut snapshot, deadline, "git branch query") {
+        return (snapshot, true);
+    }
+    match run_git_bounded_with_deadline(root, &["branch", "--show-current"], 4 * 1_024, deadline).await {
         Ok(output) => {
             snapshot.truncated |= output.truncated;
             if output.timed_out {
@@ -13030,8 +13261,8 @@ async fn inspect_git_workspace(root: &str) -> GitSnapshot {
             &format!("git branch query failed: {error}"),
         ),
     }
-    if snapshot.branch.is_none() {
-        if let Ok(output) = run_git_bounded(root, &["rev-parse", "--short", "HEAD"], 4 * 1_024).await {
+    if snapshot.branch.is_none() && !git_budget_exhausted(&mut snapshot, deadline, "git detached-HEAD probe") {
+        if let Ok(output) = run_git_bounded_with_deadline(root, &["rev-parse", "--short", "HEAD"], 4 * 1_024, deadline).await {
             snapshot.truncated |= output.truncated;
             if output.success && !output.timed_out {
                 let head = String::from_utf8_lossy(&output.stdout).trim().to_owned();
@@ -13042,7 +13273,10 @@ async fn inspect_git_workspace(root: &str) -> GitSnapshot {
         }
     }
 
-    match run_git_bounded(
+    if git_budget_exhausted(&mut snapshot, deadline, "git status") {
+        return (snapshot, true);
+    }
+    match run_git_bounded_with_deadline(
         root,
         &[
             "status",
@@ -13054,6 +13288,7 @@ async fn inspect_git_workspace(root: &str) -> GitSnapshot {
             ".",
         ],
         GIT_OUTPUT_MAX_BYTES,
+        deadline,
     )
     .await
     {
@@ -13076,11 +13311,15 @@ async fn inspect_git_workspace(root: &str) -> GitSnapshot {
         ),
     }
 
+    if git_budget_exhausted(&mut snapshot, deadline, "git log") {
+        return (snapshot, true);
+    }
     let log_limit = (GIT_COMMIT_MAX_ENTRIES + 1).to_string();
-    match run_git_bounded(
+    match run_git_bounded_with_deadline(
         root,
         &["log", "-n", &log_limit, "--pretty=format:%H%x1f%s", "--", "."],
         16 * 1_024,
+        deadline,
     )
     .await
     {
@@ -13102,7 +13341,11 @@ async fn inspect_git_workspace(root: &str) -> GitSnapshot {
             &format!("git log failed: {error}"),
         ),
     }
-    match list_git_worktrees(root).await {
+
+    if git_budget_exhausted(&mut snapshot, deadline, "git worktree list") {
+        return (snapshot, true);
+    }
+    match list_git_worktrees_with_deadline(root, deadline).await {
         Ok(worktrees) => {
             snapshot.worktrees = worktrees.into_iter().map(protocol_worktree).collect()
         }
@@ -13111,7 +13354,7 @@ async fn inspect_git_workspace(root: &str) -> GitSnapshot {
             &format!("git worktree list failed: {}", error.message),
         ),
     }
-    snapshot
+    (snapshot, false)
 }
 
 fn parse_git_status(output: &[u8], snapshot: &mut GitSnapshot) {
@@ -19032,6 +19275,7 @@ mod tests {
                     entries: Vec::new(),
                     tree_truncated: false,
                     git,
+                    truncation: None,
                 },
             }),
         };
@@ -22948,6 +23192,10 @@ mod tests {
         }
     }
 
+    fn generous_walk_deadline() -> Instant {
+        Instant::now() + Duration::from_secs(30)
+    }
+
     #[test]
     fn workspace_tree_is_relative_and_skips_heavy_directories() {
         let root = temporary_workspace_root("tree");
@@ -22957,8 +23205,21 @@ mod tests {
         std::fs::create_dir_all(root.join("node_modules/package")).unwrap();
         std::fs::write(root.join("src/lib.rs"), b"pub fn fixture() {}\n").unwrap();
         std::fs::write(root.join("README.md"), b"fixture\n").unwrap();
+        // A renamed/agent-scoped build directory (`target-a2`-style, per the
+        // real repository's own build layout) that carries the Cache
+        // Directory Tagging Specification marker cargo writes into every
+        // `--target-dir` it creates: must be skipped even though its name
+        // does not exactly match `target`.
+        std::fs::create_dir_all(root.join("target-a2/debug")).unwrap();
+        std::fs::write(root.join("target-a2/CACHEDIR.TAG"), b"Signature: 8a477f597d28d172789f06886806bc55\n").unwrap();
+        // A directory that merely *starts with* `target` but carries no
+        // CACHEDIR.TAG: the new prefix-adjacent check must not false-match
+        // on the name alone, so this stays in the response.
+        std::fs::create_dir_all(root.join("target-notes")).unwrap();
+        std::fs::write(root.join("target-notes/plan.md"), b"not a build directory\n").unwrap();
 
-        let (entries, truncated) = collect_workspace_entries(&root);
+        let (entries, truncated, _budget) =
+            collect_workspace_entries(&root, generous_walk_deadline(), WORKSPACE_INSPECTION_ENTRY_CAP_DEFAULT);
         assert!(!truncated);
         assert!(entries.iter().any(|entry| {
             entry.relative_path.as_utf8() == Some("src")
@@ -22968,12 +23229,90 @@ mod tests {
             entry.relative_path.as_utf8() == Some("src/lib.rs")
                 && entry.kind == WorkspaceEntryKind::File
         }));
+        assert!(entries.iter().any(|entry| {
+            entry.relative_path.as_utf8() == Some("target-notes")
+                && entry.kind == WorkspaceEntryKind::Directory
+        }));
+        assert!(entries.iter().any(|entry| {
+            entry.relative_path.as_utf8() == Some("target-notes/plan.md")
+                && entry.kind == WorkspaceEntryKind::File
+        }));
         assert!(entries.iter().all(|entry| {
             let path = entry.relative_path.as_utf8().unwrap();
             !path.starts_with(".git")
-                && !path.starts_with("target")
+                && !(path == "target" || path.starts_with("target/"))
+                && !(path == "target-a2" || path.starts_with("target-a2/"))
                 && !path.starts_with("node_modules")
         }));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn workspace_walk_stops_at_its_entry_cap_and_marks_a_partial_result() {
+        let root = temporary_workspace_root("tree-entry-cap");
+        std::fs::create_dir_all(&root).unwrap();
+        for index in 0..20 {
+            std::fs::write(root.join(format!("file-{index:02}.txt")), b"fixture\n").unwrap();
+        }
+
+        let (entries, truncated, budget) =
+            collect_workspace_entries(&root, generous_walk_deadline(), 5);
+        assert!(truncated);
+        assert!(budget.entry_cap_exceeded);
+        assert!(!budget.time_budget_exceeded);
+        assert!(entries.len() <= 5);
+
+        let inspection_truncation = workspace_inspection_truncation(&budget, false, Duration::from_millis(1))
+            .expect("an entry-cap-truncated walk must report a truncation marker");
+        assert!(inspection_truncation.walk_entry_cap_exceeded);
+        assert!(!inspection_truncation.walk_time_budget_exceeded);
+        assert!(!inspection_truncation.git_time_budget_exceeded);
+        assert!(inspection_truncation.entries_visited >= 5);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn workspace_walk_within_budget_reports_no_truncation() {
+        let root = temporary_workspace_root("tree-no-truncation");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("only-file.txt"), b"fixture\n").unwrap();
+
+        let (_entries, truncated, budget) =
+            collect_workspace_entries(&root, generous_walk_deadline(), WORKSPACE_INSPECTION_ENTRY_CAP_DEFAULT);
+        assert!(!truncated);
+        assert!(workspace_inspection_truncation(&budget, false, Duration::from_millis(1)).is_none());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn workspace_walk_emits_strict_global_byte_order_for_prefix_named_siblings() {
+        let root = temporary_workspace_root("tree-prefix-siblings");
+        std::fs::create_dir_all(root.join("gate4agent-c2/src")).unwrap();
+        std::fs::write(root.join("gate4agent-c2/src/lib.rs"), b"fixture\n").unwrap();
+        std::fs::create_dir_all(root.join("gate4agent-c2-client")).unwrap();
+        std::fs::write(root.join("gate4agent-c2-client/lib.rs"), b"fixture\n").unwrap();
+
+        let (entries, truncated, _budget) =
+            collect_workspace_entries(&root, generous_walk_deadline(), WORKSPACE_INSPECTION_ENTRY_CAP_DEFAULT);
+        assert!(!truncated);
+        let paths = entries
+            .iter()
+            .map(|entry| entry.relative_path.as_utf8().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert!(paths.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(
+            paths,
+            vec![
+                "gate4agent-c2".to_owned(),
+                "gate4agent-c2-client".to_owned(),
+                "gate4agent-c2-client/lib.rs".to_owned(),
+                "gate4agent-c2/src".to_owned(),
+                "gate4agent-c2/src/lib.rs".to_owned(),
+            ],
+        );
 
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -23076,7 +23415,9 @@ mod tests {
         .unwrap();
         run_git_fixture(&root, &["add", "-A", "--", "."]).await;
 
-        let snapshot = inspect_git_workspace(root.to_str().unwrap()).await;
+        let (snapshot, git_time_budget_exceeded) =
+            inspect_git_workspace(root.to_str().unwrap(), generous_walk_deadline()).await;
+        assert!(!git_time_budget_exceeded);
 
         assert!(snapshot.is_repository, "{:?}", snapshot.diagnostic);
         let rename = snapshot

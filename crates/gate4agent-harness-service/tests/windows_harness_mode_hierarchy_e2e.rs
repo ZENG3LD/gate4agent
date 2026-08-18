@@ -67,10 +67,12 @@ struct FixturePaths {
 
 impl FixturePaths {
     fn new() -> Self {
+        static FIXTURE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
-            "gate4agent-harness-mode-hierarchy-{}-{}",
+            "gate4agent-harness-mode-hierarchy-{}-{}-{}",
             std::process::id(),
             unix_time_ms(),
+            FIXTURE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         ));
         fs::create_dir(&root).unwrap();
         Self {

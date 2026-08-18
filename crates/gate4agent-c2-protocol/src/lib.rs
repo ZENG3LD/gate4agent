@@ -1247,6 +1247,12 @@ pub struct C2WorkspaceInspection {
     pub entries: Vec<gate4agent_node_protocol::WorkspaceEntry>,
     pub tree_truncated: bool,
     pub git: C2GitSnapshot,
+    /// Additive mirror of `gate4agent_node_protocol::WorkspaceInspection::
+    /// truncation` — reuses the node-protocol type directly (plain
+    /// counts/bools, nothing sensitive), matching how `status`/
+    /// `recent_commits` already reuse node-protocol leaf types unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncation: Option<gate4agent_node_protocol::WorkspaceInspectionTruncationV1>,
 }
 
 impl<'de> Deserialize<'de> for C2WorkspaceInspection {
@@ -1260,6 +1266,8 @@ impl<'de> Deserialize<'de> for C2WorkspaceInspection {
             entries: Vec<gate4agent_node_protocol::WorkspaceEntry>,
             tree_truncated: bool,
             git: C2GitSnapshot,
+            #[serde(default)]
+            truncation: Option<gate4agent_node_protocol::WorkspaceInspectionTruncationV1>,
         }
 
         let wire = WireInspection::deserialize(deserializer)?;
@@ -1273,6 +1281,7 @@ impl<'de> Deserialize<'de> for C2WorkspaceInspection {
             entries: wire.entries,
             tree_truncated: wire.tree_truncated,
             git: wire.git,
+            truncation: wire.truncation,
         })
     }
 }
@@ -1284,6 +1293,7 @@ impl From<&gate4agent_node_protocol::WorkspaceInspection> for C2WorkspaceInspect
             entries: inspection.entries.clone(),
             tree_truncated: inspection.tree_truncated,
             git: C2GitSnapshot::from(&inspection.git),
+            truncation: inspection.truncation,
         };
         if !projected
             .git
@@ -4667,6 +4677,7 @@ mod tests {
                 truncated: false,
                 diagnostic_present: false,
             },
+            truncation: None,
         };
 
         let json = serde_json::to_string(&inspection).unwrap();
@@ -4704,6 +4715,7 @@ mod tests {
                 truncated: false,
                 diagnostic_present: false,
             },
+            truncation: None,
         };
 
         let json = serde_json::to_string(&inspection).unwrap();
@@ -4741,6 +4753,7 @@ mod tests {
                 truncated: false,
                 diagnostic: None,
             },
+            truncation: None,
         };
         let projected = C2WorkspaceInspection::from(&inspection);
         let json = serde_json::to_string(&projected).unwrap();
@@ -5358,6 +5371,7 @@ mod tests {
                     truncated: false,
                     diagnostic: Some("diagnostic-secret C:\\private\\git.stderr".to_owned()),
                 },
+                truncation: None,
             },
         });
 

@@ -4,7 +4,7 @@ use std::sync::mpsc::TryRecvError;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use portable_pty::ChildKiller;
+use gate4agent_pty::ChildKiller;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 

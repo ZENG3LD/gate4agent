@@ -23,6 +23,9 @@ use gate4agent_harness_client::{
     HarnessTaskStateV1, RedactedRunV1, RedactedTaskV1, HARNESS_ENTITY_PAGE_LIMIT_MAX,
     HARNESS_RUNTIME_INVENTORY_PAGE_LIMIT_MAX,
 };
+use gate4agent_harness_api::{
+    HarnessExecutionModeV1, HarnessRuntimeSessionAddressV1, HarnessRuntimeTerminalSizeV1,
+};
 
 const HARNESS_OPERATOR_TOKEN_ENV: &str = "GATE4AGENT_HARNESS_OPERATOR_TOKEN";
 
@@ -45,7 +48,9 @@ fn usage() -> &'static str {
      \x20 transfers RUN_ID\n\
      \x20 runtime-inventory [--after NODE_ID] [--limit N]\n\
      \x20 monitor RUN_ID\n\
-     \x20 workspace inspect NODE_ID WORKSPACE_ID"
+     \x20 workspace inspect NODE_ID WORKSPACE_ID\n\
+     \x20 session spawn NODE_ID WORKSPACE_ID PROVIDER [--profile ID] [--mode pty|inline] [--rows N] [--cols N]\n\
+     \x20 session stop NODE_ID INCARNATION_ID WORKSPACE_ID INSTANCE_ID GENERATION [--force yes]"
 }
 
 #[derive(Debug)]
@@ -89,6 +94,16 @@ enum Command {
     RuntimeInventory { after: Option<String>, limit: u16 },
     Monitor { run_id: HarnessRunId },
     WorkspaceInspect { node_id: String, workspace_id: String },
+    SessionSpawn {
+        node_id: String,
+        workspace_id: String,
+        provider: String,
+        provider_profile: String,
+        mode: HarnessExecutionModeV1,
+        rows: u16,
+        cols: u16,
+    },
+    SessionStop { session: HarnessRuntimeSessionAddressV1, force: bool },
 }
 
 enum Verb {
@@ -107,6 +122,8 @@ enum Verb {
     RuntimeInventory,
     Monitor,
     WorkspaceInspect,
+    SessionSpawn,
+    SessionStop,
 }
 
 fn resolve_verb(args: &[String]) -> Result<(Verb, usize), String> {
@@ -128,6 +145,11 @@ fn resolve_verb(args: &[String]) -> Result<(Verb, usize), String> {
         Some("transfers") => Ok((Verb::Transfers, 1)),
         Some("runtime-inventory") => Ok((Verb::RuntimeInventory, 1)),
         Some("monitor") => Ok((Verb::Monitor, 1)),
+        Some("session") => match args.get(2).map(String::as_str) {
+            Some("spawn") => Ok((Verb::SessionSpawn, 2)),
+            Some("stop") => Ok((Verb::SessionStop, 2)),
+            _ => Err(usage().to_owned()),
+        },
         Some("workspace") if args.get(2).map(String::as_str) == Some("inspect") => {
             Ok((Verb::WorkspaceInspect, 2))
         }
@@ -335,6 +357,71 @@ fn build_command(
             let (node_id, workspace_id) =
                 expect_two_positionals(positionals, ("node-id", "workspace-id"))?;
             Ok(Command::WorkspaceInspect { node_id, workspace_id })
+        }
+        Verb::SessionSpawn => {
+            if positionals.len() != 3 {
+                return Err(
+                    "session spawn expects exactly NODE_ID WORKSPACE_ID PROVIDER".to_owned()
+                );
+            }
+            let mut positionals = positionals.drain(..);
+            let node_id = positionals.next().expect("length checked above");
+            let workspace_id = positionals.next().expect("length checked above");
+            let provider = positionals.next().expect("length checked above");
+            let provider_profile =
+                take_flag(flags, "profile").unwrap_or_else(|| "default".to_owned());
+            let mode = match take_flag(flags, "mode").as_deref() {
+                None | Some("pty") => HarnessExecutionModeV1::Pty,
+                Some("inline") => HarnessExecutionModeV1::Inline,
+                Some(other) => return Err(format!("--mode must be pty or inline, got {other}")),
+            };
+            let rows = match take_flag(flags, "rows") {
+                Some(value) => value.parse().map_err(|_| "--rows must be a u16".to_owned())?,
+                None => 40,
+            };
+            let cols = match take_flag(flags, "cols") {
+                Some(value) => value.parse().map_err(|_| "--cols must be a u16".to_owned())?,
+                None => 140,
+            };
+            Ok(Command::SessionSpawn {
+                node_id,
+                workspace_id,
+                provider,
+                provider_profile,
+                mode,
+                rows,
+                cols,
+            })
+        }
+        Verb::SessionStop => {
+            if positionals.len() != 5 {
+                return Err("session stop expects exactly NODE_ID INCARNATION_ID WORKSPACE_ID INSTANCE_ID GENERATION".to_owned());
+            }
+            let mut positionals = positionals.drain(..);
+            let node_id = positionals.next().expect("length checked above");
+            let incarnation_id = positionals.next().expect("length checked above");
+            let workspace_id = positionals.next().expect("length checked above");
+            let instance_id = positionals
+                .next()
+                .expect("length checked above")
+                .parse()
+                .map_err(|_| "INSTANCE_ID must be a u64".to_owned())?;
+            let generation = positionals
+                .next()
+                .expect("length checked above")
+                .parse()
+                .map_err(|_| "GENERATION must be a u64".to_owned())?;
+            let force = take_flag(flags, "force").is_some();
+            Ok(Command::SessionStop {
+                session: HarnessRuntimeSessionAddressV1 {
+                    node_id,
+                    incarnation_id,
+                    workspace_id,
+                    instance_id,
+                    generation,
+                },
+                force,
+            })
         }
     }
 }
@@ -618,6 +705,33 @@ fn execute(invocation: Invocation) -> Result<String, String> {
                 .inspect_node_workspace(node_id, workspace_id)
                 .map_err(|error| error.to_string())?;
             render(&inspection)
+        }
+        Command::SessionSpawn {
+            node_id,
+            workspace_id,
+            provider,
+            provider_profile,
+            mode,
+            rows,
+            cols,
+        } => {
+            let session = client
+                .spawn_session(
+                    node_id,
+                    workspace_id,
+                    provider,
+                    provider_profile,
+                    mode,
+                    HarnessRuntimeTerminalSizeV1 { rows, columns: cols },
+                )
+                .map_err(|error| error.to_string())?;
+            render(&session)
+        }
+        Command::SessionStop { session, force } => {
+            client
+                .stop_session(session, force)
+                .map_err(|error| error.to_string())?;
+            render(&serde_json::json!({ "stopped": true }))
         }
     }
 }

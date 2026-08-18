@@ -5128,6 +5128,7 @@ mod tests {
                 truncated: false,
                 diagnostic: None,
             },
+            truncation: None,
         };
         let responses = vec![
             NodeResponse::Snapshot {
@@ -5211,6 +5212,7 @@ mod tests {
                     truncated: false,
                     diagnostic: None,
                 },
+                truncation: None,
             },
             WorkspaceInspection {
                 workspace_id: WorkspaceId::new("workspace-a").unwrap(),
@@ -5231,6 +5233,7 @@ mod tests {
                     truncated: false,
                     diagnostic: None,
                 },
+                truncation: None,
             },
             WorkspaceInspection {
                 workspace_id: WorkspaceId::new("workspace-a").unwrap(),
@@ -5251,6 +5254,7 @@ mod tests {
                     truncated: false,
                     diagnostic: None,
                 },
+                truncation: None,
             },
         ];
 
@@ -5296,6 +5300,7 @@ mod tests {
                 truncated: false,
                 diagnostic: None,
             },
+            truncation: None,
         };
         let frame = response_frame(NodeResponse::WorkspaceInspected { inspection });
 

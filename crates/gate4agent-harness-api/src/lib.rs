@@ -1041,6 +1041,23 @@ impl HarnessGitSummaryV1 {
     }
 }
 
+/// Additive mirror of `gate4agent_node_protocol::WorkspaceInspectionTruncationV1`
+/// carried onto both `HarnessRunWorkspaceInspectionV1` and
+/// `HarnessNodeWorkspaceInspectionV1` — see that type for field meaning.
+/// Kept as this crate's own type (rather than reused directly) to match
+/// every other leaf field on these two structs, which project into
+/// `Harness*V1` types rather than exposing node-protocol/c2-protocol types
+/// on the operator-facing API surface.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessWorkspaceInspectionTruncationV1 {
+    pub walk_time_budget_exceeded: bool,
+    pub walk_entry_cap_exceeded: bool,
+    pub git_time_budget_exceeded: bool,
+    pub entries_visited: u64,
+    pub elapsed_ms: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HarnessRunWorkspaceInspectionV1 {
@@ -1048,6 +1065,8 @@ pub struct HarnessRunWorkspaceInspectionV1 {
     pub entries: Vec<HarnessWorkspaceTreeEntryV1>,
     pub tree_truncated: bool,
     pub git: HarnessGitSummaryV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncation: Option<HarnessWorkspaceInspectionTruncationV1>,
 }
 
 impl HarnessRunWorkspaceInspectionV1 {
@@ -1077,6 +1096,8 @@ pub struct HarnessNodeWorkspaceInspectionV1 {
     pub entries: Vec<HarnessWorkspaceTreeEntryV1>,
     pub tree_truncated: bool,
     pub git: HarnessGitSummaryV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncation: Option<HarnessWorkspaceInspectionTruncationV1>,
 }
 
 impl HarnessNodeWorkspaceInspectionV1 {
@@ -5819,6 +5840,7 @@ mod tests {
                         }],
                         truncated: false,
                     },
+                    truncation: None,
                 },
             ),
             HarnessOperatorResponseV1::RunWorkspaceFileRead(HarnessRunWorkspaceFileV1 {
@@ -5946,6 +5968,7 @@ mod tests {
             entries: entries.clone(),
             tree_truncated: false,
             git: empty_git.clone(),
+            truncation: None,
         }.validate().is_ok());
         let mut too_many_entries = entries;
         too_many_entries.push(HarnessWorkspaceTreeEntryV1 {
@@ -5957,6 +5980,7 @@ mod tests {
             entries: too_many_entries,
             tree_truncated: true,
             git: empty_git,
+            truncation: None,
         }.validate().is_err());
 
         let status: Vec<_> = (0..HARNESS_GIT_STATUS_ENTRIES_MAX)
@@ -6532,6 +6556,7 @@ mod tests {
                         }],
                         truncated: false,
                     },
+                    truncation: None,
                 },
             ),
             HarnessOperatorResponseV1::NodeWorkspaceFileRead(HarnessNodeWorkspaceFileV1 {

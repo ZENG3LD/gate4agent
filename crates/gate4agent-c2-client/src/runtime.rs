@@ -3422,6 +3422,7 @@ mod tests {
                     truncated: false,
                     diagnostic_present: false,
                 },
+                truncation: None,
             },
         }
     }

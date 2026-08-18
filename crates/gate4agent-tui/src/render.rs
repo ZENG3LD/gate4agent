@@ -12185,6 +12185,7 @@ mod tests {
                 truncated: false,
                 diagnostic: None,
             },
+            truncation: None,
         }
     }
 

@@ -2346,6 +2346,23 @@ pub enum AppAction {
         rows: u16,
         cols: u16,
     },
+    // No token, unlike `HarnessStopSession`/`HarnessRemoveSession`/
+    // `HarnessResumeSession` above: exporting a context pack never mutates
+    // the runtime-inventory roster (see `ResourceMutationKind::invalidates_
+    // runtime_inventory`'s doc comment, gate4agent-harness-service/c2.rs),
+    // so there is no pending-refresh token to roll back on failure -- same
+    // fire-and-forget shape as `HarnessWriteSessionInput`/`HarnessPasteSession`.
+    // Rewritten from the light-shaped `ExportContextPack { address }` by
+    // `route_harness_session_verb` (needs the same `SessionAddress` ->
+    // `HarnessRuntimeSessionAddressV1` incarnation lookup every other
+    // session-address-scoped Harness action above needs); its bare-`node_id`
+    // siblings (`RegisterWorkspace`..`RemoveWorktree`, `ForgetContextPack`)
+    // need no such rewrite and ride the harness-operator mutation lane under
+    // their own light-shaped names -- see `harness_resource_mutation_action`
+    // in `client.rs`.
+    HarnessExportContextPack {
+        session: HarnessRuntimeSessionAddressV1,
+    },
     HarnessLoadTaskCorrelations {
         task: HarnessTaskRef,
         launch_token: u64,
@@ -6113,6 +6130,10 @@ impl App {
                     let token = self.begin_harness_mutation_refresh();
                     AppAction::HarnessResumeSession { token, session, rows, cols }
                 }
+                None => AppAction::None,
+            },
+            AppAction::ExportContextPack { address } => match self.harness_session_address(&address) {
+                Some(session) => AppAction::HarnessExportContextPack { session },
                 None => AppAction::None,
             },
             other => other,

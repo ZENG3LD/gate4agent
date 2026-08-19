@@ -23,13 +23,15 @@ use gate4agent_c2_client::{
 };
 use gate4agent_c2_protocol::{
     C2ControlEvent, C2ControlEventKind, C2ManagedSessionRecord, C2NodeEvent, C2NodeFailure, C2NodeResponse,
-    C2NodeSnapshot, C2RelayRoute, C2SessionSnapshot, C2SessionStatus, C2Topology, NodeRoute,
+    C2NodeSnapshot, C2RelayRoute, C2SessionSnapshot, C2SessionStatus, C2Topology, C2WorkspaceSnapshot, NodeRoute,
     NodeTransportState, C2WorkspaceInspection,
 };
 use gate4agent_node_protocol::{
-    AgentProgressV1, CapabilityId, ControllerState, GitCommitDetails, GitCommitSummary, GitDiff, GitDiffMode,
+    AgentProgressV1, CapabilityId, ContextPackLineageReceipt, ControllerState, GitCommitDetails,
+    GitCommitSummary, GitDiff, GitDiffMode,
     GitSnapshot, GitStatusEntry,
-    GitDiffRequest, GitHistoryPage, GitObjectId, HostDirectoryListing, ManagedSessionRecord,
+    GitDiffRequest, GitHistoryPage, GitObjectId, HostDirectoryEntry, HostDirectoryListing,
+    ManagedSessionRecord,
     ManagedWorktreeLeaseSnapshot, ManagedWorktreeLeaseState, ManagedWorktreeSpawnReceipt,
     ManagedWorktreeSpawnRequest,
     NativeSessionCatalogEntry, NativeSessionCatalogPage, NativeSessionCatalogRoute as WireNativeSessionCatalogRoute,
@@ -39,11 +41,11 @@ use gate4agent_node_protocol::{
     LaunchInventory, ResolvedBundleReceipt, ResolvedEnvironmentProfileReceipt, SpawnProfileSummary,
     ManagedSessionState, OpaqueHostPath, SessionAddress as WireSessionAddress, SessionKey,
     SessionMode, SessionRecordId, SpawnBundleId,
-    SpawnContextId, SpawnDeadlineMs, SpawnIdempotencyKey, SpawnOverride, SpawnOverrides,
+    SpawnContextDigest, SpawnContextId, SpawnDeadlineMs, SpawnIdempotencyKey, SpawnOverride, SpawnOverrides,
     SpawnProfileId, SpawnProfileRevision, SpawnPrompt, SpawnRequiredCapabilities, SpawnSpec,
     SpawnTarget,
     RepositoryPath, WorkspaceEntry, WorkspaceEntryKind, WorkspaceFileContent, WorkspaceFileRead,
-    WorkspaceFileRevision, WorkspaceId,
+    WorkspaceFileRevision, WorkspaceId, WorktreeServiceMode,
     WorktreeProfileId, MAX_NODE_TEXT_BYTES,
     NODE_OBSERVATION_EVENTS_CAPABILITY, NODE_OBSERVATION_MANAGED_TARGET_CAPABILITY,
     NODE_OBSERVATION_WORKFLOW_DETAIL_CAPABILITY,
@@ -78,6 +80,8 @@ use gate4agent_harness_client::{
     HarnessNodeWorkspaceFileV1, HarnessNodeWorkspaceInspectionV1, HarnessNodeWorkspaceDirectoryV1,
     HarnessWorkspaceFileRevisionV1,
     HarnessNodeGitDiffV1, HarnessNodeGitHistoryPageV1,
+    HarnessGitWorktreeSnapshotV1, HarnessHostDirectoryListingV1, HarnessHostPathV1,
+    HarnessResolvedContextPackReceiptV1, HarnessWorkspaceSnapshotV1, HarnessWorktreeServiceModeV1,
     RedactedTaskV1, RunPageV1, TaskPageV1,
     SessionMonitorV1 as HarnessSessionMonitorV1, TimelineEntryV1,
     HARNESS_TERMINAL_PAGE_LIMIT_MAX,
@@ -92,9 +96,9 @@ use gate4agent_observation_service::{
     ObservationCommittedRoute, ObservationCommittedSnapshot, ObservationService,
 };
 use gate4agent_types::{
-    AgentId, ControlEvent, ControlEventKind, ProviderActivity, ProviderSessionIdentity,
+    AgentId, AgentInstanceId, ControlEvent, ControlEventKind, ProviderActivity, ProviderSessionIdentity,
     HistoryMessageRole, NativeSessionExternalGroup, NativeSessionExternalGroupKind,
-    NativeSessionPreviewMessage, SessionSnapshot, SessionStatus,
+    NativeSessionPreviewMessage, SessionGeneration, SessionSnapshot, SessionStatus,
     TerminalFrame, TerminalSize,
     TerminalMouseProtocolEncoding, TransportKind,
 };
@@ -1762,10 +1766,12 @@ fn send_operator_action(
     let harness_detail_read = harness_only && harness_detail_read_action(&action);
     let harness_session_record_mutation =
         harness_only && harness_session_record_mutation_action(&action);
+    let harness_resource_mutation = harness_only && harness_resource_mutation_action(&action);
     if harness_only && node_id != HARNESS_COMMAND_ROUTE
         && !harness_native_history_read
         && !harness_detail_read
         && !harness_session_record_mutation
+        && !harness_resource_mutation
     {
         if !reject_history_refresh_action(app, &action, "Harness-owned session action unavailable") {
             app.notice = Some(
@@ -1779,7 +1785,10 @@ fn send_operator_action(
         commands.get(HARNESS_DETAIL_COMMAND_ROUTE)
     } else if harness_native_history_read {
         commands.get(HARNESS_HISTORY_COMMAND_ROUTE)
-    } else if harness_session_record_mutation || node_id == HARNESS_COMMAND_ROUTE {
+    } else if harness_session_record_mutation
+        || harness_resource_mutation
+        || node_id == HARNESS_COMMAND_ROUTE
+    {
         commands.get(HARNESS_COMMAND_ROUTE)
     } else {
         commands.get(&node_id).or_else(|| commands.get(C2_COMMAND_ROUTE))
@@ -2077,6 +2086,32 @@ fn harness_session_record_mutation_action(action: &AppAction) -> bool {
     )
 }
 
+/// The resource-mutation family: `BrowseHostDirectories`/`RegisterWorkspace`/
+/// `UnregisterWorkspace`/`CreateStandaloneWorkspace`/`CreateWorktree`/
+/// `RemoveWorktree`/`ForgetContextPack`. Same shape as `harness_session_
+/// record_mutation_action`'s own six verbs: each of these seven already
+/// carries a bare `node_id: String` field, no `SessionAddress` ->
+/// `HarnessRuntimeSessionAddressV1` translation needed, so they ride the
+/// harness-operator mutation lane (`HARNESS_COMMAND_ROUTE`) unmodified.
+/// `ExportContextPack` is this family's eighth verb but is not listed here:
+/// it needs that translation (its light shape carries a bare `SessionAddress`
+/// with no `incarnation_id`), so `route_harness_session_verb` rewrites it
+/// into `HarnessExportContextPack` instead -- already routed to
+/// `HARNESS_COMMAND_ROUTE` via `action_node_id`'s `Harness*Session*` cluster,
+/// the same way the eight session-control verbs are.
+fn harness_resource_mutation_action(action: &AppAction) -> bool {
+    matches!(
+        action,
+        AppAction::BrowseHostDirectories { .. }
+            | AppAction::RegisterWorkspace { .. }
+            | AppAction::UnregisterWorkspace { .. }
+            | AppAction::CreateStandaloneWorkspace { .. }
+            | AppAction::CreateWorktree { .. }
+            | AppAction::RemoveWorktree { .. }
+            | AppAction::ForgetContextPack { .. }
+    )
+}
+
 fn harness_detail_read_action(action: &AppAction) -> bool {
     matches!(
         action,
@@ -2105,19 +2140,42 @@ fn harness_detail_read_action(action: &AppAction) -> bool {
 }
 
 /// What remains legitimately unroutable in harness-only mode now that the
-/// session-record read (`PreviewSessionRecord`/`RefreshSessionRecordHistory`)
-/// and mutation (`ResumeSessionRecord`/`RenameSessionRecord`/`SetSessionTask`/
-/// `ForgetSessionRecord`/`IndexProviderSession`/`IndexNativeSession`) families
-/// each have a typed harness route: `DiscoverHistory`/`LoadHistory`.
-/// Both operate against an already-open `SessionAddress`'s own native-history
-/// discovery (feeding a plain `Resume`, not a managed `SessionRecordId`) --
-/// a direct-C2/light-mode-only concept from before the managed
-/// `SessionRecord` family existed, with no harness-operator wire mapping and
-/// no live per-node connection in harness mode to relay it through. Ignores
-/// the generic `reason` string the other three call sites pass (busy/
-/// unavailable/queue-full framings would misdescribe a verb that can never
-/// succeed in this mode regardless of queue state) in favor of naming the
-/// actual cause.
+/// session-record read (`PreviewSessionRecord`/`RefreshSessionRecordHistory`),
+/// mutation (`ResumeSessionRecord`/`RenameSessionRecord`/`SetSessionTask`/
+/// `ForgetSessionRecord`/`IndexProviderSession`/`IndexNativeSession`), and
+/// resource-mutation (`BrowseHostDirectories`/`RegisterWorkspace`/
+/// `UnregisterWorkspace`/`CreateStandaloneWorkspace`/`CreateWorktree`/
+/// `RemoveWorktree`/`ExportContextPack`/`ForgetContextPack`) families each
+/// have a typed harness route: `DiscoverHistory`/`LoadHistory` and
+/// `SpawnManagedWorktree`.
+///
+/// `DiscoverHistory`/`LoadHistory` operate against an already-open
+/// `SessionAddress`'s own native-history discovery (feeding a plain
+/// `Resume`, not a managed `SessionRecordId`) -- a direct-C2/light-mode-only
+/// concept from before the managed `SessionRecord` family existed, with no
+/// harness-operator wire mapping and no live per-node connection in harness
+/// mode to relay it through.
+///
+/// `SpawnManagedWorktree` is genuinely dead too, not merely unimplemented:
+/// its `NodeRequest::SpawnManagedWorktree`/`V2` payload is a full
+/// `ManagedWorktreeSpawnRequest` (a `SpawnSpec` -- profile id/revision,
+/// bundle/context/environment-profile overrides, deadline, idempotency key,
+/// required capabilities -- plus a `WorktreeProfileId`), the same profile-
+/// and-catalog-resolved shape `StartTaskV2` builds internally through the
+/// task-execution-spec/launch-catalog pipeline. The harness operator wire's
+/// own `SpawnSession` (the closest sibling this task considered folding it
+/// into) is deliberately the opposite: raw provider/profile-string/mode/
+/// terminal-size fields, no `SpawnSpec` involved at all -- see that request
+/// variant's own doc comment ("no Task/Run/plan"). Building a typed harness
+/// verb for `SpawnManagedWorktree` would mean re-exposing the entire
+/// `SpawnSpec` construction surface on the operator wire, a materially
+/// different and separate scope from this slice's workspace/worktree CRUD
+/// and host-directory-browse/context-pack verbs.
+///
+/// Ignores the generic `reason` string the other three call sites pass
+/// (busy/unavailable/queue-full framings would misdescribe a verb that can
+/// never succeed in this mode regardless of queue state) in favor of naming
+/// the actual cause.
 fn reject_history_refresh_action(app: &mut App, action: &AppAction, reason: &str) -> bool {
     // A record-history refresh that cannot be delivered (queue busy/closed,
     // node unavailable) must still clear its pending marker with a
@@ -2134,6 +2192,15 @@ fn reject_history_refresh_action(app: &mut App, action: &AppAction, reason: &str
             record_id.clone(),
             *node_incarnation_id,
             reason.to_owned(),
+        );
+        return true;
+    }
+    if matches!(action, AppAction::SpawnManagedWorktree { .. }) {
+        app.notice = Some(
+            "Harness-owned session action unavailable: SpawnManagedWorktree has no typed \
+             harness-operator verb -- it requires a full SpawnSpec construction (profile/\
+             bundle/context resolution) this wire does not expose outside a Task"
+                .to_owned(),
         );
         return true;
     }
@@ -2208,7 +2275,8 @@ fn action_node_id(action: &AppAction) -> Option<&str> {
         | AppAction::HarnessWriteSessionBytes { .. }
         | AppAction::HarnessPasteSession { .. }
         | AppAction::HarnessRemoveSession { .. }
-        | AppAction::HarnessResumeSession { .. } => Some(HARNESS_COMMAND_ROUTE),
+        | AppAction::HarnessResumeSession { .. }
+        | AppAction::HarnessExportContextPack { .. } => Some(HARNESS_COMMAND_ROUTE),
         AppAction::HarnessOpenTerminal { .. }
         | AppAction::HarnessLoadTaskLaunchOptions { .. }
         | AppAction::HarnessLoadRunTransfer { .. }
@@ -2951,6 +3019,173 @@ fn harness_operator_worker(
                     })
                 })();
                 let _ = updates.blocking_send(update.unwrap_or_else(|failure| failure));
+            }
+            // The resource-mutation family below (host-directory browse plus
+            // workspace/worktree lifecycle and context-pack export/forget)
+            // shares the session-record family's own shape immediately
+            // above: no `publish_harness_snapshot`/`publish_harness_failure`
+            // refresh-token gate (none of these eight originate from
+            // `route_harness_session_verb`'s `begin_harness_mutation_refresh`
+            // call -- `HarnessExportContextPack` is the one rewritten action
+            // here, and it carries no token either, see its own doc comment
+            // in `app.rs`). Results land through the exact same mode-
+            // agnostic `WorkerUpdate`/`App::apply_*` pairs the light-mode C2
+            // response handler above (`WorkerUpdate::HostDirectoriesBrowsed`
+            // -> `app.apply_host_directories`, `publish_workspace_registered`/
+            // `publish_workspace_removed`, `WorkerUpdate::ContextExported`/
+            // `ContextForgotten`) already fills -- never a Harness-only
+            // parallel state.
+            AppAction::BrowseHostDirectories { node_id, directory, after, token, append } => {
+                let update = (|| -> Result<WorkerUpdate, WorkerUpdate> {
+                    let harness_directory = directory.map(harness_host_path)
+                        .transpose()
+                        .map_err(|message| WorkerUpdate::HostDirectoryBrowseFailed {
+                            node_id: node_id.clone(), token, message,
+                        })?;
+                    let harness_after = after.map(harness_host_path)
+                        .transpose()
+                        .map_err(|message| WorkerUpdate::HostDirectoryBrowseFailed {
+                            node_id: node_id.clone(), token, message,
+                        })?;
+                    let listing = client.browse_host_directories(
+                        node_id.clone(), harness_directory, harness_after,
+                    ).map_err(|error| WorkerUpdate::HostDirectoryBrowseFailed {
+                        node_id: node_id.clone(), token, message: error.to_string(),
+                    })?;
+                    let listing = project_harness_host_directory_listing(listing)
+                        .map_err(|message| WorkerUpdate::HostDirectoryBrowseFailed {
+                            node_id: node_id.clone(), token, message,
+                        })?;
+                    Ok(WorkerUpdate::HostDirectoriesBrowsed { node_id, token, append, listing })
+                })();
+                let _ = updates.blocking_send(update.unwrap_or_else(|failure| failure));
+            }
+            AppAction::RegisterWorkspace { node_id, workspace_id, root } => {
+                let update = (|| -> Result<WorkspaceSnapshotUpdate, String> {
+                    let root = harness_host_path(root)?;
+                    let snapshot = client.register_workspace(
+                        node_id.clone(), workspace_id, root,
+                    ).map_err(|error| error.to_string())?;
+                    project_harness_workspace_snapshot(snapshot)
+                })();
+                match update {
+                    Ok(update) => publish_harness_workspace_registered(&updates, &node_id, update),
+                    Err(message) => {
+                        let _ = updates.blocking_send(WorkerUpdate::Notice(format!("{node_id}: {message}")));
+                    }
+                }
+            }
+            AppAction::UnregisterWorkspace { node_id, workspace_id } => {
+                match client.unregister_workspace(node_id.clone(), workspace_id) {
+                    Ok(workspace_id) => {
+                        let _ = updates.blocking_send(WorkerUpdate::WorkspaceRemoved {
+                            node_id: node_id.clone(), workspace_id: workspace_id.clone(),
+                        });
+                        let _ = updates.blocking_send(WorkerUpdate::Notice(format!(
+                            "{node_id}: space {workspace_id} unregistered"
+                        )));
+                    }
+                    Err(error) => {
+                        let _ = updates.blocking_send(WorkerUpdate::Notice(format!("{node_id}: {error}")));
+                    }
+                }
+            }
+            AppAction::CreateStandaloneWorkspace { node_id, workspace_id, root, initial_branch } => {
+                let update = (|| -> Result<WorkspaceSnapshotUpdate, String> {
+                    let root = harness_host_path(root)?;
+                    let snapshot = client.create_standalone_workspace(
+                        node_id.clone(), workspace_id, root, initial_branch,
+                    ).map_err(|error| error.to_string())?;
+                    project_harness_workspace_snapshot(snapshot)
+                })();
+                match update {
+                    Ok(update) => {
+                        publish_harness_workspace_registered(&updates, &node_id, update);
+                        let _ = updates.blocking_send(WorkerUpdate::Notice(format!(
+                            "{node_id}: standalone repository created and ready to Launch"
+                        )));
+                    }
+                    Err(message) => {
+                        let _ = updates.blocking_send(WorkerUpdate::Notice(format!("{node_id}: {message}")));
+                    }
+                }
+            }
+            // Unlike `RegisterWorkspace`/`CreateStandaloneWorkspace` above,
+            // this does not upsert the new worktree's own workspace into
+            // `app.workspaces` -- it just selects it, the same way the
+            // light-mode `C2NodeResponse::WorktreeCreated` handler does
+            // (`SelectWorkspace` only, no `WorkspaceUpserted`); the sidebar's
+            // own auto-inspection picks the freshly selected workspace up.
+            AppAction::CreateWorktree {
+                node_id, source_workspace_id, workspace_id, target_root, branch, base,
+            } => {
+                let update = (|| -> Result<(HarnessGitWorktreeSnapshotV1, HarnessWorkspaceSnapshotV1), String> {
+                    let target_root = harness_host_path(target_root)?;
+                    client.create_worktree(
+                        node_id.clone(), source_workspace_id, workspace_id, target_root, branch, base,
+                    ).map_err(|error| error.to_string())
+                })();
+                match update {
+                    Ok((worktree, workspace)) => {
+                        let _ = updates.blocking_send(WorkerUpdate::SelectWorkspace {
+                            node_id: node_id.clone(), workspace_id: workspace.workspace_id,
+                        });
+                        let _ = updates.blocking_send(WorkerUpdate::Notice(format!(
+                            "{node_id}: worktree {} created", worktree.path.as_str(),
+                        )));
+                    }
+                    Err(message) => {
+                        let _ = updates.blocking_send(WorkerUpdate::Notice(format!("{node_id}: {message}")));
+                    }
+                }
+            }
+            AppAction::RemoveWorktree { node_id, source_workspace_id, target_root } => {
+                let update = (|| -> Result<String, String> {
+                    let target_root = harness_host_path(target_root)?;
+                    let (removed_path, _workspace_id) = client.remove_worktree(
+                        node_id.clone(), source_workspace_id, target_root,
+                    ).map_err(|error| error.to_string())?;
+                    Ok(removed_path)
+                })();
+                match update {
+                    Ok(removed_path) => {
+                        let _ = updates.blocking_send(WorkerUpdate::Notice(format!(
+                            "{node_id}: worktree {removed_path} removed"
+                        )));
+                    }
+                    Err(message) => {
+                        let _ = updates.blocking_send(WorkerUpdate::Notice(format!("{node_id}: {message}")));
+                    }
+                }
+            }
+            AppAction::HarnessExportContextPack { session } => {
+                let node_id = session.node_id.clone();
+                let update = client.export_context_pack(session)
+                    .map_err(|error| error.to_string())
+                    .and_then(project_harness_context_pack_receipt);
+                match update {
+                    Ok(receipt) => {
+                        let _ = updates.blocking_send(WorkerUpdate::ContextExported(receipt));
+                    }
+                    Err(message) => {
+                        let _ = updates.blocking_send(WorkerUpdate::Notice(format!("{node_id}: {message}")));
+                    }
+                }
+            }
+            AppAction::ForgetContextPack { node_id, context_id } => {
+                match client.forget_context_pack(node_id.clone(), context_id) {
+                    Ok(context_id) => match SpawnContextId::new(context_id) {
+                        Ok(context_id) => {
+                            let _ = updates.blocking_send(WorkerUpdate::ContextForgotten(context_id));
+                        }
+                        Err(error) => {
+                            let _ = updates.blocking_send(WorkerUpdate::Notice(format!("{node_id}: {error}")));
+                        }
+                    },
+                    Err(error) => {
+                        let _ = updates.blocking_send(WorkerUpdate::Notice(format!("{node_id}: {error}")));
+                    }
+                }
             }
             AppAction::HarnessCreateTask {
                 token,
@@ -6958,7 +7193,8 @@ fn action_to_request(action: AppAction) -> Option<NodeRequest> {
         | AppAction::HarnessWriteSessionBytes { .. }
         | AppAction::HarnessPasteSession { .. }
         | AppAction::HarnessRemoveSession { .. }
-        | AppAction::HarnessResumeSession { .. } => None,
+        | AppAction::HarnessResumeSession { .. }
+        | AppAction::HarnessExportContextPack { .. } => None,
     }
 }
 
@@ -9087,6 +9323,130 @@ fn project_harness_inventory_managed_session(
             generation: address.generation,
         }),
         last_error: None,
+    })
+}
+
+/// Narrows a light-shaped `OpaqueHostPath` (Windows/Unix filesystem path --
+/// may carry the non-UTF-8 `unix-bytes` representation) into the harness
+/// operator wire's `HarnessHostPathV1` (UTF-8 only), the same narrowing
+/// `gate4agent-harness-service`'s `repository_path_from_api` already applies
+/// to repository-relative paths on this same wire.
+fn harness_host_path(path: OpaqueHostPath) -> Result<HarnessHostPathV1, String> {
+    let text = path.as_utf8()
+        .ok_or_else(|| "host path is not representable as UTF-8".to_owned())?;
+    HarnessHostPathV1::new(text).map_err(|error| error.to_string())
+}
+
+/// Reverse of `harness_host_path`: every harness host path is already
+/// UTF-8-bounded, so this never fails the way `OpaqueHostPath::utf8` could
+/// for an arbitrary caller-supplied string -- kept fallible only to mirror
+/// `OpaqueHostPath::utf8`'s own signature at the one call site
+/// (`project_harness_host_directory_listing`) that walks a whole page of
+/// them.
+fn opaque_host_path_from_harness(path: HarnessHostPathV1) -> Result<OpaqueHostPath, String> {
+    OpaqueHostPath::utf8(path.as_str().to_owned()).map_err(|error| error.to_string())
+}
+
+/// `BrowseHostDirectories`'s reply, projected back into the light-shaped
+/// `HostDirectoryListing` `App::apply_host_directories` already consumes --
+/// see the doc comment on the resource-mutation match arms above for why
+/// this reuses that mode-agnostic apply path rather than a Harness-only one.
+fn project_harness_host_directory_listing(
+    listing: HarnessHostDirectoryListingV1,
+) -> Result<HostDirectoryListing, String> {
+    Ok(HostDirectoryListing {
+        directory: listing.directory.map(opaque_host_path_from_harness).transpose()?,
+        parent: listing.parent.map(opaque_host_path_from_harness).transpose()?,
+        entries: listing.entries.into_iter().map(|entry| Ok(HostDirectoryEntry {
+            path: opaque_host_path_from_harness(entry.path)?,
+            display_name: entry.display_name,
+            is_link: entry.is_link,
+        })).collect::<Result<Vec<_>, String>>()?,
+        next_after: listing.next_after.map(opaque_host_path_from_harness).transpose()?,
+        incomplete: listing.incomplete,
+    })
+}
+
+/// `RegisterWorkspace`/`CreateStandaloneWorkspace`'s reply, projected into
+/// `WorkspaceSnapshotUpdate::C2` -- the same privacy-thinned shape the
+/// light-mode C2 relay already carries this data in (see that enum's own
+/// doc comment). `sessions`/`managed_worktree_profiles` are always empty/
+/// `None`: the harness wire's `HarnessWorkspaceSnapshotV1` deliberately drops
+/// both (see that type's own doc comment in `gate4agent-harness-api`), and
+/// the roster-affecting mutation that produced this snapshot already
+/// invalidated the runtime inventory server-side, so the sidebar converges
+/// on the real session list through that route instead.
+fn project_harness_workspace_snapshot(
+    snapshot: HarnessWorkspaceSnapshotV1,
+) -> Result<WorkspaceSnapshotUpdate, String> {
+    Ok(WorkspaceSnapshotUpdate::C2(C2WorkspaceSnapshot {
+        workspace_id: WorkspaceId::new(snapshot.workspace_id)
+            .map_err(|error| error.to_string())?,
+        canonical_root: opaque_host_path_from_harness(snapshot.canonical_root)?,
+        sessions: Vec::new(),
+        worktree_service_mode: snapshot.worktree_service_mode.map(|mode| match mode {
+            HarnessWorktreeServiceModeV1::Manual => WorktreeServiceMode::Manual,
+            HarnessWorktreeServiceModeV1::Managed => WorktreeServiceMode::Managed,
+            HarnessWorktreeServiceModeV1::Off => WorktreeServiceMode::Off,
+        }),
+        managed_worktree_profiles: None,
+    }))
+}
+
+/// Sync counterpart of the async `publish_workspace_registered` above (the
+/// light-mode C2 worker's own helper): `harness_operator_worker` runs inside
+/// `tokio::task::spawn_blocking` and drives `updates` with `blocking_send`
+/// throughout, never `.await`, so it cannot call that `async fn` directly.
+/// Sends the identical `WorkerUpdate` pair in the identical order.
+fn publish_harness_workspace_registered(
+    updates: &mpsc::Sender<WorkerUpdate>,
+    node_id: &str,
+    workspace: WorkspaceSnapshotUpdate,
+) {
+    let workspace_id = match &workspace {
+        WorkspaceSnapshotUpdate::Direct(workspace) => workspace.workspace_id.to_string(),
+        WorkspaceSnapshotUpdate::C2(workspace) => workspace.workspace_id.to_string(),
+    };
+    let _ = updates.blocking_send(WorkerUpdate::WorkspaceUpserted {
+        node_id: node_id.to_owned(),
+        workspace,
+    });
+    let _ = updates.blocking_send(WorkerUpdate::SelectWorkspace {
+        node_id: node_id.to_owned(),
+        workspace_id,
+    });
+}
+
+/// `ExportContextPack`'s reply, projected back into the light-shaped
+/// `ResolvedContextPackReceipt` `WorkerUpdate::ContextExported`/
+/// `App::apply_context_exported` already consume -- the harness-service-side
+/// mirror of this exact conversion is `harness_context_to_node` in
+/// `gate4agent-harness-service`'s `c2.rs`; this is the TUI's own copy across
+/// the crate boundary, same field-for-field shape.
+fn project_harness_context_pack_receipt(
+    context: HarnessResolvedContextPackReceiptV1,
+) -> Result<ResolvedContextPackReceipt, String> {
+    Ok(ResolvedContextPackReceipt {
+        id: SpawnContextId::new(context.id.as_str()).map_err(|error| error.to_string())?,
+        digest: SpawnContextDigest::new(context.digest.as_str()).map_err(|error| error.to_string())?,
+        lineage: ContextPackLineageReceipt {
+            source_node_id: NodeId::new(context.lineage.source_node_id.as_str())
+                .map_err(|error| error.to_string())?,
+            source_session: WireSessionAddress {
+                workspace_id: WorkspaceId::new(context.lineage.source_workspace_id.as_str())
+                    .map_err(|error| error.to_string())?,
+                session: SessionKey {
+                    instance_id: AgentInstanceId(context.lineage.source_instance_id),
+                    generation: SessionGeneration(context.lineage.source_generation),
+                },
+            },
+            source_provider: AgentId::new(context.lineage.source_provider.as_str())
+                .map_err(|error| error.to_string())?,
+        },
+        source_message_count: context.source_message_count,
+        retained_message_count: context.retained_message_count,
+        byte_len: context.byte_len,
+        truncated: context.truncated,
     })
 }
 
@@ -12274,20 +12634,28 @@ mod tests {
             (HARNESS_DETAIL_COMMAND_ROUTE.to_owned(), detail_tx),
         ]);
 
-        // `UnregisterWorkspace` has neither a Harness route nor a specific
-        // reject handler (unlike `WriteWorkspaceFile`/`CreateWorkspace*`,
-        // covered by `harness_only_backend_clears_optimistic_write_state_instead_of_hanging`
-        // below): the generic fallback notice is the only feedback.
-        // `InspectWorkspace` and siblings are covered by
-        // `harness_only_backend_routes_sidebar_workspace_reads_to_the_detail_lane`,
-        // now that the dispatch layer rewrites them.
+        // After the management-verb family landed, every routable node
+        // action has a typed harness path — the only remaining rejects are
+        // the deliberately dead actions with their own precise messages.
+        // `SpawnManagedWorktree` is that case: a full SpawnSpec construction
+        // the operator wire does not expose outside a Task.
         send_action(
             &mut app,
             &commands,
             &BTreeMap::new(),
-            AppAction::UnregisterWorkspace {
+            AppAction::SpawnManagedWorktree {
                 node_id: "node-a".to_owned(),
                 workspace_id: "workspace-a".to_owned(),
+                provider: "claude".parse().unwrap(),
+                rows: 24,
+                cols: 80,
+                profile_id: "profile-a".to_owned(),
+                profile_revision: "r1".to_owned(),
+                worktree_profile_id: "worktree-a".to_owned(),
+                prompt: None,
+                bundle_id: None,
+                context_id: None,
+                idempotency_key: "idem-a".to_owned(),
             },
         );
 
@@ -12305,7 +12673,11 @@ mod tests {
         ));
         assert_eq!(
             app.notice.as_deref(),
-            Some("Harness-owned session action unavailable: no typed Harness intent exists"),
+            Some(
+                "Harness-owned session action unavailable: SpawnManagedWorktree has no typed \
+                 harness-operator verb -- it requires a full SpawnSpec construction (profile/\
+                 bundle/context resolution) this wire does not expose outside a Task"
+            ),
         );
     }
 

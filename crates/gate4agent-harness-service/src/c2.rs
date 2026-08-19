@@ -2,15 +2,17 @@ use gate4agent_c2_client::{
     connect_local, C2ControlError, C2ControlHandle, C2EventReceiver, C2PendingRequest,
 };
 use gate4agent_c2_protocol::{
-    C2ManagedSessionRecord, C2NodeEventEnvelope, C2NodeResponse, C2NodeSnapshot,
-    C2ObservationSupport, C2Topology, C2WorkspaceInspection, NodeRoute,
-    NodeTransportState, RoutedNodeEvent,
+    C2GitWorktreeSnapshot, C2ManagedSessionRecord, C2NodeEventEnvelope, C2NodeResponse,
+    C2NodeSnapshot, C2ObservationSupport, C2Topology, C2WorkspaceInspection, C2WorkspaceSnapshot,
+    NodeRoute, NodeTransportState, RoutedNodeEvent,
 };
 use gate4agent_harness_delivery::CompiledDeliveryBundleV2;
 use gate4agent_harness_api::{
     HarnessGitCommitSummaryV1, HarnessGitCommitV1, HarnessGitDiffModeV1,
     HarnessGitObjectIdV1, HarnessGitSignatureStatusV1, HarnessGitStatusCodeV1,
     HarnessGitStatusEntryV1, HarnessGitSummaryV1, HarnessNodeIncarnationV1,
+    HarnessGitWorktreeSnapshotV1, HarnessHostDirectoryEntryV1, HarnessHostDirectoryListingV1,
+    HarnessHostPathV1, HarnessWorkspaceSnapshotV1, HarnessWorktreeServiceModeV1,
     HarnessNativeSessionCatalogEntryV1, HarnessNativeSessionCatalogPageV1,
     HarnessNativeSessionCatalogScopeV1, HarnessNativeSessionCatalogSummaryV1,
     HarnessNativeSessionCatalogWindowV1, HarnessNativeSessionExternalGroupKindV1,
@@ -36,6 +38,7 @@ use gate4agent_harness_api::{
     HarnessWorkspaceTreeEntryV1, HARNESS_GIT_COMMIT_PARENTS_MAX,
     HARNESS_GIT_DIFF_MAX_BYTES, HARNESS_GIT_HISTORY_LIMIT_MAX,
     HARNESS_GIT_RECENT_COMMITS_MAX, HARNESS_GIT_STATUS_ENTRIES_MAX,
+    HARNESS_HOST_DIRECTORY_ENTRIES_MAX,
     HARNESS_SESSION_RECORD_DISPLAY_NAME_MAX_BYTES,
     HARNESS_WORKSPACE_FILE_MAX_BYTES, HARNESS_WORKSPACE_TREE_ENTRIES_MAX,
 };
@@ -50,8 +53,10 @@ use gate4agent_node_protocol::{
     ResolvedHarnessMcpProxyReceiptV1,
     ResolvedSpawnReceipt, ResolvedSpawnSpec,
     GitDiff, GitDiffMode, GitDiffRequest, GitHistoryPage, GitObjectId,
-    GitSignatureStatus, RepositoryPath, WorkspaceEntryKind, WorkspaceFileContent,
-    WorkspaceFileRead, WorkspaceFileRevision,
+    GitSignatureStatus, HostDirectoryListing, OpaqueHostPath, RepositoryPath,
+    SpawnContextId,
+    WorkspaceEntryKind, WorkspaceFileContent,
+    WorkspaceFileRead, WorkspaceFileRevision, WorktreeServiceMode,
     SessionAddress, SessionKey, SessionMode,
     SessionRecordId, SpawnFieldProvenance, SpawnDeadlineMs, SpawnIdempotencyKey,
     SpawnOverride, SpawnOverrides, SpawnProfileRevision,
@@ -82,6 +87,12 @@ const RUN_READ_TIMEOUT_FLOOR: Duration = Duration::from_secs(4);
 // its own floor rather than reusing `RUN_READ_TIMEOUT_FLOOR`'s much shorter
 // one.
 const SESSION_RECORD_MUTATION_TIMEOUT_FLOOR: Duration = Duration::from_secs(24);
+// Same proportion of `HOST_RESOURCE_MUTATION_RESPONSE_DEADLINE` (`runtime.rs`)
+// that `SESSION_RECORD_MUTATION_TIMEOUT_FLOOR` is of its own outer deadline:
+// `CreateWorktree`/`RemoveWorktree` shell out to git (comparable cost to a
+// fresh process spawn), so this family gets the same floor class rather than
+// `RUN_READ_TIMEOUT_FLOOR`'s much shorter one.
+const RESOURCE_MUTATION_TIMEOUT_FLOOR: Duration = Duration::from_secs(24);
 const RUN_CONTEXT_SOURCE_C2_DEADLINE: Duration = Duration::from_secs(10);
 const RUN_CONTEXT_SOURCE_MESSAGE_LIMIT: u16 = 1;
 // Matches the light TUI's own direct `spawn_spec()` (client.rs) node-local
@@ -633,6 +644,45 @@ impl HarnessC2Adapter {
         let pending = self.control.start_request(prepared.route.clone(), wire_request)
             .map_err(HarnessC2Error::SessionRecordMutationEnqueue)?;
         Ok(PendingSessionRecordMutation {
+            prepared,
+            started_at: Instant::now(),
+            pending: Some(pending),
+        })
+    }
+
+    /// Node-scoped sibling of `start_prepared_node_workspace_read`: the
+    /// folder-browser dialog's host-directory listing, resolved live via
+    /// `exact_route` the same way -- see `PreparedHostDirectoryBrowse`'s own
+    /// doc comment for why this rides its own bounded pool rather than that
+    /// family's.
+    pub(crate) fn start_prepared_host_directory_browse(
+        &self,
+        prepared: PreparedHostDirectoryBrowse,
+    ) -> Result<PendingHostDirectoryBrowse, HarnessC2Error> {
+        self.ensure_current_incarnation(&prepared.route)?;
+        let wire_request = prepared.wire_request();
+        let pending = self.control.start_request(prepared.route.clone(), wire_request)
+            .map_err(HarnessC2Error::HostDirectoryBrowseEnqueue)?;
+        Ok(PendingHostDirectoryBrowse {
+            prepared,
+            started_at: Instant::now(),
+            pending: Some(pending),
+        })
+    }
+
+    /// Mutation-family sibling of `start_prepared_session_record_mutation`:
+    /// same live route resolution and enqueue shape, feeding
+    /// `PendingResourceMutation` instead -- see `ResourceMutationKind`'s doc
+    /// comment for the seven verbs this covers.
+    pub(crate) fn start_prepared_resource_mutation(
+        &self,
+        prepared: PreparedResourceMutation,
+    ) -> Result<PendingResourceMutation, HarnessC2Error> {
+        self.ensure_current_incarnation(&prepared.route)?;
+        let wire_request = prepared.wire_request();
+        let pending = self.control.start_request(prepared.route.clone(), wire_request)
+            .map_err(HarnessC2Error::ResourceMutationEnqueue)?;
+        Ok(PendingResourceMutation {
             prepared,
             started_at: Instant::now(),
             pending: Some(pending),
@@ -3072,6 +3122,464 @@ fn project_c2_managed_session(
     })
 }
 
+/// Sealed authority for one `BrowseHostDirectories` page, routed directly
+/// from a node id via `exact_route` -- no workspace pairing at all, unlike
+/// `PreparedNodeWorkspaceRead`: the node's own `NodeRequest::
+/// BrowseHostDirectories` targets the host filesystem, not a registered
+/// workspace, so `WorkspaceReadKind`'s "what to read from a fixed
+/// `workspace_id`" shape genuinely does not fit here. Own bounded worker
+/// pool (`is_host_directory_browse_request` in `runtime.rs`), for the same
+/// traffic-isolation reason every other family on this wire gets one: a
+/// burst of folder-browser paging must never be able to starve a concurrent
+/// sidebar Files/Git read, or vice versa.
+pub(crate) struct PreparedHostDirectoryBrowse {
+    route: NodeRoute,
+    directory: Option<OpaqueHostPath>,
+    after: Option<OpaqueHostPath>,
+}
+
+impl PreparedHostDirectoryBrowse {
+    pub(crate) fn from_operator_request(
+        adapter: &HarnessC2Adapter,
+        request: HarnessOperatorRequestV1,
+    ) -> Result<Self, HarnessC2Error> {
+        request.validate().map_err(|_| HarnessC2Error::InvalidHostDirectoryBrowseRequest)?;
+        let HarnessOperatorRequestV1::BrowseHostDirectories { node_id, directory, after } = request
+        else {
+            return Err(HarnessC2Error::InvalidHostDirectoryBrowseRequest);
+        };
+        let node_id = NodeId::new(node_id)
+            .map_err(|_| HarnessC2Error::InvalidHostDirectoryBrowseRequest)?;
+        let route = adapter.exact_route(&node_id)?;
+        Ok(Self {
+            route,
+            directory: directory.map(|value| OpaqueHostPath::utf8(value.as_str().to_owned()))
+                .transpose()
+                .map_err(|_| HarnessC2Error::InvalidHostDirectoryBrowseRequest)?,
+            after: after.map(|value| OpaqueHostPath::utf8(value.as_str().to_owned()))
+                .transpose()
+                .map_err(|_| HarnessC2Error::InvalidHostDirectoryBrowseRequest)?,
+        })
+    }
+
+    fn wire_request(&self) -> NodeRequest {
+        NodeRequest::BrowseHostDirectories {
+            directory: self.directory.clone(),
+            after: self.after.clone(),
+        }
+    }
+}
+
+pub(crate) struct PendingHostDirectoryBrowse {
+    prepared: PreparedHostDirectoryBrowse,
+    started_at: Instant,
+    pending: Option<C2PendingRequest>,
+}
+
+impl PendingHostDirectoryBrowse {
+    pub(crate) async fn finish(mut self) -> Result<HarnessOperatorResponseV1, HarnessC2Error> {
+        let pending = self.pending.take()
+            .expect("pending host directory browse owns exactly one C2 waiter");
+        match pending.finish().await {
+            Err(C2ControlError::Closed)
+                if self.started_at.elapsed() >= RUN_READ_TIMEOUT_FLOOR => {
+                    Err(HarnessC2Error::HostDirectoryBrowseDeadline)
+                }
+            Err(error) => Err(HarnessC2Error::HostDirectoryBrowseTransport(error)),
+            Ok(routed) if routed.node_id != self.prepared.route.node_id
+                || routed.incarnation_id != self.prepared.route.expected_incarnation_id =>
+            {
+                Err(HarnessC2Error::HostDirectoryBrowseRouteMismatch)
+            }
+            Ok(routed) => match routed.response {
+                Err(failure) => Err(HarnessC2Error::HostDirectoryBrowseRejected { code: failure.code }),
+                Ok(C2NodeResponse::HostDirectoriesBrowsed { listing }) => {
+                    let response = HarnessOperatorResponseV1::HostDirectoriesBrowsed(
+                        project_host_directory_listing(listing)?,
+                    );
+                    response.validate()
+                        .map_err(|_| HarnessC2Error::HostDirectoryBrowseProjection)?;
+                    Ok(response)
+                }
+                Ok(_) => Err(HarnessC2Error::HostDirectoryBrowseCorrelationMismatch),
+            },
+        }
+    }
+}
+
+fn project_host_path(path: &OpaqueHostPath) -> Result<HarnessHostPathV1, HarnessC2Error> {
+    let text = path.as_utf8().ok_or(HarnessC2Error::ResourceMutationProjection)?;
+    HarnessHostPathV1::new(text).map_err(|_| HarnessC2Error::ResourceMutationProjection)
+}
+
+fn project_host_directory_listing(
+    listing: HostDirectoryListing,
+) -> Result<HarnessHostDirectoryListingV1, HarnessC2Error> {
+    if listing.entries.len() > HARNESS_HOST_DIRECTORY_ENTRIES_MAX {
+        return Err(HarnessC2Error::HostDirectoryBrowseProjection);
+    }
+    Ok(HarnessHostDirectoryListingV1 {
+        directory: listing.directory.as_ref().map(project_host_path).transpose()
+            .map_err(|_| HarnessC2Error::HostDirectoryBrowseProjection)?,
+        parent: listing.parent.as_ref().map(project_host_path).transpose()
+            .map_err(|_| HarnessC2Error::HostDirectoryBrowseProjection)?,
+        entries: listing.entries.into_iter().map(|entry| Ok(HarnessHostDirectoryEntryV1 {
+            path: project_host_path(&entry.path)
+                .map_err(|_| HarnessC2Error::HostDirectoryBrowseProjection)?,
+            display_name: entry.display_name,
+            is_link: entry.is_link,
+        })).collect::<Result<Vec<_>, HarnessC2Error>>()?,
+        next_after: listing.next_after.as_ref().map(project_host_path).transpose()
+            .map_err(|_| HarnessC2Error::HostDirectoryBrowseProjection)?,
+        incomplete: listing.incomplete,
+    })
+}
+
+/// What to mutate in the node's workspace/worktree/context-pack surface,
+/// routed directly from a node id -- the resource-lifecycle sibling of
+/// `SessionRecordMutationKind` (six heterogeneous verbs, one bounded pool,
+/// each with its own distinct correlated reply, the same shape this enum
+/// follows). Workspace/worktree lifecycle (`RegisterWorkspace`..
+/// `RemoveWorktree`) and context-pack export/forget (`ExportContextPack`/
+/// `ForgetContextPack`) are both occasional, deliberate operator actions --
+/// distinct from live-session keystroke/resize traffic (`SessionControlKind`)
+/// or the managed-session-record family's own traffic -- so they share one
+/// bounded pool with each other, not with either of those. Unlike
+/// `WorkspaceReadKind`/`WorkspaceWriteKind` (both scoped to one fixed
+/// `workspace_id` the `Prepared*` struct carries once), every variant here
+/// carries its own workspace/session/context identity inline: there is no
+/// single workspace or session this whole family is "about".
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ResourceMutationKind {
+    RegisterWorkspace { workspace_id: WorkspaceId, root: OpaqueHostPath },
+    UnregisterWorkspace { workspace_id: WorkspaceId },
+    CreateStandaloneWorkspace {
+        workspace_id: WorkspaceId,
+        root: OpaqueHostPath,
+        initial_branch: Option<String>,
+    },
+    CreateWorktree {
+        source_workspace_id: WorkspaceId,
+        workspace_id: WorkspaceId,
+        target_root: OpaqueHostPath,
+        branch: String,
+        base: Option<String>,
+    },
+    RemoveWorktree { source_workspace_id: WorkspaceId, target_root: OpaqueHostPath },
+    ExportContextPack { session: SessionAddress },
+    ForgetContextPack { context_id: SpawnContextId },
+}
+
+impl ResourceMutationKind {
+    /// Workspace register/unregister/create-standalone and worktree
+    /// create/remove all mutate the node's `workspaces` map, which the
+    /// runtime inventory's own roster caches (`HarnessRuntimeInventoryV1::
+    /// workspaces`) -- unconditionally invalidated on success the same way
+    /// `HostCommand::SessionRecordMutationFinished` unconditionally
+    /// invalidates for all six of its own verbs, rather than special-casing
+    /// exactly which of these five actually changed the map (e.g.
+    /// `RemoveWorktree` only unregisters a workspace when the node's
+    /// `WorktreeRemoved` reply carries one back -- cheaper to always refetch
+    /// than to thread that per-response distinction back through here).
+    /// `ExportContextPack`/`ForgetContextPack` touch the node's context-pack
+    /// store only -- no `workspaces` or `managed_sessions` roster effect at
+    /// all -- so those two stay `false`.
+    fn invalidates_runtime_inventory(&self) -> bool {
+        match self {
+            Self::RegisterWorkspace { .. }
+            | Self::UnregisterWorkspace { .. }
+            | Self::CreateStandaloneWorkspace { .. }
+            | Self::CreateWorktree { .. }
+            | Self::RemoveWorktree { .. } => true,
+            Self::ExportContextPack { .. } | Self::ForgetContextPack { .. } => false,
+        }
+    }
+}
+
+pub(crate) struct PreparedResourceMutation {
+    route: NodeRoute,
+    kind: ResourceMutationKind,
+}
+
+impl PreparedResourceMutation {
+    pub(crate) fn from_operator_request(
+        adapter: &HarnessC2Adapter,
+        request: HarnessOperatorRequestV1,
+    ) -> Result<Self, HarnessC2Error> {
+        request.validate().map_err(|_| HarnessC2Error::InvalidResourceMutationRequest)?;
+        // `ExportContextPack` is session-address-scoped (route + incarnation
+        // check derived from `session`, mirroring `PreparedSessionControl`'s
+        // own pattern exactly), unlike the other six bare-`node_id`-scoped
+        // verbs below -- it builds and returns `Self` directly rather than
+        // funnelling through the shared `(node_id, kind)` tail.
+        if let HarnessOperatorRequestV1::ExportContextPack { session } = request {
+            let node_id = NodeId::new(session.node_id.clone())
+                .map_err(|_| HarnessC2Error::InvalidResourceMutationRequest)?;
+            let workspace_id = WorkspaceId::new(session.workspace_id.as_str())
+                .map_err(|_| HarnessC2Error::InvalidResourceMutationRequest)?;
+            let incarnation_id: NodeIncarnationId = session.incarnation_id.parse()
+                .map_err(|_| HarnessC2Error::InvalidResourceMutationRequest)?;
+            let route = adapter.exact_route(&node_id)?;
+            if route.expected_incarnation_id != incarnation_id {
+                return Err(HarnessC2Error::IncarnationChanged { node_id: route.node_id.clone() });
+            }
+            let address = SessionAddress {
+                workspace_id,
+                session: SessionKey {
+                    instance_id: AgentInstanceId(session.instance_id),
+                    generation: SessionGeneration(session.generation),
+                },
+            };
+            return Ok(Self { route, kind: ResourceMutationKind::ExportContextPack { session: address } });
+        }
+        let (node_id, kind) = match request {
+            HarnessOperatorRequestV1::RegisterWorkspace { node_id, workspace_id, root } => (
+                node_id,
+                ResourceMutationKind::RegisterWorkspace {
+                    workspace_id: WorkspaceId::new(workspace_id)
+                        .map_err(|_| HarnessC2Error::InvalidResourceMutationRequest)?,
+                    root: OpaqueHostPath::utf8(root.as_str().to_owned())
+                        .map_err(|_| HarnessC2Error::InvalidResourceMutationRequest)?,
+                },
+            ),
+            HarnessOperatorRequestV1::UnregisterWorkspace { node_id, workspace_id } => (
+                node_id,
+                ResourceMutationKind::UnregisterWorkspace {
+                    workspace_id: WorkspaceId::new(workspace_id)
+                        .map_err(|_| HarnessC2Error::InvalidResourceMutationRequest)?,
+                },
+            ),
+            HarnessOperatorRequestV1::CreateStandaloneWorkspace {
+                node_id, workspace_id, root, initial_branch,
+            } => (
+                node_id,
+                ResourceMutationKind::CreateStandaloneWorkspace {
+                    workspace_id: WorkspaceId::new(workspace_id)
+                        .map_err(|_| HarnessC2Error::InvalidResourceMutationRequest)?,
+                    root: OpaqueHostPath::utf8(root.as_str().to_owned())
+                        .map_err(|_| HarnessC2Error::InvalidResourceMutationRequest)?,
+                    initial_branch,
+                },
+            ),
+            HarnessOperatorRequestV1::CreateWorktree {
+                node_id, source_workspace_id, workspace_id, target_root, branch, base,
+            } => (
+                node_id,
+                ResourceMutationKind::CreateWorktree {
+                    source_workspace_id: WorkspaceId::new(source_workspace_id)
+                        .map_err(|_| HarnessC2Error::InvalidResourceMutationRequest)?,
+                    workspace_id: WorkspaceId::new(workspace_id)
+                        .map_err(|_| HarnessC2Error::InvalidResourceMutationRequest)?,
+                    target_root: OpaqueHostPath::utf8(target_root.as_str().to_owned())
+                        .map_err(|_| HarnessC2Error::InvalidResourceMutationRequest)?,
+                    branch,
+                    base,
+                },
+            ),
+            HarnessOperatorRequestV1::RemoveWorktree { node_id, source_workspace_id, target_root } => (
+                node_id,
+                ResourceMutationKind::RemoveWorktree {
+                    source_workspace_id: WorkspaceId::new(source_workspace_id)
+                        .map_err(|_| HarnessC2Error::InvalidResourceMutationRequest)?,
+                    target_root: OpaqueHostPath::utf8(target_root.as_str().to_owned())
+                        .map_err(|_| HarnessC2Error::InvalidResourceMutationRequest)?,
+                },
+            ),
+            HarnessOperatorRequestV1::ForgetContextPack { node_id, context_id } => (
+                node_id,
+                ResourceMutationKind::ForgetContextPack {
+                    context_id: SpawnContextId::new(context_id.as_str())
+                        .map_err(|_| HarnessC2Error::InvalidResourceMutationRequest)?,
+                },
+            ),
+            _ => return Err(HarnessC2Error::InvalidResourceMutationRequest),
+        };
+        let node_id = NodeId::new(node_id)
+            .map_err(|_| HarnessC2Error::InvalidResourceMutationRequest)?;
+        let route = adapter.exact_route(&node_id)?;
+        Ok(Self { route, kind })
+    }
+
+    pub(crate) fn route(&self) -> &NodeRoute { &self.route }
+
+    pub(crate) fn invalidates_runtime_inventory(&self) -> bool {
+        self.kind.invalidates_runtime_inventory()
+    }
+
+    fn wire_request(&self) -> NodeRequest {
+        match &self.kind {
+            ResourceMutationKind::RegisterWorkspace { workspace_id, root } => {
+                NodeRequest::RegisterWorkspace {
+                    workspace_id: workspace_id.clone(),
+                    root: root.clone(),
+                }
+            }
+            ResourceMutationKind::UnregisterWorkspace { workspace_id } => {
+                NodeRequest::UnregisterWorkspace { workspace_id: workspace_id.clone() }
+            }
+            ResourceMutationKind::CreateStandaloneWorkspace { workspace_id, root, initial_branch } => {
+                NodeRequest::CreateStandaloneWorkspace {
+                    workspace_id: workspace_id.clone(),
+                    root: root.clone(),
+                    initial_branch: initial_branch.clone(),
+                }
+            }
+            ResourceMutationKind::CreateWorktree {
+                source_workspace_id, workspace_id, target_root, branch, base,
+            } => NodeRequest::CreateWorktree {
+                source_workspace_id: source_workspace_id.clone(),
+                workspace_id: workspace_id.clone(),
+                target_root: target_root.clone(),
+                branch: branch.clone(),
+                base: base.clone(),
+            },
+            ResourceMutationKind::RemoveWorktree { source_workspace_id, target_root } => {
+                NodeRequest::RemoveWorktree {
+                    source_workspace_id: source_workspace_id.clone(),
+                    target_root: target_root.clone(),
+                }
+            }
+            ResourceMutationKind::ExportContextPack { session } => {
+                NodeRequest::ExportContextPack { session: session.clone() }
+            }
+            ResourceMutationKind::ForgetContextPack { context_id } => {
+                NodeRequest::ForgetContextPack { context_id: context_id.clone() }
+            }
+        }
+    }
+}
+
+pub(crate) struct PendingResourceMutation {
+    prepared: PreparedResourceMutation,
+    started_at: Instant,
+    pending: Option<C2PendingRequest>,
+}
+
+impl PendingResourceMutation {
+    pub(crate) fn route(&self) -> &NodeRoute { self.prepared.route() }
+
+    pub(crate) fn invalidates_runtime_inventory(&self) -> bool {
+        self.prepared.invalidates_runtime_inventory()
+    }
+
+    pub(crate) async fn finish(mut self) -> Result<HarnessOperatorResponseV1, HarnessC2Error> {
+        let pending = self.pending.take()
+            .expect("pending resource mutation owns exactly one C2 waiter");
+        match pending.finish().await {
+            Err(C2ControlError::Closed)
+                if self.started_at.elapsed() >= RESOURCE_MUTATION_TIMEOUT_FLOOR => {
+                    Err(HarnessC2Error::ResourceMutationDeadline)
+                }
+            Err(error) => Err(HarnessC2Error::ResourceMutationTransport(error)),
+            Ok(routed) if routed.node_id != self.prepared.route.node_id
+                || routed.incarnation_id != self.prepared.route.expected_incarnation_id =>
+            {
+                Err(HarnessC2Error::ResourceMutationRouteMismatch)
+            }
+            Ok(routed) => match routed.response {
+                Err(failure) => Err(HarnessC2Error::ResourceMutationRejected { code: failure.code }),
+                Ok(response) => correlate_resource_mutation_response(&self.prepared, response),
+            },
+        }
+    }
+}
+
+fn project_workspace_snapshot(
+    workspace: C2WorkspaceSnapshot,
+) -> Result<HarnessWorkspaceSnapshotV1, HarnessC2Error> {
+    Ok(HarnessWorkspaceSnapshotV1 {
+        workspace_id: workspace.workspace_id.as_str().to_owned(),
+        canonical_root: project_host_path(&workspace.canonical_root)
+            .map_err(|_| HarnessC2Error::ResourceMutationProjection)?,
+        worktree_service_mode: workspace.worktree_service_mode.map(|mode| match mode {
+            WorktreeServiceMode::Manual => HarnessWorktreeServiceModeV1::Manual,
+            WorktreeServiceMode::Managed => HarnessWorktreeServiceModeV1::Managed,
+            WorktreeServiceMode::Off => HarnessWorktreeServiceModeV1::Off,
+        }),
+    })
+}
+
+fn project_git_worktree_snapshot(
+    worktree: C2GitWorktreeSnapshot,
+) -> Result<HarnessGitWorktreeSnapshotV1, HarnessC2Error> {
+    Ok(HarnessGitWorktreeSnapshotV1 {
+        path: project_host_path(&worktree.path)
+            .map_err(|_| HarnessC2Error::ResourceMutationProjection)?,
+        head: worktree.head,
+        branch: worktree.branch,
+        is_bare: worktree.is_bare,
+        is_main: worktree.is_main,
+        locked: worktree.locked,
+        prunable: worktree.prunable,
+        workspace_id: worktree.workspace_id.map(|id| id.as_str().to_owned()),
+    })
+}
+
+fn correlate_resource_mutation_response(
+    prepared: &PreparedResourceMutation,
+    response: C2NodeResponse,
+) -> Result<HarnessOperatorResponseV1, HarnessC2Error> {
+    let response = match (&prepared.kind, response) {
+        (
+            ResourceMutationKind::RegisterWorkspace { workspace_id, .. },
+            C2NodeResponse::WorkspaceRegistered { workspace },
+        ) if &workspace.workspace_id == workspace_id => {
+            HarnessOperatorResponseV1::WorkspaceRegistered(project_workspace_snapshot(workspace)?)
+        }
+        (
+            ResourceMutationKind::UnregisterWorkspace { workspace_id },
+            C2NodeResponse::WorkspaceUnregistered { workspace_id: echoed },
+        ) if &echoed == workspace_id => {
+            HarnessOperatorResponseV1::WorkspaceUnregistered {
+                workspace_id: echoed.as_str().to_owned(),
+            }
+        }
+        (
+            ResourceMutationKind::CreateStandaloneWorkspace { workspace_id, .. },
+            C2NodeResponse::StandaloneWorkspaceCreated { workspace },
+        ) if &workspace.workspace_id == workspace_id => {
+            HarnessOperatorResponseV1::StandaloneWorkspaceCreated(project_workspace_snapshot(workspace)?)
+        }
+        (
+            ResourceMutationKind::CreateWorktree { workspace_id, .. },
+            C2NodeResponse::WorktreeCreated { worktree, workspace },
+        ) if &workspace.workspace_id == workspace_id => {
+            HarnessOperatorResponseV1::WorktreeCreated {
+                worktree: project_git_worktree_snapshot(worktree)?,
+                workspace: project_workspace_snapshot(workspace)?,
+            }
+        }
+        (
+            ResourceMutationKind::RemoveWorktree { target_root, .. },
+            C2NodeResponse::WorktreeRemoved { target_root: echoed, workspace_id },
+        ) if &echoed == target_root => {
+            HarnessOperatorResponseV1::WorktreeRemoved {
+                target_root: project_host_path(&echoed)
+                    .map_err(|_| HarnessC2Error::ResourceMutationProjection)?,
+                workspace_id: workspace_id.map(|id| id.as_str().to_owned()),
+            }
+        }
+        (
+            ResourceMutationKind::ExportContextPack { session },
+            C2NodeResponse::ContextPackExported { context },
+        ) if &context.lineage.source_session == session => {
+            HarnessOperatorResponseV1::ContextPackExported(
+                crate::context_receipt_from_node(&context)
+                    .map_err(|_| HarnessC2Error::ResourceMutationProjection)?,
+            )
+        }
+        (
+            ResourceMutationKind::ForgetContextPack { context_id },
+            C2NodeResponse::ContextPackForgotten { context_id: echoed },
+        ) if &echoed == context_id => {
+            HarnessOperatorResponseV1::ContextPackForgotten { context_id: echoed.as_str().to_owned() }
+        }
+        _ => return Err(HarnessC2Error::ResourceMutationCorrelationMismatch),
+    };
+    response.validate().map_err(|_| HarnessC2Error::ResourceMutationProjection)?;
+    Ok(response)
+}
+
 fn node_workspace_read_response_route_matches(
     prepared: &PreparedNodeWorkspaceRead,
     node_id: &NodeId,
@@ -5443,6 +5951,42 @@ pub enum HarnessC2Error {
     SessionRecordMutationProjection,
     #[error("Node rejected the session record mutation request with {code:?}")]
     SessionRecordMutationRejected { code: NodeFailureCode },
+    #[error("host directory browse request is invalid")]
+    InvalidHostDirectoryBrowseRequest,
+    #[error("host directory browse was not enqueued: {0}")]
+    HostDirectoryBrowseEnqueue(C2ControlError),
+    #[error("host directory browse transport failed: {0}")]
+    HostDirectoryBrowseTransport(C2ControlError),
+    #[error("host directory browse deadline elapsed")]
+    HostDirectoryBrowseDeadline,
+    #[error("host directory browse was cancelled after the harness operator connection's own deadline fired first")]
+    HostDirectoryBrowseCancelled,
+    #[error("host directory browse response route or incarnation does not match")]
+    HostDirectoryBrowseRouteMismatch,
+    #[error("host directory browse response does not exactly correlate with the request")]
+    HostDirectoryBrowseCorrelationMismatch,
+    #[error("host directory browse response cannot be projected into the bounded harness API")]
+    HostDirectoryBrowseProjection,
+    #[error("Node rejected host directory browse with {code:?}")]
+    HostDirectoryBrowseRejected { code: NodeFailureCode },
+    #[error("resource mutation request is invalid")]
+    InvalidResourceMutationRequest,
+    #[error("resource mutation was not enqueued: {0}")]
+    ResourceMutationEnqueue(C2ControlError),
+    #[error("resource mutation transport failed: {0}")]
+    ResourceMutationTransport(C2ControlError),
+    #[error("resource mutation deadline elapsed")]
+    ResourceMutationDeadline,
+    #[error("resource mutation was cancelled after the harness operator connection's own deadline fired first")]
+    ResourceMutationCancelled,
+    #[error("resource mutation response route or incarnation does not match")]
+    ResourceMutationRouteMismatch,
+    #[error("resource mutation response does not exactly correlate with the request")]
+    ResourceMutationCorrelationMismatch,
+    #[error("resource mutation response cannot be projected into the bounded harness API")]
+    ResourceMutationProjection,
+    #[error("Node rejected the resource mutation request with {code:?}")]
+    ResourceMutationRejected { code: NodeFailureCode },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5471,7 +6015,7 @@ mod tests {
     use super::*;
     use gate4agent_c2_protocol::C2TopologyNode;
     use gate4agent_node_protocol::{
-        CapabilityId, ContextPackLineageReceipt, NodeIncarnationId,
+        CapabilityId, ContextPackLineageReceipt, HostDirectoryEntry, NodeIncarnationId,
         ResolvedBundleReceipt, ResolvedContextPackReceipt,
         ManagedSessionState, ManagedWorktreeLeaseId, ManagedWorktreeRetention,
         OpaqueHostPath, ResolvedEnvironmentProfileReceipt,
@@ -7663,5 +8207,290 @@ mod tests {
         assert_eq!(routes[1].route().node_id.as_str(), "node-b");
         assert_eq!(routes[1].route().expected_incarnation_id, incarnation_b);
         assert_eq!(routes[1].support(), Some(support_b));
+    }
+
+    /// `PreparedResourceMutation` has no adapter-free constructor for the
+    /// same reason `node_workspace_read_fixture`'s doc comment already
+    /// explains for its own family -- this builds the struct directly to
+    /// unit-test everything downstream of route resolution: request-to-wire
+    /// relay, response correlation/projection, and roster-invalidation
+    /// truth.
+    fn resource_mutation_fixture(kind: ResourceMutationKind) -> PreparedResourceMutation {
+        PreparedResourceMutation {
+            route: NodeRoute {
+                node_id: NodeId::new("node-a").unwrap(),
+                expected_incarnation_id: NodeIncarnationId::from_bytes([7; 16]),
+            },
+            kind,
+        }
+    }
+
+    fn c2_workspace_snapshot(workspace_id: &str) -> C2WorkspaceSnapshot {
+        C2WorkspaceSnapshot {
+            workspace_id: WorkspaceId::new(workspace_id).unwrap(),
+            canonical_root: OpaqueHostPath::utf8(r"C:\fixtures\workspace".to_owned()).unwrap(),
+            sessions: Vec::new(),
+            worktree_service_mode: Some(WorktreeServiceMode::Manual),
+            managed_worktree_profiles: None,
+        }
+    }
+
+    fn c2_git_worktree_snapshot(workspace_id: Option<&str>) -> C2GitWorktreeSnapshot {
+        C2GitWorktreeSnapshot {
+            path: OpaqueHostPath::utf8(r"C:\fixtures\worktree".to_owned()).unwrap(),
+            head: "a".repeat(40),
+            branch: Some("feature/resource-mutation".to_owned()),
+            is_bare: false,
+            is_main: false,
+            locked: false,
+            prunable: false,
+            workspace_id: workspace_id.map(|id| WorkspaceId::new(id).unwrap()),
+        }
+    }
+
+    #[test]
+    fn resource_mutation_relays_the_exact_route_and_kind_to_the_wire() {
+        let register = resource_mutation_fixture(ResourceMutationKind::RegisterWorkspace {
+            workspace_id: WorkspaceId::new("workspace-b").unwrap(),
+            root: OpaqueHostPath::utf8(r"C:\fixtures\workspace-b".to_owned()).unwrap(),
+        });
+        assert!(matches!(
+            register.wire_request(),
+            NodeRequest::RegisterWorkspace { workspace_id, root }
+                if workspace_id.as_str() == "workspace-b"
+                    && root.as_utf8() == Some(r"C:\fixtures\workspace-b")
+        ));
+        assert_eq!(register.route().node_id.as_str(), "node-a");
+
+        let create_worktree = resource_mutation_fixture(ResourceMutationKind::CreateWorktree {
+            source_workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+            workspace_id: WorkspaceId::new("worktree-workspace").unwrap(),
+            target_root: OpaqueHostPath::utf8(r"C:\fixtures\worktree".to_owned()).unwrap(),
+            branch: "feature/resource-mutation".to_owned(),
+            base: Some("main".to_owned()),
+        });
+        assert!(matches!(
+            create_worktree.wire_request(),
+            NodeRequest::CreateWorktree { source_workspace_id, workspace_id, branch, base, .. }
+                if source_workspace_id.as_str() == "workspace-a"
+                    && workspace_id.as_str() == "worktree-workspace"
+                    && branch == "feature/resource-mutation"
+                    && base.as_deref() == Some("main")
+        ));
+
+        let session = SessionAddress {
+            workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+            session: SessionKey {
+                instance_id: AgentInstanceId(41),
+                generation: SessionGeneration(3),
+            },
+        };
+        let export = resource_mutation_fixture(ResourceMutationKind::ExportContextPack {
+            session: session.clone(),
+        });
+        assert!(matches!(
+            export.wire_request(),
+            NodeRequest::ExportContextPack { session: wired } if wired == session
+        ));
+
+        let forget = resource_mutation_fixture(ResourceMutationKind::ForgetContextPack {
+            context_id: SpawnContextId::new("context-a").unwrap(),
+        });
+        assert!(matches!(
+            forget.wire_request(),
+            NodeRequest::ForgetContextPack { context_id } if context_id.as_str() == "context-a"
+        ));
+    }
+
+    #[test]
+    fn resource_mutation_invalidates_runtime_inventory_only_for_workspace_worktree_kinds() {
+        let session = SessionAddress {
+            workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+            session: SessionKey {
+                instance_id: AgentInstanceId(41),
+                generation: SessionGeneration(3),
+            },
+        };
+        let invalidating = [
+            ResourceMutationKind::RegisterWorkspace {
+                workspace_id: WorkspaceId::new("workspace-b").unwrap(),
+                root: OpaqueHostPath::utf8(r"C:\fixtures\workspace-b".to_owned()).unwrap(),
+            },
+            ResourceMutationKind::UnregisterWorkspace {
+                workspace_id: WorkspaceId::new("workspace-b").unwrap(),
+            },
+            ResourceMutationKind::CreateStandaloneWorkspace {
+                workspace_id: WorkspaceId::new("workspace-c").unwrap(),
+                root: OpaqueHostPath::utf8(r"C:\fixtures\workspace-c".to_owned()).unwrap(),
+                initial_branch: None,
+            },
+            ResourceMutationKind::CreateWorktree {
+                source_workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+                workspace_id: WorkspaceId::new("worktree-workspace").unwrap(),
+                target_root: OpaqueHostPath::utf8(r"C:\fixtures\worktree".to_owned()).unwrap(),
+                branch: "feature/resource-mutation".to_owned(),
+                base: None,
+            },
+            ResourceMutationKind::RemoveWorktree {
+                source_workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+                target_root: OpaqueHostPath::utf8(r"C:\fixtures\worktree".to_owned()).unwrap(),
+            },
+        ];
+        for kind in invalidating {
+            assert!(resource_mutation_fixture(kind).invalidates_runtime_inventory());
+        }
+        let non_invalidating = [
+            ResourceMutationKind::ExportContextPack { session },
+            ResourceMutationKind::ForgetContextPack {
+                context_id: SpawnContextId::new("context-a").unwrap(),
+            },
+        ];
+        for kind in non_invalidating {
+            assert!(!resource_mutation_fixture(kind).invalidates_runtime_inventory());
+        }
+    }
+
+    #[test]
+    fn resource_mutation_correlates_matching_responses() {
+        let register = resource_mutation_fixture(ResourceMutationKind::RegisterWorkspace {
+            workspace_id: WorkspaceId::new("workspace-b").unwrap(),
+            root: OpaqueHostPath::utf8(r"C:\fixtures\workspace-b".to_owned()).unwrap(),
+        });
+        let registered = correlate_resource_mutation_response(
+            &register,
+            C2NodeResponse::WorkspaceRegistered { workspace: c2_workspace_snapshot("workspace-b") },
+        ).unwrap();
+        assert!(matches!(
+            registered,
+            HarnessOperatorResponseV1::WorkspaceRegistered(snapshot)
+                if snapshot.workspace_id == "workspace-b"
+        ));
+
+        let create_worktree = resource_mutation_fixture(ResourceMutationKind::CreateWorktree {
+            source_workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+            workspace_id: WorkspaceId::new("worktree-workspace").unwrap(),
+            target_root: OpaqueHostPath::utf8(r"C:\fixtures\worktree".to_owned()).unwrap(),
+            branch: "feature/resource-mutation".to_owned(),
+            base: None,
+        });
+        let created = correlate_resource_mutation_response(
+            &create_worktree,
+            C2NodeResponse::WorktreeCreated {
+                worktree: c2_git_worktree_snapshot(Some("worktree-workspace")),
+                workspace: c2_workspace_snapshot("worktree-workspace"),
+            },
+        ).unwrap();
+        assert!(matches!(
+            created,
+            HarnessOperatorResponseV1::WorktreeCreated { workspace, .. }
+                if workspace.workspace_id == "worktree-workspace"
+        ));
+
+        let remove_worktree = resource_mutation_fixture(ResourceMutationKind::RemoveWorktree {
+            source_workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+            target_root: OpaqueHostPath::utf8(r"C:\fixtures\worktree".to_owned()).unwrap(),
+        });
+        let removed = correlate_resource_mutation_response(
+            &remove_worktree,
+            C2NodeResponse::WorktreeRemoved {
+                target_root: OpaqueHostPath::utf8(r"C:\fixtures\worktree".to_owned()).unwrap(),
+                workspace_id: Some(WorkspaceId::new("worktree-workspace").unwrap()),
+            },
+        ).unwrap();
+        assert!(matches!(
+            removed,
+            HarnessOperatorResponseV1::WorktreeRemoved { workspace_id, .. }
+                if workspace_id.as_deref() == Some("worktree-workspace")
+        ));
+
+        let forget = resource_mutation_fixture(ResourceMutationKind::ForgetContextPack {
+            context_id: SpawnContextId::new("context-a").unwrap(),
+        });
+        let forgotten = correlate_resource_mutation_response(
+            &forget,
+            C2NodeResponse::ContextPackForgotten {
+                context_id: SpawnContextId::new("context-a").unwrap(),
+            },
+        ).unwrap();
+        assert!(matches!(
+            forgotten,
+            HarnessOperatorResponseV1::ContextPackForgotten { context_id }
+                if context_id == "context-a"
+        ));
+    }
+
+    #[test]
+    fn resource_mutation_rejects_a_mismatched_response() {
+        let register = resource_mutation_fixture(ResourceMutationKind::RegisterWorkspace {
+            workspace_id: WorkspaceId::new("workspace-b").unwrap(),
+            root: OpaqueHostPath::utf8(r"C:\fixtures\workspace-b".to_owned()).unwrap(),
+        });
+        assert!(matches!(
+            correlate_resource_mutation_response(
+                &register,
+                C2NodeResponse::WorkspaceUnregistered {
+                    workspace_id: WorkspaceId::new("workspace-b").unwrap(),
+                },
+            ),
+            Err(HarnessC2Error::ResourceMutationCorrelationMismatch),
+        ));
+        assert!(matches!(
+            correlate_resource_mutation_response(
+                &register,
+                C2NodeResponse::WorkspaceRegistered {
+                    workspace: c2_workspace_snapshot("workspace-other"),
+                },
+            ),
+            Err(HarnessC2Error::ResourceMutationCorrelationMismatch),
+        ));
+    }
+
+    /// `PreparedHostDirectoryBrowse` has no adapter-free constructor, same
+    /// reason as `node_workspace_read_fixture`.
+    fn host_directory_browse_fixture(
+        directory: Option<OpaqueHostPath>,
+        after: Option<OpaqueHostPath>,
+    ) -> PreparedHostDirectoryBrowse {
+        PreparedHostDirectoryBrowse {
+            route: NodeRoute {
+                node_id: NodeId::new("node-a").unwrap(),
+                expected_incarnation_id: NodeIncarnationId::from_bytes([7; 16]),
+            },
+            directory,
+            after,
+        }
+    }
+
+    #[test]
+    fn host_directory_browse_relays_the_exact_directory_and_after_to_the_wire() {
+        let directory = OpaqueHostPath::utf8(r"C:\fixtures".to_owned()).unwrap();
+        let after = OpaqueHostPath::utf8(r"C:\fixtures\a".to_owned()).unwrap();
+        let browse = host_directory_browse_fixture(Some(directory.clone()), Some(after.clone()));
+        assert!(matches!(
+            browse.wire_request(),
+            NodeRequest::BrowseHostDirectories { directory: wired_directory, after: wired_after }
+                if wired_directory == Some(directory) && wired_after == Some(after)
+        ));
+    }
+
+    #[test]
+    fn host_directory_listing_projects_into_the_bounded_harness_api() {
+        let listing = HostDirectoryListing {
+            directory: Some(OpaqueHostPath::utf8(r"C:\fixtures".to_owned()).unwrap()),
+            parent: Some(OpaqueHostPath::utf8(r"C:\".to_owned()).unwrap()),
+            entries: vec![HostDirectoryEntry {
+                path: OpaqueHostPath::utf8(r"C:\fixtures\workspace".to_owned()).unwrap(),
+                display_name: "workspace".to_owned(),
+                is_link: false,
+            }],
+            next_after: Some(OpaqueHostPath::utf8(r"C:\fixtures\workspace".to_owned()).unwrap()),
+            incomplete: true,
+        };
+        let projected = project_host_directory_listing(listing).unwrap();
+        assert_eq!(projected.directory.as_ref().map(HarnessHostPathV1::as_str), Some(r"C:\fixtures"));
+        assert_eq!(projected.entries.len(), 1);
+        assert_eq!(projected.entries[0].display_name, "workspace");
+        assert!(projected.incomplete);
+        HarnessOperatorResponseV1::HostDirectoriesBrowsed(projected).validate().unwrap();
     }
 }

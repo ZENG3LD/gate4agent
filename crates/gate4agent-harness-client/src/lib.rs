@@ -17,9 +17,9 @@ pub const HARNESS_READ_DEADLINE: Duration = Duration::from_secs(3);
 pub const HARNESS_OPERATOR_DEADLINE: Duration = Duration::from_secs(3);
 // Also the outer bound for the node-workspace write/create verbs
 // (`write_node_workspace_file`/`create_node_workspace_file`/
-// `create_node_workspace_directory`): same order of node-side I/O cost as a
-// workspace read, just a write instead of a read -- see `send`'s deadline
-// selection.
+// `create_node_workspace_directory`) and `browse_host_directories`: same
+// order of node-side I/O cost as a workspace read (a write, or a directory
+// listing, instead of a read) -- see `send`'s deadline selection.
 pub const HARNESS_RUN_WORKSPACE_READ_DEADLINE: Duration = Duration::from_secs(14);
 pub const HARNESS_NATIVE_HISTORY_DEADLINE: Duration = Duration::from_secs(42);
 pub const HARNESS_CONTEXT_SOURCE_OBSERVATION_DEADLINE: Duration = Duration::from_secs(14);
@@ -32,11 +32,13 @@ pub const HARNESS_CONTEXT_SOURCE_OBSERVATION_DEADLINE: Duration = Duration::from
 pub const HARNESS_SESSION_SPAWN_DEADLINE: Duration = Duration::from_secs(30);
 pub const HARNESS_SESSION_CONTROL_DEADLINE: Duration = Duration::from_secs(24);
 // Client-side outer bound for the session-record mutation family (resume,
-// rename, set-task, forget, index-provider, index-native): sized like
+// rename, set-task, forget, index-provider, index-native) and the resource-
+// mutation family (register/unregister/create-standalone-workspace, create/
+// remove-worktree, export/forget-context-pack): sized like
 // `HARNESS_SESSION_SPAWN_DEADLINE` rather than the thinner session-control
-// deadline, since `ResumeSessionRecord` spawns a brand-new process the same
-// way a plain spawn does -- the other five verbs are cheap store mutations
-// that settle well inside this ceiling.
+// deadline, since `ResumeSessionRecord`/`CreateWorktree`/`RemoveWorktree`
+// spawn a process or shell out to git the same way a plain spawn does -- the
+// other, cheaper verbs in both families settle well inside this ceiling.
 pub const HARNESS_SESSION_RECORD_MUTATION_DEADLINE: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
@@ -980,6 +982,121 @@ impl HarnessOperatorClient {
         }
     }
 
+    /// The folder-browser dialog's paged host-directory listing -- the
+    /// harness-mode sibling of the light TUI's own direct `NodeRequest::
+    /// BrowseHostDirectories`.
+    pub fn browse_host_directories(
+        &self,
+        node_id: String,
+        directory: Option<HarnessHostPathV1>,
+        after: Option<HarnessHostPathV1>,
+    ) -> Result<HarnessHostDirectoryListingV1, HarnessOperatorClientError> {
+        match self.send(HarnessOperatorRequestV1::BrowseHostDirectories {
+            node_id, directory, after,
+        })? {
+            HarnessOperatorResponseV1::HostDirectoriesBrowsed(value) => Ok(value),
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
+    pub fn register_workspace(
+        &self,
+        node_id: String,
+        workspace_id: String,
+        root: HarnessHostPathV1,
+    ) -> Result<HarnessWorkspaceSnapshotV1, HarnessOperatorClientError> {
+        match self.send(HarnessOperatorRequestV1::RegisterWorkspace {
+            node_id, workspace_id, root,
+        })? {
+            HarnessOperatorResponseV1::WorkspaceRegistered(value) => Ok(value),
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
+    pub fn unregister_workspace(
+        &self,
+        node_id: String,
+        workspace_id: String,
+    ) -> Result<String, HarnessOperatorClientError> {
+        match self.send(HarnessOperatorRequestV1::UnregisterWorkspace { node_id, workspace_id })? {
+            HarnessOperatorResponseV1::WorkspaceUnregistered { workspace_id } => Ok(workspace_id),
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
+    pub fn create_standalone_workspace(
+        &self,
+        node_id: String,
+        workspace_id: String,
+        root: HarnessHostPathV1,
+        initial_branch: Option<String>,
+    ) -> Result<HarnessWorkspaceSnapshotV1, HarnessOperatorClientError> {
+        match self.send(HarnessOperatorRequestV1::CreateStandaloneWorkspace {
+            node_id, workspace_id, root, initial_branch,
+        })? {
+            HarnessOperatorResponseV1::StandaloneWorkspaceCreated(value) => Ok(value),
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
+    pub fn create_worktree(
+        &self,
+        node_id: String,
+        source_workspace_id: String,
+        workspace_id: String,
+        target_root: HarnessHostPathV1,
+        branch: String,
+        base: Option<String>,
+    ) -> Result<(HarnessGitWorktreeSnapshotV1, HarnessWorkspaceSnapshotV1), HarnessOperatorClientError> {
+        match self.send(HarnessOperatorRequestV1::CreateWorktree {
+            node_id, source_workspace_id, workspace_id, target_root, branch, base,
+        })? {
+            HarnessOperatorResponseV1::WorktreeCreated { worktree, workspace } => {
+                Ok((worktree, workspace))
+            }
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
+    pub fn remove_worktree(
+        &self,
+        node_id: String,
+        source_workspace_id: String,
+        target_root: HarnessHostPathV1,
+    ) -> Result<(String, Option<String>), HarnessOperatorClientError> {
+        match self.send(HarnessOperatorRequestV1::RemoveWorktree {
+            node_id, source_workspace_id, target_root,
+        })? {
+            HarnessOperatorResponseV1::WorktreeRemoved { target_root, workspace_id } => {
+                Ok((target_root.as_str().to_owned(), workspace_id))
+            }
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
+    pub fn export_context_pack(
+        &self,
+        session: HarnessRuntimeSessionAddressV1,
+    ) -> Result<HarnessResolvedContextPackReceiptV1, HarnessOperatorClientError> {
+        match self.send(HarnessOperatorRequestV1::ExportContextPack { session })? {
+            HarnessOperatorResponseV1::ContextPackExported(value) => Ok(value),
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
+    pub fn forget_context_pack(
+        &self,
+        node_id: String,
+        context_id: String,
+    ) -> Result<String, HarnessOperatorClientError> {
+        let context_id = HarnessSelectorV1::new(context_id)
+            .map_err(HarnessOperatorApiError::Protocol)?;
+        match self.send(HarnessOperatorRequestV1::ForgetContextPack { node_id, context_id })? {
+            HarnessOperatorResponseV1::ContextPackForgotten { context_id } => Ok(context_id),
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
     pub fn submit_intent(
         &self,
         intent: HarnessOperatorIntentV1,
@@ -1160,6 +1277,13 @@ impl HarnessOperatorClient {
                 | HarnessOperatorRequestV1::ForgetSessionRecord { .. }
                 | HarnessOperatorRequestV1::IndexProviderSession { .. }
                 | HarnessOperatorRequestV1::IndexNativeSession { .. }
+                | HarnessOperatorRequestV1::RegisterWorkspace { .. }
+                | HarnessOperatorRequestV1::UnregisterWorkspace { .. }
+                | HarnessOperatorRequestV1::CreateStandaloneWorkspace { .. }
+                | HarnessOperatorRequestV1::CreateWorktree { .. }
+                | HarnessOperatorRequestV1::RemoveWorktree { .. }
+                | HarnessOperatorRequestV1::ExportContextPack { .. }
+                | HarnessOperatorRequestV1::ForgetContextPack { .. }
         ) {
             HARNESS_SESSION_RECORD_MUTATION_DEADLINE
         } else if matches!(
@@ -1175,6 +1299,7 @@ impl HarnessOperatorClient {
                 | HarnessOperatorRequestV1::WriteNodeWorkspaceFile { .. }
                 | HarnessOperatorRequestV1::CreateNodeWorkspaceFile { .. }
                 | HarnessOperatorRequestV1::CreateNodeWorkspaceDirectory { .. }
+                | HarnessOperatorRequestV1::BrowseHostDirectories { .. }
         ) {
             HARNESS_RUN_WORKSPACE_READ_DEADLINE
         } else if matches!(&request, HarnessOperatorRequestV1::SpawnSession { .. }) {

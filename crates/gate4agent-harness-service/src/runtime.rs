@@ -4,11 +4,13 @@ use crate::{
         ArmedHarnessMcpReservationProof,
         ContextPackExportStart, ExportContextPackOutcome, HarnessC2Adapter,
         HarnessC2Error, HarnessC2EventReceiver,
-        HarnessObservationResync, PendingNativeHistoryRequest, PendingNodeWorkspaceRead,
-        PendingNodeWorkspaceWrite, PendingRunRead,
+        HarnessObservationResync, PendingHostDirectoryBrowse, PendingNativeHistoryRequest,
+        PendingNodeWorkspaceRead,
+        PendingNodeWorkspaceWrite, PendingResourceMutation, PendingRunRead,
         PendingRunContextSourceObservation, PendingSessionControl,
-        PendingSessionRecordMutation, PreparedRunContextSourceObservation,
-        PreparedNodeWorkspaceRead, PreparedNodeWorkspaceWrite,
+        PendingSessionRecordMutation, PreparedHostDirectoryBrowse,
+        PreparedRunContextSourceObservation,
+        PreparedNodeWorkspaceRead, PreparedNodeWorkspaceWrite, PreparedResourceMutation,
         PreparedRunRead, PreparedSessionControl, PreparedSessionRecordMutation,
         PreparedSessionSpawn,
         RunContextSourceObservationCompletion,
@@ -154,6 +156,16 @@ const HOST_SESSION_SPAWN_RESPONSE_DEADLINE: Duration = Duration::from_secs(28);
 // five verbs in the family (rename/set-task/forget/index-provider/
 // index-native) are cheap store mutations that settle well inside it.
 const HOST_SESSION_RECORD_MUTATION_RESPONSE_DEADLINE: Duration = Duration::from_secs(28);
+// Same class as `HOST_RUN_READ_RESPONSE_DEADLINE`: a folder-browser page is a
+// fast local directory listing, not a spawn or a git operation.
+const HOST_DIRECTORY_BROWSE_RESPONSE_DEADLINE: Duration = Duration::from_secs(12);
+// `CreateWorktree`/`RemoveWorktree` shell out to git (comparable cost to a
+// fresh process spawn); the other five verbs in this family (register/
+// unregister/create-standalone-workspace, export/forget-context-pack) are
+// cheap by comparison but share this same bound the same way the session-
+// record-mutation family's own five cheap verbs share `ResumeSessionRecord`'s
+// bound -- see that constant's own doc comment for the identical reasoning.
+const HOST_RESOURCE_MUTATION_RESPONSE_DEADLINE: Duration = Duration::from_secs(28);
 const HOST_CONNECTION_DEADLINE: Duration = Duration::from_secs(45);
 const OBSERVATION_RECOVERY_RETRY: Duration = Duration::from_secs(1);
 const OBSERVATION_RECOVERY_MAX_IN_FLIGHT: usize = 8;
@@ -185,6 +197,16 @@ const SESSION_CONTROL_WORKERS_MAX: usize = 8;
 // index-native, resume-session-record) must never be able to starve a
 // concurrent live-session keystroke/resize, or vice versa.
 const SESSION_RECORD_MUTATION_WORKERS_MAX: usize = 8;
+// Own pool, not shared with `NODE_WORKSPACE_READ_WORKERS_MAX`: a burst of
+// folder-browser paging must never be able to starve a concurrent sidebar
+// Files/Git read, or vice versa -- same isolation rationale as that
+// constant's own doc comment.
+const HOST_DIRECTORY_BROWSE_WORKERS_MAX: usize = 8;
+// Own pool, not shared with `SESSION_RECORD_MUTATION_WORKERS_MAX`: a burst of
+// resource mutations (workspace/worktree lifecycle, context-pack export/
+// forget) must never be able to starve a concurrent session-record mutation,
+// or vice versa.
+const RESOURCE_MUTATION_WORKERS_MAX: usize = 8;
 const RUN_CONTEXT_SOURCE_WORKERS_MAX: usize = 8;
 // Deliberately separate from `RUN_READ_WORKERS_MAX`, not shared: background
 // git-facts capture must never be able to starve a live operator's own
@@ -318,11 +340,14 @@ enum HostCommand {
         reply: oneshot::Sender<HarnessOperatorReplyV1>,
         /// Signals when `handle_connection`'s own `response_deadline` fires
         /// before a reply arrives. Only ever populated for a node-workspace
-        /// read, node-workspace write, session-spawn, or session-control
-        /// request (see `start_node_workspace_read_worker`/
+        /// read, node-workspace write, session-spawn, session-control,
+        /// session-record-mutation, host-directory-browse, or resource-
+        /// mutation request (see `start_node_workspace_read_worker`/
         /// `start_node_workspace_write_worker`/`start_session_spawn_worker`/
-        /// `start_session_control_worker`); every other request kind leaves
-        /// this `None` and the worker that eventually handles it ignores it.
+        /// `start_session_control_worker`/`start_session_record_mutation_
+        /// worker`/`start_host_directory_browse_worker`/`start_resource_
+        /// mutation_worker`); every other request kind leaves this `None` and
+        /// the worker that eventually handles it ignores it.
         /// `None` on the two constructed-in-tests call sites means "behaves
         /// exactly as before this field existed" — no cancellation
         /// available, not an error.
@@ -431,6 +456,24 @@ enum HostCommand {
         reply: oneshot::Sender<HarnessOperatorReplyV1>,
         identity: OperatorRequestLogIdentity,
         route: NodeRoute,
+    },
+    HostDirectoryBrowseFinished {
+        result: Result<HarnessOperatorResponseV1, HarnessC2Error>,
+        reply: oneshot::Sender<HarnessOperatorReplyV1>,
+        identity: OperatorRequestLogIdentity,
+    },
+    /// See `ResourceMutationKind::invalidates_runtime_inventory`'s doc
+    /// comment (`c2.rs`) for which of the seven verbs in this family set
+    /// `invalidates_runtime_inventory` true -- captured from
+    /// `PendingResourceMutation::invalidates_runtime_inventory` before it was
+    /// consumed, the same timing `SessionControlFinished`'s `roster_effect`
+    /// uses.
+    ResourceMutationFinished {
+        result: Result<HarnessOperatorResponseV1, HarnessC2Error>,
+        reply: oneshot::Sender<HarnessOperatorReplyV1>,
+        identity: OperatorRequestLogIdentity,
+        route: NodeRoute,
+        invalidates_runtime_inventory: bool,
     },
     RunGitFactsCaptureFinished {
         run_id: gate4agent_harness_protocol::HarnessRunId,
@@ -959,6 +1002,16 @@ struct SessionRecordMutationWorkerRegistry {
 }
 
 #[derive(Default)]
+struct HostDirectoryBrowseWorkerRegistry {
+    in_flight: usize,
+}
+
+#[derive(Default)]
+struct ResourceMutationWorkerRegistry {
+    in_flight: usize,
+}
+
+#[derive(Default)]
 struct RunGitFactsWorkerRegistry {
     in_flight: usize,
 }
@@ -1050,6 +1103,30 @@ impl SessionControlWorkerRegistry {
 impl SessionRecordMutationWorkerRegistry {
     fn try_start(&mut self) -> bool {
         if self.in_flight >= SESSION_RECORD_MUTATION_WORKERS_MAX { return false; }
+        self.in_flight += 1;
+        true
+    }
+
+    fn finish(&mut self) {
+        self.in_flight = self.in_flight.saturating_sub(1);
+    }
+}
+
+impl HostDirectoryBrowseWorkerRegistry {
+    fn try_start(&mut self) -> bool {
+        if self.in_flight >= HOST_DIRECTORY_BROWSE_WORKERS_MAX { return false; }
+        self.in_flight += 1;
+        true
+    }
+
+    fn finish(&mut self) {
+        self.in_flight = self.in_flight.saturating_sub(1);
+    }
+}
+
+impl ResourceMutationWorkerRegistry {
+    fn try_start(&mut self) -> bool {
+        if self.in_flight >= RESOURCE_MUTATION_WORKERS_MAX { return false; }
         self.in_flight += 1;
         true
     }
@@ -2076,6 +2153,84 @@ fn start_session_record_mutation_worker(
     });
 }
 
+/// Read-family sibling of `start_node_workspace_read_worker`: no roster
+/// effect at all (a folder-browser page never mutates anything), so unlike
+/// `start_resource_mutation_worker` there is no `route`/roster-effect
+/// capture -- just the bounded-worker/cooperative-cancel shape every family
+/// on this wire shares.
+fn start_host_directory_browse_worker(
+    pending: PendingHostDirectoryBrowse,
+    commands: mpsc::Sender<HostCommand>,
+    reply: oneshot::Sender<HarnessOperatorReplyV1>,
+    identity: OperatorRequestLogIdentity,
+    cancel: Option<oneshot::Receiver<()>>,
+) {
+    tokio::spawn(async move {
+        let result = match cancel {
+            Some(cancel) => {
+                tokio::select! {
+                    result = pending.finish() => result,
+                    _ = cancel => {
+                        tracing::warn!(
+                            operation = %identity.operation,
+                            node_id = identity.node_id(),
+                            path = identity.path(),
+                            "host directory browse worker cancelled: the operator connection's own deadline fired before the node replied",
+                        );
+                        Err(HarnessC2Error::HostDirectoryBrowseCancelled)
+                    }
+                }
+            }
+            None => pending.finish().await,
+        };
+        let _ = commands
+            .send(HostCommand::HostDirectoryBrowseFinished { result, reply, identity })
+            .await;
+    });
+}
+
+/// Resource-mutation-family sibling of `start_session_record_mutation_worker`:
+/// same bounded-worker/cooperative-cancel shape, plus capturing `route` and
+/// whether this kind invalidates the runtime-inventory roster (see
+/// `ResourceMutationKind::invalidates_runtime_inventory`'s doc comment,
+/// `c2.rs`) before `pending.finish()` consumes it.
+fn start_resource_mutation_worker(
+    pending: PendingResourceMutation,
+    commands: mpsc::Sender<HostCommand>,
+    reply: oneshot::Sender<HarnessOperatorReplyV1>,
+    identity: OperatorRequestLogIdentity,
+    cancel: Option<oneshot::Receiver<()>>,
+) {
+    tokio::spawn(async move {
+        let route = pending.route().clone();
+        let invalidates_runtime_inventory = pending.invalidates_runtime_inventory();
+        let result = match cancel {
+            Some(cancel) => {
+                tokio::select! {
+                    result = pending.finish() => result,
+                    _ = cancel => {
+                        tracing::warn!(
+                            operation = %identity.operation,
+                            node_id = identity.node_id(),
+                            workspace_id = identity.workspace_id(),
+                            source_workspace_id = identity.source_workspace_id(),
+                            path = identity.path(),
+                            "resource mutation worker cancelled: the operator connection's own deadline fired before the node replied",
+                        );
+                        Err(HarnessC2Error::ResourceMutationCancelled)
+                    }
+                }
+            }
+            None => pending.finish().await,
+        };
+        let _ = commands
+            .send(HostCommand::ResourceMutationFinished {
+                result, reply, identity, route, invalidates_runtime_inventory,
+            })
+            .await;
+    });
+}
+
 /// Direct operator `SpawnSession`: unlike `start_node_workspace_read_worker`
 /// (which only awaits an already-enqueued round trip), the whole dispatch --
 /// preflight, build, enqueue, await -- runs inside this task, because
@@ -2566,6 +2721,112 @@ fn map_session_record_mutation_error(error: HarnessC2Error) -> HarnessOperatorHo
     }
 }
 
+fn map_host_directory_browse_error(error: HarnessC2Error) -> HarnessOperatorHostErrorV1 {
+    match error {
+        HarnessC2Error::InvalidHostDirectoryBrowseRequest => {
+            HarnessOperatorHostErrorV1::InvalidRequest
+        }
+        HarnessC2Error::HostDirectoryBrowseEnqueue(
+            gate4agent_c2_client::C2ControlError::QueueFull,
+        ) => HarnessOperatorHostErrorV1::Busy,
+        HarnessC2Error::HostDirectoryBrowseEnqueue(_)
+        | HarnessC2Error::HostDirectoryBrowseTransport(_)
+        | HarnessC2Error::UnknownNode(_)
+        | HarnessC2Error::NodeOffline(_)
+        | HarnessC2Error::MissingIncarnation(_) => HarnessOperatorHostErrorV1::Unavailable,
+        HarnessC2Error::IncarnationChanged { .. }
+        | HarnessC2Error::HostDirectoryBrowseRouteMismatch
+        | HarnessC2Error::HostDirectoryBrowseCorrelationMismatch => {
+            HarnessOperatorHostErrorV1::Conflict
+        }
+        HarnessC2Error::HostDirectoryBrowseDeadline
+        | HarnessC2Error::HostDirectoryBrowseCancelled => HarnessOperatorHostErrorV1::Deadline,
+        HarnessC2Error::HostDirectoryBrowseProjection => HarnessOperatorHostErrorV1::Internal,
+        HarnessC2Error::HostDirectoryBrowseRejected { code } => match code {
+            NodeFailureCode::InvalidRequest | NodeFailureCode::HostDirectoryInvalid => {
+                HarnessOperatorHostErrorV1::InvalidRequest
+            }
+            NodeFailureCode::ControllerBusy
+            | NodeFailureCode::WorkspaceBusy
+            | NodeFailureCode::BackendBusy => HarnessOperatorHostErrorV1::Busy,
+            NodeFailureCode::HostDirectoryReadTimedOut => HarnessOperatorHostErrorV1::Deadline,
+            NodeFailureCode::UnsupportedCapability
+            | NodeFailureCode::HostDirectoryReadFailed
+            | NodeFailureCode::BackendDisconnected
+            | NodeFailureCode::BackendOperationFailed
+            | NodeFailureCode::ShuttingDown => HarnessOperatorHostErrorV1::Unavailable,
+            _ => HarnessOperatorHostErrorV1::Internal,
+        },
+        _ => HarnessOperatorHostErrorV1::Internal,
+    }
+}
+
+/// Covers every `NodeFailureCode` plausible for the seven heterogeneous
+/// verbs `ResourceMutationKind` relays (workspace/worktree lifecycle,
+/// context-pack export/forget) with the same semantic bucketing every other
+/// map function on this wire already uses (invalid-shape -> `InvalidRequest`,
+/// unknown-target -> `NotFound`, already-exists/in-a-state-that-conflicts ->
+/// `Conflict`, contended -> `Busy`, timed-out -> `Deadline`, unsupported/
+/// disconnected -> `Unavailable`), not a per-verb table: unlike the session-
+/// record-mutation family (six verbs sharing a narrower, more homogeneous
+/// failure surface), a git-worktree operation's failure surface (protected/
+/// dirty/locked worktrees, duplicate workspace ids/roots, recovery-required
+/// states) does not cleanly overlap the context-pack family's, so this
+/// mapper covers both by node-failure-code meaning rather than by verb.
+fn map_resource_mutation_error(error: HarnessC2Error) -> HarnessOperatorHostErrorV1 {
+    match error {
+        HarnessC2Error::InvalidResourceMutationRequest => HarnessOperatorHostErrorV1::InvalidRequest,
+        HarnessC2Error::ResourceMutationEnqueue(
+            gate4agent_c2_client::C2ControlError::QueueFull,
+        ) => HarnessOperatorHostErrorV1::Busy,
+        HarnessC2Error::ResourceMutationEnqueue(_)
+        | HarnessC2Error::ResourceMutationTransport(_)
+        | HarnessC2Error::UnknownNode(_)
+        | HarnessC2Error::NodeOffline(_)
+        | HarnessC2Error::MissingIncarnation(_) => HarnessOperatorHostErrorV1::Unavailable,
+        HarnessC2Error::IncarnationChanged { .. }
+        | HarnessC2Error::ResourceMutationRouteMismatch
+        | HarnessC2Error::ResourceMutationCorrelationMismatch => HarnessOperatorHostErrorV1::Conflict,
+        HarnessC2Error::ResourceMutationDeadline
+        | HarnessC2Error::ResourceMutationCancelled => HarnessOperatorHostErrorV1::Deadline,
+        HarnessC2Error::ResourceMutationProjection => HarnessOperatorHostErrorV1::Internal,
+        HarnessC2Error::ResourceMutationRejected { code } => match code {
+            NodeFailureCode::InvalidRequest
+            | NodeFailureCode::InvalidWorkspaceRoot
+            | NodeFailureCode::InvalidRepositoryPath => HarnessOperatorHostErrorV1::InvalidRequest,
+            NodeFailureCode::UnknownWorkspace
+            | NodeFailureCode::UnknownSession
+            | NodeFailureCode::UnknownContextPack
+            | NodeFailureCode::NotGitRepository => HarnessOperatorHostErrorV1::NotFound,
+            NodeFailureCode::BindingMismatch
+            | NodeFailureCode::DuplicateWorkspaceId
+            | NodeFailureCode::DuplicateWorkspaceRoot
+            | NodeFailureCode::LastWorkspace
+            | NodeFailureCode::WorktreeConflict
+            | NodeFailureCode::WorktreeProtected
+            | NodeFailureCode::WorktreeDirty
+            | NodeFailureCode::WorktreeLocked
+            | NodeFailureCode::WorkspaceRegistrationRequired
+            | NodeFailureCode::StandaloneWorkspaceRecoveryRequired
+            | NodeFailureCode::ManagedWorktreeRecoveryRequired
+            | NodeFailureCode::StaleGeneration => HarnessOperatorHostErrorV1::Conflict,
+            NodeFailureCode::ControllerBusy
+            | NodeFailureCode::ControllerRequired
+            | NodeFailureCode::WorkspaceBusy
+            | NodeFailureCode::BackendBusy
+            | NodeFailureCode::ContextPackBusy => HarnessOperatorHostErrorV1::Busy,
+            NodeFailureCode::SpawnDeadlineExceeded => HarnessOperatorHostErrorV1::Deadline,
+            NodeFailureCode::UnsupportedCapability
+            | NodeFailureCode::ContextPackMaterializationFailed
+            | NodeFailureCode::BackendDisconnected
+            | NodeFailureCode::BackendOperationFailed
+            | NodeFailureCode::ShuttingDown => HarnessOperatorHostErrorV1::Unavailable,
+            _ => HarnessOperatorHostErrorV1::Internal,
+        },
+        _ => HarnessOperatorHostErrorV1::Internal,
+    }
+}
+
 fn map_native_history_error(error: HarnessC2Error) -> HarnessOperatorHostErrorV1 {
     match error {
         HarnessC2Error::InvalidNativeHistoryRequest => {
@@ -2645,6 +2906,32 @@ fn is_session_record_mutation_request(request: &HarnessOperatorRequestV1) -> boo
             | HarnessOperatorRequestV1::ForgetSessionRecord { .. }
             | HarnessOperatorRequestV1::IndexProviderSession { .. }
             | HarnessOperatorRequestV1::IndexNativeSession { .. }
+    )
+}
+
+/// `BrowseHostDirectories`: the folder-browser dialog's paged host-directory
+/// listing. Node-scoped only (no `workspace_id`) -- see
+/// `PreparedHostDirectoryBrowse`'s doc comment (`c2.rs`) for why this does
+/// not ride `is_node_workspace_read_request`'s pool.
+fn is_host_directory_browse_request(request: &HarnessOperatorRequestV1) -> bool {
+    matches!(request, HarnessOperatorRequestV1::BrowseHostDirectories { .. })
+}
+
+/// The resource-mutation family: `RegisterWorkspace`/`UnregisterWorkspace`/
+/// `CreateStandaloneWorkspace`/`CreateWorktree`/`RemoveWorktree`/
+/// `ExportContextPack`/`ForgetContextPack` -- see `ResourceMutationKind`'s
+/// doc comment (`c2.rs`) for why these seven heterogeneous verbs share one
+/// bounded pool.
+fn is_resource_mutation_request(request: &HarnessOperatorRequestV1) -> bool {
+    matches!(
+        request,
+        HarnessOperatorRequestV1::RegisterWorkspace { .. }
+            | HarnessOperatorRequestV1::UnregisterWorkspace { .. }
+            | HarnessOperatorRequestV1::CreateStandaloneWorkspace { .. }
+            | HarnessOperatorRequestV1::CreateWorktree { .. }
+            | HarnessOperatorRequestV1::RemoveWorktree { .. }
+            | HarnessOperatorRequestV1::ExportContextPack { .. }
+            | HarnessOperatorRequestV1::ForgetContextPack { .. }
     )
 }
 
@@ -2730,6 +3017,11 @@ struct OperatorRequestLogIdentity {
     provider: Option<String>,
     provider_profile: Option<String>,
     path: Option<String>,
+    /// Only the worktree family (`CreateWorktree`/`RemoveWorktree`) carries a
+    /// second workspace id worth logging: `workspace_id` above holds the
+    /// worktree's own (new, or -- for a remove -- absent) id, this field
+    /// holds the workspace the worktree is created from/removed against.
+    source_workspace_id: Option<String>,
 }
 
 impl OperatorRequestLogIdentity {
@@ -2771,7 +3063,32 @@ impl OperatorRequestLogIdentity {
                 selection.route.workspace_id.clone(),
                 None,
             ),
+            HarnessOperatorRequestV1::BrowseHostDirectories { node_id, .. }
+            | HarnessOperatorRequestV1::RemoveWorktree { node_id, .. } => {
+                (Some(node_id.clone()), None, None)
+            }
+            HarnessOperatorRequestV1::RegisterWorkspace { node_id, workspace_id, .. }
+            | HarnessOperatorRequestV1::UnregisterWorkspace { node_id, workspace_id }
+            | HarnessOperatorRequestV1::CreateStandaloneWorkspace { node_id, workspace_id, .. }
+            | HarnessOperatorRequestV1::CreateWorktree { node_id, workspace_id, .. } => {
+                (Some(node_id.clone()), Some(workspace_id.clone()), None)
+            }
+            HarnessOperatorRequestV1::ExportContextPack { session } => (
+                Some(session.node_id.clone()),
+                Some(session.workspace_id.clone()),
+                Some(format!("{}/{}", session.instance_id, session.generation)),
+            ),
+            HarnessOperatorRequestV1::ForgetContextPack { node_id, context_id } => {
+                (Some(node_id.clone()), None, Some(context_id.as_str().to_owned()))
+            }
             _ => (None, None, None),
+        };
+        let source_workspace_id = match request {
+            HarnessOperatorRequestV1::CreateWorktree { source_workspace_id, .. }
+            | HarnessOperatorRequestV1::RemoveWorktree { source_workspace_id, .. } => {
+                Some(source_workspace_id.clone())
+            }
+            _ => None,
         };
         let run_id = match request {
             HarnessOperatorRequestV1::InspectRunWorkspace { run_id }
@@ -2794,11 +3111,27 @@ impl OperatorRequestLogIdentity {
         // change -- see `WriteNodeWorkspaceFile`/`CreateNodeWorkspaceFile`/
         // `CreateNodeWorkspaceDirectory`'s call sites in the host select
         // loop and `HostCommand::NodeWorkspaceWriteFinished`'s handler.
+        // `root`/`target_root`/`directory` share this same field with the
+        // node-workspace-write family's repository-relative `path` above:
+        // both are "the path this request concerns" for logging purposes,
+        // even though a host path and a repository-relative path are
+        // different wire types.
         let path = match request {
             HarnessOperatorRequestV1::WriteNodeWorkspaceFile { path, .. }
             | HarnessOperatorRequestV1::CreateNodeWorkspaceFile { path, .. }
             | HarnessOperatorRequestV1::CreateNodeWorkspaceDirectory { path, .. } => {
                 Some(path.as_str().to_owned())
+            }
+            HarnessOperatorRequestV1::BrowseHostDirectories { directory, .. } => {
+                directory.as_ref().map(|value| value.as_str().to_owned())
+            }
+            HarnessOperatorRequestV1::RegisterWorkspace { root, .. }
+            | HarnessOperatorRequestV1::CreateStandaloneWorkspace { root, .. } => {
+                Some(root.as_str().to_owned())
+            }
+            HarnessOperatorRequestV1::CreateWorktree { target_root, .. }
+            | HarnessOperatorRequestV1::RemoveWorktree { target_root, .. } => {
+                Some(target_root.as_str().to_owned())
             }
             _ => None,
         };
@@ -2810,6 +3143,7 @@ impl OperatorRequestLogIdentity {
             .unwrap_or_else(|| "unknown".to_owned());
         Self {
             operation, node_id, workspace_id, run_id, session_id, provider, provider_profile, path,
+            source_workspace_id,
         }
     }
 
@@ -2840,6 +3174,10 @@ impl OperatorRequestLogIdentity {
     fn path(&self) -> &str {
         self.path.as_deref().unwrap_or("")
     }
+
+    fn source_workspace_id(&self) -> &str {
+        self.source_workspace_id.as_deref().unwrap_or("")
+    }
 }
 
 fn operator_response_deadline(request: &HarnessOperatorRequestV1) -> Duration {
@@ -2858,6 +3196,10 @@ fn operator_response_deadline(request: &HarnessOperatorRequestV1) -> Duration {
         HOST_SESSION_CONTROL_RESPONSE_DEADLINE
     } else if is_session_record_mutation_request(request) {
         HOST_SESSION_RECORD_MUTATION_RESPONSE_DEADLINE
+    } else if is_host_directory_browse_request(request) {
+        HOST_DIRECTORY_BROWSE_RESPONSE_DEADLINE
+    } else if is_resource_mutation_request(request) {
+        HOST_RESOURCE_MUTATION_RESPONSE_DEADLINE
     } else {
         HOST_DEADLINE
     }
@@ -3719,6 +4061,8 @@ pub async fn start_harness_host_with_operator_and_catalogs(
         let mut session_spawn_workers = SessionSpawnWorkerRegistry::default();
         let mut session_control_workers = SessionControlWorkerRegistry::default();
         let mut session_record_mutation_workers = SessionRecordMutationWorkerRegistry::default();
+        let mut host_directory_browse_workers = HostDirectoryBrowseWorkerRegistry::default();
+        let mut resource_mutation_workers = ResourceMutationWorkerRegistry::default();
         // Host-local nonce for `mint_session_spawn_ids` -- see its doc
         // comment for why this only needs to be distinct, not unpredictable.
         let mut session_spawn_nonce: u64 = 0;
@@ -4246,6 +4590,130 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                         );
                                         let _ = reply.send(HarnessOperatorReplyV1::Error {
                                             error: map_session_record_mutation_error(cause),
+                                        });
+                                    }
+                                }
+                                continue;
+                            }
+                            if is_host_directory_browse_request(&request) {
+                                let identity = OperatorRequestLogIdentity::describe(&request);
+                                let prepared = PreparedHostDirectoryBrowse::from_operator_request(
+                                    &adapter,
+                                    request,
+                                );
+                                let prepared = match prepared {
+                                    Ok(prepared) => prepared,
+                                    Err(cause) => {
+                                        tracing::warn!(
+                                            operation = %identity.operation,
+                                            node_id = identity.node_id(),
+                                            path = identity.path(),
+                                            cause = %cause,
+                                            "host directory browse request rejected before C2 dispatch",
+                                        );
+                                        let _ = reply.send(HarnessOperatorReplyV1::Error {
+                                            error: map_host_directory_browse_error(cause),
+                                        });
+                                        continue;
+                                    }
+                                };
+                                if !host_directory_browse_workers.try_start() {
+                                    tracing::warn!(
+                                        operation = %identity.operation,
+                                        node_id = identity.node_id(),
+                                        path = identity.path(),
+                                        limit = HOST_DIRECTORY_BROWSE_WORKERS_MAX,
+                                        "host directory browse rejected: harness-side worker capacity is busy",
+                                    );
+                                    let _ = reply.send(HarnessOperatorReplyV1::Error {
+                                        error: HarnessOperatorHostErrorV1::Busy,
+                                    });
+                                    continue;
+                                }
+                                match adapter.start_prepared_host_directory_browse(prepared) {
+                                    Ok(pending) => start_host_directory_browse_worker(
+                                        pending,
+                                        commands.clone(),
+                                        reply,
+                                        identity,
+                                        cancel,
+                                    ),
+                                    Err(cause) => {
+                                        host_directory_browse_workers.finish();
+                                        tracing::warn!(
+                                            operation = %identity.operation,
+                                            node_id = identity.node_id(),
+                                            path = identity.path(),
+                                            cause = %cause,
+                                            "host directory browse rejected: could not start the C2 dispatch",
+                                        );
+                                        let _ = reply.send(HarnessOperatorReplyV1::Error {
+                                            error: map_host_directory_browse_error(cause),
+                                        });
+                                    }
+                                }
+                                continue;
+                            }
+                            if is_resource_mutation_request(&request) {
+                                let identity = OperatorRequestLogIdentity::describe(&request);
+                                let prepared = PreparedResourceMutation::from_operator_request(
+                                    &adapter,
+                                    request,
+                                );
+                                let prepared = match prepared {
+                                    Ok(prepared) => prepared,
+                                    Err(cause) => {
+                                        tracing::warn!(
+                                            operation = %identity.operation,
+                                            node_id = identity.node_id(),
+                                            workspace_id = identity.workspace_id(),
+                                            source_workspace_id = identity.source_workspace_id(),
+                                            path = identity.path(),
+                                            cause = %cause,
+                                            "resource mutation request rejected before C2 dispatch",
+                                        );
+                                        let _ = reply.send(HarnessOperatorReplyV1::Error {
+                                            error: map_resource_mutation_error(cause),
+                                        });
+                                        continue;
+                                    }
+                                };
+                                if !resource_mutation_workers.try_start() {
+                                    tracing::warn!(
+                                        operation = %identity.operation,
+                                        node_id = identity.node_id(),
+                                        workspace_id = identity.workspace_id(),
+                                        source_workspace_id = identity.source_workspace_id(),
+                                        path = identity.path(),
+                                        limit = RESOURCE_MUTATION_WORKERS_MAX,
+                                        "resource mutation rejected: harness-side worker capacity is busy",
+                                    );
+                                    let _ = reply.send(HarnessOperatorReplyV1::Error {
+                                        error: HarnessOperatorHostErrorV1::Busy,
+                                    });
+                                    continue;
+                                }
+                                match adapter.start_prepared_resource_mutation(prepared) {
+                                    Ok(pending) => start_resource_mutation_worker(
+                                        pending,
+                                        commands.clone(),
+                                        reply,
+                                        identity,
+                                        cancel,
+                                    ),
+                                    Err(cause) => {
+                                        resource_mutation_workers.finish();
+                                        tracing::warn!(
+                                            operation = %identity.operation,
+                                            node_id = identity.node_id(),
+                                            workspace_id = identity.workspace_id(),
+                                            source_workspace_id = identity.source_workspace_id(),
+                                            path = identity.path(),
+                                            cause = %cause,
+                                            "resource mutation rejected: could not start the C2 dispatch",
+                                        );
+                                        let _ = reply.send(HarnessOperatorReplyV1::Error {
+                                            error: map_resource_mutation_error(cause),
                                         });
                                     }
                                 }
@@ -5324,6 +5792,74 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                     );
                                     HarnessOperatorReplyV1::Error {
                                         error: map_session_record_mutation_error(cause),
+                                    }
+                                }
+                            };
+                            let _ = reply.send(reply_value);
+                        }
+                        Some(HostCommand::HostDirectoryBrowseFinished { result, reply, identity }) => {
+                            host_directory_browse_workers.finish();
+                            let reply_value = match result {
+                                Ok(response) => HarnessOperatorReplyV1::Ok { response },
+                                Err(cause) => {
+                                    tracing::warn!(
+                                        operation = %identity.operation,
+                                        node_id = identity.node_id(),
+                                        path = identity.path(),
+                                        cause = %cause,
+                                        "host directory browse request rejected after its C2 round trip",
+                                    );
+                                    HarnessOperatorReplyV1::Error {
+                                        error: map_host_directory_browse_error(cause),
+                                    }
+                                }
+                            };
+                            let _ = reply.send(reply_value);
+                        }
+                        Some(HostCommand::ResourceMutationFinished {
+                            result,
+                            reply,
+                            identity,
+                            route,
+                            invalidates_runtime_inventory,
+                        }) => {
+                            resource_mutation_workers.finish();
+                            let reply_value = match result {
+                                Ok(response) => {
+                                    if invalidates_runtime_inventory {
+                                        tracing::info!(
+                                            operation = %identity.operation,
+                                            node_id = identity.node_id(),
+                                            workspace_id = identity.workspace_id(),
+                                            "resource mutation accepted; invalidating the node's runtime inventory route",
+                                        );
+                                        invalidate_runtime_inventory_for_route(
+                                            &mut runtime_inventory,
+                                            &mut subscribers,
+                                            &mut observation_recovery,
+                                            &route,
+                                        );
+                                    } else {
+                                        tracing::info!(
+                                            operation = %identity.operation,
+                                            node_id = identity.node_id(),
+                                            "resource mutation accepted",
+                                        );
+                                    }
+                                    HarnessOperatorReplyV1::Ok { response }
+                                }
+                                Err(cause) => {
+                                    tracing::warn!(
+                                        operation = %identity.operation,
+                                        node_id = identity.node_id(),
+                                        workspace_id = identity.workspace_id(),
+                                        source_workspace_id = identity.source_workspace_id(),
+                                        path = identity.path(),
+                                        cause = %cause,
+                                        "resource mutation request rejected after its C2 round trip",
+                                    );
+                                    HarnessOperatorReplyV1::Error {
+                                        error: map_resource_mutation_error(cause),
                                     }
                                 }
                             };
@@ -7243,6 +7779,20 @@ fn execute_operator_request(
         | HarnessOperatorRequestV1::IndexNativeSession { .. } => {
             return Err(HarnessOperatorHostErrorV1::Internal);
         }
+        // Same reasoning again: the host select loop intercepts the host-
+        // directory-browse read (`is_host_directory_browse_request`) and the
+        // resource-mutation family (`is_resource_mutation_request`) before
+        // this function ever sees them.
+        HarnessOperatorRequestV1::BrowseHostDirectories { .. }
+        | HarnessOperatorRequestV1::RegisterWorkspace { .. }
+        | HarnessOperatorRequestV1::UnregisterWorkspace { .. }
+        | HarnessOperatorRequestV1::CreateStandaloneWorkspace { .. }
+        | HarnessOperatorRequestV1::CreateWorktree { .. }
+        | HarnessOperatorRequestV1::RemoveWorktree { .. }
+        | HarnessOperatorRequestV1::ExportContextPack { .. }
+        | HarnessOperatorRequestV1::ForgetContextPack { .. } => {
+            return Err(HarnessOperatorHostErrorV1::Internal);
+        }
         HarnessOperatorRequestV1::SubmitIntent { .. } => {
             return Err(HarnessOperatorHostErrorV1::Internal);
         }
@@ -7607,21 +8157,26 @@ async fn handle_connection(
                 subscription = Some((receiver, subscriber_permit));
                 return Ok(());
             }
-            // A node-workspace-read, node-workspace-write, session-spawn, or
-            // session-control request gets a cancel signal: these are the
-            // request families whose worker can run an unbounded C2 round
-            // trip behind it (see `start_node_workspace_read_worker`/
-            // `start_node_workspace_write_worker`/`start_session_spawn_worker`/
-            // `start_session_control_worker`). `cancel_tx` fires explicitly
-            // on the deadline branch below, and is also dropped (equivalent
-            // to firing) on every other early return past this point,
-            // including the outer `HOST_CONNECTION_DEADLINE` cutoff wrapping
-            // this whole block.
+            // A node-workspace-read, node-workspace-write, session-spawn,
+            // session-control, session-record-mutation, host-directory-
+            // browse, or resource-mutation request gets a cancel signal:
+            // these are the request families whose worker can run an
+            // unbounded C2 round trip behind it (see `start_node_workspace_
+            // read_worker`/`start_node_workspace_write_worker`/
+            // `start_session_spawn_worker`/`start_session_control_worker`/
+            // `start_session_record_mutation_worker`/`start_host_directory_
+            // browse_worker`/`start_resource_mutation_worker`). `cancel_tx`
+            // fires explicitly on the deadline branch below, and is also
+            // dropped (equivalent to firing) on every other early return past
+            // this point, including the outer `HOST_CONNECTION_DEADLINE`
+            // cutoff wrapping this whole block.
             let needs_cancel_signal = is_node_workspace_read_request(&request)
                 || is_node_workspace_write_request(&request)
                 || is_session_spawn_request(&request)
                 || is_session_control_request(&request)
-                || is_session_record_mutation_request(&request);
+                || is_session_record_mutation_request(&request)
+                || is_host_directory_browse_request(&request)
+                || is_resource_mutation_request(&request);
             let mut cancel_tx = None;
             let cancel_rx = if needs_cancel_signal {
                 let (tx, rx) = oneshot::channel();

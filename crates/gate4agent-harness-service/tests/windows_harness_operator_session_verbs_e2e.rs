@@ -43,7 +43,8 @@
 use std::{
     fs,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    path::PathBuf,
+    path::{Path, PathBuf},
+    process::Command,
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -51,7 +52,8 @@ use std::{
 use gate4agent_c2::{C2Config, C2NodeConfig, C2Running, C2Timings};
 use gate4agent_c2_client::C2Client;
 use gate4agent_harness_api::{
-    HarnessOperatorCredential, HarnessOperatorHostErrorV1, HarnessRuntimeSessionAddressV1,
+    HarnessHostPathV1, HarnessOperatorCredential, HarnessOperatorHostErrorV1,
+    HarnessRuntimeSessionAddressV1,
     HarnessRuntimeSessionV1, HarnessTerminalControlV1, HARNESS_TERMINAL_PAGE_LIMIT_MAX,
 };
 use gate4agent_harness_client::{HarnessOperatorClient, HarnessOperatorClientError};
@@ -704,6 +706,275 @@ async fn windows_harness_operator_session_record_family_index_rename_forget_roun
         client.index_native_session(bogus_native_selection, "Never cataloged".to_owned()).is_err(),
         "indexing a selection outside the node's real native-session catalog must be rejected",
     );
+
+    host.shutdown().await.unwrap();
+    timeout(Duration::from_secs(5), host_task).await.unwrap().unwrap().unwrap();
+    let c2_shutdown = c2.shutdown_handle();
+    c2_shutdown.shutdown();
+    timeout(Duration::from_secs(5), c2.wait()).await.unwrap().unwrap();
+    node_shutdown.request_shutdown().await.unwrap();
+    timeout(Duration::from_secs(10), node_task).await.unwrap().unwrap().unwrap();
+}
+
+fn assert_git_success(repository: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .current_dir(repository)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {:?} failed: stdout={} stderr={}",
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// Minimal one-commit repository, just enough for `CreateWorktree` to have a
+/// real `HEAD` to branch a worktree from -- unlike `windows_harness_run_
+/// workspace_read_e2e.rs`'s own `prepare_repository`, this test's git
+/// summary/diff/status content is never inspected, so no tracked/staged/
+/// binary files are staged here.
+fn init_git_repository(workspace: &Path) {
+    let init = Command::new("git")
+        .args(["init", "-b", "main"])
+        .arg(workspace)
+        .output()
+        .unwrap();
+    assert!(init.status.success(), "git init failed: {}", String::from_utf8_lossy(&init.stderr));
+    fs::write(workspace.join("tracked.txt"), b"committed line\n").unwrap();
+    assert_git_success(workspace, &["add", "--", "tracked.txt"]);
+    assert_git_success(
+        workspace,
+        &[
+            "-c", "user.name=Gate4Agent Fixture",
+            "-c", "user.email=fixture@gate4agent.invalid",
+            "-c", "commit.gpgSign=false",
+            "-c", "core.hooksPath=NUL",
+            "commit", "--quiet", "-m", "fixture initial commit",
+        ],
+    );
+}
+
+/// E2E coverage for the resource-mutation operator verb family
+/// (`BrowseHostDirectories`/`RegisterWorkspace`/`UnregisterWorkspace`/
+/// `CreateStandaloneWorkspace`/`CreateWorktree`/`RemoveWorktree`/
+/// `ExportContextPack`/`ForgetContextPack`) added alongside the two verb
+/// families above. Same fixture shape, plus a one-commit git repository in
+/// the fixture's primary workspace (`init_git_repository`): `CreateWorktree`
+/// needs a real `HEAD` to branch from.
+///
+/// `ExportContextPack` is exercised only through its real wire-relay and
+/// node-rejection path, not a full success round trip: unlike the session-
+/// record family's `IndexProviderSession` (a direct node-side store write,
+/// no process involved), a context pack is exported from a session's actual
+/// provider-history buffer, which this fixture's plain PTY-echo session
+/// never populates with anything the node's own context-pack machinery
+/// recognizes as exportable -- see the module doc comment's `PasteSession`
+/// precedent for the same "prove the rejection relays faithfully, not a
+/// success this fixture cannot honestly produce" choice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn windows_harness_operator_resource_mutation_family_round_trip_and_rejections() {
+    require_headless_supervisor();
+    let fixture = FixturePaths::new();
+    init_git_repository(&fixture.workspace);
+    let node_endpoint = pipe("node");
+    let control_endpoint = pipe("control");
+    let node_id = NodeId::new("resource-mutation-node").unwrap();
+    let workspace_id = WorkspaceId::new("primary").unwrap();
+    let node_token = "resource-mutation-node-token";
+    let c2_token = "resource-mutation-c2-token";
+    let operator_credential = HarnessOperatorCredential::parse(format!(
+        "g4aho_{}",
+        "d".repeat(64),
+    )).unwrap();
+    let profile_id = SpawnProfileId::new("interactive-default").unwrap();
+    let profile_revision = SpawnProfileRevision::new("resource-mutation-r1").unwrap();
+
+    let node = NodeServer::new_fixture(node_config(
+        &fixture,
+        &node_endpoint,
+        node_token,
+        &node_id,
+        &workspace_id,
+        &profile_id,
+        &profile_revision,
+    )).unwrap();
+    let node_shutdown = node.shutdown_handle();
+    let node_task = tokio::spawn(node.run());
+
+    let timings = C2Timings {
+        poll_interval: Duration::from_millis(20),
+        fresh_for: Duration::from_secs(2),
+        attempt_deadline: Duration::from_secs(2),
+        transient_backoffs: [Duration::from_millis(20); 5],
+        parked_backoff: Duration::from_millis(100),
+        http_io_deadline: Duration::from_secs(1),
+    };
+    let c2 = C2Running::start(C2Config::new(
+        "127.0.0.1:0".parse().unwrap(),
+        c2_token,
+        vec![C2NodeConfig::new(node_id.clone(), node_endpoint.clone(), node_token).unwrap()],
+    ).unwrap()
+        .with_control_endpoint(control_endpoint.clone()).unwrap()
+        .with_timings(timings)).await.unwrap();
+    let c2_client = C2Client::new(c2.api_addr(), c2_token).unwrap()
+        .with_deadline(Duration::from_secs(1));
+    wait_online(&c2_client, &node_id).await;
+
+    let (adapter, events) = connect_harness_adapter(&control_endpoint, c2_token).await;
+    let (host, host_task) = start_harness_host_with_operator_and_catalogs(
+        HarnessService::open(&fixture.harness).unwrap(),
+        ObservationService::open(&fixture.observation).unwrap(),
+        adapter,
+        events,
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        Some(operator_credential.clone()),
+        HarnessRuntimeCatalogs::default(),
+    ).await.unwrap();
+    let harness_endpoint = host.endpoint().socket_addr();
+    let client = HarnessOperatorClient::new(harness_endpoint, operator_credential).unwrap();
+
+    // BrowseHostDirectories: the fixture root contains exactly the primary
+    // workspace directory this test's own `FixturePaths::new` created.
+    let root_listing = client.browse_host_directories(
+        node_id.as_str().to_owned(),
+        Some(HarnessHostPathV1::new(fixture.root.to_string_lossy().into_owned()).unwrap()),
+        None,
+    ).unwrap();
+    assert!(
+        root_listing.entries.iter().any(|entry| entry.display_name == "workspace"),
+        "host directory page did not contain the fixture workspace directory: {:?}",
+        root_listing.entries,
+    );
+
+    // RegisterWorkspace: a second, plain (non-git) directory -- discoverable
+    // through the runtime inventory afterward, the same convergence route
+    // the session-record family's own `IndexProviderSession` test already
+    // proves.
+    let second_workspace_dir = fixture.root.join("second-workspace");
+    fs::create_dir_all(&second_workspace_dir).unwrap();
+    let registered = client.register_workspace(
+        node_id.as_str().to_owned(),
+        "second".to_owned(),
+        HarnessHostPathV1::new(second_workspace_dir.to_string_lossy().into_owned()).unwrap(),
+    ).unwrap();
+    assert_eq!(registered.workspace_id, "second");
+    timeout(Duration::from_secs(15), async {
+        loop {
+            if let Ok(page) = client.runtime_inventory_list(None, 16) {
+                if page.nodes.iter().any(|node| {
+                    node.node_id == node_id.as_str()
+                        && node.inventory.workspaces.contains_key("second")
+                }) {
+                    return;
+                }
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    }).await.expect("registered workspace never appeared in the runtime inventory");
+
+    // CreateWorktree: branched from the primary workspace's own `HEAD`
+    // (`init_git_repository`). `InspectNodeWorkspace` (the V9 node-scoped
+    // read family) confirms the new workspace is a real repository on the
+    // requested branch -- `HarnessGitSummaryV1` carries no worktree list of
+    // its own (only the run-scoped/node-scoped tree+status+commits already
+    // covered by `windows_harness_run_workspace_read_e2e.rs`), so this reads
+    // the created worktree's own workspace identity instead of a worktree
+    // listing.
+    let worktree_target = fixture.root.join("worktree-target");
+    let (worktree, worktree_workspace) = client.create_worktree(
+        node_id.as_str().to_owned(),
+        workspace_id.as_str().to_owned(),
+        "worktree-ws".to_owned(),
+        HarnessHostPathV1::new(worktree_target.to_string_lossy().into_owned()).unwrap(),
+        "feature/e2e-worktree".to_owned(),
+        None,
+    ).unwrap();
+    assert_eq!(worktree_workspace.workspace_id, "worktree-ws");
+    assert_eq!(worktree.branch.as_deref(), Some("feature/e2e-worktree"));
+    assert!(worktree_target.is_dir(), "git worktree add did not create the target directory");
+    let inspected = client.inspect_node_workspace(
+        node_id.as_str().to_owned(),
+        "worktree-ws".to_owned(),
+    ).unwrap();
+    assert!(inspected.git.is_repository);
+    assert_eq!(inspected.git.branch.as_deref(), Some("feature/e2e-worktree"));
+
+    // RemoveWorktree: the target directory `git worktree remove` deletes on
+    // disk is the direct, filesystem-level proof this test can check without
+    // a dedicated worktree-listing read (see the comment above).
+    let (removed_target, _removed_workspace_id) = client.remove_worktree(
+        node_id.as_str().to_owned(),
+        workspace_id.as_str().to_owned(),
+        HarnessHostPathV1::new(worktree_target.to_string_lossy().into_owned()).unwrap(),
+    ).unwrap();
+    assert_eq!(removed_target, worktree_target.to_string_lossy().into_owned());
+    assert!(!worktree_target.exists(), "removed worktree directory is still present on disk");
+
+    // UnregisterWorkspace: the second workspace registered above leaves the
+    // runtime inventory.
+    let unregistered = client.unregister_workspace(
+        node_id.as_str().to_owned(),
+        "second".to_owned(),
+    ).unwrap();
+    assert_eq!(unregistered, "second");
+    timeout(Duration::from_secs(15), async {
+        loop {
+            if let Ok(page) = client.runtime_inventory_list(None, 16) {
+                if page.nodes.iter().any(|node| node.node_id == node_id.as_str())
+                    && !page.nodes.iter().any(|node| {
+                        node.node_id == node_id.as_str()
+                            && node.inventory.workspaces.contains_key("second")
+                    })
+                {
+                    return;
+                }
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    }).await.expect("unregistered workspace never left the runtime inventory");
+
+    // ExportContextPack: real wire relay against a live (unmanaged, PTY-
+    // echo) session -- see the module doc comment for why only the
+    // rejection path is asserted here, not a success.
+    let session = client.spawn_session(
+        node_id.as_str().to_owned(),
+        workspace_id.as_str().to_owned(),
+        "claude".to_owned(),
+        profile_id.as_str().to_owned(),
+        HarnessExecutionModeV1::Pty,
+        gate4agent_harness_api::HarnessRuntimeTerminalSizeV1 { rows: 24, columns: 80 },
+    ).unwrap();
+    assert!(
+        client.export_context_pack(session).is_err(),
+        "exporting a context pack from a plain PTY-echo session with no exportable history must be rejected",
+    );
+
+    // ForgetContextPack against a context id the node never exported:
+    // `NodeFailureCode::UnknownContextPack` relays through
+    // `map_resource_mutation_error` to `NotFound`, the same "unknown X"
+    // mapping every other family on this wire already uses.
+    assert!(matches!(
+        client.forget_context_pack(node_id.as_str().to_owned(), "context-never-exported".to_owned()),
+        Err(HarnessOperatorClientError::Host(HarnessOperatorHostErrorV1::NotFound)),
+    ));
+
+    // Negative: `CreateWorktree` against a source workspace the node has
+    // never registered relays the node's own rejection faithfully.
+    assert!(matches!(
+        client.create_worktree(
+            node_id.as_str().to_owned(),
+            "no-such-workspace".to_owned(),
+            "worktree-ws-2".to_owned(),
+            HarnessHostPathV1::new(fixture.root.join("worktree-target-2").to_string_lossy().into_owned())
+                .unwrap(),
+            "feature/e2e-worktree-2".to_owned(),
+            None,
+        ),
+        Err(HarnessOperatorClientError::Host(HarnessOperatorHostErrorV1::NotFound)),
+    ));
 
     host.shutdown().await.unwrap();
     timeout(Duration::from_secs(5), host_task).await.unwrap().unwrap().unwrap();

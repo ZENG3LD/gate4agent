@@ -31,6 +31,7 @@ pub use gate4agent_harness_protocol::{
     HarnessTaskLaunchIssuanceId, HarnessTaskLaunchIssuanceRefV1,
     HarnessTaskReviewPolicyV1,
     HarnessTaskStartOutcomeV1,
+    HarnessContextPackLineageV1,
     HarnessReadPermissionsV1, HarnessReconciliationOutcomeV1, HarnessResolvedContextPackReceiptV1,
     HarnessResultDispositionV1,
     HarnessInlineRef, HarnessReceiptRef, HarnessResultRef, HarnessRevision, HarnessRunId, HarnessRunIntentV1,
@@ -115,6 +116,17 @@ pub const HARNESS_SESSION_INPUT_MAX_BYTES: usize = 32 * 1_024;
 // ceiling `WriteSessionBytes` is rejected above, not a substitute for the
 // node's own authoritative re-check.
 pub const HARNESS_SESSION_BYTES_MAX_BYTES: usize = 64;
+// Matches the node's own `MAX_WORKSPACE_ROOT_BYTES` (gate4agent-node-protocol,
+// itself `gate4agent_types::WORKING_DIRECTORY_MAX_BYTES`): the wire-level
+// ceiling `HarnessHostPathV1` (a host filesystem path -- workspace/worktree
+// root, host-directory-browse cursor) is rejected above. Not shared with
+// `HARNESS_REPOSITORY_PATH_MAX_BYTES`: that bound is for repo-relative paths,
+// a categorically smaller and differently-shaped value.
+pub const HARNESS_HOST_PATH_MAX_BYTES: usize = 32 * 1_024;
+// Matches the node's own `MAX_HOST_DIRECTORY_ENTRIES`/
+// `MAX_HOST_DIRECTORY_DISPLAY_NAME_BYTES` (gate4agent-node-protocol).
+pub const HARNESS_HOST_DIRECTORY_ENTRIES_MAX: usize = 256;
+pub const HARNESS_HOST_DIRECTORY_DISPLAY_NAME_MAX_BYTES: usize = 1_024;
 
 pub const HARNESS_READ_TOOL_IDS: [&str; 8] = [
     "g4a_context_get",
@@ -830,6 +842,51 @@ impl<'de> Deserialize<'de> for HarnessRepositoryPathV1 {
     }
 }
 
+/// A bounded, UTF-8 host filesystem path: a workspace/worktree root, a
+/// worktree target, or a host-directory-browse cursor (`directory`/`after`/
+/// `parent`/`next_after`). Mirrors the node's own `OpaqueHostPath` narrowed
+/// to its UTF-8 representation only, the same way `HarnessRepositoryPathV1`
+/// narrows the node's dual-representation `RepositoryPath` -- see
+/// `repository_path_from_api`/`project_repository_path` in
+/// `gate4agent-harness-service` for that precedent: a genuinely non-UTF-8
+/// host path from the node is a projection failure, never silently
+/// lossy-displayed. Validation intentionally stays as minimal as the node's
+/// own `validate_opaque_host_path` (non-empty, bounded, no NUL byte): unlike
+/// a repository-relative path, an absolute host path legitimately contains
+/// backslashes, drive letters, and colons (Windows), so this type imposes no
+/// format assumptions beyond that.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct HarnessHostPathV1(String);
+
+impl HarnessHostPathV1 {
+    pub fn new(value: impl Into<String>) -> Result<Self, HarnessOperatorApiError> {
+        let value = value.into();
+        validate_host_path(&value)?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str { &self.0 }
+
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        validate_host_path(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for HarnessHostPathV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where D: Deserializer<'de> {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+fn validate_host_path(value: &str) -> Result<(), HarnessOperatorApiError> {
+    if value.is_empty() || value.len() > HARNESS_HOST_PATH_MAX_BYTES || value.contains('\0') {
+        return Err(HarnessOperatorApiError::InvalidHostPath);
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct HarnessGitObjectIdV1(String);
@@ -1279,6 +1336,137 @@ impl HarnessNodeWorkspaceDirectoryV1 {
         self.origin.validate_for(node_id, workspace_id)?;
         if &self.entry.relative_path != path {
             return Err(HarnessOperatorApiError::InvalidWorkspaceTree);
+        }
+        Ok(())
+    }
+}
+
+/// One entry in a `BrowseHostDirectories` page. Mirrors the node's own
+/// `HostDirectoryEntry` field-for-field; that type's own constructor already
+/// rejects a non-UTF-8 `path`, so the node never actually produces the case
+/// `HarnessHostPathV1` would reject here.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessHostDirectoryEntryV1 {
+    pub path: HarnessHostPathV1,
+    pub display_name: String,
+    pub is_link: bool,
+}
+
+impl HarnessHostDirectoryEntryV1 {
+    fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        self.path.validate()?;
+        if self.display_name.is_empty()
+            || self.display_name.len() > HARNESS_HOST_DIRECTORY_DISPLAY_NAME_MAX_BYTES
+            || self.display_name.chars().any(char::is_control)
+        {
+            return Err(HarnessOperatorApiError::InvalidHostDirectoryBrowseRequest);
+        }
+        Ok(())
+    }
+}
+
+/// `BrowseHostDirectories`'s reply: mirrors the node's own
+/// `HostDirectoryListing` field-for-field. Entries are deliberately not
+/// asserted to be sorted (unlike most other bounded collections on this
+/// wire, e.g. `HarnessWorkspaceTreeEntryV1`): a live directory listing has no
+/// such guarantee from the underlying filesystem, so imposing one here would
+/// reject a legitimate page.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessHostDirectoryListingV1 {
+    pub directory: Option<HarnessHostPathV1>,
+    pub parent: Option<HarnessHostPathV1>,
+    pub entries: Vec<HarnessHostDirectoryEntryV1>,
+    pub next_after: Option<HarnessHostPathV1>,
+    /// True only when another page of supported directory entries is
+    /// available.
+    pub incomplete: bool,
+}
+
+impl HarnessHostDirectoryListingV1 {
+    fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        if let Some(directory) = &self.directory { directory.validate()?; }
+        if let Some(parent) = &self.parent { parent.validate()?; }
+        if self.entries.len() > HARNESS_HOST_DIRECTORY_ENTRIES_MAX {
+            return Err(HarnessOperatorApiError::InvalidHostDirectoryBrowseRequest);
+        }
+        for entry in &self.entries { entry.validate()?; }
+        if let Some(next_after) = &self.next_after { next_after.validate()?; }
+        Ok(())
+    }
+}
+
+/// Mirrors the node's own `WorktreeServiceMode`.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessWorktreeServiceModeV1 {
+    Manual,
+    Managed,
+    Off,
+}
+
+/// `RegisterWorkspace`/`CreateStandaloneWorkspace`'s reply, and half of
+/// `CreateWorktree`'s. A deliberately narrowed projection of the node's own
+/// `WorkspaceSnapshot`: `sessions` is dropped (redundant with the runtime
+/// inventory, which every roster-affecting resource mutation already
+/// invalidates on success -- see `HarnessOperatorRequestV1::RegisterWorkspace`'s
+/// doc comment) and `managed_worktree_profiles` is dropped (`SpawnManagedWorktree`
+/// has no typed operator verb -- see that request variant's own doc comment
+/// for why -- so a profile-catalog listing here would serve no reachable
+/// caller). `workspace_id` stays a bounded opaque string rather than a typed
+/// selector, matching every other node-scoped workspace id on this wire
+/// (`HarnessNodeWorkspaceOriginV1.workspace_id`, etc).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessWorkspaceSnapshotV1 {
+    pub workspace_id: String,
+    pub canonical_root: HarnessHostPathV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_service_mode: Option<HarnessWorktreeServiceModeV1>,
+}
+
+impl HarnessWorkspaceSnapshotV1 {
+    fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        if !valid_runtime_id(&self.workspace_id, 128) {
+            return Err(HarnessOperatorApiError::InvalidResourceMutationRequest);
+        }
+        self.canonical_root.validate()
+    }
+}
+
+/// The other half of `CreateWorktree`'s reply. Mirrors the node's own
+/// `GitWorktreeSnapshot`, minus `lock_reason`/`prunable_reason` (free-text
+/// reason strings the node's own C2-facing mirror, `C2GitWorktreeSnapshot`,
+/// already drops -- this wire never receives them to begin with).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessGitWorktreeSnapshotV1 {
+    pub path: HarnessHostPathV1,
+    pub head: String,
+    pub branch: Option<String>,
+    pub is_bare: bool,
+    pub is_main: bool,
+    pub locked: bool,
+    pub prunable: bool,
+    pub workspace_id: Option<String>,
+}
+
+impl HarnessGitWorktreeSnapshotV1 {
+    fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        self.path.validate()?;
+        if !valid_native_single_line(&self.head, HARNESS_GIT_SUMMARY_MAX_BYTES, true) {
+            return Err(HarnessOperatorApiError::InvalidResourceMutationRequest);
+        }
+        if let Some(branch) = &self.branch {
+            if !valid_native_single_line(branch, HARNESS_REPOSITORY_PATH_MAX_BYTES, false) {
+                return Err(HarnessOperatorApiError::InvalidResourceMutationRequest);
+            }
+        }
+        if let Some(workspace_id) = &self.workspace_id {
+            if !valid_runtime_id(workspace_id, 128) {
+                return Err(HarnessOperatorApiError::InvalidResourceMutationRequest);
+            }
         }
         Ok(())
     }
@@ -2136,6 +2324,86 @@ pub enum HarnessOperatorRequestV1 {
     ReplaceTaskExecutionSpecV2 { request: HarnessReplaceTaskExecutionSpecRequestV2 },
     StartTaskV2 { request: HarnessStartTaskRequestV2 },
     SubmitIntent { intent: HarnessOperatorIntentV1 },
+    // Node-scoped, paged host-directory listing behind the folder-browser
+    // dialog: the harness-mode sibling of the light TUI's own
+    // `AppAction::BrowseHostDirectories`, relaying `NodeRequest::
+    // BrowseHostDirectories` directly. No `workspace_id`: unlike every read
+    // above, a host-directory browse targets the node's host filesystem, not
+    // a registered workspace, so it does not fit `InspectNodeWorkspace`'s
+    // family (see `PreparedHostDirectoryBrowse`'s doc comment in
+    // `gate4agent-harness-service` for why this rides its own bounded read
+    // lane rather than that family's). `directory: None` opens the node's
+    // default root; `after` pages a previously returned `next_after` cursor.
+    BrowseHostDirectories {
+        node_id: String,
+        directory: Option<HarnessHostPathV1>,
+        after: Option<HarnessHostPathV1>,
+    },
+    // `RegisterWorkspace`/`UnregisterWorkspace`/`CreateStandaloneWorkspace`/
+    // `CreateWorktree`/`RemoveWorktree`/`ExportContextPack`/
+    // `ForgetContextPack` are the resource-mutation family: workspace/
+    // worktree lifecycle plus context-pack export/forget, dispatched through
+    // the bounded resource-mutation worker pool (`is_resource_mutation_
+    // request` in `gate4agent-harness-service`) the same way the session-
+    // record family uses its own pool -- see `ResourceMutationKind`'s doc
+    // comment there for why these seven heterogeneous verbs share one lane.
+    // `RegisterWorkspace`'s success (like every workspace/worktree lifecycle
+    // verb in this family) adds an entry to the node's `workspaces` map,
+    // which the runtime inventory's own roster caches
+    // (`HarnessRuntimeInventoryV1::workspaces`) -- the host invalidates that
+    // route's cached entry unconditionally on success, so a harness-mode
+    // sidebar converges the same way it does after a session-record
+    // mutation.
+    RegisterWorkspace {
+        node_id: String,
+        workspace_id: String,
+        root: HarnessHostPathV1,
+    },
+    UnregisterWorkspace {
+        node_id: String,
+        workspace_id: String,
+    },
+    CreateStandaloneWorkspace {
+        node_id: String,
+        workspace_id: String,
+        root: HarnessHostPathV1,
+        initial_branch: Option<String>,
+    },
+    CreateWorktree {
+        node_id: String,
+        source_workspace_id: String,
+        workspace_id: String,
+        target_root: HarnessHostPathV1,
+        branch: String,
+        base: Option<String>,
+    },
+    RemoveWorktree {
+        node_id: String,
+        source_workspace_id: String,
+        target_root: HarnessHostPathV1,
+    },
+    // Session-address-scoped, not node-id-scoped like the five workspace/
+    // worktree verbs above: relays `NodeRequest::ExportContextPack` exactly
+    // the way the eight session-control verbs relay their own node requests
+    // from a `HarnessRuntimeSessionAddressV1` -- the node/incarnation this
+    // targets comes from `session.node_id`/`session.incarnation_id`, so
+    // there is no separate `node_id` field. Reuses
+    // `HarnessResolvedContextPackReceiptV1` (already defined for the A2 run-
+    // continuation arc) as its reply verbatim rather than inventing a
+    // duplicate: the node's own `ResolvedContextPackReceipt` is the exact
+    // same payload shape either way `ExportContextPack`/
+    // `ExportContextPackForSessionRecord` produces it.
+    ExportContextPack {
+        session: HarnessRuntimeSessionAddressV1,
+    },
+    // Node-scoped like the five workspace/worktree verbs above, not session-
+    // address-scoped like `ExportContextPack`: forgetting an exported
+    // context pack from the node's `ContextPackStore` needs only the node
+    // and the pack's own id, no session or incarnation binding.
+    ForgetContextPack {
+        node_id: String,
+        context_id: HarnessSelectorV1,
+    },
     // Opens a long-lived, server-push subscription instead of the usual
     // one-shot request/reply: see the framing note on `HarnessOperatorEventV1`
     // for the wire shape this switches the connection into.
@@ -2444,6 +2712,68 @@ impl HarnessOperatorRequestV1 {
             Self::ReplaceTaskExecutionSpecV2 { request } => request.validate(),
             Self::StartTaskV2 { request } => request.validate(),
             Self::SubmitIntent { intent } => intent.validate(),
+            Self::BrowseHostDirectories { node_id, directory, after } => {
+                if !valid_runtime_id(node_id, 128) {
+                    return Err(HarnessOperatorApiError::InvalidHostDirectoryBrowseRequest);
+                }
+                if let Some(directory) = directory { directory.validate()?; }
+                if let Some(after) = after { after.validate()?; }
+                Ok(())
+            }
+            Self::RegisterWorkspace { node_id, workspace_id, root } => {
+                if !valid_runtime_id(node_id, 128) || !valid_runtime_id(workspace_id, 128) {
+                    return Err(HarnessOperatorApiError::InvalidResourceMutationRequest);
+                }
+                root.validate()
+            }
+            Self::UnregisterWorkspace { node_id, workspace_id } => {
+                if !valid_runtime_id(node_id, 128) || !valid_runtime_id(workspace_id, 128) {
+                    return Err(HarnessOperatorApiError::InvalidResourceMutationRequest);
+                }
+                Ok(())
+            }
+            Self::CreateStandaloneWorkspace { node_id, workspace_id, root, initial_branch } => {
+                if !valid_runtime_id(node_id, 128) || !valid_runtime_id(workspace_id, 128) {
+                    return Err(HarnessOperatorApiError::InvalidResourceMutationRequest);
+                }
+                root.validate()?;
+                if let Some(branch) = initial_branch {
+                    if !valid_native_single_line(branch, HARNESS_REPOSITORY_PATH_MAX_BYTES, true) {
+                        return Err(HarnessOperatorApiError::InvalidResourceMutationRequest);
+                    }
+                }
+                Ok(())
+            }
+            Self::CreateWorktree {
+                node_id, source_workspace_id, workspace_id, target_root, branch, base,
+            } => {
+                if !valid_runtime_id(node_id, 128)
+                    || !valid_runtime_id(source_workspace_id, 128)
+                    || !valid_runtime_id(workspace_id, 128)
+                    || !valid_native_single_line(branch, HARNESS_REPOSITORY_PATH_MAX_BYTES, true)
+                {
+                    return Err(HarnessOperatorApiError::InvalidResourceMutationRequest);
+                }
+                if let Some(base) = base {
+                    if !valid_native_single_line(base, HARNESS_REPOSITORY_PATH_MAX_BYTES, true) {
+                        return Err(HarnessOperatorApiError::InvalidResourceMutationRequest);
+                    }
+                }
+                target_root.validate()
+            }
+            Self::RemoveWorktree { node_id, source_workspace_id, target_root } => {
+                if !valid_runtime_id(node_id, 128) || !valid_runtime_id(source_workspace_id, 128) {
+                    return Err(HarnessOperatorApiError::InvalidResourceMutationRequest);
+                }
+                target_root.validate()
+            }
+            Self::ExportContextPack { session } => session.validate(),
+            Self::ForgetContextPack { node_id, context_id } => {
+                if !valid_runtime_id(node_id, 128) {
+                    return Err(HarnessOperatorApiError::InvalidResourceMutationRequest);
+                }
+                context_id.validate().map_err(HarnessOperatorApiError::Protocol)
+            }
             Self::SubscribeEvents {} => Ok(()),
         }
     }
@@ -2534,6 +2864,14 @@ impl HarnessOperatorRequestV1 {
                 | Self::ForgetSessionRecord { .. }
                 | Self::IndexProviderSession { .. }
                 | Self::IndexNativeSession { .. }
+                | Self::BrowseHostDirectories { .. }
+                | Self::RegisterWorkspace { .. }
+                | Self::UnregisterWorkspace { .. }
+                | Self::CreateStandaloneWorkspace { .. }
+                | Self::CreateWorktree { .. }
+                | Self::RemoveWorktree { .. }
+                | Self::ExportContextPack { .. }
+                | Self::ForgetContextPack { .. }
         )
     }
 
@@ -2698,6 +3036,20 @@ pub enum HarnessOperatorResponseV1 {
     SessionRecordForgotten { record_id: String },
     ProviderSessionIndexed(HarnessRuntimeManagedSessionV1),
     NativeSessionIndexed(HarnessNativeSessionIndexedV1),
+    HostDirectoriesBrowsed(HarnessHostDirectoryListingV1),
+    WorkspaceRegistered(HarnessWorkspaceSnapshotV1),
+    StandaloneWorkspaceCreated(HarnessWorkspaceSnapshotV1),
+    WorkspaceUnregistered { workspace_id: String },
+    WorktreeCreated {
+        worktree: HarnessGitWorktreeSnapshotV1,
+        workspace: HarnessWorkspaceSnapshotV1,
+    },
+    WorktreeRemoved {
+        target_root: HarnessHostPathV1,
+        workspace_id: Option<String>,
+    },
+    ContextPackExported(HarnessResolvedContextPackReceiptV1),
+    ContextPackForgotten { context_id: String },
     Mutation(HarnessOperatorMutationOutcomeV1),
     ExecutionSpecMutation(HarnessOperatorMutationOutcomeV1),
     Schedule(HarnessScheduleOutcomeV1),
@@ -2763,6 +3115,38 @@ impl HarnessOperatorResponseV1 {
                 Ok(())
             }
             Self::NativeSessionIndexed(value) => value.validate(),
+            Self::HostDirectoriesBrowsed(value) => value.validate(),
+            Self::WorkspaceRegistered(value) | Self::StandaloneWorkspaceCreated(value) => {
+                value.validate()
+            }
+            Self::WorkspaceUnregistered { workspace_id } => {
+                if !valid_runtime_id(workspace_id, 128) {
+                    return Err(HarnessOperatorApiError::InvalidResourceMutationRequest);
+                }
+                Ok(())
+            }
+            Self::WorktreeCreated { worktree, workspace } => {
+                worktree.validate()?;
+                workspace.validate()
+            }
+            Self::WorktreeRemoved { target_root, workspace_id } => {
+                target_root.validate()?;
+                if let Some(workspace_id) = workspace_id {
+                    if !valid_runtime_id(workspace_id, 128) {
+                        return Err(HarnessOperatorApiError::InvalidResourceMutationRequest);
+                    }
+                }
+                Ok(())
+            }
+            Self::ContextPackExported(value) => {
+                value.validate().map_err(HarnessOperatorApiError::Protocol)
+            }
+            Self::ContextPackForgotten { context_id } => {
+                if !valid_runtime_id(context_id, 128) {
+                    return Err(HarnessOperatorApiError::InvalidResourceMutationRequest);
+                }
+                Ok(())
+            }
             Self::Mutation(_) | Self::ExecutionSpecMutation(_) => Ok(()),
             Self::Schedule(HarnessScheduleOutcomeV1::Idle) => Ok(()),
             Self::Schedule(HarnessScheduleOutcomeV1::Dispatch(value)) => {
@@ -5028,6 +5412,12 @@ pub enum HarnessOperatorApiError {
     InvalidSessionControl,
     #[error("harness session record request is invalid")]
     InvalidSessionRecordRequest,
+    #[error("harness host path is invalid")]
+    InvalidHostPath,
+    #[error("harness host directory browse request is invalid")]
+    InvalidHostDirectoryBrowseRequest,
+    #[error("harness workspace or worktree resource mutation request is invalid")]
+    InvalidResourceMutationRequest,
     #[error("harness operator response is invalid")]
     Read(#[source] HarnessReadApiError),
     #[error("harness protocol value is invalid: {0}")]
@@ -8209,6 +8599,273 @@ mod tests {
                 selection: malformed_selection,
                 record: sample_managed_session("record-a"),
             }).validate().is_err()
+        );
+    }
+
+    fn host_path(value: &str) -> HarnessHostPathV1 {
+        HarnessHostPathV1::new(value).unwrap()
+    }
+
+    fn sample_workspace_snapshot(workspace_id: &str) -> HarnessWorkspaceSnapshotV1 {
+        HarnessWorkspaceSnapshotV1 {
+            workspace_id: workspace_id.to_owned(),
+            canonical_root: host_path(r"C:\fixtures\workspace"),
+            worktree_service_mode: Some(HarnessWorktreeServiceModeV1::Manual),
+        }
+    }
+
+    fn sample_git_worktree_snapshot() -> HarnessGitWorktreeSnapshotV1 {
+        HarnessGitWorktreeSnapshotV1 {
+            path: host_path(r"C:\fixtures\worktree"),
+            head: "a".repeat(40),
+            branch: Some("feature/resource-mutation".to_owned()),
+            is_bare: false,
+            is_main: false,
+            locked: false,
+            prunable: false,
+            workspace_id: Some("worktree-workspace".to_owned()),
+        }
+    }
+
+    #[test]
+    fn operator_resource_mutation_family_requests_are_exact_round_trips_and_fail_closed_on_v10() {
+        let requests = vec![
+            HarnessOperatorRequestV1::BrowseHostDirectories {
+                node_id: "node-a".to_owned(),
+                directory: Some(host_path(r"C:\fixtures")),
+                after: Some(host_path(r"C:\fixtures\a")),
+            },
+            HarnessOperatorRequestV1::RegisterWorkspace {
+                node_id: "node-a".to_owned(),
+                workspace_id: "workspace-b".to_owned(),
+                root: host_path(r"C:\fixtures\workspace-b"),
+            },
+            HarnessOperatorRequestV1::UnregisterWorkspace {
+                node_id: "node-a".to_owned(),
+                workspace_id: "workspace-b".to_owned(),
+            },
+            HarnessOperatorRequestV1::CreateStandaloneWorkspace {
+                node_id: "node-a".to_owned(),
+                workspace_id: "workspace-c".to_owned(),
+                root: host_path(r"C:\fixtures\workspace-c"),
+                initial_branch: Some("main".to_owned()),
+            },
+            HarnessOperatorRequestV1::CreateWorktree {
+                node_id: "node-a".to_owned(),
+                source_workspace_id: "workspace-a".to_owned(),
+                workspace_id: "worktree-workspace".to_owned(),
+                target_root: host_path(r"C:\fixtures\worktree"),
+                branch: "feature/resource-mutation".to_owned(),
+                base: Some("main".to_owned()),
+            },
+            HarnessOperatorRequestV1::RemoveWorktree {
+                node_id: "node-a".to_owned(),
+                source_workspace_id: "workspace-a".to_owned(),
+                target_root: host_path(r"C:\fixtures\worktree"),
+            },
+            HarnessOperatorRequestV1::ExportContextPack { session: session_address(41, 3) },
+            HarnessOperatorRequestV1::ForgetContextPack {
+                node_id: "node-a".to_owned(),
+                context_id: HarnessSelectorV1::new("context-a").unwrap(),
+            },
+        ];
+        let credential = HarnessOperatorCredential::parse(format!(
+            "g4aho_{}",
+            "b".repeat(64),
+        )).unwrap();
+        for request in requests {
+            request.validate().expect("valid resource-mutation family request");
+            assert_eq!(request.minimum_wire_version(), HARNESS_OPERATOR_WIRE_VERSION_V11);
+            let encoded = serde_json::to_string(&request).unwrap();
+            let decoded: HarnessOperatorRequestV1 = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, request);
+            assert!(matches!(
+                HarnessOperatorEnvelopeV1 {
+                    version: HARNESS_OPERATOR_WIRE_VERSION_V10,
+                    credential: credential.clone(),
+                    request: request.clone(),
+                }.validate(),
+                Err(HarnessOperatorApiError::UnsupportedVersion),
+            ));
+            HarnessOperatorEnvelopeV1 {
+                version: HARNESS_OPERATOR_WIRE_VERSION_V11,
+                credential: credential.clone(),
+                request,
+            }.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn operator_resource_mutation_family_responses_are_exact_round_trips() {
+        let responses = vec![
+            HarnessOperatorResponseV1::HostDirectoriesBrowsed(HarnessHostDirectoryListingV1 {
+                directory: Some(host_path(r"C:\fixtures")),
+                parent: Some(host_path(r"C:\")),
+                entries: vec![HarnessHostDirectoryEntryV1 {
+                    path: host_path(r"C:\fixtures\workspace"),
+                    display_name: "workspace".to_owned(),
+                    is_link: false,
+                }],
+                next_after: Some(host_path(r"C:\fixtures\workspace")),
+                incomplete: true,
+            }),
+            HarnessOperatorResponseV1::WorkspaceRegistered(sample_workspace_snapshot("workspace-b")),
+            HarnessOperatorResponseV1::StandaloneWorkspaceCreated(
+                sample_workspace_snapshot("workspace-c"),
+            ),
+            HarnessOperatorResponseV1::WorkspaceUnregistered {
+                workspace_id: "workspace-b".to_owned(),
+            },
+            HarnessOperatorResponseV1::WorktreeCreated {
+                worktree: sample_git_worktree_snapshot(),
+                workspace: sample_workspace_snapshot("worktree-workspace"),
+            },
+            HarnessOperatorResponseV1::WorktreeRemoved {
+                target_root: host_path(r"C:\fixtures\worktree"),
+                workspace_id: Some("worktree-workspace".to_owned()),
+            },
+            HarnessOperatorResponseV1::ContextPackExported(HarnessResolvedContextPackReceiptV1 {
+                id: HarnessSelectorV1::new("context-a").unwrap(),
+                digest: "sha256:".to_owned() + &"a".repeat(64),
+                lineage: HarnessContextPackLineageV1 {
+                    source_node_id: HarnessSelectorV1::new("node-a").unwrap(),
+                    source_workspace_id: HarnessSelectorV1::new("workspace-a").unwrap(),
+                    source_instance_id: 41,
+                    source_generation: 3,
+                    source_provider: HarnessSelectorV1::new("codex").unwrap(),
+                },
+                source_message_count: 4,
+                retained_message_count: 4,
+                byte_len: 128,
+                truncated: false,
+            }),
+            HarnessOperatorResponseV1::ContextPackForgotten { context_id: "context-a".to_owned() },
+        ];
+        for response in responses {
+            response.validate().expect("valid resource-mutation family response");
+            let encoded = serde_json::to_string(&response).unwrap();
+            let decoded: HarnessOperatorResponseV1 = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, response);
+        }
+    }
+
+    #[test]
+    fn resource_mutation_family_requests_reject_malformed_fields() {
+        let bad_node_id = HarnessOperatorRequestV1::BrowseHostDirectories {
+            node_id: String::new(),
+            directory: None,
+            after: None,
+        };
+        assert!(matches!(
+            bad_node_id.validate(),
+            Err(HarnessOperatorApiError::InvalidHostDirectoryBrowseRequest),
+        ));
+
+        assert!(matches!(
+            HarnessHostPathV1::new(""),
+            Err(HarnessOperatorApiError::InvalidHostPath),
+        ));
+        assert!(matches!(
+            HarnessHostPathV1::new("x".repeat(HARNESS_HOST_PATH_MAX_BYTES + 1)),
+            Err(HarnessOperatorApiError::InvalidHostPath),
+        ));
+        HarnessHostPathV1::new("x".repeat(HARNESS_HOST_PATH_MAX_BYTES)).unwrap();
+
+        let bad_workspace_id = HarnessOperatorRequestV1::RegisterWorkspace {
+            node_id: "node-a".to_owned(),
+            workspace_id: String::new(),
+            root: host_path(r"C:\fixtures\workspace-b"),
+        };
+        assert!(matches!(
+            bad_workspace_id.validate(),
+            Err(HarnessOperatorApiError::InvalidResourceMutationRequest),
+        ));
+
+        let empty_branch = HarnessOperatorRequestV1::CreateWorktree {
+            node_id: "node-a".to_owned(),
+            source_workspace_id: "workspace-a".to_owned(),
+            workspace_id: "worktree-workspace".to_owned(),
+            target_root: host_path(r"C:\fixtures\worktree"),
+            branch: String::new(),
+            base: None,
+        };
+        assert!(matches!(
+            empty_branch.validate(),
+            Err(HarnessOperatorApiError::InvalidResourceMutationRequest),
+        ));
+
+        let control_char_base = HarnessOperatorRequestV1::CreateWorktree {
+            node_id: "node-a".to_owned(),
+            source_workspace_id: "workspace-a".to_owned(),
+            workspace_id: "worktree-workspace".to_owned(),
+            target_root: host_path(r"C:\fixtures\worktree"),
+            branch: "feature/resource-mutation".to_owned(),
+            base: Some("main\u{0007}".to_owned()),
+        };
+        assert!(matches!(
+            control_char_base.validate(),
+            Err(HarnessOperatorApiError::InvalidResourceMutationRequest),
+        ));
+
+        let mut malformed_session = session_address(41, 3);
+        malformed_session.instance_id = 0;
+        assert!(
+            HarnessOperatorRequestV1::ExportContextPack { session: malformed_session }
+                .validate()
+                .is_err()
+        );
+
+        let bad_context_id = HarnessOperatorRequestV1::ForgetContextPack {
+            node_id: "node-a".to_owned(),
+            context_id: HarnessSelectorV1::new("context-a").unwrap(),
+        };
+        bad_context_id.validate().unwrap();
+        let empty_forget_node_id = HarnessOperatorRequestV1::ForgetContextPack {
+            node_id: String::new(),
+            context_id: HarnessSelectorV1::new("context-a").unwrap(),
+        };
+        assert!(matches!(
+            empty_forget_node_id.validate(),
+            Err(HarnessOperatorApiError::InvalidResourceMutationRequest),
+        ));
+    }
+
+    #[test]
+    fn resource_mutation_family_responses_reject_malformed_fields() {
+        assert!(
+            HarnessOperatorResponseV1::WorkspaceUnregistered { workspace_id: String::new() }
+                .validate()
+                .is_err()
+        );
+
+        let mut malformed_workspace = sample_workspace_snapshot("workspace-b");
+        malformed_workspace.workspace_id = String::new();
+        assert!(
+            HarnessOperatorResponseV1::WorkspaceRegistered(malformed_workspace)
+                .validate()
+                .is_err()
+        );
+
+        let mut malformed_worktree = sample_git_worktree_snapshot();
+        malformed_worktree.head = String::new();
+        assert!(
+            HarnessOperatorResponseV1::WorktreeCreated {
+                worktree: malformed_worktree,
+                workspace: sample_workspace_snapshot("worktree-workspace"),
+            }.validate().is_err()
+        );
+
+        assert!(
+            HarnessOperatorResponseV1::WorktreeRemoved {
+                target_root: host_path(r"C:\fixtures\worktree"),
+                workspace_id: Some(String::new()),
+            }.validate().is_err()
+        );
+
+        assert!(
+            HarnessOperatorResponseV1::ContextPackForgotten { context_id: String::new() }
+                .validate()
+                .is_err()
         );
     }
 

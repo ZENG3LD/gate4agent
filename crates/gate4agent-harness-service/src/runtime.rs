@@ -44,7 +44,8 @@ use gate4agent_harness_api::{
     HarnessInlineRunSessionV1, HarnessManagedRunSessionV1,
     HarnessLaunchPlanPageV1, HarnessLaunchPlanSummaryV1,
     HarnessNodeIncarnationV1,
-    HarnessOperatorCredential, HarnessOperatorEnvelopeV1, HarnessOperatorHostErrorV1,
+    HarnessOperatorCredential, HarnessOperatorEnvelopeV1, HarnessOperatorEventV1,
+    HarnessOperatorHostErrorV1,
     HarnessOperatorIntentV1,
     HarnessOperatorMutationOutcomeV1, HarnessOperatorReplyV1, HarnessOperatorRequestV1,
     HarnessOperatorResponseV1, HarnessReadCredential, HarnessReadEnvelopeV1,
@@ -116,6 +117,18 @@ use tokio::{
 
 const HOST_COMMAND_CAPACITY: usize = 64;
 const HOST_CONNECTION_LIMIT: usize = 32;
+// A subscribed connection is long-lived by design (it never sees
+// `HOST_CONNECTION_DEADLINE`), so it must not compete with ordinary
+// one-shot requests for the shared `HOST_CONNECTION_LIMIT` pool -- a leaked
+// or hung subscriber would otherwise permanently shrink the ordinary
+// concurrent-request headroom. Its own, much smaller cap lives here instead.
+const HOST_SUBSCRIBER_LIMIT: usize = 8;
+// Bounded per-subscriber outbound queue: `SubscriberRegistry::emit` uses
+// `try_send`, never blocking the single-writer select loop on a slow
+// reader. A subscriber whose queue fills up is marked `needs_baseline`
+// (see `HarnessEventSubscriber`) rather than back-pressuring event
+// application.
+const HOST_SUBSCRIBER_QUEUE_CAPACITY: usize = 256;
 const HOST_DEADLINE: Duration = Duration::from_secs(3);
 const HOST_NATIVE_HISTORY_RESPONSE_DEADLINE: Duration = Duration::from_secs(40);
 const HOST_RUN_READ_RESPONSE_DEADLINE: Duration = Duration::from_secs(12);
@@ -371,6 +384,14 @@ enum HostCommand {
         result: Result<(), HarnessC2Error>,
         reply: oneshot::Sender<HarnessOperatorReplyV1>,
         identity: OperatorRequestLogIdentity,
+        /// The route and, for a `Stop`, the exact session address --
+        /// captured from `PendingSessionControl` before it was consumed, so
+        /// a successful stop can record a targeted "this session must be
+        /// gone" expectation on the route's recovery entry. `None` for
+        /// `WriteSessionInput`/`ResizeSession` (see `stop_session_address`'s
+        /// doc comment).
+        route: NodeRoute,
+        stopped_session: Option<SessionAddress>,
     },
     RunGitFactsCaptureFinished {
         run_id: gate4agent_harness_protocol::HarnessRunId,
@@ -380,9 +401,330 @@ enum HostCommand {
         completion: RunContextSourceObservationCompletion,
         reply: oneshot::Sender<HarnessOperatorReplyV1>,
     },
+    /// Registers a new event subscriber. Fire-and-forget: unlike every other
+    /// variant carrying a `reply`, there is no ack here -- the connection
+    /// task already holds the paired `mpsc::Receiver`, and the loop's own
+    /// `SnapshotBaseline` push (sent to `sender` the moment this arm runs)
+    /// is itself the observable proof of successful registration. See
+    /// `handle_connection`'s `SubscribeEvents` branch for the sender side.
+    Subscribe {
+        sender: mpsc::Sender<HarnessOperatorEventV1>,
+        identity: OperatorRequestLogIdentity,
+    },
     Shutdown {
         reply: oneshot::Sender<Result<(), HarnessRuntimeError>>,
     },
+}
+
+/// Outcome of one attempted push to a single subscriber's outbound channel.
+/// Shared by every call site in `SubscriberRegistry` so `Full`/`Closed`
+/// handling never drifts between `emit`, `send_to`, and `recover_lagged`.
+enum SubscriberSendOutcome {
+    Sent,
+    Full,
+    Closed,
+}
+
+/// One connection's worth of push-event subscription state, owned entirely
+/// by the select loop. Registered via `HostCommand::Subscribe`; pruned the
+/// moment its `sender` reports `Closed` (the connection task ended,
+/// including a normal client-side unsubscribe-by-disconnect).
+struct HarnessEventSubscriber {
+    id: u64,
+    sender: mpsc::Sender<HarnessOperatorEventV1>,
+    /// Set by `emit` when a `try_send` finds the queue full: the event that
+    /// overflowed it is dropped for this subscriber only (every other live
+    /// subscriber is unaffected). Cleared only once `recover_lagged` lands
+    /// both a `Lagged` and the `SnapshotBaseline` that must follow it.
+    needs_baseline: bool,
+    /// Per-subscription monotonic; never resets, including across a
+    /// `Lagged`/`SnapshotBaseline` pair -- see `HarnessOperatorEventV1`'s
+    /// doc comment.
+    next_sequence: u64,
+    identity: OperatorRequestLogIdentity,
+}
+
+impl HarnessEventSubscriber {
+    fn try_send(
+        &mut self,
+        build: impl FnOnce(u64) -> HarnessOperatorEventV1,
+    ) -> SubscriberSendOutcome {
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.wrapping_add(1);
+        match self.sender.try_send(build(sequence)) {
+            Ok(()) => SubscriberSendOutcome::Sent,
+            Err(mpsc::error::TrySendError::Full(_)) => SubscriberSendOutcome::Full,
+            Err(mpsc::error::TrySendError::Closed(_)) => SubscriberSendOutcome::Closed,
+        }
+    }
+}
+
+/// Loop-local registry of live event subscribers. A `Vec`, not a map:
+/// subscriber count is capped tiny (`HOST_SUBSCRIBER_LIMIT`) by a dedicated
+/// semaphore before a connection ever reaches `HostCommand::Subscribe`, so
+/// linear scan/removal costs nothing observable.
+#[derive(Default)]
+struct SubscriberRegistry {
+    subscribers: Vec<HarnessEventSubscriber>,
+    next_id: u64,
+}
+
+impl SubscriberRegistry {
+    fn insert(
+        &mut self,
+        sender: mpsc::Sender<HarnessOperatorEventV1>,
+        identity: OperatorRequestLogIdentity,
+    ) -> u64 {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.subscribers.push(HarnessEventSubscriber {
+            id,
+            sender,
+            needs_baseline: false,
+            next_sequence: 0,
+            identity,
+        });
+        id
+    }
+
+    fn is_empty(&self) -> bool {
+        self.subscribers.is_empty()
+    }
+
+    fn remove_at(&mut self, index: usize) {
+        let removed = self.subscribers.swap_remove(index);
+        tracing::info!(
+            subscriber_id = removed.id,
+            operation = %removed.identity.operation,
+            node_id = removed.identity.node_id(),
+            workspace_id = removed.identity.workspace_id(),
+            "harness operator event subscriber closed",
+        );
+    }
+
+    /// Pushes to exactly one subscriber by id -- used right after `insert`
+    /// to deliver the mandatory first `SnapshotBaseline`, before the caller
+    /// has any other event to fan out.
+    fn send_to(&mut self, id: u64, build: impl FnOnce(u64) -> HarnessOperatorEventV1) {
+        let Some(index) = self.subscribers.iter().position(|subscriber| subscriber.id == id)
+        else {
+            return;
+        };
+        match self.subscribers[index].try_send(build) {
+            SubscriberSendOutcome::Sent => {}
+            SubscriberSendOutcome::Full => { self.subscribers[index].needs_baseline = true; }
+            SubscriberSendOutcome::Closed => self.remove_at(index),
+        }
+    }
+
+    /// Fans an event out to every live, caught-up subscriber. `build` is
+    /// called once per subscriber, not once total: every subscriber owns
+    /// its own `sequence` counter (see `HarnessOperatorEventV1`'s doc
+    /// comment), so the same logical event carries a different `sequence`
+    /// per recipient. A subscriber already marked `needs_baseline` is
+    /// skipped entirely -- it is treated as stale until `recover_lagged`
+    /// catches it back up, so it must not observe this event out of order
+    /// relative to the `SnapshotBaseline` it is waiting for.
+    fn emit(&mut self, mut build: impl FnMut(u64) -> HarnessOperatorEventV1) {
+        let mut index = 0;
+        while index < self.subscribers.len() {
+            if self.subscribers[index].needs_baseline {
+                index += 1;
+                continue;
+            }
+            match self.subscribers[index].try_send(&mut build) {
+                SubscriberSendOutcome::Sent => index += 1,
+                SubscriberSendOutcome::Full => {
+                    let subscriber = &mut self.subscribers[index];
+                    subscriber.needs_baseline = true;
+                    tracing::info!(
+                        subscriber_id = subscriber.id,
+                        operation = %subscriber.identity.operation,
+                        node_id = subscriber.identity.node_id(),
+                        "harness operator event subscriber lagged: outbound queue is full",
+                    );
+                    index += 1;
+                }
+                SubscriberSendOutcome::Closed => self.remove_at(index),
+            }
+        }
+    }
+
+    /// Runs once per select-loop pass. Every subscriber marked
+    /// `needs_baseline` gets a `Lagged` frame followed by a fresh
+    /// `SnapshotBaseline`; the flag clears only once both sends succeed --
+    /// if either one is still `Full`, the subscriber stays marked and this
+    /// retries on the next pass. The (potentially non-trivial) redaction
+    /// pass over every task/run only runs when at least one subscriber
+    /// actually needs it.
+    fn recover_lagged(
+        &mut self,
+        harness: &HarnessService,
+        runtime_inventory: &HarnessRuntimeInventoryCache,
+    ) {
+        if !self.subscribers.iter().any(|subscriber| subscriber.needs_baseline) {
+            return;
+        }
+        let (tasks, runs) = harness_snapshot_baseline_payload(harness);
+        let nodes = runtime_inventory.all_nodes();
+        let mut index = 0;
+        while index < self.subscribers.len() {
+            if !self.subscribers[index].needs_baseline {
+                index += 1;
+                continue;
+            }
+            match self.subscribers[index]
+                .try_send(|sequence| HarnessOperatorEventV1::Lagged { sequence })
+            {
+                SubscriberSendOutcome::Sent => {}
+                SubscriberSendOutcome::Full => {
+                    index += 1;
+                    continue;
+                }
+                SubscriberSendOutcome::Closed => {
+                    self.remove_at(index);
+                    continue;
+                }
+            }
+            let (tasks, runs, nodes) = (tasks.clone(), runs.clone(), nodes.clone());
+            match self.subscribers[index].try_send(move |sequence| {
+                HarnessOperatorEventV1::SnapshotBaseline { sequence, tasks, runs, nodes }
+            }) {
+                SubscriberSendOutcome::Sent => {
+                    self.subscribers[index].needs_baseline = false;
+                    index += 1;
+                }
+                SubscriberSendOutcome::Full => index += 1,
+                SubscriberSendOutcome::Closed => self.remove_at(index),
+            }
+        }
+    }
+}
+
+/// Accumulates the task/run identities touched by a batch of engine
+/// mutations that happen several call frames away from the code that
+/// eventually needs to turn them into `HarnessOperatorEventV1::{TaskChanged,
+/// RunChanged}` notifications -- the live-event and recovery-lifecycle
+/// appliers (`apply_exact_control_lifecycle`, `apply_snapshot_lifecycle`,
+/// `freeze_bound_route_waiting`, `reconcile_task_result_refs`). An id
+/// landing here more than once is free: `notify_touched` re-reads current
+/// engine state and redacts once per call, so a duplicate id is just a
+/// duplicate, harmless wire event, never a duplicate expensive computation.
+#[derive(Default)]
+struct EngineTouch {
+    task_ids: Vec<gate4agent_harness_protocol::HarnessTaskId>,
+    run_ids: Vec<gate4agent_harness_protocol::HarnessRunId>,
+}
+
+impl EngineTouch {
+    fn merge(&mut self, other: EngineTouch) {
+        self.task_ids.extend(other.task_ids);
+        self.run_ids.extend(other.run_ids);
+    }
+}
+
+fn harness_snapshot_baseline_payload(
+    harness: &HarnessService,
+) -> (Vec<RedactedTaskV1>, Vec<RedactedRunV1>) {
+    (
+        harness.engine().tasks().map(redact_operator_task).collect(),
+        harness.engine().runs().map(redact_operator_run).collect(),
+    )
+}
+
+fn notify_task_changed(
+    subscribers: &mut SubscriberRegistry,
+    harness: &HarnessService,
+    task_id: &gate4agent_harness_protocol::HarnessTaskId,
+) {
+    if subscribers.is_empty() { return; }
+    let Some(task) = harness.engine().task(task_id) else { return; };
+    let redacted = redact_operator_task(task);
+    subscribers.emit(|sequence| HarnessOperatorEventV1::TaskChanged {
+        sequence,
+        task: redacted.clone(),
+    });
+}
+
+fn notify_run_changed(
+    subscribers: &mut SubscriberRegistry,
+    harness: &HarnessService,
+    run_id: &gate4agent_harness_protocol::HarnessRunId,
+) {
+    if subscribers.is_empty() { return; }
+    let Some(run) = harness.engine().run(run_id) else { return; };
+    let redacted = redact_operator_run(run);
+    subscribers.emit(|sequence| HarnessOperatorEventV1::RunChanged {
+        sequence,
+        run: redacted.clone(),
+    });
+}
+
+fn notify_touched(subscribers: &mut SubscriberRegistry, harness: &HarnessService, touch: &EngineTouch) {
+    if subscribers.is_empty() { return; }
+    for task_id in &touch.task_ids { notify_task_changed(subscribers, harness, task_id); }
+    for run_id in &touch.run_ids { notify_run_changed(subscribers, harness, run_id); }
+}
+
+/// Best-effort task/run change notification for a `HostCommand::*Finished`
+/// dispatch-pipeline arm keyed by `operation_id`
+/// (`DispatchPreflightFinished`/`DispatchFinished`/`HarnessMcpArmFinished`/
+/// `DeliveryStageFinished`/`ContinuationExportFinished`, plus
+/// `ApplyHarnessMutation` via `HarnessMutationV1::operation()`): every one of
+/// them mutates exactly the run+task the operation already points at
+/// (`HarnessOperationV1::task_id`/`run_id`), so re-reading the operation
+/// after the mutation and redacting whatever it now names is enough --
+/// cheaper and less fragile than threading a touch-accumulator through each
+/// of those helpers individually. A harmless no-op re-send on a branch that
+/// ended up not changing anything observable is tolerated: the TUI apply
+/// path is an idempotent upsert.
+fn notify_operation_touched(
+    subscribers: &mut SubscriberRegistry,
+    harness: &HarnessService,
+    operation_id: &HarnessOperationId,
+) {
+    if subscribers.is_empty() { return; }
+    let Some(operation) = harness.engine().operation(operation_id) else { return; };
+    let task_id = operation.task_id.clone();
+    let run_id = operation.run_id.clone();
+    if let Some(task_id) = &task_id { notify_task_changed(subscribers, harness, task_id); }
+    if let Some(run_id) = &run_id { notify_run_changed(subscribers, harness, run_id); }
+}
+
+/// The task id a successful operator mutation-family request touches, known
+/// directly from the request body -- every mutation variant carries its
+/// target `task_id`, including a freshly minted one for `CreateTask` (see
+/// `HarnessCreateTaskRequestV1`). `SubmitIntent` is resolved exactly the way
+/// `execute_operator_request` itself resolves it
+/// (`authorize_operator_intent`, deterministic and pure) so the same task id
+/// comes out whether the caller submitted the concrete request directly or
+/// wrapped it in an intent. `None` for every read-only request and for
+/// `ScheduleNext`, whose target task/run is only known from the response's
+/// `HarnessDispatchIntentV1` (see `scheduled_dispatch_from_operator_response`,
+/// used at the mutation-family reply site instead).
+fn operator_mutation_task_id(
+    request: &HarnessOperatorRequestV1,
+) -> Option<gate4agent_harness_protocol::HarnessTaskId> {
+    match request {
+        HarnessOperatorRequestV1::CreateTask { request } => Some(request.task_id.clone()),
+        HarnessOperatorRequestV1::ReplaceTask { request } => Some(request.task_id.clone()),
+        HarnessOperatorRequestV1::MoveTask { request } => Some(request.task_id.clone()),
+        HarnessOperatorRequestV1::CancelTask { request } => Some(request.task_id.clone()),
+        HarnessOperatorRequestV1::RetryTask { request } => Some(request.task_id.clone()),
+        HarnessOperatorRequestV1::ReplaceTaskExecutionSpec { request } => {
+            Some(request.task_id.clone())
+        }
+        HarnessOperatorRequestV1::StartTask { request } => Some(request.task_id.clone()),
+        HarnessOperatorRequestV1::ReplaceTaskExecutionSpecV2 { request } => {
+            Some(request.task_id.clone())
+        }
+        HarnessOperatorRequestV1::StartTaskV2 { request } => Some(request.task_id.clone()),
+        HarnessOperatorRequestV1::SubmitIntent { intent } => {
+            authorize_operator_intent(intent.clone()).ok()
+                .and_then(|resolved| operator_mutation_task_id(&resolved))
+        }
+        _ => None,
+    }
 }
 
 type ObservationRecoveryRouteKey = (NodeId, NodeIncarnationId);
@@ -402,6 +744,17 @@ struct RouteObservationRecovery {
     overflowed: bool,
     refresh_after_completion: bool,
     retry_after: Instant,
+    /// Sessions a caller has told this route to expect gone -- today, only
+    /// a successful `StopSession` (see `HostCommand::SessionControlFinished`'s
+    /// `stopped_session` field). A forced stop's C2 relay ack can outrace
+    /// the node's own internal session-list update, so a resync that lands
+    /// before the node has caught up is structurally valid but stale: as
+    /// long as any of these are still present in the just-refreshed
+    /// inventory, `finish_observation_recovery` keeps retrying (the same
+    /// `retry_after` cadence an ordinary transport failure already uses)
+    /// instead of accepting that resync as final. Cleared the moment none
+    /// of them are present anymore.
+    awaiting_absent_sessions: Vec<SessionAddress>,
 }
 
 impl RouteObservationRecovery {
@@ -414,6 +767,7 @@ impl RouteObservationRecovery {
             overflowed: false,
             refresh_after_completion: false,
             retry_after: Instant::now(),
+            awaiting_absent_sessions: Vec::new(),
         }
     }
 
@@ -905,7 +1259,7 @@ fn specialized_spawn_spec(
 fn reconcile_task_result_refs(
     harness: &mut HarnessService,
     now_unix_ms: u64,
-) -> Result<(), HarnessRuntimeError> {
+) -> Result<Vec<gate4agent_harness_protocol::HarnessTaskId>, HarnessRuntimeError> {
     let mut matches = Vec::new();
     for task in harness.engine().tasks() {
         for run_id in &task.run_ids {
@@ -919,11 +1273,13 @@ fn reconcile_task_result_refs(
             }
         }
     }
+    let mut touched_task_ids = Vec::with_capacity(matches.len());
     for (task_id, run_id) in matches {
         harness.record_task_result_ref(&task_id, &run_id, now_unix_ms)
             .map_err(HarnessRuntimeError::Harness)?;
+        touched_task_ids.push(task_id);
     }
-    Ok(())
+    Ok(touched_task_ids)
 }
 
 fn apply_spawn_result(
@@ -1408,21 +1764,26 @@ fn commit_lifecycle_projection(
     ).map_err(HarnessRuntimeError::Harness)
 }
 
+/// Returns every task/run id this call actually committed a lifecycle
+/// projection for, so a caller several frames away from the mutation
+/// (`apply_or_buffer_host_live_event`, `finish_observation_recovery`) can
+/// turn it into `TaskChanged`/`RunChanged` notifications without re-deriving
+/// which run matched.
 fn apply_exact_control_lifecycle(
     harness: &mut HarnessService,
     routed: &RoutedNodeEvent,
     now_unix_ms: u64,
-) -> Result<(), HarnessRuntimeError> {
+) -> Result<EngineTouch, HarnessRuntimeError> {
     let matches = harness.engine().runs().filter_map(|run| {
         exact_bound_control_lifecycle(run, routed).map(|(sequence, kind, projection)| {
-            (run.run_id.clone(), sequence, kind, projection)
+            (run.run_id.clone(), run.task_id.clone(), sequence, kind, projection)
         })
     }).collect::<Vec<_>>();
     if matches.len() > 1 {
         return Err(HarnessRuntimeError::DispatchPreparation);
     }
-    let Some((run_id, sequence, kind, projection)) = matches.into_iter().next() else {
-        return Ok(());
+    let Some((run_id, task_id, sequence, kind, projection)) = matches.into_iter().next() else {
+        return Ok(EngineTouch::default());
     };
     commit_lifecycle_projection(
         harness,
@@ -1434,15 +1795,22 @@ fn apply_exact_control_lifecycle(
         projection,
         now_unix_ms,
     )?;
-    reconcile_task_result_refs(harness, now_unix_ms)
+    let mut touch = EngineTouch { task_ids: vec![task_id], run_ids: vec![run_id] };
+    touch.merge(EngineTouch {
+        task_ids: reconcile_task_result_refs(harness, now_unix_ms)?,
+        run_ids: Vec::new(),
+    });
+    Ok(touch)
 }
 
+/// Returns every run+task id this call actually froze to `Waiting`, for the
+/// same reason `apply_exact_control_lifecycle` returns its own touch set.
 fn freeze_bound_route_waiting(
     harness: &mut HarnessService,
     route: &NodeRoute,
     event_sequence: u64,
     now_unix_ms: u64,
-) -> Result<(), HarnessRuntimeError> {
+) -> Result<EngineTouch, HarnessRuntimeError> {
     let runs = harness.engine().runs().filter(|run| {
         run.lifecycle == HarnessRunLifecycleV1::Running
             && run.binding.as_ref().is_some_and(|binding| {
@@ -1450,8 +1818,9 @@ fn freeze_bound_route_waiting(
                     && binding.node_incarnation.as_str()
                         == route.expected_incarnation_id.to_string()
             })
-    }).map(|run| run.run_id.clone()).collect::<Vec<_>>();
-    for run_id in runs {
+    }).map(|run| (run.run_id.clone(), run.task_id.clone())).collect::<Vec<_>>();
+    let mut touch = EngineTouch::default();
+    for (run_id, task_id) in runs {
         commit_lifecycle_projection(
             harness,
             &run_id,
@@ -1462,8 +1831,10 @@ fn freeze_bound_route_waiting(
             HarnessLifecycleProjectionV1::Waiting,
             now_unix_ms,
         )?;
+        touch.run_ids.push(run_id);
+        touch.task_ids.push(task_id);
     }
-    Ok(())
+    Ok(touch)
 }
 
 fn start_dispatch_preflight(
@@ -1608,6 +1979,7 @@ fn start_session_spawn_worker(
 /// already enqueued (`adapter.start_prepared_session_control`), this only
 /// awaits the reply and races the same cooperative cancel.
 fn start_session_control_worker(
+    adapter: HarnessC2Adapter,
     pending: PendingSessionControl,
     commands: mpsc::Sender<HostCommand>,
     reply: oneshot::Sender<HarnessOperatorReplyV1>,
@@ -1615,6 +1987,9 @@ fn start_session_control_worker(
     cancel: Option<oneshot::Receiver<()>>,
 ) {
     tokio::spawn(async move {
+        // Captured before `pending.finish()` consumes it below.
+        let route = pending.route().clone();
+        let stopped_session = pending.stop_session_address();
         let result = match cancel {
             Some(cancel) => {
                 tokio::select! {
@@ -1633,9 +2008,31 @@ fn start_session_control_worker(
             }
             None => pending.finish().await,
         };
+        // A settled `StopSession` needs a follow-up node-side reap (see
+        // `HarnessC2Adapter::remove_stopped_session`'s doc comment). Taken
+        // before `stopped_session` moves into the `HostCommand` below, but
+        // only acted on after that command is sent -- the operator's own
+        // `StopSession` reply travels through the host loop from that send,
+        // so a slow or failed reap must never delay or fail the verb itself.
+        let reap = result.is_ok().then(|| stopped_session.clone()).flatten();
         let _ = commands
-            .send(HostCommand::SessionControlFinished { result, reply, identity })
+            .send(HostCommand::SessionControlFinished {
+                result,
+                reply,
+                identity,
+                route: route.clone(),
+                stopped_session,
+            })
             .await;
+        if let Some(session) = reap {
+            if let Err(error) = adapter.remove_stopped_session(&route, session).await {
+                tracing::warn!(
+                    node_id = route.node_id.as_str(),
+                    cause = %error,
+                    "force-stopped session failed to reap from the node's runtime inventory; it remains reported until removed",
+                );
+            }
+        }
     });
 }
 
@@ -2948,8 +3345,10 @@ pub async fn start_harness_host_with_operator_and_catalogs(
     let (commands, mut command_rx) = mpsc::channel(HOST_COMMAND_CAPACITY);
     let handle = HarnessHostHandle { endpoint, commands: commands.clone() };
     let connections = Arc::new(Semaphore::new(HOST_CONNECTION_LIMIT));
+    let subscriber_connections = Arc::new(Semaphore::new(HOST_SUBSCRIBER_LIMIT));
     let task = tokio::spawn(async move {
         let mut active_dispatch = None;
+        let mut subscribers = SubscriberRegistry::default();
         let mut harness_mcp_workers = HarnessMcpWorkerRegistry::default();
         let mut native_history_workers = NativeHistoryWorkerRegistry::default();
         let mut run_read_workers = RunReadWorkerRegistry::default();
@@ -3340,6 +3739,7 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                 }
                                 match adapter.start_prepared_session_control(prepared) {
                                     Ok(pending) => start_session_control_worker(
+                                        adapter.clone(),
                                         pending,
                                         commands.clone(),
                                         reply,
@@ -3385,6 +3785,13 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                 }
                                 continue;
                             }
+                            // Captured before `request` moves into
+                            // `execute_operator_request` below -- see
+                            // `operator_mutation_task_id`'s doc comment for
+                            // why this (not the response) is the right
+                            // source for every mutation variant except
+                            // `ScheduleNext`.
+                            let mutation_task_id = operator_mutation_task_id(&request);
                             let response = execute_operator_request(
                                 &mut harness,
                                 &observation,
@@ -3397,6 +3804,15 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                             );
                             let scheduled_dispatch = response.as_ref().ok()
                                 .and_then(scheduled_dispatch_from_operator_response);
+                            if response.is_ok() {
+                                if let Some(task_id) = &mutation_task_id {
+                                    notify_task_changed(&mut subscribers, &harness, task_id);
+                                }
+                                if let Some(dispatch) = &scheduled_dispatch {
+                                    notify_task_changed(&mut subscribers, &harness, &dispatch.task_id);
+                                    notify_run_changed(&mut subscribers, &harness, &dispatch.run_id);
+                                }
+                            }
                             let reply_value = match response {
                                 Ok(response) => HarnessOperatorReplyV1::Ok { response },
                                 Err(error) => HarnessOperatorReplyV1::Error { error },
@@ -3417,6 +3833,12 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                         }
                         Some(HostCommand::ApplyHarnessMutation { mutation, reply }) => {
                             let prior = non_revoked_harness_mcp_abort_cleanup(&harness);
+                            // Captured before `mutation` moves into
+                            // `harness.apply` below: every `HarnessMutationV1`
+                            // variant carries its own `HarnessOperationV1`,
+                            // which already names the task/run it touches.
+                            let touched_task_id = mutation.operation().task_id.clone();
+                            let touched_run_id = mutation.operation().run_id.clone();
                             let result = harness.apply(mutation).map_err(HarnessRuntimeError::Harness);
                             if result.is_ok() {
                                 enqueue_newly_revoked_harness_mcp_aborts(
@@ -3430,6 +3852,12 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                     &mut harness_mcp_workers,
                                     &mut pending_harness_mcp_aborts,
                                 );
+                                if let Some(task_id) = &touched_task_id {
+                                    notify_task_changed(&mut subscribers, &harness, task_id);
+                                }
+                                if let Some(run_id) = &touched_run_id {
+                                    notify_run_changed(&mut subscribers, &harness, run_id);
+                                }
                             }
                             let _ = reply.send(result);
                         }
@@ -3500,6 +3928,13 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                             }) {
                                 continue;
                             }
+                            // `intent.operation_id`/`.task_id`/`.run_id`
+                            // partially move out of `intent` on some branches
+                            // below (e.g. `ActiveDispatchJob::new`), so these
+                            // notification ids are captured up front rather
+                            // than re-read from `intent` at each exit point.
+                            let notify_task_id = intent.task_id.clone();
+                            let notify_run_id = intent.run_id.clone();
                             let profile = match result {
                                 Ok(profile) => profile,
                                 Err(error) => {
@@ -3519,6 +3954,8 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                                 .or_insert(cleanup);
                                         }
                                     }
+                                    notify_task_changed(&mut subscribers, &harness, &notify_task_id);
+                                    notify_run_changed(&mut subscribers, &harness, &notify_run_id);
                                     continue;
                                 }
                             };
@@ -3731,6 +4168,8 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                     }
                                 }
                             }
+                            notify_task_changed(&mut subscribers, &harness, &notify_task_id);
+                            notify_run_changed(&mut subscribers, &harness, &notify_run_id);
                         }
                         Some(HostCommand::HarnessMcpActivationFinished {
                             reservation_id,
@@ -3854,6 +4293,7 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                         .or_insert(cleanup);
                                 }
                             }
+                            notify_operation_touched(&mut subscribers, &harness, &operation_id);
                         }
                         Some(HostCommand::HarnessMcpArmFinished {
                             operation_id,
@@ -3867,6 +4307,11 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                 continue;
                             }
                             active_dispatch = None;
+                            // `operation_id` moves into `active_dispatch` on
+                            // the success path below, so this notification
+                            // id is captured up front rather than reused
+                            // after the move.
+                            let notify_operation_id = operation_id.clone();
                             match result {
                                 Ok(proof) => {
                                     let pending = (|| -> Result<_, HarnessRuntimeError> {
@@ -3938,6 +4383,7 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                     }
                                 }
                             }
+                            notify_operation_touched(&mut subscribers, &harness, &notify_operation_id);
                         }
                         Some(HostCommand::DeliveryStageFinished { operation_id, result }) => {
                             if !active_dispatch.as_ref().is_some_and(|job| {
@@ -3979,6 +4425,7 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                                     .or_insert(cleanup);
                                             }
                                         }
+                                        notify_operation_touched(&mut subscribers, &harness, &operation_id);
                                         continue;
                                     }
                                     let intent = harness.pending_scheduled_dispatch()?
@@ -4011,6 +4458,7 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                     }
                                 }
                             }
+                            notify_operation_touched(&mut subscribers, &harness, &operation_id);
                         }
                         Some(HostCommand::ContinuationExportFinished { operation_id, result }) => {
                             if !active_dispatch.as_ref().is_some_and(|job| {
@@ -4112,6 +4560,7 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                     )?;
                                 }
                             }
+                            notify_operation_touched(&mut subscribers, &harness, &operation_id);
                         }
                         Some(HostCommand::ObservationRecoveryFinished {
                             route,
@@ -4125,6 +4574,7 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                 &mut observation,
                                 &mut support,
                                 &mut runtime_inventory,
+                                &mut subscribers,
                                 route,
                                 attempt_id,
                                 requested_after,
@@ -4231,8 +4681,22 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                             };
                             let _ = reply.send(reply_value);
                         }
-                        Some(HostCommand::SessionControlFinished { result, reply, identity }) => {
+                        Some(HostCommand::SessionControlFinished {
+                            result,
+                            reply,
+                            identity,
+                            route,
+                            stopped_session,
+                        }) => {
                             session_control_workers.finish();
+                            // `route`/`stopped_session` were captured from
+                            // `PendingSessionControl` before its own C2
+                            // round trip even started (see
+                            // `PendingSessionControl::stop_session_address`),
+                            // so -- unlike `identity`'s log-only strings --
+                            // both are already-resolved, structured values;
+                            // nothing left to re-parse or re-look-up here.
+                            let stopped = result.is_ok().then_some(stopped_session).flatten();
                             let reply_value = match result {
                                 Ok(()) => HarnessOperatorReplyV1::Ok {
                                     response: session_control_response(&identity),
@@ -4251,16 +4715,45 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                     }
                                 }
                             };
+                            if let Some(session) = stopped {
+                                tracing::info!(
+                                    node_id = identity.node_id(),
+                                    session_id = identity.session_id(),
+                                    "stop-session accepted; invalidating the node's runtime inventory route",
+                                );
+                                // Same call set as the reactive live-event
+                                // path (which does NOT mark the route
+                                // unhealthy): the recovery sweep picks the
+                                // ensured route up on the next loop pass.
+                                // The session address is recorded as a
+                                // pending expectation on that same route
+                                // entry so a resync that lands before the
+                                // node's own internal session-list update
+                                // catches up gets retried instead of
+                                // accepted as final -- see
+                                // `RouteObservationRecovery::
+                                // awaiting_absent_sessions`.
+                                invalidate_runtime_inventory_for_route(
+                                    &mut runtime_inventory,
+                                    &mut subscribers,
+                                    &mut observation_recovery,
+                                    &route,
+                                );
+                                observation_recovery.ensure_route(route)
+                                    .awaiting_absent_sessions.push(session);
+                            }
                             let _ = reply.send(reply_value);
                         }
                         Some(HostCommand::RunGitFactsCaptureFinished { run_id, completion }) => {
                             run_git_facts_workers.finish();
+                            let notify_run_id = run_id.clone();
                             finish_run_git_facts_capture(
                                 &mut harness,
                                 run_id,
                                 completion,
                                 unix_time_ms(),
                             );
+                            notify_run_changed(&mut subscribers, &harness, &notify_run_id);
                         }
                         Some(HostCommand::RunContextSourceFinished { completion, reply }) => {
                             run_context_source_workers.finish();
@@ -4327,6 +4820,19 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                         Some(HostCommand::NativeHistoryWorkerFinished) => {
                             native_history_workers.finish();
                         }
+                        Some(HostCommand::Subscribe { sender, identity }) => {
+                            tracing::info!(
+                                operation = %identity.operation,
+                                node_id = identity.node_id(),
+                                "harness operator event subscriber registered",
+                            );
+                            let id = subscribers.insert(sender, identity);
+                            let (tasks, runs) = harness_snapshot_baseline_payload(&harness);
+                            let nodes = runtime_inventory.all_nodes();
+                            subscribers.send_to(id, |sequence| {
+                                HarnessOperatorEventV1::SnapshotBaseline { sequence, tasks, runs, nodes }
+                            });
+                        }
                         Some(HostCommand::Shutdown { reply }) => {
                             let result = harness.flush().map_err(HarnessRuntimeError::Harness)
                                 .and_then(|_| observation.flush().map_err(HarnessRuntimeError::Observation));
@@ -4390,6 +4896,7 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                     &mut support,
                                     &mut observation_recovery,
                                     &mut runtime_inventory,
+                                    &mut subscribers,
                                     event,
                                 )
                             };
@@ -4413,7 +4920,14 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                 .map(|observation_route| observation_route.route().clone())
                                 .collect::<Vec<_>>();
                             observation_recovery.reconcile_topology(&routes);
-                            runtime_inventory.reconcile_topology(&routes);
+                            for removed_node_id in runtime_inventory.reconcile_topology(&routes) {
+                                subscribers.emit(|sequence| {
+                                    HarnessOperatorEventV1::RuntimeInventoryRemoved {
+                                        sequence,
+                                        node_id: removed_node_id.as_str().to_owned(),
+                                    }
+                                });
+                            }
                             terminal_buffers.reconcile_topology(&routes);
                             for route in &routes {
                                 support.mark_unhealthy(
@@ -4511,16 +5025,19 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                     let Ok(permit) = connections.clone().try_acquire_owned() else { continue; };
                     let request_commands = commands.clone();
                     let request_operator_authority = operator_authority.clone();
+                    let request_subscriber_connections = subscriber_connections.clone();
                     tokio::spawn(async move {
-                        let _permit = permit;
                         let _ = handle_connection(
                             stream,
                             request_commands,
                             request_operator_authority,
+                            permit,
+                            request_subscriber_connections,
                         ).await;
                     });
                 }
             }
+            subscribers.recover_lagged(&harness, &runtime_inventory);
             start_pending_observation_recoveries(
                 &adapter,
                 &commands,
@@ -5066,7 +5583,17 @@ struct ManagedWorktreeProfileOptionsCache {
 }
 
 impl HarnessRuntimeInventoryCache {
-    fn refresh(&mut self, resync: &HarnessObservationResync, observed_at_unix_ms: u64) {
+    /// Returns the freshly built node projection when it actually differs
+    /// from whatever was cached for this node id before this call (or when
+    /// there was nothing cached yet) -- `None` when the refresh landed the
+    /// exact same value again (`HarnessRuntimeNodeInventoryV1` is `Eq`), so
+    /// a caller pushing `RuntimeInventoryChanged` events can skip emitting a
+    /// no-op change.
+    fn refresh(
+        &mut self,
+        resync: &HarnessObservationResync,
+        observed_at_unix_ms: u64,
+    ) -> Option<HarnessRuntimeNodeInventoryV1> {
         let route = resync.route();
         let mut profiles = Vec::new();
         for workspace in &resync.snapshot().workspaces {
@@ -5128,7 +5655,7 @@ impl HarnessRuntimeInventoryCache {
                 truncated,
             },
         );
-        self.nodes.insert(route.node_id.clone(), HarnessRuntimeNodeInventoryV1 {
+        let node = HarnessRuntimeNodeInventoryV1 {
             node_id: route.node_id.as_str().to_owned(),
             incarnation_id: route.expected_incarnation_id.to_string(),
             observed_at_unix_ms,
@@ -5136,10 +5663,17 @@ impl HarnessRuntimeInventoryCache {
             inventory: redact_runtime_inventory(
                 gate4agent_c2_protocol::SlimNodeInventory::from_c2_snapshot(resync.snapshot()),
             ),
-        });
+        };
+        let changed = self.nodes.get(&route.node_id) != Some(&node);
+        self.nodes.insert(route.node_id.clone(), node.clone());
+        changed.then_some(node)
     }
 
-    fn reconcile_topology(&mut self, routes: &[NodeRoute]) {
+    /// Returns the ids of every node the topology change actually dropped
+    /// from the cache, so a caller can emit `RuntimeInventoryRemoved` per
+    /// dropped node rather than guessing from the `retain` predicate.
+    fn reconcile_topology(&mut self, routes: &[NodeRoute]) -> Vec<NodeId> {
+        let before = self.nodes.keys().cloned().collect::<Vec<_>>();
         self.nodes.retain(|node_id, inventory| {
             routes.iter().any(|route| {
                 &route.node_id == node_id
@@ -5152,15 +5686,43 @@ impl HarnessRuntimeInventoryCache {
                     && profiles.node_incarnation == route.expected_incarnation_id.to_string()
             })
         });
+        before.into_iter().filter(|node_id| !self.nodes.contains_key(node_id)).collect()
     }
 
-    fn invalidate(&mut self, route: &NodeRoute) {
+    /// Returns `true` when this call actually dropped a cached node -- the
+    /// caller uses that to decide whether a `RuntimeInventoryRemoved` event
+    /// is warranted (see `invalidate_runtime_inventory_for_event`). Matches
+    /// the poll-based read path's existing behavior exactly: a node
+    /// invalidated between two `RuntimeInventoryList` polls already read as
+    /// transiently absent there, well before this push feature existed.
+    fn invalidate(&mut self, route: &NodeRoute) -> bool {
         if self.nodes.get(&route.node_id).is_some_and(|inventory| {
             inventory.incarnation_id == route.expected_incarnation_id.to_string()
         }) {
             self.nodes.remove(&route.node_id);
             self.managed_worktree_profiles.remove(&route.node_id);
+            true
+        } else {
+            false
         }
+    }
+
+    /// Every currently cached node, unpaginated -- the runtime-inventory
+    /// counterpart of `harness_snapshot_baseline_payload`'s task/run lists,
+    /// used to build a `SnapshotBaseline` (which is a full replacement, not
+    /// a page, so it deliberately does not go through `page`'s
+    /// `HARNESS_RUNTIME_INVENTORY_PAGE_LIMIT_MAX` cap).
+    fn all_nodes(&self) -> Vec<HarnessRuntimeNodeInventoryV1> {
+        self.nodes.values().cloned().collect()
+    }
+
+    /// The single cached node by id, regardless of whether the most recent
+    /// `refresh` actually changed it (`refresh` returns `None` on an
+    /// unchanged value; this still finds it) -- used by
+    /// `finish_observation_recovery` to check `awaiting_absent_sessions`
+    /// against whatever is now cached.
+    fn node(&self, node_id: &NodeId) -> Option<&HarnessRuntimeNodeInventoryV1> {
+        self.nodes.get(node_id)
     }
 
     fn page(
@@ -6078,6 +6640,14 @@ fn execute_operator_request(
         HarnessOperatorRequestV1::SubmitIntent { .. } => {
             return Err(HarnessOperatorHostErrorV1::Internal);
         }
+        // Unreachable in production: `handle_connection` intercepts
+        // `SubscribeEvents` before it is ever wrapped into
+        // `HostCommand::Operator` (it registers via `HostCommand::Subscribe`
+        // instead -- see that branch's doc comment). This arm exists only so
+        // this match stays exhaustive.
+        HarnessOperatorRequestV1::SubscribeEvents {} => {
+            return Err(HarnessOperatorHostErrorV1::Internal);
+        }
     };
     response.validate().map_err(|_| HarnessOperatorHostErrorV1::Internal)?;
     Ok(response)
@@ -6312,8 +6882,19 @@ async fn handle_connection(
     mut stream: TcpStream,
     commands: mpsc::Sender<HostCommand>,
     operator_authority: Option<HarnessOperatorCredentialAuthority>,
+    connection_permit: tokio::sync::OwnedSemaphorePermit,
+    subscriber_connections: Arc<Semaphore>,
 ) -> Result<(), HarnessRuntimeError> {
     let mut operator_frame = false;
+    // Populated only by the `SubscribeEvents` branch below. Read after the
+    // `timeout(HOST_CONNECTION_DEADLINE, ...)` wrapper resolves: a
+    // subscription must not sit under that deadline for its whole (unbounded)
+    // lifetime, only for the classify-and-register handshake leading up to
+    // it -- see the branch's own doc comment.
+    let mut subscription: Option<(
+        mpsc::Receiver<HarnessOperatorEventV1>,
+        tokio::sync::OwnedSemaphorePermit,
+    )> = None;
     let outcome = timeout(HOST_CONNECTION_DEADLINE, async {
         let frame = match timeout(
             HOST_DEADLINE,
@@ -6385,6 +6966,39 @@ async fn handle_connection(
                         error: HarnessOperatorHostErrorV1::Unauthorized,
                     },
                 ).await?;
+                return Ok(());
+            }
+            // `SubscribeEvents` branches out of the ordinary one-shot
+            // oneshot/deadline path entirely: it registers via
+            // `HostCommand::Subscribe` (a bounded `mpsc` sender, not a
+            // `oneshot::Sender<HarnessOperatorReplyV1>` -- see
+            // `operator_response_deadline`'s doc comment for why a single
+            // finite `Duration` cannot bound an open-ended push stream) and
+            // returns immediately; the mandatory first `SnapshotBaseline`
+            // arrives through that same channel moments later, forwarded by
+            // `run_operator_event_subscription` once this whole classify
+            // block resolves. Recorded into the outer `subscription` local
+            // (captured by mutable reference, the same way `operator_frame`
+            // already is) rather than returned directly, so the connection's
+            // whole subsequent forwarding-loop lifetime runs outside
+            // `HOST_CONNECTION_DEADLINE`.
+            if matches!(request, HarnessOperatorRequestV1::SubscribeEvents {}) {
+                let Ok(subscriber_permit) = subscriber_connections.clone().try_acquire_owned()
+                else {
+                    tracing::info!(
+                        limit = HOST_SUBSCRIBER_LIMIT,
+                        "harness operator event subscribe rejected: subscriber limit reached",
+                    );
+                    write_operator_reply(
+                        &mut stream,
+                        HarnessOperatorReplyV1::Error { error: HarnessOperatorHostErrorV1::Busy },
+                    ).await?;
+                    return Ok(());
+                };
+                let (sender, receiver) = mpsc::channel(HOST_SUBSCRIBER_QUEUE_CAPACITY);
+                commands.send(HostCommand::Subscribe { sender, identity }).await
+                    .map_err(|_| HarnessRuntimeError::HostStopped)?;
+                subscription = Some((receiver, subscriber_permit));
                 return Ok(());
             }
             // A node-workspace-read, session-spawn, or session-control
@@ -6473,7 +7087,19 @@ async fn handle_connection(
         }
     }).await;
     match outcome {
-        Ok(result) => result,
+        Ok(Ok(())) => match subscription {
+            Some((receiver, subscriber_permit)) => {
+                // The main connection permit is released here, not held for
+                // the subscription's whole (unbounded) lifetime: see
+                // `HOST_SUBSCRIBER_LIMIT`'s doc comment. `subscriber_permit`
+                // takes over as the thing keeping this connection counted
+                // against a limit for as long as it stays open.
+                drop(connection_permit);
+                run_operator_event_subscription(stream, receiver, subscriber_permit).await
+            }
+            None => Ok(()),
+        },
+        Ok(Err(error)) => Err(error),
         Err(_) => {
             if operator_frame {
                 let _ = write_operator_reply(
@@ -6491,6 +7117,73 @@ async fn handle_connection(
             Err(HarnessRuntimeError::Deadline)
         }
     }
+}
+
+/// Forwarding loop for a connection that just subscribed
+/// (`handle_connection`'s `SubscribeEvents` branch): repeatedly receives
+/// from `events` and writes each one as its own newline-terminated JSON line
+/// (`write_operator_event`) -- deliberately outside
+/// `HOST_CONNECTION_DEADLINE`, so a subscription lives exactly as long as
+/// the client keeps the socket open, not 45s. Ends -- dropping
+/// `subscriber_permit`, which frees this connection's slot in the dedicated
+/// subscriber pool -- the moment a write fails or `events` closes (the
+/// select loop pruned this subscriber: its sender's `Closed` outcome in
+/// `SubscriberRegistry::emit`/`recover_lagged`, or the host shutting down).
+/// There is no unsubscribe frame to read for: the framing this connection
+/// negotiated has no representable second client-to-host message (see the
+/// module doc), so the client's own `Drop` for its subscription handle is
+/// exactly "close the socket," which this loop observes as a write failure
+/// on its very next attempt.
+async fn run_operator_event_subscription(
+    mut stream: TcpStream,
+    mut events: mpsc::Receiver<HarnessOperatorEventV1>,
+    _subscriber_permit: tokio::sync::OwnedSemaphorePermit,
+) -> Result<(), HarnessRuntimeError> {
+    tracing::info!("operator event subscription forwarding started");
+    while let Some(event) = events.recv().await {
+        tracing::debug!(kind = event_kind_label(&event), "forwarding operator event");
+        write_operator_event(&mut stream, event).await?;
+    }
+    tracing::info!("operator event subscription channel drained; closing");
+    Ok(())
+}
+
+fn event_kind_label(event: &HarnessOperatorEventV1) -> &'static str {
+    match event {
+        HarnessOperatorEventV1::SnapshotBaseline { .. } => "snapshot-baseline",
+        HarnessOperatorEventV1::TaskChanged { .. } => "task-changed",
+        HarnessOperatorEventV1::RunChanged { .. } => "run-changed",
+        HarnessOperatorEventV1::RuntimeInventoryChanged { .. } => "runtime-inventory-changed",
+        HarnessOperatorEventV1::RuntimeInventoryRemoved { .. } => "runtime-inventory-removed",
+        HarnessOperatorEventV1::Lagged { .. } => "lagged",
+    }
+}
+
+/// Push-frame counterpart to `write_operator_reply`: writes one
+/// newline-terminated `HarnessOperatorEventV1` and flushes, but -- unlike
+/// `write_operator_reply` -- never shuts the connection down afterward, so
+/// the socket stays open for the next event.
+async fn write_operator_event(
+    stream: &mut TcpStream,
+    event: HarnessOperatorEventV1,
+) -> Result<(), HarnessRuntimeError> {
+    event.validate().map_err(|error| {
+        // A push frame failing its own validation is a server-side bug; the
+        // stream dies here, so the cause must not die silently with it.
+        tracing::warn!(
+            error = ?error,
+            kind = event_kind_label(&event),
+            "operator event failed validation before write; closing the subscription",
+        );
+        HarnessRuntimeError::InvalidReply
+    })?;
+    let mut encoded = serde_json::to_vec(&event).map_err(|_| HarnessRuntimeError::InvalidReply)?;
+    if encoded.len().saturating_add(1) > HARNESS_OPERATOR_RESPONSE_MAX_BYTES {
+        return Err(HarnessRuntimeError::ResponseTooLarge);
+    }
+    encoded.push(b'\n');
+    stream.write_all(&encoded).await.map_err(|_| HarnessRuntimeError::WriteFailed)?;
+    stream.flush().await.map_err(|_| HarnessRuntimeError::WriteFailed)
 }
 
 fn frame_is_operator(frame: &[u8]) -> bool {
@@ -6729,6 +7422,7 @@ fn apply_or_buffer_host_live_event(
     support: &mut ObservationSupportRegistry,
     recovery: &mut ObservationRecoveryRegistry,
     runtime_inventory: &mut HarnessRuntimeInventoryCache,
+    subscribers: &mut SubscriberRegistry,
     routed: RoutedNodeEvent,
 ) -> Result<(), HarnessRuntimeError> {
     let route = NodeRoute {
@@ -6754,6 +7448,7 @@ fn apply_or_buffer_host_live_event(
     }
     let inventory_refresh_required = invalidate_runtime_inventory_for_event(
         runtime_inventory,
+        subscribers,
         recovery,
         &route,
         &routed.event,
@@ -6763,12 +7458,13 @@ fn apply_or_buffer_host_live_event(
         || routed.cursor.sequence > prior.unwrap_or(0).saturating_add(1)
         || matches!(routed.event, C2NodeEvent::ResyncRequired { .. });
     if recovery_required {
-        freeze_bound_route_waiting(
+        let touch = freeze_bound_route_waiting(
             harness,
             &route,
             routed.cursor.sequence,
             unix_time_ms(),
         )?;
+        notify_touched(subscribers, harness, &touch);
         support.mark_unhealthy(&route.node_id, route.expected_incarnation_id);
     }
     let already_recovering = recovery.contains(&route);
@@ -6782,8 +7478,13 @@ fn apply_or_buffer_host_live_event(
         return Ok(());
     }
     let received_at = unix_time_ms();
-    apply_exact_control_lifecycle(harness, &routed, received_at)?;
-    apply_live_context_pack_receipt(harness, &route, &routed, received_at)?;
+    let lifecycle_touch = apply_exact_control_lifecycle(harness, &routed, received_at)?;
+    notify_touched(subscribers, harness, &lifecycle_touch);
+    let context_pack_run_ids = apply_live_context_pack_receipt(harness, &route, &routed, received_at)?;
+    notify_touched(subscribers, harness, &EngineTouch {
+        task_ids: Vec::new(),
+        run_ids: context_pack_run_ids,
+    });
     if durable_cursor_for(observation, &route).is_some_and(|sequence| {
         sequence >= routed.cursor.sequence
     }) {
@@ -6809,6 +7510,7 @@ fn event_affects_runtime_inventory(event: &C2NodeEvent) -> bool {
 
 fn invalidate_runtime_inventory_for_event(
     runtime_inventory: &mut HarnessRuntimeInventoryCache,
+    subscribers: &mut SubscriberRegistry,
     recovery: &mut ObservationRecoveryRegistry,
     route: &NodeRoute,
     event: &C2NodeEvent,
@@ -6816,12 +7518,45 @@ fn invalidate_runtime_inventory_for_event(
     if !event_affects_runtime_inventory(event) {
         return false;
     }
-    runtime_inventory.invalidate(route);
+    invalidate_runtime_inventory_for_route(runtime_inventory, subscribers, recovery, route);
+    true
+}
+
+/// Unconditional counterpart to `invalidate_runtime_inventory_for_event`,
+/// with no `C2NodeEvent` to gate on: drops the cached node (emitting
+/// `RuntimeInventoryRemoved` through the normal registry when it actually
+/// had one cached) and schedules a targeted resync for `route` the same way
+/// the reactive live-event path does, so `start_pending_observation_
+/// recoveries`'s very next pass picks it up and `finish_observation_
+/// recovery` emits `RuntimeInventoryChanged` through the same Eq-diffed
+/// `refresh` -- no direct event construction bypassing that diff.
+///
+/// Exists for callers that know a route needs a fresh resync from context
+/// alone, not from a live event that happened to carry the news: today,
+/// exactly one -- a successful `StopSession`. A forced stop kills the node's
+/// PTY process directly and is not guaranteed to round-trip a
+/// `SessionRecordUpserted`/`SessionRecordRemoved`/`Control` event back
+/// through the live C2 stream the way every other inventory-affecting
+/// change does (the asymmetry: session creation reliably publishes one,
+/// abrupt termination is not guaranteed to), so the reactive path alone
+/// cannot be relied on to notice.
+fn invalidate_runtime_inventory_for_route(
+    runtime_inventory: &mut HarnessRuntimeInventoryCache,
+    subscribers: &mut SubscriberRegistry,
+    recovery: &mut ObservationRecoveryRegistry,
+    route: &NodeRoute,
+) {
+    if runtime_inventory.invalidate(route) {
+        let node_id = route.node_id.as_str().to_owned();
+        subscribers.emit(|sequence| HarnessOperatorEventV1::RuntimeInventoryRemoved {
+            sequence,
+            node_id: node_id.clone(),
+        });
+    }
     let route_recovery = recovery.ensure_route(route.clone());
     if route_recovery.attempt.is_some() {
         route_recovery.refresh_after_completion = true;
     }
-    true
 }
 
 fn start_pending_observation_recoveries(
@@ -6871,6 +7606,7 @@ fn finish_observation_recovery(
     observation: &mut ObservationService,
     support: &mut ObservationSupportRegistry,
     runtime_inventory: &mut HarnessRuntimeInventoryCache,
+    subscribers: &mut SubscriberRegistry,
     route: NodeRoute,
     attempt_id: u64,
     requested_after: u64,
@@ -6901,9 +7637,15 @@ fn finish_observation_recovery(
     }
 
     let received_at = unix_time_ms();
-    apply_resync_lifecycle(harness, &resync, received_at)?;
+    let resync_touch = apply_resync_lifecycle(harness, &resync, received_at)?;
+    notify_touched(subscribers, harness, &resync_touch);
     commit_observation_resync(observation, support, &resync, received_at)?;
-    runtime_inventory.refresh(&resync, received_at);
+    if let Some(node) = runtime_inventory.refresh(&resync, received_at) {
+        subscribers.emit(|sequence| HarnessOperatorEventV1::RuntimeInventoryChanged {
+            sequence,
+            node: node.clone(),
+        });
+    }
 
     let requires_follow_up = route_recovery.overflowed
         || route_recovery.refresh_after_completion;
@@ -6925,17 +7667,46 @@ fn finish_observation_recovery(
             follow_up = true;
             break;
         }
-        apply_exact_control_lifecycle(harness, &routed, received_at)?;
-        apply_live_context_pack_receipt(harness, &route, &routed, received_at)?;
+        let lifecycle_touch = apply_exact_control_lifecycle(harness, &routed, received_at)?;
+        notify_touched(subscribers, harness, &lifecycle_touch);
+        let context_pack_run_ids =
+            apply_live_context_pack_receipt(harness, &route, &routed, received_at)?;
+        notify_touched(subscribers, harness, &EngineTouch {
+            task_ids: Vec::new(),
+            run_ids: context_pack_run_ids,
+        });
         observation.apply_ingress(routed_event_to_ingress(routed, received_at)?)?;
     }
     if follow_up {
         route_recovery.prepare_follow_up();
         support.mark_unhealthy(&route.node_id, route.expected_incarnation_id);
-    } else {
-        recovery.routes.remove(&key);
+        return Ok(());
     }
+    // A resync this structurally clean can still be stale for a route with
+    // a pending `awaiting_absent_sessions` expectation -- see that field's
+    // doc comment. Re-check against whatever `refresh` just cached (not the
+    // `Option` it returned, which is `None` on an unchanged value) and, if
+    // any expected-gone session is still there, retry instead of treating
+    // this resync as the final word.
+    let session_still_present = route_recovery.awaiting_absent_sessions.iter().any(|session| {
+        runtime_inventory.node(&route.node_id)
+            .is_some_and(|node| node_still_has_session(node, session))
+    });
+    if session_still_present {
+        route_recovery.retry_after = Instant::now() + OBSERVATION_RECOVERY_RETRY;
+        return Ok(());
+    }
+    route_recovery.awaiting_absent_sessions.clear();
+    recovery.routes.remove(&key);
     Ok(())
+}
+
+fn node_still_has_session(node: &HarnessRuntimeNodeInventoryV1, session: &SessionAddress) -> bool {
+    node.inventory.workspaces.get(session.workspace_id.as_str())
+        .is_some_and(|workspace| workspace.sessions.iter().any(|candidate| {
+            candidate.instance_id == session.session.instance_id.0
+                && candidate.generation == session.session.generation.0
+        }))
 }
 
 struct HarnessMcpRelayPlan {
@@ -7167,30 +7938,31 @@ fn apply_resync_lifecycle(
     harness: &mut HarnessService,
     resync: &HarnessObservationResync,
     received_at_ms: u64,
-) -> Result<(), HarnessRuntimeError> {
+) -> Result<EngineTouch, HarnessRuntimeError> {
     let eviction_gap_sequence = resync.has_eviction_gap()
         .then_some(resync.oldest_available_sequence() - 1);
-    apply_replayed_lifecycle_events(
+    let mut touch = apply_replayed_lifecycle_events(
         harness,
         resync.route(),
         eviction_gap_sequence,
         resync.lifecycle_control_events(),
         received_at_ms,
     )?;
-    apply_snapshot_lifecycle(
+    touch.merge(apply_snapshot_lifecycle(
         harness,
         resync.route(),
         resync.event_sequence(),
         resync.snapshot(),
         resync.lifecycle_control_events(),
         received_at_ms,
-    )?;
-    apply_snapshot_context_pack_receipts(
+    )?);
+    touch.run_ids.extend(apply_snapshot_context_pack_receipts(
         harness,
         resync.route(),
         resync.snapshot(),
         received_at_ms,
-    )
+    )?);
+    Ok(touch)
 }
 
 /// Reconciles one more durable fact from a managed session record: its most
@@ -7214,9 +7986,9 @@ fn apply_context_pack_receipt_for_record(
     route: &NodeRoute,
     record: &C2ManagedSessionRecord,
     received_at_ms: u64,
-) -> Result<(), HarnessRuntimeError> {
+) -> Result<Vec<gate4agent_harness_protocol::HarnessRunId>, HarnessRuntimeError> {
     let Some(exported_context) = record.exported_context.as_ref() else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     let matches = harness.engine().runs().filter_map(|run| {
         if run.context_pack.is_some() {
@@ -7235,17 +8007,17 @@ fn apply_context_pack_receipt_for_record(
         }
         Some(run.run_id.clone())
     }).collect::<Vec<_>>();
-    for run_id in matches {
+    for run_id in &matches {
         let receipt = crate::context_receipt_from_node(exported_context)?;
         harness.record_run_context_pack(
-            &run_id,
+            run_id,
             receipt,
             received_at_ms,
             &route.node_id,
             route.expected_incarnation_id,
         )?;
     }
-    Ok(())
+    Ok(matches)
 }
 
 /// Resync/recovery path: scans a full snapshot's session records for any
@@ -7257,14 +8029,17 @@ fn apply_snapshot_context_pack_receipts(
     route: &NodeRoute,
     snapshot: &gate4agent_c2_protocol::C2NodeSnapshot,
     received_at_ms: u64,
-) -> Result<(), HarnessRuntimeError> {
+) -> Result<Vec<gate4agent_harness_protocol::HarnessRunId>, HarnessRuntimeError> {
     if snapshot.node_id != route.node_id {
-        return Ok(());
+        return Ok(Vec::new());
     }
+    let mut touched_run_ids = Vec::new();
     for record in &snapshot.session_records {
-        apply_context_pack_receipt_for_record(harness, route, record, received_at_ms)?;
+        touched_run_ids.extend(
+            apply_context_pack_receipt_for_record(harness, route, record, received_at_ms)?,
+        );
     }
-    Ok(())
+    Ok(touched_run_ids)
 }
 
 /// Steady-state path: reacts to the live `SessionRecordUpserted` event a
@@ -7284,9 +8059,9 @@ fn apply_live_context_pack_receipt(
     route: &NodeRoute,
     routed: &RoutedNodeEvent,
     received_at_ms: u64,
-) -> Result<(), HarnessRuntimeError> {
+) -> Result<Vec<gate4agent_harness_protocol::HarnessRunId>, HarnessRuntimeError> {
     let C2NodeEvent::SessionRecordUpserted { record } = &routed.event else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     apply_context_pack_receipt_for_record(harness, route, record, received_at_ms)
 }
@@ -7463,9 +8238,9 @@ fn apply_snapshot_lifecycle(
     snapshot: &gate4agent_c2_protocol::C2NodeSnapshot,
     lifecycle_control_events: &[gate4agent_c2_protocol::C2NodeEventEnvelope],
     received_at_ms: u64,
-) -> Result<(), HarnessRuntimeError> {
+) -> Result<EngineTouch, HarnessRuntimeError> {
     if event_sequence == 0 {
-        return Ok(());
+        return Ok(EngineTouch::default());
     }
     let matches = harness.engine().runs().filter_map(|run| {
         if run.lifecycle != HarnessRunLifecycleV1::Waiting
@@ -7474,10 +8249,11 @@ fn apply_snapshot_lifecycle(
             return None;
         }
         exact_snapshot_lifecycle(run, route, snapshot).map(|(kind, projection)| {
-            (run.run_id.clone(), kind, projection)
+            (run.run_id.clone(), run.task_id.clone(), kind, projection)
         })
     }).collect::<Vec<_>>();
-    for (run_id, kind, projection) in matches {
+    let mut touch = EngineTouch::default();
+    for (run_id, task_id, kind, projection) in matches {
         commit_lifecycle_projection(
             harness,
             &run_id,
@@ -7488,8 +8264,14 @@ fn apply_snapshot_lifecycle(
             projection,
             received_at_ms,
         )?;
+        touch.run_ids.push(run_id);
+        touch.task_ids.push(task_id);
     }
-    reconcile_task_result_refs(harness, received_at_ms)
+    touch.merge(EngineTouch {
+        task_ids: reconcile_task_result_refs(harness, received_at_ms)?,
+        run_ids: Vec::new(),
+    });
+    Ok(touch)
 }
 
 fn replay_contains_exact_lifecycle(
@@ -7585,12 +8367,13 @@ fn apply_replayed_lifecycle_events(
     eviction_gap_sequence: Option<u64>,
     events: &[gate4agent_c2_protocol::C2NodeEventEnvelope],
     received_at_ms: u64,
-) -> Result<(), HarnessRuntimeError> {
+) -> Result<EngineTouch, HarnessRuntimeError> {
+    let mut touch = EngineTouch::default();
     if let Some(gap_sequence) = eviction_gap_sequence {
-        freeze_bound_route_waiting(harness, route, gap_sequence, received_at_ms)?;
+        touch.merge(freeze_bound_route_waiting(harness, route, gap_sequence, received_at_ms)?);
     }
     for event in events {
-        apply_exact_control_lifecycle(
+        touch.merge(apply_exact_control_lifecycle(
             harness,
             &RoutedNodeEvent {
                 node_id: route.node_id.clone(),
@@ -7601,9 +8384,9 @@ fn apply_replayed_lifecycle_events(
                 event: event.event.clone(),
             },
             received_at_ms,
-        )?;
+        )?);
     }
-    Ok(())
+    Ok(touch)
 }
 
 fn commit_observation_resync(
@@ -9717,10 +10500,12 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (commands, _receiver) = mpsc::channel(HOST_COMMAND_CAPACITY);
+        let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+        let subscriber_connections = Arc::new(Semaphore::new(HOST_SUBSCRIBER_LIMIT));
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             assert!(matches!(
-                handle_connection(stream, commands, None).await,
+                handle_connection(stream, commands, None, permit, subscriber_connections).await,
                 Err(HarnessRuntimeError::Deadline),
             ));
         });
@@ -9748,10 +10533,18 @@ mod tests {
             "a".repeat(64),
         )).unwrap();
         let authority = HarnessOperatorCredentialAuthority::new(credential.clone()).unwrap();
+        let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+        let subscriber_connections = Arc::new(Semaphore::new(HOST_SUBSCRIBER_LIMIT));
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             assert!(matches!(
-                handle_connection(stream, commands, Some(authority)).await,
+                handle_connection(
+                    stream,
+                    commands,
+                    Some(authority),
+                    permit,
+                    subscriber_connections,
+                ).await,
                 Err(HarnessRuntimeError::Deadline),
             ));
         });
@@ -10004,11 +10797,13 @@ mod tests {
         assert_eq!(cache.page(None, 1).nodes.len(), 1);
 
         let mut recovery = ObservationRecoveryRegistry::default();
+        let mut subscribers = SubscriberRegistry::default();
         let event = C2NodeEvent::SessionRecordUpserted {
             record: snapshot.session_records[0].clone(),
         };
         assert!(invalidate_runtime_inventory_for_event(
             &mut cache,
+            &mut subscribers,
             &mut recovery,
             &route,
             &event,
@@ -11080,5 +11875,74 @@ mod tests {
             expected_incarnation_id: NodeIncarnationId::from_bytes([4; 16]),
         };
         assert!(topology_binding_matches_route(&binding, &current_route));
+    }
+
+    /// Pure-logic coverage of `SubscriberRegistry`'s overflow/recovery/
+    /// pruning semantics, independent of any real connection: `emit` against
+    /// a capacity-2 channel the test deliberately fills (`Full` ->
+    /// `needs_baseline`, the overflowing event dropped for this subscriber
+    /// only — and its sequence number burned, sequences are monotonic with
+    /// gaps, never reused); `recover_lagged` landing exactly `Lagged` then
+    /// `SnapshotBaseline` — a pair, so recovery needs TWO free slots and
+    /// keeps the flag until a pass lands both; and a closed receiver
+    /// pruning the subscriber outright on the next `emit`.
+    #[test]
+    fn subscriber_registry_full_then_lagged_recovery_and_closed_removal() {
+        let identity = OperatorRequestLogIdentity::describe(
+            &HarnessOperatorRequestV1::SubscribeEvents {},
+        );
+        let mut subscribers = SubscriberRegistry::default();
+        let (sender, mut receiver) = mpsc::channel::<HarnessOperatorEventV1>(2);
+        subscribers.insert(sender, identity);
+        assert_eq!(subscribers.subscribers.len(), 1);
+
+        // Two sends fill the capacity-2 queue.
+        subscribers.emit(|sequence| HarnessOperatorEventV1::Lagged { sequence });
+        subscribers.emit(|sequence| HarnessOperatorEventV1::Lagged { sequence });
+        assert!(!subscribers.subscribers[0].needs_baseline);
+        // Third send overflows the full queue: the event is dropped for
+        // this subscriber (its sequence number burned) and it is marked
+        // lagged, not removed.
+        subscribers.emit(|sequence| HarnessOperatorEventV1::Lagged { sequence });
+        assert!(subscribers.subscribers[0].needs_baseline);
+        assert_eq!(subscribers.subscribers.len(), 1);
+
+        // Recovery cannot land the Lagged+SnapshotBaseline pair while the
+        // queue is still full — the flag must survive the failed pass.
+        let harness_path = database_path();
+        let harness = HarnessService::open(&harness_path).unwrap();
+        let runtime_inventory = HarnessRuntimeInventoryCache::default();
+        subscribers.recover_lagged(&harness, &runtime_inventory);
+        assert!(subscribers.subscribers[0].needs_baseline);
+
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            HarnessOperatorEventV1::Lagged { sequence: 0 },
+        ));
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            HarnessOperatorEventV1::Lagged { sequence: 1 },
+        ));
+        assert!(receiver.try_recv().is_err(), "the overflowing send must not have queued");
+
+        // With the queue drained, one pass lands Lagged then
+        // SnapshotBaseline and clears the flag. Sequences 2 (overflow) and
+        // 3 (failed recovery Lagged) were burned, never reused.
+        subscribers.recover_lagged(&harness, &runtime_inventory);
+        assert!(!subscribers.subscribers[0].needs_baseline);
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            HarnessOperatorEventV1::Lagged { sequence: 4 },
+        ));
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            HarnessOperatorEventV1::SnapshotBaseline { sequence: 5, .. },
+        ));
+        let _ = fs::remove_file(&harness_path);
+
+        // A closed receiver is pruned outright on the next attempted send.
+        drop(receiver);
+        subscribers.emit(|sequence| HarnessOperatorEventV1::Lagged { sequence });
+        assert!(subscribers.subscribers.is_empty());
     }
 }

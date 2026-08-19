@@ -3,6 +3,7 @@ use std::fs;
 use std::io::{self, stdout};
 use std::path::{Path, PathBuf};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc as sync_mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -54,7 +55,8 @@ use gate4agent_harness_client::{
     HarnessNativeSessionExternalGroupKindV1, HarnessNativeSessionPreviewRoleV1,
     HarnessNativeSessionPreviewV1, HarnessNativeSessionRouteV1,
     HarnessNativeSessionSelectionV1,
-    HarnessOperatorActionV1, HarnessOperatorClient, HarnessOperatorCredential,
+    HarnessOperatorActionV1, HarnessOperatorClient,
+    HarnessOperatorCredential, HarnessOperatorEventV1,
     HarnessOperatorIntentV1, HarnessOperatorMutationOutcomeV1, HarnessOperatorRequestRefV1,
     HarnessOperatorResponseV1, HarnessTaskLaunchOptionsV1,
     HarnessRunContextSourceObservationV1,
@@ -128,6 +130,12 @@ const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(250);
 /// operator mutation, so sessions spawned moments ago (or by any other
 /// client of the same harness) never appear until a manual refresh.
 const HARNESS_SNAPSHOT_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+/// Reconnect backoff for `harness_event_subscription_worker`: 1s, 2s, 4s,
+/// capped at 8s. Doubles on every failed `subscribe_events` call or ended
+/// subscription, resets to the initial value the moment a subscription
+/// goes live again.
+const HARNESS_SUBSCRIPTION_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
+const HARNESS_SUBSCRIPTION_BACKOFF_MAX: Duration = Duration::from_secs(8);
 const RAW_INPUT_COALESCE: Duration = Duration::from_millis(12);
 const INSPECTION_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const HARNESS_TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -654,6 +662,27 @@ enum WorkerUpdate {
         token: u64,
         message: String,
     },
+    /// Pushed by `harness_event_subscription_worker` for a
+    /// `HarnessOperatorEventV1::SnapshotBaseline` -- the subscription's
+    /// mandatory first frame, and its recovery frame after a `Lagged` (see
+    /// `HarnessEventLagged`). Token-free unlike `HarnessSnapshot`: applied
+    /// via `App::apply_harness_snapshot_pushed`, not the token-gated
+    /// `apply_harness_snapshot`.
+    HarnessEventSnapshotBaseline {
+        tasks: Vec<RedactedTaskV1>,
+        runs: Vec<RedactedRunV1>,
+        nodes: Vec<NodeView>,
+    },
+    HarnessTaskChanged(RedactedTaskV1),
+    HarnessRunChanged(RedactedRunV1),
+    HarnessRuntimeInventoryNodeChanged(NodeView),
+    HarnessRuntimeInventoryNodeRemoved { node_id: String },
+    /// The subscription fell behind and the host dropped one or more
+    /// events for it; a `HarnessEventSnapshotBaseline` always follows once
+    /// the host can build one. No-op on its own -- the recovery frame is
+    /// what actually resynchronizes state -- kept as its own variant purely
+    /// so a future diagnostic surface has something to hook.
+    HarnessEventLagged,
     HarnessMonitor {
         run: RedactedRunV1,
         monitor: HarnessSessionMonitorV1,
@@ -1242,6 +1271,11 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
     }
     app.terminal_cols = cols;
     app.terminal_rows = rows;
+    // Set by `harness_event_subscription_worker` (Harness mode only) the
+    // moment a subscription goes live; read by the run loop below to skip
+    // the `HARNESS_SNAPSHOT_REFRESH_INTERVAL` poll while a subscription is
+    // carrying updates -- see that gate's call site.
+    let harness_subscription_active = Arc::new(AtomicBool::new(false));
     match mode {
         StartupMode::ManualC2(endpoint) => {
             let (command_tx, command_rx) = mpsc::channel(COMMAND_QUEUE);
@@ -1268,6 +1302,7 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
             let operator_inventory = runtime_inventory.clone();
             let history_client = client.clone();
             let detail_client = client.clone();
+            let subscription_client = client.clone();
             tokio::task::spawn_blocking(move || {
                 harness_operator_worker(client, command_rx, harness_updates, operator_inventory)
             });
@@ -1282,6 +1317,15 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
                     history_rx,
                     history_updates,
                     runtime_inventory,
+                )
+            });
+            let subscription_updates = updates_tx.clone();
+            let subscription_active = harness_subscription_active.clone();
+            tokio::task::spawn_blocking(move || {
+                harness_event_subscription_worker(
+                    subscription_client,
+                    subscription_updates,
+                    subscription_active,
                 )
             });
             let action = app.enable_harness_kanban();
@@ -1361,7 +1405,16 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
             next_auto_inspection = now + INSPECTION_REFRESH_INTERVAL;
             state_changed = true;
         }
-        if selected_backend.harness_worker && now >= next_harness_snapshot_refresh {
+        // The poll is the fallback once a push subscription is live: while
+        // `harness_subscription_active` is true, `next_harness_snapshot_
+        // refresh` deliberately stays un-rearmed (stale, in the past), so
+        // the instant the subscription drops this fires on the very next
+        // loop pass instead of waiting up to `HARNESS_SNAPSHOT_REFRESH_
+        // INTERVAL` for a stale re-arm to catch up.
+        if selected_backend.harness_worker
+            && now >= next_harness_snapshot_refresh
+            && !harness_subscription_active.load(Ordering::Relaxed)
+        {
             let action = app.request_harness_refresh();
             if !matches!(action, AppAction::None) {
                 queue_action(
@@ -7530,6 +7583,36 @@ fn apply_update(app: &mut App, c2: &mut C2ApplyState, update: WorkerUpdate) -> A
         WorkerUpdate::HarnessRefreshFailed { token, message } => {
             app.fail_harness_refresh(token, message);
         }
+        WorkerUpdate::HarnessEventSnapshotBaseline { tasks, runs, nodes } => {
+            let retained = nodes.iter().map(|node| node.node_id.clone()).collect::<BTreeSet<_>>();
+            let removed = app.nodes.iter()
+                .filter(|node| !retained.contains(&node.node_id))
+                .map(|node| node.node_id.clone())
+                .collect::<Vec<_>>();
+            for node_id in removed {
+                app.remove_topology_node(&node_id);
+            }
+            for mut node in nodes {
+                app.preserve_known_session_terminal_state(&mut node);
+                app.upsert_node(node);
+            }
+            app.apply_harness_snapshot_pushed(tasks, runs);
+            follow_up = app.ensure_initial_agents_catalog();
+        }
+        WorkerUpdate::HarnessTaskChanged(task) => {
+            app.apply_harness_task_changed(task);
+        }
+        WorkerUpdate::HarnessRunChanged(run) => {
+            app.apply_harness_run_changed(run);
+        }
+        WorkerUpdate::HarnessRuntimeInventoryNodeChanged(mut node) => {
+            app.preserve_known_session_terminal_state(&mut node);
+            app.upsert_node(node);
+        }
+        WorkerUpdate::HarnessRuntimeInventoryNodeRemoved { node_id } => {
+            app.remove_topology_node(&node_id);
+        }
+        WorkerUpdate::HarnessEventLagged => {}
         WorkerUpdate::HarnessMonitor { run, monitor, timeline } => {
             app.apply_harness_monitor(run, monitor, timeline);
         }
@@ -8210,6 +8293,84 @@ fn project_harness_inventory_node(entry: HarnessRuntimeNodeInventoryV1) -> Resul
         workspaces,
         session_records,
     })
+}
+
+/// Subscription-reader thread: opens `SubscribeEvents` on its own dedicated
+/// connection (separate from `harness_operator_worker`'s poll connection)
+/// and forwards every pushed frame into `updates` as a `WorkerUpdate`,
+/// reconnecting with capped exponential backoff
+/// (`HARNESS_SUBSCRIPTION_BACKOFF_INITIAL`..`HARNESS_SUBSCRIPTION_BACKOFF_MAX`)
+/// whenever the connection ends. `active` flips true the moment a
+/// subscription goes live -- gating the run loop's
+/// `HARNESS_SNAPSHOT_REFRESH_INTERVAL` poll into a fallback, see its call
+/// site -- and false the moment the subscription ends, so the poll resumes
+/// as a fallback during any reconnect gap.
+fn harness_event_subscription_worker(
+    client: HarnessOperatorClient,
+    updates: mpsc::Sender<WorkerUpdate>,
+    active: Arc<AtomicBool>,
+) {
+    let mut backoff = HARNESS_SUBSCRIPTION_BACKOFF_INITIAL;
+    loop {
+        let mut subscription = match client.subscribe_events() {
+            Ok(subscription) => subscription,
+            Err(_) => {
+                thread::sleep(backoff);
+                backoff = (backoff * 2).min(HARNESS_SUBSCRIPTION_BACKOFF_MAX);
+                continue;
+            }
+        };
+        active.store(true, Ordering::Relaxed);
+        backoff = HARNESS_SUBSCRIPTION_BACKOFF_INITIAL;
+        loop {
+            let event = match subscription.next_event() {
+                Ok(event) => event,
+                Err(_) => break,
+            };
+            let Some(update) = project_harness_operator_event(event) else { continue; };
+            if updates.blocking_send(update).is_err() {
+                active.store(false, Ordering::Relaxed);
+                return;
+            }
+        }
+        active.store(false, Ordering::Relaxed);
+        thread::sleep(backoff);
+        backoff = (backoff * 2).min(HARNESS_SUBSCRIPTION_BACKOFF_MAX);
+    }
+}
+
+/// Projects one pushed `HarnessOperatorEventV1` into its `WorkerUpdate`,
+/// mirroring the wire<->app-view split `publish_harness_snapshot`/
+/// `project_harness_inventory_node` already keep for the poll path. `None`
+/// when the event carries nothing the app needs to apply: a runtime
+/// inventory node this build's `project_harness_inventory_node` cannot
+/// project is dropped silently, the same tolerance the poll path already
+/// has for a stale/partial view over a broken one (`load_harness_runtime_
+/// inventory`'s own per-node projection failure only fails that one page,
+/// never crashes the worker).
+fn project_harness_operator_event(event: HarnessOperatorEventV1) -> Option<WorkerUpdate> {
+    match event {
+        HarnessOperatorEventV1::SnapshotBaseline { tasks, runs, nodes, .. } => {
+            let nodes = nodes.into_iter()
+                .filter_map(|node| project_harness_inventory_node(node).ok())
+                .collect();
+            Some(WorkerUpdate::HarnessEventSnapshotBaseline { tasks, runs, nodes })
+        }
+        HarnessOperatorEventV1::TaskChanged { task, .. } => {
+            Some(WorkerUpdate::HarnessTaskChanged(task))
+        }
+        HarnessOperatorEventV1::RunChanged { run, .. } => {
+            Some(WorkerUpdate::HarnessRunChanged(run))
+        }
+        HarnessOperatorEventV1::RuntimeInventoryChanged { node, .. } => {
+            project_harness_inventory_node(node).ok()
+                .map(WorkerUpdate::HarnessRuntimeInventoryNodeChanged)
+        }
+        HarnessOperatorEventV1::RuntimeInventoryRemoved { node_id, .. } => {
+            Some(WorkerUpdate::HarnessRuntimeInventoryNodeRemoved { node_id })
+        }
+        HarnessOperatorEventV1::Lagged { .. } => Some(WorkerUpdate::HarnessEventLagged),
+    }
 }
 
 fn harness_terminal_session_address(

@@ -1228,9 +1228,14 @@ impl NativeEffectShell {
                     exit_code: outcome.exit_code,
                     final_terminal: Some(terminal_frame(outcome.terminal)),
                 },
-                Err(error) => ControlObservation::StopFailed {
-                    message: error.to_string(),
-                },
+                Err(error) => {
+                    eprintln!(
+                        "[gate4agent-shell-native] PTY stop failed for {key:?} (force={force}): {error}",
+                    );
+                    ControlObservation::StopFailed {
+                        message: error.to_string(),
+                    }
+                }
             };
         }
         if let Some(owned) = self.pipe_sessions.remove(&key) {
@@ -1287,6 +1292,12 @@ impl NativeEffectShell {
                 },
             };
         }
+        // A kill this function skips entirely -- nothing owns `key` in any
+        // transport map -- must say so out loud: silently returning
+        // `StopFailed` here left no trail at the point where the skip
+        // actually happened, only a message string several layers removed
+        // from anyone watching this process's own output.
+        eprintln!("[gate4agent-shell-native] stop skipped: no session owns {key:?} in any transport map");
         ControlObservation::StopFailed {
             message: missing_session_message(key),
         }

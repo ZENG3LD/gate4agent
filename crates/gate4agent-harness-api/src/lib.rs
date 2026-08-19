@@ -67,6 +67,7 @@ pub const HARNESS_OPERATOR_WIRE_VERSION_V7: u16 = 7;
 pub const HARNESS_OPERATOR_WIRE_VERSION_V8: u16 = 8;
 pub const HARNESS_OPERATOR_WIRE_VERSION_V9: u16 = 9;
 pub const HARNESS_OPERATOR_WIRE_VERSION_V10: u16 = 10;
+pub const HARNESS_OPERATOR_WIRE_VERSION_V11: u16 = 11;
 pub const HARNESS_OPERATOR_REQUEST_MAX_BYTES: usize = 64 * 1024;
 pub const HARNESS_OPERATOR_RESPONSE_MAX_BYTES: usize = 1024 * 1024;
 pub const HARNESS_OPERATOR_CREDENTIAL_MAX_BYTES: usize = 256;
@@ -207,6 +208,7 @@ impl HarnessOperatorEnvelopeV1 {
                 | HARNESS_OPERATOR_WIRE_VERSION_V8
                 | HARNESS_OPERATOR_WIRE_VERSION_V9
                 | HARNESS_OPERATOR_WIRE_VERSION_V10
+                | HARNESS_OPERATOR_WIRE_VERSION_V11
         ) || self.version < self.request.minimum_wire_version()
         {
             return Err(HarnessOperatorApiError::UnsupportedVersion);
@@ -1873,6 +1875,10 @@ pub enum HarnessOperatorRequestV1 {
     ReplaceTaskExecutionSpecV2 { request: HarnessReplaceTaskExecutionSpecRequestV2 },
     StartTaskV2 { request: HarnessStartTaskRequestV2 },
     SubmitIntent { intent: HarnessOperatorIntentV1 },
+    // Opens a long-lived, server-push subscription instead of the usual
+    // one-shot request/reply: see the framing note on `HarnessOperatorEventV1`
+    // for the wire shape this switches the connection into.
+    SubscribeEvents {},
 }
 
 impl HarnessOperatorRequestV1 {
@@ -2067,6 +2073,7 @@ impl HarnessOperatorRequestV1 {
             Self::ReplaceTaskExecutionSpecV2 { request } => request.validate(),
             Self::StartTaskV2 { request } => request.validate(),
             Self::SubmitIntent { intent } => intent.validate(),
+            Self::SubscribeEvents {} => Ok(()),
         }
     }
 
@@ -2137,8 +2144,14 @@ impl HarnessOperatorRequestV1 {
         )
     }
 
+    pub fn requires_v11(&self) -> bool {
+        matches!(self, Self::SubscribeEvents {})
+    }
+
     pub fn minimum_wire_version(&self) -> u16 {
-        if self.requires_v10() {
+        if self.requires_v11() {
+            HARNESS_OPERATOR_WIRE_VERSION_V11
+        } else if self.requires_v10() {
             HARNESS_OPERATOR_WIRE_VERSION_V10
         } else if self.requires_v9() {
             HARNESS_OPERATOR_WIRE_VERSION_V9
@@ -2172,6 +2185,75 @@ impl HarnessOperatorReplyV1 {
         match self {
             Self::Ok { response } => response.validate(),
             Self::Error { .. } => Ok(()),
+        }
+    }
+}
+
+/// Long-lived, server-push counterpart to `HarnessOperatorReplyV1`. A
+/// `SubscribeEvents` connection stops replying with a single frame and
+/// instead writes one of these, newline-terminated, per change -- see the
+/// module doc for the framing this switches the connection into.
+/// `sequence` is a per-subscription monotonic counter the host mints for
+/// that one connection alone; it never resets, including across a
+/// `Lagged`/`SnapshotBaseline` pair, so a client can detect a gap without
+/// cross-referencing wall time. An auth failure or an over-limit subscribe
+/// never reaches this type at all -- both still use the ordinary
+/// single-frame `HarnessOperatorReplyV1::Error` before the connection
+/// closes, since neither one ever admits a subscription in the first place.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum HarnessOperatorEventV1 {
+    /// Always the first frame after a successful subscribe, and re-sent as
+    /// the recovery frame immediately after a `Lagged` -- the client must
+    /// treat this as a full replacement of its task/run/node state, never a
+    /// delta against whatever it held before.
+    SnapshotBaseline {
+        sequence: u64,
+        tasks: Vec<RedactedTaskV1>,
+        runs: Vec<RedactedRunV1>,
+        nodes: Vec<HarnessRuntimeNodeInventoryV1>,
+    },
+    TaskChanged { sequence: u64, task: RedactedTaskV1 },
+    RunChanged { sequence: u64, run: RedactedRunV1 },
+    RuntimeInventoryChanged { sequence: u64, node: HarnessRuntimeNodeInventoryV1 },
+    RuntimeInventoryRemoved { sequence: u64, node_id: String },
+    /// This subscriber's outbound queue overflowed and one or more events
+    /// were dropped for it specifically -- other subscribers are unaffected.
+    /// The host always follows this with a fresh `SnapshotBaseline` once it
+    /// can build one; until that frame arrives the client must treat every
+    /// task/run/node it is holding as stale rather than trying to patch
+    /// around the gap.
+    Lagged { sequence: u64 },
+}
+
+impl HarnessOperatorEventV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        match self {
+            Self::SnapshotBaseline { tasks, runs, nodes, .. } => {
+                for task in tasks { task.validate().map_err(HarnessOperatorApiError::Read)?; }
+                if tasks.windows(2).any(|pair| pair[0].task_id >= pair[1].task_id) {
+                    return Err(HarnessOperatorApiError::Read(HarnessReadApiError::InvalidCollection));
+                }
+                for run in runs { run.validate().map_err(HarnessOperatorApiError::Read)?; }
+                if runs.windows(2).any(|pair| pair[0].run_id >= pair[1].run_id) {
+                    return Err(HarnessOperatorApiError::Read(HarnessReadApiError::InvalidCollection));
+                }
+                for node in nodes { node.validate()?; }
+                if nodes.windows(2).any(|pair| pair[0].node_id >= pair[1].node_id) {
+                    return Err(HarnessOperatorApiError::InvalidRuntimeInventory);
+                }
+                Ok(())
+            }
+            Self::TaskChanged { task, .. } => task.validate().map_err(HarnessOperatorApiError::Read),
+            Self::RunChanged { run, .. } => run.validate().map_err(HarnessOperatorApiError::Read),
+            Self::RuntimeInventoryChanged { node, .. } => node.validate(),
+            Self::RuntimeInventoryRemoved { node_id, .. } => {
+                if !valid_runtime_id(node_id, 128) {
+                    return Err(HarnessOperatorApiError::InvalidRuntimeInventory);
+                }
+                Ok(())
+            }
+            Self::Lagged { .. } => Ok(()),
         }
     }
 }
@@ -6972,5 +7054,156 @@ mod tests {
             force: false,
         };
         assert!(bad_stop.validate().is_err());
+    }
+
+    fn sample_redacted_task(id_byte: char) -> RedactedTaskV1 {
+        RedactedTaskV1 {
+            task_id: HarnessTaskId::new(format!("htask_{}", id_byte.to_string().repeat(24)))
+                .unwrap(),
+            revision: HarnessRevision::new(1).unwrap(),
+            title: "Task title".to_owned(),
+            body: String::new(),
+            creator: TaskCreatorCategoryV1::User,
+            parent_task_id: None,
+            dependency_ids: Vec::new(),
+            state: HarnessTaskStateV1::Backlog,
+            run_ids: Vec::new(),
+            references_redacted: false,
+            result_refs: Vec::new(),
+            artifact_refs: Vec::new(),
+            created_at_unix_ms: 10,
+            updated_at_unix_ms: 10,
+        }
+    }
+
+    fn sample_redacted_run(id_byte: char) -> RedactedRunV1 {
+        RedactedRunV1 {
+            run_id: HarnessRunId::new(format!("hrun_{}", id_byte.to_string().repeat(24)))
+                .unwrap(),
+            revision: HarnessRevision::new(1).unwrap(),
+            parent_run_id: None,
+            task_id: None,
+            operation_id: None,
+            intent: RedactedRunIntentV1 {
+                mode: HarnessExecutionModeV1::Pty,
+                worktree: RedactedWorktreeIntentV1::Existing,
+                has_delivery_bundle: false,
+                has_continuation: false,
+            },
+            lifecycle: HarnessRunLifecycleV1::Requested,
+            binding: RedactedBindingStateV1::None,
+            result_disposition: None,
+            failure_category: None,
+            context_pack: None,
+            git_facts: None,
+            references_redacted: false,
+            created_at_unix_ms: 10,
+            updated_at_unix_ms: 10,
+        }
+    }
+
+    fn simple_node_inventory(node_id: &str) -> HarnessRuntimeNodeInventoryV1 {
+        HarnessRuntimeNodeInventoryV1 {
+            node_id: node_id.to_owned(),
+            incarnation_id: "07".repeat(16),
+            observed_at_unix_ms: 1_000,
+            event_sequence: 1,
+            inventory: HarnessRuntimeInventoryV1 {
+                enabled_providers: Vec::new(),
+                workspaces: BTreeMap::new(),
+                workspace_count: 0,
+                workspaces_truncated: false,
+                session_count: 0,
+                sessions_truncated: false,
+                managed_sessions: Vec::new(),
+                managed_session_count: 0,
+                managed_sessions_truncated: false,
+                launch_inventory: None,
+            },
+        }
+    }
+
+    #[test]
+    fn operator_v11_subscribe_events_is_exact_round_trip_and_fails_closed_on_v10() {
+        let request = HarnessOperatorRequestV1::SubscribeEvents {};
+        request.validate().expect("valid v11 subscribe request");
+        assert_eq!(request.minimum_wire_version(), HARNESS_OPERATOR_WIRE_VERSION_V11);
+        let encoded = serde_json::to_string(&request).unwrap();
+        let decoded: HarnessOperatorRequestV1 = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, request);
+
+        let credential = HarnessOperatorCredential::parse(format!(
+            "g4aho_{}",
+            "a".repeat(64),
+        )).unwrap();
+        assert!(matches!(
+            HarnessOperatorEnvelopeV1 {
+                version: HARNESS_OPERATOR_WIRE_VERSION_V10,
+                credential: credential.clone(),
+                request: request.clone(),
+            }.validate(),
+            Err(HarnessOperatorApiError::UnsupportedVersion),
+        ));
+        HarnessOperatorEnvelopeV1 {
+            version: HARNESS_OPERATOR_WIRE_VERSION_V11,
+            credential,
+            request,
+        }.validate().unwrap();
+    }
+
+    #[test]
+    fn operator_event_variants_are_exact_round_trips() {
+        let task = sample_redacted_task('a');
+        let run = sample_redacted_run('b');
+        let node = simple_node_inventory("node-a");
+        let events = vec![
+            HarnessOperatorEventV1::SnapshotBaseline {
+                sequence: 0,
+                tasks: vec![task.clone()],
+                runs: vec![run.clone()],
+                nodes: vec![node.clone()],
+            },
+            HarnessOperatorEventV1::TaskChanged { sequence: 1, task: task.clone() },
+            HarnessOperatorEventV1::RunChanged { sequence: 2, run: run.clone() },
+            HarnessOperatorEventV1::RuntimeInventoryChanged { sequence: 3, node: node.clone() },
+            HarnessOperatorEventV1::RuntimeInventoryRemoved {
+                sequence: 4,
+                node_id: "node-a".to_owned(),
+            },
+            HarnessOperatorEventV1::Lagged { sequence: 5 },
+        ];
+        for event in events {
+            event.validate().expect("valid operator event");
+            let encoded = serde_json::to_string(&event).unwrap();
+            let decoded: HarnessOperatorEventV1 = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, event);
+        }
+    }
+
+    #[test]
+    fn operator_event_validate_rejects_malformed_frames() {
+        let task_a = sample_redacted_task('a');
+        let task_b = sample_redacted_task('b');
+        let out_of_order = HarnessOperatorEventV1::SnapshotBaseline {
+            sequence: 0,
+            tasks: vec![task_b, task_a],
+            runs: Vec::new(),
+            nodes: Vec::new(),
+        };
+        assert!(out_of_order.validate().is_err());
+
+        let bad_node_id = HarnessOperatorEventV1::RuntimeInventoryRemoved {
+            sequence: 0,
+            node_id: String::new(),
+        };
+        assert!(matches!(
+            bad_node_id.validate(),
+            Err(HarnessOperatorApiError::InvalidRuntimeInventory),
+        ));
+
+        let mut malformed_task = sample_redacted_task('c');
+        malformed_task.title = "\0".to_owned();
+        let bad_task = HarnessOperatorEventV1::TaskChanged { sequence: 0, task: malformed_task };
+        assert!(bad_task.validate().is_err());
     }
 }

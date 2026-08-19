@@ -10936,6 +10936,20 @@ impl NodeShared {
         Ok(())
     }
 
+    /// Polls until `address`'s session leaves the engine's own session map,
+    /// or the bounded deadline expires.
+    ///
+    /// A `Remove` sent while the session is not yet in a terminal status
+    /// (e.g. still `Stopping`, mid-effect right after a `Stop`) is rejected
+    /// once by the engine (`Gate4AgentEngine::remove` requires `Registered`/
+    /// `Exited`/`Failed`) and then discarded -- nothing re-issues it on its
+    /// own, so the removal that would satisfy this wait never arrives and
+    /// the caller was guaranteed to time out even though the session settles
+    /// microseconds later. Re-dispatch `Remove` on every poll tick so a
+    /// session that settles mid-wait -- the common case right after a
+    /// `Stop` -- still gets removed inside the same bounded deadline instead
+    /// of a guaranteed timeout. A rejected re-dispatch is a harmless no-op
+    /// here: the only outcome this loop observes is the session's presence.
     async fn wait_until_removed(
         &self,
         address: &SessionAddress,
@@ -10958,6 +10972,9 @@ impl NodeShared {
                     "remove did not commit before the bounded deadline; session binding was retained",
                 ));
             }
+            let _ = self.dispatch(ControlCommand::Remove {
+                instance_id: address.session.instance_id,
+            });
             sleep(Duration::from_millis(2)).await;
         }
     }

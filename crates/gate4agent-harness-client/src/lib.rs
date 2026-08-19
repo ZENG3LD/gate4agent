@@ -793,6 +793,46 @@ impl HarnessOperatorClient {
         }
     }
 
+    /// Opens a long-lived, server-push subscription instead of the ordinary
+    /// one-shot request/reply: see the module doc for the framing this
+    /// switches the connection into and `HarnessOperatorEventV1` for the
+    /// event shapes it yields. Unlike every other method on this client,
+    /// which connects fresh per call and closes right after one reply, the
+    /// returned `HarnessEventSubscription` owns its connection for as long
+    /// as it stays alive -- dropping it closes the socket, which is this
+    /// wire's only representable form of "unsubscribe" (see `send`'s
+    /// connect-per-call framing note below).
+    pub fn subscribe_events(&self) -> Result<HarnessEventSubscription, HarnessOperatorClientError> {
+        let request = HarnessOperatorRequestV1::SubscribeEvents {};
+        request.validate()?;
+        let version = request.minimum_wire_version();
+        let envelope = HarnessOperatorEnvelopeV1 {
+            version,
+            credential: self.credential.clone(),
+            request,
+        };
+        envelope.validate()?;
+        let mut encoded = serde_json::to_vec(&envelope)
+            .map_err(|_| HarnessOperatorClientError::Encoding)?;
+        if encoded.len() >= HARNESS_OPERATOR_REQUEST_MAX_BYTES {
+            return Err(HarnessOperatorClientError::RequestTooLarge);
+        }
+        encoded.push(b'\n');
+
+        let mut stream = TcpStream::connect_timeout(&self.endpoint, self.deadline)
+            .map_err(map_operator_connect_error)?;
+        stream.set_write_timeout(Some(self.deadline))
+            .map_err(|_| HarnessOperatorClientError::Transport)?;
+        stream.write_all(&encoded).map_err(map_operator_io_error)?;
+        stream.shutdown(Shutdown::Write)
+            .map_err(|_| HarnessOperatorClientError::Transport)?;
+
+        // Deliberately no read timeout set here or anywhere else on this
+        // stream: `HarnessEventSubscription::next_event` blocks until the
+        // host pushes a frame or the connection ends.
+        Ok(HarnessEventSubscription { reader: BufReader::new(stream) })
+    }
+
     fn send_mutation(
         &self,
         request: HarnessOperatorRequestV1,
@@ -882,6 +922,49 @@ impl HarnessOperatorClient {
                 Err(HarnessOperatorClientError::Host(error))
             }
         }
+    }
+}
+
+/// A live `SubscribeEvents` connection: see
+/// `HarnessOperatorClient::subscribe_events`. Dropping this value closes the
+/// socket, which is the wire's only representable unsubscribe.
+pub struct HarnessEventSubscription {
+    reader: BufReader<TcpStream>,
+}
+
+impl HarnessEventSubscription {
+    /// Blocks until the next pushed frame arrives, or returns an error once
+    /// the connection ends. No read deadline: unlike every other call on
+    /// this client, a subscription is meant to sit idle for arbitrarily long
+    /// stretches between changes, so this simply blocks on the socket
+    /// rather than racing a timer -- reusing `read_operator_bounded_line`
+    /// in a loop-by-repeated-call is exactly what it was already built to
+    /// support (it stops at the first `\n`, never assuming EOF follows).
+    ///
+    /// Every call, including the first, sniffs whether the line is an
+    /// ordinary `HarnessOperatorReplyV1` rather than a push event before
+    /// parsing it as one: an auth failure or an over-limit subscribe both
+    /// still reply with the usual single-frame `HarnessOperatorReplyV1::Error`
+    /// before closing (neither one ever admits a subscription), and this is
+    /// the only place that shape can surface for a connection opened via
+    /// `subscribe_events`.
+    pub fn next_event(&mut self) -> Result<HarnessOperatorEventV1, HarnessOperatorClientError> {
+        let line = read_operator_bounded_line(&mut self.reader, HARNESS_OPERATOR_RESPONSE_MAX_BYTES)?;
+        let value: serde_json::Value = serde_json::from_slice(&line)
+            .map_err(|_| HarnessOperatorClientError::InvalidResponse)?;
+        if value.get("status").is_some() {
+            let reply: HarnessOperatorReplyV1 = serde_json::from_value(value)
+                .map_err(|_| HarnessOperatorClientError::InvalidResponse)?;
+            reply.validate()?;
+            return match reply {
+                HarnessOperatorReplyV1::Error { error } => Err(HarnessOperatorClientError::Host(error)),
+                HarnessOperatorReplyV1::Ok { .. } => Err(HarnessOperatorClientError::UnexpectedResponse),
+            };
+        }
+        let event: HarnessOperatorEventV1 = serde_json::from_value(value)
+            .map_err(|_| HarnessOperatorClientError::InvalidResponse)?;
+        event.validate()?;
+        Ok(event)
     }
 }
 

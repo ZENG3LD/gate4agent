@@ -783,6 +783,7 @@ impl PtySession {
     /// reader/exit path within a bounded deadline.
     pub async fn shutdown(mut self) -> Result<PtyShutdownOutcome, AgentError> {
         let shutdown_started = Instant::now();
+        let root_pid = self.root_pid;
         let termination = if self.reader_finished() {
             None
         } else {
@@ -794,8 +795,18 @@ impl PtySession {
                 &mut reader_task,
             )
             .await
-            .map_err(|_| AgentError::PtyShutdownTimedOut {
-                timeout_ms: PTY_SHUTDOWN_TIMEOUT_MS,
+            .map_err(|_| {
+                // The kill itself may well have landed (`termination`,
+                // above) -- this is the reader thread failing to join and
+                // observe that within budget, a separate and, until now,
+                // silent way for a PTY shutdown to get stuck.
+                eprintln!(
+                    "[gate4agent-pty-session] shutdown timed out joining the reader thread for \
+                     root_pid={root_pid:?} after {PTY_SHUTDOWN_TIMEOUT_MS}ms (termination={termination:?})",
+                );
+                AgentError::PtyShutdownTimedOut {
+                    timeout_ms: PTY_SHUTDOWN_TIMEOUT_MS,
+                }
             })?
             .map_err(|_| AgentError::Pty("PTY reader task panicked".into()))?;
         }

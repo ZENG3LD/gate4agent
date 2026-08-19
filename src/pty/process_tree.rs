@@ -93,6 +93,15 @@ pub(crate) fn terminate_process_tree(
             let forced = snapshot.as_ref().is_some_and(force_identity_matched_root);
             root_force_attempted = usize::from(forced);
             if !forced || !wait_for_root_ownership_end(root_pid, snapshot.as_ref()) {
+                // The root PTY process survives every escalation this
+                // function has (initial kill, then an identity-checked
+                // force-kill fallback) -- log the cause here, at the point
+                // the kill actually failed, rather than only as a message
+                // string several layers removed from anyone watching this
+                // process's own output.
+                eprintln!(
+                    "[gate4agent-pty-process-tree] failed to kill PTY root_pid={root_pid:?}: {error}",
+                );
                 return Err(PtyTreeTerminationError::Root(error));
             }
         }

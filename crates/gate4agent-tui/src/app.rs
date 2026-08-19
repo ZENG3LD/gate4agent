@@ -4801,6 +4801,34 @@ impl App {
             return;
         }
         self.harness_kanban.pending_refresh = None;
+        self.apply_harness_snapshot_inner(tasks, runs);
+    }
+
+    /// Token-free counterpart to `apply_harness_snapshot`: applies a pushed
+    /// `SnapshotBaseline` (the harness operator event-subscription wire's
+    /// mandatory first frame, and its recovery frame after a `Lagged`) the
+    /// same way, but with no `pending_refresh` token to gate against -- a
+    /// push is never the answer to a specific poll request, so reusing that
+    /// gate as-is would silently drop every pushed snapshot. See
+    /// `apply_harness_snapshot_inner` for the shared body.
+    pub fn apply_harness_snapshot_pushed(
+        &mut self,
+        tasks: Vec<RedactedTaskV1>,
+        runs: Vec<RedactedRunV1>,
+    ) {
+        self.apply_harness_snapshot_inner(tasks, runs);
+    }
+
+    /// Shared full-replacement body for `apply_harness_snapshot`/
+    /// `apply_harness_snapshot_pushed`: replaces the whole task/run map and
+    /// prunes every piece of derived kanban state that no longer matches
+    /// the fresh data (correlations, run observations, transfers, context
+    /// sources, launch options, an in-flight execution mutation).
+    fn apply_harness_snapshot_inner(
+        &mut self,
+        tasks: Vec<RedactedTaskV1>,
+        runs: Vec<RedactedRunV1>,
+    ) {
         self.harness_kanban.stale_reason = None;
         self.harness_kanban.tasks = tasks
             .into_iter()
@@ -4875,6 +4903,25 @@ impl App {
             self.harness_kanban.execution_mutation = None;
             self.notice = Some("Harness launch action became stale after task refresh".to_owned());
         }
+        self.reconcile_harness_kanban();
+    }
+
+    /// Token-free single-task upsert for a pushed `TaskChanged` (see the
+    /// harness operator event-subscription wire). Unlike
+    /// `apply_harness_snapshot_inner`'s full replacement, an upsert only
+    /// adds or updates one entry, so it can never orphan another task's or
+    /// run's derived state the way replacing the whole map can -- no retain
+    /// pass is needed here, only the same viewport-derived reconcile the
+    /// bulk apply ends with.
+    pub fn apply_harness_task_changed(&mut self, task: RedactedTaskV1) {
+        self.harness_kanban.tasks.insert(task.task_id.clone(), task);
+        self.reconcile_harness_kanban();
+    }
+
+    /// Token-free single-run upsert counterpart to
+    /// `apply_harness_task_changed`, for a pushed `RunChanged`.
+    pub fn apply_harness_run_changed(&mut self, run: RedactedRunV1) {
+        self.harness_kanban.runs.insert(run.run_id.clone(), run);
         self.reconcile_harness_kanban();
     }
 
@@ -19444,6 +19491,60 @@ mod tests {
 
         app.harness_schedule_plan = None;
         assert_eq!(app.harness_schedule_next(), AppAction::None);
+    }
+
+    /// `apply_harness_snapshot_pushed` (the harness operator
+    /// event-subscription wire's `SnapshotBaseline` apply path) must land
+    /// its tasks/runs with no `begin_harness_refresh` token ever set --
+    /// unlike `apply_harness_snapshot`, a push is never the answer to a
+    /// specific poll request, so there is no token to match.
+    #[test]
+    fn apply_harness_snapshot_pushed_applies_without_pending_refresh_token() {
+        let mut app = App::default();
+        assert_eq!(app.harness_kanban.pending_refresh, None);
+        let task = harness_task('1', HarnessTaskStateV1::Ready, 1);
+        let run = harness_run('1', task.task_id.clone(), RedactedBindingStateV1::None);
+        app.apply_harness_snapshot_pushed(vec![task.clone()], vec![run.clone()]);
+        assert_eq!(app.harness_kanban.pending_refresh, None);
+        assert_eq!(app.harness_kanban.tasks.get(&task.task_id), Some(&task));
+        assert_eq!(app.harness_kanban.runs.get(&run.run_id), Some(&run));
+    }
+
+    /// `apply_harness_task_changed`/`apply_harness_run_changed` (pushed
+    /// `TaskChanged`/`RunChanged`) upsert one entry and reconcile the same
+    /// way the bulk apply does -- observable here via `harness_kanban.
+    /// selected` defaulting onto the newly inserted task the moment the
+    /// board goes from empty to non-empty, exactly what `reconcile_harness_
+    /// kanban` does on every apply path.
+    #[test]
+    fn single_entity_task_and_run_changed_upsert_and_reconcile() {
+        let mut app = App::default();
+        assert!(app.harness_kanban.tasks.is_empty());
+        assert_eq!(app.harness_kanban.selected, None);
+
+        let task = harness_task('2', HarnessTaskStateV1::Ready, 1);
+        app.apply_harness_task_changed(task.clone());
+        assert_eq!(app.harness_kanban.tasks.get(&task.task_id), Some(&task));
+        assert_eq!(app.harness_kanban.selected, Some(task.task_id.clone()));
+
+        let mut retitled = task.clone();
+        retitled.revision = HarnessRevision::new(2).unwrap();
+        retitled.title = "retitled".to_owned();
+        app.apply_harness_task_changed(retitled.clone());
+        assert_eq!(app.harness_kanban.tasks.get(&task.task_id), Some(&retitled));
+        assert_eq!(app.harness_kanban.tasks.len(), 1, "an upsert must not add a second entry");
+
+        let run = harness_run('2', task.task_id.clone(), RedactedBindingStateV1::None);
+        app.apply_harness_run_changed(run.clone());
+        assert_eq!(app.harness_kanban.runs.get(&run.run_id), Some(&run));
+
+        let mut rebound = run.clone();
+        rebound.revision = HarnessRevision::new(2).unwrap();
+        rebound.binding = RedactedBindingStateV1::ManagedActive;
+        rebound.lifecycle = HarnessRunLifecycleV1::Running;
+        app.apply_harness_run_changed(rebound.clone());
+        assert_eq!(app.harness_kanban.runs.get(&run.run_id), Some(&rebound));
+        assert_eq!(app.harness_kanban.runs.len(), 1, "an upsert must not add a second entry");
     }
 
     #[test]

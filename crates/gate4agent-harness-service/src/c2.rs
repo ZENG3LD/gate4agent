@@ -1128,6 +1128,42 @@ impl HarnessC2Adapter {
         }
         Ok(())
     }
+
+    /// Best-effort follow-up to a settled `StopSession`: asks the node to
+    /// drop the stopped session's own binding, the same `NodeRequest::Remove`
+    /// an explicit Remove verb would send. Without this, a session the node
+    /// just force-killed keeps reporting itself in the runtime inventory
+    /// forever -- nothing on the node side unbinds it on its own once a
+    /// `Stop` settles. Called from `start_session_control_worker`'s own
+    /// detached task, after that worker has already replied to the
+    /// operator's `StopSession` call, so a slow or failed reap never delays
+    /// or fails the verb itself; `RouteObservationRecovery::
+    /// awaiting_absent_sessions` (runtime.rs) is what makes the operator's
+    /// runtime-inventory read wait for this to actually land.
+    pub(crate) async fn remove_stopped_session(
+        &self,
+        route: &NodeRoute,
+        session: SessionAddress,
+    ) -> Result<(), HarnessC2Error> {
+        self.ensure_current_incarnation(route)?;
+        let pending = self
+            .control
+            .start_request(route.clone(), NodeRequest::Remove { session })
+            .map_err(HarnessC2Error::SessionControlEnqueue)?;
+        match pending.finish().await {
+            Err(error) => Err(HarnessC2Error::SessionControlTransport(error)),
+            Ok(routed) if routed.node_id != route.node_id
+                || routed.incarnation_id != route.expected_incarnation_id =>
+            {
+                Err(HarnessC2Error::SessionControlRouteMismatch)
+            }
+            Ok(routed) => match routed.response {
+                Ok(C2NodeResponse::Accepted) => Ok(()),
+                Ok(_) => Err(HarnessC2Error::UnexpectedSessionControlResponse),
+                Err(failure) => Err(HarnessC2Error::SessionControlRejected { code: failure.code }),
+            },
+        }
+    }
 }
 
 pub(crate) struct DeliveryUploadStage {
@@ -2274,6 +2310,22 @@ pub(crate) struct PendingSessionControl {
 }
 
 impl PendingSessionControl {
+    pub(crate) fn route(&self) -> &NodeRoute {
+        &self.prepared.route
+    }
+
+    /// The session address this control verb targets, only for `Stop` --
+    /// the one session-control verb whose success can make a session
+    /// disappear from the runtime-inventory roster the harness host caches.
+    /// Read before `finish` consumes `self`, so a caller can capture a
+    /// "this session must be gone" expectation on the route's recovery
+    /// entry before the C2 round trip even starts (see `RouteObservation
+    /// Recovery::awaiting_absent_sessions`).
+    pub(crate) fn stop_session_address(&self) -> Option<SessionAddress> {
+        matches!(self.prepared.kind, SessionControlKind::Stop { .. })
+            .then(|| self.prepared.session.clone())
+    }
+
     pub(crate) async fn finish(mut self) -> Result<(), HarnessC2Error> {
         let pending = self.pending.take()
             .expect("pending session control owns exactly one C2 waiter");

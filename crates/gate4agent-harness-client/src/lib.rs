@@ -31,6 +31,13 @@ pub const HARNESS_CONTEXT_SOURCE_OBSERVATION_DEADLINE: Duration = Duration::from
 // verbs below already use.
 pub const HARNESS_SESSION_SPAWN_DEADLINE: Duration = Duration::from_secs(30);
 pub const HARNESS_SESSION_CONTROL_DEADLINE: Duration = Duration::from_secs(24);
+// Client-side outer bound for the session-record mutation family (resume,
+// rename, set-task, forget, index-provider, index-native): sized like
+// `HARNESS_SESSION_SPAWN_DEADLINE` rather than the thinner session-control
+// deadline, since `ResumeSessionRecord` spawns a brand-new process the same
+// way a plain spawn does -- the other five verbs are cheap store mutations
+// that settle well inside this ceiling.
+pub const HARNESS_SESSION_RECORD_MUTATION_DEADLINE: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
 pub struct HarnessReadClient {
@@ -851,6 +858,128 @@ impl HarnessOperatorClient {
         }
     }
 
+    /// Same node request (`NodeRequest::PreviewSessionRecord`) the light TUI
+    /// sends for both an initial preview open and a background history
+    /// refresh of an already-open preview tab -- see the doc comment on
+    /// `HarnessOperatorRequestV1::PreviewSessionRecord`. Callers needing the
+    /// refresh's incarnation-staleness guard perform it themselves before
+    /// calling this (the harness operator wire has no per-connection
+    /// incarnation to compare against the way the light TUI's persistent
+    /// per-node C2 connection does).
+    pub fn preview_session_record(
+        &self,
+        node_id: String,
+        record_id: String,
+        message_limit: u16,
+    ) -> Result<HarnessSessionRecordPreviewedV1, HarnessOperatorClientError> {
+        match self.send(HarnessOperatorRequestV1::PreviewSessionRecord {
+            node_id,
+            record_id,
+            message_limit,
+        })? {
+            HarnessOperatorResponseV1::SessionRecordPreviewed(value) => Ok(value),
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Resumes a dormant managed-session record into a fresh live session.
+    /// Unlike `resume_session` (ack-only), the node returns the new
+    /// session's address synchronously -- see `HarnessSessionRecordResumedV1`'s
+    /// doc comment.
+    pub fn resume_session_record(
+        &self,
+        node_id: String,
+        record_id: String,
+        terminal_size: HarnessRuntimeTerminalSizeV1,
+        initial_prompt: Option<String>,
+    ) -> Result<HarnessSessionRecordResumedV1, HarnessOperatorClientError> {
+        match self.send(HarnessOperatorRequestV1::ResumeSessionRecord {
+            node_id,
+            record_id,
+            terminal_size,
+            initial_prompt,
+        })? {
+            HarnessOperatorResponseV1::SessionRecordResumed(value) => Ok(value),
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
+    pub fn rename_session_record(
+        &self,
+        node_id: String,
+        record_id: String,
+        display_name: String,
+    ) -> Result<HarnessRuntimeManagedSessionV1, HarnessOperatorClientError> {
+        match self.send(HarnessOperatorRequestV1::RenameSessionRecord {
+            node_id,
+            record_id,
+            display_name,
+        })? {
+            HarnessOperatorResponseV1::SessionRecordUpdated(value) => Ok(value),
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
+    pub fn set_session_task(
+        &self,
+        node_id: String,
+        record_id: String,
+        expected_revision: u64,
+        target: HarnessSessionTaskTargetV1,
+    ) -> Result<HarnessRuntimeManagedSessionV1, HarnessOperatorClientError> {
+        match self.send(HarnessOperatorRequestV1::SetSessionTask {
+            node_id,
+            record_id,
+            expected_revision,
+            target,
+        })? {
+            HarnessOperatorResponseV1::SessionRecordUpdated(value) => Ok(value),
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
+    pub fn forget_session_record(
+        &self,
+        node_id: String,
+        record_id: String,
+    ) -> Result<String, HarnessOperatorClientError> {
+        match self.send(HarnessOperatorRequestV1::ForgetSessionRecord { node_id, record_id })? {
+            HarnessOperatorResponseV1::SessionRecordForgotten { record_id } => Ok(record_id),
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
+    pub fn index_provider_session(
+        &self,
+        node_id: String,
+        workspace_id: String,
+        provider: String,
+        identity: HarnessProviderSessionIdentityV1,
+        display_name: String,
+    ) -> Result<HarnessRuntimeManagedSessionV1, HarnessOperatorClientError> {
+        match self.send(HarnessOperatorRequestV1::IndexProviderSession {
+            node_id,
+            workspace_id,
+            provider,
+            identity,
+            display_name,
+        })? {
+            HarnessOperatorResponseV1::ProviderSessionIndexed(value) => Ok(value),
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
+    pub fn index_native_session(
+        &self,
+        selection: HarnessNativeSessionSelectionV1,
+        display_name: String,
+    ) -> Result<HarnessNativeSessionIndexedV1, HarnessOperatorClientError> {
+        match self.send(HarnessOperatorRequestV1::IndexNativeSession { selection, display_name })? {
+            HarnessOperatorResponseV1::NativeSessionIndexed(value) => Ok(value),
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
     pub fn submit_intent(
         &self,
         intent: HarnessOperatorIntentV1,
@@ -1020,8 +1149,19 @@ impl HarnessOperatorClient {
             HarnessOperatorRequestV1::CatalogNativeSessions { .. }
                 | HarnessOperatorRequestV1::PageNativeSessions { .. }
                 | HarnessOperatorRequestV1::PreviewNativeSession { .. }
+                | HarnessOperatorRequestV1::PreviewSessionRecord { .. }
         ) {
             HARNESS_NATIVE_HISTORY_DEADLINE
+        } else if matches!(
+            &request,
+            HarnessOperatorRequestV1::ResumeSessionRecord { .. }
+                | HarnessOperatorRequestV1::RenameSessionRecord { .. }
+                | HarnessOperatorRequestV1::SetSessionTask { .. }
+                | HarnessOperatorRequestV1::ForgetSessionRecord { .. }
+                | HarnessOperatorRequestV1::IndexProviderSession { .. }
+                | HarnessOperatorRequestV1::IndexNativeSession { .. }
+        ) {
+            HARNESS_SESSION_RECORD_MUTATION_DEADLINE
         } else if matches!(
             &request,
             HarnessOperatorRequestV1::InspectRunWorkspace { .. }

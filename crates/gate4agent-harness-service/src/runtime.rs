@@ -6,9 +6,11 @@ use crate::{
         HarnessC2Error, HarnessC2EventReceiver,
         HarnessObservationResync, PendingNativeHistoryRequest, PendingNodeWorkspaceRead,
         PendingNodeWorkspaceWrite, PendingRunRead,
-        PendingRunContextSourceObservation, PendingSessionControl, PreparedRunContextSourceObservation,
+        PendingRunContextSourceObservation, PendingSessionControl,
+        PendingSessionRecordMutation, PreparedRunContextSourceObservation,
         PreparedNodeWorkspaceRead, PreparedNodeWorkspaceWrite,
-        PreparedRunRead, PreparedSessionControl, PreparedSessionSpawn,
+        PreparedRunRead, PreparedSessionControl, PreparedSessionRecordMutation,
+        PreparedSessionSpawn,
         RunContextSourceObservationCompletion,
         RunContextSourceProjection, RunReadCompletion, WorkspaceReadKind,
         ManagedWorktreeSpawnDispatchOutcome, PendingManagedWorktreeSpawnDispatch,
@@ -146,6 +148,12 @@ const HOST_SESSION_CONTROL_RESPONSE_DEADLINE: Duration = Duration::from_secs(22)
 // `deadline_ms` (`SESSION_SPAWN_DEADLINE_MS` in c2.rs, 20s) plus the same 5s
 // `RELAY_REPLY_HEADROOM` -- 25s inner. This outer bound stays above that.
 const HOST_SESSION_SPAWN_RESPONSE_DEADLINE: Duration = Duration::from_secs(28);
+// `ResumeSessionRecord` spawns a new process the same way `SpawnSpec` does,
+// so this family's outer bound matches `HOST_SESSION_SPAWN_RESPONSE_DEADLINE`
+// rather than the thinner `HOST_SESSION_CONTROL_RESPONSE_DEADLINE`; the other
+// five verbs in the family (rename/set-task/forget/index-provider/
+// index-native) are cheap store mutations that settle well inside it.
+const HOST_SESSION_RECORD_MUTATION_RESPONSE_DEADLINE: Duration = Duration::from_secs(28);
 const HOST_CONNECTION_DEADLINE: Duration = Duration::from_secs(45);
 const OBSERVATION_RECOVERY_RETRY: Duration = Duration::from_secs(1);
 const OBSERVATION_RECOVERY_MAX_IN_FLIGHT: usize = 8;
@@ -172,6 +180,11 @@ const NODE_WORKSPACE_WRITE_WORKERS_MAX: usize = 8;
 // a concurrent node-workspace read or vice versa.
 const SESSION_SPAWN_WORKERS_MAX: usize = 8;
 const SESSION_CONTROL_WORKERS_MAX: usize = 8;
+// Own pool, not shared with `SESSION_CONTROL_WORKERS_MAX`: a burst of
+// session-record mutations (rename, set-task, forget, index-provider,
+// index-native, resume-session-record) must never be able to starve a
+// concurrent live-session keystroke/resize, or vice versa.
+const SESSION_RECORD_MUTATION_WORKERS_MAX: usize = 8;
 const RUN_CONTEXT_SOURCE_WORKERS_MAX: usize = 8;
 // Deliberately separate from `RUN_READ_WORKERS_MAX`, not shared: background
 // git-facts capture must never be able to starve a live operator's own
@@ -405,6 +418,19 @@ enum HostCommand {
         /// (and, for `Stop`/`Remove`, the "this session must be gone")
         /// expectation on the route's recovery entry.
         roster_effect: SessionRosterEffect,
+    },
+    /// Every session-record mutation invalidates the route's cached
+    /// runtime-inventory entry on success (see the handler below) --
+    /// unconditionally, unlike `SessionControlFinished`'s per-verb
+    /// `SessionRosterEffect`: all six verbs in this family mutate the node's
+    /// managed-session store the runtime inventory's `managed_sessions`
+    /// roster caches, so there is no verb here with `SessionRosterEffect::
+    /// None`'s "cannot possibly change the roster" property.
+    SessionRecordMutationFinished {
+        result: Result<HarnessOperatorResponseV1, HarnessC2Error>,
+        reply: oneshot::Sender<HarnessOperatorReplyV1>,
+        identity: OperatorRequestLogIdentity,
+        route: NodeRoute,
     },
     RunGitFactsCaptureFinished {
         run_id: gate4agent_harness_protocol::HarnessRunId,
@@ -928,6 +954,11 @@ struct SessionControlWorkerRegistry {
 }
 
 #[derive(Default)]
+struct SessionRecordMutationWorkerRegistry {
+    in_flight: usize,
+}
+
+#[derive(Default)]
 struct RunGitFactsWorkerRegistry {
     in_flight: usize,
 }
@@ -1007,6 +1038,18 @@ impl SessionSpawnWorkerRegistry {
 impl SessionControlWorkerRegistry {
     fn try_start(&mut self) -> bool {
         if self.in_flight >= SESSION_CONTROL_WORKERS_MAX { return false; }
+        self.in_flight += 1;
+        true
+    }
+
+    fn finish(&mut self) {
+        self.in_flight = self.in_flight.saturating_sub(1);
+    }
+}
+
+impl SessionRecordMutationWorkerRegistry {
+    fn try_start(&mut self) -> bool {
+        if self.in_flight >= SESSION_RECORD_MUTATION_WORKERS_MAX { return false; }
         self.in_flight += 1;
         true
     }
@@ -1995,6 +2038,44 @@ fn start_node_workspace_write_worker(
     });
 }
 
+/// Session-record-mutation-family sibling of `start_node_workspace_write_worker`:
+/// same bounded-worker/cooperative-cancel shape, plus capturing `route`
+/// before `pending.finish()` consumes it -- every settled mutation here
+/// invalidates the route's runtime-inventory entry, unconditionally (see
+/// `HostCommand::SessionRecordMutationFinished`'s handler).
+fn start_session_record_mutation_worker(
+    pending: PendingSessionRecordMutation,
+    commands: mpsc::Sender<HostCommand>,
+    reply: oneshot::Sender<HarnessOperatorReplyV1>,
+    identity: OperatorRequestLogIdentity,
+    cancel: Option<oneshot::Receiver<()>>,
+) {
+    tokio::spawn(async move {
+        let route = pending.route().clone();
+        let result = match cancel {
+            Some(cancel) => {
+                tokio::select! {
+                    result = pending.finish() => result,
+                    _ = cancel => {
+                        tracing::warn!(
+                            operation = %identity.operation,
+                            node_id = identity.node_id(),
+                            workspace_id = identity.workspace_id(),
+                            session_id = identity.session_id(),
+                            "session record mutation worker cancelled: the operator connection's own deadline fired before the node replied",
+                        );
+                        Err(HarnessC2Error::SessionRecordMutationCancelled)
+                    }
+                }
+            }
+            None => pending.finish().await,
+        };
+        let _ = commands
+            .send(HostCommand::SessionRecordMutationFinished { result, reply, identity, route })
+            .await;
+    });
+}
+
 /// Direct operator `SpawnSession`: unlike `start_node_workspace_read_worker`
 /// (which only awaits an already-enqueued round trip), the whole dispatch --
 /// preflight, build, enqueue, await -- runs inside this task, because
@@ -2438,6 +2519,53 @@ fn map_session_control_error(error: HarnessC2Error) -> HarnessOperatorHostErrorV
     }
 }
 
+fn map_session_record_mutation_error(error: HarnessC2Error) -> HarnessOperatorHostErrorV1 {
+    match error {
+        HarnessC2Error::InvalidSessionRecordMutationRequest => {
+            HarnessOperatorHostErrorV1::InvalidRequest
+        }
+        HarnessC2Error::SessionRecordMutationEnqueue(
+            gate4agent_c2_client::C2ControlError::QueueFull,
+        ) => HarnessOperatorHostErrorV1::Busy,
+        HarnessC2Error::SessionRecordMutationEnqueue(_)
+        | HarnessC2Error::SessionRecordMutationTransport(_)
+        | HarnessC2Error::UnknownNode(_)
+        | HarnessC2Error::NodeOffline(_)
+        | HarnessC2Error::MissingIncarnation(_) => HarnessOperatorHostErrorV1::Unavailable,
+        HarnessC2Error::IncarnationChanged { .. }
+        | HarnessC2Error::SessionRecordMutationRouteMismatch
+        | HarnessC2Error::SessionRecordMutationCorrelationMismatch => {
+            HarnessOperatorHostErrorV1::Conflict
+        }
+        HarnessC2Error::SessionRecordMutationDeadline
+        | HarnessC2Error::SessionRecordMutationCancelled => HarnessOperatorHostErrorV1::Deadline,
+        HarnessC2Error::SessionRecordMutationProjection => HarnessOperatorHostErrorV1::Internal,
+        HarnessC2Error::SessionRecordMutationRejected { code } => match code {
+            NodeFailureCode::InvalidRequest => HarnessOperatorHostErrorV1::InvalidRequest,
+            NodeFailureCode::UnknownSessionRecord | NodeFailureCode::UnknownWorkspace => {
+                HarnessOperatorHostErrorV1::NotFound
+            }
+            NodeFailureCode::SessionRecordConflict
+            | NodeFailureCode::SessionRecordNotResumable
+            | NodeFailureCode::SessionWorkspaceMismatch
+            | NodeFailureCode::WorkspaceRegistrationRequired
+            | NodeFailureCode::BindingMismatch
+            | NodeFailureCode::StaleGeneration
+            | NodeFailureCode::StaleNativeSessionCatalog => HarnessOperatorHostErrorV1::Conflict,
+            NodeFailureCode::SessionRecordBusy
+            | NodeFailureCode::ControllerBusy
+            | NodeFailureCode::WorkspaceBusy
+            | NodeFailureCode::BackendBusy => HarnessOperatorHostErrorV1::Busy,
+            NodeFailureCode::UnsupportedCapability
+            | NodeFailureCode::BackendDisconnected
+            | NodeFailureCode::BackendOperationFailed
+            | NodeFailureCode::ShuttingDown => HarnessOperatorHostErrorV1::Unavailable,
+            _ => HarnessOperatorHostErrorV1::Internal,
+        },
+        _ => HarnessOperatorHostErrorV1::Internal,
+    }
+}
+
 fn map_native_history_error(error: HarnessC2Error) -> HarnessOperatorHostErrorV1 {
     match error {
         HarnessC2Error::InvalidNativeHistoryRequest => {
@@ -2458,6 +2586,14 @@ fn map_native_history_error(error: HarnessC2Error) -> HarnessOperatorHostErrorV1
         HarnessC2Error::NativeHistoryDeadline => HarnessOperatorHostErrorV1::Deadline,
         HarnessC2Error::NativeHistoryRejected { code } => match code {
             NodeFailureCode::InvalidRequest => HarnessOperatorHostErrorV1::InvalidRequest,
+            // `PreviewSessionRecord` rides this same pool (see
+            // `is_native_history_request`'s doc comment) and is the only
+            // verb here that can fail with this code (an unknown
+            // `record_id`); the other three verbs in the pool never
+            // produce it. `UnknownWorkspace` stays mapped to `Unavailable`
+            // below, unchanged, rather than moving here -- this new arm is
+            // additive only.
+            NodeFailureCode::UnknownSessionRecord => HarnessOperatorHostErrorV1::NotFound,
             NodeFailureCode::StaleNativeSessionCatalog => {
                 HarnessOperatorHostErrorV1::Conflict
             }
@@ -2483,6 +2619,32 @@ fn is_native_history_request(request: &HarnessOperatorRequestV1) -> bool {
         HarnessOperatorRequestV1::CatalogNativeSessions { .. }
             | HarnessOperatorRequestV1::PageNativeSessions { .. }
             | HarnessOperatorRequestV1::PreviewNativeSession { .. }
+            // `PreviewSessionRecord` relays the exact same `NodeRequest::
+            // PreviewSessionRecord` the light TUI's initial-preview-open and
+            // background-history-refresh actions both send (see the doc
+            // comment on `HarnessOperatorRequestV1::PreviewSessionRecord`),
+            // so it rides this same read-worker pool rather than getting its
+            // own.
+            | HarnessOperatorRequestV1::PreviewSessionRecord { .. }
+    )
+}
+
+/// The session-record mutation family: `ResumeSessionRecord`/
+/// `RenameSessionRecord`/`SetSessionTask`/`ForgetSessionRecord`/
+/// `IndexProviderSession`/`IndexNativeSession` -- see
+/// `SessionRecordMutationKind`'s doc comment (`c2.rs`) for why this rides its
+/// own bounded pool rather than either `is_session_control_request`'s pool
+/// (thin ack-only session-address-scoped verbs) or `is_native_history_
+/// request`'s pool (reads, no roster invalidation on success).
+fn is_session_record_mutation_request(request: &HarnessOperatorRequestV1) -> bool {
+    matches!(
+        request,
+        HarnessOperatorRequestV1::ResumeSessionRecord { .. }
+            | HarnessOperatorRequestV1::RenameSessionRecord { .. }
+            | HarnessOperatorRequestV1::SetSessionTask { .. }
+            | HarnessOperatorRequestV1::ForgetSessionRecord { .. }
+            | HarnessOperatorRequestV1::IndexProviderSession { .. }
+            | HarnessOperatorRequestV1::IndexNativeSession { .. }
     )
 }
 
@@ -2595,6 +2757,20 @@ impl OperatorRequestLogIdentity {
                 Some(session.workspace_id.clone()),
                 Some(format!("{}/{}", session.instance_id, session.generation)),
             ),
+            HarnessOperatorRequestV1::ResumeSessionRecord { node_id, record_id, .. }
+            | HarnessOperatorRequestV1::RenameSessionRecord { node_id, record_id, .. }
+            | HarnessOperatorRequestV1::SetSessionTask { node_id, record_id, .. }
+            | HarnessOperatorRequestV1::ForgetSessionRecord { node_id, record_id } => {
+                (Some(node_id.clone()), None, Some(record_id.clone()))
+            }
+            HarnessOperatorRequestV1::IndexProviderSession { node_id, workspace_id, .. } => {
+                (Some(node_id.clone()), Some(workspace_id.clone()), None)
+            }
+            HarnessOperatorRequestV1::IndexNativeSession { selection, .. } => (
+                Some(selection.route.node_id.clone()),
+                selection.route.workspace_id.clone(),
+                None,
+            ),
             _ => (None, None, None),
         };
         let run_id = match request {
@@ -2680,6 +2856,8 @@ fn operator_response_deadline(request: &HarnessOperatorRequestV1) -> Duration {
         HOST_SESSION_SPAWN_RESPONSE_DEADLINE
     } else if is_session_control_request(request) {
         HOST_SESSION_CONTROL_RESPONSE_DEADLINE
+    } else if is_session_record_mutation_request(request) {
+        HOST_SESSION_RECORD_MUTATION_RESPONSE_DEADLINE
     } else {
         HOST_DEADLINE
     }
@@ -3540,6 +3718,7 @@ pub async fn start_harness_host_with_operator_and_catalogs(
         let mut node_workspace_write_workers = NodeWorkspaceWriteWorkerRegistry::default();
         let mut session_spawn_workers = SessionSpawnWorkerRegistry::default();
         let mut session_control_workers = SessionControlWorkerRegistry::default();
+        let mut session_record_mutation_workers = SessionRecordMutationWorkerRegistry::default();
         // Host-local nonce for `mint_session_spawn_ids` -- see its doc
         // comment for why this only needs to be distinct, not unpredictable.
         let mut session_spawn_nonce: u64 = 0;
@@ -4005,6 +4184,68 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                         );
                                         let _ = reply.send(HarnessOperatorReplyV1::Error {
                                             error: map_session_control_error(cause),
+                                        });
+                                    }
+                                }
+                                continue;
+                            }
+                            if is_session_record_mutation_request(&request) {
+                                let identity = OperatorRequestLogIdentity::describe(&request);
+                                let prepared = PreparedSessionRecordMutation::from_operator_request(
+                                    &adapter,
+                                    request,
+                                );
+                                let prepared = match prepared {
+                                    Ok(prepared) => prepared,
+                                    Err(cause) => {
+                                        tracing::warn!(
+                                            operation = %identity.operation,
+                                            node_id = identity.node_id(),
+                                            workspace_id = identity.workspace_id(),
+                                            session_id = identity.session_id(),
+                                            cause = %cause,
+                                            "session record mutation request rejected before C2 dispatch",
+                                        );
+                                        let _ = reply.send(HarnessOperatorReplyV1::Error {
+                                            error: map_session_record_mutation_error(cause),
+                                        });
+                                        continue;
+                                    }
+                                };
+                                if !session_record_mutation_workers.try_start() {
+                                    tracing::warn!(
+                                        operation = %identity.operation,
+                                        node_id = identity.node_id(),
+                                        workspace_id = identity.workspace_id(),
+                                        session_id = identity.session_id(),
+                                        limit = SESSION_RECORD_MUTATION_WORKERS_MAX,
+                                        "session record mutation rejected: harness-side worker capacity is busy",
+                                    );
+                                    let _ = reply.send(HarnessOperatorReplyV1::Error {
+                                        error: HarnessOperatorHostErrorV1::Busy,
+                                    });
+                                    continue;
+                                }
+                                match adapter.start_prepared_session_record_mutation(prepared) {
+                                    Ok(pending) => start_session_record_mutation_worker(
+                                        pending,
+                                        commands.clone(),
+                                        reply,
+                                        identity,
+                                        cancel,
+                                    ),
+                                    Err(cause) => {
+                                        session_record_mutation_workers.finish();
+                                        tracing::warn!(
+                                            operation = %identity.operation,
+                                            node_id = identity.node_id(),
+                                            workspace_id = identity.workspace_id(),
+                                            session_id = identity.session_id(),
+                                            cause = %cause,
+                                            "session record mutation rejected: could not start the C2 dispatch",
+                                        );
+                                        let _ = reply.send(HarnessOperatorReplyV1::Error {
+                                            error: map_session_record_mutation_error(cause),
                                         });
                                     }
                                 }
@@ -5044,6 +5285,48 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                     );
                                 }
                             }
+                            let _ = reply.send(reply_value);
+                        }
+                        Some(HostCommand::SessionRecordMutationFinished {
+                            result,
+                            reply,
+                            identity,
+                            route,
+                        }) => {
+                            session_record_mutation_workers.finish();
+                            let reply_value = match result {
+                                Ok(response) => {
+                                    // Unconditional, unlike `SessionControlFinished`'s
+                                    // per-verb `SessionRosterEffect` -- see
+                                    // `HostCommand::SessionRecordMutationFinished`'s
+                                    // doc comment.
+                                    tracing::info!(
+                                        operation = %identity.operation,
+                                        node_id = identity.node_id(),
+                                        "session record mutation accepted; invalidating the node's runtime inventory route",
+                                    );
+                                    invalidate_runtime_inventory_for_route(
+                                        &mut runtime_inventory,
+                                        &mut subscribers,
+                                        &mut observation_recovery,
+                                        &route,
+                                    );
+                                    HarnessOperatorReplyV1::Ok { response }
+                                }
+                                Err(cause) => {
+                                    tracing::warn!(
+                                        operation = %identity.operation,
+                                        node_id = identity.node_id(),
+                                        workspace_id = identity.workspace_id(),
+                                        session_id = identity.session_id(),
+                                        cause = %cause,
+                                        "session record mutation request rejected after its C2 round trip",
+                                    );
+                                    HarnessOperatorReplyV1::Error {
+                                        error: map_session_record_mutation_error(cause),
+                                    }
+                                }
+                            };
                             let _ = reply.send(reply_value);
                         }
                         Some(HostCommand::RunGitFactsCaptureFinished { run_id, completion }) => {
@@ -6947,6 +7230,19 @@ fn execute_operator_request(
         | HarnessOperatorRequestV1::ResumeSession { .. } => {
             return Err(HarnessOperatorHostErrorV1::Internal);
         }
+        // Same reasoning as the nine session verbs above: the host select
+        // loop intercepts the session-record read (`is_native_history_
+        // request`) and mutation (`is_session_record_mutation_request`)
+        // families before this function ever sees them.
+        HarnessOperatorRequestV1::PreviewSessionRecord { .. }
+        | HarnessOperatorRequestV1::ResumeSessionRecord { .. }
+        | HarnessOperatorRequestV1::RenameSessionRecord { .. }
+        | HarnessOperatorRequestV1::SetSessionTask { .. }
+        | HarnessOperatorRequestV1::ForgetSessionRecord { .. }
+        | HarnessOperatorRequestV1::IndexProviderSession { .. }
+        | HarnessOperatorRequestV1::IndexNativeSession { .. } => {
+            return Err(HarnessOperatorHostErrorV1::Internal);
+        }
         HarnessOperatorRequestV1::SubmitIntent { .. } => {
             return Err(HarnessOperatorHostErrorV1::Internal);
         }
@@ -7324,7 +7620,8 @@ async fn handle_connection(
             let needs_cancel_signal = is_node_workspace_read_request(&request)
                 || is_node_workspace_write_request(&request)
                 || is_session_spawn_request(&request)
-                || is_session_control_request(&request);
+                || is_session_control_request(&request)
+                || is_session_record_mutation_request(&request);
             let mut cancel_tx = None;
             let cancel_rx = if needs_cancel_signal {
                 let (tx, rx) = oneshot::channel();

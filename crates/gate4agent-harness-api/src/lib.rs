@@ -75,6 +75,10 @@ pub const HARNESS_RUNTIME_INVENTORY_PAGE_LIMIT_MAX: u16 = 64;
 pub const HARNESS_NATIVE_SESSION_CATALOG_LIMIT_MAX: u16 = 64;
 pub const HARNESS_NATIVE_SESSION_PREVIEW_MESSAGE_LIMIT_MAX: u16 = 24;
 pub const HARNESS_NATIVE_SESSION_PREVIEW_TEXT_MAX_BYTES: usize = 4_096;
+pub const HARNESS_SESSION_RECORD_DISPLAY_NAME_MAX_BYTES: usize = 256;
+pub const HARNESS_SESSION_RECORD_TASK_ID_MAX_BYTES: usize = 128;
+pub const HARNESS_PROVIDER_SESSION_ID_MAX_BYTES: usize = 512;
+pub const HARNESS_PROVIDER_SESSION_TRANSCRIPT_PATH_MAX_BYTES: usize = 32_768;
 pub const HARNESS_LAUNCH_PLAN_PAGE_LIMIT_MAX: u16 = 64;
 pub const HARNESS_TASK_LAUNCH_OPTIONS_MAX: usize = 64;
 pub const HARNESS_RUNTIME_SPAWN_PROFILES_MAX: usize = 64;
@@ -1785,6 +1789,76 @@ impl HarnessReverseAttributionV1 {
     }
 }
 
+/// Mirrors `gate4agent_types::ProviderSessionKey` exactly, for the same
+/// reason `HarnessTerminalControlV1` duplicates `TerminalControl` rather than
+/// importing it -- see that type's own doc comment.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessProviderSessionKeyV1 {
+    SessionId,
+    ConversationId,
+}
+
+/// Mirrors `gate4agent_types::ProviderSessionIdentity`: the caller-supplied
+/// reference `IndexProviderSession` binds a durable managed-session record
+/// to. Bounds match the node's own `PROVIDER_EVENT_ID_MAX_BYTES`/
+/// `PROVIDER_SESSION_LOCATOR_MAX_BYTES` (the node re-validates on its own
+/// terms regardless; this bound exists to reject an obviously-oversized
+/// request before it ever reaches C2).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessProviderSessionIdentityV1 {
+    pub key: HarnessProviderSessionKeyV1,
+    pub id: String,
+    pub transcript_path: Option<String>,
+}
+
+impl HarnessProviderSessionIdentityV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        if self.id.is_empty()
+            || self.id.len() > HARNESS_PROVIDER_SESSION_ID_MAX_BYTES
+            || self.id.starts_with('-')
+            || self.id.chars().any(char::is_control)
+            || self.transcript_path.as_ref().is_some_and(|path| {
+                path.is_empty()
+                    || path.len() > HARNESS_PROVIDER_SESSION_TRANSCRIPT_PATH_MAX_BYTES
+                    || path.chars().any(char::is_control)
+            })
+        {
+            return Err(HarnessOperatorApiError::InvalidSessionRecordRequest);
+        }
+        Ok(())
+    }
+}
+
+/// Mirrors the node's own `SessionTaskTargetV1` shape exactly (`New` starts
+/// a fresh correlation, `Existing` binds to a caller-named task, `Clear`
+/// removes the binding). The node's `task_id` there is its own local
+/// identifier space (format `task-<24 lowercase hex>`, unrelated to this
+/// crate's `HarnessTaskId` despite the similar name -- the node layer has no
+/// dependency on `gate4agent-harness-protocol` and never mints one from a
+/// `HarnessTaskId`), so `task_id` here stays a bounded opaque string rather
+/// than the typed `HarnessTaskId`: the harness-service boundary parses and
+/// validates it against the node's own format when building the C2 request.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum HarnessSessionTaskTargetV1 {
+    New,
+    Existing { task_id: String },
+    Clear,
+}
+
+impl HarnessSessionTaskTargetV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        if let Self::Existing { task_id } = self {
+            if !valid_runtime_id(task_id, HARNESS_SESSION_RECORD_TASK_ID_MAX_BYTES) {
+                return Err(HarnessOperatorApiError::InvalidSessionRecordRequest);
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum HarnessOperatorRequestV1 {
@@ -1980,6 +2054,76 @@ pub enum HarnessOperatorRequestV1 {
     PreviewNativeSession {
         selection: HarnessNativeSessionSelectionV1,
         message_limit: u16,
+    },
+    // Session-record family: node-scoped like `InspectNodeWorkspace`
+    // (`node_id` resolved live via `exact_route`, no caller-pinned
+    // incarnation), not session-address-scoped like the eight session-
+    // control verbs above -- a managed session record has its own
+    // `record_id` identity independent of whether it currently has a live
+    // PTY bound to it. `PreviewSessionRecord` relays `NodeRequest::
+    // PreviewSessionRecord` and rides the same read-worker pool as
+    // `CatalogNativeSessions`/`PageNativeSessions`/`PreviewNativeSession`
+    // above (`is_native_history_request` in `gate4agent-harness-service`) --
+    // the light TUI sends this exact node request for both an initial
+    // preview open and a background history refresh of an already-open
+    // preview tab, so this wire stays a single verb the same way.
+    PreviewSessionRecord {
+        node_id: String,
+        record_id: String,
+        message_limit: u16,
+    },
+    // `ResumeSessionRecord`/`RenameSessionRecord`/`SetSessionTask`/
+    // `ForgetSessionRecord`/`IndexProviderSession`/`IndexNativeSession` are
+    // mutations, dispatched through the bounded session-record-mutation
+    // worker pool (`is_session_record_mutation_request`) the same way the
+    // eight session-control verbs use their own pool -- unlike those eight,
+    // each of these six carries a distinct, non-`Accepted` node reply (a
+    // managed-session record, or for `ResumeSessionRecord` a record plus the
+    // freshly spawned session address), so the reply is relayed back
+    // correlated rather than collapsed into one shared ack shape. Unlike
+    // `ResumeSession` (existing live session, ack-only, generation bump
+    // reported through the runtime inventory), `ResumeSessionRecord` spawns
+    // a *new* session from a dormant record and the node returns that
+    // session's address synchronously -- this wire mirrors that exactly.
+    ResumeSessionRecord {
+        node_id: String,
+        record_id: String,
+        terminal_size: HarnessRuntimeTerminalSizeV1,
+        initial_prompt: Option<String>,
+    },
+    RenameSessionRecord {
+        node_id: String,
+        record_id: String,
+        display_name: String,
+    },
+    SetSessionTask {
+        node_id: String,
+        record_id: String,
+        expected_revision: u64,
+        target: HarnessSessionTaskTargetV1,
+    },
+    ForgetSessionRecord {
+        node_id: String,
+        record_id: String,
+    },
+    IndexProviderSession {
+        node_id: String,
+        workspace_id: String,
+        provider: String,
+        identity: HarnessProviderSessionIdentityV1,
+        display_name: String,
+    },
+    // Unlike the five siblings above, routed via `selection.route` (same
+    // caller-pinned-incarnation shape `CatalogNativeSessions`/
+    // `PageNativeSessions`/`PreviewNativeSession` already use) rather than a
+    // bare `node_id`: the selection being committed into a durable record
+    // was chosen from a previously fetched native-session catalog page, so
+    // it carries its own route already. Still dispatched through the
+    // session-record-mutation pool, not the native-history read pool --
+    // it mutates the managed-session store, it does not read a catalog.
+    IndexNativeSession {
+        selection: HarnessNativeSessionSelectionV1,
+        display_name: String,
     },
     CreateTask { request: HarnessCreateTaskRequestV1 },
     ReplaceTask { request: HarnessReplaceTaskRequestV1 },
@@ -2202,6 +2346,77 @@ impl HarnessOperatorRequestV1 {
                 }
                 Ok(())
             }
+            Self::PreviewSessionRecord { node_id, record_id, message_limit } => {
+                if !valid_runtime_id(node_id, 128) || !valid_runtime_id(record_id, 128) {
+                    return Err(HarnessOperatorApiError::InvalidSessionRecordRequest);
+                }
+                if !(1..=HARNESS_NATIVE_SESSION_PREVIEW_MESSAGE_LIMIT_MAX)
+                    .contains(message_limit)
+                {
+                    return Err(HarnessOperatorApiError::InvalidLimit);
+                }
+                Ok(())
+            }
+            Self::ResumeSessionRecord { node_id, record_id, terminal_size, initial_prompt } => {
+                if !valid_runtime_id(node_id, 128)
+                    || !valid_runtime_id(record_id, 128)
+                    || terminal_size.rows == 0
+                    || terminal_size.columns == 0
+                {
+                    return Err(HarnessOperatorApiError::InvalidSessionRecordRequest);
+                }
+                if initial_prompt.as_deref().is_some_and(|prompt| {
+                    prompt.is_empty() || prompt.len() > HARNESS_BODY_MAX_BYTES
+                }) {
+                    return Err(HarnessOperatorApiError::InvalidSessionRecordRequest);
+                }
+                Ok(())
+            }
+            Self::RenameSessionRecord { node_id, record_id, display_name } => {
+                if !valid_runtime_id(node_id, 128)
+                    || !valid_runtime_id(record_id, 128)
+                    || display_name.is_empty()
+                    || display_name.len() > HARNESS_SESSION_RECORD_DISPLAY_NAME_MAX_BYTES
+                    || display_name.chars().any(char::is_control)
+                {
+                    return Err(HarnessOperatorApiError::InvalidSessionRecordRequest);
+                }
+                Ok(())
+            }
+            Self::SetSessionTask { node_id, record_id, target, .. } => {
+                if !valid_runtime_id(node_id, 128) || !valid_runtime_id(record_id, 128) {
+                    return Err(HarnessOperatorApiError::InvalidSessionRecordRequest);
+                }
+                target.validate()
+            }
+            Self::ForgetSessionRecord { node_id, record_id } => {
+                if !valid_runtime_id(node_id, 128) || !valid_runtime_id(record_id, 128) {
+                    return Err(HarnessOperatorApiError::InvalidSessionRecordRequest);
+                }
+                Ok(())
+            }
+            Self::IndexProviderSession { node_id, workspace_id, provider, identity, display_name } => {
+                if !valid_runtime_id(node_id, 128)
+                    || !valid_runtime_id(workspace_id, 128)
+                    || !valid_runtime_id(provider, 128)
+                    || display_name.is_empty()
+                    || display_name.len() > HARNESS_SESSION_RECORD_DISPLAY_NAME_MAX_BYTES
+                    || display_name.chars().any(char::is_control)
+                {
+                    return Err(HarnessOperatorApiError::InvalidSessionRecordRequest);
+                }
+                identity.validate()
+            }
+            Self::IndexNativeSession { selection, display_name } => {
+                selection.validate()?;
+                if display_name.is_empty()
+                    || display_name.len() > HARNESS_SESSION_RECORD_DISPLAY_NAME_MAX_BYTES
+                    || display_name.chars().any(char::is_control)
+                {
+                    return Err(HarnessOperatorApiError::InvalidSessionRecordRequest);
+                }
+                Ok(())
+            }
             Self::CreateTask { request } => {
                 request.validate().map_err(HarnessOperatorApiError::Protocol)
             }
@@ -2312,6 +2527,13 @@ impl HarnessOperatorRequestV1 {
                 | Self::WriteNodeWorkspaceFile { .. }
                 | Self::CreateNodeWorkspaceFile { .. }
                 | Self::CreateNodeWorkspaceDirectory { .. }
+                | Self::PreviewSessionRecord { .. }
+                | Self::ResumeSessionRecord { .. }
+                | Self::RenameSessionRecord { .. }
+                | Self::SetSessionTask { .. }
+                | Self::ForgetSessionRecord { .. }
+                | Self::IndexProviderSession { .. }
+                | Self::IndexNativeSession { .. }
         )
     }
 
@@ -2470,6 +2692,12 @@ pub enum HarnessOperatorResponseV1 {
     NativeSessionsCataloged(HarnessNativeSessionsCatalogedV1),
     NativeSessionsPaged(HarnessNativeSessionsPagedV1),
     NativeSessionPreviewed(HarnessNativeSessionPreviewedV1),
+    SessionRecordPreviewed(HarnessSessionRecordPreviewedV1),
+    SessionRecordResumed(HarnessSessionRecordResumedV1),
+    SessionRecordUpdated(HarnessRuntimeManagedSessionV1),
+    SessionRecordForgotten { record_id: String },
+    ProviderSessionIndexed(HarnessRuntimeManagedSessionV1),
+    NativeSessionIndexed(HarnessNativeSessionIndexedV1),
     Mutation(HarnessOperatorMutationOutcomeV1),
     ExecutionSpecMutation(HarnessOperatorMutationOutcomeV1),
     Schedule(HarnessScheduleOutcomeV1),
@@ -2523,6 +2751,18 @@ impl HarnessOperatorResponseV1 {
             Self::NativeSessionsCataloged(value) => value.validate(),
             Self::NativeSessionsPaged(value) => value.validate(),
             Self::NativeSessionPreviewed(value) => value.validate(),
+            Self::SessionRecordPreviewed(value) => value.validate(),
+            Self::SessionRecordResumed(value) => value.validate(),
+            Self::SessionRecordUpdated(value) | Self::ProviderSessionIndexed(value) => {
+                value.validate()
+            }
+            Self::SessionRecordForgotten { record_id } => {
+                if !valid_runtime_id(record_id, 128) {
+                    return Err(HarnessOperatorApiError::InvalidRuntimeInventory);
+                }
+                Ok(())
+            }
+            Self::NativeSessionIndexed(value) => value.validate(),
             Self::Mutation(_) | Self::ExecutionSpecMutation(_) => Ok(()),
             Self::Schedule(HarnessScheduleOutcomeV1::Idle) => Ok(()),
             Self::Schedule(HarnessScheduleOutcomeV1::Dispatch(value)) => {
@@ -3766,6 +4006,64 @@ impl HarnessNativeSessionPreviewedV1 {
     }
 }
 
+/// `PreviewSessionRecord`'s reply: reuses `HarnessNativeSessionPreviewV1`
+/// verbatim rather than defining a session-record-specific preview shape --
+/// the node's own `SessionRecordPreview` and `NativeSessionPreview` are the
+/// same type (`pub type NativeSessionPreview = SessionRecordPreview;` in
+/// `gate4agent-node-protocol`), so the wire mirrors that identity instead of
+/// inventing a duplicate.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessSessionRecordPreviewedV1 {
+    pub record_id: String,
+    pub preview: HarnessNativeSessionPreviewV1,
+}
+
+impl HarnessSessionRecordPreviewedV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        if !valid_runtime_id(&self.record_id, 128) {
+            return Err(HarnessOperatorApiError::InvalidRuntimeInventory);
+        }
+        self.preview.validate()
+    }
+}
+
+/// `ResumeSessionRecord`'s reply: unlike `ResumeSession` (ack-only, no
+/// address -- see that request variant's doc comment), the node returns the
+/// freshly spawned session's address synchronously alongside the updated
+/// record, and this wire mirrors that exactly.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessSessionRecordResumedV1 {
+    pub record: HarnessRuntimeManagedSessionV1,
+    pub session: HarnessRuntimeSessionAddressV1,
+}
+
+impl HarnessSessionRecordResumedV1 {
+    fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        self.record.validate()?;
+        self.session.validate()
+    }
+}
+
+/// `IndexNativeSession`'s reply: echoes the committed selection alongside
+/// the resulting managed-session record, the same pairing
+/// `HarnessNativeSessionPreviewedV1` uses for its own selection/payload
+/// echo.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessNativeSessionIndexedV1 {
+    pub selection: HarnessNativeSessionSelectionV1,
+    pub record: HarnessRuntimeManagedSessionV1,
+}
+
+impl HarnessNativeSessionIndexedV1 {
+    fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        self.selection.validate()?;
+        self.record.validate()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HarnessOperatorMutationOutcomeV1 {
@@ -4728,6 +5026,8 @@ pub enum HarnessOperatorApiError {
     InvalidSessionSpawn,
     #[error("harness session control request is invalid")]
     InvalidSessionControl,
+    #[error("harness session record request is invalid")]
+    InvalidSessionRecordRequest,
     #[error("harness operator response is invalid")]
     Read(#[source] HarnessReadApiError),
     #[error("harness protocol value is invalid: {0}")]
@@ -7603,6 +7903,313 @@ mod tests {
             control: HarnessTerminalControlV1::Interrupt,
         };
         assert!(bad_control.validate().is_err());
+    }
+
+    fn sample_native_session_selection() -> HarnessNativeSessionSelectionV1 {
+        HarnessNativeSessionSelectionV1 {
+            route: HarnessNativeSessionRouteV1 {
+                node_id: "node-a".to_owned(),
+                incarnation_id: "1".repeat(32),
+                scope: HarnessNativeSessionCatalogScopeV1::Workspace,
+                workspace_id: Some("workspace-a".to_owned()),
+                provider: "codex".to_owned(),
+            },
+            catalog_revision: 7,
+            recent_cutoff_unix_ms: 9,
+            selection_id: "selection-a".to_owned(),
+        }
+    }
+
+    fn sample_managed_session(record_id: &str) -> HarnessRuntimeManagedSessionV1 {
+        HarnessRuntimeManagedSessionV1 {
+            record_id: record_id.to_owned(),
+            display_name: "Session display name".to_owned(),
+            display_name_truncated: false,
+            provider: "codex".to_owned(),
+            mode: HarnessRuntimeManagedModeV1::Pty,
+            state: HarnessRuntimeManagedStateV1::Dormant,
+            workspace_id: "workspace-a".to_owned(),
+            active_binding: None,
+            provider_identity_present: true,
+            updated_at_unix_ms: 10,
+        }
+    }
+
+    #[test]
+    fn operator_session_record_family_requests_are_exact_round_trips_and_fail_closed_on_v10() {
+        let requests = vec![
+            HarnessOperatorRequestV1::PreviewSessionRecord {
+                node_id: "node-a".to_owned(),
+                record_id: "record-a".to_owned(),
+                message_limit: HARNESS_NATIVE_SESSION_PREVIEW_MESSAGE_LIMIT_MAX,
+            },
+            HarnessOperatorRequestV1::ResumeSessionRecord {
+                node_id: "node-a".to_owned(),
+                record_id: "record-a".to_owned(),
+                terminal_size: HarnessRuntimeTerminalSizeV1 { rows: 24, columns: 80 },
+                initial_prompt: Some("continue".to_owned()),
+            },
+            HarnessOperatorRequestV1::RenameSessionRecord {
+                node_id: "node-a".to_owned(),
+                record_id: "record-a".to_owned(),
+                display_name: "Renamed session".to_owned(),
+            },
+            HarnessOperatorRequestV1::SetSessionTask {
+                node_id: "node-a".to_owned(),
+                record_id: "record-a".to_owned(),
+                expected_revision: 3,
+                target: HarnessSessionTaskTargetV1::Existing {
+                    task_id: format!("task-{}", "a".repeat(24)),
+                },
+            },
+            HarnessOperatorRequestV1::ForgetSessionRecord {
+                node_id: "node-a".to_owned(),
+                record_id: "record-a".to_owned(),
+            },
+            HarnessOperatorRequestV1::IndexProviderSession {
+                node_id: "node-a".to_owned(),
+                workspace_id: "workspace-a".to_owned(),
+                provider: "codex".to_owned(),
+                identity: HarnessProviderSessionIdentityV1 {
+                    key: HarnessProviderSessionKeyV1::SessionId,
+                    id: "session-123".to_owned(),
+                    transcript_path: Some("/tmp/transcript.json".to_owned()),
+                },
+                display_name: "Indexed session".to_owned(),
+            },
+            HarnessOperatorRequestV1::IndexNativeSession {
+                selection: sample_native_session_selection(),
+                display_name: "Native indexed".to_owned(),
+            },
+        ];
+        let credential = HarnessOperatorCredential::parse(format!(
+            "g4aho_{}",
+            "a".repeat(64),
+        )).unwrap();
+        for request in requests {
+            request.validate().expect("valid session-record family request");
+            assert_eq!(request.minimum_wire_version(), HARNESS_OPERATOR_WIRE_VERSION_V11);
+            let encoded = serde_json::to_string(&request).unwrap();
+            let decoded: HarnessOperatorRequestV1 = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, request);
+            assert!(matches!(
+                HarnessOperatorEnvelopeV1 {
+                    version: HARNESS_OPERATOR_WIRE_VERSION_V10,
+                    credential: credential.clone(),
+                    request: request.clone(),
+                }.validate(),
+                Err(HarnessOperatorApiError::UnsupportedVersion),
+            ));
+            HarnessOperatorEnvelopeV1 {
+                version: HARNESS_OPERATOR_WIRE_VERSION_V11,
+                credential: credential.clone(),
+                request,
+            }.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn operator_session_record_family_responses_are_exact_round_trips() {
+        let record = sample_managed_session("record-a");
+        let responses = vec![
+            HarnessOperatorResponseV1::SessionRecordPreviewed(HarnessSessionRecordPreviewedV1 {
+                record_id: "record-a".to_owned(),
+                preview: HarnessNativeSessionPreviewV1 {
+                    title: Some("Preview title".to_owned()),
+                    modified_at_unix_ms: Some(10),
+                    model: Some("gpt".to_owned()),
+                    message_count: 1,
+                    message_count_exact: true,
+                    completed_turn_count: Some(1),
+                    total_tokens: Some(100),
+                    truncated: false,
+                    messages: vec![HarnessNativeSessionPreviewMessageV1 {
+                        role: HarnessNativeSessionPreviewRoleV1::User,
+                        text: "hello".to_owned(),
+                    }],
+                },
+            }),
+            HarnessOperatorResponseV1::SessionRecordResumed(HarnessSessionRecordResumedV1 {
+                record: record.clone(),
+                session: session_address(41, 3),
+            }),
+            HarnessOperatorResponseV1::SessionRecordUpdated(record.clone()),
+            HarnessOperatorResponseV1::SessionRecordForgotten { record_id: "record-a".to_owned() },
+            HarnessOperatorResponseV1::ProviderSessionIndexed(record.clone()),
+            HarnessOperatorResponseV1::NativeSessionIndexed(HarnessNativeSessionIndexedV1 {
+                selection: sample_native_session_selection(),
+                record,
+            }),
+        ];
+        for response in responses {
+            response.validate().expect("valid session-record family response");
+            let encoded = serde_json::to_string(&response).unwrap();
+            let decoded: HarnessOperatorResponseV1 = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, response);
+        }
+    }
+
+    #[test]
+    fn session_record_family_requests_reject_malformed_fields() {
+        let bad_node_id = HarnessOperatorRequestV1::PreviewSessionRecord {
+            node_id: String::new(),
+            record_id: "record-a".to_owned(),
+            message_limit: 1,
+        };
+        assert!(matches!(
+            bad_node_id.validate(),
+            Err(HarnessOperatorApiError::InvalidSessionRecordRequest),
+        ));
+
+        let bad_limit = HarnessOperatorRequestV1::PreviewSessionRecord {
+            node_id: "node-a".to_owned(),
+            record_id: "record-a".to_owned(),
+            message_limit: 0,
+        };
+        assert!(matches!(bad_limit.validate(), Err(HarnessOperatorApiError::InvalidLimit)));
+
+        let empty_display_name = HarnessOperatorRequestV1::RenameSessionRecord {
+            node_id: "node-a".to_owned(),
+            record_id: "record-a".to_owned(),
+            display_name: String::new(),
+        };
+        assert!(matches!(
+            empty_display_name.validate(),
+            Err(HarnessOperatorApiError::InvalidSessionRecordRequest),
+        ));
+
+        let oversized_display_name = HarnessOperatorRequestV1::RenameSessionRecord {
+            node_id: "node-a".to_owned(),
+            record_id: "record-a".to_owned(),
+            display_name: "x".repeat(HARNESS_SESSION_RECORD_DISPLAY_NAME_MAX_BYTES + 1),
+        };
+        assert!(matches!(
+            oversized_display_name.validate(),
+            Err(HarnessOperatorApiError::InvalidSessionRecordRequest),
+        ));
+
+        let bounded_display_name = HarnessOperatorRequestV1::RenameSessionRecord {
+            node_id: "node-a".to_owned(),
+            record_id: "record-a".to_owned(),
+            display_name: "x".repeat(HARNESS_SESSION_RECORD_DISPLAY_NAME_MAX_BYTES),
+        };
+        bounded_display_name.validate().unwrap();
+
+        let zero_resume_size = HarnessOperatorRequestV1::ResumeSessionRecord {
+            node_id: "node-a".to_owned(),
+            record_id: "record-a".to_owned(),
+            terminal_size: HarnessRuntimeTerminalSizeV1 { rows: 0, columns: 80 },
+            initial_prompt: None,
+        };
+        assert!(matches!(
+            zero_resume_size.validate(),
+            Err(HarnessOperatorApiError::InvalidSessionRecordRequest),
+        ));
+
+        let empty_initial_prompt = HarnessOperatorRequestV1::ResumeSessionRecord {
+            node_id: "node-a".to_owned(),
+            record_id: "record-a".to_owned(),
+            terminal_size: HarnessRuntimeTerminalSizeV1 { rows: 24, columns: 80 },
+            initial_prompt: Some(String::new()),
+        };
+        assert!(matches!(
+            empty_initial_prompt.validate(),
+            Err(HarnessOperatorApiError::InvalidSessionRecordRequest),
+        ));
+
+        let bad_task_id = HarnessOperatorRequestV1::SetSessionTask {
+            node_id: "node-a".to_owned(),
+            record_id: "record-a".to_owned(),
+            expected_revision: 1,
+            target: HarnessSessionTaskTargetV1::Existing { task_id: String::new() },
+        };
+        assert!(matches!(
+            bad_task_id.validate(),
+            Err(HarnessOperatorApiError::InvalidSessionRecordRequest),
+        ));
+
+        let valid_clear_task = HarnessOperatorRequestV1::SetSessionTask {
+            node_id: "node-a".to_owned(),
+            record_id: "record-a".to_owned(),
+            expected_revision: 1,
+            target: HarnessSessionTaskTargetV1::Clear,
+        };
+        valid_clear_task.validate().unwrap();
+
+        let bad_identity_id = HarnessOperatorRequestV1::IndexProviderSession {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            provider: "codex".to_owned(),
+            identity: HarnessProviderSessionIdentityV1 {
+                key: HarnessProviderSessionKeyV1::SessionId,
+                id: String::new(),
+                transcript_path: None,
+            },
+            display_name: "Indexed session".to_owned(),
+        };
+        assert!(matches!(
+            bad_identity_id.validate(),
+            Err(HarnessOperatorApiError::InvalidSessionRecordRequest),
+        ));
+
+        let mut malformed_selection = sample_native_session_selection();
+        malformed_selection.catalog_revision = 0;
+        let bad_index_native = HarnessOperatorRequestV1::IndexNativeSession {
+            selection: malformed_selection.clone(),
+            display_name: "Native indexed".to_owned(),
+        };
+        assert!(bad_index_native.validate().is_err());
+        malformed_selection.catalog_revision = 7;
+        HarnessOperatorRequestV1::IndexNativeSession {
+            selection: malformed_selection,
+            display_name: "Native indexed".to_owned(),
+        }.validate().unwrap();
+    }
+
+    #[test]
+    fn session_record_family_responses_reject_malformed_fields() {
+        let mut malformed_record = sample_managed_session("record-a");
+        malformed_record.record_id = String::new();
+        assert!(
+            HarnessOperatorResponseV1::SessionRecordUpdated(malformed_record.clone())
+                .validate()
+                .is_err()
+        );
+        assert!(
+            HarnessOperatorResponseV1::ProviderSessionIndexed(malformed_record.clone())
+                .validate()
+                .is_err()
+        );
+        assert!(
+            HarnessOperatorResponseV1::SessionRecordResumed(HarnessSessionRecordResumedV1 {
+                record: malformed_record,
+                session: session_address(41, 3),
+            }).validate().is_err()
+        );
+
+        assert!(
+            HarnessOperatorResponseV1::SessionRecordForgotten { record_id: String::new() }
+                .validate()
+                .is_err()
+        );
+
+        let mut malformed_session = session_address(41, 3);
+        malformed_session.instance_id = 0;
+        assert!(
+            HarnessOperatorResponseV1::SessionRecordResumed(HarnessSessionRecordResumedV1 {
+                record: sample_managed_session("record-a"),
+                session: malformed_session,
+            }).validate().is_err()
+        );
+
+        let mut malformed_selection = sample_native_session_selection();
+        malformed_selection.selection_id = String::new();
+        assert!(
+            HarnessOperatorResponseV1::NativeSessionIndexed(HarnessNativeSessionIndexedV1 {
+                selection: malformed_selection,
+                record: sample_managed_session("record-a"),
+            }).validate().is_err()
+        );
     }
 
     fn sample_redacted_task(id_byte: char) -> RedactedTaskV1 {

@@ -16,21 +16,27 @@ use gate4agent_harness_api::{
     HarnessNativeSessionCatalogWindowV1, HarnessNativeSessionExternalGroupKindV1,
     HarnessNativeSessionExternalGroupV1, HarnessNativeSessionPreviewMessageV1,
     HarnessNativeSessionPreviewRoleV1, HarnessNativeSessionPreviewV1,
-    HarnessNativeSessionPreviewedV1, HarnessNativeSessionRouteV1,
+    HarnessNativeSessionIndexedV1, HarnessNativeSessionPreviewedV1, HarnessNativeSessionRouteV1,
     HarnessNativeSessionSelectionV1, HarnessNativeSessionsCatalogedV1,
     HarnessNativeSessionsPagedV1, HarnessOperatorRequestV1, HarnessOperatorResponseV1,
+    HarnessProviderSessionIdentityV1, HarnessProviderSessionKeyV1,
     HarnessRepositoryPathV1, HarnessRunGitDiffV1, HarnessRunGitHistoryPageV1,
+    HarnessSessionRecordPreviewedV1,
     HarnessTerminalControlV1,
     HarnessRunWorkspaceFileV1, HarnessRunWorkspaceInspectionV1,
     HarnessRunWorkspaceOriginV1, HarnessWorkspaceEntryKindV1,
     HarnessNodeGitDiffV1, HarnessNodeGitHistoryPageV1,
     HarnessNodeWorkspaceDirectoryV1,
     HarnessNodeWorkspaceFileV1, HarnessNodeWorkspaceInspectionV1, HarnessNodeWorkspaceOriginV1,
+    HarnessRuntimeManagedModeV1, HarnessRuntimeManagedSessionV1, HarnessRuntimeManagedStateV1,
+    HarnessRuntimeSessionAddressV1, HarnessRuntimeSessionBindingV1,
+    HarnessSessionRecordResumedV1, HarnessSessionTaskTargetV1,
     HarnessWorkspaceFileContentV1, HarnessWorkspaceFileRevisionV1,
     HarnessWorkspaceInspectionTruncationV1,
     HarnessWorkspaceTreeEntryV1, HARNESS_GIT_COMMIT_PARENTS_MAX,
     HARNESS_GIT_DIFF_MAX_BYTES, HARNESS_GIT_HISTORY_LIMIT_MAX,
     HARNESS_GIT_RECENT_COMMITS_MAX, HARNESS_GIT_STATUS_ENTRIES_MAX,
+    HARNESS_SESSION_RECORD_DISPLAY_NAME_MAX_BYTES,
     HARNESS_WORKSPACE_FILE_MAX_BYTES, HARNESS_WORKSPACE_TREE_ENTRIES_MAX,
 };
 use gate4agent_node_protocol::{
@@ -69,6 +75,13 @@ use std::{sync::Arc, time::{Duration, Instant}};
 
 const NATIVE_HISTORY_TIMEOUT_FLOOR: Duration = Duration::from_secs(34);
 const RUN_READ_TIMEOUT_FLOOR: Duration = Duration::from_secs(4);
+// Same proportion of the session-record-mutation deadline
+// (`HOST_SESSION_RECORD_MUTATION_RESPONSE_DEADLINE`, `runtime.rs`) that
+// `NATIVE_HISTORY_TIMEOUT_FLOOR` is of the native-history deadline: `Resume
+// SessionRecord` is spawn-heavy (a whole new process), so this family gets
+// its own floor rather than reusing `RUN_READ_TIMEOUT_FLOOR`'s much shorter
+// one.
+const SESSION_RECORD_MUTATION_TIMEOUT_FLOOR: Duration = Duration::from_secs(24);
 const RUN_CONTEXT_SOURCE_C2_DEADLINE: Duration = Duration::from_secs(10);
 const RUN_CONTEXT_SOURCE_MESSAGE_LIMIT: u16 = 1;
 // Matches the light TUI's own direct `spawn_spec()` (client.rs) node-local
@@ -541,7 +554,7 @@ impl HarnessC2Adapter {
         &self,
         request: HarnessOperatorRequestV1,
     ) -> Result<PendingNativeHistoryRequest, HarnessC2Error> {
-        let (route, wire_request) = native_history_wire_request(&request)?;
+        let (route, wire_request) = native_history_wire_request(self, &request)?;
         self.ensure_current_incarnation(&route)?;
         let pending = self.control.start_request(route.clone(), wire_request)
             .map_err(HarnessC2Error::NativeHistoryEnqueue)?;
@@ -602,6 +615,24 @@ impl HarnessC2Adapter {
         let pending = self.control.start_request(prepared.route.clone(), wire_request)
             .map_err(HarnessC2Error::NodeWorkspaceWriteEnqueue)?;
         Ok(PendingNodeWorkspaceWrite {
+            prepared,
+            started_at: Instant::now(),
+            pending: Some(pending),
+        })
+    }
+
+    /// Mutation-family sibling of `start_prepared_node_workspace_write`: same
+    /// live route resolution and enqueue shape, feeding
+    /// `PendingSessionRecordMutation` instead.
+    pub(crate) fn start_prepared_session_record_mutation(
+        &self,
+        prepared: PreparedSessionRecordMutation,
+    ) -> Result<PendingSessionRecordMutation, HarnessC2Error> {
+        self.ensure_current_incarnation(&prepared.route)?;
+        let wire_request = prepared.wire_request();
+        let pending = self.control.start_request(prepared.route.clone(), wire_request)
+            .map_err(HarnessC2Error::SessionRecordMutationEnqueue)?;
+        Ok(PendingSessionRecordMutation {
             prepared,
             started_at: Instant::now(),
             pending: Some(pending),
@@ -2687,6 +2718,360 @@ impl PendingSessionControl {
     }
 }
 
+/// What to mutate on a managed session record, routed directly from a
+/// node/record-id pair -- the mutation-family sibling of `SessionControlKind`
+/// (eight thin ack-only verbs, one shared C2 relay) and `WorkspaceWriteKind`
+/// (rich per-verb correlated reply, node-scoped `exact_route` resolution).
+/// This family follows `WorkspaceWriteKind`'s shape: each of the six node
+/// requests it relays to (`RenameSessionRecord`/`SetSessionTask`/
+/// `ForgetSessionRecord`/`IndexProviderSession`/`IndexNativeSession`/
+/// `ResumeSessionRecord`) returns its own distinct payload, not one shared
+/// ack, so `PendingSessionRecordMutation::finish` correlates and returns the
+/// full `HarnessOperatorResponseV1` the same way `PendingNodeWorkspaceWrite::
+/// finish` does. Unlike `WorkspaceWriteKind`, a settled mutation here also
+/// always invalidates the route's cached runtime-inventory entry on success
+/// (see `HostCommand::SessionRecordMutationFinished` in `runtime.rs`): every
+/// one of these six verbs changes the node's managed-session store, which
+/// the runtime inventory's `managed_sessions` roster caches.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SessionRecordMutationKind {
+    Resume {
+        record_id: SessionRecordId,
+        terminal_size: TerminalSize,
+        initial_prompt: Option<String>,
+    },
+    Rename { record_id: SessionRecordId, display_name: String },
+    SetTask {
+        record_id: SessionRecordId,
+        expected_revision: u64,
+        target: gate4agent_node_protocol::SessionTaskTargetV1,
+    },
+    Forget { record_id: SessionRecordId },
+    IndexProvider {
+        workspace_id: WorkspaceId,
+        provider: AgentId,
+        identity: gate4agent_types::ProviderSessionIdentity,
+        display_name: String,
+    },
+    IndexNative { selection: NativeSessionSelection, display_name: String },
+}
+
+pub(crate) struct PreparedSessionRecordMutation {
+    route: NodeRoute,
+    kind: SessionRecordMutationKind,
+}
+
+impl PreparedSessionRecordMutation {
+    pub(crate) fn from_operator_request(
+        adapter: &HarnessC2Adapter,
+        request: HarnessOperatorRequestV1,
+    ) -> Result<Self, HarnessC2Error> {
+        request.validate().map_err(|_| HarnessC2Error::InvalidSessionRecordMutationRequest)?;
+        let (node_id, kind) = match request {
+            HarnessOperatorRequestV1::ResumeSessionRecord {
+                node_id, record_id, terminal_size, initial_prompt,
+            } => (
+                node_id,
+                SessionRecordMutationKind::Resume {
+                    record_id: SessionRecordId::new(record_id)
+                        .map_err(|_| HarnessC2Error::InvalidSessionRecordMutationRequest)?,
+                    terminal_size: TerminalSize {
+                        rows: terminal_size.rows,
+                        columns: terminal_size.columns,
+                    },
+                    initial_prompt,
+                },
+            ),
+            HarnessOperatorRequestV1::RenameSessionRecord { node_id, record_id, display_name } => (
+                node_id,
+                SessionRecordMutationKind::Rename {
+                    record_id: SessionRecordId::new(record_id)
+                        .map_err(|_| HarnessC2Error::InvalidSessionRecordMutationRequest)?,
+                    display_name,
+                },
+            ),
+            HarnessOperatorRequestV1::SetSessionTask {
+                node_id, record_id, expected_revision, target,
+            } => (
+                node_id,
+                SessionRecordMutationKind::SetTask {
+                    record_id: SessionRecordId::new(record_id)
+                        .map_err(|_| HarnessC2Error::InvalidSessionRecordMutationRequest)?,
+                    expected_revision,
+                    target: session_task_target_from_api(&target)?,
+                },
+            ),
+            HarnessOperatorRequestV1::ForgetSessionRecord { node_id, record_id } => (
+                node_id,
+                SessionRecordMutationKind::Forget {
+                    record_id: SessionRecordId::new(record_id)
+                        .map_err(|_| HarnessC2Error::InvalidSessionRecordMutationRequest)?,
+                },
+            ),
+            HarnessOperatorRequestV1::IndexProviderSession {
+                node_id, workspace_id, provider, identity, display_name,
+            } => (
+                node_id,
+                SessionRecordMutationKind::IndexProvider {
+                    workspace_id: WorkspaceId::new(workspace_id)
+                        .map_err(|_| HarnessC2Error::InvalidSessionRecordMutationRequest)?,
+                    provider: AgentId::new(provider)
+                        .map_err(|_| HarnessC2Error::InvalidSessionRecordMutationRequest)?,
+                    identity: provider_session_identity_from_api(&identity)?,
+                    display_name,
+                },
+            ),
+            HarnessOperatorRequestV1::IndexNativeSession { selection, display_name } => {
+                let node_id = selection.route.node_id.clone();
+                (
+                    node_id,
+                    SessionRecordMutationKind::IndexNative {
+                        selection: native_history_wire_selection(&selection)
+                            .map_err(|_| HarnessC2Error::InvalidSessionRecordMutationRequest)?,
+                        display_name,
+                    },
+                )
+            }
+            _ => return Err(HarnessC2Error::InvalidSessionRecordMutationRequest),
+        };
+        let node_id = NodeId::new(node_id)
+            .map_err(|_| HarnessC2Error::InvalidSessionRecordMutationRequest)?;
+        let route = adapter.exact_route(&node_id)?;
+        Ok(Self { route, kind })
+    }
+
+    pub(crate) fn route(&self) -> &NodeRoute { &self.route }
+
+    fn wire_request(&self) -> NodeRequest {
+        match &self.kind {
+            SessionRecordMutationKind::Resume { record_id, terminal_size, initial_prompt } => {
+                NodeRequest::ResumeSessionRecord {
+                    record_id: record_id.clone(),
+                    terminal_size: *terminal_size,
+                    initial_prompt: initial_prompt.clone(),
+                }
+            }
+            SessionRecordMutationKind::Rename { record_id, display_name } => {
+                NodeRequest::RenameSessionRecord {
+                    record_id: record_id.clone(),
+                    display_name: display_name.clone(),
+                }
+            }
+            SessionRecordMutationKind::SetTask { record_id, expected_revision, target } => {
+                NodeRequest::SetSessionTask {
+                    record_id: record_id.clone(),
+                    expected_revision: *expected_revision,
+                    target: target.clone(),
+                }
+            }
+            SessionRecordMutationKind::Forget { record_id } => {
+                NodeRequest::ForgetSessionRecord { record_id: record_id.clone() }
+            }
+            SessionRecordMutationKind::IndexProvider { workspace_id, provider, identity, display_name } => {
+                NodeRequest::IndexProviderSession {
+                    workspace_id: workspace_id.clone(),
+                    provider: provider.clone(),
+                    identity: identity.clone(),
+                    display_name: display_name.clone(),
+                }
+            }
+            SessionRecordMutationKind::IndexNative { selection, display_name } => {
+                NodeRequest::IndexNativeSession {
+                    selection: selection.clone(),
+                    display_name: display_name.clone(),
+                }
+            }
+        }
+    }
+}
+
+fn session_task_target_from_api(
+    target: &HarnessSessionTaskTargetV1,
+) -> Result<gate4agent_node_protocol::SessionTaskTargetV1, HarnessC2Error> {
+    Ok(match target {
+        HarnessSessionTaskTargetV1::New => gate4agent_node_protocol::SessionTaskTargetV1::New,
+        HarnessSessionTaskTargetV1::Existing { task_id } => {
+            gate4agent_node_protocol::SessionTaskTargetV1::Existing {
+                task_id: task_id.parse()
+                    .map_err(|_| HarnessC2Error::InvalidSessionRecordMutationRequest)?,
+            }
+        }
+        HarnessSessionTaskTargetV1::Clear => gate4agent_node_protocol::SessionTaskTargetV1::Clear,
+    })
+}
+
+fn provider_session_identity_from_api(
+    identity: &HarnessProviderSessionIdentityV1,
+) -> Result<gate4agent_types::ProviderSessionIdentity, HarnessC2Error> {
+    Ok(gate4agent_types::ProviderSessionIdentity {
+        key: match identity.key {
+            HarnessProviderSessionKeyV1::SessionId => gate4agent_types::ProviderSessionKey::SessionId,
+            HarnessProviderSessionKeyV1::ConversationId => {
+                gate4agent_types::ProviderSessionKey::ConversationId
+            }
+        },
+        id: identity.id.clone(),
+        transcript_path: identity.transcript_path.clone(),
+    })
+}
+
+pub(crate) struct PendingSessionRecordMutation {
+    prepared: PreparedSessionRecordMutation,
+    started_at: Instant,
+    pending: Option<C2PendingRequest>,
+}
+
+impl PendingSessionRecordMutation {
+    pub(crate) fn route(&self) -> &NodeRoute { self.prepared.route() }
+
+    pub(crate) async fn finish(mut self) -> Result<HarnessOperatorResponseV1, HarnessC2Error> {
+        let pending = self.pending.take()
+            .expect("pending session record mutation owns exactly one C2 waiter");
+        match pending.finish().await {
+            Err(C2ControlError::Closed)
+                if self.started_at.elapsed() >= SESSION_RECORD_MUTATION_TIMEOUT_FLOOR => {
+                    Err(HarnessC2Error::SessionRecordMutationDeadline)
+                }
+            Err(error) => Err(HarnessC2Error::SessionRecordMutationTransport(error)),
+            Ok(routed) if routed.node_id != self.prepared.route.node_id
+                || routed.incarnation_id != self.prepared.route.expected_incarnation_id =>
+            {
+                Err(HarnessC2Error::SessionRecordMutationRouteMismatch)
+            }
+            Ok(routed) => match routed.response {
+                Err(failure) => Err(HarnessC2Error::SessionRecordMutationRejected { code: failure.code }),
+                Ok(response) => correlate_session_record_mutation_response(&self.prepared, response),
+            },
+        }
+    }
+}
+
+fn correlate_session_record_mutation_response(
+    prepared: &PreparedSessionRecordMutation,
+    response: C2NodeResponse,
+) -> Result<HarnessOperatorResponseV1, HarnessC2Error> {
+    let response = match (&prepared.kind, response) {
+        (
+            SessionRecordMutationKind::Resume { record_id, .. },
+            C2NodeResponse::SessionRecordResumed { record, session },
+        ) if &record.record_id == record_id => {
+            HarnessOperatorResponseV1::SessionRecordResumed(HarnessSessionRecordResumedV1 {
+                record: project_c2_managed_session(record)?,
+                session: HarnessRuntimeSessionAddressV1 {
+                    node_id: prepared.route.node_id.as_str().to_owned(),
+                    incarnation_id: prepared.route.expected_incarnation_id.to_string(),
+                    workspace_id: session.workspace_id.as_str().to_owned(),
+                    instance_id: session.session.instance_id.0,
+                    generation: session.session.generation.0,
+                },
+            })
+        }
+        (
+            SessionRecordMutationKind::Rename { record_id, .. },
+            C2NodeResponse::SessionRecordUpdated { record },
+        ) if &record.record_id == record_id => {
+            HarnessOperatorResponseV1::SessionRecordUpdated(project_c2_managed_session(record)?)
+        }
+        (
+            SessionRecordMutationKind::SetTask { record_id, .. },
+            C2NodeResponse::SessionRecordUpdated { record },
+        ) if &record.record_id == record_id => {
+            HarnessOperatorResponseV1::SessionRecordUpdated(project_c2_managed_session(record)?)
+        }
+        (
+            SessionRecordMutationKind::Forget { record_id },
+            C2NodeResponse::SessionRecordForgotten { record_id: echoed },
+        ) if &echoed == record_id => {
+            HarnessOperatorResponseV1::SessionRecordForgotten { record_id: echoed.to_string() }
+        }
+        (
+            SessionRecordMutationKind::IndexProvider { .. },
+            C2NodeResponse::ProviderSessionIndexed { record },
+        ) => HarnessOperatorResponseV1::ProviderSessionIndexed(project_c2_managed_session(record)?),
+        (
+            SessionRecordMutationKind::IndexNative { selection, .. },
+            C2NodeResponse::NativeSessionIndexed { selection: echoed, record },
+        ) if &echoed == selection => {
+            HarnessOperatorResponseV1::NativeSessionIndexed(HarnessNativeSessionIndexedV1 {
+                selection: HarnessNativeSessionSelectionV1 {
+                    route: HarnessNativeSessionRouteV1 {
+                        node_id: prepared.route.node_id.as_str().to_owned(),
+                        incarnation_id: prepared.route.expected_incarnation_id.to_string(),
+                        scope: match echoed.route.scope {
+                            gate4agent_node_protocol::NativeSessionCatalogScope::Workspace => {
+                                HarnessNativeSessionCatalogScopeV1::Workspace
+                            }
+                            gate4agent_node_protocol::NativeSessionCatalogScope::Unregistered => {
+                                HarnessNativeSessionCatalogScopeV1::Unregistered
+                            }
+                        },
+                        workspace_id: echoed.route.workspace_id.as_ref()
+                            .map(|id| id.as_str().to_owned()),
+                        provider: echoed.route.provider.as_str().to_owned(),
+                    },
+                    catalog_revision: echoed.catalog_revision,
+                    recent_cutoff_unix_ms: echoed.recent_cutoff_unix_ms,
+                    selection_id: echoed.selection_id,
+                },
+                record: project_c2_managed_session(record)?,
+            })
+        }
+        _ => return Err(HarnessC2Error::SessionRecordMutationCorrelationMismatch),
+    };
+    response.validate().map_err(|_| HarnessC2Error::SessionRecordMutationProjection)?;
+    Ok(response)
+}
+
+/// Thins a node-side managed-session record down to the same 10-field shape
+/// the runtime-inventory roster already uses (`HarnessRuntimeManagedSessionV1`,
+/// see `redact_runtime_inventory` in `runtime.rs` for the roster's own
+/// twin of this projection) -- no receipts, no raw provider session
+/// identity, just enough to keep the operator's session-record surfaces in
+/// sync. `record` here is `C2ManagedSessionRecord`, C2's own privacy-thinned
+/// mirror of the node's `ManagedSessionRecord` (drops `canonical_root`/
+/// `provider_session`/`last_error`), the type every session-record `C2NodeResponse`
+/// carries.
+fn project_c2_managed_session(
+    record: C2ManagedSessionRecord,
+) -> Result<HarnessRuntimeManagedSessionV1, HarnessC2Error> {
+    let (display_name, display_name_truncated) = truncate_utf8_at_byte_boundary(
+        record.display_name,
+        HARNESS_SESSION_RECORD_DISPLAY_NAME_MAX_BYTES,
+    );
+    Ok(HarnessRuntimeManagedSessionV1 {
+        record_id: record.record_id.as_str().to_owned(),
+        display_name,
+        display_name_truncated,
+        provider: record.provider.as_str().to_owned(),
+        mode: match record.mode {
+            SessionMode::Pty => HarnessRuntimeManagedModeV1::Pty,
+            SessionMode::Inline => HarnessRuntimeManagedModeV1::Inline,
+        },
+        state: match record.state {
+            gate4agent_node_protocol::ManagedSessionState::IdentityPending => {
+                HarnessRuntimeManagedStateV1::IdentityPending
+            }
+            gate4agent_node_protocol::ManagedSessionState::Live => {
+                HarnessRuntimeManagedStateV1::Live
+            }
+            gate4agent_node_protocol::ManagedSessionState::Dormant => {
+                HarnessRuntimeManagedStateV1::Dormant
+            }
+            gate4agent_node_protocol::ManagedSessionState::Unavailable => {
+                HarnessRuntimeManagedStateV1::Unavailable
+            }
+        },
+        workspace_id: record.workspace_id.as_str().to_owned(),
+        active_binding: record.active_session.map(|address| HarnessRuntimeSessionBindingV1 {
+            workspace_id: address.workspace_id.as_str().to_owned(),
+            instance_id: address.session.instance_id.0,
+            generation: address.session.generation.0,
+        }),
+        provider_identity_present: record.provider_identity_present,
+        updated_at_unix_ms: record.updated_at_unix_ms,
+    })
+}
+
 fn node_workspace_read_response_route_matches(
     prepared: &PreparedNodeWorkspaceRead,
     node_id: &NodeId,
@@ -3305,8 +3690,24 @@ impl PendingNativeHistoryRequest {
 }
 
 fn native_history_wire_request(
+    adapter: &HarnessC2Adapter,
     request: &HarnessOperatorRequestV1,
 ) -> Result<(NodeRoute, NodeRequest), HarnessC2Error> {
+    // `PreviewSessionRecord` is node-scoped (bare `node_id`, resolved live
+    // via `exact_route`) rather than route-scoped (caller-pinned
+    // incarnation) like its three pool-mates -- see the doc comment on
+    // `HarnessOperatorRequestV1::PreviewSessionRecord`.
+    if let HarnessOperatorRequestV1::PreviewSessionRecord { node_id, record_id, message_limit } = request {
+        let node_id = NodeId::new(node_id.as_str())
+            .map_err(|_| HarnessC2Error::InvalidNativeHistoryRequest)?;
+        let record_id = SessionRecordId::new(record_id.as_str())
+            .map_err(|_| HarnessC2Error::InvalidNativeHistoryRequest)?;
+        let route = adapter.exact_route(&node_id)?;
+        return Ok((
+            route,
+            NodeRequest::PreviewSessionRecord { record_id, message_limit: *message_limit },
+        ));
+    }
     let api_route = match request {
         HarnessOperatorRequestV1::CatalogNativeSessions { route, .. }
         | HarnessOperatorRequestV1::PageNativeSessions { route, .. } => route,
@@ -3454,6 +3855,17 @@ fn correlate_native_history_response(
             Ok(HarnessOperatorResponseV1::NativeSessionPreviewed(
                 HarnessNativeSessionPreviewedV1 {
                     selection,
+                    preview: project_native_history_preview(preview),
+                },
+            ))
+        }
+        (
+            HarnessOperatorRequestV1::PreviewSessionRecord { record_id, .. },
+            C2NodeResponse::SessionRecordPreviewed { record_id: echoed_record_id, preview },
+        ) if echoed_record_id.as_str() == record_id.as_str() => {
+            Ok(HarnessOperatorResponseV1::SessionRecordPreviewed(
+                HarnessSessionRecordPreviewedV1 {
+                    record_id,
                     preview: project_native_history_preview(preview),
                 },
             ))
@@ -5013,6 +5425,24 @@ pub enum HarnessC2Error {
     SessionControlCancelled,
     #[error("Node rejected the session control request with {code:?}")]
     SessionControlRejected { code: NodeFailureCode },
+    #[error("session record mutation request is invalid")]
+    InvalidSessionRecordMutationRequest,
+    #[error("session record mutation was not enqueued: {0}")]
+    SessionRecordMutationEnqueue(C2ControlError),
+    #[error("session record mutation transport failed: {0}")]
+    SessionRecordMutationTransport(C2ControlError),
+    #[error("session record mutation deadline elapsed")]
+    SessionRecordMutationDeadline,
+    #[error("session record mutation was cancelled after the harness operator connection's own deadline fired first")]
+    SessionRecordMutationCancelled,
+    #[error("session record mutation response route or incarnation does not match")]
+    SessionRecordMutationRouteMismatch,
+    #[error("session record mutation response does not exactly correlate with the request")]
+    SessionRecordMutationCorrelationMismatch,
+    #[error("session record mutation response cannot be projected into the bounded harness API")]
+    SessionRecordMutationProjection,
+    #[error("Node rejected the session record mutation request with {code:?}")]
+    SessionRecordMutationRejected { code: NodeFailureCode },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

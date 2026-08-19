@@ -68,6 +68,7 @@ use gate4agent_harness_client::{
     HarnessWorkspaceEntryKindV1, HarnessWorkspaceFileContentV1,
     HarnessTaskStartOutcomeV1, RedactedBindingStateV1, RedactedRunV1, HarnessRunCorrelationV1,
     HarnessRunTransferSummaryV1,
+    HarnessProviderSessionIdentityV1, HarnessProviderSessionKeyV1, HarnessSessionTaskTargetV1,
     HarnessRuntimeManagedModeV1, HarnessRuntimeManagedSessionV1,
     HarnessRuntimeManagedStateV1, HarnessRuntimeNodeInventoryV1,
     HarnessRuntimeMouseProtocolEncodingV1, HarnessRuntimeSessionAddressV1,
@@ -1759,9 +1760,12 @@ fn send_operator_action(
     };
     let harness_native_history_read = harness_only && harness_native_history_read_action(&action);
     let harness_detail_read = harness_only && harness_detail_read_action(&action);
+    let harness_session_record_mutation =
+        harness_only && harness_session_record_mutation_action(&action);
     if harness_only && node_id != HARNESS_COMMAND_ROUTE
         && !harness_native_history_read
         && !harness_detail_read
+        && !harness_session_record_mutation
     {
         if !reject_history_refresh_action(app, &action, "Harness-owned session action unavailable") {
             app.notice = Some(
@@ -1775,7 +1779,7 @@ fn send_operator_action(
         commands.get(HARNESS_DETAIL_COMMAND_ROUTE)
     } else if harness_native_history_read {
         commands.get(HARNESS_HISTORY_COMMAND_ROUTE)
-    } else if node_id == HARNESS_COMMAND_ROUTE {
+    } else if harness_session_record_mutation || node_id == HARNESS_COMMAND_ROUTE {
         commands.get(HARNESS_COMMAND_ROUTE)
     } else {
         commands.get(&node_id).or_else(|| commands.get(C2_COMMAND_ROUTE))
@@ -2039,6 +2043,37 @@ fn harness_native_history_read_action(action: &AppAction) -> bool {
         AppAction::CatalogNativeSessions { .. }
             | AppAction::PageNativeSessions { .. }
             | AppAction::PreviewNativeSession { .. }
+            // `PreviewSessionRecord`/`RefreshSessionRecordHistory` both send
+            // the exact same node request (`NodeRequest::PreviewSessionRecord`
+            // -- see `c2_preview_session_record`/`c2_refresh_session_record_
+            // history` above, which relay the same `NodeRequest::
+            // PreviewSessionRecord`), so they ride this same harness-mode
+            // read lane the same way the light-mode C2 path reuses one node
+            // request for both.
+            | AppAction::PreviewSessionRecord { .. }
+            | AppAction::RefreshSessionRecordHistory { .. }
+    )
+}
+
+/// The session-record mutation family: `ResumeSessionRecord`/
+/// `RenameSessionRecord`/`SetSessionTask`/`ForgetSessionRecord`/
+/// `IndexProviderSession`/`IndexNativeSession`. Unlike the eight direct
+/// session-control verbs `route_harness_session_verb` rewrites into typed
+/// `Harness*` actions (they need `SessionAddress` -> `HarnessRuntimeSessionAddressV1`
+/// translation via `harness_session_address`), these six already carry a
+/// bare `node_id: String` field -- no translation needed, only a routing
+/// decision -- so they ride the harness-operator mutation lane
+/// (`HARNESS_COMMAND_ROUTE`) unmodified, the same way `harness_native_
+/// history_read_action`'s four verbs ride the history lane unmodified.
+fn harness_session_record_mutation_action(action: &AppAction) -> bool {
+    matches!(
+        action,
+        AppAction::ResumeSessionRecord { .. }
+            | AppAction::RenameSessionRecord { .. }
+            | AppAction::SetSessionTask { .. }
+            | AppAction::ForgetSessionRecord { .. }
+            | AppAction::IndexProviderSession { .. }
+            | AppAction::IndexNativeSession { .. }
     )
 }
 
@@ -2069,20 +2104,46 @@ fn harness_detail_read_action(action: &AppAction) -> bool {
     )
 }
 
+/// What remains legitimately unroutable in harness-only mode now that the
+/// session-record read (`PreviewSessionRecord`/`RefreshSessionRecordHistory`)
+/// and mutation (`ResumeSessionRecord`/`RenameSessionRecord`/`SetSessionTask`/
+/// `ForgetSessionRecord`/`IndexProviderSession`/`IndexNativeSession`) families
+/// each have a typed harness route: `DiscoverHistory`/`LoadHistory`.
+/// Both operate against an already-open `SessionAddress`'s own native-history
+/// discovery (feeding a plain `Resume`, not a managed `SessionRecordId`) --
+/// a direct-C2/light-mode-only concept from before the managed
+/// `SessionRecord` family existed, with no harness-operator wire mapping and
+/// no live per-node connection in harness mode to relay it through. Ignores
+/// the generic `reason` string the other three call sites pass (busy/
+/// unavailable/queue-full framings would misdescribe a verb that can never
+/// succeed in this mode regardless of queue state) in favor of naming the
+/// actual cause.
 fn reject_history_refresh_action(app: &mut App, action: &AppAction, reason: &str) -> bool {
-    let AppAction::RefreshSessionRecordHistory {
+    // A record-history refresh that cannot be delivered (queue busy/closed,
+    // node unavailable) must still clear its pending marker with a
+    // descriptive reason, or the Session Monitor spins forever.
+    if let AppAction::RefreshSessionRecordHistory {
         node_id,
         node_incarnation_id,
         record_id,
         ..
-    } = action else {
+    } = action
+    {
+        app.fail_session_record_history_refresh(
+            node_id.clone(),
+            record_id.clone(),
+            *node_incarnation_id,
+            reason.to_owned(),
+        );
+        return true;
+    }
+    if !matches!(action, AppAction::DiscoverHistory { .. } | AppAction::LoadHistory { .. }) {
         return false;
-    };
-    app.fail_session_record_history_refresh(
-        node_id.clone(),
-        record_id.clone(),
-        *node_incarnation_id,
-        reason.to_owned(),
+    }
+    app.notice = Some(
+        "Harness-owned session action unavailable: native session-history discovery has no \
+         harness-operator wire mapping (light-mode direct-C2 only)"
+            .to_owned(),
     );
     true
 }
@@ -2731,6 +2792,166 @@ fn harness_operator_worker(
                     Err(error) => publish_harness_failure(token, error.to_string(), &updates),
                 }
             }
+            // The six session-record mutation verbs below never touch the
+            // harness kanban refresh-token gate (`publish_harness_snapshot`/
+            // `publish_harness_failure`): unlike the task-CAS/session-control
+            // mutations above, none of them originate from
+            // `route_harness_session_verb`'s `begin_harness_mutation_refresh`
+            // call, so there is no pending-refresh token to roll back on
+            // failure. Runtime-inventory convergence for a successful
+            // mutation happens server-side instead (`invalidate_runtime_
+            // inventory_for_route` in `HostCommand::SessionRecordMutationFinished`,
+            // gate4agent-harness-service/runtime.rs), which pushes an event
+            // this session's own `harness_event_subscription_worker`
+            // receives -- no client-side follow-up call needed here.
+            AppAction::ResumeSessionRecord {
+                node_id, record_id, rows, cols, initial_prompt, operation_token,
+            } => {
+                let update = match client.resume_session_record(
+                    node_id.clone(),
+                    record_id.clone(),
+                    HarnessRuntimeTerminalSizeV1 { rows, columns: cols },
+                    initial_prompt,
+                ) {
+                    Ok(resumed) => match project_harness_inventory_managed_session(&node_id, resumed.record) {
+                        Ok(record) => WorkerUpdate::SessionRecordResumed {
+                            record,
+                            session: SessionAddress {
+                                node_id: resumed.session.node_id,
+                                workspace_id: resumed.session.workspace_id,
+                                instance_id: resumed.session.instance_id,
+                                generation: resumed.session.generation,
+                            },
+                            operation_token,
+                        },
+                        Err(message) => WorkerUpdate::ExistingSessionOperationFailed {
+                            node_id, record_id: Some(record_id), indexing: false, operation_token,
+                            message, stale_catalog: false,
+                        },
+                    },
+                    Err(error) => WorkerUpdate::ExistingSessionOperationFailed {
+                        node_id, record_id: Some(record_id), indexing: false, operation_token,
+                        message: error.to_string(), stale_catalog: false,
+                    },
+                };
+                let _ = updates.blocking_send(update);
+            }
+            AppAction::RenameSessionRecord { node_id, record_id, display_name } => {
+                match client.rename_session_record(node_id.clone(), record_id, display_name) {
+                    Ok(record) => match project_harness_inventory_managed_session(&node_id, record) {
+                        Ok(record) => {
+                            let _ = updates.blocking_send(WorkerUpdate::SessionRecordUpserted(record));
+                        }
+                        Err(message) => {
+                            let _ = updates.blocking_send(WorkerUpdate::Notice(format!("{node_id}: {message}")));
+                        }
+                    },
+                    Err(error) => {
+                        let _ = updates.blocking_send(WorkerUpdate::Notice(format!("{node_id}: {error}")));
+                    }
+                }
+            }
+            AppAction::SetSessionTask { node_id, record_id, expected_revision, target } => {
+                match client.set_session_task(
+                    node_id.clone(),
+                    record_id,
+                    expected_revision,
+                    harness_session_task_target(&target),
+                ) {
+                    Ok(record) => match project_harness_inventory_managed_session(&node_id, record) {
+                        Ok(record) => {
+                            let _ = updates.blocking_send(WorkerUpdate::SessionRecordUpserted(record));
+                        }
+                        Err(message) => {
+                            let _ = updates.blocking_send(WorkerUpdate::Notice(format!("{node_id}: {message}")));
+                        }
+                    },
+                    Err(error) => {
+                        let _ = updates.blocking_send(WorkerUpdate::Notice(format!("{node_id}: {error}")));
+                    }
+                }
+            }
+            AppAction::ForgetSessionRecord { node_id, record_id } => {
+                match client.forget_session_record(node_id.clone(), record_id) {
+                    Ok(record_id) => {
+                        let _ = updates.blocking_send(WorkerUpdate::SessionRecordRemoved { node_id, record_id });
+                    }
+                    Err(error) => {
+                        let _ = updates.blocking_send(WorkerUpdate::Notice(format!("{node_id}: {error}")));
+                    }
+                }
+            }
+            AppAction::IndexProviderSession {
+                node_id, workspace_id, provider, identity, display_name, operation_token,
+            } => {
+                let source_session_id = identity.id.clone();
+                let update = match client.index_provider_session(
+                    node_id.clone(),
+                    workspace_id.clone(),
+                    provider.as_str().to_owned(),
+                    harness_provider_session_identity(&identity),
+                    display_name,
+                ) {
+                    Ok(record) => {
+                        let identity_matches = record.provider_identity_present;
+                        match project_harness_inventory_managed_session(&node_id, record) {
+                            Ok(record) => WorkerUpdate::ProviderSessionIndexed {
+                                record, identity_matches, node_id,
+                                workspace_id, provider, session_id: source_session_id, operation_token,
+                            },
+                            Err(message) => WorkerUpdate::ExistingSessionOperationFailed {
+                                node_id, record_id: None, indexing: true, operation_token,
+                                message, stale_catalog: false,
+                            },
+                        }
+                    }
+                    Err(error) => WorkerUpdate::ExistingSessionOperationFailed {
+                        node_id, record_id: None, indexing: true, operation_token,
+                        message: error.to_string(), stale_catalog: false,
+                    },
+                };
+                let _ = updates.blocking_send(update);
+            }
+            AppAction::IndexNativeSession {
+                node_id, route, catalog_revision, recent_cutoff_unix_ms, selection_id,
+                display_name, operation_token,
+            } => {
+                let nodes = harness_runtime_inventory_snapshot(&runtime_inventory);
+                let update = (|| {
+                    let selection = HarnessNativeSessionSelectionV1 {
+                        route: harness_native_session_route(nodes.as_deref(), &node_id, &route)
+                            .map_err(|message| WorkerUpdate::ExistingSessionOperationFailed {
+                                node_id: node_id.clone(), record_id: None, indexing: true, operation_token,
+                                message, stale_catalog: false,
+                            })?,
+                        catalog_revision,
+                        recent_cutoff_unix_ms,
+                        selection_id: selection_id.clone(),
+                    };
+                    let indexed = client.index_native_session(selection.clone(), display_name)
+                        .map_err(|error| WorkerUpdate::ExistingSessionOperationFailed {
+                            node_id: node_id.clone(), record_id: None, indexing: true, operation_token,
+                            message: error.to_string(), stale_catalog: false,
+                        })?;
+                    if indexed.selection != selection {
+                        return Err(WorkerUpdate::ExistingSessionOperationFailed {
+                            node_id: node_id.clone(), record_id: None, indexing: true, operation_token,
+                            message: "Harness operator returned a mismatched native session selection".to_owned(),
+                            stale_catalog: false,
+                        });
+                    }
+                    let record = project_harness_inventory_managed_session(&node_id, indexed.record)
+                        .map_err(|message| WorkerUpdate::ExistingSessionOperationFailed {
+                            node_id: node_id.clone(), record_id: None, indexing: true, operation_token,
+                            message, stale_catalog: false,
+                        })?;
+                    Ok(WorkerUpdate::NativeSessionIndexed {
+                        node_id, route, catalog_revision, recent_cutoff_unix_ms, selection_id,
+                        record, operation_token,
+                    })
+                })();
+                let _ = updates.blocking_send(update.unwrap_or_else(|failure| failure));
+            }
             AppAction::HarnessCreateTask {
                 token,
                 title,
@@ -3044,6 +3265,17 @@ fn harness_native_history_worker(
                 selection_id,
                 message_limit,
                 token,
+            ),
+            AppAction::PreviewSessionRecord { node_id, record_id, message_limit, token } => {
+                publish_harness_session_record_preview(
+                    &client, &updates, node_id, record_id, message_limit, token,
+                )
+            }
+            AppAction::RefreshSessionRecordHistory {
+                node_id, node_incarnation_id, record_id, message_limit,
+            } => publish_harness_session_record_history_refresh(
+                &client, &updates, nodes.as_deref(), node_id, node_incarnation_id, record_id,
+                message_limit,
             ),
             _ => {}
         }
@@ -4030,6 +4262,84 @@ fn publish_harness_native_preview(
             stale_catalog: error.stale_catalog,
         }
     });
+    let _ = updates.blocking_send(update);
+}
+
+/// Harness-mode sibling of `c2_preview_session_record`: same node request
+/// (`NodeRequest::PreviewSessionRecord`, relayed via `HarnessOperatorRequestV1::
+/// PreviewSessionRecord`), same success/failure `WorkerUpdate` shapes, so
+/// `apply_worker_update` applies either mode's result through the identical
+/// `App::apply_session_record_preview`/`fail_session_record_preview` pair.
+fn publish_harness_session_record_preview(
+    client: &HarnessOperatorClient,
+    updates: &mpsc::Sender<WorkerUpdate>,
+    node_id: String,
+    record_id: String,
+    message_limit: u16,
+    token: u64,
+) {
+    let update = match client.preview_session_record(node_id.clone(), record_id.clone(), message_limit) {
+        Ok(previewed) if previewed.record_id == record_id => WorkerUpdate::SessionRecordPreviewed {
+            node_id,
+            record_id,
+            token,
+            preview: project_harness_native_preview(previewed.preview),
+        },
+        Ok(_) => WorkerUpdate::SessionRecordPreviewFailed {
+            node_id, record_id, token,
+            message: "Harness operator returned a mismatched session record preview".to_owned(),
+            unavailable: false,
+        },
+        Err(error) => {
+            let error = HarnessNativeHistoryError::from_client(&error);
+            WorkerUpdate::SessionRecordPreviewFailed {
+                node_id, record_id, token, message: error.message, unavailable: error.unavailable,
+            }
+        }
+    };
+    let _ = updates.blocking_send(update);
+}
+
+/// Harness-mode sibling of `c2_refresh_session_record_history`: same
+/// `history_refresh_incarnation_matches` pre-flight guard the light TUI's
+/// per-node C2 connection performs against its own `route.expected_incarnation_id`
+/// -- here against the harness runtime-inventory snapshot's cached
+/// incarnation for the node, since a harness operator connection is
+/// stateless per call rather than pinned to one node's connection.
+fn publish_harness_session_record_history_refresh(
+    client: &HarnessOperatorClient,
+    updates: &mpsc::Sender<WorkerUpdate>,
+    nodes: Option<&[NodeView]>,
+    node_id: String,
+    incarnation_id: gate4agent_node_protocol::NodeIncarnationId,
+    record_id: String,
+    message_limit: u16,
+) {
+    let current_incarnation = nodes.and_then(|nodes| {
+        nodes.iter().find(|node| node.node_id == node_id).and_then(|node| node.incarnation_id)
+    });
+    if current_incarnation != Some(incarnation_id) {
+        let _ = updates.blocking_send(WorkerUpdate::SessionRecordHistoryRefreshFailed {
+            node_id, record_id, incarnation_id,
+            message: "node incarnation changed".to_owned(),
+        });
+        return;
+    }
+    let update = match client.preview_session_record(node_id.clone(), record_id.clone(), message_limit) {
+        Ok(previewed) if previewed.record_id == record_id => {
+            WorkerUpdate::SessionRecordHistoryRefreshed { node_id, record_id, incarnation_id }
+        }
+        Ok(_) => WorkerUpdate::SessionRecordHistoryRefreshFailed {
+            node_id, record_id, incarnation_id,
+            message: "Harness operator returned a mismatched session record preview".to_owned(),
+        },
+        Err(error) => {
+            let error = HarnessNativeHistoryError::from_client(&error);
+            WorkerUpdate::SessionRecordHistoryRefreshFailed {
+                node_id, record_id, incarnation_id, message: error.message,
+            }
+        }
+    };
     let _ = updates.blocking_send(update);
 }
 
@@ -8126,6 +8436,37 @@ fn harness_native_session_route(
         workspace_id: route.workspace_id.clone(),
         provider: route.provider.to_string(),
     })
+}
+
+/// Mirrors `gate4agent_node_protocol::SessionTaskTargetV1` into its wire
+/// twin, the same duplication `map_terminal_control` (app.rs) uses for
+/// `TerminalControl` and for the same reason -- see
+/// `HarnessSessionTaskTargetV1`'s own doc comment.
+fn harness_session_task_target(
+    target: &gate4agent_node_protocol::SessionTaskTargetV1,
+) -> HarnessSessionTaskTargetV1 {
+    match target {
+        gate4agent_node_protocol::SessionTaskTargetV1::New => HarnessSessionTaskTargetV1::New,
+        gate4agent_node_protocol::SessionTaskTargetV1::Existing { task_id } => {
+            HarnessSessionTaskTargetV1::Existing { task_id: task_id.to_string() }
+        }
+        gate4agent_node_protocol::SessionTaskTargetV1::Clear => HarnessSessionTaskTargetV1::Clear,
+    }
+}
+
+fn harness_provider_session_identity(
+    identity: &ProviderSessionIdentity,
+) -> HarnessProviderSessionIdentityV1 {
+    HarnessProviderSessionIdentityV1 {
+        key: match identity.key {
+            gate4agent_types::ProviderSessionKey::SessionId => HarnessProviderSessionKeyV1::SessionId,
+            gate4agent_types::ProviderSessionKey::ConversationId => {
+                HarnessProviderSessionKeyV1::ConversationId
+            }
+        },
+        id: identity.id.clone(),
+        transcript_path: identity.transcript_path.clone(),
+    }
 }
 
 fn project_harness_native_catalog_entry(
@@ -12482,11 +12823,11 @@ mod tests {
     }
 
     #[test]
-    fn harness_native_history_reads_route_to_history_but_resume_mutation_fails_closed() {
+    fn harness_native_history_and_session_record_families_route_in_harness_mode() {
         let mut app = App::default();
-        let (harness_tx, mut harness_rx) = mpsc::channel(2);
-        let (history_tx, mut history_rx) = mpsc::channel(2);
-        let (detail_tx, mut detail_rx) = mpsc::channel(2);
+        let (harness_tx, mut harness_rx) = mpsc::channel(4);
+        let (history_tx, mut history_rx) = mpsc::channel(4);
+        let (detail_tx, mut detail_rx) = mpsc::channel(4);
         let commands = BTreeMap::from([
             (HARNESS_COMMAND_ROUTE.to_owned(), harness_tx),
             (HARNESS_HISTORY_COMMAND_ROUTE.to_owned(), history_tx),
@@ -12497,6 +12838,7 @@ mod tests {
             provider("codex"),
         );
 
+        // Native-session-catalog reads keep riding the history lane.
         send_operator_action(
             &mut app,
             &commands,
@@ -12512,12 +12854,50 @@ mod tests {
             Ok(AppAction::CatalogNativeSessions { node_id, token: 11, .. })
                 if node_id == "node-a",
         ));
-        assert!(matches!(
-            harness_rx.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty),
-        ));
+        assert!(matches!(harness_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
         assert!(matches!(detail_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
 
+        // Session-record preview/refresh: same node request as native
+        // session preview, so they ride the same history lane unmodified.
+        send_operator_action(
+            &mut app,
+            &commands,
+            AppAction::PreviewSessionRecord {
+                node_id: "node-a".to_owned(),
+                record_id: "record-a".to_owned(),
+                message_limit: 8,
+                token: 13,
+            },
+        );
+        assert!(matches!(
+            history_rx.try_recv(),
+            Ok(AppAction::PreviewSessionRecord { node_id, record_id, token: 13, .. })
+                if node_id == "node-a" && record_id == "record-a",
+        ));
+        assert!(matches!(harness_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+
+        send_operator_action(
+            &mut app,
+            &commands,
+            AppAction::RefreshSessionRecordHistory {
+                node_id: "node-a".to_owned(),
+                node_incarnation_id: gate4agent_node_protocol::NodeIncarnationId::from_bytes([9; 16]),
+                record_id: "record-a".to_owned(),
+                message_limit: 8,
+            },
+        );
+        assert!(matches!(
+            history_rx.try_recv(),
+            Ok(AppAction::RefreshSessionRecordHistory { node_id, record_id, .. })
+                if node_id == "node-a" && record_id == "record-a",
+        ));
+        assert!(matches!(harness_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+
+        // Session-record mutations: bare `node_id`, no `SessionAddress`
+        // translation needed, so `route_harness_session_verb` leaves them
+        // unmodified and they ride the operator mutation lane like every
+        // other typed Harness verb -- the dispatch gap this test used to
+        // document (`IndexNativeSession` failing closed) is now closed.
         send_operator_action(
             &mut app,
             &commands,
@@ -12533,15 +12913,49 @@ mod tests {
         );
         assert!(matches!(
             harness_rx.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty),
+            Ok(AppAction::IndexNativeSession { node_id, operation_token: 12, .. })
+                if node_id == "node-a",
         ));
+        assert!(matches!(history_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+        assert!(matches!(detail_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+
+        send_operator_action(
+            &mut app,
+            &commands,
+            AppAction::RenameSessionRecord {
+                node_id: "node-a".to_owned(),
+                record_id: "record-a".to_owned(),
+                display_name: "Renamed".to_owned(),
+            },
+        );
         assert!(matches!(
-            history_rx.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty),
+            harness_rx.try_recv(),
+            Ok(AppAction::RenameSessionRecord { node_id, record_id, display_name })
+                if node_id == "node-a" && record_id == "record-a" && display_name == "Renamed",
         ));
+
+        // `DiscoverHistory`/`LoadHistory` stay legitimately unroutable: no
+        // harness-operator wire mapping exists for them (see the doc
+        // comment on `reject_history_refresh_action`), and the rejection
+        // now names that reason precisely instead of the generic notice.
+        let address = SessionAddress {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            instance_id: 1,
+            generation: 1,
+        };
+        send_operator_action(
+            &mut app,
+            &commands,
+            AppAction::DiscoverHistory { address, limit: 16 },
+        );
+        assert!(matches!(harness_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+        assert!(matches!(history_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
         assert_eq!(
             app.notice.as_deref(),
-            Some("Harness-owned session action unavailable: no typed Harness intent exists"),
+            Some(
+                "Harness-owned session action unavailable: native session-history discovery has no harness-operator wire mapping (light-mode direct-C2 only)",
+            ),
         );
     }
 

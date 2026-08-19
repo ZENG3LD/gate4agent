@@ -449,3 +449,267 @@ async fn windows_harness_operator_session_verbs_spawn_input_resize_control_stop_
     node_shutdown.request_shutdown().await.unwrap();
     timeout(Duration::from_secs(10), node_task).await.unwrap().unwrap().unwrap();
 }
+
+/// Finds a managed-session record inside a `RuntimeInventoryList` page by
+/// node + record id -- the managed-record sibling of `find_runtime_session`.
+fn find_managed_session<'a>(
+    page: &'a gate4agent_harness_api::HarnessRuntimeInventoryPageV1,
+    node_id: &str,
+    record_id: &str,
+) -> Option<&'a gate4agent_harness_api::HarnessRuntimeManagedSessionV1> {
+    page.nodes.iter()
+        .find(|node| node.node_id == node_id)?
+        .inventory.managed_sessions.iter()
+        .find(|record| record.record_id == record_id)
+}
+
+/// E2E coverage for the session-record operator verb family added alongside
+/// the nine direct session verbs above (`PreviewSessionRecord`/
+/// `ResumeSessionRecord`/`RenameSessionRecord`/`SetSessionTask`/
+/// `ForgetSessionRecord`/`IndexProviderSession`/`IndexNativeSession`). Same
+/// fixture shape, but no PTY fixture spawn is needed: `IndexProviderSession`
+/// with no `transcript_path` (the only shape `NodeRequest::
+/// IndexProviderSession`'s handler accepts -- see `index_provider_session_
+/// with_policy`'s `allow_validated_transcript_path: false`) creates a
+/// `ManagedSessionRecord` directly against the node's session-record store,
+/// no process involved. That gives a real, live `record_id` to exercise the
+/// mutation family's full round trip (index -> discover -> rename -> forget)
+/// against genuine node state.
+///
+/// `ResumeSessionRecord`/`PreviewSessionRecord`/`SetSessionTask`/
+/// `IndexNativeSession` are covered only through their real wire-relay and
+/// node-rejection paths, not a full success round trip: a record indexed
+/// this way carries no resumable provider transcript (staging one would mean
+/// fabricating a real on-disk native-session file matching a provider's
+/// exact format, and `SetSessionTask` binding to a real Harness task is a
+/// second, unrelated fixture concern) -- see the module doc comment's
+/// `PasteSession` precedent for the same "prove the rejection relays
+/// faithfully, not a success this fixture cannot honestly produce" choice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn windows_harness_operator_session_record_family_index_rename_forget_round_trip_and_rejections() {
+    require_headless_supervisor();
+    let fixture = FixturePaths::new();
+    let node_endpoint = pipe("node");
+    let control_endpoint = pipe("control");
+    let node_id = NodeId::new("session-record-node").unwrap();
+    let workspace_id = WorkspaceId::new("primary").unwrap();
+    let node_token = "session-record-node-token";
+    let c2_token = "session-record-c2-token";
+    let operator_credential = HarnessOperatorCredential::parse(format!(
+        "g4aho_{}",
+        "e".repeat(64),
+    )).unwrap();
+    let profile_id = SpawnProfileId::new("interactive-default").unwrap();
+    let profile_revision = SpawnProfileRevision::new("session-record-r1").unwrap();
+
+    let node = NodeServer::new_fixture(node_config(
+        &fixture,
+        &node_endpoint,
+        node_token,
+        &node_id,
+        &workspace_id,
+        &profile_id,
+        &profile_revision,
+    )).unwrap();
+    let node_shutdown = node.shutdown_handle();
+    let node_task = tokio::spawn(node.run());
+
+    let timings = C2Timings {
+        poll_interval: Duration::from_millis(20),
+        fresh_for: Duration::from_secs(2),
+        attempt_deadline: Duration::from_secs(2),
+        transient_backoffs: [Duration::from_millis(20); 5],
+        parked_backoff: Duration::from_millis(100),
+        http_io_deadline: Duration::from_secs(1),
+    };
+    let c2 = C2Running::start(C2Config::new(
+        "127.0.0.1:0".parse().unwrap(),
+        c2_token,
+        vec![C2NodeConfig::new(node_id.clone(), node_endpoint.clone(), node_token).unwrap()],
+    ).unwrap()
+        .with_control_endpoint(control_endpoint.clone()).unwrap()
+        .with_timings(timings)).await.unwrap();
+    let c2_client = C2Client::new(c2.api_addr(), c2_token).unwrap()
+        .with_deadline(Duration::from_secs(1));
+    wait_online(&c2_client, &node_id).await;
+
+    let (adapter, events) = connect_harness_adapter(&control_endpoint, c2_token).await;
+    let (host, host_task) = start_harness_host_with_operator_and_catalogs(
+        HarnessService::open(&fixture.harness).unwrap(),
+        ObservationService::open(&fixture.observation).unwrap(),
+        adapter,
+        events,
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        Some(operator_credential.clone()),
+        HarnessRuntimeCatalogs::default(),
+    ).await.unwrap();
+    let harness_endpoint = host.endpoint().socket_addr();
+    let client = HarnessOperatorClient::new(harness_endpoint, operator_credential).unwrap();
+
+    // IndexProviderSession: real node-side write, no process spawned.
+    let identity = gate4agent_types::ProviderSessionIdentity {
+        key: gate4agent_types::ProviderSessionKey::SessionId,
+        id: "external-provider-session-id".to_owned(),
+        transcript_path: None,
+    };
+    let indexed = client.index_provider_session(
+        node_id.as_str().to_owned(),
+        workspace_id.as_str().to_owned(),
+        "claude".to_owned(),
+        gate4agent_harness_api::HarnessProviderSessionIdentityV1 {
+            key: gate4agent_harness_api::HarnessProviderSessionKeyV1::SessionId,
+            id: identity.id.clone(),
+            transcript_path: identity.transcript_path.clone(),
+        },
+        "Indexed provider session".to_owned(),
+    ).unwrap();
+    assert_eq!(indexed.workspace_id, workspace_id.as_str());
+    assert!(indexed.provider_identity_present);
+    let record_id = indexed.record_id.clone();
+
+    // Discoverable through the runtime inventory (RuntimeInventoryList) --
+    // the same route a harness-mode TUI sidebar reads the roster through.
+    let discovered = timeout(Duration::from_secs(15), async {
+        loop {
+            if let Ok(page) = client.runtime_inventory_list(None, 16) {
+                if let Some(found) = find_managed_session(&page, node_id.as_str(), &record_id) {
+                    return found.clone();
+                }
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    }).await.expect("indexed record never appeared in the runtime inventory");
+    assert_eq!(discovered.display_name, "Indexed provider session");
+
+    // RenameSessionRecord: real success, reflected in the reply and in a
+    // subsequent runtime-inventory read (the server-side route invalidation
+    // `HostCommand::SessionRecordMutationFinished` triggers on every settled
+    // mutation).
+    let renamed = client.rename_session_record(
+        node_id.as_str().to_owned(),
+        record_id.clone(),
+        "Renamed provider session".to_owned(),
+    ).unwrap();
+    assert_eq!(renamed.record_id, record_id);
+    assert_eq!(renamed.display_name, "Renamed provider session");
+    timeout(Duration::from_secs(15), async {
+        loop {
+            if let Ok(page) = client.runtime_inventory_list(None, 16) {
+                if find_managed_session(&page, node_id.as_str(), &record_id)
+                    .is_some_and(|record| record.display_name == "Renamed provider session")
+                {
+                    return;
+                }
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    }).await.expect("rename never converged in the runtime inventory");
+
+    // ResumeSessionRecord/PreviewSessionRecord against a record with no
+    // resumable transcript: real rejection, not a success this fixture
+    // cannot honestly produce -- see the doc comment above.
+    let resume_rejected = client.resume_session_record(
+        node_id.as_str().to_owned(),
+        record_id.clone(),
+        gate4agent_harness_api::HarnessRuntimeTerminalSizeV1 { rows: 24, columns: 80 },
+        None,
+    );
+    assert!(resume_rejected.is_err(), "resuming a non-resumable indexed record must be rejected");
+    let preview_rejected = client.preview_session_record(node_id.as_str().to_owned(), record_id.clone(), 8);
+    assert!(preview_rejected.is_err(), "previewing a record with no transcript must be rejected");
+
+    // ForgetSessionRecord: real success, gone from a subsequent read.
+    let forgotten_record_id = client.forget_session_record(
+        node_id.as_str().to_owned(),
+        record_id.clone(),
+    ).unwrap();
+    assert_eq!(forgotten_record_id, record_id);
+    timeout(Duration::from_secs(15), async {
+        loop {
+            if let Ok(page) = client.runtime_inventory_list(None, 16) {
+                if find_managed_session(&page, node_id.as_str(), &record_id).is_none() {
+                    return;
+                }
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    }).await.expect("forgotten record never left the runtime inventory");
+
+    // Every verb's real wire-relay + node-rejection path against a
+    // `record_id` the node has never seen: `NodeFailureCode::
+    // UnknownSessionRecord` relayed end to end, mapped to
+    // `HarnessOperatorHostErrorV1::NotFound` for the read family
+    // (`map_native_history_error`) and the mutation family
+    // (`map_session_record_mutation_error`) alike.
+    let unknown_record_id = "record-never-indexed".to_owned();
+    assert!(matches!(
+        client.preview_session_record(node_id.as_str().to_owned(), unknown_record_id.clone(), 8),
+        Err(HarnessOperatorClientError::Host(HarnessOperatorHostErrorV1::NotFound)),
+    ));
+    assert!(matches!(
+        client.resume_session_record(
+            node_id.as_str().to_owned(),
+            unknown_record_id.clone(),
+            gate4agent_harness_api::HarnessRuntimeTerminalSizeV1 { rows: 24, columns: 80 },
+            None,
+        ),
+        Err(HarnessOperatorClientError::Host(HarnessOperatorHostErrorV1::NotFound)),
+    ));
+    assert!(matches!(
+        client.rename_session_record(
+            node_id.as_str().to_owned(),
+            unknown_record_id.clone(),
+            "Nobody home".to_owned(),
+        ),
+        Err(HarnessOperatorClientError::Host(HarnessOperatorHostErrorV1::NotFound)),
+    ));
+    assert!(matches!(
+        client.set_session_task(
+            node_id.as_str().to_owned(),
+            unknown_record_id.clone(),
+            1,
+            gate4agent_harness_api::HarnessSessionTaskTargetV1::Clear,
+        ),
+        Err(HarnessOperatorClientError::Host(HarnessOperatorHostErrorV1::NotFound)),
+    ));
+    assert!(matches!(
+        client.forget_session_record(node_id.as_str().to_owned(), unknown_record_id.clone()),
+        Err(HarnessOperatorClientError::Host(HarnessOperatorHostErrorV1::NotFound)),
+    ));
+
+    // `IndexNativeSession` against a selection the node's native-session
+    // catalog can never contain (garbage `selection_id`, `catalog_revision`
+    // above zero to pass wire validation): the node's own catalog-lookup
+    // rejection relays through faithfully. Not asserting the exact mapped
+    // host error here (unlike the five above): unlike an unknown
+    // `record_id`, "no native session catalog entry matches this selection"
+    // is not exercised by the fixture's real catalog paging path, only by
+    // this synthetic selection, so only "the wire relay round-trips and the
+    // node rejects it" is asserted -- fabricating a real on-disk native-
+    // session file to pin the exact code would be staging a fixture this
+    // module's own doc comment already says is out of scope.
+    let bogus_native_selection = gate4agent_harness_api::HarnessNativeSessionSelectionV1 {
+        route: gate4agent_harness_api::HarnessNativeSessionRouteV1 {
+            node_id: node_id.as_str().to_owned(),
+            incarnation_id: "0".repeat(32),
+            scope: gate4agent_harness_api::HarnessNativeSessionCatalogScopeV1::Workspace,
+            workspace_id: Some(workspace_id.as_str().to_owned()),
+            provider: "claude".to_owned(),
+        },
+        catalog_revision: 1,
+        recent_cutoff_unix_ms: 1,
+        selection_id: "never-cataloged".to_owned(),
+    };
+    assert!(
+        client.index_native_session(bogus_native_selection, "Never cataloged".to_owned()).is_err(),
+        "indexing a selection outside the node's real native-session catalog must be rejected",
+    );
+
+    host.shutdown().await.unwrap();
+    timeout(Duration::from_secs(5), host_task).await.unwrap().unwrap().unwrap();
+    let c2_shutdown = c2.shutdown_handle();
+    c2_shutdown.shutdown();
+    timeout(Duration::from_secs(5), c2.wait()).await.unwrap().unwrap();
+    node_shutdown.request_shutdown().await.unwrap();
+    timeout(Duration::from_secs(10), node_task).await.unwrap().unwrap().unwrap();
+}

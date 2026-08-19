@@ -3248,6 +3248,16 @@ fn render_agent_board(
     }
 }
 
+/// Sessions strip caps out here (1 summary line + a few session rows) even
+/// on a generously tall terminal; it stays a compact rail, not a second
+/// board.
+const HARNESS_SESSIONS_STRIP_MAX_ROWS: u16 = 4;
+/// Rows the Harness Kanban board's own chrome (divider + column header row +
+/// divider) plus at least two stacked task cards must keep before the
+/// sessions strip may claim any of the remaining height. Keeps the strip
+/// from crushing the kanban board on small terminals.
+const HARNESS_SESSIONS_STRIP_RESERVED_KANBAN_ROWS: u16 = 13;
+
 fn render_harness_kanban(
     app: &App,
     area: Rect,
@@ -3319,6 +3329,24 @@ fn render_harness_kanban(
         ).saturating_add(1);
     }
     let mut header_rows = 1_u16;
+    let sessions_strip_capacity = inner
+        .height
+        .saturating_sub(header_rows)
+        .saturating_sub(HARNESS_SESSIONS_STRIP_RESERVED_KANBAN_ROWS)
+        .min(HARNESS_SESSIONS_STRIP_MAX_ROWS);
+    let sessions_strip_area = Rect::new(
+        inner.x,
+        inner.y.saturating_add(header_rows),
+        inner.width,
+        sessions_strip_capacity,
+    );
+    header_rows = header_rows.saturating_add(render_harness_sessions_strip(
+        app,
+        sessions_strip_area,
+        buf,
+        layout,
+        theme,
+    ));
     if let Some(task) = app.harness_selected_task() {
         let context_area = Rect::new(
             inner.x,
@@ -3590,6 +3618,118 @@ fn render_harness_kanban(
             layout,
         );
     }
+}
+
+/// Compact, always-visible rail of live sessions rendered above the Harness
+/// Kanban board's task columns. Kanban cards are keyed by Harness task
+/// state, so a session with no task/run binding (an operator's direct
+/// spawn) never appears as a task card there; this strip surfaces the same
+/// session roster the Runtime board (`K`/`M` toggle) shows, without
+/// requiring the toggle. Returns the number of rows it actually painted so
+/// the caller can shift the rest of the board's header stack down by that
+/// much and hand any unused reserved height back to the kanban columns.
+fn render_harness_sessions_strip(
+    app: &App,
+    area: Rect,
+    buf: &mut TerminalBuffer,
+    layout: &mut LayoutRects,
+    theme: Theme,
+) -> u16 {
+    if area.width == 0 || area.height == 0 {
+        return 0;
+    }
+    let cards = app.agent_board_cards();
+    if cards.is_empty() {
+        return 0;
+    }
+    let attention = cards.iter().filter(|card| card.column == AgentBoardColumn::Attention).count();
+    let summary_rect = Rect::new(area.x, area.y, area.width, 1);
+    fill_rect(summary_rect, theme.panel, buf);
+    Paragraph::new(truncate_cells(
+        &format!(" Sessions ({}, {attention} attention) ", cards.len()),
+        area.width as usize,
+    ))
+        .style(
+            Style::default()
+                .fg(if attention > 0 { theme.red } else { theme.muted })
+                .bg(theme.panel)
+                .add_modifier(Modifier::BOLD),
+        )
+        .render(summary_rect, buf);
+    let row_capacity = area.height.saturating_sub(1) as usize;
+    if row_capacity == 0 {
+        return 1;
+    }
+    let overflow = cards.len() > row_capacity;
+    let shown = if overflow { row_capacity.saturating_sub(1) } else { cards.len() };
+    for (index, card) in cards.iter().take(shown).enumerate() {
+        let row = Rect::new(area.x, area.y.saturating_add(1 + index as u16), area.width, 1);
+        render_harness_session_strip_row(app, card, row, buf, layout, theme);
+    }
+    if overflow {
+        let hidden = cards.len() - shown;
+        let row = Rect::new(area.x, area.y.saturating_add(1 + shown as u16), area.width, 1);
+        fill_rect(row, theme.panel, buf);
+        Paragraph::new(truncate_cells(
+            &format!(" +{hidden} more session(s), press K for the full roster"),
+            area.width as usize,
+        ))
+            .style(Style::default().fg(theme.muted).bg(theme.panel))
+            .render(row, buf);
+    }
+    1_u16.saturating_add(shown as u16).saturating_add(u16::from(overflow))
+}
+
+/// One session row in the sessions strip. The whole row is a single click
+/// target that opens the session's PTY tab directly (`HitTarget::
+/// AgentBoardCardOpen`, the same target the Runtime board's cards use), so
+/// an operator does not need to select-then-open on a compact rail.
+fn render_harness_session_strip_row(
+    app: &App,
+    card: &AgentBoardCard,
+    area: Rect,
+    buf: &mut TerminalBuffer,
+    layout: &mut LayoutRects,
+    theme: Theme,
+) {
+    if area.width == 0 {
+        return;
+    }
+    let selected = app.agent_board.selected.as_ref() == Some(&card.key);
+    let background = if selected { theme.active } else { theme.panel };
+    fill_rect(area, background, buf);
+    layout.hits.push(HitRegion {
+        rect: area,
+        target: HitTarget::AgentBoardCardOpen(card.key.clone()),
+    });
+    let label = match &card.key {
+        AgentRowKey::Managed { .. } => {
+            let Some(record) = app.find_managed_session(&card.key) else {
+                return;
+            };
+            format!("{} | {}", record.provider, record.short_title())
+        }
+        AgentRowKey::Legacy(address) => {
+            let Some(session) = app.find_session(address) else {
+                return;
+            };
+            session.short_title()
+        }
+    };
+    let status_color = if card.column == AgentBoardColumn::Attention {
+        theme.red
+    } else {
+        theme.dim
+    };
+    let text = format!(" {label} | {}: {} \u{203a}", card.column.label(), card.reason);
+    Paragraph::new(truncate_cells(&text, area.width as usize))
+        .style(
+            Style::default()
+                .fg(status_color)
+                .bg(background)
+                .add_modifier(if selected { Modifier::BOLD } else { Modifier::empty() }),
+        )
+        .render(area, buf);
 }
 
 fn draw_harness_composer_frame(
@@ -11386,6 +11526,125 @@ mod tests {
             assert!(hit.rect.y > modal.y, "{target:?}: {:?}", hit.rect);
             assert!(hit.rect.bottom() < modal.bottom(), "{target:?}: {:?}", hit.rect);
         }
+    }
+
+    #[test]
+    fn harness_kanban_sessions_strip_shows_direct_session_provider_and_status() {
+        let mut app = fixture(PtyColorMode::Inherited);
+        app.harness_kanban.enabled = true;
+        app.agent_board_mode = crate::app::AgentBoardMode::HarnessKanban;
+        // The fixture's single session has no task/run binding: it is a
+        // "direct" operator spawn, the exact case the sessions strip exists
+        // to surface on the default (kanban) board.
+        app.nodes[0].workspaces[0].sessions[0].progress = Some(test_agent_progress());
+
+        let mut buf = TerminalBuffer::new(220, 30);
+        let mut layout = LayoutRects::default();
+        render_harness_kanban(
+            &app,
+            Rect::new(0, 0, 220, 30),
+            &mut buf,
+            &mut layout,
+            Theme::for_mode(PtyColorMode::Inherited),
+        );
+        let text = buffer_text(&buf);
+        assert!(text.contains("Sessions ("), "missing sessions strip header: {text}");
+        assert!(text.contains("kimi"), "missing session provider in sessions strip: {text}");
+        assert!(text.contains("Working"), "missing session status in sessions strip: {text}");
+        // The kanban columns must still be present alongside the strip.
+        for label in ["Backlog", "Ready", "Running", "Waiting", "Review", "Done", "Failed", "Cancelled"] {
+            assert!(text.contains(label), "sessions strip crowded out Harness column {label}: {text}");
+        }
+        let address = app.nodes[0].workspaces[0].sessions[0].address.clone();
+        assert!(
+            layout.hits.iter().any(|hit| {
+                hit.target == HitTarget::AgentBoardCardOpen(AgentRowKey::Legacy(address.clone()))
+            }),
+            "missing open hit for the direct session row: {text}",
+        );
+    }
+
+    #[test]
+    fn harness_kanban_sessions_strip_collapses_on_a_small_board() {
+        let mut app = fixture(PtyColorMode::Inherited);
+        app.harness_kanban.enabled = true;
+        app.agent_board_mode = crate::app::AgentBoardMode::HarnessKanban;
+
+        // Same exact-position assertions the kanban board itself makes on a
+        // narrow/short terminal: the sessions strip must not shift the
+        // board's own chrome down when there is no room for it.
+        let mut buf = TerminalBuffer::new(72, 14);
+        let mut layout = LayoutRects::default();
+        render_harness_kanban(
+            &app,
+            Rect::new(0, 0, 72, 14),
+            &mut buf,
+            &mut layout,
+            Theme::for_mode(PtyColorMode::Inherited),
+        );
+        let text = buffer_text(&buf);
+        assert!(!text.contains("Sessions ("), "sessions strip did not collapse: {text}");
+        assert_eq!(buf.get(0, 2).symbol, "├", "header divider must stay at its small-board row");
+        assert_eq!(buf.get(24, 4).symbol, "┼", "column header divider must stay at its small-board row");
+        assert_eq!(buf.get(24, 5).symbol, "│", "table body must stay at its small-board row");
+    }
+
+    #[test]
+    fn harness_kanban_sessions_strip_click_opens_pty_tab_for_direct_session() {
+        let mut app = fixture(PtyColorMode::Inherited);
+        app.harness_kanban.enabled = true;
+        app.agent_board_mode = crate::app::AgentBoardMode::HarnessKanban;
+        let direct_address = SessionAddress {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            instance_id: 2,
+            generation: 1,
+        };
+        app.nodes[0].workspaces[0].sessions.push(SessionView {
+            address: direct_address.clone(),
+            provider: provider("codex"),
+            status: "running".to_owned(),
+            running: true,
+            stoppable: true,
+            removable: false,
+            restartable: false,
+            attention: false,
+            has_provider_session_identity: true,
+            progress: Some(test_agent_progress()),
+            terminal_formatted: Vec::new(),
+            terminal_scrollback: Vec::new(),
+            terminal_alternate_screen: false,
+            terminal_mouse_protocol_enabled: false,
+            terminal_mouse_protocol_encoding: TerminalMouseProtocolEncoding::Default,
+            terminal_cursor: None,
+        });
+        assert!(
+            !app.surface.all_tabs().iter().any(|tab| **tab == SurfaceTab::Pty(direct_address.clone())),
+            "the direct session must start without an already-open PTY tab",
+        );
+
+        let mut buf = TerminalBuffer::new(100, 30);
+        let mut layout = LayoutRects::default();
+        render_harness_kanban(
+            &app,
+            Rect::new(0, 0, 100, 30),
+            &mut buf,
+            &mut layout,
+            Theme::for_mode(PtyColorMode::Inherited),
+        );
+        let text = buffer_text(&buf);
+        let key = AgentRowKey::Legacy(direct_address.clone());
+        let hit = layout.hits.iter()
+            .find(|hit| hit.target == HitTarget::AgentBoardCardOpen(key.clone()))
+            .unwrap_or_else(|| panic!("missing open hit for direct session row: {text}"));
+        let rect = hit.rect;
+
+        app.layout = layout;
+        assert_eq!(app.click(rect.x, rect.y), crate::app::AppAction::None);
+        assert!(
+            app.surface.all_tabs().iter().any(|tab| **tab == SurfaceTab::Pty(direct_address.clone())),
+            "clicking the sessions strip row must open the session's PTY tab",
+        );
     }
 
     fn context_receipt() -> ResolvedContextPackReceipt {

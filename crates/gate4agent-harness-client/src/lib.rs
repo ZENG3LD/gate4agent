@@ -15,6 +15,11 @@ use thiserror::Error;
 
 pub const HARNESS_READ_DEADLINE: Duration = Duration::from_secs(3);
 pub const HARNESS_OPERATOR_DEADLINE: Duration = Duration::from_secs(3);
+// Also the outer bound for the node-workspace write/create verbs
+// (`write_node_workspace_file`/`create_node_workspace_file`/
+// `create_node_workspace_directory`): same order of node-side I/O cost as a
+// workspace read, just a write instead of a read -- see `send`'s deadline
+// selection.
 pub const HARNESS_RUN_WORKSPACE_READ_DEADLINE: Duration = Duration::from_secs(14);
 pub const HARNESS_NATIVE_HISTORY_DEADLINE: Duration = Duration::from_secs(42);
 pub const HARNESS_CONTEXT_SOURCE_OBSERVATION_DEADLINE: Duration = Duration::from_secs(14);
@@ -599,6 +604,91 @@ impl HarnessOperatorClient {
         }
     }
 
+    /// Editor-save sibling of `read_node_workspace_file`: relays to the same
+    /// C2 `NodeRequest::WriteWorkspaceFile` verb the light TUI's editor save
+    /// already uses. `expected_revision` is the node's own CAS guard -- a
+    /// stale value surfaces as `HarnessOperatorClientError::Host(
+    /// HarnessOperatorHostErrorV1::Conflict)`, not folded into any other
+    /// error shape.
+    pub fn write_node_workspace_file(
+        &self,
+        node_id: String,
+        workspace_id: String,
+        path: HarnessRepositoryPathV1,
+        content: String,
+        expected_revision: HarnessWorkspaceFileRevisionV1,
+    ) -> Result<HarnessNodeWorkspaceFileV1, HarnessOperatorClientError> {
+        let expected_node_id = node_id.clone();
+        let expected_workspace_id = workspace_id.clone();
+        let expected_path = path.clone();
+        match self.send(HarnessOperatorRequestV1::WriteNodeWorkspaceFile {
+            node_id,
+            workspace_id,
+            path,
+            content,
+            expected_revision,
+        })? {
+            HarnessOperatorResponseV1::NodeWorkspaceFileWritten(value) => {
+                value.validate_for(&expected_node_id, &expected_workspace_id, &expected_path)?;
+                Ok(value)
+            }
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Sidebar "new file" sibling of `read_node_workspace_file`: relays to
+    /// the same C2 `NodeRequest::CreateWorkspaceFile` verb the light TUI's
+    /// create-file dialog already uses. The node always creates an empty
+    /// file -- see `HarnessNodeWorkspaceFileV1`'s content on the returned
+    /// value.
+    pub fn create_node_workspace_file(
+        &self,
+        node_id: String,
+        workspace_id: String,
+        path: HarnessRepositoryPathV1,
+    ) -> Result<HarnessNodeWorkspaceFileV1, HarnessOperatorClientError> {
+        let expected_node_id = node_id.clone();
+        let expected_workspace_id = workspace_id.clone();
+        let expected_path = path.clone();
+        match self.send(HarnessOperatorRequestV1::CreateNodeWorkspaceFile {
+            node_id,
+            workspace_id,
+            path,
+        })? {
+            HarnessOperatorResponseV1::NodeWorkspaceFileCreated(value) => {
+                value.validate_for(&expected_node_id, &expected_workspace_id, &expected_path)?;
+                Ok(value)
+            }
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Sidebar "new directory" sibling of `create_node_workspace_file`:
+    /// relays to the same C2 `NodeRequest::CreateWorkspaceDirectory` verb the
+    /// light TUI's create-directory dialog already uses -- a distinct node
+    /// verb from file creation, not a kind flag on one shared request.
+    pub fn create_node_workspace_directory(
+        &self,
+        node_id: String,
+        workspace_id: String,
+        path: HarnessRepositoryPathV1,
+    ) -> Result<HarnessNodeWorkspaceDirectoryV1, HarnessOperatorClientError> {
+        let expected_node_id = node_id.clone();
+        let expected_workspace_id = workspace_id.clone();
+        let expected_path = path.clone();
+        match self.send(HarnessOperatorRequestV1::CreateNodeWorkspaceDirectory {
+            node_id,
+            workspace_id,
+            path,
+        })? {
+            HarnessOperatorResponseV1::NodeWorkspaceDirectoryCreated(value) => {
+                value.validate_for(&expected_node_id, &expected_workspace_id, &expected_path)?;
+                Ok(value)
+            }
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
     /// Node-scoped sibling of `read_run_git_history`.
     pub fn read_node_git_history(
         &self,
@@ -942,6 +1032,9 @@ impl HarnessOperatorClient {
                 | HarnessOperatorRequestV1::ReadNodeWorkspaceFile { .. }
                 | HarnessOperatorRequestV1::ReadNodeGitHistory { .. }
                 | HarnessOperatorRequestV1::ReadNodeGitDiff { .. }
+                | HarnessOperatorRequestV1::WriteNodeWorkspaceFile { .. }
+                | HarnessOperatorRequestV1::CreateNodeWorkspaceFile { .. }
+                | HarnessOperatorRequestV1::CreateNodeWorkspaceDirectory { .. }
         ) {
             HARNESS_RUN_WORKSPACE_READ_DEADLINE
         } else if matches!(&request, HarnessOperatorRequestV1::SpawnSession { .. }) {
@@ -2252,6 +2345,110 @@ mod tests {
                 Some(path),
             ).unwrap(),
             expected_diff,
+        );
+        host.join().expect("host");
+    }
+
+    #[test]
+    fn operator_client_round_trips_v11_node_workspace_writes_over_one_shot_sockets() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let endpoint = listener.local_addr().expect("address");
+        let path = HarnessRepositoryPathV1::new("src/lib.rs").unwrap();
+        let origin = HarnessNodeWorkspaceOriginV1 {
+            node_id: "node-a".to_owned(),
+            node_incarnation_id: "07".repeat(16),
+            workspace_id: "workspace-a".to_owned(),
+        };
+        let written = HarnessNodeWorkspaceFileV1 {
+            origin: origin.clone(),
+            path: path.clone(),
+            content: HarnessWorkspaceFileContentV1::Utf8 {
+                text: "fn main() {}\n".to_owned(),
+                byte_len: 13,
+            },
+            revision: Some(HarnessWorkspaceFileRevisionV1::new("c".repeat(64)).unwrap()),
+        };
+        let created_file = HarnessNodeWorkspaceFileV1 {
+            origin: origin.clone(),
+            path: path.clone(),
+            content: HarnessWorkspaceFileContentV1::Utf8 { text: String::new(), byte_len: 0 },
+            revision: Some(HarnessWorkspaceFileRevisionV1::new("d".repeat(64)).unwrap()),
+        };
+        let created_directory = HarnessNodeWorkspaceDirectoryV1 {
+            origin,
+            entry: HarnessWorkspaceTreeEntryV1 {
+                relative_path: path.clone(),
+                kind: HarnessWorkspaceEntryKindV1::Directory,
+            },
+        };
+        let expected_written = written.clone();
+        let expected_created_file = created_file.clone();
+        let expected_created_directory = created_directory.clone();
+        let expected_path = path.clone();
+        let host = thread::spawn(move || {
+            for index in 0..3 {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut request = String::new();
+                stream.read_to_string(&mut request).expect("request");
+                for forbidden in ["run_id", "endpoint", "root", "worktree", "environment"] {
+                    assert!(!request.contains(forbidden), "request exposed {forbidden}");
+                }
+                let envelope: HarnessOperatorEnvelopeV1 =
+                    serde_json::from_str(request.trim_end()).expect("operator envelope");
+                assert_eq!(envelope.version, HARNESS_OPERATOR_WIRE_VERSION_V11);
+                let response = match (index, envelope.request) {
+                    (0, HarnessOperatorRequestV1::WriteNodeWorkspaceFile { path, content, .. })
+                        if path == expected_path && content == "fn main() {}\n" =>
+                    {
+                        HarnessOperatorResponseV1::NodeWorkspaceFileWritten(written.clone())
+                    }
+                    (1, HarnessOperatorRequestV1::CreateNodeWorkspaceFile { path, .. })
+                        if path == expected_path =>
+                    {
+                        HarnessOperatorResponseV1::NodeWorkspaceFileCreated(created_file.clone())
+                    }
+                    (2, HarnessOperatorRequestV1::CreateNodeWorkspaceDirectory { path, .. })
+                        if path == expected_path =>
+                    {
+                        HarnessOperatorResponseV1::NodeWorkspaceDirectoryCreated(
+                            created_directory.clone(),
+                        )
+                    }
+                    _ => panic!("unexpected V11 node workspace write request"),
+                };
+                let reply = HarnessOperatorReplyV1::Ok { response };
+                let mut encoded = serde_json::to_vec(&reply).expect("reply");
+                encoded.push(b'\n');
+                stream.write_all(&encoded).expect("write reply");
+            }
+        });
+        let client = HarnessOperatorClient::new(endpoint, operator_credential())
+            .expect("operator client");
+        assert_eq!(
+            client.write_node_workspace_file(
+                "node-a".to_owned(),
+                "workspace-a".to_owned(),
+                path.clone(),
+                "fn main() {}\n".to_owned(),
+                HarnessWorkspaceFileRevisionV1::new("b".repeat(64)).unwrap(),
+            ).unwrap(),
+            expected_written,
+        );
+        assert_eq!(
+            client.create_node_workspace_file(
+                "node-a".to_owned(),
+                "workspace-a".to_owned(),
+                path.clone(),
+            ).unwrap(),
+            expected_created_file,
+        );
+        assert_eq!(
+            client.create_node_workspace_directory(
+                "node-a".to_owned(),
+                "workspace-a".to_owned(),
+                path,
+            ).unwrap(),
+            expected_created_directory,
         );
         host.join().expect("host");
     }

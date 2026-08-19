@@ -74,7 +74,8 @@ use gate4agent_harness_client::{
     HarnessRuntimeSessionStatusV1, HarnessRuntimeSessionV1, HarnessRuntimeTerminalFrameV1,
     HarnessRuntimeTerminalPageV1, HarnessRuntimeTerminalSizeV1, HarnessRuntimeTransportV1,
     HarnessRuntimeLaunchInventoryV1,
-    HarnessNodeWorkspaceFileV1, HarnessNodeWorkspaceInspectionV1,
+    HarnessNodeWorkspaceFileV1, HarnessNodeWorkspaceInspectionV1, HarnessNodeWorkspaceDirectoryV1,
+    HarnessWorkspaceFileRevisionV1,
     HarnessNodeGitDiffV1, HarnessNodeGitHistoryPageV1,
     RedactedTaskV1, RunPageV1, TaskPageV1,
     SessionMonitorV1 as HarnessSessionMonitorV1, TimelineEntryV1,
@@ -815,6 +816,37 @@ enum WorkerUpdate {
     },
     HarnessNodeWorkspaceFileFailed {
         key: WorkspaceFileTabKey,
+        token: u64,
+        message: String,
+    },
+    // Write/create siblings of the node-workspace read pair above: the
+    // editor save and create-file/create-directory dialog, still landing in
+    // the same direct-mode state (`file_tabs`, `create_workspace_entry`) the
+    // direct-C2 replies fill -- see `harness_route_workspace_action`.
+    HarnessNodeWorkspaceFileWritten {
+        node_id: String,
+        token: u64,
+        file: HarnessNodeWorkspaceFileV1,
+    },
+    HarnessNodeWorkspaceFileWriteFailed {
+        key: WorkspaceFileTabKey,
+        token: u64,
+        message: String,
+    },
+    HarnessNodeWorkspaceFileCreated {
+        node_id: String,
+        token: u64,
+        file: HarnessNodeWorkspaceFileV1,
+    },
+    HarnessNodeWorkspaceDirectoryCreated {
+        token: u64,
+        directory: HarnessNodeWorkspaceDirectoryV1,
+    },
+    HarnessNodeWorkspaceEntryCreateFailed {
+        node_id: String,
+        workspace_id: String,
+        path: RepositoryPath,
+        kind: WorkspaceEntryKind,
         token: u64,
         message: String,
     },
@@ -1664,16 +1696,19 @@ fn send_action(
     send_operator_action(app, commands, action);
 }
 
-/// Rewrites a direct-shaped workspace-read action into its harness-routed,
-/// node-scoped sibling when the session has no direct node connection
-/// (harness-operator mode: `harness_only`). The App methods that build
-/// `InspectWorkspace`/`ReadWorkspaceFile`/`ReadGitHistory`/`ReadGitDiff` stay
-/// mode-agnostic and keep populating the same direct-mode state
-/// (`inspection_pending`, `file_tabs`, `git_tabs`) either way — only the
-/// wire-level action this dispatch boundary sends onward changes. Applied
-/// once, here, rather than at each of the several call sites that build
-/// these four actions (sidebar open, pagination, diff selection).
-fn harness_route_workspace_read(harness_only: bool, action: AppAction) -> AppAction {
+/// Rewrites a direct-shaped workspace-read or workspace-write action into
+/// its harness-routed, node-scoped sibling when the session has no direct
+/// node connection (harness-operator mode: `harness_only`). The App methods
+/// that build `InspectWorkspace`/`ReadWorkspaceFile`/`ReadGitHistory`/
+/// `ReadGitDiff`/`WriteWorkspaceFile`/`CreateWorkspaceFile`/
+/// `CreateWorkspaceDirectory` stay mode-agnostic and keep populating the
+/// same direct-mode state (`inspection_pending`, `file_tabs`, `git_tabs`,
+/// `create_workspace_entry`) either way — only the wire-level action this
+/// dispatch boundary sends onward changes. Applied once, here, rather than
+/// at each of the several call sites that build these seven actions
+/// (sidebar open, pagination, diff selection, editor save, create-entry
+/// dialog).
+fn harness_route_workspace_action(harness_only: bool, action: AppAction) -> AppAction {
     if !harness_only {
         return action;
     }
@@ -1692,6 +1727,17 @@ fn harness_route_workspace_read(harness_only: bool, action: AppAction) -> AppAct
         AppAction::ReadGitDiff { node_id, workspace_id, target, token, destination } => {
             AppAction::HarnessReadNodeGitDiff { node_id, workspace_id, target, token, destination }
         }
+        AppAction::WriteWorkspaceFile {
+            node_id, workspace_id, path, expected_revision, text, token,
+        } => AppAction::HarnessWriteNodeWorkspaceFile {
+            node_id, workspace_id, path, expected_revision, text, token,
+        },
+        AppAction::CreateWorkspaceFile { node_id, workspace_id, path, token } => {
+            AppAction::HarnessCreateNodeWorkspaceFile { node_id, workspace_id, path, token }
+        }
+        AppAction::CreateWorkspaceDirectory { node_id, workspace_id, path, token } => {
+            AppAction::HarnessCreateNodeWorkspaceDirectory { node_id, workspace_id, path, token }
+        }
         other => other,
     }
 }
@@ -1706,7 +1752,7 @@ fn send_operator_action(
         && commands.contains_key(HARNESS_DETAIL_COMMAND_ROUTE)
         && !commands.contains_key(C2_COMMAND_ROUTE)
         && commands.len() == 3;
-    let action = harness_route_workspace_read(harness_only, action);
+    let action = harness_route_workspace_action(harness_only, action);
     let action = app.route_harness_session_verb(harness_only, action);
     let Some(node_id) = action_node_id(&action).map(str::to_owned) else {
         return;
@@ -1717,9 +1763,7 @@ fn send_operator_action(
         && !harness_native_history_read
         && !harness_detail_read
     {
-        if !reject_history_refresh_action(app, &action, "Harness-owned session action unavailable")
-            && !reject_workspace_write_action(app, &action, "Harness-owned session action unavailable")
-        {
+        if !reject_history_refresh_action(app, &action, "Harness-owned session action unavailable") {
             app.notice = Some(
                 "Harness-owned session action unavailable: no typed Harness intent exists"
                     .to_owned(),
@@ -1836,6 +1880,42 @@ fn reject_harness_queue_action(
         }
         AppAction::HarnessReadNodeGitDiff { destination, token, .. } => {
             app.fail_git_diff(destination, *token, detail_failure().display());
+            return true;
+        }
+        // Write/create siblings of the four node-workspace reads above: the
+        // sidebar's editor save and create-file/create-directory dialog
+        // would otherwise hang in the "saving"/"creating" state a direct-
+        // mode key handler already set (`TextEditor::mark_saving`,
+        // `CreateWorkspaceEntryDialog::pending`) if this queue is busy or
+        // closed before `harness_detail_worker` ever sees the action.
+        AppAction::HarnessWriteNodeWorkspaceFile { node_id, workspace_id, path, token, .. } => {
+            app.fail_workspace_file(
+                &WorkspaceFileTabKey {
+                    node_id: node_id.clone(),
+                    workspace_id: workspace_id.clone(),
+                    path: path.clone(),
+                },
+                *token,
+                detail_failure().display(),
+                true,
+            );
+            return true;
+        }
+        AppAction::HarnessCreateNodeWorkspaceFile { node_id, workspace_id, path, token }
+        | AppAction::HarnessCreateNodeWorkspaceDirectory { node_id, workspace_id, path, token } => {
+            let kind = if matches!(action, AppAction::HarnessCreateNodeWorkspaceFile { .. }) {
+                WorkspaceEntryKind::File
+            } else {
+                WorkspaceEntryKind::Directory
+            };
+            app.fail_workspace_entry_create(
+                node_id.clone(),
+                workspace_id.clone(),
+                path.clone(),
+                kind,
+                *token,
+                detail_failure().display(),
+            );
             return true;
         }
         AppAction::HarnessLoadRunTransfer { run, token } => {
@@ -1980,6 +2060,12 @@ fn harness_detail_read_action(action: &AppAction) -> bool {
             | AppAction::HarnessReadNodeWorkspaceFile { .. }
             | AppAction::HarnessReadNodeGitHistory { .. }
             | AppAction::HarnessReadNodeGitDiff { .. }
+            // Writes/creates: same one-shot synchronous `HarnessOperatorClient`
+            // worker route as the four node-workspace reads above, not a
+            // "read" in the strict sense but the same dispatch shape.
+            | AppAction::HarnessWriteNodeWorkspaceFile { .. }
+            | AppAction::HarnessCreateNodeWorkspaceFile { .. }
+            | AppAction::HarnessCreateNodeWorkspaceDirectory { .. }
     )
 }
 
@@ -1999,50 +2085,6 @@ fn reject_history_refresh_action(app: &mut App, action: &AppAction, reason: &str
         reason.to_owned(),
     );
     true
-}
-
-/// Honest-notice sibling of `reject_history_refresh_action` for the
-/// sidebar's write affordances (save, create file/directory), which stay
-/// direct-mode-only — harness mode has no typed Harness intent for them.
-/// Without this, the optimistic "saving"/"creating" state the direct-mode
-/// key handler already set (`TextEditor::mark_saving`,
-/// `CreateWorkspaceEntryDialog::pending`) would never clear in harness mode:
-/// a silent hang rather than the honest notice the generic rejection below
-/// already gives every other untranslatable action.
-fn reject_workspace_write_action(app: &mut App, action: &AppAction, reason: &str) -> bool {
-    match action {
-        AppAction::WriteWorkspaceFile { node_id, workspace_id, path, token, .. } => {
-            app.fail_workspace_file(
-                &WorkspaceFileTabKey {
-                    node_id: node_id.clone(),
-                    workspace_id: workspace_id.clone(),
-                    path: path.clone(),
-                },
-                *token,
-                reason.to_owned(),
-                true,
-            );
-            true
-        }
-        AppAction::CreateWorkspaceFile { node_id, workspace_id, path, token }
-        | AppAction::CreateWorkspaceDirectory { node_id, workspace_id, path, token } => {
-            let kind = if matches!(action, AppAction::CreateWorkspaceFile { .. }) {
-                WorkspaceEntryKind::File
-            } else {
-                WorkspaceEntryKind::Directory
-            };
-            app.fail_workspace_entry_create(
-                node_id.clone(),
-                workspace_id.clone(),
-                path.clone(),
-                kind,
-                *token,
-                reason.to_owned(),
-            );
-            true
-        }
-        _ => false,
-    }
 }
 
 fn action_node_id(action: &AppAction) -> Option<&str> {
@@ -2118,7 +2160,10 @@ fn action_node_id(action: &AppAction) -> Option<&str> {
         | AppAction::HarnessInspectNodeWorkspace { .. }
         | AppAction::HarnessReadNodeWorkspaceFile { .. }
         | AppAction::HarnessReadNodeGitHistory { .. }
-        | AppAction::HarnessReadNodeGitDiff { .. } => Some(HARNESS_DETAIL_COMMAND_ROUTE),
+        | AppAction::HarnessReadNodeGitDiff { .. }
+        | AppAction::HarnessWriteNodeWorkspaceFile { .. }
+        | AppAction::HarnessCreateNodeWorkspaceFile { .. }
+        | AppAction::HarnessCreateNodeWorkspaceDirectory { .. } => Some(HARNESS_DETAIL_COMMAND_ROUTE),
         AppAction::None | AppAction::Quit => None,
     }
 }
@@ -3446,6 +3491,88 @@ fn harness_detail_worker(
                     return;
                 }
             }
+            AppAction::HarnessWriteNodeWorkspaceFile {
+                node_id,
+                workspace_id,
+                path,
+                expected_revision,
+                text,
+                token,
+            } => {
+                let result = (|| {
+                    let wire_path = project_harness_repository_path(&path)?;
+                    let wire_revision = HarnessWorkspaceFileRevisionV1::new(expected_revision)
+                        .map_err(HarnessOperatorClientError::Api)?;
+                    client.write_node_workspace_file(
+                        node_id.clone(),
+                        workspace_id.clone(),
+                        wire_path,
+                        text,
+                        wire_revision,
+                    )
+                })();
+                let update = match result {
+                    Ok(file) => WorkerUpdate::HarnessNodeWorkspaceFileWritten { node_id, token, file },
+                    Err(error) => WorkerUpdate::HarnessNodeWorkspaceFileWriteFailed {
+                        key: WorkspaceFileTabKey { node_id, workspace_id, path },
+                        token,
+                        message: error.to_string(),
+                    },
+                };
+                if updates.blocking_send(update).is_err() {
+                    return;
+                }
+            }
+            AppAction::HarnessCreateNodeWorkspaceFile { node_id, workspace_id, path, token } => {
+                let result = project_harness_repository_path(&path)
+                    .and_then(|wire_path| {
+                        client.create_node_workspace_file(
+                            node_id.clone(),
+                            workspace_id.clone(),
+                            wire_path,
+                        )
+                    });
+                let update = match result {
+                    Ok(file) => WorkerUpdate::HarnessNodeWorkspaceFileCreated { node_id, token, file },
+                    Err(error) => WorkerUpdate::HarnessNodeWorkspaceEntryCreateFailed {
+                        node_id,
+                        workspace_id,
+                        path,
+                        kind: WorkspaceEntryKind::File,
+                        token,
+                        message: error.to_string(),
+                    },
+                };
+                if updates.blocking_send(update).is_err() {
+                    return;
+                }
+            }
+            AppAction::HarnessCreateNodeWorkspaceDirectory { node_id, workspace_id, path, token } => {
+                let result = project_harness_repository_path(&path)
+                    .and_then(|wire_path| {
+                        client.create_node_workspace_directory(
+                            node_id.clone(),
+                            workspace_id.clone(),
+                            wire_path,
+                        )
+                    });
+                let update = match result {
+                    Ok(directory) => {
+                        WorkerUpdate::HarnessNodeWorkspaceDirectoryCreated { token, directory }
+                    }
+                    Err(error) => WorkerUpdate::HarnessNodeWorkspaceEntryCreateFailed {
+                        node_id,
+                        workspace_id,
+                        path,
+                        kind: WorkspaceEntryKind::Directory,
+                        token,
+                        message: error.to_string(),
+                    },
+                };
+                if updates.blocking_send(update).is_err() {
+                    return;
+                }
+            }
             _ => {}
         }
     }
@@ -3700,6 +3827,28 @@ fn project_harness_node_workspace_file(
         content: project_harness_file_content(file.content),
         revision,
     }))
+}
+
+/// Node-scoped sibling projecting straight to `WorkspaceEntry` for
+/// `apply_workspace_directory_created`, the same direct-mode apply function
+/// the direct-C2 `CreateWorkspaceDirectory` reply uses. Unlike
+/// `project_harness_node_workspace_file`, this is infallible: `origin.
+/// workspace_id` stays a plain `String` on `apply_workspace_directory_
+/// created`'s own signature (it never needs a typed `WorkspaceId`), and
+/// `project_harness_path` already is.
+fn project_harness_node_workspace_directory(
+    directory: HarnessNodeWorkspaceDirectoryV1,
+) -> (String, String, gate4agent_node_protocol::WorkspaceEntry) {
+    let node_id = directory.origin.node_id;
+    let workspace_id = directory.origin.workspace_id;
+    let entry = gate4agent_node_protocol::WorkspaceEntry {
+        relative_path: project_harness_path(directory.entry.relative_path),
+        kind: match directory.entry.kind {
+            HarnessWorkspaceEntryKindV1::File => WorkspaceEntryKind::File,
+            HarnessWorkspaceEntryKindV1::Directory => WorkspaceEntryKind::Directory,
+        },
+    };
+    (node_id, workspace_id, entry)
 }
 
 /// Node-scoped sibling projecting straight to the `(commits, next_before,
@@ -6488,6 +6637,9 @@ fn action_to_request(action: AppAction) -> Option<NodeRequest> {
         | AppAction::HarnessReadNodeWorkspaceFile { .. }
         | AppAction::HarnessReadNodeGitHistory { .. }
         | AppAction::HarnessReadNodeGitDiff { .. }
+        | AppAction::HarnessWriteNodeWorkspaceFile { .. }
+        | AppAction::HarnessCreateNodeWorkspaceFile { .. }
+        | AppAction::HarnessCreateNodeWorkspaceDirectory { .. }
         | AppAction::HarnessSpawnSession { .. }
         | AppAction::HarnessWriteSessionInput { .. }
         | AppAction::HarnessResizeSession { .. }
@@ -7843,6 +7995,37 @@ fn apply_update(app: &mut App, c2: &mut C2ApplyState, update: WorkerUpdate) -> A
         }
         WorkerUpdate::HarnessNodeWorkspaceFileFailed { key, token, message } => {
             app.fail_workspace_file(&key, token, message, false);
+        }
+        WorkerUpdate::HarnessNodeWorkspaceFileWritten { node_id: expected_node_id, token, file } => {
+            match project_harness_node_workspace_file(file) {
+                Ok((node_id, file)) => app.apply_workspace_file_written(node_id, token, file),
+                Err(message) => app.notice = Some(format!("{expected_node_id}: {message}")),
+            }
+        }
+        WorkerUpdate::HarnessNodeWorkspaceFileWriteFailed { key, token, message } => {
+            app.fail_workspace_file(&key, token, message, true);
+        }
+        WorkerUpdate::HarnessNodeWorkspaceFileCreated { node_id: expected_node_id, token, file } => {
+            match project_harness_node_workspace_file(file) {
+                Ok((node_id, file)) => {
+                    follow_up = app.apply_workspace_file_created(node_id, token, file);
+                }
+                Err(message) => app.notice = Some(format!("{expected_node_id}: {message}")),
+            }
+        }
+        WorkerUpdate::HarnessNodeWorkspaceDirectoryCreated { token, directory } => {
+            let (node_id, workspace_id, entry) = project_harness_node_workspace_directory(directory);
+            follow_up = app.apply_workspace_directory_created(node_id, workspace_id, token, entry);
+        }
+        WorkerUpdate::HarnessNodeWorkspaceEntryCreateFailed {
+            node_id,
+            workspace_id,
+            path,
+            kind,
+            token,
+            message,
+        } => {
+            app.fail_workspace_entry_create(node_id, workspace_id, path, kind, token, message);
         }
         WorkerUpdate::HarnessNodeGitHistoryRead { destination, token, page } => {
             let (commits, next_before, has_more) = project_harness_node_git_history(page);
@@ -11786,21 +11969,99 @@ mod tests {
     }
 
     #[test]
-    fn harness_only_backend_clears_optimistic_write_state_instead_of_hanging() {
+    fn harness_only_backend_routes_workspace_writes_and_creates_to_the_detail_lane() {
         let mut app = App::default();
-        let (harness_tx, _harness_rx) = mpsc::channel(1);
-        let (history_tx, _history_rx) = mpsc::channel(1);
-        let (detail_tx, _detail_rx) = mpsc::channel(1);
+        let (harness_tx, mut harness_rx) = mpsc::channel(4);
+        let (history_tx, mut history_rx) = mpsc::channel(4);
+        let (detail_tx, mut detail_rx) = mpsc::channel(4);
         let commands = BTreeMap::from([
             (HARNESS_COMMAND_ROUTE.to_owned(), harness_tx),
             (HARNESS_HISTORY_COMMAND_ROUTE.to_owned(), history_tx),
             (HARNESS_DETAIL_COMMAND_ROUTE.to_owned(), detail_tx),
         ]);
 
-        // Writes stay direct-mode-only (no Harness intent exists for them).
+        let path = RepositoryPath::utf8("src/lib.rs".to_owned()).unwrap();
+        send_action(
+            &mut app,
+            &commands,
+            &BTreeMap::new(),
+            AppAction::WriteWorkspaceFile {
+                node_id: "node-a".to_owned(),
+                workspace_id: "workspace-a".to_owned(),
+                path: path.clone(),
+                expected_revision: "b".repeat(64),
+                text: "fn main() {}\n".to_owned(),
+                token: 1,
+            },
+        );
+        assert!(matches!(
+            detail_rx.try_recv(),
+            Ok(AppAction::HarnessWriteNodeWorkspaceFile {
+                node_id, workspace_id, path: routed_path, token: 1, ..
+            }) if node_id == "node-a" && workspace_id == "workspace-a" && routed_path == path
+        ));
+
+        send_action(
+            &mut app,
+            &commands,
+            &BTreeMap::new(),
+            AppAction::CreateWorkspaceFile {
+                node_id: "node-a".to_owned(),
+                workspace_id: "workspace-a".to_owned(),
+                path: path.clone(),
+                token: 2,
+            },
+        );
+        assert!(matches!(
+            detail_rx.try_recv(),
+            Ok(AppAction::HarnessCreateNodeWorkspaceFile {
+                node_id, workspace_id, path: routed_path, token: 2,
+            }) if node_id == "node-a" && workspace_id == "workspace-a" && routed_path == path
+        ));
+
+        send_action(
+            &mut app,
+            &commands,
+            &BTreeMap::new(),
+            AppAction::CreateWorkspaceDirectory {
+                node_id: "node-a".to_owned(),
+                workspace_id: "workspace-a".to_owned(),
+                path: path.clone(),
+                token: 3,
+            },
+        );
+        assert!(matches!(
+            detail_rx.try_recv(),
+            Ok(AppAction::HarnessCreateNodeWorkspaceDirectory {
+                node_id, workspace_id, path: routed_path, token: 3,
+            }) if node_id == "node-a" && workspace_id == "workspace-a" && routed_path == path
+        ));
+
+        assert!(matches!(harness_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+        assert!(matches!(history_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+        assert_eq!(app.notice, None);
+    }
+
+    #[test]
+    fn harness_only_backend_clears_optimistic_write_state_when_the_detail_lane_is_busy() {
+        let mut app = App::default();
+        let (harness_tx, _harness_rx) = mpsc::channel(1);
+        let (history_tx, _history_rx) = mpsc::channel(1);
+        let (detail_tx, _detail_rx) = mpsc::channel(1);
+        // Fill the detail lane so the routed write/create below observes
+        // `TrySendError::Full` -- the same busy path a live harness detail
+        // worker under load would hit.
+        detail_tx.try_send(AppAction::None).unwrap();
+        let commands = BTreeMap::from([
+            (HARNESS_COMMAND_ROUTE.to_owned(), harness_tx),
+            (HARNESS_HISTORY_COMMAND_ROUTE.to_owned(), history_tx),
+            (HARNESS_DETAIL_COMMAND_ROUTE.to_owned(), detail_tx),
+        ]);
+
         // The optimistic "saving" state `Ctrl+s` already set on the editor
-        // must clear to an honest error, not hang forever — see
-        // `reject_workspace_write_action`.
+        // must clear to an honest error, not hang forever, when the harness
+        // detail lane is busy -- see `reject_harness_queue_action`'s
+        // `HarnessWriteNodeWorkspaceFile` arm.
         let path = RepositoryPath::utf8("src/lib.rs".to_owned()).unwrap();
         let file_key = WorkspaceFileTabKey {
             node_id: "node-a".to_owned(),
@@ -11832,8 +12093,8 @@ mod tests {
                 token: 1,
             },
         );
-        // No generic notice: `reject_workspace_write_action` already routed
-        // the honest failure into the file tab's own error state (rendered
+        // No generic notice: the busy-lane rejection already routed the
+        // honest failure into the file tab's own error state (rendered
         // inline where the user tried to save), the same division of labor
         // `reject_history_refresh_action` uses for history refresh.
         assert_eq!(app.notice, None);
@@ -11868,7 +12129,7 @@ mod tests {
         // save) — both channels carry the same honest, non-generic message.
         assert_eq!(
             app.notice.as_deref(),
-            Some("Harness-owned session action unavailable"),
+            Some("busy: Harness detail/read command queue is full"),
         );
         let dialog = app.create_workspace_entry.as_ref().unwrap();
         assert!(!dialog.pending, "create rejection must clear the pending spinner, not hang");

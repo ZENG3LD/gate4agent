@@ -5,9 +5,10 @@ use crate::{
         ContextPackExportStart, ExportContextPackOutcome, HarnessC2Adapter,
         HarnessC2Error, HarnessC2EventReceiver,
         HarnessObservationResync, PendingNativeHistoryRequest, PendingNodeWorkspaceRead,
-        PendingRunRead,
+        PendingNodeWorkspaceWrite, PendingRunRead,
         PendingRunContextSourceObservation, PendingSessionControl, PreparedRunContextSourceObservation,
-        PreparedNodeWorkspaceRead, PreparedRunRead, PreparedSessionControl, PreparedSessionSpawn,
+        PreparedNodeWorkspaceRead, PreparedNodeWorkspaceWrite,
+        PreparedRunRead, PreparedSessionControl, PreparedSessionSpawn,
         RunContextSourceObservationCompletion,
         RunContextSourceProjection, RunReadCompletion, WorkspaceReadKind,
         ManagedWorktreeSpawnDispatchOutcome, PendingManagedWorktreeSpawnDispatch,
@@ -161,6 +162,11 @@ const RUN_READ_WORKERS_MAX: usize = 8;
 // never be able to starve a live operator's run-scoped
 // `InspectRunWorkspace` by soaking up the shared pool.
 const NODE_WORKSPACE_READ_WORKERS_MAX: usize = 8;
+// Own pool, not shared with `NODE_WORKSPACE_READ_WORKERS_MAX`: an editor
+// save or a file/directory creation must never be able to starve a
+// concurrent sidebar Files/Git read (or vice versa) by soaking up the same
+// pool -- same isolation rationale as that constant's own doc comment.
+const NODE_WORKSPACE_WRITE_WORKERS_MAX: usize = 8;
 // Own pools, not shared with `NODE_WORKSPACE_READ_WORKERS_MAX`: a burst of
 // session-control traffic (keystrokes, resizes) must never be able to starve
 // a concurrent node-workspace read or vice versa.
@@ -299,8 +305,9 @@ enum HostCommand {
         reply: oneshot::Sender<HarnessOperatorReplyV1>,
         /// Signals when `handle_connection`'s own `response_deadline` fires
         /// before a reply arrives. Only ever populated for a node-workspace
-        /// read, session-spawn, or session-control request (see
-        /// `start_node_workspace_read_worker`/`start_session_spawn_worker`/
+        /// read, node-workspace write, session-spawn, or session-control
+        /// request (see `start_node_workspace_read_worker`/
+        /// `start_node_workspace_write_worker`/`start_session_spawn_worker`/
         /// `start_session_control_worker`); every other request kind leaves
         /// this `None` and the worker that eventually handles it ignores it.
         /// `None` on the two constructed-in-tests call sites means "behaves
@@ -371,6 +378,11 @@ enum HostCommand {
         reply: oneshot::Sender<HarnessOperatorReplyV1>,
     },
     NodeWorkspaceReadFinished {
+        result: Result<HarnessOperatorResponseV1, HarnessC2Error>,
+        reply: oneshot::Sender<HarnessOperatorReplyV1>,
+        identity: OperatorRequestLogIdentity,
+    },
+    NodeWorkspaceWriteFinished {
         result: Result<HarnessOperatorResponseV1, HarnessC2Error>,
         reply: oneshot::Sender<HarnessOperatorReplyV1>,
         identity: OperatorRequestLogIdentity,
@@ -901,6 +913,11 @@ struct NodeWorkspaceReadWorkerRegistry {
 }
 
 #[derive(Default)]
+struct NodeWorkspaceWriteWorkerRegistry {
+    in_flight: usize,
+}
+
+#[derive(Default)]
 struct SessionSpawnWorkerRegistry {
     in_flight: usize,
 }
@@ -954,6 +971,18 @@ impl RunReadWorkerRegistry {
 impl NodeWorkspaceReadWorkerRegistry {
     fn try_start(&mut self) -> bool {
         if self.in_flight >= NODE_WORKSPACE_READ_WORKERS_MAX { return false; }
+        self.in_flight += 1;
+        true
+    }
+
+    fn finish(&mut self) {
+        self.in_flight = self.in_flight.saturating_sub(1);
+    }
+}
+
+impl NodeWorkspaceWriteWorkerRegistry {
+    fn try_start(&mut self) -> bool {
+        if self.in_flight >= NODE_WORKSPACE_WRITE_WORKERS_MAX { return false; }
         self.in_flight += 1;
         true
     }
@@ -1931,6 +1960,41 @@ fn start_node_workspace_read_worker(
     });
 }
 
+/// Write/create sibling of `start_node_workspace_read_worker`: same bounded
+/// worker shape, same cooperative-cancel race against the operator
+/// connection's own deadline.
+fn start_node_workspace_write_worker(
+    pending: PendingNodeWorkspaceWrite,
+    commands: mpsc::Sender<HostCommand>,
+    reply: oneshot::Sender<HarnessOperatorReplyV1>,
+    identity: OperatorRequestLogIdentity,
+    cancel: Option<oneshot::Receiver<()>>,
+) {
+    tokio::spawn(async move {
+        let result = match cancel {
+            Some(cancel) => {
+                tokio::select! {
+                    result = pending.finish() => result,
+                    _ = cancel => {
+                        tracing::warn!(
+                            operation = %identity.operation,
+                            node_id = identity.node_id(),
+                            workspace_id = identity.workspace_id(),
+                            path = identity.path(),
+                            "node workspace write worker cancelled: the operator connection's own deadline fired before the node replied",
+                        );
+                        Err(HarnessC2Error::NodeWorkspaceWriteCancelled)
+                    }
+                }
+            }
+            None => pending.finish().await,
+        };
+        let _ = commands
+            .send(HostCommand::NodeWorkspaceWriteFinished { result, reply, identity })
+            .await;
+    });
+}
+
 /// Direct operator `SpawnSession`: unlike `start_node_workspace_read_worker`
 /// (which only awaits an already-enqueued round trip), the whole dispatch --
 /// preflight, build, enqueue, await -- runs inside this task, because
@@ -2231,6 +2295,67 @@ fn map_node_workspace_read_error(error: HarnessC2Error) -> HarnessOperatorHostEr
     }
 }
 
+/// Write/create sibling of `map_node_workspace_read_error`. Unlike that
+/// function (whose `NodeFailureCode` branch is kept in lockstep with
+/// `map_run_read_error`'s, since both read families relay identical
+/// `NodeRequest` verbs), a write's failure surface is a genuine superset of
+/// a read's: `WriteWorkspaceFile`'s CAS can be rejected with
+/// `RepositoryFileRevisionConflict` (the stale-`expected_revision` case --
+/// surfaces as `Conflict`, never collapsed into `Internal`), and
+/// `CreateWorkspaceFile`/`CreateWorkspaceDirectory` can be rejected with the
+/// entry-creation-specific codes below that a read never produces.
+fn map_node_workspace_write_error(error: HarnessC2Error) -> HarnessOperatorHostErrorV1 {
+    match error {
+        HarnessC2Error::InvalidNodeWorkspaceWriteRequest => {
+            HarnessOperatorHostErrorV1::InvalidRequest
+        }
+        HarnessC2Error::NodeWorkspaceWriteEnqueue(gate4agent_c2_client::C2ControlError::QueueFull) => {
+            HarnessOperatorHostErrorV1::Busy
+        }
+        HarnessC2Error::NodeWorkspaceWriteEnqueue(_)
+        | HarnessC2Error::NodeWorkspaceWriteTransport(_)
+        | HarnessC2Error::UnknownNode(_)
+        | HarnessC2Error::NodeOffline(_)
+        | HarnessC2Error::MissingIncarnation(_) => HarnessOperatorHostErrorV1::Unavailable,
+        HarnessC2Error::IncarnationChanged { .. }
+        | HarnessC2Error::NodeWorkspaceWriteRouteMismatch => HarnessOperatorHostErrorV1::Conflict,
+        HarnessC2Error::NodeWorkspaceWriteDeadline
+        | HarnessC2Error::NodeWorkspaceWriteCancelled => HarnessOperatorHostErrorV1::Deadline,
+        HarnessC2Error::NodeWorkspaceWriteTooLarge => HarnessOperatorHostErrorV1::TooLarge,
+        HarnessC2Error::NodeWorkspaceWriteRejected { code } => match code {
+            NodeFailureCode::InvalidRequest
+            | NodeFailureCode::InvalidRepositoryPath => HarnessOperatorHostErrorV1::InvalidRequest,
+            NodeFailureCode::UnknownWorkspace
+            | NodeFailureCode::RepositoryFileNotFound
+            | NodeFailureCode::RepositoryParentNotFound => HarnessOperatorHostErrorV1::NotFound,
+            NodeFailureCode::BindingMismatch
+            | NodeFailureCode::RepositoryFileRevisionConflict
+            | NodeFailureCode::RepositoryFileNotRegular
+            | NodeFailureCode::RepositoryPathUnsafe
+            | NodeFailureCode::RepositoryEntryAlreadyExists
+            | NodeFailureCode::RepositoryParentNotDirectory
+            | NodeFailureCode::StaleGeneration => HarnessOperatorHostErrorV1::Conflict,
+            NodeFailureCode::ControllerBusy
+            | NodeFailureCode::WorkspaceBusy
+            | NodeFailureCode::BackendBusy => HarnessOperatorHostErrorV1::Busy,
+            NodeFailureCode::RepositoryFileWriteTimedOut
+            | NodeFailureCode::RepositoryEntryCreateTimedOut
+            | NodeFailureCode::SpawnDeadlineExceeded => HarnessOperatorHostErrorV1::Deadline,
+            NodeFailureCode::ResponseTooLarge => HarnessOperatorHostErrorV1::TooLarge,
+            NodeFailureCode::UnsupportedCapability
+            | NodeFailureCode::RepositoryFileWriteFailed
+            | NodeFailureCode::RepositoryEntryCreateFailed
+            | NodeFailureCode::BackendDisconnected
+            | NodeFailureCode::BackendOperationFailed
+            | NodeFailureCode::ShuttingDown => HarnessOperatorHostErrorV1::Unavailable,
+            _ => HarnessOperatorHostErrorV1::Internal,
+        },
+        HarnessC2Error::NodeWorkspaceWriteCorrelationMismatch
+        | HarnessC2Error::NodeWorkspaceWriteProjection => HarnessOperatorHostErrorV1::Internal,
+        _ => HarnessOperatorHostErrorV1::Internal,
+    }
+}
+
 /// Maps everything `HarnessC2Adapter::dispatch_session_spawn` can return
 /// before or around the C2 round trip. A `SpawnDispatchOutcome::Rejected`/
 /// `OutcomeUnknown` reply (the round trip actually happened) is handled
@@ -2383,6 +2508,18 @@ fn is_node_workspace_read_request(request: &HarnessOperatorRequestV1) -> bool {
     )
 }
 
+/// Write/create sibling of `is_node_workspace_read_request`: the editor
+/// save and file/directory creation verbs, routed the same way (live
+/// `exact_route`, no run in flight, own bounded worker pool).
+fn is_node_workspace_write_request(request: &HarnessOperatorRequestV1) -> bool {
+    matches!(
+        request,
+        HarnessOperatorRequestV1::WriteNodeWorkspaceFile { .. }
+            | HarnessOperatorRequestV1::CreateNodeWorkspaceFile { .. }
+            | HarnessOperatorRequestV1::CreateNodeWorkspaceDirectory { .. }
+    )
+}
+
 fn is_run_context_source_request(request: &HarnessOperatorRequestV1) -> bool {
     matches!(request, HarnessOperatorRequestV1::ObserveRunContextSource { .. })
 }
@@ -2430,6 +2567,7 @@ struct OperatorRequestLogIdentity {
     session_id: Option<String>,
     provider: Option<String>,
     provider_profile: Option<String>,
+    path: Option<String>,
 }
 
 impl OperatorRequestLogIdentity {
@@ -2439,6 +2577,9 @@ impl OperatorRequestLogIdentity {
             | HarnessOperatorRequestV1::ReadNodeWorkspaceFile { node_id, workspace_id, .. }
             | HarnessOperatorRequestV1::ReadNodeGitHistory { node_id, workspace_id, .. }
             | HarnessOperatorRequestV1::ReadNodeGitDiff { node_id, workspace_id, .. }
+            | HarnessOperatorRequestV1::WriteNodeWorkspaceFile { node_id, workspace_id, .. }
+            | HarnessOperatorRequestV1::CreateNodeWorkspaceFile { node_id, workspace_id, .. }
+            | HarnessOperatorRequestV1::CreateNodeWorkspaceDirectory { node_id, workspace_id, .. }
             | HarnessOperatorRequestV1::SpawnSession { node_id, workspace_id, .. } => {
                 (Some(node_id.clone()), Some(workspace_id.clone()), None)
             }
@@ -2471,13 +2612,29 @@ impl OperatorRequestLogIdentity {
             }
             _ => (None, None),
         };
+        // Only the node-workspace write family carries a path worth logging
+        // here: the read family's rejection/success sites never referenced
+        // one before this, and adding it there is out of scope for this
+        // change -- see `WriteNodeWorkspaceFile`/`CreateNodeWorkspaceFile`/
+        // `CreateNodeWorkspaceDirectory`'s call sites in the host select
+        // loop and `HostCommand::NodeWorkspaceWriteFinished`'s handler.
+        let path = match request {
+            HarnessOperatorRequestV1::WriteNodeWorkspaceFile { path, .. }
+            | HarnessOperatorRequestV1::CreateNodeWorkspaceFile { path, .. }
+            | HarnessOperatorRequestV1::CreateNodeWorkspaceDirectory { path, .. } => {
+                Some(path.as_str().to_owned())
+            }
+            _ => None,
+        };
         let operation = serde_json::to_value(request)
             .ok()
             .and_then(|value| {
                 value.get("kind").and_then(|kind| kind.as_str().map(str::to_owned))
             })
             .unwrap_or_else(|| "unknown".to_owned());
-        Self { operation, node_id, workspace_id, run_id, session_id, provider, provider_profile }
+        Self {
+            operation, node_id, workspace_id, run_id, session_id, provider, provider_profile, path,
+        }
     }
 
     fn node_id(&self) -> &str {
@@ -2503,6 +2660,10 @@ impl OperatorRequestLogIdentity {
     fn provider_profile(&self) -> &str {
         self.provider_profile.as_deref().unwrap_or("")
     }
+
+    fn path(&self) -> &str {
+        self.path.as_deref().unwrap_or("")
+    }
 }
 
 fn operator_response_deadline(request: &HarnessOperatorRequestV1) -> Duration {
@@ -2510,7 +2671,10 @@ fn operator_response_deadline(request: &HarnessOperatorRequestV1) -> Duration {
         HOST_NATIVE_HISTORY_RESPONSE_DEADLINE
     } else if is_run_context_source_request(request) {
         HOST_RUN_CONTEXT_SOURCE_RESPONSE_DEADLINE
-    } else if is_run_read_request(request) || is_node_workspace_read_request(request) {
+    } else if is_run_read_request(request)
+        || is_node_workspace_read_request(request)
+        || is_node_workspace_write_request(request)
+    {
         HOST_RUN_READ_RESPONSE_DEADLINE
     } else if is_session_spawn_request(request) {
         HOST_SESSION_SPAWN_RESPONSE_DEADLINE
@@ -3373,6 +3537,7 @@ pub async fn start_harness_host_with_operator_and_catalogs(
         let mut native_history_workers = NativeHistoryWorkerRegistry::default();
         let mut run_read_workers = RunReadWorkerRegistry::default();
         let mut node_workspace_read_workers = NodeWorkspaceReadWorkerRegistry::default();
+        let mut node_workspace_write_workers = NodeWorkspaceWriteWorkerRegistry::default();
         let mut session_spawn_workers = SessionSpawnWorkerRegistry::default();
         let mut session_control_workers = SessionControlWorkerRegistry::default();
         // Host-local nonce for `mint_session_spawn_ids` -- see its doc
@@ -3645,6 +3810,68 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                         );
                                         let _ = reply.send(HarnessOperatorReplyV1::Error {
                                             error: map_node_workspace_read_error(cause),
+                                        });
+                                    }
+                                }
+                                continue;
+                            }
+                            if is_node_workspace_write_request(&request) {
+                                let identity = OperatorRequestLogIdentity::describe(&request);
+                                let prepared = PreparedNodeWorkspaceWrite::from_operator_request(
+                                    &adapter,
+                                    request,
+                                );
+                                let prepared = match prepared {
+                                    Ok(prepared) => prepared,
+                                    Err(cause) => {
+                                        tracing::warn!(
+                                            operation = %identity.operation,
+                                            node_id = identity.node_id(),
+                                            workspace_id = identity.workspace_id(),
+                                            path = identity.path(),
+                                            cause = %cause,
+                                            "node workspace write request rejected before C2 dispatch",
+                                        );
+                                        let _ = reply.send(HarnessOperatorReplyV1::Error {
+                                            error: map_node_workspace_write_error(cause),
+                                        });
+                                        continue;
+                                    }
+                                };
+                                if !node_workspace_write_workers.try_start() {
+                                    tracing::warn!(
+                                        operation = %identity.operation,
+                                        node_id = identity.node_id(),
+                                        workspace_id = identity.workspace_id(),
+                                        path = identity.path(),
+                                        limit = NODE_WORKSPACE_WRITE_WORKERS_MAX,
+                                        "node workspace write rejected: harness-side worker capacity is busy",
+                                    );
+                                    let _ = reply.send(HarnessOperatorReplyV1::Error {
+                                        error: HarnessOperatorHostErrorV1::Busy,
+                                    });
+                                    continue;
+                                }
+                                match adapter.start_prepared_node_workspace_write(prepared) {
+                                    Ok(pending) => start_node_workspace_write_worker(
+                                        pending,
+                                        commands.clone(),
+                                        reply,
+                                        identity,
+                                        cancel,
+                                    ),
+                                    Err(cause) => {
+                                        node_workspace_write_workers.finish();
+                                        tracing::warn!(
+                                            operation = %identity.operation,
+                                            node_id = identity.node_id(),
+                                            workspace_id = identity.workspace_id(),
+                                            path = identity.path(),
+                                            cause = %cause,
+                                            "node workspace write rejected: could not start the C2 dispatch",
+                                        );
+                                        let _ = reply.send(HarnessOperatorReplyV1::Error {
+                                            error: map_node_workspace_write_error(cause),
                                         });
                                     }
                                 }
@@ -4632,6 +4859,39 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                     );
                                     HarnessOperatorReplyV1::Error {
                                         error: map_node_workspace_read_error(cause),
+                                    }
+                                }
+                            };
+                            let _ = reply.send(reply_value);
+                        }
+                        Some(HostCommand::NodeWorkspaceWriteFinished { result, reply, identity }) => {
+                            node_workspace_write_workers.finish();
+                            let reply_value = match result {
+                                Ok(response) => {
+                                    // Unlike a read, a settled write/create is
+                                    // a state change on the node's disk --
+                                    // logged at INFO, the same way a settled
+                                    // `SessionSpawnFinished::Accepted` is.
+                                    tracing::info!(
+                                        operation = %identity.operation,
+                                        node_id = identity.node_id(),
+                                        workspace_id = identity.workspace_id(),
+                                        path = identity.path(),
+                                        "node workspace write applied by the node",
+                                    );
+                                    HarnessOperatorReplyV1::Ok { response }
+                                }
+                                Err(cause) => {
+                                    tracing::warn!(
+                                        operation = %identity.operation,
+                                        node_id = identity.node_id(),
+                                        workspace_id = identity.workspace_id(),
+                                        path = identity.path(),
+                                        cause = %cause,
+                                        "node workspace write rejected after its C2 round trip",
+                                    );
+                                    HarnessOperatorReplyV1::Error {
+                                        error: map_node_workspace_write_error(cause),
                                     }
                                 }
                             };
@@ -6589,7 +6849,10 @@ fn execute_operator_request(
         | HarnessOperatorRequestV1::InspectNodeWorkspace { .. }
         | HarnessOperatorRequestV1::ReadNodeWorkspaceFile { .. }
         | HarnessOperatorRequestV1::ReadNodeGitHistory { .. }
-        | HarnessOperatorRequestV1::ReadNodeGitDiff { .. } => {
+        | HarnessOperatorRequestV1::ReadNodeGitDiff { .. }
+        | HarnessOperatorRequestV1::WriteNodeWorkspaceFile { .. }
+        | HarnessOperatorRequestV1::CreateNodeWorkspaceFile { .. }
+        | HarnessOperatorRequestV1::CreateNodeWorkspaceDirectory { .. } => {
             return Err(HarnessOperatorHostErrorV1::Internal);
         }
         HarnessOperatorRequestV1::CreateTask { request } => {
@@ -7048,16 +7311,18 @@ async fn handle_connection(
                 subscription = Some((receiver, subscriber_permit));
                 return Ok(());
             }
-            // A node-workspace-read, session-spawn, or session-control
-            // request gets a cancel signal: these are the request families
-            // whose worker can run an unbounded C2 round trip behind it (see
-            // `start_node_workspace_read_worker`/`start_session_spawn_worker`/
+            // A node-workspace-read, node-workspace-write, session-spawn, or
+            // session-control request gets a cancel signal: these are the
+            // request families whose worker can run an unbounded C2 round
+            // trip behind it (see `start_node_workspace_read_worker`/
+            // `start_node_workspace_write_worker`/`start_session_spawn_worker`/
             // `start_session_control_worker`). `cancel_tx` fires explicitly
             // on the deadline branch below, and is also dropped (equivalent
             // to firing) on every other early return past this point,
             // including the outer `HOST_CONNECTION_DEADLINE` cutoff wrapping
             // this whole block.
             let needs_cancel_signal = is_node_workspace_read_request(&request)
+                || is_node_workspace_write_request(&request)
                 || is_session_spawn_request(&request)
                 || is_session_control_request(&request);
             let mut cancel_tx = None;
@@ -11293,6 +11558,76 @@ mod tests {
         );
         assert_eq!(
             map_node_workspace_read_error(HarnessC2Error::NodeWorkspaceReadRejected {
+                code: NodeFailureCode::ResponseTooLarge,
+            }),
+            HarnessOperatorHostErrorV1::TooLarge,
+        );
+    }
+
+    /// Write/create sibling of
+    /// `node_workspace_read_worker_cap_deadline_and_failure_mapping_are_typed`:
+    /// the same worker-cap/deadline/failure-mapping contract, plus the
+    /// write-only `NodeFailureCode`s a read never produces -- most notably
+    /// `RepositoryFileRevisionConflict` (the stale-`expected_revision` CAS
+    /// rejection), which must land on the typed `Conflict` host error, not
+    /// `Internal`.
+    #[test]
+    fn node_workspace_write_worker_cap_deadline_and_failure_mapping_are_typed() {
+        let mut workers = NodeWorkspaceWriteWorkerRegistry::default();
+        for _ in 0..NODE_WORKSPACE_WRITE_WORKERS_MAX { assert!(workers.try_start()); }
+        assert!(!workers.try_start());
+        workers.finish();
+        assert!(workers.try_start());
+
+        let request = HarnessOperatorRequestV1::CreateNodeWorkspaceFile {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            path: gate4agent_harness_api::HarnessRepositoryPathV1::new("notes/created.txt").unwrap(),
+        };
+        assert_eq!(
+            operator_response_deadline(&request),
+            HOST_RUN_READ_RESPONSE_DEADLINE,
+        );
+        assert_eq!(
+            map_node_workspace_write_error(HarnessC2Error::NodeWorkspaceWriteEnqueue(
+                gate4agent_c2_client::C2ControlError::QueueFull,
+            )),
+            HarnessOperatorHostErrorV1::Busy,
+        );
+        assert_eq!(
+            map_node_workspace_write_error(HarnessC2Error::NodeWorkspaceWriteDeadline),
+            HarnessOperatorHostErrorV1::Deadline,
+        );
+        assert_eq!(
+            map_node_workspace_write_error(HarnessC2Error::NodeWorkspaceWriteRouteMismatch),
+            HarnessOperatorHostErrorV1::Conflict,
+        );
+        assert_eq!(
+            map_node_workspace_write_error(HarnessC2Error::NodeOffline(
+                gate4agent_node_protocol::NodeId::new("node-a").unwrap(),
+            )),
+            HarnessOperatorHostErrorV1::Unavailable,
+        );
+        assert_eq!(
+            map_node_workspace_write_error(HarnessC2Error::NodeWorkspaceWriteRejected {
+                code: NodeFailureCode::RepositoryFileRevisionConflict,
+            }),
+            HarnessOperatorHostErrorV1::Conflict,
+        );
+        assert_eq!(
+            map_node_workspace_write_error(HarnessC2Error::NodeWorkspaceWriteRejected {
+                code: NodeFailureCode::RepositoryEntryAlreadyExists,
+            }),
+            HarnessOperatorHostErrorV1::Conflict,
+        );
+        assert_eq!(
+            map_node_workspace_write_error(HarnessC2Error::NodeWorkspaceWriteRejected {
+                code: NodeFailureCode::RepositoryParentNotFound,
+            }),
+            HarnessOperatorHostErrorV1::NotFound,
+        );
+        assert_eq!(
+            map_node_workspace_write_error(HarnessC2Error::NodeWorkspaceWriteRejected {
                 code: NodeFailureCode::ResponseTooLarge,
             }),
             HarnessOperatorHostErrorV1::TooLarge,

@@ -1242,6 +1242,44 @@ impl HarnessNodeWorkspaceFileV1 {
     }
 }
 
+/// Response payload for `CreateNodeWorkspaceDirectory`: the one node-scoped
+/// creation response (`WorkspaceDirectoryCreated`) that carries a
+/// `WorkspaceEntry` instead of a `WorkspaceFileRead` -- `HarnessNodeWorkspace
+/// FileV1` above covers `WriteNodeWorkspaceFile`/`CreateNodeWorkspaceFile`,
+/// both of which echo a file. Reuses `HarnessWorkspaceTreeEntryV1`, already
+/// the entry shape inside `HarnessNodeWorkspaceInspectionV1`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessNodeWorkspaceDirectoryV1 {
+    pub origin: HarnessNodeWorkspaceOriginV1,
+    pub entry: HarnessWorkspaceTreeEntryV1,
+}
+
+impl HarnessNodeWorkspaceDirectoryV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        self.origin.validate()?;
+        self.entry.validate()?;
+        if self.entry.kind != HarnessWorkspaceEntryKindV1::Directory {
+            return Err(HarnessOperatorApiError::InvalidWorkspaceTree);
+        }
+        Ok(())
+    }
+
+    pub fn validate_for(
+        &self,
+        node_id: &str,
+        workspace_id: &str,
+        path: &HarnessRepositoryPathV1,
+    ) -> Result<(), HarnessOperatorApiError> {
+        self.validate()?;
+        self.origin.validate_for(node_id, workspace_id)?;
+        if &self.entry.relative_path != path {
+            return Err(HarnessOperatorApiError::InvalidWorkspaceTree);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HarnessGitSignatureStatusV1 {
@@ -1812,6 +1850,40 @@ pub enum HarnessOperatorRequestV1 {
         mode: HarnessGitDiffModeV1,
         path: Option<HarnessRepositoryPathV1>,
     },
+    // V11 write/create siblings of the four node-workspace read verbs above:
+    // same direct node/workspace-pair routing (`exact_route`, no run
+    // binding involved), just a write instead of a read -- the harness-mode
+    // twin of the light TUI editor's save/create-file/create-directory
+    // affordances. `WriteNodeWorkspaceFile` relays `NodeRequest::
+    // WriteWorkspaceFile`: the node's own CAS write, gated on
+    // `expected_revision` matching the file's current on-disk SHA-256. A
+    // stale value comes back as the node's `RepositoryFileRevisionConflict`
+    // failure code, which this wire surfaces as the typed `Conflict` host
+    // error (see `map_node_workspace_write_error` in
+    // `gate4agent-harness-service`), never collapsed into `Internal`.
+    // `CreateNodeWorkspaceFile`/`CreateNodeWorkspaceDirectory` relay the
+    // node's own two distinct creation verbs (`NodeRequest::
+    // CreateWorkspaceFile`/`CreateWorkspaceDirectory`) -- the node models
+    // file and directory creation as two separate requests, not one verb
+    // with a kind flag, so this wire mirrors that shape exactly rather than
+    // inventing a combined one.
+    WriteNodeWorkspaceFile {
+        node_id: String,
+        workspace_id: String,
+        path: HarnessRepositoryPathV1,
+        content: String,
+        expected_revision: HarnessWorkspaceFileRevisionV1,
+    },
+    CreateNodeWorkspaceFile {
+        node_id: String,
+        workspace_id: String,
+        path: HarnessRepositoryPathV1,
+    },
+    CreateNodeWorkspaceDirectory {
+        node_id: String,
+        workspace_id: String,
+        path: HarnessRepositoryPathV1,
+    },
     LaunchPlansList {
         after_plan_id: Option<HarnessSelectorV1>,
         limit: u16,
@@ -2005,6 +2077,22 @@ impl HarnessOperatorRequestV1 {
                 mode.validate()?;
                 if let Some(path) = path { path.validate()?; }
                 Ok(())
+            }
+            Self::WriteNodeWorkspaceFile {
+                node_id, workspace_id, path, content, expected_revision,
+            } => {
+                validate_node_workspace_route(node_id, workspace_id)?;
+                path.validate()?;
+                expected_revision.validate()?;
+                if content.len() > HARNESS_WORKSPACE_FILE_MAX_BYTES {
+                    return Err(HarnessOperatorApiError::InvalidWorkspaceFile);
+                }
+                Ok(())
+            }
+            Self::CreateNodeWorkspaceFile { node_id, workspace_id, path }
+            | Self::CreateNodeWorkspaceDirectory { node_id, workspace_id, path } => {
+                validate_node_workspace_route(node_id, workspace_id)?;
+                path.validate()
             }
             Self::LaunchPlansList { after_plan_id, limit } => {
                 if let Some(plan_id) = after_plan_id {
@@ -2221,6 +2309,9 @@ impl HarnessOperatorRequestV1 {
                 | Self::PasteSession { .. }
                 | Self::RemoveSession { .. }
                 | Self::ResumeSession { .. }
+                | Self::WriteNodeWorkspaceFile { .. }
+                | Self::CreateNodeWorkspaceFile { .. }
+                | Self::CreateNodeWorkspaceDirectory { .. }
         )
     }
 
@@ -2355,6 +2446,13 @@ pub enum HarnessOperatorResponseV1 {
     NodeWorkspaceFileRead(HarnessNodeWorkspaceFileV1),
     NodeGitHistoryRead(HarnessNodeGitHistoryPageV1),
     NodeGitDiffRead(HarnessNodeGitDiffV1),
+    // V11 write/create siblings of the three node-workspace read responses
+    // above: same payload shapes the node's own `WorkspaceFileWritten`/
+    // `WorkspaceFileCreated`/`WorkspaceDirectoryCreated` replies carry,
+    // projected the same way `NodeWorkspaceFileRead` already is.
+    NodeWorkspaceFileWritten(HarnessNodeWorkspaceFileV1),
+    NodeWorkspaceFileCreated(HarnessNodeWorkspaceFileV1),
+    NodeWorkspaceDirectoryCreated(HarnessNodeWorkspaceDirectoryV1),
     LaunchPlans(HarnessLaunchPlanPageV1),
     TaskExecutionSpec(Option<HarnessTaskExecutionSpecV1>),
     TaskLaunchOptions(HarnessTaskLaunchOptionsV1),
@@ -2399,6 +2497,10 @@ impl HarnessOperatorResponseV1 {
             Self::NodeWorkspaceFileRead(value) => value.validate(),
             Self::NodeGitHistoryRead(value) => value.validate(),
             Self::NodeGitDiffRead(value) => value.validate(),
+            Self::NodeWorkspaceFileWritten(value) | Self::NodeWorkspaceFileCreated(value) => {
+                value.validate()
+            }
+            Self::NodeWorkspaceDirectoryCreated(value) => value.validate(),
             Self::LaunchPlans(value) => value.validate(),
             Self::TaskExecutionSpec(value) => {
                 if let Some(value) = value {
@@ -6934,6 +7036,169 @@ mod tests {
         };
         assert!(mismatched_workspace.validate_for("node-a", "workspace-a").is_err());
         mismatched_workspace.validate_for("node-a", "other-workspace").unwrap();
+    }
+
+    #[test]
+    fn operator_v11_node_workspace_write_verbs_are_exact_round_trips_and_fail_closed_on_v10() {
+        let node_id = node_workspace_origin().node_id;
+        let workspace_id = node_workspace_origin().workspace_id;
+        let path = HarnessRepositoryPathV1::new("src/lib.rs").unwrap();
+        let revision = HarnessWorkspaceFileRevisionV1::new("b".repeat(64)).unwrap();
+        let requests = vec![
+            HarnessOperatorRequestV1::WriteNodeWorkspaceFile {
+                node_id: node_id.clone(),
+                workspace_id: workspace_id.clone(),
+                path: path.clone(),
+                content: "fn main() {}\n".to_owned(),
+                expected_revision: revision.clone(),
+            },
+            HarnessOperatorRequestV1::CreateNodeWorkspaceFile {
+                node_id: node_id.clone(),
+                workspace_id: workspace_id.clone(),
+                path: path.clone(),
+            },
+            HarnessOperatorRequestV1::CreateNodeWorkspaceDirectory {
+                node_id: node_id.clone(),
+                workspace_id: workspace_id.clone(),
+                path: path.clone(),
+            },
+        ];
+        let credential = HarnessOperatorCredential::parse(format!(
+            "g4aho_{}",
+            "a".repeat(64),
+        )).unwrap();
+        for request in requests {
+            request.validate().expect("valid V11 node-workspace write request");
+            assert_eq!(request.minimum_wire_version(), HARNESS_OPERATOR_WIRE_VERSION_V11);
+            let encoded = serde_json::to_string(&request).unwrap();
+            for forbidden in ["run_id", "endpoint", "root", "worktree", "environment"] {
+                assert!(!encoded.contains(forbidden), "request exposed {forbidden}");
+            }
+            let decoded: HarnessOperatorRequestV1 = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, request);
+            assert!(matches!(
+                HarnessOperatorEnvelopeV1 {
+                    version: HARNESS_OPERATOR_WIRE_VERSION_V10,
+                    credential: credential.clone(),
+                    request: request.clone(),
+                }.validate(),
+                Err(HarnessOperatorApiError::UnsupportedVersion),
+            ));
+            HarnessOperatorEnvelopeV1 {
+                version: HARNESS_OPERATOR_WIRE_VERSION_V11,
+                credential: credential.clone(),
+                request,
+            }.validate().unwrap();
+        }
+
+        let origin = node_workspace_origin();
+        let responses = vec![
+            HarnessOperatorResponseV1::NodeWorkspaceFileWritten(HarnessNodeWorkspaceFileV1 {
+                origin: origin.clone(),
+                path: path.clone(),
+                content: HarnessWorkspaceFileContentV1::Utf8 {
+                    text: "fn main() {}\n".to_owned(),
+                    byte_len: 13,
+                },
+                revision: Some(revision.clone()),
+            }),
+            HarnessOperatorResponseV1::NodeWorkspaceFileCreated(HarnessNodeWorkspaceFileV1 {
+                origin: origin.clone(),
+                path: path.clone(),
+                content: HarnessWorkspaceFileContentV1::Utf8 {
+                    text: String::new(),
+                    byte_len: 0,
+                },
+                revision: Some(revision.clone()),
+            }),
+            HarnessOperatorResponseV1::NodeWorkspaceDirectoryCreated(
+                HarnessNodeWorkspaceDirectoryV1 {
+                    origin: origin.clone(),
+                    entry: HarnessWorkspaceTreeEntryV1 {
+                        relative_path: path.clone(),
+                        kind: HarnessWorkspaceEntryKindV1::Directory,
+                    },
+                },
+            ),
+        ];
+        for response in responses {
+            response.validate().expect("valid V11 node-workspace write response");
+            let encoded = serde_json::to_string(&response).unwrap();
+            assert_json_has_no_forbidden_keys(&encoded, &[
+                "run_id",
+                "run_revision",
+                "root",
+                "worktree",
+                "endpoint",
+                "diagnostic",
+                "environment",
+            ]);
+            let decoded: HarnessOperatorResponseV1 = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, response);
+        }
+
+        let wrong_kind_directory = HarnessNodeWorkspaceDirectoryV1 {
+            origin,
+            entry: HarnessWorkspaceTreeEntryV1 {
+                relative_path: path,
+                kind: HarnessWorkspaceEntryKindV1::File,
+            },
+        };
+        assert!(wrong_kind_directory.validate().is_err());
+    }
+
+    #[test]
+    fn node_workspace_write_v11_requests_reject_malformed_fields() {
+        let node_id = node_workspace_origin().node_id;
+        let workspace_id = node_workspace_origin().workspace_id;
+        let path = HarnessRepositoryPathV1::new("src/lib.rs").unwrap();
+        let revision = HarnessWorkspaceFileRevisionV1::new("b".repeat(64)).unwrap();
+
+        let oversized_content = HarnessOperatorRequestV1::WriteNodeWorkspaceFile {
+            node_id: node_id.clone(),
+            workspace_id: workspace_id.clone(),
+            path: path.clone(),
+            content: "x".repeat(HARNESS_WORKSPACE_FILE_MAX_BYTES + 1),
+            expected_revision: revision.clone(),
+        };
+        assert!(matches!(
+            oversized_content.validate(),
+            Err(HarnessOperatorApiError::InvalidWorkspaceFile),
+        ));
+        let bounded_content = HarnessOperatorRequestV1::WriteNodeWorkspaceFile {
+            node_id: node_id.clone(),
+            workspace_id: workspace_id.clone(),
+            path: path.clone(),
+            content: "x".repeat(HARNESS_WORKSPACE_FILE_MAX_BYTES),
+            expected_revision: revision.clone(),
+        };
+        bounded_content.validate().unwrap();
+
+        assert!(HarnessWorkspaceFileRevisionV1::new("not-a-sha256-digest").is_err());
+        assert!(HarnessWorkspaceFileRevisionV1::new("A".repeat(64)).is_err());
+
+        let empty_node_write = HarnessOperatorRequestV1::WriteNodeWorkspaceFile {
+            node_id: String::new(),
+            workspace_id: workspace_id.clone(),
+            path: path.clone(),
+            content: "ok".to_owned(),
+            expected_revision: revision,
+        };
+        assert!(empty_node_write.validate().is_err());
+
+        let empty_workspace_create_file = HarnessOperatorRequestV1::CreateNodeWorkspaceFile {
+            node_id: node_id.clone(),
+            workspace_id: String::new(),
+            path: path.clone(),
+        };
+        assert!(empty_workspace_create_file.validate().is_err());
+
+        let empty_node_create_directory = HarnessOperatorRequestV1::CreateNodeWorkspaceDirectory {
+            node_id: String::new(),
+            workspace_id,
+            path,
+        };
+        assert!(empty_node_create_directory.validate().is_err());
     }
 
     #[test]

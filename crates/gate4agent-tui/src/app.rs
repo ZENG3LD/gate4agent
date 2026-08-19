@@ -2410,7 +2410,7 @@ pub enum AppAction {
     // The client dispatch layer rewrites the matching direct action
     // (`InspectWorkspace`/`ReadWorkspaceFile`/`ReadGitHistory`/`ReadGitDiff`)
     // into these when there is no direct node connection — see
-    // `client.rs::harness_route_workspace_read`.
+    // `client.rs::harness_route_workspace_action`.
     // No token: mirrors direct-mode `InspectWorkspace`, which is also
     // tokenless — `inspection_pending`/`workspace_inspections` correlate by
     // `(node_id, workspace_id)` alone (see `apply_workspace_inspection`).
@@ -2439,6 +2439,33 @@ pub enum AppAction {
         target: WorkspaceGitDiffTarget,
         token: u64,
         destination: WorkspaceGitRequestDestination,
+    },
+    // Write/create siblings of the four node-workspace reads above: the
+    // sidebar's harness-mode editor save and file/directory creation,
+    // routed straight from a node/workspace pair with no run in flight.
+    // `client.rs::harness_route_workspace_action` rewrites `WriteWorkspaceFile`/
+    // `CreateWorkspaceFile`/`CreateWorkspaceDirectory` into these the same
+    // way it rewrites the four reads -- same fields, same types, only the
+    // wire-level action changes.
+    HarnessWriteNodeWorkspaceFile {
+        node_id: String,
+        workspace_id: String,
+        path: RepositoryPath,
+        expected_revision: String,
+        text: String,
+        token: u64,
+    },
+    HarnessCreateNodeWorkspaceFile {
+        node_id: String,
+        workspace_id: String,
+        path: RepositoryPath,
+        token: u64,
+    },
+    HarnessCreateNodeWorkspaceDirectory {
+        node_id: String,
+        workspace_id: String,
+        path: RepositoryPath,
+        token: u64,
     },
 }
 

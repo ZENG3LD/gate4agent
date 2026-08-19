@@ -24,6 +24,7 @@ use gate4agent_harness_api::{
     HarnessRunWorkspaceFileV1, HarnessRunWorkspaceInspectionV1,
     HarnessRunWorkspaceOriginV1, HarnessWorkspaceEntryKindV1,
     HarnessNodeGitDiffV1, HarnessNodeGitHistoryPageV1,
+    HarnessNodeWorkspaceDirectoryV1,
     HarnessNodeWorkspaceFileV1, HarnessNodeWorkspaceInspectionV1, HarnessNodeWorkspaceOriginV1,
     HarnessWorkspaceFileContentV1, HarnessWorkspaceFileRevisionV1,
     HarnessWorkspaceInspectionTruncationV1,
@@ -44,7 +45,7 @@ use gate4agent_node_protocol::{
     ResolvedSpawnReceipt, ResolvedSpawnSpec,
     GitDiff, GitDiffMode, GitDiffRequest, GitHistoryPage, GitObjectId,
     GitSignatureStatus, RepositoryPath, WorkspaceEntryKind, WorkspaceFileContent,
-    WorkspaceFileRead,
+    WorkspaceFileRead, WorkspaceFileRevision,
     SessionAddress, SessionKey, SessionMode,
     SessionRecordId, SpawnFieldProvenance, SpawnDeadlineMs, SpawnIdempotencyKey,
     SpawnOverride, SpawnOverrides, SpawnProfileRevision,
@@ -582,6 +583,25 @@ impl HarnessC2Adapter {
         let pending = self.control.start_request(prepared.route.clone(), wire_request)
             .map_err(HarnessC2Error::NodeWorkspaceReadEnqueue)?;
         Ok(PendingNodeWorkspaceRead {
+            prepared,
+            started_at: Instant::now(),
+            pending: Some(pending),
+        })
+    }
+
+    /// Write/create sibling of `start_prepared_node_workspace_read`: the
+    /// route was already resolved live in `PreparedNodeWorkspaceWrite::
+    /// from_operator_request` (`exact_route`), so this re-check only guards
+    /// the enqueue-time gap between that lookup and this call.
+    pub(crate) fn start_prepared_node_workspace_write(
+        &self,
+        prepared: PreparedNodeWorkspaceWrite,
+    ) -> Result<PendingNodeWorkspaceWrite, HarnessC2Error> {
+        self.ensure_current_incarnation(&prepared.route)?;
+        let wire_request = prepared.wire_request();
+        let pending = self.control.start_request(prepared.route.clone(), wire_request)
+            .map_err(HarnessC2Error::NodeWorkspaceWriteEnqueue)?;
+        Ok(PendingNodeWorkspaceWrite {
             prepared,
             started_at: Instant::now(),
             pending: Some(pending),
@@ -2181,6 +2201,167 @@ impl PendingNodeWorkspaceRead {
     }
 }
 
+/// What to write or create in a workspace, routed directly from a node/
+/// workspace pair -- the write-family sibling of `WorkspaceReadKind`. Kept
+/// as its own enum rather than folded into `WorkspaceReadKind` for two
+/// reasons: (1) that enum is shared between `PreparedRunRead`'s run-bound
+/// reads and `PreparedNodeWorkspaceRead`'s node-bound reads, and a
+/// node-workspace write has no run-bound counterpart to share with -- see
+/// `PreparedNodeWorkspaceWrite`'s own doc comment; (2) an enum named "Read"
+/// gaining write variants would misdescribe itself. Mirrors
+/// `SessionControlKind`'s shape instead: one enum, one `Prepared*`/
+/// `Pending*` pair, one C2 relay -- the node's own `expected_revision` CAS
+/// on `WriteFile` is relayed through untouched, not re-implemented here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum WorkspaceWriteKind {
+    WriteFile {
+        path: RepositoryPath,
+        expected_revision: WorkspaceFileRevision,
+        content: String,
+    },
+    CreateFile { path: RepositoryPath },
+    CreateDirectory { path: RepositoryPath },
+}
+
+fn workspace_write_wire_request(
+    workspace_id: &WorkspaceId,
+    kind: &WorkspaceWriteKind,
+) -> NodeRequest {
+    match kind {
+        WorkspaceWriteKind::WriteFile { path, expected_revision, content } => {
+            NodeRequest::WriteWorkspaceFile {
+                workspace_id: workspace_id.clone(),
+                path: path.clone(),
+                expected_revision: expected_revision.clone(),
+                text: content.clone(),
+            }
+        }
+        WorkspaceWriteKind::CreateFile { path } => NodeRequest::CreateWorkspaceFile {
+            workspace_id: workspace_id.clone(),
+            path: path.clone(),
+        },
+        WorkspaceWriteKind::CreateDirectory { path } => NodeRequest::CreateWorkspaceDirectory {
+            workspace_id: workspace_id.clone(),
+            path: path.clone(),
+        },
+    }
+}
+
+/// Node-scoped write/create sibling of `PreparedNodeWorkspaceRead`: same
+/// live route resolution (`exact_route`, no stored binding to seal it from)
+/// and the same "no run in flight" scope -- see that type's doc comment.
+/// There is no `PreparedRunWrite` counterpart: a run's workspace is only
+/// ever read through the harness (`PreparedRunRead`), never edited straight
+/// from the operator wire, so this stays node-scoped only.
+pub(crate) struct PreparedNodeWorkspaceWrite {
+    route: NodeRoute,
+    workspace_id: WorkspaceId,
+    kind: WorkspaceWriteKind,
+}
+
+impl PreparedNodeWorkspaceWrite {
+    pub(crate) fn from_operator_request(
+        adapter: &HarnessC2Adapter,
+        request: HarnessOperatorRequestV1,
+    ) -> Result<Self, HarnessC2Error> {
+        request.validate().map_err(|_| HarnessC2Error::InvalidNodeWorkspaceWriteRequest)?;
+        let (node_id, workspace_id, kind) = match request {
+            HarnessOperatorRequestV1::WriteNodeWorkspaceFile {
+                node_id, workspace_id, path, content, expected_revision,
+            } => (
+                node_id,
+                workspace_id,
+                WorkspaceWriteKind::WriteFile {
+                    path: node_repository_path_from_api(&path)?,
+                    expected_revision: node_workspace_file_revision_from_api(&expected_revision)?,
+                    content,
+                },
+            ),
+            HarnessOperatorRequestV1::CreateNodeWorkspaceFile { node_id, workspace_id, path } => (
+                node_id,
+                workspace_id,
+                WorkspaceWriteKind::CreateFile { path: node_repository_path_from_api(&path)? },
+            ),
+            HarnessOperatorRequestV1::CreateNodeWorkspaceDirectory {
+                node_id, workspace_id, path,
+            } => (
+                node_id,
+                workspace_id,
+                WorkspaceWriteKind::CreateDirectory { path: node_repository_path_from_api(&path)? },
+            ),
+            _ => return Err(HarnessC2Error::InvalidNodeWorkspaceWriteRequest),
+        };
+        let node_id = NodeId::new(node_id)
+            .map_err(|_| HarnessC2Error::InvalidNodeWorkspaceWriteRequest)?;
+        let workspace_id = WorkspaceId::new(workspace_id)
+            .map_err(|_| HarnessC2Error::InvalidNodeWorkspaceWriteRequest)?;
+        let route = adapter.exact_route(&node_id)?;
+        Ok(Self { route, workspace_id, kind })
+    }
+
+    fn wire_request(&self) -> NodeRequest {
+        workspace_write_wire_request(&self.workspace_id, &self.kind)
+    }
+
+    fn origin(&self) -> HarnessNodeWorkspaceOriginV1 {
+        HarnessNodeWorkspaceOriginV1 {
+            node_id: self.route.node_id.as_str().to_owned(),
+            node_incarnation_id: self.route.expected_incarnation_id.to_string(),
+            workspace_id: self.workspace_id.as_str().to_owned(),
+        }
+    }
+}
+
+pub(crate) struct PendingNodeWorkspaceWrite {
+    prepared: PreparedNodeWorkspaceWrite,
+    started_at: Instant,
+    pending: Option<C2PendingRequest>,
+}
+
+impl PendingNodeWorkspaceWrite {
+    /// Same shape as `PendingNodeWorkspaceRead::finish`: the only consumer is
+    /// the live operator waiter, so this returns the operator reply directly
+    /// rather than a `*Completion` wrapper.
+    pub(crate) async fn finish(mut self) -> Result<HarnessOperatorResponseV1, HarnessC2Error> {
+        let pending = self.pending.take()
+            .expect("pending node workspace write owns exactly one C2 waiter");
+        match pending.finish().await {
+            Err(C2ControlError::Closed)
+                if self.started_at.elapsed() >= RUN_READ_TIMEOUT_FLOOR => {
+                    Err(HarnessC2Error::NodeWorkspaceWriteDeadline)
+                }
+            Err(error) => Err(HarnessC2Error::NodeWorkspaceWriteTransport(error)),
+            Ok(routed) if !node_workspace_write_response_route_matches(
+                &self.prepared,
+                &routed.node_id,
+                routed.incarnation_id,
+            ) => {
+                    Err(HarnessC2Error::NodeWorkspaceWriteRouteMismatch)
+                }
+            Ok(routed) => match routed.response {
+                Err(failure) => Err(HarnessC2Error::NodeWorkspaceWriteRejected { code: failure.code }),
+                Ok(response) => correlate_node_workspace_write_response(&self.prepared, response),
+            },
+        }
+    }
+}
+
+fn node_workspace_write_response_route_matches(
+    prepared: &PreparedNodeWorkspaceWrite,
+    node_id: &NodeId,
+    incarnation_id: gate4agent_node_protocol::NodeIncarnationId,
+) -> bool {
+    node_id == &prepared.route.node_id
+        && incarnation_id == prepared.route.expected_incarnation_id
+}
+
+fn node_workspace_file_revision_from_api(
+    revision: &HarnessWorkspaceFileRevisionV1,
+) -> Result<WorkspaceFileRevision, HarnessC2Error> {
+    WorkspaceFileRevision::new(revision.as_str().to_owned())
+        .map_err(|_| HarnessC2Error::InvalidNodeWorkspaceWriteRequest)
+}
+
 /// Node-scoped sibling of `PreparedNodeWorkspaceRead` for a direct operator
 /// `SpawnSession`: the route is resolved live via `exact_route`, same as a
 /// node-workspace read -- there is no stored binding to seal it from, and no
@@ -2954,6 +3135,88 @@ fn project_node_workspace_file(
         revision: file.revision.map(|revision| {
             HarnessWorkspaceFileRevisionV1::new(revision.as_str())
                 .map_err(|_| HarnessC2Error::NodeWorkspaceReadProjection)
+        }).transpose()?,
+    })
+}
+
+/// Write/create sibling of `correlate_node_workspace_read_response`: matches
+/// the `WorkspaceWriteKind` the prepared write dispatched against the one
+/// `C2NodeResponse` shape the node returns for it, exactly the way the read
+/// family pairs `WorkspaceReadKind` against its four `C2NodeResponse`
+/// shapes.
+fn correlate_node_workspace_write_response(
+    prepared: &PreparedNodeWorkspaceWrite,
+    response: C2NodeResponse,
+) -> Result<HarnessOperatorResponseV1, HarnessC2Error> {
+    let response = match (&prepared.kind, response) {
+        (
+            WorkspaceWriteKind::WriteFile { path, .. },
+            C2NodeResponse::WorkspaceFileWritten { file },
+        ) if file.workspace_id == prepared.workspace_id && &file.path == path => {
+            HarnessOperatorResponseV1::NodeWorkspaceFileWritten(
+                project_node_workspace_write_file(prepared, file)?,
+            )
+        }
+        (
+            WorkspaceWriteKind::CreateFile { path },
+            C2NodeResponse::WorkspaceFileCreated { file },
+        ) if file.workspace_id == prepared.workspace_id && &file.path == path => {
+            HarnessOperatorResponseV1::NodeWorkspaceFileCreated(
+                project_node_workspace_write_file(prepared, file)?,
+            )
+        }
+        (
+            WorkspaceWriteKind::CreateDirectory { path },
+            C2NodeResponse::WorkspaceDirectoryCreated { workspace_id, entry },
+        ) if workspace_id == prepared.workspace_id && &entry.relative_path == path => {
+            HarnessOperatorResponseV1::NodeWorkspaceDirectoryCreated(HarnessNodeWorkspaceDirectoryV1 {
+                origin: prepared.origin(),
+                entry: HarnessWorkspaceTreeEntryV1 {
+                    relative_path: project_repository_path(&entry.relative_path)?,
+                    kind: match entry.kind {
+                        WorkspaceEntryKind::File => HarnessWorkspaceEntryKindV1::File,
+                        WorkspaceEntryKind::Directory => HarnessWorkspaceEntryKindV1::Directory,
+                    },
+                },
+            })
+        }
+        _ => return Err(HarnessC2Error::NodeWorkspaceWriteCorrelationMismatch),
+    };
+    response.validate().map_err(|_| HarnessC2Error::NodeWorkspaceWriteProjection)?;
+    Ok(response)
+}
+
+/// Write-family sibling of `project_node_workspace_file`: same per-field
+/// projection, but raises this family's own `HarnessC2Error` variants on the
+/// two inline checks (oversized text, malformed revision) instead of the
+/// read family's, per the "kept in lockstep by hand, duplicated on purpose"
+/// convention `map_node_workspace_read_error`'s doc comment already
+/// documents for this codebase.
+fn project_node_workspace_write_file(
+    prepared: &PreparedNodeWorkspaceWrite,
+    file: WorkspaceFileRead,
+) -> Result<HarnessNodeWorkspaceFileV1, HarnessC2Error> {
+    let content = match file.content {
+        WorkspaceFileContent::Utf8 { text, byte_len } => {
+            if text.len() > HARNESS_WORKSPACE_FILE_MAX_BYTES {
+                return Err(HarnessC2Error::NodeWorkspaceWriteTooLarge);
+            }
+            HarnessWorkspaceFileContentV1::Utf8 { text, byte_len }
+        }
+        WorkspaceFileContent::NonUtf8 { byte_len } => {
+            HarnessWorkspaceFileContentV1::NonUtf8 { byte_len }
+        }
+        WorkspaceFileContent::TooLarge { limit_bytes } => {
+            HarnessWorkspaceFileContentV1::TooLarge { limit_bytes }
+        }
+    };
+    Ok(HarnessNodeWorkspaceFileV1 {
+        origin: prepared.origin(),
+        path: project_repository_path(&file.path)?,
+        content,
+        revision: file.revision.map(|revision| {
+            HarnessWorkspaceFileRevisionV1::new(revision.as_str())
+                .map_err(|_| HarnessC2Error::NodeWorkspaceWriteProjection)
         }).transpose()?,
     })
 }
@@ -4712,6 +4975,26 @@ pub enum HarnessC2Error {
     NodeWorkspaceReadTooLarge,
     #[error("Node rejected node workspace read with {code:?}")]
     NodeWorkspaceReadRejected { code: NodeFailureCode },
+    #[error("node workspace write request is invalid")]
+    InvalidNodeWorkspaceWriteRequest,
+    #[error("node workspace write was not enqueued: {0}")]
+    NodeWorkspaceWriteEnqueue(C2ControlError),
+    #[error("node workspace write transport failed: {0}")]
+    NodeWorkspaceWriteTransport(C2ControlError),
+    #[error("node workspace write deadline elapsed")]
+    NodeWorkspaceWriteDeadline,
+    #[error("node workspace write was cancelled after the harness operator connection's own deadline fired first")]
+    NodeWorkspaceWriteCancelled,
+    #[error("node workspace write response route or incarnation does not match")]
+    NodeWorkspaceWriteRouteMismatch,
+    #[error("node workspace write response does not exactly correlate with the request")]
+    NodeWorkspaceWriteCorrelationMismatch,
+    #[error("node workspace write response cannot be projected into the bounded harness API")]
+    NodeWorkspaceWriteProjection,
+    #[error("node workspace write response exceeds the bounded harness API")]
+    NodeWorkspaceWriteTooLarge,
+    #[error("Node rejected node workspace write with {code:?}")]
+    NodeWorkspaceWriteRejected { code: NodeFailureCode },
     #[error("session spawn request is invalid")]
     InvalidSessionSpawnRequest,
     #[error("session spawn was cancelled after the harness operator connection's own deadline fired first")]
@@ -6659,6 +6942,155 @@ mod tests {
             NodeIncarnationId::from_bytes([8; 16]),
         ));
         assert!(!node_workspace_read_response_route_matches(
+            &prepared,
+            &NodeId::new("node-b").unwrap(),
+            NodeIncarnationId::from_bytes([7; 16]),
+        ));
+    }
+
+    /// Same adapter-free-constructor rationale as `node_workspace_read_fixture`.
+    fn node_workspace_write_fixture(kind: WorkspaceWriteKind) -> PreparedNodeWorkspaceWrite {
+        PreparedNodeWorkspaceWrite {
+            route: NodeRoute {
+                node_id: NodeId::new("node-a").unwrap(),
+                expected_incarnation_id: NodeIncarnationId::from_bytes([7; 16]),
+            },
+            workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+            kind,
+        }
+    }
+
+    #[test]
+    fn node_workspace_write_relays_the_exact_route_and_kind_to_the_wire() {
+        let path = RepositoryPath::utf8("src/lib.rs".to_owned()).unwrap();
+        let revision = WorkspaceFileRevision::new("b".repeat(64)).unwrap();
+        let write = node_workspace_write_fixture(WorkspaceWriteKind::WriteFile {
+            path: path.clone(),
+            expected_revision: revision.clone(),
+            content: "fn main() {}\n".to_owned(),
+        });
+        assert!(matches!(
+            write.wire_request(),
+            NodeRequest::WriteWorkspaceFile { workspace_id, path: wire_path, expected_revision, text }
+                if workspace_id.as_str() == "workspace-a"
+                    && wire_path == path
+                    && expected_revision == revision
+                    && text == "fn main() {}\n"
+        ));
+        let origin = write.origin();
+        assert_eq!(origin.node_id, "node-a");
+        assert_eq!(origin.node_incarnation_id, "07".repeat(16));
+        assert_eq!(origin.workspace_id, "workspace-a");
+
+        let create_file = node_workspace_write_fixture(WorkspaceWriteKind::CreateFile {
+            path: path.clone(),
+        });
+        assert!(matches!(
+            create_file.wire_request(),
+            NodeRequest::CreateWorkspaceFile { workspace_id, path: wire_path }
+                if workspace_id.as_str() == "workspace-a" && wire_path == path
+        ));
+
+        let create_directory = node_workspace_write_fixture(WorkspaceWriteKind::CreateDirectory {
+            path: path.clone(),
+        });
+        assert!(matches!(
+            create_directory.wire_request(),
+            NodeRequest::CreateWorkspaceDirectory { workspace_id, path: wire_path }
+                if workspace_id.as_str() == "workspace-a" && wire_path == path
+        ));
+    }
+
+    #[test]
+    fn node_workspace_write_projects_matching_response_and_rejects_mismatch() {
+        let path = RepositoryPath::utf8("src/lib.rs".to_owned()).unwrap();
+        let revision = WorkspaceFileRevision::new("b".repeat(64)).unwrap();
+        let prepared = node_workspace_write_fixture(WorkspaceWriteKind::WriteFile {
+            path: path.clone(),
+            expected_revision: revision,
+            content: "fn main() {}\n".to_owned(),
+        });
+        let file = WorkspaceFileRead {
+            workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+            path: path.clone(),
+            content: WorkspaceFileContent::Utf8 {
+                text: "fn main() {}\n".to_owned(),
+                byte_len: 13,
+            },
+            revision: Some(WorkspaceFileRevision::new("c".repeat(64)).unwrap()),
+        };
+        let response = correlate_node_workspace_write_response(
+            &prepared,
+            C2NodeResponse::WorkspaceFileWritten { file: file.clone() },
+        ).unwrap();
+        let HarnessOperatorResponseV1::NodeWorkspaceFileWritten(projected) = &response else {
+            panic!("write projected another response");
+        };
+        assert_eq!(projected.origin.node_id, "node-a");
+        assert_eq!(projected.path.as_str(), "src/lib.rs");
+        response.validate().expect("projected node workspace write is bounded");
+
+        // A write correlated against the node's create-file response shape
+        // is a mismatch, not a fallback -- the two are distinct node verbs.
+        assert!(matches!(
+            correlate_node_workspace_write_response(
+                &prepared,
+                C2NodeResponse::WorkspaceFileCreated { file: file.clone() },
+            ),
+            Err(HarnessC2Error::NodeWorkspaceWriteCorrelationMismatch),
+        ));
+
+        let wrong_path = WorkspaceFileRead {
+            path: RepositoryPath::utf8("other.rs".to_owned()).unwrap(),
+            ..file
+        };
+        assert!(matches!(
+            correlate_node_workspace_write_response(
+                &prepared,
+                C2NodeResponse::WorkspaceFileWritten { file: wrong_path },
+            ),
+            Err(HarnessC2Error::NodeWorkspaceWriteCorrelationMismatch),
+        ));
+
+        let create_directory = node_workspace_write_fixture(WorkspaceWriteKind::CreateDirectory {
+            path: path.clone(),
+        });
+        let entry = gate4agent_node_protocol::WorkspaceEntry {
+            relative_path: path,
+            kind: WorkspaceEntryKind::Directory,
+        };
+        let directory_response = correlate_node_workspace_write_response(
+            &create_directory,
+            C2NodeResponse::WorkspaceDirectoryCreated {
+                workspace_id: WorkspaceId::new("workspace-a").unwrap(),
+                entry,
+            },
+        ).unwrap();
+        let HarnessOperatorResponseV1::NodeWorkspaceDirectoryCreated(projected) = &directory_response
+        else {
+            panic!("directory creation projected another response");
+        };
+        assert_eq!(projected.entry.relative_path.as_str(), "src/lib.rs");
+        directory_response.validate().expect("projected node workspace directory is bounded");
+    }
+
+    #[test]
+    fn node_workspace_write_stale_response_route_is_rejected() {
+        let prepared = node_workspace_write_fixture(WorkspaceWriteKind::CreateFile {
+            path: RepositoryPath::utf8("src/lib.rs".to_owned()).unwrap(),
+        });
+        let node_id = NodeId::new("node-a").unwrap();
+        assert!(node_workspace_write_response_route_matches(
+            &prepared,
+            &node_id,
+            NodeIncarnationId::from_bytes([7; 16]),
+        ));
+        assert!(!node_workspace_write_response_route_matches(
+            &prepared,
+            &node_id,
+            NodeIncarnationId::from_bytes([8; 16]),
+        ));
+        assert!(!node_workspace_write_response_route_matches(
             &prepared,
             &NodeId::new("node-b").unwrap(),
             NodeIncarnationId::from_bytes([7; 16]),

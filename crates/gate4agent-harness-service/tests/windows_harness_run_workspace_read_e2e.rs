@@ -20,6 +20,7 @@ use gate4agent_harness_api::{
     HarnessOperatorRequestRefV1, HarnessOperatorResponseV1, HarnessRepositoryPathV1,
     HarnessRunCorrelationAvailabilityV1, HarnessRunWorkspaceOriginV1,
     HarnessTaskExecutionSpecInputV1, HarnessTaskReviewPolicyV1,
+    HarnessWorkspaceEntryKindV1,
     HarnessWorkspaceFileContentV1, HARNESS_WORKSPACE_FILE_MAX_BYTES,
 };
 use gate4agent_harness_client::{HarnessOperatorClient, HarnessOperatorClientError};
@@ -65,10 +66,13 @@ struct FixturePaths {
 
 impl FixturePaths {
     fn new() -> Self {
+        static FIXTURE_SEQUENCE: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
-            "gate4agent-harness-run-workspace-read-{}-{}",
+            "gate4agent-harness-run-workspace-read-{}-{}-{}",
             std::process::id(),
             unix_time_ms(),
+            FIXTURE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         ));
         let workspace = root.join(WORKSPACE_ROOT_CANARY);
         fs::create_dir_all(&workspace).unwrap();
@@ -670,4 +674,175 @@ async fn tui_like_harness_client_reads_exact_run_workspace_and_rejects_stale_inc
     timeout(Duration::from_secs(5), c2.wait()).await.unwrap().unwrap();
     restarted_shutdown.request_shutdown().await.unwrap();
     timeout(Duration::from_secs(10), restarted_task).await.unwrap().unwrap().unwrap();
+}
+
+/// Node-scoped sibling of the run-scoped read E2E above: no task/run binding
+/// involved, just the operator wire's `WriteNodeWorkspaceFile`/
+/// `CreateNodeWorkspaceFile`/`CreateNodeWorkspaceDirectory` verbs relayed
+/// straight from a node/workspace pair, on the same real node+C2+harness
+/// stack and fixture repository.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tui_like_harness_client_writes_and_creates_node_workspace_entries_and_rejects_stale_revision() {
+    require_headless_supervisor();
+    let fixture = FixturePaths::new();
+    prepare_repository(&fixture);
+    let canonical_workspace = fs::canonicalize(&fixture.workspace).unwrap()
+        .to_string_lossy().into_owned();
+    let node_endpoint = pipe("node");
+    let control_endpoint = pipe("control");
+    let node_id = NodeId::new("harness-node-write-node").unwrap();
+    let workspace_id = WorkspaceId::new("primary").unwrap();
+    let node_token = "harness-node-write-node-token";
+    let c2_token = "harness-node-write-c2-token";
+    let operator_credential = HarnessOperatorCredential::parse(format!(
+        "g4aho_{}",
+        "f".repeat(64),
+    )).unwrap();
+
+    let node = NodeServer::new_clean_exit_fixture(
+        node_config(&fixture, &node_endpoint, node_token, &node_id, &workspace_id),
+        fixture.root.clone(),
+        fixture.started.clone(),
+        fixture.release.clone(),
+    ).unwrap();
+    let node_shutdown = node.shutdown_handle();
+    let node_task = tokio::spawn(node.run());
+
+    let timings = C2Timings {
+        poll_interval: Duration::from_millis(20),
+        fresh_for: Duration::from_secs(2),
+        attempt_deadline: Duration::from_secs(2),
+        transient_backoffs: [Duration::from_millis(20); 5],
+        parked_backoff: Duration::from_millis(100),
+        http_io_deadline: Duration::from_secs(1),
+    };
+    let c2 = C2Running::start(C2Config::new(
+        "127.0.0.1:0".parse().unwrap(),
+        c2_token,
+        vec![C2NodeConfig::new(node_id.clone(), node_endpoint.clone(), node_token).unwrap()],
+    ).unwrap()
+        .with_control_endpoint(control_endpoint.clone()).unwrap()
+        .with_timings(timings)).await.unwrap();
+    let c2_client = C2Client::new(c2.api_addr(), c2_token).unwrap()
+        .with_deadline(Duration::from_secs(1));
+    wait_online(&c2_client, &node_id).await;
+
+    let (adapter, events) = connect_harness_adapter(&control_endpoint, c2_token).await;
+    let catalogs = HarnessRuntimeCatalogs::new(
+        launch_catalog(&node_id, &workspace_id),
+        DeliveryCatalogV2::default(),
+    ).unwrap();
+    let (host, host_task) = start_harness_host_with_operator_and_catalogs(
+        HarnessService::open(&fixture.harness).unwrap(),
+        ObservationService::open(&fixture.observation).unwrap(),
+        adapter,
+        events,
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        Some(operator_credential.clone()),
+        catalogs,
+    ).await.unwrap();
+    let harness_endpoint = host.endpoint().socket_addr();
+    let tui = HarnessOperatorClient::new(harness_endpoint, operator_credential).unwrap();
+
+    // Read the existing tracked file to learn its live revision -- exactly
+    // what the harness-mode editor does before it can offer a save.
+    let before = tui.read_node_workspace_file(
+        node_id.as_str().to_owned(),
+        workspace_id.as_str().to_owned(),
+        path("tracked.txt"),
+    ).unwrap();
+    let HarnessWorkspaceFileContentV1::Utf8 { .. } = before.content else {
+        panic!("fixture tracked.txt must be UTF-8");
+    };
+    let stale_revision = before.revision.expect("tracked file must carry a revision");
+
+    // Write a file through the operator wire.
+    let written = tui.write_node_workspace_file(
+        node_id.as_str().to_owned(),
+        workspace_id.as_str().to_owned(),
+        path("tracked.txt"),
+        "rewritten by the operator wire\n".to_owned(),
+        stale_revision.clone(),
+    ).unwrap();
+    assert_eq!(
+        written.content,
+        HarnessWorkspaceFileContentV1::Utf8 {
+            text: "rewritten by the operator wire\n".to_owned(),
+            byte_len: 31,
+        },
+    );
+    assert_ne!(written.revision, Some(stale_revision.clone()));
+    assert_private_reply(&written, &canonical_workspace);
+
+    // Read it back through the same wire -- content matches.
+    let read_back = tui.read_node_workspace_file(
+        node_id.as_str().to_owned(),
+        workspace_id.as_str().to_owned(),
+        path("tracked.txt"),
+    ).unwrap();
+    assert_eq!(read_back.content, written.content);
+    assert_eq!(read_back.revision, written.revision);
+
+    // The first-captured (now stale) expected_revision -> typed conflict,
+    // not collapsed into Internal.
+    assert!(matches!(
+        tui.write_node_workspace_file(
+            node_id.as_str().to_owned(),
+            workspace_id.as_str().to_owned(),
+            path("tracked.txt"),
+            "should never land\n".to_owned(),
+            stale_revision,
+        ),
+        Err(HarnessOperatorClientError::Host(HarnessOperatorHostErrorV1::Conflict)),
+    ));
+
+    // Create a file and a directory through the operator wire.
+    let created_file = tui.create_node_workspace_file(
+        node_id.as_str().to_owned(),
+        workspace_id.as_str().to_owned(),
+        path("notes/created.txt"),
+    ).unwrap();
+    assert_eq!(
+        created_file.content,
+        HarnessWorkspaceFileContentV1::Utf8 { text: String::new(), byte_len: 0 },
+    );
+    assert!(created_file.revision.is_some());
+    assert_private_reply(&created_file, &canonical_workspace);
+
+    let created_directory = tui.create_node_workspace_directory(
+        node_id.as_str().to_owned(),
+        workspace_id.as_str().to_owned(),
+        path("created-dir"),
+    ).unwrap();
+    assert_eq!(created_directory.entry.kind, HarnessWorkspaceEntryKindV1::Directory);
+    assert_eq!(created_directory.entry.relative_path.as_str(), "created-dir");
+    assert_private_reply(&created_directory, &canonical_workspace);
+
+    // Inspection lists both new entries.
+    let inspection = tui.inspect_node_workspace(
+        node_id.as_str().to_owned(),
+        workspace_id.as_str().to_owned(),
+    ).unwrap();
+    assert!(
+        inspection.entries.iter().any(|entry| {
+            entry.relative_path.as_str() == "notes/created.txt"
+                && entry.kind == HarnessWorkspaceEntryKindV1::File
+        }),
+        "inspection did not list the created file",
+    );
+    assert!(
+        inspection.entries.iter().any(|entry| {
+            entry.relative_path.as_str() == "created-dir"
+                && entry.kind == HarnessWorkspaceEntryKindV1::Directory
+        }),
+        "inspection did not list the created directory",
+    );
+
+    host.shutdown().await.unwrap();
+    timeout(Duration::from_secs(5), host_task).await.unwrap().unwrap().unwrap();
+    let c2_shutdown = c2.shutdown_handle();
+    c2_shutdown.shutdown();
+    timeout(Duration::from_secs(5), c2.wait()).await.unwrap().unwrap();
+    node_shutdown.request_shutdown().await.unwrap();
+    timeout(Duration::from_secs(10), node_task).await.unwrap().unwrap().unwrap();
 }

@@ -1,14 +1,44 @@
 #![cfg(windows)]
 
-//! E2E coverage for the four typed operator session verbs (`SpawnSession`,
-//! `WriteSessionInput`, `ResizeSession`, `StopSession`) added alongside the
-//! existing node-scoped read family. Fixture node + C2 + harness host, the
-//! same three-process shape `windows_harness_run_workspace_read_e2e.rs`/
-//! `windows_harness_mode_hierarchy_e2e.rs` already use, but exercising the
-//! direct-spawn path instead of the Task/Run/launch-plan catalog: no
-//! `HarnessLaunchCatalog` entry is registered, because `SpawnSession` never
-//! consults one (see the doc comment on
+//! E2E coverage for the nine typed operator session verbs (`SpawnSession`,
+//! `WriteSessionInput`, `ResizeSession`, `StopSession`, `ControlSession`,
+//! `WriteSessionBytes`, `PasteSession`, `RemoveSession`, `ResumeSession`)
+//! added alongside the existing node-scoped read family. Fixture node + C2 +
+//! harness host, the same three-process shape `windows_harness_run_
+//! workspace_read_e2e.rs`/`windows_harness_mode_hierarchy_e2e.rs` already
+//! use, but exercising the direct-spawn path instead of the Task/Run/
+//! launch-plan catalog: no `HarnessLaunchCatalog` entry is registered,
+//! because `SpawnSession` never consults one (see the doc comment on
 //! `HarnessOperatorRequestV1::SpawnSession`).
+//!
+//! `RemoveSession`/`ResumeSession` are exercised against the session this
+//! test's own `StopSession { force: true }` step already tears down, not a
+//! freshly present one: a settled `StopSession` (forced or graceful) already
+//! triggers the harness's own best-effort node-side reap (see
+//! `HarnessC2Adapter::remove_stopped_session`'s doc comment), so by the time
+//! that step's own roster-clearance wait below completes, the node no
+//! longer recognizes the address at all. This is deterministic (no race
+//! against that reap: the wait already settled) and reproduces something
+//! `RemoveSession`/`ResumeSession` must both handle correctly on their own
+//! -- an operator call against a session the node has already forgotten --
+//! rather than a race-prone "beat the reap to it" positive-clearance
+//! assertion. It also answers, empirically, whether the node supports
+//! resuming a removed session: it does not (`ResumeSession`, like every
+//! other session-control verb, first re-validates the address the same way
+//! `RemoveSession` just found gone).
+//!
+//! `PasteSession` is exercised as a negative case, not alongside
+//! `ControlSession`/`WriteSessionBytes`'s positive round trip: unlike those
+//! two (relayed with no runtime-policy gate at all -- see the node's
+//! `NodeRequest::TerminalBytes`/`TerminalControl` handlers), the node's own
+//! `NodeRequest::Paste` handler requires `ProviderRuntimeRequirement::
+//! SemanticPrompt`, which this fixture's plain PTY-echo `AgentSpec` (no
+//! declared semantic PTY adapter) never admits -- the same policy gate
+//! `windows_fixture_runtime_policy_e2e.rs` (gate4agent-node) already proves
+//! rejects a semantic `NodeRequest::Prompt`/`Paste`/`ResumeWithPrompt` under
+//! a raw-PTY-only policy. So this fixture's session can only ever prove
+//! `PasteSession` relays the node's rejection faithfully end to end, not
+//! that a paste actually lands -- the real, empirically verified behavior.
 
 use std::{
     fs,
@@ -22,7 +52,7 @@ use gate4agent_c2::{C2Config, C2NodeConfig, C2Running, C2Timings};
 use gate4agent_c2_client::C2Client;
 use gate4agent_harness_api::{
     HarnessOperatorCredential, HarnessOperatorHostErrorV1, HarnessRuntimeSessionAddressV1,
-    HarnessRuntimeSessionV1, HARNESS_TERMINAL_PAGE_LIMIT_MAX,
+    HarnessRuntimeSessionV1, HarnessTerminalControlV1, HARNESS_TERMINAL_PAGE_LIMIT_MAX,
 };
 use gate4agent_harness_client::{HarnessOperatorClient, HarnessOperatorClientError};
 use gate4agent_harness_protocol::HarnessExecutionModeV1;
@@ -208,7 +238,7 @@ async fn wait_for_terminal_text(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn windows_harness_operator_session_verbs_spawn_input_resize_stop_round_trip() {
+async fn windows_harness_operator_session_verbs_spawn_input_resize_control_stop_remove_resume_round_trip() {
     require_headless_supervisor();
     let fixture = FixturePaths::new();
     let node_endpoint = pipe("node");
@@ -308,12 +338,11 @@ async fn windows_harness_operator_session_verbs_spawn_input_resize_stop_round_tr
     // Wait for the fixture's own ready prompt before sending input.
     wait_for_terminal_text(&client, &session, "fixture-ready>").await;
 
-    // WriteSessionInput -> TerminalRead shows the echoed bytes. There is no
-    // `TerminalControl::Enter` among the four typed session verbs (only
-    // `NodeRequest::Input` is relayed), so this checks the PTY's own local
-    // echo of the typed characters rather than the fixture script's
-    // application-level `fixture-echo:` response, which needs a submitted
-    // line.
+    // WriteSessionInput -> TerminalRead shows the echoed bytes: the PTY's
+    // own local echo of the typed characters, not yet the fixture script's
+    // application-level `fixture-echo:` response (that needs a submitted
+    // line -- see `ControlSession`'s `TerminalControl::Enter` below, which
+    // submits it).
     let probe_text = "session-verb-e2e-probe";
     client.write_session_input(session.clone(), probe_text.to_owned()).unwrap();
     wait_for_terminal_text(&client, &session, probe_text).await;
@@ -338,6 +367,28 @@ async fn windows_harness_operator_session_verbs_spawn_input_resize_stop_round_tr
         }
     }).await.expect("resized terminal size never appeared in a terminal frame");
 
+    // WriteSessionBytes appends to the same still-unsubmitted line via a raw
+    // node-level byte write, then ControlSession's `TerminalControl::Enter`
+    // submits it. Asserting on the fixture's application-level `fixture-
+    // echo:` response (rather than the raw terminal rendering of either
+    // fragment) proves both verbs actually reached the PTY's input stream,
+    // in order.
+    client.write_session_bytes(session.clone(), b"-bytes".to_vec()).unwrap();
+    client.control_session(session.clone(), HarnessTerminalControlV1::Enter).unwrap();
+    let expected_line = format!("fixture-echo:{probe_text}-bytes");
+    wait_for_terminal_text(&client, &session, &expected_line).await;
+
+    // PasteSession, negative: see the module doc comment for why this
+    // fixture's plain PTY-echo `AgentSpec` never admits a semantic paste --
+    // `NodeFailureCode::UnsupportedCapability` relays through
+    // `map_session_control_error`'s same catch-all every other session-
+    // control verb's capability rejection already uses.
+    let paste_rejected = client.paste_session(session.clone(), "rejected paste".to_owned());
+    assert!(matches!(
+        paste_rejected,
+        Err(HarnessOperatorClientError::Host(HarnessOperatorHostErrorV1::Unavailable)),
+    ));
+
     // StopSession, then the session leaves the runtime inventory roster.
     client.stop_session(session.clone(), true).unwrap();
     timeout(Duration::from_secs(15), async {
@@ -350,6 +401,31 @@ async fn windows_harness_operator_session_verbs_spawn_input_resize_stop_round_tr
             sleep(Duration::from_millis(20)).await;
         }
     }).await.expect("stopped session never left the runtime inventory roster");
+
+    // RemoveSession/ResumeSession against the now-stopped-and-reaped session
+    // -- see the module doc comment for why this is the deterministic case
+    // to assert rather than a race against the reap that already ran. Both
+    // fail the same way every other session-control verb already fails
+    // against an unrecognized address (`controlled_session`'s `validate_
+    // address` check, `NodeFailureCode::UnknownSession` -> the same
+    // `map_session_control_error` catch-all `HarnessOperatorHostErrorV1::
+    // Internal` an unknown-session `WriteSessionInput`/`ResizeSession`/
+    // `StopSession` would also get -- not a dedicated "not found" host
+    // error; that pre-existing catch-all is unchanged by this session's
+    // addition of `RemoveSession`/`ResumeSession` alongside the other four).
+    let remove_after_reap = client.remove_session(session.clone());
+    assert!(matches!(
+        remove_after_reap,
+        Err(HarnessOperatorClientError::Host(HarnessOperatorHostErrorV1::Internal)),
+    ));
+    let resume_after_reap = client.resume_session(
+        session.clone(),
+        gate4agent_harness_api::HarnessRuntimeTerminalSizeV1 { rows: 24, columns: 80 },
+    );
+    assert!(matches!(
+        resume_after_reap,
+        Err(HarnessOperatorClientError::Host(HarnessOperatorHostErrorV1::Internal)),
+    ));
 
     // Negative: a bogus provider profile is a typed rejection, not a spawn.
     let rejected = client.spawn_session(

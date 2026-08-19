@@ -18,7 +18,8 @@ pub const HARNESS_OPERATOR_DEADLINE: Duration = Duration::from_secs(3);
 pub const HARNESS_RUN_WORKSPACE_READ_DEADLINE: Duration = Duration::from_secs(14);
 pub const HARNESS_NATIVE_HISTORY_DEADLINE: Duration = Duration::from_secs(42);
 pub const HARNESS_CONTEXT_SOURCE_OBSERVATION_DEADLINE: Duration = Duration::from_secs(14);
-// Client-side outer bounds for the four direct session verbs. Both stay
+// Client-side outer bounds for the nine direct session verbs: spawn, plus
+// the eight thin session-control verbs that share one deadline. Both stay
 // above the host's own `HOST_SESSION_SPAWN_RESPONSE_DEADLINE`/
 // `HOST_SESSION_CONTROL_RESPONSE_DEADLINE` (gate4agent-harness-service/
 // runtime.rs) with the same ~2s margin the other extended-deadline
@@ -297,6 +298,78 @@ impl HarnessOperatorClient {
     ) -> Result<(), HarnessOperatorClientError> {
         match self.send(HarnessOperatorRequestV1::StopSession { session, force })? {
             HarnessOperatorResponseV1::SessionStopped => Ok(()),
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Typed special-key send to an already-live session -- relays to the
+    /// same C2 `NodeRequest::TerminalControl` verb the light TUI already
+    /// uses.
+    pub fn control_session(
+        &self,
+        session: HarnessRuntimeSessionAddressV1,
+        control: HarnessTerminalControlV1,
+    ) -> Result<(), HarnessOperatorClientError> {
+        match self.send(HarnessOperatorRequestV1::ControlSession { session, control })? {
+            HarnessOperatorResponseV1::SessionControlled => Ok(()),
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Typed raw-byte send to an already-live session -- relays to the same
+    /// C2 `NodeRequest::TerminalBytes` verb the light TUI already uses.
+    pub fn write_session_bytes(
+        &self,
+        session: HarnessRuntimeSessionAddressV1,
+        bytes: Vec<u8>,
+    ) -> Result<(), HarnessOperatorClientError> {
+        match self.send(HarnessOperatorRequestV1::WriteSessionBytes { session, bytes })? {
+            HarnessOperatorResponseV1::SessionBytesWritten => Ok(()),
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Typed bracketed-paste text send to an already-live session -- relays
+    /// to the same C2 `NodeRequest::Paste` verb the light TUI already uses.
+    /// A distinct wire verb from `write_session_input`: the node frames this
+    /// as a semantic paste, not plain typed text.
+    pub fn paste_session(
+        &self,
+        session: HarnessRuntimeSessionAddressV1,
+        text: String,
+    ) -> Result<(), HarnessOperatorClientError> {
+        match self.send(HarnessOperatorRequestV1::PasteSession { session, text })? {
+            HarnessOperatorResponseV1::SessionPasted => Ok(()),
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Clears an exited/failed session's binding from the node -- relays to
+    /// the same C2 `NodeRequest::Remove` verb the light TUI already uses.
+    pub fn remove_session(
+        &self,
+        session: HarnessRuntimeSessionAddressV1,
+    ) -> Result<(), HarnessOperatorClientError> {
+        match self.send(HarnessOperatorRequestV1::RemoveSession { session })? {
+            HarnessOperatorResponseV1::SessionRemoved => Ok(()),
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Restarts the current provider on an already-registered, not-yet-
+    /// removed session -- relays to the same C2 `NodeRequest::Resume` verb
+    /// the light TUI's `AppAction::Resume` already uses. Unlike
+    /// `spawn_session`, the node acks dispatch only: a successful resume
+    /// keeps the same `instance_id` and only bumps `generation` once the
+    /// resume actually settles, reported through the runtime inventory
+    /// rather than this reply.
+    pub fn resume_session(
+        &self,
+        session: HarnessRuntimeSessionAddressV1,
+        terminal_size: HarnessRuntimeTerminalSizeV1,
+    ) -> Result<(), HarnessOperatorClientError> {
+        match self.send(HarnessOperatorRequestV1::ResumeSession { session, terminal_size })? {
+            HarnessOperatorResponseV1::SessionResumed => Ok(()),
             _ => Err(HarnessOperatorClientError::UnexpectedResponse),
         }
     }
@@ -878,6 +951,11 @@ impl HarnessOperatorClient {
             HarnessOperatorRequestV1::WriteSessionInput { .. }
                 | HarnessOperatorRequestV1::ResizeSession { .. }
                 | HarnessOperatorRequestV1::StopSession { .. }
+                | HarnessOperatorRequestV1::ControlSession { .. }
+                | HarnessOperatorRequestV1::WriteSessionBytes { .. }
+                | HarnessOperatorRequestV1::PasteSession { .. }
+                | HarnessOperatorRequestV1::RemoveSession { .. }
+                | HarnessOperatorRequestV1::ResumeSession { .. }
         ) {
             HARNESS_SESSION_CONTROL_DEADLINE
         } else {

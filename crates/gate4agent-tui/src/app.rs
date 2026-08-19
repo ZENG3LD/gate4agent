@@ -49,7 +49,7 @@ use gate4agent_harness_client::{
     HarnessRepositoryPathV1, HarnessReverseAttributionSubjectV1,
     HarnessReverseAttributionV1, HarnessReverseAttributionWorkspaceV1,
     HarnessReviewedTaskLaunchSelectionV1, HarnessReviewedWorktreeSelectionV1,
-    HarnessRevision,
+    HarnessRevision, HarnessTerminalControlV1,
     HarnessNodeIncarnationV1, HarnessRunCorrelationAvailabilityV1, HarnessRunCorrelationV1,
     HarnessRunId, HarnessRunSessionViewV1,
     HarnessRunTransferSummaryV1, HarnessRuntimeSessionAddressV1,
@@ -2288,11 +2288,12 @@ pub enum AppAction {
         session: HarnessRuntimeSessionAddressV1,
         after_sequence: Option<u64>,
     },
-    // Typed harness-operator siblings of `SpawnSpec`/`Input`/`Resize`/`Stop`,
-    // rewritten in from those direct-mode shapes by
-    // `App::route_harness_session_verb` (see its doc comment) rather than
-    // built directly -- `build_launch_action` and the terminal input/resize/
-    // stop key handlers stay mode-agnostic.
+    // Typed harness-operator siblings of `SpawnSpec`/`Input`/`Resize`/`Stop`/
+    // `TerminalControl`/`TerminalBytes`/`Paste`/`Remove`/`Resume`, rewritten
+    // in from those direct-mode shapes by `App::route_harness_session_verb`
+    // (see its doc comment) rather than built directly -- `build_launch_
+    // action` and the terminal input/resize/stop/paste/control key handlers
+    // stay mode-agnostic.
     HarnessSpawnSession {
         token: u64,
         node_id: String,
@@ -2316,6 +2317,34 @@ pub enum AppAction {
         token: u64,
         session: HarnessRuntimeSessionAddressV1,
         force: bool,
+    },
+    HarnessControlSession {
+        session: HarnessRuntimeSessionAddressV1,
+        control: HarnessTerminalControlV1,
+    },
+    HarnessWriteSessionBytes {
+        session: HarnessRuntimeSessionAddressV1,
+        bytes: Vec<u8>,
+    },
+    HarnessPasteSession {
+        session: HarnessRuntimeSessionAddressV1,
+        text: String,
+    },
+    // `RemoveSession`/`ResumeSession` carry a `token` like `HarnessStopSession`
+    // above (not `HarnessWriteSessionInput`/`HarnessResizeSession`'s fire-and-
+    // forget shape): both can change what the runtime-inventory roster
+    // reports, so both follow up with a `publish_harness_snapshot(require_
+    // inventory_change: true)` refresh on success -- see
+    // `harness_operator_worker` in `client.rs`.
+    HarnessRemoveSession {
+        token: u64,
+        session: HarnessRuntimeSessionAddressV1,
+    },
+    HarnessResumeSession {
+        token: u64,
+        session: HarnessRuntimeSessionAddressV1,
+        rows: u16,
+        cols: u16,
     },
     HarnessLoadTaskCorrelations {
         task: HarnessTaskRef,
@@ -5978,18 +6007,21 @@ impl App {
     /// typed harness-operator siblings when running in harness-only mode
     /// (direct-C2 light-TUI mode leaves `harness_only` false, so this is a
     /// no-op passthrough there). `build_launch_action` and the terminal
-    /// input/resize/stop key handlers stay mode-agnostic and keep building
-    /// the same `SpawnSpec`/`Input`/`Resize`/`Stop` actions either way; only
-    /// this dispatch-time rewrite changes what actually gets sent. Lives
-    /// here (not `client.rs`) because it needs `begin_harness_mutation_
-    /// refresh`: `HarnessSpawnSession`/`HarnessStopSession` follow up with a
-    /// snapshot refresh on success (`publish_harness_snapshot` in
-    /// `client.rs`, the same pattern `harness_schedule_next` already uses),
-    /// which needs the same `harness_kanban.pending_refresh` token gate
-    /// every other harness mutation arms first.
-    /// `HarnessWriteSessionInput`/`HarnessResizeSession` carry no token:
-    /// they are fire-and-forget (no kanban-visible state change on
-    /// success), so arming that gate on every keystroke would be wrong.
+    /// input/resize/stop/paste/control key handlers stay mode-agnostic and
+    /// keep building the same `SpawnSpec`/`Input`/`Resize`/`Stop`/
+    /// `TerminalControl`/`TerminalBytes`/`Paste`/`Remove`/`Resume` actions
+    /// either way; only this dispatch-time rewrite changes what actually
+    /// gets sent. Lives here (not `client.rs`) because it needs
+    /// `begin_harness_mutation_refresh`: `HarnessSpawnSession`/
+    /// `HarnessStopSession`/`HarnessRemoveSession`/`HarnessResumeSession`
+    /// follow up with a snapshot refresh on success (`publish_harness_
+    /// snapshot` in `client.rs`, the same pattern `harness_schedule_next`
+    /// already uses), which needs the same `harness_kanban.pending_refresh`
+    /// token gate every other harness mutation arms first.
+    /// `HarnessWriteSessionInput`/`HarnessResizeSession`/`HarnessControlSession`/
+    /// `HarnessWriteSessionBytes`/`HarnessPasteSession` carry no token: they
+    /// are fire-and-forget (no kanban-visible state change on success), so
+    /// arming that gate on every keystroke would be wrong.
     pub fn route_harness_session_verb(&mut self, harness_only: bool, action: AppAction) -> AppAction {
         if !harness_only {
             return action;
@@ -6020,6 +6052,39 @@ impl App {
                 Some(session) => {
                     let token = self.begin_harness_mutation_refresh();
                     AppAction::HarnessStopSession { token, session, force }
+                }
+                None => AppAction::None,
+            },
+            AppAction::TerminalControl { address, control } => {
+                match self.harness_session_address(&address) {
+                    Some(session) => AppAction::HarnessControlSession {
+                        session,
+                        control: harness_terminal_control(control),
+                    },
+                    None => AppAction::None,
+                }
+            }
+            AppAction::TerminalBytes { address, bytes } => {
+                match self.harness_session_address(&address) {
+                    Some(session) => AppAction::HarnessWriteSessionBytes { session, bytes },
+                    None => AppAction::None,
+                }
+            }
+            AppAction::Paste { address, text } => match self.harness_session_address(&address) {
+                Some(session) => AppAction::HarnessPasteSession { session, text },
+                None => AppAction::None,
+            },
+            AppAction::Remove { address } => match self.harness_session_address(&address) {
+                Some(session) => {
+                    let token = self.begin_harness_mutation_refresh();
+                    AppAction::HarnessRemoveSession { token, session }
+                }
+                None => AppAction::None,
+            },
+            AppAction::Resume { address, rows, cols } => match self.harness_session_address(&address) {
+                Some(session) => {
+                    let token = self.begin_harness_mutation_refresh();
+                    AppAction::HarnessResumeSession { token, session, rows, cols }
                 }
                 None => AppAction::None,
             },
@@ -19015,6 +19080,71 @@ fn control_for_ctrl(ch: char) -> Option<TerminalControl> {
         'y' => Some(TerminalControl::ControlY),
         'z' => Some(TerminalControl::ControlZ),
         _ => None,
+    }
+}
+
+/// Converts the direct-mode key vocabulary to its harness-operator wire
+/// sibling for `route_harness_session_verb`'s `TerminalControl` rewrite --
+/// exact mirror of `gate4agent_harness_service::c2::map_terminal_control`'s
+/// reverse direction. Exhaustive, so a variant added to either
+/// `TerminalControl` or `HarnessTerminalControlV1` without the other fails
+/// to compile here.
+fn harness_terminal_control(control: TerminalControl) -> HarnessTerminalControlV1 {
+    match control {
+        TerminalControl::Interrupt => HarnessTerminalControlV1::Interrupt,
+        TerminalControl::EndOfFile => HarnessTerminalControlV1::EndOfFile,
+        TerminalControl::ControlA => HarnessTerminalControlV1::ControlA,
+        TerminalControl::ControlB => HarnessTerminalControlV1::ControlB,
+        TerminalControl::ControlE => HarnessTerminalControlV1::ControlE,
+        TerminalControl::ControlF => HarnessTerminalControlV1::ControlF,
+        TerminalControl::ControlG => HarnessTerminalControlV1::ControlG,
+        TerminalControl::ControlH => HarnessTerminalControlV1::ControlH,
+        TerminalControl::ControlI => HarnessTerminalControlV1::ControlI,
+        TerminalControl::ControlJ => HarnessTerminalControlV1::ControlJ,
+        TerminalControl::ControlK => HarnessTerminalControlV1::ControlK,
+        TerminalControl::ControlL => HarnessTerminalControlV1::ControlL,
+        TerminalControl::ControlM => HarnessTerminalControlV1::ControlM,
+        TerminalControl::ControlN => HarnessTerminalControlV1::ControlN,
+        TerminalControl::ControlO => HarnessTerminalControlV1::ControlO,
+        TerminalControl::ControlP => HarnessTerminalControlV1::ControlP,
+        TerminalControl::ControlQ => HarnessTerminalControlV1::ControlQ,
+        TerminalControl::ControlR => HarnessTerminalControlV1::ControlR,
+        TerminalControl::ControlS => HarnessTerminalControlV1::ControlS,
+        TerminalControl::ControlT => HarnessTerminalControlV1::ControlT,
+        TerminalControl::ControlU => HarnessTerminalControlV1::ControlU,
+        TerminalControl::ControlV => HarnessTerminalControlV1::ControlV,
+        TerminalControl::ControlW => HarnessTerminalControlV1::ControlW,
+        TerminalControl::ControlX => HarnessTerminalControlV1::ControlX,
+        TerminalControl::ControlY => HarnessTerminalControlV1::ControlY,
+        TerminalControl::ControlZ => HarnessTerminalControlV1::ControlZ,
+        TerminalControl::Enter => HarnessTerminalControlV1::Enter,
+        TerminalControl::LineFeed => HarnessTerminalControlV1::LineFeed,
+        TerminalControl::Escape => HarnessTerminalControlV1::Escape,
+        TerminalControl::Backspace => HarnessTerminalControlV1::Backspace,
+        TerminalControl::Tab => HarnessTerminalControlV1::Tab,
+        TerminalControl::BackTab => HarnessTerminalControlV1::BackTab,
+        TerminalControl::Insert => HarnessTerminalControlV1::Insert,
+        TerminalControl::Delete => HarnessTerminalControlV1::Delete,
+        TerminalControl::Home => HarnessTerminalControlV1::Home,
+        TerminalControl::End => HarnessTerminalControlV1::End,
+        TerminalControl::PageUp => HarnessTerminalControlV1::PageUp,
+        TerminalControl::PageDown => HarnessTerminalControlV1::PageDown,
+        TerminalControl::ArrowUp => HarnessTerminalControlV1::ArrowUp,
+        TerminalControl::ArrowDown => HarnessTerminalControlV1::ArrowDown,
+        TerminalControl::ArrowRight => HarnessTerminalControlV1::ArrowRight,
+        TerminalControl::ArrowLeft => HarnessTerminalControlV1::ArrowLeft,
+        TerminalControl::Function1 => HarnessTerminalControlV1::Function1,
+        TerminalControl::Function2 => HarnessTerminalControlV1::Function2,
+        TerminalControl::Function3 => HarnessTerminalControlV1::Function3,
+        TerminalControl::Function4 => HarnessTerminalControlV1::Function4,
+        TerminalControl::Function5 => HarnessTerminalControlV1::Function5,
+        TerminalControl::Function6 => HarnessTerminalControlV1::Function6,
+        TerminalControl::Function7 => HarnessTerminalControlV1::Function7,
+        TerminalControl::Function8 => HarnessTerminalControlV1::Function8,
+        TerminalControl::Function9 => HarnessTerminalControlV1::Function9,
+        TerminalControl::Function10 => HarnessTerminalControlV1::Function10,
+        TerminalControl::Function11 => HarnessTerminalControlV1::Function11,
+        TerminalControl::Function12 => HarnessTerminalControlV1::Function12,
     }
 }
 

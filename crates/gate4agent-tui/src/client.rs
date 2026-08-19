@@ -2100,7 +2100,12 @@ fn action_node_id(action: &AppAction) -> Option<&str> {
         | AppAction::HarnessSpawnSession { .. }
         | AppAction::HarnessWriteSessionInput { .. }
         | AppAction::HarnessResizeSession { .. }
-        | AppAction::HarnessStopSession { .. } => Some(HARNESS_COMMAND_ROUTE),
+        | AppAction::HarnessStopSession { .. }
+        | AppAction::HarnessControlSession { .. }
+        | AppAction::HarnessWriteSessionBytes { .. }
+        | AppAction::HarnessPasteSession { .. }
+        | AppAction::HarnessRemoveSession { .. }
+        | AppAction::HarnessResumeSession { .. } => Some(HARNESS_COMMAND_ROUTE),
         AppAction::HarnessOpenTerminal { .. }
         | AppAction::HarnessLoadTaskLaunchOptions { .. }
         | AppAction::HarnessLoadRunTransfer { .. }
@@ -2613,6 +2618,64 @@ fn harness_operator_worker(
             }
             AppAction::HarnessStopSession { token, session, force } => {
                 match client.stop_session(session, force) {
+                    Ok(()) => publish_harness_snapshot(
+                        &client,
+                        token,
+                        &updates,
+                        &runtime_inventory,
+                        true,
+                    ),
+                    Err(error) => publish_harness_failure(token, error.to_string(), &updates),
+                }
+            }
+            AppAction::HarnessControlSession { session, control } => {
+                if let Err(error) = client.control_session(session, control) {
+                    let _ = updates.blocking_send(WorkerUpdate::Notice(format!(
+                        "harness session control failed: {error}"
+                    )));
+                }
+            }
+            AppAction::HarnessWriteSessionBytes { session, bytes } => {
+                if let Err(error) = client.write_session_bytes(session, bytes) {
+                    let _ = updates.blocking_send(WorkerUpdate::Notice(format!(
+                        "harness session byte send failed: {error}"
+                    )));
+                }
+            }
+            AppAction::HarnessPasteSession { session, text } => {
+                if let Err(error) = client.paste_session(session, text) {
+                    let _ = updates.blocking_send(WorkerUpdate::Notice(format!(
+                        "harness session paste failed: {error}"
+                    )));
+                }
+            }
+            AppAction::HarnessRemoveSession { token, session } => {
+                match client.remove_session(session) {
+                    // `require_inventory_change: true` mirrors
+                    // `HarnessStopSession` above: the mutation just
+                    // happened, so a retry-until-changed snapshot is worth
+                    // the extra round trips (the runtime inventory should
+                    // no longer include the removed session).
+                    Ok(()) => publish_harness_snapshot(
+                        &client,
+                        token,
+                        &updates,
+                        &runtime_inventory,
+                        true,
+                    ),
+                    Err(error) => publish_harness_failure(token, error.to_string(), &updates),
+                }
+            }
+            AppAction::HarnessResumeSession { token, session, rows, cols } => {
+                match client.resume_session(
+                    session,
+                    HarnessRuntimeTerminalSizeV1 { rows, columns: cols },
+                ) {
+                    // Same reasoning as `HarnessRemoveSession` above: the
+                    // resumed session's status change (and bumped
+                    // generation) is only visible through a fresh runtime-
+                    // inventory read, never through this reply -- see
+                    // `HarnessOperatorClient::resume_session`'s doc comment.
                     Ok(()) => publish_harness_snapshot(
                         &client,
                         token,
@@ -6428,7 +6491,12 @@ fn action_to_request(action: AppAction) -> Option<NodeRequest> {
         | AppAction::HarnessSpawnSession { .. }
         | AppAction::HarnessWriteSessionInput { .. }
         | AppAction::HarnessResizeSession { .. }
-        | AppAction::HarnessStopSession { .. } => None,
+        | AppAction::HarnessStopSession { .. }
+        | AppAction::HarnessControlSession { .. }
+        | AppAction::HarnessWriteSessionBytes { .. }
+        | AppAction::HarnessPasteSession { .. }
+        | AppAction::HarnessRemoveSession { .. }
+        | AppAction::HarnessResumeSession { .. } => None,
     }
 }
 

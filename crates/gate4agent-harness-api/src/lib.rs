@@ -105,6 +105,12 @@ pub const HARNESS_TERMINAL_FRAME_MAX_BYTES: usize = 2 * 1_024 * 1_024;
 // as the wire-level ceiling `WriteSessionInput` is rejected above; the node
 // re-checks the same limit authoritatively on its own side regardless.
 pub const HARNESS_SESSION_INPUT_MAX_BYTES: usize = 32 * 1_024;
+// Matches the node's own `MAX_NODE_TERMINAL_BYTES` (gate4agent-node-protocol)
+// / `gate4agent_types::TERMINAL_BYTES_MAX_BYTES`, mirrored here for the same
+// reason as `HARNESS_SESSION_INPUT_MAX_BYTES` above: this is the wire-level
+// ceiling `WriteSessionBytes` is rejected above, not a substitute for the
+// node's own authoritative re-check.
+pub const HARNESS_SESSION_BYTES_MAX_BYTES: usize = 64;
 
 pub const HARNESS_READ_TOOL_IDS: [&str; 8] = [
     "g4a_context_get",
@@ -1848,6 +1854,45 @@ pub enum HarnessOperatorRequestV1 {
         session: HarnessRuntimeSessionAddressV1,
         force: bool,
     },
+    // V11 siblings of the four V10 session verbs above -- the same direct,
+    // no-CAS C2 relay, just five more `NodeRequest` shapes the light TUI's
+    // terminal already sends. `ControlSession` relays `NodeRequest::
+    // TerminalControl` (special keys: Enter, Ctrl-C, arrows, ...).
+    // `WriteSessionBytes` relays `NodeRequest::TerminalBytes` (a short raw
+    // byte sequence, bounded well below `WriteSessionInput`'s text ceiling --
+    // see `HARNESS_SESSION_BYTES_MAX_BYTES`). `PasteSession` relays
+    // `NodeRequest::Paste`: a distinct node-level verb from `WriteSessionInput`
+    // (the node frames it as a semantic bracketed paste, not plain typed
+    // text), so it gets its own wire verb rather than folding into
+    // `WriteSessionInput`. `RemoveSession` relays `NodeRequest::Remove`,
+    // clearing an exited/failed session's binding from the node -- the same
+    // node-side call a successful `StopSession` already fires as a best-effort
+    // follow-up reap (see `HarnessC2Adapter::remove_stopped_session`'s doc
+    // comment in `gate4agent-harness-service`), now exposed as its own
+    // first-class verb for a session that reached that state on its own.
+    // `ResumeSession` relays `NodeRequest::Resume` and, unlike `SpawnSession`,
+    // acks dispatch only: the node never returns a new address for it (same
+    // `instance_id`, generation bumped only once the resume actually settles,
+    // reported through the runtime inventory rather than this reply).
+    ControlSession {
+        session: HarnessRuntimeSessionAddressV1,
+        control: HarnessTerminalControlV1,
+    },
+    WriteSessionBytes {
+        session: HarnessRuntimeSessionAddressV1,
+        bytes: Vec<u8>,
+    },
+    PasteSession {
+        session: HarnessRuntimeSessionAddressV1,
+        text: String,
+    },
+    RemoveSession {
+        session: HarnessRuntimeSessionAddressV1,
+    },
+    ResumeSession {
+        session: HarnessRuntimeSessionAddressV1,
+        terminal_size: HarnessRuntimeTerminalSizeV1,
+    },
     CatalogNativeSessions {
         route: HarnessNativeSessionRouteV1,
         limit: u16,
@@ -2016,6 +2061,29 @@ impl HarnessOperatorRequestV1 {
                 Ok(())
             }
             Self::StopSession { session, .. } => session.validate(),
+            Self::ControlSession { session, .. } => session.validate(),
+            Self::WriteSessionBytes { session, bytes } => {
+                session.validate()?;
+                if bytes.is_empty() || bytes.len() > HARNESS_SESSION_BYTES_MAX_BYTES {
+                    return Err(HarnessOperatorApiError::InvalidSessionControl);
+                }
+                Ok(())
+            }
+            Self::PasteSession { session, text } => {
+                session.validate()?;
+                if text.len() > HARNESS_SESSION_INPUT_MAX_BYTES {
+                    return Err(HarnessOperatorApiError::InvalidSessionControl);
+                }
+                Ok(())
+            }
+            Self::RemoveSession { session } => session.validate(),
+            Self::ResumeSession { session, terminal_size } => {
+                session.validate()?;
+                if terminal_size.rows == 0 || terminal_size.columns == 0 {
+                    return Err(HarnessOperatorApiError::InvalidSessionControl);
+                }
+                Ok(())
+            }
             Self::CatalogNativeSessions { route, limit } => {
                 route.validate()?;
                 validate_native_session_catalog_limit(*limit)
@@ -2145,7 +2213,15 @@ impl HarnessOperatorRequestV1 {
     }
 
     pub fn requires_v11(&self) -> bool {
-        matches!(self, Self::SubscribeEvents {})
+        matches!(
+            self,
+            Self::SubscribeEvents {}
+                | Self::ControlSession { .. }
+                | Self::WriteSessionBytes { .. }
+                | Self::PasteSession { .. }
+                | Self::RemoveSession { .. }
+                | Self::ResumeSession { .. }
+        )
     }
 
     pub fn minimum_wire_version(&self) -> u16 {
@@ -2288,6 +2364,11 @@ pub enum HarnessOperatorResponseV1 {
     SessionInputWritten,
     SessionResized,
     SessionStopped,
+    SessionControlled,
+    SessionBytesWritten,
+    SessionPasted,
+    SessionRemoved,
+    SessionResumed,
     NativeSessionsCataloged(HarnessNativeSessionsCatalogedV1),
     NativeSessionsPaged(HarnessNativeSessionsPagedV1),
     NativeSessionPreviewed(HarnessNativeSessionPreviewedV1),
@@ -2329,7 +2410,14 @@ impl HarnessOperatorResponseV1 {
             Self::RuntimeInventory(value) => value.validate(),
             Self::TerminalRead(value) => value.validate(),
             Self::SessionSpawned(value) => value.validate(),
-            Self::SessionInputWritten | Self::SessionResized | Self::SessionStopped => Ok(()),
+            Self::SessionInputWritten
+            | Self::SessionResized
+            | Self::SessionStopped
+            | Self::SessionControlled
+            | Self::SessionBytesWritten
+            | Self::SessionPasted
+            | Self::SessionRemoved
+            | Self::SessionResumed => Ok(()),
             Self::NativeSessionsCataloged(value) => value.validate(),
             Self::NativeSessionsPaged(value) => value.validate(),
             Self::NativeSessionPreviewed(value) => value.validate(),
@@ -3009,6 +3097,76 @@ pub enum HarnessRuntimeTransportV1 { Pty, Pipe, Acp }
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HarnessRuntimeSessionStatusV1 { Registered, Starting, Running, Stopping, Exited, Failed }
+
+/// Exact mirror of `gate4agent_types::TerminalControl`: this crate has no
+/// dependency on `gate4agent-types` (see the doc comment on
+/// `HARNESS_SESSION_BYTES_MAX_BYTES`), so `ControlSession`'s special-key
+/// payload is duplicated here as its own closed wire enum rather than
+/// imported. The variant set and names are kept in lockstep by hand --
+/// `gate4agent-harness-service`'s `c2::map_terminal_control` is the single
+/// place that converts one into the other, so a variant added to one side
+/// without the other fails to compile there. No `validate()` method: unlike
+/// a bounded string or byte vector, a closed enum's own deserialization is
+/// already the bound -- an unrecognized variant name is rejected before this
+/// type is ever constructed.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessTerminalControlV1 {
+    Interrupt,
+    EndOfFile,
+    ControlA,
+    ControlB,
+    ControlE,
+    ControlF,
+    ControlG,
+    ControlH,
+    ControlI,
+    ControlJ,
+    ControlK,
+    ControlL,
+    ControlM,
+    ControlN,
+    ControlO,
+    ControlP,
+    ControlQ,
+    ControlR,
+    ControlS,
+    ControlT,
+    ControlU,
+    ControlV,
+    ControlW,
+    ControlX,
+    ControlY,
+    ControlZ,
+    Enter,
+    LineFeed,
+    Escape,
+    Backspace,
+    Tab,
+    BackTab,
+    Insert,
+    Delete,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    ArrowUp,
+    ArrowDown,
+    ArrowRight,
+    ArrowLeft,
+    Function1,
+    Function2,
+    Function3,
+    Function4,
+    Function5,
+    Function6,
+    Function7,
+    Function8,
+    Function9,
+    Function10,
+    Function11,
+    Function12,
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -7054,6 +7212,132 @@ mod tests {
             force: false,
         };
         assert!(bad_stop.validate().is_err());
+    }
+
+    #[test]
+    fn operator_v11_session_control_verbs_are_exact_round_trips_and_fail_closed_on_v10() {
+        let session = session_address(41, 3);
+        let requests = vec![
+            HarnessOperatorRequestV1::ControlSession {
+                session: session.clone(),
+                control: HarnessTerminalControlV1::Enter,
+            },
+            HarnessOperatorRequestV1::WriteSessionBytes {
+                session: session.clone(),
+                bytes: vec![0x1b, b'[', b'A'],
+            },
+            HarnessOperatorRequestV1::PasteSession {
+                session: session.clone(),
+                text: "pasted text\n".to_owned(),
+            },
+            HarnessOperatorRequestV1::RemoveSession {
+                session: session.clone(),
+            },
+            HarnessOperatorRequestV1::ResumeSession {
+                session: session.clone(),
+                terminal_size: HarnessRuntimeTerminalSizeV1 { rows: 24, columns: 80 },
+            },
+        ];
+        let credential = HarnessOperatorCredential::parse(format!(
+            "g4aho_{}",
+            "a".repeat(64),
+        )).unwrap();
+        for request in requests {
+            request.validate().expect("valid V11 session control verb request");
+            assert_eq!(request.minimum_wire_version(), HARNESS_OPERATOR_WIRE_VERSION_V11);
+            let encoded = serde_json::to_string(&request).unwrap();
+            let decoded: HarnessOperatorRequestV1 = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, request);
+            assert!(matches!(
+                HarnessOperatorEnvelopeV1 {
+                    version: HARNESS_OPERATOR_WIRE_VERSION_V10,
+                    credential: credential.clone(),
+                    request: request.clone(),
+                }.validate(),
+                Err(HarnessOperatorApiError::UnsupportedVersion),
+            ));
+            HarnessOperatorEnvelopeV1 {
+                version: HARNESS_OPERATOR_WIRE_VERSION_V11,
+                credential: credential.clone(),
+                request,
+            }.validate().unwrap();
+        }
+
+        let responses = vec![
+            HarnessOperatorResponseV1::SessionControlled,
+            HarnessOperatorResponseV1::SessionBytesWritten,
+            HarnessOperatorResponseV1::SessionPasted,
+            HarnessOperatorResponseV1::SessionRemoved,
+            HarnessOperatorResponseV1::SessionResumed,
+        ];
+        for response in responses {
+            response.validate().expect("valid V11 session control verb response");
+            let encoded = serde_json::to_string(&response).unwrap();
+            let decoded: HarnessOperatorResponseV1 = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, response);
+        }
+    }
+
+    #[test]
+    fn session_control_v11_requests_reject_malformed_fields() {
+        let session = session_address(41, 3);
+
+        let oversized_bytes = HarnessOperatorRequestV1::WriteSessionBytes {
+            session: session.clone(),
+            bytes: vec![0u8; HARNESS_SESSION_BYTES_MAX_BYTES + 1],
+        };
+        assert!(matches!(
+            oversized_bytes.validate(),
+            Err(HarnessOperatorApiError::InvalidSessionControl),
+        ));
+        let empty_bytes = HarnessOperatorRequestV1::WriteSessionBytes {
+            session: session.clone(),
+            bytes: Vec::new(),
+        };
+        assert!(matches!(
+            empty_bytes.validate(),
+            Err(HarnessOperatorApiError::InvalidSessionControl),
+        ));
+        let bounded_bytes = HarnessOperatorRequestV1::WriteSessionBytes {
+            session: session.clone(),
+            bytes: vec![0u8; HARNESS_SESSION_BYTES_MAX_BYTES],
+        };
+        bounded_bytes.validate().unwrap();
+
+        let oversized_paste = HarnessOperatorRequestV1::PasteSession {
+            session: session.clone(),
+            text: "x".repeat(HARNESS_SESSION_INPUT_MAX_BYTES + 1),
+        };
+        assert!(matches!(
+            oversized_paste.validate(),
+            Err(HarnessOperatorApiError::InvalidSessionControl),
+        ));
+        let bounded_paste = HarnessOperatorRequestV1::PasteSession {
+            session: session.clone(),
+            text: "x".repeat(HARNESS_SESSION_INPUT_MAX_BYTES),
+        };
+        bounded_paste.validate().unwrap();
+
+        let zero_resume_size = HarnessOperatorRequestV1::ResumeSession {
+            session: session.clone(),
+            terminal_size: HarnessRuntimeTerminalSizeV1 { rows: 0, columns: 80 },
+        };
+        assert!(matches!(
+            zero_resume_size.validate(),
+            Err(HarnessOperatorApiError::InvalidSessionControl),
+        ));
+
+        let mut malformed_session = session.clone();
+        malformed_session.instance_id = 0;
+        let bad_remove = HarnessOperatorRequestV1::RemoveSession {
+            session: malformed_session.clone(),
+        };
+        assert!(bad_remove.validate().is_err());
+        let bad_control = HarnessOperatorRequestV1::ControlSession {
+            session: malformed_session,
+            control: HarnessTerminalControlV1::Interrupt,
+        };
+        assert!(bad_control.validate().is_err());
     }
 
     fn sample_redacted_task(id_byte: char) -> RedactedTaskV1 {

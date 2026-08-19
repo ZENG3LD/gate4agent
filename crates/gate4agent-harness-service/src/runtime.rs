@@ -11,6 +11,7 @@ use crate::{
         RunContextSourceObservationCompletion,
         RunContextSourceProjection, RunReadCompletion, WorkspaceReadKind,
         ManagedWorktreeSpawnDispatchOutcome, PendingManagedWorktreeSpawnDispatch,
+        SessionRosterEffect,
         SpawnDispatchOutcome, SpawnProfileRevisionProof,
         StagedDeliveryProof,
     },
@@ -384,14 +385,14 @@ enum HostCommand {
         result: Result<(), HarnessC2Error>,
         reply: oneshot::Sender<HarnessOperatorReplyV1>,
         identity: OperatorRequestLogIdentity,
-        /// The route and, for a `Stop`, the exact session address --
-        /// captured from `PendingSessionControl` before it was consumed, so
-        /// a successful stop can record a targeted "this session must be
-        /// gone" expectation on the route's recovery entry. `None` for
-        /// `WriteSessionInput`/`ResizeSession` (see `stop_session_address`'s
-        /// doc comment).
         route: NodeRoute,
-        stopped_session: Option<SessionAddress>,
+        /// `SessionRosterEffect::None` unless the verb settled successfully
+        /// -- captured from `PendingSessionControl::roster_effect` before it
+        /// was consumed (see that method's doc comment), so a successful
+        /// `Stop`/`Remove`/`Resume` can record the roster-invalidation
+        /// (and, for `Stop`/`Remove`, the "this session must be gone")
+        /// expectation on the route's recovery entry.
+        roster_effect: SessionRosterEffect,
     },
     RunGitFactsCaptureFinished {
         run_id: gate4agent_harness_protocol::HarnessRunId,
@@ -1990,6 +1991,7 @@ fn start_session_control_worker(
         // Captured before `pending.finish()` consumes it below.
         let route = pending.route().clone();
         let stopped_session = pending.stop_session_address();
+        let roster_effect = pending.roster_effect();
         let result = match cancel {
             Some(cancel) => {
                 tokio::select! {
@@ -2010,18 +2012,19 @@ fn start_session_control_worker(
         };
         // A settled `StopSession` needs a follow-up node-side reap (see
         // `HarnessC2Adapter::remove_stopped_session`'s doc comment). Taken
-        // before `stopped_session` moves into the `HostCommand` below, but
-        // only acted on after that command is sent -- the operator's own
-        // `StopSession` reply travels through the host loop from that send,
-        // so a slow or failed reap must never delay or fail the verb itself.
+        // before `stopped_session` moves below, but only acted on after the
+        // `HostCommand` is sent -- the operator's own `StopSession` reply
+        // travels through the host loop from that send, so a slow or failed
+        // reap must never delay or fail the verb itself.
         let reap = result.is_ok().then(|| stopped_session.clone()).flatten();
+        let roster_effect = if result.is_ok() { roster_effect } else { SessionRosterEffect::None };
         let _ = commands
             .send(HostCommand::SessionControlFinished {
                 result,
                 reply,
                 identity,
                 route: route.clone(),
-                stopped_session,
+                roster_effect,
             })
             .await;
         if let Some(session) = reap {
@@ -2271,11 +2274,13 @@ fn map_session_spawn_node_failure(code: NodeFailureCode) -> HarnessOperatorHostE
     }
 }
 
-/// `WriteSessionInput`/`ResizeSession`/`StopSession` share one C2 relay
-/// shape (`PreparedSessionControl`/`PendingSessionControl::finish`), so one
-/// mapper covers all three -- unlike spawn, none of these carries a
-/// multi-outcome transport ambiguity worth its own host error (DECISIONS:
-/// "naturally idempotent-enough", no dedup, no `OutcomeUnknown` case here).
+/// `WriteSessionInput`/`ResizeSession`/`StopSession`/`ControlSession`/
+/// `WriteSessionBytes`/`PasteSession`/`RemoveSession`/`ResumeSession` share
+/// one C2 relay shape (`PreparedSessionControl`/`PendingSessionControl::
+/// finish`), so one mapper covers all eight -- unlike spawn, none of these
+/// carries a multi-outcome transport ambiguity worth its own host error
+/// (DECISIONS: "naturally idempotent-enough", no dedup, no `OutcomeUnknown`
+/// case here).
 fn map_session_control_error(error: HarnessC2Error) -> HarnessOperatorHostErrorV1 {
     match error {
         HarnessC2Error::InvalidSessionControlRequest => HarnessOperatorHostErrorV1::InvalidRequest,
@@ -2388,7 +2393,7 @@ fn is_session_spawn_request(request: &HarnessOperatorRequestV1) -> bool {
     matches!(request, HarnessOperatorRequestV1::SpawnSession { .. })
 }
 
-/// The three thin session-control verbs sharing one C2 relay shape --
+/// The eight thin session-control verbs sharing one C2 relay shape --
 /// `PreparedSessionControl`/`PendingSessionControl` in `c2.rs`.
 fn is_session_control_request(request: &HarnessOperatorRequestV1) -> bool {
     matches!(
@@ -2396,6 +2401,11 @@ fn is_session_control_request(request: &HarnessOperatorRequestV1) -> bool {
         HarnessOperatorRequestV1::WriteSessionInput { .. }
             | HarnessOperatorRequestV1::ResizeSession { .. }
             | HarnessOperatorRequestV1::StopSession { .. }
+            | HarnessOperatorRequestV1::ControlSession { .. }
+            | HarnessOperatorRequestV1::WriteSessionBytes { .. }
+            | HarnessOperatorRequestV1::PasteSession { .. }
+            | HarnessOperatorRequestV1::RemoveSession { .. }
+            | HarnessOperatorRequestV1::ResumeSession { .. }
     )
 }
 
@@ -2434,7 +2444,12 @@ impl OperatorRequestLogIdentity {
             }
             HarnessOperatorRequestV1::WriteSessionInput { session, .. }
             | HarnessOperatorRequestV1::ResizeSession { session, .. }
-            | HarnessOperatorRequestV1::StopSession { session, .. } => (
+            | HarnessOperatorRequestV1::StopSession { session, .. }
+            | HarnessOperatorRequestV1::ControlSession { session, .. }
+            | HarnessOperatorRequestV1::WriteSessionBytes { session, .. }
+            | HarnessOperatorRequestV1::PasteSession { session, .. }
+            | HarnessOperatorRequestV1::RemoveSession { session, .. }
+            | HarnessOperatorRequestV1::ResumeSession { session, .. } => (
                 Some(session.node_id.clone()),
                 Some(session.workspace_id.clone()),
                 Some(format!("{}/{}", session.instance_id, session.generation)),
@@ -2526,7 +2541,7 @@ fn session_address_from_receipt(
 }
 
 /// Picks the right unit response for a completed `SessionControlFinished`.
-/// The three verbs share one C2 relay path and `PendingSessionControl`
+/// The eight verbs share one C2 relay path and `PendingSessionControl`
 /// deliberately only returns `Result<(), _>` (see its doc comment), so the
 /// wire `kind` tag in `identity.operation` -- never hand-guessed, read the
 /// same way `OperatorRequestLogIdentity::describe` reads it -- is what picks
@@ -2536,6 +2551,11 @@ fn session_control_response(identity: &OperatorRequestLogIdentity) -> HarnessOpe
         "write-session-input" => HarnessOperatorResponseV1::SessionInputWritten,
         "resize-session" => HarnessOperatorResponseV1::SessionResized,
         "stop-session" => HarnessOperatorResponseV1::SessionStopped,
+        "control-session" => HarnessOperatorResponseV1::SessionControlled,
+        "write-session-bytes" => HarnessOperatorResponseV1::SessionBytesWritten,
+        "paste-session" => HarnessOperatorResponseV1::SessionPasted,
+        "remove-session" => HarnessOperatorResponseV1::SessionRemoved,
+        "resume-session" => HarnessOperatorResponseV1::SessionResumed,
         other => {
             tracing::error!(operation = other, "unexpected session control operation label");
             HarnessOperatorResponseV1::SessionInputWritten
@@ -4686,17 +4706,9 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                             reply,
                             identity,
                             route,
-                            stopped_session,
+                            roster_effect,
                         }) => {
                             session_control_workers.finish();
-                            // `route`/`stopped_session` were captured from
-                            // `PendingSessionControl` before its own C2
-                            // round trip even started (see
-                            // `PendingSessionControl::stop_session_address`),
-                            // so -- unlike `identity`'s log-only strings --
-                            // both are already-resolved, structured values;
-                            // nothing left to re-parse or re-look-up here.
-                            let stopped = result.is_ok().then_some(stopped_session).flatten();
                             let reply_value = match result {
                                 Ok(()) => HarnessOperatorReplyV1::Ok {
                                     response: session_control_response(&identity),
@@ -4715,32 +4727,62 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                     }
                                 }
                             };
-                            if let Some(session) = stopped {
-                                tracing::info!(
-                                    node_id = identity.node_id(),
-                                    session_id = identity.session_id(),
-                                    "stop-session accepted; invalidating the node's runtime inventory route",
-                                );
-                                // Same call set as the reactive live-event
-                                // path (which does NOT mark the route
-                                // unhealthy): the recovery sweep picks the
-                                // ensured route up on the next loop pass.
-                                // The session address is recorded as a
-                                // pending expectation on that same route
-                                // entry so a resync that lands before the
-                                // node's own internal session-list update
-                                // catches up gets retried instead of
-                                // accepted as final -- see
-                                // `RouteObservationRecovery::
-                                // awaiting_absent_sessions`.
-                                invalidate_runtime_inventory_for_route(
-                                    &mut runtime_inventory,
-                                    &mut subscribers,
-                                    &mut observation_recovery,
-                                    &route,
-                                );
-                                observation_recovery.ensure_route(route)
-                                    .awaiting_absent_sessions.push(session);
+                            // `route`/`roster_effect` were captured from
+                            // `PendingSessionControl` before its own C2
+                            // round trip even started (see
+                            // `PendingSessionControl::roster_effect`'s doc
+                            // comment), so -- unlike `identity`'s log-only
+                            // strings -- both are already-resolved,
+                            // structured values; nothing left to re-parse or
+                            // re-look-up here.
+                            match roster_effect {
+                                SessionRosterEffect::None => {}
+                                SessionRosterEffect::Absent(session) => {
+                                    tracing::info!(
+                                        node_id = identity.node_id(),
+                                        session_id = identity.session_id(),
+                                        "stop/remove-session accepted; invalidating the node's runtime inventory route",
+                                    );
+                                    // Same call set as the reactive live-event
+                                    // path (which does NOT mark the route
+                                    // unhealthy): the recovery sweep picks the
+                                    // ensured route up on the next loop pass.
+                                    // The session address is recorded as a
+                                    // pending expectation on that same route
+                                    // entry so a resync that lands before the
+                                    // node's own internal session-list update
+                                    // catches up gets retried instead of
+                                    // accepted as final -- see
+                                    // `RouteObservationRecovery::
+                                    // awaiting_absent_sessions`.
+                                    invalidate_runtime_inventory_for_route(
+                                        &mut runtime_inventory,
+                                        &mut subscribers,
+                                        &mut observation_recovery,
+                                        &route,
+                                    );
+                                    observation_recovery.ensure_route(route)
+                                        .awaiting_absent_sessions.push(session);
+                                }
+                                SessionRosterEffect::Changed => {
+                                    tracing::info!(
+                                        node_id = identity.node_id(),
+                                        session_id = identity.session_id(),
+                                        "resume-session accepted; invalidating the node's runtime inventory route",
+                                    );
+                                    // No `awaiting_absent_sessions` entry:
+                                    // unlike `Absent`, a resumed session is
+                                    // expected to reappear, not disappear --
+                                    // an ordinary targeted resync is enough
+                                    // (see `SessionRosterEffect::Changed`'s
+                                    // doc comment).
+                                    invalidate_runtime_inventory_for_route(
+                                        &mut runtime_inventory,
+                                        &mut subscribers,
+                                        &mut observation_recovery,
+                                        &route,
+                                    );
+                                }
                             }
                             let _ = reply.send(reply_value);
                         }
@@ -6626,7 +6668,7 @@ fn execute_operator_request(
             )
         }
         // Unreachable in production: the host select loop intercepts these
-        // four verbs above this function (see `is_session_spawn_request`/
+        // nine verbs above this function (see `is_session_spawn_request`/
         // `is_session_control_request` in the `HostCommand::Operator` arm) —
         // this function is synchronous with no C2/adapter handle in scope,
         // so it cannot dispatch a spawn or session-control round trip
@@ -6634,7 +6676,12 @@ fn execute_operator_request(
         HarnessOperatorRequestV1::SpawnSession { .. }
         | HarnessOperatorRequestV1::WriteSessionInput { .. }
         | HarnessOperatorRequestV1::ResizeSession { .. }
-        | HarnessOperatorRequestV1::StopSession { .. } => {
+        | HarnessOperatorRequestV1::StopSession { .. }
+        | HarnessOperatorRequestV1::ControlSession { .. }
+        | HarnessOperatorRequestV1::WriteSessionBytes { .. }
+        | HarnessOperatorRequestV1::PasteSession { .. }
+        | HarnessOperatorRequestV1::RemoveSession { .. }
+        | HarnessOperatorRequestV1::ResumeSession { .. } => {
             return Err(HarnessOperatorHostErrorV1::Internal);
         }
         HarnessOperatorRequestV1::SubmitIntent { .. } => {

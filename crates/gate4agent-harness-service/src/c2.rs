@@ -20,6 +20,7 @@ use gate4agent_harness_api::{
     HarnessNativeSessionSelectionV1, HarnessNativeSessionsCatalogedV1,
     HarnessNativeSessionsPagedV1, HarnessOperatorRequestV1, HarnessOperatorResponseV1,
     HarnessRepositoryPathV1, HarnessRunGitDiffV1, HarnessRunGitHistoryPageV1,
+    HarnessTerminalControlV1,
     HarnessRunWorkspaceFileV1, HarnessRunWorkspaceInspectionV1,
     HarnessRunWorkspaceOriginV1, HarnessWorkspaceEntryKindV1,
     HarnessNodeGitDiffV1, HarnessNodeGitHistoryPageV1,
@@ -61,7 +62,7 @@ use gate4agent_harness_protocol::{
     HarnessSelectorV1, HarnessSessionBindingV1, HarnessSessionIdentityV1,
 };
 use gate4agent_node_wire::local_hmac_sha256;
-use gate4agent_types::{AgentId, AgentInstanceId, SessionGeneration, TerminalSize};
+use gate4agent_types::{AgentId, AgentInstanceId, SessionGeneration, TerminalControl, TerminalSize};
 use thiserror::Error;
 use std::{sync::Arc, time::{Duration, Instant}};
 
@@ -2227,16 +2228,86 @@ impl PreparedSessionSpawn {
     pub(crate) fn route(&self) -> &NodeRoute { &self.route }
 }
 
-/// The three thin session-control verbs (`WriteSessionInput`/
-/// `ResizeSession`/`StopSession`) relay straight to the same C2 wire verbs
-/// the light TUI already uses (`NodeRequest::Input`/`Resize`/`Stop`) -- there
-/// is no CAS/replay layer and no multi-outcome transport ambiguity worth
+/// The eight thin session-control verbs (`WriteSessionInput`/`ResizeSession`/
+/// `StopSession`/`ControlSession`/`WriteSessionBytes`/`PasteSession`/
+/// `RemoveSession`/`ResumeSession`) relay straight to the same C2 wire verbs
+/// the light TUI already uses (`NodeRequest::Input`/`Resize`/`Stop`/
+/// `TerminalControl`/`TerminalBytes`/`Paste`/`Remove`/`Resume`) -- there is
+/// no CAS/replay layer and no multi-outcome transport ambiguity worth
 /// surfacing separately the way a spawn's `SpawnDispatchOutcome` is (see
-/// `dispatch_session_spawn`), so one enum covers all three shapes.
+/// `dispatch_session_spawn`), so one enum covers all eight shapes.
 pub(crate) enum SessionControlKind {
     Input { text: String },
     Resize { size: TerminalSize },
     Stop { force: bool },
+    Control { control: TerminalControl },
+    Bytes { bytes: Vec<u8> },
+    Paste { text: String },
+    Remove,
+    Resume { terminal_size: TerminalSize },
+}
+
+/// Exact mirror of `gate4agent_types::TerminalControl` -> the wire type
+/// `HarnessTerminalControlV1` (see its own doc comment for why this crate
+/// duplicates the enum instead of importing it). Exhaustive, so a variant
+/// added to either side without the other fails to compile here.
+fn map_terminal_control(control: HarnessTerminalControlV1) -> TerminalControl {
+    match control {
+        HarnessTerminalControlV1::Interrupt => TerminalControl::Interrupt,
+        HarnessTerminalControlV1::EndOfFile => TerminalControl::EndOfFile,
+        HarnessTerminalControlV1::ControlA => TerminalControl::ControlA,
+        HarnessTerminalControlV1::ControlB => TerminalControl::ControlB,
+        HarnessTerminalControlV1::ControlE => TerminalControl::ControlE,
+        HarnessTerminalControlV1::ControlF => TerminalControl::ControlF,
+        HarnessTerminalControlV1::ControlG => TerminalControl::ControlG,
+        HarnessTerminalControlV1::ControlH => TerminalControl::ControlH,
+        HarnessTerminalControlV1::ControlI => TerminalControl::ControlI,
+        HarnessTerminalControlV1::ControlJ => TerminalControl::ControlJ,
+        HarnessTerminalControlV1::ControlK => TerminalControl::ControlK,
+        HarnessTerminalControlV1::ControlL => TerminalControl::ControlL,
+        HarnessTerminalControlV1::ControlM => TerminalControl::ControlM,
+        HarnessTerminalControlV1::ControlN => TerminalControl::ControlN,
+        HarnessTerminalControlV1::ControlO => TerminalControl::ControlO,
+        HarnessTerminalControlV1::ControlP => TerminalControl::ControlP,
+        HarnessTerminalControlV1::ControlQ => TerminalControl::ControlQ,
+        HarnessTerminalControlV1::ControlR => TerminalControl::ControlR,
+        HarnessTerminalControlV1::ControlS => TerminalControl::ControlS,
+        HarnessTerminalControlV1::ControlT => TerminalControl::ControlT,
+        HarnessTerminalControlV1::ControlU => TerminalControl::ControlU,
+        HarnessTerminalControlV1::ControlV => TerminalControl::ControlV,
+        HarnessTerminalControlV1::ControlW => TerminalControl::ControlW,
+        HarnessTerminalControlV1::ControlX => TerminalControl::ControlX,
+        HarnessTerminalControlV1::ControlY => TerminalControl::ControlY,
+        HarnessTerminalControlV1::ControlZ => TerminalControl::ControlZ,
+        HarnessTerminalControlV1::Enter => TerminalControl::Enter,
+        HarnessTerminalControlV1::LineFeed => TerminalControl::LineFeed,
+        HarnessTerminalControlV1::Escape => TerminalControl::Escape,
+        HarnessTerminalControlV1::Backspace => TerminalControl::Backspace,
+        HarnessTerminalControlV1::Tab => TerminalControl::Tab,
+        HarnessTerminalControlV1::BackTab => TerminalControl::BackTab,
+        HarnessTerminalControlV1::Insert => TerminalControl::Insert,
+        HarnessTerminalControlV1::Delete => TerminalControl::Delete,
+        HarnessTerminalControlV1::Home => TerminalControl::Home,
+        HarnessTerminalControlV1::End => TerminalControl::End,
+        HarnessTerminalControlV1::PageUp => TerminalControl::PageUp,
+        HarnessTerminalControlV1::PageDown => TerminalControl::PageDown,
+        HarnessTerminalControlV1::ArrowUp => TerminalControl::ArrowUp,
+        HarnessTerminalControlV1::ArrowDown => TerminalControl::ArrowDown,
+        HarnessTerminalControlV1::ArrowRight => TerminalControl::ArrowRight,
+        HarnessTerminalControlV1::ArrowLeft => TerminalControl::ArrowLeft,
+        HarnessTerminalControlV1::Function1 => TerminalControl::Function1,
+        HarnessTerminalControlV1::Function2 => TerminalControl::Function2,
+        HarnessTerminalControlV1::Function3 => TerminalControl::Function3,
+        HarnessTerminalControlV1::Function4 => TerminalControl::Function4,
+        HarnessTerminalControlV1::Function5 => TerminalControl::Function5,
+        HarnessTerminalControlV1::Function6 => TerminalControl::Function6,
+        HarnessTerminalControlV1::Function7 => TerminalControl::Function7,
+        HarnessTerminalControlV1::Function8 => TerminalControl::Function8,
+        HarnessTerminalControlV1::Function9 => TerminalControl::Function9,
+        HarnessTerminalControlV1::Function10 => TerminalControl::Function10,
+        HarnessTerminalControlV1::Function11 => TerminalControl::Function11,
+        HarnessTerminalControlV1::Function12 => TerminalControl::Function12,
+    }
 }
 
 pub(crate) struct PreparedSessionControl {
@@ -2264,6 +2335,25 @@ impl PreparedSessionControl {
             HarnessOperatorRequestV1::StopSession { session, force } => {
                 (session, SessionControlKind::Stop { force })
             }
+            HarnessOperatorRequestV1::ControlSession { session, control } => (
+                session,
+                SessionControlKind::Control { control: map_terminal_control(control) },
+            ),
+            HarnessOperatorRequestV1::WriteSessionBytes { session, bytes } => {
+                (session, SessionControlKind::Bytes { bytes })
+            }
+            HarnessOperatorRequestV1::PasteSession { session, text } => {
+                (session, SessionControlKind::Paste { text })
+            }
+            HarnessOperatorRequestV1::RemoveSession { session } => {
+                (session, SessionControlKind::Remove)
+            }
+            HarnessOperatorRequestV1::ResumeSession { session, terminal_size } => (
+                session,
+                SessionControlKind::Resume {
+                    terminal_size: TerminalSize { rows: terminal_size.rows, columns: terminal_size.columns },
+                },
+            ),
             _ => return Err(HarnessC2Error::InvalidSessionControlRequest),
         };
         let node_id = NodeId::new(session_address.node_id.as_str())
@@ -2300,8 +2390,57 @@ impl PreparedSessionControl {
                 session: self.session.clone(),
                 force: *force,
             },
+            SessionControlKind::Control { control } => NodeRequest::TerminalControl {
+                session: self.session.clone(),
+                control: *control,
+            },
+            SessionControlKind::Bytes { bytes } => NodeRequest::TerminalBytes {
+                session: self.session.clone(),
+                bytes: bytes.clone(),
+            },
+            SessionControlKind::Paste { text } => NodeRequest::Paste {
+                session: self.session.clone(),
+                text: text.clone(),
+            },
+            SessionControlKind::Remove => NodeRequest::Remove {
+                session: self.session.clone(),
+            },
+            // `initial_prompt: None` always: unlike `ResumeSessionRecord`'s
+            // managed-record path, `AppAction::Resume` (the light TUI action
+            // `ResumeSession` relays) never carries one -- see the doc
+            // comment on `HarnessOperatorRequestV1::ResumeSession`.
+            SessionControlKind::Resume { terminal_size } => NodeRequest::Resume {
+                session: self.session.clone(),
+                terminal_size: *terminal_size,
+                initial_prompt: None,
+            },
         }
     }
+}
+
+/// What runtime-inventory roster effect a settled `PendingSessionControl`'s
+/// success implies -- read once, via `PendingSessionControl::roster_effect`,
+/// before `finish` consumes `self` (same timing as `stop_session_address`,
+/// for the same reason), and threaded through `HostCommand::
+/// SessionControlFinished` (runtime.rs) to the host select loop, the only
+/// place with `runtime_inventory`/`subscribers`/`observation_recovery` in
+/// scope to act on it.
+#[derive(Clone, Debug)]
+pub(crate) enum SessionRosterEffect {
+    /// `Input`/`Resize`/`Control`/`Bytes`/`Paste`: none of these can make a
+    /// session appear or disappear from the roster.
+    None,
+    /// `Stop`/`Remove`: the session must disappear from the roster. Also the
+    /// one effect needing `RouteObservationRecovery::awaiting_absent_
+    /// sessions` (see its doc comment): a resync landing before the node's
+    /// own internal session-list update catches up must not be accepted as
+    /// final.
+    Absent(SessionAddress),
+    /// `Resume`: the session is expected to reappear (or otherwise change
+    /// status, e.g. its generation bumping once the resume actually
+    /// settles). Unlike `Absent`, there is no "must be gone" condition to
+    /// await -- an ordinary targeted resync is enough.
+    Changed,
 }
 
 pub(crate) struct PendingSessionControl {
@@ -2320,10 +2459,32 @@ impl PendingSessionControl {
     /// Read before `finish` consumes `self`, so a caller can capture a
     /// "this session must be gone" expectation on the route's recovery
     /// entry before the C2 round trip even starts (see `RouteObservation
-    /// Recovery::awaiting_absent_sessions`).
+    /// Recovery::awaiting_absent_sessions`). Kept narrowly `Stop`-only
+    /// (unlike the broader `roster_effect` below) because it drives the
+    /// *extra* node-side reap round trip (`HarnessC2Adapter::remove_
+    /// stopped_session`) that only a force-killed `Stop` needs: an explicit
+    /// `Remove` already IS that same call, so re-issuing it would be a
+    /// redundant round trip against a binding that is already gone.
     pub(crate) fn stop_session_address(&self) -> Option<SessionAddress> {
         matches!(self.prepared.kind, SessionControlKind::Stop { .. })
             .then(|| self.prepared.session.clone())
+    }
+
+    /// See `SessionRosterEffect`'s doc comment. A strict superset of
+    /// `stop_session_address`'s `Some` cases (`Stop` is `Absent` here too),
+    /// plus `Remove` (also `Absent`) and `Resume` (`Changed`).
+    pub(crate) fn roster_effect(&self) -> SessionRosterEffect {
+        match &self.prepared.kind {
+            SessionControlKind::Stop { .. } | SessionControlKind::Remove => {
+                SessionRosterEffect::Absent(self.prepared.session.clone())
+            }
+            SessionControlKind::Resume { .. } => SessionRosterEffect::Changed,
+            SessionControlKind::Input { .. }
+            | SessionControlKind::Resize { .. }
+            | SessionControlKind::Control { .. }
+            | SessionControlKind::Bytes { .. }
+            | SessionControlKind::Paste { .. } => SessionRosterEffect::None,
+        }
     }
 
     pub(crate) async fn finish(mut self) -> Result<(), HarnessC2Error> {

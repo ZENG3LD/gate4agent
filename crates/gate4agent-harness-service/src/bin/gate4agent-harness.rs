@@ -19,6 +19,10 @@ use std::{
 const C2_TOKEN_ENV: &str = "GATE4AGENT_C2_TOKEN";
 const OPERATOR_TOKEN_ENV: &str = "GATE4AGENT_HARNESS_OPERATOR_TOKEN";
 const USAGE: &str = "usage: gate4agent-harness --harness-db ABSOLUTE_PATH --observation-db ABSOLUTE_PATH --c2-endpoint LOCAL_ENDPOINT --read-bind 127.0.0.1:PORT [--launch-plan-json JSON]... [--delivery-bundle-json JSON]...\n\
+     --launch-plan-json is an explicit override, not a requirement: the harness always derives\n\
+     a default ordinary launch plan per node/workspace/enabled-provider/spawn-profile combination\n\
+     from the live runtime inventory, so task launch stays available with zero --launch-plan-json\n\
+     arguments; a --launch-plan-json plan id that collides with a derived one takes precedence.\n\
      operator credential env: GATE4AGENT_HARNESS_OPERATOR_TOKEN\n\
      c2 control token env: GATE4AGENT_C2_TOKEN";
 

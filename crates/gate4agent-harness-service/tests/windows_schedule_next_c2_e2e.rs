@@ -11,14 +11,20 @@ use std::{
 
 use gate4agent_c2::{C2Config, C2NodeConfig, C2Running, C2Timings};
 use gate4agent_c2_client::C2Client;
-use gate4agent_harness_api::HarnessOperatorCredential;
+use gate4agent_harness_api::{
+    HarnessOperatorCredential, HarnessOperatorMutationOutcomeV1,
+    HarnessReplaceTaskExecutionSpecRequestV2, HarnessReviewedTaskLaunchSelectionV1,
+    HarnessReviewedWorktreeSelectionV1, HarnessStartTaskRequestV2,
+};
 use gate4agent_harness_client::HarnessOperatorClient;
 use gate4agent_harness_delivery::DeliveryCatalogV2;
 use gate4agent_harness_protocol::{
-    HarnessCreateTaskRequestV1, HarnessExecutionModeV1, HarnessIdempotencyRef,
+    HarnessCreateTaskRequestV1, HarnessExecutionModeV1, HarnessExpectedExecutionSpecRevisionV1,
+    HarnessIdempotencyRef,
     HarnessOperationId, HarnessOperatorAuthorityV1, HarnessRevision,
     HarnessRunLifecycleV1, HarnessScheduleNextRequestV1, HarnessScheduleOutcomeV1,
-    HarnessSelectorV1, HarnessTaskId, HarnessTaskStateV1, HarnessWorktreeIntentV1,
+    HarnessSelectorV1, HarnessTaskId, HarnessTaskReviewPolicyV1, HarnessTaskStateV1,
+    HarnessWorktreeIntentV1,
 };
 use gate4agent_harness_service::{
     c2::HarnessC2Adapter,
@@ -51,10 +57,17 @@ struct FixturePaths {
 
 impl FixturePaths {
     fn new() -> Self {
+        // PID+timestamp alone collides when two test functions in this file
+        // call `FixturePaths::new()` within the same millisecond (e.g. a
+        // plain `cargo test` run outside the one-test-per-process Windows
+        // headless supervisor) -- the same reason `pipe` below carries its
+        // own atomic counter.
+        static NEXT: AtomicU64 = AtomicU64::new(1);
         let root = std::env::temp_dir().join(format!(
-            "gate4agent-schedule-next-c2-{}-{}",
+            "gate4agent-schedule-next-c2-{}-{}-{}",
             std::process::id(),
             unix_time_ms(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
         ));
         fs::create_dir(&root).unwrap();
         Self {
@@ -357,6 +370,211 @@ async fn schedule_next_replay_and_harness_restart_do_not_resend() {
     assert_eq!(final_adapter.snapshot(&final_route).await.unwrap().session_records.len(), 1);
     drop(final_adapter);
     drop(final_events);
+    assert_private_bytes_absent(&fixture.root, &[
+        c2_token, node_token, operator_secret.as_str(), workspace.to_string_lossy().as_ref(),
+    ]);
+    let c2_shutdown = c2.shutdown_handle();
+    c2_shutdown.shutdown();
+    timeout(Duration::from_secs(5), c2.wait()).await.unwrap().unwrap();
+    node_shutdown.request_shutdown().await.unwrap();
+    timeout(Duration::from_secs(10), node_task).await.unwrap().unwrap().unwrap();
+}
+
+/// The harness advertises task-start capability from the live runtime
+/// inventory alone -- no `--launch-plan-json` plan anywhere. This starts
+/// the harness with the exact zero-plan catalog the `gate4agent-harness`
+/// binary constructs from zero `--launch-plan-json` arguments
+/// (`HarnessLaunchCatalog::from_json_arguments([])`), then drives task
+/// launch options -> spec save -> task start end to end using only the
+/// plan the harness derives from the fixture node's own reported
+/// inventory (`auto-claude-<workspace>-<profile>`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn derived_launch_plan_starts_a_task_with_zero_launch_plan_json_args() {
+    require_headless_supervisor();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
+        .with_writer(std::io::stderr)
+        .try_init();
+    let fixture = FixturePaths::new();
+    let node_endpoint = pipe("derived-node");
+    let control_endpoint = pipe("derived-control");
+    let node_id = NodeId::new("derived-plan-node").unwrap();
+    let workspace_id = WorkspaceId::new("primary").unwrap();
+    let node_token = "node-secret-derived-plan-canary";
+    let c2_token = "c2-secret-derived-plan-canary";
+    let operator_secret = format!("g4aho_{}", "d".repeat(64));
+    let operator_credential = HarnessOperatorCredential::parse(operator_secret.clone()).unwrap();
+    let workspace = std::env::current_dir().unwrap();
+
+    let profile_id = SpawnProfileId::new("clean-exit").unwrap();
+    let profile_revision = SpawnProfileRevision::new("derived-plan-r1").unwrap();
+    let profiles = SpawnProfileRegistry::new([SpawnProfileDefaults {
+        profile_id: profile_id.clone(),
+        revision: profile_revision.clone(),
+        provider: AgentId::new("claude").unwrap(),
+        mode: SessionMode::Pty,
+        terminal_size: TerminalSize { rows: 24, columns: 80 },
+        prompt: None,
+        bundle_id: None,
+        context_id: None,
+        environment_profile_id: None,
+    }]).unwrap();
+    let node_config = NodeServerConfig::new(
+        &node_endpoint,
+        node_token,
+        node_id.clone(),
+        [WorkspaceConfig::new(workspace_id.clone(), workspace.clone()).unwrap()],
+    ).unwrap()
+        .with_state_path(fixture.node_state.clone()).unwrap()
+        .with_spawn_profiles(profiles);
+    let node = NodeServer::new_clean_exit_fixture(
+        node_config,
+        fixture.root.clone(),
+        fixture.started.clone(),
+        fixture.release.clone(),
+    ).unwrap();
+    let node_shutdown = node.shutdown_handle();
+    let node_task = tokio::spawn(node.run());
+
+    let timings = C2Timings {
+        poll_interval: Duration::from_millis(20),
+        fresh_for: Duration::from_secs(2),
+        attempt_deadline: Duration::from_secs(2),
+        transient_backoffs: [Duration::from_millis(20); 5],
+        parked_backoff: Duration::from_millis(100),
+        http_io_deadline: Duration::from_secs(1),
+    };
+    let c2 = C2Running::start(C2Config::new(
+        "127.0.0.1:0".parse().unwrap(),
+        c2_token,
+        vec![C2NodeConfig::new(node_id.clone(), node_endpoint, node_token).unwrap()],
+    ).unwrap().with_control_endpoint(control_endpoint.clone()).unwrap().with_timings(timings)).await.unwrap();
+    let c2_client = C2Client::new(c2.api_addr(), c2_token).unwrap()
+        .with_deadline(Duration::from_secs(1));
+    wait_online(&c2_client, &node_id).await;
+
+    let catalogs = HarnessRuntimeCatalogs::new(
+        HarnessLaunchCatalog::default(),
+        DeliveryCatalogV2::default(),
+    ).unwrap();
+    let (adapter, events) = connect_harness_adapter(&control_endpoint, c2_token).await;
+    let (host, host_task) = start_harness_host_with_operator_and_catalogs(
+        HarnessService::open(&fixture.harness).unwrap(),
+        ObservationService::open(&fixture.observation).unwrap(),
+        adapter,
+        events,
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        Some(operator_credential.clone()),
+        catalogs,
+    ).await.unwrap();
+    let client = HarnessOperatorClient::new(
+        host.endpoint().socket_addr(), operator_credential.clone(),
+    ).unwrap();
+
+    let task_id = HarnessTaskId::new(format!("htask_{}", "2".repeat(24))).unwrap();
+    let body = "derived launch plan fixture body";
+    assert_eq!(client.create_task(HarnessCreateTaskRequestV1 {
+        authority: authority('a', unix_time_ms()),
+        task_id: task_id.clone(),
+        title: "Derived launch plan fixture".to_owned(),
+        body: body.to_owned(),
+        parent_task_id: None,
+        dependencies: Vec::new(),
+        initial_state: HarnessTaskStateV1::Ready,
+    }).unwrap(), HarnessOperatorMutationOutcomeV1::Applied);
+
+    // Nothing in this test names a plan id: the "primary" workspace, the
+    // "claude" enabled provider, and the one "clean-exit" spawn profile all
+    // come from the node's own C2 snapshot, reaching the harness through
+    // observation resync -- the same path `HarnessRuntimeInventoryCache`
+    // fills for `RuntimeInventoryList` today, now also driving
+    // `derive_launch_plans_from_inventory`.
+    let expected_plan_id = selector(format!(
+        "auto-claude-{}-{}", workspace_id.as_str(), profile_id.as_str(),
+    ));
+    let options = timeout(Duration::from_secs(10), async {
+        loop {
+            let options = client.task_launch_options_get(task_id.clone()).unwrap();
+            if options.plans.iter().any(|plan| plan.plan.plan_id == expected_plan_id) {
+                break options;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    }).await.expect("derived launch plan did not surface in task launch options");
+    assert!(!options.truncated);
+    let plan = options.plans.iter()
+        .find(|plan| plan.plan.plan_id == expected_plan_id)
+        .unwrap()
+        .clone();
+    assert_eq!(plan.node_id.as_str(), node_id.as_str());
+    assert_eq!(plan.source_workspace_id.as_str(), workspace_id.as_str());
+    assert_eq!(plan.provider_profile.as_str(), profile_id.as_str());
+    assert_eq!(plan.provider_id.as_str(), "claude");
+    assert_eq!(plan.mode, HarnessExecutionModeV1::Pty);
+
+    let selection = HarnessReviewedTaskLaunchSelectionV1 {
+        plan,
+        worktree: HarnessReviewedWorktreeSelectionV1::Existing,
+        context_source: None,
+        delivery: None,
+        review_policy: HarnessTaskReviewPolicyV1::OperatorReview,
+    };
+    assert_eq!(
+        client.replace_task_execution_spec_v2(HarnessReplaceTaskExecutionSpecRequestV2 {
+            authority: authority('b', unix_time_ms()),
+            task_id: task_id.clone(),
+            expected_task_revision: options.task_revision,
+            expected_execution_spec_revision: HarnessExpectedExecutionSpecRevisionV1::Absent,
+            selection,
+        }).unwrap(),
+        HarnessOperatorMutationOutcomeV1::Applied,
+    );
+
+    let issued_options = client.task_launch_options_get(task_id.clone()).unwrap();
+    let issued_spec = issued_options.current_issued_spec.clone()
+        .expect("spec save issued an execution spec");
+    let dispatch = client.start_task_v2(HarnessStartTaskRequestV2 {
+        authority: authority('c', unix_time_ms()),
+        task_id: task_id.clone(),
+        expected_task_revision: issued_options.task_revision,
+        expected_execution_spec_revision: issued_spec.revision,
+        expected_launch_issuance: issued_spec.launch_issuance,
+    }).unwrap();
+    assert!(!dispatch.replayed);
+
+    timeout(Duration::from_secs(15), async {
+        loop {
+            if fs::read(&fixture.started).ok().as_deref() == Some(b"started\n") { break; }
+            sleep(Duration::from_millis(20)).await;
+        }
+    }).await.expect("provider did not create exact started marker");
+    // The clean-exit fixture blocks on `release_signal` after writing the
+    // started marker (`controlled_clean_exit_agent_spec`) -- without this it
+    // never reaches exit 0, and the run/task poll below spins until its own
+    // timeout instead of observing Completed/Review.
+    OpenOptions::new().write(true).create_new(true).open(&fixture.release).unwrap()
+        .write_all(b"release\n").unwrap();
+    let completion = timeout(Duration::from_secs(15), async {
+        loop {
+            let task = client.task_get(task_id.clone())?;
+            let run = client.run_get(dispatch.dispatch.run_id.clone())?;
+            if task.state == HarnessTaskStateV1::Review
+                && run.lifecycle == HarnessRunLifecycleV1::Completed
+            {
+                break Ok::<(), gate4agent_harness_client::HarnessOperatorClientError>(());
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    }).await;
+    if matches!(completion, Ok(Err(_))) && host_task.is_finished() {
+        let joined = host_task.await;
+        panic!("host task exited early: {completion:?} / join={joined:?}");
+    }
+    completion.unwrap().expect("run/task did not become Completed/Review from a derived launch plan");
+    assert_eq!(client.task_get(task_id).unwrap().body, body);
+
+    host.shutdown().await.unwrap();
+    timeout(Duration::from_secs(5), host_task).await.unwrap().unwrap().unwrap();
     assert_private_bytes_absent(&fixture.root, &[
         c2_token, node_token, operator_secret.as_str(), workspace.to_string_lossy().as_ref(),
     ]);

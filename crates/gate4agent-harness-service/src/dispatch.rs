@@ -17,6 +17,7 @@ use gate4agent_node_protocol::{
 use gate4agent_harness_delivery::{
     compile_reviewed_delivery_bundle_v2, DeliveryCatalogV2, ReviewedDeliverySourceV2,
 };
+use gate4agent_harness_api::HarnessRuntimeNodeInventoryV1;
 use gate4agent_types::{AgentId, TerminalSize};
 use gate4agent_node_wire::local_hmac_sha256;
 use serde::{Deserialize, Serialize};
@@ -491,6 +492,24 @@ impl HarnessLaunchCatalog {
         })
     }
 
+    /// Every plan in this catalog, regardless of dispatch shape or grant
+    /// policy -- unlike `ordinary_plans`, nothing is filtered out. Used by
+    /// the runtime host to preserve every explicitly configured plan
+    /// (including privileged ones) when composing the effective catalog
+    /// that derived plans (`derive_launch_plans_from_inventory`) fill in.
+    pub(crate) fn all_plans(&self) -> impl Iterator<Item = &HarnessLaunchPlanV1> {
+        self.plans.values()
+    }
+
+    /// True when `plan_id` is explicitly present in this catalog. Used by
+    /// the runtime host to tell an explicitly configured (CLI) plan apart
+    /// from one it synthesized from the live runtime inventory, both for
+    /// CLI-wins-on-collision precedence and for "was a derived plan just
+    /// used" logging.
+    pub(crate) fn contains(&self, plan_id: &HarnessSelectorV1) -> bool {
+        self.plans.contains_key(plan_id)
+    }
+
     pub fn validate_delivery_catalog(
         &self,
         delivery_catalog: &DeliveryCatalogV2,
@@ -577,6 +596,128 @@ impl HarnessLaunchCatalog {
         }
         Ok(plan)
     }
+}
+
+/// Terminal size every derived launch plan uses: a generous interactive-PTY
+/// default (`40x140`), independent of whatever an operator-authored CLI
+/// `--launch-plan-json` override picks for its own plan id.
+const DERIVED_LAUNCH_PLAN_TERMINAL_SIZE: TerminalSize = TerminalSize { rows: 40, columns: 140 };
+/// Spawn deadline every derived launch plan uses, matching the CLI catalog
+/// examples this harness has shipped with since `HarnessLaunchPlanV1` was
+/// introduced.
+const DERIVED_LAUNCH_PLAN_DEADLINE_MS: u64 = 30_000;
+const DERIVED_LAUNCH_PLAN_ID_PREFIX: &str = "auto";
+
+/// Synthesizes the default ordinary launch plan for one node/workspace/
+/// provider/spawn-profile combination: an existing-worktree, PTY,
+/// no-prompt-override, operator-grant dispatch with delivery, continuation,
+/// and harness MCP all disabled -- the same shape
+/// `HarnessLaunchPlanV1::is_ordinary_dispatch` requires, so a derived plan
+/// is always eligible for `HarnessLaunchCatalog::ordinary_plans` and never
+/// needs an exact grant.
+///
+/// `prompt_source` is deliberately `Clear`, not `TaskBody`: the Node's
+/// `ProviderRuntimeRequirement` derivation
+/// (`gate4agent-node::provider_runtime`) treats any resolved prompt in
+/// `Pty` mode as `SemanticPrompt`, which only admits a provider whose
+/// runtime probe verifies semantic/structured-prompt readiness -- a raw
+/// PTY-only provider (no semantic adapter) is rejected outright and the
+/// spawn never starts. The advertised runtime inventory
+/// (`HarnessRuntimeSpawnProfileSummaryV1`) carries no signal for which
+/// providers clear that bar, so a derived plan cannot tell `TaskBody`
+/// would be safe for a given combination; `Clear` maps to `RawPty`
+/// admission, which every PTY-capable provider satisfies by construction
+/// -- the only prompt source guaranteed to actually launch.
+///
+/// `include_node_id` disambiguates the synthesized id across multiple
+/// nodes advertising the same workspace/provider/profile combination (see
+/// `derive_launch_plans_from_inventory`). Returns `None` only if the
+/// synthesized id, or one of the component strings, fails to round-trip
+/// through its own domain type -- practically unreachable for inventory
+/// sourced from `SlimNodeInventory`, whose fields already validated as the
+/// matching domain types on the Node side, but this keeps the derivation a
+/// pure, total function: an unrepresentable combination is silently
+/// omitted rather than panicking or failing every other plan alongside it.
+fn derived_launch_plan(
+    node_id: &str,
+    workspace_id: &str,
+    provider: &str,
+    profile_id: &str,
+    include_node_id: bool,
+) -> Option<HarnessLaunchPlanV1> {
+    let raw_plan_id = if include_node_id {
+        format!(
+            "{DERIVED_LAUNCH_PLAN_ID_PREFIX}-{provider}-{node_id}-{workspace_id}-{profile_id}",
+        )
+    } else {
+        format!("{DERIVED_LAUNCH_PLAN_ID_PREFIX}-{provider}-{workspace_id}-{profile_id}")
+    };
+    Some(HarnessLaunchPlanV1 {
+        plan_id: HarnessSelectorV1::new(raw_plan_id).ok()?,
+        revision: HarnessRevision::new(1).ok()?,
+        node_id: HarnessSelectorV1::new(node_id).ok()?,
+        workspace_id: HarnessSelectorV1::new(workspace_id).ok()?,
+        worktree: HarnessWorktreeIntentV1::Existing,
+        provider_profile: HarnessSelectorV1::new(profile_id).ok()?,
+        provider: AgentId::new(provider).ok()?,
+        mode: HarnessExecutionModeV1::Pty,
+        terminal_size: DERIVED_LAUNCH_PLAN_TERMINAL_SIZE,
+        prompt_source: HarnessPromptSourceV1::Clear,
+        delivery: None,
+        continuation: HarnessContinuationPolicyV1::None,
+        grant: HarnessGrantPolicyV1::Operator,
+        harness_mcp: HarnessMcpPolicyV1::Disabled,
+        deadline_ms: DERIVED_LAUNCH_PLAN_DEADLINE_MS,
+    })
+}
+
+/// Derives the harness's default ordinary launch plan set from the live
+/// runtime inventory: one plan per node x workspace x enabled provider x
+/// advertised spawn profile combination `nodes` currently reports. This is
+/// what the harness advertises for a combination no CLI
+/// `--launch-plan-json` plan already names -- see
+/// `runtime::effective_launch_catalog`, which composes this with the CLI
+/// catalog (CLI wins on plan id collision) and enforces
+/// `HARNESS_LAUNCH_CATALOG_MAX`.
+///
+/// Pure and total: never touches storage, never fails, and reflects
+/// exactly the `nodes` slice handed to it -- callers recompute fresh from
+/// the current runtime inventory cache on every use rather than caching
+/// this output, so a node that joins or leaves the fleet changes the
+/// derived set on the very next call, no restart required.
+///
+/// The node id is folded into every synthesized plan id whenever `nodes`
+/// carries more than one node, so two nodes advertising the same
+/// workspace/provider/profile combination never collide -- see
+/// `derived_launch_plan`.
+pub(crate) fn derive_launch_plans_from_inventory(
+    nodes: &[HarnessRuntimeNodeInventoryV1],
+) -> Vec<HarnessLaunchPlanV1> {
+    let include_node_id = nodes.len() > 1;
+    let mut plans = Vec::new();
+    for node in nodes {
+        let Some(spawn_profiles) = node.inventory.launch_inventory.as_ref()
+            .and_then(|launch_inventory| launch_inventory.spawn_profiles.as_ref())
+        else {
+            continue;
+        };
+        for workspace_id in node.inventory.workspaces.keys() {
+            for provider in &node.inventory.enabled_providers {
+                for profile in spawn_profiles {
+                    if let Some(plan) = derived_launch_plan(
+                        node.node_id.as_str(),
+                        workspace_id.as_str(),
+                        provider.as_str(),
+                        profile.id.as_str(),
+                        include_node_id,
+                    ) {
+                        plans.push(plan);
+                    }
+                }
+            }
+        }
+    }
+    plans
 }
 
 pub(crate) fn execution_mode(mode: HarnessExecutionModeV1) -> SessionMode {
@@ -1147,6 +1288,10 @@ mod tests {
     use gate4agent_harness_protocol::{
         HarnessTaskId,
     };
+    use gate4agent_harness_api::{
+        HarnessRuntimeInventoryV1, HarnessRuntimeLaunchInventoryV1,
+        HarnessRuntimeSpawnProfileSummaryV1, HarnessRuntimeWorkspaceV1,
+    };
 
     fn selector(value: &str) -> HarnessSelectorV1 {
         HarnessSelectorV1::new(value).unwrap()
@@ -1499,5 +1644,142 @@ mod tests {
             ),
             Err(HarnessDispatchError::IntentMismatch),
         ));
+    }
+
+    fn node_inventory(
+        node_id: &str,
+        workspace_ids: &[&str],
+        providers: &[&str],
+        profile_ids: &[&str],
+    ) -> HarnessRuntimeNodeInventoryV1 {
+        let workspaces = workspace_ids.iter().map(|workspace_id| {
+            ((*workspace_id).to_owned(), HarnessRuntimeWorkspaceV1 {
+                workspace_id: (*workspace_id).to_owned(),
+                display_root: format!(r"C:\fixture\{workspace_id}"),
+                display_root_truncated: false,
+                sessions: Vec::new(),
+                session_count: 0,
+                sessions_truncated: false,
+            })
+        }).collect::<BTreeMap<_, _>>();
+        let spawn_profiles = profile_ids.iter().map(|profile_id| {
+            HarnessRuntimeSpawnProfileSummaryV1 {
+                id: (*profile_id).to_owned(),
+                revision: "r1".to_owned(),
+                environment_profile: None,
+            }
+        }).collect::<Vec<_>>();
+        HarnessRuntimeNodeInventoryV1 {
+            node_id: node_id.to_owned(),
+            incarnation_id: "0".repeat(32),
+            observed_at_unix_ms: 1,
+            event_sequence: 1,
+            inventory: HarnessRuntimeInventoryV1 {
+                enabled_providers: providers.iter().map(|provider| (*provider).to_owned())
+                    .collect(),
+                workspace_count: workspaces.len(),
+                workspaces,
+                workspaces_truncated: false,
+                session_count: 0,
+                sessions_truncated: false,
+                managed_sessions: Vec::new(),
+                managed_session_count: 0,
+                managed_sessions_truncated: false,
+                launch_inventory: Some(HarnessRuntimeLaunchInventoryV1 {
+                    spawn_profiles: Some(spawn_profiles),
+                    bundles: None,
+                }),
+            },
+        }
+    }
+
+    #[test]
+    fn derive_launch_plans_multi_node_disambiguates_by_node_id() {
+        let node_a = node_inventory("node-a", &["workspace-a"], &["codex"], &["codex-default"]);
+        let node_b = node_inventory("node-b", &["workspace-a"], &["codex"], &["codex-default"]);
+        let plans = derive_launch_plans_from_inventory(&[node_a, node_b]);
+        assert_eq!(plans.len(), 2);
+        assert_ne!(plans[0].plan_id, plans[1].plan_id);
+        for (plan, node_id) in plans.iter().zip(["node-a", "node-b"]) {
+            assert!(plan.plan_id.as_str().contains(node_id));
+            assert_eq!(plan.node_id.as_str(), node_id);
+            plan.validate().unwrap();
+            assert!(plan.is_ordinary_dispatch());
+        }
+    }
+
+    #[test]
+    fn derive_launch_plans_single_node_omits_node_id_from_plan_id() {
+        let node = node_inventory("node-a", &["workspace-a"], &["codex"], &["codex-default"]);
+        let plans = derive_launch_plans_from_inventory(&[node]);
+        assert_eq!(plans.len(), 1);
+        assert!(!plans[0].plan_id.as_str().contains("node-a"));
+        assert_eq!(plans[0].plan_id.as_str(), "auto-codex-workspace-a-codex-default");
+    }
+
+    #[test]
+    fn derive_launch_plans_cross_product_has_unique_ids_and_ordinary_shape() {
+        let node = node_inventory(
+            "node-a",
+            &["workspace-a", "workspace-b"],
+            &["claude", "codex"],
+            &["default", "review"],
+        );
+        let plans = derive_launch_plans_from_inventory(&[node]);
+        assert_eq!(plans.len(), 2 * 2 * 2);
+        let mut ids = plans.iter().map(|plan| plan.plan_id.clone()).collect::<Vec<_>>();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), plans.len());
+        for plan in &plans {
+            plan.validate().unwrap();
+            assert!(plan.is_ordinary_dispatch());
+            assert_eq!(plan.worktree, HarnessWorktreeIntentV1::Existing);
+            assert_eq!(plan.mode, HarnessExecutionModeV1::Pty);
+            assert_eq!(plan.prompt_source, HarnessPromptSourceV1::Clear);
+            assert_eq!(plan.grant, HarnessGrantPolicyV1::Operator);
+            assert_eq!(plan.harness_mcp, HarnessMcpPolicyV1::Disabled);
+            assert_eq!(plan.deadline_ms, DERIVED_LAUNCH_PLAN_DEADLINE_MS);
+            assert_eq!(plan.terminal_size, DERIVED_LAUNCH_PLAN_TERMINAL_SIZE);
+            assert_eq!(plan.revision, HarnessRevision::new(1).unwrap());
+        }
+    }
+
+    #[test]
+    fn derive_launch_plans_empty_and_missing_inventory_yields_no_plans() {
+        assert!(derive_launch_plans_from_inventory(&[]).is_empty());
+
+        let mut node = node_inventory("node-a", &["workspace-a"], &["codex"], &[]);
+        node.inventory.launch_inventory = None;
+        assert!(derive_launch_plans_from_inventory(&[node.clone()]).is_empty());
+
+        node.inventory.launch_inventory = Some(HarnessRuntimeLaunchInventoryV1 {
+            spawn_profiles: None,
+            bundles: None,
+        });
+        assert!(derive_launch_plans_from_inventory(&[node.clone()]).is_empty());
+
+        node.inventory.launch_inventory = Some(HarnessRuntimeLaunchInventoryV1 {
+            spawn_profiles: Some(vec![HarnessRuntimeSpawnProfileSummaryV1 {
+                id: "codex-default".to_owned(),
+                revision: "r1".to_owned(),
+                environment_profile: None,
+            }]),
+            bundles: None,
+        });
+        node.inventory.enabled_providers = Vec::new();
+        assert!(derive_launch_plans_from_inventory(&[node.clone()]).is_empty());
+
+        node.inventory.enabled_providers = vec!["codex".to_owned()];
+        node.inventory.workspaces = BTreeMap::new();
+        assert!(derive_launch_plans_from_inventory(&[node]).is_empty());
+    }
+
+    #[test]
+    fn launch_catalog_all_plans_and_contains_see_every_configured_plan() {
+        let catalog = HarnessLaunchCatalog::new([plan(HarnessPromptSourceV1::TaskBody)]).unwrap();
+        assert_eq!(catalog.all_plans().count(), 1);
+        assert!(catalog.contains(&selector("default")));
+        assert!(!catalog.contains(&selector("auto-codex-workspace-a-codex-default")));
     }
 }

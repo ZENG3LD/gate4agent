@@ -31,8 +31,10 @@ use crate::{
 use crate::dispatch::{
     deterministic_dispatch_ids, deterministic_issued_dispatch_ids,
     deterministic_lifecycle_authority_ids,
+    derive_launch_plans_from_inventory,
     exact_bound_control_lifecycle,
     HarnessLaunchCatalog, HarnessLifecycleEventKindV1, HarnessLifecycleProjectionV1,
+    HARNESS_LAUNCH_CATALOG_MAX,
 };
 use crate::terminal::{terminal_frame_to_wire, TerminalBufferRegistry};
 use gate4agent_harness_delivery::DeliveryCatalogV2;
@@ -1270,8 +1272,11 @@ enum CoordinatorPreflightStart {
     Spawn {
         route: NodeRoute,
         pending: PendingCoordinatorSpawn,
+        plan: crate::dispatch::HarnessLaunchPlanV1,
     },
-    HarnessMcpArm,
+    HarnessMcpArm {
+        plan: crate::dispatch::HarnessLaunchPlanV1,
+    },
 }
 
 enum PendingCoordinatorSpawn {
@@ -1349,11 +1354,29 @@ fn has_issued_operator_transfer_authority(
 struct ActiveDispatchJob {
     operation_id: HarnessOperationId,
     phase: CoordinatorDispatchPhase,
+    /// The exact launch plan resolved when this job started (or last
+    /// resumed) -- carried through every later phase of the SAME dispatch
+    /// so a phase-completion handler (`DispatchFinished` -> `apply_spawn_
+    /// result`'s `Accepted` arm, specifically) never needs to re-derive it
+    /// from `effective_launch_catalog` at that later moment. Re-deriving
+    /// there raced a live `HarnessRuntimeInventoryCache` invalidation: the
+    /// Control event that confirms the very spawn this job is completing
+    /// is itself one of the events that invalidates the target node's
+    /// cached inventory (`event_affects_runtime_inventory`) until the next
+    /// resync lands, and a derived plan resolves to nothing while its node
+    /// is invalidated. A CLI plan is immune (its catalog is static and
+    /// never invalidated), which is why this only ever surfaced for a
+    /// derived one.
+    plan: crate::dispatch::HarnessLaunchPlanV1,
 }
 
 impl ActiveDispatchJob {
-    fn new(operation_id: HarnessOperationId, phase: CoordinatorDispatchPhase) -> Self {
-        Self { operation_id, phase }
+    fn new(
+        operation_id: HarnessOperationId,
+        phase: CoordinatorDispatchPhase,
+        plan: crate::dispatch::HarnessLaunchPlanV1,
+    ) -> Self {
+        Self { operation_id, phase, plan }
     }
 
     fn is(&self, operation_id: &HarnessOperationId, phase: CoordinatorDispatchPhase) -> bool {
@@ -3710,11 +3733,16 @@ fn start_or_resume_dispatch_job(
     adapter: &HarnessC2Adapter,
     commands: &mpsc::Sender<HostCommand>,
     catalogs: &HarnessRuntimeCatalogs,
+    runtime_inventory: &HarnessRuntimeInventoryCache,
     intent: HarnessDispatchIntentV1,
 ) -> Result<Option<ActiveDispatchJob>, HarnessRuntimeError> {
+    // Recomputed here (not threaded in from the caller) so this always
+    // resolves the durable scheduled ref against the launch catalog
+    // current as of this call -- see `effective_launch_catalog`.
+    let (launch, _truncated) = effective_launch_catalog(&catalogs.launch, runtime_inventory);
     let scheduled = harness.scheduled_launch(&intent.operation_id)
         .ok_or(HarnessRuntimeError::DispatchPreparation)?;
-    let plan = catalogs.launch.resolve_scheduled(scheduled)
+    let plan = launch.resolve_scheduled(scheduled)
         .map_err(|_| HarnessRuntimeError::DispatchPreparation)?
         .clone();
     let has_delivery = harness.engine().delivery_for_run(&intent.run_id).is_some();
@@ -3724,11 +3752,12 @@ fn start_or_resume_dispatch_job(
         return Ok(Some(ActiveDispatchJob::new(
             intent.operation_id,
             CoordinatorDispatchPhase::Preflight,
+            plan,
         )));
     }
     if !has_delivery && !has_continuation {
         harness.prepare_scheduled_specialized_authorities(
-            &catalogs.launch,
+            &launch,
             &catalogs.delivery,
             &intent.operation_id,
             unix_time_ms(),
@@ -3760,6 +3789,7 @@ fn start_or_resume_dispatch_job(
             return Ok(Some(ActiveDispatchJob::new(
                 operation_id,
                 CoordinatorDispatchPhase::Delivery,
+                plan,
             )));
         }
     }
@@ -3800,6 +3830,7 @@ fn start_or_resume_dispatch_job(
                 return Ok(Some(ActiveDispatchJob::new(
                     operation_id,
                     CoordinatorDispatchPhase::Continuation,
+                    plan,
                 )));
             }
             ContinuationResumeAction::RecoverOutcomeUnknown => {
@@ -3844,6 +3875,7 @@ fn start_or_resume_dispatch_job(
     Ok(Some(ActiveDispatchJob::new(
         intent.operation_id,
         CoordinatorDispatchPhase::Preflight,
+        plan,
     )))
 }
 
@@ -3864,6 +3896,7 @@ fn start_or_terminalize_dispatch_job(
     adapter: &HarnessC2Adapter,
     commands: &mpsc::Sender<HostCommand>,
     catalogs: &HarnessRuntimeCatalogs,
+    runtime_inventory: &HarnessRuntimeInventoryCache,
     pending_harness_mcp_aborts: &mut BTreeMap<
         HarnessMcpReservationId,
         PendingHarnessMcpAbort,
@@ -3871,7 +3904,7 @@ fn start_or_terminalize_dispatch_job(
     intent: HarnessDispatchIntentV1,
 ) -> Result<Option<ActiveDispatchJob>, HarnessRuntimeError> {
     let operation_id = intent.operation_id.clone();
-    match start_or_resume_dispatch_job(harness, adapter, commands, catalogs, intent) {
+    match start_or_resume_dispatch_job(harness, adapter, commands, catalogs, runtime_inventory, intent) {
         Ok(job) => Ok(job),
         Err(error) => {
             let operation_state = harness.engine().operation(&operation_id)
@@ -3885,7 +3918,7 @@ fn start_or_terminalize_dispatch_job(
                 )?,
                 Some(HarnessOperationStateV1::Dispatching) => apply_spawn_result(
                     harness,
-                    &catalogs.launch,
+                    &effective_launch_catalog(&catalogs.launch, runtime_inventory).0,
                     &operation_id,
                     match dispatch_start_pre_dispatch_result(&error) {
                         CoordinatorPreDispatchResult::Failed => CoordinatorSpawnResult::Failed,
@@ -4086,7 +4119,7 @@ pub async fn start_harness_host_with_operator_and_catalogs(
         for operation_id in stranded_dispatches {
             if let Some(reservation_id) = apply_spawn_result(
                 &mut harness,
-                &catalogs.launch,
+                &effective_launch_catalog(&catalogs.launch, &runtime_inventory).0,
                 &operation_id,
                 CoordinatorSpawnResult::OutcomeUnknown,
                 unix_time_ms(),
@@ -4107,6 +4140,7 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                 &adapter,
                 &commands,
                 &catalogs,
+                &runtime_inventory,
                 &mut pending_harness_mcp_aborts,
                 intent,
             )?;
@@ -4767,6 +4801,12 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                 if let Some(dispatch) = &scheduled_dispatch {
                                     notify_task_changed(&mut subscribers, &harness, &dispatch.task_id);
                                     notify_run_changed(&mut subscribers, &harness, &dispatch.run_id);
+                                    log_if_derived_launch_plan_used(
+                                        &harness,
+                                        &catalogs.launch,
+                                        &runtime_inventory,
+                                        &dispatch.operation_id,
+                                    );
                                 }
                             }
                             let reply_value = match response {
@@ -4781,6 +4821,7 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                         &adapter,
                                         &commands,
                                         &catalogs,
+                                        &runtime_inventory,
                                         &mut pending_harness_mcp_aborts,
                                         intent,
                                     )?;
@@ -4915,6 +4956,15 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                     continue;
                                 }
                             };
+                            // Computed once for this whole closure -- reused
+                            // below by `issue_spawn_lease` too -- so `plan`
+                            // and that later resolve agree on the exact same
+                            // launch catalog snapshot (see
+                            // `effective_launch_catalog`).
+                            let (effective_launch, _truncated) = effective_launch_catalog(
+                                &catalogs.launch,
+                                &runtime_inventory,
+                            );
                             let preparation = (|| -> Result<_, HarnessRuntimeError> {
                             let run = harness.engine().run(&intent.run_id)
                                 .ok_or(HarnessRuntimeError::DispatchPreparation)?.clone();
@@ -4924,7 +4974,7 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                 .ok_or(HarnessRuntimeError::DispatchPreparation)?.clone();
                             let scheduled = harness.scheduled_launch(&intent.operation_id)
                                 .ok_or(HarnessRuntimeError::DispatchPreparation)?.clone();
-                            let plan = catalogs.launch.resolve_scheduled(&scheduled)
+                            let plan = effective_launch.resolve_scheduled(&scheduled)
                                 .map_err(|_| HarnessRuntimeError::DispatchPreparation)?;
                             let issued_dispatch = (
                                 matches!(intent.intent.worktree, HarnessWorktreeIntentV1::ManagedProfile { .. })
@@ -5034,10 +5084,10 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                     profile,
                                     pending,
                                 );
-                                Ok(CoordinatorPreflightStart::HarnessMcpArm)
+                                Ok(CoordinatorPreflightStart::HarnessMcpArm { plan: plan.clone() })
                             } else {
                                 let prepared = harness.issue_spawn_lease(
-                                    &catalogs.launch,
+                                    &effective_launch,
                                     run.revision,
                                     dispatching_run,
                                     operation.revision,
@@ -5060,11 +5110,11 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                         )
                                     }
                                 };
-                                Ok(CoordinatorPreflightStart::Spawn { route, pending })
+                                Ok(CoordinatorPreflightStart::Spawn { route, pending, plan: plan.clone() })
                             }
                             })();
                             match preparation {
-                                Ok(CoordinatorPreflightStart::Spawn { route, pending }) => {
+                                Ok(CoordinatorPreflightStart::Spawn { route, pending, plan }) => {
                                     start_dispatch_finish(
                                         adapter.clone(),
                                         commands.clone(),
@@ -5075,12 +5125,14 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                     active_dispatch = Some(ActiveDispatchJob::new(
                                         intent.operation_id,
                                         CoordinatorDispatchPhase::Spawn,
+                                        plan,
                                     ));
                                 }
-                                Ok(CoordinatorPreflightStart::HarnessMcpArm) => {
+                                Ok(CoordinatorPreflightStart::HarnessMcpArm { plan }) => {
                                     active_dispatch = Some(ActiveDispatchJob::new(
                                         intent.operation_id,
                                         CoordinatorDispatchPhase::HarnessMcpArm,
+                                        plan,
                                     ));
                                 }
                                 Err(error) => {
@@ -5093,7 +5145,10 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                     {
                                         if let Some(reservation_id) = apply_spawn_result(
                                             &mut harness,
-                                            &catalogs.launch,
+                                            &effective_launch_catalog(
+                                                &catalogs.launch,
+                                                &runtime_inventory,
+                                            ).0,
                                             &intent.operation_id,
                                             dispatching_start_error_result(&error),
                                             unix_time_ms(),
@@ -5232,10 +5287,22 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                             }) {
                                 continue;
                             }
-                            active_dispatch = None;
+                            // The plan resolves against a single-entry catalog
+                            // built from what this job already resolved when it
+                            // started -- not a fresh `effective_launch_catalog`
+                            // call -- because the Control event that reports
+                            // this very spawn as accepted is also one of the
+                            // events that invalidates the target node's cached
+                            // runtime inventory (see `ActiveDispatchJob::plan`).
+                            // Re-deriving here raced that invalidation and lost.
+                            let resolved_plan = active_dispatch.take()
+                                .map(|job| job.plan)
+                                .ok_or(HarnessRuntimeError::DispatchPreparation)?;
+                            let resolved_launch = HarnessLaunchCatalog::new([resolved_plan])
+                                .unwrap_or_default();
                             if let Some(reservation_id) = apply_spawn_result(
                                 &mut harness,
-                                &catalogs.launch,
+                                &resolved_launch,
                                 &operation_id,
                                 result,
                                 unix_time_ms(),
@@ -5268,12 +5335,19 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                             // id is captured up front rather than reused
                             // after the move.
                             let notify_operation_id = operation_id.clone();
+                            // Shared by every branch below (`record_harness_
+                            // mcp_armed_and_issue_spawn_lease` and both
+                            // `apply_spawn_result` fallbacks) so they all
+                            // resolve against the exact same launch catalog
+                            // snapshot -- see `effective_launch_catalog`.
+                            let (effective_launch, _truncated) =
+                                effective_launch_catalog(&catalogs.launch, &runtime_inventory);
                             match result {
                                 Ok(proof) => {
                                     let pending = (|| -> Result<_, HarnessRuntimeError> {
                                         let prepared = harness
                                             .record_harness_mcp_armed_and_issue_spawn_lease(
-                                            &catalogs.launch,
+                                            &effective_launch,
                                             proof,
                                             unix_time_ms(),
                                             spec,
@@ -5295,15 +5369,28 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                                 route,
                                                 pending,
                                             );
+                                            // Grant-bound (harness-MCP) plans are
+                                            // always CLI-authored -- see
+                                            // `derived_launch_plan` -- so
+                                            // `effective_launch` resolving this
+                                            // scheduled ref is exactly as stable
+                                            // here as it always was.
+                                            let armed_plan = harness.scheduled_launch(&operation_id)
+                                                .and_then(|scheduled| {
+                                                    effective_launch.resolve_scheduled(scheduled).ok()
+                                                })
+                                                .ok_or(HarnessRuntimeError::DispatchPreparation)?
+                                                .clone();
                                             active_dispatch = Some(ActiveDispatchJob::new(
                                                 operation_id,
                                                 CoordinatorDispatchPhase::Spawn,
+                                                armed_plan,
                                             ));
                                         }
                                         Err(error) => {
                                             if let Some(reservation_id) = apply_spawn_result(
                                                 &mut harness,
-                                                &catalogs.launch,
+                                                &effective_launch,
                                                 &operation_id,
                                                 dispatching_start_error_result(&error),
                                                 unix_time_ms(),
@@ -5323,7 +5410,7 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                 Err(error) => {
                                     if let Some(reservation_id) = apply_spawn_result(
                                         &mut harness,
-                                        &catalogs.launch,
+                                        &effective_launch,
                                         &operation_id,
                                         harness_mcp_arm_finish_result(&error),
                                         unix_time_ms(),
@@ -5392,6 +5479,7 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                         &adapter,
                                         &commands,
                                         &catalogs,
+                                        &runtime_inventory,
                                         &mut pending_harness_mcp_aborts,
                                         intent,
                                     )?;
@@ -5449,6 +5537,7 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                                 &adapter,
                                                 &commands,
                                                 &catalogs,
+                                                &runtime_inventory,
                                                 &mut pending_harness_mcp_aborts,
                                                 intent,
                                             )?;
@@ -6063,6 +6152,7 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                         &adapter,
                                         &commands,
                                         &catalogs,
+                                        &runtime_inventory,
                                         &mut pending_harness_mcp_aborts,
                                         intent,
                                     )?;
@@ -6126,6 +6216,7 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                 &adapter,
                                 &commands,
                                 &catalogs,
+                                &runtime_inventory,
                                 &mut pending_harness_mcp_aborts,
                                 intent,
                             )?;
@@ -6929,6 +7020,81 @@ impl HarnessRuntimeInventoryCache {
     }
 }
 
+/// Composes the harness's effective launch catalog for one call: every
+/// explicitly configured (CLI `--launch-plan-json`) plan first, then one
+/// synthesized ordinary plan per node/workspace/provider/spawn-profile
+/// combination `runtime_inventory` currently advertises
+/// (`derive_launch_plans_from_inventory`) for every combination whose id
+/// does not collide with a CLI plan id -- the CLI plan always wins on
+/// collision, and a derived plan that cannot fit within
+/// `HARNESS_LAUNCH_CATALOG_MAX` alongside the CLI plans is dropped (the
+/// returned `bool` reports whether that happened).
+///
+/// Recomputed fresh on every call -- nothing here is cached beyond what
+/// `runtime_inventory` itself already is, so a node that joins the fleet
+/// after startup contributes plans on the very next call and one that
+/// leaves stops contributing just as immediately, no restart required.
+/// Building `HarnessLaunchCatalog::new` from this composition can fail
+/// only if a derived plan id collided with another derived plan id, which
+/// `derive_launch_plans_from_inventory` already prevents by construction
+/// (see its own doc comment) -- the CLI-only fallback below exists purely
+/// so a defect in that invariant degrades to the explicit configuration
+/// instead of panicking or losing it too.
+fn effective_launch_catalog(
+    cli: &HarnessLaunchCatalog,
+    runtime_inventory: &HarnessRuntimeInventoryCache,
+) -> (HarnessLaunchCatalog, bool) {
+    let mut plans = cli.all_plans().cloned().collect::<Vec<_>>();
+    let capacity = HARNESS_LAUNCH_CATALOG_MAX.saturating_sub(plans.len());
+    let mut truncated = false;
+    let mut added = 0usize;
+    for plan in derive_launch_plans_from_inventory(&runtime_inventory.all_nodes()) {
+        if cli.contains(&plan.plan_id) {
+            continue;
+        }
+        if added >= capacity {
+            truncated = true;
+            continue;
+        }
+        plans.push(plan);
+        added += 1;
+    }
+    let catalog = HarnessLaunchCatalog::new(plans).unwrap_or_else(|_| cli.clone());
+    (catalog, truncated)
+}
+
+/// Logs once, at INFO, when the launch plan durably scheduled for
+/// `operation_id` is not one of the explicitly configured CLI plans in
+/// `cli_launch_catalog` -- i.e. the harness just dispatched a task using a
+/// plan it synthesized from the live runtime inventory
+/// (`derive_launch_plans_from_inventory`) rather than an operator-authored
+/// `--launch-plan-json` entry. Called once per freshly created schedule
+/// (`ScheduleNext`, `StartTask`, and `StartTaskV2` all funnel through the
+/// same `scheduled_dispatch_from_operator_response` check at the call
+/// site), not on every resume of an already-scheduled dispatch, so this
+/// stays a per-dispatch signal instead of firing on every inventory
+/// refresh or replay.
+fn log_if_derived_launch_plan_used(
+    harness: &HarnessService,
+    cli_launch_catalog: &HarnessLaunchCatalog,
+    runtime_inventory: &HarnessRuntimeInventoryCache,
+    operation_id: &HarnessOperationId,
+) {
+    let Some(scheduled) = harness.scheduled_launch(operation_id) else { return; };
+    if cli_launch_catalog.contains(&scheduled.plan.plan_id) {
+        return;
+    }
+    let (effective_launch, _truncated) =
+        effective_launch_catalog(cli_launch_catalog, runtime_inventory);
+    let Ok(plan) = effective_launch.resolve_scheduled(scheduled) else { return; };
+    tracing::info!(
+        plan_id = scheduled.plan.plan_id.as_str(),
+        node_id = plan.node_id.as_str(),
+        provider = plan.provider.as_str(),
+        "derived launch plan used for a new task dispatch",
+    );
+}
+
 fn project_operator_run_correlation(
     harness: &HarnessService,
     runtime_inventory: &HarnessRuntimeInventoryCache,
@@ -7271,9 +7437,32 @@ fn task_launch_options(
 ) -> Result<HarnessTaskLaunchOptionsV1, HarnessOperatorHostErrorV1> {
     let task = harness.engine().task(task_id)
         .ok_or(HarnessOperatorHostErrorV1::NotFound)?;
-    let mut plans = launch_catalog.ordinary_plans()
+    let (effective_launch, catalog_truncated) =
+        effective_launch_catalog(launch_catalog, runtime_inventory);
+    if catalog_truncated {
+        tracing::warn!(
+            "launch catalog exceeds HARNESS_LAUNCH_CATALOG_MAX -- some derived launch plans \
+             were dropped from the CLI catalog's remaining capacity",
+        );
+    }
+    if effective_launch.is_empty() {
+        tracing::warn!(
+            task_id = task_id.as_str(),
+            "no launch plans available -- the CLI catalog and the derived runtime inventory \
+             are both empty, starting this task would fail",
+        );
+    }
+    let mut plans = effective_launch.ordinary_plans()
         .filter(|plan| matches!(plan.worktree, HarnessWorktreeIntentV1::Existing))
         .map(|plan| {
+            if !launch_catalog.contains(&plan.plan_id) {
+                tracing::info!(
+                    plan_id = plan.plan_id.as_str(),
+                    node_id = plan.node_id.as_str(),
+                    provider = plan.provider.as_str(),
+                    "derived launch plan surfaced in task launch options",
+                );
+            }
             Ok(HarnessOrdinaryLaunchPlanOptionV1 {
                 plan: plan.plan_ref()?,
                 node_id: plan.node_id.clone(),
@@ -7595,7 +7784,9 @@ fn execute_operator_request(
             )
         }
         HarnessOperatorRequestV1::LaunchPlansList { after_plan_id, limit } => {
-            let mut plans = launch_catalog.ordinary_plans()
+            let (effective_launch, _truncated) =
+                effective_launch_catalog(launch_catalog, runtime_inventory);
+            let mut plans = effective_launch.ordinary_plans()
                 .filter(|plan| {
                     after_plan_id.as_ref().map_or(true, |after| &plan.plan_id > after)
                 })
@@ -7690,17 +7881,27 @@ fn execute_operator_request(
             operator_mutation_response(harness.operator_retry_task(request))?
         }
         HarnessOperatorRequestV1::ScheduleNext { request } => {
+            let (effective_launch, _truncated) =
+                effective_launch_catalog(launch_catalog, runtime_inventory);
+            if effective_launch.is_empty() {
+                tracing::warn!(
+                    "no launch plans available -- the CLI catalog and the derived runtime \
+                     inventory are both empty, schedule-next would fail",
+                );
+            }
             HarnessOperatorResponseV1::Schedule(
                 harness.schedule_next(
-                    launch_catalog,
+                    &effective_launch,
                     request.authority,
                     request.plan_id.as_ref(),
                 ).map_err(map_operator_service_error)?,
             )
         }
         HarnessOperatorRequestV1::ReplaceTaskExecutionSpec { request } => {
+            let (effective_launch, _truncated) =
+                effective_launch_catalog(launch_catalog, runtime_inventory);
             let outcome = harness.operator_replace_task_execution_spec(
-                launch_catalog,
+                &effective_launch,
                 request,
             ).map_err(map_operator_service_error)?;
             HarnessOperatorResponseV1::ExecutionSpecMutation(match outcome {
@@ -7709,8 +7910,10 @@ fn execute_operator_request(
             })
         }
         HarnessOperatorRequestV1::StartTask { request } => {
+            let (effective_launch, _truncated) =
+                effective_launch_catalog(launch_catalog, runtime_inventory);
             HarnessOperatorResponseV1::TaskStarted(
-                harness.start_task(launch_catalog, request)
+                harness.start_task(&effective_launch, request)
                     .map_err(map_operator_service_error)?,
             )
         }
@@ -7743,9 +7946,11 @@ fn execute_operator_request(
                 runtime_inventory,
                 &request.task_id,
             )?;
+            let (effective_launch, _truncated) =
+                effective_launch_catalog(launch_catalog, runtime_inventory);
             HarnessOperatorResponseV1::TaskStarted(
                 harness
-                    .start_task_v2(launch_catalog, &options, request)
+                    .start_task_v2(&effective_launch, &options, request)
                     .map_err(map_operator_service_error)?,
             )
         }
@@ -12087,6 +12292,7 @@ mod tests {
         let active = ActiveDispatchJob::new(
             operation_id.clone(),
             CoordinatorDispatchPhase::Delivery,
+            accepted_transition_plan(false, false, crate::dispatch::HarnessMcpPolicyV1::Disabled),
         );
         assert!(active.is(&operation_id, CoordinatorDispatchPhase::Delivery));
         assert!(!active.is(&other, CoordinatorDispatchPhase::Delivery));
@@ -12102,14 +12308,17 @@ mod tests {
         let delivery = ActiveDispatchJob::new(
             operation_id.clone(),
             CoordinatorDispatchPhase::Delivery,
+            accepted_transition_plan(false, false, crate::dispatch::HarnessMcpPolicyV1::Disabled),
         );
         let continuation = ActiveDispatchJob::new(
             operation_id.clone(),
             CoordinatorDispatchPhase::Continuation,
+            accepted_transition_plan(false, false, crate::dispatch::HarnessMcpPolicyV1::Disabled),
         );
         let preflight = ActiveDispatchJob::new(
             operation_id.clone(),
             CoordinatorDispatchPhase::Preflight,
+            accepted_transition_plan(false, false, crate::dispatch::HarnessMcpPolicyV1::Disabled),
         );
         assert!(delivery.is(&operation_id, CoordinatorDispatchPhase::Delivery));
         assert!(continuation.is(

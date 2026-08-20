@@ -1015,7 +1015,10 @@ fn render_roster(
     let board_label = " [B Board] ";
     let board_width = (cell_width(board_label) as u16)
         .min(area.right().saturating_sub(x));
-    if board_width > 0 {
+    // The board button belongs to the full harness only (see
+    // `App::open_agent_board`'s light gate) — a button that opens nothing
+    // must not render.
+    if board_width > 0 && app.harness_kanban.enabled {
         let board_x = area.right().saturating_sub(board_width);
         if board_x >= x {
             Paragraph::new(board_label)
@@ -11646,6 +11649,34 @@ mod tests {
         let action = app.set_agent_board_mode(crate::app::AgentBoardMode::HarnessKanban);
         assert!(matches!(action, AppAction::None));
         assert_eq!(app.agent_board_mode, crate::app::AgentBoardMode::SessionMonitoring);
+
+        // The roster sidebar renders no [B Board] button in light, and the
+        // board-open entry is a no-op (button, B key, and hit target all
+        // funnel through open_agent_board).
+        let mut sidebar_buf = TerminalBuffer::new(40, 20);
+        let mut sidebar_layout = LayoutRects::default();
+        render_roster(
+            &app,
+            Rect::new(0, 0, 40, 20),
+            &mut sidebar_buf,
+            &mut sidebar_layout,
+            Theme::for_mode(PtyColorMode::Inherited),
+        );
+        let sidebar_text = buffer_text(&sidebar_buf);
+        assert!(
+            !sidebar_text.contains("[B Board]"),
+            "light roster must not render the board button: {sidebar_text}",
+        );
+        assert!(
+            !sidebar_layout.hits.iter().any(|hit| hit.target == HitTarget::AgentBoardOpen),
+            "light roster must register no board-open hit target",
+        );
+        let opened = app.open_agent_board_for_test();
+        assert!(matches!(opened, AppAction::None));
+        assert!(
+            !app.surface.all_tabs().iter().any(|tab| **tab == SurfaceTab::AgentBoard),
+            "the board tab must not open in light mode",
+        );
     }
 
     #[test]
@@ -12638,6 +12669,7 @@ mod tests {
     #[test]
     fn agents_surface_renders_native_tree_and_hides_empty_workspace() {
         let mut app = fixture(PtyColorMode::Inherited);
+        app.harness_kanban.enabled = true;
         app.nodes[0].session_records.clear();
         let mut workspace_b = app.nodes[0].workspaces[0].clone();
         workspace_b.workspace_id = "workspace-b".to_owned();

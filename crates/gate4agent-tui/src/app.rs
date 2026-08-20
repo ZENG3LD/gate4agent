@@ -6936,6 +6936,11 @@ impl App {
         self.reconcile_agent_board();
     }
 
+    #[cfg(test)]
+    pub(crate) fn open_agent_board_for_test(&mut self) -> AppAction {
+        self.open_agent_board()
+    }
+
     fn reconcile_agent_board(&mut self) {
         // Canon invariant: the kanban is a FULL-harness feature. When the
         // kanban is disabled (light mode — the light harness holds no
@@ -6985,6 +6990,14 @@ impl App {
     }
 
     fn open_agent_board(&mut self) -> AppAction {
+        // Light mode has no board at all: the kanban needs the full
+        // harness's task kernel, and the runtime-state column board was fed
+        // by the observation pipeline the light cutover removed. The roster
+        // sidebar and PTY tabs are the light surface. Every entry (the
+        // [B Board] button, the B key, hit targets) funnels through here.
+        if !self.harness_kanban.enabled {
+            return AppAction::None;
+        }
         if self.harness_kanban.enabled {
             self.agent_board_mode = AgentBoardMode::HarnessKanban;
         }
@@ -20833,6 +20846,7 @@ mod tests {
     #[test]
     fn agent_board_hits_reuse_existing_open_run_and_monitor_actions() {
         let mut app = fixture();
+        app.harness_kanban.enabled = true;
         let key = AgentRowKey::Legacy(active_pty_address(&app));
         app.nodes[0].incarnation_id = Some(NodeIncarnationId::from_bytes([43; 16]));
         app.surface = SurfaceState::default();
@@ -20840,7 +20854,7 @@ mod tests {
             rect: Rect::new(1, 1, 6, 1),
             target: HitTarget::AgentBoardOpen,
         }];
-        assert_eq!(app.click(2, 1), AppAction::None);
+        assert!(matches!(app.click(2, 1), AppAction::HarnessRefresh { .. }));
         assert_eq!(app.surface.active_tab(), Some(&SurfaceTab::AgentBoard));
         app.layout.hits = vec![HitRegion {
             rect: Rect::new(1, 1, 6, 1),
@@ -20868,11 +20882,12 @@ mod tests {
     #[test]
     fn agent_board_b_shortcut_opens_activity_surface_from_agents() {
         let mut app = fixture();
+        app.harness_kanban.enabled = true;
         app.surface = SurfaceState::default();
         app.focus = Focus::Agents;
         app.roster_mode = RosterMode::Agents;
 
-        assert_eq!(app.reduce_agents(UiKey::Char('b')), AppAction::None);
+        assert!(matches!(app.reduce_agents(UiKey::Char('b')), AppAction::HarnessRefresh { .. }));
         assert_eq!(app.surface.active_tab(), Some(&SurfaceTab::AgentBoard));
         assert_eq!(app.focus, Focus::Viewport);
     }

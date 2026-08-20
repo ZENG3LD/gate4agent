@@ -6914,6 +6914,15 @@ impl App {
     }
 
     fn reconcile_agent_board(&mut self) {
+        // Canon invariant: the kanban is a FULL-harness feature. When the
+        // kanban is disabled (light mode — the light harness holds no
+        // tasks), the board mode can never be HarnessKanban, whatever
+        // click/keyboard path tried to set it.
+        if !self.harness_kanban.enabled
+            && self.agent_board_mode == AgentBoardMode::HarnessKanban
+        {
+            self.agent_board_mode = AgentBoardMode::SessionMonitoring;
+        }
         let mut cards = self.agent_board_cards();
         if self.agent_board.task_filter.is_some() && cards.is_empty() {
             self.agent_board.task_filter = None;
@@ -9733,7 +9742,9 @@ impl App {
                 return self.harness_start_launch();
             }
             Some(HitTarget::HarnessBoardMode(mode)) => {
-                if self.agent_board_mode == *mode {
+                if self.agent_board_mode == *mode
+                    || (*mode == AgentBoardMode::HarnessKanban && !self.harness_kanban.enabled)
+                {
                     return AppAction::None;
                 }
                 self.agent_board_mode = *mode;

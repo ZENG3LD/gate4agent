@@ -9,13 +9,13 @@ use gate4agent_node_protocol::{
 };
 
 use crate::app::{
-    App, ControlSection, ManagedAgentPreference, MenuPlacement, PtyColorMode, RosterMode,
-    SidebarMode, SidebarPresentation, MAX_LOCAL_AGENT_ALIAS_BYTES,
+    App, ControlSection, ManagedAgentPreference, MenuPlacement, PtyColorMode, RailIcons,
+    RosterMode, SidebarMode, SidebarPresentation, MAX_LOCAL_AGENT_ALIAS_BYTES,
     MAX_MANAGED_AGENT_PREFERENCES, MAX_MANAGED_AGENT_RECORD_ID_BYTES,
 };
 use crate::surface::LayoutPreset;
 
-const CONFIG_VERSION: u16 = 6;
+const CONFIG_VERSION: u16 = 7;
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const MAX_COLLAPSED_DIRECTORY_PREFERENCES: usize = 512;
 
@@ -32,6 +32,7 @@ pub struct UiPreferences {
     pub menu_placement: MenuPlacement,
     pub sidebar_presentation: SidebarPresentation,
     pub sidebar_collapsed: bool,
+    pub rail_icons: RailIcons,
     pub control_section: ControlSection,
     pub roster_mode: RosterMode,
     pub sidebar_width: u16,
@@ -48,8 +49,13 @@ impl Default for UiPreferences {
         Self {
             color_mode: PtyColorMode::Inherited,
             menu_placement: MenuPlacement::Sidebar,
-            sidebar_presentation: SidebarPresentation::Split,
+            // D1a default-mode flip: the glyph rail + toolbar sidebar
+            // (Activity) is the owner's developed mode. Split and Modal
+            // stay fully selectable, just no longer the fresh-install
+            // default.
+            sidebar_presentation: SidebarPresentation::Activity,
             sidebar_collapsed: false,
+            rail_icons: RailIcons::Glyph,
             control_section: ControlSection::Files,
             roster_mode: RosterMode::Agents,
             sidebar_width: 26,
@@ -74,6 +80,7 @@ impl UiPreferences {
             menu_placement: app.menu_placement,
             sidebar_presentation: app.sidebar_presentation,
             sidebar_collapsed: app.sidebar_collapsed,
+            rail_icons: app.rail_icons,
             control_section,
             roster_mode: match app.roster_mode {
                 RosterMode::NativeSessions => RosterMode::Agents,
@@ -112,6 +119,7 @@ impl UiPreferences {
         app.menu_placement = self.menu_placement;
         app.sidebar_presentation = self.sidebar_presentation;
         app.sidebar_collapsed = self.sidebar_collapsed;
+        app.rail_icons = self.rail_icons;
         app.control_section = match self.control_section {
             ControlSection::Settings => ControlSection::Files,
             section => section,
@@ -203,11 +211,12 @@ impl UiPreferences {
         validate_managed_agents(&self.managed_agents)?;
         validate_collapsed_directories(&self.collapsed_directories)?;
         let mut encoded = format!(
-            "version={CONFIG_VERSION}\nstyle={}\nmenu={}\nsidebar_presentation={}\nsidebar_collapsed={}\ncontrol_section={}\nroster_mode={}\nsidebar_width={}\nsidebar_split_percent={}\ncontrol_modal_position={}\ncontrol_modal_size={}\nsurface_layout={}\n",
+            "version={CONFIG_VERSION}\nstyle={}\nmenu={}\nsidebar_presentation={}\nsidebar_collapsed={}\nrail_icons={}\ncontrol_section={}\nroster_mode={}\nsidebar_width={}\nsidebar_split_percent={}\ncontrol_modal_position={}\ncontrol_modal_size={}\nsurface_layout={}\n",
             self.color_mode.id(),
             self.menu_placement.id(),
             self.sidebar_presentation.id(),
             self.sidebar_collapsed,
+            self.rail_icons.id(),
             self.control_section.id(),
             match self.roster_mode {
                 RosterMode::NativeSessions => RosterMode::Agents.id(),
@@ -413,6 +422,13 @@ fn parse(contents: &str) -> io::Result<UiPreferences> {
                     _ => preferences.sidebar_collapsed,
                 }
             }
+            "rail_icons" => {
+                preferences.rail_icons = match value.trim() {
+                    "glyph" => RailIcons::Glyph,
+                    "ascii" => RailIcons::Ascii,
+                    _ => preferences.rail_icons,
+                }
+            }
             "control_section" => {
                 preferences.control_section = match value.trim() {
                     "files" => ControlSection::Files,
@@ -487,21 +503,43 @@ fn parse(contents: &str) -> io::Result<UiPreferences> {
             preferences.collapsed_directories.clear();
             Ok(preferences)
         }
+        Some(6) => {
+            // D1a (CONFIG_VERSION 6 -> 7): the owner's default flips to the
+            // glyph rail + toolbar sidebar. A v6 config's presentation is
+            // migrated to Activity exactly once here; every other stored
+            // field -- including this same managed-agent/collapsed-
+            // directory shape v7 uses -- survives untouched.
+            // `rail_icons` has no v6 representation and keeps the struct
+            // default (Glyph) set before this loop ran.
+            preferences.sidebar_presentation = SidebarPresentation::Activity;
+            finish_with_collections(preferences, managed_agents, collapsed_directory_values)
+        }
         Some(CONFIG_VERSION) => {
-            preferences.managed_agents = managed_agents;
-            if collapsed_directory_values.len() > MAX_COLLAPSED_DIRECTORY_PREFERENCES {
-                return Err(invalid_data("too many collapsed directory preferences"));
-            }
-            preferences.collapsed_directories = collapsed_directory_values
-                .iter()
-                .map(|value| parse_collapsed_directory_preference(value))
-                .collect::<io::Result<Vec<_>>>()?;
-            validate_collapsed_directories(&preferences.collapsed_directories)?;
-            Ok(preferences)
+            finish_with_collections(preferences, managed_agents, collapsed_directory_values)
         }
         Some(other) => Err(invalid_data(format!("unsupported preferences version {other}"))),
         None => Err(invalid_data("preferences version is missing")),
     }
+}
+
+/// The v6/v7 tail shared by both versions' `parse()` arms: attach the
+/// managed-agent rows already parsed by the per-line loop, then parse and
+/// validate the collapsed-directory rows.
+fn finish_with_collections(
+    mut preferences: UiPreferences,
+    managed_agents: Vec<ManagedAgentPreference>,
+    collapsed_directory_values: Vec<String>,
+) -> io::Result<UiPreferences> {
+    preferences.managed_agents = managed_agents;
+    if collapsed_directory_values.len() > MAX_COLLAPSED_DIRECTORY_PREFERENCES {
+        return Err(invalid_data("too many collapsed directory preferences"));
+    }
+    preferences.collapsed_directories = collapsed_directory_values
+        .iter()
+        .map(|value| parse_collapsed_directory_preference(value))
+        .collect::<io::Result<Vec<_>>>()?;
+    validate_collapsed_directories(&preferences.collapsed_directories)?;
+    Ok(preferences)
 }
 
 fn parse_managed_agent_preference(value: &str) -> io::Result<ManagedAgentPreference> {
@@ -694,6 +732,7 @@ mod tests {
             menu_placement: MenuPlacement::Modal,
             sidebar_presentation: SidebarPresentation::Activity,
             sidebar_collapsed: true,
+            rail_icons: RailIcons::Ascii,
             control_section: ControlSection::Agents,
             roster_mode: RosterMode::Agents,
             sidebar_width: 41,
@@ -744,6 +783,7 @@ mod tests {
             menu_placement: MenuPlacement::Modal,
             sidebar_presentation: SidebarPresentation::Activity,
             sidebar_collapsed: true,
+            rail_icons: RailIcons::Glyph,
             control_section: ControlSection::Workspaces,
             roster_mode: RosterMode::Workspaces,
             sidebar_width: 38,
@@ -814,17 +854,17 @@ mod tests {
     }
 
     #[test]
-    fn preferences_v1_through_v4_migrate_to_v6_with_empty_collections() {
+    fn preferences_v1_through_v4_migrate_to_v7_with_empty_collections() {
         for version in 1..=4 {
             let loaded = parse(&format!("version={version}\nstyle=gate\n")).unwrap();
             assert!(loaded.managed_agents.is_empty(), "version {version}");
             assert!(loaded.collapsed_directories.is_empty(), "version {version}");
-            assert!(loaded.encode().unwrap().starts_with("version=6\n"), "version {version}");
+            assert!(loaded.encode().unwrap().starts_with("version=7\n"), "version {version}");
         }
     }
 
     #[test]
-    fn preferences_v6_managed_agents_round_trip_deterministically() {
+    fn preferences_v7_managed_agents_round_trip_deterministically() {
         let mut preferences = UiPreferences::default();
         preferences.managed_agents = vec![
             ManagedAgentPreference {
@@ -854,7 +894,7 @@ mod tests {
     }
 
     #[test]
-    fn preferences_v6_collapsed_directories_round_trip_non_utf8_deterministically() {
+    fn preferences_v7_collapsed_directories_round_trip_non_utf8_deterministically() {
         let utf8 = collapsed_directory(
             "node-a",
             "workspace-a",
@@ -871,14 +911,14 @@ mod tests {
 
         let encoded = preferences.encode().unwrap();
         let decoded = parse(&encoded).unwrap();
-        assert!(encoded.starts_with("version=6\n"));
+        assert!(encoded.starts_with("version=7\n"));
         assert_eq!(decoded.collapsed_directories, vec![utf8.clone(), opaque.clone()]);
         assert_eq!(decoded.collapsed_directories[1].path.as_bytes(), opaque_bytes);
         assert_eq!(decoded.collapsed_directories[1].path.as_utf8(), None);
         assert!(encoded.contains(&encode_hex(&opaque_bytes)));
         assert_eq!(decoded.encode().unwrap(), encoded);
 
-        let path = temp_path("v6-collapsed-directories");
+        let path = temp_path("v7-collapsed-directories");
         preferences.save(&path).unwrap();
         assert_eq!(UiPreferences::load(&path).unwrap(), decoded);
         let _ = fs::remove_dir_all(path.parent().unwrap());
@@ -901,7 +941,81 @@ mod tests {
 
         assert!(loaded.collapsed_directories.is_empty());
         assert_eq!(loaded.color_mode, PtyColorMode::GateOverride);
-        assert!(loaded.encode().unwrap().starts_with("version=6\n"));
+        assert!(loaded.encode().unwrap().starts_with("version=7\n"));
+    }
+
+    /// D1a's default-mode flip (CONFIG_VERSION 6 -> 7): a v6 config's
+    /// `sidebar_presentation` is migrated to `Activity` exactly once, no
+    /// matter what it was stored as, while every other field -- including
+    /// managed agents and collapsed directories -- survives untouched. Once
+    /// re-saved (now at v7), the owner's own choice sticks: a v7 config
+    /// that stores `Split` loads as `Split`, proving the flip does not fire
+    /// again on every load.
+    #[test]
+    fn preferences_v6_migrates_presentation_to_activity_once_then_v7_choice_persists() {
+        let managed_agent_line = format!(
+            "managed_agent={},{},1,2,-\n",
+            encode_hex(b"node-a"),
+            encode_hex(b"record-1"),
+        );
+        let collapsed_directory_line = format!(
+            "collapsed_directory=node-a,workspace-a,{}\n",
+            encode_hex(b"src"),
+        );
+        let v6_payload = format!(
+            "version=6\nstyle=gate\nmenu=sidebar\nsidebar_presentation=split\n\
+             sidebar_collapsed=true\ncontrol_section=workspaces\nroster_mode=workspaces\n\
+             sidebar_width=45\nsidebar_split_percent=67\ncontrol_modal_position=none\n\
+             control_modal_size=none\nsurface_layout=2x2\n{managed_agent_line}{collapsed_directory_line}",
+        );
+
+        let loaded = parse(&v6_payload).unwrap();
+
+        // The flip: stored as `split`, migrated to `Activity`.
+        assert_eq!(loaded.sidebar_presentation, SidebarPresentation::Activity);
+        // rail_icons has no v6 representation; it keeps the struct default.
+        assert_eq!(loaded.rail_icons, RailIcons::Glyph);
+
+        // Everything else survives the migration unchanged.
+        assert_eq!(loaded.color_mode, PtyColorMode::GateOverride);
+        assert_eq!(loaded.menu_placement, MenuPlacement::Sidebar);
+        assert!(loaded.sidebar_collapsed);
+        assert_eq!(loaded.control_section, ControlSection::Workspaces);
+        assert_eq!(loaded.roster_mode, RosterMode::Workspaces);
+        assert_eq!(loaded.sidebar_width, 45);
+        assert_eq!(loaded.sidebar_split_percent, 67);
+        assert_eq!(loaded.surface_layout, LayoutPreset::TwoByTwo);
+        assert_eq!(
+            loaded.managed_agents,
+            vec![ManagedAgentPreference {
+                node_id: "node-a".to_owned(),
+                record_id: "record-1".to_owned(),
+                pinned: true,
+                alias: None,
+                order: Some(2),
+            }],
+        );
+        assert_eq!(
+            loaded.collapsed_directories,
+            vec![collapsed_directory(
+                "node-a",
+                "workspace-a",
+                RepositoryPath::utf8("src".to_owned()).unwrap(),
+            )],
+        );
+
+        // Re-saved, the config now round-trips at v7 with the migrated
+        // presentation -- applying it to an App reflects the same flip.
+        let reencoded = loaded.encode().unwrap();
+        assert!(reencoded.starts_with("version=7\n"));
+        let mut app = App::default();
+        loaded.apply_to(&mut app);
+        assert_eq!(app.sidebar_presentation, SidebarPresentation::Activity);
+
+        // A v7 config is never touched by the flip: an explicit `Split`
+        // choice made after migrating away from the new default persists.
+        let v7_split = parse("version=7\nsidebar_presentation=split\n").unwrap();
+        assert_eq!(v7_split.sidebar_presentation, SidebarPresentation::Split);
     }
 
     #[test]

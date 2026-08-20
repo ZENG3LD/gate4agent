@@ -1210,6 +1210,25 @@ impl SidebarPresentation {
     }
 }
 
+/// Activity-rail button rendering: `Glyph` draws the restricted Geometric
+/// Shapes / Block Elements icon set, `Ascii` draws the `[X]`-bracket
+/// fallback for terminals/fonts without reliable glyph coverage.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RailIcons {
+    #[default]
+    Glyph,
+    Ascii,
+}
+
+impl RailIcons {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Glyph => "glyph",
+            Self::Ascii => "ascii",
+        }
+    }
+}
+
 impl MenuPlacement {
     pub fn id(self) -> &'static str {
         match self {
@@ -2645,6 +2664,7 @@ pub enum HitTarget {
     SettingsPlacement,
     SettingsPresentation,
     SettingsSidebarCollapsed,
+    SettingsRailIcons,
     ActivitySection(ControlSection),
     SidebarCollapse,
     ControlDrag,
@@ -2717,6 +2737,7 @@ pub struct App {
     pub menu_placement: MenuPlacement,
     pub sidebar_presentation: SidebarPresentation,
     pub sidebar_collapsed: bool,
+    pub rail_icons: RailIcons,
     pub control_section: ControlSection,
     pub settings_return_focus: Focus,
     pub control_modal_position: Option<(u16, u16)>,
@@ -2822,6 +2843,7 @@ impl Default for App {
             menu_placement: MenuPlacement::Sidebar,
             sidebar_presentation: SidebarPresentation::Split,
             sidebar_collapsed: false,
+            rail_icons: RailIcons::Glyph,
             control_section: ControlSection::Files,
             settings_return_focus: Focus::Tabs,
             control_modal_position: None,
@@ -9916,6 +9938,7 @@ impl App {
                 Some(HitTarget::SettingsPlacement) => self.toggle_menu_placement(),
                 Some(HitTarget::SettingsPresentation) => self.toggle_sidebar_presentation(),
                 Some(HitTarget::SettingsSidebarCollapsed) => self.toggle_sidebar_collapsed(),
+                Some(HitTarget::SettingsRailIcons) => self.toggle_rail_icons(),
                 Some(HitTarget::SidebarItem(index)) => {
                     let mode = match self.control_section {
                         ControlSection::Files => SidebarMode::Files,
@@ -10304,6 +10327,7 @@ impl App {
                 | HitTarget::SettingsPlacement
                 | HitTarget::SettingsPresentation
                 | HitTarget::SettingsSidebarCollapsed
+                | HitTarget::SettingsRailIcons
                 | HitTarget::ControlDrag
                 | HitTarget::ControlResize
                 | HitTarget::SpawnDrag
@@ -18349,6 +18373,13 @@ impl App {
         self.sidebar_collapsed = !self.sidebar_collapsed;
     }
 
+    fn toggle_rail_icons(&mut self) {
+        self.rail_icons = match self.rail_icons {
+            RailIcons::Glyph => RailIcons::Ascii,
+            RailIcons::Ascii => RailIcons::Glyph,
+        };
+    }
+
     fn reduce_settings(&mut self, key: UiKey) -> AppAction {
         if self.menu_placement == MenuPlacement::Sidebar {
             match key {
@@ -18359,6 +18390,7 @@ impl App {
                 }
                 UiKey::Char('p') => self.toggle_sidebar_presentation(),
                 UiKey::Char('b') => self.toggle_sidebar_collapsed(),
+                UiKey::Char('i') => self.toggle_rail_icons(),
                 _ => {}
             }
             return AppAction::None;
@@ -18425,6 +18457,9 @@ impl App {
             }
             UiKey::Char('b') if self.control_section == ControlSection::Settings => {
                 self.toggle_sidebar_collapsed()
+            }
+            UiKey::Char('i') if self.control_section == ControlSection::Settings => {
+                self.toggle_rail_icons()
             }
             UiKey::Char('n') if self.control_section == ControlSection::Agents => {
                 return self.begin_rename_selected_agent();

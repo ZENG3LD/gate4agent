@@ -27,7 +27,7 @@ use crate::app::{
     ContextUsageHover, ContextUsageSegment, ContextUsageSegmentHit,
     ExistingSessionMode, ExistingSessionOperation, Focus, FolderBrowserField,
     AgentRunGitScopeView, GitLocationDialogKind, HitRegion, HitTarget, LaunchContextMode, LaunchField, LaunchTarget,
-    LayoutRects, MenuPlacement, NativeSessionGroupKey, NativeSessionTreeItem, NodeView, PreviewTabPhase, PreviewTabView, PtyColorMode, RosterMode, SessionView,
+    LayoutRects, MenuPlacement, NativeSessionGroupKey, NativeSessionTreeItem, NodeView, PreviewTabPhase, PreviewTabView, PtyColorMode, RailIcons, RosterMode, SessionView,
     ObservationPersistenceState, SessionMonitorKey, SessionMonitorSection, SessionMonitorTarget,
     SessionMonitorView, SidebarMode, SurfaceTab,
     HarnessReverseAttributionState,
@@ -187,7 +187,9 @@ pub fn render(app: &App, buf: &mut TerminalBuffer) -> LayoutRects {
                 (Rect::default(), sidebar_content, spaces, agents, columns[1])
             }
             (MenuPlacement::Sidebar, SidebarPresentation::Activity) => {
-                let rail_width = 3_u16.min(area.width.saturating_sub(1));
+                // 4 wide: 1 column for the left accent bar (`▎`) that marks
+                // the active button, 3 for the glyph centered beside it.
+                let rail_width = 4_u16.min(area.width.saturating_sub(1));
                 let content_width = if app.sidebar_collapsed {
                     0
                 } else {
@@ -355,6 +357,59 @@ pub fn render(app: &App, buf: &mut TerminalBuffer) -> LayoutRects {
     layout
 }
 
+/// One glyph/ascii button on the activity rail: a view-select action plus
+/// the current selected/active state driving its accent styling.
+struct RailButton {
+    target: HitTarget,
+    glyph: &'static str,
+    ascii: &'static str,
+    selected: bool,
+}
+
+/// Draws a single activity-rail row as a button: full-row background tint
+/// when selected, a left accent bar (`▎`) in column 0 marking the active
+/// row, and the glyph/ascii label centered in the remaining columns. Always
+/// registers `button.target` as a hit region across the full row so the
+/// accent column is clickable too.
+fn render_rail_button(
+    row: Rect,
+    button: &RailButton,
+    icons: RailIcons,
+    buf: &mut TerminalBuffer,
+    layout: &mut LayoutRects,
+    theme: Theme,
+) {
+    if row.width == 0 {
+        return;
+    }
+    let bg = if button.selected { theme.accent } else { theme.panel };
+    fill_rect(row, bg, buf);
+    let has_accent_column = row.width >= 2;
+    let label_area = if has_accent_column {
+        Rect::new(row.x + 1, row.y, row.width - 1, 1)
+    } else {
+        row
+    };
+    let label = match icons {
+        RailIcons::Glyph => button.glyph,
+        RailIcons::Ascii => button.ascii,
+    };
+    Paragraph::new(centered_label(label, label_area.width as usize))
+        .style(
+            Style::default()
+                .fg(if button.selected { theme.active_tab_text } else { theme.muted })
+                .bg(bg)
+                .add_modifier(if button.selected { Modifier::BOLD } else { Modifier::empty() }),
+        )
+        .render(label_area, buf);
+    if has_accent_column && button.selected {
+        let cell = buf.get_mut(row.x, row.y);
+        cell.symbol = "▎".into();
+        cell.style = Style::default().fg(theme.active_tab_text).bg(bg);
+    }
+    layout.hits.push(HitRegion { rect: row, target: button.target.clone() });
+}
+
 fn render_activity_rail(
     app: &App,
     area: Rect,
@@ -366,71 +421,86 @@ fn render_activity_rail(
         return;
     }
     fill_rect(area, theme.panel, buf);
-    let sections = [(ControlSection::Files, "F"), (ControlSection::Git, "G")];
-    for (index, (section, label)) in sections.into_iter().enumerate() {
+
+    // Top group: primary views. Board only exists once the harness kanban
+    // is enabled -- light mode never renders it (same invariant enforced
+    // everywhere else the kanban surfaces).
+    let mut top = vec![
+        RailButton {
+            target: HitTarget::ActivitySection(ControlSection::Files),
+            glyph: "▤",
+            ascii: "[F]",
+            selected: app.control_section == ControlSection::Files && !app.sidebar_collapsed,
+        },
+        RailButton {
+            target: HitTarget::ActivitySection(ControlSection::Git),
+            glyph: "◈",
+            ascii: "[G]",
+            selected: app.control_section == ControlSection::Git && !app.sidebar_collapsed,
+        },
+        RailButton {
+            target: HitTarget::RosterMode(RosterMode::Agents),
+            glyph: "◉",
+            ascii: "[A]",
+            selected: app.control_section == ControlSection::Agents
+                && matches!(app.roster_mode, RosterMode::Agents | RosterMode::NativeSessions)
+                && !app.sidebar_collapsed,
+        },
+    ];
+    if app.harness_kanban.enabled {
+        top.push(RailButton {
+            target: HitTarget::AgentBoardOpen,
+            glyph: "▦",
+            ascii: "[K]",
+            selected: app.surface.active_tab() == Some(&SurfaceTab::AgentBoard),
+        });
+    }
+    for (index, button) in top.iter().enumerate() {
         let y = area.y.saturating_add(index as u16);
         if y >= area.bottom() {
             break;
         }
-        let selected = app.control_section == section && !app.sidebar_collapsed;
-        let row = Rect::new(area.x, y, area.width, 1);
-        Paragraph::new(centered_label(label, area.width as usize))
-            .style(
-                Style::default()
-                    .fg(if selected { theme.active_tab_text } else { theme.muted })
-                    .bg(if selected { theme.accent } else { theme.panel })
-                    .add_modifier(if selected { Modifier::BOLD } else { Modifier::empty() }),
-            )
-            .render(row, buf);
-        layout.hits.push(HitRegion {
-            rect: row,
-            target: HitTarget::ActivitySection(section),
-        });
+        render_rail_button(Rect::new(area.x, y, area.width, 1), button, app.rail_icons, buf, layout, theme);
     }
-    for (offset, mode) in [RosterMode::Agents, RosterMode::Workspaces]
-        .into_iter()
-        .enumerate()
-    {
-        let y = area.y.saturating_add(2 + offset as u16);
-        if y >= area.bottom() {
-            break;
-        }
-        let selected = (app.roster_mode == mode
-            || (mode == RosterMode::Agents && app.roster_mode == RosterMode::NativeSessions))
-            && app.control_section == match mode {
-                RosterMode::Agents => ControlSection::Agents,
-                RosterMode::Workspaces => ControlSection::Workspaces,
-                RosterMode::NativeSessions => unreachable!("native sessions are not visible"),
-            }
-            && !app.sidebar_collapsed;
-        let row = Rect::new(area.x, y, area.width, 1);
-        Paragraph::new(centered_label(mode.compact_id(), area.width as usize))
-            .style(
-                Style::default()
-                    .fg(if selected { theme.active_tab_text } else { theme.muted })
-                    .bg(if selected { theme.accent } else { theme.panel })
-                    .add_modifier(if selected { Modifier::BOLD } else { Modifier::empty() }),
-            )
-            .render(row, buf);
-        layout.hits.push(HitRegion {
-            rect: row,
-            target: HitTarget::RosterMode(mode),
-        });
-    }
-    if area.height >= 2 {
-        let collapse = Rect::new(area.x, area.bottom() - 2, area.width, 1);
-        Paragraph::new(centered_label(if app.sidebar_collapsed { ">" } else { "<" }, area.width as usize))
-            .style(Style::default().fg(theme.dim).bg(theme.panel))
-            .render(collapse, buf);
+
+    // Bottom group, bottom-anchored: the collapse toggle, one blank row
+    // reserved for the D3 connection-health dot (not drawn yet), then
+    // Settings at the very bottom row.
+    if area.height >= 3 {
+        let collapse = Rect::new(area.x, area.bottom() - 3, area.width, 1);
+        fill_rect(collapse, theme.panel, buf);
+        let collapse_label_area = if collapse.width >= 2 {
+            Rect::new(collapse.x + 1, collapse.y, collapse.width - 1, 1)
+        } else {
+            collapse
+        };
+        Paragraph::new(centered_label(
+            if app.sidebar_collapsed { ">" } else { "<" },
+            collapse_label_area.width as usize,
+        ))
+        .style(Style::default().fg(theme.dim).bg(theme.panel))
+        .render(collapse_label_area, buf);
         layout.hits.push(HitRegion { rect: collapse, target: HitTarget::SidebarCollapse });
+
+        // area.bottom() - 2 stays untouched: the reserved health-dot row.
+
         let settings = Rect::new(area.x, area.bottom() - 1, area.width, 1);
-        Paragraph::new(centered_label("S", area.width as usize))
-            .style(Style::default().fg(theme.muted).bg(theme.panel))
-            .render(settings, buf);
-        layout.hits.push(HitRegion {
-            rect: settings,
-            target: HitTarget::ActivitySection(ControlSection::Settings),
-        });
+        render_rail_button(
+            settings,
+            &RailButton {
+                target: HitTarget::ActivitySection(ControlSection::Settings),
+                glyph: "◇",
+                ascii: "[S]",
+                // Settings opens as an overlay dialog rather than selecting
+                // a persistent control_section, so (matching the pre-D1a
+                // rail) this row never shows as the active one.
+                selected: false,
+            },
+            app.rail_icons,
+            buf,
+            layout,
+            theme,
+        );
     }
 }
 
@@ -9479,6 +9549,22 @@ fn render_settings_controls(
         rect: Rect::new(area.x, area.y + 3, collapsed_width, 1),
         target: HitTarget::SettingsSidebarCollapsed,
     });
+    if area.height < 5 {
+        return;
+    }
+    let icons_text = if app.rail_icons == RailIcons::Glyph {
+        " icons [glyph]|ascii "
+    } else {
+        " icons glyph|[ascii] "
+    };
+    let icons_width = (cell_width(icons_text) as u16).min(area.width);
+    Paragraph::new(icons_text)
+        .style(Style::default().fg(theme.teal).bg(theme.modal))
+        .render(Rect::new(area.x, area.y + 4, icons_width, 1), buf);
+    layout.hits.push(HitRegion {
+        rect: Rect::new(area.x, area.y + 4, icons_width, 1),
+        target: HitTarget::SettingsRailIcons,
+    });
 }
 
 fn render_drag_preview(
@@ -9989,6 +10075,20 @@ mod tests {
         (0..buf.height())
             .map(|row| {
                 (0..buf.width())
+                    .map(|column| buf.get(column, row).symbol.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Same shape as `buffer_text`, scoped to a single rect -- used for the
+    /// activity rail so assertions can't collide with unrelated chrome
+    /// (e.g. the tab strip's own unrelated `[S]` settings button).
+    fn rect_text(buf: &TerminalBuffer, rect: Rect) -> String {
+        (rect.y..rect.bottom())
+            .map(|row| {
+                (rect.x..rect.right())
                     .map(|column| buf.get(column, row).symbol.as_str())
                     .collect::<String>()
             })
@@ -11883,6 +11983,23 @@ mod tests {
             .clone()
     }
 
+    /// Renders `app`, wires the fresh layout onto it (matching how the real
+    /// event loop feeds `click` from the last render), finds the hit region
+    /// for `target`, and clicks it -- proving the region is both present
+    /// and wired to `App::click`'s normal dispatch, not just drawn.
+    fn click_activity_rail_button(app: &mut App, target: HitTarget) -> AppAction {
+        let mut buf = TerminalBuffer::new(100, 24);
+        app.layout = render(app, &mut buf);
+        let rect = app
+            .layout
+            .hits
+            .iter()
+            .find(|hit| hit.target == target)
+            .unwrap_or_else(|| panic!("no activity-rail hit region for {target:?}"))
+            .rect;
+        app.click(rect.x, rect.y)
+    }
+
     fn test_agent_progress() -> AgentProgressV1 {
         AgentProgressV1 {
             provider_sequence: 9,
@@ -12633,7 +12750,7 @@ mod tests {
     }
 
     #[test]
-    fn roster_exposes_only_agents_and_workspaces_controls_across_layouts() {
+    fn roster_controls_span_split_and_modal_but_activity_rail_drops_workspaces() {
         let mut app = fixture(PtyColorMode::Inherited);
         let mut buf = TerminalBuffer::new(100, 24);
 
@@ -12645,16 +12762,24 @@ mod tests {
             hit.target == HitTarget::RosterMode(RosterMode::NativeSessions)
         }));
 
+        // D1a: the activity rail's top group is Explorer/Source Control/
+        // Agents/Board only -- Workspaces has no rail button anymore (it
+        // folds into Explorer's header in D1b). Agents stays reachable;
+        // Workspaces and NativeSessions do not.
         app.sidebar_presentation = SidebarPresentation::Activity;
         app.control_section = ControlSection::Agents;
         let activity = render(&app, &mut buf);
-        assert!([RosterMode::Agents, RosterMode::Workspaces]
-            .iter()
-            .all(|mode| activity.hits.iter().any(|hit| hit.target == HitTarget::RosterMode(*mode))));
+        assert!(activity.hits.iter().any(|hit| hit.target == HitTarget::RosterMode(RosterMode::Agents)));
+        assert!(!activity.hits.iter().any(|hit| {
+            hit.target == HitTarget::RosterMode(RosterMode::Workspaces)
+        }));
         assert!(!activity.hits.iter().any(|hit| {
             hit.target == HitTarget::RosterMode(RosterMode::NativeSessions)
         }));
 
+        // The Modal-placement Settings tab strip is unaffected by the rail
+        // redesign -- it still lists all of ControlSection::ALL, Workspaces
+        // included.
         app.menu_placement = MenuPlacement::Modal;
         app.focus = Focus::Settings;
         let modal = render(&app, &mut buf);
@@ -13681,6 +13806,9 @@ mod tests {
         app.control_section = ControlSection::Settings;
         let settings_layout = render(&app, &mut buf);
         assert!(settings_layout.hits.iter().any(|hit| hit.target == HitTarget::SettingsStyle));
+        // The rail-icons toggle also fits the expanded (Modal-placement)
+        // Settings tab content, not just the compact sidebar dialog.
+        assert!(settings_layout.hits.iter().any(|hit| hit.target == HitTarget::SettingsRailIcons));
         let placement_hit = settings_layout
             .hits
             .iter()
@@ -14563,17 +14691,19 @@ mod tests {
         app.control_section = ControlSection::Agents;
         let mut expanded = TerminalBuffer::new(100, 24);
         let expanded_layout = render(&app, &mut expanded);
-        assert_eq!(expanded_layout.activity_rail.width, 3);
+        // 1 accent-bar column + 3 for the centered glyph.
+        assert_eq!(expanded_layout.activity_rail.width, 4);
         assert!(expanded_layout.agents.width > 0);
         assert!([ControlSection::Files, ControlSection::Git].iter().all(|section| expanded_layout
             .hits
             .iter()
             .any(|hit| hit.target == HitTarget::ActivitySection(*section))));
-        assert!([RosterMode::Agents, RosterMode::Workspaces]
-            .iter()
-            .all(|mode| expanded_layout.hits.iter().any(|hit| {
-            hit.target == HitTarget::RosterMode(*mode)
-        })));
+        assert!(expanded_layout.hits.iter().any(|hit| {
+            hit.target == HitTarget::RosterMode(RosterMode::Agents)
+        }));
+        assert!(!expanded_layout.hits.iter().any(|hit| {
+            hit.target == HitTarget::RosterMode(RosterMode::Workspaces)
+        }));
         assert!(!expanded_layout.hits.iter().any(|hit| {
             hit.target == HitTarget::RosterMode(RosterMode::NativeSessions)
         }));
@@ -14593,13 +14723,155 @@ mod tests {
         app.sidebar_collapsed = true;
         let mut collapsed = TerminalBuffer::new(100, 24);
         let collapsed_layout = render(&app, &mut collapsed);
-        assert_eq!(collapsed_layout.activity_rail.width, 3);
+        assert_eq!(collapsed_layout.activity_rail.width, 4);
         assert_eq!(collapsed_layout.agents.width, 0);
-        assert_eq!(collapsed_layout.tabs.x, 3);
+        assert_eq!(collapsed_layout.tabs.x, 4);
         assert!(collapsed_layout
             .hits
             .iter()
             .any(|hit| hit.target == HitTarget::SidebarCollapse));
+    }
+
+    #[test]
+    fn activity_rail_board_button_only_exists_in_full_mode() {
+        let mut app = fixture(PtyColorMode::Inherited);
+        app.sidebar_presentation = SidebarPresentation::Activity;
+        app.harness_kanban.enabled = false;
+        let mut light_buf = TerminalBuffer::new(100, 24);
+        let light_layout = render(&app, &mut light_buf);
+        let rail = light_layout.activity_rail;
+        assert!(!light_layout.hits.iter().any(|hit| {
+            hit.target == HitTarget::AgentBoardOpen && rail.contains(hit.rect.x, hit.rect.y)
+        }));
+        assert!(!rect_text(&light_buf, rail).contains('▦'));
+
+        app.harness_kanban.enabled = true;
+        let mut full_buf = TerminalBuffer::new(100, 24);
+        let full_layout = render(&app, &mut full_buf);
+        let rail = full_layout.activity_rail;
+        assert!(full_layout.hits.iter().any(|hit| {
+            hit.target == HitTarget::AgentBoardOpen && rail.contains(hit.rect.x, hit.rect.y)
+        }));
+        assert!(rect_text(&full_buf, rail).contains('▦'));
+    }
+
+    #[test]
+    fn activity_rail_buttons_show_accent_bar_only_on_the_active_row() {
+        let mut app = fixture(PtyColorMode::GateOverride);
+        app.sidebar_presentation = SidebarPresentation::Activity;
+        app.control_section = ControlSection::Git;
+        let mut buf = TerminalBuffer::new(100, 24);
+        let layout = render(&app, &mut buf);
+
+        let git_hit = layout
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::ActivitySection(ControlSection::Git))
+            .expect("git rail button");
+        assert_eq!(buf.get(git_hit.rect.x, git_hit.rect.y).symbol, "▎");
+        let accent = Theme::for_mode(app.color_mode).accent;
+        assert_eq!(buf.get(git_hit.rect.x, git_hit.rect.y).style.bg, accent);
+
+        for target in [
+            HitTarget::ActivitySection(ControlSection::Files),
+            HitTarget::RosterMode(RosterMode::Agents),
+            HitTarget::ActivitySection(ControlSection::Settings),
+        ] {
+            let hit = layout
+                .hits
+                .iter()
+                .find(|hit| hit.target == target)
+                .unwrap_or_else(|| panic!("missing rail hit for {target:?}"));
+            assert_ne!(
+                buf.get(hit.rect.x, hit.rect.y).symbol,
+                "▎",
+                "{target:?} must not show the accent bar while inactive",
+            );
+        }
+    }
+
+    #[test]
+    fn activity_rail_hit_regions_dispatch_the_same_actions_as_before() {
+        let mut app = fixture(PtyColorMode::Inherited);
+        app.sidebar_presentation = SidebarPresentation::Activity;
+        app.control_section = ControlSection::Files;
+        click_activity_rail_button(&mut app, HitTarget::ActivitySection(ControlSection::Git));
+        assert_eq!(app.control_section, ControlSection::Git);
+
+        let mut app = fixture(PtyColorMode::Inherited);
+        app.sidebar_presentation = SidebarPresentation::Activity;
+        click_activity_rail_button(&mut app, HitTarget::RosterMode(RosterMode::Agents));
+        assert_eq!(app.control_section, ControlSection::Agents);
+        assert_eq!(app.roster_mode, RosterMode::Agents);
+
+        let mut app = fixture(PtyColorMode::Inherited);
+        app.sidebar_presentation = SidebarPresentation::Activity;
+        assert!(!app.sidebar_collapsed);
+        click_activity_rail_button(&mut app, HitTarget::SidebarCollapse);
+        assert!(app.sidebar_collapsed);
+
+        let mut app = fixture(PtyColorMode::Inherited);
+        app.sidebar_presentation = SidebarPresentation::Activity;
+        click_activity_rail_button(&mut app, HitTarget::ActivitySection(ControlSection::Settings));
+        assert_eq!(app.focus, Focus::Settings);
+
+        let mut app = fixture(PtyColorMode::Inherited);
+        app.sidebar_presentation = SidebarPresentation::Activity;
+        app.harness_kanban.enabled = true;
+        click_activity_rail_button(&mut app, HitTarget::AgentBoardOpen);
+        assert_eq!(app.surface.active_tab(), Some(&SurfaceTab::AgentBoard));
+    }
+
+    #[test]
+    fn activity_rail_ascii_and_glyph_modes_render_the_expected_labels() {
+        let mut app = fixture(PtyColorMode::Inherited);
+        app.sidebar_presentation = SidebarPresentation::Activity;
+        app.harness_kanban.enabled = true;
+        assert_eq!(app.rail_icons, RailIcons::Glyph);
+
+        let mut glyph_buf = TerminalBuffer::new(100, 24);
+        let glyph_layout = render(&app, &mut glyph_buf);
+        let glyph_text = rect_text(&glyph_buf, glyph_layout.activity_rail);
+        for glyph in ["▤", "◈", "◉", "▦", "◇"] {
+            assert!(glyph_text.contains(glyph), "missing {glyph}: {glyph_text:?}");
+        }
+        for ascii in ["[F]", "[G]", "[A]", "[K]", "[S]"] {
+            assert!(!glyph_text.contains(ascii), "unexpected {ascii} in glyph mode: {glyph_text:?}");
+        }
+
+        app.rail_icons = RailIcons::Ascii;
+        let mut ascii_buf = TerminalBuffer::new(100, 24);
+        let ascii_layout = render(&app, &mut ascii_buf);
+        let ascii_text = rect_text(&ascii_buf, ascii_layout.activity_rail);
+        for ascii in ["[F]", "[G]", "[A]", "[K]", "[S]"] {
+            assert!(ascii_text.contains(ascii), "missing {ascii}: {ascii_text:?}");
+        }
+        for glyph in ["▤", "◈", "◉", "▦", "◇"] {
+            assert!(!ascii_text.contains(glyph), "unexpected {glyph} in ascii mode: {ascii_text:?}");
+        }
+    }
+
+    #[test]
+    fn settings_rail_icons_toggle_has_mouse_and_keyboard_parity() {
+        let mut app = fixture(PtyColorMode::Inherited);
+        app.focus = Focus::Settings;
+        assert_eq!(app.rail_icons, RailIcons::Glyph);
+        let mut buf = TerminalBuffer::new(100, 24);
+        let layout = render(&app, &mut buf);
+        let icons_hit = layout
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::SettingsRailIcons)
+            .expect("settings dialog exposes the rail-icons toggle");
+        let row = rect_text(&buf, icons_hit.rect);
+        assert!(row.contains("icons [glyph]|ascii"), "{row:?}");
+
+        app.layout = render(&app, &mut buf);
+        app.click(icons_hit.rect.x, icons_hit.rect.y);
+        assert_eq!(app.rail_icons, RailIcons::Ascii);
+
+        assert_eq!(app.reduce(crate::UiKey::Char('i')), AppAction::None);
+        assert_eq!(app.rail_icons, RailIcons::Glyph);
     }
 
     #[test]

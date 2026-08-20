@@ -7248,7 +7248,24 @@ fn project_run_correlation(
     Ok(correlation)
 }
 
-fn redact_runtime_inventory(
+/// Projects a `SlimNodeInventory` (itself already the C2-side projection of
+/// one node's `C2NodeSnapshot`, via `SlimNodeInventory::from_c2_snapshot`)
+/// into the operator wire's `HarnessRuntimeInventoryV1`: workspace/session/
+/// managed-session/launch-inventory field mapping, with no other input and
+/// no side effects.
+///
+/// Promoted `pub` for `gate4agent-harness-light`: this is exactly the
+/// projection that crate's own runtime-inventory maintenance needs
+/// (`RuntimeInventoryList`'s served-from-cache path), and it is pure data
+/// mapping with zero kernel entanglement -- unlike
+/// `HarnessRuntimeInventoryCache` itself (`pub(crate)`, keyed to this
+/// crate's own `HarnessObservationResync`/observation-recovery machinery,
+/// which the light harness has no equivalent for and does not want; see
+/// `gate4agent-harness-light::inventory`'s module doc for why that cache is
+/// reimplemented light-local instead of reused). Reusing this one function
+/// keeps both harnesses' `HarnessRuntimeInventoryV1` projection identical by
+/// construction, with no duplicated field-mapping logic to drift.
+pub fn redact_runtime_inventory(
     inventory: gate4agent_c2_protocol::SlimNodeInventory,
 ) -> HarnessRuntimeInventoryV1 {
     let enabled_providers = inventory.enabled_providers.into_iter()
@@ -8567,7 +8584,21 @@ async fn read_single_frame(stream: &mut TcpStream) -> Result<Vec<u8>, HarnessRun
     read_single_frame_detecting_operator(stream, &mut operator_frame).await
 }
 
-async fn read_single_frame_detecting_operator(
+/// Reads one newline-delimited request frame off `stream`, bounded by
+/// `HARNESS_READ_REQUEST_MAX_BYTES`, flipping `*operator_frame` to `true`
+/// the moment any read chunk contains the `g4aho_` operator-credential
+/// prefix (a cheap streaming classification used by [`handle_connection`]'s
+/// deadline-branch reply-shape choice; a caller that only ever serves
+/// operator frames, like `gate4agent-harness-light`, can pass a throwaway
+/// `&mut bool` and ignore it).
+///
+/// Promoted `pub` for `gate4agent-harness-light`: the light harness serves
+/// the identical newline-delimited-JSON operator wire this function already
+/// frames for the full harness, and reimplementing this exact byte-level
+/// read loop (size cap, single-frame/no-embedded-newline validation, EOF
+/// handling) would only risk the two hosts silently drifting apart on
+/// framing while adding nothing light mode needs to do differently.
+pub async fn read_single_frame_detecting_operator(
     stream: &mut TcpStream,
     operator_frame: &mut bool,
 ) -> Result<Vec<u8>, HarnessRuntimeError> {
@@ -8607,7 +8638,17 @@ async fn write_reply(
     stream.shutdown().await.map_err(|_| HarnessRuntimeError::WriteFailed)
 }
 
-async fn write_operator_reply(
+/// Validates, encodes, and writes one newline-terminated
+/// `HarnessOperatorReplyV1`, bounded by `HARNESS_OPERATOR_RESPONSE_MAX_BYTES`,
+/// then shuts the write half down (the wire's one-request-per-connection
+/// framing: EOF-after-reply is the reply boundary, matching
+/// [`read_single_frame_detecting_operator`]'s EOF-is-the-request-boundary on
+/// the other side).
+///
+/// Promoted `pub` for `gate4agent-harness-light`, alongside
+/// `read_single_frame_detecting_operator`: same framing, same size cap, same
+/// consumer.
+pub async fn write_operator_reply(
     stream: &mut TcpStream,
     reply: HarnessOperatorReplyV1,
 ) -> Result<(), HarnessRuntimeError> {

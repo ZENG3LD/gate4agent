@@ -4058,6 +4058,11 @@ fn project_harness_read_failure(error: HarnessOperatorClientError) -> HarnessRea
             HarnessOperatorHostErrorV1::Unavailable => "unavailable",
             HarnessOperatorHostErrorV1::OutcomeUnknown => "outcome-unknown",
             HarnessOperatorHostErrorV1::Internal => "internal",
+            // Added alongside `gate4agent-harness-light` (see
+            // `HarnessOperatorHostErrorV1::Unsupported`'s own doc comment):
+            // the full harness this TUI's harness mode talks to never
+            // returns it, but the match must stay exhaustive.
+            HarnessOperatorHostErrorV1::Unsupported => "unsupported",
         },
         HarnessOperatorClientError::Api(_) => "validation",
         HarnessOperatorClientError::Deadline => "deadline",

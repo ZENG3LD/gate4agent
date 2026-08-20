@@ -78,6 +78,7 @@ members = [
     "crates/gate4agent-harness-engine",
     "crates/gate4agent-harness-service",
     "crates/gate4agent-harness-api",
+    "crates/gate4agent-harness-light",
     "crates/gate4agent-harness-client",
     "crates/gate4agent-harness-mcp",
     "crates/gate4agent-harness-delivery",

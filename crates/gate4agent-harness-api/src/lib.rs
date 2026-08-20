@@ -4473,6 +4473,26 @@ pub enum HarnessOperatorHostErrorV1 {
     // runtime inventory before retrying", not "retry freely".
     OutcomeUnknown,
     Internal,
+    // Added alongside `gate4agent-harness-light` (the P2.2 light-harness
+    // extraction), riding the V11 era: distinct from `NotFound` (a request
+    // scoped to an id that provably does not and never will exist under the
+    // current backend, e.g. any task/run id against a backend with no task
+    // kernel) and from `Internal` (an unexpected failure). `Unsupported`
+    // means "this verb is recognized and well-formed, but this particular
+    // operator host does not implement it" -- a light-harness host rejecting
+    // the task-kernel mutation family (`SubmitIntent` and its authorized
+    // siblings), the node-workspace/native-history/session-record/resource-
+    // mutation families, `TerminalRead`, and `SubscribeEvents` in its first
+    // slice, per the app-harness protocol contract's fail-closed principle
+    // (a verb a host cannot serve gets a typed rejection, never silent
+    // misbehavior or a misleading `NotFound`). Purely additive: an existing
+    // host (the full harness) never returns it, and every wire version this
+    // enum has ever shipped under already tolerates an unrecognized error
+    // variant the same way `#[serde(rename_all = "kebab-case")]` does for
+    // any other closed enum here -- see this module's round-trip tests. No
+    // skew risk in practice: `gate4agent-harness-light` pairs this crate
+    // in-process (same build, same binary), never across a version boundary.
+    Unsupported,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -9018,5 +9038,24 @@ mod tests {
         malformed_task.title = "\0".to_owned();
         let bad_task = HarnessOperatorEventV1::TaskChanged { sequence: 0, task: malformed_task };
         assert!(bad_task.validate().is_err());
+    }
+
+    /// `HarnessOperatorHostErrorV1::Unsupported` (added alongside
+    /// `gate4agent-harness-light`, see its own doc comment): a purely
+    /// additive unit variant, so this only needs to prove it round-trips --
+    /// on its own, and wrapped in the `HarnessOperatorReplyV1::Error` shape
+    /// every operator host error actually rides on the wire.
+    #[test]
+    fn operator_host_error_unsupported_round_trips() {
+        let error = HarnessOperatorHostErrorV1::Unsupported;
+        let encoded = serde_json::to_string(&error).unwrap();
+        assert_eq!(encoded, "\"unsupported\"");
+        assert_eq!(serde_json::from_str::<HarnessOperatorHostErrorV1>(&encoded).unwrap(), error);
+
+        let reply = HarnessOperatorReplyV1::Error { error };
+        assert!(reply.validate().is_ok());
+        let encoded_reply = serde_json::to_vec(&reply).unwrap();
+        let decoded_reply: HarnessOperatorReplyV1 = serde_json::from_slice(&encoded_reply).unwrap();
+        assert_eq!(decoded_reply, reply);
     }
 }

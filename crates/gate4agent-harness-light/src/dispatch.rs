@@ -3,9 +3,15 @@
 //! hard error; every rejection (typed `NotFound`/`Unsupported`/relay
 //! failure) is itself the reply. Request coverage, per the app-harness
 //! protocol contract (A1 session verbs + A2 workspace/history/record/
-//! management/terminal; A3 subscription and task-kernel mutations remain
-//! `Unsupported`/`NotFound` by canon):
+//! management/terminal + A3 event subscription; task-kernel mutations
+//! remain `Unsupported` by canon -- light mode has no kernel to mutate):
 //!
+//! - **Never reaches this dispatcher**: `SubscribeEvents` (A3) branches out
+//!   of the ordinary one-shot request/reply path in `lib.rs`'s
+//!   `handle_connection`, before dispatch is ever called -- see that
+//!   function's own doc comment and `crate::inventory::refresh_route`/
+//!   `reconcile_topology` for where the roster changes it pushes
+//!   (`RuntimeInventoryChanged`/`RuntimeInventoryRemoved`) originate.
 //! - **Served** from the maintained runtime inventory: `RuntimeInventoryList`.
 //! - **Served** from the maintained terminal ring (`crate::terminal`):
 //!   `TerminalRead`.
@@ -43,9 +49,9 @@
 //!   that id (or any id) will ever exist, so `NotFound` is the correct
 //!   answer, not a placeholder.
 //! - **Typed `Unsupported`**: the task-kernel mutation family (`SubmitIntent`
-//!   and its ten authorized siblings `CreateTask`..`StartTaskV2`) and
-//!   `SubscribeEvents` (no push-subscription surface until A3). Every
-//!   `Unsupported` rejection logs the operation name.
+//!   and its ten authorized siblings `CreateTask`..`StartTaskV2`) -- light
+//!   mode has no task kernel to mutate, by canon. Every `Unsupported`
+//!   rejection logs the operation name.
 
 use gate4agent_harness_api::{
     HarnessOperatorHostErrorV1, HarnessOperatorReplyV1, HarnessOperatorRequestV1,

@@ -33,11 +33,12 @@ use gate4agent_c2::{C2Config, C2NodeConfig, C2Running, C2Timings};
 use gate4agent_c2_client::C2Client;
 use gate4agent_harness_api::{
     HarnessExecutionModeV1, HarnessHostPathV1, HarnessNativeSessionCatalogScopeV1,
-    HarnessNativeSessionRouteV1, HarnessOperatorActionV1, HarnessOperatorHostErrorV1,
-    HarnessOperatorIntentV1, HarnessOperatorRequestRefV1, HarnessRepositoryPathV1,
-    HarnessRuntimeInventoryPageV1, HarnessRuntimeSessionAddressV1, HarnessRuntimeSessionStatusV1,
-    HarnessRuntimeSessionV1, HarnessRuntimeTerminalSizeV1, HarnessTaskStateV1,
-    HarnessTerminalControlV1, HarnessWorkspaceFileContentV1,
+    HarnessNativeSessionRouteV1, HarnessOperatorActionV1, HarnessOperatorEventV1,
+    HarnessOperatorHostErrorV1, HarnessOperatorIntentV1, HarnessOperatorRequestRefV1,
+    HarnessRepositoryPathV1, HarnessRuntimeInventoryPageV1, HarnessRuntimeNodeInventoryV1,
+    HarnessRuntimeSessionAddressV1, HarnessRuntimeSessionStatusV1, HarnessRuntimeSessionV1,
+    HarnessRuntimeTerminalSizeV1, HarnessTaskStateV1, HarnessTerminalControlV1,
+    HarnessWorkspaceFileContentV1,
 };
 use gate4agent_harness_client::{HarnessOperatorClient, HarnessOperatorClientError};
 use gate4agent_harness_light::start_harness_light;
@@ -46,6 +47,7 @@ use gate4agent_node::protocol::{
 };
 use gate4agent_node::{NodeServer, NodeServerConfig, SpawnProfileRegistry, WorkspaceConfig};
 use gate4agent_types::{AgentId, TerminalSize};
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::{sleep, timeout};
 
 struct FixturePaths {
@@ -156,6 +158,99 @@ fn find_runtime_session<'a>(
         .find(|session| {
             session.instance_id == address.instance_id && session.generation == address.generation
         })
+}
+
+/// Same node -> workspace -> session navigation as [`find_runtime_session`],
+/// but against a single `HarnessRuntimeNodeInventoryV1` -- the shape a
+/// `SubscribeEvents` push (`SnapshotBaseline`'s `nodes` list,
+/// `RuntimeInventoryChanged`'s `node`) carries, not a paged
+/// `RuntimeInventoryList` reply. Mirrors
+/// `gate4agent-harness-service`'s own subscription E2E's identical helper.
+fn find_session_in_node(
+    node: &HarnessRuntimeNodeInventoryV1,
+    address: &HarnessRuntimeSessionAddressV1,
+) -> Option<HarnessRuntimeSessionV1> {
+    if node.node_id != address.node_id {
+        return None;
+    }
+    node.inventory.workspaces.get(&address.workspace_id)?
+        .sessions.iter()
+        .find(|session| {
+            session.instance_id == address.instance_id && session.generation == address.generation
+        })
+        .cloned()
+}
+
+/// The `sequence` every `HarnessOperatorEventV1` variant carries -- pulled
+/// out once so `wait_for_event` can assert monotonicity without a
+/// per-variant match at every call site.
+fn event_sequence(event: &HarnessOperatorEventV1) -> u64 {
+    match event {
+        HarnessOperatorEventV1::SnapshotBaseline { sequence, .. }
+        | HarnessOperatorEventV1::TaskChanged { sequence, .. }
+        | HarnessOperatorEventV1::RunChanged { sequence, .. }
+        | HarnessOperatorEventV1::RuntimeInventoryChanged { sequence, .. }
+        | HarnessOperatorEventV1::RuntimeInventoryRemoved { sequence, .. }
+        | HarnessOperatorEventV1::Lagged { sequence } => *sequence,
+    }
+}
+
+/// Pulls events off one subscription's background reader-thread channel
+/// (`HarnessEventSubscription::next_event` blocks, so each subscription is
+/// drained on its own `std::thread`, not directly inside the async test
+/// body -- see the test's own subscribe section) until one satisfies
+/// `matches`, asserting every event observed along the way -- not just the
+/// matched one -- carries a strictly increasing `sequence` for THIS
+/// subscription. Mirrors `gate4agent-harness-service`'s own subscription
+/// E2E's identical helper.
+async fn wait_for_event(
+    event_rx: &mut UnboundedReceiver<HarnessOperatorEventV1>,
+    last_sequence: &mut Option<u64>,
+    mut matches: impl FnMut(&HarnessOperatorEventV1) -> bool,
+) -> HarnessOperatorEventV1 {
+    timeout(Duration::from_secs(15), async {
+        loop {
+            let event = event_rx.recv().await
+                .expect("event subscription reader thread ended early");
+            let sequence = event_sequence(&event);
+            if let Some(previous) = *last_sequence {
+                assert!(
+                    sequence > previous,
+                    "event sequence must be strictly increasing per subscription",
+                );
+            }
+            *last_sequence = Some(sequence);
+            if matches(&event) {
+                return event;
+            }
+        }
+    }).await.expect("expected operator event never arrived")
+}
+
+/// Spawns a background thread draining `client.subscribe_events()` into an
+/// unbounded channel the async test body can `.recv().await` from --
+/// `HarnessEventSubscription::next_event` blocks the calling thread, so it
+/// must never run directly inside the test's own async task (see
+/// `wait_for_event`'s doc comment).
+fn spawn_subscription_reader(
+    client: &HarnessOperatorClient,
+) -> UnboundedReceiver<HarnessOperatorEventV1> {
+    let subscription = client.subscribe_events().unwrap();
+    let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+    std::thread::spawn(move || {
+        let mut subscription = subscription;
+        loop {
+            match subscription.next_event() {
+                Ok(event) => {
+                    if event_tx.send(event).is_err() {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+    });
+    event_rx
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -544,6 +639,154 @@ async fn windows_harness_light_operator_workspace_history_management_and_termina
     }
 
     client.stop_session(session, true).unwrap();
+
+    running.shutdown().await.unwrap();
+    let c2_shutdown = c2.shutdown_handle();
+    c2_shutdown.shutdown();
+    timeout(Duration::from_secs(5), c2.wait()).await.unwrap().unwrap();
+    node_shutdown.request_shutdown().await.unwrap();
+    timeout(Duration::from_secs(10), node_task).await.unwrap().unwrap().unwrap();
+}
+
+/// A3 coverage: `SubscribeEvents` serves the SAME V11 push contract the full
+/// harness does (see `gate4agent-harness-service/tests/windows_harness_
+/// operator_event_subscription_e2e.rs`, this test's own template) -- a
+/// subscriber gets a `SnapshotBaseline` immediately (nodes from the live
+/// inventory, tasks/runs always empty: light mode has no task kernel, by
+/// canon), then `RuntimeInventoryChanged` pushes as a directly spawned
+/// session appears and disappears from the roster (the A1 stop-reap makes
+/// the disappearance converge, see `crate::relay::spawn_stop_reap`). Two
+/// independent subscribers prove the registry fans the same roster changes
+/// out to every live subscriber, each with its own baseline and its own
+/// monotonic sequence space. Same three-process fixture shape as the two
+/// tests above, with its own atomic-counter-suffixed fixture paths/pipe
+/// names so all three never collide when run in parallel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn windows_harness_light_operator_event_subscription_baseline_and_inventory_round_trip() {
+    require_headless_supervisor();
+    let fixture = FixturePaths::new();
+    let node_endpoint = pipe("node");
+    let control_endpoint = pipe("control");
+    let node_id = NodeId::new("light-events-node").unwrap();
+    let workspace_id = WorkspaceId::new("primary").unwrap();
+    let node_token = "light-events-node-token";
+    let c2_token = "light-events-c2-token";
+    let profile_id = SpawnProfileId::new("interactive-default").unwrap();
+    let profile_revision = SpawnProfileRevision::new("light-events-r1").unwrap();
+
+    let node = NodeServer::new_fixture(node_config(
+        &fixture,
+        &node_endpoint,
+        node_token,
+        &node_id,
+        &workspace_id,
+        &profile_id,
+        &profile_revision,
+    )).unwrap();
+    let node_shutdown = node.shutdown_handle();
+    let node_task = tokio::spawn(node.run());
+
+    let timings = C2Timings {
+        poll_interval: Duration::from_millis(20),
+        fresh_for: Duration::from_secs(2),
+        attempt_deadline: Duration::from_secs(2),
+        transient_backoffs: [Duration::from_millis(20); 5],
+        parked_backoff: Duration::from_millis(100),
+        http_io_deadline: Duration::from_secs(1),
+    };
+    let c2 = C2Running::start(C2Config::new(
+        "127.0.0.1:0".parse().unwrap(),
+        c2_token,
+        vec![C2NodeConfig::new(node_id.clone(), node_endpoint.clone(), node_token).unwrap()],
+    ).unwrap()
+        .with_control_endpoint(control_endpoint.clone()).unwrap()
+        .with_timings(timings)).await.unwrap();
+    let c2_client = C2Client::new(c2.api_addr(), c2_token).unwrap()
+        .with_deadline(Duration::from_secs(1));
+    wait_online(&c2_client, &node_id).await;
+
+    let running = start_harness_light(&control_endpoint, c2_token).await.unwrap();
+    let client = HarnessOperatorClient::new(running.operator_endpoint(), running.operator_credential()).unwrap();
+
+    // Two independent subscribers, each drained on its own thread -- see
+    // `spawn_subscription_reader`'s own doc comment for why this cannot run
+    // directly inside this async test body.
+    let mut event_rx = spawn_subscription_reader(&client);
+    let mut last_sequence = None;
+    let mut second_event_rx = spawn_subscription_reader(&client);
+    let mut second_last_sequence = None;
+
+    // SnapshotBaseline always arrives first for each subscriber, independently:
+    // no tasks/runs (canon: no kernel), and the fixture node already present
+    // (the initial sweep in `start_harness_light` completed before this test
+    // could even connect).
+    for (event_rx, last_sequence) in [
+        (&mut event_rx, &mut last_sequence),
+        (&mut second_event_rx, &mut second_last_sequence),
+    ] {
+        let baseline = wait_for_event(event_rx, last_sequence, |event| {
+            matches!(event, HarnessOperatorEventV1::SnapshotBaseline { .. })
+        }).await;
+        match baseline {
+            HarnessOperatorEventV1::SnapshotBaseline { tasks, runs, nodes, .. } => {
+                assert!(tasks.is_empty(), "light mode has no task kernel: baseline tasks must be empty");
+                assert!(runs.is_empty(), "light mode has no task kernel: baseline runs must be empty");
+                assert!(
+                    nodes.iter().any(|node| node.node_id == node_id.as_str()),
+                    "the fixture node must already be present in the baseline",
+                );
+            }
+            other => panic!("expected SnapshotBaseline, got {other:?}"),
+        }
+    }
+
+    // SpawnSession via the operator wire; both subscribers eventually see a
+    // RuntimeInventoryChanged carrying the session Running, not merely
+    // present (mirrors the full harness's own subscription E2E: a force-stop
+    // issued while the provider child is still starting races the node's
+    // own lifecycle).
+    let session = client.spawn_session(
+        node_id.as_str().to_owned(),
+        workspace_id.as_str().to_owned(),
+        "claude".to_owned(),
+        profile_id.as_str().to_owned(),
+        HarnessExecutionModeV1::Pty,
+        HarnessRuntimeTerminalSizeV1 { rows: 24, columns: 80 },
+    ).unwrap();
+    assert_eq!(session.node_id, node_id.as_str());
+
+    for (event_rx, last_sequence) in [
+        (&mut event_rx, &mut last_sequence),
+        (&mut second_event_rx, &mut second_last_sequence),
+    ] {
+        wait_for_event(event_rx, last_sequence, |event| {
+            matches!(
+                event,
+                HarnessOperatorEventV1::RuntimeInventoryChanged { node, .. }
+                    if find_session_in_node(node, &session).is_some_and(|found| {
+                        found.status == HarnessRuntimeSessionStatusV1::Running
+                    }),
+            )
+        }).await;
+    }
+
+    // StopSession, then both subscribers eventually see another inventory
+    // push with the session gone -- the A1 stop-reap
+    // (`crate::relay::spawn_stop_reap`) is what makes this converge: a
+    // settled Stop does not unbind the session on the node side by itself.
+    client.stop_session(session.clone(), true).unwrap();
+    for (event_rx, last_sequence) in [
+        (&mut event_rx, &mut last_sequence),
+        (&mut second_event_rx, &mut second_last_sequence),
+    ] {
+        wait_for_event(event_rx, last_sequence, |event| {
+            matches!(
+                event,
+                HarnessOperatorEventV1::RuntimeInventoryChanged { node, .. }
+                    if node.node_id == session.node_id && find_session_in_node(node, &session).is_none(),
+            )
+        }).await;
+    }
 
     running.shutdown().await.unwrap();
     let c2_shutdown = c2.shutdown_handle();

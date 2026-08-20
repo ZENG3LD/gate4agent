@@ -187,7 +187,7 @@ async fn spawn_session_inner(
         instance_id: receipt.session.session.instance_id.0,
         generation: receipt.session.session.generation.0,
     };
-    refresh_route(&state.control, &state.snapshot_gate, &state.inventory, &route).await;
+    refresh_route(&state.control, &state.snapshot_gate, &state.inventory, &state.commands, &route).await;
     Ok(address)
 }
 
@@ -341,7 +341,7 @@ async fn session_control_inner(
         Err(failure) => return Err(LightRelayError::NodeRejected(failure.code)),
     }
     if verb.affects_roster() {
-        refresh_route(&state.control, &state.snapshot_gate, &state.inventory, &route).await;
+        refresh_route(&state.control, &state.snapshot_gate, &state.inventory, &state.commands, &route).await;
     }
     // A settled `Stop` does not unbind itself on the node side -- nothing
     // there drops a stopped session's own binding on its own, so without an
@@ -362,6 +362,11 @@ fn spawn_stop_reap(state: &LightState, route: NodeRoute, session: SessionAddress
     let control = state.control.clone();
     let inventory = state.inventory.clone();
     let snapshot_gate = state.snapshot_gate.clone();
+    // `mpsc::Sender` clones cheaply (no `Arc` wrapper needed, unlike
+    // `snapshot_gate` above) -- this detached task outlives the request
+    // that spawned it, so it cannot borrow `state.commands` the way every
+    // other `refresh_route` caller does.
+    let commands = state.commands.clone();
     tokio::spawn(async move {
         let node_id = route.node_id.as_str().to_owned();
         match control.request(route.clone(), NodeRequest::Remove { session }).await {
@@ -395,7 +400,7 @@ fn spawn_stop_reap(state: &LightState, route: NodeRoute, session: SessionAddress
         // Best-effort either way: whether the node actually dropped the
         // binding or not, a fresh snapshot is what the roster should reflect
         // next.
-        refresh_route(&control, &snapshot_gate, &inventory, &route).await;
+        refresh_route(&control, &snapshot_gate, &inventory, &commands, &route).await;
     });
 }
 
@@ -1022,7 +1027,7 @@ async fn session_record_mutation_inner(
     // doc comment on why this family never special-cases which of the six
     // actually changed anything (the A1 eager-refresh pattern, see
     // `crate::relay`'s own module doc comment above `SessionVerb`).
-    refresh_route(&state.control, &state.snapshot_gate, &state.inventory, &route).await;
+    refresh_route(&state.control, &state.snapshot_gate, &state.inventory, &state.commands, &route).await;
     Ok(response)
 }
 
@@ -1184,7 +1189,7 @@ async fn resource_mutation_inner(
     // own doc comment (promoted alongside the enum) for why this stays
     // unconditional per-verb-group rather than special-cased per response.
     if invalidates_runtime_inventory {
-        refresh_route(&state.control, &state.snapshot_gate, &state.inventory, &route).await;
+        refresh_route(&state.control, &state.snapshot_gate, &state.inventory, &state.commands, &route).await;
     }
     Ok(response)
 }

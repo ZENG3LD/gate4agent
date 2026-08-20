@@ -35,11 +35,11 @@ use gate4agent_harness_api::{
     HarnessRuntimeInventoryPageV1, HarnessRuntimeNodeInventoryV1,
 };
 use gate4agent_harness_service::runtime::redact_runtime_inventory;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 
 use crate::c2::fetch_snapshot_serialized;
 use crate::util::unix_time_ms;
-use crate::LightState;
+use crate::{LightCommand, LightState};
 
 /// Roster keyed by the wire's own `node_id: String` (not the typed
 /// `NodeId`): the map's natural iteration order then already matches
@@ -70,10 +70,25 @@ pub(crate) fn new_shared() -> SharedInventory {
 /// the freshness guard a snapshot issued *before* a mutation could still
 /// land *after* one issued after it, overwriting fresher data with stale
 /// data.
+///
+/// Every caller runs detached from `lib.rs`'s `run_light_host` select loop
+/// (a per-connection task, or one of that loop's own detached per-event/
+/// per-topology-change tasks) and so cannot touch the loop-owned
+/// `SubscriberRegistry` directly -- see that loop's own doc comment for the
+/// drain doctrine. When this call's `UpsertOutcome` actually changed
+/// something observable (`emits_inventory_changed`), it reports the fresh
+/// node value back to the loop via `commands` (`try_send`, never awaited:
+/// this must never block a connection/event task on the loop's own pace,
+/// including the very first call any of them ever makes -- the initial
+/// `sweep_online_nodes` at `start_harness_light`, which runs *before*
+/// `run_light_host` has even been spawned to start draining `commands` at
+/// all; see `LIGHT_COMMAND_CAPACITY`'s doc comment for why that is safe
+/// regardless).
 pub(crate) async fn refresh_route(
     control: &C2ControlHandle,
     snapshot_gate: &Mutex<()>,
     inventory: &SharedInventory,
+    commands: &mpsc::Sender<LightCommand>,
     route: &NodeRoute,
 ) {
     match fetch_snapshot_serialized(control, snapshot_gate, route).await {
@@ -86,10 +101,26 @@ pub(crate) async fn refresh_route(
                 inventory: redact_runtime_inventory(SlimNodeInventory::from_c2_snapshot(&snapshot)),
             };
             let node_id = node.node_id.clone();
+            // Cloned before the map takes ownership: mirrors
+            // `gate4agent-harness-service::runtime`'s own
+            // `HarnessRuntimeInventoryCache::refresh`, which pays this exact
+            // same one clone unconditionally (`self.nodes.insert(..,
+            // node.clone())`) so it can still hand the original back to its
+            // own caller as the `RuntimeInventoryChanged` payload.
+            let node_for_emit = node.clone();
             let outcome = {
                 let mut guard = inventory.write().await;
                 upsert_if_fresher(&mut guard, node)
             };
+            if emits_inventory_changed(outcome) {
+                if commands.try_send(LightCommand::InventoryChanged(node_for_emit)).is_err() {
+                    tracing::debug!(
+                        node_id,
+                        "harness-light: dropped an inventory-changed subscription notification \
+                         (command queue full or host stopped)",
+                    );
+                }
+            }
             match outcome {
                 UpsertOutcome::Inserted | UpsertOutcome::Changed => {
                     tracing::debug!(node_id, "harness-light: runtime inventory entry refreshed");
@@ -112,6 +143,20 @@ pub(crate) async fn refresh_route(
             );
         }
     }
+}
+
+/// Whether `outcome` warrants a `RuntimeInventoryChanged` subscription push
+/// -- the Eq-diff gate `refresh_route` applies before ever touching
+/// `commands`: an `Unchanged` (byte-for-byte duplicate) or `StaleIgnored`
+/// (superseded by an already-landed fresher response) refresh must never
+/// fan a spurious event out to a live subscriber, only an
+/// `Inserted`/`Changed` one that actually altered what `RuntimeInventoryList`
+/// reports. Split out, mirroring `event_affects_roster`/`stale_node_ids`
+/// below, so this decision is unit-testable without a live C2 connection
+/// (`refresh_route` itself needs one, for the snapshot fetch the outcome is
+/// computed from).
+fn emits_inventory_changed(outcome: UpsertOutcome) -> bool {
+    matches!(outcome, UpsertOutcome::Inserted | UpsertOutcome::Changed)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -166,7 +211,7 @@ pub(crate) async fn sweep_online_nodes(state: &LightState) {
         }
         let Some(expected_incarnation_id) = node.current_incarnation_id else { continue };
         let route = NodeRoute { node_id: node.node_id.clone(), expected_incarnation_id };
-        refresh_route(&state.control, &state.snapshot_gate, &state.inventory, &route).await;
+        refresh_route(&state.control, &state.snapshot_gate, &state.inventory, &state.commands, &route).await;
     }
 }
 
@@ -196,6 +241,18 @@ pub(crate) async fn reconcile_topology(state: &LightState, topology: &C2Topology
         drop(guard);
         for node_id in &stale {
             tracing::debug!(node_id, "harness-light: runtime inventory entry dropped (topology change)");
+            // `try_send`, never awaited -- same never-block-the-sender
+            // rationale as `refresh_route`'s own `InventoryChanged` push
+            // (this function already runs detached from the select loop
+            // that owns `SubscriberRegistry`, see that loop's own doc
+            // comment).
+            if state.commands.try_send(LightCommand::InventoryRemoved(node_id.clone())).is_err() {
+                tracing::debug!(
+                    node_id,
+                    "harness-light: dropped an inventory-removed subscription notification \
+                     (command queue full or host stopped)",
+                );
+            }
         }
     }
     sweep_online_nodes(state).await;
@@ -263,7 +320,7 @@ pub(crate) async fn handle_event(state: &LightState, event: &RoutedNodeEvent) {
         return;
     }
     let route = NodeRoute { node_id: event.node_id.clone(), expected_incarnation_id };
-    refresh_route(&state.control, &state.snapshot_gate, &state.inventory, &route).await;
+    refresh_route(&state.control, &state.snapshot_gate, &state.inventory, &state.commands, &route).await;
 }
 
 /// Serves `RuntimeInventoryList` from the maintained roster: a plain,
@@ -474,6 +531,19 @@ mod tests {
             UpsertOutcome::Unchanged,
         );
         assert_eq!(map.get("node-a").unwrap().event_sequence, 13);
+    }
+
+    /// The Eq-diff gate `refresh_route` applies before ever touching
+    /// `commands`: only an outcome that actually altered the cached entry
+    /// (`Inserted`/`Changed`) warrants a `RuntimeInventoryChanged` push --
+    /// an `Unchanged` (duplicate) or `StaleIgnored` (superseded) refresh
+    /// must never fan a spurious event out to a live subscriber.
+    #[test]
+    fn emits_inventory_changed_gates_on_inserted_or_changed_only() {
+        assert!(emits_inventory_changed(UpsertOutcome::Inserted));
+        assert!(emits_inventory_changed(UpsertOutcome::Changed));
+        assert!(!emits_inventory_changed(UpsertOutcome::Unchanged));
+        assert!(!emits_inventory_changed(UpsertOutcome::StaleIgnored));
     }
 
     /// A lower `event_sequence` for a *different* incarnation is not stale

@@ -547,14 +547,25 @@ impl HarnessEventSubscriber {
 /// subscriber count is capped tiny (`HOST_SUBSCRIBER_LIMIT`) by a dedicated
 /// semaphore before a connection ever reaches `HostCommand::Subscribe`, so
 /// linear scan/removal costs nothing observable.
+///
+/// Promoted `pub` for `gate4agent-harness-light` (A3): every method here
+/// (`insert`/`is_empty`/`send_to`/`emit`/`needs_recovery`/`recover_lagged_with`)
+/// works purely in terms of `mpsc::Sender<HarnessOperatorEventV1>` and
+/// `OperatorRequestLogIdentity` -- no `HarnessService`/kernel entanglement --
+/// so the light harness reuses this registry verbatim rather than
+/// reimplementing the overflow/lag-recovery/pruning state machine
+/// light-local. Only `recover_lagged` itself (below, still private) stays
+/// tied to this crate's own `HarnessService`/`HarnessRuntimeInventoryCache`
+/// baseline; `recover_lagged_with` is the kernel-free generalization both
+/// harnesses' own loops call.
 #[derive(Default)]
-struct SubscriberRegistry {
+pub struct SubscriberRegistry {
     subscribers: Vec<HarnessEventSubscriber>,
     next_id: u64,
 }
 
 impl SubscriberRegistry {
-    fn insert(
+    pub fn insert(
         &mut self,
         sender: mpsc::Sender<HarnessOperatorEventV1>,
         identity: OperatorRequestLogIdentity,
@@ -571,7 +582,7 @@ impl SubscriberRegistry {
         id
     }
 
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.subscribers.is_empty()
     }
 
@@ -589,7 +600,7 @@ impl SubscriberRegistry {
     /// Pushes to exactly one subscriber by id -- used right after `insert`
     /// to deliver the mandatory first `SnapshotBaseline`, before the caller
     /// has any other event to fan out.
-    fn send_to(&mut self, id: u64, build: impl FnOnce(u64) -> HarnessOperatorEventV1) {
+    pub fn send_to(&mut self, id: u64, build: impl FnOnce(u64) -> HarnessOperatorEventV1) {
         let Some(index) = self.subscribers.iter().position(|subscriber| subscriber.id == id)
         else {
             return;
@@ -609,7 +620,7 @@ impl SubscriberRegistry {
     /// skipped entirely -- it is treated as stale until `recover_lagged`
     /// catches it back up, so it must not observe this event out of order
     /// relative to the `SnapshotBaseline` it is waiting for.
-    fn emit(&mut self, mut build: impl FnMut(u64) -> HarnessOperatorEventV1) {
+    pub fn emit(&mut self, mut build: impl FnMut(u64) -> HarnessOperatorEventV1) {
         let mut index = 0;
         while index < self.subscribers.len() {
             if self.subscribers[index].needs_baseline {
@@ -634,23 +645,42 @@ impl SubscriberRegistry {
         }
     }
 
+    /// Whether any live subscriber's outbound queue is currently full and
+    /// awaiting a `Lagged`+`SnapshotBaseline` recovery pair --
+    /// `recover_lagged_with`'s own cheap pre-check, promoted `pub` so a
+    /// caller whose baseline is expensive (or, for `gate4agent-harness-light`,
+    /// needs an async lock read no sync closure can perform) to assemble
+    /// can decide whether to pay that cost at all before calling it.
+    pub fn needs_recovery(&self) -> bool {
+        self.subscribers.iter().any(|subscriber| subscriber.needs_baseline)
+    }
+
     /// Runs once per select-loop pass. Every subscriber marked
     /// `needs_baseline` gets a `Lagged` frame followed by a fresh
     /// `SnapshotBaseline`; the flag clears only once both sends succeed --
     /// if either one is still `Full`, the subscriber stays marked and this
-    /// retries on the next pass. The (potentially non-trivial) redaction
-    /// pass over every task/run only runs when at least one subscriber
-    /// actually needs it.
-    fn recover_lagged(
+    /// retries on the next pass. `baseline` is called at most once, and only
+    /// once `needs_recovery` is true (mirroring the inline check this was
+    /// generalized from) -- the (potentially non-trivial, and for
+    /// `gate4agent-harness-light`, async-lock-guarded) baseline assembly
+    /// only ever runs when at least one subscriber actually needs it.
+    ///
+    /// Promoted `pub` and generalized from the original `recover_lagged`
+    /// (kept below, now a thin wrapper) so `gate4agent-harness-light` (no
+    /// `HarnessService`/`HarnessRuntimeInventoryCache`, no task/run kernel at
+    /// all) can supply its own light-local baseline -- empty tasks/runs
+    /// (canon: light has no kernel) and nodes from its own shared,
+    /// `Arc<RwLock<..>>`-guarded runtime inventory -- while every other bit
+    /// of overflow/pruning/retry bookkeeping stays exactly this one shared
+    /// implementation.
+    pub fn recover_lagged_with(
         &mut self,
-        harness: &HarnessService,
-        runtime_inventory: &HarnessRuntimeInventoryCache,
+        baseline: impl FnOnce() -> (Vec<RedactedTaskV1>, Vec<RedactedRunV1>, Vec<HarnessRuntimeNodeInventoryV1>),
     ) {
-        if !self.subscribers.iter().any(|subscriber| subscriber.needs_baseline) {
+        if !self.needs_recovery() {
             return;
         }
-        let (tasks, runs) = harness_snapshot_baseline_payload(harness);
-        let nodes = runtime_inventory.all_nodes();
+        let (tasks, runs, nodes) = baseline();
         let mut index = 0;
         while index < self.subscribers.len() {
             if !self.subscribers[index].needs_baseline {
@@ -682,6 +712,20 @@ impl SubscriberRegistry {
                 SubscriberSendOutcome::Closed => self.remove_at(index),
             }
         }
+    }
+
+    /// This crate's own call site: `HarnessService`/`HarnessRuntimeInventoryCache`
+    /// -backed baseline, over `recover_lagged_with`.
+    fn recover_lagged(
+        &mut self,
+        harness: &HarnessService,
+        runtime_inventory: &HarnessRuntimeInventoryCache,
+    ) {
+        self.recover_lagged_with(|| {
+            let (tasks, runs) = harness_snapshot_baseline_payload(harness);
+            let nodes = runtime_inventory.all_nodes();
+            (tasks, runs, nodes)
+        });
     }
 }
 
@@ -3030,8 +3074,13 @@ fn is_session_control_request(request: &HarnessOperatorRequestV1) -> bool {
 /// from the request's own serde `kind` tag rather than hand-matched, so it
 /// can never drift from the wire discriminant as request variants are
 /// added.
+///
+/// Promoted `pub` for `gate4agent-harness-light`: its own `SubscribeEvents`
+/// branch (A3) needs an identity to hand `SubscriberRegistry::insert`, and
+/// this is exactly the same pure `&HarnessOperatorRequestV1 ->` identity
+/// mapping either harness wants, with zero kernel entanglement.
 #[derive(Clone, Debug)]
-struct OperatorRequestLogIdentity {
+pub struct OperatorRequestLogIdentity {
     operation: String,
     node_id: Option<String>,
     workspace_id: Option<String>,
@@ -3048,7 +3097,7 @@ struct OperatorRequestLogIdentity {
 }
 
 impl OperatorRequestLogIdentity {
-    fn describe(request: &HarnessOperatorRequestV1) -> Self {
+    pub fn describe(request: &HarnessOperatorRequestV1) -> Self {
         let (node_id, workspace_id, session_id) = match request {
             HarnessOperatorRequestV1::InspectNodeWorkspace { node_id, workspace_id }
             | HarnessOperatorRequestV1::ReadNodeWorkspaceFile { node_id, workspace_id, .. }
@@ -8520,7 +8569,12 @@ async fn handle_connection(
 /// module doc), so the client's own `Drop` for its subscription handle is
 /// exactly "close the socket," which this loop observes as a write failure
 /// on its very next attempt.
-async fn run_operator_event_subscription(
+///
+/// Promoted `pub` for `gate4agent-harness-light` (A3): this forwarding loop
+/// has no kernel dependency of its own (a bare `TcpStream` + `mpsc::Receiver`
+/// + `OwnedSemaphorePermit`), so it is reused verbatim for that crate's own
+/// `SubscribeEvents` connections rather than reimplemented.
+pub async fn run_operator_event_subscription(
     mut stream: TcpStream,
     mut events: mpsc::Receiver<HarnessOperatorEventV1>,
     _subscriber_permit: tokio::sync::OwnedSemaphorePermit,
@@ -8549,7 +8603,10 @@ fn event_kind_label(event: &HarnessOperatorEventV1) -> &'static str {
 /// newline-terminated `HarnessOperatorEventV1` and flushes, but -- unlike
 /// `write_operator_reply` -- never shuts the connection down afterward, so
 /// the socket stays open for the next event.
-async fn write_operator_event(
+///
+/// Promoted `pub` for `gate4agent-harness-light` (A3), same reasoning as
+/// `run_operator_event_subscription` (its one caller) above.
+pub async fn write_operator_event(
     stream: &mut TcpStream,
     event: HarnessOperatorEventV1,
 ) -> Result<(), HarnessRuntimeError> {

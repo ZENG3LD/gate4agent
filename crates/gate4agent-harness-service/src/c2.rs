@@ -1963,7 +1963,7 @@ fn correlate_run_context_source_response(
 /// (route sealed to a stored run binding) and `PreparedNodeWorkspaceRead`
 /// (route resolved live from a node ID, no run involved).
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum WorkspaceReadKind {
+pub enum WorkspaceReadKind {
     InspectWorkspace,
     ReadWorkspaceFile { path: RepositoryPath },
     ReadGitHistory {
@@ -2175,13 +2175,22 @@ fn run_read_response_route_matches(
 /// flight. The route is resolved live via `HarnessC2Adapter::exact_route`
 /// (mirrors `preflight_spawn_profile`'s live lookup) — there is no stored
 /// binding to seal it from.
-pub(crate) struct PreparedNodeWorkspaceRead {
+pub struct PreparedNodeWorkspaceRead {
     route: NodeRoute,
     workspace_id: WorkspaceId,
     kind: WorkspaceReadKind,
 }
 
 impl PreparedNodeWorkspaceRead {
+    /// `pub`: the light-local counterpart of `from_operator_request` below --
+    /// `gate4agent-harness-light` has no `HarnessC2Adapter` (see this crate's
+    /// own doc comment on why that stays unshared) and resolves its own
+    /// `NodeRoute` via a raw `C2ControlHandle`, so it builds this bundle
+    /// directly rather than through the adapter-entangled constructor.
+    pub fn new(route: NodeRoute, workspace_id: WorkspaceId, kind: WorkspaceReadKind) -> Self {
+        Self { route, workspace_id, kind }
+    }
+
     pub(crate) fn from_operator_request(
         adapter: &HarnessC2Adapter,
         request: HarnessOperatorRequestV1,
@@ -2233,7 +2242,7 @@ impl PreparedNodeWorkspaceRead {
         Ok(Self { route, workspace_id, kind })
     }
 
-    fn wire_request(&self) -> NodeRequest {
+    pub fn wire_request(&self) -> NodeRequest {
         workspace_read_wire_request(&self.workspace_id, &self.kind)
     }
 
@@ -2294,7 +2303,7 @@ impl PendingNodeWorkspaceRead {
 /// `Pending*` pair, one C2 relay -- the node's own `expected_revision` CAS
 /// on `WriteFile` is relayed through untouched, not re-implemented here.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum WorkspaceWriteKind {
+pub enum WorkspaceWriteKind {
     WriteFile {
         path: RepositoryPath,
         expected_revision: WorkspaceFileRevision,
@@ -2334,13 +2343,19 @@ fn workspace_write_wire_request(
 /// There is no `PreparedRunWrite` counterpart: a run's workspace is only
 /// ever read through the harness (`PreparedRunRead`), never edited straight
 /// from the operator wire, so this stays node-scoped only.
-pub(crate) struct PreparedNodeWorkspaceWrite {
+pub struct PreparedNodeWorkspaceWrite {
     route: NodeRoute,
     workspace_id: WorkspaceId,
     kind: WorkspaceWriteKind,
 }
 
 impl PreparedNodeWorkspaceWrite {
+    /// `pub`: light-local counterpart of `from_operator_request` below, same
+    /// rationale as `PreparedNodeWorkspaceRead::new`.
+    pub fn new(route: NodeRoute, workspace_id: WorkspaceId, kind: WorkspaceWriteKind) -> Self {
+        Self { route, workspace_id, kind }
+    }
+
     pub(crate) fn from_operator_request(
         adapter: &HarnessC2Adapter,
         request: HarnessOperatorRequestV1,
@@ -2380,7 +2395,7 @@ impl PreparedNodeWorkspaceWrite {
         Ok(Self { route, workspace_id, kind })
     }
 
-    fn wire_request(&self) -> NodeRequest {
+    pub fn wire_request(&self) -> NodeRequest {
         workspace_write_wire_request(&self.workspace_id, &self.kind)
     }
 
@@ -2784,7 +2799,7 @@ impl PendingSessionControl {
 /// one of these six verbs changes the node's managed-session store, which
 /// the runtime inventory's `managed_sessions` roster caches.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum SessionRecordMutationKind {
+pub enum SessionRecordMutationKind {
     Resume {
         record_id: SessionRecordId,
         terminal_size: TerminalSize,
@@ -2806,12 +2821,22 @@ pub(crate) enum SessionRecordMutationKind {
     IndexNative { selection: NativeSessionSelection, display_name: String },
 }
 
-pub(crate) struct PreparedSessionRecordMutation {
+pub struct PreparedSessionRecordMutation {
     route: NodeRoute,
     kind: SessionRecordMutationKind,
 }
 
 impl PreparedSessionRecordMutation {
+    /// `pub`: light-local counterpart of `from_operator_request` below, same
+    /// rationale as `PreparedNodeWorkspaceRead::new`. `IndexNativeSession`
+    /// still resolves its route live via the caller's own `exact_route`
+    /// equivalent (unlike the native-history pool, this family never trusts
+    /// a caller-pinned incarnation), matching this crate's own
+    /// `from_operator_request` below exactly.
+    pub fn new(route: NodeRoute, kind: SessionRecordMutationKind) -> Self {
+        Self { route, kind }
+    }
+
     pub(crate) fn from_operator_request(
         adapter: &HarnessC2Adapter,
         request: HarnessOperatorRequestV1,
@@ -2890,9 +2915,9 @@ impl PreparedSessionRecordMutation {
         Ok(Self { route, kind })
     }
 
-    pub(crate) fn route(&self) -> &NodeRoute { &self.route }
+    pub fn route(&self) -> &NodeRoute { &self.route }
 
-    fn wire_request(&self) -> NodeRequest {
+    pub fn wire_request(&self) -> NodeRequest {
         match &self.kind {
             SessionRecordMutationKind::Resume { record_id, terminal_size, initial_prompt } => {
                 NodeRequest::ResumeSessionRecord {
@@ -2935,7 +2960,9 @@ impl PreparedSessionRecordMutation {
     }
 }
 
-fn session_task_target_from_api(
+/// `pub`: reused by `gate4agent-harness-light`'s `SetSessionTask` relay to
+/// build `SessionRecordMutationKind::SetTask`.
+pub fn session_task_target_from_api(
     target: &HarnessSessionTaskTargetV1,
 ) -> Result<gate4agent_node_protocol::SessionTaskTargetV1, HarnessC2Error> {
     Ok(match target {
@@ -2950,7 +2977,9 @@ fn session_task_target_from_api(
     })
 }
 
-fn provider_session_identity_from_api(
+/// `pub`: reused by `gate4agent-harness-light`'s `IndexProviderSession` relay
+/// to build `SessionRecordMutationKind::IndexProvider`.
+pub fn provider_session_identity_from_api(
     identity: &HarnessProviderSessionIdentityV1,
 ) -> Result<gate4agent_types::ProviderSessionIdentity, HarnessC2Error> {
     Ok(gate4agent_types::ProviderSessionIdentity {
@@ -2996,7 +3025,9 @@ impl PendingSessionRecordMutation {
     }
 }
 
-fn correlate_session_record_mutation_response(
+/// `pub`: reused verbatim by `gate4agent-harness-light`'s session-record-
+/// mutation relay -- pure correlation/projection, no adapter dependency.
+pub fn correlate_session_record_mutation_response(
     prepared: &PreparedSessionRecordMutation,
     response: C2NodeResponse,
 ) -> Result<HarnessOperatorResponseV1, HarnessC2Error> {
@@ -3212,7 +3243,11 @@ fn project_host_path(path: &OpaqueHostPath) -> Result<HarnessHostPathV1, Harness
     HarnessHostPathV1::new(text).map_err(|_| HarnessC2Error::ResourceMutationProjection)
 }
 
-fn project_host_directory_listing(
+/// `pub`: reused verbatim by `gate4agent-harness-light`'s `BrowseHostDirectories`
+/// relay, which has no `PreparedHostDirectoryBrowse`/`Kind` enum of its own
+/// to promote (there is only one verb in this family) and so calls this
+/// projection directly.
+pub fn project_host_directory_listing(
     listing: HostDirectoryListing,
 ) -> Result<HarnessHostDirectoryListingV1, HarnessC2Error> {
     if listing.entries.len() > HARNESS_HOST_DIRECTORY_ENTRIES_MAX {
@@ -3250,7 +3285,7 @@ fn project_host_directory_listing(
 /// carries its own workspace/session/context identity inline: there is no
 /// single workspace or session this whole family is "about".
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum ResourceMutationKind {
+pub enum ResourceMutationKind {
     RegisterWorkspace { workspace_id: WorkspaceId, root: OpaqueHostPath },
     UnregisterWorkspace { workspace_id: WorkspaceId },
     CreateStandaloneWorkspace {
@@ -3284,7 +3319,7 @@ impl ResourceMutationKind {
     /// `ExportContextPack`/`ForgetContextPack` touch the node's context-pack
     /// store only -- no `workspaces` or `managed_sessions` roster effect at
     /// all -- so those two stay `false`.
-    fn invalidates_runtime_inventory(&self) -> bool {
+    pub fn invalidates_runtime_inventory(&self) -> bool {
         match self {
             Self::RegisterWorkspace { .. }
             | Self::UnregisterWorkspace { .. }
@@ -3296,12 +3331,18 @@ impl ResourceMutationKind {
     }
 }
 
-pub(crate) struct PreparedResourceMutation {
+pub struct PreparedResourceMutation {
     route: NodeRoute,
     kind: ResourceMutationKind,
 }
 
 impl PreparedResourceMutation {
+    /// `pub`: light-local counterpart of `from_operator_request` below, same
+    /// rationale as `PreparedNodeWorkspaceRead::new`.
+    pub fn new(route: NodeRoute, kind: ResourceMutationKind) -> Self {
+        Self { route, kind }
+    }
+
     pub(crate) fn from_operator_request(
         adapter: &HarnessC2Adapter,
         request: HarnessOperatorRequestV1,
@@ -3400,13 +3441,13 @@ impl PreparedResourceMutation {
         Ok(Self { route, kind })
     }
 
-    pub(crate) fn route(&self) -> &NodeRoute { &self.route }
+    pub fn route(&self) -> &NodeRoute { &self.route }
 
-    pub(crate) fn invalidates_runtime_inventory(&self) -> bool {
+    pub fn invalidates_runtime_inventory(&self) -> bool {
         self.kind.invalidates_runtime_inventory()
     }
 
-    fn wire_request(&self) -> NodeRequest {
+    pub fn wire_request(&self) -> NodeRequest {
         match &self.kind {
             ResourceMutationKind::RegisterWorkspace { workspace_id, root } => {
                 NodeRequest::RegisterWorkspace {
@@ -3515,7 +3556,9 @@ fn project_git_worktree_snapshot(
     })
 }
 
-fn correlate_resource_mutation_response(
+/// `pub`: reused verbatim by `gate4agent-harness-light`'s management-family
+/// relay -- pure correlation/projection, no adapter dependency.
+pub fn correlate_resource_mutation_response(
     prepared: &PreparedResourceMutation,
     response: C2NodeResponse,
 ) -> Result<HarnessOperatorResponseV1, HarnessC2Error> {
@@ -3911,7 +3954,12 @@ fn project_git_diff_mode(
 /// `project_git_status_entry`, `project_git_commit`, `project_git_diff_mode`)
 /// with the run-scoped family — only the top-level origin and response
 /// variant differ.
-fn correlate_node_workspace_read_response(
+/// `pub`: reused verbatim by `gate4agent-harness-light`'s node-workspace-read
+/// relay. Pure projection (route/kind + `C2NodeResponse` -> wire response,
+/// with the honesty/truncation-marker and size-cap logic every per-field
+/// helper below it already carries) -- no adapter/kernel dependency, so this
+/// is a straight promotion rather than a light-local reimplementation.
+pub fn correlate_node_workspace_read_response(
     prepared: &PreparedNodeWorkspaceRead,
     response: C2NodeResponse,
 ) -> Result<HarnessOperatorResponseV1, HarnessC2Error> {
@@ -4037,7 +4085,9 @@ fn project_node_workspace_file(
 /// `C2NodeResponse` shape the node returns for it, exactly the way the read
 /// family pairs `WorkspaceReadKind` against its four `C2NodeResponse`
 /// shapes.
-fn correlate_node_workspace_write_response(
+/// `pub`: write-family sibling of `correlate_node_workspace_read_response`,
+/// reused the same way and for the same reason.
+pub fn correlate_node_workspace_write_response(
     prepared: &PreparedNodeWorkspaceWrite,
     response: C2NodeResponse,
 ) -> Result<HarnessOperatorResponseV1, HarnessC2Error> {
@@ -4261,7 +4311,13 @@ fn native_history_wire_request(
     Ok((route, wire_request))
 }
 
-fn native_history_wire_route(
+/// `pub`: reused verbatim by `gate4agent-harness-light`'s native-history
+/// relay for the three incarnation-pinned verbs (`CatalogNativeSessions`/
+/// `PageNativeSessions`/`PreviewNativeSession`), which trust the caller-
+/// supplied route the same way this crate's own dispatch does -- no
+/// `HarnessC2Adapter`/`exact_route` call in this function at all, so it is
+/// kernel-free by construction.
+pub fn native_history_wire_route(
     route: &HarnessNativeSessionRouteV1,
 ) -> Result<NativeSessionCatalogRoute, HarnessC2Error> {
     let provider = AgentId::new(route.provider.as_str())
@@ -4285,7 +4341,11 @@ fn native_history_wire_route(
     }
 }
 
-fn native_history_wire_selection(
+/// `pub`: see `native_history_wire_route`'s doc comment; also used by the
+/// session-record-mutation relay's `IndexNativeSession` (which re-resolves
+/// its route live rather than trusting the pin, but still needs this same
+/// pure selection mapping).
+pub fn native_history_wire_selection(
     selection: &HarnessNativeSessionSelectionV1,
 ) -> Result<NativeSessionSelection, HarnessC2Error> {
     Ok(NativeSessionSelection {
@@ -4296,7 +4356,8 @@ fn native_history_wire_selection(
     })
 }
 
-fn native_history_wire_window(
+/// `pub`: see `native_history_wire_route`'s doc comment.
+pub fn native_history_wire_window(
     window: HarnessNativeSessionCatalogWindowV1,
 ) -> gate4agent_node_protocol::NativeSessionCatalogWindow {
     match window {
@@ -4309,7 +4370,12 @@ fn native_history_wire_window(
     }
 }
 
-fn correlate_native_history_response(
+/// `pub`: reused verbatim by `gate4agent-harness-light` for all four native-
+/// history-pool verbs (`CatalogNativeSessions`/`PageNativeSessions`/
+/// `PreviewNativeSession`/`PreviewSessionRecord`) -- pure request/response
+/// correlation plus projection (`project_native_history_*`), no adapter
+/// dependency.
+pub fn correlate_native_history_response(
     request: HarnessOperatorRequestV1,
     response: C2NodeResponse,
 ) -> Result<HarnessOperatorResponseV1, HarnessC2Error> {

@@ -7,7 +7,7 @@ pub mod dispatch;
 pub mod read;
 pub mod runtime;
 mod store;
-mod terminal;
+pub mod terminal;
 
 use gate4agent_harness_engine::{
     HarnessApplyOutcome, HarnessEngine, HarnessEngineCheckpointV1, HarnessEngineError,
@@ -6141,7 +6141,11 @@ fn continuation_source_session(
     })
 }
 
-fn context_receipt_from_node(
+/// `pub`: reused verbatim by `gate4agent-harness-light`'s resource-mutation
+/// relay (`ExportContextPack`) via `c2::correlate_resource_mutation_response`,
+/// which already calls this function internally -- pure node-receipt-to-wire
+/// projection, no task-kernel/SQLite dependency.
+pub fn context_receipt_from_node(
     context: &gate4agent_node_protocol::ResolvedContextPackReceipt,
 ) -> Result<HarnessResolvedContextPackReceiptV1, HarnessServiceError> {
     let receipt = HarnessResolvedContextPackReceiptV1 {

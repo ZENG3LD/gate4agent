@@ -1,13 +1,35 @@
-//! Dispatches one authorized `HarnessOperatorRequestV1` to its A1-scope
+//! Dispatches one authorized `HarnessOperatorRequestV1` to its light-harness
 //! handling and always produces a typed `HarnessOperatorReplyV1` -- never a
 //! hard error; every rejection (typed `NotFound`/`Unsupported`/relay
-//! failure) is itself the reply. Request coverage, per the A1 contract
-//! slice:
+//! failure) is itself the reply. Request coverage, per the app-harness
+//! protocol contract (A1 session verbs + A2 workspace/history/record/
+//! management/terminal; A3 subscription and task-kernel mutations remain
+//! `Unsupported`/`NotFound` by canon):
 //!
 //! - **Served** from the maintained runtime inventory: `RuntimeInventoryList`.
-//! - **Relayed** straight to the C2/Node verb (`crate::relay`): `SpawnSession`,
-//!   `WriteSessionInput`, `ResizeSession`, `StopSession`, `ControlSession`,
-//!   `WriteSessionBytes`, `PasteSession`, `RemoveSession`, `ResumeSession`.
+//! - **Served** from the maintained terminal ring (`crate::terminal`):
+//!   `TerminalRead`.
+//! - **Relayed** straight to the C2/Node verb (`crate::relay`):
+//!   - Session verbs (A1): `SpawnSession`, `WriteSessionInput`,
+//!     `ResizeSession`, `StopSession`, `ControlSession`, `WriteSessionBytes`,
+//!     `PasteSession`, `RemoveSession`, `ResumeSession`.
+//!   - Node-scoped workspace (A2): `InspectNodeWorkspace`,
+//!     `ReadNodeWorkspaceFile`, `ReadNodeGitHistory`, `ReadNodeGitDiff`,
+//!     `WriteNodeWorkspaceFile`, `CreateNodeWorkspaceFile`,
+//!     `CreateNodeWorkspaceDirectory` (CAS conflict on a stale
+//!     `expected_revision` surfaces as a typed `Conflict`).
+//!   - Native history (A2): `CatalogNativeSessions`, `PageNativeSessions`,
+//!     `PreviewNativeSession`, `PreviewSessionRecord`.
+//!   - Session-record mutations (A2): `ResumeSessionRecord`,
+//!     `RenameSessionRecord`, `SetSessionTask`, `ForgetSessionRecord`,
+//!     `IndexProviderSession`, `IndexNativeSession` -- every settled mutation
+//!     eagerly refreshes the affected node's runtime-inventory entry (the A1
+//!     pattern, see `crate::relay`'s module doc comment).
+//!   - Management (A2): `RegisterWorkspace`, `UnregisterWorkspace`,
+//!     `CreateStandaloneWorkspace`, `CreateWorktree`, `RemoveWorktree`
+//!     (workspace/worktree lifecycle -- refreshes the route on success),
+//!     `ExportContextPack`, `ForgetContextPack` (no roster effect, no
+//!     refresh), `BrowseHostDirectories`.
 //! - **Empty pages**: `TasksList`/`RunsList` -- light mode has no task
 //!   kernel, so there is no kanban board to page over, by canon (see the
 //!   app-harness protocol contract's own "Stays in the app" / "Dead by
@@ -20,13 +42,9 @@
 //!   `TaskLaunchOptionsGet`) -- honestly true in light mode: no task/run by
 //!   that id (or any id) will ever exist, so `NotFound` is the correct
 //!   answer, not a placeholder.
-//! - **Typed `Unsupported`** (new in this slice, see `gate4agent-harness-api`):
-//!   everything else -- the task-kernel mutation family (`SubmitIntent` and
-//!   its ten authorized siblings `CreateTask`..`StartTaskV2`), the node-
-//!   workspace read/write family, the native-history and session-record
-//!   families, the resource-mutation family, `TerminalRead`
-//!   (`TerminalBufferRegistry` is deliberately deferred past A1), and
-//!   `SubscribeEvents` (no push-subscription surface in A1 either). Every
+//! - **Typed `Unsupported`**: the task-kernel mutation family (`SubmitIntent`
+//!   and its ten authorized siblings `CreateTask`..`StartTaskV2`) and
+//!   `SubscribeEvents` (no push-subscription surface until A3). Every
 //!   `Unsupported` rejection logs the operation name.
 
 use gate4agent_harness_api::{
@@ -34,7 +52,10 @@ use gate4agent_harness_api::{
     HarnessOperatorResponseV1, RunPageV1, TaskPageV1,
 };
 
-use crate::relay::{self, SessionVerb};
+use crate::relay::{
+    self, NodeWorkspaceReadRequest, NodeWorkspaceWriteRequest, ResourceMutationRequest,
+    SessionRecordMutationRequest, SessionVerb,
+};
 use crate::LightState;
 
 pub(crate) async fn handle_request(
@@ -81,6 +102,149 @@ pub(crate) async fn handle_request(
         }
         HarnessOperatorRequestV1::ResumeSession { session, terminal_size } => {
             relay::session_control(state, session, SessionVerb::Resume { terminal_size }).await
+        }
+
+        HarnessOperatorRequestV1::InspectNodeWorkspace { node_id, workspace_id } => {
+            relay::node_workspace_read(state, node_id, workspace_id, NodeWorkspaceReadRequest::Inspect).await
+        }
+        HarnessOperatorRequestV1::ReadNodeWorkspaceFile { node_id, workspace_id, path } => {
+            relay::node_workspace_read(
+                state, node_id, workspace_id, NodeWorkspaceReadRequest::File { path },
+            ).await
+        }
+        HarnessOperatorRequestV1::ReadNodeGitHistory { node_id, workspace_id, path, before, limit } => {
+            relay::node_workspace_read(
+                state, node_id, workspace_id,
+                NodeWorkspaceReadRequest::GitHistory { path, before, limit },
+            ).await
+        }
+        HarnessOperatorRequestV1::ReadNodeGitDiff { node_id, workspace_id, mode, path } => {
+            relay::node_workspace_read(
+                state, node_id, workspace_id, NodeWorkspaceReadRequest::GitDiff { mode, path },
+            ).await
+        }
+        HarnessOperatorRequestV1::WriteNodeWorkspaceFile {
+            node_id, workspace_id, path, content, expected_revision,
+        } => {
+            relay::node_workspace_write(
+                state, node_id, workspace_id,
+                NodeWorkspaceWriteRequest::File { path, content, expected_revision },
+            ).await
+        }
+        HarnessOperatorRequestV1::CreateNodeWorkspaceFile { node_id, workspace_id, path } => {
+            relay::node_workspace_write(
+                state, node_id, workspace_id, NodeWorkspaceWriteRequest::CreateFile { path },
+            ).await
+        }
+        HarnessOperatorRequestV1::CreateNodeWorkspaceDirectory { node_id, workspace_id, path } => {
+            relay::node_workspace_write(
+                state, node_id, workspace_id, NodeWorkspaceWriteRequest::CreateDirectory { path },
+            ).await
+        }
+
+        HarnessOperatorRequestV1::CatalogNativeSessions { route, limit } => {
+            relay::catalog_native_sessions(state, route, limit).await
+        }
+        HarnessOperatorRequestV1::PageNativeSessions {
+            route, window, catalog_revision, recent_cutoff_unix_ms, after_selection_id, limit,
+        } => {
+            relay::page_native_sessions(
+                state, route, window, catalog_revision, recent_cutoff_unix_ms, after_selection_id, limit,
+            ).await
+        }
+        HarnessOperatorRequestV1::PreviewNativeSession { selection, message_limit } => {
+            relay::preview_native_session(state, selection, message_limit).await
+        }
+        HarnessOperatorRequestV1::PreviewSessionRecord { node_id, record_id, message_limit } => {
+            relay::preview_session_record(state, node_id, record_id, message_limit).await
+        }
+
+        HarnessOperatorRequestV1::ResumeSessionRecord { node_id, record_id, terminal_size, initial_prompt } => {
+            relay::session_record_mutation(
+                state,
+                SessionRecordMutationRequest::Resume { node_id, record_id, terminal_size, initial_prompt },
+            ).await
+        }
+        HarnessOperatorRequestV1::RenameSessionRecord { node_id, record_id, display_name } => {
+            relay::session_record_mutation(
+                state, SessionRecordMutationRequest::Rename { node_id, record_id, display_name },
+            ).await
+        }
+        HarnessOperatorRequestV1::SetSessionTask { node_id, record_id, expected_revision, target } => {
+            relay::session_record_mutation(
+                state,
+                SessionRecordMutationRequest::SetTask { node_id, record_id, expected_revision, target },
+            ).await
+        }
+        HarnessOperatorRequestV1::ForgetSessionRecord { node_id, record_id } => {
+            relay::session_record_mutation(
+                state, SessionRecordMutationRequest::Forget { node_id, record_id },
+            ).await
+        }
+        HarnessOperatorRequestV1::IndexProviderSession {
+            node_id, workspace_id, provider, identity, display_name,
+        } => {
+            relay::session_record_mutation(
+                state,
+                SessionRecordMutationRequest::IndexProvider {
+                    node_id, workspace_id, provider, identity, display_name,
+                },
+            ).await
+        }
+        HarnessOperatorRequestV1::IndexNativeSession { selection, display_name } => {
+            relay::session_record_mutation(
+                state, SessionRecordMutationRequest::IndexNative { selection, display_name },
+            ).await
+        }
+
+        HarnessOperatorRequestV1::RegisterWorkspace { node_id, workspace_id, root } => {
+            relay::resource_mutation(
+                state, ResourceMutationRequest::RegisterWorkspace { node_id, workspace_id, root },
+            ).await
+        }
+        HarnessOperatorRequestV1::UnregisterWorkspace { node_id, workspace_id } => {
+            relay::resource_mutation(
+                state, ResourceMutationRequest::UnregisterWorkspace { node_id, workspace_id },
+            ).await
+        }
+        HarnessOperatorRequestV1::CreateStandaloneWorkspace { node_id, workspace_id, root, initial_branch } => {
+            relay::resource_mutation(
+                state,
+                ResourceMutationRequest::CreateStandaloneWorkspace {
+                    node_id, workspace_id, root, initial_branch,
+                },
+            ).await
+        }
+        HarnessOperatorRequestV1::CreateWorktree {
+            node_id, source_workspace_id, workspace_id, target_root, branch, base,
+        } => {
+            relay::resource_mutation(
+                state,
+                ResourceMutationRequest::CreateWorktree {
+                    node_id, source_workspace_id, workspace_id, target_root, branch, base,
+                },
+            ).await
+        }
+        HarnessOperatorRequestV1::RemoveWorktree { node_id, source_workspace_id, target_root } => {
+            relay::resource_mutation(
+                state,
+                ResourceMutationRequest::RemoveWorktree { node_id, source_workspace_id, target_root },
+            ).await
+        }
+        HarnessOperatorRequestV1::ExportContextPack { session } => {
+            relay::resource_mutation(state, ResourceMutationRequest::ExportContextPack { session }).await
+        }
+        HarnessOperatorRequestV1::ForgetContextPack { node_id, context_id } => {
+            relay::resource_mutation(
+                state, ResourceMutationRequest::ForgetContextPack { node_id, context_id },
+            ).await
+        }
+        HarnessOperatorRequestV1::BrowseHostDirectories { node_id, directory, after } => {
+            relay::browse_host_directories(state, node_id, directory, after).await
+        }
+
+        HarnessOperatorRequestV1::TerminalRead { session, after_sequence, limit } => {
+            crate::terminal::read(&state.terminal, session, after_sequence, limit).await
         }
 
         HarnessOperatorRequestV1::TasksList { .. } => {

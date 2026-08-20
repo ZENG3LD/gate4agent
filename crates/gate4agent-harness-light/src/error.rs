@@ -13,6 +13,7 @@
 
 use gate4agent_c2_client::C2ControlError;
 use gate4agent_harness_api::{HarnessOperatorApiError, HarnessOperatorHostErrorV1};
+use gate4agent_harness_service::c2::HarnessC2Error;
 use gate4agent_node_protocol::NodeFailureCode;
 use thiserror::Error;
 
@@ -67,6 +68,21 @@ pub(crate) enum LightRelayError {
     SpawnProfileUnavailable,
     #[error("credential/nonce cryptography failed: {0}")]
     Crypto(String),
+    /// A relay call did not settle inside its family's per-request deadline
+    /// bucket (`crate::relay::deadline` -- mirrors the full harness's own
+    /// `HOST_*_RESPONSE_DEADLINE` constants). A hung node call must not hang
+    /// the connection forever; see `crate::relay`'s module doc comment.
+    #[error("the request exceeded its response deadline")]
+    Deadline,
+    /// A reused `gate4agent_harness_service::c2` correlate/project function
+    /// (node-workspace read/write, native history, session-record mutation,
+    /// resource mutation) rejected the node's own response: either it did not
+    /// match what was asked (`*CorrelationMismatch`), it failed re-validation
+    /// after projection (`*Projection`), or -- read-family only -- the file
+    /// content exceeded the wire's size cap (`NodeWorkspaceReadTooLarge`).
+    /// Carries the original `HarnessC2Error` for logging.
+    #[error("response projection rejected: {0:?}")]
+    Projection(HarnessC2Error),
 }
 
 impl LightRelayError {
@@ -91,25 +107,107 @@ impl LightRelayError {
             Self::IncarnationChanged => HarnessOperatorHostErrorV1::Conflict,
             Self::UnexpectedResponse | Self::Crypto(_) => HarnessOperatorHostErrorV1::Internal,
             Self::NodeRejected(code) => map_node_failure(*code),
+            Self::Deadline => HarnessOperatorHostErrorV1::Deadline,
+            // `NodeWorkspaceReadTooLarge` is the only member of this family
+            // that is not a bare correlation/re-validation failure; every
+            // other `HarnessC2Error` a reused correlate/project function can
+            // possibly return (`*CorrelationMismatch`/`*Projection`) means
+            // the node's own response did not match its own request or
+            // failed re-validation after projection -- a host-side bug, not
+            // anything the operator caused, so `Internal`.
+            Self::Projection(HarnessC2Error::NodeWorkspaceReadTooLarge) => {
+                HarnessOperatorHostErrorV1::TooLarge
+            }
+            Self::Projection(_) => HarnessOperatorHostErrorV1::Internal,
         }
     }
 }
 
+/// One shared `NodeFailureCode` -> `HarnessOperatorHostErrorV1` taxonomy
+/// across every verb family this crate relays (session spawn/control,
+/// node-workspace read/write, native history, session-record mutation,
+/// resource mutation, host-directory browse) -- unlike
+/// `gate4agent-harness-service::runtime`, which keeps one bespoke `map_*_error`
+/// per family (six of them) because each family's `HarnessC2Error` wraps a
+/// distinct set of enqueue/transport/deadline/route-mismatch variants around
+/// the shared `NodeFailureCode`. Light mode's direct-relay model (no
+/// `Prepared`/`Pending` C2-waiter split, see `crate::relay`'s module doc
+/// comment) has no such per-family error wrapper to key off, so this is
+/// deliberately the union of the full harness's six tables, bucketed by the
+/// same invalid-shape/unknown-target/already-conflicting/contended/timed-out/
+/// unsupported meaning every one of them already uses. Two codes are
+/// genuinely ambiguous across families in the full harness's own tables
+/// (`UnknownWorkspace`: `NotFound` in read/write/resource/session-record,
+/// `Unavailable` only in the native-history pool; `NotGitRepository`:
+/// `Conflict` in read/write, `NotFound` in resource) -- this union picks the
+/// majority mapping for each (`NotFound` for both) rather than threading verb
+/// identity through this shared function for two edge cases. Every mapping
+/// remains a real, typed `HarnessOperatorHostErrorV1`, per the app-harness
+/// protocol contract's typed-rejection principle -- only the granularity is
+/// coarser than the full harness's own per-family tables in these two spots.
 fn map_node_failure(code: NodeFailureCode) -> HarnessOperatorHostErrorV1 {
     match code {
-        NodeFailureCode::InvalidRequest => HarnessOperatorHostErrorV1::InvalidRequest,
-        NodeFailureCode::UnknownWorkspace => HarnessOperatorHostErrorV1::NotFound,
+        NodeFailureCode::InvalidRequest
+        | NodeFailureCode::InvalidRepositoryPath
+        | NodeFailureCode::InvalidWorkspaceRoot
+        | NodeFailureCode::HostDirectoryInvalid => HarnessOperatorHostErrorV1::InvalidRequest,
+        NodeFailureCode::UnknownWorkspace
+        | NodeFailureCode::RepositoryFileNotFound
+        | NodeFailureCode::RepositoryParentNotFound
+        | NodeFailureCode::UnknownSessionRecord
+        | NodeFailureCode::UnknownSession
+        | NodeFailureCode::UnknownContextPack
+        | NodeFailureCode::NotGitRepository => HarnessOperatorHostErrorV1::NotFound,
         NodeFailureCode::SpawnProfileRevisionMismatch
         | NodeFailureCode::BindingMismatch
-        | NodeFailureCode::StaleGeneration => HarnessOperatorHostErrorV1::Conflict,
+        | NodeFailureCode::StaleGeneration
+        // The CAS conflict: a stale `expected_revision` on `WriteNodeWorkspaceFile`
+        // must surface as a typed `Conflict`, never a generic failure -- see
+        // the app-harness protocol contract's mutation-discipline principle.
+        | NodeFailureCode::RepositoryFileRevisionConflict
+        | NodeFailureCode::RepositoryFileNotRegular
+        | NodeFailureCode::RepositoryPathUnsafe
+        | NodeFailureCode::RepositoryEntryAlreadyExists
+        | NodeFailureCode::RepositoryParentNotDirectory
+        | NodeFailureCode::SessionRecordConflict
+        | NodeFailureCode::SessionRecordNotResumable
+        | NodeFailureCode::SessionWorkspaceMismatch
+        | NodeFailureCode::WorkspaceRegistrationRequired
+        | NodeFailureCode::StaleNativeSessionCatalog
+        | NodeFailureCode::DuplicateWorkspaceId
+        | NodeFailureCode::DuplicateWorkspaceRoot
+        | NodeFailureCode::LastWorkspace
+        | NodeFailureCode::WorktreeConflict
+        | NodeFailureCode::WorktreeProtected
+        | NodeFailureCode::WorktreeDirty
+        | NodeFailureCode::WorktreeLocked
+        | NodeFailureCode::StandaloneWorkspaceRecoveryRequired
+        | NodeFailureCode::ManagedWorktreeRecoveryRequired => HarnessOperatorHostErrorV1::Conflict,
         NodeFailureCode::ControllerBusy
         | NodeFailureCode::WorkspaceBusy
-        | NodeFailureCode::BackendBusy => HarnessOperatorHostErrorV1::Busy,
-        NodeFailureCode::SpawnDeadlineExceeded => HarnessOperatorHostErrorV1::Deadline,
+        | NodeFailureCode::BackendBusy
+        | NodeFailureCode::SessionRecordBusy
+        | NodeFailureCode::ControllerRequired
+        | NodeFailureCode::ContextPackBusy => HarnessOperatorHostErrorV1::Busy,
+        NodeFailureCode::SpawnDeadlineExceeded
+        | NodeFailureCode::RepositoryFileReadTimedOut
+        | NodeFailureCode::GitReadTimedOut
+        | NodeFailureCode::HostDirectoryReadTimedOut
+        | NodeFailureCode::RepositoryFileWriteTimedOut
+        | NodeFailureCode::RepositoryEntryCreateTimedOut => HarnessOperatorHostErrorV1::Deadline,
+        NodeFailureCode::ResponseTooLarge => HarnessOperatorHostErrorV1::TooLarge,
         NodeFailureCode::UnsupportedCapability
         | NodeFailureCode::BackendDisconnected
         | NodeFailureCode::BackendOperationFailed
-        | NodeFailureCode::ShuttingDown => HarnessOperatorHostErrorV1::Unavailable,
+        | NodeFailureCode::ShuttingDown
+        | NodeFailureCode::RepositoryFileReadFailed
+        | NodeFailureCode::GitReadFailed
+        | NodeFailureCode::RepositoryFileWriteFailed
+        | NodeFailureCode::RepositoryEntryCreateFailed
+        | NodeFailureCode::HostDirectoryReadFailed
+        | NodeFailureCode::ContextPackMaterializationFailed => {
+            HarnessOperatorHostErrorV1::Unavailable
+        }
         NodeFailureCode::Unauthorized => HarnessOperatorHostErrorV1::Unauthorized,
         _ => HarnessOperatorHostErrorV1::Internal,
     }

@@ -4,6 +4,13 @@
 //! into the SQLite-backed observation store -- `routed_event_to_ingress`
 //! (`runtime.rs`) stays the sole SQLite ingress path and is untouched by this
 //! module. This registry is a parallel, in-memory-only tap.
+//!
+//! `pub`: this whole module is reused verbatim by `gate4agent-harness-light`
+//! (`crate::terminal` there) to serve `TerminalRead`. It is kernel-free by
+//! construction (no `HarnessService`/SQLite/`HarnessC2Adapter` dependency --
+//! only `NodeRoute`, wire types, and the plain `RuntimeSessionKey`), so unlike
+//! the adapter-entangled `Prepared*`/`Pending*` C2 relay types in `c2.rs`,
+//! this is a straight promotion with no light-local reimplementation.
 
 use gate4agent_c2_protocol::NodeRoute;
 use gate4agent_harness_api::{
@@ -19,7 +26,7 @@ const TERMINAL_BYTES_PER_SESSION_MAX: usize = 512 * 1024; // 512 KiB/session
 const TERMINAL_SESSIONS_MAX: usize = 64; // worst case ~32 MiB total
 
 #[derive(Default)]
-pub(crate) struct TerminalBufferRegistry {
+pub struct TerminalBufferRegistry {
     sessions: HashMap<RuntimeSessionKey, TerminalSessionBuffer>,
     touch_order: VecDeque<RuntimeSessionKey>, // LRU eviction, most-recently-used at the back
 }
@@ -31,7 +38,7 @@ struct TerminalSessionBuffer {
     bytes: usize,
 }
 
-pub(crate) struct TerminalPageResult<'a> {
+pub struct TerminalPageResult<'a> {
     pub frames: Vec<&'a TerminalFrame>,
     pub dropped: u64,
     pub transport_incomplete: bool,
@@ -44,7 +51,7 @@ impl TerminalBufferRegistry {
     /// exceeded. Frames that are not strictly newer than the session's most
     /// recent retained frame are ignored (stale/duplicate delivery) rather
     /// than counted as a drop -- `dropped` tracks capacity evictions only.
-    pub(crate) fn ingest(&mut self, key: RuntimeSessionKey, frame: TerminalFrame) {
+    pub fn ingest(&mut self, key: RuntimeSessionKey, frame: TerminalFrame) {
         let is_new_session = !self.sessions.contains_key(&key);
         if is_new_session && self.sessions.len() >= TERMINAL_SESSIONS_MAX {
             if let Some(evicted) = self.touch_order.pop_front() {
@@ -74,7 +81,7 @@ impl TerminalBufferRegistry {
 
     /// Drops every session buffered under `route`'s node+incarnation.
     /// Mirrors `HarnessRuntimeInventoryCache::invalidate`.
-    pub(crate) fn invalidate(&mut self, route: &NodeRoute) {
+    pub fn invalidate(&mut self, route: &NodeRoute) {
         self.sessions.retain(|key, _| {
             !(key.node_id == route.node_id && key.incarnation_id == route.expected_incarnation_id)
         });
@@ -83,7 +90,7 @@ impl TerminalBufferRegistry {
 
     /// Drops every session whose node+incarnation is no longer part of the
     /// current topology. Mirrors `HarnessRuntimeInventoryCache::reconcile_topology`.
-    pub(crate) fn reconcile_topology(&mut self, routes: &[NodeRoute]) {
+    pub fn reconcile_topology(&mut self, routes: &[NodeRoute]) {
         self.sessions.retain(|key, _| {
             routes.iter().any(|route| {
                 route.node_id == key.node_id && route.expected_incarnation_id == key.incarnation_id
@@ -97,7 +104,7 @@ impl TerminalBufferRegistry {
         self.touch_order.retain(|key| remaining.contains(key));
     }
 
-    pub(crate) fn page(
+    pub fn page(
         &self,
         key: &RuntimeSessionKey,
         after_sequence: Option<u64>,
@@ -138,7 +145,7 @@ fn frame_byte_footprint(frame: &TerminalFrame) -> usize {
 // this crate, so the orphan rule forbids implementing the foreign `From`
 // trait for a foreign type here. This crate is the only one that depends on
 // both sides, so the translation lives here as a plain function instead.
-pub(crate) fn terminal_frame_to_wire(frame: &TerminalFrame) -> HarnessRuntimeTerminalFrameV1 {
+pub fn terminal_frame_to_wire(frame: &TerminalFrame) -> HarnessRuntimeTerminalFrameV1 {
     HarnessRuntimeTerminalFrameV1 {
         sequence: frame.sequence,
         size: HarnessRuntimeTerminalSizeV1 {

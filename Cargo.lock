@@ -432,6 +432,7 @@ dependencies = [
  "gate4agent-node",
  "gate4agent-node-protocol",
  "gate4agent-node-wire",
+ "gate4agent-observation-api",
  "gate4agent-types",
  "serde_json",
  "thiserror",

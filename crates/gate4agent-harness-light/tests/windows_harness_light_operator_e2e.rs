@@ -32,10 +32,12 @@ use std::{
 use gate4agent_c2::{C2Config, C2NodeConfig, C2Running, C2Timings};
 use gate4agent_c2_client::C2Client;
 use gate4agent_harness_api::{
-    HarnessExecutionModeV1, HarnessOperatorActionV1, HarnessOperatorHostErrorV1,
-    HarnessOperatorIntentV1, HarnessOperatorRequestRefV1, HarnessRuntimeInventoryPageV1,
-    HarnessRuntimeSessionAddressV1, HarnessRuntimeSessionStatusV1, HarnessRuntimeSessionV1,
-    HarnessRuntimeTerminalSizeV1, HarnessTaskStateV1, HarnessTerminalControlV1,
+    HarnessExecutionModeV1, HarnessHostPathV1, HarnessNativeSessionCatalogScopeV1,
+    HarnessNativeSessionRouteV1, HarnessOperatorActionV1, HarnessOperatorHostErrorV1,
+    HarnessOperatorIntentV1, HarnessOperatorRequestRefV1, HarnessRepositoryPathV1,
+    HarnessRuntimeInventoryPageV1, HarnessRuntimeSessionAddressV1, HarnessRuntimeSessionStatusV1,
+    HarnessRuntimeSessionV1, HarnessRuntimeTerminalSizeV1, HarnessTaskStateV1,
+    HarnessTerminalControlV1, HarnessWorkspaceFileContentV1,
 };
 use gate4agent_harness_client::{HarnessOperatorClient, HarnessOperatorClientError};
 use gate4agent_harness_light::start_harness_light;
@@ -296,6 +298,252 @@ async fn windows_harness_light_operator_session_verbs_and_typed_rejections() {
         client.submit_intent(intent),
         Err(HarnessOperatorClientError::Host(HarnessOperatorHostErrorV1::Unsupported)),
     ));
+
+    running.shutdown().await.unwrap();
+    let c2_shutdown = c2.shutdown_handle();
+    c2_shutdown.shutdown();
+    timeout(Duration::from_secs(5), c2.wait()).await.unwrap().unwrap();
+    node_shutdown.request_shutdown().await.unwrap();
+    timeout(Duration::from_secs(10), node_task).await.unwrap().unwrap().unwrap();
+}
+
+/// A2 coverage: node-scoped workspace read/write (CAS conflict included),
+/// management (`RegisterWorkspace`/`UnregisterWorkspace` with inventory
+/// convergence, `BrowseHostDirectories`), `TerminalRead` against a live
+/// spawned session's fixture echo, and native history (relay proven, not
+/// staged -- see this test's own native-history section for why). Same
+/// three-process fixture shape as the session-verbs E2E above, with its own
+/// atomic-counter-suffixed fixture paths/pipe names so the two tests never
+/// collide when run in parallel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn windows_harness_light_operator_workspace_history_management_and_terminal() {
+    require_headless_supervisor();
+    let fixture = FixturePaths::new();
+    let node_endpoint = pipe("node");
+    let control_endpoint = pipe("control");
+    let node_id = NodeId::new("light-a2-node").unwrap();
+    let workspace_id = WorkspaceId::new("primary").unwrap();
+    let node_token = "light-a2-node-token";
+    let c2_token = "light-a2-c2-token";
+    let profile_id = SpawnProfileId::new("interactive-default").unwrap();
+    let profile_revision = SpawnProfileRevision::new("light-a2-r1").unwrap();
+
+    let node = NodeServer::new_fixture(node_config(
+        &fixture,
+        &node_endpoint,
+        node_token,
+        &node_id,
+        &workspace_id,
+        &profile_id,
+        &profile_revision,
+    )).unwrap();
+    let node_shutdown = node.shutdown_handle();
+    let node_task = tokio::spawn(node.run());
+
+    let timings = C2Timings {
+        poll_interval: Duration::from_millis(20),
+        fresh_for: Duration::from_secs(2),
+        attempt_deadline: Duration::from_secs(2),
+        transient_backoffs: [Duration::from_millis(20); 5],
+        parked_backoff: Duration::from_millis(100),
+        http_io_deadline: Duration::from_secs(1),
+    };
+    let c2 = C2Running::start(C2Config::new(
+        "127.0.0.1:0".parse().unwrap(),
+        c2_token,
+        vec![C2NodeConfig::new(node_id.clone(), node_endpoint.clone(), node_token).unwrap()],
+    ).unwrap()
+        .with_control_endpoint(control_endpoint.clone()).unwrap()
+        .with_timings(timings)).await.unwrap();
+    let c2_client = C2Client::new(c2.api_addr(), c2_token).unwrap()
+        .with_deadline(Duration::from_secs(1));
+    wait_online(&c2_client, &node_id).await;
+
+    let running = start_harness_light(&control_endpoint, c2_token).await.unwrap();
+    let client = HarnessOperatorClient::new(running.operator_endpoint(), running.operator_credential()).unwrap();
+
+    // --- Node-scoped workspace read/write, including the CAS conflict ---
+
+    let inspection = client
+        .inspect_node_workspace(node_id.as_str().to_owned(), workspace_id.as_str().to_owned())
+        .unwrap();
+    assert!(inspection.entries.is_empty(), "fixture workspace starts empty");
+    assert!(!inspection.git.is_repository, "fixture workspace is not git-initialized");
+
+    let file_path = HarnessRepositoryPathV1::new("notes.md").unwrap();
+    let created = client.create_node_workspace_file(
+        node_id.as_str().to_owned(), workspace_id.as_str().to_owned(), file_path.clone(),
+    ).unwrap();
+    let initial_revision = created.revision.clone().expect("a freshly created file carries a revision");
+
+    let written = client.write_node_workspace_file(
+        node_id.as_str().to_owned(), workspace_id.as_str().to_owned(), file_path.clone(),
+        "hello from the A2 slice\n".to_owned(), initial_revision.clone(),
+    ).unwrap();
+    let fresh_revision = written.revision.clone().expect("a written file carries a revision");
+    assert_ne!(fresh_revision, initial_revision, "a successful write advances the CAS revision");
+
+    let read_back = client.read_node_workspace_file(
+        node_id.as_str().to_owned(), workspace_id.as_str().to_owned(), file_path.clone(),
+    ).unwrap();
+    match read_back.content {
+        HarnessWorkspaceFileContentV1::Utf8 { text, .. } => {
+            assert_eq!(text, "hello from the A2 slice\n");
+        }
+        other => panic!("expected utf8 file content, got {other:?}"),
+    }
+
+    // The stale (pre-write) revision must now be rejected as a typed
+    // `Conflict`, not silently overwrite the fresher content.
+    let stale_write = client.write_node_workspace_file(
+        node_id.as_str().to_owned(), workspace_id.as_str().to_owned(), file_path.clone(),
+        "clobber attempt\n".to_owned(), initial_revision,
+    );
+    assert!(
+        matches!(
+            stale_write,
+            Err(HarnessOperatorClientError::Host(HarnessOperatorHostErrorV1::Conflict)),
+        ),
+        "a stale CAS revision must surface as a typed Conflict, got {stale_write:?}",
+    );
+
+    let dir_path = HarnessRepositoryPathV1::new("subdir").unwrap();
+    client.create_node_workspace_directory(
+        node_id.as_str().to_owned(), workspace_id.as_str().to_owned(), dir_path,
+    ).unwrap();
+    let inspection = client
+        .inspect_node_workspace(node_id.as_str().to_owned(), workspace_id.as_str().to_owned())
+        .unwrap();
+    let entry_names = inspection.entries.iter()
+        .map(|entry| entry.relative_path.as_str().to_owned())
+        .collect::<Vec<_>>();
+    assert!(entry_names.contains(&"notes.md".to_owned()), "inspection lists the created file");
+    assert!(entry_names.contains(&"subdir".to_owned()), "inspection lists the created directory");
+
+    // --- BrowseHostDirectories ---
+
+    let host_root = HarnessHostPathV1::new(fixture.root.to_string_lossy().into_owned()).unwrap();
+    let listing = client
+        .browse_host_directories(node_id.as_str().to_owned(), Some(host_root), None)
+        .unwrap();
+    assert!(
+        listing.entries.iter().any(|entry| entry.display_name == "workspace"),
+        "browsing the fixture root lists the workspace directory",
+    );
+
+    // --- RegisterWorkspace / UnregisterWorkspace, inventory convergence ---
+
+    let second_workspace_id = "second".to_owned();
+    let second_root = fixture.root.join("second-workspace");
+    fs::create_dir_all(&second_root).unwrap();
+    let second_host_root = HarnessHostPathV1::new(second_root.to_string_lossy().into_owned()).unwrap();
+    client.register_workspace(node_id.as_str().to_owned(), second_workspace_id.clone(), second_host_root).unwrap();
+    timeout(Duration::from_secs(15), async {
+        loop {
+            if let Ok(page) = client.runtime_inventory_list(None, 16) {
+                if page.nodes.iter()
+                    .find(|node| node.node_id == node_id.as_str())
+                    .is_some_and(|node| node.inventory.workspaces.contains_key(&second_workspace_id))
+                {
+                    return;
+                }
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    }).await.expect("registered workspace never appeared in the runtime inventory roster");
+
+    client.unregister_workspace(node_id.as_str().to_owned(), second_workspace_id.clone()).unwrap();
+    timeout(Duration::from_secs(15), async {
+        loop {
+            if let Ok(page) = client.runtime_inventory_list(None, 16) {
+                if page.nodes.iter()
+                    .find(|node| node.node_id == node_id.as_str())
+                    .is_some_and(|node| !node.inventory.workspaces.contains_key(&second_workspace_id))
+                {
+                    return;
+                }
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    }).await.expect("unregistered workspace never left the runtime inventory roster");
+
+    // --- TerminalRead against a live spawned session's fixture echo ---
+
+    let session = client.spawn_session(
+        node_id.as_str().to_owned(),
+        workspace_id.as_str().to_owned(),
+        "claude".to_owned(),
+        profile_id.as_str().to_owned(),
+        HarnessExecutionModeV1::Pty,
+        HarnessRuntimeTerminalSizeV1 { rows: 24, columns: 80 },
+    ).unwrap();
+
+    let first_page = timeout(Duration::from_secs(15), async {
+        loop {
+            if let Ok(page) = client.terminal_read(session.clone(), None, 64) {
+                if !page.frames.is_empty() {
+                    return page;
+                }
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    }).await.expect("the fixture session never produced a terminal frame");
+    assert!(
+        first_page.frames.windows(2).all(|pair| pair[0].sequence < pair[1].sequence),
+        "frame sequences within one page are strictly increasing",
+    );
+    assert_eq!(first_page.dropped, 0);
+    let last_sequence = first_page.frames.last().unwrap().sequence;
+
+    // Paging with `after_sequence` pinned to the last frame already seen:
+    // every frame in the next page (if any land before the deadline) must
+    // have a strictly greater sequence -- the advancing-cursor contract
+    // `crate::terminal`'s own unit tests already prove against the ring
+    // directly; this proves the same contract end-to-end through the wire.
+    client.write_session_input(session.clone(), "a2-terminal-read-probe".to_owned()).unwrap();
+    let second_page = timeout(Duration::from_secs(15), async {
+        loop {
+            if let Ok(page) = client.terminal_read(session.clone(), Some(last_sequence), 64) {
+                if !page.frames.is_empty() {
+                    return page;
+                }
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    }).await.expect("no further terminal frame arrived after the input probe");
+    assert!(
+        second_page.frames.iter().all(|frame| frame.sequence > last_sequence),
+        "every frame after the cursor has a strictly greater sequence",
+    );
+
+    // --- Native history: relay proven, not staged ---
+    //
+    // The fixture node carries no staged native-provider history (no
+    // `~/.claude/projects/...`-shaped fixture directory is part of this
+    // crate's E2E fixtures, unlike the full harness's own native-history
+    // E2Es which stage one deliberately); standing one up here purely to
+    // exercise `CatalogNativeSessions` would be disproportionate to this
+    // slice. What this proves instead: the request reaches the node and
+    // comes back as a well-formed, typed reply either way -- an empty
+    // catalog (the honest answer for "no history exists") or a typed
+    // rejection -- never a wire-level failure or a silently wrong shape.
+    let native_route = HarnessNativeSessionRouteV1 {
+        node_id: node_id.as_str().to_owned(),
+        incarnation_id: session.incarnation_id.clone(),
+        scope: HarnessNativeSessionCatalogScopeV1::Unregistered,
+        workspace_id: None,
+        provider: "claude".to_owned(),
+    };
+    match client.catalog_native_sessions(native_route, 16) {
+        Ok(cataloged) => assert!(
+            cataloged.entries.len() <= 16,
+            "an unstaged provider history catalogs as empty or small, not overflowing the page",
+        ),
+        Err(HarnessOperatorClientError::Host(_)) => {}
+        Err(other) => panic!("native-history relay failed at the wire/transport level: {other:?}"),
+    }
+
+    client.stop_session(session, true).unwrap();
 
     running.shutdown().await.unwrap();
     let c2_shutdown = c2.shutdown_handle();

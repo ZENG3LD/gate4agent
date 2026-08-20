@@ -9,7 +9,7 @@
 //! is meant to be hosted in-process inside a light client binary (e.g.
 //! `gate4agent-tui-light`), talking directly to C2 instead of going through
 //! a durable single-writer authority. See `crate::dispatch`'s module doc for
-//! exactly which operator requests this A1 slice serves, relays, or
+//! exactly which operator requests this crate serves, relays, or
 //! typed-rejects.
 //!
 //! ```no_run
@@ -31,6 +31,7 @@ mod dispatch;
 mod error;
 mod inventory;
 mod relay;
+mod terminal;
 mod util;
 
 use std::net::{Ipv4Addr, SocketAddr};
@@ -66,6 +67,12 @@ const LIGHT_CONNECTION_DEADLINE: Duration = Duration::from_secs(45);
 pub(crate) struct LightState {
     control: C2ControlHandle,
     inventory: inventory::SharedInventory,
+    /// The maintained ring of live terminal frames, kept in lockstep with
+    /// `inventory` on every C2 event/topology change -- see `crate::terminal`'s
+    /// module doc comment for why this reuses
+    /// `gate4agent_harness_service::terminal::TerminalBufferRegistry` verbatim
+    /// rather than a light-local reimplementation.
+    terminal: terminal::SharedTerminalRegistry,
     credential_authority: credential::LightCredentialAuthority,
     /// Serializes every `NodeRequest::Snapshot` this process issues -- see
     /// `crate::c2::fetch_snapshot_serialized`'s doc comment for why.
@@ -134,9 +141,11 @@ pub async fn start_harness_light(
     let (credential_authority, operator_credential) = credential::LightCredentialAuthority::mint()?;
 
     let inventory = inventory::new_shared();
+    let terminal = terminal::new_shared();
     let state = LightState {
         control,
         inventory,
+        terminal,
         credential_authority,
         snapshot_gate: Arc::new(tokio::sync::Mutex::new(())),
     };
@@ -157,7 +166,8 @@ pub async fn start_harness_light(
 /// (spawning a detached handler per connection, matching
 /// `gate4agent-harness-service::runtime`'s own per-connection task shape),
 /// applies live C2 events and topology changes to the runtime-inventory
-/// roster, and stops on `LightCommand::Shutdown`.
+/// roster AND the terminal ring (`crate::terminal`), and stops on
+/// `LightCommand::Shutdown`.
 async fn run_light_host(
     listener: TcpListener,
     state: Arc<LightState>,
@@ -177,18 +187,24 @@ async fn run_light_host(
     //
     // Both the per-event and per-topology-change handling are spawned as
     // their own detached tasks rather than awaited inline in this loop:
-    // `handle_event`/`reconcile_topology` each end in a `NodeRequest::
-    // Snapshot` round trip serialized behind `LightState::snapshot_gate`
-    // (see that field's doc comment), which can legitimately take a while
-    // under load or contention. Awaiting that inline here would mean this
-    // one loop iteration's `select!` branch does not resolve until that
-    // whole round trip settles -- and since this same loop is what drains
-    // the *next* event off `events` and accepts the *next* operator
-    // connection, one slow refresh would stall every other event and every
-    // new connection behind it. Draining stays cheap and constant-time;
-    // processing runs independently and concurrently, one task per event/
-    // topology change, naturally serialized against each other only by the
-    // shared `snapshot_gate` they already both go through.
+    // `inventory::handle_event`/`reconcile_topology` each end in a
+    // `NodeRequest::Snapshot` round trip serialized behind
+    // `LightState::snapshot_gate` (see that field's doc comment), which can
+    // legitimately take a while under load or contention. Awaiting that
+    // inline here would mean this one loop iteration's `select!` branch does
+    // not resolve until that whole round trip settles -- and since this same
+    // loop is what drains the *next* event off `events` and accepts the
+    // *next* operator connection, one slow refresh would stall every other
+    // event and every new connection behind it. Draining stays cheap and
+    // constant-time; processing runs independently and concurrently, one
+    // task per event/topology change, naturally serialized against each
+    // other only by the shared `snapshot_gate` they already both go through.
+    // `terminal::handle_event`/`reconcile_topology` ride the very same
+    // detached task, called right after their `inventory` counterpart: they
+    // never touch `snapshot_gate` or C2 at all (a pure in-memory ring
+    // ingest/prune), so folding them in adds no new blocking point -- see
+    // `crate::terminal`'s own module doc comment for why this is one shared
+    // task rather than a second spawn per event.
     let mut events_open = true;
     let mut topology_open = true;
     loop {
@@ -217,7 +233,10 @@ async fn run_light_host(
                 match event {
                     Some(event) => {
                         let state = Arc::clone(&state);
-                        tokio::spawn(async move { inventory::handle_event(&state, &event).await; });
+                        tokio::spawn(async move {
+                            inventory::handle_event(&state, &event).await;
+                            terminal::handle_event(&state.terminal, &event).await;
+                        });
                     }
                     None => {
                         events_open = false;
@@ -229,7 +248,10 @@ async fn run_light_host(
                 if changed.is_ok() {
                     let current = topology.borrow().clone();
                     let state = Arc::clone(&state);
-                    tokio::spawn(async move { inventory::reconcile_topology(&state, &current).await; });
+                    tokio::spawn(async move {
+                        inventory::reconcile_topology(&state, &current).await;
+                        terminal::reconcile_topology(&state.terminal, &current).await;
+                    });
                 } else {
                     topology_open = false;
                     tracing::warn!("harness-light: c2 topology watch closed");

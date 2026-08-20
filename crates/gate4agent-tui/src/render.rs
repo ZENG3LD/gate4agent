@@ -11589,6 +11589,65 @@ mod tests {
         assert_eq!(buf.get(24, 5).symbol, "│", "table body must stay at its small-board row");
     }
 
+    /// Light-mode invariant sweep: with the kanban disabled (the light
+    /// harness holds no tasks), the rendered board must contain ZERO kanban
+    /// affordances — no [Tasks]/[New task]/[Refresh]/[Run next Ready]
+    /// toolbar, no [Harness tasks] tab, no kanban hit targets — and a
+    /// forced/clicked switch into the kanban mode must bounce back to the
+    /// session board.
+    #[test]
+    fn light_mode_renders_no_kanban_affordances_and_mode_clamps() {
+        let mut app = fixture(PtyColorMode::Inherited);
+        app.harness_kanban.enabled = false;
+
+        // A stray mode write (the pre-clamp leak) is corrected by reconcile.
+        app.agent_board_mode = crate::app::AgentBoardMode::HarnessKanban;
+        app.reconcile_agent_board_for_test();
+        assert_eq!(
+            app.agent_board_mode,
+            crate::app::AgentBoardMode::SessionMonitoring,
+            "the kanban mode must be impossible while the kanban is disabled",
+        );
+
+        let mut buf = TerminalBuffer::new(110, 32);
+        let mut layout = LayoutRects::default();
+        render_agent_board(
+            &app,
+            Rect::new(0, 0, 110, 32),
+            &mut buf,
+            &mut layout,
+            Theme::for_mode(PtyColorMode::Inherited),
+        );
+        let text = buffer_text(&buf);
+        for forbidden in [
+            "[Tasks]",
+            "[New task]",
+            "[Refresh]",
+            "[Run next Ready]",
+            "[Harness tasks]",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "light board must not render {forbidden}: {text}",
+            );
+        }
+        assert!(
+            !layout.hits.iter().any(|hit| matches!(
+                hit.target,
+                HitTarget::HarnessTaskCreate
+                    | HitTarget::HarnessTaskRefresh
+                    | HitTarget::HarnessScheduleNext
+                    | HitTarget::HarnessBoardMode(crate::app::AgentBoardMode::HarnessKanban)
+            )),
+            "light board must register no kanban hit targets",
+        );
+
+        // The mode-switch hit target refuses even if it somehow existed.
+        let action = app.set_agent_board_mode(crate::app::AgentBoardMode::HarnessKanban);
+        assert!(matches!(action, AppAction::None));
+        assert_eq!(app.agent_board_mode, crate::app::AgentBoardMode::SessionMonitoring);
+    }
+
     #[test]
     fn harness_kanban_sessions_strip_click_opens_pty_tab_for_direct_session() {
         let mut app = fixture(PtyColorMode::Inherited);

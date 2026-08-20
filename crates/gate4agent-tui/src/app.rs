@@ -6913,6 +6913,29 @@ impl App {
         (card.column == expected_column).then_some(progress)
     }
 
+    /// The single entry for board-mode switches (the `HarnessBoardMode` hit
+    /// target and tests): refuses the kanban outright while it is disabled
+    /// — the canon invariant, enforced at the entry as well as by
+    /// `reconcile_agent_board`'s clamp.
+    pub(crate) fn set_agent_board_mode(&mut self, mode: AgentBoardMode) -> AppAction {
+        if self.agent_board_mode == mode
+            || (mode == AgentBoardMode::HarnessKanban && !self.harness_kanban.enabled)
+        {
+            return AppAction::None;
+        }
+        self.agent_board_mode = mode;
+        if mode == AgentBoardMode::HarnessKanban {
+            self.request_harness_refresh()
+        } else {
+            AppAction::None
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reconcile_agent_board_for_test(&mut self) {
+        self.reconcile_agent_board();
+    }
+
     fn reconcile_agent_board(&mut self) {
         // Canon invariant: the kanban is a FULL-harness feature. When the
         // kanban is disabled (light mode — the light harness holds no
@@ -9742,17 +9765,7 @@ impl App {
                 return self.harness_start_launch();
             }
             Some(HitTarget::HarnessBoardMode(mode)) => {
-                if self.agent_board_mode == *mode
-                    || (*mode == AgentBoardMode::HarnessKanban && !self.harness_kanban.enabled)
-                {
-                    return AppAction::None;
-                }
-                self.agent_board_mode = *mode;
-                return if *mode == AgentBoardMode::HarnessKanban {
-                    self.request_harness_refresh()
-                } else {
-                    AppAction::None
-                };
+                return self.set_agent_board_mode(*mode);
             }
             Some(HitTarget::AgentBoardCard(key)) => {
                 self.select_agent_board_key(key);

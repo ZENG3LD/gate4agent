@@ -15,9 +15,7 @@ pub use app::{
     ManagedSessionView, MenuPlacement, NodeView, Provider, PtyColorMode, RosterMode,
     SessionAddress, SessionView, SidebarMode, SidebarPresentation, SpawnDialog, UiKey, WorkspaceView,
 };
-pub use client::{
-    run, C2Endpoint, HarnessOperatorEndpoint, RunOptions, StartupMode, StartupRequest,
-};
+pub use client::{run, HarnessOperatorEndpoint, RunOptions};
 pub use preferences::UiPreferences;
 pub use render::render;
 pub use surface::{LayoutPreset, Pane, PaneId, PaneNode, SplitAxis, SurfaceDropZone, SurfaceState};

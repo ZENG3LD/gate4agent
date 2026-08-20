@@ -1,11 +1,19 @@
 use std::str::FromStr;
 
-use gate4agent_node_protocol::{NodeId, WorkspaceId};
-use gate4agent_tui::{
-    C2Endpoint, Provider, PtyColorMode, RunOptions, StartupMode, StartupRequest,
-};
+use gate4agent_tui::{HarnessOperatorEndpoint, PtyColorMode, RunOptions};
 
 const C2_TOKEN_ENV: &str = "GATE4AGENT_C2_TOKEN";
+
+/// Parsed CLI surface: unchanged from the direct-C2 era (c2 endpoint arg +
+/// `GATE4AGENT_C2_TOKEN` env, plus the mode-agnostic `--style` override) even
+/// though what happens with it changed completely -- `main` now feeds
+/// `c2_endpoint`/`c2_token` to `gate4agent_harness_light::start_harness_light`
+/// instead of dialing the app's own (now-dead) direct-C2 worker.
+struct LightStartup {
+    c2_endpoint: String,
+    c2_token: String,
+    color_mode_override: Option<PtyColorMode>,
+}
 
 fn value(args: &[String], index: &mut usize, flag: &str) -> Result<String, String> {
     *index += 1;
@@ -17,11 +25,8 @@ fn value(args: &[String], index: &mut usize, flag: &str) -> Result<String, Strin
 fn parse_args_from(
     args: &[String],
     mut read_secret: impl FnMut(&str) -> Result<String, String>,
-) -> Result<RunOptions, String> {
+) -> Result<LightStartup, String> {
     let mut c2_control = None;
-    let mut startup_node = None;
-    let mut workspace = None;
-    let mut provider = None;
     let mut color_mode_override = None;
     let mut index = 1;
 
@@ -36,33 +41,13 @@ fn parse_args_from(
                 }
                 c2_control = Some(value(args, &mut index, "--c2-control")?);
             }
-            "--startup-node" => {
-                startup_node = Some(
-                    NodeId::new(value(args, &mut index, "--startup-node")?)
-                        .map_err(|error| error.to_string())?,
-                )
-            }
-            "--workspace" => {
-                workspace = Some(
-                    WorkspaceId::new(value(args, &mut index, "--workspace")?)
-                        .map_err(|error| error.to_string())?,
-                )
-            }
-            "--agent" => {
-                provider = Some(
-                    Provider::from_str(&value(args, &mut index, "--agent")?)
-                        .map_err(|error| error.to_string())?,
-                )
-            }
             "--style" => {
                 color_mode_override = Some(PtyColorMode::from_str(&value(args, &mut index, "--style")?)?)
             }
             "--help" | "-h" => {
                 return Err(
-                    "usage: gate4agent-tui-light --c2-control PIPE\n\
-                     credential env: GATE4AGENT_C2_TOKEN\n\
-                     optional startup: --startup-node NODE_ID --workspace WORKSPACE_ID \
-                     --agent PROVIDER_ID [--style inherit|gate]"
+                    "usage: gate4agent-tui-light --c2-control PIPE [--style inherit|gate]\n\
+                     credential env: GATE4AGENT_C2_TOKEN"
                         .to_owned(),
                 )
             }
@@ -71,35 +56,16 @@ fn parse_args_from(
         index += 1;
     }
 
-    let endpoint = c2_control
+    let c2_endpoint = c2_control
         .ok_or_else(|| "configure --c2-control PIPE".to_owned())?;
-    let token = read_secret(C2_TOKEN_ENV)?;
-    if token.is_empty() {
+    let c2_token = read_secret(C2_TOKEN_ENV)?;
+    if c2_token.is_empty() {
         return Err(format!("{C2_TOKEN_ENV} must not be empty"));
     }
-    let startup_requested = startup_node.is_some() || workspace.is_some() || provider.is_some();
-    let startup = if startup_requested {
-        let node_id = startup_node
-            .ok_or_else(|| "startup requires --startup-node".to_owned())?;
-        let workspace_id = workspace
-            .ok_or_else(|| "startup requires --workspace".to_owned())?;
-        let provider = provider.ok_or_else(|| "startup requires --agent".to_owned())?;
-        Some(StartupRequest {
-            node_id,
-            workspace_id,
-            provider,
-        })
-    } else {
-        None
-    };
-    Ok(RunOptions {
-        mode: StartupMode::ManualC2(C2Endpoint { endpoint, token }),
-        startup,
-        color_mode_override,
-    })
+    Ok(LightStartup { c2_endpoint, c2_token, color_mode_override })
 }
 
-fn parse_args() -> Result<RunOptions, String> {
+fn parse_args() -> Result<LightStartup, String> {
     let args = std::env::args().collect::<Vec<_>>();
     parse_args_from(&args, |name| {
         let value = std::env::var(name)
@@ -112,14 +78,44 @@ fn parse_args() -> Result<RunOptions, String> {
 #[tokio::main]
 async fn main() {
     gate4agent_tui::diagnostics::install_panic_hook();
-    let options = match parse_args() {
-        Ok(options) => options,
+    let startup = match parse_args() {
+        Ok(startup) => startup,
         Err(message) => {
             eprintln!("{message}");
             std::process::exit(if message.starts_with("usage:") { 0 } else { 2 });
         }
     };
-    if let Err(error) = gate4agent_tui::run(options).await {
+    // The light binary hosts `gate4agent-harness-light` in-process (see that
+    // crate's own doc comment) instead of speaking the c2 dialect itself: the
+    // minted operator credential/endpoint hand-off is an in-process return
+    // value, never an env round trip.
+    let running = match gate4agent_harness_light::start_harness_light(
+        &startup.c2_endpoint,
+        &startup.c2_token,
+    ).await {
+        Ok(running) => running,
+        Err(error) => {
+            eprintln!("gate4agent-tui-light: harness-light startup failed: {error}");
+            std::process::exit(1);
+        }
+    };
+    let options = RunOptions {
+        operator: HarnessOperatorEndpoint {
+            endpoint: running.operator_endpoint(),
+            credential: running.operator_credential(),
+            launch_plan_id: None,
+        },
+        // The kanban (task/run board) stays disabled: light-harness tasks/
+        // runs are always empty (no task kernel, by canon), so the session
+        // board is the default view -- matching light's pre-cutover UX.
+        kanban_default: false,
+        color_mode_override: startup.color_mode_override,
+    };
+    let run_result = gate4agent_tui::run(options).await;
+    if let Err(error) = running.shutdown().await {
+        eprintln!("gate4agent-tui-light: harness-light shutdown failed: {error}");
+    }
+    if let Err(error) = run_result {
         gate4agent_tui::diagnostics::record_runtime(
             gate4agent_tui::diagnostics::RuntimeDiagnostic::Fatal,
         );
@@ -133,7 +129,7 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
-    fn parse(args: &[&str], secrets: &[(&str, &str)]) -> Result<RunOptions, String> {
+    fn parse(args: &[&str], secrets: &[(&str, &str)]) -> Result<LightStartup, String> {
         let args = args.iter().map(|value| value.to_string()).collect::<Vec<_>>();
         let secrets = secrets
             .iter()
@@ -157,7 +153,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_node_and_harness_modes_are_not_available() {
+    fn direct_node_and_harness_operator_arguments_are_not_available() {
         let direct = parse(
             &["gate4agent-tui-light", "--node", r"desk-a=\\.\pipe\desk-a"],
             &[],
@@ -172,46 +168,31 @@ mod tests {
     }
 
     #[test]
-    fn startup_requires_all_explicit_identifiers() {
-        let error = parse(
-            &[
-                "gate4agent-tui-light",
-                "--c2-control",
-                r"\\.\pipe\gate4agent-c2",
-                "--agent",
-                "codex",
-            ],
-            &[(C2_TOKEN_ENV, "token")],
-        ).err().unwrap();
-        assert_eq!(error, "startup requires --startup-node");
+    fn startup_arguments_are_not_accepted() {
+        for argument in ["--startup-node", "--workspace", "--agent"] {
+            let error = parse(
+                &["gate4agent-tui-light", argument, "value"],
+                &[(C2_TOKEN_ENV, "token")],
+            ).err().unwrap();
+            assert_eq!(error, format!("unknown argument: {argument}"));
+        }
     }
 
     #[test]
-    fn manual_c2_mode_preserves_startup_and_style_options() {
-        let options = parse(
+    fn c2_control_and_style_options_parse() {
+        let startup = parse(
             &[
                 "gate4agent-tui-light",
                 "--c2-control",
                 r"\\.\pipe\gate4agent-c2",
-                "--startup-node",
-                "desk-a",
-                "--workspace",
-                "acme",
-                "--agent",
-                "claude",
                 "--style",
                 "gate",
             ],
             &[(C2_TOKEN_ENV, "c2-token")],
         ).unwrap();
-        let StartupMode::ManualC2(endpoint) = &options.mode else { panic!("manual C2 mode") };
-        assert_eq!(endpoint.endpoint, r"\\.\pipe\gate4agent-c2");
-        assert_eq!(endpoint.token, "c2-token");
-        let startup = options.startup.as_ref().unwrap();
-        assert_eq!(startup.node_id.as_str(), "desk-a");
-        assert_eq!(startup.workspace_id.as_str(), "acme");
-        assert_eq!(startup.provider.as_str(), "claude");
-        assert_eq!(options.color_mode_override, Some(PtyColorMode::GateOverride));
+        assert_eq!(startup.c2_endpoint, r"\\.\pipe\gate4agent-c2");
+        assert_eq!(startup.c2_token, "c2-token");
+        assert_eq!(startup.color_mode_override, Some(PtyColorMode::GateOverride));
     }
 
     #[test]

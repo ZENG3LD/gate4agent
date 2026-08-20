@@ -6047,11 +6047,11 @@ impl App {
         token
     }
 
-    /// Rewrites the direct-mode launch/session-control actions into their
-    /// typed harness-operator siblings when running in harness-only mode
-    /// (direct-C2 light-TUI mode leaves `harness_only` false, so this is a
-    /// no-op passthrough there). `build_launch_action` and the terminal
-    /// input/resize/stop/paste/control key handlers stay mode-agnostic and
+    /// Rewrites the direct-shaped launch/session-control actions into their
+    /// typed harness-operator siblings -- the app speaks only the harness
+    /// operator wire now (both `gate4agent-tui` and `gate4agent-tui-light`),
+    /// so this rewrite is unconditional. `build_launch_action` and the terminal
+    /// input/resize/stop/paste/control key handlers stay dialect-agnostic and
     /// keep building the same `SpawnSpec`/`Input`/`Resize`/`Stop`/
     /// `TerminalControl`/`TerminalBytes`/`Paste`/`Remove`/`Resume` actions
     /// either way; only this dispatch-time rewrite changes what actually
@@ -6066,10 +6066,7 @@ impl App {
     /// `HarnessWriteSessionBytes`/`HarnessPasteSession` carry no token: they
     /// are fire-and-forget (no kanban-visible state change on success), so
     /// arming that gate on every keystroke would be wrong.
-    pub fn route_harness_session_verb(&mut self, harness_only: bool, action: AppAction) -> AppAction {
-        if !harness_only {
-            return action;
-        }
+    pub fn route_harness_session_verb(&mut self, action: AppAction) -> AppAction {
         match action {
             AppAction::SpawnSpec { node_id, workspace_id, provider, rows, cols, profile_id, .. } => {
                 let token = self.begin_harness_mutation_refresh();

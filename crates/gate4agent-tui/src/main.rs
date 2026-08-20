@@ -3,7 +3,7 @@ use std::str::FromStr;
 
 use gate4agent_harness_client::HarnessOperatorCredential;
 use gate4agent_harness_protocol::HarnessSelectorV1;
-use gate4agent_tui::{HarnessOperatorEndpoint, PtyColorMode, RunOptions, StartupMode};
+use gate4agent_tui::{HarnessOperatorEndpoint, PtyColorMode, RunOptions};
 
 const HARNESS_OPERATOR_TOKEN_ENV: &str = "GATE4AGENT_HARNESS_OPERATOR_TOKEN";
 const HARNESS_LAUNCH_PLAN_ID_ENV: &str = "GATE4AGENT_HARNESS_LAUNCH_PLAN_ID";
@@ -53,12 +53,12 @@ fn parse_args_from(
     let credential = HarnessOperatorCredential::parse(token)
         .map_err(|_| format!("{HARNESS_OPERATOR_TOKEN_ENV} is malformed"))?;
     Ok(RunOptions {
-        mode: StartupMode::Harness(HarnessOperatorEndpoint {
+        operator: HarnessOperatorEndpoint {
             endpoint,
             credential,
             launch_plan_id: None,
-        }),
-        startup: None,
+        },
+        kanban_default: true,
         color_mode_override,
     })
 }
@@ -84,10 +84,7 @@ fn parse_args() -> Result<RunOptions, String> {
         .map(HarnessSelectorV1::new)
         .transpose()
         .map_err(|_| format!("{HARNESS_LAUNCH_PLAN_ID_ENV} is malformed"))?;
-    let StartupMode::Harness(operator) = &mut options.mode else {
-        unreachable!("the primary TUI parser only constructs Harness mode")
-    };
-    operator.launch_plan_id = launch_plan_id;
+    options.operator.launch_plan_id = launch_plan_id;
     Ok(options)
 }
 
@@ -157,9 +154,8 @@ mod tests {
             ],
             &[(HARNESS_OPERATOR_TOKEN_ENV, token.as_str())],
         ).unwrap();
-        let StartupMode::Harness(endpoint) = options.mode else { panic!("Harness mode") };
-        assert_eq!(endpoint.endpoint, "127.0.0.1:18080".parse().unwrap());
-        assert!(options.startup.is_none());
+        assert_eq!(options.operator.endpoint, "127.0.0.1:18080".parse().unwrap());
+        assert!(options.kanban_default);
         assert_eq!(options.color_mode_override, Some(PtyColorMode::GateOverride));
     }
 

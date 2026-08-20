@@ -2,7 +2,7 @@
 name = "gate4agent-tui"
 version = "0.1.0"
 edition = "2021"
-description = "Terminal client for gate4agent: gate4agent-tui (harness mode) and gate4agent-tui-light (direct-C2 light mode)"
+description = "Terminal client for gate4agent: both gate4agent-tui and gate4agent-tui-light speak only the harness operator wire -- light hosts gate4agent-harness-light in-process over c2 instead of a durable task kernel"
 publish = false
 
 [dependencies]
@@ -10,6 +10,7 @@ crossterm = "0.28"
 gate4agent-c2-client = { path = "../gate4agent-c2-client" }
 gate4agent-c2-protocol = { path = "../gate4agent-c2-protocol" }
 gate4agent-harness-client = { path = "../gate4agent-harness-client" }
+gate4agent-harness-light = { path = "../gate4agent-harness-light" }
 gate4agent-harness-protocol = { path = "../gate4agent-harness-protocol" }
 gate4agent-node-protocol = { path = "../gate4agent-node-protocol" }
 gate4agent-observation-api = { path = "../gate4agent-observation-api" }

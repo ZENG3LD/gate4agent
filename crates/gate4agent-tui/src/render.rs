@@ -595,6 +595,206 @@ fn render_compact_trailing_text(
         .render(text_area, buf);
 }
 
+/// Height, in cell rows, of one sidebar content panel's own dedicated
+/// control-plane strip (see [`render_control_strip`]): 2 rows of real
+/// rail-sized buttons -- the SAME 40x40 sixel / 8x12 braille assets the
+/// activity rail itself uses (`icons::SIXEL_ICON_CELLS_WIDE` x `_TALL`
+/// == 4x2, an exact fit for the sixel tier; the braille tier's own
+/// 4-cell x 3-row asset is flushed into this shorter 2-row body and
+/// crops its own bottom dot row via `PixelCanvas::flush`'s documented
+/// area clamp -- see that fn's own doc comment -- rather than a new,
+/// smaller bake, per this strip's own "reuse the rail-size tier, do not
+/// bake a new size" brief).
+const CONTROL_STRIP_BUTTON_ROWS: u16 = 2;
+/// One more row for the thin `─` separator painted directly under the
+/// strip's own button rows -- see [`render_control_strip`]'s own body.
+const CONTROL_STRIP_ROWS: u16 = CONTROL_STRIP_BUTTON_ROWS + 1;
+/// One strip button's own cell width -- exactly `icons::
+/// SIXEL_ICON_CELLS_WIDE` (4), so the sixel tier's own rail-size asset
+/// fills the whole button body with no runtime scaling.
+const CONTROL_STRIP_BUTTON_WIDTH: u16 = icons::SIXEL_ICON_CELLS_WIDE;
+/// Blank columns between two adjacent strip buttons.
+const CONTROL_STRIP_BUTTON_GAP: u16 = 1;
+/// Minimum panel height (the strip's own [`CONTROL_STRIP_ROWS`], plus at
+/// least 1 title row, plus at least 2 content rows below that) below
+/// which [`control_strip_fits`] rejects the strip in favor of the pre-
+/// strip single-row inline buttons -- the "~6 rows" threshold this
+/// strip's own brief named.
+const CONTROL_STRIP_MIN_PANEL_ROWS: u16 = 6;
+/// Minimum panel width to fit at least 2 strip buttons side by side
+/// (`2 * CONTROL_STRIP_BUTTON_WIDTH + 1 * CONTROL_STRIP_BUTTON_GAP`) --
+/// this strip's own "too narrow to fit at least two buttons" threshold.
+const CONTROL_STRIP_MIN_PANEL_COLUMNS: u16 =
+    CONTROL_STRIP_BUTTON_WIDTH * 2 + CONTROL_STRIP_BUTTON_GAP;
+
+/// True when `area` has room for a sidebar content panel's own full
+/// control-plane strip (see [`render_control_strip`]) -- the Explorer/
+/// Files and Git panels share these same thresholds; neither is panel-
+/// specific. Below either bound the CALLER keeps rendering its own pre-
+/// strip single-row inline buttons instead (see `render_workspace_
+/// files`/`render_git_snapshot`'s own fallback branches), so no hit
+/// target is ever lost on a cramped sidebar.
+fn control_strip_fits(area: Rect) -> bool {
+    area.height >= CONTROL_STRIP_MIN_PANEL_ROWS && area.width >= CONTROL_STRIP_MIN_PANEL_COLUMNS
+}
+
+/// One action button hosted in a sidebar content panel's own control-
+/// plane strip -- see [`render_control_strip`]. `enabled` mirrors the
+/// button's own pre-strip visibility gate (e.g. NewFile/NewDirectory
+/// only when a workspace is selected) so relocating it into the strip
+/// does not change WHEN it can be clicked, only WHERE it is drawn; a
+/// disabled button occupies no slot at all -- the same "just don't
+/// render it" convention the pre-strip buttons already used (there is
+/// no disabled/greyed-out visual state anywhere else in this sidebar to
+/// match instead).
+struct ControlStripButton {
+    icon: icons::IconId,
+    target: HitTarget,
+    enabled: bool,
+}
+
+/// Draws one sidebar content panel's own control-plane strip: a full-
+/// width, [`CONTROL_STRIP_BUTTON_ROWS`]-tall row of `buttons` (left to
+/// right, [`CONTROL_STRIP_BUTTON_GAP`] apart, each [`CONTROL_STRIP_
+/// BUTTON_WIDTH`] cells -- see [`render_control_strip_button`] for one
+/// button's own paint) on the panel background, plus a thin `─`
+/// separator on the row directly under it. Returns the panel's own
+/// remaining area BELOW the strip (title row, then content), already
+/// shrunk by [`CONTROL_STRIP_ROWS`] -- the caller must render everything
+/// else into that returned rect, never the original `area`, so nothing
+/// overdraws the strip. The caller must have already checked
+/// [`control_strip_fits`]; this fn does not fall back on its own.
+fn render_control_strip(
+    area: Rect,
+    buttons: &[ControlStripButton],
+    theme: Theme,
+    tier: RailIcons,
+    buf: &mut TerminalBuffer,
+    layout: &mut LayoutRects,
+) -> Rect {
+    let strip = Rect::new(area.x, area.y, area.width, CONTROL_STRIP_BUTTON_ROWS.min(area.height));
+    fill_rect(strip, theme.panel, buf);
+    let mut x = strip.x;
+    for button in buttons {
+        if !button.enabled {
+            continue;
+        }
+        if x.saturating_add(CONTROL_STRIP_BUTTON_WIDTH) > strip.right() {
+            break;
+        }
+        let block = Rect::new(x, strip.y, CONTROL_STRIP_BUTTON_WIDTH, strip.height);
+        render_control_strip_button(block, button.icon, button.target.clone(), theme, tier, buf, layout);
+        x = x
+            .saturating_add(CONTROL_STRIP_BUTTON_WIDTH)
+            .saturating_add(CONTROL_STRIP_BUTTON_GAP);
+    }
+    let separator_y = area.y.saturating_add(CONTROL_STRIP_BUTTON_ROWS);
+    if separator_y < area.bottom() {
+        for cx in area.x..area.right() {
+            let cell = buf.get_mut(cx, separator_y);
+            cell.symbol = "─".into();
+            cell.style = Style::default().fg(theme.border).bg(theme.panel);
+        }
+    }
+    Rect::new(
+        area.x,
+        area.y.saturating_add(CONTROL_STRIP_ROWS.min(area.height)),
+        area.width,
+        area.height.saturating_sub(CONTROL_STRIP_ROWS),
+    )
+}
+
+/// Draws one action button inside a sidebar panel's own control-plane
+/// strip (see [`render_control_strip`]): a fixed [`CONTROL_STRIP_
+/// BUTTON_WIDTH`]-cell x [`CONTROL_STRIP_BUTTON_ROWS`]-row body hosting
+/// the SAME rail-tier `icons::sixel`/`icons::braille` asset the activity
+/// rail itself uses (see [`CONTROL_STRIP_BUTTON_ROWS`]'s own doc comment
+/// for why the braille tier's own 3rd dot row crops here). Background/
+/// bold treatment mirrors [`render_rail_button`]'s own `theme.active`
+/// at-rest body -- these are one-shot actions, never a persisted
+/// `selected` view the way `ControlSection` rail buttons are, the same
+/// "never shows as active" precedent as the rail's own Settings button.
+/// `RailIcons::Ascii` paints [`icons::ascii`]'s short (<=2 char) catalog
+/// label centered on the block, not the long bracket-text labels the
+/// pre-strip inline buttons used -- those were sized for a much wider
+/// single-row rect and cannot fit this fixed narrow body.
+fn render_control_strip_button(
+    block: Rect,
+    icon: icons::IconId,
+    target: HitTarget,
+    theme: Theme,
+    tier: RailIcons,
+    buf: &mut TerminalBuffer,
+    layout: &mut LayoutRects,
+) {
+    if block.width == 0 || block.height == 0 {
+        return;
+    }
+    let bg = theme.active;
+    fill_rect(block, bg, buf);
+    match tier {
+        RailIcons::Sixel => {
+            let icon_area = Rect::new(
+                block.x,
+                block.y,
+                block.width.min(icons::SIXEL_ICON_CELLS_WIDE),
+                block.height.min(icons::SIXEL_ICON_CELLS_TALL),
+            );
+            layout.sixel_icons.push(SixelIconPlacement {
+                icon,
+                rect: icon_area,
+                selected: false,
+                size: SixelIconSize::Rail,
+            });
+        }
+        RailIcons::Braille => {
+            icons::braille(icon).flush(block, buf);
+            matte_canvas_background(block, bg, buf);
+        }
+        RailIcons::Ascii => {
+            let row = Rect::new(block.x, block.y + block.height / 2, block.width, 1);
+            Paragraph::new(centered_label(icons::ascii(icon), row.width as usize))
+                .style(Style::default().fg(theme.text).bg(bg).add_modifier(Modifier::BOLD))
+                .render(row, buf);
+        }
+    }
+    layout.hits.push(HitRegion { rect: block, target });
+}
+
+/// Packs one inline compact-icon button immediately to the LEFT of
+/// `*cursor_x`, `width` cells wide, on `area`'s own top row (`area.y`)
+/// -- the pre-strip fallback title-row buttons (see [`control_strip_
+/// fits`]'s own doc comment for when this path runs instead of the
+/// strip). `*cursor_x` is both the right boundary to butt up against
+/// (already excluding any gap -- the caller's very first call passes
+/// `area`'s own right edge, flush, and every button drawn here already
+/// leaves its own 1-column gap for whatever packs next) and, on
+/// success, gets advanced past the button just drawn plus that same
+/// 1-column gap. Renders nothing and leaves `*cursor_x` untouched when
+/// there is no room -- the same "drop what doesn't fit" behaviour the
+/// pre-existing NewFile/NewDirectory guard already had, just
+/// generalized to more buttons.
+fn pack_inline_button_left(
+    area: Rect,
+    cursor_x: &mut u16,
+    width: u16,
+    icon: icons::IconId,
+    target: HitTarget,
+    style: Style,
+    tier: RailIcons,
+    buf: &mut TerminalBuffer,
+    layout: &mut LayoutRects,
+) {
+    if cursor_x.saturating_sub(area.x) < width {
+        return;
+    }
+    let x = *cursor_x - width;
+    let rect = Rect::new(x, area.y, width, 1);
+    render_compact_icon_button(rect, icon, None, icons::ascii(icon), style, tier, buf, layout);
+    layout.hits.push(HitRegion { rect, target });
+    *cursor_x = x.saturating_sub(1);
+}
+
 fn render_activity_rail(
     app: &App,
     area: Rect,
@@ -957,51 +1157,80 @@ fn render_workspace_files(
     layout: &mut LayoutRects,
     theme: Theme,
 ) {
+    let selected = app.selected_workspace().is_some();
+    let use_strip = control_strip_fits(area);
+    let area = if use_strip {
+        render_control_strip(
+            area,
+            &[
+                ControlStripButton { icon: icons::IconId::NewFile, target: HitTarget::NewFile, enabled: selected },
+                ControlStripButton { icon: icons::IconId::NewFolder, target: HitTarget::NewDirectory, enabled: selected },
+                ControlStripButton { icon: icons::IconId::Add, target: HitTarget::AddSpace, enabled: true },
+                ControlStripButton { icon: icons::IconId::Trash, target: HitTarget::RemoveSpace, enabled: true },
+                ControlStripButton { icon: icons::IconId::Refresh, target: HitTarget::RefreshWorkspace, enabled: true },
+            ],
+            theme,
+            app.rail_icons,
+            buf,
+            layout,
+        )
+    } else {
+        area
+    };
     let list = render_inspector_header(app, area, buf, layout, theme);
-    if area.width > 0 && area.height > 0 && app.selected_workspace().is_some() {
-        let directory_label = "[+>]";
-        let file_label = "[+.]";
-        let directory_width = cell_width(directory_label) as u16;
-        let file_width = cell_width(file_label) as u16;
+    if !use_strip && area.width > 0 && area.height > 0 {
         let lens_offset = if app.agent_run_lens.is_some() { 6 } else { 0 };
-        if area.width >= directory_width.saturating_add(lens_offset) {
-            let directory = Rect::new(
-                area.right().saturating_sub(directory_width).saturating_sub(lens_offset),
-                area.y,
-                directory_width,
-                1,
-            );
-            render_compact_icon_button(
-                directory,
-                icons::IconId::NewFolder,
-                None,
-                directory_label,
-                Style::default().fg(theme.teal).bg(theme.panel).add_modifier(Modifier::BOLD),
-                app.rail_icons,
-                buf,
-                layout,
-            );
-            layout.hits.push(HitRegion {
-                rect: directory,
-                target: HitTarget::NewDirectory,
-            });
-            if directory.x >= area.x.saturating_add(file_width + 1) {
-                let file = Rect::new(directory.x - file_width - 1, area.y, file_width, 1);
+        let mut cursor_x = area.right().saturating_sub(lens_offset);
+        if selected {
+            let directory_label = "[+>]";
+            let file_label = "[+.]";
+            let directory_width = cell_width(directory_label) as u16;
+            let file_width = cell_width(file_label) as u16;
+            if area.width >= directory_width.saturating_add(lens_offset) {
+                let directory = Rect::new(cursor_x - directory_width, area.y, directory_width, 1);
                 render_compact_icon_button(
-                    file,
-                    icons::IconId::NewFile,
+                    directory,
+                    icons::IconId::NewFolder,
                     None,
-                    file_label,
+                    directory_label,
                     Style::default().fg(theme.teal).bg(theme.panel).add_modifier(Modifier::BOLD),
                     app.rail_icons,
                     buf,
                     layout,
                 );
                 layout.hits.push(HitRegion {
-                    rect: file,
-                    target: HitTarget::NewFile,
+                    rect: directory,
+                    target: HitTarget::NewDirectory,
                 });
+                cursor_x = directory.x.saturating_sub(1);
+                if directory.x >= area.x.saturating_add(file_width + 1) {
+                    let file = Rect::new(directory.x - file_width - 1, area.y, file_width, 1);
+                    render_compact_icon_button(
+                        file,
+                        icons::IconId::NewFile,
+                        None,
+                        file_label,
+                        Style::default().fg(theme.teal).bg(theme.panel).add_modifier(Modifier::BOLD),
+                        app.rail_icons,
+                        buf,
+                        layout,
+                    );
+                    layout.hits.push(HitRegion {
+                        rect: file,
+                        target: HitTarget::NewFile,
+                    });
+                    cursor_x = file.x.saturating_sub(1);
+                }
             }
+        }
+        let accent = Style::default().fg(theme.teal).bg(theme.panel).add_modifier(Modifier::BOLD);
+        let danger = Style::default().fg(theme.red).bg(theme.panel).add_modifier(Modifier::BOLD);
+        for (icon, target, style) in [
+            (icons::IconId::Add, HitTarget::AddSpace, accent),
+            (icons::IconId::Trash, HitTarget::RemoveSpace, danger),
+            (icons::IconId::Refresh, HitTarget::RefreshWorkspace, accent),
+        ] {
+            pack_inline_button_left(area, &mut cursor_x, 4, icon, target, style, app.rail_icons, buf, layout);
         }
     }
     let Some(inspection) = app.selected_workspace_inspection() else {
@@ -1164,12 +1393,38 @@ fn render_workspace_git(
     layout: &mut LayoutRects,
     theme: Theme,
 ) {
+    let use_strip = control_strip_fits(area);
+    let area = if use_strip {
+        let selected_removable_worktree = app
+            .selected_workspace_inspection()
+            .and_then(|inspection| inspection.git.worktrees.get(app.git_cursor))
+            .filter(|worktree| !worktree.is_main && !worktree.is_bare && !worktree.locked && !worktree.prunable)
+            .map(|_| app.git_cursor);
+        render_control_strip(
+            area,
+            &[
+                ControlStripButton { icon: icons::IconId::RepoForked, target: HitTarget::CreateWorktree, enabled: true },
+                ControlStripButton {
+                    icon: icons::IconId::Trash,
+                    target: HitTarget::RemoveWorktree(selected_removable_worktree.unwrap_or_default()),
+                    enabled: selected_removable_worktree.is_some(),
+                },
+                ControlStripButton { icon: icons::IconId::Refresh, target: HitTarget::RefreshWorkspace, enabled: true },
+            ],
+            theme,
+            app.rail_icons,
+            buf,
+            layout,
+        )
+    } else {
+        area
+    };
     let body = render_inspector_header(app, area, buf, layout, theme);
     let Some(inspection) = app.selected_workspace_inspection() else {
         render_inspector_empty(app, body, buf, "loading workspace...", theme);
         return;
     };
-    render_git_snapshot(app, inspection, body, buf, layout, theme);
+    render_git_snapshot(app, inspection, body, buf, layout, theme, use_strip);
 }
 
 fn render_git_snapshot(
@@ -1179,6 +1434,7 @@ fn render_git_snapshot(
     buf: &mut TerminalBuffer,
     layout: &mut LayoutRects,
     theme: Theme,
+    use_strip: bool,
 ) {
     if area.height == 0 {
         return;
@@ -1192,24 +1448,64 @@ fn render_git_snapshot(
         return;
     }
     let branch = git.branch.as_deref().unwrap_or("detached");
-    let create = " + worktree ";
-    let branch_width = area.width.saturating_sub(cell_width(create) as u16);
-    Paragraph::new(format!(" branch {}", truncate_cells(branch, branch_width.saturating_sub(8) as usize)))
-        .style(Style::default().fg(theme.teal).bg(theme.panel).add_modifier(Modifier::BOLD))
-        .render(Rect::new(area.x, area.y, branch_width, 1), buf);
-    if branch_width < area.width {
-        let create_rect = Rect::new(area.x + branch_width, area.y, area.width - branch_width, 1);
-        render_compact_icon_button(
-            create_rect,
-            icons::IconId::RepoForked,
-            Some("worktree"),
-            create,
-            Style::default().fg(theme.active_tab_text).bg(theme.accent).add_modifier(Modifier::BOLD),
+    if use_strip {
+        Paragraph::new(format!(" branch {}", truncate_cells(branch, area.width.saturating_sub(8) as usize)))
+            .style(Style::default().fg(theme.teal).bg(theme.panel).add_modifier(Modifier::BOLD))
+            .render(Rect::new(area.x, area.y, area.width, 1), buf);
+    } else {
+        let mut cursor_x = area.right();
+        let refresh_style = Style::default().fg(theme.teal).bg(theme.panel).add_modifier(Modifier::BOLD);
+        pack_inline_button_left(
+            area,
+            &mut cursor_x,
+            4,
+            icons::IconId::Refresh,
+            HitTarget::RefreshWorkspace,
+            refresh_style,
             app.rail_icons,
             buf,
             layout,
         );
-        layout.hits.push(HitRegion { rect: create_rect, target: HitTarget::CreateWorktree });
+        let selected_removable_worktree = git
+            .worktrees
+            .get(app.git_cursor)
+            .filter(|worktree| !worktree.is_main && !worktree.is_bare && !worktree.locked && !worktree.prunable)
+            .map(|_| app.git_cursor);
+        if let Some(index) = selected_removable_worktree {
+            let remove_style = Style::default().fg(theme.red).bg(theme.panel).add_modifier(Modifier::BOLD);
+            pack_inline_button_left(
+                area,
+                &mut cursor_x,
+                4,
+                icons::IconId::Trash,
+                HitTarget::RemoveWorktree(index),
+                remove_style,
+                app.rail_icons,
+                buf,
+                layout,
+            );
+        }
+        let create = " + worktree ";
+        let create_width = cell_width(create) as u16;
+        let usable_width = cursor_x.saturating_sub(area.x);
+        let branch_width = usable_width.saturating_sub(create_width);
+        Paragraph::new(format!(" branch {}", truncate_cells(branch, branch_width.saturating_sub(8) as usize)))
+            .style(Style::default().fg(theme.teal).bg(theme.panel).add_modifier(Modifier::BOLD))
+            .render(Rect::new(area.x, area.y, branch_width, 1), buf);
+        if branch_width < usable_width {
+            let create_rect = Rect::new(area.x + branch_width, area.y, usable_width - branch_width, 1);
+            render_compact_icon_button(
+                create_rect,
+                icons::IconId::RepoForked,
+                Some("worktree"),
+                create,
+                Style::default().fg(theme.active_tab_text).bg(theme.accent).add_modifier(Modifier::BOLD),
+                app.rail_icons,
+                buf,
+                layout,
+            );
+            layout.hits.push(HitRegion { rect: create_rect, target: HitTarget::CreateWorktree });
+        }
     }
     let area = Rect::new(area.x, area.y + 1, area.width, area.height.saturating_sub(1));
     let capacity = area.height as usize;
@@ -12989,12 +13285,22 @@ mod tests {
     /// [`icons::IconId::Add`] (the label carries information the icon
     /// alone cannot); RemoveSpace, a plain remove action mirroring
     /// RemoveWorktree, becomes icon-only. Same 3-tier + stable-hit-rect
-    /// coverage as `workspace_files_create_buttons_render_a_compact_icon_
-    /// per_tier`.
+    /// coverage as `workspace_files_create_buttons_render_in_the_
+    /// control_strip_per_tier`. Renders `render_space_list` directly
+    /// (not the full `render()`) -- the Explorer panel's own control-
+    /// plane strip now ALSO carries an `AddSpace`/`RemoveSpace` button
+    /// (see `explorer_control_strip_carries_the_specified_buttons_in_
+    /// order`), and in the default Split presentation both panels are
+    /// on screen at once, so a full render leaves two hit regions for
+    /// each target; this test's own subject is `render_space_list`'s
+    /// OWN button specifically, not whichever one a full render's hit
+    /// list happens to list first.
     #[test]
     fn space_list_add_and_remove_buttons_render_a_compact_icon_per_tier() {
         let mut app = fixture(PtyColorMode::GateOverride);
         app.roster_mode = RosterMode::Workspaces;
+        let area = Rect::new(0, 0, 40, 20);
+        let theme = Theme::for_mode(app.color_mode);
 
         let hit_rect = |layout: &LayoutRects, target: HitTarget| {
             layout
@@ -13006,8 +13312,9 @@ mod tests {
         };
 
         assert_eq!(app.rail_icons, RailIcons::Sixel);
-        let mut sixel_buf = TerminalBuffer::new(100, 24);
-        let sixel_layout = render(&app, &mut sixel_buf);
+        let mut sixel_buf = TerminalBuffer::new(40, 20);
+        let mut sixel_layout = LayoutRects::default();
+        render_space_list(&app, area, &mut sixel_buf, &mut sixel_layout, theme);
         let add_rect = hit_rect(&sixel_layout, HitTarget::AddSpace);
         let remove_rect = hit_rect(&sixel_layout, HitTarget::RemoveSpace);
         assert!(sixel_layout.sixel_icons.iter().any(|placement| {
@@ -13025,8 +13332,9 @@ mod tests {
         assert!(!rect_text(&sixel_buf, remove_rect).contains("remove"));
 
         app.rail_icons = RailIcons::Braille;
-        let mut braille_buf = TerminalBuffer::new(100, 24);
-        let braille_layout = render(&app, &mut braille_buf);
+        let mut braille_buf = TerminalBuffer::new(40, 20);
+        let mut braille_layout = LayoutRects::default();
+        render_space_list(&app, area, &mut braille_buf, &mut braille_layout, theme);
         assert_eq!(hit_rect(&braille_layout, HitTarget::AddSpace), add_rect);
         assert_eq!(hit_rect(&braille_layout, HitTarget::RemoveSpace), remove_rect);
         assert!(braille_layout.sixel_icons.is_empty());
@@ -13035,8 +13343,9 @@ mod tests {
         assert!(rect_text(&braille_buf, add_rect).contains("workspace"));
 
         app.rail_icons = RailIcons::Ascii;
-        let mut ascii_buf = TerminalBuffer::new(100, 24);
-        let ascii_layout = render(&app, &mut ascii_buf);
+        let mut ascii_buf = TerminalBuffer::new(40, 20);
+        let mut ascii_layout = LayoutRects::default();
+        render_space_list(&app, area, &mut ascii_buf, &mut ascii_layout, theme);
         assert_eq!(hit_rect(&ascii_layout, HitTarget::AddSpace), add_rect);
         assert_eq!(hit_rect(&ascii_layout, HitTarget::RemoveSpace), remove_rect);
         assert!(ascii_layout.sixel_icons.is_empty());
@@ -14196,7 +14505,11 @@ mod tests {
         assert!(layout.hits.iter().any(|hit| hit.target == HitTarget::ControlResize));
         assert!(layout.control_modal.width < 96);
         assert!(layout.control_modal.height < 24);
-        assert!(!layout.hits.iter().any(|hit| hit.target == HitTarget::RefreshWorkspace));
+        // The Explorer panel's own control-plane strip (or, on a modal
+        // this compact, its pre-strip inline fallback -- see
+        // `control_strip_fits`) is Refresh's only rendered home; it used
+        // to have none at all (dispatched by the `r` key only).
+        assert!(layout.hits.iter().any(|hit| hit.target == HitTarget::RefreshWorkspace));
         assert!(layout.hits.iter().any(|hit| hit.target == HitTarget::SidebarItem(0)));
 
         app.control_modal_size = Some((72, 18));
@@ -14243,13 +14556,18 @@ mod tests {
         app.sidebar_mode = SidebarMode::Files;
         let mut files = TerminalBuffer::new(100, 24);
         let files_layout = render(&app, &mut files);
-        assert!(!files_layout.hits.iter().any(|hit| hit.target == HitTarget::RefreshWorkspace));
+        // Both panels' own control-plane strip carries a Refresh button
+        // wired to the exact same `r`-key action (`inspect_selected_
+        // workspace`, which refreshes the whole `WorkspaceInspection` --
+        // files AND git together) -- see `explorer_control_strip_*`/
+        // `git_control_strip_*` for the strip's own dedicated coverage.
+        assert!(files_layout.hits.iter().any(|hit| hit.target == HitTarget::RefreshWorkspace));
         assert!(files_layout.hits.iter().any(|hit| hit.target == HitTarget::SidebarItem(0)));
 
         app.sidebar_mode = SidebarMode::Git;
         let mut git = TerminalBuffer::new(100, 24);
         let git_layout = render(&app, &mut git);
-        assert!(!git_layout.hits.iter().any(|hit| hit.target == HitTarget::RefreshWorkspace));
+        assert!(git_layout.hits.iter().any(|hit| hit.target == HitTarget::RefreshWorkspace));
         assert!(git_layout.hits.iter().any(|hit| hit.target == HitTarget::SidebarItem(0)));
     }
 
@@ -14325,13 +14643,17 @@ mod tests {
         assert!(text.contains("No overwrite"));
     }
 
-    /// Wave-1 icon labelling: NewFile/NewDirectory paint a compact baked
-    /// icon in `Sixel`/`Braille` mode and the untouched original bracket
-    /// text in `Ascii` mode, and -- the load-bearing invariant for a
-    /// pure labelling change -- their own [`HitRegion`] rect is BYTE-
+    /// The control-plane strip's own NewFile/NewDirectory buttons: a
+    /// rail-tier baked icon (the SAME 40x40/8x12 assets the activity
+    /// rail itself uses -- see `render_control_strip_button`'s own doc
+    /// comment) in `Sixel`/`Braille` mode, and a short 2-char catalog
+    /// label (`icons::ascii`) in `Ascii` mode, NOT the pre-strip
+    /// bracket text -- the strip's fixed 4-cell body cannot fit
+    /// `"[+.]"`/`"[+>]"`. The load-bearing invariant carried over from
+    /// the pre-strip version: their own [`HitRegion`] rect is BYTE-
     /// IDENTICAL across all three tiers (same position, same target).
     #[test]
-    fn workspace_files_create_buttons_render_a_compact_icon_per_tier() {
+    fn workspace_files_create_buttons_render_in_the_control_strip_per_tier() {
         let mut app = fixture(PtyColorMode::GateOverride);
         app.apply_workspace_inspection("node-a".to_owned(), inspection());
         app.sidebar_mode = SidebarMode::Files;
@@ -14350,14 +14672,17 @@ mod tests {
         let sixel_layout = render(&app, &mut sixel_buf);
         let new_file_rect = hit_rect(&sixel_layout, HitTarget::NewFile);
         let new_directory_rect = hit_rect(&sixel_layout, HitTarget::NewDirectory);
+        assert_eq!(new_file_rect.height, CONTROL_STRIP_BUTTON_ROWS);
+        assert_eq!(new_file_rect.width, CONTROL_STRIP_BUTTON_WIDTH);
+        assert_eq!(new_directory_rect.height, CONTROL_STRIP_BUTTON_ROWS);
         assert!(sixel_layout.sixel_icons.iter().any(|placement| {
             placement.icon == icons::IconId::NewFile
-                && placement.size == crate::app::SixelIconSize::Compact
+                && placement.size == crate::app::SixelIconSize::Rail
                 && new_file_rect.contains(placement.rect.x, placement.rect.y)
         }));
         assert!(sixel_layout.sixel_icons.iter().any(|placement| {
             placement.icon == icons::IconId::NewFolder
-                && placement.size == crate::app::SixelIconSize::Compact
+                && placement.size == crate::app::SixelIconSize::Rail
                 && new_directory_rect.contains(placement.rect.x, placement.rect.y)
         }));
         let sixel_text = buffer_text(&sixel_buf);
@@ -14379,7 +14704,9 @@ mod tests {
         assert_eq!(hit_rect(&ascii_layout, HitTarget::NewDirectory), new_directory_rect);
         assert!(ascii_layout.sixel_icons.is_empty());
         let ascii_text = buffer_text(&ascii_buf);
-        assert!(ascii_text.contains("[+.]") && ascii_text.contains("[+>]"), "{ascii_text}");
+        assert!(!ascii_text.contains("[+.]") && !ascii_text.contains("[+>]"), "{ascii_text}");
+        assert!(rect_text(&ascii_buf, new_file_rect).contains(icons::ascii(icons::IconId::NewFile)));
+        assert!(rect_text(&ascii_buf, new_directory_rect).contains(icons::ascii(icons::IconId::NewFolder)));
     }
 
     #[test]
@@ -14426,13 +14753,21 @@ mod tests {
         assert!(layout.hits.iter().any(|hit| hit.target == HitTarget::SidebarItem(2)));
     }
 
-    /// Wave-1 icon labelling: CreateWorktree keeps its "worktree" text
-    /// next to [`icons::IconId::RepoForked`]; RemoveWorktree (a 4-column
-    /// `" rm "` button -- no room for text even if it carried any) becomes
-    /// icon-only [`icons::IconId::Trash`]. Same 3-tier + stable-hit-rect
-    /// coverage as the Explorer panel's own compact-icon test.
+    /// The control-plane strip's own CreateWorktree/RemoveWorktree
+    /// buttons: rail-tier baked icons ([`icons::IconId::RepoForked`] /
+    /// [`icons::IconId::Trash`]) in `Sixel`/`Braille` mode, icon-only --
+    /// the strip's fixed 4-cell body has no room for CreateWorktree's
+    /// old "worktree" trailing text -- and a short 2-char catalog label
+    /// in `Ascii` mode. `RemoveWorktree`'s own strip button targets
+    /// whichever worktree `app.git_cursor` currently selects (the same
+    /// resolution the Delete key's own `remove_selected_git_worktree`
+    /// already used); this fixture's single worktree sits at cursor 0
+    /// and is removable, so the strip carries `RemoveWorktree(0)`, the
+    /// SAME target its own per-row list button also carries. Same
+    /// 3-tier + stable-hit-rect coverage as the Explorer panel's own
+    /// control-strip test.
     #[test]
-    fn git_worktree_create_and_remove_buttons_render_a_compact_icon_per_tier() {
+    fn git_worktree_create_and_remove_buttons_render_in_the_control_strip_per_tier() {
         let mut app = fixture(PtyColorMode::GateOverride);
         let mut snapshot = inspection();
         snapshot.git.worktrees = vec![GitWorktreeSnapshot {
@@ -14464,17 +14799,20 @@ mod tests {
         let sixel_layout = render(&app, &mut sixel_buf);
         let create_rect = hit_rect(&sixel_layout, HitTarget::CreateWorktree);
         let remove_rect = hit_rect(&sixel_layout, HitTarget::RemoveWorktree(0));
+        assert_eq!(create_rect.height, CONTROL_STRIP_BUTTON_ROWS);
+        assert_eq!(create_rect.width, CONTROL_STRIP_BUTTON_WIDTH);
+        assert_eq!(remove_rect.height, CONTROL_STRIP_BUTTON_ROWS);
         assert!(sixel_layout.sixel_icons.iter().any(|placement| {
             placement.icon == icons::IconId::RepoForked
-                && placement.size == crate::app::SixelIconSize::Compact
+                && placement.size == crate::app::SixelIconSize::Rail
                 && create_rect.contains(placement.rect.x, placement.rect.y)
         }));
         assert!(sixel_layout.sixel_icons.iter().any(|placement| {
             placement.icon == icons::IconId::Trash
-                && placement.size == crate::app::SixelIconSize::Compact
+                && placement.size == crate::app::SixelIconSize::Rail
                 && remove_rect.contains(placement.rect.x, placement.rect.y)
         }));
-        assert!(rect_text(&sixel_buf, create_rect).contains("worktree"));
+        assert!(!rect_text(&sixel_buf, create_rect).contains("worktree"));
 
         app.rail_icons = RailIcons::Braille;
         let mut braille_buf = TerminalBuffer::new(100, 24);
@@ -14484,7 +14822,6 @@ mod tests {
         assert!(braille_layout.sixel_icons.is_empty());
         assert!(contains_braille_glyph(&rect_text(&braille_buf, create_rect)));
         assert!(contains_braille_glyph(&rect_text(&braille_buf, remove_rect)));
-        assert!(rect_text(&braille_buf, create_rect).contains("worktree"));
 
         app.rail_icons = RailIcons::Ascii;
         let mut ascii_buf = TerminalBuffer::new(100, 24);
@@ -14492,8 +14829,294 @@ mod tests {
         assert_eq!(hit_rect(&ascii_layout, HitTarget::CreateWorktree), create_rect);
         assert_eq!(hit_rect(&ascii_layout, HitTarget::RemoveWorktree(0)), remove_rect);
         assert!(ascii_layout.sixel_icons.is_empty());
-        assert!(rect_text(&ascii_buf, create_rect).contains("+ worktree"));
-        assert!(rect_text(&ascii_buf, remove_rect).contains("rm"));
+        assert!(!rect_text(&ascii_buf, create_rect).contains("+ worktree"));
+        assert!(rect_text(&ascii_buf, create_rect).contains(icons::ascii(icons::IconId::RepoForked)));
+        assert!(rect_text(&ascii_buf, remove_rect).contains(icons::ascii(icons::IconId::Trash)));
+    }
+
+    /// The exact fallback thresholds this wave picked for [`control_strip_
+    /// fits`]: a panel needs >= 6 of its own rows (2 button rows + 1
+    /// separator + at least 1 title row + at least 2 content rows below
+    /// that) and >= 9 columns (room for at least 2 buttons, `2 * 4 + 1`
+    /// gap column) to host the strip; falling short of EITHER drops back
+    /// to the pre-strip single-row inline buttons (see `render_workspace_
+    /// files`/`render_workspace_git`'s own fallback branches).
+    #[test]
+    fn control_strip_fits_thresholds_are_six_rows_and_nine_columns() {
+        assert!(!control_strip_fits(Rect::new(0, 0, 40, 5)));
+        assert!(control_strip_fits(Rect::new(0, 0, 40, 6)));
+        assert!(!control_strip_fits(Rect::new(0, 0, 8, 40)));
+        assert!(control_strip_fits(Rect::new(0, 0, 9, 40)));
+    }
+
+    /// Explorer's own control-plane strip: exactly [`CONTROL_STRIP_
+    /// BUTTON_ROWS`] tall, NewFile/NewDirectory/AddSpace/RemoveSpace/
+    /// Refresh left to right in that exact order, each [`CONTROL_STRIP_
+    /// BUTTON_WIDTH`] cells wide with [`CONTROL_STRIP_BUTTON_GAP`]
+    /// between adjacent buttons, and each one's own baked rail-tier
+    /// sixel icon placed INSIDE its own hit rect.
+    #[test]
+    fn explorer_control_strip_carries_the_specified_buttons_in_order() {
+        let mut app = fixture(PtyColorMode::GateOverride);
+        app.apply_workspace_inspection("node-a".to_owned(), inspection());
+        app.sidebar_mode = SidebarMode::Files;
+        let mut buf = TerminalBuffer::new(100, 24);
+
+        let layout = render(&app, &mut buf);
+
+        let strip_top = layout.spaces.y + 1;
+        let expected_order = [
+            (HitTarget::NewFile, icons::IconId::NewFile),
+            (HitTarget::NewDirectory, icons::IconId::NewFolder),
+            (HitTarget::AddSpace, icons::IconId::Add),
+            (HitTarget::RemoveSpace, icons::IconId::Trash),
+            (HitTarget::RefreshWorkspace, icons::IconId::Refresh),
+        ];
+        let mut previous_right = None;
+        for (index, (target, icon)) in expected_order.into_iter().enumerate() {
+            let hit = layout
+                .hits
+                .iter()
+                .find(|hit| hit.target == target)
+                .unwrap_or_else(|| panic!("missing strip hit for {target:?}"));
+            assert_eq!(hit.rect.y, strip_top, "{target:?} must sit on the strip's own top row");
+            assert_eq!(hit.rect.width, CONTROL_STRIP_BUTTON_WIDTH, "{target:?}");
+            assert_eq!(hit.rect.height, CONTROL_STRIP_BUTTON_ROWS, "{target:?}");
+            if index == 0 {
+                assert_eq!(hit.rect.x, layout.spaces.x, "the first strip button sits flush at the panel's own left edge");
+            } else {
+                assert_eq!(
+                    hit.rect.x,
+                    previous_right.unwrap_or_default() + CONTROL_STRIP_BUTTON_GAP,
+                    "{target:?} must sit exactly one gap column after the previous button",
+                );
+            }
+            previous_right = Some(hit.rect.right());
+            assert!(
+                layout.sixel_icons.iter().any(|placement| {
+                    placement.icon == icon
+                        && placement.size == crate::app::SixelIconSize::Rail
+                        && hit.rect.contains(placement.rect.x, placement.rect.y)
+                }),
+                "{target:?} must place its rail-tier {icon:?} sixel icon inside its own hit rect: {:?}",
+                layout.sixel_icons,
+            );
+        }
+    }
+
+    /// The Git panel's own control-plane strip: CreateWorktree/
+    /// RemoveWorktree/Refresh left to right, same geometry invariants as
+    /// `explorer_control_strip_carries_the_specified_buttons_in_order`.
+    /// `RemoveWorktree`'s own strip target tracks `app.git_cursor` (0 in
+    /// this fixture, its single worktree, which is removable) -- the
+    /// exact same resolution the Delete key's own `remove_selected_git_
+    /// worktree` already used, so this is `RemoveWorktree(0)`, the SAME
+    /// target its per-row list button also carries.
+    #[test]
+    fn git_control_strip_carries_the_specified_buttons_in_order() {
+        let mut app = fixture(PtyColorMode::GateOverride);
+        let mut snapshot = inspection();
+        snapshot.git.worktrees = vec![GitWorktreeSnapshot {
+            path: host_path(r"C:\work\feature"),
+            head: "bbbb".to_owned(),
+            branch: Some("feature/a".to_owned()),
+            is_bare: false,
+            is_main: false,
+            locked: false,
+            lock_reason: None,
+            prunable: false,
+            prunable_reason: None,
+            workspace_id: None,
+        }];
+        app.apply_workspace_inspection("node-a".to_owned(), snapshot);
+        app.sidebar_mode = SidebarMode::Git;
+        let mut buf = TerminalBuffer::new(100, 24);
+
+        let layout = render(&app, &mut buf);
+
+        let strip_top = layout.spaces.y + 1;
+        let expected_order = [
+            (HitTarget::CreateWorktree, icons::IconId::RepoForked),
+            (HitTarget::RemoveWorktree(0), icons::IconId::Trash),
+            (HitTarget::RefreshWorkspace, icons::IconId::Refresh),
+        ];
+        let mut previous_right = None;
+        for (index, (target, icon)) in expected_order.into_iter().enumerate() {
+            let hit = layout
+                .hits
+                .iter()
+                .find(|hit| hit.target == target)
+                .unwrap_or_else(|| panic!("missing strip hit for {target:?}"));
+            assert_eq!(hit.rect.y, strip_top, "{target:?} must sit on the strip's own top row");
+            assert_eq!(hit.rect.width, CONTROL_STRIP_BUTTON_WIDTH, "{target:?}");
+            assert_eq!(hit.rect.height, CONTROL_STRIP_BUTTON_ROWS, "{target:?}");
+            if index == 0 {
+                assert_eq!(hit.rect.x, layout.spaces.x, "the first strip button sits flush at the panel's own left edge");
+            } else {
+                assert_eq!(
+                    hit.rect.x,
+                    previous_right.unwrap_or_default() + CONTROL_STRIP_BUTTON_GAP,
+                    "{target:?} must sit exactly one gap column after the previous button",
+                );
+            }
+            previous_right = Some(hit.rect.right());
+            assert!(
+                layout.sixel_icons.iter().any(|placement| {
+                    placement.icon == icon
+                        && placement.size == crate::app::SixelIconSize::Rail
+                        && hit.rect.contains(placement.rect.x, placement.rect.y)
+                }),
+                "{target:?} must place its rail-tier {icon:?} sixel icon inside its own hit rect: {:?}",
+                layout.sixel_icons,
+            );
+        }
+    }
+
+    /// Neither panel's own content (file tree / git worktree+status
+    /// list) may start before its own strip, separator, and title row(s)
+    /// end -- Git carries one more title row than Files (the shared
+    /// workspace-label header, THEN git's own "branch <name>" row, drawn
+    /// only when the strip is active -- see `render_git_snapshot`).
+    #[test]
+    fn control_strip_content_area_starts_below_the_strip_and_its_title_row() {
+        let mut app = fixture(PtyColorMode::GateOverride);
+        app.apply_workspace_inspection("node-a".to_owned(), inspection());
+        app.sidebar_mode = SidebarMode::Files;
+        let mut files_buf = TerminalBuffer::new(100, 24);
+        let files_layout = render(&app, &mut files_buf);
+        let files_strip_top = files_layout.spaces.y + 1;
+        // strip (2 rows) + separator (1 row) + the shared workspace-label
+        // header (1 row; no agent-run-lens scope row in this fixture).
+        let expected_files_content_top = files_strip_top + CONTROL_STRIP_ROWS + 1;
+        let first_file_row = files_layout
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::SidebarItem(0))
+            .expect("first file row");
+        assert_eq!(first_file_row.rect.y, expected_files_content_top);
+        for target in [
+            HitTarget::NewFile,
+            HitTarget::NewDirectory,
+            HitTarget::AddSpace,
+            HitTarget::RemoveSpace,
+            HitTarget::RefreshWorkspace,
+        ] {
+            let hit = files_layout.hits.iter().find(|hit| hit.target == target).expect("strip button");
+            assert!(hit.rect.bottom() <= expected_files_content_top, "{target:?} must not overdraw into the content area");
+        }
+
+        app.sidebar_mode = SidebarMode::Git;
+        let mut git_buf = TerminalBuffer::new(100, 24);
+        let git_layout = render(&app, &mut git_buf);
+        let git_strip_top = git_layout.spaces.y + 1;
+        // strip (2) + separator (1) + the shared header (1) + git's own
+        // "branch <name>" row (1, strip-only -- see `render_git_snapshot`).
+        let expected_git_content_top = git_strip_top + CONTROL_STRIP_ROWS + 2;
+        let first_git_row = git_layout
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::SidebarItem(0))
+            .expect("first git status row");
+        assert_eq!(first_git_row.rect.y, expected_git_content_top);
+        let create_worktree_hit = git_layout.hits.iter().find(|hit| hit.target == HitTarget::CreateWorktree).expect("strip button");
+        assert!(create_worktree_hit.rect.bottom() <= expected_git_content_top);
+    }
+
+    /// Below [`CONTROL_STRIP_MIN_PANEL_ROWS`] the Explorer panel drops
+    /// the strip and falls back to its own pre-strip single-row inline
+    /// title-row buttons -- EVERY one of the strip's own 5 targets must
+    /// still be reachable, not just the two (NewFile/NewDirectory) that
+    /// already had an inline form before this wave.
+    #[test]
+    fn explorer_control_strip_falls_back_to_inline_buttons_when_the_panel_is_too_short() {
+        let mut app = fixture(PtyColorMode::GateOverride);
+        app.apply_workspace_inspection("node-a".to_owned(), inspection());
+        let area = Rect::new(0, 0, 80, 4);
+        assert!(!control_strip_fits(area), "4 rows must be below the strip's own minimum");
+        let mut buf = TerminalBuffer::new(80, 4);
+        let mut layout = LayoutRects::default();
+        let theme = Theme::for_mode(app.color_mode);
+
+        render_workspace_files(&app, area, &mut buf, &mut layout, theme);
+
+        for target in [
+            HitTarget::NewFile,
+            HitTarget::NewDirectory,
+            HitTarget::AddSpace,
+            HitTarget::RemoveSpace,
+            HitTarget::RefreshWorkspace,
+        ] {
+            let hit = layout
+                .hits
+                .iter()
+                .find(|hit| hit.target == target)
+                .unwrap_or_else(|| panic!("fallback must still expose {target:?}"));
+            assert_eq!(hit.rect.height, 1, "the fallback keeps the pre-strip single-row button, not the strip's 2-row body");
+            assert!(hit.rect.bottom() <= area.bottom());
+        }
+    }
+
+    /// Same fallback coverage as `explorer_control_strip_falls_back_to_
+    /// inline_buttons_when_the_panel_is_too_short`, for the Git panel:
+    /// CreateWorktree, RemoveWorktree(selected), and Refresh must all
+    /// still be reachable inline when the panel is too short for the
+    /// strip.
+    #[test]
+    fn git_control_strip_falls_back_to_inline_buttons_when_the_panel_is_too_short() {
+        let mut app = fixture(PtyColorMode::GateOverride);
+        let mut snapshot = inspection();
+        snapshot.git.worktrees = vec![GitWorktreeSnapshot {
+            path: host_path(r"C:\work\feature"),
+            head: "bbbb".to_owned(),
+            branch: Some("feature/a".to_owned()),
+            is_bare: false,
+            is_main: false,
+            locked: false,
+            lock_reason: None,
+            prunable: false,
+            prunable_reason: None,
+            workspace_id: None,
+        }];
+        app.apply_workspace_inspection("node-a".to_owned(), snapshot);
+        let area = Rect::new(0, 0, 80, 4);
+        assert!(!control_strip_fits(area), "4 rows must be below the strip's own minimum");
+        let mut buf = TerminalBuffer::new(80, 4);
+        let mut layout = LayoutRects::default();
+        let theme = Theme::for_mode(app.color_mode);
+
+        render_workspace_git(&app, area, &mut buf, &mut layout, theme);
+
+        for target in [HitTarget::CreateWorktree, HitTarget::RemoveWorktree(0), HitTarget::RefreshWorkspace] {
+            let hit = layout
+                .hits
+                .iter()
+                .find(|hit| hit.target == target)
+                .unwrap_or_else(|| panic!("fallback must still expose {target:?}"));
+            assert_eq!(hit.rect.height, 1, "the fallback keeps a single-row button, not the strip's 2-row body");
+            assert!(hit.rect.bottom() <= area.bottom());
+        }
+    }
+
+    /// End-to-end proof for the one target that used to have NO rendered
+    /// button at all (dispatched only by the `r` key -- see
+    /// `App::reduce_spaces`): both panels' own Refresh strip button
+    /// resolves to a real hit region and clicking it dispatches the
+    /// exact same `AppAction::InspectWorkspace` the key already did.
+    #[test]
+    fn explorer_and_git_refresh_strip_buttons_dispatch_inspect_selected_workspace() {
+        let mut app = fixture(PtyColorMode::GateOverride);
+        app.apply_workspace_inspection("node-a".to_owned(), inspection());
+        app.sidebar_mode = SidebarMode::Files;
+        assert!(matches!(
+            click_activity_rail_button(&mut app, HitTarget::RefreshWorkspace),
+            AppAction::InspectWorkspace { .. }
+        ));
+
+        app.sidebar_mode = SidebarMode::Git;
+        assert!(matches!(
+            click_activity_rail_button(&mut app, HitTarget::RefreshWorkspace),
+            AppAction::InspectWorkspace { .. }
+        ));
     }
 
     #[test]
@@ -14570,6 +15193,9 @@ mod tests {
         let mut layout = LayoutRects::default();
         let inspection = app.selected_workspace_inspection().unwrap();
 
+        // 4 rows is below `CONTROL_STRIP_MIN_PANEL_ROWS` -- the fallback
+        // (inline title-row buttons, `use_strip: false`) is what a real
+        // caller (`render_workspace_git`) would compute for this height.
         render_git_snapshot(
             &app,
             inspection,
@@ -14577,6 +15203,7 @@ mod tests {
             &mut buf,
             &mut layout,
             Theme::for_mode(app.color_mode),
+            false,
         );
         let hit = layout.hits.iter()
             .find(|hit| hit.target == HitTarget::SidebarItem(0))
@@ -15390,16 +16017,21 @@ mod tests {
         let sixel_layout = render(&app, &mut sixel_buf);
         let sixel_text = rect_text(&sixel_buf, sixel_layout.activity_rail);
         // `app.control_section` defaults to `Files`, so the Explorer
-        // panel's own compact NewFile/NewDirectory buttons ALSO place
-        // sixel icons this frame (`SixelIconSize::Compact`) alongside
-        // the rail's own 6 (`SixelIconSize::Rail`) -- filter to the
-        // rail's own tier, the invariant this test actually covers (the
-        // compact tier has its own coverage in `workspace_files_render_
-        // create_actions_and_entry_dialog`).
+        // panel's own control-plane strip ALSO places rail-SIZED sixel
+        // icons this frame (`SixelIconSize::Rail`, the SAME tier the
+        // rail itself uses -- see `render_control_strip_button`'s own
+        // doc comment) -- filter to placements actually INSIDE the
+        // rail's own rect, the invariant this test actually covers (the
+        // strip's own coverage lives in `workspace_files_render_create_
+        // actions_and_entry_dialog` and the `explorer_control_strip_*`/
+        // `git_control_strip_*` tests).
         let rail_sixel_icons = sixel_layout
             .sixel_icons
             .iter()
-            .filter(|placement| placement.size == crate::app::SixelIconSize::Rail)
+            .filter(|placement| {
+                placement.size == crate::app::SixelIconSize::Rail
+                    && sixel_layout.activity_rail.contains(placement.rect.x, placement.rect.y)
+            })
             .collect::<Vec<_>>();
         assert_eq!(
             rail_sixel_icons.len(),
@@ -15423,9 +16055,11 @@ mod tests {
         }
         assert!(
             sixel_layout.sixel_icons.iter().any(|placement| {
-                placement.size == crate::app::SixelIconSize::Compact && placement.icon == icons::IconId::NewFile
+                placement.size == crate::app::SixelIconSize::Rail
+                    && placement.icon == icons::IconId::NewFile
+                    && !sixel_layout.activity_rail.contains(placement.rect.x, placement.rect.y)
             }),
-            "the default Files panel's own compact NewFile button must also place a sixel icon: {:?}",
+            "the default Files panel's own control-plane strip must also place a rail-tier NewFile sixel icon outside the rail: {:?}",
             sixel_layout.sixel_icons,
         );
         assert!(!contains_braille_glyph(&sixel_text), "sixel mode must not paint braille cells: {sixel_text:?}");

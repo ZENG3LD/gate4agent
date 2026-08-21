@@ -81,7 +81,7 @@ use gate4agent_harness_client::{
 };
 use uzor_tui::Rect;
 
-use crate::icons::IconId;
+use crate::icons::{IconId, SixelVariant};
 use crate::surface::{
     LayoutPreset, PaneId, PaneSplitPath, SplitAxis, SurfaceDropZone, SurfaceError, SurfaceState,
 };
@@ -2693,34 +2693,42 @@ pub struct HitRegion {
     pub target: HitTarget,
 }
 
-/// Which baked raster [`SixelIconPlacement::icon`] resolves to --
-/// `Rail`: the full `icons::sixel` asset (~4 cells wide x 2 rows, the
-/// activity rail's own button body); `Compact`: the much smaller
-/// `icons::sixel_compact` asset (exactly one assumed terminal cell), for
-/// dense single-row buttons in the Explorer/Git sidebar panels and their
-/// modals -- see `render::render_compact_icon_button`.
+/// Which baked raster [`SixelIconPlacement::icon`] resolves to -- `Rail`:
+/// the full `icons::sixel` asset (~4 cells wide x 2 rows, the activity
+/// rail's own button body); `Compact`: the much smaller `icons::
+/// sixel_compact` asset (exactly one assumed terminal cell), for dense
+/// single-row buttons in the Explorer/Git sidebar panels and their modals
+/// -- see `render::render_compact_icon_button`; `Strip`: the sidebar
+/// content panels' own control-plane strip asset (`icons::sixel_strip`,
+/// 2 cells wide x 1 row) -- see `render::render_control_strip_button`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SixelIconSize {
     Rail,
     Compact,
+    Strip,
 }
 
 /// One button's own baked sixel icon, positioned at its absolute screen
 /// cell coordinates for this frame -- see `LayoutRects::sixel_icons`'s
-/// own doc comment. `selected` rides along because it changes the
-/// button body's own background color underneath a transparent-
-/// background sixel image (`icons::sixel`'s own `BackgroundMode::
-/// Transparent` encoding): the terminal repaints that background via a
-/// plain cell-buffer diff (invisible to this struct), which visually
-/// erases whatever sixel pixels were sitting there, so a selection
-/// change must be part of the gating signature too, not just the icon
-/// identity and its rect. `size` selects which of the two baked assets
-/// `client::flush_sixel_icon` prints for this placement.
+/// own doc comment. `size` selects which tier's baked asset `client::
+/// flush_sixel_icon` prints for this placement; `variant` selects WHICH
+/// of that tier's own baked backgrounds (see `icons::SixelVariant`'s own
+/// doc comment) -- derived from `app.color_mode` plus, for the rail tier
+/// only, the button's own selected state (the control-plane strip has no
+/// selected state at all, so it only ever requests `GateActive`/
+/// `Transparent`). `variant` rides along as part of the gating signature
+/// (not just the icon identity and its rect) because a selection change
+/// in `PtyColorMode::GateOverride` selects a DIFFERENT pre-baked asset
+/// (`GateActive` vs `GateAccent`), and in `PtyColorMode::Inherited` the
+/// button body's own background still changes underneath a transparent-
+/// background sixel image via a plain cell-buffer diff invisible to this
+/// struct, which visually erases whatever sixel pixels were sitting
+/// there -- either way, a `variant`-carrying re-emission is required.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SixelIconPlacement {
     pub icon: IconId,
     pub rect: Rect,
-    pub selected: bool,
+    pub variant: SixelVariant,
     pub size: SixelIconSize,
 }
 

@@ -23,7 +23,8 @@ use std::sync::LazyLock;
 use uzor_tui::canvas::{CanvasMode, PixelCanvas};
 
 use super::{
-    build_sixel, build_sixel_compact, rgba_to_canvas, BRAILLE_ICON_CELLS_TALL, BRAILLE_ICON_CELLS_WIDE,
+    build_sixel, build_sixel_compact, build_sixel_gate, build_sixel_strip, build_sixel_strip_gate,
+    rgba_to_canvas, SixelVariant, BRAILLE_ICON_CELLS_TALL, BRAILLE_ICON_CELLS_WIDE,
     COMPACT_BRAILLE_ICON_CELLS_TALL, COMPACT_BRAILLE_ICON_CELLS_WIDE,
 };
 
@@ -156,68 +157,534 @@ impl IconId {
     ];
 }
 
-/// Encoded sixel string for `id` -- see `../icons.rs::build_sixel`'s own
-/// doc comment for why this is cached (`LazyLock`) rather than re-encoded
+/// Encoded rail-tier sixel string for `id` at `variant`'s own background
+/// (see [`SixelVariant`]'s own doc comment) -- see `../icons.rs::build_sixel`'s
+/// own doc comment for why this is cached (`LazyLock`) rather than re-encoded
 /// per call.
-pub fn sixel(id: IconId) -> &'static str {
+pub fn sixel(id: IconId, variant: SixelVariant) -> &'static str {
     match id {
-        IconId::Files => FILES_SIXEL.as_str(),
-        IconId::SourceControl => SOURCE_CONTROL_SIXEL.as_str(),
-        IconId::Person => PERSON_SIXEL.as_str(),
-        IconId::Project => PROJECT_SIXEL.as_str(),
-        IconId::SettingsGear => SETTINGS_GEAR_SIXEL.as_str(),
-        IconId::ChevronLeft => CHEVRON_LEFT_SIXEL.as_str(),
-        IconId::ChevronRight => CHEVRON_RIGHT_SIXEL.as_str(),
-        IconId::ChevronDown => CHEVRON_DOWN_SIXEL.as_str(),
-        IconId::NewFile => NEW_FILE_SIXEL.as_str(),
-        IconId::NewFolder => NEW_FOLDER_SIXEL.as_str(),
-        IconId::Folder => FOLDER_SIXEL.as_str(),
-        IconId::FolderOpened => FOLDER_OPENED_SIXEL.as_str(),
-        IconId::File => FILE_SIXEL.as_str(),
-        IconId::Save => SAVE_SIXEL.as_str(),
-        IconId::Refresh => REFRESH_SIXEL.as_str(),
-        IconId::Add => ADD_SIXEL.as_str(),
-        IconId::Trash => TRASH_SIXEL.as_str(),
-        IconId::Search => SEARCH_SIXEL.as_str(),
-        IconId::Check => CHECK_SIXEL.as_str(),
-        IconId::Close => CLOSE_SIXEL.as_str(),
-        IconId::ArrowUp => ARROW_UP_SIXEL.as_str(),
-        IconId::ArrowDown => ARROW_DOWN_SIXEL.as_str(),
-        IconId::ArrowLeft => ARROW_LEFT_SIXEL.as_str(),
-        IconId::ArrowRight => ARROW_RIGHT_SIXEL.as_str(),
-        IconId::ArrowSwap => ARROW_SWAP_SIXEL.as_str(),
-        IconId::GitCommit => GIT_COMMIT_SIXEL.as_str(),
-        IconId::GitBranch => GIT_BRANCH_SIXEL.as_str(),
-        IconId::Diff => DIFF_SIXEL.as_str(),
-        IconId::DiffAdded => DIFF_ADDED_SIXEL.as_str(),
-        IconId::GitCompare => GIT_COMPARE_SIXEL.as_str(),
-        IconId::Repo => REPO_SIXEL.as_str(),
-        IconId::RepoForked => REPO_FORKED_SIXEL.as_str(),
-        IconId::DebugStop => DEBUG_STOP_SIXEL.as_str(),
-        IconId::DebugRestart => DEBUG_RESTART_SIXEL.as_str(),
-        IconId::Edit => EDIT_SIXEL.as_str(),
-        IconId::History => HISTORY_SIXEL.as_str(),
-        IconId::Terminal => TERMINAL_SIXEL.as_str(),
-        IconId::Output => OUTPUT_SIXEL.as_str(),
-        IconId::CloudDownload => CLOUD_DOWNLOAD_SIXEL.as_str(),
-        IconId::Ellipsis => ELLIPSIS_SIXEL.as_str(),
-        IconId::Link => LINK_SIXEL.as_str(),
-        IconId::CircleFilled => CIRCLE_FILLED_SIXEL.as_str(),
-        IconId::CircleSlash => CIRCLE_SLASH_SIXEL.as_str(),
-        IconId::Warning => WARNING_SIXEL.as_str(),
-        IconId::Error => ERROR_SIXEL.as_str(),
-        IconId::Info => INFO_SIXEL.as_str(),
-        IconId::RunAll => RUN_ALL_SIXEL.as_str(),
-        IconId::Play => PLAY_SIXEL.as_str(),
-        IconId::Sync => SYNC_SIXEL.as_str(),
-        IconId::GoToFile => GO_TO_FILE_SIXEL.as_str(),
-        IconId::Pulse => PULSE_SIXEL.as_str(),
-        IconId::Checklist => CHECKLIST_SIXEL.as_str(),
-        IconId::Eye => EYE_SIXEL.as_str(),
-        IconId::Layout => LAYOUT_SIXEL.as_str(),
-        IconId::SplitHorizontal => SPLIT_HORIZONTAL_SIXEL.as_str(),
-        IconId::SplitVertical => SPLIT_VERTICAL_SIXEL.as_str(),
-        IconId::Preview => PREVIEW_SIXEL.as_str(),
+        IconId::Files => match variant {
+            SixelVariant::Transparent => FILES_SIXEL.as_str(),
+            SixelVariant::GateActive => FILES_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => FILES_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::SourceControl => match variant {
+            SixelVariant::Transparent => SOURCE_CONTROL_SIXEL.as_str(),
+            SixelVariant::GateActive => SOURCE_CONTROL_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => SOURCE_CONTROL_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::Person => match variant {
+            SixelVariant::Transparent => PERSON_SIXEL.as_str(),
+            SixelVariant::GateActive => PERSON_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => PERSON_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::Project => match variant {
+            SixelVariant::Transparent => PROJECT_SIXEL.as_str(),
+            SixelVariant::GateActive => PROJECT_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => PROJECT_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::SettingsGear => match variant {
+            SixelVariant::Transparent => SETTINGS_GEAR_SIXEL.as_str(),
+            SixelVariant::GateActive => SETTINGS_GEAR_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => SETTINGS_GEAR_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::ChevronLeft => match variant {
+            SixelVariant::Transparent => CHEVRON_LEFT_SIXEL.as_str(),
+            SixelVariant::GateActive => CHEVRON_LEFT_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => CHEVRON_LEFT_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::ChevronRight => match variant {
+            SixelVariant::Transparent => CHEVRON_RIGHT_SIXEL.as_str(),
+            SixelVariant::GateActive => CHEVRON_RIGHT_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => CHEVRON_RIGHT_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::ChevronDown => match variant {
+            SixelVariant::Transparent => CHEVRON_DOWN_SIXEL.as_str(),
+            SixelVariant::GateActive => CHEVRON_DOWN_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => CHEVRON_DOWN_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::NewFile => match variant {
+            SixelVariant::Transparent => NEW_FILE_SIXEL.as_str(),
+            SixelVariant::GateActive => NEW_FILE_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => NEW_FILE_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::NewFolder => match variant {
+            SixelVariant::Transparent => NEW_FOLDER_SIXEL.as_str(),
+            SixelVariant::GateActive => NEW_FOLDER_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => NEW_FOLDER_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::Folder => match variant {
+            SixelVariant::Transparent => FOLDER_SIXEL.as_str(),
+            SixelVariant::GateActive => FOLDER_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => FOLDER_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::FolderOpened => match variant {
+            SixelVariant::Transparent => FOLDER_OPENED_SIXEL.as_str(),
+            SixelVariant::GateActive => FOLDER_OPENED_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => FOLDER_OPENED_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::File => match variant {
+            SixelVariant::Transparent => FILE_SIXEL.as_str(),
+            SixelVariant::GateActive => FILE_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => FILE_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::Save => match variant {
+            SixelVariant::Transparent => SAVE_SIXEL.as_str(),
+            SixelVariant::GateActive => SAVE_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => SAVE_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::Refresh => match variant {
+            SixelVariant::Transparent => REFRESH_SIXEL.as_str(),
+            SixelVariant::GateActive => REFRESH_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => REFRESH_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::Add => match variant {
+            SixelVariant::Transparent => ADD_SIXEL.as_str(),
+            SixelVariant::GateActive => ADD_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => ADD_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::Trash => match variant {
+            SixelVariant::Transparent => TRASH_SIXEL.as_str(),
+            SixelVariant::GateActive => TRASH_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => TRASH_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::Search => match variant {
+            SixelVariant::Transparent => SEARCH_SIXEL.as_str(),
+            SixelVariant::GateActive => SEARCH_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => SEARCH_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::Check => match variant {
+            SixelVariant::Transparent => CHECK_SIXEL.as_str(),
+            SixelVariant::GateActive => CHECK_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => CHECK_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::Close => match variant {
+            SixelVariant::Transparent => CLOSE_SIXEL.as_str(),
+            SixelVariant::GateActive => CLOSE_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => CLOSE_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::ArrowUp => match variant {
+            SixelVariant::Transparent => ARROW_UP_SIXEL.as_str(),
+            SixelVariant::GateActive => ARROW_UP_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => ARROW_UP_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::ArrowDown => match variant {
+            SixelVariant::Transparent => ARROW_DOWN_SIXEL.as_str(),
+            SixelVariant::GateActive => ARROW_DOWN_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => ARROW_DOWN_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::ArrowLeft => match variant {
+            SixelVariant::Transparent => ARROW_LEFT_SIXEL.as_str(),
+            SixelVariant::GateActive => ARROW_LEFT_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => ARROW_LEFT_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::ArrowRight => match variant {
+            SixelVariant::Transparent => ARROW_RIGHT_SIXEL.as_str(),
+            SixelVariant::GateActive => ARROW_RIGHT_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => ARROW_RIGHT_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::ArrowSwap => match variant {
+            SixelVariant::Transparent => ARROW_SWAP_SIXEL.as_str(),
+            SixelVariant::GateActive => ARROW_SWAP_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => ARROW_SWAP_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::GitCommit => match variant {
+            SixelVariant::Transparent => GIT_COMMIT_SIXEL.as_str(),
+            SixelVariant::GateActive => GIT_COMMIT_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => GIT_COMMIT_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::GitBranch => match variant {
+            SixelVariant::Transparent => GIT_BRANCH_SIXEL.as_str(),
+            SixelVariant::GateActive => GIT_BRANCH_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => GIT_BRANCH_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::Diff => match variant {
+            SixelVariant::Transparent => DIFF_SIXEL.as_str(),
+            SixelVariant::GateActive => DIFF_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => DIFF_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::DiffAdded => match variant {
+            SixelVariant::Transparent => DIFF_ADDED_SIXEL.as_str(),
+            SixelVariant::GateActive => DIFF_ADDED_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => DIFF_ADDED_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::GitCompare => match variant {
+            SixelVariant::Transparent => GIT_COMPARE_SIXEL.as_str(),
+            SixelVariant::GateActive => GIT_COMPARE_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => GIT_COMPARE_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::Repo => match variant {
+            SixelVariant::Transparent => REPO_SIXEL.as_str(),
+            SixelVariant::GateActive => REPO_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => REPO_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::RepoForked => match variant {
+            SixelVariant::Transparent => REPO_FORKED_SIXEL.as_str(),
+            SixelVariant::GateActive => REPO_FORKED_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => REPO_FORKED_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::DebugStop => match variant {
+            SixelVariant::Transparent => DEBUG_STOP_SIXEL.as_str(),
+            SixelVariant::GateActive => DEBUG_STOP_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => DEBUG_STOP_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::DebugRestart => match variant {
+            SixelVariant::Transparent => DEBUG_RESTART_SIXEL.as_str(),
+            SixelVariant::GateActive => DEBUG_RESTART_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => DEBUG_RESTART_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::Edit => match variant {
+            SixelVariant::Transparent => EDIT_SIXEL.as_str(),
+            SixelVariant::GateActive => EDIT_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => EDIT_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::History => match variant {
+            SixelVariant::Transparent => HISTORY_SIXEL.as_str(),
+            SixelVariant::GateActive => HISTORY_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => HISTORY_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::Terminal => match variant {
+            SixelVariant::Transparent => TERMINAL_SIXEL.as_str(),
+            SixelVariant::GateActive => TERMINAL_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => TERMINAL_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::Output => match variant {
+            SixelVariant::Transparent => OUTPUT_SIXEL.as_str(),
+            SixelVariant::GateActive => OUTPUT_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => OUTPUT_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::CloudDownload => match variant {
+            SixelVariant::Transparent => CLOUD_DOWNLOAD_SIXEL.as_str(),
+            SixelVariant::GateActive => CLOUD_DOWNLOAD_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => CLOUD_DOWNLOAD_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::Ellipsis => match variant {
+            SixelVariant::Transparent => ELLIPSIS_SIXEL.as_str(),
+            SixelVariant::GateActive => ELLIPSIS_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => ELLIPSIS_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::Link => match variant {
+            SixelVariant::Transparent => LINK_SIXEL.as_str(),
+            SixelVariant::GateActive => LINK_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => LINK_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::CircleFilled => match variant {
+            SixelVariant::Transparent => CIRCLE_FILLED_SIXEL.as_str(),
+            SixelVariant::GateActive => CIRCLE_FILLED_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => CIRCLE_FILLED_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::CircleSlash => match variant {
+            SixelVariant::Transparent => CIRCLE_SLASH_SIXEL.as_str(),
+            SixelVariant::GateActive => CIRCLE_SLASH_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => CIRCLE_SLASH_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::Warning => match variant {
+            SixelVariant::Transparent => WARNING_SIXEL.as_str(),
+            SixelVariant::GateActive => WARNING_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => WARNING_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::Error => match variant {
+            SixelVariant::Transparent => ERROR_SIXEL.as_str(),
+            SixelVariant::GateActive => ERROR_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => ERROR_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::Info => match variant {
+            SixelVariant::Transparent => INFO_SIXEL.as_str(),
+            SixelVariant::GateActive => INFO_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => INFO_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::RunAll => match variant {
+            SixelVariant::Transparent => RUN_ALL_SIXEL.as_str(),
+            SixelVariant::GateActive => RUN_ALL_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => RUN_ALL_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::Play => match variant {
+            SixelVariant::Transparent => PLAY_SIXEL.as_str(),
+            SixelVariant::GateActive => PLAY_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => PLAY_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::Sync => match variant {
+            SixelVariant::Transparent => SYNC_SIXEL.as_str(),
+            SixelVariant::GateActive => SYNC_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => SYNC_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::GoToFile => match variant {
+            SixelVariant::Transparent => GO_TO_FILE_SIXEL.as_str(),
+            SixelVariant::GateActive => GO_TO_FILE_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => GO_TO_FILE_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::Pulse => match variant {
+            SixelVariant::Transparent => PULSE_SIXEL.as_str(),
+            SixelVariant::GateActive => PULSE_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => PULSE_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::Checklist => match variant {
+            SixelVariant::Transparent => CHECKLIST_SIXEL.as_str(),
+            SixelVariant::GateActive => CHECKLIST_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => CHECKLIST_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::Eye => match variant {
+            SixelVariant::Transparent => EYE_SIXEL.as_str(),
+            SixelVariant::GateActive => EYE_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => EYE_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::Layout => match variant {
+            SixelVariant::Transparent => LAYOUT_SIXEL.as_str(),
+            SixelVariant::GateActive => LAYOUT_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => LAYOUT_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::SplitHorizontal => match variant {
+            SixelVariant::Transparent => SPLIT_HORIZONTAL_SIXEL.as_str(),
+            SixelVariant::GateActive => SPLIT_HORIZONTAL_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => SPLIT_HORIZONTAL_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::SplitVertical => match variant {
+            SixelVariant::Transparent => SPLIT_VERTICAL_SIXEL.as_str(),
+            SixelVariant::GateActive => SPLIT_VERTICAL_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => SPLIT_VERTICAL_SIXEL_GATE_ACCENT.as_str(),
+        },
+        IconId::Preview => match variant {
+            SixelVariant::Transparent => PREVIEW_SIXEL.as_str(),
+            SixelVariant::GateActive => PREVIEW_SIXEL_GATE_ACTIVE.as_str(),
+            SixelVariant::GateAccent => PREVIEW_SIXEL_GATE_ACCENT.as_str(),
+        },
+    }
+}
+
+/// Encoded control-plane-strip-tier sixel string for `id` at `variant`'s
+/// own background -- the strip never shows a selected state (see `../
+/// render.rs::render_control_strip_button`'s own doc comment), so
+/// `GateAccent` resolves to the SAME asset as `GateActive` here.
+pub fn sixel_strip(id: IconId, variant: SixelVariant) -> &'static str {
+    match id {
+        IconId::Files => match variant {
+            SixelVariant::Transparent => FILES_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => FILES_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::SourceControl => match variant {
+            SixelVariant::Transparent => SOURCE_CONTROL_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => SOURCE_CONTROL_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::Person => match variant {
+            SixelVariant::Transparent => PERSON_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => PERSON_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::Project => match variant {
+            SixelVariant::Transparent => PROJECT_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => PROJECT_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::SettingsGear => match variant {
+            SixelVariant::Transparent => SETTINGS_GEAR_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => SETTINGS_GEAR_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::ChevronLeft => match variant {
+            SixelVariant::Transparent => CHEVRON_LEFT_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => CHEVRON_LEFT_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::ChevronRight => match variant {
+            SixelVariant::Transparent => CHEVRON_RIGHT_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => CHEVRON_RIGHT_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::ChevronDown => match variant {
+            SixelVariant::Transparent => CHEVRON_DOWN_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => CHEVRON_DOWN_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::NewFile => match variant {
+            SixelVariant::Transparent => NEW_FILE_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => NEW_FILE_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::NewFolder => match variant {
+            SixelVariant::Transparent => NEW_FOLDER_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => NEW_FOLDER_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::Folder => match variant {
+            SixelVariant::Transparent => FOLDER_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => FOLDER_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::FolderOpened => match variant {
+            SixelVariant::Transparent => FOLDER_OPENED_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => FOLDER_OPENED_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::File => match variant {
+            SixelVariant::Transparent => FILE_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => FILE_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::Save => match variant {
+            SixelVariant::Transparent => SAVE_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => SAVE_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::Refresh => match variant {
+            SixelVariant::Transparent => REFRESH_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => REFRESH_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::Add => match variant {
+            SixelVariant::Transparent => ADD_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => ADD_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::Trash => match variant {
+            SixelVariant::Transparent => TRASH_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => TRASH_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::Search => match variant {
+            SixelVariant::Transparent => SEARCH_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => SEARCH_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::Check => match variant {
+            SixelVariant::Transparent => CHECK_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => CHECK_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::Close => match variant {
+            SixelVariant::Transparent => CLOSE_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => CLOSE_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::ArrowUp => match variant {
+            SixelVariant::Transparent => ARROW_UP_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => ARROW_UP_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::ArrowDown => match variant {
+            SixelVariant::Transparent => ARROW_DOWN_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => ARROW_DOWN_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::ArrowLeft => match variant {
+            SixelVariant::Transparent => ARROW_LEFT_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => ARROW_LEFT_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::ArrowRight => match variant {
+            SixelVariant::Transparent => ARROW_RIGHT_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => ARROW_RIGHT_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::ArrowSwap => match variant {
+            SixelVariant::Transparent => ARROW_SWAP_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => ARROW_SWAP_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::GitCommit => match variant {
+            SixelVariant::Transparent => GIT_COMMIT_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => GIT_COMMIT_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::GitBranch => match variant {
+            SixelVariant::Transparent => GIT_BRANCH_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => GIT_BRANCH_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::Diff => match variant {
+            SixelVariant::Transparent => DIFF_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => DIFF_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::DiffAdded => match variant {
+            SixelVariant::Transparent => DIFF_ADDED_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => DIFF_ADDED_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::GitCompare => match variant {
+            SixelVariant::Transparent => GIT_COMPARE_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => GIT_COMPARE_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::Repo => match variant {
+            SixelVariant::Transparent => REPO_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => REPO_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::RepoForked => match variant {
+            SixelVariant::Transparent => REPO_FORKED_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => REPO_FORKED_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::DebugStop => match variant {
+            SixelVariant::Transparent => DEBUG_STOP_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => DEBUG_STOP_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::DebugRestart => match variant {
+            SixelVariant::Transparent => DEBUG_RESTART_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => DEBUG_RESTART_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::Edit => match variant {
+            SixelVariant::Transparent => EDIT_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => EDIT_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::History => match variant {
+            SixelVariant::Transparent => HISTORY_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => HISTORY_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::Terminal => match variant {
+            SixelVariant::Transparent => TERMINAL_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => TERMINAL_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::Output => match variant {
+            SixelVariant::Transparent => OUTPUT_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => OUTPUT_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::CloudDownload => match variant {
+            SixelVariant::Transparent => CLOUD_DOWNLOAD_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => CLOUD_DOWNLOAD_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::Ellipsis => match variant {
+            SixelVariant::Transparent => ELLIPSIS_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => ELLIPSIS_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::Link => match variant {
+            SixelVariant::Transparent => LINK_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => LINK_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::CircleFilled => match variant {
+            SixelVariant::Transparent => CIRCLE_FILLED_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => CIRCLE_FILLED_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::CircleSlash => match variant {
+            SixelVariant::Transparent => CIRCLE_SLASH_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => CIRCLE_SLASH_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::Warning => match variant {
+            SixelVariant::Transparent => WARNING_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => WARNING_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::Error => match variant {
+            SixelVariant::Transparent => ERROR_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => ERROR_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::Info => match variant {
+            SixelVariant::Transparent => INFO_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => INFO_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::RunAll => match variant {
+            SixelVariant::Transparent => RUN_ALL_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => RUN_ALL_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::Play => match variant {
+            SixelVariant::Transparent => PLAY_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => PLAY_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::Sync => match variant {
+            SixelVariant::Transparent => SYNC_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => SYNC_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::GoToFile => match variant {
+            SixelVariant::Transparent => GO_TO_FILE_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => GO_TO_FILE_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::Pulse => match variant {
+            SixelVariant::Transparent => PULSE_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => PULSE_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::Checklist => match variant {
+            SixelVariant::Transparent => CHECKLIST_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => CHECKLIST_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::Eye => match variant {
+            SixelVariant::Transparent => EYE_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => EYE_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::Layout => match variant {
+            SixelVariant::Transparent => LAYOUT_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => LAYOUT_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::SplitHorizontal => match variant {
+            SixelVariant::Transparent => SPLIT_HORIZONTAL_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => SPLIT_HORIZONTAL_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::SplitVertical => match variant {
+            SixelVariant::Transparent => SPLIT_VERTICAL_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => SPLIT_VERTICAL_SIXEL_STRIP_GATE.as_str(),
+        },
+        IconId::Preview => match variant {
+            SixelVariant::Transparent => PREVIEW_SIXEL_STRIP.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => PREVIEW_SIXEL_STRIP_GATE.as_str(),
+        },
     }
 }
 
@@ -736,10 +1203,273 @@ pub(crate) fn braille_compact_source_rgba(id: IconId) -> &'static [u8] {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn sixel_gate_active_source_rgba(id: IconId) -> &'static [u8] {
+    match id {
+        IconId::Files => FILES_GATE_ACTIVE_RGBA,
+        IconId::SourceControl => SOURCE_CONTROL_GATE_ACTIVE_RGBA,
+        IconId::Person => PERSON_GATE_ACTIVE_RGBA,
+        IconId::Project => PROJECT_GATE_ACTIVE_RGBA,
+        IconId::SettingsGear => SETTINGS_GEAR_GATE_ACTIVE_RGBA,
+        IconId::ChevronLeft => CHEVRON_LEFT_GATE_ACTIVE_RGBA,
+        IconId::ChevronRight => CHEVRON_RIGHT_GATE_ACTIVE_RGBA,
+        IconId::ChevronDown => CHEVRON_DOWN_GATE_ACTIVE_RGBA,
+        IconId::NewFile => NEW_FILE_GATE_ACTIVE_RGBA,
+        IconId::NewFolder => NEW_FOLDER_GATE_ACTIVE_RGBA,
+        IconId::Folder => FOLDER_GATE_ACTIVE_RGBA,
+        IconId::FolderOpened => FOLDER_OPENED_GATE_ACTIVE_RGBA,
+        IconId::File => FILE_GATE_ACTIVE_RGBA,
+        IconId::Save => SAVE_GATE_ACTIVE_RGBA,
+        IconId::Refresh => REFRESH_GATE_ACTIVE_RGBA,
+        IconId::Add => ADD_GATE_ACTIVE_RGBA,
+        IconId::Trash => TRASH_GATE_ACTIVE_RGBA,
+        IconId::Search => SEARCH_GATE_ACTIVE_RGBA,
+        IconId::Check => CHECK_GATE_ACTIVE_RGBA,
+        IconId::Close => CLOSE_GATE_ACTIVE_RGBA,
+        IconId::ArrowUp => ARROW_UP_GATE_ACTIVE_RGBA,
+        IconId::ArrowDown => ARROW_DOWN_GATE_ACTIVE_RGBA,
+        IconId::ArrowLeft => ARROW_LEFT_GATE_ACTIVE_RGBA,
+        IconId::ArrowRight => ARROW_RIGHT_GATE_ACTIVE_RGBA,
+        IconId::ArrowSwap => ARROW_SWAP_GATE_ACTIVE_RGBA,
+        IconId::GitCommit => GIT_COMMIT_GATE_ACTIVE_RGBA,
+        IconId::GitBranch => GIT_BRANCH_GATE_ACTIVE_RGBA,
+        IconId::Diff => DIFF_GATE_ACTIVE_RGBA,
+        IconId::DiffAdded => DIFF_ADDED_GATE_ACTIVE_RGBA,
+        IconId::GitCompare => GIT_COMPARE_GATE_ACTIVE_RGBA,
+        IconId::Repo => REPO_GATE_ACTIVE_RGBA,
+        IconId::RepoForked => REPO_FORKED_GATE_ACTIVE_RGBA,
+        IconId::DebugStop => DEBUG_STOP_GATE_ACTIVE_RGBA,
+        IconId::DebugRestart => DEBUG_RESTART_GATE_ACTIVE_RGBA,
+        IconId::Edit => EDIT_GATE_ACTIVE_RGBA,
+        IconId::History => HISTORY_GATE_ACTIVE_RGBA,
+        IconId::Terminal => TERMINAL_GATE_ACTIVE_RGBA,
+        IconId::Output => OUTPUT_GATE_ACTIVE_RGBA,
+        IconId::CloudDownload => CLOUD_DOWNLOAD_GATE_ACTIVE_RGBA,
+        IconId::Ellipsis => ELLIPSIS_GATE_ACTIVE_RGBA,
+        IconId::Link => LINK_GATE_ACTIVE_RGBA,
+        IconId::CircleFilled => CIRCLE_FILLED_GATE_ACTIVE_RGBA,
+        IconId::CircleSlash => CIRCLE_SLASH_GATE_ACTIVE_RGBA,
+        IconId::Warning => WARNING_GATE_ACTIVE_RGBA,
+        IconId::Error => ERROR_GATE_ACTIVE_RGBA,
+        IconId::Info => INFO_GATE_ACTIVE_RGBA,
+        IconId::RunAll => RUN_ALL_GATE_ACTIVE_RGBA,
+        IconId::Play => PLAY_GATE_ACTIVE_RGBA,
+        IconId::Sync => SYNC_GATE_ACTIVE_RGBA,
+        IconId::GoToFile => GO_TO_FILE_GATE_ACTIVE_RGBA,
+        IconId::Pulse => PULSE_GATE_ACTIVE_RGBA,
+        IconId::Checklist => CHECKLIST_GATE_ACTIVE_RGBA,
+        IconId::Eye => EYE_GATE_ACTIVE_RGBA,
+        IconId::Layout => LAYOUT_GATE_ACTIVE_RGBA,
+        IconId::SplitHorizontal => SPLIT_HORIZONTAL_GATE_ACTIVE_RGBA,
+        IconId::SplitVertical => SPLIT_VERTICAL_GATE_ACTIVE_RGBA,
+        IconId::Preview => PREVIEW_GATE_ACTIVE_RGBA,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn sixel_gate_accent_source_rgba(id: IconId) -> &'static [u8] {
+    match id {
+        IconId::Files => FILES_GATE_ACCENT_RGBA,
+        IconId::SourceControl => SOURCE_CONTROL_GATE_ACCENT_RGBA,
+        IconId::Person => PERSON_GATE_ACCENT_RGBA,
+        IconId::Project => PROJECT_GATE_ACCENT_RGBA,
+        IconId::SettingsGear => SETTINGS_GEAR_GATE_ACCENT_RGBA,
+        IconId::ChevronLeft => CHEVRON_LEFT_GATE_ACCENT_RGBA,
+        IconId::ChevronRight => CHEVRON_RIGHT_GATE_ACCENT_RGBA,
+        IconId::ChevronDown => CHEVRON_DOWN_GATE_ACCENT_RGBA,
+        IconId::NewFile => NEW_FILE_GATE_ACCENT_RGBA,
+        IconId::NewFolder => NEW_FOLDER_GATE_ACCENT_RGBA,
+        IconId::Folder => FOLDER_GATE_ACCENT_RGBA,
+        IconId::FolderOpened => FOLDER_OPENED_GATE_ACCENT_RGBA,
+        IconId::File => FILE_GATE_ACCENT_RGBA,
+        IconId::Save => SAVE_GATE_ACCENT_RGBA,
+        IconId::Refresh => REFRESH_GATE_ACCENT_RGBA,
+        IconId::Add => ADD_GATE_ACCENT_RGBA,
+        IconId::Trash => TRASH_GATE_ACCENT_RGBA,
+        IconId::Search => SEARCH_GATE_ACCENT_RGBA,
+        IconId::Check => CHECK_GATE_ACCENT_RGBA,
+        IconId::Close => CLOSE_GATE_ACCENT_RGBA,
+        IconId::ArrowUp => ARROW_UP_GATE_ACCENT_RGBA,
+        IconId::ArrowDown => ARROW_DOWN_GATE_ACCENT_RGBA,
+        IconId::ArrowLeft => ARROW_LEFT_GATE_ACCENT_RGBA,
+        IconId::ArrowRight => ARROW_RIGHT_GATE_ACCENT_RGBA,
+        IconId::ArrowSwap => ARROW_SWAP_GATE_ACCENT_RGBA,
+        IconId::GitCommit => GIT_COMMIT_GATE_ACCENT_RGBA,
+        IconId::GitBranch => GIT_BRANCH_GATE_ACCENT_RGBA,
+        IconId::Diff => DIFF_GATE_ACCENT_RGBA,
+        IconId::DiffAdded => DIFF_ADDED_GATE_ACCENT_RGBA,
+        IconId::GitCompare => GIT_COMPARE_GATE_ACCENT_RGBA,
+        IconId::Repo => REPO_GATE_ACCENT_RGBA,
+        IconId::RepoForked => REPO_FORKED_GATE_ACCENT_RGBA,
+        IconId::DebugStop => DEBUG_STOP_GATE_ACCENT_RGBA,
+        IconId::DebugRestart => DEBUG_RESTART_GATE_ACCENT_RGBA,
+        IconId::Edit => EDIT_GATE_ACCENT_RGBA,
+        IconId::History => HISTORY_GATE_ACCENT_RGBA,
+        IconId::Terminal => TERMINAL_GATE_ACCENT_RGBA,
+        IconId::Output => OUTPUT_GATE_ACCENT_RGBA,
+        IconId::CloudDownload => CLOUD_DOWNLOAD_GATE_ACCENT_RGBA,
+        IconId::Ellipsis => ELLIPSIS_GATE_ACCENT_RGBA,
+        IconId::Link => LINK_GATE_ACCENT_RGBA,
+        IconId::CircleFilled => CIRCLE_FILLED_GATE_ACCENT_RGBA,
+        IconId::CircleSlash => CIRCLE_SLASH_GATE_ACCENT_RGBA,
+        IconId::Warning => WARNING_GATE_ACCENT_RGBA,
+        IconId::Error => ERROR_GATE_ACCENT_RGBA,
+        IconId::Info => INFO_GATE_ACCENT_RGBA,
+        IconId::RunAll => RUN_ALL_GATE_ACCENT_RGBA,
+        IconId::Play => PLAY_GATE_ACCENT_RGBA,
+        IconId::Sync => SYNC_GATE_ACCENT_RGBA,
+        IconId::GoToFile => GO_TO_FILE_GATE_ACCENT_RGBA,
+        IconId::Pulse => PULSE_GATE_ACCENT_RGBA,
+        IconId::Checklist => CHECKLIST_GATE_ACCENT_RGBA,
+        IconId::Eye => EYE_GATE_ACCENT_RGBA,
+        IconId::Layout => LAYOUT_GATE_ACCENT_RGBA,
+        IconId::SplitHorizontal => SPLIT_HORIZONTAL_GATE_ACCENT_RGBA,
+        IconId::SplitVertical => SPLIT_VERTICAL_GATE_ACCENT_RGBA,
+        IconId::Preview => PREVIEW_GATE_ACCENT_RGBA,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn sixel_strip_source_rgba(id: IconId) -> &'static [u8] {
+    match id {
+        IconId::Files => FILES_STRIP_RGBA,
+        IconId::SourceControl => SOURCE_CONTROL_STRIP_RGBA,
+        IconId::Person => PERSON_STRIP_RGBA,
+        IconId::Project => PROJECT_STRIP_RGBA,
+        IconId::SettingsGear => SETTINGS_GEAR_STRIP_RGBA,
+        IconId::ChevronLeft => CHEVRON_LEFT_STRIP_RGBA,
+        IconId::ChevronRight => CHEVRON_RIGHT_STRIP_RGBA,
+        IconId::ChevronDown => CHEVRON_DOWN_STRIP_RGBA,
+        IconId::NewFile => NEW_FILE_STRIP_RGBA,
+        IconId::NewFolder => NEW_FOLDER_STRIP_RGBA,
+        IconId::Folder => FOLDER_STRIP_RGBA,
+        IconId::FolderOpened => FOLDER_OPENED_STRIP_RGBA,
+        IconId::File => FILE_STRIP_RGBA,
+        IconId::Save => SAVE_STRIP_RGBA,
+        IconId::Refresh => REFRESH_STRIP_RGBA,
+        IconId::Add => ADD_STRIP_RGBA,
+        IconId::Trash => TRASH_STRIP_RGBA,
+        IconId::Search => SEARCH_STRIP_RGBA,
+        IconId::Check => CHECK_STRIP_RGBA,
+        IconId::Close => CLOSE_STRIP_RGBA,
+        IconId::ArrowUp => ARROW_UP_STRIP_RGBA,
+        IconId::ArrowDown => ARROW_DOWN_STRIP_RGBA,
+        IconId::ArrowLeft => ARROW_LEFT_STRIP_RGBA,
+        IconId::ArrowRight => ARROW_RIGHT_STRIP_RGBA,
+        IconId::ArrowSwap => ARROW_SWAP_STRIP_RGBA,
+        IconId::GitCommit => GIT_COMMIT_STRIP_RGBA,
+        IconId::GitBranch => GIT_BRANCH_STRIP_RGBA,
+        IconId::Diff => DIFF_STRIP_RGBA,
+        IconId::DiffAdded => DIFF_ADDED_STRIP_RGBA,
+        IconId::GitCompare => GIT_COMPARE_STRIP_RGBA,
+        IconId::Repo => REPO_STRIP_RGBA,
+        IconId::RepoForked => REPO_FORKED_STRIP_RGBA,
+        IconId::DebugStop => DEBUG_STOP_STRIP_RGBA,
+        IconId::DebugRestart => DEBUG_RESTART_STRIP_RGBA,
+        IconId::Edit => EDIT_STRIP_RGBA,
+        IconId::History => HISTORY_STRIP_RGBA,
+        IconId::Terminal => TERMINAL_STRIP_RGBA,
+        IconId::Output => OUTPUT_STRIP_RGBA,
+        IconId::CloudDownload => CLOUD_DOWNLOAD_STRIP_RGBA,
+        IconId::Ellipsis => ELLIPSIS_STRIP_RGBA,
+        IconId::Link => LINK_STRIP_RGBA,
+        IconId::CircleFilled => CIRCLE_FILLED_STRIP_RGBA,
+        IconId::CircleSlash => CIRCLE_SLASH_STRIP_RGBA,
+        IconId::Warning => WARNING_STRIP_RGBA,
+        IconId::Error => ERROR_STRIP_RGBA,
+        IconId::Info => INFO_STRIP_RGBA,
+        IconId::RunAll => RUN_ALL_STRIP_RGBA,
+        IconId::Play => PLAY_STRIP_RGBA,
+        IconId::Sync => SYNC_STRIP_RGBA,
+        IconId::GoToFile => GO_TO_FILE_STRIP_RGBA,
+        IconId::Pulse => PULSE_STRIP_RGBA,
+        IconId::Checklist => CHECKLIST_STRIP_RGBA,
+        IconId::Eye => EYE_STRIP_RGBA,
+        IconId::Layout => LAYOUT_STRIP_RGBA,
+        IconId::SplitHorizontal => SPLIT_HORIZONTAL_STRIP_RGBA,
+        IconId::SplitVertical => SPLIT_VERTICAL_STRIP_RGBA,
+        IconId::Preview => PREVIEW_STRIP_RGBA,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn sixel_strip_gate_source_rgba(id: IconId) -> &'static [u8] {
+    match id {
+        IconId::Files => FILES_STRIP_GATE_RGBA,
+        IconId::SourceControl => SOURCE_CONTROL_STRIP_GATE_RGBA,
+        IconId::Person => PERSON_STRIP_GATE_RGBA,
+        IconId::Project => PROJECT_STRIP_GATE_RGBA,
+        IconId::SettingsGear => SETTINGS_GEAR_STRIP_GATE_RGBA,
+        IconId::ChevronLeft => CHEVRON_LEFT_STRIP_GATE_RGBA,
+        IconId::ChevronRight => CHEVRON_RIGHT_STRIP_GATE_RGBA,
+        IconId::ChevronDown => CHEVRON_DOWN_STRIP_GATE_RGBA,
+        IconId::NewFile => NEW_FILE_STRIP_GATE_RGBA,
+        IconId::NewFolder => NEW_FOLDER_STRIP_GATE_RGBA,
+        IconId::Folder => FOLDER_STRIP_GATE_RGBA,
+        IconId::FolderOpened => FOLDER_OPENED_STRIP_GATE_RGBA,
+        IconId::File => FILE_STRIP_GATE_RGBA,
+        IconId::Save => SAVE_STRIP_GATE_RGBA,
+        IconId::Refresh => REFRESH_STRIP_GATE_RGBA,
+        IconId::Add => ADD_STRIP_GATE_RGBA,
+        IconId::Trash => TRASH_STRIP_GATE_RGBA,
+        IconId::Search => SEARCH_STRIP_GATE_RGBA,
+        IconId::Check => CHECK_STRIP_GATE_RGBA,
+        IconId::Close => CLOSE_STRIP_GATE_RGBA,
+        IconId::ArrowUp => ARROW_UP_STRIP_GATE_RGBA,
+        IconId::ArrowDown => ARROW_DOWN_STRIP_GATE_RGBA,
+        IconId::ArrowLeft => ARROW_LEFT_STRIP_GATE_RGBA,
+        IconId::ArrowRight => ARROW_RIGHT_STRIP_GATE_RGBA,
+        IconId::ArrowSwap => ARROW_SWAP_STRIP_GATE_RGBA,
+        IconId::GitCommit => GIT_COMMIT_STRIP_GATE_RGBA,
+        IconId::GitBranch => GIT_BRANCH_STRIP_GATE_RGBA,
+        IconId::Diff => DIFF_STRIP_GATE_RGBA,
+        IconId::DiffAdded => DIFF_ADDED_STRIP_GATE_RGBA,
+        IconId::GitCompare => GIT_COMPARE_STRIP_GATE_RGBA,
+        IconId::Repo => REPO_STRIP_GATE_RGBA,
+        IconId::RepoForked => REPO_FORKED_STRIP_GATE_RGBA,
+        IconId::DebugStop => DEBUG_STOP_STRIP_GATE_RGBA,
+        IconId::DebugRestart => DEBUG_RESTART_STRIP_GATE_RGBA,
+        IconId::Edit => EDIT_STRIP_GATE_RGBA,
+        IconId::History => HISTORY_STRIP_GATE_RGBA,
+        IconId::Terminal => TERMINAL_STRIP_GATE_RGBA,
+        IconId::Output => OUTPUT_STRIP_GATE_RGBA,
+        IconId::CloudDownload => CLOUD_DOWNLOAD_STRIP_GATE_RGBA,
+        IconId::Ellipsis => ELLIPSIS_STRIP_GATE_RGBA,
+        IconId::Link => LINK_STRIP_GATE_RGBA,
+        IconId::CircleFilled => CIRCLE_FILLED_STRIP_GATE_RGBA,
+        IconId::CircleSlash => CIRCLE_SLASH_STRIP_GATE_RGBA,
+        IconId::Warning => WARNING_STRIP_GATE_RGBA,
+        IconId::Error => ERROR_STRIP_GATE_RGBA,
+        IconId::Info => INFO_STRIP_GATE_RGBA,
+        IconId::RunAll => RUN_ALL_STRIP_GATE_RGBA,
+        IconId::Play => PLAY_STRIP_GATE_RGBA,
+        IconId::Sync => SYNC_STRIP_GATE_RGBA,
+        IconId::GoToFile => GO_TO_FILE_STRIP_GATE_RGBA,
+        IconId::Pulse => PULSE_STRIP_GATE_RGBA,
+        IconId::Checklist => CHECKLIST_STRIP_GATE_RGBA,
+        IconId::Eye => EYE_STRIP_GATE_RGBA,
+        IconId::Layout => LAYOUT_STRIP_GATE_RGBA,
+        IconId::SplitHorizontal => SPLIT_HORIZONTAL_STRIP_GATE_RGBA,
+        IconId::SplitVertical => SPLIT_VERTICAL_STRIP_GATE_RGBA,
+        IconId::Preview => PREVIEW_STRIP_GATE_RGBA,
+    }
+}
+
 // ---- Files (files) --------------------------------------------------
 
 const FILES_RGBA: &[u8] = include_bytes!("files.rgba");
 static FILES_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(FILES_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const FILES_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("files_gate_active.rgba");
+static FILES_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(FILES_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const FILES_GATE_ACCENT_RGBA: &[u8] = include_bytes!("files_gate_accent.rgba");
+static FILES_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(FILES_GATE_ACCENT_RGBA));
 
 const FILES_BRAILLE_RGBA: &[u8] = include_bytes!("files_braille.rgba");
 /// ~40% coverage (102/255), override (replaying the pre-existing rail icon's own hand-tuned constant, unchanged) -- 31/96 dots lit at this threshold.
@@ -770,10 +1500,29 @@ static FILES_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const FILES_STRIP_RGBA: &[u8] = include_bytes!("files_strip.rgba");
+static FILES_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(FILES_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const FILES_STRIP_GATE_RGBA: &[u8] = include_bytes!("files_strip_gate.rgba");
+static FILES_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(FILES_STRIP_GATE_RGBA));
+
 // ---- SourceControl (source-control) ---------------------------------
 
 const SOURCE_CONTROL_RGBA: &[u8] = include_bytes!("source_control.rgba");
 static SOURCE_CONTROL_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(SOURCE_CONTROL_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const SOURCE_CONTROL_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("source_control_gate_active.rgba");
+static SOURCE_CONTROL_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SOURCE_CONTROL_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const SOURCE_CONTROL_GATE_ACCENT_RGBA: &[u8] = include_bytes!("source_control_gate_accent.rgba");
+static SOURCE_CONTROL_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SOURCE_CONTROL_GATE_ACCENT_RGBA));
 
 const SOURCE_CONTROL_BRAILLE_RGBA: &[u8] = include_bytes!("source_control_braille.rgba");
 /// ~40% coverage (102/255), override (replaying the pre-existing rail icon's own hand-tuned constant, unchanged) -- 20/96 dots lit at this threshold.
@@ -804,10 +1553,29 @@ static SOURCE_CONTROL_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| 
     )
 });
 
+const SOURCE_CONTROL_STRIP_RGBA: &[u8] = include_bytes!("source_control_strip.rgba");
+static SOURCE_CONTROL_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(SOURCE_CONTROL_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const SOURCE_CONTROL_STRIP_GATE_RGBA: &[u8] = include_bytes!("source_control_strip_gate.rgba");
+static SOURCE_CONTROL_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(SOURCE_CONTROL_STRIP_GATE_RGBA));
+
 // ---- Person (person) ------------------------------------------------
 
 const PERSON_RGBA: &[u8] = include_bytes!("person.rgba");
 static PERSON_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(PERSON_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const PERSON_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("person_gate_active.rgba");
+static PERSON_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(PERSON_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const PERSON_GATE_ACCENT_RGBA: &[u8] = include_bytes!("person_gate_accent.rgba");
+static PERSON_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(PERSON_GATE_ACCENT_RGBA));
 
 const PERSON_BRAILLE_RGBA: &[u8] = include_bytes!("person_braille.rgba");
 /// ~35% coverage (89/255), override (replaying the pre-existing rail icon's own hand-tuned constant, unchanged) -- 17/96 dots lit at this threshold.
@@ -838,10 +1606,29 @@ static PERSON_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const PERSON_STRIP_RGBA: &[u8] = include_bytes!("person_strip.rgba");
+static PERSON_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(PERSON_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const PERSON_STRIP_GATE_RGBA: &[u8] = include_bytes!("person_strip_gate.rgba");
+static PERSON_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(PERSON_STRIP_GATE_RGBA));
+
 // ---- Project (project) ----------------------------------------------
 
 const PROJECT_RGBA: &[u8] = include_bytes!("project.rgba");
 static PROJECT_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(PROJECT_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const PROJECT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("project_gate_active.rgba");
+static PROJECT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(PROJECT_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const PROJECT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("project_gate_accent.rgba");
+static PROJECT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(PROJECT_GATE_ACCENT_RGBA));
 
 const PROJECT_BRAILLE_RGBA: &[u8] = include_bytes!("project_braille.rgba");
 /// ~40% coverage (102/255), override (replaying the pre-existing rail icon's own hand-tuned constant, unchanged) -- 22/96 dots lit at this threshold.
@@ -872,10 +1659,29 @@ static PROJECT_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const PROJECT_STRIP_RGBA: &[u8] = include_bytes!("project_strip.rgba");
+static PROJECT_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(PROJECT_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const PROJECT_STRIP_GATE_RGBA: &[u8] = include_bytes!("project_strip_gate.rgba");
+static PROJECT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(PROJECT_STRIP_GATE_RGBA));
+
 // ---- SettingsGear (settings-gear) -----------------------------------
 
 const SETTINGS_GEAR_RGBA: &[u8] = include_bytes!("settings_gear.rgba");
 static SETTINGS_GEAR_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(SETTINGS_GEAR_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const SETTINGS_GEAR_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("settings_gear_gate_active.rgba");
+static SETTINGS_GEAR_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SETTINGS_GEAR_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const SETTINGS_GEAR_GATE_ACCENT_RGBA: &[u8] = include_bytes!("settings_gear_gate_accent.rgba");
+static SETTINGS_GEAR_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SETTINGS_GEAR_GATE_ACCENT_RGBA));
 
 const SETTINGS_GEAR_BRAILLE_RGBA: &[u8] = include_bytes!("settings_gear_braille.rgba");
 /// ~35% coverage (89/255), override (replaying the pre-existing rail icon's own hand-tuned constant, unchanged) -- 24/96 dots lit at this threshold.
@@ -907,10 +1713,29 @@ static SETTINGS_GEAR_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const SETTINGS_GEAR_STRIP_RGBA: &[u8] = include_bytes!("settings_gear_strip.rgba");
+static SETTINGS_GEAR_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(SETTINGS_GEAR_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const SETTINGS_GEAR_STRIP_GATE_RGBA: &[u8] = include_bytes!("settings_gear_strip_gate.rgba");
+static SETTINGS_GEAR_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(SETTINGS_GEAR_STRIP_GATE_RGBA));
+
 // ---- ChevronLeft (chevron-left) -------------------------------------
 
 const CHEVRON_LEFT_RGBA: &[u8] = include_bytes!("chevron_left.rgba");
 static CHEVRON_LEFT_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(CHEVRON_LEFT_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const CHEVRON_LEFT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("chevron_left_gate_active.rgba");
+static CHEVRON_LEFT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CHEVRON_LEFT_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const CHEVRON_LEFT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("chevron_left_gate_accent.rgba");
+static CHEVRON_LEFT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CHEVRON_LEFT_GATE_ACCENT_RGBA));
 
 const CHEVRON_LEFT_BRAILLE_RGBA: &[u8] = include_bytes!("chevron_left_braille.rgba");
 /// ~30% coverage (77/255), override (replaying the pre-existing rail icon's own hand-tuned constant, unchanged) -- 12/96 dots lit at this threshold.
@@ -941,10 +1766,29 @@ static CHEVRON_LEFT_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const CHEVRON_LEFT_STRIP_RGBA: &[u8] = include_bytes!("chevron_left_strip.rgba");
+static CHEVRON_LEFT_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(CHEVRON_LEFT_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const CHEVRON_LEFT_STRIP_GATE_RGBA: &[u8] = include_bytes!("chevron_left_strip_gate.rgba");
+static CHEVRON_LEFT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(CHEVRON_LEFT_STRIP_GATE_RGBA));
+
 // ---- ChevronRight (chevron-right) -----------------------------------
 
 const CHEVRON_RIGHT_RGBA: &[u8] = include_bytes!("chevron_right.rgba");
 static CHEVRON_RIGHT_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(CHEVRON_RIGHT_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const CHEVRON_RIGHT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("chevron_right_gate_active.rgba");
+static CHEVRON_RIGHT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CHEVRON_RIGHT_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const CHEVRON_RIGHT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("chevron_right_gate_accent.rgba");
+static CHEVRON_RIGHT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CHEVRON_RIGHT_GATE_ACCENT_RGBA));
 
 const CHEVRON_RIGHT_BRAILLE_RGBA: &[u8] = include_bytes!("chevron_right_braille.rgba");
 /// ~30% coverage (77/255), override (replaying the pre-existing rail icon's own hand-tuned constant, unchanged) -- 12/96 dots lit at this threshold.
@@ -975,10 +1819,29 @@ static CHEVRON_RIGHT_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const CHEVRON_RIGHT_STRIP_RGBA: &[u8] = include_bytes!("chevron_right_strip.rgba");
+static CHEVRON_RIGHT_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(CHEVRON_RIGHT_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const CHEVRON_RIGHT_STRIP_GATE_RGBA: &[u8] = include_bytes!("chevron_right_strip_gate.rgba");
+static CHEVRON_RIGHT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(CHEVRON_RIGHT_STRIP_GATE_RGBA));
+
 // ---- ChevronDown (chevron-down) -------------------------------------
 
 const CHEVRON_DOWN_RGBA: &[u8] = include_bytes!("chevron_down.rgba");
 static CHEVRON_DOWN_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(CHEVRON_DOWN_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const CHEVRON_DOWN_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("chevron_down_gate_active.rgba");
+static CHEVRON_DOWN_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CHEVRON_DOWN_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const CHEVRON_DOWN_GATE_ACCENT_RGBA: &[u8] = include_bytes!("chevron_down_gate_accent.rgba");
+static CHEVRON_DOWN_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CHEVRON_DOWN_GATE_ACCENT_RGBA));
 
 const CHEVRON_DOWN_BRAILLE_RGBA: &[u8] = include_bytes!("chevron_down_braille.rgba");
 /// ~6% coverage (15/255), auto-selected by bake_icons.py::choose_threshold -- 14/96 dots lit at this threshold.
@@ -1009,10 +1872,29 @@ static CHEVRON_DOWN_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const CHEVRON_DOWN_STRIP_RGBA: &[u8] = include_bytes!("chevron_down_strip.rgba");
+static CHEVRON_DOWN_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(CHEVRON_DOWN_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const CHEVRON_DOWN_STRIP_GATE_RGBA: &[u8] = include_bytes!("chevron_down_strip_gate.rgba");
+static CHEVRON_DOWN_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(CHEVRON_DOWN_STRIP_GATE_RGBA));
+
 // ---- NewFile (new-file) ---------------------------------------------
 
 const NEW_FILE_RGBA: &[u8] = include_bytes!("new_file.rgba");
 static NEW_FILE_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(NEW_FILE_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const NEW_FILE_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("new_file_gate_active.rgba");
+static NEW_FILE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(NEW_FILE_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const NEW_FILE_GATE_ACCENT_RGBA: &[u8] = include_bytes!("new_file_gate_accent.rgba");
+static NEW_FILE_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(NEW_FILE_GATE_ACCENT_RGBA));
 
 const NEW_FILE_BRAILLE_RGBA: &[u8] = include_bytes!("new_file_braille.rgba");
 /// ~50% coverage (128/255), auto-selected by bake_icons.py::choose_threshold -- 23/96 dots lit at this threshold.
@@ -1043,10 +1925,29 @@ static NEW_FILE_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const NEW_FILE_STRIP_RGBA: &[u8] = include_bytes!("new_file_strip.rgba");
+static NEW_FILE_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(NEW_FILE_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const NEW_FILE_STRIP_GATE_RGBA: &[u8] = include_bytes!("new_file_strip_gate.rgba");
+static NEW_FILE_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(NEW_FILE_STRIP_GATE_RGBA));
+
 // ---- NewFolder (new-folder) -----------------------------------------
 
 const NEW_FOLDER_RGBA: &[u8] = include_bytes!("new_folder.rgba");
 static NEW_FOLDER_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(NEW_FOLDER_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const NEW_FOLDER_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("new_folder_gate_active.rgba");
+static NEW_FOLDER_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(NEW_FOLDER_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const NEW_FOLDER_GATE_ACCENT_RGBA: &[u8] = include_bytes!("new_folder_gate_accent.rgba");
+static NEW_FOLDER_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(NEW_FOLDER_GATE_ACCENT_RGBA));
 
 const NEW_FOLDER_BRAILLE_RGBA: &[u8] = include_bytes!("new_folder_braille.rgba");
 /// ~50% coverage (128/255), auto-selected by bake_icons.py::choose_threshold -- 27/96 dots lit at this threshold.
@@ -1077,10 +1978,29 @@ static NEW_FOLDER_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const NEW_FOLDER_STRIP_RGBA: &[u8] = include_bytes!("new_folder_strip.rgba");
+static NEW_FOLDER_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(NEW_FOLDER_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const NEW_FOLDER_STRIP_GATE_RGBA: &[u8] = include_bytes!("new_folder_strip_gate.rgba");
+static NEW_FOLDER_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(NEW_FOLDER_STRIP_GATE_RGBA));
+
 // ---- Folder (folder) ------------------------------------------------
 
 const FOLDER_RGBA: &[u8] = include_bytes!("folder.rgba");
 static FOLDER_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(FOLDER_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const FOLDER_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("folder_gate_active.rgba");
+static FOLDER_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(FOLDER_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const FOLDER_GATE_ACCENT_RGBA: &[u8] = include_bytes!("folder_gate_accent.rgba");
+static FOLDER_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(FOLDER_GATE_ACCENT_RGBA));
 
 const FOLDER_BRAILLE_RGBA: &[u8] = include_bytes!("folder_braille.rgba");
 /// ~50% coverage (128/255), auto-selected by bake_icons.py::choose_threshold -- 20/96 dots lit at this threshold.
@@ -1111,10 +2031,29 @@ static FOLDER_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const FOLDER_STRIP_RGBA: &[u8] = include_bytes!("folder_strip.rgba");
+static FOLDER_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(FOLDER_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const FOLDER_STRIP_GATE_RGBA: &[u8] = include_bytes!("folder_strip_gate.rgba");
+static FOLDER_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(FOLDER_STRIP_GATE_RGBA));
+
 // ---- FolderOpened (folder-opened) -----------------------------------
 
 const FOLDER_OPENED_RGBA: &[u8] = include_bytes!("folder_opened.rgba");
 static FOLDER_OPENED_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(FOLDER_OPENED_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const FOLDER_OPENED_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("folder_opened_gate_active.rgba");
+static FOLDER_OPENED_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(FOLDER_OPENED_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const FOLDER_OPENED_GATE_ACCENT_RGBA: &[u8] = include_bytes!("folder_opened_gate_accent.rgba");
+static FOLDER_OPENED_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(FOLDER_OPENED_GATE_ACCENT_RGBA));
 
 const FOLDER_OPENED_BRAILLE_RGBA: &[u8] = include_bytes!("folder_opened_braille.rgba");
 /// ~50% coverage (128/255), auto-selected by bake_icons.py::choose_threshold -- 20/96 dots lit at this threshold.
@@ -1145,10 +2084,29 @@ static FOLDER_OPENED_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const FOLDER_OPENED_STRIP_RGBA: &[u8] = include_bytes!("folder_opened_strip.rgba");
+static FOLDER_OPENED_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(FOLDER_OPENED_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const FOLDER_OPENED_STRIP_GATE_RGBA: &[u8] = include_bytes!("folder_opened_strip_gate.rgba");
+static FOLDER_OPENED_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(FOLDER_OPENED_STRIP_GATE_RGBA));
+
 // ---- File (file) ----------------------------------------------------
 
 const FILE_RGBA: &[u8] = include_bytes!("file.rgba");
 static FILE_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(FILE_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const FILE_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("file_gate_active.rgba");
+static FILE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(FILE_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const FILE_GATE_ACCENT_RGBA: &[u8] = include_bytes!("file_gate_accent.rgba");
+static FILE_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(FILE_GATE_ACCENT_RGBA));
 
 const FILE_BRAILLE_RGBA: &[u8] = include_bytes!("file_braille.rgba");
 /// ~45% coverage (115/255), auto-selected by bake_icons.py::choose_threshold -- 20/96 dots lit at this threshold.
@@ -1179,10 +2137,29 @@ static FILE_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const FILE_STRIP_RGBA: &[u8] = include_bytes!("file_strip.rgba");
+static FILE_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(FILE_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const FILE_STRIP_GATE_RGBA: &[u8] = include_bytes!("file_strip_gate.rgba");
+static FILE_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(FILE_STRIP_GATE_RGBA));
+
 // ---- Save (save) ----------------------------------------------------
 
 const SAVE_RGBA: &[u8] = include_bytes!("save.rgba");
 static SAVE_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(SAVE_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const SAVE_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("save_gate_active.rgba");
+static SAVE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SAVE_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const SAVE_GATE_ACCENT_RGBA: &[u8] = include_bytes!("save_gate_accent.rgba");
+static SAVE_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SAVE_GATE_ACCENT_RGBA));
 
 const SAVE_BRAILLE_RGBA: &[u8] = include_bytes!("save_braille.rgba");
 /// ~50% coverage (128/255), auto-selected by bake_icons.py::choose_threshold -- 24/96 dots lit at this threshold.
@@ -1213,10 +2190,29 @@ static SAVE_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const SAVE_STRIP_RGBA: &[u8] = include_bytes!("save_strip.rgba");
+static SAVE_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(SAVE_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const SAVE_STRIP_GATE_RGBA: &[u8] = include_bytes!("save_strip_gate.rgba");
+static SAVE_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(SAVE_STRIP_GATE_RGBA));
+
 // ---- Refresh (refresh) ----------------------------------------------
 
 const REFRESH_RGBA: &[u8] = include_bytes!("refresh.rgba");
 static REFRESH_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(REFRESH_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const REFRESH_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("refresh_gate_active.rgba");
+static REFRESH_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(REFRESH_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const REFRESH_GATE_ACCENT_RGBA: &[u8] = include_bytes!("refresh_gate_accent.rgba");
+static REFRESH_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(REFRESH_GATE_ACCENT_RGBA));
 
 const REFRESH_BRAILLE_RGBA: &[u8] = include_bytes!("refresh_braille.rgba");
 /// ~10% coverage (26/255), auto-selected by bake_icons.py::choose_threshold -- 21/96 dots lit at this threshold.
@@ -1247,10 +2243,29 @@ static REFRESH_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const REFRESH_STRIP_RGBA: &[u8] = include_bytes!("refresh_strip.rgba");
+static REFRESH_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(REFRESH_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const REFRESH_STRIP_GATE_RGBA: &[u8] = include_bytes!("refresh_strip_gate.rgba");
+static REFRESH_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(REFRESH_STRIP_GATE_RGBA));
+
 // ---- Add (add) ------------------------------------------------------
 
 const ADD_RGBA: &[u8] = include_bytes!("add.rgba");
 static ADD_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(ADD_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const ADD_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("add_gate_active.rgba");
+static ADD_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ADD_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const ADD_GATE_ACCENT_RGBA: &[u8] = include_bytes!("add_gate_accent.rgba");
+static ADD_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ADD_GATE_ACCENT_RGBA));
 
 const ADD_BRAILLE_RGBA: &[u8] = include_bytes!("add_braille.rgba");
 /// ~6% coverage (15/255), auto-selected by bake_icons.py::choose_threshold -- 13/96 dots lit at this threshold.
@@ -1281,10 +2296,29 @@ static ADD_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const ADD_STRIP_RGBA: &[u8] = include_bytes!("add_strip.rgba");
+static ADD_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(ADD_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const ADD_STRIP_GATE_RGBA: &[u8] = include_bytes!("add_strip_gate.rgba");
+static ADD_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(ADD_STRIP_GATE_RGBA));
+
 // ---- Trash (trash) --------------------------------------------------
 
 const TRASH_RGBA: &[u8] = include_bytes!("trash.rgba");
 static TRASH_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(TRASH_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const TRASH_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("trash_gate_active.rgba");
+static TRASH_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(TRASH_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const TRASH_GATE_ACCENT_RGBA: &[u8] = include_bytes!("trash_gate_accent.rgba");
+static TRASH_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(TRASH_GATE_ACCENT_RGBA));
 
 const TRASH_BRAILLE_RGBA: &[u8] = include_bytes!("trash_braille.rgba");
 /// ~50% coverage (128/255), auto-selected by bake_icons.py::choose_threshold -- 18/96 dots lit at this threshold.
@@ -1315,10 +2349,29 @@ static TRASH_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const TRASH_STRIP_RGBA: &[u8] = include_bytes!("trash_strip.rgba");
+static TRASH_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(TRASH_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const TRASH_STRIP_GATE_RGBA: &[u8] = include_bytes!("trash_strip_gate.rgba");
+static TRASH_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(TRASH_STRIP_GATE_RGBA));
+
 // ---- Search (search) ------------------------------------------------
 
 const SEARCH_RGBA: &[u8] = include_bytes!("search.rgba");
 static SEARCH_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(SEARCH_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const SEARCH_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("search_gate_active.rgba");
+static SEARCH_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SEARCH_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const SEARCH_GATE_ACCENT_RGBA: &[u8] = include_bytes!("search_gate_accent.rgba");
+static SEARCH_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SEARCH_GATE_ACCENT_RGBA));
 
 const SEARCH_BRAILLE_RGBA: &[u8] = include_bytes!("search_braille.rgba");
 /// ~15% coverage (38/255), auto-selected by bake_icons.py::choose_threshold -- 21/96 dots lit at this threshold.
@@ -1349,10 +2402,29 @@ static SEARCH_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const SEARCH_STRIP_RGBA: &[u8] = include_bytes!("search_strip.rgba");
+static SEARCH_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(SEARCH_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const SEARCH_STRIP_GATE_RGBA: &[u8] = include_bytes!("search_strip_gate.rgba");
+static SEARCH_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(SEARCH_STRIP_GATE_RGBA));
+
 // ---- Check (check) --------------------------------------------------
 
 const CHECK_RGBA: &[u8] = include_bytes!("check.rgba");
 static CHECK_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(CHECK_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const CHECK_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("check_gate_active.rgba");
+static CHECK_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CHECK_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const CHECK_GATE_ACCENT_RGBA: &[u8] = include_bytes!("check_gate_accent.rgba");
+static CHECK_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CHECK_GATE_ACCENT_RGBA));
 
 const CHECK_BRAILLE_RGBA: &[u8] = include_bytes!("check_braille.rgba");
 /// ~6% coverage (15/255), auto-selected by bake_icons.py::choose_threshold -- 13/96 dots lit at this threshold.
@@ -1383,10 +2455,29 @@ static CHECK_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const CHECK_STRIP_RGBA: &[u8] = include_bytes!("check_strip.rgba");
+static CHECK_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(CHECK_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const CHECK_STRIP_GATE_RGBA: &[u8] = include_bytes!("check_strip_gate.rgba");
+static CHECK_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(CHECK_STRIP_GATE_RGBA));
+
 // ---- Close (close) --------------------------------------------------
 
 const CLOSE_RGBA: &[u8] = include_bytes!("close.rgba");
 static CLOSE_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(CLOSE_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const CLOSE_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("close_gate_active.rgba");
+static CLOSE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CLOSE_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const CLOSE_GATE_ACCENT_RGBA: &[u8] = include_bytes!("close_gate_accent.rgba");
+static CLOSE_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CLOSE_GATE_ACCENT_RGBA));
 
 const CLOSE_BRAILLE_RGBA: &[u8] = include_bytes!("close_braille.rgba");
 /// ~30% coverage (77/255), override, hand-picked after reviewing bake_icons.py's own auto-suggested preview -- 12/96 dots lit at this threshold.
@@ -1417,10 +2508,29 @@ static CLOSE_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const CLOSE_STRIP_RGBA: &[u8] = include_bytes!("close_strip.rgba");
+static CLOSE_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(CLOSE_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const CLOSE_STRIP_GATE_RGBA: &[u8] = include_bytes!("close_strip_gate.rgba");
+static CLOSE_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(CLOSE_STRIP_GATE_RGBA));
+
 // ---- ArrowUp (arrow-up) ---------------------------------------------
 
 const ARROW_UP_RGBA: &[u8] = include_bytes!("arrow_up.rgba");
 static ARROW_UP_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(ARROW_UP_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const ARROW_UP_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("arrow_up_gate_active.rgba");
+static ARROW_UP_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ARROW_UP_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const ARROW_UP_GATE_ACCENT_RGBA: &[u8] = include_bytes!("arrow_up_gate_accent.rgba");
+static ARROW_UP_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ARROW_UP_GATE_ACCENT_RGBA));
 
 const ARROW_UP_BRAILLE_RGBA: &[u8] = include_bytes!("arrow_up_braille.rgba");
 /// ~6% coverage (15/255), auto-selected by bake_icons.py::choose_threshold -- 16/96 dots lit at this threshold.
@@ -1451,10 +2561,29 @@ static ARROW_UP_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const ARROW_UP_STRIP_RGBA: &[u8] = include_bytes!("arrow_up_strip.rgba");
+static ARROW_UP_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(ARROW_UP_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const ARROW_UP_STRIP_GATE_RGBA: &[u8] = include_bytes!("arrow_up_strip_gate.rgba");
+static ARROW_UP_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(ARROW_UP_STRIP_GATE_RGBA));
+
 // ---- ArrowDown (arrow-down) -----------------------------------------
 
 const ARROW_DOWN_RGBA: &[u8] = include_bytes!("arrow_down.rgba");
 static ARROW_DOWN_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(ARROW_DOWN_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const ARROW_DOWN_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("arrow_down_gate_active.rgba");
+static ARROW_DOWN_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ARROW_DOWN_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const ARROW_DOWN_GATE_ACCENT_RGBA: &[u8] = include_bytes!("arrow_down_gate_accent.rgba");
+static ARROW_DOWN_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ARROW_DOWN_GATE_ACCENT_RGBA));
 
 const ARROW_DOWN_BRAILLE_RGBA: &[u8] = include_bytes!("arrow_down_braille.rgba");
 /// ~6% coverage (15/255), auto-selected by bake_icons.py::choose_threshold -- 16/96 dots lit at this threshold.
@@ -1485,10 +2614,29 @@ static ARROW_DOWN_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const ARROW_DOWN_STRIP_RGBA: &[u8] = include_bytes!("arrow_down_strip.rgba");
+static ARROW_DOWN_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(ARROW_DOWN_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const ARROW_DOWN_STRIP_GATE_RGBA: &[u8] = include_bytes!("arrow_down_strip_gate.rgba");
+static ARROW_DOWN_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(ARROW_DOWN_STRIP_GATE_RGBA));
+
 // ---- ArrowLeft (arrow-left) -----------------------------------------
 
 const ARROW_LEFT_RGBA: &[u8] = include_bytes!("arrow_left.rgba");
 static ARROW_LEFT_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(ARROW_LEFT_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const ARROW_LEFT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("arrow_left_gate_active.rgba");
+static ARROW_LEFT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ARROW_LEFT_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const ARROW_LEFT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("arrow_left_gate_accent.rgba");
+static ARROW_LEFT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ARROW_LEFT_GATE_ACCENT_RGBA));
 
 const ARROW_LEFT_BRAILLE_RGBA: &[u8] = include_bytes!("arrow_left_braille.rgba");
 /// ~6% coverage (15/255), auto-selected by bake_icons.py::choose_threshold -- 16/96 dots lit at this threshold.
@@ -1519,10 +2667,29 @@ static ARROW_LEFT_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const ARROW_LEFT_STRIP_RGBA: &[u8] = include_bytes!("arrow_left_strip.rgba");
+static ARROW_LEFT_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(ARROW_LEFT_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const ARROW_LEFT_STRIP_GATE_RGBA: &[u8] = include_bytes!("arrow_left_strip_gate.rgba");
+static ARROW_LEFT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(ARROW_LEFT_STRIP_GATE_RGBA));
+
 // ---- ArrowRight (arrow-right) ---------------------------------------
 
 const ARROW_RIGHT_RGBA: &[u8] = include_bytes!("arrow_right.rgba");
 static ARROW_RIGHT_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(ARROW_RIGHT_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const ARROW_RIGHT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("arrow_right_gate_active.rgba");
+static ARROW_RIGHT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ARROW_RIGHT_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const ARROW_RIGHT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("arrow_right_gate_accent.rgba");
+static ARROW_RIGHT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ARROW_RIGHT_GATE_ACCENT_RGBA));
 
 const ARROW_RIGHT_BRAILLE_RGBA: &[u8] = include_bytes!("arrow_right_braille.rgba");
 /// ~6% coverage (15/255), auto-selected by bake_icons.py::choose_threshold -- 16/96 dots lit at this threshold.
@@ -1553,10 +2720,29 @@ static ARROW_RIGHT_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const ARROW_RIGHT_STRIP_RGBA: &[u8] = include_bytes!("arrow_right_strip.rgba");
+static ARROW_RIGHT_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(ARROW_RIGHT_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const ARROW_RIGHT_STRIP_GATE_RGBA: &[u8] = include_bytes!("arrow_right_strip_gate.rgba");
+static ARROW_RIGHT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(ARROW_RIGHT_STRIP_GATE_RGBA));
+
 // ---- ArrowSwap (arrow-swap) -----------------------------------------
 
 const ARROW_SWAP_RGBA: &[u8] = include_bytes!("arrow_swap.rgba");
 static ARROW_SWAP_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(ARROW_SWAP_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const ARROW_SWAP_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("arrow_swap_gate_active.rgba");
+static ARROW_SWAP_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ARROW_SWAP_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const ARROW_SWAP_GATE_ACCENT_RGBA: &[u8] = include_bytes!("arrow_swap_gate_accent.rgba");
+static ARROW_SWAP_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ARROW_SWAP_GATE_ACCENT_RGBA));
 
 const ARROW_SWAP_BRAILLE_RGBA: &[u8] = include_bytes!("arrow_swap_braille.rgba");
 /// ~30% coverage (77/255), auto-selected by bake_icons.py::choose_threshold -- 18/96 dots lit at this threshold.
@@ -1587,10 +2773,29 @@ static ARROW_SWAP_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const ARROW_SWAP_STRIP_RGBA: &[u8] = include_bytes!("arrow_swap_strip.rgba");
+static ARROW_SWAP_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(ARROW_SWAP_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const ARROW_SWAP_STRIP_GATE_RGBA: &[u8] = include_bytes!("arrow_swap_strip_gate.rgba");
+static ARROW_SWAP_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(ARROW_SWAP_STRIP_GATE_RGBA));
+
 // ---- GitCommit (git-commit) -----------------------------------------
 
 const GIT_COMMIT_RGBA: &[u8] = include_bytes!("git_commit.rgba");
 static GIT_COMMIT_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(GIT_COMMIT_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const GIT_COMMIT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("git_commit_gate_active.rgba");
+static GIT_COMMIT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(GIT_COMMIT_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const GIT_COMMIT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("git_commit_gate_accent.rgba");
+static GIT_COMMIT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(GIT_COMMIT_GATE_ACCENT_RGBA));
 
 const GIT_COMMIT_BRAILLE_RGBA: &[u8] = include_bytes!("git_commit_braille.rgba");
 /// ~10% coverage (26/255), auto-selected by bake_icons.py::choose_threshold -- 20/96 dots lit at this threshold.
@@ -1621,10 +2826,29 @@ static GIT_COMMIT_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const GIT_COMMIT_STRIP_RGBA: &[u8] = include_bytes!("git_commit_strip.rgba");
+static GIT_COMMIT_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(GIT_COMMIT_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const GIT_COMMIT_STRIP_GATE_RGBA: &[u8] = include_bytes!("git_commit_strip_gate.rgba");
+static GIT_COMMIT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(GIT_COMMIT_STRIP_GATE_RGBA));
+
 // ---- GitBranch (git-branch) -----------------------------------------
 
 const GIT_BRANCH_RGBA: &[u8] = include_bytes!("git_branch.rgba");
 static GIT_BRANCH_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(GIT_BRANCH_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const GIT_BRANCH_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("git_branch_gate_active.rgba");
+static GIT_BRANCH_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(GIT_BRANCH_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const GIT_BRANCH_GATE_ACCENT_RGBA: &[u8] = include_bytes!("git_branch_gate_accent.rgba");
+static GIT_BRANCH_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(GIT_BRANCH_GATE_ACCENT_RGBA));
 
 const GIT_BRANCH_BRAILLE_RGBA: &[u8] = include_bytes!("git_branch_braille.rgba");
 /// ~40% coverage (102/255), auto-selected by bake_icons.py::choose_threshold -- 20/96 dots lit at this threshold.
@@ -1655,10 +2879,29 @@ static GIT_BRANCH_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const GIT_BRANCH_STRIP_RGBA: &[u8] = include_bytes!("git_branch_strip.rgba");
+static GIT_BRANCH_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(GIT_BRANCH_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const GIT_BRANCH_STRIP_GATE_RGBA: &[u8] = include_bytes!("git_branch_strip_gate.rgba");
+static GIT_BRANCH_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(GIT_BRANCH_STRIP_GATE_RGBA));
+
 // ---- Diff (diff) ----------------------------------------------------
 
 const DIFF_RGBA: &[u8] = include_bytes!("diff.rgba");
 static DIFF_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(DIFF_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const DIFF_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("diff_gate_active.rgba");
+static DIFF_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(DIFF_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const DIFF_GATE_ACCENT_RGBA: &[u8] = include_bytes!("diff_gate_accent.rgba");
+static DIFF_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(DIFF_GATE_ACCENT_RGBA));
 
 const DIFF_BRAILLE_RGBA: &[u8] = include_bytes!("diff_braille.rgba");
 /// ~50% coverage (128/255), auto-selected by bake_icons.py::choose_threshold -- 28/96 dots lit at this threshold.
@@ -1689,10 +2932,29 @@ static DIFF_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const DIFF_STRIP_RGBA: &[u8] = include_bytes!("diff_strip.rgba");
+static DIFF_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(DIFF_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const DIFF_STRIP_GATE_RGBA: &[u8] = include_bytes!("diff_strip_gate.rgba");
+static DIFF_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(DIFF_STRIP_GATE_RGBA));
+
 // ---- DiffAdded (diff-added) -----------------------------------------
 
 const DIFF_ADDED_RGBA: &[u8] = include_bytes!("diff_added.rgba");
 static DIFF_ADDED_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(DIFF_ADDED_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const DIFF_ADDED_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("diff_added_gate_active.rgba");
+static DIFF_ADDED_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(DIFF_ADDED_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const DIFF_ADDED_GATE_ACCENT_RGBA: &[u8] = include_bytes!("diff_added_gate_accent.rgba");
+static DIFF_ADDED_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(DIFF_ADDED_GATE_ACCENT_RGBA));
 
 const DIFF_ADDED_BRAILLE_RGBA: &[u8] = include_bytes!("diff_added_braille.rgba");
 /// ~50% coverage (128/255), auto-selected by bake_icons.py::choose_threshold -- 22/96 dots lit at this threshold.
@@ -1723,10 +2985,29 @@ static DIFF_ADDED_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const DIFF_ADDED_STRIP_RGBA: &[u8] = include_bytes!("diff_added_strip.rgba");
+static DIFF_ADDED_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(DIFF_ADDED_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const DIFF_ADDED_STRIP_GATE_RGBA: &[u8] = include_bytes!("diff_added_strip_gate.rgba");
+static DIFF_ADDED_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(DIFF_ADDED_STRIP_GATE_RGBA));
+
 // ---- GitCompare (git-compare) ---------------------------------------
 
 const GIT_COMPARE_RGBA: &[u8] = include_bytes!("git_compare.rgba");
 static GIT_COMPARE_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(GIT_COMPARE_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const GIT_COMPARE_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("git_compare_gate_active.rgba");
+static GIT_COMPARE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(GIT_COMPARE_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const GIT_COMPARE_GATE_ACCENT_RGBA: &[u8] = include_bytes!("git_compare_gate_accent.rgba");
+static GIT_COMPARE_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(GIT_COMPARE_GATE_ACCENT_RGBA));
 
 const GIT_COMPARE_BRAILLE_RGBA: &[u8] = include_bytes!("git_compare_braille.rgba");
 /// ~40% coverage (102/255), auto-selected by bake_icons.py::choose_threshold -- 22/96 dots lit at this threshold.
@@ -1757,10 +3038,29 @@ static GIT_COMPARE_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const GIT_COMPARE_STRIP_RGBA: &[u8] = include_bytes!("git_compare_strip.rgba");
+static GIT_COMPARE_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(GIT_COMPARE_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const GIT_COMPARE_STRIP_GATE_RGBA: &[u8] = include_bytes!("git_compare_strip_gate.rgba");
+static GIT_COMPARE_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(GIT_COMPARE_STRIP_GATE_RGBA));
+
 // ---- Repo (repo) ----------------------------------------------------
 
 const REPO_RGBA: &[u8] = include_bytes!("repo.rgba");
 static REPO_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(REPO_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const REPO_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("repo_gate_active.rgba");
+static REPO_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(REPO_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const REPO_GATE_ACCENT_RGBA: &[u8] = include_bytes!("repo_gate_accent.rgba");
+static REPO_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(REPO_GATE_ACCENT_RGBA));
 
 const REPO_BRAILLE_RGBA: &[u8] = include_bytes!("repo_braille.rgba");
 /// ~45% coverage (115/255), auto-selected by bake_icons.py::choose_threshold -- 24/96 dots lit at this threshold.
@@ -1791,10 +3091,29 @@ static REPO_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const REPO_STRIP_RGBA: &[u8] = include_bytes!("repo_strip.rgba");
+static REPO_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(REPO_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const REPO_STRIP_GATE_RGBA: &[u8] = include_bytes!("repo_strip_gate.rgba");
+static REPO_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(REPO_STRIP_GATE_RGBA));
+
 // ---- RepoForked (repo-forked) ---------------------------------------
 
 const REPO_FORKED_RGBA: &[u8] = include_bytes!("repo_forked.rgba");
 static REPO_FORKED_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(REPO_FORKED_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const REPO_FORKED_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("repo_forked_gate_active.rgba");
+static REPO_FORKED_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(REPO_FORKED_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const REPO_FORKED_GATE_ACCENT_RGBA: &[u8] = include_bytes!("repo_forked_gate_accent.rgba");
+static REPO_FORKED_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(REPO_FORKED_GATE_ACCENT_RGBA));
 
 const REPO_FORKED_BRAILLE_RGBA: &[u8] = include_bytes!("repo_forked_braille.rgba");
 /// ~35% coverage (89/255), auto-selected by bake_icons.py::choose_threshold -- 19/96 dots lit at this threshold.
@@ -1825,10 +3144,29 @@ static REPO_FORKED_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const REPO_FORKED_STRIP_RGBA: &[u8] = include_bytes!("repo_forked_strip.rgba");
+static REPO_FORKED_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(REPO_FORKED_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const REPO_FORKED_STRIP_GATE_RGBA: &[u8] = include_bytes!("repo_forked_strip_gate.rgba");
+static REPO_FORKED_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(REPO_FORKED_STRIP_GATE_RGBA));
+
 // ---- DebugStop (debug-stop) -----------------------------------------
 
 const DEBUG_STOP_RGBA: &[u8] = include_bytes!("debug_stop.rgba");
 static DEBUG_STOP_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(DEBUG_STOP_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const DEBUG_STOP_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("debug_stop_gate_active.rgba");
+static DEBUG_STOP_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(DEBUG_STOP_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const DEBUG_STOP_GATE_ACCENT_RGBA: &[u8] = include_bytes!("debug_stop_gate_accent.rgba");
+static DEBUG_STOP_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(DEBUG_STOP_GATE_ACCENT_RGBA));
 
 const DEBUG_STOP_BRAILLE_RGBA: &[u8] = include_bytes!("debug_stop_braille.rgba");
 /// ~58% coverage (148/255), auto-selected by bake_icons.py::choose_threshold -- 20/96 dots lit at this threshold.
@@ -1859,10 +3197,29 @@ static DEBUG_STOP_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const DEBUG_STOP_STRIP_RGBA: &[u8] = include_bytes!("debug_stop_strip.rgba");
+static DEBUG_STOP_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(DEBUG_STOP_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const DEBUG_STOP_STRIP_GATE_RGBA: &[u8] = include_bytes!("debug_stop_strip_gate.rgba");
+static DEBUG_STOP_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(DEBUG_STOP_STRIP_GATE_RGBA));
+
 // ---- DebugRestart (debug-restart) -----------------------------------
 
 const DEBUG_RESTART_RGBA: &[u8] = include_bytes!("debug_restart.rgba");
 static DEBUG_RESTART_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(DEBUG_RESTART_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const DEBUG_RESTART_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("debug_restart_gate_active.rgba");
+static DEBUG_RESTART_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(DEBUG_RESTART_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const DEBUG_RESTART_GATE_ACCENT_RGBA: &[u8] = include_bytes!("debug_restart_gate_accent.rgba");
+static DEBUG_RESTART_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(DEBUG_RESTART_GATE_ACCENT_RGBA));
 
 const DEBUG_RESTART_BRAILLE_RGBA: &[u8] = include_bytes!("debug_restart_braille.rgba");
 /// ~45% coverage (115/255), auto-selected by bake_icons.py::choose_threshold -- 18/96 dots lit at this threshold.
@@ -1893,10 +3250,29 @@ static DEBUG_RESTART_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const DEBUG_RESTART_STRIP_RGBA: &[u8] = include_bytes!("debug_restart_strip.rgba");
+static DEBUG_RESTART_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(DEBUG_RESTART_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const DEBUG_RESTART_STRIP_GATE_RGBA: &[u8] = include_bytes!("debug_restart_strip_gate.rgba");
+static DEBUG_RESTART_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(DEBUG_RESTART_STRIP_GATE_RGBA));
+
 // ---- Edit (edit) ----------------------------------------------------
 
 const EDIT_RGBA: &[u8] = include_bytes!("edit.rgba");
 static EDIT_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(EDIT_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const EDIT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("edit_gate_active.rgba");
+static EDIT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(EDIT_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const EDIT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("edit_gate_accent.rgba");
+static EDIT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(EDIT_GATE_ACCENT_RGBA));
 
 const EDIT_BRAILLE_RGBA: &[u8] = include_bytes!("edit_braille.rgba");
 /// ~30% coverage (77/255), auto-selected by bake_icons.py::choose_threshold -- 24/96 dots lit at this threshold.
@@ -1927,10 +3303,29 @@ static EDIT_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const EDIT_STRIP_RGBA: &[u8] = include_bytes!("edit_strip.rgba");
+static EDIT_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(EDIT_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const EDIT_STRIP_GATE_RGBA: &[u8] = include_bytes!("edit_strip_gate.rgba");
+static EDIT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(EDIT_STRIP_GATE_RGBA));
+
 // ---- History (history) ----------------------------------------------
 
 const HISTORY_RGBA: &[u8] = include_bytes!("history.rgba");
 static HISTORY_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(HISTORY_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const HISTORY_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("history_gate_active.rgba");
+static HISTORY_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(HISTORY_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const HISTORY_GATE_ACCENT_RGBA: &[u8] = include_bytes!("history_gate_accent.rgba");
+static HISTORY_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(HISTORY_GATE_ACCENT_RGBA));
 
 const HISTORY_BRAILLE_RGBA: &[u8] = include_bytes!("history_braille.rgba");
 /// ~45% coverage (115/255), auto-selected by bake_icons.py::choose_threshold -- 19/96 dots lit at this threshold.
@@ -1961,10 +3356,29 @@ static HISTORY_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const HISTORY_STRIP_RGBA: &[u8] = include_bytes!("history_strip.rgba");
+static HISTORY_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(HISTORY_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const HISTORY_STRIP_GATE_RGBA: &[u8] = include_bytes!("history_strip_gate.rgba");
+static HISTORY_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(HISTORY_STRIP_GATE_RGBA));
+
 // ---- Terminal (terminal) --------------------------------------------
 
 const TERMINAL_RGBA: &[u8] = include_bytes!("terminal.rgba");
 static TERMINAL_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(TERMINAL_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const TERMINAL_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("terminal_gate_active.rgba");
+static TERMINAL_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(TERMINAL_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const TERMINAL_GATE_ACCENT_RGBA: &[u8] = include_bytes!("terminal_gate_accent.rgba");
+static TERMINAL_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(TERMINAL_GATE_ACCENT_RGBA));
 
 const TERMINAL_BRAILLE_RGBA: &[u8] = include_bytes!("terminal_braille.rgba");
 /// ~50% coverage (128/255), auto-selected by bake_icons.py::choose_threshold -- 19/96 dots lit at this threshold.
@@ -1995,10 +3409,29 @@ static TERMINAL_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const TERMINAL_STRIP_RGBA: &[u8] = include_bytes!("terminal_strip.rgba");
+static TERMINAL_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(TERMINAL_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const TERMINAL_STRIP_GATE_RGBA: &[u8] = include_bytes!("terminal_strip_gate.rgba");
+static TERMINAL_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(TERMINAL_STRIP_GATE_RGBA));
+
 // ---- Output (output) ------------------------------------------------
 
 const OUTPUT_RGBA: &[u8] = include_bytes!("output.rgba");
 static OUTPUT_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(OUTPUT_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const OUTPUT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("output_gate_active.rgba");
+static OUTPUT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(OUTPUT_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const OUTPUT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("output_gate_accent.rgba");
+static OUTPUT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(OUTPUT_GATE_ACCENT_RGBA));
 
 const OUTPUT_BRAILLE_RGBA: &[u8] = include_bytes!("output_braille.rgba");
 /// ~45% coverage (115/255), auto-selected by bake_icons.py::choose_threshold -- 18/96 dots lit at this threshold.
@@ -2029,10 +3462,29 @@ static OUTPUT_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const OUTPUT_STRIP_RGBA: &[u8] = include_bytes!("output_strip.rgba");
+static OUTPUT_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(OUTPUT_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const OUTPUT_STRIP_GATE_RGBA: &[u8] = include_bytes!("output_strip_gate.rgba");
+static OUTPUT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(OUTPUT_STRIP_GATE_RGBA));
+
 // ---- CloudDownload (cloud-download) ---------------------------------
 
 const CLOUD_DOWNLOAD_RGBA: &[u8] = include_bytes!("cloud_download.rgba");
 static CLOUD_DOWNLOAD_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(CLOUD_DOWNLOAD_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const CLOUD_DOWNLOAD_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("cloud_download_gate_active.rgba");
+static CLOUD_DOWNLOAD_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CLOUD_DOWNLOAD_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const CLOUD_DOWNLOAD_GATE_ACCENT_RGBA: &[u8] = include_bytes!("cloud_download_gate_accent.rgba");
+static CLOUD_DOWNLOAD_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CLOUD_DOWNLOAD_GATE_ACCENT_RGBA));
 
 const CLOUD_DOWNLOAD_BRAILLE_RGBA: &[u8] = include_bytes!("cloud_download_braille.rgba");
 /// ~45% coverage (115/255), auto-selected by bake_icons.py::choose_threshold -- 19/96 dots lit at this threshold.
@@ -2063,10 +3515,29 @@ static CLOUD_DOWNLOAD_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| 
     )
 });
 
+const CLOUD_DOWNLOAD_STRIP_RGBA: &[u8] = include_bytes!("cloud_download_strip.rgba");
+static CLOUD_DOWNLOAD_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(CLOUD_DOWNLOAD_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const CLOUD_DOWNLOAD_STRIP_GATE_RGBA: &[u8] = include_bytes!("cloud_download_strip_gate.rgba");
+static CLOUD_DOWNLOAD_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(CLOUD_DOWNLOAD_STRIP_GATE_RGBA));
+
 // ---- Ellipsis (ellipsis) --------------------------------------------
 
 const ELLIPSIS_RGBA: &[u8] = include_bytes!("ellipsis.rgba");
 static ELLIPSIS_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(ELLIPSIS_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const ELLIPSIS_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("ellipsis_gate_active.rgba");
+static ELLIPSIS_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ELLIPSIS_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const ELLIPSIS_GATE_ACCENT_RGBA: &[u8] = include_bytes!("ellipsis_gate_accent.rgba");
+static ELLIPSIS_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ELLIPSIS_GATE_ACCENT_RGBA));
 
 const ELLIPSIS_BRAILLE_RGBA: &[u8] = include_bytes!("ellipsis_braille.rgba");
 /// ~15% coverage (38/255), override, hand-picked after reviewing bake_icons.py's own auto-suggested preview -- 12/96 dots lit at this threshold.
@@ -2098,10 +3569,29 @@ static ELLIPSIS_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const ELLIPSIS_STRIP_RGBA: &[u8] = include_bytes!("ellipsis_strip.rgba");
+static ELLIPSIS_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(ELLIPSIS_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const ELLIPSIS_STRIP_GATE_RGBA: &[u8] = include_bytes!("ellipsis_strip_gate.rgba");
+static ELLIPSIS_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(ELLIPSIS_STRIP_GATE_RGBA));
+
 // ---- Link (link) ----------------------------------------------------
 
 const LINK_RGBA: &[u8] = include_bytes!("link.rgba");
 static LINK_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(LINK_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const LINK_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("link_gate_active.rgba");
+static LINK_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LINK_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const LINK_GATE_ACCENT_RGBA: &[u8] = include_bytes!("link_gate_accent.rgba");
+static LINK_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LINK_GATE_ACCENT_RGBA));
 
 const LINK_BRAILLE_RGBA: &[u8] = include_bytes!("link_braille.rgba");
 /// ~25% coverage (64/255), override, hand-picked after reviewing bake_icons.py's own auto-suggested preview -- 12/96 dots lit at this threshold.
@@ -2133,10 +3623,29 @@ static LINK_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const LINK_STRIP_RGBA: &[u8] = include_bytes!("link_strip.rgba");
+static LINK_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(LINK_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const LINK_STRIP_GATE_RGBA: &[u8] = include_bytes!("link_strip_gate.rgba");
+static LINK_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LINK_STRIP_GATE_RGBA));
+
 // ---- CircleFilled (circle-filled) -----------------------------------
 
 const CIRCLE_FILLED_RGBA: &[u8] = include_bytes!("circle_filled.rgba");
 static CIRCLE_FILLED_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(CIRCLE_FILLED_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const CIRCLE_FILLED_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("circle_filled_gate_active.rgba");
+static CIRCLE_FILLED_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CIRCLE_FILLED_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const CIRCLE_FILLED_GATE_ACCENT_RGBA: &[u8] = include_bytes!("circle_filled_gate_accent.rgba");
+static CIRCLE_FILLED_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CIRCLE_FILLED_GATE_ACCENT_RGBA));
 
 const CIRCLE_FILLED_BRAILLE_RGBA: &[u8] = include_bytes!("circle_filled_braille.rgba");
 /// ~6% coverage (15/255), auto-selected by bake_icons.py::choose_threshold -- 16/96 dots lit at this threshold.
@@ -2167,10 +3676,29 @@ static CIRCLE_FILLED_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const CIRCLE_FILLED_STRIP_RGBA: &[u8] = include_bytes!("circle_filled_strip.rgba");
+static CIRCLE_FILLED_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(CIRCLE_FILLED_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const CIRCLE_FILLED_STRIP_GATE_RGBA: &[u8] = include_bytes!("circle_filled_strip_gate.rgba");
+static CIRCLE_FILLED_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(CIRCLE_FILLED_STRIP_GATE_RGBA));
+
 // ---- CircleSlash (circle-slash) -------------------------------------
 
 const CIRCLE_SLASH_RGBA: &[u8] = include_bytes!("circle_slash.rgba");
 static CIRCLE_SLASH_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(CIRCLE_SLASH_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const CIRCLE_SLASH_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("circle_slash_gate_active.rgba");
+static CIRCLE_SLASH_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CIRCLE_SLASH_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const CIRCLE_SLASH_GATE_ACCENT_RGBA: &[u8] = include_bytes!("circle_slash_gate_accent.rgba");
+static CIRCLE_SLASH_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CIRCLE_SLASH_GATE_ACCENT_RGBA));
 
 const CIRCLE_SLASH_BRAILLE_RGBA: &[u8] = include_bytes!("circle_slash_braille.rgba");
 /// ~40% coverage (102/255), auto-selected by bake_icons.py::choose_threshold -- 22/96 dots lit at this threshold.
@@ -2201,10 +3729,29 @@ static CIRCLE_SLASH_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const CIRCLE_SLASH_STRIP_RGBA: &[u8] = include_bytes!("circle_slash_strip.rgba");
+static CIRCLE_SLASH_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(CIRCLE_SLASH_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const CIRCLE_SLASH_STRIP_GATE_RGBA: &[u8] = include_bytes!("circle_slash_strip_gate.rgba");
+static CIRCLE_SLASH_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(CIRCLE_SLASH_STRIP_GATE_RGBA));
+
 // ---- Warning (warning) ----------------------------------------------
 
 const WARNING_RGBA: &[u8] = include_bytes!("warning.rgba");
 static WARNING_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(WARNING_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const WARNING_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("warning_gate_active.rgba");
+static WARNING_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(WARNING_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const WARNING_GATE_ACCENT_RGBA: &[u8] = include_bytes!("warning_gate_accent.rgba");
+static WARNING_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(WARNING_GATE_ACCENT_RGBA));
 
 const WARNING_BRAILLE_RGBA: &[u8] = include_bytes!("warning_braille.rgba");
 /// ~35% coverage (89/255), auto-selected by bake_icons.py::choose_threshold -- 18/96 dots lit at this threshold.
@@ -2235,10 +3782,29 @@ static WARNING_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const WARNING_STRIP_RGBA: &[u8] = include_bytes!("warning_strip.rgba");
+static WARNING_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(WARNING_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const WARNING_STRIP_GATE_RGBA: &[u8] = include_bytes!("warning_strip_gate.rgba");
+static WARNING_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(WARNING_STRIP_GATE_RGBA));
+
 // ---- Error (error) --------------------------------------------------
 
 const ERROR_RGBA: &[u8] = include_bytes!("error.rgba");
 static ERROR_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(ERROR_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const ERROR_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("error_gate_active.rgba");
+static ERROR_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ERROR_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const ERROR_GATE_ACCENT_RGBA: &[u8] = include_bytes!("error_gate_accent.rgba");
+static ERROR_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ERROR_GATE_ACCENT_RGBA));
 
 const ERROR_BRAILLE_RGBA: &[u8] = include_bytes!("error_braille.rgba");
 /// ~40% coverage (102/255), auto-selected by bake_icons.py::choose_threshold -- 20/96 dots lit at this threshold.
@@ -2269,10 +3835,29 @@ static ERROR_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const ERROR_STRIP_RGBA: &[u8] = include_bytes!("error_strip.rgba");
+static ERROR_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(ERROR_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const ERROR_STRIP_GATE_RGBA: &[u8] = include_bytes!("error_strip_gate.rgba");
+static ERROR_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(ERROR_STRIP_GATE_RGBA));
+
 // ---- Info (info) ----------------------------------------------------
 
 const INFO_RGBA: &[u8] = include_bytes!("info.rgba");
 static INFO_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(INFO_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const INFO_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("info_gate_active.rgba");
+static INFO_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(INFO_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const INFO_GATE_ACCENT_RGBA: &[u8] = include_bytes!("info_gate_accent.rgba");
+static INFO_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(INFO_GATE_ACCENT_RGBA));
 
 const INFO_BRAILLE_RGBA: &[u8] = include_bytes!("info_braille.rgba");
 /// ~35% coverage (89/255), auto-selected by bake_icons.py::choose_threshold -- 20/96 dots lit at this threshold.
@@ -2303,10 +3888,29 @@ static INFO_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const INFO_STRIP_RGBA: &[u8] = include_bytes!("info_strip.rgba");
+static INFO_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(INFO_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const INFO_STRIP_GATE_RGBA: &[u8] = include_bytes!("info_strip_gate.rgba");
+static INFO_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(INFO_STRIP_GATE_RGBA));
+
 // ---- RunAll (run-all) -----------------------------------------------
 
 const RUN_ALL_RGBA: &[u8] = include_bytes!("run_all.rgba");
 static RUN_ALL_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(RUN_ALL_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const RUN_ALL_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("run_all_gate_active.rgba");
+static RUN_ALL_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(RUN_ALL_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const RUN_ALL_GATE_ACCENT_RGBA: &[u8] = include_bytes!("run_all_gate_accent.rgba");
+static RUN_ALL_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(RUN_ALL_GATE_ACCENT_RGBA));
 
 const RUN_ALL_BRAILLE_RGBA: &[u8] = include_bytes!("run_all_braille.rgba");
 /// ~45% coverage (115/255), auto-selected by bake_icons.py::choose_threshold -- 19/96 dots lit at this threshold.
@@ -2337,10 +3941,29 @@ static RUN_ALL_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const RUN_ALL_STRIP_RGBA: &[u8] = include_bytes!("run_all_strip.rgba");
+static RUN_ALL_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(RUN_ALL_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const RUN_ALL_STRIP_GATE_RGBA: &[u8] = include_bytes!("run_all_strip_gate.rgba");
+static RUN_ALL_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(RUN_ALL_STRIP_GATE_RGBA));
+
 // ---- Play (play) ----------------------------------------------------
 
 const PLAY_RGBA: &[u8] = include_bytes!("play.rgba");
 static PLAY_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(PLAY_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const PLAY_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("play_gate_active.rgba");
+static PLAY_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(PLAY_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const PLAY_GATE_ACCENT_RGBA: &[u8] = include_bytes!("play_gate_accent.rgba");
+static PLAY_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(PLAY_GATE_ACCENT_RGBA));
 
 const PLAY_BRAILLE_RGBA: &[u8] = include_bytes!("play_braille.rgba");
 /// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_threshold -- 18/96 dots lit at this threshold.
@@ -2371,10 +3994,29 @@ static PLAY_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const PLAY_STRIP_RGBA: &[u8] = include_bytes!("play_strip.rgba");
+static PLAY_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(PLAY_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const PLAY_STRIP_GATE_RGBA: &[u8] = include_bytes!("play_strip_gate.rgba");
+static PLAY_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(PLAY_STRIP_GATE_RGBA));
+
 // ---- Sync (sync) ----------------------------------------------------
 
 const SYNC_RGBA: &[u8] = include_bytes!("sync.rgba");
 static SYNC_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(SYNC_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const SYNC_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("sync_gate_active.rgba");
+static SYNC_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SYNC_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const SYNC_GATE_ACCENT_RGBA: &[u8] = include_bytes!("sync_gate_accent.rgba");
+static SYNC_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SYNC_GATE_ACCENT_RGBA));
 
 const SYNC_BRAILLE_RGBA: &[u8] = include_bytes!("sync_braille.rgba");
 /// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_threshold -- 18/96 dots lit at this threshold.
@@ -2405,10 +4047,29 @@ static SYNC_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const SYNC_STRIP_RGBA: &[u8] = include_bytes!("sync_strip.rgba");
+static SYNC_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(SYNC_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const SYNC_STRIP_GATE_RGBA: &[u8] = include_bytes!("sync_strip_gate.rgba");
+static SYNC_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(SYNC_STRIP_GATE_RGBA));
+
 // ---- GoToFile (go-to-file) ------------------------------------------
 
 const GO_TO_FILE_RGBA: &[u8] = include_bytes!("go_to_file.rgba");
 static GO_TO_FILE_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(GO_TO_FILE_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const GO_TO_FILE_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("go_to_file_gate_active.rgba");
+static GO_TO_FILE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(GO_TO_FILE_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const GO_TO_FILE_GATE_ACCENT_RGBA: &[u8] = include_bytes!("go_to_file_gate_accent.rgba");
+static GO_TO_FILE_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(GO_TO_FILE_GATE_ACCENT_RGBA));
 
 const GO_TO_FILE_BRAILLE_RGBA: &[u8] = include_bytes!("go_to_file_braille.rgba");
 /// ~45% coverage (115/255), auto-selected by bake_icons.py::choose_threshold -- 21/96 dots lit at this threshold.
@@ -2439,10 +4100,29 @@ static GO_TO_FILE_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const GO_TO_FILE_STRIP_RGBA: &[u8] = include_bytes!("go_to_file_strip.rgba");
+static GO_TO_FILE_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(GO_TO_FILE_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const GO_TO_FILE_STRIP_GATE_RGBA: &[u8] = include_bytes!("go_to_file_strip_gate.rgba");
+static GO_TO_FILE_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(GO_TO_FILE_STRIP_GATE_RGBA));
+
 // ---- Pulse (pulse) --------------------------------------------------
 
 const PULSE_RGBA: &[u8] = include_bytes!("pulse.rgba");
 static PULSE_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(PULSE_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const PULSE_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("pulse_gate_active.rgba");
+static PULSE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(PULSE_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const PULSE_GATE_ACCENT_RGBA: &[u8] = include_bytes!("pulse_gate_accent.rgba");
+static PULSE_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(PULSE_GATE_ACCENT_RGBA));
 
 const PULSE_BRAILLE_RGBA: &[u8] = include_bytes!("pulse_braille.rgba");
 /// ~10% coverage (26/255), auto-selected by bake_icons.py::choose_threshold -- 20/96 dots lit at this threshold.
@@ -2474,10 +4154,29 @@ static PULSE_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const PULSE_STRIP_RGBA: &[u8] = include_bytes!("pulse_strip.rgba");
+static PULSE_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(PULSE_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const PULSE_STRIP_GATE_RGBA: &[u8] = include_bytes!("pulse_strip_gate.rgba");
+static PULSE_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(PULSE_STRIP_GATE_RGBA));
+
 // ---- Checklist (checklist) ------------------------------------------
 
 const CHECKLIST_RGBA: &[u8] = include_bytes!("checklist.rgba");
 static CHECKLIST_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(CHECKLIST_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const CHECKLIST_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("checklist_gate_active.rgba");
+static CHECKLIST_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CHECKLIST_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const CHECKLIST_GATE_ACCENT_RGBA: &[u8] = include_bytes!("checklist_gate_accent.rgba");
+static CHECKLIST_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CHECKLIST_GATE_ACCENT_RGBA));
 
 const CHECKLIST_BRAILLE_RGBA: &[u8] = include_bytes!("checklist_braille.rgba");
 /// ~25% coverage (64/255), override, hand-picked after reviewing bake_icons.py's own auto-suggested preview -- 21/96 dots lit at this threshold.
@@ -2509,10 +4208,29 @@ static CHECKLIST_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const CHECKLIST_STRIP_RGBA: &[u8] = include_bytes!("checklist_strip.rgba");
+static CHECKLIST_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(CHECKLIST_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const CHECKLIST_STRIP_GATE_RGBA: &[u8] = include_bytes!("checklist_strip_gate.rgba");
+static CHECKLIST_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(CHECKLIST_STRIP_GATE_RGBA));
+
 // ---- Eye (eye) ------------------------------------------------------
 
 const EYE_RGBA: &[u8] = include_bytes!("eye.rgba");
 static EYE_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(EYE_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const EYE_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("eye_gate_active.rgba");
+static EYE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(EYE_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const EYE_GATE_ACCENT_RGBA: &[u8] = include_bytes!("eye_gate_accent.rgba");
+static EYE_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(EYE_GATE_ACCENT_RGBA));
 
 const EYE_BRAILLE_RGBA: &[u8] = include_bytes!("eye_braille.rgba");
 /// ~30% coverage (77/255), override, hand-picked after reviewing bake_icons.py's own auto-suggested preview -- 12/96 dots lit at this threshold.
@@ -2543,10 +4261,29 @@ static EYE_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const EYE_STRIP_RGBA: &[u8] = include_bytes!("eye_strip.rgba");
+static EYE_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(EYE_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const EYE_STRIP_GATE_RGBA: &[u8] = include_bytes!("eye_strip_gate.rgba");
+static EYE_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(EYE_STRIP_GATE_RGBA));
+
 // ---- Layout (layout) ------------------------------------------------
 
 const LAYOUT_RGBA: &[u8] = include_bytes!("layout.rgba");
 static LAYOUT_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(LAYOUT_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const LAYOUT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("layout_gate_active.rgba");
+static LAYOUT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LAYOUT_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const LAYOUT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("layout_gate_accent.rgba");
+static LAYOUT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LAYOUT_GATE_ACCENT_RGBA));
 
 const LAYOUT_BRAILLE_RGBA: &[u8] = include_bytes!("layout_braille.rgba");
 /// ~45% coverage (115/255), auto-selected by bake_icons.py::choose_threshold -- 32/96 dots lit at this threshold.
@@ -2578,10 +4315,29 @@ static LAYOUT_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const LAYOUT_STRIP_RGBA: &[u8] = include_bytes!("layout_strip.rgba");
+static LAYOUT_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(LAYOUT_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const LAYOUT_STRIP_GATE_RGBA: &[u8] = include_bytes!("layout_strip_gate.rgba");
+static LAYOUT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LAYOUT_STRIP_GATE_RGBA));
+
 // ---- SplitHorizontal (split-horizontal) -----------------------------
 
 const SPLIT_HORIZONTAL_RGBA: &[u8] = include_bytes!("split_horizontal.rgba");
 static SPLIT_HORIZONTAL_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(SPLIT_HORIZONTAL_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const SPLIT_HORIZONTAL_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("split_horizontal_gate_active.rgba");
+static SPLIT_HORIZONTAL_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SPLIT_HORIZONTAL_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const SPLIT_HORIZONTAL_GATE_ACCENT_RGBA: &[u8] = include_bytes!("split_horizontal_gate_accent.rgba");
+static SPLIT_HORIZONTAL_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SPLIT_HORIZONTAL_GATE_ACCENT_RGBA));
 
 const SPLIT_HORIZONTAL_BRAILLE_RGBA: &[u8] = include_bytes!("split_horizontal_braille.rgba");
 /// ~25% coverage (64/255), override, hand-picked after reviewing bake_icons.py's own auto-suggested preview -- 36/96 dots lit at this threshold.
@@ -2612,10 +4368,29 @@ static SPLIT_HORIZONTAL_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|
     )
 });
 
+const SPLIT_HORIZONTAL_STRIP_RGBA: &[u8] = include_bytes!("split_horizontal_strip.rgba");
+static SPLIT_HORIZONTAL_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(SPLIT_HORIZONTAL_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const SPLIT_HORIZONTAL_STRIP_GATE_RGBA: &[u8] = include_bytes!("split_horizontal_strip_gate.rgba");
+static SPLIT_HORIZONTAL_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(SPLIT_HORIZONTAL_STRIP_GATE_RGBA));
+
 // ---- SplitVertical (split-vertical) ---------------------------------
 
 const SPLIT_VERTICAL_RGBA: &[u8] = include_bytes!("split_vertical.rgba");
 static SPLIT_VERTICAL_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(SPLIT_VERTICAL_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const SPLIT_VERTICAL_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("split_vertical_gate_active.rgba");
+static SPLIT_VERTICAL_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SPLIT_VERTICAL_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const SPLIT_VERTICAL_GATE_ACCENT_RGBA: &[u8] = include_bytes!("split_vertical_gate_accent.rgba");
+static SPLIT_VERTICAL_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SPLIT_VERTICAL_GATE_ACCENT_RGBA));
 
 const SPLIT_VERTICAL_BRAILLE_RGBA: &[u8] = include_bytes!("split_vertical_braille.rgba");
 /// ~25% coverage (64/255), override, hand-picked after reviewing bake_icons.py's own auto-suggested preview -- 36/96 dots lit at this threshold.
@@ -2646,10 +4421,29 @@ static SPLIT_VERTICAL_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| 
     )
 });
 
+const SPLIT_VERTICAL_STRIP_RGBA: &[u8] = include_bytes!("split_vertical_strip.rgba");
+static SPLIT_VERTICAL_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(SPLIT_VERTICAL_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const SPLIT_VERTICAL_STRIP_GATE_RGBA: &[u8] = include_bytes!("split_vertical_strip_gate.rgba");
+static SPLIT_VERTICAL_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(SPLIT_VERTICAL_STRIP_GATE_RGBA));
+
 // ---- Preview (preview) ----------------------------------------------
 
 const PREVIEW_RGBA: &[u8] = include_bytes!("preview.rgba");
 static PREVIEW_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(PREVIEW_RGBA));
+
+/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
+/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
+/// bake_icons.py` module doc).
+const PREVIEW_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("preview_gate_active.rgba");
+static PREVIEW_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(PREVIEW_GATE_ACTIVE_RGBA));
+
+/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
+/// the rail's own selected-state background.
+const PREVIEW_GATE_ACCENT_RGBA: &[u8] = include_bytes!("preview_gate_accent.rgba");
+static PREVIEW_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(PREVIEW_GATE_ACCENT_RGBA));
 
 const PREVIEW_BRAILLE_RGBA: &[u8] = include_bytes!("preview_braille.rgba");
 /// ~50% coverage (128/255), auto-selected by bake_icons.py::choose_threshold -- 25/96 dots lit at this threshold.
@@ -2679,4 +4473,12 @@ static PREVIEW_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
         PREVIEW_COMPACT_BRAILLE_ALPHA_THRESHOLD,
     )
 });
+
+const PREVIEW_STRIP_RGBA: &[u8] = include_bytes!("preview_strip.rgba");
+static PREVIEW_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(PREVIEW_STRIP_RGBA));
+
+/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail tier above.
+const PREVIEW_STRIP_GATE_RGBA: &[u8] = include_bytes!("preview_strip_gate.rgba");
+static PREVIEW_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(PREVIEW_STRIP_GATE_RGBA));
 

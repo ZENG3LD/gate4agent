@@ -75,6 +75,14 @@ const TEAL: Color = Color::Rgb(148, 226, 213);
 
 #[derive(Clone, Copy)]
 struct Theme {
+    /// The [`PtyColorMode`] this `Theme` was built from -- carried along
+    /// so a sixel-tier render call site (`render_rail_button`/`render_
+    /// control_strip_button`) can pick the right pre-baked `icons::
+    /// SixelVariant` without a second, separately-threaded parameter. See
+    /// [`icons::SixelVariant`]'s own doc comment for why only
+    /// `GateOverride` has a knowable exact background to composite
+    /// against.
+    mode: PtyColorMode,
     surface: Color,
     panel: Color,
     modal: Color,
@@ -99,6 +107,7 @@ impl Theme {
     fn for_mode(mode: PtyColorMode) -> Self {
         match mode {
             PtyColorMode::Inherited => Self {
+                mode,
                 surface: Color::Reset,
                 panel: Color::Reset,
                 modal: Color::Black,
@@ -119,6 +128,7 @@ impl Theme {
                 diff_meta: Color::Indexed(0),
             },
             PtyColorMode::GateOverride => Self {
+                mode,
                 surface: TERM_BG,
                 panel: SIDEBAR_BG,
                 modal: SIDEBAR_BG,
@@ -138,6 +148,28 @@ impl Theme {
                 diff_hunk: Color::Indexed(24),
                 diff_meta: Color::Indexed(0),
             },
+        }
+    }
+
+    /// The [`icons::SixelVariant`] a sixel-tier icon should use for a
+    /// button painted with this theme's own `active` background (the
+    /// activity rail's at-rest state; the control-plane strip's own
+    /// only state, since it never shows selected) -- see [`Self::mode`]'s
+    /// own doc comment.
+    fn sixel_active_variant(self) -> icons::SixelVariant {
+        match self.mode {
+            PtyColorMode::GateOverride => icons::SixelVariant::GateActive,
+            PtyColorMode::Inherited => icons::SixelVariant::Transparent,
+        }
+    }
+
+    /// Same as [`Self::sixel_active_variant`], for a button painted with
+    /// this theme's own `accent` background (the activity rail's own
+    /// selected state).
+    fn sixel_accent_variant(self) -> icons::SixelVariant {
+        match self.mode {
+            PtyColorMode::GateOverride => icons::SixelVariant::GateAccent,
+            PtyColorMode::Inherited => icons::SixelVariant::Transparent,
         }
     }
 }
@@ -463,7 +495,8 @@ fn render_rail_button(
                 body.width.min(icons::SIXEL_ICON_CELLS_WIDE),
                 body.height.min(icons::SIXEL_ICON_CELLS_TALL),
             );
-            layout.sixel_icons.push(SixelIconPlacement { icon: button.icon, rect: icon_area, selected: button.selected, size: SixelIconSize::Rail });
+            let variant = if button.selected { theme.sixel_accent_variant() } else { theme.sixel_active_variant() };
+            layout.sixel_icons.push(SixelIconPlacement { icon: button.icon, rect: icon_area, variant, size: SixelIconSize::Rail });
         }
         RailIcons::Braille => {
             icons::braille(button.icon).flush(body, buf);
@@ -555,10 +588,19 @@ fn render_compact_icon_button(
             // paint it -- see `SixelIconPlacement`'s own doc comment.
             let icon_width = icons::COMPACT_SIXEL_ICON_CELLS_WIDE.min(rect.width);
             let icon_area = Rect::new(rect.x, rect.y, icon_width, 1);
+            // The compact tier is out of scope for cause 1's background-
+            // compositing fix (see `tools/bake_icons.py`'s own module
+            // doc): it is dense panel/modal content with 3+ distinct
+            // backgrounds in `PtyColorMode::GateOverride` alone (panel,
+            // accent, active), unlike the rail's 2 and the strip's 1, and
+            // touching it would mean changing already-shipped panel
+            // content pixels this task's own brief did not ask for.
+            // `Transparent` here is the SAME asset/behaviour this tier
+            // has always had, byte-for-byte.
             layout.sixel_icons.push(SixelIconPlacement {
                 icon,
                 rect: icon_area,
-                selected: false,
+                variant: icons::SixelVariant::Transparent,
                 size: SixelIconSize::Compact,
             });
             render_compact_trailing_text(rect, icon_width, text, style, buf);
@@ -596,31 +638,32 @@ fn render_compact_trailing_text(
 }
 
 /// Height, in cell rows, of one sidebar content panel's own dedicated
-/// control-plane strip (see [`render_control_strip`]): 2 rows of real
-/// rail-sized buttons -- the SAME 40x40 sixel / 8x12 braille assets the
-/// activity rail itself uses (`icons::SIXEL_ICON_CELLS_WIDE` x `_TALL`
-/// == 4x2, an exact fit for the sixel tier; the braille tier's own
-/// 4-cell x 3-row asset is flushed into this shorter 2-row body and
-/// crops its own bottom dot row via `PixelCanvas::flush`'s documented
-/// area clamp -- see that fn's own doc comment -- rather than a new,
-/// smaller bake, per this strip's own "reuse the rail-size tier, do not
-/// bake a new size" brief).
-const CONTROL_STRIP_BUTTON_ROWS: u16 = 2;
+/// control-plane strip (see [`render_control_strip`]): a single row of
+/// real buttons, each hosting the STRIP tier's own dedicated ~20x20px
+/// sixel asset (`icons::STRIP_SIXEL_ICON_CELLS_WIDE` x `_TALL` == 2x1,
+/// an exact fit) / the pre-existing COMPACT braille asset (`icons::
+/// COMPACT_BRAILLE_ICON_CELLS_WIDE` x `_TALL`, ALSO already 2x1 -- see
+/// `icons.rs`'s own "Strip tier" doc section for why no separate braille
+/// bake exists for this tier). Roughly a quarter the area of the 4-cell
+/// x 2-row body this strip used before its own resize (the rail itself
+/// is unchanged and still uses that original size -- see `render_rail_
+/// button`).
+const CONTROL_STRIP_BUTTON_ROWS: u16 = 1;
 /// One more row for the thin `─` separator painted directly under the
-/// strip's own button rows -- see [`render_control_strip`]'s own body.
+/// strip's own button row -- see [`render_control_strip`]'s own body.
 const CONTROL_STRIP_ROWS: u16 = CONTROL_STRIP_BUTTON_ROWS + 1;
 /// One strip button's own cell width -- exactly `icons::
-/// SIXEL_ICON_CELLS_WIDE` (4), so the sixel tier's own rail-size asset
-/// fills the whole button body with no runtime scaling.
-const CONTROL_STRIP_BUTTON_WIDTH: u16 = icons::SIXEL_ICON_CELLS_WIDE;
+/// STRIP_SIXEL_ICON_CELLS_WIDE` (2), so the sixel tier's own strip-size
+/// asset fills the whole button body with no runtime scaling.
+const CONTROL_STRIP_BUTTON_WIDTH: u16 = icons::STRIP_SIXEL_ICON_CELLS_WIDE;
 /// Blank columns between two adjacent strip buttons.
 const CONTROL_STRIP_BUTTON_GAP: u16 = 1;
 /// Minimum panel height (the strip's own [`CONTROL_STRIP_ROWS`], plus at
 /// least 1 title row, plus at least 2 content rows below that) below
 /// which [`control_strip_fits`] rejects the strip in favor of the pre-
-/// strip single-row inline buttons -- the "~6 rows" threshold this
-/// strip's own brief named.
-const CONTROL_STRIP_MIN_PANEL_ROWS: u16 = 6;
+/// strip single-row inline buttons -- derived from [`CONTROL_STRIP_ROWS`]
+/// above, so it shrinks along with the strip's own resize.
+const CONTROL_STRIP_MIN_PANEL_ROWS: u16 = CONTROL_STRIP_ROWS + 1 + 2;
 /// Minimum panel width to fit at least 2 strip buttons side by side
 /// (`2 * CONTROL_STRIP_BUTTON_WIDTH + 1 * CONTROL_STRIP_BUTTON_GAP`) --
 /// this strip's own "too narrow to fit at least two buttons" threshold.
@@ -707,17 +750,21 @@ fn render_control_strip(
 /// Draws one action button inside a sidebar panel's own control-plane
 /// strip (see [`render_control_strip`]): a fixed [`CONTROL_STRIP_
 /// BUTTON_WIDTH`]-cell x [`CONTROL_STRIP_BUTTON_ROWS`]-row body hosting
-/// the SAME rail-tier `icons::sixel`/`icons::braille` asset the activity
-/// rail itself uses (see [`CONTROL_STRIP_BUTTON_ROWS`]'s own doc comment
-/// for why the braille tier's own 3rd dot row crops here). Background/
-/// bold treatment mirrors [`render_rail_button`]'s own `theme.active`
-/// at-rest body -- these are one-shot actions, never a persisted
-/// `selected` view the way `ControlSection` rail buttons are, the same
-/// "never shows as active" precedent as the rail's own Settings button.
-/// `RailIcons::Ascii` paints [`icons::ascii`]'s short (<=2 char) catalog
-/// label centered on the block, not the long bracket-text labels the
-/// pre-strip inline buttons used -- those were sized for a much wider
-/// single-row rect and cannot fit this fixed narrow body.
+/// the STRIP tier's own dedicated `icons::sixel_strip` asset / the pre-
+/// existing `icons::braille_compact` asset (see this module's own
+/// `CONTROL_STRIP_BUTTON_ROWS` doc comment for why braille reuses the
+/// compact tier rather than a dedicated strip bake) -- an EXACT fit for
+/// both, no cropping. Background/bold treatment mirrors [`render_rail_
+/// button`]'s own `theme.active` at-rest body -- these are one-shot
+/// actions, never a persisted `selected` view the way `ControlSection`
+/// rail buttons are, the same "never shows as active" precedent as the
+/// rail's own Settings button; in `Sixel` mode that also means this
+/// button only ever requests [`Theme::sixel_active_variant`], never
+/// [`Theme::sixel_accent_variant`] (see [`icons::SixelVariant`]'s own doc
+/// comment). `RailIcons::Ascii` paints [`icons::ascii`]'s short (<=2
+/// char) catalog label centered on the block, not the long bracket-text
+/// labels the pre-strip inline buttons used -- those were sized for a
+/// much wider single-row rect and cannot fit this fixed narrow body.
 fn render_control_strip_button(
     block: Rect,
     icon: icons::IconId,
@@ -737,18 +784,18 @@ fn render_control_strip_button(
             let icon_area = Rect::new(
                 block.x,
                 block.y,
-                block.width.min(icons::SIXEL_ICON_CELLS_WIDE),
-                block.height.min(icons::SIXEL_ICON_CELLS_TALL),
+                block.width.min(icons::STRIP_SIXEL_ICON_CELLS_WIDE),
+                block.height.min(icons::STRIP_SIXEL_ICON_CELLS_TALL),
             );
             layout.sixel_icons.push(SixelIconPlacement {
                 icon,
                 rect: icon_area,
-                selected: false,
-                size: SixelIconSize::Rail,
+                variant: theme.sixel_active_variant(),
+                size: SixelIconSize::Strip,
             });
         }
         RailIcons::Braille => {
-            icons::braille(icon).flush(block, buf);
+            icons::braille_compact(icon).flush(block, buf);
             matte_canvas_background(block, bg, buf);
         }
         RailIcons::Ascii => {
@@ -14644,14 +14691,17 @@ mod tests {
     }
 
     /// The control-plane strip's own NewFile/NewDirectory buttons: a
-    /// rail-tier baked icon (the SAME 40x40/8x12 assets the activity
-    /// rail itself uses -- see `render_control_strip_button`'s own doc
-    /// comment) in `Sixel`/`Braille` mode, and a short 2-char catalog
-    /// label (`icons::ascii`) in `Ascii` mode, NOT the pre-strip
-    /// bracket text -- the strip's fixed 4-cell body cannot fit
-    /// `"[+.]"`/`"[+>]"`. The load-bearing invariant carried over from
-    /// the pre-strip version: their own [`HitRegion`] rect is BYTE-
-    /// IDENTICAL across all three tiers (same position, same target).
+    /// strip-tier baked icon (`icons::sixel_strip`/`icons::braille_
+    /// compact` -- see `render_control_strip_button`'s own doc comment)
+    /// in `Sixel`/`Braille` mode, and a short 2-char catalog label
+    /// (`icons::ascii`) in `Ascii` mode, NOT the pre-strip bracket text --
+    /// the strip's fixed 2-cell body cannot fit `"[+.]"`/`"[+>]"`. The
+    /// load-bearing invariant carried over from the pre-strip version:
+    /// their own [`HitRegion`] rect is BYTE-IDENTICAL across all three
+    /// tiers (same position, same target). The sixel tier's own asset
+    /// also resolves to `GateActive` (this fixture's `PtyColorMode::
+    /// GateOverride`) -- cause 1's fix, see `icons::SixelVariant`'s own
+    /// doc comment.
     #[test]
     fn workspace_files_create_buttons_render_in_the_control_strip_per_tier() {
         let mut app = fixture(PtyColorMode::GateOverride);
@@ -14677,12 +14727,13 @@ mod tests {
         assert_eq!(new_directory_rect.height, CONTROL_STRIP_BUTTON_ROWS);
         assert!(sixel_layout.sixel_icons.iter().any(|placement| {
             placement.icon == icons::IconId::NewFile
-                && placement.size == crate::app::SixelIconSize::Rail
+                && placement.size == crate::app::SixelIconSize::Strip
+                && placement.variant == icons::SixelVariant::GateActive
                 && new_file_rect.contains(placement.rect.x, placement.rect.y)
         }));
         assert!(sixel_layout.sixel_icons.iter().any(|placement| {
             placement.icon == icons::IconId::NewFolder
-                && placement.size == crate::app::SixelIconSize::Rail
+                && placement.size == crate::app::SixelIconSize::Strip
                 && new_directory_rect.contains(placement.rect.x, placement.rect.y)
         }));
         let sixel_text = buffer_text(&sixel_buf);
@@ -14754,9 +14805,9 @@ mod tests {
     }
 
     /// The control-plane strip's own CreateWorktree/RemoveWorktree
-    /// buttons: rail-tier baked icons ([`icons::IconId::RepoForked`] /
+    /// buttons: strip-tier baked icons ([`icons::IconId::RepoForked`] /
     /// [`icons::IconId::Trash`]) in `Sixel`/`Braille` mode, icon-only --
-    /// the strip's fixed 4-cell body has no room for CreateWorktree's
+    /// the strip's fixed 2-cell body has no room for CreateWorktree's
     /// old "worktree" trailing text -- and a short 2-char catalog label
     /// in `Ascii` mode. `RemoveWorktree`'s own strip button targets
     /// whichever worktree `app.git_cursor` currently selects (the same
@@ -14804,12 +14855,13 @@ mod tests {
         assert_eq!(remove_rect.height, CONTROL_STRIP_BUTTON_ROWS);
         assert!(sixel_layout.sixel_icons.iter().any(|placement| {
             placement.icon == icons::IconId::RepoForked
-                && placement.size == crate::app::SixelIconSize::Rail
+                && placement.size == crate::app::SixelIconSize::Strip
+                && placement.variant == icons::SixelVariant::GateActive
                 && create_rect.contains(placement.rect.x, placement.rect.y)
         }));
         assert!(sixel_layout.sixel_icons.iter().any(|placement| {
             placement.icon == icons::IconId::Trash
-                && placement.size == crate::app::SixelIconSize::Rail
+                && placement.size == crate::app::SixelIconSize::Strip
                 && remove_rect.contains(placement.rect.x, placement.rect.y)
         }));
         assert!(!rect_text(&sixel_buf, create_rect).contains("worktree"));
@@ -14834,26 +14886,31 @@ mod tests {
         assert!(rect_text(&ascii_buf, remove_rect).contains(icons::ascii(icons::IconId::Trash)));
     }
 
-    /// The exact fallback thresholds this wave picked for [`control_strip_
-    /// fits`]: a panel needs >= 6 of its own rows (2 button rows + 1
-    /// separator + at least 1 title row + at least 2 content rows below
-    /// that) and >= 9 columns (room for at least 2 buttons, `2 * 4 + 1`
-    /// gap column) to host the strip; falling short of EITHER drops back
-    /// to the pre-strip single-row inline buttons (see `render_workspace_
-    /// files`/`render_workspace_git`'s own fallback branches).
+    /// The exact fallback thresholds this wave's own strip resize picked
+    /// for [`control_strip_fits`]: a panel needs >= 5 of its own rows (1
+    /// button row + 1 separator + at least 1 title row + at least 2
+    /// content rows below that) and >= 5 columns (room for at least 2
+    /// buttons, `2 * 2 + 1` gap column) to host the strip; falling short
+    /// of EITHER drops back to the pre-strip single-row inline buttons
+    /// (see `render_workspace_files`/`render_workspace_git`'s own
+    /// fallback branches). Both thresholds are DERIVED from [`CONTROL_
+    /// STRIP_BUTTON_WIDTH`]/[`CONTROL_STRIP_ROWS`], which shrank along
+    /// with the strip's own button body -- this test's own hardcoded
+    /// numbers must be updated by hand if either constant ever changes
+    /// again.
     #[test]
-    fn control_strip_fits_thresholds_are_six_rows_and_nine_columns() {
-        assert!(!control_strip_fits(Rect::new(0, 0, 40, 5)));
-        assert!(control_strip_fits(Rect::new(0, 0, 40, 6)));
-        assert!(!control_strip_fits(Rect::new(0, 0, 8, 40)));
-        assert!(control_strip_fits(Rect::new(0, 0, 9, 40)));
+    fn control_strip_fits_thresholds_are_five_rows_and_five_columns() {
+        assert!(!control_strip_fits(Rect::new(0, 0, 40, 4)));
+        assert!(control_strip_fits(Rect::new(0, 0, 40, 5)));
+        assert!(!control_strip_fits(Rect::new(0, 0, 4, 40)));
+        assert!(control_strip_fits(Rect::new(0, 0, 5, 40)));
     }
 
     /// Explorer's own control-plane strip: exactly [`CONTROL_STRIP_
     /// BUTTON_ROWS`] tall, NewFile/NewDirectory/AddSpace/RemoveSpace/
     /// Refresh left to right in that exact order, each [`CONTROL_STRIP_
     /// BUTTON_WIDTH`] cells wide with [`CONTROL_STRIP_BUTTON_GAP`]
-    /// between adjacent buttons, and each one's own baked rail-tier
+    /// between adjacent buttons, and each one's own baked strip-tier
     /// sixel icon placed INSIDE its own hit rect.
     #[test]
     fn explorer_control_strip_carries_the_specified_buttons_in_order() {
@@ -14895,10 +14952,10 @@ mod tests {
             assert!(
                 layout.sixel_icons.iter().any(|placement| {
                     placement.icon == icon
-                        && placement.size == crate::app::SixelIconSize::Rail
+                        && placement.size == crate::app::SixelIconSize::Strip
                         && hit.rect.contains(placement.rect.x, placement.rect.y)
                 }),
-                "{target:?} must place its rail-tier {icon:?} sixel icon inside its own hit rect: {:?}",
+                "{target:?} must place its strip-tier {icon:?} sixel icon inside its own hit rect: {:?}",
                 layout.sixel_icons,
             );
         }
@@ -14963,10 +15020,10 @@ mod tests {
             assert!(
                 layout.sixel_icons.iter().any(|placement| {
                     placement.icon == icon
-                        && placement.size == crate::app::SixelIconSize::Rail
+                        && placement.size == crate::app::SixelIconSize::Strip
                         && hit.rect.contains(placement.rect.x, placement.rect.y)
                 }),
-                "{target:?} must place its rail-tier {icon:?} sixel icon inside its own hit rect: {:?}",
+                "{target:?} must place its strip-tier {icon:?} sixel icon inside its own hit rect: {:?}",
                 layout.sixel_icons,
             );
         }
@@ -16017,14 +16074,15 @@ mod tests {
         let sixel_layout = render(&app, &mut sixel_buf);
         let sixel_text = rect_text(&sixel_buf, sixel_layout.activity_rail);
         // `app.control_section` defaults to `Files`, so the Explorer
-        // panel's own control-plane strip ALSO places rail-SIZED sixel
-        // icons this frame (`SixelIconSize::Rail`, the SAME tier the
-        // rail itself uses -- see `render_control_strip_button`'s own
-        // doc comment) -- filter to placements actually INSIDE the
-        // rail's own rect, the invariant this test actually covers (the
-        // strip's own coverage lives in `workspace_files_render_create_
-        // actions_and_entry_dialog` and the `explorer_control_strip_*`/
-        // `git_control_strip_*` tests).
+        // panel's own control-plane strip ALSO places STRIP-tier sixel
+        // icons this frame (`SixelIconSize::Strip`, a DIFFERENT, smaller
+        // tier than the rail's own `SixelIconSize::Rail` -- see `render_
+        // control_strip_button`'s own doc comment) -- filter to
+        // `SixelIconSize::Rail` placements actually INSIDE the rail's own
+        // rect, the invariant this test actually covers (the strip's own
+        // coverage lives in `workspace_files_render_create_actions_and_
+        // entry_dialog` and the `explorer_control_strip_*`/`git_control_
+        // strip_*` tests).
         let rail_sixel_icons = sixel_layout
             .sixel_icons
             .iter()
@@ -16055,11 +16113,11 @@ mod tests {
         }
         assert!(
             sixel_layout.sixel_icons.iter().any(|placement| {
-                placement.size == crate::app::SixelIconSize::Rail
+                placement.size == crate::app::SixelIconSize::Strip
                     && placement.icon == icons::IconId::NewFile
                     && !sixel_layout.activity_rail.contains(placement.rect.x, placement.rect.y)
             }),
-            "the default Files panel's own control-plane strip must also place a rail-tier NewFile sixel icon outside the rail: {:?}",
+            "the default Files panel's own control-plane strip must also place a strip-tier NewFile sixel icon outside the rail: {:?}",
             sixel_layout.sixel_icons,
         );
         assert!(!contains_braille_glyph(&sixel_text), "sixel mode must not paint braille cells: {sixel_text:?}");

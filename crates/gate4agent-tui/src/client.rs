@@ -1726,8 +1726,9 @@ fn flush_sixel_icon_into<W: io::Write>(writer: &mut W, app: &App, state: &mut Si
             continue;
         }
         let encoded = match placement.size {
-            SixelIconSize::Rail => icons::sixel(placement.icon),
+            SixelIconSize::Rail => icons::sixel(placement.icon, placement.variant),
             SixelIconSize::Compact => icons::sixel_compact(placement.icon),
+            SixelIconSize::Strip => icons::sixel_strip(placement.icon, placement.variant),
         };
         execute!(
             writer,
@@ -5436,14 +5437,14 @@ mod tests {
         gate4agent_node_protocol::NodeIncarnationId::from_bytes([byte; 16])
     }
 
-    fn sixel_placement(icon: icons::IconId, x: u16, selected: bool) -> SixelIconPlacement {
-        SixelIconPlacement { icon, rect: uzor_tui::Rect::new(x, 1, 4, 2), selected, size: SixelIconSize::Rail }
+    fn sixel_placement(icon: icons::IconId, x: u16, variant: icons::SixelVariant) -> SixelIconPlacement {
+        SixelIconPlacement { icon, rect: uzor_tui::Rect::new(x, 1, 4, 2), variant, size: SixelIconSize::Rail }
     }
 
     #[test]
     fn flush_sixel_icon_skips_a_second_emission_when_the_signature_is_unchanged() {
         let mut app = App::default();
-        app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 2, false)];
+        app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 2, icons::SixelVariant::Transparent)];
         let mut state = SixelEmitState::default();
         let mut written = Vec::new();
 
@@ -5456,30 +5457,32 @@ mod tests {
     }
 
     #[test]
-    fn flush_sixel_icon_reemits_when_the_rect_or_selection_changes() {
+    fn flush_sixel_icon_reemits_when_the_rect_or_variant_changes() {
         let mut app = App::default();
-        app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 2, false)];
+        app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 2, icons::SixelVariant::Transparent)];
         let mut state = SixelEmitState::default();
         let mut written = Vec::new();
         flush_sixel_icon_into(&mut written, &app, &mut state).unwrap();
         let after_first = written.len();
 
         // Moved: same icon, different rect.
-        app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 9, false)];
+        app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 9, icons::SixelVariant::Transparent)];
         flush_sixel_icon_into(&mut written, &app, &mut state).unwrap();
         assert!(written.len() > after_first, "a moved icon must trigger a fresh emission");
         let after_move = written.len();
 
-        // Selection flips: same icon, same rect, only `selected` differs.
-        app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 9, true)];
+        // Selection flips (in `PtyColorMode::GateOverride`, a rail button
+        // going from at-rest to selected re-resolves to a DIFFERENT
+        // pre-baked asset): same icon, same rect, only `variant` differs.
+        app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 9, icons::SixelVariant::GateAccent)];
         flush_sixel_icon_into(&mut written, &app, &mut state).unwrap();
-        assert!(written.len() > after_move, "a selection change must trigger a fresh emission even at the same rect");
+        assert!(written.len() > after_move, "a variant change must trigger a fresh emission even at the same rect");
     }
 
     #[test]
     fn flush_sixel_icon_force_next_reemits_even_with_an_unchanged_signature() {
         let mut app = App::default();
-        app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 2, false)];
+        app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 2, icons::SixelVariant::Transparent)];
         let mut state = SixelEmitState::default();
         let mut written = Vec::new();
         flush_sixel_icon_into(&mut written, &app, &mut state).unwrap();
@@ -5515,7 +5518,7 @@ mod tests {
         app.layout.sixel_icons = vec![SixelIconPlacement {
             icon: icons::IconId::NewFile,
             rect: uzor_tui::Rect::new(2, 1, 1, 1),
-            selected: false,
+            variant: icons::SixelVariant::Transparent,
             size: SixelIconSize::Compact,
         }];
         let mut state = SixelEmitState::default();
@@ -5527,8 +5530,66 @@ mod tests {
             "compact placement must emit the compact-tier sixel bytes"
         );
         assert!(
-            !output.contains(icons::sixel(icons::IconId::NewFile)),
+            !output.contains(icons::sixel(icons::IconId::NewFile, icons::SixelVariant::Transparent)),
             "compact placement must NOT emit the rail-tier sixel bytes"
+        );
+    }
+
+    #[test]
+    fn flush_sixel_icon_prints_the_strip_asset_for_a_strip_placement() {
+        // Same proof as `flush_sixel_icon_prints_the_compact_asset_for_a_
+        // compact_placement` above, for the (newer, smaller) strip tier:
+        // `icons::sixel_strip` is a DIFFERENT raster than both the rail
+        // and compact tiers' own for the same icon.
+        let mut app = App::default();
+        app.layout.sixel_icons = vec![SixelIconPlacement {
+            icon: icons::IconId::NewFile,
+            rect: uzor_tui::Rect::new(2, 1, 2, 1),
+            variant: icons::SixelVariant::Transparent,
+            size: SixelIconSize::Strip,
+        }];
+        let mut state = SixelEmitState::default();
+        let mut written = Vec::new();
+        flush_sixel_icon_into(&mut written, &app, &mut state).unwrap();
+        let output = String::from_utf8_lossy(&written);
+        assert!(
+            output.contains(icons::sixel_strip(icons::IconId::NewFile, icons::SixelVariant::Transparent)),
+            "strip placement must emit the strip-tier sixel bytes"
+        );
+        assert!(
+            !output.contains(icons::sixel(icons::IconId::NewFile, icons::SixelVariant::Transparent)),
+            "strip placement must NOT emit the rail-tier sixel bytes"
+        );
+        assert!(
+            !output.contains(icons::sixel_compact(icons::IconId::NewFile)),
+            "strip placement must NOT emit the compact-tier sixel bytes"
+        );
+    }
+
+    #[test]
+    fn flush_sixel_icon_prints_the_gate_variant_matching_the_placement() {
+        // `SixelVariant::GateActive`/`GateAccent` are DIFFERENT (pre-
+        // composited opaque) bytes from `Transparent` for the same icon
+        // and the same tier -- this proves `flush_sixel_icon_into` keys
+        // off `placement.variant`, not just `placement.size`.
+        let mut app = App::default();
+        app.layout.sixel_icons = vec![SixelIconPlacement {
+            icon: icons::IconId::Files,
+            rect: uzor_tui::Rect::new(2, 1, 4, 2),
+            variant: icons::SixelVariant::GateAccent,
+            size: SixelIconSize::Rail,
+        }];
+        let mut state = SixelEmitState::default();
+        let mut written = Vec::new();
+        flush_sixel_icon_into(&mut written, &app, &mut state).unwrap();
+        let output = String::from_utf8_lossy(&written);
+        assert!(
+            output.contains(icons::sixel(icons::IconId::Files, icons::SixelVariant::GateAccent)),
+            "GateAccent placement must emit the GateAccent-variant sixel bytes"
+        );
+        assert!(
+            !output.contains(icons::sixel(icons::IconId::Files, icons::SixelVariant::Transparent)),
+            "GateAccent placement must NOT emit the Transparent-variant sixel bytes"
         );
     }
 

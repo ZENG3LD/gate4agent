@@ -63,6 +63,94 @@ What this does, every run:
 Nothing here is a build-time Cargo dependency -- `resvg`/`ffmpeg` run
 once, offline, from a developer's own PATH, producing checked-in
 `.rgba` files `include_bytes!`'d at compile time (see `src/icons.rs`).
+
+## Quality pass (dirty edges / blurred strokes / control-strip resize)
+
+Two defects diagnosed against the running TUI, both verified against this
+tool's own pipeline (not taken on faith) before fixing:
+
+1. DIRTY EDGES -- CONFIRMED, root cause identified precisely. Every sixel
+   asset was baked with a transparent background and encoded via
+   `icy_sixel::BackgroundMode::Transparent`. `icy_sixel` 0.6's own encoder
+   (`encoder.rs::sixel_encode_impl`) applies a HARD alpha>=128 opacity
+   threshold per pixel -- there is no partial-coverage/blend information
+   in the encoded SIXEL stream at all, only "fully drawn, at this pixel's
+   flat ink colour" or "fully undrawn". Windows Terminal's own sixel
+   decoder does not implement the "undrawn -> show whatever is already
+   there" transparency semantics DEC's P2=1 mode specifies, so "undrawn"
+   pixels do not read as transparent in practice. FIX: composite every
+   icon over the EXACT background colour the button paints (`GATE_ACTIVE_
+   BG_RGB`/`GATE_ACCENT_BG_RGB` below, hand-synced to `render.rs`'s own
+   `ACTIVE_BG`/`MAUVE`), fully opaque, so the encoder's threshold and the
+   terminal's transparency support both become irrelevant -- there is no
+   transparent pixel left to mishandle. This is done as a SEPARATE, pure-
+   Python compositing pass (`composite_over_background`) over an already-
+   rasterized buffer -- never a second resvg/ffmpeg call -- so it can
+   never regress into cause 2's own double-resampling anti-pattern. Only
+   possible for `PtyColorMode::GateOverride`, whose panel/rail colours are
+   fixed, known constants; `PtyColorMode::Inherited` has no knowable exact
+   background (crossterm has no reliable query for the terminal's own
+   background colour, the same gap `icons.rs::ASSUMED_CELL_WIDTH_PX`'s own
+   doc comment already names for cell-pixel size) and keeps the original
+   transparent-encoded asset as its only available option. The rail tier
+   has two backgrounds (`theme.active` at rest, `theme.accent` selected)
+   so it gets two composited variants (`SixelVariant::GateActive`/
+   `GateAccent`); the new strip tier below has exactly one (control-strip
+   buttons never show a selected state), so it gets one.
+
+2. BLURRED STROKES -- diagnosed as "rasterized on a non-integer scale from
+   a 24-unit source grid"; PARTIALLY CONFIRMED, PARTIALLY REFUTED once
+   checked against the actual 57-icon manifest and the actual pipeline:
+   - The "24-unit grid" premise is WRONG for most of this set: 52/57
+     source SVGs use a 16x16 viewBox, only 4 use 24x24 (`files`,
+     `settings-gear`, `source-control`, `terminal`) and 1 uses 24x25
+     (`output`, already a documented exception elsewhere in this file).
+   - The "second ffmpeg downscale" claim is REFUTED for every SIXEL tier:
+     `rasterize_sixel`/`rasterize_compact_sixel` each do exactly ONE
+     resvg pass, directly at the target pixel size, followed only by a
+     SAME-SIZE ffmpeg pad (verified at authoring time: a fresh direct
+     `resvg -w 40 -h 40`+identity-pad rebake is byte-for-byte identical to
+     the checked-in `check.rgba`). The braille tiers DO supersample-then-
+     area-downscale, but that is a deliberate, necessary coverage
+     computation for per-dot alpha thresholding, not a source of visible
+     blur (braille's own final output is a binary lit/unlit dot pattern
+     after `choose_threshold`, which a soft source edge does not survive
+     unchanged either way).
+   - The underlying mechanism IS real, though: rasterizing a straight,
+     axis-aligned 1-source-unit stroke at a size that is not an integer
+     multiple of its own source grid measurably softens it. Verified
+     directly: `add.svg`'s (16-unit grid) plus-sign bar, rasterized via a
+     single direct resvg pass, comes out as a crisp `[255]`/`[255, 255]`/
+     `[255, 255, 255]` alpha run at 16/32/48px (exact multiples of 16) but
+     a soft `[128, 255, 255]` run (one half-opacity fringe pixel) at the
+     rail's own current 40px (40/16 = 2.5x, non-integer).
+   FIX applied given the above: the new strip tier below (~20x20px,
+   forced by the required 2-cell x 1-row button footprint, itself not an
+   integer multiple of either 16 or 24) uses a single resvg AA pass
+   DIRECTLY at that target size -- the third option this task's own brief
+   named ("the target size with resvg's own high-quality AA applied
+   ONCE"), and the only one available without either breaking the
+   required button footprint or reintroducing a second resampling pass.
+   The pre-existing rail (40x40) and compact (10x20) tiers keep their
+   current pixel sizes unchanged -- neither's geometry is in this task's
+   scope (rail geometry is explicitly frozen; compact tier is untouched
+   panel content) -- so their modest, now-measured softening on axis-
+   aligned strokes is a real but small, pre-existing, out-of-scope
+   residual; cause 1's fix (the dominant defect by far) still applies to
+   the rail tier's own pixel CONTENT (not its size) via the composited
+   `GateActive`/`GateAccent` variants above.
+
+Also: every sixel encode (all tiers, all variants) now goes through
+`icons.rs::icon_encode_options()` -- `max_colors: 32` (was the library's
+own default of 256) and `diffusion: 0.0` (was Floyd-Steinberg dithering
+on by default) -- "encode with a small explicit palette" per this task's
+own brief. A composited icon's true colour count is just its own number
+of distinct alpha/coverage levels (measured on real baked assets at
+authoring time: 6-26 across this manifest), so 32 is generous headroom,
+not a visible compression; dithering exists to fake extra apparent colours
+via spatial noise for photographic content and only ever adds speckle
+noise to a flat-colour UI glyph like these, so it is switched off outright
+rather than tuned down.
 """
 
 from __future__ import annotations
@@ -114,6 +202,28 @@ COMPACT_BRAILLE_TOTAL_DOTS = COMPACT_BRAILLE_FINAL_W * COMPACT_BRAILLE_FINAL_H
 
 COMPACT_SIXEL_RGBA_LEN = COMPACT_SIXEL_PX_W * COMPACT_SIXEL_PX_H * 4
 COMPACT_BRAILLE_RGBA_LEN = COMPACT_BRAILLE_FINAL_W * COMPACT_BRAILLE_FINAL_H * 4
+
+# ---- Strip tier (sidebar content panels' own control-plane strip -- see
+# `render::render_control_strip`/`render_control_strip_button`) -- 2 cells
+# wide x 1 row tall, exactly `icons::STRIP_SIXEL_ICON_WIDTH_PX`/`_HEIGHT_
+# PX` (keep these two numbers in sync with that Rust module by hand, same
+# precedent as `COMPACT_SIXEL_PX_W`/`_H` above). SIXEL only -- the strip's
+# own braille tier reuses the COMPACT braille assets/constants above
+# unchanged (that tier's own 4x4-dot / 2-cell-wide-x-1-row footprint
+# already matches this tier's required geometry exactly), so there is no
+# separate `STRIP_BRAILLE_*` bake.
+STRIP_SIXEL_PX_W = 20
+STRIP_SIXEL_PX_H = 20
+STRIP_SIXEL_RGBA_LEN = STRIP_SIXEL_PX_W * STRIP_SIXEL_PX_H * 4
+
+# ---- GateOverride compositing (cause 1's fix -- see this module's own
+# header doc comment). Hand-synced to render.rs's own fixed theme
+# constants: `ACTIVE_BG` (the rail/strip button body's own "at rest"
+# colour) and `MAUVE` (`theme.accent`, the rail's own "selected" colour).
+# `PtyColorMode::GateOverride` only -- see `icons::SixelVariant`'s own doc
+# comment for why `PtyColorMode::Inherited` has no equivalent.
+GATE_ACTIVE_BG_RGB = (30, 30, 46)  # render.rs::ACTIVE_BG
+GATE_ACCENT_BG_RGB = (203, 166, 247)  # render.rs::MAUVE / theme.accent
 
 # Proportional to `MIN_LIT_DOTS_TARGET`'s own 18/96 (~19%) share of the
 # rail tier's 96 total dots, applied to the compact braille tier's own
@@ -538,11 +648,110 @@ def rasterize_compact_braille(patched_svg: Path, out_rgba: Path) -> None:
         die(f"compact braille raster for {patched_svg} produced {actual} bytes, expected {COMPACT_BRAILLE_RGBA_LEN}")
 
 
-def ensure_assets(spec: IconSpec, cache_dir: Path, force: bool) -> tuple[Path, Path]:
-    """Ensure both `.rgba` outputs for `spec` exist on disk, baking
-    whatever is missing (or everything, if `force`). Returns their paths.
-    This is the idempotency boundary: a normal re-run with nothing new to
-    bake touches no network and spawns no subprocess at all."""
+def svg_intrinsic_size(svg_path: Path) -> tuple[int, int]:
+    """Read the root `<svg>`'s own `width="..."` / `height="..."` (both
+    always present, always an integer pixel-equivalent unit count, on
+    every codicon source in this manifest -- verified against all 57 at
+    authoring time, same verification precedent as `patch_fill`'s own
+    `fill="currentColor"` count check). Used to precompute exact
+    fit-within target dimensions ourselves rather than relying on
+    resvg's own dual `-w`/`-h` rounding, which was found (at authoring
+    time, baking the strip tier below -- see this module's own header
+    doc comment) to occasionally round a non-square source's OTHER axis
+    slightly PAST a small requested box: `output.svg`'s 24x25 (the one
+    documented non-square exception) rasterized to 20x21 -- one pixel
+    too tall -- when asked to fit within 20x20 directly, even though the
+    correct floor-rounded fit is 19x20."""
+    text = svg_path.read_text(encoding="utf-8")
+    width_match = re.search(r'\bwidth="(\d+)"', text)
+    height_match = re.search(r'\bheight="(\d+)"', text)
+    if not width_match or not height_match:
+        die(f"{svg_path} has no numeric width=/height= on its root <svg> -- cannot compute a fit-within size")
+    return int(width_match.group(1)), int(height_match.group(1))
+
+
+def fit_within(src_w: int, src_h: int, box_w: int, box_h: int) -> tuple[int, int]:
+    """Standard "fit within a `box_w`x`box_h` box, preserve aspect, never
+    exceed either bound" -- floor-rounded so the result can never round UP
+    past the box (see `svg_intrinsic_size`'s own doc comment for why this
+    is computed by hand rather than left to resvg's own `-w`/`-h`
+    rounding)."""
+    scale = min(box_w / src_w, box_h / src_h)
+    return max(1, int(src_w * scale)), max(1, int(src_h * scale))
+
+
+def rasterize_strip_sixel(patched_svg: Path, out_rgba: Path) -> None:
+    """Control-plane strip tier: fit-within `STRIP_SIXEL_PX_W`x`_H` (2
+    cells wide x 1 row tall, exactly the button's own full body -- unlike
+    the rail tier's own square crop of a taller body, see `../icons.rs`'s
+    own `SIXEL_ICON_WIDTH_PX` doc comment). Single resvg pass DIRECTLY at
+    the target size -- the same "rasterize once, at the target size, with
+    resvg's own high-quality AA" recipe `rasterize_sixel`/`rasterize_
+    compact_sixel` already use (see this module's own header doc comment's
+    cause-2 note: there is no larger intermediate render and no second
+    ffmpeg scale here, only a same-size pad) -- except the exact fit-within
+    pixel size handed to resvg is precomputed by hand (`svg_intrinsic_
+    size`/`fit_within`) rather than resvg's own `-w`/`-h`, to sidestep a
+    rounding edge case at this tier's own small absolute size (see `svg_
+    intrinsic_size`'s own doc comment).
+
+    Equivalent hand-run commands (for a square 16x16/24x24 source; a non-
+    square source like `output.svg` fits within 20x20 first, see above):
+        resvg -w 20 -h 20 <slug>.patched.svg <slug>_raw.png
+        ffmpeg -i <slug>_raw.png \\
+            -vf "pad=20:20:(ow-iw)/2:(oh-ih)/2:color=black@0.0" \\
+            -f rawvideo -pix_fmt rgba <slug>_strip.rgba
+    """
+    fit_w, fit_h = fit_within(*svg_intrinsic_size(patched_svg), STRIP_SIXEL_PX_W, STRIP_SIXEL_PX_H)
+    with tempfile.TemporaryDirectory() as tmp:
+        raw_png = Path(tmp) / "raw.png"
+        run_tool(["resvg", "-w", str(fit_w), "-h", str(fit_h), str(patched_svg), str(raw_png)])
+        run_tool([
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", str(raw_png),
+            "-vf", f"pad={STRIP_SIXEL_PX_W}:{STRIP_SIXEL_PX_H}:(ow-iw)/2:(oh-ih)/2:color=black@0.0",
+            "-f", "rawvideo", "-pix_fmt", "rgba",
+            str(out_rgba),
+        ])
+    actual = out_rgba.stat().st_size
+    if actual != STRIP_SIXEL_RGBA_LEN:
+        die(f"strip sixel raster for {patched_svg} produced {actual} bytes, expected {STRIP_SIXEL_RGBA_LEN}")
+
+
+def composite_over_background(rgba: bytes, bg: tuple[int, int, int]) -> bytes:
+    """Cause 1's actual fix: alpha-composite a straight (non-premultiplied)
+    RGBA buffer -- resvg's own convention, where a partially-covered "ink"
+    pixel's RGB channels stay at the flat fill colour regardless of alpha,
+    verified in `../icons.rs`'s own module doc -- over a flat, fully
+    opaque `bg` colour, per pixel: `out = ink * (a/255) + bg * (1 - a/255)`,
+    `out_alpha = 255` throughout. Pure arithmetic over an ALREADY-
+    rasterized buffer -- same width/height in and out, no interpolation --
+    so this can never become a second resampling pass (see this module's
+    own header doc comment on why that distinction matters for cause 2).
+    The icon's own ink colour is already `#cdd6f4` from `patch_fill`
+    above, so no separate "tint to the theme foreground" step is needed
+    here -- the source is already the right colour, this only decides what
+    shows through where it is not fully opaque."""
+    bg_r, bg_g, bg_b = bg
+    out = bytearray(len(rgba))
+    for i in range(0, len(rgba), 4):
+        r, g, b, a = rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]
+        inv = 255 - a
+        out[i] = (r * a + bg_r * inv + 127) // 255
+        out[i + 1] = (g * a + bg_g * inv + 127) // 255
+        out[i + 2] = (b * a + bg_b * inv + 127) // 255
+        out[i + 3] = 255
+    return bytes(out)
+
+
+def ensure_assets(spec: IconSpec, cache_dir: Path, force: bool) -> tuple[Path, Path, Path, Path]:
+    """Ensure every rail-tier `.rgba` output for `spec` exists on disk,
+    baking whatever is missing (or everything, if `force`). Returns
+    (sixel, braille, gate_active, gate_accent) paths. This is the
+    idempotency boundary: a normal re-run with nothing new to bake touches
+    no network and spawns no subprocess at all -- the two GateOverride
+    variants are pure Python derived from the already-baked transparent
+    sixel bytes, so they cost nothing extra even on a cold cache."""
     sixel_path = ICONS_DIR / f"{spec.stem()}.rgba"
     braille_path = ICONS_DIR / f"{spec.stem()}_braille.rgba"
 
@@ -557,7 +766,59 @@ def ensure_assets(spec: IconSpec, cache_dir: Path, force: bool) -> tuple[Path, P
         if need_braille:
             rasterize_braille(patched, braille_path)
 
-    return sixel_path, braille_path
+    active_path, accent_path = ensure_gate_variants(sixel_path, force)
+
+    return sixel_path, braille_path, active_path, accent_path
+
+
+def ensure_gate_variants(sixel_path: Path, force: bool) -> tuple[Path, Path]:
+    """Derive `<stem>_gate_active.rgba` / `<stem>_gate_accent.rgba` --
+    cause 1's fix for the rail tier: the SAME 40x40 pixels `sixel_path`
+    already has, alpha-composited (`composite_over_background`, pure
+    Python, no subprocess) over `GATE_ACTIVE_BG_RGB`/`GATE_ACCENT_BG_RGB`.
+    `PtyColorMode::GateOverride`'s own two fixed rail button backgrounds
+    (at rest / selected) are known exactly at bake time, so there is no
+    reason to ship a transparent image and hope the terminal blends it --
+    see this module's own header doc comment."""
+    stem = sixel_path.name.removesuffix(".rgba")
+    active_path = ICONS_DIR / f"{stem}_gate_active.rgba"
+    accent_path = ICONS_DIR / f"{stem}_gate_accent.rgba"
+    need_active = force or not active_path.exists() or active_path.stat().st_size != SIXEL_RGBA_LEN
+    need_accent = force or not accent_path.exists() or accent_path.stat().st_size != SIXEL_RGBA_LEN
+    if need_active or need_accent:
+        source = sixel_path.read_bytes()
+        if need_active:
+            active_path.write_bytes(composite_over_background(source, GATE_ACTIVE_BG_RGB))
+        if need_accent:
+            accent_path.write_bytes(composite_over_background(source, GATE_ACCENT_BG_RGB))
+    return active_path, accent_path
+
+
+def ensure_strip_assets(spec: IconSpec, cache_dir: Path, force: bool) -> tuple[Path, Path]:
+    """Ensure the control-plane strip's own two sixel-tier outputs:
+    `<stem>_strip.rgba` (transparent, single-pass resvg raster directly at
+    the strip's own 20x20 target -- see `rasterize_strip_sixel`) and
+    `<stem>_strip_gate.rgba` (the same pixels alpha-composited over
+    `GATE_ACTIVE_BG_RGB`, pure Python, no second raster pass -- see
+    `composite_over_background`). The strip never shows a `selected`
+    state (see `render::render_control_strip_button`'s own doc comment),
+    so there is no `_strip_gate_accent` variant."""
+    transparent_path = ICONS_DIR / f"{spec.stem()}_strip.rgba"
+    gate_path = ICONS_DIR / f"{spec.stem()}_strip_gate.rgba"
+    need_transparent = force or not transparent_path.exists() or transparent_path.stat().st_size != STRIP_SIXEL_RGBA_LEN
+    need_gate = force or not gate_path.exists() or gate_path.stat().st_size != STRIP_SIXEL_RGBA_LEN
+
+    if need_transparent:
+        svg = fetch_svg(spec.slug, cache_dir)
+        patched = patch_fill(svg, spec.slug, cache_dir)
+        rasterize_strip_sixel(patched, transparent_path)
+    if need_gate:
+        # Always re-read from disk rather than threading a maybe-stale
+        # in-memory copy through: correct whether or not `need_transparent`
+        # was also true this run.
+        gate_path.write_bytes(composite_over_background(transparent_path.read_bytes(), GATE_ACTIVE_BG_RGB))
+
+    return transparent_path, gate_path
 
 
 def ensure_compact_assets(spec: IconSpec, cache_dir: Path, force: bool) -> tuple[Path, Path]:
@@ -742,7 +1003,8 @@ def generate_catalog(analyses: dict[str, ThresholdChoice], compact_analyses: dic
     lines.append("use uzor_tui::canvas::{CanvasMode, PixelCanvas};")
     lines.append("")
     lines.append("use super::{")
-    lines.append("    build_sixel, build_sixel_compact, rgba_to_canvas, BRAILLE_ICON_CELLS_TALL, BRAILLE_ICON_CELLS_WIDE,")
+    lines.append("    build_sixel, build_sixel_compact, build_sixel_gate, build_sixel_strip, build_sixel_strip_gate,")
+    lines.append("    rgba_to_canvas, SixelVariant, BRAILLE_ICON_CELLS_TALL, BRAILLE_ICON_CELLS_WIDE,")
     lines.append("    COMPACT_BRAILLE_ICON_CELLS_TALL, COMPACT_BRAILLE_ICON_CELLS_WIDE,")
     lines.append("};")
     lines.append("")
@@ -765,13 +1027,34 @@ def generate_catalog(analyses: dict[str, ThresholdChoice], compact_analyses: dic
     lines.append("    ];")
     lines.append("}")
     lines.append("")
-    lines.append("/// Encoded sixel string for `id` -- see `../icons.rs::build_sixel`'s own")
-    lines.append("/// doc comment for why this is cached (`LazyLock`) rather than re-encoded")
+    lines.append("/// Encoded rail-tier sixel string for `id` at `variant`'s own background")
+    lines.append("/// (see [`SixelVariant`]'s own doc comment) -- see `../icons.rs::build_sixel`'s")
+    lines.append("/// own doc comment for why this is cached (`LazyLock`) rather than re-encoded")
     lines.append("/// per call.")
-    lines.append("pub fn sixel(id: IconId) -> &'static str {")
+    lines.append("pub fn sixel(id: IconId, variant: SixelVariant) -> &'static str {")
     lines.append("    match id {")
     for spec in MANIFEST:
-        lines.append(f"        IconId::{spec.rust_name} => {to_screaming_snake(spec.rust_name)}_SIXEL.as_str(),")
+        upper = to_screaming_snake(spec.rust_name)
+        lines.append(f"        IconId::{spec.rust_name} => match variant {{")
+        lines.append(f"            SixelVariant::Transparent => {upper}_SIXEL.as_str(),")
+        lines.append(f"            SixelVariant::GateActive => {upper}_SIXEL_GATE_ACTIVE.as_str(),")
+        lines.append(f"            SixelVariant::GateAccent => {upper}_SIXEL_GATE_ACCENT.as_str(),")
+        lines.append("        },")
+    lines.append("    }")
+    lines.append("}")
+    lines.append("")
+    lines.append("/// Encoded control-plane-strip-tier sixel string for `id` at `variant`'s")
+    lines.append("/// own background -- the strip never shows a selected state (see `../")
+    lines.append("/// render.rs::render_control_strip_button`'s own doc comment), so")
+    lines.append("/// `GateAccent` resolves to the SAME asset as `GateActive` here.")
+    lines.append("pub fn sixel_strip(id: IconId, variant: SixelVariant) -> &'static str {")
+    lines.append("    match id {")
+    for spec in MANIFEST:
+        upper = to_screaming_snake(spec.rust_name)
+        lines.append(f"        IconId::{spec.rust_name} => match variant {{")
+        lines.append(f"            SixelVariant::Transparent => {upper}_SIXEL_STRIP.as_str(),")
+        lines.append(f"            SixelVariant::GateActive | SixelVariant::GateAccent => {upper}_SIXEL_STRIP_GATE.as_str(),")
+        lines.append("        },")
     lines.append("    }")
     lines.append("}")
     lines.append("")
@@ -850,6 +1133,38 @@ def generate_catalog(analyses: dict[str, ThresholdChoice], compact_analyses: dic
     lines.append("    }")
     lines.append("}")
     lines.append("")
+    lines.append("#[cfg(test)]")
+    lines.append("pub(crate) fn sixel_gate_active_source_rgba(id: IconId) -> &'static [u8] {")
+    lines.append("    match id {")
+    for spec in MANIFEST:
+        lines.append(f"        IconId::{spec.rust_name} => {to_screaming_snake(spec.rust_name)}_GATE_ACTIVE_RGBA,")
+    lines.append("    }")
+    lines.append("}")
+    lines.append("")
+    lines.append("#[cfg(test)]")
+    lines.append("pub(crate) fn sixel_gate_accent_source_rgba(id: IconId) -> &'static [u8] {")
+    lines.append("    match id {")
+    for spec in MANIFEST:
+        lines.append(f"        IconId::{spec.rust_name} => {to_screaming_snake(spec.rust_name)}_GATE_ACCENT_RGBA,")
+    lines.append("    }")
+    lines.append("}")
+    lines.append("")
+    lines.append("#[cfg(test)]")
+    lines.append("pub(crate) fn sixel_strip_source_rgba(id: IconId) -> &'static [u8] {")
+    lines.append("    match id {")
+    for spec in MANIFEST:
+        lines.append(f"        IconId::{spec.rust_name} => {to_screaming_snake(spec.rust_name)}_STRIP_RGBA,")
+    lines.append("    }")
+    lines.append("}")
+    lines.append("")
+    lines.append("#[cfg(test)]")
+    lines.append("pub(crate) fn sixel_strip_gate_source_rgba(id: IconId) -> &'static [u8] {")
+    lines.append("    match id {")
+    for spec in MANIFEST:
+        lines.append(f"        IconId::{spec.rust_name} => {to_screaming_snake(spec.rust_name)}_STRIP_GATE_RGBA,")
+    lines.append("    }")
+    lines.append("}")
+    lines.append("")
 
     for spec in MANIFEST:
         upper = to_screaming_snake(spec.rust_name)
@@ -860,6 +1175,17 @@ def generate_catalog(analyses: dict[str, ThresholdChoice], compact_analyses: dic
         lines.append("")
         lines.append(f'const {upper}_RGBA: &[u8] = include_bytes!("{spec.stem()}.rgba");')
         lines.append(f"static {upper}_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel({upper}_RGBA));")
+        lines.append("")
+        lines.append("/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited")
+        lines.append("/// opaque at bake time, cause 1's own fix (see this crate's own `tools/")
+        lines.append("/// bake_icons.py` module doc).")
+        lines.append(f'const {upper}_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("{spec.stem()}_gate_active.rgba");')
+        lines.append(f"static {upper}_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate({upper}_GATE_ACTIVE_RGBA));")
+        lines.append("")
+        lines.append("/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,")
+        lines.append("/// the rail's own selected-state background.")
+        lines.append(f'const {upper}_GATE_ACCENT_RGBA: &[u8] = include_bytes!("{spec.stem()}_gate_accent.rgba");')
+        lines.append(f"static {upper}_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate({upper}_GATE_ACCENT_RGBA));")
         lines.append("")
         lines.append(f'const {upper}_BRAILLE_RGBA: &[u8] = include_bytes!("{spec.stem()}_braille.rgba");')
         if spec.slug in LEGACY_RAIL_SLUGS:
@@ -909,6 +1235,14 @@ def generate_catalog(analyses: dict[str, ThresholdChoice], compact_analyses: dic
         lines.append("    )")
         lines.append("});")
         lines.append("")
+        lines.append(f'const {upper}_STRIP_RGBA: &[u8] = include_bytes!("{spec.stem()}_strip.rgba");')
+        lines.append(f"static {upper}_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip({upper}_STRIP_RGBA));")
+        lines.append("")
+        lines.append("/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --")
+        lines.append("/// pre-composited opaque at bake time, same fix as the rail tier above.")
+        lines.append(f'const {upper}_STRIP_GATE_RGBA: &[u8] = include_bytes!("{spec.stem()}_strip_gate.rgba");')
+        lines.append(f"static {upper}_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate({upper}_STRIP_GATE_RGBA));")
+        lines.append("")
 
     return "\n".join(lines) + "\n"
 
@@ -923,7 +1257,9 @@ def print_report(
     analyses: dict[str, ThresholdChoice],
     compact_analyses: dict[str, CompactThresholdChoice],
     asset_sizes: dict[str, tuple[int, int, bool]],
+    gate_asset_sizes: dict[str, tuple[int, int, bool]],
     compact_asset_sizes: dict[str, tuple[int, int, bool]],
+    strip_asset_sizes: dict[str, tuple[int, int, bool]],
 ) -> None:
     print()
     print("=" * 78)
@@ -962,6 +1298,11 @@ def print_report(
     print(f"Icons total: {len(MANIFEST)}  (newly baked this run: {n_new})")
     print(f"Sixel tier:   {total_sixel:>9} bytes total ({total_sixel / 1024:.1f} KiB)  -- {newly_baked_sixel} bytes newly added")
     print(f"Braille tier: {total_braille:>9} bytes total ({total_braille / 1024:.1f} KiB) -- {newly_baked_braille} bytes newly added")
+    total_gate = total_compact_sixel = total_compact_braille = total_strip = 0
+    if gate_asset_sizes:
+        total_gate = sum(a + c for a, c, _ in gate_asset_sizes.values())
+        newly_baked_gate = sum(a + c for a, c, new in gate_asset_sizes.values() if new)
+        print(f"Rail GateOverride variants (active+accent): {total_gate:>9} bytes total ({total_gate / 1024:.1f} KiB) -- {newly_baked_gate} bytes newly added")
     if compact_asset_sizes:
         total_compact_sixel = sum(s for s, _, _ in compact_asset_sizes.values())
         total_compact_braille = sum(b for _, b, _ in compact_asset_sizes.values())
@@ -969,11 +1310,13 @@ def print_report(
         newly_baked_compact_braille = sum(b for _, b, new in compact_asset_sizes.values() if new)
         print(f"Compact sixel tier:   {total_compact_sixel:>9} bytes total ({total_compact_sixel / 1024:.1f} KiB)  -- {newly_baked_compact_sixel} bytes newly added")
         print(f"Compact braille tier: {total_compact_braille:>9} bytes total ({total_compact_braille / 1024:.1f} KiB) -- {newly_baked_compact_braille} bytes newly added")
-    else:
-        total_compact_sixel = total_compact_braille = 0
+    if strip_asset_sizes:
+        total_strip = sum(t + g for t, g, _ in strip_asset_sizes.values())
+        newly_baked_strip = sum(t + g for t, g, new in strip_asset_sizes.values() if new)
+        print(f"Strip sixel tier (transparent+gate): {total_strip:>9} bytes total ({total_strip / 1024:.1f} KiB) -- {newly_baked_strip} bytes newly added")
     print(
-        f"Combined:     {total_sixel + total_braille + total_compact_sixel + total_compact_braille:>9} bytes total "
-        f"({(total_sixel + total_braille + total_compact_sixel + total_compact_braille) / 1024:.1f} KiB)"
+        f"Combined:     {total_sixel + total_braille + total_gate + total_compact_sixel + total_compact_braille + total_strip:>9} bytes total "
+        f"({(total_sixel + total_braille + total_gate + total_compact_sixel + total_compact_braille + total_strip) / 1024:.1f} KiB)"
     )
     if CATALOG_RS.exists():
         catalog_size = CATALOG_RS.stat().st_size
@@ -1000,14 +1343,23 @@ def main(argv: list[str]) -> int:
 
     analyses: dict[str, ThresholdChoice] = {}
     asset_sizes: dict[str, tuple[int, int, bool]] = {}
+    gate_asset_sizes: dict[str, tuple[int, int, bool]] = {}
     compact_analyses: dict[str, CompactThresholdChoice] = {}
     compact_asset_sizes: dict[str, tuple[int, int, bool]] = {}
+    strip_asset_sizes: dict[str, tuple[int, int, bool]] = {}
     for spec in selected:
         sixel_existed = (ICONS_DIR / f"{spec.stem()}.rgba").exists()
         braille_existed = (ICONS_DIR / f"{spec.stem()}_braille.rgba").exists()
-        sixel_path, braille_path = ensure_assets(spec, args.cache_dir, args.force)
+        active_existed = (ICONS_DIR / f"{spec.stem()}_gate_active.rgba").exists()
+        accent_existed = (ICONS_DIR / f"{spec.stem()}_gate_accent.rgba").exists()
+        sixel_path, braille_path, active_path, accent_path = ensure_assets(spec, args.cache_dir, args.force)
         newly_baked = args.force or not sixel_existed or not braille_existed
         asset_sizes[spec.slug] = (sixel_path.stat().st_size, braille_path.stat().st_size, newly_baked)
+        gate_asset_sizes[spec.slug] = (
+            active_path.stat().st_size,
+            accent_path.stat().st_size,
+            args.force or not active_existed or not accent_existed,
+        )
         rgba = braille_path.read_bytes()
         analyses[spec.slug] = choose_threshold(rgba, THRESHOLD_OVERRIDES.get(spec.slug))
 
@@ -1019,6 +1371,15 @@ def main(argv: list[str]) -> int:
         compact_rgba = compact_braille_path.read_bytes()
         compact_analyses[spec.slug] = choose_compact_threshold(compact_rgba, COMPACT_THRESHOLD_OVERRIDES.get(spec.slug))
 
+        strip_existed = (ICONS_DIR / f"{spec.stem()}_strip.rgba").exists()
+        strip_gate_existed = (ICONS_DIR / f"{spec.stem()}_strip_gate.rgba").exists()
+        strip_path, strip_gate_path = ensure_strip_assets(spec, args.cache_dir, args.force)
+        strip_asset_sizes[spec.slug] = (
+            strip_path.stat().st_size,
+            strip_gate_path.stat().st_size,
+            args.force or not strip_existed or not strip_gate_existed,
+        )
+
     if only is None:
         # Full manifest processed -- every icon has assets on disk and an
         # analysis in hand, safe to regenerate the complete catalog.
@@ -1027,7 +1388,7 @@ def main(argv: list[str]) -> int:
     else:
         print(f"--only restricted this run to {sorted(only)} -- catalog.rs NOT regenerated (needs the full manifest)")
 
-    print_report(analyses, compact_analyses, asset_sizes, compact_asset_sizes)
+    print_report(analyses, compact_analyses, asset_sizes, gate_asset_sizes, compact_asset_sizes, strip_asset_sizes)
     return 0
 
 

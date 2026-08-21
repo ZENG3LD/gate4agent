@@ -7,13 +7,14 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::{
-    cursor::{Hide, MoveTo, Show},
+    cursor::{Hide, MoveTo, RestorePosition, SavePosition, Show},
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
         EnableMouseCapture, Event as TerminalEvent, KeyCode, KeyEvent, KeyEventKind,
         KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
+    style::Print,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use gate4agent_c2_protocol::{
@@ -86,10 +87,11 @@ use crate::app::{
     ManagedSessionView, NativeSessionCatalogRoute, NativeSessionCatalogRowView, NativeSessionPreviewMessageView,
     NativeSessionPreviewView, SessionAddress, SessionView, UiKey, GitCommitView,
     HarnessReadFailure, HarnessRunOrigin, HarnessRunRef, HarnessWorkspaceFileTabKey,
-    HarnessWorkspaceGitRequestDestination, WorkspaceFileTabKey, WorkspaceGitDiffTarget, WorkspaceGitDiffView,
+    HarnessWorkspaceGitRequestDestination, SixelIconPlacement, WorkspaceFileTabKey, WorkspaceGitDiffTarget, WorkspaceGitDiffView,
     WorkspaceGitRequestDestination, WorkspaceView,
 };
 use crate::diagnostics::RuntimeDiagnostic;
+use crate::icons;
 use crate::preferences::{self, UiPreferences};
 use crate::render;
 
@@ -772,6 +774,7 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
     let mut persisted_preferences = loaded_preferences;
     let mut preferences_deadline = None;
     let mut frames = FrameScheduler::new(Instant::now());
+    let mut sixel_emit_state = SixelEmitState::default();
     while !app.should_quit {
         let mut state_changed = false;
         while let Ok(update) = updates_rx.try_recv() {
@@ -900,6 +903,7 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
                 queue_action(&mut app, &commands, &inspection_commands, &mut pending_raw, action);
             }
             screen.flush()?;
+            flush_sixel_icon(&app, &mut sixel_emit_state)?;
             sync_cursor(&app)?;
         }
 
@@ -959,7 +963,19 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
                     frames.mark_dirty();
                 }
                 TerminalEvent::Resize(cols, rows) => {
-                    screen.resize(cols, rows);
+                    // `Screen::resize` itself debounces (a no-op unless
+                    // the size actually changed) and, on a real change,
+                    // clears the WHOLE terminal on its own next `flush()`
+                    // (`force_full_redraw`) -- wiping any sixel pixels
+                    // already drawn there regardless of whether this
+                    // frame's rail layout comes out byte-identical to the
+                    // last one. Mirror that exact condition here so the
+                    // gate in `flush_sixel_icon` cannot skip the one
+                    // frame that actually needs a fresh emission.
+                    if screen.size() != (cols, rows) {
+                        screen.resize(cols, rows);
+                        sixel_emit_state.force_next = true;
+                    }
                     app.terminal_cols = cols;
                     app.terminal_rows = rows;
                     frames.mark_dirty();
@@ -1640,6 +1656,84 @@ fn action_node_id(action: &AppAction) -> Option<&str> {
         | AppAction::HarnessCreateNodeWorkspaceDirectory { .. } => Some(HARNESS_DETAIL_COMMAND_ROUTE),
         AppAction::None | AppAction::Quit => None,
     }
+}
+
+/// What `flush_sixel_icon` wrote to the terminal on its last actual
+/// emission, plus a one-shot override -- see `flush_sixel_icon`'s own
+/// doc comment for exactly what this gates.
+#[derive(Default)]
+struct SixelEmitState {
+    last: Vec<SixelIconPlacement>,
+    /// Set by the run loop's own `TerminalEvent::Resize` handling
+    /// whenever `Screen::resize` is about to actually redraw (its own
+    /// debounced size-changed condition, mirrored there) -- consumed
+    /// (reset to `false`) by the very next `flush_sixel_icon` call
+    /// regardless of whether the signature also changed.
+    force_next: bool,
+}
+
+/// Writes every activity-rail button's own baked sixel icon
+/// (`app.layout.sixel_icons`, populated by `render::render_rail_button`
+/// only in `RailIcons::Sixel` mode) directly to the terminal, each at its
+/// own absolute cell coordinates -- a plain terminal cell cannot hold a
+/// raster image, so `render::render` (already run for this frame, via
+/// `screen.buffer_mut()`) only leaves each such button's own body blank
+/// in the cell buffer; this is the step that actually draws pixels
+/// there. Called every frame right after `screen.flush()` writes the
+/// diffed cell buffer to the SAME `stdout()` writer this uses (a fresh
+/// handle each call, same pattern as `sync_cursor` below -- every
+/// `Stdout` handle shares one underlying, already-flushed buffer, so
+/// there is no interleaving risk running strictly after `screen.flush()`
+/// returns in this single-threaded run loop). Saves/restores the real
+/// cursor around each write since a terminal's own post-sixel cursor
+/// placement is inconsistent across implementations (DEC spec leaves it
+/// underspecified) -- `sync_cursor` re-authoritatively repositions it
+/// right after this returns anyway.
+///
+/// GATED: sixel encoding itself is already cached for the process
+/// lifetime (`icons::sixel`'s own `LazyLock`s), but writing already-
+/// encoded bytes to the terminal every single frame still costs a
+/// syscall plus the terminal's own decode/rasterize work on the far end,
+/// for a rail that visually changes on a small minority of frames. `state`
+/// tracks the placements actually written last time (icon identity,
+/// absolute rect, and selection -- see `SixelIconPlacement`'s own doc
+/// comment for why `selected` has to be part of this) and this function
+/// is a no-op whenever `app.layout.sixel_icons` is unchanged from that
+/// AND no resize forced a redraw since. An empty `sixel_icons` (`Braille`/
+/// `Ascii` mode, or a terminal too short for the tall rail) still updates
+/// `state.last` to empty and simply writes nothing -- correct either way,
+/// since there is nothing this function itself needs to erase (the
+/// cell-buffer diff already repainted those cells as plain background
+/// text, which is what actually erases stale sixel pixels on a real
+/// terminal).
+fn flush_sixel_icon(app: &App, state: &mut SixelEmitState) -> io::Result<()> {
+    flush_sixel_icon_into(&mut stdout(), app, state)
+}
+
+/// The actual gating + write logic behind [`flush_sixel_icon`], generic
+/// over the writer purely so this module's own tests can assert on the
+/// real bytes (a `Vec<u8>` sink) without a live terminal attached -- the
+/// production call site above always plugs in the real `stdout()`.
+fn flush_sixel_icon_into<W: io::Write>(writer: &mut W, app: &App, state: &mut SixelEmitState) -> io::Result<()> {
+    let unchanged = !state.force_next && app.layout.sixel_icons == state.last;
+    state.force_next = false;
+    if unchanged {
+        return Ok(());
+    }
+    state.last = app.layout.sixel_icons.clone();
+    for placement in &app.layout.sixel_icons {
+        if placement.rect.width == 0 || placement.rect.height == 0 {
+            continue;
+        }
+        execute!(
+            writer,
+            SavePosition,
+            MoveTo(placement.rect.x, placement.rect.y),
+            Print(icons::sixel(placement.icon)),
+            RestorePosition,
+        )?;
+    }
+    Ok(())
 }
 
 fn sync_cursor(app: &App) -> io::Result<()> {
@@ -5336,6 +5430,74 @@ mod tests {
 
     fn incarnation(byte: u8) -> gate4agent_node_protocol::NodeIncarnationId {
         gate4agent_node_protocol::NodeIncarnationId::from_bytes([byte; 16])
+    }
+
+    fn sixel_placement(icon: icons::RailIconId, x: u16, selected: bool) -> SixelIconPlacement {
+        SixelIconPlacement { icon, rect: uzor_tui::Rect::new(x, 1, 4, 2), selected }
+    }
+
+    #[test]
+    fn flush_sixel_icon_skips_a_second_emission_when_the_signature_is_unchanged() {
+        let mut app = App::default();
+        app.layout.sixel_icons = vec![sixel_placement(icons::RailIconId::Files, 2, false)];
+        let mut state = SixelEmitState::default();
+        let mut written = Vec::new();
+
+        flush_sixel_icon_into(&mut written, &app, &mut state).unwrap();
+        assert!(!written.is_empty(), "the first emission for a non-empty sixel_icons must write real bytes");
+        let after_first = written.len();
+
+        flush_sixel_icon_into(&mut written, &app, &mut state).unwrap();
+        assert_eq!(written.len(), after_first, "an unchanged signature must not write anything on the second call");
+    }
+
+    #[test]
+    fn flush_sixel_icon_reemits_when_the_rect_or_selection_changes() {
+        let mut app = App::default();
+        app.layout.sixel_icons = vec![sixel_placement(icons::RailIconId::Files, 2, false)];
+        let mut state = SixelEmitState::default();
+        let mut written = Vec::new();
+        flush_sixel_icon_into(&mut written, &app, &mut state).unwrap();
+        let after_first = written.len();
+
+        // Moved: same icon, different rect.
+        app.layout.sixel_icons = vec![sixel_placement(icons::RailIconId::Files, 9, false)];
+        flush_sixel_icon_into(&mut written, &app, &mut state).unwrap();
+        assert!(written.len() > after_first, "a moved icon must trigger a fresh emission");
+        let after_move = written.len();
+
+        // Selection flips: same icon, same rect, only `selected` differs.
+        app.layout.sixel_icons = vec![sixel_placement(icons::RailIconId::Files, 9, true)];
+        flush_sixel_icon_into(&mut written, &app, &mut state).unwrap();
+        assert!(written.len() > after_move, "a selection change must trigger a fresh emission even at the same rect");
+    }
+
+    #[test]
+    fn flush_sixel_icon_force_next_reemits_even_with_an_unchanged_signature() {
+        let mut app = App::default();
+        app.layout.sixel_icons = vec![sixel_placement(icons::RailIconId::Files, 2, false)];
+        let mut state = SixelEmitState::default();
+        let mut written = Vec::new();
+        flush_sixel_icon_into(&mut written, &app, &mut state).unwrap();
+        let after_first = written.len();
+
+        // Same signature, but a resize (or any other forced-redraw path)
+        // set `force_next` -- the next call must still write bytes.
+        state.force_next = true;
+        flush_sixel_icon_into(&mut written, &app, &mut state).unwrap();
+        assert!(written.len() > after_first, "force_next must force a real emission even when nothing in sixel_icons changed");
+    }
+
+    #[test]
+    fn flush_sixel_icon_writes_nothing_for_an_empty_sixel_icons() {
+        // Braille/Ascii tier, or a terminal too short for the tall rail:
+        // `layout.sixel_icons` is empty and there is nothing to draw.
+        let app = App::default();
+        assert!(app.layout.sixel_icons.is_empty());
+        let mut state = SixelEmitState::default();
+        let mut written = Vec::new();
+        flush_sixel_icon_into(&mut written, &app, &mut state).unwrap();
+        assert!(written.is_empty(), "an empty sixel_icons must never write terminal bytes");
     }
 
     fn paginated_harness_task(index: usize) -> RedactedTaskV1 {

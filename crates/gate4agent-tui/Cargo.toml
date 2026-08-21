@@ -17,6 +17,7 @@ gate4agent-observation-api = { path = "../gate4agent-observation-api" }
 gate4agent-observation-engine = { path = "../gate4agent-observation-engine" }
 gate4agent-observation-service = { path = "../gate4agent-observation-service" }
 gate4agent-types = { path = "../gate4agent-types" }
+icy_sixel = "0.6"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 uzor-tui = "1.5.1"
 vt100 = "0.16"

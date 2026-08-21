@@ -81,6 +81,7 @@ use gate4agent_harness_client::{
 };
 use uzor_tui::Rect;
 
+use crate::icons::RailIconId;
 use crate::surface::{
     LayoutPreset, PaneId, PaneSplitPath, SplitAxis, SurfaceDropZone, SurfaceError, SurfaceState,
 };
@@ -88,6 +89,10 @@ use crate::text_editor::TextEditor;
 use crate::platform::{read_clipboard_text, write_clipboard_text};
 
 const WHEEL_SCROLL_LINES: usize = 3;
+/// Dragging the sidebar's width divider left of this many content columns
+/// collapses the sidebar outright (the rail stays, and is how it reopens)
+/// instead of parking at the 18-column minimum.
+const SIDEBAR_COLLAPSE_DRAG_THRESHOLD: u16 = 12;
 const MIN_CONTROL_MODAL_WIDTH: u16 = 36;
 const MIN_CONTROL_MODAL_HEIGHT: u16 = 6;
 pub(crate) const MAX_BROWSER_LOADED_ENTRIES: usize = 2_048;
@@ -1210,20 +1215,28 @@ impl SidebarPresentation {
     }
 }
 
-/// Activity-rail button rendering: `Glyph` draws the restricted Geometric
-/// Shapes / Block Elements icon set, `Ascii` draws the `[X]`-bracket
-/// fallback for terminals/fonts without reliable glyph coverage.
+/// Activity-rail button rendering, cycled by the Settings row/key (see
+/// `App::toggle_rail_icons`): `Sixel` writes the baked raster icon
+/// (`icons::sixel`) straight to the terminal via `client::run`'s
+/// post-flush hook, `Braille` paints the baked `PixelCanvas`
+/// (`icons::braille`) straight into the cell buffer, `Ascii` draws the
+/// `[X]`-bracket fallback for terminals/fonts without reliable glyph or
+/// sixel coverage. `Sixel` is the default -- see D? owner verdict: tier 1
+/// (sixel) read as nearly ideal, tier 2 (braille) as decent-enough-to-
+/// keep, tier 3 (half-block) was rejected outright and removed.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RailIcons {
     #[default]
-    Glyph,
+    Sixel,
+    Braille,
     Ascii,
 }
 
 impl RailIcons {
     pub fn id(self) -> &'static str {
         match self {
-            Self::Glyph => "glyph",
+            Self::Sixel => "sixel",
+            Self::Braille => "braille",
             Self::Ascii => "ascii",
         }
     }
@@ -2680,6 +2693,23 @@ pub struct HitRegion {
     pub target: HitTarget,
 }
 
+/// One activity-rail button's own baked sixel icon, positioned at its
+/// absolute screen cell coordinates for this frame -- see
+/// `LayoutRects::sixel_icons`'s own doc comment. `selected` rides along
+/// because it changes the button body's own background color underneath
+/// a transparent-background sixel image (`icons::sixel`'s own
+/// `BackgroundMode::Transparent` encoding): the terminal repaints that
+/// background via a plain cell-buffer diff (invisible to this struct),
+/// which visually erases whatever sixel pixels were sitting there, so a
+/// selection change must be part of the gating signature too, not just
+/// the icon identity and its rect.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SixelIconPlacement {
+    pub icon: RailIconId,
+    pub rect: Rect,
+    pub selected: bool,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SurfacePaneLayout {
     pub pane_id: PaneId,
@@ -2691,6 +2721,19 @@ pub struct SurfacePaneLayout {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct LayoutRects {
     pub activity_rail: Rect,
+    /// Every activity-rail button's own baked sixel icon placement this
+    /// frame, populated by `render::render_rail_button` only when
+    /// `RailIcons::Sixel` and the rail is tall enough for the 3-row
+    /// button treatment (empty in `Braille`/`Ascii` mode, or on a
+    /// terminal too short for the tall rail -- nothing to draw this
+    /// frame) -- consumed by `client::run`'s post-flush hook, which is
+    /// the only place that actually writes the sixel bytes; a terminal
+    /// cell cannot hold an escape sequence, so each such button's own
+    /// body cells stay plain background-filled blanks in the buffer.
+    /// `client::run` also uses this `Vec`, compared frame-to-frame, as
+    /// the gating signature that skips re-emitting unchanged sixel bytes
+    /// -- see `client::flush_sixel_icon`'s own doc comment.
+    pub sixel_icons: Vec<SixelIconPlacement>,
     pub spaces: Rect,
     pub agents: Rect,
     pub tabs: Rect,
@@ -2843,7 +2886,7 @@ impl Default for App {
             menu_placement: MenuPlacement::Sidebar,
             sidebar_presentation: SidebarPresentation::Split,
             sidebar_collapsed: false,
-            rail_icons: RailIcons::Glyph,
+            rail_icons: RailIcons::Sixel,
             control_section: ControlSection::Files,
             settings_return_focus: Focus::Tabs,
             control_modal_position: None,
@@ -10885,7 +10928,24 @@ impl App {
                 } else {
                     column
                 };
-                self.sidebar_width = content_column.saturating_add(1).clamp(18, maximum);
+                // Squeezing the divider past the floor shuts the sidebar
+                // instead of sticking at the minimum width; dragging back
+                // out past the floor reopens it. Only in the rail
+                // presentation, where the rail stays on screen to reopen
+                // from -- collapsing a rail-less sidebar would leave the
+                // operator no way back.
+                let collapse_by_drag = self.sidebar_presentation == SidebarPresentation::Activity
+                    && content_column < SIDEBAR_COLLAPSE_DRAG_THRESHOLD;
+                if collapse_by_drag {
+                    self.sidebar_collapsed = true;
+                } else {
+                    if self.sidebar_presentation == SidebarPresentation::Activity
+                        && self.sidebar_collapsed
+                    {
+                        self.sidebar_collapsed = false;
+                    }
+                    self.sidebar_width = content_column.saturating_add(1).clamp(18, maximum);
+                }
             }
             DragState::SidebarSplit => {
                 let height = self.terminal_rows.max(1);
@@ -18375,8 +18435,9 @@ impl App {
 
     fn toggle_rail_icons(&mut self) {
         self.rail_icons = match self.rail_icons {
-            RailIcons::Glyph => RailIcons::Ascii,
-            RailIcons::Ascii => RailIcons::Glyph,
+            RailIcons::Sixel => RailIcons::Braille,
+            RailIcons::Braille => RailIcons::Ascii,
+            RailIcons::Ascii => RailIcons::Sixel,
         };
     }
 
@@ -24544,6 +24605,36 @@ mod tests {
         assert_eq!(app.click(10, 20), AppAction::None);
         assert_eq!(app.drag(10, 28), AppAction::None);
         assert_eq!(app.sidebar_split_percent, 70);
+        app.end_drag();
+    }
+
+    #[test]
+    fn squeezing_the_sidebar_divider_collapses_it_and_dragging_back_out_reopens_it() {
+        let mut app = App::default();
+        app.terminal_cols = 120;
+        app.terminal_rows = 40;
+        app.sidebar_presentation = SidebarPresentation::Activity;
+        app.sidebar_collapsed = false;
+        app.sidebar_width = 30;
+        app.layout.activity_rail = Rect::new(0, 0, 6, 40);
+        app.layout.hits.push(HitRegion {
+            rect: Rect::new(36, 0, 1, 40),
+            target: HitTarget::SidebarWidthDrag,
+        });
+
+        assert_eq!(app.click(36, 10), AppAction::None);
+        assert!(matches!(app.drag_state, Some(DragState::SidebarWidth)));
+
+        // Squeezed past the floor: the sidebar shuts, the stored width is
+        // kept for the reopen.
+        assert_eq!(app.drag(12, 10), AppAction::None);
+        assert!(app.sidebar_collapsed, "squeezing past the threshold must collapse the sidebar");
+        assert_eq!(app.sidebar_width, 30, "the collapsed sidebar keeps its width for reopening");
+
+        // Dragging back out reopens it and resumes resizing.
+        assert_eq!(app.drag(50, 10), AppAction::None);
+        assert!(!app.sidebar_collapsed, "dragging back out must reopen the sidebar");
+        assert_eq!(app.sidebar_width, 45);
         app.end_drag();
     }
 

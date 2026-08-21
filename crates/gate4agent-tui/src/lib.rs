@@ -1,6 +1,7 @@
 pub mod app;
 pub mod client;
 pub mod diagnostics;
+pub mod icons;
 pub mod pty_palette;
 pub mod platform;
 pub mod preferences;

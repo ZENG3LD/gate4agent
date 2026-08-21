@@ -15,7 +15,7 @@ use crate::app::{
 };
 use crate::surface::LayoutPreset;
 
-const CONFIG_VERSION: u16 = 7;
+const CONFIG_VERSION: u16 = 8;
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const MAX_COLLAPSED_DIRECTORY_PREFERENCES: usize = 512;
 
@@ -55,7 +55,11 @@ impl Default for UiPreferences {
             // default.
             sidebar_presentation: SidebarPresentation::Activity,
             sidebar_collapsed: false,
-            rail_icons: RailIcons::Glyph,
+            // D? tier toggle: sixel read as nearly ideal on the owner's
+            // own box, so it stays the fresh-install default -- braille
+            // and ascii are still fully selectable, just not the
+            // out-of-the-box choice.
+            rail_icons: RailIcons::Sixel,
             control_section: ControlSection::Files,
             roster_mode: RosterMode::Agents,
             sidebar_width: 26,
@@ -424,7 +428,14 @@ fn parse(contents: &str) -> io::Result<UiPreferences> {
             }
             "rail_icons" => {
                 preferences.rail_icons = match value.trim() {
-                    "glyph" => RailIcons::Glyph,
+                    // "glyph" is the pre-v8 token for what is now the
+                    // Sixel tier (the old two-state Glyph/Ascii toggle's
+                    // "real icon" side) -- kept as a permanent alias, the
+                    // same pattern `roster_mode`'s "native sessions"
+                    // legacy token already uses, so an old config loads
+                    // correctly under any `version=` that still has it.
+                    "sixel" | "glyph" => RailIcons::Sixel,
+                    "braille" => RailIcons::Braille,
                     "ascii" => RailIcons::Ascii,
                     _ => preferences.rail_icons,
                 }
@@ -508,13 +519,20 @@ fn parse(contents: &str) -> io::Result<UiPreferences> {
             // glyph rail + toolbar sidebar. A v6 config's presentation is
             // migrated to Activity exactly once here; every other stored
             // field -- including this same managed-agent/collapsed-
-            // directory shape v7 uses -- survives untouched.
+            // directory shape v7/v8 use -- survives untouched.
             // `rail_icons` has no v6 representation and keeps the struct
-            // default (Glyph) set before this loop ran.
+            // default (Sixel) set before this loop ran.
             preferences.sidebar_presentation = SidebarPresentation::Activity;
             finish_with_collections(preferences, managed_agents, collapsed_directory_values)
         }
-        Some(CONFIG_VERSION) => {
+        // D? (CONFIG_VERSION 7 -> 8): the rail-icons toggle grows a third
+        // state (Sixel/Braille/Ascii, replacing Glyph/Ascii). The stored
+        // token itself carries the migration (`"glyph"` is a permanent
+        // alias for `Sixel` in the per-line match above, the same
+        // pattern `roster_mode`'s legacy "native sessions" token already
+        // uses), so v7 and v8 share the exact same tail here -- nothing
+        // else in the v7 shape changes.
+        Some(7) | Some(CONFIG_VERSION) => {
             finish_with_collections(preferences, managed_agents, collapsed_directory_values)
         }
         Some(other) => Err(invalid_data(format!("unsupported preferences version {other}"))),
@@ -522,9 +540,9 @@ fn parse(contents: &str) -> io::Result<UiPreferences> {
     }
 }
 
-/// The v6/v7 tail shared by both versions' `parse()` arms: attach the
-/// managed-agent rows already parsed by the per-line loop, then parse and
-/// validate the collapsed-directory rows.
+/// The v6/v7/v8 tail shared by all three versions' `parse()` arms: attach
+/// the managed-agent rows already parsed by the per-line loop, then parse
+/// and validate the collapsed-directory rows.
 fn finish_with_collections(
     mut preferences: UiPreferences,
     managed_agents: Vec<ManagedAgentPreference>,
@@ -783,7 +801,7 @@ mod tests {
             menu_placement: MenuPlacement::Modal,
             sidebar_presentation: SidebarPresentation::Activity,
             sidebar_collapsed: true,
-            rail_icons: RailIcons::Glyph,
+            rail_icons: RailIcons::Braille,
             control_section: ControlSection::Workspaces,
             roster_mode: RosterMode::Workspaces,
             sidebar_width: 38,
@@ -853,13 +871,36 @@ mod tests {
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
+    /// D? rail-icons toggle (CONFIG_VERSION 7 -> 8): the pre-v8 two-state
+    /// `rail_icons=glyph` token -- the "real icon" side of the old
+    /// Glyph/Ascii toggle -- migrates to the new three-state `Sixel`
+    /// variant, the same "legacy token stays a permanent alias" pattern
+    /// `legacy_native_sessions_preference_migrates_to_agents` above
+    /// already exercises for `roster_mode`.
     #[test]
-    fn preferences_v1_through_v4_migrate_to_v7_with_empty_collections() {
+    fn legacy_glyph_rail_icons_preference_migrates_to_sixel() {
+        let path = temp_path("legacy-glyph-rail-icons");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "version=7\nrail_icons=glyph\n").unwrap();
+
+        let loaded = UiPreferences::load(&path).unwrap();
+        assert_eq!(loaded.rail_icons, RailIcons::Sixel);
+        let mut app = App::default();
+        loaded.apply_to(&mut app);
+        assert_eq!(app.rail_icons, RailIcons::Sixel);
+        assert!(loaded.encode().unwrap().contains("rail_icons=sixel\n"));
+        assert!(!loaded.encode().unwrap().contains("glyph"));
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn preferences_v1_through_v4_migrate_to_v8_with_empty_collections() {
         for version in 1..=4 {
             let loaded = parse(&format!("version={version}\nstyle=gate\n")).unwrap();
             assert!(loaded.managed_agents.is_empty(), "version {version}");
             assert!(loaded.collapsed_directories.is_empty(), "version {version}");
-            assert!(loaded.encode().unwrap().starts_with("version=7\n"), "version {version}");
+            assert!(loaded.encode().unwrap().starts_with("version=8\n"), "version {version}");
         }
     }
 
@@ -911,7 +952,7 @@ mod tests {
 
         let encoded = preferences.encode().unwrap();
         let decoded = parse(&encoded).unwrap();
-        assert!(encoded.starts_with("version=7\n"));
+        assert!(encoded.starts_with("version=8\n"));
         assert_eq!(decoded.collapsed_directories, vec![utf8.clone(), opaque.clone()]);
         assert_eq!(decoded.collapsed_directories[1].path.as_bytes(), opaque_bytes);
         assert_eq!(decoded.collapsed_directories[1].path.as_utf8(), None);
@@ -941,16 +982,16 @@ mod tests {
 
         assert!(loaded.collapsed_directories.is_empty());
         assert_eq!(loaded.color_mode, PtyColorMode::GateOverride);
-        assert!(loaded.encode().unwrap().starts_with("version=7\n"));
+        assert!(loaded.encode().unwrap().starts_with("version=8\n"));
     }
 
     /// D1a's default-mode flip (CONFIG_VERSION 6 -> 7): a v6 config's
     /// `sidebar_presentation` is migrated to `Activity` exactly once, no
     /// matter what it was stored as, while every other field -- including
     /// managed agents and collapsed directories -- survives untouched. Once
-    /// re-saved (now at v7), the owner's own choice sticks: a v7 config
-    /// that stores `Split` loads as `Split`, proving the flip does not fire
-    /// again on every load.
+    /// re-saved (now at v8, CONFIG_VERSION's current value), the owner's
+    /// own choice sticks: a v7 OR v8 config that stores `Split` loads as
+    /// `Split`, proving the flip does not fire again on every load.
     #[test]
     fn preferences_v6_migrates_presentation_to_activity_once_then_v7_choice_persists() {
         let managed_agent_line = format!(
@@ -974,7 +1015,7 @@ mod tests {
         // The flip: stored as `split`, migrated to `Activity`.
         assert_eq!(loaded.sidebar_presentation, SidebarPresentation::Activity);
         // rail_icons has no v6 representation; it keeps the struct default.
-        assert_eq!(loaded.rail_icons, RailIcons::Glyph);
+        assert_eq!(loaded.rail_icons, RailIcons::Sixel);
 
         // Everything else survives the migration unchanged.
         assert_eq!(loaded.color_mode, PtyColorMode::GateOverride);
@@ -1004,18 +1045,21 @@ mod tests {
             )],
         );
 
-        // Re-saved, the config now round-trips at v7 with the migrated
+        // Re-saved, the config now round-trips at v8 with the migrated
         // presentation -- applying it to an App reflects the same flip.
         let reencoded = loaded.encode().unwrap();
-        assert!(reencoded.starts_with("version=7\n"));
+        assert!(reencoded.starts_with("version=8\n"));
         let mut app = App::default();
         loaded.apply_to(&mut app);
         assert_eq!(app.sidebar_presentation, SidebarPresentation::Activity);
 
-        // A v7 config is never touched by the flip: an explicit `Split`
-        // choice made after migrating away from the new default persists.
+        // Neither a v7 nor a v8 config is ever touched by the flip: an
+        // explicit `Split` choice made after migrating away from the new
+        // default persists at either version.
         let v7_split = parse("version=7\nsidebar_presentation=split\n").unwrap();
         assert_eq!(v7_split.sidebar_presentation, SidebarPresentation::Split);
+        let v8_split = parse("version=8\nsidebar_presentation=split\n").unwrap();
+        assert_eq!(v8_split.sidebar_presentation, SidebarPresentation::Split);
     }
 
     #[test]

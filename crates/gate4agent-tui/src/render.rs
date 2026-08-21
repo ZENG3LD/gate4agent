@@ -28,6 +28,7 @@ use crate::app::{
     ExistingSessionMode, ExistingSessionOperation, Focus, FolderBrowserField,
     AgentRunGitScopeView, GitLocationDialogKind, HitRegion, HitTarget, LaunchContextMode, LaunchField, LaunchTarget,
     LayoutRects, MenuPlacement, NativeSessionGroupKey, NativeSessionTreeItem, NodeView, PreviewTabPhase, PreviewTabView, PtyColorMode, RailIcons, RosterMode, SessionView,
+    SixelIconPlacement,
     ObservationPersistenceState, SessionMonitorKey, SessionMonitorSection, SessionMonitorTarget,
     SessionMonitorView, SidebarMode, SurfaceTab,
     HarnessReverseAttributionState,
@@ -36,6 +37,7 @@ use crate::app::{
     WorkspaceGitTabView, WorkspaceView,
     MAX_BROWSER_LOADED_ENTRIES, RESTORE_VIA_SKILL_DISABLED_REASON,
 };
+use crate::icons;
 use crate::pty_palette::{apply_pty_palette, GATE_FG, TERM_BG};
 use crate::surface::{
     LayoutPreset, PaneBranch, PaneId, PaneNode, PaneSplitPath, SplitAxis, SurfaceDropZone,
@@ -187,9 +189,12 @@ pub fn render(app: &App, buf: &mut TerminalBuffer) -> LayoutRects {
                 (Rect::default(), sidebar_content, spaces, agents, columns[1])
             }
             (MenuPlacement::Sidebar, SidebarPresentation::Activity) => {
-                // 4 wide: 1 column for the left accent bar (`▎`) that marks
-                // the active button, 3 for the glyph centered beside it.
-                let rail_width = 4_u16.min(area.width.saturating_sub(1));
+                // 6 wide: 1 margin column for the left accent bar (`▎`)
+                // that marks the active button, 4 for the button body
+                // (glyph centered on its middle row when tall enough for
+                // the 3-row treatment), 1 trailing margin column back to
+                // the rail background.
+                let rail_width = 6_u16.min(area.width.saturating_sub(1));
                 let content_width = if app.sidebar_collapsed {
                     0
                 } else {
@@ -231,6 +236,7 @@ pub fn render(app: &App, buf: &mut TerminalBuffer) -> LayoutRects {
     );
     let mut layout = LayoutRects {
         activity_rail,
+        sixel_icons: Vec::new(),
         spaces,
         agents,
         tabs: right[0],
@@ -357,57 +363,147 @@ pub fn render(app: &App, buf: &mut TerminalBuffer) -> LayoutRects {
     layout
 }
 
-/// One glyph/ascii button on the activity rail: a view-select action plus
-/// the current selected/active state driving its accent styling.
+/// One rail button on the activity rail: a view-select action plus the
+/// current selected/active state driving its accent styling, plus which
+/// baked icon (`icons::RailIconId`) represents it. EVERY current rail
+/// button carries a real baked icon (see `render_activity_rail`'s own
+/// construction of `top` and the bottom group) -- there is no more
+/// block-art fallback tier; `app::RailIcons` picks WHICH baked tier
+/// (`Sixel`/`Braille`) paints `icon`, globally, for the whole rail, not
+/// per button (see `render_rail_button`'s own match). `glyph`/`ascii`
+/// stay plain single-character labels, used only where a real baked icon
+/// cannot fit: the short-terminal fallback (`block.height < 3`, both
+/// raster tiers) and `RailIcons::Ascii` mode's own tall-body label.
 struct RailButton {
     target: HitTarget,
     glyph: &'static str,
     ascii: &'static str,
     selected: bool,
+    icon: icons::RailIconId,
 }
 
-/// Draws a single activity-rail row as a button: full-row background tint
-/// when selected, a left accent bar (`▎`) in column 0 marking the active
-/// row, and the glyph/ascii label centered in the remaining columns. Always
-/// registers `button.target` as a hit region across the full row so the
-/// accent column is clickable too.
+/// Draws a single activity-rail entry as a real button. When there is
+/// room (`block.height >= 3`) this paints a 3-row body -- `block` inset by
+/// 1 column on each side so it reads as a filled button block rather than
+/// a thin accent stripe -- with the glyph/ascii label centered on the
+/// middle row: `theme.active` background when inactive (deliberately
+/// different from the rail's own `theme.panel` background so an at-rest
+/// button stays visible instead of vanishing into the rail), `theme.accent`
+/// when selected, bold in both states, and a `▎` accent bar down `block`'s
+/// leftmost column on all three rows while selected. Below that height it
+/// falls back to the original thin single row so every button and its hit
+/// region still exist on a cramped terminal. Always registers
+/// `button.target` as a hit region across the full block (including the
+/// margin/accent column) so the accent bar is clickable too.
 fn render_rail_button(
-    row: Rect,
+    block: Rect,
     button: &RailButton,
     icons: RailIcons,
     buf: &mut TerminalBuffer,
     layout: &mut LayoutRects,
     theme: Theme,
 ) {
-    if row.width == 0 {
+    if block.width == 0 || block.height == 0 {
         return;
     }
-    let bg = if button.selected { theme.accent } else { theme.panel };
-    fill_rect(row, bg, buf);
-    let has_accent_column = row.width >= 2;
-    let label_area = if has_accent_column {
-        Rect::new(row.x + 1, row.y, row.width - 1, 1)
-    } else {
-        row
-    };
     let label = match icons {
-        RailIcons::Glyph => button.glyph,
+        RailIcons::Sixel | RailIcons::Braille => button.glyph,
         RailIcons::Ascii => button.ascii,
     };
-    Paragraph::new(centered_label(label, label_area.width as usize))
-        .style(
-            Style::default()
-                .fg(if button.selected { theme.active_tab_text } else { theme.muted })
-                .bg(bg)
-                .add_modifier(if button.selected { Modifier::BOLD } else { Modifier::empty() }),
-        )
-        .render(label_area, buf);
-    if has_accent_column && button.selected {
-        let cell = buf.get_mut(row.x, row.y);
-        cell.symbol = "▎".into();
-        cell.style = Style::default().fg(theme.active_tab_text).bg(bg);
+
+    if block.height < 3 {
+        // Short-terminal fallback: the original thin single-row button.
+        let bg = if button.selected { theme.accent } else { theme.panel };
+        fill_rect(block, bg, buf);
+        let has_accent_column = block.width >= 2;
+        let label_area = if has_accent_column {
+            Rect::new(block.x + 1, block.y, block.width - 1, 1)
+        } else {
+            block
+        };
+        Paragraph::new(centered_label(label, label_area.width as usize))
+            .style(
+                Style::default()
+                    .fg(if button.selected { theme.active_tab_text } else { theme.muted })
+                    .bg(bg)
+                    .add_modifier(if button.selected { Modifier::BOLD } else { Modifier::empty() }),
+            )
+            .render(label_area, buf);
+        if has_accent_column && button.selected {
+            let cell = buf.get_mut(block.x, block.y);
+            cell.symbol = "▎".into();
+            cell.style = Style::default().fg(theme.active_tab_text).bg(bg);
+        }
+        layout.hits.push(HitRegion { rect: block, target: button.target.clone() });
+        return;
     }
-    layout.hits.push(HitRegion { rect: row, target: button.target.clone() });
+
+    let bg = if button.selected { theme.accent } else { theme.active };
+    let body = Rect::new(
+        block.x.saturating_add(1),
+        block.y,
+        block.width.saturating_sub(2),
+        block.height,
+    );
+    fill_rect(body, bg, buf);
+    let fg = if button.selected { theme.active_tab_text } else { theme.text };
+    let style = Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD);
+    match icons {
+        RailIcons::Sixel => {
+            // The real pixels are written by `client::run`'s post-flush
+            // hook, not here. This only reserves the icon's own cell
+            // footprint (already a plain `bg`-filled blank from the
+            // `fill_rect` above -- nothing further is drawn on top of
+            // it) and records where the flush hook should draw it, plus
+            // `button.selected` (part of the flush hook's own gating
+            // signature -- see `SixelIconPlacement`'s own doc comment).
+            let icon_area = Rect::new(
+                body.x,
+                body.y,
+                body.width.min(icons::SIXEL_ICON_CELLS_WIDE),
+                body.height.min(icons::SIXEL_ICON_CELLS_TALL),
+            );
+            layout.sixel_icons.push(SixelIconPlacement { icon: button.icon, rect: icon_area, selected: button.selected });
+        }
+        RailIcons::Braille => {
+            icons::braille(button.icon).flush(body, buf);
+            matte_canvas_background(body, bg, buf);
+        }
+        RailIcons::Ascii => {
+            let label_row = Rect::new(body.x, body.y + block.height / 2, body.width, 1);
+            Paragraph::new(centered_label(label, label_row.width as usize))
+                .style(style)
+                .render(label_row, buf);
+        }
+    }
+    if button.selected {
+        for y in block.y..block.bottom() {
+            let cell = buf.get_mut(block.x, y);
+            cell.symbol = "▎".into();
+            cell.style = Style::default().fg(theme.active_tab_text).bg(bg);
+        }
+    }
+    layout.hits.push(HitRegion { rect: block, target: button.target.clone() });
+}
+
+/// After [`PixelCanvas::flush`](uzor_tui::canvas::PixelCanvas::flush)
+/// paints `body` in braille mode, patch every cell the canvas itself left
+/// with no background of its own (`style.bg == Color::Reset` -- braille
+/// never sets a cell's `bg` at all) back to the button's own themed `bg`
+/// instead of the terminal's default background, so the icon reads as
+/// sitting on the button rather than punching a Reset-colored hole
+/// through it. Icon RGBA source pixels never decode to `Color::Reset`
+/// (see `icons::rgba_to_canvas`), so this check can't mistake real ink
+/// for "unpainted."
+fn matte_canvas_background(body: Rect, bg: Color, buf: &mut TerminalBuffer) {
+    for y in body.y..body.bottom() {
+        for x in body.x..body.right() {
+            let cell = buf.get_mut(x, y);
+            if cell.style.bg == Color::Reset {
+                cell.style.bg = bg;
+            }
+        }
+    }
 }
 
 fn render_activity_rail(
@@ -429,72 +525,102 @@ fn render_activity_rail(
         RailButton {
             target: HitTarget::ActivitySection(ControlSection::Files),
             glyph: "▤",
-            ascii: "[F]",
+            ascii: "F",
             selected: app.control_section == ControlSection::Files && !app.sidebar_collapsed,
+            icon: icons::RailIconId::Files,
         },
         RailButton {
             target: HitTarget::ActivitySection(ControlSection::Git),
             glyph: "◈",
-            ascii: "[G]",
+            ascii: "G",
             selected: app.control_section == ControlSection::Git && !app.sidebar_collapsed,
+            icon: icons::RailIconId::SourceControl,
         },
         RailButton {
             target: HitTarget::RosterMode(RosterMode::Agents),
             glyph: "◉",
-            ascii: "[A]",
+            ascii: "A",
             selected: app.control_section == ControlSection::Agents
                 && matches!(app.roster_mode, RosterMode::Agents | RosterMode::NativeSessions)
                 && !app.sidebar_collapsed,
+            icon: icons::RailIconId::Person,
         },
     ];
     if app.harness_kanban.enabled {
         top.push(RailButton {
             target: HitTarget::AgentBoardOpen,
             glyph: "▦",
-            ascii: "[K]",
+            ascii: "K",
             selected: app.surface.active_tab() == Some(&SurfaceTab::AgentBoard),
+            icon: icons::RailIconId::Project,
         });
     }
-    for (index, button) in top.iter().enumerate() {
-        let y = area.y.saturating_add(index as u16);
+
+    // Each rail entry draws as a real 3-row button with 1 blank
+    // rail-background row between entries. On a terminal too short to fit
+    // the top group and the bottom group at that size, everything falls
+    // back to the original thin single-row-per-button rendering instead,
+    // so every button and its hit region still exist.
+    let top_len = top.len() as u16;
+    let top_rows_tall = top_len.saturating_mul(3).saturating_add(top_len.saturating_sub(1));
+    let tall_enough = area.height >= top_rows_tall.saturating_add(7);
+    let button_rows: u16 = if tall_enough { 3 } else { 1 };
+    let step = button_rows.saturating_add(if tall_enough { 1 } else { 0 });
+
+    let mut y = area.y;
+    for button in &top {
         if y >= area.bottom() {
             break;
         }
-        render_rail_button(Rect::new(area.x, y, area.width, 1), button, app.rail_icons, buf, layout, theme);
+        render_rail_button(Rect::new(area.x, y, area.width, button_rows), button, app.rail_icons, buf, layout, theme);
+        y = y.saturating_add(step);
     }
 
-    // Bottom group, bottom-anchored: the collapse toggle, one blank row
-    // reserved for the D3 connection-health dot (not drawn yet), then
-    // Settings at the very bottom row.
-    if area.height >= 3 {
-        let collapse = Rect::new(area.x, area.bottom() - 3, area.width, 1);
-        fill_rect(collapse, theme.panel, buf);
-        let collapse_label_area = if collapse.width >= 2 {
-            Rect::new(collapse.x + 1, collapse.y, collapse.width - 1, 1)
+    // Bottom group, bottom-anchored: the collapse toggle, one reserved
+    // blank row for the future D3 connection-health dot (not drawn yet),
+    // then Settings at the very bottom -- the same button treatment and
+    // row count as the top group.
+    let bottom_rows = button_rows;
+    let bottom_group_rows = bottom_rows.saturating_mul(2).saturating_add(1);
+    if area.height >= bottom_group_rows {
+        // Collapse points AT the sidebar's own edge: `<` (chevron-left)
+        // while it's open (clicking collapses it further left), `>`
+        // (chevron-right) once collapsed (clicking expands it back out).
+        let (collapse_glyph, collapse_icon) = if app.sidebar_collapsed {
+            (">", icons::RailIconId::ChevronRight)
         } else {
-            collapse
+            ("<", icons::RailIconId::ChevronLeft)
         };
-        Paragraph::new(centered_label(
-            if app.sidebar_collapsed { ">" } else { "<" },
-            collapse_label_area.width as usize,
-        ))
-        .style(Style::default().fg(theme.dim).bg(theme.panel))
-        .render(collapse_label_area, buf);
-        layout.hits.push(HitRegion { rect: collapse, target: HitTarget::SidebarCollapse });
-
-        // area.bottom() - 2 stays untouched: the reserved health-dot row.
-
-        let settings = Rect::new(area.x, area.bottom() - 1, area.width, 1);
         render_rail_button(
-            settings,
+            Rect::new(area.x, area.bottom() - bottom_group_rows, area.width, bottom_rows),
+            &RailButton {
+                target: HitTarget::SidebarCollapse,
+                glyph: collapse_glyph,
+                ascii: collapse_glyph,
+                selected: false,
+                icon: collapse_icon,
+            },
+            app.rail_icons,
+            buf,
+            layout,
+            theme,
+        );
+
+        // The row directly above Settings stays untouched (always exactly
+        // 1 row, tall or fallback): reserved for the future D3
+        // connection-health dot.
+
+        render_rail_button(
+            Rect::new(area.x, area.bottom() - bottom_rows, area.width, bottom_rows),
             &RailButton {
                 target: HitTarget::ActivitySection(ControlSection::Settings),
                 glyph: "◇",
-                ascii: "[S]",
+                ascii: "S",
                 // Settings opens as an overlay dialog rather than selecting
                 // a persistent control_section, so (matching the pre-D1a
                 // rail) this row never shows as the active one.
                 selected: false,
+                icon: icons::RailIconId::SettingsGear,
             },
             app.rail_icons,
             buf,
@@ -9552,10 +9678,10 @@ fn render_settings_controls(
     if area.height < 5 {
         return;
     }
-    let icons_text = if app.rail_icons == RailIcons::Glyph {
-        " icons [glyph]|ascii "
-    } else {
-        " icons glyph|[ascii] "
+    let icons_text = match app.rail_icons {
+        RailIcons::Sixel => " icons [sixel]|braille|ascii ",
+        RailIcons::Braille => " icons sixel|[braille]|ascii ",
+        RailIcons::Ascii => " icons sixel|braille|[ascii] ",
     };
     let icons_width = (cell_width(icons_text) as u16).min(area.width);
     Paragraph::new(icons_text)
@@ -14691,8 +14817,8 @@ mod tests {
         app.control_section = ControlSection::Agents;
         let mut expanded = TerminalBuffer::new(100, 24);
         let expanded_layout = render(&app, &mut expanded);
-        // 1 accent-bar column + 3 for the centered glyph.
-        assert_eq!(expanded_layout.activity_rail.width, 4);
+        // 1 accent-bar margin column + 4 for the button body + 1 trailing margin.
+        assert_eq!(expanded_layout.activity_rail.width, 6);
         assert!(expanded_layout.agents.width > 0);
         assert!([ControlSection::Files, ControlSection::Git].iter().all(|section| expanded_layout
             .hits
@@ -14723,9 +14849,9 @@ mod tests {
         app.sidebar_collapsed = true;
         let mut collapsed = TerminalBuffer::new(100, 24);
         let collapsed_layout = render(&app, &mut collapsed);
-        assert_eq!(collapsed_layout.activity_rail.width, 4);
+        assert_eq!(collapsed_layout.activity_rail.width, 6);
         assert_eq!(collapsed_layout.agents.width, 0);
-        assert_eq!(collapsed_layout.tabs.x, 4);
+        assert_eq!(collapsed_layout.tabs.x, 6);
         assert!(collapsed_layout
             .hits
             .iter()
@@ -14743,7 +14869,7 @@ mod tests {
         assert!(!light_layout.hits.iter().any(|hit| {
             hit.target == HitTarget::AgentBoardOpen && rail.contains(hit.rect.x, hit.rect.y)
         }));
-        assert!(!rect_text(&light_buf, rail).contains('▦'));
+        assert!(!light_layout.sixel_icons.iter().any(|placement| placement.icon == icons::RailIconId::Project));
 
         app.harness_kanban.enabled = true;
         let mut full_buf = TerminalBuffer::new(100, 24);
@@ -14752,7 +14878,9 @@ mod tests {
         assert!(full_layout.hits.iter().any(|hit| {
             hit.target == HitTarget::AgentBoardOpen && rail.contains(hit.rect.x, hit.rect.y)
         }));
-        assert!(rect_text(&full_buf, rail).contains('▦'));
+        // The icon itself is a real baked sixel icon now (Project), not
+        // block art -- its placement in `sixel_icons` is the invariant.
+        assert!(full_layout.sixel_icons.iter().any(|placement| placement.icon == icons::RailIconId::Project));
     }
 
     #[test]
@@ -14822,32 +14950,135 @@ mod tests {
         assert_eq!(app.surface.active_tab(), Some(&SurfaceTab::AgentBoard));
     }
 
+    fn contains_braille_glyph(text: &str) -> bool {
+        text.chars().any(|c| ('\u{2800}'..='\u{28FF}').contains(&c))
+    }
+
+    /// Covers all three `RailIcons` tiers end to end: `Sixel` records
+    /// every button's own placement in `layout.sixel_icons` and paints
+    /// NOTHING into the cell buffer for those bodies (a terminal cell
+    /// cannot hold a raster image -- see `client::flush_sixel_icon`'s own
+    /// doc comment for the step that actually draws pixels), `Braille`
+    /// paints real braille glyphs straight into the cell buffer and
+    /// records no sixel placements at all, and `Ascii` falls back to the
+    /// plain `F`/`G`/`A`/`K`/`S` bracket labels with neither of the
+    /// other two tiers' own markers present.
     #[test]
-    fn activity_rail_ascii_and_glyph_modes_render_the_expected_labels() {
+    fn activity_rail_sixel_braille_and_ascii_modes_render_the_expected_output() {
         let mut app = fixture(PtyColorMode::Inherited);
         app.sidebar_presentation = SidebarPresentation::Activity;
         app.harness_kanban.enabled = true;
-        assert_eq!(app.rail_icons, RailIcons::Glyph);
+        assert_eq!(app.rail_icons, RailIcons::Sixel);
 
-        let mut glyph_buf = TerminalBuffer::new(100, 24);
-        let glyph_layout = render(&app, &mut glyph_buf);
-        let glyph_text = rect_text(&glyph_buf, glyph_layout.activity_rail);
-        for glyph in ["▤", "◈", "◉", "▦", "◇"] {
-            assert!(glyph_text.contains(glyph), "missing {glyph}: {glyph_text:?}");
+        let mut sixel_buf = TerminalBuffer::new(100, 24);
+        let sixel_layout = render(&app, &mut sixel_buf);
+        let sixel_text = rect_text(&sixel_buf, sixel_layout.activity_rail);
+        assert_eq!(
+            sixel_layout.sixel_icons.len(),
+            6,
+            "Files/Git/Agents/Board/SidebarCollapse/Settings must each place one sixel icon: {:?}",
+            sixel_layout.sixel_icons,
+        );
+        for icon in [
+            icons::RailIconId::Files,
+            icons::RailIconId::SourceControl,
+            icons::RailIconId::Person,
+            icons::RailIconId::Project,
+            icons::RailIconId::ChevronLeft,
+            icons::RailIconId::SettingsGear,
+        ] {
+            assert!(
+                sixel_layout.sixel_icons.iter().any(|placement| placement.icon == icon),
+                "missing sixel placement for {icon:?}: {:?}",
+                sixel_layout.sixel_icons,
+            );
         }
-        for ascii in ["[F]", "[G]", "[A]", "[K]", "[S]"] {
-            assert!(!glyph_text.contains(ascii), "unexpected {ascii} in glyph mode: {glyph_text:?}");
+        assert!(!contains_braille_glyph(&sixel_text), "sixel mode must not paint braille cells: {sixel_text:?}");
+        for ascii in ["F", "G", "A", "K", "S"] {
+            assert!(!sixel_text.contains(ascii), "unexpected {ascii} in sixel mode: {sixel_text:?}");
+        }
+
+        app.rail_icons = RailIcons::Braille;
+        let mut braille_buf = TerminalBuffer::new(100, 24);
+        let braille_layout = render(&app, &mut braille_buf);
+        let braille_text = rect_text(&braille_buf, braille_layout.activity_rail);
+        assert!(
+            braille_layout.sixel_icons.is_empty(),
+            "braille mode must not place any sixel icon: {:?}",
+            braille_layout.sixel_icons,
+        );
+        assert!(contains_braille_glyph(&braille_text), "braille mode must paint braille cells: {braille_text:?}");
+        for ascii in ["F", "G", "A", "K", "S"] {
+            assert!(!braille_text.contains(ascii), "unexpected {ascii} in braille mode: {braille_text:?}");
         }
 
         app.rail_icons = RailIcons::Ascii;
         let mut ascii_buf = TerminalBuffer::new(100, 24);
         let ascii_layout = render(&app, &mut ascii_buf);
         let ascii_text = rect_text(&ascii_buf, ascii_layout.activity_rail);
-        for ascii in ["[F]", "[G]", "[A]", "[K]", "[S]"] {
+        assert!(ascii_layout.sixel_icons.is_empty(), "ascii mode must not place any sixel icon: {:?}", ascii_layout.sixel_icons);
+        for ascii in ["F", "G", "A", "K", "S"] {
             assert!(ascii_text.contains(ascii), "missing {ascii}: {ascii_text:?}");
         }
-        for glyph in ["▤", "◈", "◉", "▦", "◇"] {
-            assert!(!ascii_text.contains(glyph), "unexpected {glyph} in ascii mode: {ascii_text:?}");
+        assert!(!contains_braille_glyph(&ascii_text), "ascii mode must not paint braille cells: {ascii_text:?}");
+    }
+
+    #[test]
+    fn activity_rail_inactive_button_paints_a_background_distinct_from_the_rail() {
+        // The exact bug this rework fixes: an inactive button used to fill
+        // with `theme.panel`, the rail's own background, so it was
+        // invisible at rest. The button body must now use a color the
+        // rail itself never paints with.
+        let mut app = fixture(PtyColorMode::GateOverride);
+        app.sidebar_presentation = SidebarPresentation::Activity;
+        app.control_section = ControlSection::Files;
+        let mut buf = TerminalBuffer::new(100, 24);
+        let layout = render(&app, &mut buf);
+
+        let theme = Theme::for_mode(app.color_mode);
+        assert_ne!(theme.active, theme.panel, "fixture must use colors where the bug would show");
+
+        let git_hit = layout
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::ActivitySection(ControlSection::Git))
+            .expect("git rail button is inactive here");
+        assert_eq!(git_hit.rect.height, 3, "expected the tall button treatment at this height");
+        // Sample the button body (inset past the left margin/accent
+        // column, which stays the rail's own background either way).
+        let body_x = git_hit.rect.x + 1;
+        let body_y = git_hit.rect.y + git_hit.rect.height / 2;
+        assert_eq!(buf.get(body_x, body_y).style.bg, theme.active);
+        assert_ne!(buf.get(body_x, body_y).style.bg, theme.panel);
+    }
+
+    #[test]
+    fn activity_rail_short_terminal_falls_back_to_one_row_per_button_with_hit_regions() {
+        // Too short for the 3-row treatment (top group + bottom group) --
+        // every button must still render with a full-width hit region,
+        // just back at the original single-row size, so nothing is lost
+        // on a cramped terminal.
+        let mut app = fixture(PtyColorMode::Inherited);
+        app.sidebar_presentation = SidebarPresentation::Activity;
+        app.harness_kanban.enabled = false;
+        let mut buf = TerminalBuffer::new(100, 14);
+        let layout = render(&app, &mut buf);
+
+        assert_eq!(layout.activity_rail.width, 6);
+        for target in [
+            HitTarget::ActivitySection(ControlSection::Files),
+            HitTarget::ActivitySection(ControlSection::Git),
+            HitTarget::RosterMode(RosterMode::Agents),
+            HitTarget::SidebarCollapse,
+            HitTarget::ActivitySection(ControlSection::Settings),
+        ] {
+            let hit = layout
+                .hits
+                .iter()
+                .find(|hit| hit.target == target)
+                .unwrap_or_else(|| panic!("missing rail hit for {target:?} on a short terminal"));
+            assert_eq!(hit.rect.height, 1, "{target:?} must fall back to a single-row button");
+            assert_eq!(hit.rect.width, 6, "{target:?} hit region must still span the full rail width");
         }
     }
 
@@ -14855,7 +15086,7 @@ mod tests {
     fn settings_rail_icons_toggle_has_mouse_and_keyboard_parity() {
         let mut app = fixture(PtyColorMode::Inherited);
         app.focus = Focus::Settings;
-        assert_eq!(app.rail_icons, RailIcons::Glyph);
+        assert_eq!(app.rail_icons, RailIcons::Sixel);
         let mut buf = TerminalBuffer::new(100, 24);
         let layout = render(&app, &mut buf);
         let icons_hit = layout
@@ -14864,14 +15095,33 @@ mod tests {
             .find(|hit| hit.target == HitTarget::SettingsRailIcons)
             .expect("settings dialog exposes the rail-icons toggle");
         let row = rect_text(&buf, icons_hit.rect);
-        assert!(row.contains("icons [glyph]|ascii"), "{row:?}");
+        assert!(row.contains("icons [sixel]|braille|ascii"), "{row:?}");
 
+        // Mouse: Sixel -> Braille -> Ascii -> Sixel, one click per step at
+        // the SAME hit rect throughout -- every state's own label text is
+        // the same length, only the `[...]` bracket moves, so the hit
+        // region itself never needs to move to stay clickable.
         app.layout = render(&app, &mut buf);
         app.click(icons_hit.rect.x, icons_hit.rect.y);
-        assert_eq!(app.rail_icons, RailIcons::Ascii);
+        assert_eq!(app.rail_icons, RailIcons::Braille);
+        app.layout = render(&app, &mut buf);
+        assert!(rect_text(&buf, icons_hit.rect).contains("icons sixel|[braille]|ascii"));
 
+        app.click(icons_hit.rect.x, icons_hit.rect.y);
+        assert_eq!(app.rail_icons, RailIcons::Ascii);
+        app.layout = render(&app, &mut buf);
+        assert!(rect_text(&buf, icons_hit.rect).contains("icons sixel|braille|[ascii]"));
+
+        app.click(icons_hit.rect.x, icons_hit.rect.y);
+        assert_eq!(app.rail_icons, RailIcons::Sixel);
+
+        // Keyboard: the same 3-state cycle via the 'i' shortcut.
         assert_eq!(app.reduce(crate::UiKey::Char('i')), AppAction::None);
-        assert_eq!(app.rail_icons, RailIcons::Glyph);
+        assert_eq!(app.rail_icons, RailIcons::Braille);
+        assert_eq!(app.reduce(crate::UiKey::Char('i')), AppAction::None);
+        assert_eq!(app.rail_icons, RailIcons::Ascii);
+        assert_eq!(app.reduce(crate::UiKey::Char('i')), AppAction::None);
+        assert_eq!(app.rail_icons, RailIcons::Sixel);
     }
 
     #[test]

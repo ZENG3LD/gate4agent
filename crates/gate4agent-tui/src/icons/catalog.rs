@@ -13,13 +13,19 @@
 //! icons' hand-tuned constants unchanged, or an auto coverage-histogram
 //! search) -- see that function, not prose duplicated per icon here, for
 //! the selection reasoning; a `DEGRADED` line marks icons whose shape does
-//! not survive at 8x12 even at the best achievable threshold.
+//! not survive at 8x12 even at the best achievable threshold. The compact
+//! tier (2x1-cell braille / 1-cell sixel, for dense single-row buttons --
+//! see `../icons.rs`'s own module doc) is chosen the same way by
+//! `choose_compact_threshold`, against `COMPACT_THRESHOLD_OVERRIDES`.
 
 use std::sync::LazyLock;
 
 use uzor_tui::canvas::{CanvasMode, PixelCanvas};
 
-use super::{build_sixel, rgba_to_canvas, BRAILLE_ICON_CELLS_TALL, BRAILLE_ICON_CELLS_WIDE};
+use super::{
+    build_sixel, build_sixel_compact, rgba_to_canvas, BRAILLE_ICON_CELLS_TALL, BRAILLE_ICON_CELLS_WIDE,
+    COMPACT_BRAILLE_ICON_CELLS_TALL, COMPACT_BRAILLE_ICON_CELLS_WIDE,
+};
 
 /// Every baked icon this crate ships, sixel + braille + ascii tiers, one
 /// enum covering the full catalog (not just the activity rail -- see
@@ -279,6 +285,136 @@ pub fn braille(id: IconId) -> &'static PixelCanvas {
     }
 }
 
+/// Encoded COMPACT-tier sixel string for `id` (exactly one assumed
+/// terminal cell -- see `../icons.rs`'s own module doc) -- for dense
+/// single-row buttons where the rail's own 40x40 icon does not fit.
+pub fn sixel_compact(id: IconId) -> &'static str {
+    match id {
+        IconId::Files => FILES_SIXEL_COMPACT.as_str(),
+        IconId::SourceControl => SOURCE_CONTROL_SIXEL_COMPACT.as_str(),
+        IconId::Person => PERSON_SIXEL_COMPACT.as_str(),
+        IconId::Project => PROJECT_SIXEL_COMPACT.as_str(),
+        IconId::SettingsGear => SETTINGS_GEAR_SIXEL_COMPACT.as_str(),
+        IconId::ChevronLeft => CHEVRON_LEFT_SIXEL_COMPACT.as_str(),
+        IconId::ChevronRight => CHEVRON_RIGHT_SIXEL_COMPACT.as_str(),
+        IconId::ChevronDown => CHEVRON_DOWN_SIXEL_COMPACT.as_str(),
+        IconId::NewFile => NEW_FILE_SIXEL_COMPACT.as_str(),
+        IconId::NewFolder => NEW_FOLDER_SIXEL_COMPACT.as_str(),
+        IconId::Folder => FOLDER_SIXEL_COMPACT.as_str(),
+        IconId::FolderOpened => FOLDER_OPENED_SIXEL_COMPACT.as_str(),
+        IconId::File => FILE_SIXEL_COMPACT.as_str(),
+        IconId::Save => SAVE_SIXEL_COMPACT.as_str(),
+        IconId::Refresh => REFRESH_SIXEL_COMPACT.as_str(),
+        IconId::Add => ADD_SIXEL_COMPACT.as_str(),
+        IconId::Trash => TRASH_SIXEL_COMPACT.as_str(),
+        IconId::Search => SEARCH_SIXEL_COMPACT.as_str(),
+        IconId::Check => CHECK_SIXEL_COMPACT.as_str(),
+        IconId::Close => CLOSE_SIXEL_COMPACT.as_str(),
+        IconId::ArrowUp => ARROW_UP_SIXEL_COMPACT.as_str(),
+        IconId::ArrowDown => ARROW_DOWN_SIXEL_COMPACT.as_str(),
+        IconId::ArrowLeft => ARROW_LEFT_SIXEL_COMPACT.as_str(),
+        IconId::ArrowRight => ARROW_RIGHT_SIXEL_COMPACT.as_str(),
+        IconId::ArrowSwap => ARROW_SWAP_SIXEL_COMPACT.as_str(),
+        IconId::GitCommit => GIT_COMMIT_SIXEL_COMPACT.as_str(),
+        IconId::GitBranch => GIT_BRANCH_SIXEL_COMPACT.as_str(),
+        IconId::Diff => DIFF_SIXEL_COMPACT.as_str(),
+        IconId::DiffAdded => DIFF_ADDED_SIXEL_COMPACT.as_str(),
+        IconId::GitCompare => GIT_COMPARE_SIXEL_COMPACT.as_str(),
+        IconId::Repo => REPO_SIXEL_COMPACT.as_str(),
+        IconId::RepoForked => REPO_FORKED_SIXEL_COMPACT.as_str(),
+        IconId::DebugStop => DEBUG_STOP_SIXEL_COMPACT.as_str(),
+        IconId::DebugRestart => DEBUG_RESTART_SIXEL_COMPACT.as_str(),
+        IconId::Edit => EDIT_SIXEL_COMPACT.as_str(),
+        IconId::History => HISTORY_SIXEL_COMPACT.as_str(),
+        IconId::Terminal => TERMINAL_SIXEL_COMPACT.as_str(),
+        IconId::Output => OUTPUT_SIXEL_COMPACT.as_str(),
+        IconId::CloudDownload => CLOUD_DOWNLOAD_SIXEL_COMPACT.as_str(),
+        IconId::Ellipsis => ELLIPSIS_SIXEL_COMPACT.as_str(),
+        IconId::Link => LINK_SIXEL_COMPACT.as_str(),
+        IconId::CircleFilled => CIRCLE_FILLED_SIXEL_COMPACT.as_str(),
+        IconId::CircleSlash => CIRCLE_SLASH_SIXEL_COMPACT.as_str(),
+        IconId::Warning => WARNING_SIXEL_COMPACT.as_str(),
+        IconId::Error => ERROR_SIXEL_COMPACT.as_str(),
+        IconId::Info => INFO_SIXEL_COMPACT.as_str(),
+        IconId::RunAll => RUN_ALL_SIXEL_COMPACT.as_str(),
+        IconId::Play => PLAY_SIXEL_COMPACT.as_str(),
+        IconId::Sync => SYNC_SIXEL_COMPACT.as_str(),
+        IconId::GoToFile => GO_TO_FILE_SIXEL_COMPACT.as_str(),
+        IconId::Pulse => PULSE_SIXEL_COMPACT.as_str(),
+        IconId::Checklist => CHECKLIST_SIXEL_COMPACT.as_str(),
+        IconId::Eye => EYE_SIXEL_COMPACT.as_str(),
+        IconId::Layout => LAYOUT_SIXEL_COMPACT.as_str(),
+        IconId::SplitHorizontal => SPLIT_HORIZONTAL_SIXEL_COMPACT.as_str(),
+        IconId::SplitVertical => SPLIT_VERTICAL_SIXEL_COMPACT.as_str(),
+        IconId::Preview => PREVIEW_SIXEL_COMPACT.as_str(),
+    }
+}
+
+/// COMPACT-tier braille [`PixelCanvas`] for `id` (2 cells wide x 1 row
+/// tall -- see `../icons.rs`'s own module doc), same silhouette rule as
+/// [`braille`].
+pub fn braille_compact(id: IconId) -> &'static PixelCanvas {
+    match id {
+        IconId::Files => &*FILES_BRAILLE_COMPACT,
+        IconId::SourceControl => &*SOURCE_CONTROL_BRAILLE_COMPACT,
+        IconId::Person => &*PERSON_BRAILLE_COMPACT,
+        IconId::Project => &*PROJECT_BRAILLE_COMPACT,
+        IconId::SettingsGear => &*SETTINGS_GEAR_BRAILLE_COMPACT,
+        IconId::ChevronLeft => &*CHEVRON_LEFT_BRAILLE_COMPACT,
+        IconId::ChevronRight => &*CHEVRON_RIGHT_BRAILLE_COMPACT,
+        IconId::ChevronDown => &*CHEVRON_DOWN_BRAILLE_COMPACT,
+        IconId::NewFile => &*NEW_FILE_BRAILLE_COMPACT,
+        IconId::NewFolder => &*NEW_FOLDER_BRAILLE_COMPACT,
+        IconId::Folder => &*FOLDER_BRAILLE_COMPACT,
+        IconId::FolderOpened => &*FOLDER_OPENED_BRAILLE_COMPACT,
+        IconId::File => &*FILE_BRAILLE_COMPACT,
+        IconId::Save => &*SAVE_BRAILLE_COMPACT,
+        IconId::Refresh => &*REFRESH_BRAILLE_COMPACT,
+        IconId::Add => &*ADD_BRAILLE_COMPACT,
+        IconId::Trash => &*TRASH_BRAILLE_COMPACT,
+        IconId::Search => &*SEARCH_BRAILLE_COMPACT,
+        IconId::Check => &*CHECK_BRAILLE_COMPACT,
+        IconId::Close => &*CLOSE_BRAILLE_COMPACT,
+        IconId::ArrowUp => &*ARROW_UP_BRAILLE_COMPACT,
+        IconId::ArrowDown => &*ARROW_DOWN_BRAILLE_COMPACT,
+        IconId::ArrowLeft => &*ARROW_LEFT_BRAILLE_COMPACT,
+        IconId::ArrowRight => &*ARROW_RIGHT_BRAILLE_COMPACT,
+        IconId::ArrowSwap => &*ARROW_SWAP_BRAILLE_COMPACT,
+        IconId::GitCommit => &*GIT_COMMIT_BRAILLE_COMPACT,
+        IconId::GitBranch => &*GIT_BRANCH_BRAILLE_COMPACT,
+        IconId::Diff => &*DIFF_BRAILLE_COMPACT,
+        IconId::DiffAdded => &*DIFF_ADDED_BRAILLE_COMPACT,
+        IconId::GitCompare => &*GIT_COMPARE_BRAILLE_COMPACT,
+        IconId::Repo => &*REPO_BRAILLE_COMPACT,
+        IconId::RepoForked => &*REPO_FORKED_BRAILLE_COMPACT,
+        IconId::DebugStop => &*DEBUG_STOP_BRAILLE_COMPACT,
+        IconId::DebugRestart => &*DEBUG_RESTART_BRAILLE_COMPACT,
+        IconId::Edit => &*EDIT_BRAILLE_COMPACT,
+        IconId::History => &*HISTORY_BRAILLE_COMPACT,
+        IconId::Terminal => &*TERMINAL_BRAILLE_COMPACT,
+        IconId::Output => &*OUTPUT_BRAILLE_COMPACT,
+        IconId::CloudDownload => &*CLOUD_DOWNLOAD_BRAILLE_COMPACT,
+        IconId::Ellipsis => &*ELLIPSIS_BRAILLE_COMPACT,
+        IconId::Link => &*LINK_BRAILLE_COMPACT,
+        IconId::CircleFilled => &*CIRCLE_FILLED_BRAILLE_COMPACT,
+        IconId::CircleSlash => &*CIRCLE_SLASH_BRAILLE_COMPACT,
+        IconId::Warning => &*WARNING_BRAILLE_COMPACT,
+        IconId::Error => &*ERROR_BRAILLE_COMPACT,
+        IconId::Info => &*INFO_BRAILLE_COMPACT,
+        IconId::RunAll => &*RUN_ALL_BRAILLE_COMPACT,
+        IconId::Play => &*PLAY_BRAILLE_COMPACT,
+        IconId::Sync => &*SYNC_BRAILLE_COMPACT,
+        IconId::GoToFile => &*GO_TO_FILE_BRAILLE_COMPACT,
+        IconId::Pulse => &*PULSE_BRAILLE_COMPACT,
+        IconId::Checklist => &*CHECKLIST_BRAILLE_COMPACT,
+        IconId::Eye => &*EYE_BRAILLE_COMPACT,
+        IconId::Layout => &*LAYOUT_BRAILLE_COMPACT,
+        IconId::SplitHorizontal => &*SPLIT_HORIZONTAL_BRAILLE_COMPACT,
+        IconId::SplitVertical => &*SPLIT_VERTICAL_BRAILLE_COMPACT,
+        IconId::Preview => &*PREVIEW_BRAILLE_COMPACT,
+    }
+}
+
 /// Short (<=2 char) plain-ASCII label for `id` -- the rail's own existing
 /// letters (`F`/`G`/`A`/`K`/`S`/`<`/`>`) are reproduced unchanged for the
 /// original 7; every other icon gets an obvious short mark (see
@@ -474,6 +610,132 @@ pub(crate) fn braille_source_rgba(id: IconId) -> &'static [u8] {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn sixel_compact_source_rgba(id: IconId) -> &'static [u8] {
+    match id {
+        IconId::Files => FILES_COMPACT_RGBA,
+        IconId::SourceControl => SOURCE_CONTROL_COMPACT_RGBA,
+        IconId::Person => PERSON_COMPACT_RGBA,
+        IconId::Project => PROJECT_COMPACT_RGBA,
+        IconId::SettingsGear => SETTINGS_GEAR_COMPACT_RGBA,
+        IconId::ChevronLeft => CHEVRON_LEFT_COMPACT_RGBA,
+        IconId::ChevronRight => CHEVRON_RIGHT_COMPACT_RGBA,
+        IconId::ChevronDown => CHEVRON_DOWN_COMPACT_RGBA,
+        IconId::NewFile => NEW_FILE_COMPACT_RGBA,
+        IconId::NewFolder => NEW_FOLDER_COMPACT_RGBA,
+        IconId::Folder => FOLDER_COMPACT_RGBA,
+        IconId::FolderOpened => FOLDER_OPENED_COMPACT_RGBA,
+        IconId::File => FILE_COMPACT_RGBA,
+        IconId::Save => SAVE_COMPACT_RGBA,
+        IconId::Refresh => REFRESH_COMPACT_RGBA,
+        IconId::Add => ADD_COMPACT_RGBA,
+        IconId::Trash => TRASH_COMPACT_RGBA,
+        IconId::Search => SEARCH_COMPACT_RGBA,
+        IconId::Check => CHECK_COMPACT_RGBA,
+        IconId::Close => CLOSE_COMPACT_RGBA,
+        IconId::ArrowUp => ARROW_UP_COMPACT_RGBA,
+        IconId::ArrowDown => ARROW_DOWN_COMPACT_RGBA,
+        IconId::ArrowLeft => ARROW_LEFT_COMPACT_RGBA,
+        IconId::ArrowRight => ARROW_RIGHT_COMPACT_RGBA,
+        IconId::ArrowSwap => ARROW_SWAP_COMPACT_RGBA,
+        IconId::GitCommit => GIT_COMMIT_COMPACT_RGBA,
+        IconId::GitBranch => GIT_BRANCH_COMPACT_RGBA,
+        IconId::Diff => DIFF_COMPACT_RGBA,
+        IconId::DiffAdded => DIFF_ADDED_COMPACT_RGBA,
+        IconId::GitCompare => GIT_COMPARE_COMPACT_RGBA,
+        IconId::Repo => REPO_COMPACT_RGBA,
+        IconId::RepoForked => REPO_FORKED_COMPACT_RGBA,
+        IconId::DebugStop => DEBUG_STOP_COMPACT_RGBA,
+        IconId::DebugRestart => DEBUG_RESTART_COMPACT_RGBA,
+        IconId::Edit => EDIT_COMPACT_RGBA,
+        IconId::History => HISTORY_COMPACT_RGBA,
+        IconId::Terminal => TERMINAL_COMPACT_RGBA,
+        IconId::Output => OUTPUT_COMPACT_RGBA,
+        IconId::CloudDownload => CLOUD_DOWNLOAD_COMPACT_RGBA,
+        IconId::Ellipsis => ELLIPSIS_COMPACT_RGBA,
+        IconId::Link => LINK_COMPACT_RGBA,
+        IconId::CircleFilled => CIRCLE_FILLED_COMPACT_RGBA,
+        IconId::CircleSlash => CIRCLE_SLASH_COMPACT_RGBA,
+        IconId::Warning => WARNING_COMPACT_RGBA,
+        IconId::Error => ERROR_COMPACT_RGBA,
+        IconId::Info => INFO_COMPACT_RGBA,
+        IconId::RunAll => RUN_ALL_COMPACT_RGBA,
+        IconId::Play => PLAY_COMPACT_RGBA,
+        IconId::Sync => SYNC_COMPACT_RGBA,
+        IconId::GoToFile => GO_TO_FILE_COMPACT_RGBA,
+        IconId::Pulse => PULSE_COMPACT_RGBA,
+        IconId::Checklist => CHECKLIST_COMPACT_RGBA,
+        IconId::Eye => EYE_COMPACT_RGBA,
+        IconId::Layout => LAYOUT_COMPACT_RGBA,
+        IconId::SplitHorizontal => SPLIT_HORIZONTAL_COMPACT_RGBA,
+        IconId::SplitVertical => SPLIT_VERTICAL_COMPACT_RGBA,
+        IconId::Preview => PREVIEW_COMPACT_RGBA,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn braille_compact_source_rgba(id: IconId) -> &'static [u8] {
+    match id {
+        IconId::Files => FILES_COMPACT_BRAILLE_RGBA,
+        IconId::SourceControl => SOURCE_CONTROL_COMPACT_BRAILLE_RGBA,
+        IconId::Person => PERSON_COMPACT_BRAILLE_RGBA,
+        IconId::Project => PROJECT_COMPACT_BRAILLE_RGBA,
+        IconId::SettingsGear => SETTINGS_GEAR_COMPACT_BRAILLE_RGBA,
+        IconId::ChevronLeft => CHEVRON_LEFT_COMPACT_BRAILLE_RGBA,
+        IconId::ChevronRight => CHEVRON_RIGHT_COMPACT_BRAILLE_RGBA,
+        IconId::ChevronDown => CHEVRON_DOWN_COMPACT_BRAILLE_RGBA,
+        IconId::NewFile => NEW_FILE_COMPACT_BRAILLE_RGBA,
+        IconId::NewFolder => NEW_FOLDER_COMPACT_BRAILLE_RGBA,
+        IconId::Folder => FOLDER_COMPACT_BRAILLE_RGBA,
+        IconId::FolderOpened => FOLDER_OPENED_COMPACT_BRAILLE_RGBA,
+        IconId::File => FILE_COMPACT_BRAILLE_RGBA,
+        IconId::Save => SAVE_COMPACT_BRAILLE_RGBA,
+        IconId::Refresh => REFRESH_COMPACT_BRAILLE_RGBA,
+        IconId::Add => ADD_COMPACT_BRAILLE_RGBA,
+        IconId::Trash => TRASH_COMPACT_BRAILLE_RGBA,
+        IconId::Search => SEARCH_COMPACT_BRAILLE_RGBA,
+        IconId::Check => CHECK_COMPACT_BRAILLE_RGBA,
+        IconId::Close => CLOSE_COMPACT_BRAILLE_RGBA,
+        IconId::ArrowUp => ARROW_UP_COMPACT_BRAILLE_RGBA,
+        IconId::ArrowDown => ARROW_DOWN_COMPACT_BRAILLE_RGBA,
+        IconId::ArrowLeft => ARROW_LEFT_COMPACT_BRAILLE_RGBA,
+        IconId::ArrowRight => ARROW_RIGHT_COMPACT_BRAILLE_RGBA,
+        IconId::ArrowSwap => ARROW_SWAP_COMPACT_BRAILLE_RGBA,
+        IconId::GitCommit => GIT_COMMIT_COMPACT_BRAILLE_RGBA,
+        IconId::GitBranch => GIT_BRANCH_COMPACT_BRAILLE_RGBA,
+        IconId::Diff => DIFF_COMPACT_BRAILLE_RGBA,
+        IconId::DiffAdded => DIFF_ADDED_COMPACT_BRAILLE_RGBA,
+        IconId::GitCompare => GIT_COMPARE_COMPACT_BRAILLE_RGBA,
+        IconId::Repo => REPO_COMPACT_BRAILLE_RGBA,
+        IconId::RepoForked => REPO_FORKED_COMPACT_BRAILLE_RGBA,
+        IconId::DebugStop => DEBUG_STOP_COMPACT_BRAILLE_RGBA,
+        IconId::DebugRestart => DEBUG_RESTART_COMPACT_BRAILLE_RGBA,
+        IconId::Edit => EDIT_COMPACT_BRAILLE_RGBA,
+        IconId::History => HISTORY_COMPACT_BRAILLE_RGBA,
+        IconId::Terminal => TERMINAL_COMPACT_BRAILLE_RGBA,
+        IconId::Output => OUTPUT_COMPACT_BRAILLE_RGBA,
+        IconId::CloudDownload => CLOUD_DOWNLOAD_COMPACT_BRAILLE_RGBA,
+        IconId::Ellipsis => ELLIPSIS_COMPACT_BRAILLE_RGBA,
+        IconId::Link => LINK_COMPACT_BRAILLE_RGBA,
+        IconId::CircleFilled => CIRCLE_FILLED_COMPACT_BRAILLE_RGBA,
+        IconId::CircleSlash => CIRCLE_SLASH_COMPACT_BRAILLE_RGBA,
+        IconId::Warning => WARNING_COMPACT_BRAILLE_RGBA,
+        IconId::Error => ERROR_COMPACT_BRAILLE_RGBA,
+        IconId::Info => INFO_COMPACT_BRAILLE_RGBA,
+        IconId::RunAll => RUN_ALL_COMPACT_BRAILLE_RGBA,
+        IconId::Play => PLAY_COMPACT_BRAILLE_RGBA,
+        IconId::Sync => SYNC_COMPACT_BRAILLE_RGBA,
+        IconId::GoToFile => GO_TO_FILE_COMPACT_BRAILLE_RGBA,
+        IconId::Pulse => PULSE_COMPACT_BRAILLE_RGBA,
+        IconId::Checklist => CHECKLIST_COMPACT_BRAILLE_RGBA,
+        IconId::Eye => EYE_COMPACT_BRAILLE_RGBA,
+        IconId::Layout => LAYOUT_COMPACT_BRAILLE_RGBA,
+        IconId::SplitHorizontal => SPLIT_HORIZONTAL_COMPACT_BRAILLE_RGBA,
+        IconId::SplitVertical => SPLIT_VERTICAL_COMPACT_BRAILLE_RGBA,
+        IconId::Preview => PREVIEW_COMPACT_BRAILLE_RGBA,
+    }
+}
+
 // ---- Files (files) --------------------------------------------------
 
 const FILES_RGBA: &[u8] = include_bytes!("files.rgba");
@@ -489,6 +751,22 @@ static FILES_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
         BRAILLE_ICON_CELLS_TALL,
         FILES_BRAILLE_RGBA,
         FILES_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
+const FILES_COMPACT_RGBA: &[u8] = include_bytes!("files_compact.rgba");
+static FILES_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(FILES_COMPACT_RGBA));
+
+const FILES_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("files_compact_braille.rgba");
+/// ~50% coverage (128/255), auto-selected by bake_icons.py::choose_compact_threshold -- 4/16 dots lit at this threshold.
+const FILES_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 128;
+static FILES_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        FILES_COMPACT_BRAILLE_RGBA,
+        FILES_COMPACT_BRAILLE_ALPHA_THRESHOLD,
     )
 });
 
@@ -510,6 +788,22 @@ static SOURCE_CONTROL_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const SOURCE_CONTROL_COMPACT_RGBA: &[u8] = include_bytes!("source_control_compact.rgba");
+static SOURCE_CONTROL_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(SOURCE_CONTROL_COMPACT_RGBA));
+
+const SOURCE_CONTROL_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("source_control_compact_braille.rgba");
+/// ~30% coverage (77/255), auto-selected by bake_icons.py::choose_compact_threshold -- 5/16 dots lit at this threshold.
+const SOURCE_CONTROL_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 77;
+static SOURCE_CONTROL_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        SOURCE_CONTROL_COMPACT_BRAILLE_RGBA,
+        SOURCE_CONTROL_COMPACT_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
 // ---- Person (person) ------------------------------------------------
 
 const PERSON_RGBA: &[u8] = include_bytes!("person.rgba");
@@ -528,6 +822,22 @@ static PERSON_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const PERSON_COMPACT_RGBA: &[u8] = include_bytes!("person_compact.rgba");
+static PERSON_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(PERSON_COMPACT_RGBA));
+
+const PERSON_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("person_compact_braille.rgba");
+/// ~35% coverage (89/255), auto-selected by bake_icons.py::choose_compact_threshold -- 3/16 dots lit at this threshold.
+const PERSON_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 89;
+static PERSON_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        PERSON_COMPACT_BRAILLE_RGBA,
+        PERSON_COMPACT_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
 // ---- Project (project) ----------------------------------------------
 
 const PROJECT_RGBA: &[u8] = include_bytes!("project.rgba");
@@ -543,6 +853,22 @@ static PROJECT_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
         BRAILLE_ICON_CELLS_TALL,
         PROJECT_BRAILLE_RGBA,
         PROJECT_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
+const PROJECT_COMPACT_RGBA: &[u8] = include_bytes!("project_compact.rgba");
+static PROJECT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(PROJECT_COMPACT_RGBA));
+
+const PROJECT_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("project_compact_braille.rgba");
+/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_compact_threshold -- 10/16 dots lit at this threshold.
+const PROJECT_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
+static PROJECT_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        PROJECT_COMPACT_BRAILLE_RGBA,
+        PROJECT_COMPACT_BRAILLE_ALPHA_THRESHOLD,
     )
 });
 
@@ -565,6 +891,22 @@ static SETTINGS_GEAR_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const SETTINGS_GEAR_COMPACT_RGBA: &[u8] = include_bytes!("settings_gear_compact.rgba");
+static SETTINGS_GEAR_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(SETTINGS_GEAR_COMPACT_RGBA));
+
+const SETTINGS_GEAR_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("settings_gear_compact_braille.rgba");
+/// ~30% coverage (77/255), auto-selected by bake_icons.py::choose_compact_threshold -- 4/16 dots lit at this threshold.
+const SETTINGS_GEAR_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 77;
+static SETTINGS_GEAR_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        SETTINGS_GEAR_COMPACT_BRAILLE_RGBA,
+        SETTINGS_GEAR_COMPACT_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
 // ---- ChevronLeft (chevron-left) -------------------------------------
 
 const CHEVRON_LEFT_RGBA: &[u8] = include_bytes!("chevron_left.rgba");
@@ -580,6 +922,22 @@ static CHEVRON_LEFT_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
         BRAILLE_ICON_CELLS_TALL,
         CHEVRON_LEFT_BRAILLE_RGBA,
         CHEVRON_LEFT_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
+const CHEVRON_LEFT_COMPACT_RGBA: &[u8] = include_bytes!("chevron_left_compact.rgba");
+static CHEVRON_LEFT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(CHEVRON_LEFT_COMPACT_RGBA));
+
+const CHEVRON_LEFT_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("chevron_left_compact_braille.rgba");
+/// ~6% coverage (15/255), auto-selected by bake_icons.py::choose_compact_threshold -- 6/16 dots lit at this threshold.
+const CHEVRON_LEFT_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 15;
+static CHEVRON_LEFT_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        CHEVRON_LEFT_COMPACT_BRAILLE_RGBA,
+        CHEVRON_LEFT_COMPACT_BRAILLE_ALPHA_THRESHOLD,
     )
 });
 
@@ -601,6 +959,22 @@ static CHEVRON_RIGHT_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const CHEVRON_RIGHT_COMPACT_RGBA: &[u8] = include_bytes!("chevron_right_compact.rgba");
+static CHEVRON_RIGHT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(CHEVRON_RIGHT_COMPACT_RGBA));
+
+const CHEVRON_RIGHT_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("chevron_right_compact_braille.rgba");
+/// ~6% coverage (15/255), auto-selected by bake_icons.py::choose_compact_threshold -- 6/16 dots lit at this threshold.
+const CHEVRON_RIGHT_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 15;
+static CHEVRON_RIGHT_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        CHEVRON_RIGHT_COMPACT_BRAILLE_RGBA,
+        CHEVRON_RIGHT_COMPACT_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
 // ---- ChevronDown (chevron-down) -------------------------------------
 
 const CHEVRON_DOWN_RGBA: &[u8] = include_bytes!("chevron_down.rgba");
@@ -616,6 +990,22 @@ static CHEVRON_DOWN_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
         BRAILLE_ICON_CELLS_TALL,
         CHEVRON_DOWN_BRAILLE_RGBA,
         CHEVRON_DOWN_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
+const CHEVRON_DOWN_COMPACT_RGBA: &[u8] = include_bytes!("chevron_down_compact.rgba");
+static CHEVRON_DOWN_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(CHEVRON_DOWN_COMPACT_RGBA));
+
+const CHEVRON_DOWN_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("chevron_down_compact_braille.rgba");
+/// ~15% coverage (38/255), auto-selected by bake_icons.py::choose_compact_threshold -- 4/16 dots lit at this threshold.
+const CHEVRON_DOWN_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 38;
+static CHEVRON_DOWN_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        CHEVRON_DOWN_COMPACT_BRAILLE_RGBA,
+        CHEVRON_DOWN_COMPACT_BRAILLE_ALPHA_THRESHOLD,
     )
 });
 
@@ -637,6 +1027,22 @@ static NEW_FILE_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const NEW_FILE_COMPACT_RGBA: &[u8] = include_bytes!("new_file_compact.rgba");
+static NEW_FILE_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(NEW_FILE_COMPACT_RGBA));
+
+const NEW_FILE_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("new_file_compact_braille.rgba");
+/// ~25% coverage (64/255), override, hand-picked after reviewing bake_icons.py's own printed report -- 10/16 dots lit at this threshold.
+const NEW_FILE_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
+static NEW_FILE_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        NEW_FILE_COMPACT_BRAILLE_RGBA,
+        NEW_FILE_COMPACT_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
 // ---- NewFolder (new-folder) -----------------------------------------
 
 const NEW_FOLDER_RGBA: &[u8] = include_bytes!("new_folder.rgba");
@@ -652,6 +1058,22 @@ static NEW_FOLDER_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
         BRAILLE_ICON_CELLS_TALL,
         NEW_FOLDER_BRAILLE_RGBA,
         NEW_FOLDER_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
+const NEW_FOLDER_COMPACT_RGBA: &[u8] = include_bytes!("new_folder_compact.rgba");
+static NEW_FOLDER_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(NEW_FOLDER_COMPACT_RGBA));
+
+const NEW_FOLDER_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("new_folder_compact_braille.rgba");
+/// ~25% coverage (64/255), override, hand-picked after reviewing bake_icons.py's own printed report -- 10/16 dots lit at this threshold.
+const NEW_FOLDER_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
+static NEW_FOLDER_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        NEW_FOLDER_COMPACT_BRAILLE_RGBA,
+        NEW_FOLDER_COMPACT_BRAILLE_ALPHA_THRESHOLD,
     )
 });
 
@@ -673,6 +1095,22 @@ static FOLDER_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const FOLDER_COMPACT_RGBA: &[u8] = include_bytes!("folder_compact.rgba");
+static FOLDER_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(FOLDER_COMPACT_RGBA));
+
+const FOLDER_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("folder_compact_braille.rgba");
+/// ~30% coverage (77/255), auto-selected by bake_icons.py::choose_compact_threshold -- 3/16 dots lit at this threshold.
+const FOLDER_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 77;
+static FOLDER_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        FOLDER_COMPACT_BRAILLE_RGBA,
+        FOLDER_COMPACT_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
 // ---- FolderOpened (folder-opened) -----------------------------------
 
 const FOLDER_OPENED_RGBA: &[u8] = include_bytes!("folder_opened.rgba");
@@ -688,6 +1126,22 @@ static FOLDER_OPENED_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
         BRAILLE_ICON_CELLS_TALL,
         FOLDER_OPENED_BRAILLE_RGBA,
         FOLDER_OPENED_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
+const FOLDER_OPENED_COMPACT_RGBA: &[u8] = include_bytes!("folder_opened_compact.rgba");
+static FOLDER_OPENED_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(FOLDER_OPENED_COMPACT_RGBA));
+
+const FOLDER_OPENED_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("folder_opened_compact_braille.rgba");
+/// ~35% coverage (89/255), auto-selected by bake_icons.py::choose_compact_threshold -- 3/16 dots lit at this threshold.
+const FOLDER_OPENED_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 89;
+static FOLDER_OPENED_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        FOLDER_OPENED_COMPACT_BRAILLE_RGBA,
+        FOLDER_OPENED_COMPACT_BRAILLE_ALPHA_THRESHOLD,
     )
 });
 
@@ -709,6 +1163,22 @@ static FILE_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const FILE_COMPACT_RGBA: &[u8] = include_bytes!("file_compact.rgba");
+static FILE_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(FILE_COMPACT_RGBA));
+
+const FILE_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("file_compact_braille.rgba");
+/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_compact_threshold -- 8/16 dots lit at this threshold.
+const FILE_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
+static FILE_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        FILE_COMPACT_BRAILLE_RGBA,
+        FILE_COMPACT_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
 // ---- Save (save) ----------------------------------------------------
 
 const SAVE_RGBA: &[u8] = include_bytes!("save.rgba");
@@ -724,6 +1194,22 @@ static SAVE_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
         BRAILLE_ICON_CELLS_TALL,
         SAVE_BRAILLE_RGBA,
         SAVE_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
+const SAVE_COMPACT_RGBA: &[u8] = include_bytes!("save_compact.rgba");
+static SAVE_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(SAVE_COMPACT_RGBA));
+
+const SAVE_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("save_compact_braille.rgba");
+/// ~35% coverage (89/255), auto-selected by bake_icons.py::choose_compact_threshold -- 6/16 dots lit at this threshold.
+const SAVE_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 89;
+static SAVE_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        SAVE_COMPACT_BRAILLE_RGBA,
+        SAVE_COMPACT_BRAILLE_ALPHA_THRESHOLD,
     )
 });
 
@@ -745,6 +1231,22 @@ static REFRESH_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const REFRESH_COMPACT_RGBA: &[u8] = include_bytes!("refresh_compact.rgba");
+static REFRESH_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(REFRESH_COMPACT_RGBA));
+
+const REFRESH_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("refresh_compact_braille.rgba");
+/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_compact_threshold -- 6/16 dots lit at this threshold.
+const REFRESH_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
+static REFRESH_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        REFRESH_COMPACT_BRAILLE_RGBA,
+        REFRESH_COMPACT_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
 // ---- Add (add) ------------------------------------------------------
 
 const ADD_RGBA: &[u8] = include_bytes!("add.rgba");
@@ -760,6 +1262,22 @@ static ADD_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
         BRAILLE_ICON_CELLS_TALL,
         ADD_BRAILLE_RGBA,
         ADD_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
+const ADD_COMPACT_RGBA: &[u8] = include_bytes!("add_compact.rgba");
+static ADD_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(ADD_COMPACT_RGBA));
+
+const ADD_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("add_compact_braille.rgba");
+/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_compact_threshold -- 3/16 dots lit at this threshold.
+const ADD_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
+static ADD_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        ADD_COMPACT_BRAILLE_RGBA,
+        ADD_COMPACT_BRAILLE_ALPHA_THRESHOLD,
     )
 });
 
@@ -781,6 +1299,22 @@ static TRASH_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const TRASH_COMPACT_RGBA: &[u8] = include_bytes!("trash_compact.rgba");
+static TRASH_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(TRASH_COMPACT_RGBA));
+
+const TRASH_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("trash_compact_braille.rgba");
+/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_compact_threshold -- 8/16 dots lit at this threshold.
+const TRASH_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
+static TRASH_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        TRASH_COMPACT_BRAILLE_RGBA,
+        TRASH_COMPACT_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
 // ---- Search (search) ------------------------------------------------
 
 const SEARCH_RGBA: &[u8] = include_bytes!("search.rgba");
@@ -796,6 +1330,22 @@ static SEARCH_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
         BRAILLE_ICON_CELLS_TALL,
         SEARCH_BRAILLE_RGBA,
         SEARCH_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
+const SEARCH_COMPACT_RGBA: &[u8] = include_bytes!("search_compact.rgba");
+static SEARCH_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(SEARCH_COMPACT_RGBA));
+
+const SEARCH_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("search_compact_braille.rgba");
+/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_compact_threshold -- 5/16 dots lit at this threshold.
+const SEARCH_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
+static SEARCH_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        SEARCH_COMPACT_BRAILLE_RGBA,
+        SEARCH_COMPACT_BRAILLE_ALPHA_THRESHOLD,
     )
 });
 
@@ -817,6 +1367,22 @@ static CHECK_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const CHECK_COMPACT_RGBA: &[u8] = include_bytes!("check_compact.rgba");
+static CHECK_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(CHECK_COMPACT_RGBA));
+
+const CHECK_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("check_compact_braille.rgba");
+/// ~10% coverage (26/255), override, hand-picked after reviewing bake_icons.py's own printed report -- 5/16 dots lit at this threshold.
+const CHECK_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 26;
+static CHECK_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        CHECK_COMPACT_BRAILLE_RGBA,
+        CHECK_COMPACT_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
 // ---- Close (close) --------------------------------------------------
 
 const CLOSE_RGBA: &[u8] = include_bytes!("close.rgba");
@@ -832,6 +1398,22 @@ static CLOSE_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
         BRAILLE_ICON_CELLS_TALL,
         CLOSE_BRAILLE_RGBA,
         CLOSE_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
+const CLOSE_COMPACT_RGBA: &[u8] = include_bytes!("close_compact.rgba");
+static CLOSE_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(CLOSE_COMPACT_RGBA));
+
+const CLOSE_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("close_compact_braille.rgba");
+/// ~30% coverage (77/255), auto-selected by bake_icons.py::choose_compact_threshold -- 4/16 dots lit at this threshold.
+const CLOSE_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 77;
+static CLOSE_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        CLOSE_COMPACT_BRAILLE_RGBA,
+        CLOSE_COMPACT_BRAILLE_ALPHA_THRESHOLD,
     )
 });
 
@@ -853,6 +1435,22 @@ static ARROW_UP_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const ARROW_UP_COMPACT_RGBA: &[u8] = include_bytes!("arrow_up_compact.rgba");
+static ARROW_UP_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(ARROW_UP_COMPACT_RGBA));
+
+const ARROW_UP_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("arrow_up_compact_braille.rgba");
+/// ~15% coverage (38/255), override, hand-picked after reviewing bake_icons.py's own printed report -- 5/16 dots lit at this threshold.
+const ARROW_UP_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 38;
+static ARROW_UP_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        ARROW_UP_COMPACT_BRAILLE_RGBA,
+        ARROW_UP_COMPACT_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
 // ---- ArrowDown (arrow-down) -----------------------------------------
 
 const ARROW_DOWN_RGBA: &[u8] = include_bytes!("arrow_down.rgba");
@@ -868,6 +1466,22 @@ static ARROW_DOWN_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
         BRAILLE_ICON_CELLS_TALL,
         ARROW_DOWN_BRAILLE_RGBA,
         ARROW_DOWN_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
+const ARROW_DOWN_COMPACT_RGBA: &[u8] = include_bytes!("arrow_down_compact.rgba");
+static ARROW_DOWN_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(ARROW_DOWN_COMPACT_RGBA));
+
+const ARROW_DOWN_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("arrow_down_compact_braille.rgba");
+/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_compact_threshold -- 3/16 dots lit at this threshold.
+const ARROW_DOWN_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
+static ARROW_DOWN_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        ARROW_DOWN_COMPACT_BRAILLE_RGBA,
+        ARROW_DOWN_COMPACT_BRAILLE_ALPHA_THRESHOLD,
     )
 });
 
@@ -889,6 +1503,22 @@ static ARROW_LEFT_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const ARROW_LEFT_COMPACT_RGBA: &[u8] = include_bytes!("arrow_left_compact.rgba");
+static ARROW_LEFT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(ARROW_LEFT_COMPACT_RGBA));
+
+const ARROW_LEFT_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("arrow_left_compact_braille.rgba");
+/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_compact_threshold -- 3/16 dots lit at this threshold.
+const ARROW_LEFT_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
+static ARROW_LEFT_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        ARROW_LEFT_COMPACT_BRAILLE_RGBA,
+        ARROW_LEFT_COMPACT_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
 // ---- ArrowRight (arrow-right) ---------------------------------------
 
 const ARROW_RIGHT_RGBA: &[u8] = include_bytes!("arrow_right.rgba");
@@ -904,6 +1534,22 @@ static ARROW_RIGHT_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
         BRAILLE_ICON_CELLS_TALL,
         ARROW_RIGHT_BRAILLE_RGBA,
         ARROW_RIGHT_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
+const ARROW_RIGHT_COMPACT_RGBA: &[u8] = include_bytes!("arrow_right_compact.rgba");
+static ARROW_RIGHT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(ARROW_RIGHT_COMPACT_RGBA));
+
+const ARROW_RIGHT_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("arrow_right_compact_braille.rgba");
+/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_compact_threshold -- 3/16 dots lit at this threshold.
+const ARROW_RIGHT_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
+static ARROW_RIGHT_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        ARROW_RIGHT_COMPACT_BRAILLE_RGBA,
+        ARROW_RIGHT_COMPACT_BRAILLE_ALPHA_THRESHOLD,
     )
 });
 
@@ -925,6 +1571,22 @@ static ARROW_SWAP_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const ARROW_SWAP_COMPACT_RGBA: &[u8] = include_bytes!("arrow_swap_compact.rgba");
+static ARROW_SWAP_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(ARROW_SWAP_COMPACT_RGBA));
+
+const ARROW_SWAP_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("arrow_swap_compact_braille.rgba");
+/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_compact_threshold -- 4/16 dots lit at this threshold.
+const ARROW_SWAP_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
+static ARROW_SWAP_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        ARROW_SWAP_COMPACT_BRAILLE_RGBA,
+        ARROW_SWAP_COMPACT_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
 // ---- GitCommit (git-commit) -----------------------------------------
 
 const GIT_COMMIT_RGBA: &[u8] = include_bytes!("git_commit.rgba");
@@ -940,6 +1602,22 @@ static GIT_COMMIT_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
         BRAILLE_ICON_CELLS_TALL,
         GIT_COMMIT_BRAILLE_RGBA,
         GIT_COMMIT_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
+const GIT_COMMIT_COMPACT_RGBA: &[u8] = include_bytes!("git_commit_compact.rgba");
+static GIT_COMMIT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(GIT_COMMIT_COMPACT_RGBA));
+
+const GIT_COMMIT_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("git_commit_compact_braille.rgba");
+/// ~30% coverage (77/255), auto-selected by bake_icons.py::choose_compact_threshold -- 4/16 dots lit at this threshold.
+const GIT_COMMIT_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 77;
+static GIT_COMMIT_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        GIT_COMMIT_COMPACT_BRAILLE_RGBA,
+        GIT_COMMIT_COMPACT_BRAILLE_ALPHA_THRESHOLD,
     )
 });
 
@@ -961,6 +1639,22 @@ static GIT_BRANCH_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const GIT_BRANCH_COMPACT_RGBA: &[u8] = include_bytes!("git_branch_compact.rgba");
+static GIT_BRANCH_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(GIT_BRANCH_COMPACT_RGBA));
+
+const GIT_BRANCH_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("git_branch_compact_braille.rgba");
+/// ~30% coverage (77/255), auto-selected by bake_icons.py::choose_compact_threshold -- 5/16 dots lit at this threshold.
+const GIT_BRANCH_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 77;
+static GIT_BRANCH_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        GIT_BRANCH_COMPACT_BRAILLE_RGBA,
+        GIT_BRANCH_COMPACT_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
 // ---- Diff (diff) ----------------------------------------------------
 
 const DIFF_RGBA: &[u8] = include_bytes!("diff.rgba");
@@ -976,6 +1670,22 @@ static DIFF_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
         BRAILLE_ICON_CELLS_TALL,
         DIFF_BRAILLE_RGBA,
         DIFF_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
+const DIFF_COMPACT_RGBA: &[u8] = include_bytes!("diff_compact.rgba");
+static DIFF_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(DIFF_COMPACT_RGBA));
+
+const DIFF_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("diff_compact_braille.rgba");
+/// ~35% coverage (89/255), auto-selected by bake_icons.py::choose_compact_threshold -- 4/16 dots lit at this threshold.
+const DIFF_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 89;
+static DIFF_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        DIFF_COMPACT_BRAILLE_RGBA,
+        DIFF_COMPACT_BRAILLE_ALPHA_THRESHOLD,
     )
 });
 
@@ -997,6 +1707,22 @@ static DIFF_ADDED_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const DIFF_ADDED_COMPACT_RGBA: &[u8] = include_bytes!("diff_added_compact.rgba");
+static DIFF_ADDED_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(DIFF_ADDED_COMPACT_RGBA));
+
+const DIFF_ADDED_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("diff_added_compact_braille.rgba");
+/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_compact_threshold -- 10/16 dots lit at this threshold.
+const DIFF_ADDED_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
+static DIFF_ADDED_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        DIFF_ADDED_COMPACT_BRAILLE_RGBA,
+        DIFF_ADDED_COMPACT_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
 // ---- GitCompare (git-compare) ---------------------------------------
 
 const GIT_COMPARE_RGBA: &[u8] = include_bytes!("git_compare.rgba");
@@ -1012,6 +1738,22 @@ static GIT_COMPARE_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
         BRAILLE_ICON_CELLS_TALL,
         GIT_COMPARE_BRAILLE_RGBA,
         GIT_COMPARE_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
+const GIT_COMPARE_COMPACT_RGBA: &[u8] = include_bytes!("git_compare_compact.rgba");
+static GIT_COMPARE_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(GIT_COMPARE_COMPACT_RGBA));
+
+const GIT_COMPARE_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("git_compare_compact_braille.rgba");
+/// ~30% coverage (77/255), auto-selected by bake_icons.py::choose_compact_threshold -- 4/16 dots lit at this threshold.
+const GIT_COMPARE_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 77;
+static GIT_COMPARE_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        GIT_COMPARE_COMPACT_BRAILLE_RGBA,
+        GIT_COMPARE_COMPACT_BRAILLE_ALPHA_THRESHOLD,
     )
 });
 
@@ -1033,6 +1775,22 @@ static REPO_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const REPO_COMPACT_RGBA: &[u8] = include_bytes!("repo_compact.rgba");
+static REPO_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(REPO_COMPACT_RGBA));
+
+const REPO_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("repo_compact_braille.rgba");
+/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_compact_threshold -- 9/16 dots lit at this threshold.
+const REPO_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
+static REPO_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        REPO_COMPACT_BRAILLE_RGBA,
+        REPO_COMPACT_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
 // ---- RepoForked (repo-forked) ---------------------------------------
 
 const REPO_FORKED_RGBA: &[u8] = include_bytes!("repo_forked.rgba");
@@ -1048,6 +1806,22 @@ static REPO_FORKED_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
         BRAILLE_ICON_CELLS_TALL,
         REPO_FORKED_BRAILLE_RGBA,
         REPO_FORKED_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
+const REPO_FORKED_COMPACT_RGBA: &[u8] = include_bytes!("repo_forked_compact.rgba");
+static REPO_FORKED_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(REPO_FORKED_COMPACT_RGBA));
+
+const REPO_FORKED_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("repo_forked_compact_braille.rgba");
+/// ~30% coverage (77/255), auto-selected by bake_icons.py::choose_compact_threshold -- 4/16 dots lit at this threshold.
+const REPO_FORKED_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 77;
+static REPO_FORKED_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        REPO_FORKED_COMPACT_BRAILLE_RGBA,
+        REPO_FORKED_COMPACT_BRAILLE_ALPHA_THRESHOLD,
     )
 });
 
@@ -1069,6 +1843,22 @@ static DEBUG_STOP_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const DEBUG_STOP_COMPACT_RGBA: &[u8] = include_bytes!("debug_stop_compact.rgba");
+static DEBUG_STOP_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(DEBUG_STOP_COMPACT_RGBA));
+
+const DEBUG_STOP_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("debug_stop_compact_braille.rgba");
+/// ~35% coverage (89/255), auto-selected by bake_icons.py::choose_compact_threshold -- 8/16 dots lit at this threshold.
+const DEBUG_STOP_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 89;
+static DEBUG_STOP_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        DEBUG_STOP_COMPACT_BRAILLE_RGBA,
+        DEBUG_STOP_COMPACT_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
 // ---- DebugRestart (debug-restart) -----------------------------------
 
 const DEBUG_RESTART_RGBA: &[u8] = include_bytes!("debug_restart.rgba");
@@ -1084,6 +1874,22 @@ static DEBUG_RESTART_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
         BRAILLE_ICON_CELLS_TALL,
         DEBUG_RESTART_BRAILLE_RGBA,
         DEBUG_RESTART_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
+const DEBUG_RESTART_COMPACT_RGBA: &[u8] = include_bytes!("debug_restart_compact.rgba");
+static DEBUG_RESTART_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(DEBUG_RESTART_COMPACT_RGBA));
+
+const DEBUG_RESTART_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("debug_restart_compact_braille.rgba");
+/// ~30% coverage (77/255), auto-selected by bake_icons.py::choose_compact_threshold -- 8/16 dots lit at this threshold.
+const DEBUG_RESTART_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 77;
+static DEBUG_RESTART_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        DEBUG_RESTART_COMPACT_BRAILLE_RGBA,
+        DEBUG_RESTART_COMPACT_BRAILLE_ALPHA_THRESHOLD,
     )
 });
 
@@ -1105,6 +1911,22 @@ static EDIT_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const EDIT_COMPACT_RGBA: &[u8] = include_bytes!("edit_compact.rgba");
+static EDIT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(EDIT_COMPACT_RGBA));
+
+const EDIT_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("edit_compact_braille.rgba");
+/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_compact_threshold -- 7/16 dots lit at this threshold.
+const EDIT_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
+static EDIT_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        EDIT_COMPACT_BRAILLE_RGBA,
+        EDIT_COMPACT_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
 // ---- History (history) ----------------------------------------------
 
 const HISTORY_RGBA: &[u8] = include_bytes!("history.rgba");
@@ -1120,6 +1942,22 @@ static HISTORY_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
         BRAILLE_ICON_CELLS_TALL,
         HISTORY_BRAILLE_RGBA,
         HISTORY_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
+const HISTORY_COMPACT_RGBA: &[u8] = include_bytes!("history_compact.rgba");
+static HISTORY_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(HISTORY_COMPACT_RGBA));
+
+const HISTORY_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("history_compact_braille.rgba");
+/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_compact_threshold -- 7/16 dots lit at this threshold.
+const HISTORY_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
+static HISTORY_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        HISTORY_COMPACT_BRAILLE_RGBA,
+        HISTORY_COMPACT_BRAILLE_ALPHA_THRESHOLD,
     )
 });
 
@@ -1141,6 +1979,22 @@ static TERMINAL_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const TERMINAL_COMPACT_RGBA: &[u8] = include_bytes!("terminal_compact.rgba");
+static TERMINAL_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(TERMINAL_COMPACT_RGBA));
+
+const TERMINAL_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("terminal_compact_braille.rgba");
+/// ~30% coverage (77/255), auto-selected by bake_icons.py::choose_compact_threshold -- 4/16 dots lit at this threshold.
+const TERMINAL_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 77;
+static TERMINAL_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        TERMINAL_COMPACT_BRAILLE_RGBA,
+        TERMINAL_COMPACT_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
 // ---- Output (output) ------------------------------------------------
 
 const OUTPUT_RGBA: &[u8] = include_bytes!("output.rgba");
@@ -1159,6 +2013,22 @@ static OUTPUT_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const OUTPUT_COMPACT_RGBA: &[u8] = include_bytes!("output_compact.rgba");
+static OUTPUT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(OUTPUT_COMPACT_RGBA));
+
+const OUTPUT_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("output_compact_braille.rgba");
+/// ~30% coverage (77/255), auto-selected by bake_icons.py::choose_compact_threshold -- 4/16 dots lit at this threshold.
+const OUTPUT_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 77;
+static OUTPUT_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        OUTPUT_COMPACT_BRAILLE_RGBA,
+        OUTPUT_COMPACT_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
 // ---- CloudDownload (cloud-download) ---------------------------------
 
 const CLOUD_DOWNLOAD_RGBA: &[u8] = include_bytes!("cloud_download.rgba");
@@ -1174,6 +2044,22 @@ static CLOUD_DOWNLOAD_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
         BRAILLE_ICON_CELLS_TALL,
         CLOUD_DOWNLOAD_BRAILLE_RGBA,
         CLOUD_DOWNLOAD_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
+const CLOUD_DOWNLOAD_COMPACT_RGBA: &[u8] = include_bytes!("cloud_download_compact.rgba");
+static CLOUD_DOWNLOAD_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(CLOUD_DOWNLOAD_COMPACT_RGBA));
+
+const CLOUD_DOWNLOAD_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("cloud_download_compact_braille.rgba");
+/// ~58% coverage (148/255), auto-selected by bake_icons.py::choose_compact_threshold -- 4/16 dots lit at this threshold.
+const CLOUD_DOWNLOAD_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 148;
+static CLOUD_DOWNLOAD_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        CLOUD_DOWNLOAD_COMPACT_BRAILLE_RGBA,
+        CLOUD_DOWNLOAD_COMPACT_BRAILLE_ALPHA_THRESHOLD,
     )
 });
 
@@ -1196,6 +2082,22 @@ static ELLIPSIS_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const ELLIPSIS_COMPACT_RGBA: &[u8] = include_bytes!("ellipsis_compact.rgba");
+static ELLIPSIS_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(ELLIPSIS_COMPACT_RGBA));
+
+const ELLIPSIS_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("ellipsis_compact_braille.rgba");
+/// ~6% coverage (15/255), auto-selected by bake_icons.py::choose_compact_threshold -- 4/16 dots lit at this threshold.
+const ELLIPSIS_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 15;
+static ELLIPSIS_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        ELLIPSIS_COMPACT_BRAILLE_RGBA,
+        ELLIPSIS_COMPACT_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
 // ---- Link (link) ----------------------------------------------------
 
 const LINK_RGBA: &[u8] = include_bytes!("link.rgba");
@@ -1212,6 +2114,22 @@ static LINK_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
         BRAILLE_ICON_CELLS_TALL,
         LINK_BRAILLE_RGBA,
         LINK_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
+const LINK_COMPACT_RGBA: &[u8] = include_bytes!("link_compact.rgba");
+static LINK_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LINK_COMPACT_RGBA));
+
+const LINK_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("link_compact_braille.rgba");
+/// ~20% coverage (51/255), auto-selected by bake_icons.py::choose_compact_threshold -- 4/16 dots lit at this threshold.
+const LINK_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 51;
+static LINK_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        LINK_COMPACT_BRAILLE_RGBA,
+        LINK_COMPACT_BRAILLE_ALPHA_THRESHOLD,
     )
 });
 
@@ -1233,6 +2151,22 @@ static CIRCLE_FILLED_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const CIRCLE_FILLED_COMPACT_RGBA: &[u8] = include_bytes!("circle_filled_compact.rgba");
+static CIRCLE_FILLED_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(CIRCLE_FILLED_COMPACT_RGBA));
+
+const CIRCLE_FILLED_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("circle_filled_compact_braille.rgba");
+/// ~58% coverage (148/255), auto-selected by bake_icons.py::choose_compact_threshold -- 4/16 dots lit at this threshold.
+const CIRCLE_FILLED_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 148;
+static CIRCLE_FILLED_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        CIRCLE_FILLED_COMPACT_BRAILLE_RGBA,
+        CIRCLE_FILLED_COMPACT_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
 // ---- CircleSlash (circle-slash) -------------------------------------
 
 const CIRCLE_SLASH_RGBA: &[u8] = include_bytes!("circle_slash.rgba");
@@ -1248,6 +2182,22 @@ static CIRCLE_SLASH_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
         BRAILLE_ICON_CELLS_TALL,
         CIRCLE_SLASH_BRAILLE_RGBA,
         CIRCLE_SLASH_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
+const CIRCLE_SLASH_COMPACT_RGBA: &[u8] = include_bytes!("circle_slash_compact.rgba");
+static CIRCLE_SLASH_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(CIRCLE_SLASH_COMPACT_RGBA));
+
+const CIRCLE_SLASH_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("circle_slash_compact_braille.rgba");
+/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_compact_threshold -- 10/16 dots lit at this threshold.
+const CIRCLE_SLASH_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
+static CIRCLE_SLASH_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        CIRCLE_SLASH_COMPACT_BRAILLE_RGBA,
+        CIRCLE_SLASH_COMPACT_BRAILLE_ALPHA_THRESHOLD,
     )
 });
 
@@ -1269,6 +2219,22 @@ static WARNING_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const WARNING_COMPACT_RGBA: &[u8] = include_bytes!("warning_compact.rgba");
+static WARNING_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(WARNING_COMPACT_RGBA));
+
+const WARNING_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("warning_compact_braille.rgba");
+/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_compact_threshold -- 6/16 dots lit at this threshold.
+const WARNING_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
+static WARNING_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        WARNING_COMPACT_BRAILLE_RGBA,
+        WARNING_COMPACT_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
 // ---- Error (error) --------------------------------------------------
 
 const ERROR_RGBA: &[u8] = include_bytes!("error.rgba");
@@ -1284,6 +2250,22 @@ static ERROR_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
         BRAILLE_ICON_CELLS_TALL,
         ERROR_BRAILLE_RGBA,
         ERROR_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
+const ERROR_COMPACT_RGBA: &[u8] = include_bytes!("error_compact.rgba");
+static ERROR_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(ERROR_COMPACT_RGBA));
+
+const ERROR_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("error_compact_braille.rgba");
+/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_compact_threshold -- 8/16 dots lit at this threshold.
+const ERROR_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
+static ERROR_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        ERROR_COMPACT_BRAILLE_RGBA,
+        ERROR_COMPACT_BRAILLE_ALPHA_THRESHOLD,
     )
 });
 
@@ -1305,6 +2287,22 @@ static INFO_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const INFO_COMPACT_RGBA: &[u8] = include_bytes!("info_compact.rgba");
+static INFO_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(INFO_COMPACT_RGBA));
+
+const INFO_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("info_compact_braille.rgba");
+/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_compact_threshold -- 8/16 dots lit at this threshold.
+const INFO_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
+static INFO_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        INFO_COMPACT_BRAILLE_RGBA,
+        INFO_COMPACT_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
 // ---- RunAll (run-all) -----------------------------------------------
 
 const RUN_ALL_RGBA: &[u8] = include_bytes!("run_all.rgba");
@@ -1320,6 +2318,22 @@ static RUN_ALL_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
         BRAILLE_ICON_CELLS_TALL,
         RUN_ALL_BRAILLE_RGBA,
         RUN_ALL_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
+const RUN_ALL_COMPACT_RGBA: &[u8] = include_bytes!("run_all_compact.rgba");
+static RUN_ALL_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(RUN_ALL_COMPACT_RGBA));
+
+const RUN_ALL_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("run_all_compact_braille.rgba");
+/// ~35% coverage (89/255), auto-selected by bake_icons.py::choose_compact_threshold -- 4/16 dots lit at this threshold.
+const RUN_ALL_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 89;
+static RUN_ALL_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        RUN_ALL_COMPACT_BRAILLE_RGBA,
+        RUN_ALL_COMPACT_BRAILLE_ALPHA_THRESHOLD,
     )
 });
 
@@ -1341,6 +2355,22 @@ static PLAY_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const PLAY_COMPACT_RGBA: &[u8] = include_bytes!("play_compact.rgba");
+static PLAY_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(PLAY_COMPACT_RGBA));
+
+const PLAY_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("play_compact_braille.rgba");
+/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_compact_threshold -- 4/16 dots lit at this threshold.
+const PLAY_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
+static PLAY_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        PLAY_COMPACT_BRAILLE_RGBA,
+        PLAY_COMPACT_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
 // ---- Sync (sync) ----------------------------------------------------
 
 const SYNC_RGBA: &[u8] = include_bytes!("sync.rgba");
@@ -1359,6 +2389,22 @@ static SYNC_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const SYNC_COMPACT_RGBA: &[u8] = include_bytes!("sync_compact.rgba");
+static SYNC_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(SYNC_COMPACT_RGBA));
+
+const SYNC_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("sync_compact_braille.rgba");
+/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_compact_threshold -- 4/16 dots lit at this threshold.
+const SYNC_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
+static SYNC_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        SYNC_COMPACT_BRAILLE_RGBA,
+        SYNC_COMPACT_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
 // ---- GoToFile (go-to-file) ------------------------------------------
 
 const GO_TO_FILE_RGBA: &[u8] = include_bytes!("go_to_file.rgba");
@@ -1374,6 +2420,22 @@ static GO_TO_FILE_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
         BRAILLE_ICON_CELLS_TALL,
         GO_TO_FILE_BRAILLE_RGBA,
         GO_TO_FILE_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
+const GO_TO_FILE_COMPACT_RGBA: &[u8] = include_bytes!("go_to_file_compact.rgba");
+static GO_TO_FILE_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(GO_TO_FILE_COMPACT_RGBA));
+
+const GO_TO_FILE_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("go_to_file_compact_braille.rgba");
+/// ~30% coverage (77/255), auto-selected by bake_icons.py::choose_compact_threshold -- 3/16 dots lit at this threshold.
+const GO_TO_FILE_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 77;
+static GO_TO_FILE_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        GO_TO_FILE_COMPACT_BRAILLE_RGBA,
+        GO_TO_FILE_COMPACT_BRAILLE_ALPHA_THRESHOLD,
     )
 });
 
@@ -1396,6 +2458,22 @@ static PULSE_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const PULSE_COMPACT_RGBA: &[u8] = include_bytes!("pulse_compact.rgba");
+static PULSE_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(PULSE_COMPACT_RGBA));
+
+const PULSE_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("pulse_compact_braille.rgba");
+/// ~30% coverage (77/255), auto-selected by bake_icons.py::choose_compact_threshold -- 3/16 dots lit at this threshold.
+const PULSE_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 77;
+static PULSE_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        PULSE_COMPACT_BRAILLE_RGBA,
+        PULSE_COMPACT_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
 // ---- Checklist (checklist) ------------------------------------------
 
 const CHECKLIST_RGBA: &[u8] = include_bytes!("checklist.rgba");
@@ -1415,6 +2493,22 @@ static CHECKLIST_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const CHECKLIST_COMPACT_RGBA: &[u8] = include_bytes!("checklist_compact.rgba");
+static CHECKLIST_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(CHECKLIST_COMPACT_RGBA));
+
+const CHECKLIST_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("checklist_compact_braille.rgba");
+/// ~20% coverage (51/255), auto-selected by bake_icons.py::choose_compact_threshold -- 3/16 dots lit at this threshold.
+const CHECKLIST_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 51;
+static CHECKLIST_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        CHECKLIST_COMPACT_BRAILLE_RGBA,
+        CHECKLIST_COMPACT_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
 // ---- Eye (eye) ------------------------------------------------------
 
 const EYE_RGBA: &[u8] = include_bytes!("eye.rgba");
@@ -1430,6 +2524,22 @@ static EYE_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
         BRAILLE_ICON_CELLS_TALL,
         EYE_BRAILLE_RGBA,
         EYE_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
+const EYE_COMPACT_RGBA: &[u8] = include_bytes!("eye_compact.rgba");
+static EYE_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(EYE_COMPACT_RGBA));
+
+const EYE_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("eye_compact_braille.rgba");
+/// ~30% coverage (77/255), auto-selected by bake_icons.py::choose_compact_threshold -- 4/16 dots lit at this threshold.
+const EYE_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 77;
+static EYE_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        EYE_COMPACT_BRAILLE_RGBA,
+        EYE_COMPACT_BRAILLE_ALPHA_THRESHOLD,
     )
 });
 
@@ -1452,6 +2562,22 @@ static LAYOUT_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const LAYOUT_COMPACT_RGBA: &[u8] = include_bytes!("layout_compact.rgba");
+static LAYOUT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LAYOUT_COMPACT_RGBA));
+
+const LAYOUT_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("layout_compact_braille.rgba");
+/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_compact_threshold -- 16/16 dots lit at this threshold.
+const LAYOUT_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
+static LAYOUT_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        LAYOUT_COMPACT_BRAILLE_RGBA,
+        LAYOUT_COMPACT_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
 // ---- SplitHorizontal (split-horizontal) -----------------------------
 
 const SPLIT_HORIZONTAL_RGBA: &[u8] = include_bytes!("split_horizontal.rgba");
@@ -1467,6 +2593,22 @@ static SPLIT_HORIZONTAL_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
         BRAILLE_ICON_CELLS_TALL,
         SPLIT_HORIZONTAL_BRAILLE_RGBA,
         SPLIT_HORIZONTAL_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
+const SPLIT_HORIZONTAL_COMPACT_RGBA: &[u8] = include_bytes!("split_horizontal_compact.rgba");
+static SPLIT_HORIZONTAL_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(SPLIT_HORIZONTAL_COMPACT_RGBA));
+
+const SPLIT_HORIZONTAL_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("split_horizontal_compact_braille.rgba");
+/// ~30% coverage (77/255), auto-selected by bake_icons.py::choose_compact_threshold -- 4/16 dots lit at this threshold.
+const SPLIT_HORIZONTAL_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 77;
+static SPLIT_HORIZONTAL_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        SPLIT_HORIZONTAL_COMPACT_BRAILLE_RGBA,
+        SPLIT_HORIZONTAL_COMPACT_BRAILLE_ALPHA_THRESHOLD,
     )
 });
 
@@ -1488,6 +2630,22 @@ static SPLIT_VERTICAL_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
     )
 });
 
+const SPLIT_VERTICAL_COMPACT_RGBA: &[u8] = include_bytes!("split_vertical_compact.rgba");
+static SPLIT_VERTICAL_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(SPLIT_VERTICAL_COMPACT_RGBA));
+
+const SPLIT_VERTICAL_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("split_vertical_compact_braille.rgba");
+/// ~30% coverage (77/255), auto-selected by bake_icons.py::choose_compact_threshold -- 4/16 dots lit at this threshold.
+const SPLIT_VERTICAL_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 77;
+static SPLIT_VERTICAL_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        SPLIT_VERTICAL_COMPACT_BRAILLE_RGBA,
+        SPLIT_VERTICAL_COMPACT_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
 // ---- Preview (preview) ----------------------------------------------
 
 const PREVIEW_RGBA: &[u8] = include_bytes!("preview.rgba");
@@ -1503,6 +2661,22 @@ static PREVIEW_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
         BRAILLE_ICON_CELLS_TALL,
         PREVIEW_BRAILLE_RGBA,
         PREVIEW_BRAILLE_ALPHA_THRESHOLD,
+    )
+});
+
+const PREVIEW_COMPACT_RGBA: &[u8] = include_bytes!("preview_compact.rgba");
+static PREVIEW_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(PREVIEW_COMPACT_RGBA));
+
+const PREVIEW_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("preview_compact_braille.rgba");
+/// ~45% coverage (115/255), auto-selected by bake_icons.py::choose_compact_threshold -- 3/16 dots lit at this threshold.
+const PREVIEW_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 115;
+static PREVIEW_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
+    rgba_to_canvas(
+        CanvasMode::Braille,
+        COMPACT_BRAILLE_ICON_CELLS_WIDE,
+        COMPACT_BRAILLE_ICON_CELLS_TALL,
+        PREVIEW_COMPACT_BRAILLE_RGBA,
+        PREVIEW_COMPACT_BRAILLE_ALPHA_THRESHOLD,
     )
 });
 

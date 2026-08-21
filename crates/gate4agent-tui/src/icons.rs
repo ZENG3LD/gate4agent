@@ -71,7 +71,7 @@ use uzor_tui::style::Color;
 
 mod catalog;
 
-pub use catalog::{ascii, braille, sixel, IconId};
+pub use catalog::{ascii, braille, braille_compact, sixel, sixel_compact, IconId};
 
 /// Assumed terminal cell size in pixels (Cascadia Mono 12pt, Windows
 /// Terminal) -- the basis the sixel tier's own pixel target was derived
@@ -107,10 +107,45 @@ pub const BRAILLE_ICON_HEIGHT_PX: u32 = 12;
 pub const BRAILLE_ICON_CELLS_WIDE: u16 = 4;
 pub const BRAILLE_ICON_CELLS_TALL: u16 = 3;
 
+// ---- Compact tier -------------------------------------------------------
+//
+// For dense, single-row inline buttons (Explorer/Git sidebar panel lists
+// and their modals -- `render::render_compact_icon_button`) where the
+// rail's own 4-cell x 2/3-row icon does not fit next to a text label in
+// the SAME row. Baked as its own separate, much smaller raster per icon
+// (not a runtime downscale of the rail-tier asset) by `tools/
+// bake_icons.py`'s own `rasterize_compact_sixel`/`rasterize_compact_
+// braille`.
+
+/// Compact sixel-tier bitmap pixel size: exactly ONE assumed terminal
+/// cell (see `ASSUMED_CELL_WIDTH_PX`/`ASSUMED_CELL_HEIGHT_PX` above).
+pub const COMPACT_SIXEL_ICON_WIDTH_PX: u32 = ASSUMED_CELL_WIDTH_PX;
+pub const COMPACT_SIXEL_ICON_HEIGHT_PX: u32 = ASSUMED_CELL_HEIGHT_PX;
+pub const COMPACT_SIXEL_ICON_CELLS_WIDE: u16 = 1;
+pub const COMPACT_SIXEL_ICON_CELLS_TALL: u16 = 1;
+
+/// Compact braille-tier bitmap: 2 cells wide x 1 row tall (a braille cell
+/// is a fixed 2x4 dot grid, so this is a 4x4-dot canvas) -- a SQUARE
+/// target, unlike the rail tier's own 2:3 portrait (8x12) grid.
+pub const COMPACT_BRAILLE_ICON_WIDTH_PX: u32 = 4;
+pub const COMPACT_BRAILLE_ICON_HEIGHT_PX: u32 = 4;
+pub const COMPACT_BRAILLE_ICON_CELLS_WIDE: u16 = 2;
+pub const COMPACT_BRAILLE_ICON_CELLS_TALL: u16 = 1;
+
 pub(crate) fn build_sixel(rgba: &[u8]) -> String {
-    let image = SixelImage::try_from_rgba(rgba.to_vec(), SIXEL_ICON_WIDTH_PX as usize, SIXEL_ICON_HEIGHT_PX as usize).expect(
-        "every sixel-tier .rgba asset's byte length is asserted against SIXEL_ICON_WIDTH_PX * \
-         SIXEL_ICON_HEIGHT_PX * 4 by this module's own unit tests -- a mismatch here means a \
+    build_sixel_sized(rgba, SIXEL_ICON_WIDTH_PX, SIXEL_ICON_HEIGHT_PX)
+}
+
+/// Same encoding as [`build_sixel`], for the compact tier's own smaller
+/// per-icon asset (see this module's own "Compact tier" section above).
+pub(crate) fn build_sixel_compact(rgba: &[u8]) -> String {
+    build_sixel_sized(rgba, COMPACT_SIXEL_ICON_WIDTH_PX, COMPACT_SIXEL_ICON_HEIGHT_PX)
+}
+
+fn build_sixel_sized(rgba: &[u8], width: u32, height: u32) -> String {
+    let image = SixelImage::try_from_rgba(rgba.to_vec(), width as usize, height as usize).expect(
+        "every sixel-tier .rgba asset's byte length is asserted against its own tier's \
+         WIDTH_PX * HEIGHT_PX * 4 by this module's own unit tests -- a mismatch here means a \
          baked asset was regenerated at a different size without updating these constants, a \
          build-time asset/constant drift, not a runtime condition",
     );
@@ -196,6 +231,60 @@ mod tests {
             let canvas = braille(id);
             assert_eq!(canvas.px_width(), BRAILLE_ICON_WIDTH_PX, "{id:?}");
             assert_eq!(canvas.px_height(), BRAILLE_ICON_HEIGHT_PX, "{id:?}");
+        }
+    }
+
+    #[test]
+    fn every_compact_sixel_rgba_matches_its_own_declared_dimensions() {
+        let expected = (COMPACT_SIXEL_ICON_WIDTH_PX * COMPACT_SIXEL_ICON_HEIGHT_PX * 4) as usize;
+        for id in IconId::ALL {
+            assert_eq!(catalog::sixel_compact_source_rgba(id).len(), expected, "{id:?} compact sixel rgba length");
+        }
+    }
+
+    #[test]
+    fn every_compact_braille_rgba_matches_its_own_declared_dimensions() {
+        let expected = (COMPACT_BRAILLE_ICON_WIDTH_PX * COMPACT_BRAILLE_ICON_HEIGHT_PX * 4) as usize;
+        for id in IconId::ALL {
+            assert_eq!(catalog::braille_compact_source_rgba(id).len(), expected, "{id:?} compact braille rgba length");
+        }
+    }
+
+    #[test]
+    fn every_icon_resolves_in_both_compact_tiers_without_panicking() {
+        for id in IconId::ALL {
+            let _sixel_compact = sixel_compact(id);
+            let _braille_compact = braille_compact(id);
+        }
+    }
+
+    #[test]
+    fn every_compact_sixel_encodes_to_a_non_empty_dcs_sequence() {
+        for id in IconId::ALL {
+            let encoded = sixel_compact(id);
+            assert!(encoded.starts_with('\u{1b}'), "{id:?} compact sixel output must start with the DCS introducer ESC");
+        }
+    }
+
+    #[test]
+    fn every_compact_braille_canvas_pixel_dimensions_match_the_baked_asset() {
+        for id in IconId::ALL {
+            let canvas = braille_compact(id);
+            assert_eq!(canvas.px_width(), COMPACT_BRAILLE_ICON_WIDTH_PX, "{id:?}");
+            assert_eq!(canvas.px_height(), COMPACT_BRAILLE_ICON_HEIGHT_PX, "{id:?}");
+        }
+    }
+
+    #[test]
+    fn every_compact_braille_canvas_lights_at_least_one_dot() {
+        for id in IconId::ALL {
+            let mut buf = TerminalBuffer::new(COMPACT_BRAILLE_ICON_CELLS_WIDE, COMPACT_BRAILLE_ICON_CELLS_TALL);
+            braille_compact(id).flush(Rect::new(0, 0, COMPACT_BRAILLE_ICON_CELLS_WIDE, COMPACT_BRAILLE_ICON_CELLS_TALL), &mut buf);
+            let lit_cells = (0..COMPACT_BRAILLE_ICON_CELLS_TALL)
+                .flat_map(|y| (0..COMPACT_BRAILLE_ICON_CELLS_WIDE).map(move |x| (x, y)))
+                .filter(|&(x, y)| buf.get(x, y).symbol.as_str() != "\u{2800}")
+                .count();
+            assert!(lit_cells > 0, "{id:?} compact braille canvas rendered fully blank");
         }
     }
 

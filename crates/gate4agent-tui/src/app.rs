@@ -2693,21 +2693,35 @@ pub struct HitRegion {
     pub target: HitTarget,
 }
 
-/// One activity-rail button's own baked sixel icon, positioned at its
-/// absolute screen cell coordinates for this frame -- see
-/// `LayoutRects::sixel_icons`'s own doc comment. `selected` rides along
-/// because it changes the button body's own background color underneath
-/// a transparent-background sixel image (`icons::sixel`'s own
-/// `BackgroundMode::Transparent` encoding): the terminal repaints that
-/// background via a plain cell-buffer diff (invisible to this struct),
-/// which visually erases whatever sixel pixels were sitting there, so a
-/// selection change must be part of the gating signature too, not just
-/// the icon identity and its rect.
+/// Which baked raster [`SixelIconPlacement::icon`] resolves to --
+/// `Rail`: the full `icons::sixel` asset (~4 cells wide x 2 rows, the
+/// activity rail's own button body); `Compact`: the much smaller
+/// `icons::sixel_compact` asset (exactly one assumed terminal cell), for
+/// dense single-row buttons in the Explorer/Git sidebar panels and their
+/// modals -- see `render::render_compact_icon_button`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SixelIconSize {
+    Rail,
+    Compact,
+}
+
+/// One button's own baked sixel icon, positioned at its absolute screen
+/// cell coordinates for this frame -- see `LayoutRects::sixel_icons`'s
+/// own doc comment. `selected` rides along because it changes the
+/// button body's own background color underneath a transparent-
+/// background sixel image (`icons::sixel`'s own `BackgroundMode::
+/// Transparent` encoding): the terminal repaints that background via a
+/// plain cell-buffer diff (invisible to this struct), which visually
+/// erases whatever sixel pixels were sitting there, so a selection
+/// change must be part of the gating signature too, not just the icon
+/// identity and its rect. `size` selects which of the two baked assets
+/// `client::flush_sixel_icon` prints for this placement.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SixelIconPlacement {
     pub icon: IconId,
     pub rect: Rect,
     pub selected: bool,
+    pub size: SixelIconSize,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

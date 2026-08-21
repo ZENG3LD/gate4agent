@@ -28,7 +28,7 @@ use crate::app::{
     ExistingSessionMode, ExistingSessionOperation, Focus, FolderBrowserField,
     AgentRunGitScopeView, GitLocationDialogKind, HitRegion, HitTarget, LaunchContextMode, LaunchField, LaunchTarget,
     LayoutRects, MenuPlacement, NativeSessionGroupKey, NativeSessionTreeItem, NodeView, PreviewTabPhase, PreviewTabView, PtyColorMode, RailIcons, RosterMode, SessionView,
-    SixelIconPlacement,
+    SixelIconPlacement, SixelIconSize,
     ObservationPersistenceState, SessionMonitorKey, SessionMonitorSection, SessionMonitorTarget,
     SessionMonitorView, SidebarMode, SurfaceTab,
     HarnessReverseAttributionState,
@@ -463,7 +463,7 @@ fn render_rail_button(
                 body.width.min(icons::SIXEL_ICON_CELLS_WIDE),
                 body.height.min(icons::SIXEL_ICON_CELLS_TALL),
             );
-            layout.sixel_icons.push(SixelIconPlacement { icon: button.icon, rect: icon_area, selected: button.selected });
+            layout.sixel_icons.push(SixelIconPlacement { icon: button.icon, rect: icon_area, selected: button.selected, size: SixelIconSize::Rail });
         }
         RailIcons::Braille => {
             icons::braille(button.icon).flush(body, buf);
@@ -504,6 +504,95 @@ fn matte_canvas_background(body: Rect, bg: Color, buf: &mut TerminalBuffer) {
             }
         }
     }
+}
+
+/// Draws one inline, single-row icon (+ optional trailing text) button
+/// INSIDE `rect` -- `rect` is never resized or repositioned here, so
+/// every call site keeps registering the exact same [`HitRegion`] it
+/// always did; this only repaints what is visually inside it. Unlike the
+/// activity rail's own 4-cell x 2/3-row [`render_rail_button`], these
+/// buttons live in dense single-row panel lists (the Explorer/Git
+/// sidebar panels and their modals) where a rail-sized icon does not
+/// fit -- see `icons.rs`'s own "Compact tier" doc section for the baked
+/// asset sizes this draws (`icons::sixel_compact`/`icons::braille_
+/// compact`, distinct assets from the rail's own, not a runtime
+/// downscale).
+///
+/// `text`, when `Some`, is the MEANING-carrying remainder of the
+/// button's original label (e.g. `"workspace"`, `"Use this folder"`),
+/// rendered right after the icon with a 1-column gap; `None` for buttons
+/// whose original label was pure decoration (e.g. the old `"[+.]"`),
+/// which the icon fully replaces with nothing kept. In `RailIcons::
+/// Ascii` mode this paints `ascii_label` UNCHANGED across the whole
+/// `rect` (ignoring `icon`/`text` entirely) -- the ascii tier keeps
+/// every button's original text exactly as it rendered before this
+/// wave.
+fn render_compact_icon_button(
+    rect: Rect,
+    icon: icons::IconId,
+    text: Option<&str>,
+    ascii_label: &str,
+    style: Style,
+    tier: RailIcons,
+    buf: &mut TerminalBuffer,
+    layout: &mut LayoutRects,
+) {
+    if rect.width == 0 || rect.height == 0 {
+        return;
+    }
+    fill_rect(rect, style.bg, buf);
+    match tier {
+        RailIcons::Ascii => {
+            Paragraph::new(truncate_cells(ascii_label, rect.width as usize))
+                .style(style)
+                .render(rect, buf);
+        }
+        RailIcons::Sixel => {
+            // Same split as the rail's own sixel branch: this only
+            // reserves the icon's cell footprint (already a plain
+            // `style.bg`-filled blank from the `fill_rect` above) and
+            // records where `client::run`'s post-flush hook should
+            // paint it -- see `SixelIconPlacement`'s own doc comment.
+            let icon_width = icons::COMPACT_SIXEL_ICON_CELLS_WIDE.min(rect.width);
+            let icon_area = Rect::new(rect.x, rect.y, icon_width, 1);
+            layout.sixel_icons.push(SixelIconPlacement {
+                icon,
+                rect: icon_area,
+                selected: false,
+                size: SixelIconSize::Compact,
+            });
+            render_compact_trailing_text(rect, icon_width, text, style, buf);
+        }
+        RailIcons::Braille => {
+            let icon_width = icons::COMPACT_BRAILLE_ICON_CELLS_WIDE.min(rect.width);
+            let icon_area = Rect::new(rect.x, rect.y, icon_width, 1);
+            icons::braille_compact(icon).flush(icon_area, buf);
+            matte_canvas_background(icon_area, style.bg, buf);
+            render_compact_trailing_text(rect, icon_width, text, style, buf);
+        }
+    }
+}
+
+/// Renders `text` (when present) immediately after a compact button's
+/// own icon footprint (`icon_width` cells, plus a 1-column gap),
+/// truncated to whatever room is left inside `rect` -- shared by the
+/// sixel/braille branches of [`render_compact_icon_button`].
+fn render_compact_trailing_text(
+    rect: Rect,
+    icon_width: u16,
+    text: Option<&str>,
+    style: Style,
+    buf: &mut TerminalBuffer,
+) {
+    let Some(text) = text else { return };
+    let text_x = rect.x.saturating_add(icon_width).saturating_add(1);
+    if text_x >= rect.right() {
+        return;
+    }
+    let text_area = Rect::new(text_x, rect.y, rect.right() - text_x, 1);
+    Paragraph::new(truncate_cells(text, text_area.width as usize))
+        .style(style)
+        .render(text_area, buf);
 }
 
 fn render_activity_rail(
@@ -685,22 +774,38 @@ fn render_space_list(
     fill_rect(area, theme.panel, buf);
     let add_label = " + workspace ";
     let add_width = (cell_width(add_label) as u16).min(area.width);
-    Paragraph::new(truncate_cells(add_label, add_width as usize))
-        .style(Style::default().fg(theme.teal).bg(theme.panel).add_modifier(Modifier::BOLD))
-        .render(Rect::new(area.x, area.y, add_width, 1), buf);
+    let add_rect = Rect::new(area.x, area.y, add_width, 1);
+    render_compact_icon_button(
+        add_rect,
+        icons::IconId::Add,
+        Some("workspace"),
+        add_label,
+        Style::default().fg(theme.teal).bg(theme.panel).add_modifier(Modifier::BOLD),
+        app.rail_icons,
+        buf,
+        layout,
+    );
     layout.hits.push(HitRegion {
-        rect: Rect::new(area.x, area.y, add_width, 1),
+        rect: add_rect,
         target: HitTarget::AddSpace,
     });
     let remove_label = " - remove ";
     let remove_width = (cell_width(remove_label) as u16).min(area.width.saturating_sub(add_width));
     let remove_x = area.right().saturating_sub(remove_width);
     if remove_width > 0 {
-        Paragraph::new(truncate_cells(remove_label, remove_width as usize))
-            .style(Style::default().fg(theme.red).bg(theme.panel))
-            .render(Rect::new(remove_x, area.y, remove_width, 1), buf);
+        let remove_rect = Rect::new(remove_x, area.y, remove_width, 1);
+        render_compact_icon_button(
+            remove_rect,
+            icons::IconId::Trash,
+            None,
+            remove_label,
+            Style::default().fg(theme.red).bg(theme.panel),
+            app.rail_icons,
+            buf,
+            layout,
+        );
         layout.hits.push(HitRegion {
-            rect: Rect::new(remove_x, area.y, remove_width, 1),
+            rect: remove_rect,
             target: HitTarget::RemoveSpace,
         });
     }
@@ -866,18 +971,32 @@ fn render_workspace_files(
                 directory_width,
                 1,
             );
-            Paragraph::new(directory_label)
-                .style(Style::default().fg(theme.teal).bg(theme.panel).add_modifier(Modifier::BOLD))
-                .render(directory, buf);
+            render_compact_icon_button(
+                directory,
+                icons::IconId::NewFolder,
+                None,
+                directory_label,
+                Style::default().fg(theme.teal).bg(theme.panel).add_modifier(Modifier::BOLD),
+                app.rail_icons,
+                buf,
+                layout,
+            );
             layout.hits.push(HitRegion {
                 rect: directory,
                 target: HitTarget::NewDirectory,
             });
             if directory.x >= area.x.saturating_add(file_width + 1) {
                 let file = Rect::new(directory.x - file_width - 1, area.y, file_width, 1);
-                Paragraph::new(file_label)
-                    .style(Style::default().fg(theme.teal).bg(theme.panel).add_modifier(Modifier::BOLD))
-                    .render(file, buf);
+                render_compact_icon_button(
+                    file,
+                    icons::IconId::NewFile,
+                    None,
+                    file_label,
+                    Style::default().fg(theme.teal).bg(theme.panel).add_modifier(Modifier::BOLD),
+                    app.rail_icons,
+                    buf,
+                    layout,
+                );
                 layout.hits.push(HitRegion {
                     rect: file,
                     target: HitTarget::NewFile,
@@ -1080,9 +1199,16 @@ fn render_git_snapshot(
         .render(Rect::new(area.x, area.y, branch_width, 1), buf);
     if branch_width < area.width {
         let create_rect = Rect::new(area.x + branch_width, area.y, area.width - branch_width, 1);
-        Paragraph::new(create)
-            .style(Style::default().fg(theme.active_tab_text).bg(theme.accent).add_modifier(Modifier::BOLD))
-            .render(create_rect, buf);
+        render_compact_icon_button(
+            create_rect,
+            icons::IconId::RepoForked,
+            Some("worktree"),
+            create,
+            Style::default().fg(theme.active_tab_text).bg(theme.accent).add_modifier(Modifier::BOLD),
+            app.rail_icons,
+            buf,
+            layout,
+        );
         layout.hits.push(HitRegion { rect: create_rect, target: HitTarget::CreateWorktree });
     }
     let area = Rect::new(area.x, area.y + 1, area.width, area.height.saturating_sub(1));
@@ -1120,7 +1246,16 @@ fn render_git_snapshot(
             });
             if removable {
                 let remove_rect = Rect::new(action_rect.right(), y, cell_width(remove) as u16, 1);
-                Paragraph::new(remove).style(Style::default().fg(theme.red).bg(theme.panel)).render(remove_rect, buf);
+                render_compact_icon_button(
+                    remove_rect,
+                    icons::IconId::Trash,
+                    None,
+                    remove,
+                    Style::default().fg(theme.red).bg(theme.panel),
+                    app.rail_icons,
+                    buf,
+                    layout,
+                );
                 layout.hits.push(HitRegion { rect: remove_rect, target: HitTarget::RemoveWorktree(index) });
             }
         } else {
@@ -8898,9 +9033,16 @@ fn render_add_space(
         layout,
     );
     let browse = Rect::new(inner.right().saturating_sub(10), inner.y + 2, 10.min(inner.width), 1);
-    Paragraph::new("[Browse…]")
-        .style(Style::default().fg(theme.teal).bg(theme.modal).add_modifier(Modifier::BOLD))
-        .render(browse, buf);
+    render_compact_icon_button(
+        browse,
+        icons::IconId::Search,
+        Some("Browse…"),
+        "[Browse…]",
+        Style::default().fg(theme.teal).bg(theme.modal).add_modifier(Modifier::BOLD),
+        app.rail_icons,
+        buf,
+        layout,
+    );
     push_modal_hit(layout, browse, HitTarget::AddSpaceBrowse);
     let register = Rect::new(inner.right().saturating_sub(10), inner.y + 4, 10.min(inner.width), 1);
     Paragraph::new("[Register]")
@@ -8991,9 +9133,16 @@ fn render_folder_browser(
         buf,
     );
     let parent = Rect::new(inner.x, inner.y + 1, 12.min(inner.width), 1);
-    Paragraph::new("[↑ Parent]")
-        .style(Style::default().fg(theme.teal).bg(theme.modal))
-        .render(parent, buf);
+    render_compact_icon_button(
+        parent,
+        icons::IconId::ArrowUp,
+        Some("Parent"),
+        "[↑ Parent]",
+        Style::default().fg(theme.teal).bg(theme.modal),
+        app.rail_icons,
+        buf,
+        layout,
+    );
     push_modal_hit(layout, parent, HitTarget::FolderBrowserParent);
     let filter_active = browser.field == FolderBrowserField::Filter;
     let filter = Rect::new(inner.x, inner.y + 2, inner.width, 1);
@@ -9060,16 +9209,30 @@ fn render_folder_browser(
         push_modal_hit(layout, load_more, HitTarget::FolderBrowserLoadMore);
     }
     let use_folder = Rect::new(inner.right().saturating_sub(17), action_row, 17.min(inner.width), 1);
-    Paragraph::new("[Use this folder]")
-        .style(Style::default().fg(if browser.directory.is_some() { theme.active_tab_text } else { theme.muted }).bg(if browser.directory.is_some() { theme.accent } else { theme.modal }).add_modifier(Modifier::BOLD))
-        .render(use_folder, buf);
+    render_compact_icon_button(
+        use_folder,
+        icons::IconId::Check,
+        Some("Use this folder"),
+        "[Use this folder]",
+        Style::default().fg(if browser.directory.is_some() { theme.active_tab_text } else { theme.muted }).bg(if browser.directory.is_some() { theme.accent } else { theme.modal }).add_modifier(Modifier::BOLD),
+        app.rail_icons,
+        buf,
+        layout,
+    );
     if browser.directory.is_some() {
         push_modal_hit(layout, use_folder, HitTarget::FolderBrowserUse);
     }
     let cancel = Rect::new(use_folder.x.saturating_sub(9).max(inner.x), action_row, 8.min(inner.width), 1);
-    Paragraph::new("[Cancel]")
-        .style(Style::default().fg(theme.text).bg(theme.active))
-        .render(cancel, buf);
+    render_compact_icon_button(
+        cancel,
+        icons::IconId::Close,
+        None,
+        "[Cancel]",
+        Style::default().fg(theme.text).bg(theme.active),
+        app.rail_icons,
+        buf,
+        layout,
+    );
     push_modal_hit(layout, cancel, HitTarget::FolderBrowserCancel);
 
     let status = if browser.pending {
@@ -12822,6 +12985,65 @@ mod tests {
         assert!(agent_layout.hits.iter().all(|hit| !matches!(hit.target, HitTarget::Viewport) || hit.rect == agent_layout.viewport));
     }
 
+    /// Wave-1 icon labelling: AddSpace keeps its "workspace" text next to
+    /// [`icons::IconId::Add`] (the label carries information the icon
+    /// alone cannot); RemoveSpace, a plain remove action mirroring
+    /// RemoveWorktree, becomes icon-only. Same 3-tier + stable-hit-rect
+    /// coverage as `workspace_files_create_buttons_render_a_compact_icon_
+    /// per_tier`.
+    #[test]
+    fn space_list_add_and_remove_buttons_render_a_compact_icon_per_tier() {
+        let mut app = fixture(PtyColorMode::GateOverride);
+        app.roster_mode = RosterMode::Workspaces;
+
+        let hit_rect = |layout: &LayoutRects, target: HitTarget| {
+            layout
+                .hits
+                .iter()
+                .find(|hit| hit.target == target)
+                .unwrap_or_else(|| panic!("missing hit for {target:?}"))
+                .rect
+        };
+
+        assert_eq!(app.rail_icons, RailIcons::Sixel);
+        let mut sixel_buf = TerminalBuffer::new(100, 24);
+        let sixel_layout = render(&app, &mut sixel_buf);
+        let add_rect = hit_rect(&sixel_layout, HitTarget::AddSpace);
+        let remove_rect = hit_rect(&sixel_layout, HitTarget::RemoveSpace);
+        assert!(sixel_layout.sixel_icons.iter().any(|placement| {
+            placement.icon == icons::IconId::Add
+                && placement.size == crate::app::SixelIconSize::Compact
+                && add_rect.contains(placement.rect.x, placement.rect.y)
+        }));
+        assert!(sixel_layout.sixel_icons.iter().any(|placement| {
+            placement.icon == icons::IconId::Trash
+                && placement.size == crate::app::SixelIconSize::Compact
+                && remove_rect.contains(placement.rect.x, placement.rect.y)
+        }));
+        let sixel_text = rect_text(&sixel_buf, add_rect);
+        assert!(sixel_text.contains("workspace"), "{sixel_text:?}");
+        assert!(!rect_text(&sixel_buf, remove_rect).contains("remove"));
+
+        app.rail_icons = RailIcons::Braille;
+        let mut braille_buf = TerminalBuffer::new(100, 24);
+        let braille_layout = render(&app, &mut braille_buf);
+        assert_eq!(hit_rect(&braille_layout, HitTarget::AddSpace), add_rect);
+        assert_eq!(hit_rect(&braille_layout, HitTarget::RemoveSpace), remove_rect);
+        assert!(braille_layout.sixel_icons.is_empty());
+        assert!(contains_braille_glyph(&rect_text(&braille_buf, add_rect)));
+        assert!(contains_braille_glyph(&rect_text(&braille_buf, remove_rect)));
+        assert!(rect_text(&braille_buf, add_rect).contains("workspace"));
+
+        app.rail_icons = RailIcons::Ascii;
+        let mut ascii_buf = TerminalBuffer::new(100, 24);
+        let ascii_layout = render(&app, &mut ascii_buf);
+        assert_eq!(hit_rect(&ascii_layout, HitTarget::AddSpace), add_rect);
+        assert_eq!(hit_rect(&ascii_layout, HitTarget::RemoveSpace), remove_rect);
+        assert!(ascii_layout.sixel_icons.is_empty());
+        assert!(rect_text(&ascii_buf, add_rect).contains("+ workspace"));
+        assert!(rect_text(&ascii_buf, remove_rect).contains("- remove"));
+    }
+
     #[test]
     fn agent_run_controls_use_stable_keys_in_roster_tree_and_inspector_header() {
         let mut app = fixture(PtyColorMode::Inherited);
@@ -13850,6 +14072,58 @@ mod tests {
         }
     }
 
+    /// Wave-1 icon labelling: AddSpaceBrowse keeps its "Browse…" text
+    /// next to [`icons::IconId::Search`]. Same 3-tier + stable-hit-rect
+    /// coverage as the sidebar panels' own compact-icon tests.
+    #[test]
+    fn add_space_browse_button_renders_a_compact_icon_per_tier() {
+        let mut app = fixture(PtyColorMode::GateOverride);
+        app.focus = Focus::AddSpace;
+        app.add_space = Some(crate::app::AddSpaceDialog {
+            node_id: "node-a".to_owned(),
+            workspace_id: "scratch".to_owned(),
+            root: r"C:\work\scratch".to_owned(),
+            original_root: None,
+            root_edited: true,
+            field: AddSpaceField::WorkspaceId,
+        });
+
+        let hit_rect = |layout: &LayoutRects, target: HitTarget| {
+            layout
+                .hits
+                .iter()
+                .find(|hit| hit.target == target)
+                .unwrap_or_else(|| panic!("missing hit for {target:?}"))
+                .rect
+        };
+
+        assert_eq!(app.rail_icons, RailIcons::Sixel);
+        let mut sixel_buf = TerminalBuffer::new(100, 24);
+        let sixel_layout = render(&app, &mut sixel_buf);
+        let browse_rect = hit_rect(&sixel_layout, HitTarget::AddSpaceBrowse);
+        assert!(sixel_layout.sixel_icons.iter().any(|placement| {
+            placement.icon == icons::IconId::Search
+                && placement.size == crate::app::SixelIconSize::Compact
+                && browse_rect.contains(placement.rect.x, placement.rect.y)
+        }));
+        assert!(rect_text(&sixel_buf, browse_rect).contains("Browse"));
+
+        app.rail_icons = RailIcons::Braille;
+        let mut braille_buf = TerminalBuffer::new(100, 24);
+        let braille_layout = render(&app, &mut braille_buf);
+        assert_eq!(hit_rect(&braille_layout, HitTarget::AddSpaceBrowse), browse_rect);
+        assert!(braille_layout.sixel_icons.is_empty());
+        assert!(contains_braille_glyph(&rect_text(&braille_buf, browse_rect)));
+        assert!(rect_text(&braille_buf, browse_rect).contains("Browse"));
+
+        app.rail_icons = RailIcons::Ascii;
+        let mut ascii_buf = TerminalBuffer::new(100, 24);
+        let ascii_layout = render(&app, &mut ascii_buf);
+        assert_eq!(hit_rect(&ascii_layout, HitTarget::AddSpaceBrowse), browse_rect);
+        assert!(ascii_layout.sixel_icons.is_empty());
+        assert!(rect_text(&ascii_buf, browse_rect).contains("[Browse\u{2026}]"));
+    }
+
     #[test]
     fn modal_menu_placement_gives_tabs_and_viewport_the_full_width() {
         let mut app = fixture(PtyColorMode::Inherited);
@@ -13993,9 +14267,24 @@ mod tests {
             .hits
             .iter()
             .any(|hit| hit.target == HitTarget::NewDirectory));
+        // `fixture()` defaults to `RailIcons::Sixel` -- NewFile/NewDirectory
+        // now paint a compact baked icon there (see
+        // `workspace_files_create_buttons_render_a_compact_icon_per_tier`
+        // for the full 3-tier coverage), not the old literal "[+.]"/"[+>]"
+        // text; that text is still exactly what `RailIcons::Ascii` paints.
         let files_text = buffer_text(&files);
-        assert!(files_text.contains("[+.]") && files_text.contains("[+>]"), "{files_text}");
+        assert!(!files_text.contains("[+.]") && !files_text.contains("[+>]"), "{files_text}");
         assert!(!files_text.contains("+file") && !files_text.contains("+dir"), "{files_text}");
+        assert!(
+            files_layout.sixel_icons.iter().any(|placement| placement.icon == icons::IconId::NewFile),
+            "{:?}",
+            files_layout.sixel_icons,
+        );
+        assert!(
+            files_layout.sixel_icons.iter().any(|placement| placement.icon == icons::IconId::NewFolder),
+            "{:?}",
+            files_layout.sixel_icons,
+        );
 
         app.create_workspace_entry = Some(CreateWorkspaceEntryDialog {
             node_id: "node-a".to_owned(),
@@ -14034,6 +14323,63 @@ mod tests {
         assert!(text.contains("notes/new.md"));
         assert!(text.contains("target"));
         assert!(text.contains("No overwrite"));
+    }
+
+    /// Wave-1 icon labelling: NewFile/NewDirectory paint a compact baked
+    /// icon in `Sixel`/`Braille` mode and the untouched original bracket
+    /// text in `Ascii` mode, and -- the load-bearing invariant for a
+    /// pure labelling change -- their own [`HitRegion`] rect is BYTE-
+    /// IDENTICAL across all three tiers (same position, same target).
+    #[test]
+    fn workspace_files_create_buttons_render_a_compact_icon_per_tier() {
+        let mut app = fixture(PtyColorMode::GateOverride);
+        app.apply_workspace_inspection("node-a".to_owned(), inspection());
+        app.sidebar_mode = SidebarMode::Files;
+
+        let hit_rect = |layout: &LayoutRects, target: HitTarget| {
+            layout
+                .hits
+                .iter()
+                .find(|hit| hit.target == target)
+                .unwrap_or_else(|| panic!("missing hit for {target:?}"))
+                .rect
+        };
+
+        assert_eq!(app.rail_icons, RailIcons::Sixel);
+        let mut sixel_buf = TerminalBuffer::new(100, 24);
+        let sixel_layout = render(&app, &mut sixel_buf);
+        let new_file_rect = hit_rect(&sixel_layout, HitTarget::NewFile);
+        let new_directory_rect = hit_rect(&sixel_layout, HitTarget::NewDirectory);
+        assert!(sixel_layout.sixel_icons.iter().any(|placement| {
+            placement.icon == icons::IconId::NewFile
+                && placement.size == crate::app::SixelIconSize::Compact
+                && new_file_rect.contains(placement.rect.x, placement.rect.y)
+        }));
+        assert!(sixel_layout.sixel_icons.iter().any(|placement| {
+            placement.icon == icons::IconId::NewFolder
+                && placement.size == crate::app::SixelIconSize::Compact
+                && new_directory_rect.contains(placement.rect.x, placement.rect.y)
+        }));
+        let sixel_text = buffer_text(&sixel_buf);
+        assert!(!sixel_text.contains("[+.]") && !sixel_text.contains("[+>]"), "{sixel_text}");
+
+        app.rail_icons = RailIcons::Braille;
+        let mut braille_buf = TerminalBuffer::new(100, 24);
+        let braille_layout = render(&app, &mut braille_buf);
+        assert_eq!(hit_rect(&braille_layout, HitTarget::NewFile), new_file_rect);
+        assert_eq!(hit_rect(&braille_layout, HitTarget::NewDirectory), new_directory_rect);
+        assert!(braille_layout.sixel_icons.is_empty());
+        assert!(contains_braille_glyph(&rect_text(&braille_buf, new_file_rect)));
+        assert!(contains_braille_glyph(&rect_text(&braille_buf, new_directory_rect)));
+
+        app.rail_icons = RailIcons::Ascii;
+        let mut ascii_buf = TerminalBuffer::new(100, 24);
+        let ascii_layout = render(&app, &mut ascii_buf);
+        assert_eq!(hit_rect(&ascii_layout, HitTarget::NewFile), new_file_rect);
+        assert_eq!(hit_rect(&ascii_layout, HitTarget::NewDirectory), new_directory_rect);
+        assert!(ascii_layout.sixel_icons.is_empty());
+        let ascii_text = buffer_text(&ascii_buf);
+        assert!(ascii_text.contains("[+.]") && ascii_text.contains("[+>]"), "{ascii_text}");
     }
 
     #[test]
@@ -14078,6 +14424,76 @@ mod tests {
         assert!(layout.hits.iter().any(|hit| hit.target == HitTarget::RemoveWorktree(1)));
         assert!(!layout.hits.iter().any(|hit| hit.target == HitTarget::RemoveWorktree(0)));
         assert!(layout.hits.iter().any(|hit| hit.target == HitTarget::SidebarItem(2)));
+    }
+
+    /// Wave-1 icon labelling: CreateWorktree keeps its "worktree" text
+    /// next to [`icons::IconId::RepoForked`]; RemoveWorktree (a 4-column
+    /// `" rm "` button -- no room for text even if it carried any) becomes
+    /// icon-only [`icons::IconId::Trash`]. Same 3-tier + stable-hit-rect
+    /// coverage as the Explorer panel's own compact-icon test.
+    #[test]
+    fn git_worktree_create_and_remove_buttons_render_a_compact_icon_per_tier() {
+        let mut app = fixture(PtyColorMode::GateOverride);
+        let mut snapshot = inspection();
+        snapshot.git.worktrees = vec![GitWorktreeSnapshot {
+            path: host_path(r"C:\work\feature"),
+            head: "bbbb".to_owned(),
+            branch: Some("feature/a".to_owned()),
+            is_bare: false,
+            is_main: false,
+            locked: false,
+            lock_reason: None,
+            prunable: false,
+            prunable_reason: None,
+            workspace_id: None,
+        }];
+        app.apply_workspace_inspection("node-a".to_owned(), snapshot);
+        app.sidebar_mode = SidebarMode::Git;
+
+        let hit_rect = |layout: &LayoutRects, target: HitTarget| {
+            layout
+                .hits
+                .iter()
+                .find(|hit| hit.target == target)
+                .unwrap_or_else(|| panic!("missing hit for {target:?}"))
+                .rect
+        };
+
+        assert_eq!(app.rail_icons, RailIcons::Sixel);
+        let mut sixel_buf = TerminalBuffer::new(100, 24);
+        let sixel_layout = render(&app, &mut sixel_buf);
+        let create_rect = hit_rect(&sixel_layout, HitTarget::CreateWorktree);
+        let remove_rect = hit_rect(&sixel_layout, HitTarget::RemoveWorktree(0));
+        assert!(sixel_layout.sixel_icons.iter().any(|placement| {
+            placement.icon == icons::IconId::RepoForked
+                && placement.size == crate::app::SixelIconSize::Compact
+                && create_rect.contains(placement.rect.x, placement.rect.y)
+        }));
+        assert!(sixel_layout.sixel_icons.iter().any(|placement| {
+            placement.icon == icons::IconId::Trash
+                && placement.size == crate::app::SixelIconSize::Compact
+                && remove_rect.contains(placement.rect.x, placement.rect.y)
+        }));
+        assert!(rect_text(&sixel_buf, create_rect).contains("worktree"));
+
+        app.rail_icons = RailIcons::Braille;
+        let mut braille_buf = TerminalBuffer::new(100, 24);
+        let braille_layout = render(&app, &mut braille_buf);
+        assert_eq!(hit_rect(&braille_layout, HitTarget::CreateWorktree), create_rect);
+        assert_eq!(hit_rect(&braille_layout, HitTarget::RemoveWorktree(0)), remove_rect);
+        assert!(braille_layout.sixel_icons.is_empty());
+        assert!(contains_braille_glyph(&rect_text(&braille_buf, create_rect)));
+        assert!(contains_braille_glyph(&rect_text(&braille_buf, remove_rect)));
+        assert!(rect_text(&braille_buf, create_rect).contains("worktree"));
+
+        app.rail_icons = RailIcons::Ascii;
+        let mut ascii_buf = TerminalBuffer::new(100, 24);
+        let ascii_layout = render(&app, &mut ascii_buf);
+        assert_eq!(hit_rect(&ascii_layout, HitTarget::CreateWorktree), create_rect);
+        assert_eq!(hit_rect(&ascii_layout, HitTarget::RemoveWorktree(0)), remove_rect);
+        assert!(ascii_layout.sixel_icons.is_empty());
+        assert!(rect_text(&ascii_buf, create_rect).contains("+ worktree"));
+        assert!(rect_text(&ascii_buf, remove_rect).contains("rm"));
     }
 
     #[test]
@@ -14973,10 +15389,22 @@ mod tests {
         let mut sixel_buf = TerminalBuffer::new(100, 24);
         let sixel_layout = render(&app, &mut sixel_buf);
         let sixel_text = rect_text(&sixel_buf, sixel_layout.activity_rail);
+        // `app.control_section` defaults to `Files`, so the Explorer
+        // panel's own compact NewFile/NewDirectory buttons ALSO place
+        // sixel icons this frame (`SixelIconSize::Compact`) alongside
+        // the rail's own 6 (`SixelIconSize::Rail`) -- filter to the
+        // rail's own tier, the invariant this test actually covers (the
+        // compact tier has its own coverage in `workspace_files_render_
+        // create_actions_and_entry_dialog`).
+        let rail_sixel_icons = sixel_layout
+            .sixel_icons
+            .iter()
+            .filter(|placement| placement.size == crate::app::SixelIconSize::Rail)
+            .collect::<Vec<_>>();
         assert_eq!(
-            sixel_layout.sixel_icons.len(),
+            rail_sixel_icons.len(),
             6,
-            "Files/Git/Agents/Board/SidebarCollapse/Settings must each place one sixel icon: {:?}",
+            "Files/Git/Agents/Board/SidebarCollapse/Settings must each place one rail-tier sixel icon: {:?}",
             sixel_layout.sixel_icons,
         );
         for icon in [
@@ -14988,11 +15416,18 @@ mod tests {
             icons::IconId::SettingsGear,
         ] {
             assert!(
-                sixel_layout.sixel_icons.iter().any(|placement| placement.icon == icon),
-                "missing sixel placement for {icon:?}: {:?}",
+                rail_sixel_icons.iter().any(|placement| placement.icon == icon),
+                "missing rail-tier sixel placement for {icon:?}: {:?}",
                 sixel_layout.sixel_icons,
             );
         }
+        assert!(
+            sixel_layout.sixel_icons.iter().any(|placement| {
+                placement.size == crate::app::SixelIconSize::Compact && placement.icon == icons::IconId::NewFile
+            }),
+            "the default Files panel's own compact NewFile button must also place a sixel icon: {:?}",
+            sixel_layout.sixel_icons,
+        );
         assert!(!contains_braille_glyph(&sixel_text), "sixel mode must not paint braille cells: {sixel_text:?}");
         for ascii in ["F", "G", "A", "K", "S"] {
             assert!(!sixel_text.contains(ascii), "unexpected {ascii} in sixel mode: {sixel_text:?}");
@@ -15167,6 +15602,101 @@ mod tests {
         ] {
             assert!(layout.hits.iter().any(|hit| hit.target == target));
         }
+    }
+
+    /// Wave-1 icon labelling: FolderBrowserParent keeps "Parent" next to
+    /// [`icons::IconId::ArrowUp`], FolderBrowserUse keeps "Use this
+    /// folder" next to [`icons::IconId::Check`] (both explicit "keep the
+    /// text" examples in the task brief), and FolderBrowserCancel (a
+    /// universal X = cancel/close convention) becomes icon-only
+    /// [`icons::IconId::Close`]. Same 3-tier + stable-hit-rect coverage
+    /// as the other converted sites.
+    #[test]
+    fn folder_browser_parent_use_and_cancel_buttons_render_a_compact_icon_per_tier() {
+        let mut app = fixture(PtyColorMode::GateOverride);
+        app.focus = Focus::FolderBrowser;
+        app.folder_browser = Some(FolderBrowserDialog {
+            node_id: "node-a".to_owned(),
+            directory: Some(host_path(r"C:\work")),
+            parent: Some(host_path(r"C:\")),
+            entries: vec![HostDirectoryEntry {
+                path: host_path(r"C:\work\acme"),
+                display_name: "acme".to_owned(),
+                is_link: false,
+            }],
+            next_after: None,
+            incomplete: false,
+            selected: 0,
+            scroll: 0,
+            filter: String::new(),
+            field: FolderBrowserField::Entries,
+            pending: false,
+            append_pending: false,
+            request_token: 7,
+            error: None,
+        });
+
+        let hit_rect = |layout: &LayoutRects, target: HitTarget| {
+            layout
+                .hits
+                .iter()
+                .find(|hit| hit.target == target)
+                .unwrap_or_else(|| panic!("missing hit for {target:?}"))
+                .rect
+        };
+
+        assert_eq!(app.rail_icons, RailIcons::Sixel);
+        let mut sixel_buf = TerminalBuffer::new(110, 30);
+        let sixel_layout = render(&app, &mut sixel_buf);
+        let parent_rect = hit_rect(&sixel_layout, HitTarget::FolderBrowserParent);
+        let use_rect = hit_rect(&sixel_layout, HitTarget::FolderBrowserUse);
+        let cancel_rect = hit_rect(&sixel_layout, HitTarget::FolderBrowserCancel);
+        assert!(sixel_layout.sixel_icons.iter().any(|placement| {
+            placement.icon == icons::IconId::ArrowUp
+                && placement.size == crate::app::SixelIconSize::Compact
+                && parent_rect.contains(placement.rect.x, placement.rect.y)
+        }));
+        assert!(sixel_layout.sixel_icons.iter().any(|placement| {
+            placement.icon == icons::IconId::Check
+                && placement.size == crate::app::SixelIconSize::Compact
+                && use_rect.contains(placement.rect.x, placement.rect.y)
+        }));
+        assert!(sixel_layout.sixel_icons.iter().any(|placement| {
+            placement.icon == icons::IconId::Close
+                && placement.size == crate::app::SixelIconSize::Compact
+                && cancel_rect.contains(placement.rect.x, placement.rect.y)
+        }));
+        assert!(rect_text(&sixel_buf, parent_rect).contains("Parent"));
+        assert!(rect_text(&sixel_buf, use_rect).contains("Use this folder"));
+
+        app.rail_icons = RailIcons::Braille;
+        let mut braille_buf = TerminalBuffer::new(110, 30);
+        let braille_layout = render(&app, &mut braille_buf);
+        assert_eq!(hit_rect(&braille_layout, HitTarget::FolderBrowserParent), parent_rect);
+        assert_eq!(hit_rect(&braille_layout, HitTarget::FolderBrowserUse), use_rect);
+        assert_eq!(hit_rect(&braille_layout, HitTarget::FolderBrowserCancel), cancel_rect);
+        assert!(braille_layout.sixel_icons.is_empty());
+        assert!(contains_braille_glyph(&rect_text(&braille_buf, parent_rect)));
+        assert!(contains_braille_glyph(&rect_text(&braille_buf, use_rect)));
+        assert!(contains_braille_glyph(&rect_text(&braille_buf, cancel_rect)));
+        assert!(rect_text(&braille_buf, parent_rect).contains("Parent"));
+        // Braille's own icon footprint is 2 cells wide (vs sixel's 1), one
+        // column narrower for trailing text in this specific 17-column
+        // button -- the full "Use this folder" (15 cells) no longer fits
+        // after it, so this asserts a shorter prefix that does, rather
+        // than the exact same string the sixel/ascii tiers can afford.
+        assert!(rect_text(&braille_buf, use_rect).contains("Use this"));
+
+        app.rail_icons = RailIcons::Ascii;
+        let mut ascii_buf = TerminalBuffer::new(110, 30);
+        let ascii_layout = render(&app, &mut ascii_buf);
+        assert_eq!(hit_rect(&ascii_layout, HitTarget::FolderBrowserParent), parent_rect);
+        assert_eq!(hit_rect(&ascii_layout, HitTarget::FolderBrowserUse), use_rect);
+        assert_eq!(hit_rect(&ascii_layout, HitTarget::FolderBrowserCancel), cancel_rect);
+        assert!(ascii_layout.sixel_icons.is_empty());
+        assert!(rect_text(&ascii_buf, parent_rect).contains("[\u{2191} Parent]"));
+        assert!(rect_text(&ascii_buf, use_rect).contains("[Use this folder]"));
+        assert!(rect_text(&ascii_buf, cancel_rect).contains("[Cancel]"));
     }
 
     #[test]

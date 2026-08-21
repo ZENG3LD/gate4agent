@@ -87,7 +87,7 @@ use crate::app::{
     ManagedSessionView, NativeSessionCatalogRoute, NativeSessionCatalogRowView, NativeSessionPreviewMessageView,
     NativeSessionPreviewView, SessionAddress, SessionView, UiKey, GitCommitView,
     HarnessReadFailure, HarnessRunOrigin, HarnessRunRef, HarnessWorkspaceFileTabKey,
-    HarnessWorkspaceGitRequestDestination, SixelIconPlacement, WorkspaceFileTabKey, WorkspaceGitDiffTarget, WorkspaceGitDiffView,
+    HarnessWorkspaceGitRequestDestination, SixelIconPlacement, SixelIconSize, WorkspaceFileTabKey, WorkspaceGitDiffTarget, WorkspaceGitDiffView,
     WorkspaceGitRequestDestination, WorkspaceView,
 };
 use crate::diagnostics::RuntimeDiagnostic;
@@ -1725,11 +1725,15 @@ fn flush_sixel_icon_into<W: io::Write>(writer: &mut W, app: &App, state: &mut Si
         if placement.rect.width == 0 || placement.rect.height == 0 {
             continue;
         }
+        let encoded = match placement.size {
+            SixelIconSize::Rail => icons::sixel(placement.icon),
+            SixelIconSize::Compact => icons::sixel_compact(placement.icon),
+        };
         execute!(
             writer,
             SavePosition,
             MoveTo(placement.rect.x, placement.rect.y),
-            Print(icons::sixel(placement.icon)),
+            Print(encoded),
             RestorePosition,
         )?;
     }
@@ -5433,7 +5437,7 @@ mod tests {
     }
 
     fn sixel_placement(icon: icons::IconId, x: u16, selected: bool) -> SixelIconPlacement {
-        SixelIconPlacement { icon, rect: uzor_tui::Rect::new(x, 1, 4, 2), selected }
+        SixelIconPlacement { icon, rect: uzor_tui::Rect::new(x, 1, 4, 2), selected, size: SixelIconSize::Rail }
     }
 
     #[test]
@@ -5498,6 +5502,34 @@ mod tests {
         let mut written = Vec::new();
         flush_sixel_icon_into(&mut written, &app, &mut state).unwrap();
         assert!(written.is_empty(), "an empty sixel_icons must never write terminal bytes");
+    }
+
+    #[test]
+    fn flush_sixel_icon_prints_the_compact_asset_for_a_compact_placement() {
+        // The compact tier's own baked asset (`icons::sixel_compact`) is a
+        // DIFFERENT, much smaller raster than the rail tier's own
+        // (`icons::sixel`) for the same icon -- this proves
+        // `flush_sixel_icon_into` picks the one matching `placement.size`,
+        // not always the rail-tier one.
+        let mut app = App::default();
+        app.layout.sixel_icons = vec![SixelIconPlacement {
+            icon: icons::IconId::NewFile,
+            rect: uzor_tui::Rect::new(2, 1, 1, 1),
+            selected: false,
+            size: SixelIconSize::Compact,
+        }];
+        let mut state = SixelEmitState::default();
+        let mut written = Vec::new();
+        flush_sixel_icon_into(&mut written, &app, &mut state).unwrap();
+        let output = String::from_utf8_lossy(&written);
+        assert!(
+            output.contains(icons::sixel_compact(icons::IconId::NewFile)),
+            "compact placement must emit the compact-tier sixel bytes"
+        );
+        assert!(
+            !output.contains(icons::sixel(icons::IconId::NewFile)),
+            "compact placement must NOT emit the rail-tier sixel bytes"
+        );
     }
 
     fn paginated_harness_task(index: usize) -> RedactedTaskV1 {

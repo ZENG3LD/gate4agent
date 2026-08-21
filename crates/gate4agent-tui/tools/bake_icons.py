@@ -96,6 +96,33 @@ BRAILLE_TOTAL_DOTS = BRAILLE_FINAL_W * BRAILLE_FINAL_H
 SIXEL_RGBA_LEN = SIXEL_PX * SIXEL_PX * 4
 BRAILLE_RGBA_LEN = BRAILLE_FINAL_W * BRAILLE_FINAL_H * 4
 
+# ---- Compact tier (dense single-row inline buttons -- Explorer/Git
+# panel labelling, wave 1; see `icons.rs`'s own module doc for the tier's
+# reasoning). Sixel: exactly ONE assumed terminal cell
+# (`icons::ASSUMED_CELL_WIDTH_PX`/`_HEIGHT_PX` -- keep these two numbers
+# in sync with that Rust module by hand, the same relationship `SIXEL_PX`
+# above already has to the rail's own cell-footprint constants). Braille:
+# 2 cells wide x 1 row tall (a braille cell is a fixed 2x4 dot grid, so
+# this is a 4x4 dot canvas) -- a SQUARE target, unlike the rail tier's
+# own 2:3 portrait (8x12) grid.
+COMPACT_SIXEL_PX_W = 10
+COMPACT_SIXEL_PX_H = 20
+COMPACT_BRAILLE_SUPER_PX = 32  # supersampled fit-within square before downsampling
+COMPACT_BRAILLE_FINAL_W = 4
+COMPACT_BRAILLE_FINAL_H = 4
+COMPACT_BRAILLE_TOTAL_DOTS = COMPACT_BRAILLE_FINAL_W * COMPACT_BRAILLE_FINAL_H
+
+COMPACT_SIXEL_RGBA_LEN = COMPACT_SIXEL_PX_W * COMPACT_SIXEL_PX_H * 4
+COMPACT_BRAILLE_RGBA_LEN = COMPACT_BRAILLE_FINAL_W * COMPACT_BRAILLE_FINAL_H * 4
+
+# Proportional to `MIN_LIT_DOTS_TARGET`'s own 18/96 (~19%) share of the
+# rail tier's 96 total dots, applied to the compact braille tier's own
+# 16 -- scaled down, not re-derived, so a canvas this much smaller does
+# not just always fall through to the ladder's noisiest (and, per this
+# tier's own review, LEAST informative -- see `COMPACT_THRESHOLD_
+# OVERRIDES` below) rung.
+COMPACT_MIN_LIT_DOTS_TARGET = 3
+
 # Threshold candidates (alpha 0-255), descending, ~6%-58% coverage -- the
 # same band the original 7-icon catalog's own hand-tuned constants (77,
 # 89, 102) sit within, extended both up and down for the wider variety of
@@ -195,6 +222,30 @@ THRESHOLD_OVERRIDES: dict[str, int] = {
 # original rail icon" ONLY for these 7, not for every other icon that
 # also happens to carry a manual override.
 LEGACY_RAIL_SLUGS: frozenset[str] = frozenset({"files", "source-control", "person", "project", "settings-gear", "chevron-left", "chevron-right"})
+
+# Same idea as `THRESHOLD_OVERRIDES` above, but for the compact braille
+# tier's own much smaller 4x4 (16-dot) canvas, where the auto search's
+# own `COMPACT_MIN_LIT_DOTS_TARGET` is low enough that the ladder's
+# highest-clearing rung is sometimes a lopsided/sparse 1-cell-only result
+# rather than a rung one or two steps lower that actually uses both
+# cells -- picked by hand after reviewing this tool's own printed report.
+COMPACT_THRESHOLD_OVERRIDES: dict[str, int] = {
+    # new-file / new-folder: both auto-select the SAME highest ladder rung
+    # (148) here, landing on the SAME near-blank glyph (only the right
+    # cell lit, 4/16 dots) for two icons that sit as ADJACENT buttons in
+    # the Explorer panel -- indistinguishable from each other at the
+    # compact size, not just individually sparse. 64 gives each its own
+    # distinct, more fully-lit (10/16) shape.
+    "new-file": 64,
+    "new-folder": 64,
+    # arrow-up / check: the auto search's own target (3 lit dots) stops
+    # at the first rung clearing it, which for these two thin-stroke
+    # glyphs is a very sparse 3-dot result; one rung lower still reads as
+    # the same basic shape (arrow stem+head / check tick) with a fuller
+    # silhouette.
+    "arrow-up": 38,
+    "check": 26,
+}
 
 # Icons where even the best-achievable threshold loses real shape detail
 # (not just a low dot count) -- a qualitative call made by reviewing every
@@ -425,6 +476,68 @@ def rasterize_braille(patched_svg: Path, out_rgba: Path) -> None:
         die(f"braille raster for {patched_svg} produced {actual} bytes, expected {BRAILLE_RGBA_LEN}")
 
 
+def rasterize_compact_sixel(patched_svg: Path, out_rgba: Path) -> None:
+    """Compact sixel tier: fit-within a `COMPACT_SIXEL_PX_W`-wide box (the
+    smaller of the two target dimensions constrains a square source, same
+    fit-within behaviour `rasterize_sixel` documents for the rail tier),
+    then pad onto the full `COMPACT_SIXEL_PX_W` x `_H` canvas -- exactly
+    one assumed terminal cell. For dense single-row buttons (Explorer/Git
+    sidebar lists and their modals) where the rail's own 40x40 icon does
+    not fit.
+
+    Equivalent hand-run commands:
+        resvg -w 10 -h 20 <slug>.patched.svg <slug>_raw.png
+        ffmpeg -i <slug>_raw.png \\
+            -vf "pad=10:20:(ow-iw)/2:(oh-ih)/2:color=black@0.0" \\
+            -f rawvideo -pix_fmt rgba <slug>_compact.rgba
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        raw_png = Path(tmp) / "raw.png"
+        run_tool(["resvg", "-w", str(COMPACT_SIXEL_PX_W), "-h", str(COMPACT_SIXEL_PX_H), str(patched_svg), str(raw_png)])
+        run_tool([
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", str(raw_png),
+            "-vf", f"pad={COMPACT_SIXEL_PX_W}:{COMPACT_SIXEL_PX_H}:(ow-iw)/2:(oh-ih)/2:color=black@0.0",
+            "-f", "rawvideo", "-pix_fmt", "rgba",
+            str(out_rgba),
+        ])
+    actual = out_rgba.stat().st_size
+    if actual != COMPACT_SIXEL_RGBA_LEN:
+        die(f"compact sixel raster for {patched_svg} produced {actual} bytes, expected {COMPACT_SIXEL_RGBA_LEN}")
+
+
+def rasterize_compact_braille(patched_svg: Path, out_rgba: Path) -> None:
+    """Compact braille tier: supersample fit-within a SQUARE 32x32 box
+    (no rectangular pad, unlike the rail tier's own 2:3 portrait target --
+    the compact grid is itself square: 2 cells wide x 1 row tall = 4x4
+    dots), then AREA-downsample straight to the final 4x4.
+
+    Equivalent hand-run commands:
+        resvg -w 32 -h 32 <slug>.patched.svg <slug>_raw32.png
+        ffmpeg -i <slug>_raw32.png -vf "\\
+            pad=32:32:(ow-iw)/2:(oh-ih)/2:color=black@0.0,\\
+            scale=4:4:flags=area" \\
+            -f rawvideo -pix_fmt rgba <slug>_compact_braille.rgba
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        raw_png = Path(tmp) / "raw32.png"
+        run_tool(["resvg", "-w", str(COMPACT_BRAILLE_SUPER_PX), "-h", str(COMPACT_BRAILLE_SUPER_PX), str(patched_svg), str(raw_png)])
+        vf = (
+            f"pad={COMPACT_BRAILLE_SUPER_PX}:{COMPACT_BRAILLE_SUPER_PX}:(ow-iw)/2:(oh-ih)/2:color=black@0.0,"
+            f"scale={COMPACT_BRAILLE_FINAL_W}:{COMPACT_BRAILLE_FINAL_H}:flags=area"
+        )
+        run_tool([
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", str(raw_png),
+            "-vf", vf,
+            "-f", "rawvideo", "-pix_fmt", "rgba",
+            str(out_rgba),
+        ])
+    actual = out_rgba.stat().st_size
+    if actual != COMPACT_BRAILLE_RGBA_LEN:
+        die(f"compact braille raster for {patched_svg} produced {actual} bytes, expected {COMPACT_BRAILLE_RGBA_LEN}")
+
+
 def ensure_assets(spec: IconSpec, cache_dir: Path, force: bool) -> tuple[Path, Path]:
     """Ensure both `.rgba` outputs for `spec` exist on disk, baking
     whatever is missing (or everything, if `force`). Returns their paths.
@@ -443,6 +556,26 @@ def ensure_assets(spec: IconSpec, cache_dir: Path, force: bool) -> tuple[Path, P
             rasterize_sixel(patched, sixel_path)
         if need_braille:
             rasterize_braille(patched, braille_path)
+
+    return sixel_path, braille_path
+
+
+def ensure_compact_assets(spec: IconSpec, cache_dir: Path, force: bool) -> tuple[Path, Path]:
+    """Same idempotency contract as `ensure_assets` above, for the
+    compact tier's own two `.rgba` outputs."""
+    sixel_path = ICONS_DIR / f"{spec.stem()}_compact.rgba"
+    braille_path = ICONS_DIR / f"{spec.stem()}_compact_braille.rgba"
+
+    need_sixel = force or not sixel_path.exists() or sixel_path.stat().st_size != COMPACT_SIXEL_RGBA_LEN
+    need_braille = force or not braille_path.exists() or braille_path.stat().st_size != COMPACT_BRAILLE_RGBA_LEN
+
+    if need_sixel or need_braille:
+        svg = fetch_svg(spec.slug, cache_dir)
+        patched = patch_fill(svg, spec.slug, cache_dir)
+        if need_sixel:
+            rasterize_compact_sixel(patched, sixel_path)
+        if need_braille:
+            rasterize_compact_braille(patched, braille_path)
 
     return sixel_path, braille_path
 
@@ -518,12 +651,71 @@ def choose_threshold(rgba: bytes, override: int | None) -> ThresholdChoice:
     )
 
 
+def compact_braille_glyph(rgba: bytes, threshold: int) -> str:
+    """2 braille glyphs (2 cells wide x 1 row tall) -- the exact compact
+    button body `PixelCanvas::flush` renders at `threshold`."""
+    lit = [
+        [rgba[(y * COMPACT_BRAILLE_FINAL_W + x) * 4 + 3] >= threshold for x in range(COMPACT_BRAILLE_FINAL_W)]
+        for y in range(COMPACT_BRAILLE_FINAL_H)
+    ]
+    chars = []
+    for cx in range(2):
+        mask = 0
+        for ly in range(4):
+            for lx in range(2):
+                if lit[ly][cx * 2 + lx]:
+                    mask |= braille_bit(lx, ly)
+        chars.append(chr(0x2800 + mask))
+    return "".join(chars)
+
+
+@dataclass
+class CompactThresholdChoice:
+    threshold: int
+    lit_dots: int
+    coverage_pct: int
+    auto: bool
+    glyph: str
+
+
+def choose_compact_threshold(rgba: bytes, override: int | None) -> CompactThresholdChoice:
+    alphas = [rgba[i] for i in range(3, len(rgba), 4)]
+
+    def lit_count(t: int) -> int:
+        return sum(1 for a in alphas if a >= t)
+
+    if override is not None:
+        threshold = override
+    else:
+        threshold = None
+        for candidate in THRESHOLD_LADDER:
+            if lit_count(candidate) >= COMPACT_MIN_LIT_DOTS_TARGET:
+                threshold = candidate
+                break
+        if threshold is None:
+            for candidate in reversed(THRESHOLD_LADDER):
+                if lit_count(candidate) >= 1:
+                    threshold = candidate
+                    break
+        if threshold is None:
+            threshold = max(1, max(alphas))
+
+    n_lit = lit_count(threshold)
+    return CompactThresholdChoice(
+        threshold=threshold,
+        lit_dots=n_lit,
+        coverage_pct=round(100 * threshold / 255),
+        auto=override is None,
+        glyph=compact_braille_glyph(rgba, threshold),
+    )
+
+
 def rust_string_literal(s: str) -> str:
     escaped = s.replace("\\", "\\\\").replace('"', '\\"')
     return f'"{escaped}"'
 
 
-def generate_catalog(analyses: dict[str, ThresholdChoice]) -> str:
+def generate_catalog(analyses: dict[str, ThresholdChoice], compact_analyses: dict[str, CompactThresholdChoice]) -> str:
     lines: list[str] = []
     lines.append("//! GENERATED by `tools/bake_icons.py` -- do not hand-edit. Re-run:")
     lines.append("//!   python tools/bake_icons.py")
@@ -540,13 +732,19 @@ def generate_catalog(analyses: dict[str, ThresholdChoice]) -> str:
     lines.append("//! icons' hand-tuned constants unchanged, or an auto coverage-histogram")
     lines.append("//! search) -- see that function, not prose duplicated per icon here, for")
     lines.append("//! the selection reasoning; a `DEGRADED` line marks icons whose shape does")
-    lines.append("//! not survive at 8x12 even at the best achievable threshold.")
+    lines.append("//! not survive at 8x12 even at the best achievable threshold. The compact")
+    lines.append("//! tier (2x1-cell braille / 1-cell sixel, for dense single-row buttons --")
+    lines.append("//! see `../icons.rs`'s own module doc) is chosen the same way by")
+    lines.append("//! `choose_compact_threshold`, against `COMPACT_THRESHOLD_OVERRIDES`.")
     lines.append("")
     lines.append("use std::sync::LazyLock;")
     lines.append("")
     lines.append("use uzor_tui::canvas::{CanvasMode, PixelCanvas};")
     lines.append("")
-    lines.append("use super::{build_sixel, rgba_to_canvas, BRAILLE_ICON_CELLS_TALL, BRAILLE_ICON_CELLS_WIDE};")
+    lines.append("use super::{")
+    lines.append("    build_sixel, build_sixel_compact, rgba_to_canvas, BRAILLE_ICON_CELLS_TALL, BRAILLE_ICON_CELLS_WIDE,")
+    lines.append("    COMPACT_BRAILLE_ICON_CELLS_TALL, COMPACT_BRAILLE_ICON_CELLS_WIDE,")
+    lines.append("};")
     lines.append("")
     lines.append("/// Every baked icon this crate ships, sixel + braille + ascii tiers, one")
     lines.append("/// enum covering the full catalog (not just the activity rail -- see")
@@ -586,6 +784,26 @@ def generate_catalog(analyses: dict[str, ThresholdChoice]) -> str:
     lines.append("    }")
     lines.append("}")
     lines.append("")
+    lines.append("/// Encoded COMPACT-tier sixel string for `id` (exactly one assumed")
+    lines.append("/// terminal cell -- see `../icons.rs`'s own module doc) -- for dense")
+    lines.append("/// single-row buttons where the rail's own 40x40 icon does not fit.")
+    lines.append("pub fn sixel_compact(id: IconId) -> &'static str {")
+    lines.append("    match id {")
+    for spec in MANIFEST:
+        lines.append(f"        IconId::{spec.rust_name} => {to_screaming_snake(spec.rust_name)}_SIXEL_COMPACT.as_str(),")
+    lines.append("    }")
+    lines.append("}")
+    lines.append("")
+    lines.append("/// COMPACT-tier braille [`PixelCanvas`] for `id` (2 cells wide x 1 row")
+    lines.append("/// tall -- see `../icons.rs`'s own module doc), same silhouette rule as")
+    lines.append("/// [`braille`].")
+    lines.append("pub fn braille_compact(id: IconId) -> &'static PixelCanvas {")
+    lines.append("    match id {")
+    for spec in MANIFEST:
+        lines.append(f"        IconId::{spec.rust_name} => &*{to_screaming_snake(spec.rust_name)}_BRAILLE_COMPACT,")
+    lines.append("    }")
+    lines.append("}")
+    lines.append("")
     lines.append("/// Short (<=2 char) plain-ASCII label for `id` -- the rail's own existing")
     lines.append("/// letters (`F`/`G`/`A`/`K`/`S`/`<`/`>`) are reproduced unchanged for the")
     lines.append("/// original 7; every other icon gets an obvious short mark (see")
@@ -616,10 +834,27 @@ def generate_catalog(analyses: dict[str, ThresholdChoice]) -> str:
     lines.append("    }")
     lines.append("}")
     lines.append("")
+    lines.append("#[cfg(test)]")
+    lines.append("pub(crate) fn sixel_compact_source_rgba(id: IconId) -> &'static [u8] {")
+    lines.append("    match id {")
+    for spec in MANIFEST:
+        lines.append(f"        IconId::{spec.rust_name} => {to_screaming_snake(spec.rust_name)}_COMPACT_RGBA,")
+    lines.append("    }")
+    lines.append("}")
+    lines.append("")
+    lines.append("#[cfg(test)]")
+    lines.append("pub(crate) fn braille_compact_source_rgba(id: IconId) -> &'static [u8] {")
+    lines.append("    match id {")
+    for spec in MANIFEST:
+        lines.append(f"        IconId::{spec.rust_name} => {to_screaming_snake(spec.rust_name)}_COMPACT_BRAILLE_RGBA,")
+    lines.append("    }")
+    lines.append("}")
+    lines.append("")
 
     for spec in MANIFEST:
         upper = to_screaming_snake(spec.rust_name)
         analysis = analyses[spec.slug]
+        compact_analysis = compact_analyses[spec.slug]
         degraded_note = KNOWN_DEGRADED.get(spec.slug)
         lines.append(f"// ---- {spec.rust_name} ({spec.slug}) " + "-" * max(1, 60 - len(spec.rust_name) - len(spec.slug)))
         lines.append("")
@@ -650,6 +885,30 @@ def generate_catalog(analyses: dict[str, ThresholdChoice]) -> str:
         lines.append("    )")
         lines.append("});")
         lines.append("")
+        lines.append(f'const {upper}_COMPACT_RGBA: &[u8] = include_bytes!("{spec.stem()}_compact.rgba");')
+        lines.append(f"static {upper}_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact({upper}_COMPACT_RGBA));")
+        lines.append("")
+        lines.append(f'const {upper}_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("{spec.stem()}_compact_braille.rgba");')
+        compact_origin = (
+            "override, hand-picked after reviewing bake_icons.py's own printed report"
+            if not compact_analysis.auto
+            else "auto-selected by bake_icons.py::choose_compact_threshold"
+        )
+        lines.append(
+            f"/// ~{compact_analysis.coverage_pct}% coverage ({compact_analysis.threshold}/255), {compact_origin} -- "
+            f"{compact_analysis.lit_dots}/{COMPACT_BRAILLE_TOTAL_DOTS} dots lit at this threshold."
+        )
+        lines.append(f"const {upper}_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = {compact_analysis.threshold};")
+        lines.append(f"static {upper}_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {{")
+        lines.append("    rgba_to_canvas(")
+        lines.append("        CanvasMode::Braille,")
+        lines.append("        COMPACT_BRAILLE_ICON_CELLS_WIDE,")
+        lines.append("        COMPACT_BRAILLE_ICON_CELLS_TALL,")
+        lines.append(f"        {upper}_COMPACT_BRAILLE_RGBA,")
+        lines.append(f"        {upper}_COMPACT_BRAILLE_ALPHA_THRESHOLD,")
+        lines.append("    )")
+        lines.append("});")
+        lines.append("")
 
     return "\n".join(lines) + "\n"
 
@@ -660,7 +919,12 @@ def to_screaming_snake(pascal: str) -> str:
     return out
 
 
-def print_report(analyses: dict[str, ThresholdChoice], asset_sizes: dict[str, tuple[int, int, bool]]) -> None:
+def print_report(
+    analyses: dict[str, ThresholdChoice],
+    compact_analyses: dict[str, CompactThresholdChoice],
+    asset_sizes: dict[str, tuple[int, int, bool]],
+    compact_asset_sizes: dict[str, tuple[int, int, bool]],
+) -> None:
     print()
     print("=" * 78)
     print("ICON CATALOG BRAILLE PREVIEW (exact PixelCanvas::flush output, per icon)")
@@ -682,6 +946,9 @@ def print_report(analyses: dict[str, ThresholdChoice], asset_sizes: dict[str, tu
             print(f"  {spec.rust_name} ({slug})  ascii={spec.ascii!r}  thr={analysis.threshold} (~{analysis.coverage_pct}%)  lit={analysis.lit_dots}/{BRAILLE_TOTAL_DOTS}{degraded}")
             for row in analysis.rows:
                 print(f"    [{row}]")
+            if slug in compact_analyses:
+                compact = compact_analyses[slug]
+                print(f"    compact: thr={compact.threshold} (~{compact.coverage_pct}%)  lit={compact.lit_dots}/{COMPACT_BRAILLE_TOTAL_DOTS}  [{compact.glyph}]")
 
     print()
     print("=" * 78)
@@ -695,7 +962,19 @@ def print_report(analyses: dict[str, ThresholdChoice], asset_sizes: dict[str, tu
     print(f"Icons total: {len(MANIFEST)}  (newly baked this run: {n_new})")
     print(f"Sixel tier:   {total_sixel:>9} bytes total ({total_sixel / 1024:.1f} KiB)  -- {newly_baked_sixel} bytes newly added")
     print(f"Braille tier: {total_braille:>9} bytes total ({total_braille / 1024:.1f} KiB) -- {newly_baked_braille} bytes newly added")
-    print(f"Combined:     {total_sixel + total_braille:>9} bytes total ({(total_sixel + total_braille) / 1024:.1f} KiB) -- {newly_baked_sixel + newly_baked_braille} bytes newly added")
+    if compact_asset_sizes:
+        total_compact_sixel = sum(s for s, _, _ in compact_asset_sizes.values())
+        total_compact_braille = sum(b for _, b, _ in compact_asset_sizes.values())
+        newly_baked_compact_sixel = sum(s for s, _, new in compact_asset_sizes.values() if new)
+        newly_baked_compact_braille = sum(b for _, b, new in compact_asset_sizes.values() if new)
+        print(f"Compact sixel tier:   {total_compact_sixel:>9} bytes total ({total_compact_sixel / 1024:.1f} KiB)  -- {newly_baked_compact_sixel} bytes newly added")
+        print(f"Compact braille tier: {total_compact_braille:>9} bytes total ({total_compact_braille / 1024:.1f} KiB) -- {newly_baked_compact_braille} bytes newly added")
+    else:
+        total_compact_sixel = total_compact_braille = 0
+    print(
+        f"Combined:     {total_sixel + total_braille + total_compact_sixel + total_compact_braille:>9} bytes total "
+        f"({(total_sixel + total_braille + total_compact_sixel + total_compact_braille) / 1024:.1f} KiB)"
+    )
     if CATALOG_RS.exists():
         catalog_size = CATALOG_RS.stat().st_size
         print(f"catalog.rs generated source: {catalog_size} bytes ({catalog_size / 1024:.1f} KiB)")
@@ -721,6 +1000,8 @@ def main(argv: list[str]) -> int:
 
     analyses: dict[str, ThresholdChoice] = {}
     asset_sizes: dict[str, tuple[int, int, bool]] = {}
+    compact_analyses: dict[str, CompactThresholdChoice] = {}
+    compact_asset_sizes: dict[str, tuple[int, int, bool]] = {}
     for spec in selected:
         sixel_existed = (ICONS_DIR / f"{spec.stem()}.rgba").exists()
         braille_existed = (ICONS_DIR / f"{spec.stem()}_braille.rgba").exists()
@@ -730,15 +1011,23 @@ def main(argv: list[str]) -> int:
         rgba = braille_path.read_bytes()
         analyses[spec.slug] = choose_threshold(rgba, THRESHOLD_OVERRIDES.get(spec.slug))
 
+        compact_sixel_existed = (ICONS_DIR / f"{spec.stem()}_compact.rgba").exists()
+        compact_braille_existed = (ICONS_DIR / f"{spec.stem()}_compact_braille.rgba").exists()
+        compact_sixel_path, compact_braille_path = ensure_compact_assets(spec, args.cache_dir, args.force)
+        compact_newly_baked = args.force or not compact_sixel_existed or not compact_braille_existed
+        compact_asset_sizes[spec.slug] = (compact_sixel_path.stat().st_size, compact_braille_path.stat().st_size, compact_newly_baked)
+        compact_rgba = compact_braille_path.read_bytes()
+        compact_analyses[spec.slug] = choose_compact_threshold(compact_rgba, COMPACT_THRESHOLD_OVERRIDES.get(spec.slug))
+
     if only is None:
         # Full manifest processed -- every icon has assets on disk and an
         # analysis in hand, safe to regenerate the complete catalog.
-        CATALOG_RS.write_text(generate_catalog(analyses), encoding="utf-8", newline="\n")
+        CATALOG_RS.write_text(generate_catalog(analyses, compact_analyses), encoding="utf-8", newline="\n")
         print(f"wrote {CATALOG_RS} ({CATALOG_RS.stat().st_size} bytes)")
     else:
         print(f"--only restricted this run to {sorted(only)} -- catalog.rs NOT regenerated (needs the full manifest)")
 
-    print_report(analyses, asset_sizes)
+    print_report(analyses, compact_analyses, asset_sizes, compact_asset_sizes)
     return 0
 
 

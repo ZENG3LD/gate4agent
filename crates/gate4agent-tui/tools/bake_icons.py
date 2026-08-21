@@ -216,6 +216,21 @@ STRIP_SIXEL_PX_W = 20
 STRIP_SIXEL_PX_H = 20
 STRIP_SIXEL_RGBA_LEN = STRIP_SIXEL_PX_W * STRIP_SIXEL_PX_H * 4
 
+# ---- Gallery tier (the icon gallery dev surface -- FIX4's own main
+# deliverable, `app::SurfaceTab::IconGallery` / `render::
+# render_icon_gallery`) -- the third of FIX2's three evenly-landing square
+# sizes (20/40/60 on the assumed 10x20px cell grid). 20 and 40 already
+# exist (the strip and rail tiers above, reused as-is by the gallery); 60
+# has no other UI consumer and so gets its own dedicated bake here, same
+# recipe as the strip tier (`STRIP_SIXEL_PX_W`/`_H` above): a single resvg
+# AA pass directly at the target size, exactly `icons::
+# GALLERY_SIXEL_ICON_WIDTH_PX`/`_HEIGHT_PX` (keep these two numbers in
+# sync with that Rust module by hand, same precedent as
+# `STRIP_SIXEL_PX_W`/`_H`).
+GALLERY_SIXEL_PX_W = 60
+GALLERY_SIXEL_PX_H = 60
+GALLERY_SIXEL_RGBA_LEN = GALLERY_SIXEL_PX_W * GALLERY_SIXEL_PX_H * 4
+
 # ---- GateOverride compositing (cause 1's fix -- see this module's own
 # header doc comment). Hand-synced to render.rs's own fixed theme
 # constants: `ACTIVE_BG` (the rail/strip button body's own "at rest"
@@ -718,6 +733,38 @@ def rasterize_strip_sixel(patched_svg: Path, out_rgba: Path) -> None:
         die(f"strip sixel raster for {patched_svg} produced {actual} bytes, expected {STRIP_SIXEL_RGBA_LEN}")
 
 
+def rasterize_gallery_sixel(patched_svg: Path, out_rgba: Path) -> None:
+    """Gallery tier: fit-within `GALLERY_SIXEL_PX_W`x`_H` (6 cells wide x
+    3 rows tall -- the icon gallery's own 60x60 comparison column, see
+    `icons::GALLERY_SIXEL_ICON_WIDTH_PX`'s own doc comment). Single resvg
+    pass DIRECTLY at the target size -- the exact same recipe `rasterize_
+    strip_sixel` already uses (see this module's own header doc comment's
+    cause-2 note), including the same precomputed fit-within pixel size
+    (`svg_intrinsic_size`/`fit_within`) rather than resvg's own `-w`/`-h`.
+
+    Equivalent hand-run commands (for a square 16x16/24x24 source; a non-
+    square source like `output.svg` fits within 60x60 first, see above):
+        resvg -w 60 -h 60 <slug>.patched.svg <slug>_raw.png
+        ffmpeg -i <slug>_raw.png \\
+            -vf "pad=60:60:(ow-iw)/2:(oh-ih)/2:color=black@0.0" \\
+            -f rawvideo -pix_fmt rgba <slug>_gallery.rgba
+    """
+    fit_w, fit_h = fit_within(*svg_intrinsic_size(patched_svg), GALLERY_SIXEL_PX_W, GALLERY_SIXEL_PX_H)
+    with tempfile.TemporaryDirectory() as tmp:
+        raw_png = Path(tmp) / "raw.png"
+        run_tool(["resvg", "-w", str(fit_w), "-h", str(fit_h), str(patched_svg), str(raw_png)])
+        run_tool([
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", str(raw_png),
+            "-vf", f"pad={GALLERY_SIXEL_PX_W}:{GALLERY_SIXEL_PX_H}:(ow-iw)/2:(oh-ih)/2:color=black@0.0",
+            "-f", "rawvideo", "-pix_fmt", "rgba",
+            str(out_rgba),
+        ])
+    actual = out_rgba.stat().st_size
+    if actual != GALLERY_SIXEL_RGBA_LEN:
+        die(f"gallery sixel raster for {patched_svg} produced {actual} bytes, expected {GALLERY_SIXEL_RGBA_LEN}")
+
+
 def composite_over_background(rgba: bytes, bg: tuple[int, int, int]) -> bytes:
     """Cause 1's actual fix: alpha-composite a straight (non-premultiplied)
     RGBA buffer -- resvg's own convention, where a partially-covered "ink"
@@ -816,6 +863,30 @@ def ensure_strip_assets(spec: IconSpec, cache_dir: Path, force: bool) -> tuple[P
         # Always re-read from disk rather than threading a maybe-stale
         # in-memory copy through: correct whether or not `need_transparent`
         # was also true this run.
+        gate_path.write_bytes(composite_over_background(transparent_path.read_bytes(), GATE_ACTIVE_BG_RGB))
+
+    return transparent_path, gate_path
+
+
+def ensure_gallery_assets(spec: IconSpec, cache_dir: Path, force: bool) -> tuple[Path, Path]:
+    """Ensure the icon gallery's own two 60x60 sixel-tier outputs:
+    `<stem>_gallery.rgba` (transparent, single-pass resvg raster directly
+    at the target size -- see `rasterize_gallery_sixel`) and `<stem>_
+    gallery_gate.rgba` (the same pixels alpha-composited over
+    `GATE_ACTIVE_BG_RGB`, pure Python, no second raster pass -- see
+    `composite_over_background`). Same "no selected state, so no
+    `_gallery_gate_accent` variant" precedent as `ensure_strip_assets`
+    above -- the gallery is a read-only comparison grid."""
+    transparent_path = ICONS_DIR / f"{spec.stem()}_gallery.rgba"
+    gate_path = ICONS_DIR / f"{spec.stem()}_gallery_gate.rgba"
+    need_transparent = force or not transparent_path.exists() or transparent_path.stat().st_size != GALLERY_SIXEL_RGBA_LEN
+    need_gate = force or not gate_path.exists() or gate_path.stat().st_size != GALLERY_SIXEL_RGBA_LEN
+
+    if need_transparent:
+        svg = fetch_svg(spec.slug, cache_dir)
+        patched = patch_fill(svg, spec.slug, cache_dir)
+        rasterize_gallery_sixel(patched, transparent_path)
+    if need_gate:
         gate_path.write_bytes(composite_over_background(transparent_path.read_bytes(), GATE_ACTIVE_BG_RGB))
 
     return transparent_path, gate_path
@@ -1003,9 +1074,9 @@ def generate_catalog(analyses: dict[str, ThresholdChoice], compact_analyses: dic
     lines.append("use uzor_tui::canvas::{CanvasMode, PixelCanvas};")
     lines.append("")
     lines.append("use super::{")
-    lines.append("    build_sixel, build_sixel_compact, build_sixel_gate, build_sixel_strip, build_sixel_strip_gate,")
-    lines.append("    rgba_to_canvas, SixelVariant, BRAILLE_ICON_CELLS_TALL, BRAILLE_ICON_CELLS_WIDE,")
-    lines.append("    COMPACT_BRAILLE_ICON_CELLS_TALL, COMPACT_BRAILLE_ICON_CELLS_WIDE,")
+    lines.append("    build_sixel, build_sixel_compact, build_sixel_gallery, build_sixel_gallery_gate, build_sixel_gate,")
+    lines.append("    build_sixel_strip, build_sixel_strip_gate, rgba_to_canvas, SixelVariant, BRAILLE_ICON_CELLS_TALL,")
+    lines.append("    BRAILLE_ICON_CELLS_WIDE, COMPACT_BRAILLE_ICON_CELLS_TALL, COMPACT_BRAILLE_ICON_CELLS_WIDE,")
     lines.append("};")
     lines.append("")
     lines.append("/// Every baked icon this crate ships, sixel + braille + ascii tiers, one")
@@ -1054,6 +1125,22 @@ def generate_catalog(analyses: dict[str, ThresholdChoice], compact_analyses: dic
         lines.append(f"        IconId::{spec.rust_name} => match variant {{")
         lines.append(f"            SixelVariant::Transparent => {upper}_SIXEL_STRIP.as_str(),")
         lines.append(f"            SixelVariant::GateActive | SixelVariant::GateAccent => {upper}_SIXEL_STRIP_GATE.as_str(),")
+        lines.append("        },")
+    lines.append("    }")
+    lines.append("}")
+    lines.append("")
+    lines.append("/// Encoded icon-gallery-tier (60x60, 6 cells wide x 3 rows tall) sixel")
+    lines.append("/// string for `id` at `variant`'s own background -- the gallery is a")
+    lines.append("/// read-only comparison grid with no selected state, so `GateAccent`")
+    lines.append("/// resolves to the SAME asset as `GateActive` here (same fold as")
+    lines.append("/// [`sixel_strip`]).")
+    lines.append("pub fn sixel_gallery(id: IconId, variant: SixelVariant) -> &'static str {")
+    lines.append("    match id {")
+    for spec in MANIFEST:
+        upper = to_screaming_snake(spec.rust_name)
+        lines.append(f"        IconId::{spec.rust_name} => match variant {{")
+        lines.append(f"            SixelVariant::Transparent => {upper}_SIXEL_GALLERY.as_str(),")
+        lines.append(f"            SixelVariant::GateActive | SixelVariant::GateAccent => {upper}_SIXEL_GALLERY_GATE.as_str(),")
         lines.append("        },")
     lines.append("    }")
     lines.append("}")
@@ -1165,6 +1252,22 @@ def generate_catalog(analyses: dict[str, ThresholdChoice], compact_analyses: dic
     lines.append("    }")
     lines.append("}")
     lines.append("")
+    lines.append("#[cfg(test)]")
+    lines.append("pub(crate) fn sixel_gallery_source_rgba(id: IconId) -> &'static [u8] {")
+    lines.append("    match id {")
+    for spec in MANIFEST:
+        lines.append(f"        IconId::{spec.rust_name} => {to_screaming_snake(spec.rust_name)}_GALLERY_RGBA,")
+    lines.append("    }")
+    lines.append("}")
+    lines.append("")
+    lines.append("#[cfg(test)]")
+    lines.append("pub(crate) fn sixel_gallery_gate_source_rgba(id: IconId) -> &'static [u8] {")
+    lines.append("    match id {")
+    for spec in MANIFEST:
+        lines.append(f"        IconId::{spec.rust_name} => {to_screaming_snake(spec.rust_name)}_GALLERY_GATE_RGBA,")
+    lines.append("    }")
+    lines.append("}")
+    lines.append("")
 
     for spec in MANIFEST:
         upper = to_screaming_snake(spec.rust_name)
@@ -1243,6 +1346,15 @@ def generate_catalog(analyses: dict[str, ThresholdChoice], compact_analyses: dic
         lines.append(f'const {upper}_STRIP_GATE_RGBA: &[u8] = include_bytes!("{spec.stem()}_strip_gate.rgba");')
         lines.append(f"static {upper}_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate({upper}_STRIP_GATE_RGBA));")
         lines.append("")
+        lines.append(f'const {upper}_GALLERY_RGBA: &[u8] = include_bytes!("{spec.stem()}_gallery.rgba");')
+        lines.append(f"static {upper}_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery({upper}_GALLERY_RGBA));")
+        lines.append("")
+        lines.append("/// GateOverride, the icon gallery's own single background (`render::")
+        lines.append("/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the")
+        lines.append("/// rail/strip tiers above.")
+        lines.append(f'const {upper}_GALLERY_GATE_RGBA: &[u8] = include_bytes!("{spec.stem()}_gallery_gate.rgba");')
+        lines.append(f"static {upper}_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate({upper}_GALLERY_GATE_RGBA));")
+        lines.append("")
 
     return "\n".join(lines) + "\n"
 
@@ -1260,6 +1372,7 @@ def print_report(
     gate_asset_sizes: dict[str, tuple[int, int, bool]],
     compact_asset_sizes: dict[str, tuple[int, int, bool]],
     strip_asset_sizes: dict[str, tuple[int, int, bool]],
+    gallery_asset_sizes: dict[str, tuple[int, int, bool]],
 ) -> None:
     print()
     print("=" * 78)
@@ -1298,7 +1411,7 @@ def print_report(
     print(f"Icons total: {len(MANIFEST)}  (newly baked this run: {n_new})")
     print(f"Sixel tier:   {total_sixel:>9} bytes total ({total_sixel / 1024:.1f} KiB)  -- {newly_baked_sixel} bytes newly added")
     print(f"Braille tier: {total_braille:>9} bytes total ({total_braille / 1024:.1f} KiB) -- {newly_baked_braille} bytes newly added")
-    total_gate = total_compact_sixel = total_compact_braille = total_strip = 0
+    total_gate = total_compact_sixel = total_compact_braille = total_strip = total_gallery = 0
     if gate_asset_sizes:
         total_gate = sum(a + c for a, c, _ in gate_asset_sizes.values())
         newly_baked_gate = sum(a + c for a, c, new in gate_asset_sizes.values() if new)
@@ -1314,9 +1427,13 @@ def print_report(
         total_strip = sum(t + g for t, g, _ in strip_asset_sizes.values())
         newly_baked_strip = sum(t + g for t, g, new in strip_asset_sizes.values() if new)
         print(f"Strip sixel tier (transparent+gate): {total_strip:>9} bytes total ({total_strip / 1024:.1f} KiB) -- {newly_baked_strip} bytes newly added")
+    if gallery_asset_sizes:
+        total_gallery = sum(t + g for t, g, _ in gallery_asset_sizes.values())
+        newly_baked_gallery = sum(t + g for t, g, new in gallery_asset_sizes.values() if new)
+        print(f"Gallery sixel tier (transparent+gate): {total_gallery:>9} bytes total ({total_gallery / 1024:.1f} KiB) -- {newly_baked_gallery} bytes newly added")
     print(
-        f"Combined:     {total_sixel + total_braille + total_gate + total_compact_sixel + total_compact_braille + total_strip:>9} bytes total "
-        f"({(total_sixel + total_braille + total_gate + total_compact_sixel + total_compact_braille + total_strip) / 1024:.1f} KiB)"
+        f"Combined:     {total_sixel + total_braille + total_gate + total_compact_sixel + total_compact_braille + total_strip + total_gallery:>9} bytes total "
+        f"({(total_sixel + total_braille + total_gate + total_compact_sixel + total_compact_braille + total_strip + total_gallery) / 1024:.1f} KiB)"
     )
     if CATALOG_RS.exists():
         catalog_size = CATALOG_RS.stat().st_size
@@ -1347,6 +1464,7 @@ def main(argv: list[str]) -> int:
     compact_analyses: dict[str, CompactThresholdChoice] = {}
     compact_asset_sizes: dict[str, tuple[int, int, bool]] = {}
     strip_asset_sizes: dict[str, tuple[int, int, bool]] = {}
+    gallery_asset_sizes: dict[str, tuple[int, int, bool]] = {}
     for spec in selected:
         sixel_existed = (ICONS_DIR / f"{spec.stem()}.rgba").exists()
         braille_existed = (ICONS_DIR / f"{spec.stem()}_braille.rgba").exists()
@@ -1380,6 +1498,15 @@ def main(argv: list[str]) -> int:
             args.force or not strip_existed or not strip_gate_existed,
         )
 
+        gallery_existed = (ICONS_DIR / f"{spec.stem()}_gallery.rgba").exists()
+        gallery_gate_existed = (ICONS_DIR / f"{spec.stem()}_gallery_gate.rgba").exists()
+        gallery_path, gallery_gate_path = ensure_gallery_assets(spec, args.cache_dir, args.force)
+        gallery_asset_sizes[spec.slug] = (
+            gallery_path.stat().st_size,
+            gallery_gate_path.stat().st_size,
+            args.force or not gallery_existed or not gallery_gate_existed,
+        )
+
     if only is None:
         # Full manifest processed -- every icon has assets on disk and an
         # analysis in hand, safe to regenerate the complete catalog.
@@ -1388,7 +1515,7 @@ def main(argv: list[str]) -> int:
     else:
         print(f"--only restricted this run to {sorted(only)} -- catalog.rs NOT regenerated (needs the full manifest)")
 
-    print_report(analyses, compact_analyses, asset_sizes, gate_asset_sizes, compact_asset_sizes, strip_asset_sizes)
+    print_report(analyses, compact_analyses, asset_sizes, gate_asset_sizes, compact_asset_sizes, strip_asset_sizes, gallery_asset_sizes)
     return 0
 
 

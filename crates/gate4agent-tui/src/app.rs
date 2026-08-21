@@ -1706,6 +1706,14 @@ pub enum SurfaceTab {
     Git(WorkspaceGitTabKey),
     HarnessFile(HarnessWorkspaceFileTabKey),
     HarnessGit(HarnessWorkspaceGitTabKey),
+    /// FIX4's own icon gallery dev surface (`render::render_icon_gallery`)
+    /// -- a read-only, singleton comparison grid (every catalog icon at
+    /// 20/40/60px sixel plus braille/ascii), reachable from the Settings
+    /// dialog's own button/key (`HitTarget::SettingsIconGallery`, `App::
+    /// open_icon_gallery`). No key payload: unlike `Preview`/`File`/`Git`
+    /// there is only ever ONE gallery, the whole catalog at once, not one
+    /// per selected item.
+    IconGallery,
 }
 
 impl SurfaceTab {
@@ -1718,7 +1726,8 @@ impl SurfaceTab {
             | Self::File(_)
             | Self::Git(_)
             | Self::HarnessFile(_)
-            | Self::HarnessGit(_) => None,
+            | Self::HarnessGit(_)
+            | Self::IconGallery => None,
         }
     }
 }
@@ -2671,14 +2680,34 @@ pub enum HitTarget {
     HarnessGitCommit(PaneId, usize),
     HarnessGitBack(PaneId),
     PreviewResume(PaneId),
-    Settings,
     ControlSection(ControlSection),
     SettingsStyle,
     SettingsPlacement,
     SettingsPresentation,
     SettingsSidebarCollapsed,
     SettingsRailIcons,
+    SettingsIconGallery,
     ActivitySection(ControlSection),
+    /// FIX2/FIX3/FIX4: the activity rail's own Board button -- goes
+    /// through the exact same activation shape as `ActivitySection`
+    /// (`App::activate_board_view`, sibling of `App::activate_activity_
+    /// section`: first click selects + expands, re-click on the already-
+    /// active view collapses) but cannot reuse `ActivitySection(Control
+    /// Section)` itself because Board is deliberately NOT a
+    /// `ControlSection` variant -- see `App::board_view_active`'s own doc
+    /// comment for why. Only ever drawn by `render::render_activity_
+    /// rail` when `app.harness_kanban.enabled` (light mode has no Board
+    /// rail button at all, matching every other kanban gate).
+    ActivityBoard,
+    /// Left over from before the activity rail's own re-click-the-active-
+    /// view collapse behaviour (`App::activate_activity_section`) made a
+    /// separate chevron button redundant -- the rail itself no longer
+    /// wires this target to any drawn hit region (see `render::
+    /// render_activity_rail`'s own doc comment). Kept only because `App::
+    /// click`'s own dispatch (`Some(HitTarget::SidebarCollapse) => self.
+    /// toggle_sidebar_collapsed()`) still references the variant; the
+    /// Settings dialog's own `SettingsSidebarCollapsed` row/key is the
+    /// real, still-wired way to reach the same toggle from a menu.
     SidebarCollapse,
     ControlDrag,
     ControlResize,
@@ -2700,12 +2729,19 @@ pub struct HitRegion {
 /// single-row buttons in the Explorer/Git sidebar panels and their modals
 /// -- see `render::render_compact_icon_button`; `Strip`: the sidebar
 /// content panels' own control-plane strip asset (`icons::sixel_strip`,
-/// 2 cells wide x 1 row) -- see `render::render_control_strip_button`.
+/// 2 cells wide x 1 row) -- see `render::render_control_strip_button`;
+/// `Gallery`: the icon gallery dev surface's own 60x60 (6 cells wide x 3
+/// rows) comparison-column asset (`icons::sixel_gallery`) -- see
+/// `render::render_icon_gallery`. The gallery's OTHER two comparison
+/// columns (20x20, 40x40) reuse `Strip`/`Rail` directly rather than
+/// getting their own variants: those are the EXACT SAME baked bytes the
+/// strip/rail already ship, not a new asset.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SixelIconSize {
     Rail,
     Compact,
     Strip,
+    Gallery,
 }
 
 /// One button's own baked sixel icon, positioned at its absolute screen
@@ -2758,6 +2794,15 @@ pub struct LayoutRects {
     pub sixel_icons: Vec<SixelIconPlacement>,
     pub spaces: Rect,
     pub agents: Rect,
+    /// FIX4: the sidebar's own Board view content area -- set to the
+    /// sidebar content rect only while `App::board_view_active`, the same
+    /// convention `spaces`/`agents` already use for Files/Git/Agents
+    /// (`render::render`'s own layout-computation), and `Rect::default()`
+    /// otherwise. Lets `App::scroll` hit-test the Board view exactly like
+    /// the other sidebar panels without overloading `agents` (Board is
+    /// deliberately not part of the `roster_mode` axis `agents` already
+    /// tracks -- see `board_view_active`'s own doc comment).
+    pub board_sidebar: Rect,
     pub tabs: Rect,
     pub viewport: Rect,
     pub control_content: Rect,
@@ -2803,7 +2848,53 @@ pub struct App {
     pub sidebar_presentation: SidebarPresentation,
     pub sidebar_collapsed: bool,
     pub rail_icons: RailIcons,
+    /// Row-scroll offset (terminal rows, wheel-only -- see `scroll_
+    /// terminal`'s own `SurfaceTab::IconGallery` arm) for the FIX4 icon
+    /// gallery dev surface (`render::render_icon_gallery`). Never
+    /// persisted (not part of `UiPreferences`): this is a one-shot
+    /// inspection scroll position, not a durable UI preference. `render_
+    /// icon_gallery` clamps this against its own actual content height
+    /// each frame rather than this field clamping itself at mutation
+    /// time, so a stale too-large value from a shorter previous frame is
+    /// simply self-correcting, never an out-of-range slice.
+    pub icon_gallery_scroll: u16,
     pub control_section: ControlSection,
+    /// FIX2/FIX4: the activity rail's own single source of truth for
+    /// "is the Board button the active rail view" -- see `render::
+    /// render_activity_rail`'s own `selected` derivation for every
+    /// button. Before this field existed, the Board button's own
+    /// `selected` read `surface.active_tab() == Some(&SurfaceTab::
+    /// AgentBoard)` -- a completely independent axis from the `control_
+    /// section` the OTHER three buttons already read, so the two could
+    /// disagree and show two accent bars at once (`control_section`
+    /// pointing at e.g. Files while a stale Board VIEWPORT tab was still
+    /// the surface's active tab). FIX4 turns Board into a sidebar view
+    /// exactly like Files/Git/Agents, so it needed a state of the SAME
+    /// shape; this field is deliberately NOT a new `ControlSection`
+    /// variant, because `ControlSection::ALL` also drives the Settings
+    /// dialog's own unrelated section picker (`render::render_control_
+    /// modal`) and the `next_control_section` keyboard cycler -- growing
+    /// either with a "Board" entry would be a behaviour change to a
+    /// surface this task never asked to touch. Every rail button's own
+    /// `selected` now reads: Board reads this field alone; Files/Git/
+    /// Agents read `!board_view_active && control_section == <theirs>`
+    /// (the `!board_view_active` guard is what makes activation mutually
+    /// exclusive -- see `App::activate_activity_section`/`App::
+    /// activate_board_view`, the only two places this field is ever set
+    /// to `true`, and `select_control_section`/`select_sidebar_mode`/
+    /// `select_roster_mode`, which clear it on any OTHER navigation that
+    /// legitimately leaves the Board view without going through either
+    /// activator). Sidebar content dispatch (`render::render`) reads this
+    /// SAME field first, before `control_section`, for exactly the same
+    /// reason.
+    pub board_view_active: bool,
+    /// Row-scroll offset (list rows, wheel-only -- see `wheel_control`'s
+    /// own board-view branch) for the FIX4 sidebar board view (`render::
+    /// render_agent_board_sidebar`). Never persisted, same "self-
+    /// correcting against actual content height every frame" contract as
+    /// `icon_gallery_scroll` just above -- see that field's own doc
+    /// comment.
+    pub board_sidebar_scroll: u16,
     pub settings_return_focus: Focus,
     pub control_modal_position: Option<(u16, u16)>,
     pub control_modal_size: Option<(u16, u16)>,
@@ -2909,7 +3000,10 @@ impl Default for App {
             sidebar_presentation: SidebarPresentation::Split,
             sidebar_collapsed: false,
             rail_icons: RailIcons::Sixel,
+            icon_gallery_scroll: 0,
             control_section: ControlSection::Files,
+            board_view_active: false,
+            board_sidebar_scroll: 0,
             settings_return_focus: Focus::Tabs,
             control_modal_position: None,
             control_modal_size: None,
@@ -3097,7 +3191,7 @@ impl App {
                 SurfaceTab::AgentBoard => self.harness_kanban.monitor
                     .as_ref()
                     .is_some_and(|monitor| monitor.loading),
-                SurfaceTab::SessionMonitor(_) | SurfaceTab::Pty(_) => false,
+                SurfaceTab::SessionMonitor(_) | SurfaceTab::Pty(_) | SurfaceTab::IconGallery => false,
                 SurfaceTab::Preview(key) => self.preview_tabs.get(key).is_some_and(|preview| {
                     preview.phase != PreviewTabPhase::Hydrated
                         || matches!(preview.preview, NativeSessionPreviewState::Loading)
@@ -3607,6 +3701,7 @@ impl App {
                 key.origin.label(),
             ),
             SurfaceTab::HarnessGit(key) => format!("git | {}", key.origin.label()),
+            SurfaceTab::IconGallery => "Icon gallery".to_owned(),
         }
     }
 
@@ -5953,7 +6048,7 @@ impl App {
                 },
                 self.harness_git_tabs.get(key)?,
             ),
-            SurfaceTab::AgentBoard | SurfaceTab::Preview(_) => None,
+            SurfaceTab::AgentBoard | SurfaceTab::Preview(_) | SurfaceTab::IconGallery => None,
         }
     }
 
@@ -7028,6 +7123,16 @@ impl App {
         self.open_agent_board()
     }
 
+    /// FIX2/FIX4: same test-only-visibility convention as `open_agent_
+    /// board_for_test` just above -- lets `render::tests` exercise `App::
+    /// activate_board_view`'s own light-mode gate directly, without a real
+    /// hit region to click (light mode never renders one at all -- that
+    /// IS the invariant under test).
+    #[cfg(test)]
+    pub(crate) fn activate_board_view_for_test(&mut self) -> AppAction {
+        self.activate_board_view()
+    }
+
     fn reconcile_agent_board(&mut self) {
         // Canon invariant: the kanban is a FULL-harness feature. When the
         // kanban is disabled (light mode — the light harness holds no
@@ -7098,6 +7203,21 @@ impl App {
         } else {
             AppAction::None
         }
+    }
+
+    /// FIX4: opens the icon gallery dev surface -- reachable from the
+    /// Settings dialog's own button (`HitTarget::SettingsIconGallery`) and
+    /// key ('g' while `Focus::Settings`, see `reduce_settings`), in BOTH
+    /// light and full mode with no feature gate at all (unlike `open_
+    /// agent_board`'s own `harness_kanban.enabled` check just above --
+    /// the gallery only reads this crate's own baked `icons` catalog, not
+    /// anything backend/harness-shaped, so there is nothing to gate). A
+    /// singleton tab, same "always available, no dialog" precedent as
+    /// `SurfaceTab::AgentBoard`.
+    fn open_icon_gallery(&mut self) -> AppAction {
+        self.surface.open_in_focused(SurfaceTab::IconGallery);
+        self.focus = Focus::Viewport;
+        AppAction::None
     }
 
     fn activate_agent_board_open(&mut self, key: AgentRowKey) -> AppAction {
@@ -7697,7 +7817,8 @@ impl App {
                 | SurfaceTab::Pty(_)
                 | SurfaceTab::Preview(_)
                 | SurfaceTab::HarnessFile(_)
-                | SurfaceTab::HarnessGit(_) => false,
+                | SurfaceTab::HarnessGit(_)
+                | SurfaceTab::IconGallery => false,
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -8091,7 +8212,7 @@ impl App {
                 }) => source_node == node_id,
                 SurfaceTab::File(key) => key.node_id == node_id,
                 SurfaceTab::Git(key) => key.node_id == node_id,
-                SurfaceTab::HarnessFile(_) | SurfaceTab::HarnessGit(_) => false,
+                SurfaceTab::HarnessFile(_) | SurfaceTab::HarnessGit(_) | SurfaceTab::IconGallery => false,
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -9089,6 +9210,7 @@ impl App {
             SurfaceTab::Git(key) => self.git_tabs.contains_key(key),
             SurfaceTab::HarnessFile(key) => self.harness_file_tabs.contains_key(key),
             SurfaceTab::HarnessGit(key) => self.harness_git_tabs.contains_key(key),
+            SurfaceTab::IconGallery => true,
         };
         if !available {
             return false;
@@ -9249,6 +9371,15 @@ impl App {
                         moved,
                     },
                 ),
+                SurfaceTab::IconGallery => Some(DragState::SessionChip {
+                    source,
+                    tab: SurfaceTab::IconGallery,
+                    start_column,
+                    start_row,
+                    current_column,
+                    current_row,
+                    moved,
+                }),
             },
             DragState::AgentSelection {
                 key,
@@ -9354,6 +9485,7 @@ impl App {
             SurfaceTab::Git(_) => "Git tab closed".to_owned(),
             SurfaceTab::HarnessFile(_) => "read-only Harness file tab closed".to_owned(),
             SurfaceTab::HarnessGit(_) => "Harness Git tab closed".to_owned(),
+            SurfaceTab::IconGallery => "Icon gallery tab closed".to_owned(),
         });
     }
 
@@ -10004,6 +10136,7 @@ impl App {
                 Some(HitTarget::SettingsPresentation) => self.toggle_sidebar_presentation(),
                 Some(HitTarget::SettingsSidebarCollapsed) => self.toggle_sidebar_collapsed(),
                 Some(HitTarget::SettingsRailIcons) => self.toggle_rail_icons(),
+                Some(HitTarget::SettingsIconGallery) => return self.open_icon_gallery(),
                 Some(HitTarget::SidebarItem(index)) => {
                     let mode = match self.control_section {
                         ControlSection::Files => SidebarMode::Files,
@@ -10056,7 +10189,6 @@ impl App {
                 Some(HitTarget::NativeSessionsOpen) => {
                     return self.start_native_session_preview();
                 }
-                Some(HitTarget::Settings) => self.close_settings(),
                 _ => {}
             }
             return AppAction::None;
@@ -10067,6 +10199,9 @@ impl App {
             }
             Some(HitTarget::ActivitySection(section)) => {
                 return self.activate_activity_section(section);
+            }
+            Some(HitTarget::ActivityBoard) => {
+                return self.activate_board_view();
             }
             Some(HitTarget::SidebarCollapse) => self.toggle_sidebar_collapsed(),
             Some(HitTarget::SidebarWidthDrag) => self.drag_state = Some(DragState::SidebarWidth),
@@ -10385,7 +10520,6 @@ impl App {
                 self.focus_surface_pane(pane_id);
                 return self.start_focused_preview_resume();
             }
-            Some(HitTarget::Settings) => self.begin_settings(),
             Some(
                 HitTarget::ControlSection(_)
                 | HitTarget::SettingsStyle
@@ -10393,6 +10527,7 @@ impl App {
                 | HitTarget::SettingsPresentation
                 | HitTarget::SettingsSidebarCollapsed
                 | HitTarget::SettingsRailIcons
+                | HitTarget::SettingsIconGallery
                 | HitTarget::ControlDrag
                 | HitTarget::ControlResize
                 | HitTarget::SpawnDrag
@@ -10804,6 +10939,19 @@ impl App {
             self.scroll_roster(self.roster_mode, up, self.layout.agents.height.saturating_sub(3));
             return AppAction::None;
         }
+        // FIX4: the sidebar Board view's own wheel scroll -- same fixed-
+        // step convention as `icon_gallery_scroll` (see that field's own
+        // doc comment): this only nudges the raw offset, `render::render_
+        // agent_board_sidebar` clamps it against its own actual row count
+        // every frame.
+        if self.layout.board_sidebar.contains(column, row) {
+            self.board_sidebar_scroll = if up {
+                self.board_sidebar_scroll.saturating_sub(WHEEL_SCROLL_LINES as u16)
+            } else {
+                self.board_sidebar_scroll.saturating_add(WHEEL_SCROLL_LINES as u16)
+            };
+            return AppAction::None;
+        }
         AppAction::None
     }
 
@@ -11167,6 +11315,10 @@ impl App {
             match tab {
                 SurfaceTab::AgentBoard => {
                     self.surface.open_in_focused(SurfaceTab::AgentBoard);
+                    self.focus = Focus::Viewport;
+                }
+                SurfaceTab::IconGallery => {
+                    self.surface.open_in_focused(SurfaceTab::IconGallery);
                     self.focus = Focus::Viewport;
                 }
                 SurfaceTab::SessionMonitor(key) if self.session_monitor(&key).is_some() => {
@@ -11846,6 +11998,15 @@ impl App {
     }
 
     fn select_roster_mode(&mut self, mode: RosterMode) -> AppAction {
+        // FIX2: same reasoning as `select_control_section`'s own leading
+        // clear -- reached both from the rail's own Agents activation
+        // (`activate_activity_section`, which already cleared this
+        // itself before delegating here) and from in-panel roster sub-
+        // tabs (Agents/NativeSessions/Workspaces) that can be clicked
+        // without ever going through the rail at all; either way,
+        // selecting a roster mode is a real navigation away from the
+        // Board sidebar view.
+        self.board_view_active = false;
         let mode = match mode {
             RosterMode::NativeSessions => RosterMode::Agents,
             mode => mode,
@@ -12969,6 +13130,10 @@ impl App {
     }
 
     fn select_sidebar_mode(&mut self, mode: SidebarMode) -> AppAction {
+        // FIX2: same reasoning as `select_control_section`'s own leading
+        // clear -- the Split-presentation Files/Git tab strip is a real
+        // navigation away from the Board sidebar view.
+        self.board_view_active = false;
         self.sidebar_mode = mode;
         self.control_section = match mode {
             SidebarMode::Files => ControlSection::Files,
@@ -12979,6 +13144,13 @@ impl App {
     }
 
     fn select_control_section(&mut self, section: ControlSection) -> AppAction {
+        // FIX2: the Settings dialog's own section picker is a real
+        // navigation away from the Board sidebar view (see `board_view_
+        // active`'s own doc comment) even though it does not go through
+        // `activate_activity_section` -- without this, closing Settings
+        // afterward would show a stale Board view instead of whatever
+        // section was just picked.
+        self.board_view_active = false;
         self.control_section = section;
         self.focus = Focus::Settings;
         match section {
@@ -13001,7 +13173,20 @@ impl App {
             self.begin_settings();
             return AppAction::None;
         }
-        if self.control_section == section && !self.sidebar_collapsed {
+        // FIX2: "already active" must also require the Board view is NOT
+        // the thing actually showing right now -- `control_section` keeps
+        // whatever value it last held while Board is active (Board is
+        // deliberately not a `ControlSection` variant, see `board_view_
+        // active`'s own doc comment), so without this a click on e.g.
+        // Files while Board is showing could spuriously match a stale
+        // `control_section == Files` left over from before Board was ever
+        // activated and collapse the sidebar instead of switching to
+        // Files.
+        let already_active = !self.board_view_active
+            && self.control_section == section
+            && !self.sidebar_collapsed;
+        self.board_view_active = false;
+        if already_active {
             self.sidebar_collapsed = true;
             return AppAction::None;
         }
@@ -13027,6 +13212,34 @@ impl App {
                 AppAction::None
             }
             ControlSection::Settings => AppAction::None,
+        }
+    }
+
+    /// FIX2/FIX3/FIX4: the activity rail's Board button's own activation,
+    /// the sibling `activate_activity_section` never had before Board
+    /// became a sidebar view -- same shape (first click selects + expands,
+    /// re-click on the already-active view collapses, click-elsewhere-
+    /// first-then-here expands + switches), driving the ONE new piece of
+    /// state (`board_view_active`) FIX2 introduced rather than a second,
+    /// independent axis. Mirrors `App::open_agent_board`'s own light-mode
+    /// gate and empty-tasks refresh, but never opens the viewport tab --
+    /// that stays the sidebar board view's own control-strip button
+    /// (`HitTarget::AgentBoardOpen`, unchanged, see `render::render_
+    /// agent_board_sidebar`).
+    fn activate_board_view(&mut self) -> AppAction {
+        if !self.harness_kanban.enabled {
+            return AppAction::None;
+        }
+        if self.board_view_active && !self.sidebar_collapsed {
+            self.sidebar_collapsed = true;
+            return AppAction::None;
+        }
+        self.board_view_active = true;
+        self.sidebar_collapsed = false;
+        if self.harness_kanban.tasks.is_empty() {
+            self.request_harness_refresh()
+        } else {
+            AppAction::None
         }
     }
 
@@ -13248,7 +13461,8 @@ impl App {
             }
             SurfaceTab::Preview(_)
             | SurfaceTab::Git(_)
-            | SurfaceTab::HarnessGit(_) => {}
+            | SurfaceTab::HarnessGit(_)
+            | SurfaceTab::IconGallery => {}
         }
     }
 
@@ -13384,6 +13598,14 @@ impl App {
                         };
                     }
                 }
+                return AppAction::None;
+            }
+            SurfaceTab::IconGallery => {
+                self.icon_gallery_scroll = if up {
+                    self.icon_gallery_scroll.saturating_sub(WHEEL_SCROLL_LINES as u16)
+                } else {
+                    self.icon_gallery_scroll.saturating_add(WHEEL_SCROLL_LINES as u16)
+                };
                 return AppAction::None;
             }
         };
@@ -18474,6 +18696,7 @@ impl App {
                 UiKey::Char('p') => self.toggle_sidebar_presentation(),
                 UiKey::Char('b') => self.toggle_sidebar_collapsed(),
                 UiKey::Char('i') => self.toggle_rail_icons(),
+                UiKey::Char('g') => return self.open_icon_gallery(),
                 _ => {}
             }
             return AppAction::None;
@@ -18543,6 +18766,9 @@ impl App {
             }
             UiKey::Char('i') if self.control_section == ControlSection::Settings => {
                 self.toggle_rail_icons()
+            }
+            UiKey::Char('g') if self.control_section == ControlSection::Settings => {
+                return self.open_icon_gallery();
             }
             UiKey::Char('n') if self.control_section == ControlSection::Agents => {
                 return self.begin_rename_selected_agent();
@@ -24507,9 +24733,15 @@ mod tests {
     fn control_modal_cycles_sections_style_and_menu_placement() {
         let mut app = fixture();
         app.focus = Focus::Viewport;
+        // FIX5: the tab strip's own "[S]" button (`HitTarget::Settings`)
+        // is gone -- the activity rail's own gear (`HitTarget::
+        // ActivitySection(ControlSection::Settings)`) is the single mouse
+        // entry point now, exercised here the same way this test always
+        // exercised the tab strip's own button: a directly-injected hit
+        // region plus a click, not a full `render()` pass.
         app.layout.hits.push(HitRegion {
             rect: Rect::new(90, 0, 10, 1),
-            target: HitTarget::Settings,
+            target: HitTarget::ActivitySection(ControlSection::Settings),
         });
 
         assert_eq!(app.click(95, 0), AppAction::None);

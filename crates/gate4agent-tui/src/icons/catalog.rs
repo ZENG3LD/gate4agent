@@ -23,9 +23,9 @@ use std::sync::LazyLock;
 use uzor_tui::canvas::{CanvasMode, PixelCanvas};
 
 use super::{
-    build_sixel, build_sixel_compact, build_sixel_gate, build_sixel_strip, build_sixel_strip_gate,
-    rgba_to_canvas, SixelVariant, BRAILLE_ICON_CELLS_TALL, BRAILLE_ICON_CELLS_WIDE,
-    COMPACT_BRAILLE_ICON_CELLS_TALL, COMPACT_BRAILLE_ICON_CELLS_WIDE,
+    build_sixel, build_sixel_compact, build_sixel_gallery, build_sixel_gallery_gate, build_sixel_gate,
+    build_sixel_strip, build_sixel_strip_gate, rgba_to_canvas, SixelVariant, BRAILLE_ICON_CELLS_TALL,
+    BRAILLE_ICON_CELLS_WIDE, COMPACT_BRAILLE_ICON_CELLS_TALL, COMPACT_BRAILLE_ICON_CELLS_WIDE,
 };
 
 /// Every baked icon this crate ships, sixel + braille + ascii tiers, one
@@ -684,6 +684,244 @@ pub fn sixel_strip(id: IconId, variant: SixelVariant) -> &'static str {
         IconId::Preview => match variant {
             SixelVariant::Transparent => PREVIEW_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => PREVIEW_SIXEL_STRIP_GATE.as_str(),
+        },
+    }
+}
+
+/// Encoded icon-gallery-tier (60x60, 6 cells wide x 3 rows tall) sixel
+/// string for `id` at `variant`'s own background -- the gallery is a
+/// read-only comparison grid with no selected state, so `GateAccent`
+/// resolves to the SAME asset as `GateActive` here (same fold as
+/// [`sixel_strip`]).
+pub fn sixel_gallery(id: IconId, variant: SixelVariant) -> &'static str {
+    match id {
+        IconId::Files => match variant {
+            SixelVariant::Transparent => FILES_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => FILES_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::SourceControl => match variant {
+            SixelVariant::Transparent => SOURCE_CONTROL_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => SOURCE_CONTROL_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::Person => match variant {
+            SixelVariant::Transparent => PERSON_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => PERSON_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::Project => match variant {
+            SixelVariant::Transparent => PROJECT_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => PROJECT_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::SettingsGear => match variant {
+            SixelVariant::Transparent => SETTINGS_GEAR_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => SETTINGS_GEAR_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::ChevronLeft => match variant {
+            SixelVariant::Transparent => CHEVRON_LEFT_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => CHEVRON_LEFT_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::ChevronRight => match variant {
+            SixelVariant::Transparent => CHEVRON_RIGHT_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => CHEVRON_RIGHT_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::ChevronDown => match variant {
+            SixelVariant::Transparent => CHEVRON_DOWN_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => CHEVRON_DOWN_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::NewFile => match variant {
+            SixelVariant::Transparent => NEW_FILE_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => NEW_FILE_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::NewFolder => match variant {
+            SixelVariant::Transparent => NEW_FOLDER_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => NEW_FOLDER_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::Folder => match variant {
+            SixelVariant::Transparent => FOLDER_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => FOLDER_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::FolderOpened => match variant {
+            SixelVariant::Transparent => FOLDER_OPENED_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => FOLDER_OPENED_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::File => match variant {
+            SixelVariant::Transparent => FILE_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => FILE_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::Save => match variant {
+            SixelVariant::Transparent => SAVE_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => SAVE_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::Refresh => match variant {
+            SixelVariant::Transparent => REFRESH_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => REFRESH_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::Add => match variant {
+            SixelVariant::Transparent => ADD_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => ADD_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::Trash => match variant {
+            SixelVariant::Transparent => TRASH_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => TRASH_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::Search => match variant {
+            SixelVariant::Transparent => SEARCH_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => SEARCH_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::Check => match variant {
+            SixelVariant::Transparent => CHECK_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => CHECK_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::Close => match variant {
+            SixelVariant::Transparent => CLOSE_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => CLOSE_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::ArrowUp => match variant {
+            SixelVariant::Transparent => ARROW_UP_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => ARROW_UP_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::ArrowDown => match variant {
+            SixelVariant::Transparent => ARROW_DOWN_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => ARROW_DOWN_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::ArrowLeft => match variant {
+            SixelVariant::Transparent => ARROW_LEFT_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => ARROW_LEFT_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::ArrowRight => match variant {
+            SixelVariant::Transparent => ARROW_RIGHT_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => ARROW_RIGHT_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::ArrowSwap => match variant {
+            SixelVariant::Transparent => ARROW_SWAP_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => ARROW_SWAP_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::GitCommit => match variant {
+            SixelVariant::Transparent => GIT_COMMIT_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => GIT_COMMIT_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::GitBranch => match variant {
+            SixelVariant::Transparent => GIT_BRANCH_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => GIT_BRANCH_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::Diff => match variant {
+            SixelVariant::Transparent => DIFF_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => DIFF_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::DiffAdded => match variant {
+            SixelVariant::Transparent => DIFF_ADDED_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => DIFF_ADDED_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::GitCompare => match variant {
+            SixelVariant::Transparent => GIT_COMPARE_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => GIT_COMPARE_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::Repo => match variant {
+            SixelVariant::Transparent => REPO_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => REPO_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::RepoForked => match variant {
+            SixelVariant::Transparent => REPO_FORKED_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => REPO_FORKED_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::DebugStop => match variant {
+            SixelVariant::Transparent => DEBUG_STOP_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => DEBUG_STOP_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::DebugRestart => match variant {
+            SixelVariant::Transparent => DEBUG_RESTART_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => DEBUG_RESTART_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::Edit => match variant {
+            SixelVariant::Transparent => EDIT_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => EDIT_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::History => match variant {
+            SixelVariant::Transparent => HISTORY_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => HISTORY_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::Terminal => match variant {
+            SixelVariant::Transparent => TERMINAL_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => TERMINAL_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::Output => match variant {
+            SixelVariant::Transparent => OUTPUT_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => OUTPUT_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::CloudDownload => match variant {
+            SixelVariant::Transparent => CLOUD_DOWNLOAD_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => CLOUD_DOWNLOAD_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::Ellipsis => match variant {
+            SixelVariant::Transparent => ELLIPSIS_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => ELLIPSIS_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::Link => match variant {
+            SixelVariant::Transparent => LINK_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => LINK_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::CircleFilled => match variant {
+            SixelVariant::Transparent => CIRCLE_FILLED_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => CIRCLE_FILLED_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::CircleSlash => match variant {
+            SixelVariant::Transparent => CIRCLE_SLASH_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => CIRCLE_SLASH_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::Warning => match variant {
+            SixelVariant::Transparent => WARNING_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => WARNING_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::Error => match variant {
+            SixelVariant::Transparent => ERROR_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => ERROR_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::Info => match variant {
+            SixelVariant::Transparent => INFO_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => INFO_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::RunAll => match variant {
+            SixelVariant::Transparent => RUN_ALL_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => RUN_ALL_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::Play => match variant {
+            SixelVariant::Transparent => PLAY_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => PLAY_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::Sync => match variant {
+            SixelVariant::Transparent => SYNC_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => SYNC_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::GoToFile => match variant {
+            SixelVariant::Transparent => GO_TO_FILE_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => GO_TO_FILE_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::Pulse => match variant {
+            SixelVariant::Transparent => PULSE_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => PULSE_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::Checklist => match variant {
+            SixelVariant::Transparent => CHECKLIST_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => CHECKLIST_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::Eye => match variant {
+            SixelVariant::Transparent => EYE_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => EYE_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::Layout => match variant {
+            SixelVariant::Transparent => LAYOUT_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => LAYOUT_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::SplitHorizontal => match variant {
+            SixelVariant::Transparent => SPLIT_HORIZONTAL_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => SPLIT_HORIZONTAL_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::SplitVertical => match variant {
+            SixelVariant::Transparent => SPLIT_VERTICAL_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => SPLIT_VERTICAL_SIXEL_GALLERY_GATE.as_str(),
+        },
+        IconId::Preview => match variant {
+            SixelVariant::Transparent => PREVIEW_SIXEL_GALLERY.as_str(),
+            SixelVariant::GateActive | SixelVariant::GateAccent => PREVIEW_SIXEL_GALLERY_GATE.as_str(),
         },
     }
 }
@@ -1455,6 +1693,132 @@ pub(crate) fn sixel_strip_gate_source_rgba(id: IconId) -> &'static [u8] {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn sixel_gallery_source_rgba(id: IconId) -> &'static [u8] {
+    match id {
+        IconId::Files => FILES_GALLERY_RGBA,
+        IconId::SourceControl => SOURCE_CONTROL_GALLERY_RGBA,
+        IconId::Person => PERSON_GALLERY_RGBA,
+        IconId::Project => PROJECT_GALLERY_RGBA,
+        IconId::SettingsGear => SETTINGS_GEAR_GALLERY_RGBA,
+        IconId::ChevronLeft => CHEVRON_LEFT_GALLERY_RGBA,
+        IconId::ChevronRight => CHEVRON_RIGHT_GALLERY_RGBA,
+        IconId::ChevronDown => CHEVRON_DOWN_GALLERY_RGBA,
+        IconId::NewFile => NEW_FILE_GALLERY_RGBA,
+        IconId::NewFolder => NEW_FOLDER_GALLERY_RGBA,
+        IconId::Folder => FOLDER_GALLERY_RGBA,
+        IconId::FolderOpened => FOLDER_OPENED_GALLERY_RGBA,
+        IconId::File => FILE_GALLERY_RGBA,
+        IconId::Save => SAVE_GALLERY_RGBA,
+        IconId::Refresh => REFRESH_GALLERY_RGBA,
+        IconId::Add => ADD_GALLERY_RGBA,
+        IconId::Trash => TRASH_GALLERY_RGBA,
+        IconId::Search => SEARCH_GALLERY_RGBA,
+        IconId::Check => CHECK_GALLERY_RGBA,
+        IconId::Close => CLOSE_GALLERY_RGBA,
+        IconId::ArrowUp => ARROW_UP_GALLERY_RGBA,
+        IconId::ArrowDown => ARROW_DOWN_GALLERY_RGBA,
+        IconId::ArrowLeft => ARROW_LEFT_GALLERY_RGBA,
+        IconId::ArrowRight => ARROW_RIGHT_GALLERY_RGBA,
+        IconId::ArrowSwap => ARROW_SWAP_GALLERY_RGBA,
+        IconId::GitCommit => GIT_COMMIT_GALLERY_RGBA,
+        IconId::GitBranch => GIT_BRANCH_GALLERY_RGBA,
+        IconId::Diff => DIFF_GALLERY_RGBA,
+        IconId::DiffAdded => DIFF_ADDED_GALLERY_RGBA,
+        IconId::GitCompare => GIT_COMPARE_GALLERY_RGBA,
+        IconId::Repo => REPO_GALLERY_RGBA,
+        IconId::RepoForked => REPO_FORKED_GALLERY_RGBA,
+        IconId::DebugStop => DEBUG_STOP_GALLERY_RGBA,
+        IconId::DebugRestart => DEBUG_RESTART_GALLERY_RGBA,
+        IconId::Edit => EDIT_GALLERY_RGBA,
+        IconId::History => HISTORY_GALLERY_RGBA,
+        IconId::Terminal => TERMINAL_GALLERY_RGBA,
+        IconId::Output => OUTPUT_GALLERY_RGBA,
+        IconId::CloudDownload => CLOUD_DOWNLOAD_GALLERY_RGBA,
+        IconId::Ellipsis => ELLIPSIS_GALLERY_RGBA,
+        IconId::Link => LINK_GALLERY_RGBA,
+        IconId::CircleFilled => CIRCLE_FILLED_GALLERY_RGBA,
+        IconId::CircleSlash => CIRCLE_SLASH_GALLERY_RGBA,
+        IconId::Warning => WARNING_GALLERY_RGBA,
+        IconId::Error => ERROR_GALLERY_RGBA,
+        IconId::Info => INFO_GALLERY_RGBA,
+        IconId::RunAll => RUN_ALL_GALLERY_RGBA,
+        IconId::Play => PLAY_GALLERY_RGBA,
+        IconId::Sync => SYNC_GALLERY_RGBA,
+        IconId::GoToFile => GO_TO_FILE_GALLERY_RGBA,
+        IconId::Pulse => PULSE_GALLERY_RGBA,
+        IconId::Checklist => CHECKLIST_GALLERY_RGBA,
+        IconId::Eye => EYE_GALLERY_RGBA,
+        IconId::Layout => LAYOUT_GALLERY_RGBA,
+        IconId::SplitHorizontal => SPLIT_HORIZONTAL_GALLERY_RGBA,
+        IconId::SplitVertical => SPLIT_VERTICAL_GALLERY_RGBA,
+        IconId::Preview => PREVIEW_GALLERY_RGBA,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn sixel_gallery_gate_source_rgba(id: IconId) -> &'static [u8] {
+    match id {
+        IconId::Files => FILES_GALLERY_GATE_RGBA,
+        IconId::SourceControl => SOURCE_CONTROL_GALLERY_GATE_RGBA,
+        IconId::Person => PERSON_GALLERY_GATE_RGBA,
+        IconId::Project => PROJECT_GALLERY_GATE_RGBA,
+        IconId::SettingsGear => SETTINGS_GEAR_GALLERY_GATE_RGBA,
+        IconId::ChevronLeft => CHEVRON_LEFT_GALLERY_GATE_RGBA,
+        IconId::ChevronRight => CHEVRON_RIGHT_GALLERY_GATE_RGBA,
+        IconId::ChevronDown => CHEVRON_DOWN_GALLERY_GATE_RGBA,
+        IconId::NewFile => NEW_FILE_GALLERY_GATE_RGBA,
+        IconId::NewFolder => NEW_FOLDER_GALLERY_GATE_RGBA,
+        IconId::Folder => FOLDER_GALLERY_GATE_RGBA,
+        IconId::FolderOpened => FOLDER_OPENED_GALLERY_GATE_RGBA,
+        IconId::File => FILE_GALLERY_GATE_RGBA,
+        IconId::Save => SAVE_GALLERY_GATE_RGBA,
+        IconId::Refresh => REFRESH_GALLERY_GATE_RGBA,
+        IconId::Add => ADD_GALLERY_GATE_RGBA,
+        IconId::Trash => TRASH_GALLERY_GATE_RGBA,
+        IconId::Search => SEARCH_GALLERY_GATE_RGBA,
+        IconId::Check => CHECK_GALLERY_GATE_RGBA,
+        IconId::Close => CLOSE_GALLERY_GATE_RGBA,
+        IconId::ArrowUp => ARROW_UP_GALLERY_GATE_RGBA,
+        IconId::ArrowDown => ARROW_DOWN_GALLERY_GATE_RGBA,
+        IconId::ArrowLeft => ARROW_LEFT_GALLERY_GATE_RGBA,
+        IconId::ArrowRight => ARROW_RIGHT_GALLERY_GATE_RGBA,
+        IconId::ArrowSwap => ARROW_SWAP_GALLERY_GATE_RGBA,
+        IconId::GitCommit => GIT_COMMIT_GALLERY_GATE_RGBA,
+        IconId::GitBranch => GIT_BRANCH_GALLERY_GATE_RGBA,
+        IconId::Diff => DIFF_GALLERY_GATE_RGBA,
+        IconId::DiffAdded => DIFF_ADDED_GALLERY_GATE_RGBA,
+        IconId::GitCompare => GIT_COMPARE_GALLERY_GATE_RGBA,
+        IconId::Repo => REPO_GALLERY_GATE_RGBA,
+        IconId::RepoForked => REPO_FORKED_GALLERY_GATE_RGBA,
+        IconId::DebugStop => DEBUG_STOP_GALLERY_GATE_RGBA,
+        IconId::DebugRestart => DEBUG_RESTART_GALLERY_GATE_RGBA,
+        IconId::Edit => EDIT_GALLERY_GATE_RGBA,
+        IconId::History => HISTORY_GALLERY_GATE_RGBA,
+        IconId::Terminal => TERMINAL_GALLERY_GATE_RGBA,
+        IconId::Output => OUTPUT_GALLERY_GATE_RGBA,
+        IconId::CloudDownload => CLOUD_DOWNLOAD_GALLERY_GATE_RGBA,
+        IconId::Ellipsis => ELLIPSIS_GALLERY_GATE_RGBA,
+        IconId::Link => LINK_GALLERY_GATE_RGBA,
+        IconId::CircleFilled => CIRCLE_FILLED_GALLERY_GATE_RGBA,
+        IconId::CircleSlash => CIRCLE_SLASH_GALLERY_GATE_RGBA,
+        IconId::Warning => WARNING_GALLERY_GATE_RGBA,
+        IconId::Error => ERROR_GALLERY_GATE_RGBA,
+        IconId::Info => INFO_GALLERY_GATE_RGBA,
+        IconId::RunAll => RUN_ALL_GALLERY_GATE_RGBA,
+        IconId::Play => PLAY_GALLERY_GATE_RGBA,
+        IconId::Sync => SYNC_GALLERY_GATE_RGBA,
+        IconId::GoToFile => GO_TO_FILE_GALLERY_GATE_RGBA,
+        IconId::Pulse => PULSE_GALLERY_GATE_RGBA,
+        IconId::Checklist => CHECKLIST_GALLERY_GATE_RGBA,
+        IconId::Eye => EYE_GALLERY_GATE_RGBA,
+        IconId::Layout => LAYOUT_GALLERY_GATE_RGBA,
+        IconId::SplitHorizontal => SPLIT_HORIZONTAL_GALLERY_GATE_RGBA,
+        IconId::SplitVertical => SPLIT_VERTICAL_GALLERY_GATE_RGBA,
+        IconId::Preview => PREVIEW_GALLERY_GATE_RGBA,
+    }
+}
+
 // ---- Files (files) --------------------------------------------------
 
 const FILES_RGBA: &[u8] = include_bytes!("files.rgba");
@@ -1507,6 +1871,15 @@ static FILES_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(
 /// pre-composited opaque at bake time, same fix as the rail tier above.
 const FILES_STRIP_GATE_RGBA: &[u8] = include_bytes!("files_strip_gate.rgba");
 static FILES_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(FILES_STRIP_GATE_RGBA));
+
+const FILES_GALLERY_RGBA: &[u8] = include_bytes!("files_gallery.rgba");
+static FILES_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(FILES_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const FILES_GALLERY_GATE_RGBA: &[u8] = include_bytes!("files_gallery_gate.rgba");
+static FILES_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(FILES_GALLERY_GATE_RGBA));
 
 // ---- SourceControl (source-control) ---------------------------------
 
@@ -1561,6 +1934,15 @@ static SOURCE_CONTROL_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_six
 const SOURCE_CONTROL_STRIP_GATE_RGBA: &[u8] = include_bytes!("source_control_strip_gate.rgba");
 static SOURCE_CONTROL_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(SOURCE_CONTROL_STRIP_GATE_RGBA));
 
+const SOURCE_CONTROL_GALLERY_RGBA: &[u8] = include_bytes!("source_control_gallery.rgba");
+static SOURCE_CONTROL_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(SOURCE_CONTROL_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const SOURCE_CONTROL_GALLERY_GATE_RGBA: &[u8] = include_bytes!("source_control_gallery_gate.rgba");
+static SOURCE_CONTROL_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(SOURCE_CONTROL_GALLERY_GATE_RGBA));
+
 // ---- Person (person) ------------------------------------------------
 
 const PERSON_RGBA: &[u8] = include_bytes!("person.rgba");
@@ -1614,6 +1996,15 @@ static PERSON_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip
 const PERSON_STRIP_GATE_RGBA: &[u8] = include_bytes!("person_strip_gate.rgba");
 static PERSON_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(PERSON_STRIP_GATE_RGBA));
 
+const PERSON_GALLERY_RGBA: &[u8] = include_bytes!("person_gallery.rgba");
+static PERSON_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(PERSON_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const PERSON_GALLERY_GATE_RGBA: &[u8] = include_bytes!("person_gallery_gate.rgba");
+static PERSON_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(PERSON_GALLERY_GATE_RGBA));
+
 // ---- Project (project) ----------------------------------------------
 
 const PROJECT_RGBA: &[u8] = include_bytes!("project.rgba");
@@ -1666,6 +2057,15 @@ static PROJECT_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_stri
 /// pre-composited opaque at bake time, same fix as the rail tier above.
 const PROJECT_STRIP_GATE_RGBA: &[u8] = include_bytes!("project_strip_gate.rgba");
 static PROJECT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(PROJECT_STRIP_GATE_RGBA));
+
+const PROJECT_GALLERY_RGBA: &[u8] = include_bytes!("project_gallery.rgba");
+static PROJECT_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(PROJECT_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const PROJECT_GALLERY_GATE_RGBA: &[u8] = include_bytes!("project_gallery_gate.rgba");
+static PROJECT_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(PROJECT_GALLERY_GATE_RGBA));
 
 // ---- SettingsGear (settings-gear) -----------------------------------
 
@@ -1721,6 +2121,15 @@ static SETTINGS_GEAR_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixe
 const SETTINGS_GEAR_STRIP_GATE_RGBA: &[u8] = include_bytes!("settings_gear_strip_gate.rgba");
 static SETTINGS_GEAR_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(SETTINGS_GEAR_STRIP_GATE_RGBA));
 
+const SETTINGS_GEAR_GALLERY_RGBA: &[u8] = include_bytes!("settings_gear_gallery.rgba");
+static SETTINGS_GEAR_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(SETTINGS_GEAR_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const SETTINGS_GEAR_GALLERY_GATE_RGBA: &[u8] = include_bytes!("settings_gear_gallery_gate.rgba");
+static SETTINGS_GEAR_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(SETTINGS_GEAR_GALLERY_GATE_RGBA));
+
 // ---- ChevronLeft (chevron-left) -------------------------------------
 
 const CHEVRON_LEFT_RGBA: &[u8] = include_bytes!("chevron_left.rgba");
@@ -1773,6 +2182,15 @@ static CHEVRON_LEFT_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel
 /// pre-composited opaque at bake time, same fix as the rail tier above.
 const CHEVRON_LEFT_STRIP_GATE_RGBA: &[u8] = include_bytes!("chevron_left_strip_gate.rgba");
 static CHEVRON_LEFT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(CHEVRON_LEFT_STRIP_GATE_RGBA));
+
+const CHEVRON_LEFT_GALLERY_RGBA: &[u8] = include_bytes!("chevron_left_gallery.rgba");
+static CHEVRON_LEFT_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(CHEVRON_LEFT_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const CHEVRON_LEFT_GALLERY_GATE_RGBA: &[u8] = include_bytes!("chevron_left_gallery_gate.rgba");
+static CHEVRON_LEFT_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(CHEVRON_LEFT_GALLERY_GATE_RGBA));
 
 // ---- ChevronRight (chevron-right) -----------------------------------
 
@@ -1827,6 +2245,15 @@ static CHEVRON_RIGHT_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixe
 const CHEVRON_RIGHT_STRIP_GATE_RGBA: &[u8] = include_bytes!("chevron_right_strip_gate.rgba");
 static CHEVRON_RIGHT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(CHEVRON_RIGHT_STRIP_GATE_RGBA));
 
+const CHEVRON_RIGHT_GALLERY_RGBA: &[u8] = include_bytes!("chevron_right_gallery.rgba");
+static CHEVRON_RIGHT_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(CHEVRON_RIGHT_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const CHEVRON_RIGHT_GALLERY_GATE_RGBA: &[u8] = include_bytes!("chevron_right_gallery_gate.rgba");
+static CHEVRON_RIGHT_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(CHEVRON_RIGHT_GALLERY_GATE_RGBA));
+
 // ---- ChevronDown (chevron-down) -------------------------------------
 
 const CHEVRON_DOWN_RGBA: &[u8] = include_bytes!("chevron_down.rgba");
@@ -1879,6 +2306,15 @@ static CHEVRON_DOWN_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel
 /// pre-composited opaque at bake time, same fix as the rail tier above.
 const CHEVRON_DOWN_STRIP_GATE_RGBA: &[u8] = include_bytes!("chevron_down_strip_gate.rgba");
 static CHEVRON_DOWN_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(CHEVRON_DOWN_STRIP_GATE_RGBA));
+
+const CHEVRON_DOWN_GALLERY_RGBA: &[u8] = include_bytes!("chevron_down_gallery.rgba");
+static CHEVRON_DOWN_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(CHEVRON_DOWN_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const CHEVRON_DOWN_GALLERY_GATE_RGBA: &[u8] = include_bytes!("chevron_down_gallery_gate.rgba");
+static CHEVRON_DOWN_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(CHEVRON_DOWN_GALLERY_GATE_RGBA));
 
 // ---- NewFile (new-file) ---------------------------------------------
 
@@ -1933,6 +2369,15 @@ static NEW_FILE_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_str
 const NEW_FILE_STRIP_GATE_RGBA: &[u8] = include_bytes!("new_file_strip_gate.rgba");
 static NEW_FILE_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(NEW_FILE_STRIP_GATE_RGBA));
 
+const NEW_FILE_GALLERY_RGBA: &[u8] = include_bytes!("new_file_gallery.rgba");
+static NEW_FILE_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(NEW_FILE_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const NEW_FILE_GALLERY_GATE_RGBA: &[u8] = include_bytes!("new_file_gallery_gate.rgba");
+static NEW_FILE_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(NEW_FILE_GALLERY_GATE_RGBA));
+
 // ---- NewFolder (new-folder) -----------------------------------------
 
 const NEW_FOLDER_RGBA: &[u8] = include_bytes!("new_folder.rgba");
@@ -1985,6 +2430,15 @@ static NEW_FOLDER_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_s
 /// pre-composited opaque at bake time, same fix as the rail tier above.
 const NEW_FOLDER_STRIP_GATE_RGBA: &[u8] = include_bytes!("new_folder_strip_gate.rgba");
 static NEW_FOLDER_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(NEW_FOLDER_STRIP_GATE_RGBA));
+
+const NEW_FOLDER_GALLERY_RGBA: &[u8] = include_bytes!("new_folder_gallery.rgba");
+static NEW_FOLDER_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(NEW_FOLDER_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const NEW_FOLDER_GALLERY_GATE_RGBA: &[u8] = include_bytes!("new_folder_gallery_gate.rgba");
+static NEW_FOLDER_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(NEW_FOLDER_GALLERY_GATE_RGBA));
 
 // ---- Folder (folder) ------------------------------------------------
 
@@ -2039,6 +2493,15 @@ static FOLDER_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip
 const FOLDER_STRIP_GATE_RGBA: &[u8] = include_bytes!("folder_strip_gate.rgba");
 static FOLDER_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(FOLDER_STRIP_GATE_RGBA));
 
+const FOLDER_GALLERY_RGBA: &[u8] = include_bytes!("folder_gallery.rgba");
+static FOLDER_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(FOLDER_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const FOLDER_GALLERY_GATE_RGBA: &[u8] = include_bytes!("folder_gallery_gate.rgba");
+static FOLDER_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(FOLDER_GALLERY_GATE_RGBA));
+
 // ---- FolderOpened (folder-opened) -----------------------------------
 
 const FOLDER_OPENED_RGBA: &[u8] = include_bytes!("folder_opened.rgba");
@@ -2091,6 +2554,15 @@ static FOLDER_OPENED_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixe
 /// pre-composited opaque at bake time, same fix as the rail tier above.
 const FOLDER_OPENED_STRIP_GATE_RGBA: &[u8] = include_bytes!("folder_opened_strip_gate.rgba");
 static FOLDER_OPENED_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(FOLDER_OPENED_STRIP_GATE_RGBA));
+
+const FOLDER_OPENED_GALLERY_RGBA: &[u8] = include_bytes!("folder_opened_gallery.rgba");
+static FOLDER_OPENED_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(FOLDER_OPENED_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const FOLDER_OPENED_GALLERY_GATE_RGBA: &[u8] = include_bytes!("folder_opened_gallery_gate.rgba");
+static FOLDER_OPENED_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(FOLDER_OPENED_GALLERY_GATE_RGBA));
 
 // ---- File (file) ----------------------------------------------------
 
@@ -2145,6 +2617,15 @@ static FILE_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(F
 const FILE_STRIP_GATE_RGBA: &[u8] = include_bytes!("file_strip_gate.rgba");
 static FILE_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(FILE_STRIP_GATE_RGBA));
 
+const FILE_GALLERY_RGBA: &[u8] = include_bytes!("file_gallery.rgba");
+static FILE_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(FILE_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const FILE_GALLERY_GATE_RGBA: &[u8] = include_bytes!("file_gallery_gate.rgba");
+static FILE_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(FILE_GALLERY_GATE_RGBA));
+
 // ---- Save (save) ----------------------------------------------------
 
 const SAVE_RGBA: &[u8] = include_bytes!("save.rgba");
@@ -2197,6 +2678,15 @@ static SAVE_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(S
 /// pre-composited opaque at bake time, same fix as the rail tier above.
 const SAVE_STRIP_GATE_RGBA: &[u8] = include_bytes!("save_strip_gate.rgba");
 static SAVE_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(SAVE_STRIP_GATE_RGBA));
+
+const SAVE_GALLERY_RGBA: &[u8] = include_bytes!("save_gallery.rgba");
+static SAVE_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(SAVE_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const SAVE_GALLERY_GATE_RGBA: &[u8] = include_bytes!("save_gallery_gate.rgba");
+static SAVE_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(SAVE_GALLERY_GATE_RGBA));
 
 // ---- Refresh (refresh) ----------------------------------------------
 
@@ -2251,6 +2741,15 @@ static REFRESH_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_stri
 const REFRESH_STRIP_GATE_RGBA: &[u8] = include_bytes!("refresh_strip_gate.rgba");
 static REFRESH_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(REFRESH_STRIP_GATE_RGBA));
 
+const REFRESH_GALLERY_RGBA: &[u8] = include_bytes!("refresh_gallery.rgba");
+static REFRESH_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(REFRESH_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const REFRESH_GALLERY_GATE_RGBA: &[u8] = include_bytes!("refresh_gallery_gate.rgba");
+static REFRESH_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(REFRESH_GALLERY_GATE_RGBA));
+
 // ---- Add (add) ------------------------------------------------------
 
 const ADD_RGBA: &[u8] = include_bytes!("add.rgba");
@@ -2303,6 +2802,15 @@ static ADD_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(AD
 /// pre-composited opaque at bake time, same fix as the rail tier above.
 const ADD_STRIP_GATE_RGBA: &[u8] = include_bytes!("add_strip_gate.rgba");
 static ADD_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(ADD_STRIP_GATE_RGBA));
+
+const ADD_GALLERY_RGBA: &[u8] = include_bytes!("add_gallery.rgba");
+static ADD_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(ADD_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const ADD_GALLERY_GATE_RGBA: &[u8] = include_bytes!("add_gallery_gate.rgba");
+static ADD_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(ADD_GALLERY_GATE_RGBA));
 
 // ---- Trash (trash) --------------------------------------------------
 
@@ -2357,6 +2865,15 @@ static TRASH_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(
 const TRASH_STRIP_GATE_RGBA: &[u8] = include_bytes!("trash_strip_gate.rgba");
 static TRASH_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(TRASH_STRIP_GATE_RGBA));
 
+const TRASH_GALLERY_RGBA: &[u8] = include_bytes!("trash_gallery.rgba");
+static TRASH_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(TRASH_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const TRASH_GALLERY_GATE_RGBA: &[u8] = include_bytes!("trash_gallery_gate.rgba");
+static TRASH_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(TRASH_GALLERY_GATE_RGBA));
+
 // ---- Search (search) ------------------------------------------------
 
 const SEARCH_RGBA: &[u8] = include_bytes!("search.rgba");
@@ -2409,6 +2926,15 @@ static SEARCH_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip
 /// pre-composited opaque at bake time, same fix as the rail tier above.
 const SEARCH_STRIP_GATE_RGBA: &[u8] = include_bytes!("search_strip_gate.rgba");
 static SEARCH_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(SEARCH_STRIP_GATE_RGBA));
+
+const SEARCH_GALLERY_RGBA: &[u8] = include_bytes!("search_gallery.rgba");
+static SEARCH_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(SEARCH_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const SEARCH_GALLERY_GATE_RGBA: &[u8] = include_bytes!("search_gallery_gate.rgba");
+static SEARCH_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(SEARCH_GALLERY_GATE_RGBA));
 
 // ---- Check (check) --------------------------------------------------
 
@@ -2463,6 +2989,15 @@ static CHECK_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(
 const CHECK_STRIP_GATE_RGBA: &[u8] = include_bytes!("check_strip_gate.rgba");
 static CHECK_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(CHECK_STRIP_GATE_RGBA));
 
+const CHECK_GALLERY_RGBA: &[u8] = include_bytes!("check_gallery.rgba");
+static CHECK_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(CHECK_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const CHECK_GALLERY_GATE_RGBA: &[u8] = include_bytes!("check_gallery_gate.rgba");
+static CHECK_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(CHECK_GALLERY_GATE_RGBA));
+
 // ---- Close (close) --------------------------------------------------
 
 const CLOSE_RGBA: &[u8] = include_bytes!("close.rgba");
@@ -2515,6 +3050,15 @@ static CLOSE_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(
 /// pre-composited opaque at bake time, same fix as the rail tier above.
 const CLOSE_STRIP_GATE_RGBA: &[u8] = include_bytes!("close_strip_gate.rgba");
 static CLOSE_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(CLOSE_STRIP_GATE_RGBA));
+
+const CLOSE_GALLERY_RGBA: &[u8] = include_bytes!("close_gallery.rgba");
+static CLOSE_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(CLOSE_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const CLOSE_GALLERY_GATE_RGBA: &[u8] = include_bytes!("close_gallery_gate.rgba");
+static CLOSE_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(CLOSE_GALLERY_GATE_RGBA));
 
 // ---- ArrowUp (arrow-up) ---------------------------------------------
 
@@ -2569,6 +3113,15 @@ static ARROW_UP_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_str
 const ARROW_UP_STRIP_GATE_RGBA: &[u8] = include_bytes!("arrow_up_strip_gate.rgba");
 static ARROW_UP_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(ARROW_UP_STRIP_GATE_RGBA));
 
+const ARROW_UP_GALLERY_RGBA: &[u8] = include_bytes!("arrow_up_gallery.rgba");
+static ARROW_UP_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(ARROW_UP_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const ARROW_UP_GALLERY_GATE_RGBA: &[u8] = include_bytes!("arrow_up_gallery_gate.rgba");
+static ARROW_UP_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(ARROW_UP_GALLERY_GATE_RGBA));
+
 // ---- ArrowDown (arrow-down) -----------------------------------------
 
 const ARROW_DOWN_RGBA: &[u8] = include_bytes!("arrow_down.rgba");
@@ -2621,6 +3174,15 @@ static ARROW_DOWN_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_s
 /// pre-composited opaque at bake time, same fix as the rail tier above.
 const ARROW_DOWN_STRIP_GATE_RGBA: &[u8] = include_bytes!("arrow_down_strip_gate.rgba");
 static ARROW_DOWN_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(ARROW_DOWN_STRIP_GATE_RGBA));
+
+const ARROW_DOWN_GALLERY_RGBA: &[u8] = include_bytes!("arrow_down_gallery.rgba");
+static ARROW_DOWN_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(ARROW_DOWN_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const ARROW_DOWN_GALLERY_GATE_RGBA: &[u8] = include_bytes!("arrow_down_gallery_gate.rgba");
+static ARROW_DOWN_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(ARROW_DOWN_GALLERY_GATE_RGBA));
 
 // ---- ArrowLeft (arrow-left) -----------------------------------------
 
@@ -2675,6 +3237,15 @@ static ARROW_LEFT_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_s
 const ARROW_LEFT_STRIP_GATE_RGBA: &[u8] = include_bytes!("arrow_left_strip_gate.rgba");
 static ARROW_LEFT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(ARROW_LEFT_STRIP_GATE_RGBA));
 
+const ARROW_LEFT_GALLERY_RGBA: &[u8] = include_bytes!("arrow_left_gallery.rgba");
+static ARROW_LEFT_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(ARROW_LEFT_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const ARROW_LEFT_GALLERY_GATE_RGBA: &[u8] = include_bytes!("arrow_left_gallery_gate.rgba");
+static ARROW_LEFT_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(ARROW_LEFT_GALLERY_GATE_RGBA));
+
 // ---- ArrowRight (arrow-right) ---------------------------------------
 
 const ARROW_RIGHT_RGBA: &[u8] = include_bytes!("arrow_right.rgba");
@@ -2727,6 +3298,15 @@ static ARROW_RIGHT_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_
 /// pre-composited opaque at bake time, same fix as the rail tier above.
 const ARROW_RIGHT_STRIP_GATE_RGBA: &[u8] = include_bytes!("arrow_right_strip_gate.rgba");
 static ARROW_RIGHT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(ARROW_RIGHT_STRIP_GATE_RGBA));
+
+const ARROW_RIGHT_GALLERY_RGBA: &[u8] = include_bytes!("arrow_right_gallery.rgba");
+static ARROW_RIGHT_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(ARROW_RIGHT_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const ARROW_RIGHT_GALLERY_GATE_RGBA: &[u8] = include_bytes!("arrow_right_gallery_gate.rgba");
+static ARROW_RIGHT_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(ARROW_RIGHT_GALLERY_GATE_RGBA));
 
 // ---- ArrowSwap (arrow-swap) -----------------------------------------
 
@@ -2781,6 +3361,15 @@ static ARROW_SWAP_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_s
 const ARROW_SWAP_STRIP_GATE_RGBA: &[u8] = include_bytes!("arrow_swap_strip_gate.rgba");
 static ARROW_SWAP_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(ARROW_SWAP_STRIP_GATE_RGBA));
 
+const ARROW_SWAP_GALLERY_RGBA: &[u8] = include_bytes!("arrow_swap_gallery.rgba");
+static ARROW_SWAP_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(ARROW_SWAP_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const ARROW_SWAP_GALLERY_GATE_RGBA: &[u8] = include_bytes!("arrow_swap_gallery_gate.rgba");
+static ARROW_SWAP_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(ARROW_SWAP_GALLERY_GATE_RGBA));
+
 // ---- GitCommit (git-commit) -----------------------------------------
 
 const GIT_COMMIT_RGBA: &[u8] = include_bytes!("git_commit.rgba");
@@ -2833,6 +3422,15 @@ static GIT_COMMIT_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_s
 /// pre-composited opaque at bake time, same fix as the rail tier above.
 const GIT_COMMIT_STRIP_GATE_RGBA: &[u8] = include_bytes!("git_commit_strip_gate.rgba");
 static GIT_COMMIT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(GIT_COMMIT_STRIP_GATE_RGBA));
+
+const GIT_COMMIT_GALLERY_RGBA: &[u8] = include_bytes!("git_commit_gallery.rgba");
+static GIT_COMMIT_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(GIT_COMMIT_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const GIT_COMMIT_GALLERY_GATE_RGBA: &[u8] = include_bytes!("git_commit_gallery_gate.rgba");
+static GIT_COMMIT_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(GIT_COMMIT_GALLERY_GATE_RGBA));
 
 // ---- GitBranch (git-branch) -----------------------------------------
 
@@ -2887,6 +3485,15 @@ static GIT_BRANCH_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_s
 const GIT_BRANCH_STRIP_GATE_RGBA: &[u8] = include_bytes!("git_branch_strip_gate.rgba");
 static GIT_BRANCH_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(GIT_BRANCH_STRIP_GATE_RGBA));
 
+const GIT_BRANCH_GALLERY_RGBA: &[u8] = include_bytes!("git_branch_gallery.rgba");
+static GIT_BRANCH_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(GIT_BRANCH_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const GIT_BRANCH_GALLERY_GATE_RGBA: &[u8] = include_bytes!("git_branch_gallery_gate.rgba");
+static GIT_BRANCH_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(GIT_BRANCH_GALLERY_GATE_RGBA));
+
 // ---- Diff (diff) ----------------------------------------------------
 
 const DIFF_RGBA: &[u8] = include_bytes!("diff.rgba");
@@ -2939,6 +3546,15 @@ static DIFF_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(D
 /// pre-composited opaque at bake time, same fix as the rail tier above.
 const DIFF_STRIP_GATE_RGBA: &[u8] = include_bytes!("diff_strip_gate.rgba");
 static DIFF_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(DIFF_STRIP_GATE_RGBA));
+
+const DIFF_GALLERY_RGBA: &[u8] = include_bytes!("diff_gallery.rgba");
+static DIFF_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(DIFF_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const DIFF_GALLERY_GATE_RGBA: &[u8] = include_bytes!("diff_gallery_gate.rgba");
+static DIFF_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(DIFF_GALLERY_GATE_RGBA));
 
 // ---- DiffAdded (diff-added) -----------------------------------------
 
@@ -2993,6 +3609,15 @@ static DIFF_ADDED_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_s
 const DIFF_ADDED_STRIP_GATE_RGBA: &[u8] = include_bytes!("diff_added_strip_gate.rgba");
 static DIFF_ADDED_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(DIFF_ADDED_STRIP_GATE_RGBA));
 
+const DIFF_ADDED_GALLERY_RGBA: &[u8] = include_bytes!("diff_added_gallery.rgba");
+static DIFF_ADDED_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(DIFF_ADDED_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const DIFF_ADDED_GALLERY_GATE_RGBA: &[u8] = include_bytes!("diff_added_gallery_gate.rgba");
+static DIFF_ADDED_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(DIFF_ADDED_GALLERY_GATE_RGBA));
+
 // ---- GitCompare (git-compare) ---------------------------------------
 
 const GIT_COMPARE_RGBA: &[u8] = include_bytes!("git_compare.rgba");
@@ -3045,6 +3670,15 @@ static GIT_COMPARE_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_
 /// pre-composited opaque at bake time, same fix as the rail tier above.
 const GIT_COMPARE_STRIP_GATE_RGBA: &[u8] = include_bytes!("git_compare_strip_gate.rgba");
 static GIT_COMPARE_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(GIT_COMPARE_STRIP_GATE_RGBA));
+
+const GIT_COMPARE_GALLERY_RGBA: &[u8] = include_bytes!("git_compare_gallery.rgba");
+static GIT_COMPARE_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(GIT_COMPARE_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const GIT_COMPARE_GALLERY_GATE_RGBA: &[u8] = include_bytes!("git_compare_gallery_gate.rgba");
+static GIT_COMPARE_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(GIT_COMPARE_GALLERY_GATE_RGBA));
 
 // ---- Repo (repo) ----------------------------------------------------
 
@@ -3099,6 +3733,15 @@ static REPO_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(R
 const REPO_STRIP_GATE_RGBA: &[u8] = include_bytes!("repo_strip_gate.rgba");
 static REPO_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(REPO_STRIP_GATE_RGBA));
 
+const REPO_GALLERY_RGBA: &[u8] = include_bytes!("repo_gallery.rgba");
+static REPO_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(REPO_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const REPO_GALLERY_GATE_RGBA: &[u8] = include_bytes!("repo_gallery_gate.rgba");
+static REPO_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(REPO_GALLERY_GATE_RGBA));
+
 // ---- RepoForked (repo-forked) ---------------------------------------
 
 const REPO_FORKED_RGBA: &[u8] = include_bytes!("repo_forked.rgba");
@@ -3151,6 +3794,15 @@ static REPO_FORKED_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_
 /// pre-composited opaque at bake time, same fix as the rail tier above.
 const REPO_FORKED_STRIP_GATE_RGBA: &[u8] = include_bytes!("repo_forked_strip_gate.rgba");
 static REPO_FORKED_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(REPO_FORKED_STRIP_GATE_RGBA));
+
+const REPO_FORKED_GALLERY_RGBA: &[u8] = include_bytes!("repo_forked_gallery.rgba");
+static REPO_FORKED_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(REPO_FORKED_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const REPO_FORKED_GALLERY_GATE_RGBA: &[u8] = include_bytes!("repo_forked_gallery_gate.rgba");
+static REPO_FORKED_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(REPO_FORKED_GALLERY_GATE_RGBA));
 
 // ---- DebugStop (debug-stop) -----------------------------------------
 
@@ -3205,6 +3857,15 @@ static DEBUG_STOP_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_s
 const DEBUG_STOP_STRIP_GATE_RGBA: &[u8] = include_bytes!("debug_stop_strip_gate.rgba");
 static DEBUG_STOP_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(DEBUG_STOP_STRIP_GATE_RGBA));
 
+const DEBUG_STOP_GALLERY_RGBA: &[u8] = include_bytes!("debug_stop_gallery.rgba");
+static DEBUG_STOP_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(DEBUG_STOP_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const DEBUG_STOP_GALLERY_GATE_RGBA: &[u8] = include_bytes!("debug_stop_gallery_gate.rgba");
+static DEBUG_STOP_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(DEBUG_STOP_GALLERY_GATE_RGBA));
+
 // ---- DebugRestart (debug-restart) -----------------------------------
 
 const DEBUG_RESTART_RGBA: &[u8] = include_bytes!("debug_restart.rgba");
@@ -3257,6 +3918,15 @@ static DEBUG_RESTART_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixe
 /// pre-composited opaque at bake time, same fix as the rail tier above.
 const DEBUG_RESTART_STRIP_GATE_RGBA: &[u8] = include_bytes!("debug_restart_strip_gate.rgba");
 static DEBUG_RESTART_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(DEBUG_RESTART_STRIP_GATE_RGBA));
+
+const DEBUG_RESTART_GALLERY_RGBA: &[u8] = include_bytes!("debug_restart_gallery.rgba");
+static DEBUG_RESTART_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(DEBUG_RESTART_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const DEBUG_RESTART_GALLERY_GATE_RGBA: &[u8] = include_bytes!("debug_restart_gallery_gate.rgba");
+static DEBUG_RESTART_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(DEBUG_RESTART_GALLERY_GATE_RGBA));
 
 // ---- Edit (edit) ----------------------------------------------------
 
@@ -3311,6 +3981,15 @@ static EDIT_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(E
 const EDIT_STRIP_GATE_RGBA: &[u8] = include_bytes!("edit_strip_gate.rgba");
 static EDIT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(EDIT_STRIP_GATE_RGBA));
 
+const EDIT_GALLERY_RGBA: &[u8] = include_bytes!("edit_gallery.rgba");
+static EDIT_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(EDIT_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const EDIT_GALLERY_GATE_RGBA: &[u8] = include_bytes!("edit_gallery_gate.rgba");
+static EDIT_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(EDIT_GALLERY_GATE_RGBA));
+
 // ---- History (history) ----------------------------------------------
 
 const HISTORY_RGBA: &[u8] = include_bytes!("history.rgba");
@@ -3363,6 +4042,15 @@ static HISTORY_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_stri
 /// pre-composited opaque at bake time, same fix as the rail tier above.
 const HISTORY_STRIP_GATE_RGBA: &[u8] = include_bytes!("history_strip_gate.rgba");
 static HISTORY_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(HISTORY_STRIP_GATE_RGBA));
+
+const HISTORY_GALLERY_RGBA: &[u8] = include_bytes!("history_gallery.rgba");
+static HISTORY_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(HISTORY_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const HISTORY_GALLERY_GATE_RGBA: &[u8] = include_bytes!("history_gallery_gate.rgba");
+static HISTORY_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(HISTORY_GALLERY_GATE_RGBA));
 
 // ---- Terminal (terminal) --------------------------------------------
 
@@ -3417,6 +4105,15 @@ static TERMINAL_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_str
 const TERMINAL_STRIP_GATE_RGBA: &[u8] = include_bytes!("terminal_strip_gate.rgba");
 static TERMINAL_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(TERMINAL_STRIP_GATE_RGBA));
 
+const TERMINAL_GALLERY_RGBA: &[u8] = include_bytes!("terminal_gallery.rgba");
+static TERMINAL_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(TERMINAL_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const TERMINAL_GALLERY_GATE_RGBA: &[u8] = include_bytes!("terminal_gallery_gate.rgba");
+static TERMINAL_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(TERMINAL_GALLERY_GATE_RGBA));
+
 // ---- Output (output) ------------------------------------------------
 
 const OUTPUT_RGBA: &[u8] = include_bytes!("output.rgba");
@@ -3470,6 +4167,15 @@ static OUTPUT_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip
 const OUTPUT_STRIP_GATE_RGBA: &[u8] = include_bytes!("output_strip_gate.rgba");
 static OUTPUT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(OUTPUT_STRIP_GATE_RGBA));
 
+const OUTPUT_GALLERY_RGBA: &[u8] = include_bytes!("output_gallery.rgba");
+static OUTPUT_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(OUTPUT_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const OUTPUT_GALLERY_GATE_RGBA: &[u8] = include_bytes!("output_gallery_gate.rgba");
+static OUTPUT_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(OUTPUT_GALLERY_GATE_RGBA));
+
 // ---- CloudDownload (cloud-download) ---------------------------------
 
 const CLOUD_DOWNLOAD_RGBA: &[u8] = include_bytes!("cloud_download.rgba");
@@ -3522,6 +4228,15 @@ static CLOUD_DOWNLOAD_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_six
 /// pre-composited opaque at bake time, same fix as the rail tier above.
 const CLOUD_DOWNLOAD_STRIP_GATE_RGBA: &[u8] = include_bytes!("cloud_download_strip_gate.rgba");
 static CLOUD_DOWNLOAD_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(CLOUD_DOWNLOAD_STRIP_GATE_RGBA));
+
+const CLOUD_DOWNLOAD_GALLERY_RGBA: &[u8] = include_bytes!("cloud_download_gallery.rgba");
+static CLOUD_DOWNLOAD_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(CLOUD_DOWNLOAD_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const CLOUD_DOWNLOAD_GALLERY_GATE_RGBA: &[u8] = include_bytes!("cloud_download_gallery_gate.rgba");
+static CLOUD_DOWNLOAD_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(CLOUD_DOWNLOAD_GALLERY_GATE_RGBA));
 
 // ---- Ellipsis (ellipsis) --------------------------------------------
 
@@ -3577,6 +4292,15 @@ static ELLIPSIS_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_str
 const ELLIPSIS_STRIP_GATE_RGBA: &[u8] = include_bytes!("ellipsis_strip_gate.rgba");
 static ELLIPSIS_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(ELLIPSIS_STRIP_GATE_RGBA));
 
+const ELLIPSIS_GALLERY_RGBA: &[u8] = include_bytes!("ellipsis_gallery.rgba");
+static ELLIPSIS_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(ELLIPSIS_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const ELLIPSIS_GALLERY_GATE_RGBA: &[u8] = include_bytes!("ellipsis_gallery_gate.rgba");
+static ELLIPSIS_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(ELLIPSIS_GALLERY_GATE_RGBA));
+
 // ---- Link (link) ----------------------------------------------------
 
 const LINK_RGBA: &[u8] = include_bytes!("link.rgba");
@@ -3631,6 +4355,15 @@ static LINK_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(L
 const LINK_STRIP_GATE_RGBA: &[u8] = include_bytes!("link_strip_gate.rgba");
 static LINK_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LINK_STRIP_GATE_RGBA));
 
+const LINK_GALLERY_RGBA: &[u8] = include_bytes!("link_gallery.rgba");
+static LINK_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(LINK_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const LINK_GALLERY_GATE_RGBA: &[u8] = include_bytes!("link_gallery_gate.rgba");
+static LINK_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LINK_GALLERY_GATE_RGBA));
+
 // ---- CircleFilled (circle-filled) -----------------------------------
 
 const CIRCLE_FILLED_RGBA: &[u8] = include_bytes!("circle_filled.rgba");
@@ -3683,6 +4416,15 @@ static CIRCLE_FILLED_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixe
 /// pre-composited opaque at bake time, same fix as the rail tier above.
 const CIRCLE_FILLED_STRIP_GATE_RGBA: &[u8] = include_bytes!("circle_filled_strip_gate.rgba");
 static CIRCLE_FILLED_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(CIRCLE_FILLED_STRIP_GATE_RGBA));
+
+const CIRCLE_FILLED_GALLERY_RGBA: &[u8] = include_bytes!("circle_filled_gallery.rgba");
+static CIRCLE_FILLED_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(CIRCLE_FILLED_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const CIRCLE_FILLED_GALLERY_GATE_RGBA: &[u8] = include_bytes!("circle_filled_gallery_gate.rgba");
+static CIRCLE_FILLED_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(CIRCLE_FILLED_GALLERY_GATE_RGBA));
 
 // ---- CircleSlash (circle-slash) -------------------------------------
 
@@ -3737,6 +4479,15 @@ static CIRCLE_SLASH_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel
 const CIRCLE_SLASH_STRIP_GATE_RGBA: &[u8] = include_bytes!("circle_slash_strip_gate.rgba");
 static CIRCLE_SLASH_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(CIRCLE_SLASH_STRIP_GATE_RGBA));
 
+const CIRCLE_SLASH_GALLERY_RGBA: &[u8] = include_bytes!("circle_slash_gallery.rgba");
+static CIRCLE_SLASH_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(CIRCLE_SLASH_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const CIRCLE_SLASH_GALLERY_GATE_RGBA: &[u8] = include_bytes!("circle_slash_gallery_gate.rgba");
+static CIRCLE_SLASH_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(CIRCLE_SLASH_GALLERY_GATE_RGBA));
+
 // ---- Warning (warning) ----------------------------------------------
 
 const WARNING_RGBA: &[u8] = include_bytes!("warning.rgba");
@@ -3789,6 +4540,15 @@ static WARNING_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_stri
 /// pre-composited opaque at bake time, same fix as the rail tier above.
 const WARNING_STRIP_GATE_RGBA: &[u8] = include_bytes!("warning_strip_gate.rgba");
 static WARNING_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(WARNING_STRIP_GATE_RGBA));
+
+const WARNING_GALLERY_RGBA: &[u8] = include_bytes!("warning_gallery.rgba");
+static WARNING_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(WARNING_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const WARNING_GALLERY_GATE_RGBA: &[u8] = include_bytes!("warning_gallery_gate.rgba");
+static WARNING_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(WARNING_GALLERY_GATE_RGBA));
 
 // ---- Error (error) --------------------------------------------------
 
@@ -3843,6 +4603,15 @@ static ERROR_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(
 const ERROR_STRIP_GATE_RGBA: &[u8] = include_bytes!("error_strip_gate.rgba");
 static ERROR_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(ERROR_STRIP_GATE_RGBA));
 
+const ERROR_GALLERY_RGBA: &[u8] = include_bytes!("error_gallery.rgba");
+static ERROR_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(ERROR_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const ERROR_GALLERY_GATE_RGBA: &[u8] = include_bytes!("error_gallery_gate.rgba");
+static ERROR_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(ERROR_GALLERY_GATE_RGBA));
+
 // ---- Info (info) ----------------------------------------------------
 
 const INFO_RGBA: &[u8] = include_bytes!("info.rgba");
@@ -3895,6 +4664,15 @@ static INFO_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(I
 /// pre-composited opaque at bake time, same fix as the rail tier above.
 const INFO_STRIP_GATE_RGBA: &[u8] = include_bytes!("info_strip_gate.rgba");
 static INFO_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(INFO_STRIP_GATE_RGBA));
+
+const INFO_GALLERY_RGBA: &[u8] = include_bytes!("info_gallery.rgba");
+static INFO_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(INFO_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const INFO_GALLERY_GATE_RGBA: &[u8] = include_bytes!("info_gallery_gate.rgba");
+static INFO_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(INFO_GALLERY_GATE_RGBA));
 
 // ---- RunAll (run-all) -----------------------------------------------
 
@@ -3949,6 +4727,15 @@ static RUN_ALL_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_stri
 const RUN_ALL_STRIP_GATE_RGBA: &[u8] = include_bytes!("run_all_strip_gate.rgba");
 static RUN_ALL_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(RUN_ALL_STRIP_GATE_RGBA));
 
+const RUN_ALL_GALLERY_RGBA: &[u8] = include_bytes!("run_all_gallery.rgba");
+static RUN_ALL_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(RUN_ALL_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const RUN_ALL_GALLERY_GATE_RGBA: &[u8] = include_bytes!("run_all_gallery_gate.rgba");
+static RUN_ALL_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(RUN_ALL_GALLERY_GATE_RGBA));
+
 // ---- Play (play) ----------------------------------------------------
 
 const PLAY_RGBA: &[u8] = include_bytes!("play.rgba");
@@ -4001,6 +4788,15 @@ static PLAY_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(P
 /// pre-composited opaque at bake time, same fix as the rail tier above.
 const PLAY_STRIP_GATE_RGBA: &[u8] = include_bytes!("play_strip_gate.rgba");
 static PLAY_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(PLAY_STRIP_GATE_RGBA));
+
+const PLAY_GALLERY_RGBA: &[u8] = include_bytes!("play_gallery.rgba");
+static PLAY_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(PLAY_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const PLAY_GALLERY_GATE_RGBA: &[u8] = include_bytes!("play_gallery_gate.rgba");
+static PLAY_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(PLAY_GALLERY_GATE_RGBA));
 
 // ---- Sync (sync) ----------------------------------------------------
 
@@ -4055,6 +4851,15 @@ static SYNC_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(S
 const SYNC_STRIP_GATE_RGBA: &[u8] = include_bytes!("sync_strip_gate.rgba");
 static SYNC_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(SYNC_STRIP_GATE_RGBA));
 
+const SYNC_GALLERY_RGBA: &[u8] = include_bytes!("sync_gallery.rgba");
+static SYNC_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(SYNC_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const SYNC_GALLERY_GATE_RGBA: &[u8] = include_bytes!("sync_gallery_gate.rgba");
+static SYNC_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(SYNC_GALLERY_GATE_RGBA));
+
 // ---- GoToFile (go-to-file) ------------------------------------------
 
 const GO_TO_FILE_RGBA: &[u8] = include_bytes!("go_to_file.rgba");
@@ -4107,6 +4912,15 @@ static GO_TO_FILE_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_s
 /// pre-composited opaque at bake time, same fix as the rail tier above.
 const GO_TO_FILE_STRIP_GATE_RGBA: &[u8] = include_bytes!("go_to_file_strip_gate.rgba");
 static GO_TO_FILE_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(GO_TO_FILE_STRIP_GATE_RGBA));
+
+const GO_TO_FILE_GALLERY_RGBA: &[u8] = include_bytes!("go_to_file_gallery.rgba");
+static GO_TO_FILE_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(GO_TO_FILE_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const GO_TO_FILE_GALLERY_GATE_RGBA: &[u8] = include_bytes!("go_to_file_gallery_gate.rgba");
+static GO_TO_FILE_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(GO_TO_FILE_GALLERY_GATE_RGBA));
 
 // ---- Pulse (pulse) --------------------------------------------------
 
@@ -4162,6 +4976,15 @@ static PULSE_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(
 const PULSE_STRIP_GATE_RGBA: &[u8] = include_bytes!("pulse_strip_gate.rgba");
 static PULSE_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(PULSE_STRIP_GATE_RGBA));
 
+const PULSE_GALLERY_RGBA: &[u8] = include_bytes!("pulse_gallery.rgba");
+static PULSE_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(PULSE_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const PULSE_GALLERY_GATE_RGBA: &[u8] = include_bytes!("pulse_gallery_gate.rgba");
+static PULSE_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(PULSE_GALLERY_GATE_RGBA));
+
 // ---- Checklist (checklist) ------------------------------------------
 
 const CHECKLIST_RGBA: &[u8] = include_bytes!("checklist.rgba");
@@ -4216,6 +5039,15 @@ static CHECKLIST_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_st
 const CHECKLIST_STRIP_GATE_RGBA: &[u8] = include_bytes!("checklist_strip_gate.rgba");
 static CHECKLIST_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(CHECKLIST_STRIP_GATE_RGBA));
 
+const CHECKLIST_GALLERY_RGBA: &[u8] = include_bytes!("checklist_gallery.rgba");
+static CHECKLIST_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(CHECKLIST_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const CHECKLIST_GALLERY_GATE_RGBA: &[u8] = include_bytes!("checklist_gallery_gate.rgba");
+static CHECKLIST_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(CHECKLIST_GALLERY_GATE_RGBA));
+
 // ---- Eye (eye) ------------------------------------------------------
 
 const EYE_RGBA: &[u8] = include_bytes!("eye.rgba");
@@ -4268,6 +5100,15 @@ static EYE_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(EY
 /// pre-composited opaque at bake time, same fix as the rail tier above.
 const EYE_STRIP_GATE_RGBA: &[u8] = include_bytes!("eye_strip_gate.rgba");
 static EYE_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(EYE_STRIP_GATE_RGBA));
+
+const EYE_GALLERY_RGBA: &[u8] = include_bytes!("eye_gallery.rgba");
+static EYE_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(EYE_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const EYE_GALLERY_GATE_RGBA: &[u8] = include_bytes!("eye_gallery_gate.rgba");
+static EYE_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(EYE_GALLERY_GATE_RGBA));
 
 // ---- Layout (layout) ------------------------------------------------
 
@@ -4323,6 +5164,15 @@ static LAYOUT_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip
 const LAYOUT_STRIP_GATE_RGBA: &[u8] = include_bytes!("layout_strip_gate.rgba");
 static LAYOUT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LAYOUT_STRIP_GATE_RGBA));
 
+const LAYOUT_GALLERY_RGBA: &[u8] = include_bytes!("layout_gallery.rgba");
+static LAYOUT_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(LAYOUT_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const LAYOUT_GALLERY_GATE_RGBA: &[u8] = include_bytes!("layout_gallery_gate.rgba");
+static LAYOUT_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LAYOUT_GALLERY_GATE_RGBA));
+
 // ---- SplitHorizontal (split-horizontal) -----------------------------
 
 const SPLIT_HORIZONTAL_RGBA: &[u8] = include_bytes!("split_horizontal.rgba");
@@ -4375,6 +5225,15 @@ static SPLIT_HORIZONTAL_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_s
 /// pre-composited opaque at bake time, same fix as the rail tier above.
 const SPLIT_HORIZONTAL_STRIP_GATE_RGBA: &[u8] = include_bytes!("split_horizontal_strip_gate.rgba");
 static SPLIT_HORIZONTAL_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(SPLIT_HORIZONTAL_STRIP_GATE_RGBA));
+
+const SPLIT_HORIZONTAL_GALLERY_RGBA: &[u8] = include_bytes!("split_horizontal_gallery.rgba");
+static SPLIT_HORIZONTAL_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(SPLIT_HORIZONTAL_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const SPLIT_HORIZONTAL_GALLERY_GATE_RGBA: &[u8] = include_bytes!("split_horizontal_gallery_gate.rgba");
+static SPLIT_HORIZONTAL_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(SPLIT_HORIZONTAL_GALLERY_GATE_RGBA));
 
 // ---- SplitVertical (split-vertical) ---------------------------------
 
@@ -4429,6 +5288,15 @@ static SPLIT_VERTICAL_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_six
 const SPLIT_VERTICAL_STRIP_GATE_RGBA: &[u8] = include_bytes!("split_vertical_strip_gate.rgba");
 static SPLIT_VERTICAL_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(SPLIT_VERTICAL_STRIP_GATE_RGBA));
 
+const SPLIT_VERTICAL_GALLERY_RGBA: &[u8] = include_bytes!("split_vertical_gallery.rgba");
+static SPLIT_VERTICAL_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(SPLIT_VERTICAL_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const SPLIT_VERTICAL_GALLERY_GATE_RGBA: &[u8] = include_bytes!("split_vertical_gallery_gate.rgba");
+static SPLIT_VERTICAL_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(SPLIT_VERTICAL_GALLERY_GATE_RGBA));
+
 // ---- Preview (preview) ----------------------------------------------
 
 const PREVIEW_RGBA: &[u8] = include_bytes!("preview.rgba");
@@ -4481,4 +5349,13 @@ static PREVIEW_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_stri
 /// pre-composited opaque at bake time, same fix as the rail tier above.
 const PREVIEW_STRIP_GATE_RGBA: &[u8] = include_bytes!("preview_strip_gate.rgba");
 static PREVIEW_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(PREVIEW_STRIP_GATE_RGBA));
+
+const PREVIEW_GALLERY_RGBA: &[u8] = include_bytes!("preview_gallery.rgba");
+static PREVIEW_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(PREVIEW_GALLERY_RGBA));
+
+/// GateOverride, the icon gallery's own single background (`render::
+/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
+/// rail/strip tiers above.
+const PREVIEW_GALLERY_GATE_RGBA: &[u8] = include_bytes!("preview_gallery_gate.rgba");
+static PREVIEW_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(PREVIEW_GALLERY_GATE_RGBA));
 

@@ -80,7 +80,7 @@ use gate4agent_types::{
     TerminalMouseProtocolEncoding, TransportKind,
 };
 use tokio::sync::{mpsc, watch};
-use uzor_tui::{Backend, CrosstermBackend, Screen};
+use uzor_tui::{Backend, CrosstermBackend, Rect, Screen, TerminalBuffer};
 
 use crate::app::{
     App, AppAction, ConnectionState, NodeView, Provider, ProviderInventory, PtyColorMode,
@@ -903,7 +903,7 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
                 queue_action(&mut app, &commands, &inspection_commands, &mut pending_raw, action);
             }
             screen.flush()?;
-            flush_sixel_icon(&app, &mut sixel_emit_state)?;
+            flush_sixel_icon(&app, screen.current(), &mut sixel_emit_state)?;
             sync_cursor(&app)?;
         }
 
@@ -969,9 +969,17 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
                     // (`force_full_redraw`) -- wiping any sixel pixels
                     // already drawn there regardless of whether this
                     // frame's rail layout comes out byte-identical to the
-                    // last one. Mirror that exact condition here so the
-                    // gate in `flush_sixel_icon` cannot skip the one
-                    // frame that actually needs a fresh emission.
+                    // last one. Mirror that exact condition here so
+                    // `flush_sixel_icon_into`'s own gate cannot skip the
+                    // one frame that actually needs a fresh clear +
+                    // re-emission -- a real terminal resize can discard or
+                    // reposition already-drawn sixel pixels even for a
+                    // placement whose rect comes out byte-identical to
+                    // last frame's, which `force_next` is what widens
+                    // `flush_sixel_icon_into`'s own clear pass to cover
+                    // (see `SixelEmitState::force_next`'s own doc
+                    // comment) on top of whatever `Screen`'s full redraw
+                    // already did.
                     if screen.size() != (cols, rows) {
                         screen.resize(cols, rows);
                         sixel_emit_state.force_next = true;
@@ -1663,13 +1671,37 @@ fn action_node_id(action: &AppAction) -> Option<&str> {
 /// doc comment for exactly what this gates.
 #[derive(Default)]
 struct SixelEmitState {
+    /// Every placement actually emitted (after the bottom-row filter --
+    /// see `flush_sixel_icon_into`'s own doc comment) on the last
+    /// non-skipped call. Deliberately the FULL placement -- icon,
+    /// absolute rect, variant, size -- not just a hash: `flush_sixel_
+    /// icon_into` needs each OLD rect back, on the very next call, to
+    /// know exactly which cells to explicitly repaint once they stop
+    /// being an image region. A raster image lives outside the cell
+    /// buffer entirely (see `LayoutRects::sixel_icons`'s own doc
+    /// comment), so nothing else in this program ever notices, let alone
+    /// erases, one that is still sitting on the real terminal after its
+    /// placement moves or disappears -- that is the ghosting/doubling
+    /// this state exists to close, not a hypothetical.
     last: Vec<SixelIconPlacement>,
     /// Set by the run loop's own `TerminalEvent::Resize` handling
     /// whenever `Screen::resize` is about to actually redraw (its own
     /// debounced size-changed condition, mirrored there) -- consumed
-    /// (reset to `false`) by the very next `flush_sixel_icon` call
-    /// regardless of whether the signature also changed.
+    /// (reset to `false`) by the very next `flush_sixel_icon` call.
+    /// Widens the clear pass below from "only rects no longer claimed by
+    /// this frame's placements" to "every rect this state remembers,
+    /// unconditionally," and widens re-emission the same way: a real
+    /// terminal resize can discard or reposition already-drawn sixel
+    /// pixels even for a placement whose own rect comes out
+    /// pixel-identical to last frame's, which a placement-vs-placement
+    /// comparison alone can never detect.
     force_next: bool,
+    /// Latches to `true` while at least one placement this frame is being
+    /// dropped under the bottom-row rule, back to `false` once none are --
+    /// read on the NEXT call so `flush_sixel_icon_into` logs the drop only
+    /// on the false -> true transition, never once per frame for as long
+    /// as the terminal stays that exact height.
+    bottom_row_skip_active: bool,
 }
 
 /// Writes every activity-rail button's own baked sixel icon
@@ -1684,11 +1716,15 @@ struct SixelEmitState {
 /// handle each call, same pattern as `sync_cursor` below -- every
 /// `Stdout` handle shares one underlying, already-flushed buffer, so
 /// there is no interleaving risk running strictly after `screen.flush()`
-/// returns in this single-threaded run loop). Saves/restores the real
-/// cursor around each write since a terminal's own post-sixel cursor
-/// placement is inconsistent across implementations (DEC spec leaves it
-/// underspecified) -- `sync_cursor` re-authoritatively repositions it
-/// right after this returns anyway.
+/// returns in this single-threaded run loop). `screen_buffer` is
+/// `screen.current()` -- what `screen.flush()` just made true on the real
+/// terminal for THIS frame -- passed through so a placement that vacates
+/// a rect (see `flush_sixel_icon_into`'s own doc comment) gets replaced
+/// with whatever is actually supposed to be there now, not a guess.
+/// Saves/restores the real cursor around each write since a terminal's
+/// own post-sixel cursor placement is inconsistent across implementations
+/// (DEC spec leaves it underspecified) -- `sync_cursor` re-authoritatively
+/// repositions it right after this returns anyway.
 ///
 /// GATED: sixel encoding itself is already cached for the process
 /// lifetime (`icons::sixel`'s own `LazyLock`s), but writing already-
@@ -1699,36 +1735,99 @@ struct SixelEmitState {
 /// absolute rect, and selection -- see `SixelIconPlacement`'s own doc
 /// comment for why `selected` has to be part of this) and this function
 /// is a no-op whenever `app.layout.sixel_icons` is unchanged from that
-/// AND no resize forced a redraw since. An empty `sixel_icons` (`Braille`/
-/// `Ascii` mode, or a terminal too short for the tall rail) still updates
-/// `state.last` to empty and simply writes nothing -- correct either way,
-/// since there is nothing this function itself needs to erase (the
-/// cell-buffer diff already repainted those cells as plain background
-/// text, which is what actually erases stale sixel pixels on a real
-/// terminal).
-fn flush_sixel_icon(app: &App, state: &mut SixelEmitState) -> io::Result<()> {
-    flush_sixel_icon_into(&mut stdout(), app, state)
+/// AND no resize forced a redraw since.
+fn flush_sixel_icon(app: &App, screen_buffer: &TerminalBuffer, state: &mut SixelEmitState) -> io::Result<()> {
+    flush_sixel_icon_into(&mut stdout(), app, screen_buffer, state)
 }
 
 /// The actual gating + write logic behind [`flush_sixel_icon`], generic
 /// over the writer purely so this module's own tests can assert on the
 /// real bytes (a `Vec<u8>` sink) without a live terminal attached -- the
 /// production call site above always plugs in the real `stdout()`.
-fn flush_sixel_icon_into<W: io::Write>(writer: &mut W, app: &App, state: &mut SixelEmitState) -> io::Result<()> {
-    let unchanged = !state.force_next && app.layout.sixel_icons == state.last;
+///
+/// A sixel image is raster painted OVER the terminal, entirely outside
+/// `uzor_tui`'s own cell buffer/diff (see `LayoutRects::sixel_icons`'s own
+/// doc comment) -- the cell underneath stays a plain background-filled
+/// blank on purpose, so the diff never tries to overdraw pixels it knows
+/// nothing about. That is exactly why a MOVED or VACATED placement used
+/// to ghost: the vacated cells are "blank" on both sides of the diff
+/// (unchanged), so `screen.flush()` writes nothing there, and the stale
+/// raster from last frame keeps showing right next to the freshly
+/// emitted one at the new position. This function closes that gap: before
+/// emitting this frame's placements, every rect `state` remembers from
+/// last time that is NOT reused at the exact same coordinates this frame
+/// (or, under `state.force_next`, every remembered rect unconditionally --
+/// see that field's own doc comment) gets explicitly repainted first, via
+/// [`clear_rect`] from `screen_buffer` (`screen.current()`, the already-
+/// correct content `render::render` computed for this exact frame -- not
+/// a generic blank guess that could stomp real widget content that
+/// legitimately grew into that space, e.g. the viewport expanding into a
+/// just-collapsed sidebar's own icon column). An image region must be
+/// explicitly cleared before it stops being one; only once that clear is
+/// written does this emit the new placements.
+///
+/// Also enforces the bottom-row rule: a placement whose bottom row is the
+/// terminal's own last row (or beyond it) is never emitted at all, and is
+/// dropped from `state.last` as if it had never been placed. Sixel output
+/// landing on the last row is a known trigger for an unsolicited
+/// terminal-side scroll (Windows Terminal in particular), which shifts
+/// the WHOLE screen up and ghosts every other image already on it -- a
+/// failure this function cannot detect or repair after the fact, so the
+/// only correct move is to never trigger it. The button still gets its
+/// themed body (`render_rail_button` and friends always paint that first,
+/// sixel or not); it just goes without its icon glyph for the one frame
+/// its own row count makes unsafe. `state.bottom_row_skip_active` reports
+/// this once per transition via `diagnostics::record_runtime`, never once
+/// per frame -- see that field's own doc comment.
+fn flush_sixel_icon_into<W: io::Write>(
+    writer: &mut W,
+    app: &App,
+    screen_buffer: &TerminalBuffer,
+    state: &mut SixelEmitState,
+) -> io::Result<()> {
+    let force_all = state.force_next;
     state.force_next = false;
-    if unchanged {
+
+    let last_row = screen_buffer.height().saturating_sub(1);
+    let mut skipped_bottom_row = false;
+    let emitted: Vec<SixelIconPlacement> = app
+        .layout
+        .sixel_icons
+        .iter()
+        .copied()
+        .filter(|placement| placement.rect.width > 0 && placement.rect.height > 0)
+        .filter(|placement| {
+            let lands_on_last_row = placement.rect.bottom().saturating_sub(1) >= last_row;
+            skipped_bottom_row |= lands_on_last_row;
+            !lands_on_last_row
+        })
+        .collect();
+
+    if skipped_bottom_row && !state.bottom_row_skip_active {
+        crate::diagnostics::record_runtime(RuntimeDiagnostic::SixelBottomRowSkipped);
+    }
+    state.bottom_row_skip_active = skipped_bottom_row;
+
+    if !force_all && emitted == state.last {
         return Ok(());
     }
-    state.last = app.layout.sixel_icons.clone();
-    for placement in &app.layout.sixel_icons {
-        if placement.rect.width == 0 || placement.rect.height == 0 {
-            continue;
-        }
+
+    for stale in state
+        .last
+        .iter()
+        .filter(|old| force_all || !emitted.iter().any(|new| new.rect == old.rect))
+    {
+        clear_rect(writer, stale.rect, screen_buffer)?;
+    }
+
+    state.last = emitted.clone();
+
+    for placement in &emitted {
         let encoded = match placement.size {
             SixelIconSize::Rail => icons::sixel(placement.icon, placement.variant),
             SixelIconSize::Compact => icons::sixel_compact(placement.icon),
             SixelIconSize::Strip => icons::sixel_strip(placement.icon, placement.variant),
+            SixelIconSize::Gallery => icons::sixel_gallery(placement.icon, placement.variant),
         };
         execute!(
             writer,
@@ -1738,6 +1837,34 @@ fn flush_sixel_icon_into<W: io::Write>(writer: &mut W, app: &App, state: &mut Si
             RestorePosition,
         )?;
     }
+    Ok(())
+}
+
+/// Explicitly repaints `rect` (clamped to `screen_buffer`'s own current
+/// bounds -- a remembered rect can outlive a shrink) with whatever
+/// `screen_buffer` already holds there, cell for cell, real character
+/// writes and all -- see `flush_sixel_icon_into`'s own doc comment for
+/// why a rect that stops being a sixel placement needs this instead of
+/// relying on `screen.flush()`'s own diff, and why it reads the content
+/// rather than filling in a generic blank (the exact-content re-print is
+/// what makes this safe to run even when the vacated rect's real content
+/// this frame is something else entirely, not sixel-button filler --
+/// re-printing identical bytes is a harmless no-op). Reuses `Crossterm
+/// Backend::draw` (the SAME cell -> SGR translation the main `Screen`
+/// itself renders through, via a throwaway backend wrapping this same
+/// writer) instead of reimplementing style serialization here.
+fn clear_rect<W: io::Write>(writer: &mut W, rect: Rect, screen_buffer: &TerminalBuffer) -> io::Result<()> {
+    let clip = rect.intersect(screen_buffer.area());
+    if clip.is_empty() {
+        return Ok(());
+    }
+    execute!(writer, SavePosition)?;
+    let mut backend = CrosstermBackend::new(&mut *writer);
+    backend.draw((clip.y..clip.bottom()).flat_map(move |row| {
+        (clip.x..clip.right()).map(move |col| (col, row, screen_buffer.get(col, row)))
+    }))?;
+    backend.flush()?;
+    execute!(writer, RestorePosition)?;
     Ok(())
 }
 
@@ -5419,8 +5546,8 @@ mod tests {
         SpawnProfileSummary,
     };
     use crate::app::{
-        ContextUsageSegment, ContextUsageSegmentHit, DragState, Focus, HitRegion, HitTarget, LaunchContextMode, LaunchField,
-        HarnessTaskComposerField, HarnessTaskRef, LaunchTarget, PtyColorMode, SpawnDialog,
+        ContextUsageSegment, ContextUsageSegmentHit, ControlSection, DragState, Focus, HitRegion, HitTarget, LaunchContextMode, LaunchField,
+        HarnessTaskComposerField, HarnessTaskRef, LaunchTarget, PtyColorMode, SidebarPresentation, SpawnDialog,
         SurfacePaneLayout,
     };
     use crate::surface::PaneId;
@@ -5441,19 +5568,34 @@ mod tests {
         SixelIconPlacement { icon, rect: uzor_tui::Rect::new(x, 1, 4, 2), variant, size: SixelIconSize::Rail }
     }
 
+    /// A `TerminalBuffer` sized to `app`'s own terminal dimensions, filled
+    /// with nothing but default (space, unstyled) cells -- stands in for
+    /// `screen.current()` in tests that don't care what the "real" screen
+    /// content is (`state.last` starts empty, so there is nothing for
+    /// `flush_sixel_icon_into` to clear on a fresh call; the buffer's
+    /// content is simply never read).
+    fn blank_screen(app: &App) -> uzor_tui::TerminalBuffer {
+        uzor_tui::TerminalBuffer::new(app.terminal_cols, app.terminal_rows)
+    }
+
     #[test]
     fn flush_sixel_icon_skips_a_second_emission_when_the_signature_is_unchanged() {
         let mut app = App::default();
         app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 2, icons::SixelVariant::Transparent)];
         let mut state = SixelEmitState::default();
         let mut written = Vec::new();
+        let screen = blank_screen(&app);
 
-        flush_sixel_icon_into(&mut written, &app, &mut state).unwrap();
+        flush_sixel_icon_into(&mut written, &app, &screen, &mut state).unwrap();
         assert!(!written.is_empty(), "the first emission for a non-empty sixel_icons must write real bytes");
         let after_first = written.len();
 
-        flush_sixel_icon_into(&mut written, &app, &mut state).unwrap();
-        assert_eq!(written.len(), after_first, "an unchanged signature must not write anything on the second call");
+        flush_sixel_icon_into(&mut written, &app, &screen, &mut state).unwrap();
+        assert_eq!(
+            written.len(),
+            after_first,
+            "an unchanged placement set must neither clear nor re-emit anything on the second call"
+        );
     }
 
     #[test]
@@ -5462,12 +5604,13 @@ mod tests {
         app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 2, icons::SixelVariant::Transparent)];
         let mut state = SixelEmitState::default();
         let mut written = Vec::new();
-        flush_sixel_icon_into(&mut written, &app, &mut state).unwrap();
+        let screen = blank_screen(&app);
+        flush_sixel_icon_into(&mut written, &app, &screen, &mut state).unwrap();
         let after_first = written.len();
 
         // Moved: same icon, different rect.
         app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 9, icons::SixelVariant::Transparent)];
-        flush_sixel_icon_into(&mut written, &app, &mut state).unwrap();
+        flush_sixel_icon_into(&mut written, &app, &screen, &mut state).unwrap();
         assert!(written.len() > after_first, "a moved icon must trigger a fresh emission");
         let after_move = written.len();
 
@@ -5475,24 +5618,210 @@ mod tests {
         // going from at-rest to selected re-resolves to a DIFFERENT
         // pre-baked asset): same icon, same rect, only `variant` differs.
         app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 9, icons::SixelVariant::GateAccent)];
-        flush_sixel_icon_into(&mut written, &app, &mut state).unwrap();
+        flush_sixel_icon_into(&mut written, &app, &screen, &mut state).unwrap();
         assert!(written.len() > after_move, "a variant change must trigger a fresh emission even at the same rect");
     }
 
     #[test]
-    fn flush_sixel_icon_force_next_reemits_even_with_an_unchanged_signature() {
+    fn flush_sixel_icon_move_clears_the_old_rect_exactly_once_and_emits_the_new_one() {
         let mut app = App::default();
         app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 2, icons::SixelVariant::Transparent)];
         let mut state = SixelEmitState::default();
         let mut written = Vec::new();
-        flush_sixel_icon_into(&mut written, &app, &mut state).unwrap();
-        let after_first = written.len();
+        flush_sixel_icon_into(&mut written, &app, &blank_screen(&app), &mut state).unwrap();
 
-        // Same signature, but a resize (or any other forced-redraw path)
-        // set `force_next` -- the next call must still write bytes.
+        // The button moves from x=2 to x=9 (e.g. rail geometry changed).
+        // Unlike `blank_screen`, this frame's REAL screen buffer already
+        // holds genuine non-sixel content at the vacated x=2 column (a
+        // marker glyph standing in for whatever real widget content is
+        // actually supposed to be there now) -- proves the clear pass
+        // reprints the buffer's own real content, not a generic blank
+        // that could stomp it.
+        let mut occupied = blank_screen(&app);
+        occupied.set(2, 1, uzor_tui::Cell::new("Q"));
+        app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 9, icons::SixelVariant::Transparent)];
+        written.clear();
+        flush_sixel_icon_into(&mut written, &app, &occupied, &mut state).unwrap();
+        let output = String::from_utf8_lossy(&written);
+        assert!(output.contains('Q'), "the vacated old rect (x=2) must be cleared using the real screen content");
+        assert!(
+            output.contains(icons::sixel(icons::IconId::Files, icons::SixelVariant::Transparent)),
+            "the new rect (x=9) must be emitted"
+        );
+
+        // "Exactly once": a further call with the SAME, now-settled
+        // placement set must neither re-clear nor re-emit.
+        written.clear();
+        flush_sixel_icon_into(&mut written, &app, &occupied, &mut state).unwrap();
+        assert!(written.is_empty(), "an unchanged placement set after the move must be a total no-op");
+    }
+
+    #[test]
+    fn flush_sixel_icon_tier_switch_away_clears_every_rect_and_emits_nothing() {
+        let mut app = App::default();
+        app.layout.sixel_icons = vec![
+            sixel_placement(icons::IconId::Files, 2, icons::SixelVariant::Transparent),
+            sixel_placement(icons::IconId::Trash, 20, icons::SixelVariant::Transparent),
+        ];
+        let mut state = SixelEmitState::default();
+        let mut written = Vec::new();
+        flush_sixel_icon_into(&mut written, &app, &blank_screen(&app), &mut state).unwrap();
+        assert_eq!(state.last.len(), 2);
+
+        // Braille/Ascii tier: `render::render` populates zero placements
+        // this frame. The real screen buffer already carries the braille
+        // dots/ascii glyphs `render::render` painted in their place.
+        let mut occupied = blank_screen(&app);
+        occupied.set(2, 1, uzor_tui::Cell::new("Q"));
+        occupied.set(20, 1, uzor_tui::Cell::new("R"));
+        app.layout.sixel_icons = Vec::new();
+        written.clear();
+        flush_sixel_icon_into(&mut written, &app, &occupied, &mut state).unwrap();
+        let output = String::from_utf8_lossy(&written);
+        assert!(
+            output.contains('Q') && output.contains('R'),
+            "every previously emitted rect must be cleared"
+        );
+        assert!(
+            !output.contains(icons::sixel(icons::IconId::Files, icons::SixelVariant::Transparent))
+                && !output.contains(icons::sixel(icons::IconId::Trash, icons::SixelVariant::Transparent)),
+            "nothing must be emitted once the tier switches away from sixel"
+        );
+        assert!(state.last.is_empty(), "a tier switch must forget every remembered placement");
+    }
+
+    #[test]
+    fn flush_sixel_icon_never_emits_a_placement_landing_on_the_terminal_last_row() {
+        let mut app = App::default();
+        app.terminal_cols = 40;
+        app.terminal_rows = 10;
+        // Rows 8..10 -> bottom row 9, which IS the last row (0-indexed) of
+        // a 10-row terminal.
+        app.layout.sixel_icons = vec![SixelIconPlacement {
+            icon: icons::IconId::Files,
+            rect: uzor_tui::Rect::new(2, 8, 4, 2),
+            variant: icons::SixelVariant::Transparent,
+            size: SixelIconSize::Rail,
+        }];
+        let mut state = SixelEmitState::default();
+        let mut written = Vec::new();
+        flush_sixel_icon_into(&mut written, &app, &blank_screen(&app), &mut state).unwrap();
+        assert!(
+            written.is_empty(),
+            "a placement whose bottom row is the terminal's last row must never be emitted -- it risks the \
+             bottom-row scroll trap"
+        );
+        assert!(
+            state.last.is_empty(),
+            "a bottom-row-skipped placement must not be remembered as if it had actually been placed"
+        );
+
+        // One row taller and the exact same placement is safe again.
+        app.terminal_rows = 11;
+        written.clear();
+        flush_sixel_icon_into(&mut written, &app, &blank_screen(&app), &mut state).unwrap();
+        assert!(
+            !written.is_empty(),
+            "the same placement must emit normally once it no longer lands on the terminal's last row"
+        );
+    }
+
+    /// FIX1 regression guard: end-to-end proof that the activity rail's
+    /// own Settings gear -- bottom-anchored, see `render::render_activity_
+    /// rail`'s own `usable_bottom` doc comment -- actually reaches the
+    /// real terminal in a normal-sized window, not just that `render::
+    /// render` PLACED it (that layer's own coverage lives in `render::
+    /// tests::activity_rail_sixel_braille_and_ascii_modes_render_the_
+    /// expected_output`, which never exercises the emission-time bottom-
+    /// row filter this test does). Before this fix, the rail's own bottom
+    /// group anchored directly against `area.bottom()`, which for a rail
+    /// spanning the terminal's full height IS the terminal's own last
+    /// row -- so this exact scenario silently dropped the gear's icon on
+    /// every single frame, in every normal-sized terminal, not as a rare
+    /// edge case. Also asserts the Agents (person) button reaches the
+    /// terminal in the same frame: `render_activity_rail`'s top group was
+    /// never bottom-anchored (this button sits mid-rail, nowhere near
+    /// `area.bottom()`, confirmed by direct row-by-row placement math
+    /// across every legal terminal height this app supports), so this is
+    /// a standing regression guard rather than evidence of a second,
+    /// independent geometry bug -- the person icon's own disappearance in
+    /// the reporting screenshot did not reproduce against either the
+    /// layout `render::render` computes or the assets `icons::catalog`
+    /// bakes for it (both independently unit-tested elsewhere in this
+    /// crate), which is exactly what this test locks in going forward.
+    #[test]
+    fn activity_rail_gear_and_person_reach_the_real_terminal_in_a_normal_size_window() {
+        let mut app = App::default();
+        app.sidebar_presentation = SidebarPresentation::Activity;
+        app.harness_kanban.enabled = true;
+        app.terminal_cols = 100;
+        app.terminal_rows = 24;
+        let mut buf = uzor_tui::TerminalBuffer::new(app.terminal_cols, app.terminal_rows);
+        app.layout = render::render(&app, &mut buf);
+
+        // Layout-level guarantee: the gear's own hit rect must never reach
+        // the terminal's true last row (`buf.height()`, exclusive) -- the
+        // reserved blank row IS the fix, not a side effect of it.
+        let gear_hit = app
+            .layout
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::ActivitySection(ControlSection::Settings))
+            .expect("rail must register a Settings hit region in a normal-size terminal");
+        assert!(
+            gear_hit.rect.bottom() < buf.height(),
+            "FIX1: the Settings gear must never occupy the terminal's own last row (rect {:?}, terminal height {})",
+            gear_hit.rect,
+            buf.height(),
+        );
+
+        // Emission-level guarantee: with the layout fix in place, the
+        // emission-time bottom-row filter (`flush_sixel_icon_into`, kept
+        // as a last-resort safety net -- see its own doc comment) must
+        // never actually fire for this placement.
+        let mut state = SixelEmitState::default();
+        let mut written = Vec::new();
+        flush_sixel_icon_into(&mut written, &app, &buf, &mut state).unwrap();
+        assert!(
+            state.last.iter().any(|placement| placement.icon == icons::IconId::SettingsGear),
+            "the rail's Settings gear must actually be emitted, not silently dropped by the \
+             bottom-row filter, in a normal 100x24 terminal: {:?}",
+            state.last,
+        );
+        assert!(
+            state.last.iter().any(|placement| placement.icon == icons::IconId::Person),
+            "the Agents (person) rail button must also be emitted: {:?}",
+            state.last,
+        );
+    }
+
+    #[test]
+    fn flush_sixel_icon_force_next_clears_every_remembered_rect_before_reemitting() {
+        let mut app = App::default();
+        app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 2, icons::SixelVariant::Transparent)];
+        let mut state = SixelEmitState::default();
+        let mut written = Vec::new();
+        flush_sixel_icon_into(&mut written, &app, &blank_screen(&app), &mut state).unwrap();
+
+        // Same signature (icon/rect/variant/size all identical), but a
+        // resize (or any other forced-redraw path) set `force_next` --
+        // the SAME rect still needs a real clear (the terminal itself may
+        // have discarded or repositioned the pixels there) before being
+        // re-emitted.
+        let mut occupied = blank_screen(&app);
+        occupied.set(2, 1, uzor_tui::Cell::new("Q"));
         state.force_next = true;
-        flush_sixel_icon_into(&mut written, &app, &mut state).unwrap();
-        assert!(written.len() > after_first, "force_next must force a real emission even when nothing in sixel_icons changed");
+        written.clear();
+        flush_sixel_icon_into(&mut written, &app, &occupied, &mut state).unwrap();
+        let output = String::from_utf8_lossy(&written);
+        assert!(
+            output.contains('Q'),
+            "force_next must clear the remembered rect for real, reading the current screen content"
+        );
+        assert!(
+            output.contains(icons::sixel(icons::IconId::Files, icons::SixelVariant::Transparent)),
+            "force_next must also re-emit the placement even though nothing in sixel_icons changed"
+        );
     }
 
     #[test]
@@ -5503,7 +5832,8 @@ mod tests {
         assert!(app.layout.sixel_icons.is_empty());
         let mut state = SixelEmitState::default();
         let mut written = Vec::new();
-        flush_sixel_icon_into(&mut written, &app, &mut state).unwrap();
+        let screen = blank_screen(&app);
+        flush_sixel_icon_into(&mut written, &app, &screen, &mut state).unwrap();
         assert!(written.is_empty(), "an empty sixel_icons must never write terminal bytes");
     }
 
@@ -5523,7 +5853,8 @@ mod tests {
         }];
         let mut state = SixelEmitState::default();
         let mut written = Vec::new();
-        flush_sixel_icon_into(&mut written, &app, &mut state).unwrap();
+        let screen = blank_screen(&app);
+        flush_sixel_icon_into(&mut written, &app, &screen, &mut state).unwrap();
         let output = String::from_utf8_lossy(&written);
         assert!(
             output.contains(icons::sixel_compact(icons::IconId::NewFile)),
@@ -5550,7 +5881,8 @@ mod tests {
         }];
         let mut state = SixelEmitState::default();
         let mut written = Vec::new();
-        flush_sixel_icon_into(&mut written, &app, &mut state).unwrap();
+        let screen = blank_screen(&app);
+        flush_sixel_icon_into(&mut written, &app, &screen, &mut state).unwrap();
         let output = String::from_utf8_lossy(&written);
         assert!(
             output.contains(icons::sixel_strip(icons::IconId::NewFile, icons::SixelVariant::Transparent)),
@@ -5563,6 +5895,37 @@ mod tests {
         assert!(
             !output.contains(icons::sixel_compact(icons::IconId::NewFile)),
             "strip placement must NOT emit the compact-tier sixel bytes"
+        );
+    }
+
+    #[test]
+    fn flush_sixel_icon_prints_the_gallery_asset_for_a_gallery_placement() {
+        // Same proof as the compact/strip tests above, for the icon
+        // gallery's own 60x60 tier: `icons::sixel_gallery` is a DIFFERENT
+        // raster than the rail/compact/strip tiers' own for the same icon.
+        let mut app = App::default();
+        app.layout.sixel_icons = vec![SixelIconPlacement {
+            icon: icons::IconId::NewFile,
+            rect: uzor_tui::Rect::new(2, 1, 6, 3),
+            variant: icons::SixelVariant::Transparent,
+            size: SixelIconSize::Gallery,
+        }];
+        let mut state = SixelEmitState::default();
+        let mut written = Vec::new();
+        let screen = blank_screen(&app);
+        flush_sixel_icon_into(&mut written, &app, &screen, &mut state).unwrap();
+        let output = String::from_utf8_lossy(&written);
+        assert!(
+            output.contains(icons::sixel_gallery(icons::IconId::NewFile, icons::SixelVariant::Transparent)),
+            "gallery placement must emit the gallery-tier sixel bytes"
+        );
+        assert!(
+            !output.contains(icons::sixel(icons::IconId::NewFile, icons::SixelVariant::Transparent)),
+            "gallery placement must NOT emit the rail-tier sixel bytes"
+        );
+        assert!(
+            !output.contains(icons::sixel_strip(icons::IconId::NewFile, icons::SixelVariant::Transparent)),
+            "gallery placement must NOT emit the strip-tier sixel bytes"
         );
     }
 
@@ -5581,7 +5944,8 @@ mod tests {
         }];
         let mut state = SixelEmitState::default();
         let mut written = Vec::new();
-        flush_sixel_icon_into(&mut written, &app, &mut state).unwrap();
+        let screen = blank_screen(&app);
+        flush_sixel_icon_into(&mut written, &app, &screen, &mut state).unwrap();
         let output = String::from_utf8_lossy(&written);
         assert!(
             output.contains(icons::sixel(icons::IconId::Files, icons::SixelVariant::GateAccent)),

@@ -266,11 +266,29 @@ pub fn render(app: &App, buf: &mut TerminalBuffer) -> LayoutRects {
         Direction::Vertical,
         &[Constraint::Fixed(1), Constraint::Min(1)],
     );
+    // FIX4: the sidebar Board view's own content area -- only ever the
+    // full sidebar content rect (matching `spaces`/`agents`'s own
+    // Activity-presentation convention just above), and only while the
+    // rail even has a Board button to have activated it from (`board_
+    // view_active` cannot legitimately be true otherwise, see `App::
+    // activate_board_view`'s own light-mode gate, but this stays
+    // defensive about it -- the one place that decides what actually
+    // renders/hit-tests should not trust an upstream invariant alone).
+    let board_sidebar = if app.menu_placement == MenuPlacement::Sidebar
+        && app.sidebar_presentation == SidebarPresentation::Activity
+        && app.board_view_active
+        && app.harness_kanban.enabled
+    {
+        sidebar_content
+    } else {
+        Rect::default()
+    };
     let mut layout = LayoutRects {
         activity_rail,
         sixel_icons: Vec::new(),
         spaces,
         agents,
+        board_sidebar,
         tabs: right[0],
         viewport: right[1],
         control_content: Rect::default(),
@@ -312,20 +330,32 @@ pub fn render(app: &App, buf: &mut TerminalBuffer) -> LayoutRects {
             Paragraph::new("")
                 .style(Style::default().bg(theme.panel))
                 .render(sidebar_content, buf);
-            match app.control_section {
-                ControlSection::Files => {
-                    render_workspace_files(app, spaces, buf, &mut layout, theme)
-                }
-                ControlSection::Git => {
-                    render_workspace_git(app, spaces, buf, &mut layout, theme)
-                }
-                ControlSection::Agents | ControlSection::Workspaces => match app.roster_mode {
-                    RosterMode::Agents | RosterMode::NativeSessions => {
-                        render_agents_surface(app, agents, buf, &mut layout, theme)
+            // FIX2/FIX4: the Board sidebar view reads `board_view_active`
+            // FIRST, the same single piece of state `render_activity_
+            // rail` now derives every button's `selected` from -- see
+            // that field's own doc comment. `control_section` keeps
+            // whatever it last held while Board is showing (Board is
+            // deliberately not one of its variants), so it must never be
+            // consulted here until this check has already ruled Board
+            // out.
+            if app.board_view_active && app.harness_kanban.enabled {
+                render_agent_board_sidebar(app, sidebar_content, buf, &mut layout, theme);
+            } else {
+                match app.control_section {
+                    ControlSection::Files => {
+                        render_workspace_files(app, spaces, buf, &mut layout, theme)
                     }
-                    RosterMode::Workspaces => render_space_list(app, agents, buf, &mut layout, theme),
-                },
-                ControlSection::Settings => {}
+                    ControlSection::Git => {
+                        render_workspace_git(app, spaces, buf, &mut layout, theme)
+                    }
+                    ControlSection::Agents | ControlSection::Workspaces => match app.roster_mode {
+                        RosterMode::Agents | RosterMode::NativeSessions => {
+                            render_agents_surface(app, agents, buf, &mut layout, theme)
+                        }
+                        RosterMode::Workspaces => render_space_list(app, agents, buf, &mut layout, theme),
+                    },
+                    ControlSection::Settings => {}
+                }
             }
             let divider_x = sidebar_content.right().saturating_sub(1);
             for y in sidebar_content.y..sidebar_content.bottom() {
@@ -404,8 +434,9 @@ pub fn render(app: &App, buf: &mut TerminalBuffer) -> LayoutRects {
 /// (`Sixel`/`Braille`) paints `icon`, globally, for the whole rail, not
 /// per button (see `render_rail_button`'s own match). `glyph`/`ascii`
 /// stay plain single-character labels, used only where a real baked icon
-/// cannot fit: the short-terminal fallback (`block.height < 3`, both
-/// raster tiers) and `RailIcons::Ascii` mode's own tall-body label.
+/// cannot fit: the short-terminal fallback (`block.height` shorter than
+/// [`rail_button_body_rows`]'s own tier, both raster tiers) and
+/// `RailIcons::Ascii` mode's own tall-body label.
 struct RailButton {
     target: HitTarget,
     glyph: &'static str,
@@ -414,15 +445,39 @@ struct RailButton {
     icon: icons::IconId,
 }
 
+/// A rail button's own highlighted-body row count when there is room for
+/// the tall treatment, one tier at a time -- the fix for "a rail button
+/// is 3 rows tall but its 40x40 sixel occupies exactly 2 rows, leaving a
+/// dead row underneath" (icon size unchanged, still `icons::
+/// RAIL_ICON_SIZE_PX`/40x40 -- see that constant's own doc comment):
+/// `Sixel`'s own highlighted body now shrinks to EXACTLY [`icons::
+/// SIXEL_ICON_CELLS_TALL`] (2) rows, the icon's own real footprint, so
+/// there is no leftover accent-colored row the icon doesn't reach.
+/// `Braille`/`Ascii` are UNCHANGED at 3 rows ([`icons::
+/// BRAILLE_ICON_CELLS_TALL`]): the braille tier's own asset is baked to
+/// fill a full 4x3-cell body already (no dead row to fix there), and the
+/// ascii tier is a centered text label, not an image with its own
+/// pixel footprint to land evenly. The gap between two buttons (and the
+/// accent-bar column's own height) both derive from whatever this
+/// returns, never a second hand-tuned number -- see `render_activity_
+/// rail`'s own use of this fn.
+fn rail_button_body_rows(icons: RailIcons) -> u16 {
+    match icons {
+        RailIcons::Sixel => icons::SIXEL_ICON_CELLS_TALL,
+        RailIcons::Braille | RailIcons::Ascii => icons::BRAILLE_ICON_CELLS_TALL,
+    }
+}
+
 /// Draws a single activity-rail entry as a real button. When there is
-/// room (`block.height >= 3`) this paints a 3-row body -- `block` inset by
-/// 1 column on each side so it reads as a filled button block rather than
-/// a thin accent stripe -- with the glyph/ascii label centered on the
-/// middle row: `theme.active` background when inactive (deliberately
-/// different from the rail's own `theme.panel` background so an at-rest
-/// button stays visible instead of vanishing into the rail), `theme.accent`
-/// when selected, bold in both states, and a `▎` accent bar down `block`'s
-/// leftmost column on all three rows while selected. Below that height it
+/// room (`block.height >= rail_button_body_rows(icons)`) this paints a
+/// body exactly that many rows tall -- `block` inset by 1 column on each
+/// side so it reads as a filled button block rather than a thin accent
+/// stripe -- with the glyph/ascii label centered on the middle row:
+/// `theme.active` background when inactive (deliberately different from
+/// the rail's own `theme.panel` background so an at-rest button stays
+/// visible instead of vanishing into the rail), `theme.accent` when
+/// selected, bold in both states, and a `▎` accent bar down `block`'s
+/// leftmost column on every body row while selected. Below that height it
 /// falls back to the original thin single row so every button and its hit
 /// region still exist on a cramped terminal. Always registers
 /// `button.target` as a hit region across the full block (including the
@@ -443,7 +498,7 @@ fn render_rail_button(
         RailIcons::Ascii => button.ascii,
     };
 
-    if block.height < 3 {
+    if block.height < rail_button_body_rows(icons) {
         // Short-terminal fallback: the original thin single-row button.
         let bg = if button.selected { theme.accent } else { theme.panel };
         fill_rect(block, bg, buf);
@@ -857,97 +912,156 @@ fn render_activity_rail(
     // Top group: primary views. Board only exists once the harness kanban
     // is enabled -- light mode never renders it (same invariant enforced
     // everywhere else the kanban surfaces).
+    //
+    // FIX2: every button's own `selected` now derives from EXACTLY the
+    // state `app::App::board_view_active`'s own doc comment describes --
+    // Board reads that field alone; Files/Git/Agents read `!board_view_
+    // active && control_section == <theirs>`. The `!board_view_active`
+    // guard is what makes the four mutually exclusive: without it, a
+    // stale `control_section` left over from before Board was last
+    // activated (Board never touches `control_section` -- see that same
+    // doc comment for why) could make one of these three ALSO read
+    // selected while Board's own button does too. Agents additionally
+    // drops the old `matches!(app.roster_mode, Agents | NativeSessions)`
+    // sub-check: `control_section` only ever equals `Agents` when `roster_
+    // mode` is already one of those two (every path that sets `roster_
+    // mode = Workspaces` also sets `control_section = ControlSection::
+    // Workspaces` in the same assignment -- see `App::select_roster_mode`/
+    // `App::activate_activity_section`), so the sub-check was always
+    // redundant with `control_section` alone once stated as an invariant
+    // rather than re-checked ad hoc.
     let mut top = vec![
         RailButton {
             target: HitTarget::ActivitySection(ControlSection::Files),
             glyph: "▤",
             ascii: "F",
-            selected: app.control_section == ControlSection::Files && !app.sidebar_collapsed,
+            selected: !app.board_view_active
+                && app.control_section == ControlSection::Files
+                && !app.sidebar_collapsed,
             icon: icons::IconId::Files,
         },
         RailButton {
             target: HitTarget::ActivitySection(ControlSection::Git),
             glyph: "◈",
             ascii: "G",
-            selected: app.control_section == ControlSection::Git && !app.sidebar_collapsed,
+            selected: !app.board_view_active
+                && app.control_section == ControlSection::Git
+                && !app.sidebar_collapsed,
             icon: icons::IconId::SourceControl,
         },
         RailButton {
-            target: HitTarget::RosterMode(RosterMode::Agents),
+            // FIX3: was `HitTarget::RosterMode(RosterMode::Agents)`, which
+            // routed through `App::select_roster_mode` directly and so
+            // never got the re-click-collapses treatment the other rail
+            // buttons already had. Now goes through the exact same
+            // `App::activate_activity_section` dispatch as Files/Git
+            // (which itself still delegates to `select_roster_mode` for
+            // the Agents arm -- see that function's own match -- so the
+            // existing_session/native-catalog side effects are unchanged,
+            // only the activation SHAPE around them changes).
+            target: HitTarget::ActivitySection(ControlSection::Agents),
             glyph: "◉",
             ascii: "A",
-            selected: app.control_section == ControlSection::Agents
-                && matches!(app.roster_mode, RosterMode::Agents | RosterMode::NativeSessions)
+            selected: !app.board_view_active
+                && app.control_section == ControlSection::Agents
                 && !app.sidebar_collapsed,
             icon: icons::IconId::Person,
         },
     ];
     if app.harness_kanban.enabled {
         top.push(RailButton {
-            target: HitTarget::AgentBoardOpen,
+            // FIX3/FIX4: was `HitTarget::AgentBoardOpen`, which opened the
+            // full kanban straight into the viewport (`App::
+            // open_agent_board`) -- inconsistent with every other rail
+            // button, which switches SIDEBAR content. Now goes through
+            // `App::activate_board_view`, the Board-specific sibling of
+            // `activate_activity_section` (same re-click-collapses shape).
+            // `HitTarget::AgentBoardOpen` still exists and still opens the
+            // full viewport tab -- just from the sidebar Board view's own
+            // control-strip button now (`render_agent_board_sidebar`), the
+            // Split-presentation roster header's own `[B Board]` button,
+            // the `B`/`b` key, and the agent context menu, all unchanged.
+            target: HitTarget::ActivityBoard,
             glyph: "▦",
             ascii: "K",
-            selected: app.surface.active_tab() == Some(&SurfaceTab::AgentBoard),
+            selected: app.board_view_active && !app.sidebar_collapsed,
             icon: icons::IconId::Project,
         });
     }
 
-    // Each rail entry draws as a real 3-row button with 1 blank
-    // rail-background row between entries. On a terminal too short to fit
-    // the top group and the bottom group at that size, everything falls
-    // back to the original thin single-row-per-button rendering instead,
-    // so every button and its hit region still exist.
+    // Each rail entry draws as a real button, [`rail_button_body_rows`]
+    // rows tall for the current icon tier, with 1 blank rail-background
+    // row between entries. On a terminal too short to fit the top group
+    // and the bottom group at that size, everything falls back to the
+    // original thin single-row-per-button rendering instead, so every
+    // button and its hit region still exist.
+    let body_rows = rail_button_body_rows(app.rail_icons);
     let top_len = top.len() as u16;
-    let top_rows_tall = top_len.saturating_mul(3).saturating_add(top_len.saturating_sub(1));
-    let tall_enough = area.height >= top_rows_tall.saturating_add(7);
-    let button_rows: u16 = if tall_enough { 3 } else { 1 };
+    let top_rows_tall = top_len.saturating_mul(body_rows).saturating_add(top_len.saturating_sub(1));
+    // Bottom group at the tall size: 1 reserved blank row (for the future
+    // D3 connection-health dot) + Settings, [`body_rows`] tall -- see the
+    // bottom-group block below, which recomputes this same shape using
+    // whichever row count `tall_enough` actually decides on.
+    let bottom_group_rows_tall = body_rows.saturating_add(1);
+
+    // FIX1: this rail always spans the terminal's FULL height (see
+    // `render::render`'s own `SidebarPresentation::Activity` branch --
+    // `Rect::new(area.x, area.y, rail_width, area.height)`, `area.height`
+    // being `buf.height()` itself) -- so `area`'s own bottom edge IS the
+    // terminal's last row, and the bottom group used to anchor directly
+    // against `area.bottom()`. That put the Settings gear's icon on the
+    // last row EVERY frame, where `client::flush_sixel_icon_into`'s own
+    // bottom-row filter (a defense against a real unsolicited-scroll
+    // ghosting trap on that row -- see that filter's own doc comment)
+    // permanently, silently dropped it: not a rare edge case, a
+    // guaranteed miss in every normal-sized terminal. The fix is a
+    // LAYOUT rule, not a bigger emission-time guard: reserve exactly one
+    // blank row at the rail's own bottom -- `usable_height`/
+    // `usable_bottom` below -- so no button this function places can
+    // ever land there in the first place. `flush_sixel_icon_into`'s own
+    // filter is unchanged and stays exactly what its own doc comment
+    // already says: a last-resort safety net for a placement this layout
+    // should never produce (e.g. a mid-resize transient frame), which
+    // this reservation means it never does in a normal layout -- see
+    // `client::tests::activity_rail_gear_and_person_reach_the_real_
+    // terminal_in_a_normal_size_window`.
+    let usable_height = area.height.saturating_sub(1);
+    let usable_bottom = area.bottom().saturating_sub(1);
+    let tall_enough = usable_height >= top_rows_tall.saturating_add(bottom_group_rows_tall);
+    let button_rows: u16 = if tall_enough { body_rows } else { 1 };
     let step = button_rows.saturating_add(if tall_enough { 1 } else { 0 });
 
     let mut y = area.y;
     for button in &top {
-        if y >= area.bottom() {
+        if y >= usable_bottom {
             break;
         }
         render_rail_button(Rect::new(area.x, y, area.width, button_rows), button, app.rail_icons, buf, layout, theme);
         y = y.saturating_add(step);
     }
 
-    // Bottom group, bottom-anchored: the collapse toggle, one reserved
-    // blank row for the future D3 connection-health dot (not drawn yet),
-    // then Settings at the very bottom -- the same button treatment and
-    // row count as the top group.
+    // Bottom group, bottom-anchored to `usable_bottom` (NOT `area.bottom()`
+    // -- see this function's own `usable_height` doc comment above): one
+    // reserved blank row for the future D3 connection-health dot (not
+    // drawn yet), then Settings at the very bottom of the USABLE area --
+    // the same button treatment and row count as the top group. There is
+    // no separate collapse button here any more: the rail's own
+    // re-click-the-active-view behaviour
+    // (`App::activate_activity_section`) plus the Settings dialog's own
+    // toggle/key already cover collapsing, so a dedicated chevron button
+    // was a redundant hit target (see `app::HitTarget::SidebarCollapse`'s
+    // own doc comment for what still references that target).
     let bottom_rows = button_rows;
-    let bottom_group_rows = bottom_rows.saturating_mul(2).saturating_add(1);
-    if area.height >= bottom_group_rows {
-        // Collapse points AT the sidebar's own edge: `<` (chevron-left)
-        // while it's open (clicking collapses it further left), `>`
-        // (chevron-right) once collapsed (clicking expands it back out).
-        let (collapse_glyph, collapse_icon) = if app.sidebar_collapsed {
-            (">", icons::IconId::ChevronRight)
-        } else {
-            ("<", icons::IconId::ChevronLeft)
-        };
-        render_rail_button(
-            Rect::new(area.x, area.bottom() - bottom_group_rows, area.width, bottom_rows),
-            &RailButton {
-                target: HitTarget::SidebarCollapse,
-                glyph: collapse_glyph,
-                ascii: collapse_glyph,
-                selected: false,
-                icon: collapse_icon,
-            },
-            app.rail_icons,
-            buf,
-            layout,
-            theme,
-        );
-
+    let bottom_group_rows = bottom_rows.saturating_add(1);
+    if usable_height >= bottom_group_rows {
         // The row directly above Settings stays untouched (always exactly
         // 1 row, tall or fallback): reserved for the future D3
-        // connection-health dot.
+        // connection-health dot. The row below Settings (`area`'s own
+        // true last row) stays untouched too -- that is this fix's own
+        // one blank reserved row, never a button.
 
         render_rail_button(
-            Rect::new(area.x, area.bottom() - bottom_rows, area.width, bottom_rows),
+            Rect::new(area.x, usable_bottom.saturating_sub(bottom_rows), area.width, bottom_rows),
             &RailButton {
                 target: HitTarget::ActivitySection(ControlSection::Settings),
                 glyph: "◇",
@@ -2798,9 +2912,13 @@ fn render_tabs(
     layout: &mut LayoutRects,
     theme: Theme,
 ) {
-    let settings_label = " [S] ";
-    let settings_width = cell_width(settings_label).min(area.width as usize) as u16;
-    let tabs_right = area.right().saturating_sub(settings_width);
+    // FIX5: the tab strip no longer carries its own "[S]" Settings
+    // button/hit target -- the activity rail's own bottom-anchored gear
+    // (`HitTarget::ActivitySection(ControlSection::Settings)`, see
+    // `render_activity_rail`) is now the single mouse entry point to the
+    // Settings dialog. `tabs_right` used to reserve `settings_width`
+    // columns for that button; the tab strip now gets the full row.
+    let tabs_right = area.right();
     Paragraph::new("")
         .style(Style::default().bg(theme.active))
         .render(Rect::new(area.x, area.y, tabs_right.saturating_sub(area.x), 1), buf);
@@ -2868,18 +2986,6 @@ fn render_tabs(
             x = x.saturating_add(width);
         }
     }
-    let settings_x = area.right().saturating_sub(settings_width);
-    Paragraph::new(settings_label)
-        .style(
-            Style::default()
-                .fg(if app.focus == Focus::Settings { theme.accent } else { theme.muted })
-                .bg(theme.active),
-        )
-        .render(Rect::new(settings_x, area.y, settings_width, 1), buf);
-    layout.hits.push(HitRegion {
-        rect: Rect::new(settings_x, area.y, settings_width, 1),
-        target: HitTarget::Settings,
-    });
 }
 
 fn render_surface(
@@ -2989,6 +3095,9 @@ fn render_surface_pane(
     match pane.active_tab() {
         Some(SurfaceTab::AgentBoard) => {
             render_agent_board(app, viewport, buf, layout, theme);
+        }
+        Some(SurfaceTab::IconGallery) => {
+            render_icon_gallery(app, viewport, buf, layout, theme);
         }
         Some(SurfaceTab::SessionMonitor(key)) => {
             if let Some(monitor) = app.session_monitor(key) {
@@ -3111,6 +3220,232 @@ fn render_surface_pane(
             }
         }
         None => {}
+    }
+}
+
+/// FIX4's own main deliverable: the icon gallery dev surface (`app::
+/// SurfaceTab::IconGallery`) -- a read-only comparison grid, one row per
+/// icon ([`GALLERY_ICON_IDS`], a representative dozen spanning the
+/// activity rail's own 7 plus a few file-op/status icons), one column
+/// per size/tier variant: 20x20 (`icons::STRIP_SIXEL_ICON_*` -- the SAME
+/// asset the control-plane strip already ships, not a new bake), 40x40
+/// (`icons::SIXEL_ICON_*` -- the SAME asset the activity rail already
+/// ships, at whatever `icons::RAIL_ICON_SIZE_PX` currently is), 60x60
+/// (`icons::GALLERY_SIXEL_ICON_*` -- a NEW bake, this surface's own only
+/// consumer), then dedicated Braille and Ascii columns.
+///
+/// The three SIZE columns are the sixel tier's own size comparison; in
+/// `RailIcons::Braille`/`RailIcons::Ascii` (this crate's own single
+/// global icon-tier switch, not a per-surface setting -- see `app::
+/// RailIcons`) they simply paint THAT tier's own rendering instead of a
+/// sixel image, exactly like the dedicated Braille/Ascii columns already
+/// do -- there is no per-size braille/ascii asset to compare (only one
+/// braille bake exists at the rail's own 4x3-cell geometry), and forcing
+/// a sixel image regardless of the owner's own global tier choice would
+/// be new, untested behaviour no other icon site in this crate has (the
+/// rail/strip themselves only ever paint their own CURRENT tier too, see
+/// `render_rail_button`'s own match). This is a deliberate reading of
+/// this surface's own brief ("in Braille/Ascii tiers the sixel columns
+/// simply show the tier's own rendering"), not a gap.
+///
+/// Wheel-scrollable (`App::scroll_terminal`'s own `SurfaceTab::
+/// IconGallery` arm, `app.icon_gallery_scroll`) since the full 12-row
+/// grid is taller than most terminal windows; a row only ever paints
+/// once it is FULLY inside `area` (never a partially-clipped one) --
+/// sixel bytes are not croppable mid-image the way plain text is, so a
+/// partially-visible row is skipped entirely rather than emitted and
+/// left to overflow past `area`'s own bottom edge.
+fn render_icon_gallery(
+    app: &App,
+    area: Rect,
+    buf: &mut TerminalBuffer,
+    layout: &mut LayoutRects,
+    theme: Theme,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    const GALLERY_ICON_IDS: [icons::IconId; 12] = [
+        icons::IconId::Files,
+        icons::IconId::SourceControl,
+        icons::IconId::Person,
+        icons::IconId::Project,
+        icons::IconId::SettingsGear,
+        icons::IconId::NewFile,
+        icons::IconId::NewFolder,
+        icons::IconId::Refresh,
+        icons::IconId::Trash,
+        icons::IconId::Add,
+        icons::IconId::Play,
+        icons::IconId::Warning,
+    ];
+    const NAME_COL_WIDTH: u16 = 15;
+    const SIZE_COL_WIDTH: u16 = 12;
+    const BRAILLE_COL_WIDTH: u16 = 10;
+    const ASCII_COL_WIDTH: u16 = 8;
+    const COLUMN_GAP: u16 = 1;
+    const HEADER_ROWS: u16 = 2;
+    let row_height = icons::GALLERY_SIXEL_ICON_CELLS_TALL;
+    let row_block_height = row_height.saturating_add(1); // +1 blank gap row
+
+    let size_20_label = format!(
+        "{}x{}px {}x{}c",
+        icons::STRIP_SIXEL_ICON_WIDTH_PX, icons::STRIP_SIXEL_ICON_HEIGHT_PX,
+        icons::STRIP_SIXEL_ICON_CELLS_WIDE, icons::STRIP_SIXEL_ICON_CELLS_TALL,
+    );
+    let size_40_label = format!(
+        "{}x{}px {}x{}c",
+        icons::SIXEL_ICON_WIDTH_PX, icons::SIXEL_ICON_HEIGHT_PX,
+        icons::SIXEL_ICON_CELLS_WIDE, icons::SIXEL_ICON_CELLS_TALL,
+    );
+    let size_60_label = format!(
+        "{}x{}px {}x{}c",
+        icons::GALLERY_SIXEL_ICON_WIDTH_PX, icons::GALLERY_SIXEL_ICON_HEIGHT_PX,
+        icons::GALLERY_SIXEL_ICON_CELLS_WIDE, icons::GALLERY_SIXEL_ICON_CELLS_TALL,
+    );
+    let headers: [(&str, u16); 6] = [
+        ("icon", NAME_COL_WIDTH),
+        (size_20_label.as_str(), SIZE_COL_WIDTH),
+        (size_40_label.as_str(), SIZE_COL_WIDTH),
+        (size_60_label.as_str(), SIZE_COL_WIDTH),
+        ("braille", BRAILLE_COL_WIDTH),
+        ("ascii", ASCII_COL_WIDTH),
+    ];
+
+    // Header row (column labels) + a `─` separator row directly under it.
+    let mut columns: Vec<(u16, u16)> = Vec::with_capacity(headers.len());
+    let mut x = area.x;
+    for (label, width) in headers {
+        columns.push((x, width));
+        let visible_width = width.min(area.right().saturating_sub(x));
+        if visible_width > 0 {
+            Paragraph::new(truncate_cells(label, visible_width as usize))
+                .style(Style::default().fg(theme.muted).bg(theme.surface).add_modifier(Modifier::BOLD))
+                .render(Rect::new(x, area.y, visible_width, 1), buf);
+        }
+        x = x.saturating_add(width).saturating_add(COLUMN_GAP);
+    }
+    if area.height > 1 {
+        let separator_y = area.y.saturating_add(1);
+        for cx in area.x..area.right() {
+            let cell = buf.get_mut(cx, separator_y);
+            cell.symbol = "─".into();
+            cell.style = Style::default().fg(theme.border).bg(theme.surface);
+        }
+    }
+
+    let total_content_rows = (GALLERY_ICON_IDS.len() as u16).saturating_mul(row_block_height);
+    let available_rows = area.height.saturating_sub(HEADER_ROWS);
+    let max_scroll = total_content_rows.saturating_sub(available_rows);
+    let scroll = app.icon_gallery_scroll.min(max_scroll);
+    let variant = theme.sixel_active_variant();
+    // FIX1: this is a scrollable, often bottom-most (sole-pane) viewport
+    // tab, so `area`'s own bottom edge can be the terminal's true last
+    // row exactly like the activity rail's own case (see `render_
+    // activity_rail`'s own `usable_bottom` doc comment for the full
+    // diagnosis) -- reserve the SAME one blank row here so a fully-
+    // scrolled gallery row's own sixel swatches can never land there
+    // either, not just the rail's buttons.
+    let usable_bottom = area.bottom().saturating_sub(1);
+
+    for (row_index, id) in GALLERY_ICON_IDS.into_iter().enumerate() {
+        let content_y = HEADER_ROWS.saturating_add((row_index as u16).saturating_mul(row_block_height));
+        if content_y < scroll {
+            continue;
+        }
+        let y = area.y.saturating_add(content_y - scroll);
+        if y.saturating_add(row_height) > usable_bottom {
+            break;
+        }
+
+        let (name_x, name_width) = columns[0];
+        let visible_name_width = name_width.min(area.right().saturating_sub(name_x));
+        if visible_name_width > 0 {
+            Paragraph::new(truncate_cells(&format!("{id:?}"), visible_name_width as usize))
+                .style(Style::default().fg(theme.text).bg(theme.surface))
+                .render(Rect::new(name_x, y, visible_name_width, 1), buf);
+        }
+
+        for (col_index, cells_wide, cells_tall, size) in [
+            (1usize, icons::STRIP_SIXEL_ICON_CELLS_WIDE, icons::STRIP_SIXEL_ICON_CELLS_TALL, SixelIconSize::Strip),
+            (2usize, icons::SIXEL_ICON_CELLS_WIDE, icons::SIXEL_ICON_CELLS_TALL, SixelIconSize::Rail),
+            (3usize, icons::GALLERY_SIXEL_ICON_CELLS_WIDE, icons::GALLERY_SIXEL_ICON_CELLS_TALL, SixelIconSize::Gallery),
+        ] {
+            let (col_x, col_width) = columns[col_index];
+            let swatch = Rect::new(col_x, y, col_width.min(area.right().saturating_sub(col_x)), row_height);
+            render_gallery_size_swatch(swatch, id, cells_wide, cells_tall, size, variant, app.rail_icons, theme, buf, layout);
+        }
+
+        let (braille_x, braille_width) = columns[4];
+        let braille_area = Rect::new(
+            braille_x,
+            y,
+            braille_width.min(area.right().saturating_sub(braille_x)).min(icons::BRAILLE_ICON_CELLS_WIDE),
+            row_height.min(icons::BRAILLE_ICON_CELLS_TALL),
+        );
+        fill_rect(braille_area, theme.active, buf);
+        icons::braille(id).flush(braille_area, buf);
+        matte_canvas_background(braille_area, theme.active, buf);
+
+        let (ascii_x, ascii_width) = columns[5];
+        let visible_ascii_width = ascii_width.min(area.right().saturating_sub(ascii_x));
+        if visible_ascii_width > 0 {
+            let ascii_bg = Rect::new(ascii_x, y, visible_ascii_width, 1);
+            fill_rect(ascii_bg, theme.active, buf);
+            Paragraph::new(icons::ascii(id))
+                .style(Style::default().fg(theme.text).bg(theme.active).add_modifier(Modifier::BOLD))
+                .render(ascii_bg, buf);
+        }
+    }
+}
+
+/// One "size" swatch cell inside [`render_icon_gallery`]'s own grid:
+/// `RailIcons::Sixel` reserves `area`'s own cell footprint (already a
+/// plain `theme.active`-filled blank -- the real pixels are written by
+/// `client::run`'s post-flush hook, same split as `render_rail_button`'s
+/// own Sixel arm) and records the placement; `Braille`/`Ascii` paint that
+/// tier's OWN rendering directly (see [`render_icon_gallery`]'s own doc
+/// comment for why this collapses all three size columns to the SAME
+/// content in those two tiers).
+fn render_gallery_size_swatch(
+    area: Rect,
+    id: icons::IconId,
+    cells_wide: u16,
+    cells_tall: u16,
+    size: SixelIconSize,
+    variant: icons::SixelVariant,
+    tier: RailIcons,
+    theme: Theme,
+    buf: &mut TerminalBuffer,
+    layout: &mut LayoutRects,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    match tier {
+        RailIcons::Sixel => {
+            let icon_area = Rect::new(area.x, area.y, area.width.min(cells_wide), area.height.min(cells_tall));
+            fill_rect(icon_area, theme.active, buf);
+            layout.sixel_icons.push(SixelIconPlacement { icon: id, rect: icon_area, variant, size });
+        }
+        RailIcons::Braille => {
+            let braille_area = Rect::new(
+                area.x,
+                area.y,
+                area.width.min(icons::BRAILLE_ICON_CELLS_WIDE),
+                area.height.min(icons::BRAILLE_ICON_CELLS_TALL),
+            );
+            fill_rect(braille_area, theme.active, buf);
+            icons::braille(id).flush(braille_area, buf);
+            matte_canvas_background(braille_area, theme.active, buf);
+        }
+        RailIcons::Ascii => {
+            let label_area = Rect::new(area.x, area.y, area.width.min(2), 1);
+            fill_rect(Rect::new(area.x, area.y, area.width, 1), theme.active, buf);
+            Paragraph::new(icons::ascii(id))
+                .style(Style::default().fg(theme.text).bg(theme.active).add_modifier(Modifier::BOLD))
+                .render(label_area, buf);
+        }
     }
 }
 
@@ -4583,6 +4918,131 @@ fn render_harness_task_card(
             rect: open_rect,
             target: HitTarget::HarnessTaskOpen(task.task_id.clone()),
         });
+    }
+}
+
+/// FIX4: the activity rail's Board button's own sidebar content -- a
+/// compact, scrollable, single-column task list built from the SAME
+/// `app.harness_kanban`/`App::harness_tasks` state the full kanban board
+/// (`render_harness_kanban`) already reads, grouped under one bold header
+/// row per non-empty `HarnessKanbanColumn` (same grouping, order and
+/// `"{label} ({count})"` text the full board's own column headers use --
+/// see that function's own `column_tasks` header `Paragraph`) with each
+/// task underneath rendered by [`render_harness_task_card`] itself, at a
+/// 1-row-tall rect -- the EXACT SAME primitive the full board's own
+/// column cards call, just handed a shorter rect: that function already
+/// degrades gracefully to "title only" at `area.height == 1` (see its own
+/// doc comment) and already pushes the same `HitTarget::HarnessTaskCard`
+/// hit region the full board relies on, so a task row here is clickable
+/// exactly like a task card there. This is a NEW view, not a new data
+/// path: no field on `HarnessKanbanState` is read here that `render_
+/// harness_kanban` does not already read the same way.
+///
+/// The leading control-strip button (reusing `render_control_strip`, the
+/// SAME sidebar control-plane strip Explorer/Git already use) is the
+/// sidebar's own "expand" affordance: `HitTarget::AgentBoardOpen`, wired
+/// to `App::open_agent_board` completely unchanged -- opens the full
+/// kanban as the viewport tab exactly as it always has (Split
+/// presentation's own `[B Board]` button and the `B`/`b` key already go
+/// through this same target/function, see `render_roster`'s own doc
+/// comment). Uses `icons::IconId::GoToFile` rather than `Project` (the
+/// rail button's OWN icon just to this view's left) specifically so the
+/// two do not paint the same glyph twice in adjacent chrome; `GoToFile`
+/// reads as "jump to the full view" the same way it does everywhere else
+/// codicons ships it.
+fn render_agent_board_sidebar(
+    app: &App,
+    area: Rect,
+    buf: &mut TerminalBuffer,
+    layout: &mut LayoutRects,
+    theme: Theme,
+) {
+    use crate::app::HarnessKanbanColumn;
+
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    fill_rect(area, theme.panel, buf);
+
+    let content = if control_strip_fits(area) {
+        render_control_strip(
+            area,
+            &[ControlStripButton {
+                icon: icons::IconId::GoToFile,
+                target: HitTarget::AgentBoardOpen,
+                enabled: true,
+            }],
+            theme,
+            app.rail_icons,
+            buf,
+            layout,
+        )
+    } else {
+        // Same "no strip, fall back to one inline row" precedent as the
+        // Explorer/Git panels' own pre-strip fallback (see `control_strip_
+        // fits`'s own doc comment) -- a cramped sidebar still keeps a
+        // real, clickable way to reach the full board.
+        let header = Rect::new(area.x, area.y, area.width, area.height.min(1));
+        let label = " [Open full board] ";
+        Paragraph::new(truncate_cells(label, header.width as usize))
+            .style(Style::default().fg(theme.teal).bg(theme.panel).add_modifier(Modifier::BOLD))
+            .render(header, buf);
+        layout.hits.push(HitRegion { rect: header, target: HitTarget::AgentBoardOpen });
+        Rect::new(area.x, area.y.saturating_add(1), area.width, area.height.saturating_sub(1))
+    };
+
+    if content.width == 0 || content.height == 0 {
+        return;
+    }
+    let tasks = app.harness_tasks();
+    if tasks.is_empty() {
+        Paragraph::new("No Harness tasks yet.")
+            .style(Style::default().fg(theme.muted).bg(theme.panel))
+            .render(Rect::new(content.x, content.y, content.width, 1), buf);
+        return;
+    }
+
+    // Flatten "one header row per non-empty column, one row per task in
+    // it" into a single scrollable list -- the "columns collapsed into a
+    // list with state-label groups" this view's own brief asks for.
+    enum Row<'a> {
+        Header { label: &'static str, count: usize },
+        Task(&'a gate4agent_harness_client::RedactedTaskV1),
+    }
+    let mut rows: Vec<Row> = Vec::new();
+    for column in HarnessKanbanColumn::ALL {
+        let column_tasks: Vec<_> = tasks
+            .iter()
+            .copied()
+            .filter(|task| HarnessKanbanColumn::from_state(task.state) == column)
+            .collect();
+        if column_tasks.is_empty() {
+            continue;
+        }
+        rows.push(Row::Header { label: column.label(), count: column_tasks.len() });
+        rows.extend(column_tasks.into_iter().map(Row::Task));
+    }
+
+    // Same "nudge now, clamp against real content every frame" contract
+    // as `render_icon_gallery`'s own `app.icon_gallery_scroll` -- see that
+    // field's own doc comment.
+    let max_scroll = (rows.len() as u16).saturating_sub(content.height);
+    let scroll = app.board_sidebar_scroll.min(max_scroll) as usize;
+    let mut y = content.y;
+    for row in rows.iter().skip(scroll) {
+        if y >= content.bottom() {
+            break;
+        }
+        let row_area = Rect::new(content.x, y, content.width, 1);
+        match row {
+            Row::Header { label, count } => {
+                Paragraph::new(truncate_cells(&format!("{label} ({count})"), row_area.width as usize))
+                    .style(Style::default().fg(theme.text).bg(theme.active).add_modifier(Modifier::BOLD))
+                    .render(row_area, buf);
+            }
+            Row::Task(task) => render_harness_task_card(app, task, row_area, buf, layout, theme),
+        }
+        y = y.saturating_add(1);
     }
 }
 
@@ -6857,6 +7317,7 @@ fn surface_pane_tab_title(app: &App, tab: &SurfaceTab) -> String {
             .map(|preview| preview.title.clone())
             .unwrap_or_else(|| "detached session".to_owned()),
         SurfaceTab::Pty(_) => app.surface_tab_title(tab),
+        SurfaceTab::IconGallery => "Icon gallery".to_owned(),
     }
 }
 
@@ -7142,6 +7603,17 @@ fn render_surface_toolbar(
         Some(SurfaceTab::Pty(_)) => {
             let _ = render_toolbar_segment(
                 " live PTY | drag select | wheel scrollback ",
+                x,
+                area,
+                detail_style,
+                None,
+                buf,
+                layout,
+            );
+        }
+        Some(SurfaceTab::IconGallery) => {
+            let _ = render_toolbar_segment(
+                " icon gallery | read-only | wheel scroll ",
                 x,
                 area,
                 detail_style,
@@ -9899,7 +10371,9 @@ fn render_settings(
         app.control_modal_size
             .unwrap_or((default_width, default_height))
     } else {
-        (44, 7)
+        // Height 8: 2 border rows + 6 `render_settings_controls` rows
+        // (style/menu/sidebar/panel/icons/gallery -- FIX4 added the 6th).
+        (44, 8)
     };
     let width = requested_width
         .clamp(36.min(available_width), available_width);
@@ -10091,7 +10565,9 @@ fn control_modal_default_size(app: &App) -> (u16, u16) {
                 .unwrap_or(24);
             (width, rows.len().saturating_mul(2).saturating_add(1))
         }
-        ControlSection::Settings => (40, 5),
+        // 6 rows: style/menu/sidebar/panel/icons/gallery (FIX4 added the
+        // 6th, `render_settings_controls`'s own gallery row).
+        ControlSection::Settings => (40, 6),
     };
     let width = tab_width.max(content_width).saturating_add(2).clamp(44, 96);
     let height = content_rows.saturating_add(3).clamp(7, 30);
@@ -10196,6 +10672,21 @@ fn render_settings_controls(
     layout.hits.push(HitRegion {
         rect: Rect::new(area.x, area.y + 4, icons_width, 1),
         target: HitTarget::SettingsRailIcons,
+    });
+    if area.height < 6 {
+        return;
+    }
+    // FIX4: opens the icon gallery dev surface -- a one-shot action row
+    // (like clicking a button), not a toggle like every row above it, so
+    // it carries no `[...]` current-state bracket.
+    let gallery_text = " icon gallery ";
+    let gallery_width = (cell_width(gallery_text) as u16).min(area.width);
+    Paragraph::new(gallery_text)
+        .style(Style::default().fg(theme.teal).bg(theme.modal))
+        .render(Rect::new(area.x, area.y + 5, gallery_width, 1), buf);
+    layout.hits.push(HitRegion {
+        rect: Rect::new(area.x, area.y + 5, gallery_width, 1),
+        target: HitTarget::SettingsIconGallery,
     });
 }
 
@@ -10716,7 +11207,7 @@ mod tests {
 
     /// Same shape as `buffer_text`, scoped to a single rect -- used for the
     /// activity rail so assertions can't collide with unrelated chrome
-    /// (e.g. the tab strip's own unrelated `[S]` settings button).
+    /// (e.g. the tab strip's own unrelated `[#]` layout-menu button).
     fn rect_text(buf: &TerminalBuffer, rect: Rect) -> String {
         (rect.y..rect.bottom())
             .map(|row| {
@@ -13320,7 +13811,10 @@ mod tests {
         assert!(!workspace_layout.hits.iter().any(|hit| hit.target == HitTarget::RosterMode(RosterMode::NativeSessions)));
         assert!(workspace_layout.hits.iter().any(|hit| hit.target == HitTarget::RosterMode(RosterMode::Workspaces)));
         assert!(workspace_layout.hits.iter().any(|hit| hit.target == HitTarget::AddTab));
-        assert!(workspace_layout.hits.iter().any(|hit| hit.target == HitTarget::Settings));
+        // FIX5: the tab strip no longer carries its own "[S]" Settings
+        // button/hit target at all -- the activity rail's own gear is the
+        // single mouse entry point now (see `sidebar_gear_opens_only_
+        // compact_positioned_settings`).
 
         app.roster_mode = RosterMode::Agents;
         let agent_layout = render(&app, &mut buf);
@@ -13473,7 +13967,13 @@ mod tests {
         app.sidebar_presentation = SidebarPresentation::Activity;
         app.control_section = ControlSection::Agents;
         let activity = render(&app, &mut buf);
-        assert!(activity.hits.iter().any(|hit| hit.target == HitTarget::RosterMode(RosterMode::Agents)));
+        // FIX3: the rail's own Agents button is `ActivitySection` now,
+        // not `RosterMode` -- see `activity_rail_hit_regions_dispatch_
+        // the_same_actions_as_before`'s own doc comment for the full
+        // reasoning; the Split/Modal roster header checked just above and
+        // below still uses `RosterMode` unchanged, that surface was never
+        // touched.
+        assert!(activity.hits.iter().any(|hit| hit.target == HitTarget::ActivitySection(ControlSection::Agents)));
         assert!(!activity.hits.iter().any(|hit| {
             hit.target == HitTarget::RosterMode(RosterMode::Workspaces)
         }));
@@ -14496,7 +14996,9 @@ mod tests {
             hit.target,
             HitTarget::SidebarMode(_) | HitTarget::RosterMode(_)
         )));
-        assert!(layout.hits.iter().any(|hit| hit.target == HitTarget::Settings));
+        // FIX5: the tab strip's own "[S]" Settings button/hit target is
+        // gone entirely -- see `inspector_roster_and_tabs_have_compact_
+        // mode_and_action_hits`'s own doc comment.
     }
 
     #[test]
@@ -14508,7 +15010,11 @@ mod tests {
 
         let layout = render(&app, &mut buf);
 
-        assert_eq!(layout.control_modal, Rect::new(56, 17, 44, 7));
+        // FIX4 added a 6th `render_settings_controls` row (icon gallery),
+        // bumping the compact Settings popover from 44x7 to 44x8 -- and,
+        // since it's centered, one row taller shifts its own top edge up
+        // by 1 (17 -> 16) to stay centered.
+        assert_eq!(layout.control_modal, Rect::new(56, 16, 44, 8));
         assert_eq!(layout.control_content, Rect::default());
         assert!(layout.hits.iter().any(|hit| hit.target == HitTarget::ControlDrag));
         assert!(layout.hits.iter().any(|hit| hit.target == HitTarget::SettingsStyle));
@@ -15924,8 +16430,12 @@ mod tests {
             .hits
             .iter()
             .any(|hit| hit.target == HitTarget::ActivitySection(*section))));
+        // FIX3: the rail's own Agents button is `ActivitySection` now, not
+        // `RosterMode` (that target is still used elsewhere -- the
+        // non-rail roster sub-tabs `render_roster` draws -- just never as
+        // the rail's OWN hit region any more).
         assert!(expanded_layout.hits.iter().any(|hit| {
-            hit.target == HitTarget::RosterMode(RosterMode::Agents)
+            hit.target == HitTarget::ActivitySection(ControlSection::Agents)
         }));
         assert!(!expanded_layout.hits.iter().any(|hit| {
             hit.target == HitTarget::RosterMode(RosterMode::Workspaces)
@@ -15938,7 +16448,7 @@ mod tests {
         let mut native_selected = TerminalBuffer::new(100, 24);
         let native_layout = render(&app, &mut native_selected);
         let agents_hit = native_layout.hits.iter().find(|hit| {
-            hit.target == HitTarget::RosterMode(RosterMode::Agents)
+            hit.target == HitTarget::ActivitySection(ControlSection::Agents)
         }).unwrap();
         let accent = Theme::for_mode(app.color_mode).accent;
         assert_eq!(native_selected.get(agents_hit.rect.x, agents_hit.rect.y).style.bg, accent);
@@ -15952,7 +16462,12 @@ mod tests {
         assert_eq!(collapsed_layout.activity_rail.width, 6);
         assert_eq!(collapsed_layout.agents.width, 0);
         assert_eq!(collapsed_layout.tabs.x, 6);
-        assert!(collapsed_layout
+        // FIX1: the rail no longer has a separate chevron collapse button
+        // at all -- collapsing (and expanding back out) happens by
+        // re-clicking the active view icon (`App::activate_activity_
+        // section`) or via the Settings dialog's own toggle/key, covered
+        // by `activity_rail_hit_regions_dispatch_the_same_actions_as_before`.
+        assert!(!collapsed_layout
             .hits
             .iter()
             .any(|hit| hit.target == HitTarget::SidebarCollapse));
@@ -15966,8 +16481,13 @@ mod tests {
         let mut light_buf = TerminalBuffer::new(100, 24);
         let light_layout = render(&app, &mut light_buf);
         let rail = light_layout.activity_rail;
+        // FIX3/FIX4: the rail's OWN Board button is `ActivityBoard` now,
+        // not `AgentBoardOpen` (that target still exists elsewhere --
+        // the Split-presentation roster header's own `[B Board]` button
+        // and the sidebar Board view's own expand control-strip button --
+        // just never inside the activity rail any more).
         assert!(!light_layout.hits.iter().any(|hit| {
-            hit.target == HitTarget::AgentBoardOpen && rail.contains(hit.rect.x, hit.rect.y)
+            hit.target == HitTarget::ActivityBoard && rail.contains(hit.rect.x, hit.rect.y)
         }));
         assert!(!light_layout.sixel_icons.iter().any(|placement| placement.icon == icons::IconId::Project));
 
@@ -15976,7 +16496,7 @@ mod tests {
         let full_layout = render(&app, &mut full_buf);
         let rail = full_layout.activity_rail;
         assert!(full_layout.hits.iter().any(|hit| {
-            hit.target == HitTarget::AgentBoardOpen && rail.contains(hit.rect.x, hit.rect.y)
+            hit.target == HitTarget::ActivityBoard && rail.contains(hit.rect.x, hit.rect.y)
         }));
         // The icon itself is a real baked sixel icon now (Project), not
         // block art -- its placement in `sixel_icons` is the invariant.
@@ -15988,6 +16508,7 @@ mod tests {
         let mut app = fixture(PtyColorMode::GateOverride);
         app.sidebar_presentation = SidebarPresentation::Activity;
         app.control_section = ControlSection::Git;
+        app.harness_kanban.enabled = true;
         let mut buf = TerminalBuffer::new(100, 24);
         let layout = render(&app, &mut buf);
 
@@ -16000,9 +16521,14 @@ mod tests {
         let accent = Theme::for_mode(app.color_mode).accent;
         assert_eq!(buf.get(git_hit.rect.x, git_hit.rect.y).style.bg, accent);
 
+        // FIX3: Agents now shares `ActivitySection` with Files/Git.
+        // FIX2/FIX4: Board (`ActivityBoard`) is included here too, so this
+        // test also locks in that having a Board button ON the rail (kanban
+        // enabled) never shows it accented while a DIFFERENT view is active.
         for target in [
             HitTarget::ActivitySection(ControlSection::Files),
-            HitTarget::RosterMode(RosterMode::Agents),
+            HitTarget::ActivitySection(ControlSection::Agents),
+            HitTarget::ActivityBoard,
             HitTarget::ActivitySection(ControlSection::Settings),
         ] {
             let hit = layout
@@ -16026,28 +16552,285 @@ mod tests {
         click_activity_rail_button(&mut app, HitTarget::ActivitySection(ControlSection::Git));
         assert_eq!(app.control_section, ControlSection::Git);
 
+        // FIX3: the Agents button now goes through the SAME
+        // `HitTarget::ActivitySection` path as Files/Git --
+        // `HitTarget::RosterMode(RosterMode::Agents)` is no longer a
+        // rail-drawn hit region at all (that target is still dispatched
+        // for the OTHER, non-rail roster sub-tabs -- see `render_
+        // roster`'s own in-panel Agents/Workspaces strip).
         let mut app = fixture(PtyColorMode::Inherited);
         app.sidebar_presentation = SidebarPresentation::Activity;
-        click_activity_rail_button(&mut app, HitTarget::RosterMode(RosterMode::Agents));
+        click_activity_rail_button(&mut app, HitTarget::ActivitySection(ControlSection::Agents));
         assert_eq!(app.control_section, ControlSection::Agents);
         assert_eq!(app.roster_mode, RosterMode::Agents);
 
+        // FIX1: no separate chevron button any more -- collapsing happens
+        // by re-clicking the ALREADY-ACTIVE view button (VS Code style),
+        // via `App::activate_activity_section`'s own re-click branch.
         let mut app = fixture(PtyColorMode::Inherited);
         app.sidebar_presentation = SidebarPresentation::Activity;
+        app.control_section = ControlSection::Git;
         assert!(!app.sidebar_collapsed);
-        click_activity_rail_button(&mut app, HitTarget::SidebarCollapse);
-        assert!(app.sidebar_collapsed);
+        click_activity_rail_button(&mut app, HitTarget::ActivitySection(ControlSection::Files));
+        assert_eq!(app.control_section, ControlSection::Files);
+        assert!(!app.sidebar_collapsed, "switching to a not-yet-active view must not collapse it");
+        click_activity_rail_button(&mut app, HitTarget::ActivitySection(ControlSection::Files));
+        assert!(app.sidebar_collapsed, "re-clicking the now-active view must collapse the sidebar");
+        click_activity_rail_button(&mut app, HitTarget::ActivitySection(ControlSection::Files));
+        assert!(!app.sidebar_collapsed, "re-clicking again must expand it back out");
+
+        // FIX3: the exact same re-click-collapses shape for Agents
+        // specifically, which used to skip it entirely (that was this
+        // fix's own complaint -- see this function's own module doc).
+        let mut app = fixture(PtyColorMode::Inherited);
+        app.sidebar_presentation = SidebarPresentation::Activity;
+        click_activity_rail_button(&mut app, HitTarget::ActivitySection(ControlSection::Agents));
+        assert!(!app.sidebar_collapsed);
+        click_activity_rail_button(&mut app, HitTarget::ActivitySection(ControlSection::Agents));
+        assert!(app.sidebar_collapsed, "re-clicking the now-active Agents view must collapse the sidebar");
+        click_activity_rail_button(&mut app, HitTarget::ActivitySection(ControlSection::Agents));
+        assert!(!app.sidebar_collapsed, "re-clicking again must expand it back out");
 
         let mut app = fixture(PtyColorMode::Inherited);
         app.sidebar_presentation = SidebarPresentation::Activity;
         click_activity_rail_button(&mut app, HitTarget::ActivitySection(ControlSection::Settings));
         assert_eq!(app.focus, Focus::Settings);
 
+        // FIX4: the rail's Board button now selects the SIDEBAR view --
+        // it must NOT open the viewport tab (that is the sidebar view's
+        // own separate `HitTarget::AgentBoardOpen` control-strip button,
+        // covered by `board_sidebar_view_switches_sidebar_content_and_
+        // its_own_expand_button_opens_the_full_tab` below) -- and FIX3's
+        // same re-click-collapses shape.
         let mut app = fixture(PtyColorMode::Inherited);
         app.sidebar_presentation = SidebarPresentation::Activity;
         app.harness_kanban.enabled = true;
-        click_activity_rail_button(&mut app, HitTarget::AgentBoardOpen);
-        assert_eq!(app.surface.active_tab(), Some(&SurfaceTab::AgentBoard));
+        click_activity_rail_button(&mut app, HitTarget::ActivityBoard);
+        assert!(app.board_view_active);
+        assert_ne!(app.surface.active_tab(), Some(&SurfaceTab::AgentBoard));
+        assert!(!app.sidebar_collapsed);
+        click_activity_rail_button(&mut app, HitTarget::ActivityBoard);
+        assert!(app.sidebar_collapsed, "re-clicking the now-active Board view must collapse the sidebar");
+        click_activity_rail_button(&mut app, HitTarget::ActivityBoard);
+        assert!(!app.sidebar_collapsed, "re-clicking again must expand it back out");
+    }
+
+    /// FIX2/FIX4: the rail's Board button selects a SIDEBAR view built
+    /// from the SAME `harness_kanban` state the full board reads (`App::
+    /// harness_tasks`) -- grouped headers plus one row per task, reusing
+    /// [`render_harness_task_card`] itself for each row (see `render_
+    /// agent_board_sidebar`'s own doc comment) -- and does NOT open the
+    /// viewport tab; the sidebar view's OWN control-strip button
+    /// (`HitTarget::AgentBoardOpen`, unchanged) is the only thing that
+    /// still does that.
+    #[test]
+    fn board_sidebar_view_switches_sidebar_content_and_its_own_expand_button_opens_the_full_tab() {
+        let mut app = fixture(PtyColorMode::Inherited);
+        app.sidebar_presentation = SidebarPresentation::Activity;
+        app.harness_kanban.enabled = true;
+        let task = RedactedTaskV1 {
+            task_id: HarnessTaskId::new("htask_222222222222222222222222").unwrap(),
+            revision: HarnessRevision::new(1).unwrap(),
+            title: "sidebar board task".to_owned(),
+            body: "body".to_owned(),
+            creator: TaskCreatorCategoryV1::User,
+            parent_task_id: None,
+            dependency_ids: Vec::new(),
+            state: HarnessTaskStateV1::Running,
+            run_ids: Vec::new(),
+            references_redacted: false,
+            result_refs: Vec::new(),
+            artifact_refs: Vec::new(),
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+        };
+        app.begin_harness_refresh(1);
+        app.apply_harness_snapshot(1, vec![task.clone()], Vec::new());
+
+        let mut buf = TerminalBuffer::new(100, 30);
+        app.layout = render(&app, &mut buf);
+        let board_hit = app
+            .layout
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::ActivityBoard)
+            .expect("rail Board button")
+            .clone();
+        app.click(board_hit.rect.x, board_hit.rect.y);
+        assert!(app.board_view_active);
+        assert_ne!(
+            app.surface.active_tab(),
+            Some(&SurfaceTab::AgentBoard),
+            "the rail's Board button must switch the SIDEBAR, not open the viewport tab",
+        );
+
+        let mut buf = TerminalBuffer::new(100, 30);
+        app.layout = render(&app, &mut buf);
+        assert!(app.layout.board_sidebar.width > 0 && app.layout.board_sidebar.height > 0);
+        let sidebar_text = rect_text(&buf, app.layout.board_sidebar);
+        assert!(sidebar_text.contains("Running (1)"), "{sidebar_text:?}");
+        assert!(sidebar_text.contains("sidebar board task"), "{sidebar_text:?}");
+        assert!(
+            app.layout.hits.iter().any(|hit| {
+                hit.target == HitTarget::HarnessTaskCard(task.task_id.clone())
+                    && app.layout.board_sidebar.contains(hit.rect.x, hit.rect.y)
+            }),
+            "the sidebar task row must reuse the SAME HarnessTaskCard hit target the full board uses",
+        );
+
+        let expand_hit = app
+            .layout
+            .hits
+            .iter()
+            .find(|hit| {
+                hit.target == HitTarget::AgentBoardOpen
+                    && app.layout.board_sidebar.contains(hit.rect.x, hit.rect.y)
+            })
+            .expect("sidebar Board view's own expand-to-full-board button")
+            .clone();
+        app.click(expand_hit.rect.x, expand_hit.rect.y);
+        assert_eq!(
+            app.surface.active_tab(),
+            Some(&SurfaceTab::AgentBoard),
+            "the sidebar view's own expand button must open the full kanban tab exactly as before",
+        );
+    }
+
+    /// FIX4's own light-mode invariant, from the rail all the way through
+    /// to content dispatch: no Board rail button, no sidebar Board view,
+    /// no way to reach one even if `board_view_active` were forced true
+    /// by something else -- `render::render`'s own content dispatch
+    /// defensively re-checks `harness_kanban.enabled`, it does not just
+    /// trust the flag (see that call site's own doc comment).
+    #[test]
+    fn light_mode_has_no_board_affordance_anywhere_in_the_rail_or_sidebar() {
+        let mut app = fixture(PtyColorMode::Inherited);
+        app.sidebar_presentation = SidebarPresentation::Activity;
+        app.harness_kanban.enabled = false;
+
+        let mut buf = TerminalBuffer::new(100, 30);
+        let layout = render(&app, &mut buf);
+        assert!(!layout.hits.iter().any(|hit| hit.target == HitTarget::ActivityBoard));
+        assert_eq!(layout.board_sidebar, Rect::default());
+
+        // `App::activate_board_view` (the ONLY normal way to set `board_
+        // view_active` to `true`) must refuse to latch on while the
+        // kanban is disabled -- mirrors `App::open_agent_board`'s own
+        // light gate. Light mode never draws a real Board hit region to
+        // click at all (that IS this invariant), so this goes through the
+        // test-only `activate_board_view_for_test` wrapper (same
+        // convention as `open_agent_board_for_test`) instead of a click.
+        let action = app.activate_board_view_for_test();
+        assert_eq!(action, AppAction::None);
+        assert!(!app.board_view_active, "activation must refuse to latch on while the kanban is disabled");
+
+        // Defensive re-check: even if `board_view_active` were forced true
+        // by something else (a stale loaded preference, a test fixture,
+        // ...), content dispatch must not trust it while the kanban is
+        // disabled either.
+        app.board_view_active = true;
+        let mut buf = TerminalBuffer::new(100, 30);
+        let layout = render(&app, &mut buf);
+        assert_eq!(
+            layout.board_sidebar,
+            Rect::default(),
+            "content dispatch must not trust a forced board_view_active while the kanban is disabled",
+        );
+        assert!(!layout.hits.iter().any(|hit| hit.target == HitTarget::ActivityBoard));
+    }
+
+    /// FIX2's own regression guard: sweeps `control_section`, `roster_
+    /// mode`, `board_view_active`, `sidebar_collapsed` and `harness_
+    /// kanban.enabled` across every combination and asserts the rail
+    /// NEVER shows more than one button's own accent bar (`▎`, the same
+    /// on-screen signal `activity_rail_buttons_show_accent_bar_only_on_
+    /// the_active_row` already checks) at once -- the actual bug FIX2
+    /// fixes (Board's old `surface.active_tab()`-derived `selected` could
+    /// read true at the same time as a Files/Git/Agents button's own
+    /// `control_section`-derived one). Also pins down the canonical
+    /// single-selection cases as EXACTLY one, not just "at most one":
+    /// `ControlSection::Settings` and `ControlSection::Workspaces` have no
+    /// dedicated rail button at all (the gear never shows selected, by
+    /// design -- see `render_activity_rail`'s own `RailButton` for
+    /// Settings; Workspaces has no rail button, only an in-panel roster
+    /// sub-tab), so zero-active is the CORRECT outcome for those two, not
+    /// a bug this test should flag.
+    #[test]
+    fn exactly_one_rail_button_is_active_across_every_section_roster_and_board_combination() {
+        fn active_rail_button_count(app: &App) -> usize {
+            let mut buf = TerminalBuffer::new(100, 24);
+            let layout = render(app, &mut buf);
+            layout
+                .hits
+                .iter()
+                .filter(|hit| {
+                    matches!(hit.target, HitTarget::ActivitySection(_) | HitTarget::ActivityBoard)
+                        && layout.activity_rail.contains(hit.rect.x, hit.rect.y)
+                })
+                .filter(|hit| buf.get(hit.rect.x, hit.rect.y).symbol == "▎")
+                .count()
+        }
+
+        for section in [
+            ControlSection::Files,
+            ControlSection::Git,
+            ControlSection::Agents,
+            ControlSection::Workspaces,
+            ControlSection::Settings,
+        ] {
+            for roster in [RosterMode::Agents, RosterMode::NativeSessions, RosterMode::Workspaces] {
+                for board_view_active in [false, true] {
+                    for sidebar_collapsed in [false, true] {
+                        for kanban_enabled in [false, true] {
+                            let mut app = fixture(PtyColorMode::GateOverride);
+                            app.sidebar_presentation = SidebarPresentation::Activity;
+                            app.control_section = section;
+                            app.roster_mode = roster;
+                            app.board_view_active = board_view_active;
+                            app.sidebar_collapsed = sidebar_collapsed;
+                            app.harness_kanban.enabled = kanban_enabled;
+                            let count = active_rail_button_count(&app);
+                            assert!(
+                                count <= 1,
+                                "expected at most one active rail button, got {count} for \
+                                 section={section:?} roster={roster:?} \
+                                 board_view_active={board_view_active} \
+                                 sidebar_collapsed={sidebar_collapsed} \
+                                 kanban_enabled={kanban_enabled}",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Canonical single-selection cases: exactly one, not zero.
+        let canonical = [
+            (ControlSection::Files, RosterMode::Agents),
+            (ControlSection::Git, RosterMode::Agents),
+            (ControlSection::Agents, RosterMode::Agents),
+            (ControlSection::Agents, RosterMode::NativeSessions),
+        ];
+        for (section, roster) in canonical {
+            let mut app = fixture(PtyColorMode::GateOverride);
+            app.sidebar_presentation = SidebarPresentation::Activity;
+            app.control_section = section;
+            app.roster_mode = roster;
+            assert_eq!(
+                active_rail_button_count(&app),
+                1,
+                "section={section:?} roster={roster:?} must show exactly one active rail button",
+            );
+        }
+        let mut board_app = fixture(PtyColorMode::GateOverride);
+        board_app.sidebar_presentation = SidebarPresentation::Activity;
+        board_app.harness_kanban.enabled = true;
+        board_app.board_view_active = true;
+        assert_eq!(
+            active_rail_button_count(&board_app),
+            1,
+            "an active Board view must show exactly its own accent bar, never a second one",
+        );
     }
 
     fn contains_braille_glyph(text: &str) -> bool {
@@ -16093,8 +16876,8 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             rail_sixel_icons.len(),
-            6,
-            "Files/Git/Agents/Board/SidebarCollapse/Settings must each place one rail-tier sixel icon: {:?}",
+            5,
+            "Files/Git/Agents/Board/Settings must each place one rail-tier sixel icon (FIX1: no separate SidebarCollapse button any more): {:?}",
             sixel_layout.sixel_icons,
         );
         for icon in [
@@ -16102,7 +16885,6 @@ mod tests {
             icons::IconId::SourceControl,
             icons::IconId::Person,
             icons::IconId::Project,
-            icons::IconId::ChevronLeft,
             icons::IconId::SettingsGear,
         ] {
             assert!(
@@ -16150,6 +16932,55 @@ mod tests {
         assert!(!contains_braille_glyph(&ascii_text), "ascii mode must not paint braille cells: {ascii_text:?}");
     }
 
+    /// FIX2: "the highlighted block is EXACTLY the icon's footprint" for
+    /// BOTH the rail and the panel control strip, in the sixel tier --
+    /// the icon's own placement rect must fill the button's own hit rect
+    /// exactly (same width, same height), leaving no leftover
+    /// highlighted-but-iconless row/column. Checked with `ControlSection::
+    /// Files` SELECTED so the rail side of this also exercises the
+    /// accent-bar-painted state, not just the at-rest one.
+    #[test]
+    fn rail_and_strip_button_highlighted_body_exactly_matches_the_icon_footprint() {
+        let mut app = fixture(PtyColorMode::GateOverride);
+        app.sidebar_presentation = SidebarPresentation::Activity;
+        app.control_section = ControlSection::Files;
+        let mut buf = TerminalBuffer::new(100, 24);
+        let layout = render(&app, &mut buf);
+
+        let files_hit = layout
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::ActivitySection(ControlSection::Files))
+            .expect("files rail button");
+        let files_icon = layout
+            .sixel_icons
+            .iter()
+            .find(|placement| placement.size == crate::app::SixelIconSize::Rail && placement.icon == icons::IconId::Files)
+            .expect("files rail icon placement");
+        assert_eq!(
+            files_hit.rect.height,
+            icons::SIXEL_ICON_CELLS_TALL,
+            "the rail button's own highlighted body must be exactly the 40x40 icon's own row footprint, not a row taller"
+        );
+        assert_eq!(files_icon.rect.height, files_hit.rect.height, "the icon must fill the whole button body top to bottom -- no dead row");
+        assert_eq!(files_icon.rect.width, icons::SIXEL_ICON_CELLS_WIDE);
+
+        let strip_new_file_hit = layout
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::NewFile)
+            .expect("explorer control-strip NewFile button");
+        let strip_new_file_icon = layout
+            .sixel_icons
+            .iter()
+            .find(|placement| placement.size == crate::app::SixelIconSize::Strip && placement.icon == icons::IconId::NewFile)
+            .expect("explorer control-strip NewFile icon placement");
+        assert_eq!(strip_new_file_hit.rect.height, icons::STRIP_SIXEL_ICON_CELLS_TALL);
+        assert_eq!(strip_new_file_hit.rect.width, icons::STRIP_SIXEL_ICON_CELLS_WIDE);
+        assert_eq!(strip_new_file_icon.rect.height, strip_new_file_hit.rect.height, "the strip icon must fill the whole button body -- already an exact fit before FIX2, locked down here");
+        assert_eq!(strip_new_file_icon.rect.width, strip_new_file_hit.rect.width);
+    }
+
     #[test]
     fn activity_rail_inactive_button_paints_a_background_distinct_from_the_rail() {
         // The exact bug this rework fixes: an inactive button used to fill
@@ -16170,7 +17001,10 @@ mod tests {
             .iter()
             .find(|hit| hit.target == HitTarget::ActivitySection(ControlSection::Git))
             .expect("git rail button is inactive here");
-        assert_eq!(git_hit.rect.height, 3, "expected the tall button treatment at this height");
+        // FIX2: the fixture's default `RailIcons::Sixel` tier's own tall
+        // body is now exactly `icons::SIXEL_ICON_CELLS_TALL` (2) rows, the
+        // 40x40 icon's own real footprint -- not the pre-FIX2 3.
+        assert_eq!(git_hit.rect.height, 2, "expected the tall button treatment at this height");
         // Sample the button body (inset past the left margin/accent
         // column, which stays the rail's own background either way).
         let body_x = git_hit.rect.x + 1;
@@ -16181,13 +17015,20 @@ mod tests {
 
     #[test]
     fn activity_rail_short_terminal_falls_back_to_one_row_per_button_with_hit_regions() {
-        // Too short for the 3-row treatment (top group + bottom group) --
+        // Too short for the tall treatment (top group + bottom group) --
         // every button must still render with a full-width hit region,
         // just back at the original single-row size, so nothing is lost
-        // on a cramped terminal.
+        // on a cramped terminal. FIX2 shrank the SIXEL tier's own tall
+        // body from 3 rows to 2 (see `rail_button_body_rows`), which on
+        // its own now fits the tall treatment even at this app's own
+        // minimum supported height (14, `render`'s own hard floor) -- so
+        // this test switches to `RailIcons::Braille` (UNCHANGED at 3 rows
+        // by FIX2, since its own baked asset already fills a full 3-row
+        // body) to keep exercising a genuine too-short-for-tall scenario.
         let mut app = fixture(PtyColorMode::Inherited);
         app.sidebar_presentation = SidebarPresentation::Activity;
         app.harness_kanban.enabled = false;
+        app.rail_icons = RailIcons::Braille;
         let mut buf = TerminalBuffer::new(100, 14);
         let layout = render(&app, &mut buf);
 
@@ -16195,8 +17036,8 @@ mod tests {
         for target in [
             HitTarget::ActivitySection(ControlSection::Files),
             HitTarget::ActivitySection(ControlSection::Git),
-            HitTarget::RosterMode(RosterMode::Agents),
-            HitTarget::SidebarCollapse,
+            // FIX3: Agents now shares `ActivitySection` with Files/Git.
+            HitTarget::ActivitySection(ControlSection::Agents),
             HitTarget::ActivitySection(ControlSection::Settings),
         ] {
             let hit = layout
@@ -16249,6 +17090,141 @@ mod tests {
         assert_eq!(app.rail_icons, RailIcons::Ascii);
         assert_eq!(app.reduce(crate::UiKey::Char('i')), AppAction::None);
         assert_eq!(app.rail_icons, RailIcons::Sixel);
+    }
+
+    /// FIX4: the icon gallery is reachable from the Settings dialog by
+    /// mouse (its own button row) and by the 'g' key, in BOTH menu
+    /// placements -- the same "button plus key, following how the
+    /// existing Settings rows are wired" parity `settings_rail_icons_
+    /// toggle_has_mouse_and_keyboard_parity` already locks down for the
+    /// rail-icons toggle.
+    #[test]
+    fn settings_icon_gallery_button_and_key_open_the_icon_gallery_tab() {
+        // Mouse, Sidebar placement (this crate's own default `menu_
+        // placement`).
+        let mut app = fixture(PtyColorMode::Inherited);
+        app.focus = Focus::Settings;
+        let mut buf = TerminalBuffer::new(100, 24);
+        app.layout = render(&app, &mut buf);
+        let gallery_hit = app
+            .layout
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::SettingsIconGallery)
+            .expect("settings dialog exposes the icon gallery button")
+            .rect;
+        assert!(rect_text(&buf, gallery_hit).contains("icon gallery"));
+        assert!(!app.surface.all_tabs().iter().any(|tab| **tab == SurfaceTab::IconGallery));
+        app.click(gallery_hit.x, gallery_hit.y);
+        assert_eq!(app.surface.active_tab(), Some(&SurfaceTab::IconGallery));
+        assert_eq!(app.focus, Focus::Viewport);
+
+        // Keyboard, Sidebar placement: the 'g' shortcut from a fresh
+        // Settings focus.
+        let mut app = fixture(PtyColorMode::Inherited);
+        app.focus = Focus::Settings;
+        assert_eq!(app.reduce(crate::UiKey::Char('g')), AppAction::None);
+        assert_eq!(app.surface.active_tab(), Some(&SurfaceTab::IconGallery));
+        assert_eq!(app.focus, Focus::Viewport);
+
+        // Keyboard, Modal placement (the "control" dialog's own Settings
+        // tab): same 'g' shortcut, gated to `ControlSection::Settings`
+        // like every other Settings-only shortcut in this placement.
+        let mut app = fixture(PtyColorMode::Inherited);
+        app.menu_placement = MenuPlacement::Modal;
+        app.control_section = ControlSection::Settings;
+        app.focus = Focus::Settings;
+        assert_eq!(app.reduce(crate::UiKey::Char('g')), AppAction::None);
+        assert_eq!(app.surface.active_tab(), Some(&SurfaceTab::IconGallery));
+        assert_eq!(app.focus, Focus::Viewport);
+    }
+
+    /// FIX4: the gallery renders the expected 12-icon grid in each of the
+    /// three `RailIcons` tiers (the sixel tier places three DIFFERENTLY
+    /// sized sixel icons per row -- 20x20/40x40/60x60 -- the braille/ascii
+    /// tiers paint that same tier's own rendering everywhere, per `render_
+    /// icon_gallery`'s own doc comment), and its tab opens and closes like
+    /// any other surface tab.
+    #[test]
+    fn icon_gallery_renders_the_expected_grid_in_each_tier_and_its_tab_opens_and_closes() {
+        let mut app = fixture(PtyColorMode::Inherited);
+        app.focus = Focus::Settings;
+        assert_eq!(app.reduce(crate::UiKey::Char('g')), AppAction::None);
+        assert_eq!(app.surface.active_tab(), Some(&SurfaceTab::IconGallery));
+        assert!(app.surface.all_tabs().iter().any(|tab| **tab == SurfaceTab::IconGallery));
+        // Opening a tab APPENDS it (same precedent as `SurfaceTab::
+        // AgentBoard`) -- the fixture's own PTY tab is still there too.
+        assert!(app.surface.all_tabs().iter().any(|tab| matches!(tab, SurfaceTab::Pty(_))));
+
+        assert_eq!(app.rail_icons, RailIcons::Sixel);
+        let mut sixel_buf = TerminalBuffer::new(120, 40);
+        let sixel_layout = render(&app, &mut sixel_buf);
+        for size in [SixelIconSize::Strip, SixelIconSize::Rail, SixelIconSize::Gallery] {
+            assert!(
+                sixel_layout.sixel_icons.iter().any(|placement| placement.icon == icons::IconId::Files && placement.size == size),
+                "missing {size:?} gallery placement for Files: {:?}",
+                sixel_layout.sixel_icons,
+            );
+        }
+        let sixel_text = rect_text(&sixel_buf, sixel_layout.viewport);
+        assert!(sixel_text.contains("Files"), "row must be labelled with the icon's own name: {sixel_text:?}");
+        assert!(sixel_text.contains("braille") && sixel_text.contains("ascii"), "header must label the dedicated comparison columns: {sixel_text:?}");
+        // The dedicated Braille/Ascii columns are UNCONDITIONAL (always
+        // "for comparison", regardless of the current global tier -- see
+        // `render_icon_gallery`'s own doc comment), so braille glyphs and
+        // the ascii label are both present here too, alongside the three
+        // real sixel placements just asserted above.
+        assert!(contains_braille_glyph(&sixel_text), "the dedicated braille column must still paint braille glyphs in sixel tier: {sixel_text:?}");
+        assert!(sixel_text.contains(icons::ascii(icons::IconId::Files)), "the dedicated ascii column must still paint the Files label in sixel tier: {sixel_text:?}");
+
+        app.rail_icons = RailIcons::Braille;
+        let mut braille_buf = TerminalBuffer::new(120, 40);
+        let braille_layout = render(&app, &mut braille_buf);
+        assert!(braille_layout.sixel_icons.is_empty(), "braille tier must not place any sixel icon: {:?}", braille_layout.sixel_icons);
+        assert!(contains_braille_glyph(&rect_text(&braille_buf, braille_layout.viewport)), "braille tier must paint braille glyphs");
+
+        app.rail_icons = RailIcons::Ascii;
+        let mut ascii_buf = TerminalBuffer::new(120, 40);
+        let ascii_layout = render(&app, &mut ascii_buf);
+        assert!(ascii_layout.sixel_icons.is_empty(), "ascii tier must not place any sixel icon: {:?}", ascii_layout.sixel_icons);
+        let ascii_text = rect_text(&ascii_buf, ascii_layout.viewport);
+        assert!(ascii_text.contains(icons::ascii(icons::IconId::Files)), "ascii tier must paint the Files ascii label: {ascii_text:?}");
+        // The dedicated Braille column is unconditional too (same as the
+        // sixel-tier check above), so braille glyphs are still present
+        // here alongside the ascii labels.
+        assert!(contains_braille_glyph(&ascii_text), "the dedicated braille column must still paint braille glyphs in ascii tier: {ascii_text:?}");
+
+        // Closes like any other tab (`Ctrl+W`'s own production handler).
+        app.close_selected_tab();
+        assert!(!app.surface.all_tabs().iter().any(|tab| **tab == SurfaceTab::IconGallery));
+        assert!(app.surface.all_tabs().iter().any(|tab| matches!(tab, SurfaceTab::Pty(_))));
+    }
+
+    /// FIX1's own reservation generalized: the icon gallery is a
+    /// scrollable, often bottom-most viewport tab, so it can reach the
+    /// terminal's true last row exactly like the activity rail could
+    /// (see `render_icon_gallery`'s own `usable_bottom` doc comment).
+    /// Sweeps a range of terminal heights, scrolled all the way to the
+    /// gallery's own bottom each time, and asserts no gallery-tier sixel
+    /// placement's own bottom row is ever the terminal's last row.
+    #[test]
+    fn icon_gallery_sixel_rows_never_land_on_the_terminals_last_row_even_fully_scrolled() {
+        let mut app = fixture(PtyColorMode::Inherited);
+        app.focus = Focus::Settings;
+        assert_eq!(app.reduce(crate::UiKey::Char('g')), AppAction::None);
+        assert_eq!(app.rail_icons, RailIcons::Sixel);
+
+        for height in 14..40 {
+            app.icon_gallery_scroll = u16::MAX;
+            let mut buf = TerminalBuffer::new(120, height);
+            let layout = render(&app, &mut buf);
+            for placement in layout.sixel_icons.iter().filter(|placement| placement.size == SixelIconSize::Gallery) {
+                assert!(
+                    placement.rect.bottom() < buf.height(),
+                    "height={height}: gallery sixel placement {placement:?} must never reach the terminal's last row",
+                );
+            }
+        }
     }
 
     #[test]
@@ -16576,7 +17552,17 @@ mod tests {
             .collect::<String>();
 
         assert!(top.starts_with(" +  [#] "), "{top:?}");
-        assert!(top.ends_with(" [S] "), "{top:?}");
+        // FIX5: the tab strip no longer registers a Settings hit target
+        // (or draws a "[S]" button) at all -- the activity rail's own
+        // gear is the single mouse entry point now.
+        assert!(!top.contains("[S]"), "{top:?}");
+        assert!(
+            !layout.hits.iter().any(|hit| {
+                hit.target == HitTarget::ActivitySection(ControlSection::Settings)
+                    && layout.tabs.contains(hit.rect.x, hit.rect.y)
+            }),
+            "the tab strip must not register the Settings hit target",
+        );
         assert!(!top.contains(" file "), "{top:?}");
         assert!(header_text.contains(" lib.rs "), "{header_text:?}");
         assert!(!header_text.contains(" file "), "{header_text:?}");
@@ -16678,7 +17664,10 @@ mod tests {
             .collect::<String>();
 
         assert!(global.starts_with(" +  [#] "), "{global:?}");
-        assert!(global.ends_with(" [S] "), "{global:?}");
+        // FIX5: no "[S]" Settings button anywhere in the tab strip any
+        // more -- see `file_surface_separates_global_controls_pane_title_
+        // actions_and_scrollbar`'s own doc comment for the full reasoning.
+        assert!(!global.contains("[S]"), "{global:?}");
         assert!(!global.to_ascii_lowercase().contains("empty"), "{global:?}");
         assert!(!pane_chrome.to_ascii_lowercase().contains("empty"), "{pane_chrome:?}");
         assert!(pane_chrome.trim().is_empty(), "{pane_chrome:?}");

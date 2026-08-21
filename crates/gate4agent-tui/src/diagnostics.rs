@@ -22,6 +22,7 @@ pub enum RuntimeDiagnostic {
     C2StartupFailed,
     C2ControlDisconnected,
     NodeDisconnected,
+    SixelBottomRowSkipped,
     Fatal,
 }
 
@@ -35,6 +36,7 @@ impl RuntimeDiagnostic {
             Self::C2StartupFailed => "c2-startup-failed",
             Self::C2ControlDisconnected => "c2-control-disconnected",
             Self::NodeDisconnected => "node-disconnected",
+            Self::SixelBottomRowSkipped => "sixel-bottom-row-skipped",
             Self::Fatal => "fatal",
         }
     }
@@ -125,6 +127,7 @@ mod tests {
             RuntimeDiagnostic::C2StartupFailed,
             RuntimeDiagnostic::C2ControlDisconnected,
             RuntimeDiagnostic::NodeDisconnected,
+            RuntimeDiagnostic::SixelBottomRowSkipped,
             RuntimeDiagnostic::Fatal,
         ] {
             let message = diagnostic.message();

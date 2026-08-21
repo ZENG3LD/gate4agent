@@ -96,7 +96,7 @@ use uzor_tui::style::Color;
 
 mod catalog;
 
-pub use catalog::{ascii, braille, braille_compact, sixel, sixel_compact, sixel_strip, IconId};
+pub use catalog::{ascii, braille, braille_compact, sixel, sixel_compact, sixel_gallery, sixel_strip, IconId};
 
 /// Which pre-baked background a sixel-tier icon asset was composited
 /// against (or left transparent for) -- see this module's own "Sixel
@@ -134,16 +134,33 @@ pub const ASSUMED_CELL_HEIGHT_PX: u32 = 20;
 
 // ---- Sixel tier -----------------------------------------------------
 
-/// Baked bitmap pixel size shared by every sixel-tier icon: ~4 cells
-/// wide x 2 rows tall at the assumed cell size above -- a SQUARE crop of
-/// the button's own 4-cell x 3-row body (leaving the body's 3rd row as
-/// plain button background), matching every source codicon's own square
-/// aspect ratio with no distortion.
-pub const SIXEL_ICON_WIDTH_PX: u32 = 40;
-pub const SIXEL_ICON_HEIGHT_PX: u32 = 40;
+/// Single source of truth for the activity rail's own sixel icon size --
+/// "keep 40x40, make switching it a one-line change" (see `render::
+/// render_activity_rail`'s own geometry doc comment). A square icon only
+/// lands on an assumed 10x20px cell with no leftover fractional row at
+/// exactly 20 (2 cells wide x 1 row tall), 40 (4 cells wide x 2 rows
+/// tall, the size shipped today) or 60 (6 cells wide x 3 rows tall) --
+/// `render::render_activity_rail`'s own button-body height derives
+/// DIRECTLY from [`SIXEL_ICON_CELLS_TALL`] below, so bumping this ONE
+/// constant is the entire rail-size swap; the only other step is
+/// re-rasterizing this tier's own `.rgba` assets at the new size via
+/// `tools/bake_icons.py` (same precedent as [`ASSUMED_CELL_WIDTH_PX`]'s
+/// own doc comment). The icon gallery (`app::SurfaceTab::IconGallery`)
+/// renders the 20/40/60 columns side by side (see this module's own
+/// "Gallery tier" section below) so the owner can judge an alternative
+/// before ever touching this constant.
+pub const RAIL_ICON_SIZE_PX: u32 = 40;
+/// Baked bitmap pixel size shared by every rail-tier sixel icon --
+/// [`RAIL_ICON_SIZE_PX`] on both axes (codicons are square, see
+/// `tools/bake_icons.py`'s own `rasterize_sixel`).
+pub const SIXEL_ICON_WIDTH_PX: u32 = RAIL_ICON_SIZE_PX;
+pub const SIXEL_ICON_HEIGHT_PX: u32 = RAIL_ICON_SIZE_PX;
 /// Cell footprint the flush hook reserves on the rail for one sixel icon
 /// (derived from the pixel size above and the assumed cell size, not
-/// hand-synced).
+/// hand-synced) -- `render::render_activity_rail` sizes the rail
+/// button's own highlighted body to EXACTLY this many rows when there is
+/// room for the tall treatment, so the icon fills its own button with no
+/// leftover unhighlighted-but-still-accented row underneath it.
 pub const SIXEL_ICON_CELLS_WIDE: u16 = (SIXEL_ICON_WIDTH_PX / ASSUMED_CELL_WIDTH_PX) as u16;
 pub const SIXEL_ICON_CELLS_TALL: u16 = (SIXEL_ICON_HEIGHT_PX / ASSUMED_CELL_HEIGHT_PX) as u16;
 
@@ -203,6 +220,27 @@ pub const STRIP_SIXEL_ICON_HEIGHT_PX: u32 = ASSUMED_CELL_HEIGHT_PX;
 pub const STRIP_SIXEL_ICON_CELLS_WIDE: u16 = 2;
 pub const STRIP_SIXEL_ICON_CELLS_TALL: u16 = 1;
 
+// ---- Gallery tier -----------------------------------------------------
+//
+// The icon gallery dev surface (`app::SurfaceTab::IconGallery`, `render::
+// render_icon_gallery`) shows every icon at all three sizes FIX2 landed
+// on side by side -- 20x20 (this crate's own strip tier, reused as-is),
+// 40x40 (the rail tier, reused as-is) and 60x60, which no other UI site
+// needs and so has no existing bake. This is that third size's own
+// dedicated raster (single-pass resvg AA directly at 60x60, same recipe
+// as the rail/strip/compact tiers -- see `tools/bake_icons.py`'s own
+// `rasterize_gallery_sixel`), not a runtime upscale of the 40x40 rail
+// asset (which would just blur the existing raster, defeating the whole
+// point of a size comparison).
+
+/// Gallery sixel-tier bitmap pixel size: 6 assumed terminal cells wide x
+/// 3 rows tall (see `ASSUMED_CELL_WIDTH_PX`/`ASSUMED_CELL_HEIGHT_PX`
+/// above) -- the third of FIX2's three evenly-landing square sizes.
+pub const GALLERY_SIXEL_ICON_WIDTH_PX: u32 = ASSUMED_CELL_WIDTH_PX * 6;
+pub const GALLERY_SIXEL_ICON_HEIGHT_PX: u32 = ASSUMED_CELL_HEIGHT_PX * 3;
+pub const GALLERY_SIXEL_ICON_CELLS_WIDE: u16 = 6;
+pub const GALLERY_SIXEL_ICON_CELLS_TALL: u16 = 3;
+
 /// Every baked icon in this crate is encoded with this SAME small,
 /// explicit, non-dithered palette -- "encode with a small explicit
 /// palette" per this task's own brief (see `tools/bake_icons.py`'s own
@@ -253,6 +291,22 @@ pub(crate) fn build_sixel_strip(rgba: &[u8]) -> String {
 /// strip tier's own pre-composited asset.
 pub(crate) fn build_sixel_strip_gate(rgba: &[u8]) -> String {
     build_sixel_sized(rgba, STRIP_SIXEL_ICON_WIDTH_PX, STRIP_SIXEL_ICON_HEIGHT_PX, BackgroundMode::Opaque)
+}
+
+/// Same encoding as [`build_sixel`], for the gallery tier's own 60x60
+/// per-icon asset (see this module's own "Gallery tier" section above).
+pub(crate) fn build_sixel_gallery(rgba: &[u8]) -> String {
+    build_sixel_sized(rgba, GALLERY_SIXEL_ICON_WIDTH_PX, GALLERY_SIXEL_ICON_HEIGHT_PX, BackgroundMode::Transparent)
+}
+
+/// Same relationship [`build_sixel_gate`] has to [`build_sixel`], for the
+/// gallery tier's own pre-composited asset -- composited over the exact
+/// background `render::render_icon_gallery` paints each swatch cell with
+/// (`render::ACTIVE_BG`, the same fixed colour the rail/strip "at rest"
+/// bodies already use), per this tier's own "composite over the exact
+/// background the gallery paints" brief.
+pub(crate) fn build_sixel_gallery_gate(rgba: &[u8]) -> String {
+    build_sixel_sized(rgba, GALLERY_SIXEL_ICON_WIDTH_PX, GALLERY_SIXEL_ICON_HEIGHT_PX, BackgroundMode::Opaque)
 }
 
 fn build_sixel_sized(rgba: &[u8], width: u32, height: u32, background_mode: BackgroundMode) -> String {
@@ -357,6 +411,7 @@ mod tests {
                 ("gate_active", catalog::sixel_gate_active_source_rgba(id)),
                 ("gate_accent", catalog::sixel_gate_accent_source_rgba(id)),
                 ("strip_gate", catalog::sixel_strip_gate_source_rgba(id)),
+                ("gallery_gate", catalog::sixel_gallery_gate_source_rgba(id)),
             ] {
                 assert!(
                     rgba.chunks_exact(4).all(|px| px[3] == 255),
@@ -380,6 +435,10 @@ mod tests {
             assert!(
                 catalog::sixel_strip_source_rgba(id).chunks_exact(4).any(|px| px[3] < 255),
                 "{id:?}'s strip Transparent source must still have transparent pixels"
+            );
+            assert!(
+                catalog::sixel_gallery_source_rgba(id).chunks_exact(4).any(|px| px[3] < 255),
+                "{id:?}'s gallery Transparent source must still have transparent pixels"
             );
         }
     }
@@ -424,6 +483,7 @@ mod tests {
             assert_matches_at_extremes(id, "rail_gate_active", catalog::sixel_source_rgba(id), catalog::sixel_gate_active_source_rgba(id), GATE_ACTIVE_BG);
             assert_matches_at_extremes(id, "rail_gate_accent", catalog::sixel_source_rgba(id), catalog::sixel_gate_accent_source_rgba(id), GATE_ACCENT_BG);
             assert_matches_at_extremes(id, "strip_gate", catalog::sixel_strip_source_rgba(id), catalog::sixel_strip_gate_source_rgba(id), GATE_ACTIVE_BG);
+            assert_matches_at_extremes(id, "gallery_gate", catalog::sixel_gallery_source_rgba(id), catalog::sixel_gallery_gate_source_rgba(id), GATE_ACTIVE_BG);
         }
     }
 
@@ -471,6 +531,45 @@ mod tests {
     fn strip_gate_accent_folds_into_the_same_bytes_as_gate_active() {
         for id in IconId::ALL {
             assert_eq!(sixel_strip(id, SixelVariant::GateAccent), sixel_strip(id, SixelVariant::GateActive), "{id:?}");
+        }
+    }
+
+    #[test]
+    fn every_gallery_sixel_rgba_matches_its_own_declared_dimensions() {
+        let expected = (GALLERY_SIXEL_ICON_WIDTH_PX * GALLERY_SIXEL_ICON_HEIGHT_PX * 4) as usize;
+        for id in IconId::ALL {
+            assert_eq!(catalog::sixel_gallery_source_rgba(id).len(), expected, "{id:?} gallery rgba length");
+            assert_eq!(catalog::sixel_gallery_gate_source_rgba(id).len(), expected, "{id:?} gallery_gate rgba length");
+        }
+    }
+
+    #[test]
+    fn every_icon_resolves_in_the_gallery_tier_without_panicking() {
+        for id in IconId::ALL {
+            for variant in SIXEL_VARIANTS {
+                let _gallery = sixel_gallery(id, variant);
+            }
+        }
+    }
+
+    #[test]
+    fn every_gallery_sixel_encodes_to_a_non_empty_dcs_sequence() {
+        for id in IconId::ALL {
+            for variant in SIXEL_VARIANTS {
+                let encoded = sixel_gallery(id, variant);
+                assert!(encoded.starts_with('\u{1b}'), "{id:?}/{variant:?} gallery sixel output must start with the DCS introducer ESC");
+            }
+        }
+    }
+
+    /// Same fold as [`strip_gate_accent_folds_into_the_same_bytes_as_gate_active`]:
+    /// the gallery tier is a read-only comparison grid, never a selected
+    /// button state, so `GateAccent` resolves to the same bytes as
+    /// `GateActive`.
+    #[test]
+    fn gallery_gate_accent_folds_into_the_same_bytes_as_gate_active() {
+        for id in IconId::ALL {
+            assert_eq!(sixel_gallery(id, SixelVariant::GateAccent), sixel_gallery(id, SixelVariant::GateActive), "{id:?}");
         }
     }
 

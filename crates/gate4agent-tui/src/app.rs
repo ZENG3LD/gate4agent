@@ -81,7 +81,7 @@ use gate4agent_harness_client::{
 };
 use uzor_tui::Rect;
 
-use crate::icons::RailIconId;
+use crate::icons::IconId;
 use crate::surface::{
     LayoutPreset, PaneId, PaneSplitPath, SplitAxis, SurfaceDropZone, SurfaceError, SurfaceState,
 };
@@ -2705,7 +2705,7 @@ pub struct HitRegion {
 /// the icon identity and its rect.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SixelIconPlacement {
-    pub icon: RailIconId,
+    pub icon: IconId,
     pub rect: Rect,
     pub selected: bool,
 }

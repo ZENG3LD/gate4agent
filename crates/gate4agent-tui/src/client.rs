@@ -5432,14 +5432,14 @@ mod tests {
         gate4agent_node_protocol::NodeIncarnationId::from_bytes([byte; 16])
     }
 
-    fn sixel_placement(icon: icons::RailIconId, x: u16, selected: bool) -> SixelIconPlacement {
+    fn sixel_placement(icon: icons::IconId, x: u16, selected: bool) -> SixelIconPlacement {
         SixelIconPlacement { icon, rect: uzor_tui::Rect::new(x, 1, 4, 2), selected }
     }
 
     #[test]
     fn flush_sixel_icon_skips_a_second_emission_when_the_signature_is_unchanged() {
         let mut app = App::default();
-        app.layout.sixel_icons = vec![sixel_placement(icons::RailIconId::Files, 2, false)];
+        app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 2, false)];
         let mut state = SixelEmitState::default();
         let mut written = Vec::new();
 
@@ -5454,20 +5454,20 @@ mod tests {
     #[test]
     fn flush_sixel_icon_reemits_when_the_rect_or_selection_changes() {
         let mut app = App::default();
-        app.layout.sixel_icons = vec![sixel_placement(icons::RailIconId::Files, 2, false)];
+        app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 2, false)];
         let mut state = SixelEmitState::default();
         let mut written = Vec::new();
         flush_sixel_icon_into(&mut written, &app, &mut state).unwrap();
         let after_first = written.len();
 
         // Moved: same icon, different rect.
-        app.layout.sixel_icons = vec![sixel_placement(icons::RailIconId::Files, 9, false)];
+        app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 9, false)];
         flush_sixel_icon_into(&mut written, &app, &mut state).unwrap();
         assert!(written.len() > after_first, "a moved icon must trigger a fresh emission");
         let after_move = written.len();
 
         // Selection flips: same icon, same rect, only `selected` differs.
-        app.layout.sixel_icons = vec![sixel_placement(icons::RailIconId::Files, 9, true)];
+        app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 9, true)];
         flush_sixel_icon_into(&mut written, &app, &mut state).unwrap();
         assert!(written.len() > after_move, "a selection change must trigger a fresh emission even at the same rect");
     }
@@ -5475,7 +5475,7 @@ mod tests {
     #[test]
     fn flush_sixel_icon_force_next_reemits_even_with_an_unchanged_signature() {
         let mut app = App::default();
-        app.layout.sixel_icons = vec![sixel_placement(icons::RailIconId::Files, 2, false)];
+        app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 2, false)];
         let mut state = SixelEmitState::default();
         let mut written = Vec::new();
         flush_sixel_icon_into(&mut written, &app, &mut state).unwrap();

@@ -365,7 +365,7 @@ pub fn render(app: &App, buf: &mut TerminalBuffer) -> LayoutRects {
 
 /// One rail button on the activity rail: a view-select action plus the
 /// current selected/active state driving its accent styling, plus which
-/// baked icon (`icons::RailIconId`) represents it. EVERY current rail
+/// baked icon (`icons::IconId`) represents it. EVERY current rail
 /// button carries a real baked icon (see `render_activity_rail`'s own
 /// construction of `top` and the bottom group) -- there is no more
 /// block-art fallback tier; `app::RailIcons` picks WHICH baked tier
@@ -379,7 +379,7 @@ struct RailButton {
     glyph: &'static str,
     ascii: &'static str,
     selected: bool,
-    icon: icons::RailIconId,
+    icon: icons::IconId,
 }
 
 /// Draws a single activity-rail entry as a real button. When there is
@@ -527,14 +527,14 @@ fn render_activity_rail(
             glyph: "▤",
             ascii: "F",
             selected: app.control_section == ControlSection::Files && !app.sidebar_collapsed,
-            icon: icons::RailIconId::Files,
+            icon: icons::IconId::Files,
         },
         RailButton {
             target: HitTarget::ActivitySection(ControlSection::Git),
             glyph: "◈",
             ascii: "G",
             selected: app.control_section == ControlSection::Git && !app.sidebar_collapsed,
-            icon: icons::RailIconId::SourceControl,
+            icon: icons::IconId::SourceControl,
         },
         RailButton {
             target: HitTarget::RosterMode(RosterMode::Agents),
@@ -543,7 +543,7 @@ fn render_activity_rail(
             selected: app.control_section == ControlSection::Agents
                 && matches!(app.roster_mode, RosterMode::Agents | RosterMode::NativeSessions)
                 && !app.sidebar_collapsed,
-            icon: icons::RailIconId::Person,
+            icon: icons::IconId::Person,
         },
     ];
     if app.harness_kanban.enabled {
@@ -552,7 +552,7 @@ fn render_activity_rail(
             glyph: "▦",
             ascii: "K",
             selected: app.surface.active_tab() == Some(&SurfaceTab::AgentBoard),
-            icon: icons::RailIconId::Project,
+            icon: icons::IconId::Project,
         });
     }
 
@@ -587,9 +587,9 @@ fn render_activity_rail(
         // while it's open (clicking collapses it further left), `>`
         // (chevron-right) once collapsed (clicking expands it back out).
         let (collapse_glyph, collapse_icon) = if app.sidebar_collapsed {
-            (">", icons::RailIconId::ChevronRight)
+            (">", icons::IconId::ChevronRight)
         } else {
-            ("<", icons::RailIconId::ChevronLeft)
+            ("<", icons::IconId::ChevronLeft)
         };
         render_rail_button(
             Rect::new(area.x, area.bottom() - bottom_group_rows, area.width, bottom_rows),
@@ -620,7 +620,7 @@ fn render_activity_rail(
                 // a persistent control_section, so (matching the pre-D1a
                 // rail) this row never shows as the active one.
                 selected: false,
-                icon: icons::RailIconId::SettingsGear,
+                icon: icons::IconId::SettingsGear,
             },
             app.rail_icons,
             buf,
@@ -14869,7 +14869,7 @@ mod tests {
         assert!(!light_layout.hits.iter().any(|hit| {
             hit.target == HitTarget::AgentBoardOpen && rail.contains(hit.rect.x, hit.rect.y)
         }));
-        assert!(!light_layout.sixel_icons.iter().any(|placement| placement.icon == icons::RailIconId::Project));
+        assert!(!light_layout.sixel_icons.iter().any(|placement| placement.icon == icons::IconId::Project));
 
         app.harness_kanban.enabled = true;
         let mut full_buf = TerminalBuffer::new(100, 24);
@@ -14880,7 +14880,7 @@ mod tests {
         }));
         // The icon itself is a real baked sixel icon now (Project), not
         // block art -- its placement in `sixel_icons` is the invariant.
-        assert!(full_layout.sixel_icons.iter().any(|placement| placement.icon == icons::RailIconId::Project));
+        assert!(full_layout.sixel_icons.iter().any(|placement| placement.icon == icons::IconId::Project));
     }
 
     #[test]
@@ -14980,12 +14980,12 @@ mod tests {
             sixel_layout.sixel_icons,
         );
         for icon in [
-            icons::RailIconId::Files,
-            icons::RailIconId::SourceControl,
-            icons::RailIconId::Person,
-            icons::RailIconId::Project,
-            icons::RailIconId::ChevronLeft,
-            icons::RailIconId::SettingsGear,
+            icons::IconId::Files,
+            icons::IconId::SourceControl,
+            icons::IconId::Person,
+            icons::IconId::Project,
+            icons::IconId::ChevronLeft,
+            icons::IconId::SettingsGear,
         ] {
             assert!(
                 sixel_layout.sixel_icons.iter().any(|placement| placement.icon == icon),

@@ -15,3 +15,8 @@ Cargo.lock
 
 # Live-stack run directories (logs, per-run sqlite, tokens, screenshots)
 /.run/
+
+# gate4agent-tui's icon bake tool's own downloaded-SVG scratch cache --
+# reproducible from tools/bake_icons.py against upstream codicons, not a
+# source of truth (the checked-in src/icons/*.rgba baked assets are).
+crates/gate4agent-tui/tools/.codicon-cache/

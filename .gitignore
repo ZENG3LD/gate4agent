@@ -20,3 +20,6 @@ Cargo.lock
 # reproducible from tools/bake_icons.py against upstream codicons, not a
 # source of truth (the checked-in src/icons/*.rgba baked assets are).
 crates/gate4agent-tui/tools/.codicon-cache/
+# Same, for the upstream Lucide source SVGs (alongside codicons -- see
+# `app::IconFamily`'s own doc comment).
+crates/gate4agent-tui/tools/.lucide-cache/

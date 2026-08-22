@@ -27,7 +27,7 @@ use crate::app::{
     ContextUsageHover, ContextUsageSegment, ContextUsageSegmentHit,
     ExistingSessionMode, ExistingSessionOperation, Focus, FolderBrowserField,
     AgentRunGitScopeView, GitLocationDialogKind, HitRegion, HitTarget, LaunchContextMode, LaunchField, LaunchTarget,
-    LayoutRects, MenuPlacement, NativeSessionGroupKey, NativeSessionTreeItem, NodeView, PreviewTabPhase, PreviewTabView, PtyColorMode, RailIcons, RosterMode, SessionView,
+    IconFamily, LayoutRects, MenuPlacement, NativeSessionGroupKey, NativeSessionTreeItem, NodeView, PreviewTabPhase, PreviewTabView, PtyColorMode, RailIcons, RosterMode, SessionView,
     SixelIconPlacement, SixelIconSize,
     ObservationPersistenceState, SessionMonitorKey, SessionMonitorSection, SessionMonitorTarget,
     SessionMonitorView, SidebarMode, SurfaceTab,
@@ -525,6 +525,7 @@ fn render_rail_button(
     block: Rect,
     button: &RailButton,
     icons: RailIcons,
+    family: IconFamily,
     buf: &mut TerminalBuffer,
     layout: &mut LayoutRects,
     theme: Theme,
@@ -612,7 +613,7 @@ fn render_rail_button(
                 body.height.min(icons::SIXEL_ICON_CELLS_TALL),
             );
             let variant = if button.selected { icons::SixelVariant::GateAccent } else { icons::SixelVariant::GateActive };
-            layout.sixel_icons.push(SixelIconPlacement { icon: button.icon, rect: icon_area, variant, size: SixelIconSize::Rail });
+            layout.sixel_icons.push(SixelIconPlacement { icon: button.icon, rect: icon_area, variant, size: SixelIconSize::Rail, family });
         }
         RailIcons::Ascii => {
             let label_row = Rect::new(body.x, body.y + block.height / 2, body.width, 1);
@@ -658,6 +659,7 @@ fn render_compact_icon_button(
     ascii_label: &str,
     style: Style,
     tier: RailIcons,
+    family: IconFamily,
     buf: &mut TerminalBuffer,
     layout: &mut LayoutRects,
 ) {
@@ -697,6 +699,7 @@ fn render_compact_icon_button(
                 rect: icon_area,
                 variant: icons::SixelVariant::GateActive,
                 size: SixelIconSize::Compact,
+                family,
             });
             render_compact_trailing_text(rect, icon_width, text, style, buf);
         }
@@ -796,6 +799,7 @@ fn render_control_strip(
     buttons: &[ControlStripButton],
     theme: Theme,
     tier: RailIcons,
+    family: IconFamily,
     buf: &mut TerminalBuffer,
     layout: &mut LayoutRects,
 ) -> Rect {
@@ -821,7 +825,7 @@ fn render_control_strip(
             break;
         }
         let block = Rect::new(x, strip.y, CONTROL_STRIP_BUTTON_WIDTH, strip.height);
-        render_control_strip_button(block, button.icon, button.target.clone(), theme, tier, buf, layout);
+        render_control_strip_button(block, button.icon, button.target.clone(), theme, tier, family, buf, layout);
         x = x
             .saturating_add(CONTROL_STRIP_BUTTON_WIDTH)
             .saturating_add(CONTROL_STRIP_BUTTON_GAP);
@@ -866,6 +870,7 @@ fn render_control_strip_button(
     target: HitTarget,
     theme: Theme,
     tier: RailIcons,
+    family: IconFamily,
     buf: &mut TerminalBuffer,
     layout: &mut LayoutRects,
 ) {
@@ -890,6 +895,7 @@ fn render_control_strip_button(
                 rect: icon_area,
                 variant: icons::SixelVariant::GateActive,
                 size: SixelIconSize::Strip,
+                family,
             });
         }
         RailIcons::Ascii => {
@@ -923,6 +929,7 @@ fn pack_inline_button_left(
     target: HitTarget,
     style: Style,
     tier: RailIcons,
+    family: IconFamily,
     buf: &mut TerminalBuffer,
     layout: &mut LayoutRects,
 ) {
@@ -931,7 +938,7 @@ fn pack_inline_button_left(
     }
     let x = *cursor_x - width;
     let rect = Rect::new(x, area.y, width, 1);
-    render_compact_icon_button(rect, icon, None, icons::ascii(icon), style, tier, buf, layout);
+    render_compact_icon_button(rect, icon, None, icons::ascii(icon), style, tier, family, buf, layout);
     layout.hits.push(HitRegion { rect, target });
     *cursor_x = x.saturating_sub(1);
 }
@@ -1093,7 +1100,7 @@ fn render_activity_rail(
         if y >= usable_bottom {
             break;
         }
-        render_rail_button(Rect::new(area.x, y, area.width, button_rows), button, app.rail_icons, buf, layout, theme);
+        render_rail_button(Rect::new(area.x, y, area.width, button_rows), button, app.rail_icons, app.icon_family, buf, layout, theme);
         y = y.saturating_add(step);
     }
 
@@ -1129,7 +1136,7 @@ fn render_activity_rail(
                 selected: false,
                 icon: icons::IconId::SettingsGear,
             },
-            app.rail_icons,
+            app.rail_icons, app.icon_family,
             buf,
             layout,
             theme,
@@ -1206,7 +1213,7 @@ fn render_space_list(
                 ControlStripButton { icon: icons::IconId::Trash, target: HitTarget::RemoveSpace, enabled: true },
             ],
             theme,
-            app.rail_icons,
+            app.rail_icons, app.icon_family,
             buf,
             layout,
         )
@@ -1223,7 +1230,7 @@ fn render_space_list(
             Some("workspace"),
             add_label,
             Style::default().fg(theme.teal).bg(theme.panel).add_modifier(Modifier::BOLD),
-            app.rail_icons,
+            app.rail_icons, app.icon_family,
             buf,
             layout,
         );
@@ -1242,7 +1249,7 @@ fn render_space_list(
                 None,
                 remove_label,
                 Style::default().fg(theme.red).bg(theme.panel),
-                app.rail_icons,
+                app.rail_icons, app.icon_family,
                 buf,
                 layout,
             );
@@ -1418,7 +1425,7 @@ fn render_workspace_files(
                 ControlStripButton { icon: icons::IconId::Refresh, target: HitTarget::RefreshWorkspace, enabled: true },
             ],
             theme,
-            app.rail_icons,
+            app.rail_icons, app.icon_family,
             buf,
             layout,
         )
@@ -1442,7 +1449,7 @@ fn render_workspace_files(
                     None,
                     directory_label,
                     Style::default().fg(theme.teal).bg(theme.panel).add_modifier(Modifier::BOLD),
-                    app.rail_icons,
+                    app.rail_icons, app.icon_family,
                     buf,
                     layout,
                 );
@@ -1459,7 +1466,7 @@ fn render_workspace_files(
                         None,
                         file_label,
                         Style::default().fg(theme.teal).bg(theme.panel).add_modifier(Modifier::BOLD),
-                        app.rail_icons,
+                        app.rail_icons, app.icon_family,
                         buf,
                         layout,
                     );
@@ -1478,7 +1485,7 @@ fn render_workspace_files(
             (icons::IconId::Trash, HitTarget::RemoveSpace, danger),
             (icons::IconId::Refresh, HitTarget::RefreshWorkspace, accent),
         ] {
-            pack_inline_button_left(area, &mut cursor_x, 4, icon, target, style, app.rail_icons, buf, layout);
+            pack_inline_button_left(area, &mut cursor_x, 4, icon, target, style, app.rail_icons, app.icon_family, buf, layout);
         }
     }
     let Some(inspection) = app.selected_workspace_inspection() else {
@@ -1662,7 +1669,7 @@ fn render_workspace_git(
                 ControlStripButton { icon: icons::IconId::Refresh, target: HitTarget::RefreshWorkspace, enabled: true },
             ],
             theme,
-            app.rail_icons,
+            app.rail_icons, app.icon_family,
             buf,
             layout,
         )
@@ -1712,7 +1719,7 @@ fn render_git_snapshot(
             icons::IconId::Refresh,
             HitTarget::RefreshWorkspace,
             refresh_style,
-            app.rail_icons,
+            app.rail_icons, app.icon_family,
             buf,
             layout,
         );
@@ -1730,7 +1737,7 @@ fn render_git_snapshot(
                 icons::IconId::Trash,
                 HitTarget::RemoveWorktree(index),
                 remove_style,
-                app.rail_icons,
+                app.rail_icons, app.icon_family,
                 buf,
                 layout,
             );
@@ -1750,7 +1757,7 @@ fn render_git_snapshot(
                 Some("worktree"),
                 create,
                 Style::default().fg(theme.active_tab_text).bg(theme.accent).add_modifier(Modifier::BOLD),
-                app.rail_icons,
+                app.rail_icons, app.icon_family,
                 buf,
                 layout,
             );
@@ -1798,7 +1805,7 @@ fn render_git_snapshot(
                     None,
                     remove,
                     Style::default().fg(theme.red).bg(theme.panel),
-                    app.rail_icons,
+                    app.rail_icons, app.icon_family,
                     buf,
                     layout,
                 );
@@ -1944,7 +1951,7 @@ fn render_agents_surface(
             area,
             &[ControlStripButton { icon: icons::IconId::Add, target: HitTarget::AddAgent, enabled: true }],
             theme,
-            app.rail_icons,
+            app.rail_icons, app.icon_family,
             buf,
             layout,
         )
@@ -3128,7 +3135,7 @@ fn render_tabs(
             // overlay dialog, not a persisted section, so this button
             // does not highlight while the dialog is open either.
             Style::default().fg(theme.muted).bg(theme.active),
-            app.rail_icons,
+            app.rail_icons, app.icon_family,
             buf,
             layout,
         );
@@ -3382,19 +3389,24 @@ fn render_surface_pane(
     }
 }
 
-/// FIX4's own main deliverable: the icon gallery dev surface (`app::
+/// FIX4's own main deliverable, widened by a later wave to be the Lucide-
+/// vs-codicons comparison surface: the icon gallery dev surface (`app::
 /// SurfaceTab::IconGallery`) -- a read-only comparison grid, one row per
-/// icon ([`GALLERY_ICON_IDS`], a representative dozen spanning the
-/// activity rail's own 7 plus a few file-op/status icons), one column
-/// per size/tier variant: the strip tier's own pixel size
-/// (`icons::STRIP_SIXEL_ICON_*` -- the SAME asset the control-plane strip
-/// already ships, not a new bake), the rail tier's own pixel size
-/// (`icons::SIXEL_ICON_*` -- the SAME asset the activity rail already
-/// ships), a third, larger size (`icons::GALLERY_SIXEL_ICON_*` -- a NEW
-/// bake, this surface's own only consumer), then a dedicated Ascii
-/// column.
+/// icon ([`GALLERY_ICON_IDS`], a representative set spanning the activity
+/// rail's own 7, a few file-op/status icons, and the two documented
+/// Lucide mapping gaps `CircleFilled`/`RunAll` -- see `icons.rs`'s own
+/// "Lucide" doc section -- so the gap itself is visible here, not just
+/// asserted in a report), one column PAIR per size/tier variant: the
+/// strip tier's own pixel size (`icons::STRIP_SIXEL_ICON_*` -- the SAME
+/// asset the control-plane strip already ships), the rail tier's own
+/// pixel size (`icons::SIXEL_ICON_*` -- ditto the activity rail), a
+/// third, larger size (`icons::GALLERY_SIXEL_ICON_*` -- this surface's
+/// own only consumer) -- each tier gets a `Codicons` column immediately
+/// followed by its own `Lucide` column (see `render_gallery_size_swatch`)
+/// so the two families read side by side AT EACH TIER without toggling
+/// any setting, then a dedicated Ascii column.
 ///
-/// The three SIZE columns are the sixel tier's own size comparison; in
+/// The six size/family columns are the sixel tier's own comparison; in
 /// `RailIcons::Ascii` (this crate's own single global icon-tier switch,
 /// not a per-surface setting -- see `app::RailIcons`) they simply paint
 /// that tier's own rendering instead of a sixel image, exactly like the
@@ -3408,12 +3420,12 @@ fn render_surface_pane(
 /// not a gap.
 ///
 /// Wheel-scrollable (`App::scroll_terminal`'s own `SurfaceTab::
-/// IconGallery` arm, `app.icon_gallery_scroll`) since the full 12-row
-/// grid is taller than most terminal windows; a row only ever paints
-/// once it is FULLY inside `area` (never a partially-clipped one) --
-/// sixel bytes are not croppable mid-image the way plain text is, so a
-/// partially-visible row is skipped entirely rather than emitted and
-/// left to overflow past `area`'s own bottom edge.
+/// IconGallery` arm, `app.icon_gallery_scroll`) since the full grid is
+/// taller than most terminal windows; a row only ever paints once it is
+/// FULLY inside `area` (never a partially-clipped one) -- sixel bytes are
+/// not croppable mid-image the way plain text is, so a partially-visible
+/// row is skipped entirely rather than emitted and left to overflow past
+/// `area`'s own bottom edge.
 fn render_icon_gallery(
     app: &App,
     area: Rect,
@@ -3424,7 +3436,7 @@ fn render_icon_gallery(
     if area.width == 0 || area.height == 0 {
         return;
     }
-    const GALLERY_ICON_IDS: [icons::IconId; 12] = [
+    const GALLERY_ICON_IDS: [icons::IconId; 14] = [
         icons::IconId::Files,
         icons::IconId::SourceControl,
         icons::IconId::Person,
@@ -3437,35 +3449,43 @@ fn render_icon_gallery(
         icons::IconId::Add,
         icons::IconId::Play,
         icons::IconId::Warning,
+        // The two reported Lucide mapping gaps (see `icons.rs`'s own
+        // "Lucide" doc section: `CircleFilled` -- Lucide ships no solid-
+        // fill glyph at all, a style gap, not a naming one; `RunAll` --
+        // no Lucide glyph distinctly means "run everything" rather than
+        // colliding with `Play`'s own meaning) -- included here so their
+        // own `n/a` swatch (`render_gallery_size_swatch`) is something
+        // the owner can actually see, not just read about.
+        icons::IconId::CircleFilled,
+        icons::IconId::RunAll,
     ];
     const NAME_COL_WIDTH: u16 = 15;
-    const SIZE_COL_WIDTH: u16 = 12;
+    const SIZE_COL_WIDTH: u16 = 11;
     const ASCII_COL_WIDTH: u16 = 8;
     const COLUMN_GAP: u16 = 1;
     const HEADER_ROWS: u16 = 2;
     let row_height = icons::GALLERY_SIXEL_ICON_CELLS_TALL;
     let row_block_height = row_height.saturating_add(1); // +1 blank gap row
 
-    let size_20_label = format!(
-        "{}x{}px {}x{}c",
-        icons::STRIP_SIXEL_ICON_WIDTH_PX, icons::STRIP_SIXEL_ICON_HEIGHT_PX,
-        icons::STRIP_SIXEL_ICON_CELLS_WIDE, icons::STRIP_SIXEL_ICON_CELLS_TALL,
-    );
-    let size_40_label = format!(
-        "{}x{}px {}x{}c",
-        icons::SIXEL_ICON_WIDTH_PX, icons::SIXEL_ICON_HEIGHT_PX,
-        icons::SIXEL_ICON_CELLS_WIDE, icons::SIXEL_ICON_CELLS_TALL,
-    );
-    let size_60_label = format!(
-        "{}x{}px {}x{}c",
-        icons::GALLERY_SIXEL_ICON_WIDTH_PX, icons::GALLERY_SIXEL_ICON_HEIGHT_PX,
-        icons::GALLERY_SIXEL_ICON_CELLS_WIDE, icons::GALLERY_SIXEL_ICON_CELLS_TALL,
-    );
-    let headers: [(&str, u16); 5] = [
+    let size_20_cod = format!("{}x{} Cod", icons::STRIP_SIXEL_ICON_WIDTH_PX, icons::STRIP_SIXEL_ICON_HEIGHT_PX);
+    let size_20_luc = format!("{}x{} Luc", icons::STRIP_SIXEL_ICON_WIDTH_PX, icons::STRIP_SIXEL_ICON_HEIGHT_PX);
+    let size_40_cod = format!("{}x{} Cod", icons::SIXEL_ICON_WIDTH_PX, icons::SIXEL_ICON_HEIGHT_PX);
+    let size_40_luc = format!("{}x{} Luc", icons::SIXEL_ICON_WIDTH_PX, icons::SIXEL_ICON_HEIGHT_PX);
+    let size_60_cod = format!("{}x{} Cod", icons::GALLERY_SIXEL_ICON_WIDTH_PX, icons::GALLERY_SIXEL_ICON_HEIGHT_PX);
+    let size_60_luc = format!("{}x{} Luc", icons::GALLERY_SIXEL_ICON_WIDTH_PX, icons::GALLERY_SIXEL_ICON_HEIGHT_PX);
+    // Tier-major, family-minor ordering ("each row shows the same IconId
+    // in BOTH families side by side AT EACH TIER" -- this task's own
+    // brief) -- NOT grouped by family first, so the pair a column-scan
+    // lands on at any tier is always directly comparable without
+    // scrolling past the other two tiers first.
+    let headers: [(&str, u16); 8] = [
         ("icon", NAME_COL_WIDTH),
-        (size_20_label.as_str(), SIZE_COL_WIDTH),
-        (size_40_label.as_str(), SIZE_COL_WIDTH),
-        (size_60_label.as_str(), SIZE_COL_WIDTH),
+        (size_20_cod.as_str(), SIZE_COL_WIDTH),
+        (size_20_luc.as_str(), SIZE_COL_WIDTH),
+        (size_40_cod.as_str(), SIZE_COL_WIDTH),
+        (size_40_luc.as_str(), SIZE_COL_WIDTH),
+        (size_60_cod.as_str(), SIZE_COL_WIDTH),
+        (size_60_luc.as_str(), SIZE_COL_WIDTH),
         ("ascii", ASCII_COL_WIDTH),
     ];
 
@@ -3529,7 +3549,7 @@ fn render_icon_gallery(
         // own panel fills: every size column's own swatch already paints
         // `ACTIVE_BG` explicitly in `Sixel` mode (see `render_gallery_
         // size_swatch`), so the WHOLE icon-columns band -- the gaps
-        // between the strip/rail/gallery columns AND any padding a
+        // between the strip/rail/gallery/family columns AND any padding a
         // swatch's own smaller icon footprint leaves inside its wider
         // column -- must state that same background too, in every
         // `PtyColorMode`, or an icon's own opaque rect reads as a plate
@@ -3538,24 +3558,27 @@ fn render_icon_gallery(
         // `Ascii` arm), so it is left alone.
         if app.rail_icons == RailIcons::Sixel {
             let (band_x, _) = columns[1];
-            let (last_x, last_width) = columns[3];
+            let (last_x, last_width) = columns[6];
             let band_right = last_x.saturating_add(last_width).min(area.right());
             if band_right > band_x {
                 fill_rect(Rect::new(band_x, y, band_right - band_x, row_height), SIDEBAR_BG, buf);
             }
         }
 
-        for (col_index, cells_wide, cells_tall, size) in [
-            (1usize, icons::STRIP_SIXEL_ICON_CELLS_WIDE, icons::STRIP_SIXEL_ICON_CELLS_TALL, SixelIconSize::Strip),
-            (2usize, icons::SIXEL_ICON_CELLS_WIDE, icons::SIXEL_ICON_CELLS_TALL, SixelIconSize::Rail),
-            (3usize, icons::GALLERY_SIXEL_ICON_CELLS_WIDE, icons::GALLERY_SIXEL_ICON_CELLS_TALL, SixelIconSize::Gallery),
+        for (col_index, cells_wide, cells_tall, size, family) in [
+            (1usize, icons::STRIP_SIXEL_ICON_CELLS_WIDE, icons::STRIP_SIXEL_ICON_CELLS_TALL, SixelIconSize::Strip, IconFamily::Codicons),
+            (2usize, icons::STRIP_SIXEL_ICON_CELLS_WIDE, icons::STRIP_SIXEL_ICON_CELLS_TALL, SixelIconSize::Strip, IconFamily::Lucide),
+            (3usize, icons::SIXEL_ICON_CELLS_WIDE, icons::SIXEL_ICON_CELLS_TALL, SixelIconSize::Rail, IconFamily::Codicons),
+            (4usize, icons::SIXEL_ICON_CELLS_WIDE, icons::SIXEL_ICON_CELLS_TALL, SixelIconSize::Rail, IconFamily::Lucide),
+            (5usize, icons::GALLERY_SIXEL_ICON_CELLS_WIDE, icons::GALLERY_SIXEL_ICON_CELLS_TALL, SixelIconSize::Gallery, IconFamily::Codicons),
+            (6usize, icons::GALLERY_SIXEL_ICON_CELLS_WIDE, icons::GALLERY_SIXEL_ICON_CELLS_TALL, SixelIconSize::Gallery, IconFamily::Lucide),
         ] {
             let (col_x, col_width) = columns[col_index];
             let swatch = Rect::new(col_x, y, col_width.min(area.right().saturating_sub(col_x)), row_height);
-            render_gallery_size_swatch(swatch, id, cells_wide, cells_tall, size, variant, app.rail_icons, theme, buf, layout);
+            render_gallery_size_swatch(swatch, id, cells_wide, cells_tall, size, variant, app.rail_icons, family, theme, buf, layout);
         }
 
-        let (ascii_x, ascii_width) = columns[4];
+        let (ascii_x, ascii_width) = columns[7];
         let visible_ascii_width = ascii_width.min(area.right().saturating_sub(ascii_x));
         if visible_ascii_width > 0 {
             let ascii_bg = Rect::new(ascii_x, y, visible_ascii_width, 1);
@@ -3567,17 +3590,24 @@ fn render_icon_gallery(
     }
 }
 
-/// One "size" swatch cell inside [`render_icon_gallery`]'s own grid:
-/// `RailIcons::Sixel` reserves `area`'s own cell footprint (already a
-/// plain, explicit-truecolor `ACTIVE_BG`-filled blank -- the SAME
-/// background the swatch's own baked asset was composited against, in
-/// every `PtyColorMode` (see [`icons::SixelVariant`]'s own doc comment);
-/// the real pixels are written by `client::run`'s post-flush hook, same
-/// split as `render_rail_button`'s own Sixel arm) and records the
-/// placement; `Ascii` paints that tier's OWN rendering directly with the
-/// theme-dependent `theme.active` (plain text, no raster to align -- see
-/// [`render_icon_gallery`]'s own doc comment for why this collapses all
-/// three size columns to the SAME content in that tier).
+/// One "size" swatch cell inside [`render_icon_gallery`]'s own grid, now
+/// one per (tier, `family`) PAIR rather than one per tier: `RailIcons::
+/// Sixel` reserves `area`'s own cell footprint (already a plain,
+/// explicit-truecolor `ACTIVE_BG`-filled blank -- the SAME background the
+/// swatch's own baked asset was composited against, in every
+/// `PtyColorMode` (see [`icons::SixelVariant`]'s own doc comment); the
+/// real pixels are written by `client::run`'s post-flush hook, same split
+/// as `render_rail_button`'s own Sixel arm) and records the placement, OR
+/// -- when `family` is `Lucide` and `id` is one of the two documented
+/// mapping gaps (`icons::lucide_slug(id).is_none()`) -- paints a plain
+/// `n/a` label instead of pushing a placement at all: `client::
+/// flush_sixel_icon_into` has no baked asset to resolve for that (icon,
+/// family) pair and would just silently paint nothing, which would read
+/// as a rendering defect rather than the deliberate, reported gap it
+/// actually is. `Ascii` paints that tier's OWN rendering directly with
+/// the theme-dependent `theme.active` (plain text, no raster to align --
+/// see [`render_icon_gallery`]'s own doc comment for why this collapses
+/// every size/family column to the SAME content in that tier).
 ///
 /// DEFECT 2 (owner: gallery icons overflow onto the pane's own frame):
 /// `client::flush_sixel_icon_into` prints whichever of `icons::sixel*`
@@ -3606,6 +3636,7 @@ fn render_gallery_size_swatch(
     size: SixelIconSize,
     variant: icons::SixelVariant,
     tier: RailIcons,
+    family: IconFamily,
     theme: Theme,
     buf: &mut TerminalBuffer,
     layout: &mut LayoutRects,
@@ -3628,7 +3659,14 @@ fn render_gallery_size_swatch(
             }
             let icon_area = Rect::new(area.x, area.y, cells_wide, cells_tall);
             fill_rect(icon_area, ACTIVE_BG, buf);
-            layout.sixel_icons.push(SixelIconPlacement { icon: id, rect: icon_area, variant, size });
+            if family == IconFamily::Lucide && icons::lucide_slug(id).is_none() {
+                let label_row = Rect::new(icon_area.x, icon_area.y + icon_area.height / 2, icon_area.width, 1);
+                Paragraph::new(centered_label("n/a", label_row.width as usize))
+                    .style(Style::default().fg(theme.muted).bg(ACTIVE_BG))
+                    .render(label_row, buf);
+                return;
+            }
+            layout.sixel_icons.push(SixelIconPlacement { icon: id, rect: icon_area, variant, size, family });
         }
         RailIcons::Ascii => {
             let label_area = Rect::new(area.x, area.y, area.width.min(2), 1);
@@ -5164,7 +5202,7 @@ fn render_agent_board_sidebar(
                 enabled: true,
             }],
             theme,
-            app.rail_icons,
+            app.rail_icons, app.icon_family,
             buf,
             layout,
         )
@@ -10165,7 +10203,7 @@ fn render_add_space(
         Some("Browse…"),
         "[Browse…]",
         Style::default().fg(theme.teal).bg(theme.modal).add_modifier(Modifier::BOLD),
-        app.rail_icons,
+        app.rail_icons, app.icon_family,
         buf,
         layout,
     );
@@ -10267,7 +10305,7 @@ fn render_folder_browser(
         Some("Parent"),
         "[↑ Parent]",
         Style::default().fg(theme.teal).bg(theme.modal),
-        app.rail_icons,
+        app.rail_icons, app.icon_family,
         buf,
         layout,
     );
@@ -10343,7 +10381,7 @@ fn render_folder_browser(
         Some("Use this folder"),
         "[Use this folder]",
         Style::default().fg(if browser.directory.is_some() { theme.active_tab_text } else { theme.muted }).bg(if browser.directory.is_some() { theme.accent } else { theme.modal }).add_modifier(Modifier::BOLD),
-        app.rail_icons,
+        app.rail_icons, app.icon_family,
         buf,
         layout,
     );
@@ -10357,7 +10395,7 @@ fn render_folder_browser(
         None,
         "[Cancel]",
         Style::default().fg(theme.text).bg(theme.active),
-        app.rail_icons,
+        app.rail_icons, app.icon_family,
         buf,
         layout,
     );
@@ -10718,9 +10756,11 @@ fn render_settings(
         app.control_modal_size
             .unwrap_or((default_width, default_height))
     } else {
-        // Height 8: 2 border rows + 6 `render_settings_controls` rows
-        // (style/menu/sidebar/panel/icons/gallery -- FIX4 added the 6th).
-        (44, 8)
+        // Height 10: 2 border rows + 8 `render_settings_controls` rows
+        // (style/menu/sidebar/panel/icons/icon-family/lucide-stroke/
+        // gallery -- the icon-family and lucide-stroke rows are this
+        // wave's own addition, next to the pre-existing sixel/ascii row).
+        (44, 10)
     };
     let width = requested_width
         .clamp(36.min(available_width), available_width);
@@ -10914,9 +10954,9 @@ fn control_modal_default_size(app: &App) -> (u16, u16) {
                 .unwrap_or(24);
             (width, rows.len().saturating_mul(2).saturating_add(1))
         }
-        // 6 rows: style/menu/sidebar/panel/icons/gallery (FIX4 added the
-        // 6th, `render_settings_controls`'s own gallery row).
-        ControlSection::Settings => (40, 6),
+        // 8 rows: style/menu/sidebar/panel/icons/icon-family/lucide-
+        // stroke/gallery (`render_settings_controls`'s own row count).
+        ControlSection::Settings => (40, 8),
     };
     let width = tab_width.max(content_width).saturating_add(2).clamp(44, 96);
     let height = content_rows.saturating_add(3).clamp(7, 30);
@@ -11024,6 +11064,47 @@ fn render_settings_controls(
     if area.height < 6 {
         return;
     }
+    // Next to the sixel/ascii toggle, per this task's own brief -- picks
+    // WHICH catalog a `RailIcons::Sixel` placement resolves against (see
+    // `app::IconFamily`'s own doc comment); inert in `RailIcons::Ascii`
+    // (plain themed text, no raster to pick a family for) but still shown
+    // unconditionally rather than hidden, same "always visible, the state
+    // it reflects is just inert" precedent every other row here follows.
+    let family_text = match app.icon_family {
+        IconFamily::Codicons => " family [codicons]|lucide ",
+        IconFamily::Lucide => " family codicons|[lucide] ",
+    };
+    let family_width = (cell_width(family_text) as u16).min(area.width);
+    Paragraph::new(family_text)
+        .style(Style::default().fg(theme.teal).bg(theme.modal))
+        .render(Rect::new(area.x, area.y + 5, family_width, 1), buf);
+    layout.hits.push(HitRegion {
+        rect: Rect::new(area.x, area.y + 5, family_width, 1),
+        target: HitTarget::SettingsIconFamily,
+    });
+    if area.height < 7 {
+        return;
+    }
+    // `LucideStrokeWidth`'s own doc comment: only ever ONE offered value
+    // today (the only width baked and checked against this crate's own
+    // densest glyphs without crowding), so this row states what it is and
+    // that it is Lucide-only rather than presenting a live-looking toggle
+    // with nothing real to switch to -- the SAME "state it plainly" brief
+    // `LucideStrokeWidth`'s own doc comment already follows for why this
+    // is a real setting row (Settings-visible, persisted) and not just an
+    // internal bake constant.
+    let stroke_text = format!(" lucide stroke {} (lucide only) ", app.lucide_stroke_width.id());
+    let stroke_width = (cell_width(&stroke_text) as u16).min(area.width);
+    Paragraph::new(stroke_text)
+        .style(Style::default().fg(theme.teal).bg(theme.modal))
+        .render(Rect::new(area.x, area.y + 6, stroke_width, 1), buf);
+    layout.hits.push(HitRegion {
+        rect: Rect::new(area.x, area.y + 6, stroke_width, 1),
+        target: HitTarget::SettingsLucideStrokeWidth,
+    });
+    if area.height < 8 {
+        return;
+    }
     // FIX4: opens the icon gallery dev surface -- a one-shot action row
     // (like clicking a button), not a toggle like every row above it, so
     // it carries no `[...]` current-state bracket.
@@ -11031,9 +11112,9 @@ fn render_settings_controls(
     let gallery_width = (cell_width(gallery_text) as u16).min(area.width);
     Paragraph::new(gallery_text)
         .style(Style::default().fg(theme.teal).bg(theme.modal))
-        .render(Rect::new(area.x, area.y + 5, gallery_width, 1), buf);
+        .render(Rect::new(area.x, area.y + 7, gallery_width, 1), buf);
     layout.hits.push(HitRegion {
-        rect: Rect::new(area.x, area.y + 5, gallery_width, 1),
+        rect: Rect::new(area.x, area.y + 7, gallery_width, 1),
         target: HitTarget::SettingsIconGallery,
     });
 }
@@ -11476,6 +11557,7 @@ fn take_suffix_cells(value: &str, max_cells: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::LucideStrokeWidth;
     use gate4agent_harness_client::{
         HarnessContextSourceSelectionV1, HarnessContextSourceAvailabilityV1,
         HarnessContinuationRef, HarnessContinuationStateV1, HarnessDeliveryBundleDigestV1,
@@ -15796,11 +15878,13 @@ mod tests {
 
         let layout = render(&app, &mut buf);
 
-        // FIX4 added a 6th `render_settings_controls` row (icon gallery),
-        // bumping the compact Settings popover from 44x7 to 44x8 -- and,
-        // since it's centered, one row taller shifts its own top edge up
-        // by 1 (17 -> 16) to stay centered.
-        assert_eq!(layout.control_modal, Rect::new(56, 16, 44, 8));
+        // This wave added the icon-family and lucide-stroke rows to
+        // `render_settings_controls`, bumping the compact Settings
+        // popover from 44x8 to 44x10 -- `control_modal_position`'s own
+        // clamp (`positioned_modal`, `y.clamp(area.y, area.bottom() -
+        // height)`) against the out-of-bounds requested (99, 99) above
+        // therefore lands 2 rows higher (16 -> 14) than before.
+        assert_eq!(layout.control_modal, Rect::new(56, 14, 44, 10));
         assert_eq!(layout.control_content, Rect::default());
         assert!(layout.hits.iter().any(|hit| hit.target == HitTarget::ControlDrag));
         assert!(layout.hits.iter().any(|hit| hit.target == HitTarget::SettingsStyle));
@@ -18366,6 +18450,72 @@ mod tests {
         assert_eq!(app.rail_icons, RailIcons::Sixel);
     }
 
+    /// Same mouse+keyboard parity contract as `settings_rail_icons_
+    /// toggle_has_mouse_and_keyboard_parity`, for the icon-family row
+    /// this task's own brief adds next to it (`app::IconFamily`).
+    #[test]
+    fn settings_icon_family_toggle_has_mouse_and_keyboard_parity() {
+        let mut app = fixture(PtyColorMode::Inherited);
+        app.focus = Focus::Settings;
+        assert_eq!(app.icon_family, IconFamily::Codicons);
+        let mut buf = TerminalBuffer::new(100, 24);
+        let layout = render(&app, &mut buf);
+        let family_hit = layout
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::SettingsIconFamily)
+            .expect("settings dialog exposes the icon-family toggle");
+        let row = rect_text(&buf, family_hit.rect);
+        assert!(row.contains("family [codicons]|lucide"), "{row:?}");
+
+        app.layout = render(&app, &mut buf);
+        app.click(family_hit.rect.x, family_hit.rect.y);
+        assert_eq!(app.icon_family, IconFamily::Lucide);
+        app.layout = render(&app, &mut buf);
+        assert!(rect_text(&buf, family_hit.rect).contains("family codicons|[lucide]"));
+
+        app.click(family_hit.rect.x, family_hit.rect.y);
+        assert_eq!(app.icon_family, IconFamily::Codicons);
+
+        assert_eq!(app.reduce(crate::UiKey::Char('f')), AppAction::None);
+        assert_eq!(app.icon_family, IconFamily::Lucide);
+        assert_eq!(app.reduce(crate::UiKey::Char('f')), AppAction::None);
+        assert_eq!(app.icon_family, IconFamily::Codicons);
+    }
+
+    /// This task's own brief: "the Settings row must say [Lucide-only]
+    /// rather than appearing dead when Codicons are selected", and "if
+    /// only one such width exists ... make the control state that rather
+    /// than inventing fractional options". Checks both claims against the
+    /// real rendered row text, in both `IconFamily` states, and that a
+    /// click is a genuine no-op (nothing to cycle to) rather than merely
+    /// unwired.
+    #[test]
+    fn settings_lucide_stroke_width_row_states_its_own_scope_and_has_one_value() {
+        let mut app = fixture(PtyColorMode::Inherited);
+        app.focus = Focus::Settings;
+        assert_eq!(app.lucide_stroke_width, LucideStrokeWidth::OnePointFive);
+        assert_eq!(LucideStrokeWidth::ALL.len(), 1, "only one width is offered -- see that type's own doc comment");
+        let mut buf = TerminalBuffer::new(100, 24);
+        let layout = render(&app, &mut buf);
+        let stroke_hit = layout
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::SettingsLucideStrokeWidth)
+            .expect("settings dialog exposes the lucide-stroke-width row");
+        let row_under_codicons = rect_text(&buf, stroke_hit.rect);
+        assert!(row_under_codicons.contains("lucide only"), "{row_under_codicons:?}");
+        assert!(row_under_codicons.contains("1.5"), "{row_under_codicons:?}");
+
+        app.icon_family = IconFamily::Lucide;
+        app.layout = render(&app, &mut buf);
+        let row_under_lucide = rect_text(&buf, stroke_hit.rect);
+        assert_eq!(row_under_lucide, row_under_codicons, "the row's own text does not depend on the current family -- it always states its scope");
+
+        app.click(stroke_hit.rect.x, stroke_hit.rect.y);
+        assert_eq!(app.lucide_stroke_width, LucideStrokeWidth::OnePointFive, "a single-entry cycle is a real no-op, not a broken toggle");
+    }
+
     /// FIX4: the icon gallery is reachable from the Settings dialog by
     /// mouse (its own button row) and by the 'g' key, in BOTH menu
     /// placements -- the same "button plus key, following how the
@@ -18461,6 +18611,70 @@ mod tests {
         app.close_selected_tab();
         assert!(!app.surface.all_tabs().iter().any(|tab| **tab == SurfaceTab::IconGallery));
         assert!(app.surface.all_tabs().iter().any(|tab| matches!(tab, SurfaceTab::Pty(_))));
+    }
+
+    /// This task's own brief: "each row shows the same IconId in BOTH
+    /// families side by side at each tier ... Label the columns by
+    /// family." Checks the header text names both families at every
+    /// tier, that a mapped icon (`Files`) gets TWO distinct sixel
+    /// placements per tier (one `Codicons`, one `Lucide`, at different
+    /// columns), and that a documented mapping gap (`CircleFilled`) gets
+    /// exactly one (`Codicons` only) plus a visible `n/a` label instead
+    /// of a silently-missing Lucide swatch.
+    #[test]
+    fn icon_gallery_shows_both_families_side_by_side_at_every_tier() {
+        let mut app = fixture(PtyColorMode::Inherited);
+        app.focus = Focus::Settings;
+        assert_eq!(app.reduce(crate::UiKey::Char('g')), AppAction::None);
+        assert_eq!(app.rail_icons, RailIcons::Sixel);
+
+        // Tall enough to show every one of the 14 `GALLERY_ICON_IDS` rows
+        // (including the two gap icons appended at the end) without
+        // scrolling -- this test checks a row near the top (Files) and
+        // the last two rows (the gap icons) in the SAME render.
+        let mut buf = TerminalBuffer::new(160, 70);
+        let layout = render(&app, &mut buf);
+        // Same whole-viewport text blob `icon_gallery_renders_the_
+        // expected_grid_in_each_tier_and_its_tab_opens_and_closes` already
+        // scans above -- the gallery's own header row sits below the pane's
+        // tab strip, not at the viewport's own row 0.
+        let header = rect_text(&buf, layout.viewport);
+        assert!(header.contains("Cod"), "header must label the codicons column: {header:?}");
+        assert!(header.contains("Luc"), "header must label the lucide column: {header:?}");
+
+        for size in [SixelIconSize::Strip, SixelIconSize::Rail, SixelIconSize::Gallery] {
+            let files_placements: Vec<_> = layout
+                .sixel_icons
+                .iter()
+                .filter(|placement| placement.icon == icons::IconId::Files && placement.size == size)
+                .collect();
+            assert_eq!(files_placements.len(), 2, "{size:?}: Files must get exactly one Codicons + one Lucide placement: {files_placements:?}");
+            assert!(
+                files_placements.iter().any(|p| p.family == IconFamily::Codicons),
+                "{size:?}: missing the Codicons placement for Files"
+            );
+            assert!(
+                files_placements.iter().any(|p| p.family == IconFamily::Lucide),
+                "{size:?}: missing the Lucide placement for Files"
+            );
+            assert_ne!(
+                files_placements[0].rect.x, files_placements[1].rect.x,
+                "{size:?}: the two family placements must sit in different columns, not overlap"
+            );
+
+            // `CircleFilled` is a documented Lucide mapping gap (see
+            // `icons.rs`'s own "Lucide" doc section) -- exactly one
+            // placement (Codicons), never a silently-missing Lucide one.
+            let gap_placements: Vec<_> = layout
+                .sixel_icons
+                .iter()
+                .filter(|placement| placement.icon == icons::IconId::CircleFilled && placement.size == size)
+                .collect();
+            assert_eq!(gap_placements.len(), 1, "{size:?}: CircleFilled must get exactly one placement (Codicons only): {gap_placements:?}");
+            assert_eq!(gap_placements[0].family, IconFamily::Codicons);
+        }
+        let gallery_text = rect_text(&buf, layout.viewport);
+        assert!(gallery_text.contains("n/a"), "the CircleFilled/RunAll gap rows must show a visible n/a label: {gallery_text:?}");
     }
 
     /// FIX1's own reservation generalized: the icon gallery is a
@@ -18738,6 +18952,7 @@ mod tests {
             rect: Rect::new(10, 10, 4, 2),
             variant: icons::SixelVariant::GateActive,
             size: SixelIconSize::Rail,
+            family: IconFamily::Codicons,
         });
         // Overlaps only the placement's own right half (x=12..14 of the
         // placement's own x=10..14), same two rows.

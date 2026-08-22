@@ -1245,6 +1245,74 @@ impl RailIcons {
     }
 }
 
+/// Which glyph set a `RailIcons::Sixel` placement resolves against --
+/// orthogonal to `RailIcons` itself (this has no effect at all in
+/// `RailIcons::Ascii`, which paints plain themed text with no raster to
+/// pick a family for). `Codicons` is the pre-existing, still-default
+/// catalog (`icons::sixel`/`sixel_strip`/`sixel_gallery`/`sixel_compact`,
+/// unchanged); `Lucide` is a second, alongside bake of the SAME `IconId`
+/// set from a stroke-based source instead of codicons' filled-outline one
+/// -- see `icons.rs`'s own "Lucide" doc section for the licence, mapping,
+/// and stroke-lattice reasoning. Owner-visible (Settings row, next to the
+/// `RailIcons` toggle) and persisted the same way (`preferences::
+/// UiPreferences::icon_family`), so it lives here next to `RailIcons`
+/// rather than in `icons.rs` alongside the render-detail-only
+/// `SixelVariant`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum IconFamily {
+    #[default]
+    Codicons,
+    Lucide,
+}
+
+impl IconFamily {
+    pub const ALL: [Self; 2] = [Self::Codicons, Self::Lucide];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Codicons => "codicons",
+            Self::Lucide => "lucide",
+        }
+    }
+}
+
+/// The Lucide-only stroke width baked into every `IconFamily::Lucide`
+/// sixel-tier asset -- inert under `IconFamily::Codicons` (codicons carry
+/// their own fixed stroke geometry baked into each path, no separate
+/// width knob at all). A setting, not a hardcoded bake-time constant,
+/// because the task this enum exists for is letting the owner compare
+/// stroke weights; but the only values worth OFFERING are the ones that
+/// still land every tier's own glyph render (16px strip / 32px rail /
+/// 48px gallery -- see `icons.rs`'s own `LUCIDE_STROKE_WIDTH_PX` doc
+/// comment) on a WHOLE device pixel, the same "no fractional-pixel
+/// stroke lattice" rule `tools/bake_icons.py::glyph_lattice_size` already
+/// enforces for codicons. Every multiple of 1.5 (Lucide's 24-unit viewBox
+/// / 16px-per-tier-step ratio) satisfies that arithmetic, but only
+/// `OnePointFive` has actually been baked and eyeballed against this
+/// crate's own densest glyphs (parallel bars in `square-split-
+/// horizontal`/`_vertical`, the `ellipsis` dot spacing) without crowding
+/// -- a second, thicker value is added here only once it is baked and
+/// checked the same way, never offered ahead of that (see this task's own
+/// brief: "if only one such width exists, say so", not invent fractional
+/// options). `ALL.len() == 1` today, so `App::cycle_lucide_stroke_width`
+/// is a real cycle that simply has nowhere else to go yet -- not a
+/// special-cased no-op.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LucideStrokeWidth {
+    #[default]
+    OnePointFive,
+}
+
+impl LucideStrokeWidth {
+    pub const ALL: [Self; 1] = [Self::OnePointFive];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::OnePointFive => "1.5",
+        }
+    }
+}
+
 impl MenuPlacement {
     pub fn id(self) -> &'static str {
         match self {
@@ -2705,6 +2773,13 @@ pub enum HitTarget {
     SettingsPresentation,
     SettingsSidebarCollapsed,
     SettingsRailIcons,
+    /// See `IconFamily`'s own doc comment. Row/key next to `SettingsRailIcons`.
+    SettingsIconFamily,
+    /// See `LucideStrokeWidth`'s own doc comment. Row next to
+    /// `SettingsIconFamily`; mouse-only (see `App::cycle_lucide_stroke_
+    /// width`'s own doc comment for why this has no dedicated key while
+    /// `LucideStrokeWidth::ALL` has exactly one entry).
+    SettingsLucideStrokeWidth,
     SettingsIconGallery,
     ActivitySection(ControlSection),
     /// FIX2/FIX3/FIX4: the activity rail's own Board button -- goes
@@ -2793,12 +2868,27 @@ pub enum SixelIconSize {
 /// exception: its own resolution function (`icons::sixel_compact`) takes
 /// no `SixelVariant` at all and never reads this field (see `render::
 /// render_compact_icon_button`'s own doc comment).
+///
+/// `family` selects WHICH catalog (`IconFamily::Codicons`/`Lucide`)
+/// `size`'s own resolution function reads from -- populated by the
+/// pusher from `app.icon_family` at every real button site (see `render::
+/// render_rail_button`/`render_control_strip_button`/`render_compact_
+/// icon_button`, each threaded an `IconFamily` alongside their existing
+/// `RailIcons` parameter), except the icon gallery's own dedicated
+/// comparison columns (`render::render_icon_gallery`), which push ONE
+/// placement per family explicitly so both render side by side regardless
+/// of the owner's live preference. Included in this struct's own
+/// `PartialEq` (part of `client::flush_sixel_icon_into`'s gating
+/// signature, same reasoning as `variant`) so toggling the Settings row
+/// forces every on-screen icon to re-resolve against the new catalog
+/// instead of reading as a stale "still the same placement" survivor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SixelIconPlacement {
     pub icon: IconId,
     pub rect: Rect,
     pub variant: SixelVariant,
     pub size: SixelIconSize,
+    pub family: IconFamily,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -2939,6 +3029,14 @@ pub struct App {
     pub sidebar_presentation: SidebarPresentation,
     pub sidebar_collapsed: bool,
     pub rail_icons: RailIcons,
+    /// Which glyph set a `RailIcons::Sixel` placement paints -- see
+    /// `IconFamily`'s own doc comment. Persisted (`UiPreferences::
+    /// icon_family`), Settings-toggled next to `rail_icons`.
+    pub icon_family: IconFamily,
+    /// Lucide-only stroke width -- see `LucideStrokeWidth`'s own doc
+    /// comment. Persisted, Settings-toggled next to `icon_family`; inert
+    /// while `icon_family == IconFamily::Codicons`.
+    pub lucide_stroke_width: LucideStrokeWidth,
     /// Row-scroll offset (terminal rows, wheel-only -- see `scroll_
     /// terminal`'s own `SurfaceTab::IconGallery` arm) for the FIX4 icon
     /// gallery dev surface (`render::render_icon_gallery`). Never
@@ -3091,6 +3189,8 @@ impl Default for App {
             sidebar_presentation: SidebarPresentation::Split,
             sidebar_collapsed: false,
             rail_icons: RailIcons::Sixel,
+            icon_family: IconFamily::Codicons,
+            lucide_stroke_width: LucideStrokeWidth::OnePointFive,
             icon_gallery_scroll: 0,
             control_section: ControlSection::Files,
             board_view_active: false,
@@ -10259,6 +10359,8 @@ impl App {
                 Some(HitTarget::SettingsPresentation) => self.toggle_sidebar_presentation(),
                 Some(HitTarget::SettingsSidebarCollapsed) => self.toggle_sidebar_collapsed(),
                 Some(HitTarget::SettingsRailIcons) => self.toggle_rail_icons(),
+                Some(HitTarget::SettingsIconFamily) => self.toggle_icon_family(),
+                Some(HitTarget::SettingsLucideStrokeWidth) => self.cycle_lucide_stroke_width(),
                 Some(HitTarget::SettingsIconGallery) => return self.open_icon_gallery(),
                 Some(HitTarget::SidebarItem(index)) => {
                     let mode = match self.control_section {
@@ -10654,6 +10756,8 @@ impl App {
                 | HitTarget::SettingsPresentation
                 | HitTarget::SettingsSidebarCollapsed
                 | HitTarget::SettingsRailIcons
+                | HitTarget::SettingsIconFamily
+                | HitTarget::SettingsLucideStrokeWidth
                 | HitTarget::SettingsIconGallery
                 | HitTarget::ControlDrag
                 | HitTarget::ControlResize
@@ -18866,14 +18970,41 @@ impl App {
         };
     }
 
+    fn toggle_icon_family(&mut self) {
+        self.icon_family = match self.icon_family {
+            IconFamily::Codicons => IconFamily::Lucide,
+            IconFamily::Lucide => IconFamily::Codicons,
+        };
+    }
+
+    /// Advances to the next entry in `LucideStrokeWidth::ALL`, wrapping --
+    /// the same index-into-a-fixed-catalog shape every other Settings
+    /// cycle in this crate uses, deliberately NOT special-cased for
+    /// `ALL.len() == 1` (see `LucideStrokeWidth`'s own doc comment for why
+    /// only one width is offered today): with one entry this arithmetic
+    /// already reduces to a no-op on its own, so there is nothing to add
+    /// or remove here the day a second verified width lands.
+    fn cycle_lucide_stroke_width(&mut self) {
+        let current = LucideStrokeWidth::ALL
+            .iter()
+            .position(|width| *width == self.lucide_stroke_width)
+            .unwrap_or(0);
+        let next = (current + 1) % LucideStrokeWidth::ALL.len();
+        self.lucide_stroke_width = LucideStrokeWidth::ALL[next];
+    }
+
     fn reduce_settings(&mut self, key: UiKey) -> AppAction {
         // The same chord that opens Settings (see the global arm in
         // `App::reduce`) closes it from in here too, through the exact
         // Escape-equivalent `close_settings` every other close path
         // already uses -- checked ahead of the `menu_placement` split
         // below so it works identically in both, and neither inner
-        // match's own keys (`s`/`m`/`p`/`b`/`i`/`g`, `Left`/`Right`/
+        // match's own keys (`s`/`m`/`p`/`b`/`i`/`f`/`g`, `Left`/`Right`/
         // `Tab`/`BackTab`/`Up`/`Down`/`Enter`) collide with a comma or F2.
+        // `SettingsLucideStrokeWidth` gets no key here (mouse-only) --
+        // see that row's own `App::cycle_lucide_stroke_width` doc comment
+        // for why a dedicated shortcut for a single-entry cycle would
+        // reserve a letter for no present benefit.
         if matches!(key, UiKey::Ctrl(',') | UiKey::Function(2)) {
             self.close_settings();
             return AppAction::None;
@@ -18888,6 +19019,7 @@ impl App {
                 UiKey::Char('p') => self.toggle_sidebar_presentation(),
                 UiKey::Char('b') => self.toggle_sidebar_collapsed(),
                 UiKey::Char('i') => self.toggle_rail_icons(),
+                UiKey::Char('f') => self.toggle_icon_family(),
                 UiKey::Char('g') => return self.open_icon_gallery(),
                 _ => {}
             }
@@ -18958,6 +19090,9 @@ impl App {
             }
             UiKey::Char('i') if self.control_section == ControlSection::Settings => {
                 self.toggle_rail_icons()
+            }
+            UiKey::Char('f') if self.control_section == ControlSection::Settings => {
+                self.toggle_icon_family()
             }
             UiKey::Char('g') if self.control_section == ControlSection::Settings => {
                 return self.open_icon_gallery();

@@ -1,37 +1,67 @@
 #!/usr/bin/env python3
-"""Bake the gate4agent-tui icon catalog from microsoft/vscode-codicons.
+"""Bake the gate4agent-tui icon catalog from microsoft/vscode-codicons,
+ALONGSIDE a second bake of the same `IconId` set from lucide-icons/lucide
+(never a replacement -- codicons stay the default, see `app::IconFamily`).
 
-Licence:  MIT (microsoft/vscode-codicons, <https://github.com/microsoft/
-          vscode-codicons/blob/main/LICENSE>). Redistributing the baked
-          RGBA raster derived from these SVGs under this crate's own
-          licence is permitted by codicons' MIT terms; this header is the
-          attribution.
-Source:   raw.githubusercontent.com/microsoft/vscode-codicons/main/src/
-          icons/<slug>.svg -- one file per `MANIFEST` entry below.
+Licence (codicons):  MIT (microsoft/vscode-codicons, <https://github.com/
+          microsoft/vscode-codicons/blob/main/LICENSE>). Redistributing
+          the baked RGBA raster derived from these SVGs under this
+          crate's own licence is permitted by codicons' MIT terms; this
+          header is the attribution.
+Source (codicons):   raw.githubusercontent.com/microsoft/vscode-codicons/
+          main/src/icons/<slug>.svg -- one file per `MANIFEST` entry.
+
+Licence (Lucide):    read directly from <https://github.com/lucide-icons/
+          lucide/blob/main/LICENSE> at authoring time (do not assume --
+          verify): the ISC License (Copyright (c) 2026 Lucide Icons and
+          Contributors) covers the set as a whole; a named subset of
+          icons "derived from the Feather project" is ADDITIONALLY under
+          the MIT License (Copyright (c) 2013-present Cole Bemis) per
+          that same file's own second block -- both permissive, both
+          permit redistributing a derived raster under this crate's own
+          licence, same as codicons above; this header is the
+          attribution. Several of `LUCIDE_SLUGS`' own values below fall
+          in the named Feather subset (e.g. `arrow-down`, `check`,
+          `chevron-left`, `info`, `search`, `trash`) -- covered either
+          way, so this header does not split by which licence applies to
+          which icon.
+Source (Lucide):     raw.githubusercontent.com/lucide-icons/lucide/main/
+          icons/<slug>.svg -- one file per `LUCIDE_SLUGS` entry below.
+
 Re-run:   python tools/bake_icons.py            (from this crate's root,
                                                    "crates/gate4agent-tui")
           python tools/bake_icons.py --force     (re-bake every icon, even
-                                                   ones already on disk)
+                                                   ones already on disk,
+                                                   both families)
           python tools/bake_icons.py --only add,close   (restrict to a
-                                                   subset -- for hand
-                                                   comparison; does NOT
-                                                   regenerate catalog.rs,
-                                                   see below)
+                                                   subset (codicon slugs)
+                                                   -- for hand comparison;
+                                                   does NOT regenerate
+                                                   catalog.rs, see below)
 
 What this does, every run:
-  1. For each `MANIFEST` entry, ensure its source SVG is present in
-     `--cache-dir` (default `tools/.codicon-cache/`, gitignored -- a
+  1. For each `MANIFEST` entry, ensure its CODICON source SVG is present
+     in `--cache-dir` (default `tools/.codicon-cache/`, gitignored -- a
      scratch mirror of upstream, not a source of truth): download once,
      reuse on every later run. A 404 aborts the ENTIRE run immediately
      with the offending slug and URL named in the error -- never silently
      skipped, never substituted automatically (see ICON LIST substitution
-     policy below).
-  2. Patch the SVG's `fill="currentColor"` (present exactly once, on the
-     root `<svg>` element, for every codicon in this set -- verified
-     against all 57 source files at authoring time) to `#cdd6f4`, this
-     crate's own `pty_palette::GATE_FG` -- the same patch the original
-     7-icon rail catalog already applied, so every tier reads as part of
-     the existing theme.
+     policy below). Separately, for each `LUCIDE_SLUGS` entry, the same
+     fetch-once/reuse/fail-loudly contract against `.lucide-cache/`
+     (`fetch_lucide_svg`) -- the two caches never share a slug namespace,
+     so neither family's own scratch files can collide with the other's.
+  2. Patch the codicon SVG's `fill="currentColor"` (present exactly once,
+     on the root `<svg>` element, for every codicon in this set --
+     verified against all 57 source files at authoring time) to
+     `#cdd6f4`, this crate's own `pty_palette::GATE_FG` -- the same patch
+     the original 7-icon rail catalog already applied, so every tier
+     reads as part of the existing theme. Separately, patch the Lucide
+     SVG's `stroke="currentColor"` to the SAME `#cdd6f4` and its
+     `stroke-width="2"` to `LUCIDE_STROKE_WIDTH` (`patch_lucide`) --
+     Lucide's ink lives in the stroke, not the fill (`fill="none"`
+     throughout, untouched), which is the entire reason this family is
+     worth baking alongside codicons at all: one number governs every
+     glyph's line weight, unlike codicons' per-path fixed geometry.
   3. Rasterize every sixel tier (rail/compact/strip/gallery) via `resvg`
      (SVG -> PNG) + `ffmpeg` (PNG -> padded -> raw RGBA8) -- see
      `rasterize_sixel`/`rasterize_compact_sixel`/`rasterize_strip_sixel`/
@@ -45,11 +75,21 @@ What this does, every run:
      own doc comment for why the ordering there matters. SKIPPED
      (idempotent, no network/subprocess work at all) for any icon whose
      outputs already exist on disk at the expected byte length, unless
-     `--force`.
+     `--force`. Lucide reuses these EXACT SAME rasterize functions
+     unchanged (see `ensure_lucide_assets` and friends, right below the
+     codicon `ensure_*` functions) -- the lattice-fit machinery cause 6
+     below describes is family-agnostic, only the fetch/patch step
+     (step 1/2 above) differs.
   4. Regenerate `src/icons/catalog.rs` from the FULL manifest (only when
-     not restricted by `--only`) -- one `IconId` enum variant, one sixel
-     `LazyLock<String>` per tier/variant, one ascii literal, per icon.
-  5. Print a report: asset-size totals.
+     not restricted by `--only`) -- one `IconId` enum variant (shared by
+     both families), one codicon sixel `LazyLock<String>` per tier/
+     variant, one Lucide `Option`-wrapped equivalent per tier/variant
+     (`None` for the two `LUCIDE_GAPS` icons), one ascii literal, per
+     icon.
+  5. Bake `LUCIDE_SLUGS`' own assets (skipping `LUCIDE_GAPS` entirely --
+     no file, no catalog entry, a real gap, not an invented substitute).
+  6. Print a report: the full `IconId` -> Lucide slug mapping, the
+     reported gaps and why, and asset-size totals for both families.
 
 Nothing here is a build-time Cargo dependency -- `resvg`/`ffmpeg` run
 once, offline, from a developer's own PATH, producing checked-in
@@ -332,6 +372,11 @@ CRATE_ROOT = Path(__file__).resolve().parent.parent
 ICONS_DIR = CRATE_ROOT / "src" / "icons"
 CATALOG_RS = ICONS_DIR / "catalog.rs"
 DEFAULT_CACHE_DIR = Path(__file__).resolve().parent / ".codicon-cache"
+# Alongside the codicon cache, gitignored, not a source of truth -- see
+# `fetch_lucide_svg`'s own doc comment. No `--cache-dir`-style CLI override
+# (the codicon one exists mainly for hand comparison against an alternate
+# checkout; Lucide has no equivalent need yet).
+DEFAULT_LUCIDE_CACHE_DIR = Path(__file__).resolve().parent / ".lucide-cache"
 
 CODICON_URL_TEMPLATE = "https://raw.githubusercontent.com/microsoft/vscode-codicons/main/src/icons/{slug}.svg"
 FILL_SOURCE = 'fill="currentColor"'
@@ -402,6 +447,151 @@ LATTICE_STEP_PX = 16
 # (see cause 4's own retirement note above).
 GATE_ACTIVE_BG_RGB = (30, 30, 46)  # render.rs::ACTIVE_BG
 GATE_ACCENT_BG_RGB = (203, 166, 247)  # render.rs::MAUVE / theme.accent
+
+
+# ---- Lucide (owner-visible ALONGSIDE codicons, never a replacement --
+# `app::IconFamily`, default `Codicons`) ------------------------------
+#
+# Licence: read directly from <https://github.com/lucide-icons/lucide/blob/
+# main/LICENSE> at authoring time (do not assume -- verify): the ISC
+# License (Copyright (c) 2026 Lucide Icons and Contributors) covers the
+# set as a whole; a named subset of icons "derived from the Feather
+# project" is ADDITIONALLY available under the MIT License (Copyright (c)
+# 2013-present Cole Bemis) per that same LICENSE file's own second block
+# -- both permissive, both permit redistributing a derived raster under
+# this crate's own licence, same as codicons' MIT terms above. Several of
+# this manifest's own LUCIDE_SLUGS values fall in that named Feather
+# subset (e.g. `arrow-down`, `check`, `chevron-left`, `info`, `search`,
+# `trash`) -- covered either way, so this header does not split the
+# manifest by which of the two licences applies to which icon.
+# Source: raw.githubusercontent.com/lucide-icons/lucide/main/icons/
+# <slug>.svg -- one file per `LUCIDE_SLUGS` entry below, same per-icon
+# fetch shape as `CODICON_URL_TEMPLATE` above.
+LUCIDE_URL_TEMPLATE = "https://raw.githubusercontent.com/lucide-icons/lucide/main/icons/{slug}.svg"
+LUCIDE_STROKE_SOURCE = 'stroke="currentColor"'
+LUCIDE_STROKE_TARGET = 'stroke="#cdd6f4"'  # same pty_palette::GATE_FG FILL_TARGET patches codicons to
+LUCIDE_WIDTH_SOURCE = 'stroke-width="2"'  # Lucide's own published default
+
+# The one authored stroke width this tool bakes every Lucide asset at --
+# see `app::LucideStrokeWidth`'s own doc comment for why only this ONE
+# value is exposed as an owner-facing setting today. Chosen so it lands
+# on a WHOLE device pixel at every tier's own `glyph_lattice_size` render
+# (16px strip / 32px rail / 48px gallery -- the SAME lattice-fit machinery
+# codicons already use, reused unchanged for Lucide below): Lucide's own
+# viewBox is a fixed 24 units, so `LUCIDE_STROKE_WIDTH * (glyph_px / 24)`
+# must be a whole number at all three glyph sizes at once. 16/24 = 2/3,
+# 32/24 = 4/3, 48/24 = 2 -- for ALL THREE of those products to land on a
+# whole number from one shared width, the width need only make the FIRST
+# one (2/3) whole, since 4/3 and 2 are then automatically whole too (each
+# is 2x/3x the first); the smallest positive value with that property is
+# 1.5 (1.5 * 2/3 = 1, 1.5 * 4/3 = 2, 1.5 * 2 = 3 -- exactly 1px/2px/3px).
+# Every further multiple of 1.5 (3.0, 4.5, ...) ALSO satisfies the same
+# arithmetic, but this tool only ever bakes the one that has actually been
+# rasterized and eyeballed against this manifest's own tightest glyphs
+# (the parallel bars in `square-split-horizontal`/`_vertical`, the
+# `ellipsis` dot spacing) without the ink crowding together -- offering an
+# unverified thicker width in the Settings row this constant feeds would
+# be inventing a fractional option this task's own brief explicitly warns
+# against, not a rounding shortcut.
+LUCIDE_STROKE_WIDTH = 1.5
+LUCIDE_WIDTH_TARGET = f'stroke-width="{LUCIDE_STROKE_WIDTH:g}"'
+
+# IconId.rust_name -> Lucide slug, one entry per icon this bake actually
+# ships a Lucide asset for. Every `MANIFEST` entry's `rust_name` must
+# appear in EXACTLY ONE of this dict or `LUCIDE_GAPS` below (checked by
+# `main` at startup) -- there is no third, silently-uncovered case.
+# Picked by MEANING, not by nearest slug spelling (verified against this
+# crate's own actual button semantics and, where a codicon glyph's own
+# shape was ambiguous from its slug alone, the cached SVG path data --
+# see this task's own report for the per-icon reasoning); duplicate
+# targets ARE allowed where two `IconId`s genuinely share one concept
+# (`SourceControl`/`GitBranch` -> `git-branch`, both a branch topology;
+# `NewFile`/`DiffAdded` -> `file-plus`, both "content added to a file")
+# -- that is a documented reuse, not a collision, and never crosses into a
+# WRONG meaning (see `LUCIDE_GAPS` below for the two cases where no
+# existing Lucide glyph clears that bar at all).
+LUCIDE_SLUGS: dict[str, str] = {
+    "Files": "files",
+    "SourceControl": "git-branch",
+    "Person": "user",
+    "Project": "kanban",
+    "SettingsGear": "settings",
+    "ChevronLeft": "chevron-left",
+    "ChevronRight": "chevron-right",
+    "ChevronDown": "chevron-down",
+    "NewFile": "file-plus",
+    "NewFolder": "folder-plus",
+    "Folder": "folder",
+    "FolderOpened": "folder-open",
+    "File": "file",
+    "Save": "save",
+    "Refresh": "refresh-cw",
+    "Add": "plus",
+    "Trash": "trash-2",
+    "Search": "search",
+    "Check": "check",
+    "Close": "x",
+    "ArrowUp": "arrow-up",
+    "ArrowDown": "arrow-down",
+    "ArrowLeft": "arrow-left",
+    "ArrowRight": "arrow-right",
+    "ArrowSwap": "arrow-left-right",
+    "GitCommit": "git-commit-horizontal",
+    "GitBranch": "git-branch",
+    "Diff": "file-diff",
+    "DiffAdded": "file-plus",
+    "GitCompare": "git-compare",
+    "Repo": "book-marked",
+    "RepoForked": "git-fork",
+    "DebugStop": "square",
+    "DebugRestart": "rotate-ccw",
+    "Edit": "pencil",
+    "History": "clock-fading",
+    "Terminal": "terminal",
+    "Output": "file-text",
+    "CloudDownload": "cloud-download",
+    "Ellipsis": "ellipsis",
+    "Link": "link",
+    "CircleSlash": "circle-slash",
+    "Warning": "triangle-alert",
+    "Error": "octagon-alert",
+    "Info": "info",
+    "Play": "play",
+    "Sync": "refresh-ccw",
+    "GoToFile": "file-symlink",
+    "Pulse": "activity",
+    "Checklist": "list-checks",
+    "Eye": "eye",
+    "Layout": "layout-grid",
+    "SplitHorizontal": "square-split-horizontal",
+    "SplitVertical": "square-split-vertical",
+    "Preview": "monitor",
+}
+
+# The two `MANIFEST` icons this tool deliberately does NOT bake a Lucide
+# asset for -- reported, never approximated (this task's own brief: "a
+# wrong-meaning icon is worse than a reported gap"). Value is the reason,
+# printed verbatim in this tool's own report.
+LUCIDE_GAPS: dict[str, str] = {
+    "CircleFilled": (
+        "Lucide ships no solid-fill glyph at all (a STYLE gap, not a "
+        "naming one): every Lucide icon is stroke-only by design (see "
+        "this crate's own IconFamily doc comment on codicons' filled "
+        "outlines vs Lucide's stroke geometry), so there is no glyph "
+        "whose FILLED-dot meaning (an 'unsaved/has content' marker) "
+        "survives -- Lucide's own plain 'circle' is an outline, which "
+        "reads as the OPPOSITE state in most editor conventions, i.e. "
+        "exactly the wrong-meaning substitution this task's own brief "
+        "warns against."
+    ),
+    "RunAll": (
+        "no Lucide glyph distinctly means 'run every item', only 'run "
+        "one' (Lucide's own 'play'). Substituting 'play' would collide "
+        "with IconId::Play's own meaning (both read identically under "
+        "Lucide); 'fast-forward' (two triangles) was considered and "
+        "rejected -- it means skip/speed, a different action, not 'all'."
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -571,6 +761,75 @@ def patch_fill(svg_path: Path, slug: str, cache_dir: Path) -> Path:
             f"inspect {svg_path} by hand before baking it."
         )
     patched = text.replace(FILL_SOURCE, FILL_TARGET)
+    dest.write_text(patched, encoding="utf-8")
+    return dest
+
+
+def fetch_lucide_svg(slug: str, cache_dir: Path) -> Path:
+    """Lucide's own `fetch_svg`: same cache-once/reuse-forever contract,
+    same "404 aborts the ENTIRE run, names the slug and URL, never
+    silently skipped" policy -- see `fetch_svg`'s own doc comment, which
+    this mirrors against `LUCIDE_URL_TEMPLATE` instead of `CODICON_URL_
+    TEMPLATE`. A 404 here means a `LUCIDE_SLUGS` entry above was typed
+    wrong (every slug in that dict was verified to exist upstream at
+    authoring time), never a real "closest existing icon" substitution
+    call -- that judgment already happened once, by hand, choosing
+    `LUCIDE_SLUGS`'s own values (or `LUCIDE_GAPS`, for the two icons with
+    no Lucide counterpart at all); this function's job is only to fetch
+    the slug it is handed."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    dest = cache_dir / f"{slug}.svg"
+    if dest.exists():
+        return dest
+    url = LUCIDE_URL_TEMPLATE.format(slug=slug)
+    try:
+        with urllib.request.urlopen(url, timeout=20) as response:
+            data = response.read()
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            die(
+                f"lucide icon '{slug}' does NOT exist upstream (404 at {url}). "
+                f"This means LUCIDE_SLUGS above names a slug that isn't real -- "
+                f"fix the mapping, do not invent an asset, do not skip this icon."
+            )
+        die(f"fetching '{slug}' failed: HTTP {exc.code} at {url}")
+    except urllib.error.URLError as exc:
+        die(f"fetching '{slug}' failed: {exc.reason} at {url}")
+    dest.write_bytes(data)
+    return dest
+
+
+def patch_lucide(svg_path: Path, slug: str, cache_dir: Path) -> Path:
+    """Patch a Lucide source SVG for baking: `stroke="currentColor"` ->
+    `stroke="#cdd6f4"` (same ink colour `patch_fill` gives codicons -- see
+    that function's own doc comment) AND `stroke-width="2"` ->
+    `LUCIDE_WIDTH_TARGET` (`LUCIDE_STROKE_WIDTH`, see that constant's own
+    doc comment for why this exact number). `fill="none"` is left
+    untouched -- Lucide glyphs carry their ink in the STROKE, not the
+    fill (see `IconFamily`'s own doc comment on why that is the whole
+    point of shipping this family alongside codicons at all), so there is
+    no fill to retarget the way `patch_fill` retargets codicons' `fill=
+    "currentColor"`. Same "exactly 1 occurrence on the root <svg>, a non-1
+    count is a structural surprise to fail loudly on, not patch partially"
+    discipline as `patch_fill` -- verified against every `LUCIDE_SLUGS`
+    source at authoring time."""
+    dest = cache_dir / f"{slug}.patched.svg"
+    if dest.exists():
+        return dest
+    text = svg_path.read_text(encoding="utf-8")
+    stroke_count = text.count(LUCIDE_STROKE_SOURCE)
+    if stroke_count != 1:
+        die(
+            f"lucide icon '{slug}' has {stroke_count} occurrences of {LUCIDE_STROKE_SOURCE!r} "
+            f"(expected exactly 1, on the root <svg> element) -- inspect {svg_path} by hand."
+        )
+    width_count = text.count(LUCIDE_WIDTH_SOURCE)
+    if width_count != 1:
+        die(
+            f"lucide icon '{slug}' has {width_count} occurrences of {LUCIDE_WIDTH_SOURCE!r} "
+            f"(expected exactly 1, on the root <svg> element) -- inspect {svg_path} by hand."
+        )
+    patched = text.replace(LUCIDE_STROKE_SOURCE, LUCIDE_STROKE_TARGET).replace(LUCIDE_WIDTH_SOURCE, LUCIDE_WIDTH_TARGET)
     dest.write_text(patched, encoding="utf-8")
     return dest
 
@@ -953,6 +1212,110 @@ def ensure_compact_assets(spec: IconSpec, cache_dir: Path, force: bool) -> Path:
     return sixel_path
 
 
+# ---- Lucide bakes -- reuse EVERY rasterize_*/composite_over_background
+# function above completely unchanged (cause 6's own lattice-fit fix
+# included): those functions only ever take "a patched SVG path" + "a
+# target canvas size" + (for compositing) "a background colour", never
+# anything codicon-specific, so the SAME 16px/32px/48px lattice-fit
+# machinery this module's own header doc comment describes for codicons
+# applies to Lucide's own 24-unit viewBox identically -- only the FETCH
+# (`fetch_lucide_svg` vs `fetch_svg`) and PATCH (`patch_lucide` vs `patch_
+# fill`) steps differ, plus the `lucide_` filename prefix so neither
+# family's own `.rgba` outputs can collide on disk. Mirrors `ensure_
+# assets`/`ensure_strip_assets`/`ensure_gallery_assets`/`ensure_compact_
+# assets` one-for-one -- same ordering precedent (one fresh raw rasterize
+# feeds every derived variant), same "raw source stays on disk test-only,
+# gate variants are the only shipped asset" split, same compact-tier
+# exception (real transparency, no gate variant, no lattice-fit -- the
+# compact canvas is 10x19, too small to host even one 16px lattice step
+# in its own narrower dimension, same reasoning `glyph_lattice_size`'s own
+# doc comment gives for why codicons' compact tier is unchanged by cause
+# 6 either).
+
+
+def ensure_lucide_assets(spec: IconSpec, slug: str, cache_dir: Path, force: bool) -> tuple[Path, Path, Path]:
+    """Lucide's own `ensure_assets` -- see that function's own doc
+    comment; `slug` is `LUCIDE_SLUGS[spec.rust_name]` (the Lucide slug),
+    NOT `spec.slug` (the codicon slug `spec` was authored around)."""
+    sixel_path = ICONS_DIR / f"lucide_{spec.stem()}.rgba"
+    active_path = ICONS_DIR / f"lucide_{spec.stem()}_gate_active.rgba"
+    accent_path = ICONS_DIR / f"lucide_{spec.stem()}_gate_accent.rgba"
+
+    need_sixel = force or not sixel_path.exists() or sixel_path.stat().st_size != SIXEL_RGBA_LEN
+    need_active = force or not active_path.exists() or active_path.stat().st_size != SIXEL_RGBA_LEN
+    need_accent = force or not accent_path.exists() or accent_path.stat().st_size != SIXEL_RGBA_LEN
+
+    if need_sixel or need_active or need_accent:
+        svg = fetch_lucide_svg(slug, cache_dir)
+        patched = patch_lucide(svg, slug, cache_dir)
+        raw = rasterize_sixel(patched)
+        if need_active:
+            active_path.write_bytes(composite_over_background(raw, GATE_ACTIVE_BG_RGB))
+        if need_accent:
+            accent_path.write_bytes(composite_over_background(raw, GATE_ACCENT_BG_RGB))
+        if need_sixel:
+            sixel_path.write_bytes(raw)
+
+    return sixel_path, active_path, accent_path
+
+
+def ensure_lucide_strip_assets(spec: IconSpec, slug: str, cache_dir: Path, force: bool) -> tuple[Path, Path]:
+    """Lucide's own `ensure_strip_assets` -- see that function's own doc
+    comment. Always sources from `slug` directly (Lucide has no
+    equivalent of cause 7's own codicon-only `strip_slug` badge-swap --
+    every `LUCIDE_SLUGS` glyph is a single coherent shape at this tier's
+    own 16px lattice render, verified at authoring time)."""
+    transparent_path = ICONS_DIR / f"lucide_{spec.stem()}_strip.rgba"
+    gate_path = ICONS_DIR / f"lucide_{spec.stem()}_strip_gate.rgba"
+    need_transparent = force or not transparent_path.exists() or transparent_path.stat().st_size != STRIP_SIXEL_RGBA_LEN
+    need_gate = force or not gate_path.exists() or gate_path.stat().st_size != STRIP_SIXEL_RGBA_LEN
+
+    if need_transparent or need_gate:
+        svg = fetch_lucide_svg(slug, cache_dir)
+        patched = patch_lucide(svg, slug, cache_dir)
+        raw = rasterize_strip_sixel(patched)
+        if need_gate:
+            gate_path.write_bytes(composite_over_background(raw, GATE_ACTIVE_BG_RGB))
+        if need_transparent:
+            transparent_path.write_bytes(raw)
+
+    return transparent_path, gate_path
+
+
+def ensure_lucide_gallery_assets(spec: IconSpec, slug: str, cache_dir: Path, force: bool) -> tuple[Path, Path]:
+    """Lucide's own `ensure_gallery_assets` -- see that function's own doc
+    comment."""
+    transparent_path = ICONS_DIR / f"lucide_{spec.stem()}_gallery.rgba"
+    gate_path = ICONS_DIR / f"lucide_{spec.stem()}_gallery_gate.rgba"
+    need_transparent = force or not transparent_path.exists() or transparent_path.stat().st_size != GALLERY_SIXEL_RGBA_LEN
+    need_gate = force or not gate_path.exists() or gate_path.stat().st_size != GALLERY_SIXEL_RGBA_LEN
+
+    if need_transparent or need_gate:
+        svg = fetch_lucide_svg(slug, cache_dir)
+        patched = patch_lucide(svg, slug, cache_dir)
+        raw = rasterize_gallery_sixel(patched)
+        if need_gate:
+            gate_path.write_bytes(composite_over_background(raw, GATE_ACTIVE_BG_RGB))
+        if need_transparent:
+            transparent_path.write_bytes(raw)
+
+    return transparent_path, gate_path
+
+
+def ensure_lucide_compact_assets(spec: IconSpec, slug: str, cache_dir: Path, force: bool) -> Path:
+    """Lucide's own `ensure_compact_assets` -- see that function's own doc
+    comment (real transparency, no gate variant, this tier's `.rgba` IS
+    the shipped asset)."""
+    sixel_path = ICONS_DIR / f"lucide_{spec.stem()}_compact.rgba"
+    need_sixel = force or not sixel_path.exists() or sixel_path.stat().st_size != COMPACT_SIXEL_RGBA_LEN
+    if need_sixel:
+        svg = fetch_lucide_svg(slug, cache_dir)
+        patched = patch_lucide(svg, slug, cache_dir)
+        raw = rasterize_compact_sixel(patched)
+        sixel_path.write_bytes(raw)
+    return sixel_path
+
+
 def rust_string_literal(s: str) -> str:
     escaped = s.replace("\\", "\\\\").replace('"', '\\"')
     return f'"{escaped}"'
@@ -963,13 +1326,25 @@ def generate_catalog() -> str:
     lines.append("//! GENERATED by `tools/bake_icons.py` -- do not hand-edit. Re-run:")
     lines.append("//!   python tools/bake_icons.py")
     lines.append("//!")
-    lines.append("//! Licence: MIT (microsoft/vscode-codicons,")
+    lines.append("//! Licence (codicons): MIT (microsoft/vscode-codicons,")
     lines.append("//! <https://github.com/microsoft/vscode-codicons/blob/main/LICENSE>).")
     lines.append("//! Source: raw.githubusercontent.com/microsoft/vscode-codicons/main/src/")
     lines.append("//! icons/<slug>.svg, `fill=\"currentColor\"` patched to `#cdd6f4`")
-    lines.append("//! (`pty_palette::GATE_FG`) before rasterizing -- see `../icons.rs`'s own")
-    lines.append("//! module doc for the full tier/pipeline explanation and")
-    lines.append("//! `tools/bake_icons.py`'s own header for the exact bake recipe.")
+    lines.append("//! (`pty_palette::GATE_FG`) before rasterizing.")
+    lines.append("//!")
+    lines.append("//! Licence (Lucide, the `_lucide`/`lucide_*`-prefixed items below):")
+    lines.append("//! ISC (Copyright (c) 2026 Lucide Icons and Contributors) for the set as a")
+    lines.append("//! whole, PLUS MIT (Copyright (c) 2013-present Cole Bemis) for a named")
+    lines.append("//! subset derived from the Feather project -- both permissive, read")
+    lines.append("//! directly from <https://github.com/lucide-icons/lucide/blob/main/")
+    lines.append("//! LICENSE> at authoring time, not assumed. Source: raw.githubusercontent.")
+    lines.append("//! com/lucide-icons/lucide/main/icons/<slug>.svg, `stroke=\"currentColor\"`")
+    lines.append("//! patched to `#cdd6f4` and `stroke-width=\"2\"` to `LUCIDE_STROKE_WIDTH`")
+    lines.append("//! (`tools/bake_icons.py`'s own constant) before rasterizing.")
+    lines.append("//!")
+    lines.append("//! See `../icons.rs`'s own module doc for the full tier/pipeline")
+    lines.append("//! explanation and `tools/bake_icons.py`'s own header for the exact bake")
+    lines.append("//! recipe (shared by both families -- only fetch/patch differ).")
     lines.append("")
     lines.append("use std::sync::LazyLock;")
     lines.append("")
@@ -1185,6 +1560,149 @@ def generate_catalog() -> str:
         lines.append(f"static {upper}_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate({upper}_GALLERY_GATE_RGBA));")
         lines.append("")
 
+    # ---- Lucide dispatch -- alongside every codicon fn above, never
+    # replacing it (see `app::IconFamily`'s own doc comment: `Codicons`
+    # stays the default, unchanged). `Option` (never a bare `&'static
+    # str`) because the two `LUCIDE_GAPS` icons have no asset to resolve
+    # at all -- a reported gap, not a panic and not a silent codicon
+    # fallback (see `render::render_gallery_size_swatch`'s own doc
+    # comment for how the ONE call site that can hit `None` today, the
+    # icon gallery, handles it).
+    lines.append("/// Encoded rail-tier Lucide sixel string for `id` at `variant`'s own")
+    lines.append("/// explicit truecolor background -- `None` for the two documented")
+    lines.append("/// mapping gaps (`tools/bake_icons.py::LUCIDE_GAPS`); every other `IconId`")
+    lines.append("/// is always `Some`. Mirrors [`sixel`], the codicon equivalent.")
+    lines.append("pub fn sixel_lucide(id: IconId, variant: SixelVariant) -> Option<&'static str> {")
+    lines.append("    match id {")
+    for spec in MANIFEST:
+        upper = to_screaming_snake(spec.rust_name)
+        if spec.rust_name in LUCIDE_SLUGS:
+            lines.append(f"        IconId::{spec.rust_name} => Some(match variant {{")
+            lines.append(f"            SixelVariant::GateActive => LUCIDE_{upper}_SIXEL_GATE_ACTIVE.as_str(),")
+            lines.append(f"            SixelVariant::GateAccent => LUCIDE_{upper}_SIXEL_GATE_ACCENT.as_str(),")
+            lines.append("        }),")
+        else:
+            lines.append(f"        IconId::{spec.rust_name} => None,")
+    lines.append("    }")
+    lines.append("}")
+    lines.append("")
+    lines.append("/// Lucide equivalent of [`sixel_strip`] -- same `None`-for-gaps contract")
+    lines.append("/// as [`sixel_lucide`], same `GateAccent` fold into `GateActive` (the")
+    lines.append("/// strip has no selected state either family needs a distinct asset for).")
+    lines.append("pub fn sixel_strip_lucide(id: IconId, variant: SixelVariant) -> Option<&'static str> {")
+    lines.append("    match id {")
+    for spec in MANIFEST:
+        upper = to_screaming_snake(spec.rust_name)
+        if spec.rust_name in LUCIDE_SLUGS:
+            lines.append(f"        IconId::{spec.rust_name} => Some(match variant {{")
+            lines.append(f"            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_{upper}_SIXEL_STRIP_GATE.as_str(),")
+            lines.append("        }),")
+        else:
+            lines.append(f"        IconId::{spec.rust_name} => None,")
+    lines.append("    }")
+    lines.append("}")
+    lines.append("")
+    lines.append("/// Lucide equivalent of [`sixel_gallery`] -- same `None`-for-gaps")
+    lines.append("/// contract, same `GateAccent` fold as [`sixel_strip_lucide`].")
+    lines.append("pub fn sixel_gallery_lucide(id: IconId, variant: SixelVariant) -> Option<&'static str> {")
+    lines.append("    match id {")
+    for spec in MANIFEST:
+        upper = to_screaming_snake(spec.rust_name)
+        if spec.rust_name in LUCIDE_SLUGS:
+            lines.append(f"        IconId::{spec.rust_name} => Some(match variant {{")
+            lines.append(f"            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_{upper}_SIXEL_GALLERY_GATE.as_str(),")
+            lines.append("        }),")
+        else:
+            lines.append(f"        IconId::{spec.rust_name} => None,")
+    lines.append("    }")
+    lines.append("}")
+    lines.append("")
+    lines.append("/// Lucide equivalent of [`sixel_compact`] -- same `None`-for-gaps")
+    lines.append("/// contract; no `SixelVariant` parameter, same reason `sixel_compact`")
+    lines.append("/// has none (real transparency, no pre-composited background variant).")
+    lines.append("pub fn sixel_compact_lucide(id: IconId) -> Option<&'static str> {")
+    lines.append("    match id {")
+    for spec in MANIFEST:
+        upper = to_screaming_snake(spec.rust_name)
+        if spec.rust_name in LUCIDE_SLUGS:
+            lines.append(f"        IconId::{spec.rust_name} => Some(LUCIDE_{upper}_SIXEL_COMPACT.as_str()),")
+        else:
+            lines.append(f"        IconId::{spec.rust_name} => None,")
+    lines.append("    }")
+    lines.append("}")
+    lines.append("")
+    lines.append("/// The Lucide slug `id` was baked from, or `None` for the two documented")
+    lines.append("/// mapping gaps -- the single source of truth `render::render_gallery_")
+    lines.append("/// size_swatch` and this crate's own tests both check before assuming a")
+    lines.append("/// Lucide asset exists for `id` at all.")
+    lines.append("pub fn lucide_slug(id: IconId) -> Option<&'static str> {")
+    lines.append("    match id {")
+    for spec in MANIFEST:
+        if spec.rust_name in LUCIDE_SLUGS:
+            lines.append(f"        IconId::{spec.rust_name} => Some({rust_string_literal(LUCIDE_SLUGS[spec.rust_name])}),")
+        else:
+            lines.append(f"        IconId::{spec.rust_name} => None,")
+    lines.append("    }")
+    lines.append("}")
+    lines.append("")
+    lines.append("// Raw true-coverage Lucide sources, test-only -- same retirement/")
+    lines.append("// `#[cfg(test)]`-gating precedent as the codicon accessors above;")
+    lines.append("// `Option` for the same `LUCIDE_GAPS` reason every dispatch fn above has.")
+    for test_fn_name, field_suffix in [
+        ("lucide_sixel_source_rgba", "_RGBA"),
+        ("lucide_sixel_compact_source_rgba", "_COMPACT_RGBA"),
+        ("lucide_sixel_gate_active_source_rgba", "_GATE_ACTIVE_RGBA"),
+        ("lucide_sixel_gate_accent_source_rgba", "_GATE_ACCENT_RGBA"),
+        ("lucide_sixel_strip_source_rgba", "_STRIP_RGBA"),
+        ("lucide_sixel_strip_gate_source_rgba", "_STRIP_GATE_RGBA"),
+        ("lucide_sixel_gallery_source_rgba", "_GALLERY_RGBA"),
+        ("lucide_sixel_gallery_gate_source_rgba", "_GALLERY_GATE_RGBA"),
+    ]:
+        lines.append("#[cfg(test)]")
+        lines.append(f"pub(crate) fn {test_fn_name}(id: IconId) -> Option<&'static [u8]> {{")
+        lines.append("    match id {")
+        for spec in MANIFEST:
+            upper = to_screaming_snake(spec.rust_name)
+            if spec.rust_name in LUCIDE_SLUGS:
+                lines.append(f"        IconId::{spec.rust_name} => Some(LUCIDE_{upper}{field_suffix}),")
+            else:
+                lines.append(f"        IconId::{spec.rust_name} => None,")
+        lines.append("    }")
+        lines.append("}")
+        lines.append("")
+
+    for spec in MANIFEST:
+        if spec.rust_name not in LUCIDE_SLUGS:
+            continue
+        upper = to_screaming_snake(spec.rust_name)
+        slug = LUCIDE_SLUGS[spec.rust_name]
+        lines.append(f"// ---- Lucide {spec.rust_name} ({slug}) " + "-" * max(1, 52 - len(spec.rust_name) - len(slug)))
+        lines.append("")
+        lines.append("#[cfg(test)]")
+        lines.append(f'const LUCIDE_{upper}_RGBA: &[u8] = include_bytes!("lucide_{spec.stem()}.rgba");')
+        lines.append("")
+        lines.append(f'const LUCIDE_{upper}_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_{spec.stem()}_gate_active.rgba");')
+        lines.append(f"static LUCIDE_{upper}_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_{upper}_GATE_ACTIVE_RGBA));")
+        lines.append("")
+        lines.append(f'const LUCIDE_{upper}_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_{spec.stem()}_gate_accent.rgba");')
+        lines.append(f"static LUCIDE_{upper}_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_{upper}_GATE_ACCENT_RGBA));")
+        lines.append("")
+        lines.append(f'const LUCIDE_{upper}_COMPACT_RGBA: &[u8] = include_bytes!("lucide_{spec.stem()}_compact.rgba");')
+        lines.append(f"static LUCIDE_{upper}_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_{upper}_COMPACT_RGBA));")
+        lines.append("")
+        lines.append("#[cfg(test)]")
+        lines.append(f'const LUCIDE_{upper}_STRIP_RGBA: &[u8] = include_bytes!("lucide_{spec.stem()}_strip.rgba");')
+        lines.append("")
+        lines.append(f'const LUCIDE_{upper}_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_{spec.stem()}_strip_gate.rgba");')
+        lines.append(f"static LUCIDE_{upper}_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_{upper}_STRIP_GATE_RGBA));")
+        lines.append("")
+        lines.append("#[cfg(test)]")
+        lines.append(f'const LUCIDE_{upper}_GALLERY_RGBA: &[u8] = include_bytes!("lucide_{spec.stem()}_gallery.rgba");')
+        lines.append("")
+        lines.append(f'const LUCIDE_{upper}_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_{spec.stem()}_gallery_gate.rgba");')
+        lines.append(f"static LUCIDE_{upper}_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_{upper}_GALLERY_GATE_RGBA));")
+        lines.append("")
+
     return "\n".join(lines) + "\n"
 
 
@@ -1200,7 +1718,20 @@ def print_report(
     compact_asset_sizes: dict[str, tuple[int, bool]],
     strip_asset_sizes: dict[str, tuple[int, int, bool]],
     gallery_asset_sizes: dict[str, tuple[int, int, bool]],
+    lucide_asset_sizes: dict[str, tuple[int, int, int, int, int, bool]],
 ) -> None:
+    print()
+    print("=" * 78)
+    print("LUCIDE MAPPING (IconId -> Lucide slug, one entry per icon)")
+    print("=" * 78)
+    for spec in MANIFEST:
+        slug = LUCIDE_SLUGS.get(spec.rust_name)
+        if slug is not None:
+            print(f"  {spec.rust_name:<18} -> {slug}")
+    print()
+    print(f"REPORTED GAPS (no Lucide glyph carries the same meaning -- {len(LUCIDE_GAPS)}):")
+    for name, reason in LUCIDE_GAPS.items():
+        print(f"  {name}: {reason}")
     print()
     print("=" * 78)
     print("ASSET SIZE TOTALS")
@@ -1227,9 +1758,29 @@ def print_report(
         total_gallery = sum(t + g for t, g, _ in gallery_asset_sizes.values())
         newly_baked_gallery = sum(t + g for t, g, new in gallery_asset_sizes.values() if new)
         print(f"Gallery sixel tier (transparent+gate): {total_gallery:>9} bytes total ({total_gallery / 1024:.1f} KiB) -- {newly_baked_gallery} bytes newly added")
+    codicon_combined = total_sixel + total_gate + total_compact_sixel + total_strip + total_gallery
+    print(f"Combined (codicons):     {codicon_combined:>9} bytes total ({codicon_combined / 1024:.1f} KiB)")
+    lucide_combined = 0
+    if lucide_asset_sizes:
+        total_lucide_gate = sum(gate for gate, _, _, _, _, _ in lucide_asset_sizes.values())
+        total_lucide_compact = sum(compact for _, compact, _, _, _, _ in lucide_asset_sizes.values())
+        total_lucide_strip = sum(strip for _, _, strip, _, _, _ in lucide_asset_sizes.values())
+        total_lucide_gallery = sum(gallery for _, _, _, gallery, _, _ in lucide_asset_sizes.values())
+        newly_baked_lucide = sum(
+            gate + compact + strip + gallery
+            for gate, compact, strip, gallery, _, new in lucide_asset_sizes.values()
+            if new
+        )
+        lucide_combined = total_lucide_gate + total_lucide_compact + total_lucide_strip + total_lucide_gallery
+        print(f"Lucide icons total: {len(lucide_asset_sizes)}  (of {len(MANIFEST)} in MANIFEST, {len(LUCIDE_GAPS)} reported gaps)")
+        print(f"Lucide rail GateActive+GateAccent:  {total_lucide_gate:>9} bytes total ({total_lucide_gate / 1024:.1f} KiB)")
+        print(f"Lucide compact tier:                {total_lucide_compact:>9} bytes total ({total_lucide_compact / 1024:.1f} KiB)")
+        print(f"Lucide strip tier (gate):           {total_lucide_strip:>9} bytes total ({total_lucide_strip / 1024:.1f} KiB)")
+        print(f"Lucide gallery tier (gate):         {total_lucide_gallery:>9} bytes total ({total_lucide_gallery / 1024:.1f} KiB)")
+        print(f"Combined (Lucide):        {lucide_combined:>9} bytes total ({lucide_combined / 1024:.1f} KiB) -- {newly_baked_lucide} bytes newly added")
     print(
-        f"Combined:     {total_sixel + total_gate + total_compact_sixel + total_strip + total_gallery:>9} bytes total "
-        f"({(total_sixel + total_gate + total_compact_sixel + total_strip + total_gallery) / 1024:.1f} KiB)"
+        f"Combined (codicons + Lucide): {codicon_combined + lucide_combined:>9} bytes total "
+        f"({(codicon_combined + lucide_combined) / 1024:.1f} KiB)"
     )
     if CATALOG_RS.exists():
         catalog_size = CATALOG_RS.stat().st_size
@@ -1244,7 +1795,31 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def check_lucide_coverage() -> None:
+    """Every `MANIFEST` icon must appear in EXACTLY ONE of `LUCIDE_SLUGS`
+    (has a Lucide asset) or `LUCIDE_GAPS` (documented, deliberate, no
+    asset) -- never neither (a silently-uncovered icon) and never both
+    (an icon this file cannot decide about). Run once at the top of
+    `main`, before any network or subprocess work, so a manifest edit
+    that adds an `IconId` without updating either dict fails loudly and
+    immediately rather than baking an incomplete catalog."""
+    manifest_names = {spec.rust_name for spec in MANIFEST}
+    slug_names = set(LUCIDE_SLUGS)
+    gap_names = set(LUCIDE_GAPS)
+    overlap = slug_names & gap_names
+    if overlap:
+        die(f"icons in BOTH LUCIDE_SLUGS and LUCIDE_GAPS: {sorted(overlap)}")
+    covered = slug_names | gap_names
+    uncovered = manifest_names - covered
+    if uncovered:
+        die(f"MANIFEST icons with NO Lucide decision (add to LUCIDE_SLUGS or LUCIDE_GAPS): {sorted(uncovered)}")
+    stale = covered - manifest_names
+    if stale:
+        die(f"LUCIDE_SLUGS/LUCIDE_GAPS name icons not in MANIFEST: {sorted(stale)}")
+
+
 def main(argv: list[str]) -> int:
+    check_lucide_coverage()
     args = parse_args(argv)
     only = set(s.strip() for s in args.only.split(",")) if args.only else None
 
@@ -1293,6 +1868,39 @@ def main(argv: list[str]) -> int:
             args.force or not gallery_existed or not gallery_gate_existed,
         )
 
+    lucide_asset_sizes: dict[str, tuple[int, int, int, int, int, bool]] = {}
+    for spec in selected:
+        lucide_slug = LUCIDE_SLUGS.get(spec.rust_name)
+        if lucide_slug is None:
+            continue  # LUCIDE_GAPS -- no asset to bake, see that dict's own doc comment.
+        sixel_existed = (ICONS_DIR / f"lucide_{spec.stem()}.rgba").exists()
+        active_existed = (ICONS_DIR / f"lucide_{spec.stem()}_gate_active.rgba").exists()
+        accent_existed = (ICONS_DIR / f"lucide_{spec.stem()}_gate_accent.rgba").exists()
+        _, active_path, accent_path = ensure_lucide_assets(spec, lucide_slug, DEFAULT_LUCIDE_CACHE_DIR, args.force)
+
+        compact_existed = (ICONS_DIR / f"lucide_{spec.stem()}_compact.rgba").exists()
+        compact_path = ensure_lucide_compact_assets(spec, lucide_slug, DEFAULT_LUCIDE_CACHE_DIR, args.force)
+
+        strip_existed = (ICONS_DIR / f"lucide_{spec.stem()}_strip.rgba").exists()
+        strip_gate_existed = (ICONS_DIR / f"lucide_{spec.stem()}_strip_gate.rgba").exists()
+        _, strip_gate_path = ensure_lucide_strip_assets(spec, lucide_slug, DEFAULT_LUCIDE_CACHE_DIR, args.force)
+
+        gallery_existed = (ICONS_DIR / f"lucide_{spec.stem()}_gallery.rgba").exists()
+        gallery_gate_existed = (ICONS_DIR / f"lucide_{spec.stem()}_gallery_gate.rgba").exists()
+        _, gallery_gate_path = ensure_lucide_gallery_assets(spec, lucide_slug, DEFAULT_LUCIDE_CACHE_DIR, args.force)
+
+        lucide_asset_sizes[spec.rust_name] = (
+            active_path.stat().st_size + accent_path.stat().st_size,
+            compact_path.stat().st_size,
+            strip_gate_path.stat().st_size,
+            gallery_gate_path.stat().st_size,
+            0,
+            args.force or not (
+                sixel_existed and active_existed and accent_existed and compact_existed
+                and strip_existed and strip_gate_existed and gallery_existed and gallery_gate_existed
+            ),
+        )
+
     if only is None:
         # Full manifest processed -- every icon has assets on disk, safe
         # to regenerate the complete catalog.
@@ -1301,7 +1909,7 @@ def main(argv: list[str]) -> int:
     else:
         print(f"--only restricted this run to {sorted(only)} -- catalog.rs NOT regenerated (needs the full manifest)")
 
-    print_report(asset_sizes, gate_asset_sizes, compact_asset_sizes, strip_asset_sizes, gallery_asset_sizes)
+    print_report(asset_sizes, gate_asset_sizes, compact_asset_sizes, strip_asset_sizes, gallery_asset_sizes, lucide_asset_sizes)
     return 0
 
 

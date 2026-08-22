@@ -9,13 +9,13 @@ use gate4agent_node_protocol::{
 };
 
 use crate::app::{
-    App, ControlSection, ManagedAgentPreference, MenuPlacement, PtyColorMode, RailIcons,
-    RosterMode, SidebarMode, SidebarPresentation, MAX_LOCAL_AGENT_ALIAS_BYTES,
-    MAX_MANAGED_AGENT_PREFERENCES, MAX_MANAGED_AGENT_RECORD_ID_BYTES,
+    App, ControlSection, IconFamily, LucideStrokeWidth, ManagedAgentPreference, MenuPlacement,
+    PtyColorMode, RailIcons, RosterMode, SidebarMode, SidebarPresentation,
+    MAX_LOCAL_AGENT_ALIAS_BYTES, MAX_MANAGED_AGENT_PREFERENCES, MAX_MANAGED_AGENT_RECORD_ID_BYTES,
 };
 use crate::surface::LayoutPreset;
 
-const CONFIG_VERSION: u16 = 9;
+const CONFIG_VERSION: u16 = 10;
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const MAX_COLLAPSED_DIRECTORY_PREFERENCES: usize = 512;
 
@@ -33,6 +33,8 @@ pub struct UiPreferences {
     pub sidebar_presentation: SidebarPresentation,
     pub sidebar_collapsed: bool,
     pub rail_icons: RailIcons,
+    pub icon_family: IconFamily,
+    pub lucide_stroke_width: LucideStrokeWidth,
     pub control_section: ControlSection,
     pub roster_mode: RosterMode,
     pub sidebar_width: u16,
@@ -62,6 +64,13 @@ impl Default for UiPreferences {
             // removed outright (unusably low quality) -- see
             // `app::RailIcons`'s own doc comment.
             rail_icons: RailIcons::Sixel,
+            // D? Lucide-alongside-codicons (CONFIG_VERSION 9 -> 10): a
+            // fresh install, and every pre-v10 config (no stored key for
+            // either field), lands on `Codicons` -- codicons stay the
+            // owner's own default, Lucide is opt-in from Settings. See
+            // `parse`'s own CONFIG_VERSION 9 -> 10 migration doc comment.
+            icon_family: IconFamily::Codicons,
+            lucide_stroke_width: LucideStrokeWidth::OnePointFive,
             control_section: ControlSection::Files,
             roster_mode: RosterMode::Agents,
             sidebar_width: 26,
@@ -87,6 +96,8 @@ impl UiPreferences {
             sidebar_presentation: app.sidebar_presentation,
             sidebar_collapsed: app.sidebar_collapsed,
             rail_icons: app.rail_icons,
+            icon_family: app.icon_family,
+            lucide_stroke_width: app.lucide_stroke_width,
             control_section,
             roster_mode: match app.roster_mode {
                 RosterMode::NativeSessions => RosterMode::Agents,
@@ -126,6 +137,8 @@ impl UiPreferences {
         app.sidebar_presentation = self.sidebar_presentation;
         app.sidebar_collapsed = self.sidebar_collapsed;
         app.rail_icons = self.rail_icons;
+        app.icon_family = self.icon_family;
+        app.lucide_stroke_width = self.lucide_stroke_width;
         app.control_section = match self.control_section {
             ControlSection::Settings => ControlSection::Files,
             section => section,
@@ -217,12 +230,14 @@ impl UiPreferences {
         validate_managed_agents(&self.managed_agents)?;
         validate_collapsed_directories(&self.collapsed_directories)?;
         let mut encoded = format!(
-            "version={CONFIG_VERSION}\nstyle={}\nmenu={}\nsidebar_presentation={}\nsidebar_collapsed={}\nrail_icons={}\ncontrol_section={}\nroster_mode={}\nsidebar_width={}\nsidebar_split_percent={}\ncontrol_modal_position={}\ncontrol_modal_size={}\nsurface_layout={}\n",
+            "version={CONFIG_VERSION}\nstyle={}\nmenu={}\nsidebar_presentation={}\nsidebar_collapsed={}\nrail_icons={}\nicon_family={}\nlucide_stroke_width={}\ncontrol_section={}\nroster_mode={}\nsidebar_width={}\nsidebar_split_percent={}\ncontrol_modal_position={}\ncontrol_modal_size={}\nsurface_layout={}\n",
             self.color_mode.id(),
             self.menu_placement.id(),
             self.sidebar_presentation.id(),
             self.sidebar_collapsed,
             self.rail_icons.id(),
+            self.icon_family.id(),
+            self.lucide_stroke_width.id(),
             self.control_section.id(),
             match self.roster_mode {
                 RosterMode::NativeSessions => RosterMode::Agents.id(),
@@ -444,6 +459,26 @@ fn parse(contents: &str) -> io::Result<UiPreferences> {
                     _ => preferences.rail_icons,
                 }
             }
+            // D? Lucide-alongside-codicons (CONFIG_VERSION 9 -> 10): both
+            // keys are new at v10 -- absent entirely in any pre-v10
+            // config, which simply keeps the struct default (`Codicons`/
+            // `OnePointFive`) set before this loop ran, same "the field
+            // just didn't exist yet" migration shape `rail_icons` itself
+            // had no v6 representation for (see this file's own D1a doc
+            // comment further down).
+            "icon_family" => {
+                preferences.icon_family = match value.trim() {
+                    "codicons" => IconFamily::Codicons,
+                    "lucide" => IconFamily::Lucide,
+                    _ => preferences.icon_family,
+                }
+            }
+            "lucide_stroke_width" => {
+                preferences.lucide_stroke_width = match value.trim() {
+                    "1.5" => LucideStrokeWidth::OnePointFive,
+                    _ => preferences.lucide_stroke_width,
+                }
+            }
             "control_section" => {
                 preferences.control_section = match value.trim() {
                     "files" => ControlSection::Files,
@@ -545,9 +580,20 @@ fn parse(contents: &str) -> io::Result<UiPreferences> {
         // same "legacy token survives forever" pattern -- so a v8 (or
         // earlier) config that had the owner on Braille lands back on
         // the tier that measured as "nearly ideal" rather than one that
-        // no longer exists. v7, v8, and v9 all share the exact same tail
-        // here -- nothing else in the v7 shape changes.
-        Some(7) | Some(8) | Some(CONFIG_VERSION) => {
+        // no longer exists. v7, v8, v9, and v10 all share the exact same
+        // tail here -- nothing else in the v7 shape changes.
+        //
+        // D? (CONFIG_VERSION 9 -> 10): `icon_family`/`lucide_stroke_
+        // width` are new keys, not a migrated field -- a v9 (or earlier)
+        // config simply has neither `icon_family=` nor `lucide_stroke_
+        // width=` line at all, so the per-line match above never touches
+        // `preferences.icon_family`/`.lucide_stroke_width`, and they keep
+        // the struct default (`Codicons`/`OnePointFive`) `UiPreferences::
+        // default()` already set before this loop ran -- "every existing
+        // config lands on Codicons" per this wave's own brief, achieved
+        // by there being nothing stored to override the default with,
+        // the same shape `rail_icons`'s own v6 gap above already uses.
+        Some(7) | Some(8) | Some(9) | Some(CONFIG_VERSION) => {
             finish_with_collections(preferences, managed_agents, collapsed_directory_values)
         }
         Some(other) => Err(invalid_data(format!("unsupported preferences version {other}"))),
@@ -766,6 +812,8 @@ mod tests {
             sidebar_presentation: SidebarPresentation::Activity,
             sidebar_collapsed: true,
             rail_icons: RailIcons::Ascii,
+            icon_family: IconFamily::Lucide,
+            lucide_stroke_width: LucideStrokeWidth::OnePointFive,
             control_section: ControlSection::Agents,
             roster_mode: RosterMode::Agents,
             sidebar_width: 41,
@@ -817,6 +865,8 @@ mod tests {
             sidebar_presentation: SidebarPresentation::Activity,
             sidebar_collapsed: true,
             rail_icons: RailIcons::Ascii,
+            icon_family: IconFamily::Lucide,
+            lucide_stroke_width: LucideStrokeWidth::OnePointFive,
             control_section: ControlSection::Workspaces,
             roster_mode: RosterMode::Workspaces,
             sidebar_width: 38,
@@ -933,13 +983,41 @@ mod tests {
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
+    /// D? Lucide-alongside-codicons (CONFIG_VERSION 9 -> 10): a v9 config
+    /// has neither `icon_family=` nor `lucide_stroke_width=` at all (both
+    /// keys are new at v10) -- this task's own brief: "bump CONFIG_VERSION
+    /// with a migration that lands existing configs on Codicons". Proves
+    /// that landing, then that it is a real value (persisted, re-savable),
+    /// not just a struct default that happens to look right once.
     #[test]
-    fn preferences_v1_through_v4_migrate_to_v9_with_empty_collections() {
+    fn preferences_v9_config_with_no_icon_family_key_lands_on_codicons() {
+        let path = temp_path("v9-lands-on-codicons");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "version=9\nstyle=gate\nrail_icons=ascii\n").unwrap();
+
+        let loaded = UiPreferences::load(&path).unwrap();
+        assert_eq!(loaded.icon_family, IconFamily::Codicons);
+        assert_eq!(loaded.lucide_stroke_width, LucideStrokeWidth::OnePointFive);
+        let mut app = App::default();
+        loaded.apply_to(&mut app);
+        assert_eq!(app.icon_family, IconFamily::Codicons);
+        assert_eq!(app.lucide_stroke_width, LucideStrokeWidth::OnePointFive);
+
+        let reencoded = loaded.encode().unwrap();
+        assert!(reencoded.starts_with("version=10\n"));
+        assert!(reencoded.contains("icon_family=codicons\n"));
+        assert!(reencoded.contains("lucide_stroke_width=1.5\n"));
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn preferences_v1_through_v4_migrate_to_v10_with_empty_collections() {
         for version in 1..=4 {
             let loaded = parse(&format!("version={version}\nstyle=gate\n")).unwrap();
             assert!(loaded.managed_agents.is_empty(), "version {version}");
             assert!(loaded.collapsed_directories.is_empty(), "version {version}");
-            assert!(loaded.encode().unwrap().starts_with("version=9\n"), "version {version}");
+            assert!(loaded.encode().unwrap().starts_with("version=10\n"), "version {version}");
         }
     }
 
@@ -991,7 +1069,7 @@ mod tests {
 
         let encoded = preferences.encode().unwrap();
         let decoded = parse(&encoded).unwrap();
-        assert!(encoded.starts_with("version=9\n"));
+        assert!(encoded.starts_with("version=10\n"));
         assert_eq!(decoded.collapsed_directories, vec![utf8.clone(), opaque.clone()]);
         assert_eq!(decoded.collapsed_directories[1].path.as_bytes(), opaque_bytes);
         assert_eq!(decoded.collapsed_directories[1].path.as_utf8(), None);
@@ -1021,7 +1099,7 @@ mod tests {
 
         assert!(loaded.collapsed_directories.is_empty());
         assert_eq!(loaded.color_mode, PtyColorMode::GateOverride);
-        assert!(loaded.encode().unwrap().starts_with("version=9\n"));
+        assert!(loaded.encode().unwrap().starts_with("version=10\n"));
     }
 
     /// D1a's default-mode flip (CONFIG_VERSION 6 -> 7): a v6 config's
@@ -1089,20 +1167,22 @@ mod tests {
         // the migrated presentation -- applying it to an App reflects the
         // same flip.
         let reencoded = loaded.encode().unwrap();
-        assert!(reencoded.starts_with("version=9\n"));
+        assert!(reencoded.starts_with("version=10\n"));
         let mut app = App::default();
         loaded.apply_to(&mut app);
         assert_eq!(app.sidebar_presentation, SidebarPresentation::Activity);
 
         // Neither a v7, v8, nor v9 config is ever touched by the flip: an
         // explicit `Split` choice made after migrating away from the new
-        // default persists at any of the three.
+        // default persists at any of the four.
         let v7_split = parse("version=7\nsidebar_presentation=split\n").unwrap();
         assert_eq!(v7_split.sidebar_presentation, SidebarPresentation::Split);
         let v8_split = parse("version=8\nsidebar_presentation=split\n").unwrap();
         assert_eq!(v8_split.sidebar_presentation, SidebarPresentation::Split);
         let v9_split = parse("version=9\nsidebar_presentation=split\n").unwrap();
         assert_eq!(v9_split.sidebar_presentation, SidebarPresentation::Split);
+        let v10_split = parse("version=10\nsidebar_presentation=split\n").unwrap();
+        assert_eq!(v10_split.sidebar_presentation, SidebarPresentation::Split);
     }
 
     #[test]

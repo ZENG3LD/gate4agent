@@ -1921,11 +1921,25 @@ fn flush_sixel_icon_into<W: io::Write>(
             PlacementDisposition::Disturbed => clear_rect(writer, placement.rect, screen_buffer)?,
             PlacementDisposition::New => {}
         }
+        // `icons::sixel_*_family` (never the bare, codicon-only `icons::
+        // sixel*`) so `placement.family` -- `IconFamily::Codicons` at
+        // every call site today except the icon gallery's own dedicated
+        // comparison columns (`render::render_icon_gallery`) -- actually
+        // selects which catalog resolves. `None` means a documented
+        // Lucide mapping gap (see `icons.rs`'s own "Lucide" doc section):
+        // this placement's own themed body was already painted by
+        // whichever `render::render_*_button` pushed it, so skipping the
+        // glyph here just leaves that body without its icon for the one
+        // (icon, family) pair with no asset to resolve, never a panic and
+        // never a silent fall-back to the other family's own asset.
         let encoded = match placement.size {
-            SixelIconSize::Rail => icons::sixel(placement.icon, placement.variant),
-            SixelIconSize::Compact => icons::sixel_compact(placement.icon),
-            SixelIconSize::Strip => icons::sixel_strip(placement.icon, placement.variant),
-            SixelIconSize::Gallery => icons::sixel_gallery(placement.icon, placement.variant),
+            SixelIconSize::Rail => icons::sixel_family(placement.icon, placement.family, placement.variant),
+            SixelIconSize::Compact => icons::sixel_compact_family(placement.icon, placement.family),
+            SixelIconSize::Strip => icons::sixel_strip_family(placement.icon, placement.family, placement.variant),
+            SixelIconSize::Gallery => icons::sixel_gallery_family(placement.icon, placement.family, placement.variant),
+        };
+        let Some(encoded) = encoded else {
+            continue;
         };
         execute!(
             writer,
@@ -5681,7 +5695,7 @@ mod tests {
         SpawnProfileSummary,
     };
     use crate::app::{
-        ContextUsageSegment, ContextUsageSegmentHit, ControlSection, DragState, Focus, HitRegion, HitTarget, LaunchContextMode, LaunchField,
+        ContextUsageSegment, ContextUsageSegmentHit, ControlSection, DragState, Focus, HitRegion, HitTarget, IconFamily, LaunchContextMode, LaunchField,
         HarnessTaskComposerField, HarnessTaskRef, LaunchTarget, PtyColorMode, SidebarPresentation, SpawnDialog,
         SurfacePaneLayout,
     };
@@ -5700,7 +5714,13 @@ mod tests {
     }
 
     fn sixel_placement(icon: icons::IconId, x: u16, variant: icons::SixelVariant) -> SixelIconPlacement {
-        SixelIconPlacement { icon, rect: uzor_tui::Rect::new(x, 1, 4, 2), variant, size: SixelIconSize::Rail }
+        SixelIconPlacement {
+            icon,
+            rect: uzor_tui::Rect::new(x, 1, 4, 2),
+            variant,
+            size: SixelIconSize::Rail,
+            family: IconFamily::Codicons,
+        }
     }
 
     /// A `TerminalBuffer` sized to `app`'s own terminal dimensions, filled
@@ -5969,6 +5989,7 @@ mod tests {
             rect: uzor_tui::Rect::new(2, 8, 4, 2),
             variant: icons::SixelVariant::GateActive,
             size: SixelIconSize::Rail,
+            family: IconFamily::Codicons,
         }];
         let mut state = SixelEmitState::default();
         let mut written = Vec::new();
@@ -6117,6 +6138,7 @@ mod tests {
             rect: uzor_tui::Rect::new(2, 1, 1, 1),
             variant: icons::SixelVariant::GateActive,
             size: SixelIconSize::Compact,
+            family: IconFamily::Codicons,
         }];
         let mut state = SixelEmitState::default();
         let mut written = Vec::new();
@@ -6145,6 +6167,7 @@ mod tests {
             rect: uzor_tui::Rect::new(2, 1, 2, 1),
             variant: icons::SixelVariant::GateActive,
             size: SixelIconSize::Strip,
+            family: IconFamily::Codicons,
         }];
         let mut state = SixelEmitState::default();
         let mut written = Vec::new();
@@ -6176,6 +6199,7 @@ mod tests {
             rect: uzor_tui::Rect::new(2, 1, 6, 3),
             variant: icons::SixelVariant::GateActive,
             size: SixelIconSize::Gallery,
+            family: IconFamily::Codicons,
         }];
         let mut state = SixelEmitState::default();
         let mut written = Vec::new();
@@ -6209,6 +6233,7 @@ mod tests {
             rect: uzor_tui::Rect::new(2, 1, 4, 2),
             variant: icons::SixelVariant::GateAccent,
             size: SixelIconSize::Rail,
+            family: IconFamily::Codicons,
         }];
         let mut state = SixelEmitState::default();
         let mut written = Vec::new();

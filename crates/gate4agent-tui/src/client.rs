@@ -5935,9 +5935,9 @@ mod tests {
         flush_sixel_icon_into(&mut written, &app, &blank_screen(&app), &mut state).unwrap();
         assert_eq!(state.last.len(), 2);
 
-        // Braille/Ascii tier: `render::render` populates zero placements
-        // this frame. The real screen buffer already carries the braille
-        // dots/ascii glyphs `render::render` painted in their place.
+        // Ascii tier: `render::render` populates zero placements this
+        // frame. The real screen buffer already carries the ascii
+        // glyphs `render::render` painted in their place.
         let mut occupied = blank_screen(&app);
         occupied.set(2, 1, uzor_tui::Cell::new("Q"));
         occupied.set(20, 1, uzor_tui::Cell::new("R"));
@@ -5998,7 +5998,7 @@ mod tests {
     /// rail`'s own `usable_bottom` doc comment -- actually reaches the
     /// real terminal in a normal-sized window, not just that `render::
     /// render` PLACED it (that layer's own coverage lives in `render::
-    /// tests::activity_rail_sixel_braille_and_ascii_modes_render_the_
+    /// tests::activity_rail_sixel_and_ascii_modes_render_the_
     /// expected_output`, which never exercises the emission-time bottom-
     /// row filter this test does). Before this fix, the rail's own bottom
     /// group anchored directly against `area.bottom()`, which for a rail
@@ -6093,7 +6093,7 @@ mod tests {
 
     #[test]
     fn flush_sixel_icon_writes_nothing_for_an_empty_sixel_icons() {
-        // Braille/Ascii tier, or a terminal too short for the tall rail:
+        // Ascii tier, or a terminal too short for the tall rail:
         // `layout.sixel_icons` is empty and there is nothing to draw.
         let app = App::default();
         assert!(app.layout.sixel_icons.is_empty());
@@ -6168,7 +6168,7 @@ mod tests {
     #[test]
     fn flush_sixel_icon_prints_the_gallery_asset_for_a_gallery_placement() {
         // Same proof as the compact/strip tests above, for the icon
-        // gallery's own 60x60 tier: `icons::sixel_gallery` is a DIFFERENT
+        // gallery's own dedicated tier: `icons::sixel_gallery` is a DIFFERENT
         // raster than the rail/compact/strip tiers' own for the same icon.
         let mut app = App::default();
         app.layout.sixel_icons = vec![SixelIconPlacement {

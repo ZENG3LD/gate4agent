@@ -2,20 +2,26 @@
 //! ~57-icon set (see [`IconId`]), not just the activity rail's original
 //! 7. Offline-rasterized, raw RGBA8 bytes checked straight into the
 //! crate via `include_bytes!` -- no `usvg`/`resvg`/`uzor-icon` runtime or
-//! build dependency. Every icon is baked in TWO raster tiers (see
+//! build dependency. Every icon is baked in ONE raster tier (see
 //! `render::render_rail_button` / `app::RailIcons`), switched globally
 //! by the owner's own preference, not fixed per button, plus a plain
 //! ASCII text tier:
 //!
 //! - Sixel (`RailIcons::Sixel`): a real raster image written directly to
 //!   the terminal by `client::run`'s post-flush hook -- see [`sixel`].
-//! - Braille (`RailIcons::Braille`): a `uzor_tui::canvas::PixelCanvas`
-//!   painted straight into the cell buffer -- see [`braille`].
 //! - Ascii (`RailIcons::Ascii`): a short (<=2 char) plain-text label --
 //!   see [`ascii`]. The activity rail itself still paints its OWN
 //!   `render::RailButton::ascii` literal in this mode rather than
 //!   calling [`ascii`] (see "Wiring status" below); that field's values
 //!   match what [`ascii`] returns for the same 7 icons regardless.
+//!
+//! A third tier, Braille (a `uzor_tui::canvas::PixelCanvas` painted
+//! straight into the cell buffer), shipped earlier and was removed
+//! outright on the owner's own order: braille's fixed 2x4 dots/cell
+//! density means the strip tier's own 2x1-cell button footprint is just
+//! a 4x4 dot grid -- nothing left to improve, unusably low quality. Same
+//! fate as the still-earlier half-block tier (see `app::RailIcons`'s own
+//! doc comment).
 //!
 //! ## Wiring status
 //!
@@ -51,19 +57,17 @@
 //! neither a dependency of this crate; both run once, offline). Re-run:
 //!
 //! ```text
-//! python tools/bake_icons.py
+//! python tools/bake_icons.py --force
 //! ```
 //!
 //! That tool's own header doc comment has the full pipeline (the exact
-//! `resvg`/`ffmpeg` filter graphs for both raster tiers, byte-for-byte)
-//! and the per-icon braille alpha-threshold selection algorithm; this
-//! module doc does not reproduce either, to avoid the two drifting
-//! apart. The original 7 rail icons' own thresholds/assets are
-//! explicitly REPLAYED unchanged by that tool (see its own
-//! `THRESHOLD_OVERRIDES` / `LEGACY_RAIL_SLUGS`), not re-derived -- this
-//! generalization is a rename, not a re-bake, for those 7 (see this
-//! module's own `tests::the_rails_original_7_icons_still_render_the_
-//! same_braille_glyphs_as_before_this_catalog_generalized`).
+//! `resvg`/`ffmpeg` filter graphs, byte-for-byte); this module doc does
+//! not reproduce it, to avoid the two drifting apart. Every icon --
+//! including the activity rail's original 7 -- is baked through this
+//! SAME single pipeline; there is no separate frozen-legacy-asset path
+//! (there used to be one, replaying the original 7's own hand-picked
+//! braille alpha thresholds unchanged; it was retired along with the
+//! braille tier itself).
 //!
 //! ## Sixel background variants ([`SixelVariant`])
 //!
@@ -82,21 +86,21 @@
 //! at bake OR at render time (crossterm has no reliable query, the same
 //! epistemic gap [`ASSUMED_CELL_WIDTH_PX`]'s own doc comment already
 //! names for cell-pixel size), so it keeps the original transparent-
-//! encoded asset as its only available option. Braille/ascii tiers need
-//! no equivalent of this at all: a terminal CELL has real native fg/bg
-//! support, so [`rgba_to_canvas`]'s own caller already paints the exact
-//! themed background straight into the cell buffer (see `render::matte_
-//! canvas_background`) -- only a sixel image, a raster the terminal has
-//! no concept of "this pixel belongs to a themed panel" for, needs a
-//! pre-baked variant per background at all.
+//! encoded asset as its only available option (pre-corrected for gamma,
+//! see `tools/bake_icons.py::precorrect_transparent_alpha`'s own doc
+//! comment -- the SAME dark-background assumption this module's `ASSUMED_
+//! CELL_WIDTH_PX` doc already documents the shape of, applied to colour
+//! instead of geometry). The ascii tier needs no equivalent of this at
+//! all: it is plain themed text drawn directly with the button's own
+//! background style, not a raster image -- only a sixel image, a raster
+//! the terminal has no concept of "this pixel belongs to a themed panel"
+//! for, needs a pre-baked variant per background at all.
 
 use icy_sixel::{BackgroundMode, EncodeOptions, SixelImage};
-use uzor_tui::canvas::{CanvasMode, PixelCanvas};
-use uzor_tui::style::Color;
 
 mod catalog;
 
-pub use catalog::{ascii, braille, braille_compact, sixel, sixel_compact, sixel_gallery, sixel_strip, IconId};
+pub use catalog::{ascii, sixel, sixel_compact, sixel_gallery, sixel_strip, IconId};
 
 /// Which pre-baked background a sixel-tier icon asset was composited
 /// against (or left transparent for) -- see this module's own "Sixel
@@ -124,65 +128,62 @@ pub enum SixelVariant {
 }
 
 /// Assumed terminal cell size in pixels (Cascadia Mono 12pt, Windows
-/// Terminal) -- the basis the sixel tier's own pixel target was derived
+/// Terminal) -- the basis every sixel tier's own pixel target is derived
 /// from. Not read at runtime (crossterm has no reliable cell-pixel
 /// probe); retuning either constant means re-rasterizing every `.rgba`
-/// sixel-tier asset at the new target size via `tools/bake_icons.py`,
-/// not just editing a number here.
+/// sixel-tier asset at the new target size via `tools/bake_icons.py`, not
+/// just editing a number here.
+///
+/// Measured directly against the owner's own Windows Terminal window (a
+/// 1129x635 window: the rail's 6 columns span 60px -- 10.0px/col -- and
+/// four consecutive gallery rows span 76px -- 19.0px/row), NOT the
+/// earlier assumed 10x20: a body sized off an over-estimated cell height
+/// overflows its own row budget and bleeds into the terminal row below
+/// it (unsafe -- visible ghosting/misalignment against whatever that
+/// next row paints); a body sized off an under-estimate merely leaves an
+/// unused blank pixel row inside its own last cell (safe). Every tier
+/// below is therefore FLOOR-rounded to a whole multiple of this height,
+/// never rounded up -- see [`SIXEL_ICON_HEIGHT_PX`]'s own doc comment for
+/// the one tier this floor-rounding makes non-square.
 pub const ASSUMED_CELL_WIDTH_PX: u32 = 10;
-pub const ASSUMED_CELL_HEIGHT_PX: u32 = 20;
+pub const ASSUMED_CELL_HEIGHT_PX: u32 = 19;
 
 // ---- Sixel tier -----------------------------------------------------
 
-/// Single source of truth for the activity rail's own sixel icon size --
-/// "keep 40x40, make switching it a one-line change" (see `render::
-/// render_activity_rail`'s own geometry doc comment). A square icon only
-/// lands on an assumed 10x20px cell with no leftover fractional row at
-/// exactly 20 (2 cells wide x 1 row tall), 40 (4 cells wide x 2 rows
-/// tall, the size shipped today) or 60 (6 cells wide x 3 rows tall) --
-/// `render::render_activity_rail`'s own button-body height derives
-/// DIRECTLY from [`SIXEL_ICON_CELLS_TALL`] below, so bumping this ONE
-/// constant is the entire rail-size swap; the only other step is
+/// Rail-tier sixel icon footprint, in whole assumed terminal cells --
+/// "keep 4 cells wide x 2 rows tall, make switching either number a
+/// one-line change" (see `render::render_activity_rail`'s own geometry
+/// doc comment). `render::render_activity_rail`'s own button-body height
+/// derives DIRECTLY from [`SIXEL_ICON_CELLS_TALL`], so changing either
+/// constant here is the entire rail-size swap; the only other step is
 /// re-rasterizing this tier's own `.rgba` assets at the new size via
-/// `tools/bake_icons.py` (same precedent as [`ASSUMED_CELL_WIDTH_PX`]'s
-/// own doc comment). The icon gallery (`app::SurfaceTab::IconGallery`)
-/// renders the 20/40/60 columns side by side (see this module's own
-/// "Gallery tier" section below) so the owner can judge an alternative
-/// before ever touching this constant.
-pub const RAIL_ICON_SIZE_PX: u32 = 40;
-/// Baked bitmap pixel size shared by every rail-tier sixel icon --
-/// [`RAIL_ICON_SIZE_PX`] on both axes (codicons are square, see
-/// `tools/bake_icons.py`'s own `rasterize_sixel`).
-pub const SIXEL_ICON_WIDTH_PX: u32 = RAIL_ICON_SIZE_PX;
-pub const SIXEL_ICON_HEIGHT_PX: u32 = RAIL_ICON_SIZE_PX;
-/// Cell footprint the flush hook reserves on the rail for one sixel icon
-/// (derived from the pixel size above and the assumed cell size, not
-/// hand-synced) -- `render::render_activity_rail` sizes the rail
-/// button's own highlighted body to EXACTLY this many rows when there is
-/// room for the tall treatment, so the icon fills its own button with no
-/// leftover unhighlighted-but-still-accented row underneath it.
-pub const SIXEL_ICON_CELLS_WIDE: u16 = (SIXEL_ICON_WIDTH_PX / ASSUMED_CELL_WIDTH_PX) as u16;
-pub const SIXEL_ICON_CELLS_TALL: u16 = (SIXEL_ICON_HEIGHT_PX / ASSUMED_CELL_HEIGHT_PX) as u16;
-
-// ---- Braille tier -----------------------------------------------------
-
-/// Baked bitmap pixel size shared by every braille-tier icon: 4 cells
-/// wide x 3 rows tall (the button's FULL body) at braille's fixed 2x4
-/// dots/cell density (see `uzor_tui::canvas::CanvasMode::Braille`).
-pub const BRAILLE_ICON_WIDTH_PX: u32 = 8;
-pub const BRAILLE_ICON_HEIGHT_PX: u32 = 12;
-pub const BRAILLE_ICON_CELLS_WIDE: u16 = 4;
-pub const BRAILLE_ICON_CELLS_TALL: u16 = 3;
+/// `tools/bake_icons.py`. The icon gallery (`app::SurfaceTab::
+/// IconGallery`) renders the strip/rail/gallery columns side by side (see
+/// this module's own "Gallery tier" section below) so the owner can judge
+/// an alternative before ever touching these constants.
+pub const SIXEL_ICON_CELLS_WIDE: u16 = 4;
+pub const SIXEL_ICON_CELLS_TALL: u16 = 2;
+/// Baked bitmap pixel width: [`SIXEL_ICON_CELLS_WIDE`] whole
+/// [`ASSUMED_CELL_WIDTH_PX`] cells.
+pub const SIXEL_ICON_WIDTH_PX: u32 = ASSUMED_CELL_WIDTH_PX * 4;
+/// Baked bitmap pixel height: [`SIXEL_ICON_CELLS_TALL`] whole
+/// [`ASSUMED_CELL_HEIGHT_PX`] cells -- deliberately NOT equal to
+/// [`SIXEL_ICON_WIDTH_PX`] (38 vs 40) even though every source codicon is
+/// square: floor-rounding a 40-tall icon to whole 19px cells lands on 38,
+/// not back up to 40 (see [`ASSUMED_CELL_HEIGHT_PX`]'s own doc comment on
+/// why floor, never ceiling). `tools/bake_icons.py::rasterize_sixel` fits
+/// a source icon within this non-square box by hand for exactly the
+/// reason `rasterize_strip_sixel`/`rasterize_gallery_sixel` already did.
+pub const SIXEL_ICON_HEIGHT_PX: u32 = ASSUMED_CELL_HEIGHT_PX * 2;
 
 // ---- Compact tier -------------------------------------------------------
 //
 // For dense, single-row inline buttons (Explorer/Git sidebar panel lists
 // and their modals -- `render::render_compact_icon_button`) where the
-// rail's own 4-cell x 2/3-row icon does not fit next to a text label in
-// the SAME row. Baked as its own separate, much smaller raster per icon
-// (not a runtime downscale of the rail-tier asset) by `tools/
-// bake_icons.py`'s own `rasterize_compact_sixel`/`rasterize_compact_
-// braille`.
+// rail's own 4-cell x 2-row icon does not fit next to a text label in the
+// SAME row. Baked as its own separate, much smaller raster per icon (not
+// a runtime downscale of the rail-tier asset) by `tools/bake_icons.py`'s
+// own `rasterize_compact_sixel`.
 
 /// Compact sixel-tier bitmap pixel size: exactly ONE assumed terminal
 /// cell (see `ASSUMED_CELL_WIDTH_PX`/`ASSUMED_CELL_HEIGHT_PX` above).
@@ -190,14 +191,6 @@ pub const COMPACT_SIXEL_ICON_WIDTH_PX: u32 = ASSUMED_CELL_WIDTH_PX;
 pub const COMPACT_SIXEL_ICON_HEIGHT_PX: u32 = ASSUMED_CELL_HEIGHT_PX;
 pub const COMPACT_SIXEL_ICON_CELLS_WIDE: u16 = 1;
 pub const COMPACT_SIXEL_ICON_CELLS_TALL: u16 = 1;
-
-/// Compact braille-tier bitmap: 2 cells wide x 1 row tall (a braille cell
-/// is a fixed 2x4 dot grid, so this is a 4x4-dot canvas) -- a SQUARE
-/// target, unlike the rail tier's own 2:3 portrait (8x12) grid.
-pub const COMPACT_BRAILLE_ICON_WIDTH_PX: u32 = 4;
-pub const COMPACT_BRAILLE_ICON_HEIGHT_PX: u32 = 4;
-pub const COMPACT_BRAILLE_ICON_CELLS_WIDE: u16 = 2;
-pub const COMPACT_BRAILLE_ICON_CELLS_TALL: u16 = 1;
 
 // ---- Strip tier -----------------------------------------------------
 //
@@ -207,11 +200,7 @@ pub const COMPACT_BRAILLE_ICON_CELLS_TALL: u16 = 1;
 // own separate raster per icon (single-pass resvg AA directly at this
 // target size, same recipe as the rail/compact tiers -- see `tools/
 // bake_icons.py`'s own `rasterize_strip_sixel`), not a runtime downscale
-// of the rail tier's own 40x40 asset. No separate braille bake exists for
-// this tier: its required geometry (4x4 dots / 2 cells wide x 1 row
-// tall) already exactly matches the COMPACT braille tier's own above, so
-// `render_control_strip_button`'s own braille branch calls
-// [`braille_compact`] directly.
+// of the rail tier's own asset.
 
 /// Strip sixel-tier bitmap pixel size: 2 assumed terminal cells wide x 1
 /// row tall (see `ASSUMED_CELL_WIDTH_PX`/`ASSUMED_CELL_HEIGHT_PX` above).
@@ -224,18 +213,18 @@ pub const STRIP_SIXEL_ICON_CELLS_TALL: u16 = 1;
 //
 // The icon gallery dev surface (`app::SurfaceTab::IconGallery`, `render::
 // render_icon_gallery`) shows every icon at all three sizes FIX2 landed
-// on side by side -- 20x20 (this crate's own strip tier, reused as-is),
-// 40x40 (the rail tier, reused as-is) and 60x60, which no other UI site
-// needs and so has no existing bake. This is that third size's own
-// dedicated raster (single-pass resvg AA directly at 60x60, same recipe
-// as the rail/strip/compact tiers -- see `tools/bake_icons.py`'s own
-// `rasterize_gallery_sixel`), not a runtime upscale of the 40x40 rail
-// asset (which would just blur the existing raster, defeating the whole
-// point of a size comparison).
+// on side by side -- the strip tier's own pixel size (reused as-is), the
+// rail tier's own pixel size (reused as-is), and a third size no other UI
+// site needs and so has no existing bake. This is that third size's own
+// dedicated raster (single-pass resvg AA directly at the target size,
+// same recipe as the rail/strip/compact tiers -- see `tools/
+// bake_icons.py`'s own `rasterize_gallery_sixel`), not a runtime upscale
+// of the rail asset (which would just blur the existing raster, defeating
+// the whole point of a size comparison).
 
 /// Gallery sixel-tier bitmap pixel size: 6 assumed terminal cells wide x
 /// 3 rows tall (see `ASSUMED_CELL_WIDTH_PX`/`ASSUMED_CELL_HEIGHT_PX`
-/// above) -- the third of FIX2's three evenly-landing square sizes.
+/// above) -- the third of FIX2's three evenly-landing sizes.
 pub const GALLERY_SIXEL_ICON_WIDTH_PX: u32 = ASSUMED_CELL_WIDTH_PX * 6;
 pub const GALLERY_SIXEL_ICON_HEIGHT_PX: u32 = ASSUMED_CELL_HEIGHT_PX * 3;
 pub const GALLERY_SIXEL_ICON_CELLS_WIDE: u16 = 6;
@@ -293,7 +282,7 @@ pub(crate) fn build_sixel_strip_gate(rgba: &[u8]) -> String {
     build_sixel_sized(rgba, STRIP_SIXEL_ICON_WIDTH_PX, STRIP_SIXEL_ICON_HEIGHT_PX, BackgroundMode::Opaque)
 }
 
-/// Same encoding as [`build_sixel`], for the gallery tier's own 60x60
+/// Same encoding as [`build_sixel`], for the gallery tier's own dedicated
 /// per-icon asset (see this module's own "Gallery tier" section above).
 pub(crate) fn build_sixel_gallery(rgba: &[u8]) -> String {
     build_sixel_sized(rgba, GALLERY_SIXEL_ICON_WIDTH_PX, GALLERY_SIXEL_ICON_HEIGHT_PX, BackgroundMode::Transparent)
@@ -322,41 +311,9 @@ fn build_sixel_sized(rgba: &[u8], width: u32, height: u32, background_mode: Back
         .expect("encoding a fixed, already-validated, in-memory RGBA buffer to SIXEL does not fail")
 }
 
-/// Builds a [`PixelCanvas`] from a baked RGBA8 buffer, one `set_pixel`
-/// per pixel at or above `alpha_threshold` (straight, non-premultiplied
-/// alpha -- see this module's own doc comment); a pixel below the
-/// threshold is left unset, matching the sixel tier's own
-/// transparent-background convention so both tiers silhouette the same
-/// glyph rather than one of them painting a filled color block. `rgba`'s
-/// length is validated by this module's own unit tests, not here -- a
-/// buffer shorter than `canvas.px_width() * px_height() * 4` degrades to
-/// leaving the missing tail unset (the same "off-canvas input degrades
-/// quietly" stance `PixelCanvas::set_pixel` itself documents) rather
-/// than panicking.
-pub(crate) fn rgba_to_canvas(mode: CanvasMode, cell_width: u16, cell_height: u16, rgba: &[u8], alpha_threshold: u8) -> PixelCanvas {
-    let mut canvas = PixelCanvas::new(mode, cell_width, cell_height);
-    let px_width = canvas.px_width();
-    let px_height = canvas.px_height();
-    for y in 0..px_height {
-        for x in 0..px_width {
-            let idx = ((y * px_width + x) * 4) as usize;
-            if idx + 4 > rgba.len() {
-                continue;
-            }
-            let (r, g, b, a) = (rgba[idx], rgba[idx + 1], rgba[idx + 2], rgba[idx + 3]);
-            if a >= alpha_threshold {
-                canvas.set_pixel(x as i64, y as i64, Color::Rgb(r, g, b));
-            }
-        }
-    }
-    canvas
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use uzor_tui::buffer::TerminalBuffer;
-    use uzor_tui::rect::Rect;
 
     #[test]
     fn every_sixel_rgba_matches_its_own_declared_dimensions() {
@@ -366,23 +323,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn every_braille_rgba_matches_its_own_declared_dimensions() {
-        let expected = (BRAILLE_ICON_WIDTH_PX * BRAILLE_ICON_HEIGHT_PX * 4) as usize;
-        for id in IconId::ALL {
-            assert_eq!(catalog::braille_source_rgba(id).len(), expected, "{id:?} braille rgba length");
-        }
-    }
-
     const SIXEL_VARIANTS: [SixelVariant; 3] = [SixelVariant::Transparent, SixelVariant::GateActive, SixelVariant::GateAccent];
 
     #[test]
-    fn every_icon_resolves_in_all_three_tiers_without_panicking() {
+    fn every_icon_resolves_in_every_tier_without_panicking() {
         for id in IconId::ALL {
             for variant in SIXEL_VARIANTS {
                 let _sixel = sixel(id, variant);
             }
-            let _braille = braille(id);
             let _ascii = ascii(id);
         }
     }
@@ -393,7 +341,7 @@ mod tests {
             for variant in SIXEL_VARIANTS {
                 let encoded = sixel(id, variant);
                 assert!(encoded.starts_with('\u{1b}'), "{id:?}/{variant:?} sixel output must start with the DCS introducer ESC");
-                assert!(encoded.len() > 16, "{id:?}/{variant:?} sixel output for a 40x40 icon with real ink must not be a near-empty stub");
+                assert!(encoded.len() > 16, "{id:?}/{variant:?} sixel output for a real icon with real ink must not be a near-empty stub");
             }
         }
     }
@@ -450,7 +398,11 @@ mod tests {
     /// composited pixel must be EXACTLY the flat background colour;
     /// wherever it is fully covered (alpha 255), the composited pixel
     /// must be EXACTLY the source's own (already `#cdd6f4`-tinted, per
-    /// `patch_fill`) ink colour, unchanged.
+    /// `patch_fill`) ink colour, unchanged. Both extremes survive `tools/
+    /// bake_icons.py::precorrect_transparent_alpha`'s own alpha remap
+    /// unchanged too (0 and 255 are its fixed points), so this holds for
+    /// the shipped `Transparent`-variant source bytes exactly as baked,
+    /// not just for some hypothetical unconverted buffer.
     #[test]
     fn gate_compositing_matches_the_background_and_ink_colours_exactly_at_full_coverage() {
         // Hand-synced to render.rs's own (private) ACTIVE_BG/MAUVE
@@ -574,15 +526,6 @@ mod tests {
     }
 
     #[test]
-    fn every_braille_canvas_pixel_dimensions_match_the_baked_asset() {
-        for id in IconId::ALL {
-            let canvas = braille(id);
-            assert_eq!(canvas.px_width(), BRAILLE_ICON_WIDTH_PX, "{id:?}");
-            assert_eq!(canvas.px_height(), BRAILLE_ICON_HEIGHT_PX, "{id:?}");
-        }
-    }
-
-    #[test]
     fn every_compact_sixel_rgba_matches_its_own_declared_dimensions() {
         let expected = (COMPACT_SIXEL_ICON_WIDTH_PX * COMPACT_SIXEL_ICON_HEIGHT_PX * 4) as usize;
         for id in IconId::ALL {
@@ -591,18 +534,9 @@ mod tests {
     }
 
     #[test]
-    fn every_compact_braille_rgba_matches_its_own_declared_dimensions() {
-        let expected = (COMPACT_BRAILLE_ICON_WIDTH_PX * COMPACT_BRAILLE_ICON_HEIGHT_PX * 4) as usize;
-        for id in IconId::ALL {
-            assert_eq!(catalog::braille_compact_source_rgba(id).len(), expected, "{id:?} compact braille rgba length");
-        }
-    }
-
-    #[test]
-    fn every_icon_resolves_in_both_compact_tiers_without_panicking() {
+    fn every_icon_resolves_in_the_compact_tier_without_panicking() {
         for id in IconId::ALL {
             let _sixel_compact = sixel_compact(id);
-            let _braille_compact = braille_compact(id);
         }
     }
 
@@ -615,111 +549,11 @@ mod tests {
     }
 
     #[test]
-    fn every_compact_braille_canvas_pixel_dimensions_match_the_baked_asset() {
-        for id in IconId::ALL {
-            let canvas = braille_compact(id);
-            assert_eq!(canvas.px_width(), COMPACT_BRAILLE_ICON_WIDTH_PX, "{id:?}");
-            assert_eq!(canvas.px_height(), COMPACT_BRAILLE_ICON_HEIGHT_PX, "{id:?}");
-        }
-    }
-
-    #[test]
-    fn every_compact_braille_canvas_lights_at_least_one_dot() {
-        for id in IconId::ALL {
-            let mut buf = TerminalBuffer::new(COMPACT_BRAILLE_ICON_CELLS_WIDE, COMPACT_BRAILLE_ICON_CELLS_TALL);
-            braille_compact(id).flush(Rect::new(0, 0, COMPACT_BRAILLE_ICON_CELLS_WIDE, COMPACT_BRAILLE_ICON_CELLS_TALL), &mut buf);
-            let lit_cells = (0..COMPACT_BRAILLE_ICON_CELLS_TALL)
-                .flat_map(|y| (0..COMPACT_BRAILLE_ICON_CELLS_WIDE).map(move |x| (x, y)))
-                .filter(|&(x, y)| buf.get(x, y).symbol.as_str() != "\u{2800}")
-                .count();
-            assert!(lit_cells > 0, "{id:?} compact braille canvas rendered fully blank");
-        }
-    }
-
-    #[test]
-    fn every_braille_canvas_lights_at_least_one_dot() {
-        for id in IconId::ALL {
-            let mut buf = TerminalBuffer::new(BRAILLE_ICON_CELLS_WIDE, BRAILLE_ICON_CELLS_TALL);
-            braille(id).flush(Rect::new(0, 0, BRAILLE_ICON_CELLS_WIDE, BRAILLE_ICON_CELLS_TALL), &mut buf);
-            let lit_cells = (0..BRAILLE_ICON_CELLS_TALL)
-                .flat_map(|y| (0..BRAILLE_ICON_CELLS_WIDE).map(move |x| (x, y)))
-                .filter(|&(x, y)| buf.get(x, y).symbol.as_str() != "\u{2800}")
-                .count();
-            assert!(lit_cells > 0, "{id:?} braille canvas rendered fully blank");
-        }
-    }
-
-    #[test]
     fn every_ascii_label_is_non_empty_and_at_most_two_chars() {
         for id in IconId::ALL {
             let label = ascii(id);
             assert!(!label.is_empty(), "{id:?} ascii label must not be empty");
             assert!(label.chars().count() <= 2, "{id:?} ascii label {label:?} is longer than 2 chars");
         }
-    }
-
-    /// The activity rail's original 7 icons (baseline commit 9f39758,
-    /// before this catalog generalized to the full ~57-icon set) must
-    /// still render byte-for-byte the same braille glyphs and carry the
-    /// same sixel-tier source bytes -- re-pointing the rail at the wider
-    /// [`IconId`] enum is a pure rename, not a re-bake, for these 7 (see
-    /// `tools/bake_icons.py`'s own `LEGACY_RAIL_SLUGS`/
-    /// `THRESHOLD_OVERRIDES`, which replay each one's original constant
-    /// unchanged rather than re-deriving it).
-    ///
-    /// Each assertion below independently `include_bytes!`s the SAME
-    /// on-disk asset the catalog's own `IconId` variant is wired to (a
-    /// fresh read at this call site, not a reuse of `catalog.rs`'s own
-    /// constant) and, for the braille tier, rebuilds a [`PixelCanvas`]
-    /// at the ORIGINAL hand-tuned threshold via the same production
-    /// `rgba_to_canvas` gate, then compares the actual RENDERED glyph
-    /// strings -- the true end-to-end "what paints on screen" check, not
-    /// an internal struct comparison (`PixelCanvas` has no `PartialEq`).
-    /// A future mis-wiring in `catalog.rs`'s per-icon match arms (wrong
-    /// asset file OR wrong threshold swapped into one variant) changes
-    /// either the source bytes or the rendered glyphs and this test
-    /// catches it.
-    #[test]
-    fn the_rails_original_7_icons_still_render_the_same_braille_glyphs_as_before_this_catalog_generalized() {
-        fn rendered_glyphs(canvas: &PixelCanvas) -> Vec<String> {
-            let mut buf = TerminalBuffer::new(BRAILLE_ICON_CELLS_WIDE, BRAILLE_ICON_CELLS_TALL);
-            canvas.flush(Rect::new(0, 0, BRAILLE_ICON_CELLS_WIDE, BRAILLE_ICON_CELLS_TALL), &mut buf);
-            let mut glyphs = Vec::new();
-            for y in 0..BRAILLE_ICON_CELLS_TALL {
-                for x in 0..BRAILLE_ICON_CELLS_WIDE {
-                    glyphs.push(buf.get(x, y).symbol.to_string());
-                }
-            }
-            glyphs
-        }
-
-        let originals: [(IconId, &[u8], u8); 7] = [
-            (IconId::Files, include_bytes!("icons/files_braille.rgba"), 102),
-            (IconId::SourceControl, include_bytes!("icons/source_control_braille.rgba"), 102),
-            (IconId::Person, include_bytes!("icons/person_braille.rgba"), 89),
-            (IconId::Project, include_bytes!("icons/project_braille.rgba"), 102),
-            (IconId::SettingsGear, include_bytes!("icons/settings_gear_braille.rgba"), 89),
-            (IconId::ChevronLeft, include_bytes!("icons/chevron_left_braille.rgba"), 77),
-            (IconId::ChevronRight, include_bytes!("icons/chevron_right_braille.rgba"), 77),
-        ];
-        for (id, rgba, threshold) in originals {
-            let expected = rgba_to_canvas(CanvasMode::Braille, BRAILLE_ICON_CELLS_WIDE, BRAILLE_ICON_CELLS_TALL, rgba, threshold);
-            assert_eq!(
-                rendered_glyphs(braille(id)),
-                rendered_glyphs(&expected),
-                "{id:?} braille glyphs changed from the pre-generalization (commit 9f39758) baseline"
-            );
-        }
-
-        // Sixel tier: the encoder (`build_sixel`) is unchanged and
-        // covered by `every_sixel_encodes_to_a_non_empty_dcs_sequence`
-        // above, so a byte-identical source RGBA is sufficient here.
-        assert_eq!(catalog::sixel_source_rgba(IconId::Files), include_bytes!("icons/files.rgba") as &[u8]);
-        assert_eq!(catalog::sixel_source_rgba(IconId::SourceControl), include_bytes!("icons/source_control.rgba") as &[u8]);
-        assert_eq!(catalog::sixel_source_rgba(IconId::Person), include_bytes!("icons/person.rgba") as &[u8]);
-        assert_eq!(catalog::sixel_source_rgba(IconId::Project), include_bytes!("icons/project.rgba") as &[u8]);
-        assert_eq!(catalog::sixel_source_rgba(IconId::SettingsGear), include_bytes!("icons/settings_gear.rgba") as &[u8]);
-        assert_eq!(catalog::sixel_source_rgba(IconId::ChevronLeft), include_bytes!("icons/chevron_left.rgba") as &[u8]);
-        assert_eq!(catalog::sixel_source_rgba(IconId::ChevronRight), include_bytes!("icons/chevron_right.rgba") as &[u8]);
     }
 }

@@ -7,30 +7,18 @@
 //! icons/<slug>.svg, `fill="currentColor"` patched to `#cdd6f4`
 //! (`pty_palette::GATE_FG`) before rasterizing -- see `../icons.rs`'s own
 //! module doc for the full tier/pipeline explanation and
-//! `tools/bake_icons.py`'s own header for the exact bake recipe. Per-icon
-//! braille alpha thresholds below are chosen by `bake_icons.py`'s own
-//! `choose_threshold` (an explicit override, replaying the original 7 rail
-//! icons' hand-tuned constants unchanged, or an auto coverage-histogram
-//! search) -- see that function, not prose duplicated per icon here, for
-//! the selection reasoning; a `DEGRADED` line marks icons whose shape does
-//! not survive at 8x12 even at the best achievable threshold. The compact
-//! tier (2x1-cell braille / 1-cell sixel, for dense single-row buttons --
-//! see `../icons.rs`'s own module doc) is chosen the same way by
-//! `choose_compact_threshold`, against `COMPACT_THRESHOLD_OVERRIDES`.
+//! `tools/bake_icons.py`'s own header for the exact bake recipe.
 
 use std::sync::LazyLock;
 
-use uzor_tui::canvas::{CanvasMode, PixelCanvas};
-
 use super::{
     build_sixel, build_sixel_compact, build_sixel_gallery, build_sixel_gallery_gate, build_sixel_gate,
-    build_sixel_strip, build_sixel_strip_gate, rgba_to_canvas, SixelVariant, BRAILLE_ICON_CELLS_TALL,
-    BRAILLE_ICON_CELLS_WIDE, COMPACT_BRAILLE_ICON_CELLS_TALL, COMPACT_BRAILLE_ICON_CELLS_WIDE,
+    build_sixel_strip, build_sixel_strip_gate, SixelVariant,
 };
 
-/// Every baked icon this crate ships, sixel + braille + ascii tiers, one
-/// enum covering the full catalog (not just the activity rail -- see
-/// `../icons.rs`'s own module doc). Only the activity rail's original 7
+/// Every baked icon this crate ships, sixel + ascii tiers, one enum
+/// covering the full catalog (not just the activity rail -- see `../
+/// icons.rs`'s own module doc). Only the activity rail's original 7
 /// variants are wired into a UI site today; the rest are baked and tested
 /// but not yet drawn anywhere -- a deliberate, scoped-out next slice, not
 /// an oversight.
@@ -688,11 +676,10 @@ pub fn sixel_strip(id: IconId, variant: SixelVariant) -> &'static str {
     }
 }
 
-/// Encoded icon-gallery-tier (60x60, 6 cells wide x 3 rows tall) sixel
-/// string for `id` at `variant`'s own background -- the gallery is a
-/// read-only comparison grid with no selected state, so `GateAccent`
-/// resolves to the SAME asset as `GateActive` here (same fold as
-/// [`sixel_strip`]).
+/// Encoded icon-gallery-tier sixel string for `id` at `variant`'s own
+/// background -- the gallery is a read-only comparison grid with no
+/// selected state, so `GateAccent` resolves to the SAME asset as
+/// `GateActive` here (same fold as [`sixel_strip`]).
 pub fn sixel_gallery(id: IconId, variant: SixelVariant) -> &'static str {
     match id {
         IconId::Files => match variant {
@@ -926,73 +913,9 @@ pub fn sixel_gallery(id: IconId, variant: SixelVariant) -> &'static str {
     }
 }
 
-/// Braille-tier [`PixelCanvas`] for `id` -- see `../icons.rs::rgba_to_canvas`'s
-/// own doc comment for the alpha-threshold silhouette rule.
-pub fn braille(id: IconId) -> &'static PixelCanvas {
-    match id {
-        IconId::Files => &*FILES_BRAILLE,
-        IconId::SourceControl => &*SOURCE_CONTROL_BRAILLE,
-        IconId::Person => &*PERSON_BRAILLE,
-        IconId::Project => &*PROJECT_BRAILLE,
-        IconId::SettingsGear => &*SETTINGS_GEAR_BRAILLE,
-        IconId::ChevronLeft => &*CHEVRON_LEFT_BRAILLE,
-        IconId::ChevronRight => &*CHEVRON_RIGHT_BRAILLE,
-        IconId::ChevronDown => &*CHEVRON_DOWN_BRAILLE,
-        IconId::NewFile => &*NEW_FILE_BRAILLE,
-        IconId::NewFolder => &*NEW_FOLDER_BRAILLE,
-        IconId::Folder => &*FOLDER_BRAILLE,
-        IconId::FolderOpened => &*FOLDER_OPENED_BRAILLE,
-        IconId::File => &*FILE_BRAILLE,
-        IconId::Save => &*SAVE_BRAILLE,
-        IconId::Refresh => &*REFRESH_BRAILLE,
-        IconId::Add => &*ADD_BRAILLE,
-        IconId::Trash => &*TRASH_BRAILLE,
-        IconId::Search => &*SEARCH_BRAILLE,
-        IconId::Check => &*CHECK_BRAILLE,
-        IconId::Close => &*CLOSE_BRAILLE,
-        IconId::ArrowUp => &*ARROW_UP_BRAILLE,
-        IconId::ArrowDown => &*ARROW_DOWN_BRAILLE,
-        IconId::ArrowLeft => &*ARROW_LEFT_BRAILLE,
-        IconId::ArrowRight => &*ARROW_RIGHT_BRAILLE,
-        IconId::ArrowSwap => &*ARROW_SWAP_BRAILLE,
-        IconId::GitCommit => &*GIT_COMMIT_BRAILLE,
-        IconId::GitBranch => &*GIT_BRANCH_BRAILLE,
-        IconId::Diff => &*DIFF_BRAILLE,
-        IconId::DiffAdded => &*DIFF_ADDED_BRAILLE,
-        IconId::GitCompare => &*GIT_COMPARE_BRAILLE,
-        IconId::Repo => &*REPO_BRAILLE,
-        IconId::RepoForked => &*REPO_FORKED_BRAILLE,
-        IconId::DebugStop => &*DEBUG_STOP_BRAILLE,
-        IconId::DebugRestart => &*DEBUG_RESTART_BRAILLE,
-        IconId::Edit => &*EDIT_BRAILLE,
-        IconId::History => &*HISTORY_BRAILLE,
-        IconId::Terminal => &*TERMINAL_BRAILLE,
-        IconId::Output => &*OUTPUT_BRAILLE,
-        IconId::CloudDownload => &*CLOUD_DOWNLOAD_BRAILLE,
-        IconId::Ellipsis => &*ELLIPSIS_BRAILLE,
-        IconId::Link => &*LINK_BRAILLE,
-        IconId::CircleFilled => &*CIRCLE_FILLED_BRAILLE,
-        IconId::CircleSlash => &*CIRCLE_SLASH_BRAILLE,
-        IconId::Warning => &*WARNING_BRAILLE,
-        IconId::Error => &*ERROR_BRAILLE,
-        IconId::Info => &*INFO_BRAILLE,
-        IconId::RunAll => &*RUN_ALL_BRAILLE,
-        IconId::Play => &*PLAY_BRAILLE,
-        IconId::Sync => &*SYNC_BRAILLE,
-        IconId::GoToFile => &*GO_TO_FILE_BRAILLE,
-        IconId::Pulse => &*PULSE_BRAILLE,
-        IconId::Checklist => &*CHECKLIST_BRAILLE,
-        IconId::Eye => &*EYE_BRAILLE,
-        IconId::Layout => &*LAYOUT_BRAILLE,
-        IconId::SplitHorizontal => &*SPLIT_HORIZONTAL_BRAILLE,
-        IconId::SplitVertical => &*SPLIT_VERTICAL_BRAILLE,
-        IconId::Preview => &*PREVIEW_BRAILLE,
-    }
-}
-
 /// Encoded COMPACT-tier sixel string for `id` (exactly one assumed
 /// terminal cell -- see `../icons.rs`'s own module doc) -- for dense
-/// single-row buttons where the rail's own 40x40 icon does not fit.
+/// single-row buttons where the rail's own icon does not fit.
 pub fn sixel_compact(id: IconId) -> &'static str {
     match id {
         IconId::Files => FILES_SIXEL_COMPACT.as_str(),
@@ -1052,71 +975,6 @@ pub fn sixel_compact(id: IconId) -> &'static str {
         IconId::SplitHorizontal => SPLIT_HORIZONTAL_SIXEL_COMPACT.as_str(),
         IconId::SplitVertical => SPLIT_VERTICAL_SIXEL_COMPACT.as_str(),
         IconId::Preview => PREVIEW_SIXEL_COMPACT.as_str(),
-    }
-}
-
-/// COMPACT-tier braille [`PixelCanvas`] for `id` (2 cells wide x 1 row
-/// tall -- see `../icons.rs`'s own module doc), same silhouette rule as
-/// [`braille`].
-pub fn braille_compact(id: IconId) -> &'static PixelCanvas {
-    match id {
-        IconId::Files => &*FILES_BRAILLE_COMPACT,
-        IconId::SourceControl => &*SOURCE_CONTROL_BRAILLE_COMPACT,
-        IconId::Person => &*PERSON_BRAILLE_COMPACT,
-        IconId::Project => &*PROJECT_BRAILLE_COMPACT,
-        IconId::SettingsGear => &*SETTINGS_GEAR_BRAILLE_COMPACT,
-        IconId::ChevronLeft => &*CHEVRON_LEFT_BRAILLE_COMPACT,
-        IconId::ChevronRight => &*CHEVRON_RIGHT_BRAILLE_COMPACT,
-        IconId::ChevronDown => &*CHEVRON_DOWN_BRAILLE_COMPACT,
-        IconId::NewFile => &*NEW_FILE_BRAILLE_COMPACT,
-        IconId::NewFolder => &*NEW_FOLDER_BRAILLE_COMPACT,
-        IconId::Folder => &*FOLDER_BRAILLE_COMPACT,
-        IconId::FolderOpened => &*FOLDER_OPENED_BRAILLE_COMPACT,
-        IconId::File => &*FILE_BRAILLE_COMPACT,
-        IconId::Save => &*SAVE_BRAILLE_COMPACT,
-        IconId::Refresh => &*REFRESH_BRAILLE_COMPACT,
-        IconId::Add => &*ADD_BRAILLE_COMPACT,
-        IconId::Trash => &*TRASH_BRAILLE_COMPACT,
-        IconId::Search => &*SEARCH_BRAILLE_COMPACT,
-        IconId::Check => &*CHECK_BRAILLE_COMPACT,
-        IconId::Close => &*CLOSE_BRAILLE_COMPACT,
-        IconId::ArrowUp => &*ARROW_UP_BRAILLE_COMPACT,
-        IconId::ArrowDown => &*ARROW_DOWN_BRAILLE_COMPACT,
-        IconId::ArrowLeft => &*ARROW_LEFT_BRAILLE_COMPACT,
-        IconId::ArrowRight => &*ARROW_RIGHT_BRAILLE_COMPACT,
-        IconId::ArrowSwap => &*ARROW_SWAP_BRAILLE_COMPACT,
-        IconId::GitCommit => &*GIT_COMMIT_BRAILLE_COMPACT,
-        IconId::GitBranch => &*GIT_BRANCH_BRAILLE_COMPACT,
-        IconId::Diff => &*DIFF_BRAILLE_COMPACT,
-        IconId::DiffAdded => &*DIFF_ADDED_BRAILLE_COMPACT,
-        IconId::GitCompare => &*GIT_COMPARE_BRAILLE_COMPACT,
-        IconId::Repo => &*REPO_BRAILLE_COMPACT,
-        IconId::RepoForked => &*REPO_FORKED_BRAILLE_COMPACT,
-        IconId::DebugStop => &*DEBUG_STOP_BRAILLE_COMPACT,
-        IconId::DebugRestart => &*DEBUG_RESTART_BRAILLE_COMPACT,
-        IconId::Edit => &*EDIT_BRAILLE_COMPACT,
-        IconId::History => &*HISTORY_BRAILLE_COMPACT,
-        IconId::Terminal => &*TERMINAL_BRAILLE_COMPACT,
-        IconId::Output => &*OUTPUT_BRAILLE_COMPACT,
-        IconId::CloudDownload => &*CLOUD_DOWNLOAD_BRAILLE_COMPACT,
-        IconId::Ellipsis => &*ELLIPSIS_BRAILLE_COMPACT,
-        IconId::Link => &*LINK_BRAILLE_COMPACT,
-        IconId::CircleFilled => &*CIRCLE_FILLED_BRAILLE_COMPACT,
-        IconId::CircleSlash => &*CIRCLE_SLASH_BRAILLE_COMPACT,
-        IconId::Warning => &*WARNING_BRAILLE_COMPACT,
-        IconId::Error => &*ERROR_BRAILLE_COMPACT,
-        IconId::Info => &*INFO_BRAILLE_COMPACT,
-        IconId::RunAll => &*RUN_ALL_BRAILLE_COMPACT,
-        IconId::Play => &*PLAY_BRAILLE_COMPACT,
-        IconId::Sync => &*SYNC_BRAILLE_COMPACT,
-        IconId::GoToFile => &*GO_TO_FILE_BRAILLE_COMPACT,
-        IconId::Pulse => &*PULSE_BRAILLE_COMPACT,
-        IconId::Checklist => &*CHECKLIST_BRAILLE_COMPACT,
-        IconId::Eye => &*EYE_BRAILLE_COMPACT,
-        IconId::Layout => &*LAYOUT_BRAILLE_COMPACT,
-        IconId::SplitHorizontal => &*SPLIT_HORIZONTAL_BRAILLE_COMPACT,
-        IconId::SplitVertical => &*SPLIT_VERTICAL_BRAILLE_COMPACT,
-        IconId::Preview => &*PREVIEW_BRAILLE_COMPACT,
     }
 }
 
@@ -1187,8 +1045,7 @@ pub fn ascii(id: IconId) -> &'static str {
 }
 
 // Raw baked-source lookups by id -- used only by this crate's own unit
-// tests (byte-length assertions, and the rail's own no-visual-regression
-// check against `../icons.rs`'s hand-written test module).
+// tests (byte-length assertions and the gate-compositing pixel checks).
 #[cfg(test)]
 pub(crate) fn sixel_source_rgba(id: IconId) -> &'static [u8] {
     match id {
@@ -1253,69 +1110,6 @@ pub(crate) fn sixel_source_rgba(id: IconId) -> &'static [u8] {
 }
 
 #[cfg(test)]
-pub(crate) fn braille_source_rgba(id: IconId) -> &'static [u8] {
-    match id {
-        IconId::Files => FILES_BRAILLE_RGBA,
-        IconId::SourceControl => SOURCE_CONTROL_BRAILLE_RGBA,
-        IconId::Person => PERSON_BRAILLE_RGBA,
-        IconId::Project => PROJECT_BRAILLE_RGBA,
-        IconId::SettingsGear => SETTINGS_GEAR_BRAILLE_RGBA,
-        IconId::ChevronLeft => CHEVRON_LEFT_BRAILLE_RGBA,
-        IconId::ChevronRight => CHEVRON_RIGHT_BRAILLE_RGBA,
-        IconId::ChevronDown => CHEVRON_DOWN_BRAILLE_RGBA,
-        IconId::NewFile => NEW_FILE_BRAILLE_RGBA,
-        IconId::NewFolder => NEW_FOLDER_BRAILLE_RGBA,
-        IconId::Folder => FOLDER_BRAILLE_RGBA,
-        IconId::FolderOpened => FOLDER_OPENED_BRAILLE_RGBA,
-        IconId::File => FILE_BRAILLE_RGBA,
-        IconId::Save => SAVE_BRAILLE_RGBA,
-        IconId::Refresh => REFRESH_BRAILLE_RGBA,
-        IconId::Add => ADD_BRAILLE_RGBA,
-        IconId::Trash => TRASH_BRAILLE_RGBA,
-        IconId::Search => SEARCH_BRAILLE_RGBA,
-        IconId::Check => CHECK_BRAILLE_RGBA,
-        IconId::Close => CLOSE_BRAILLE_RGBA,
-        IconId::ArrowUp => ARROW_UP_BRAILLE_RGBA,
-        IconId::ArrowDown => ARROW_DOWN_BRAILLE_RGBA,
-        IconId::ArrowLeft => ARROW_LEFT_BRAILLE_RGBA,
-        IconId::ArrowRight => ARROW_RIGHT_BRAILLE_RGBA,
-        IconId::ArrowSwap => ARROW_SWAP_BRAILLE_RGBA,
-        IconId::GitCommit => GIT_COMMIT_BRAILLE_RGBA,
-        IconId::GitBranch => GIT_BRANCH_BRAILLE_RGBA,
-        IconId::Diff => DIFF_BRAILLE_RGBA,
-        IconId::DiffAdded => DIFF_ADDED_BRAILLE_RGBA,
-        IconId::GitCompare => GIT_COMPARE_BRAILLE_RGBA,
-        IconId::Repo => REPO_BRAILLE_RGBA,
-        IconId::RepoForked => REPO_FORKED_BRAILLE_RGBA,
-        IconId::DebugStop => DEBUG_STOP_BRAILLE_RGBA,
-        IconId::DebugRestart => DEBUG_RESTART_BRAILLE_RGBA,
-        IconId::Edit => EDIT_BRAILLE_RGBA,
-        IconId::History => HISTORY_BRAILLE_RGBA,
-        IconId::Terminal => TERMINAL_BRAILLE_RGBA,
-        IconId::Output => OUTPUT_BRAILLE_RGBA,
-        IconId::CloudDownload => CLOUD_DOWNLOAD_BRAILLE_RGBA,
-        IconId::Ellipsis => ELLIPSIS_BRAILLE_RGBA,
-        IconId::Link => LINK_BRAILLE_RGBA,
-        IconId::CircleFilled => CIRCLE_FILLED_BRAILLE_RGBA,
-        IconId::CircleSlash => CIRCLE_SLASH_BRAILLE_RGBA,
-        IconId::Warning => WARNING_BRAILLE_RGBA,
-        IconId::Error => ERROR_BRAILLE_RGBA,
-        IconId::Info => INFO_BRAILLE_RGBA,
-        IconId::RunAll => RUN_ALL_BRAILLE_RGBA,
-        IconId::Play => PLAY_BRAILLE_RGBA,
-        IconId::Sync => SYNC_BRAILLE_RGBA,
-        IconId::GoToFile => GO_TO_FILE_BRAILLE_RGBA,
-        IconId::Pulse => PULSE_BRAILLE_RGBA,
-        IconId::Checklist => CHECKLIST_BRAILLE_RGBA,
-        IconId::Eye => EYE_BRAILLE_RGBA,
-        IconId::Layout => LAYOUT_BRAILLE_RGBA,
-        IconId::SplitHorizontal => SPLIT_HORIZONTAL_BRAILLE_RGBA,
-        IconId::SplitVertical => SPLIT_VERTICAL_BRAILLE_RGBA,
-        IconId::Preview => PREVIEW_BRAILLE_RGBA,
-    }
-}
-
-#[cfg(test)]
 pub(crate) fn sixel_compact_source_rgba(id: IconId) -> &'static [u8] {
     match id {
         IconId::Files => FILES_COMPACT_RGBA,
@@ -1375,69 +1169,6 @@ pub(crate) fn sixel_compact_source_rgba(id: IconId) -> &'static [u8] {
         IconId::SplitHorizontal => SPLIT_HORIZONTAL_COMPACT_RGBA,
         IconId::SplitVertical => SPLIT_VERTICAL_COMPACT_RGBA,
         IconId::Preview => PREVIEW_COMPACT_RGBA,
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn braille_compact_source_rgba(id: IconId) -> &'static [u8] {
-    match id {
-        IconId::Files => FILES_COMPACT_BRAILLE_RGBA,
-        IconId::SourceControl => SOURCE_CONTROL_COMPACT_BRAILLE_RGBA,
-        IconId::Person => PERSON_COMPACT_BRAILLE_RGBA,
-        IconId::Project => PROJECT_COMPACT_BRAILLE_RGBA,
-        IconId::SettingsGear => SETTINGS_GEAR_COMPACT_BRAILLE_RGBA,
-        IconId::ChevronLeft => CHEVRON_LEFT_COMPACT_BRAILLE_RGBA,
-        IconId::ChevronRight => CHEVRON_RIGHT_COMPACT_BRAILLE_RGBA,
-        IconId::ChevronDown => CHEVRON_DOWN_COMPACT_BRAILLE_RGBA,
-        IconId::NewFile => NEW_FILE_COMPACT_BRAILLE_RGBA,
-        IconId::NewFolder => NEW_FOLDER_COMPACT_BRAILLE_RGBA,
-        IconId::Folder => FOLDER_COMPACT_BRAILLE_RGBA,
-        IconId::FolderOpened => FOLDER_OPENED_COMPACT_BRAILLE_RGBA,
-        IconId::File => FILE_COMPACT_BRAILLE_RGBA,
-        IconId::Save => SAVE_COMPACT_BRAILLE_RGBA,
-        IconId::Refresh => REFRESH_COMPACT_BRAILLE_RGBA,
-        IconId::Add => ADD_COMPACT_BRAILLE_RGBA,
-        IconId::Trash => TRASH_COMPACT_BRAILLE_RGBA,
-        IconId::Search => SEARCH_COMPACT_BRAILLE_RGBA,
-        IconId::Check => CHECK_COMPACT_BRAILLE_RGBA,
-        IconId::Close => CLOSE_COMPACT_BRAILLE_RGBA,
-        IconId::ArrowUp => ARROW_UP_COMPACT_BRAILLE_RGBA,
-        IconId::ArrowDown => ARROW_DOWN_COMPACT_BRAILLE_RGBA,
-        IconId::ArrowLeft => ARROW_LEFT_COMPACT_BRAILLE_RGBA,
-        IconId::ArrowRight => ARROW_RIGHT_COMPACT_BRAILLE_RGBA,
-        IconId::ArrowSwap => ARROW_SWAP_COMPACT_BRAILLE_RGBA,
-        IconId::GitCommit => GIT_COMMIT_COMPACT_BRAILLE_RGBA,
-        IconId::GitBranch => GIT_BRANCH_COMPACT_BRAILLE_RGBA,
-        IconId::Diff => DIFF_COMPACT_BRAILLE_RGBA,
-        IconId::DiffAdded => DIFF_ADDED_COMPACT_BRAILLE_RGBA,
-        IconId::GitCompare => GIT_COMPARE_COMPACT_BRAILLE_RGBA,
-        IconId::Repo => REPO_COMPACT_BRAILLE_RGBA,
-        IconId::RepoForked => REPO_FORKED_COMPACT_BRAILLE_RGBA,
-        IconId::DebugStop => DEBUG_STOP_COMPACT_BRAILLE_RGBA,
-        IconId::DebugRestart => DEBUG_RESTART_COMPACT_BRAILLE_RGBA,
-        IconId::Edit => EDIT_COMPACT_BRAILLE_RGBA,
-        IconId::History => HISTORY_COMPACT_BRAILLE_RGBA,
-        IconId::Terminal => TERMINAL_COMPACT_BRAILLE_RGBA,
-        IconId::Output => OUTPUT_COMPACT_BRAILLE_RGBA,
-        IconId::CloudDownload => CLOUD_DOWNLOAD_COMPACT_BRAILLE_RGBA,
-        IconId::Ellipsis => ELLIPSIS_COMPACT_BRAILLE_RGBA,
-        IconId::Link => LINK_COMPACT_BRAILLE_RGBA,
-        IconId::CircleFilled => CIRCLE_FILLED_COMPACT_BRAILLE_RGBA,
-        IconId::CircleSlash => CIRCLE_SLASH_COMPACT_BRAILLE_RGBA,
-        IconId::Warning => WARNING_COMPACT_BRAILLE_RGBA,
-        IconId::Error => ERROR_COMPACT_BRAILLE_RGBA,
-        IconId::Info => INFO_COMPACT_BRAILLE_RGBA,
-        IconId::RunAll => RUN_ALL_COMPACT_BRAILLE_RGBA,
-        IconId::Play => PLAY_COMPACT_BRAILLE_RGBA,
-        IconId::Sync => SYNC_COMPACT_BRAILLE_RGBA,
-        IconId::GoToFile => GO_TO_FILE_COMPACT_BRAILLE_RGBA,
-        IconId::Pulse => PULSE_COMPACT_BRAILLE_RGBA,
-        IconId::Checklist => CHECKLIST_COMPACT_BRAILLE_RGBA,
-        IconId::Eye => EYE_COMPACT_BRAILLE_RGBA,
-        IconId::Layout => LAYOUT_COMPACT_BRAILLE_RGBA,
-        IconId::SplitHorizontal => SPLIT_HORIZONTAL_COMPACT_BRAILLE_RGBA,
-        IconId::SplitVertical => SPLIT_VERTICAL_COMPACT_BRAILLE_RGBA,
-        IconId::Preview => PREVIEW_COMPACT_BRAILLE_RGBA,
     }
 }
 
@@ -1825,8 +1556,8 @@ const FILES_RGBA: &[u8] = include_bytes!("files.rgba");
 static FILES_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(FILES_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const FILES_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("files_gate_active.rgba");
 static FILES_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(FILES_GATE_ACTIVE_RGBA));
 
@@ -1835,34 +1566,8 @@ static FILES_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_
 const FILES_GATE_ACCENT_RGBA: &[u8] = include_bytes!("files_gate_accent.rgba");
 static FILES_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(FILES_GATE_ACCENT_RGBA));
 
-const FILES_BRAILLE_RGBA: &[u8] = include_bytes!("files_braille.rgba");
-/// ~40% coverage (102/255), override (replaying the pre-existing rail icon's own hand-tuned constant, unchanged) -- 31/96 dots lit at this threshold.
-const FILES_BRAILLE_ALPHA_THRESHOLD: u8 = 102;
-static FILES_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        FILES_BRAILLE_RGBA,
-        FILES_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const FILES_COMPACT_RGBA: &[u8] = include_bytes!("files_compact.rgba");
 static FILES_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(FILES_COMPACT_RGBA));
-
-const FILES_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("files_compact_braille.rgba");
-/// ~50% coverage (128/255), auto-selected by bake_icons.py::choose_compact_threshold -- 4/16 dots lit at this threshold.
-const FILES_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 128;
-static FILES_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        FILES_COMPACT_BRAILLE_RGBA,
-        FILES_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const FILES_STRIP_RGBA: &[u8] = include_bytes!("files_strip.rgba");
 static FILES_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(FILES_STRIP_RGBA));
@@ -1887,8 +1592,8 @@ const SOURCE_CONTROL_RGBA: &[u8] = include_bytes!("source_control.rgba");
 static SOURCE_CONTROL_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(SOURCE_CONTROL_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const SOURCE_CONTROL_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("source_control_gate_active.rgba");
 static SOURCE_CONTROL_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SOURCE_CONTROL_GATE_ACTIVE_RGBA));
 
@@ -1897,34 +1602,8 @@ static SOURCE_CONTROL_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| bui
 const SOURCE_CONTROL_GATE_ACCENT_RGBA: &[u8] = include_bytes!("source_control_gate_accent.rgba");
 static SOURCE_CONTROL_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SOURCE_CONTROL_GATE_ACCENT_RGBA));
 
-const SOURCE_CONTROL_BRAILLE_RGBA: &[u8] = include_bytes!("source_control_braille.rgba");
-/// ~40% coverage (102/255), override (replaying the pre-existing rail icon's own hand-tuned constant, unchanged) -- 20/96 dots lit at this threshold.
-const SOURCE_CONTROL_BRAILLE_ALPHA_THRESHOLD: u8 = 102;
-static SOURCE_CONTROL_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        SOURCE_CONTROL_BRAILLE_RGBA,
-        SOURCE_CONTROL_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const SOURCE_CONTROL_COMPACT_RGBA: &[u8] = include_bytes!("source_control_compact.rgba");
 static SOURCE_CONTROL_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(SOURCE_CONTROL_COMPACT_RGBA));
-
-const SOURCE_CONTROL_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("source_control_compact_braille.rgba");
-/// ~30% coverage (77/255), auto-selected by bake_icons.py::choose_compact_threshold -- 5/16 dots lit at this threshold.
-const SOURCE_CONTROL_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 77;
-static SOURCE_CONTROL_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        SOURCE_CONTROL_COMPACT_BRAILLE_RGBA,
-        SOURCE_CONTROL_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const SOURCE_CONTROL_STRIP_RGBA: &[u8] = include_bytes!("source_control_strip.rgba");
 static SOURCE_CONTROL_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(SOURCE_CONTROL_STRIP_RGBA));
@@ -1949,8 +1628,8 @@ const PERSON_RGBA: &[u8] = include_bytes!("person.rgba");
 static PERSON_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(PERSON_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const PERSON_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("person_gate_active.rgba");
 static PERSON_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(PERSON_GATE_ACTIVE_RGBA));
 
@@ -1959,34 +1638,8 @@ static PERSON_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel
 const PERSON_GATE_ACCENT_RGBA: &[u8] = include_bytes!("person_gate_accent.rgba");
 static PERSON_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(PERSON_GATE_ACCENT_RGBA));
 
-const PERSON_BRAILLE_RGBA: &[u8] = include_bytes!("person_braille.rgba");
-/// ~35% coverage (89/255), override (replaying the pre-existing rail icon's own hand-tuned constant, unchanged) -- 17/96 dots lit at this threshold.
-const PERSON_BRAILLE_ALPHA_THRESHOLD: u8 = 89;
-static PERSON_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        PERSON_BRAILLE_RGBA,
-        PERSON_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const PERSON_COMPACT_RGBA: &[u8] = include_bytes!("person_compact.rgba");
 static PERSON_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(PERSON_COMPACT_RGBA));
-
-const PERSON_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("person_compact_braille.rgba");
-/// ~35% coverage (89/255), auto-selected by bake_icons.py::choose_compact_threshold -- 3/16 dots lit at this threshold.
-const PERSON_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 89;
-static PERSON_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        PERSON_COMPACT_BRAILLE_RGBA,
-        PERSON_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const PERSON_STRIP_RGBA: &[u8] = include_bytes!("person_strip.rgba");
 static PERSON_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(PERSON_STRIP_RGBA));
@@ -2011,8 +1664,8 @@ const PROJECT_RGBA: &[u8] = include_bytes!("project.rgba");
 static PROJECT_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(PROJECT_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const PROJECT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("project_gate_active.rgba");
 static PROJECT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(PROJECT_GATE_ACTIVE_RGBA));
 
@@ -2021,34 +1674,8 @@ static PROJECT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixe
 const PROJECT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("project_gate_accent.rgba");
 static PROJECT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(PROJECT_GATE_ACCENT_RGBA));
 
-const PROJECT_BRAILLE_RGBA: &[u8] = include_bytes!("project_braille.rgba");
-/// ~40% coverage (102/255), override (replaying the pre-existing rail icon's own hand-tuned constant, unchanged) -- 22/96 dots lit at this threshold.
-const PROJECT_BRAILLE_ALPHA_THRESHOLD: u8 = 102;
-static PROJECT_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        PROJECT_BRAILLE_RGBA,
-        PROJECT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const PROJECT_COMPACT_RGBA: &[u8] = include_bytes!("project_compact.rgba");
 static PROJECT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(PROJECT_COMPACT_RGBA));
-
-const PROJECT_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("project_compact_braille.rgba");
-/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_compact_threshold -- 10/16 dots lit at this threshold.
-const PROJECT_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
-static PROJECT_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        PROJECT_COMPACT_BRAILLE_RGBA,
-        PROJECT_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const PROJECT_STRIP_RGBA: &[u8] = include_bytes!("project_strip.rgba");
 static PROJECT_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(PROJECT_STRIP_RGBA));
@@ -2073,8 +1700,8 @@ const SETTINGS_GEAR_RGBA: &[u8] = include_bytes!("settings_gear.rgba");
 static SETTINGS_GEAR_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(SETTINGS_GEAR_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const SETTINGS_GEAR_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("settings_gear_gate_active.rgba");
 static SETTINGS_GEAR_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SETTINGS_GEAR_GATE_ACTIVE_RGBA));
 
@@ -2083,35 +1710,8 @@ static SETTINGS_GEAR_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| buil
 const SETTINGS_GEAR_GATE_ACCENT_RGBA: &[u8] = include_bytes!("settings_gear_gate_accent.rgba");
 static SETTINGS_GEAR_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SETTINGS_GEAR_GATE_ACCENT_RGBA));
 
-const SETTINGS_GEAR_BRAILLE_RGBA: &[u8] = include_bytes!("settings_gear_braille.rgba");
-/// ~35% coverage (89/255), override (replaying the pre-existing rail icon's own hand-tuned constant, unchanged) -- 24/96 dots lit at this threshold.
-/// DEGRADED: teeth merge into a round, hollow-centered blob -- an honest 8x12 resolution ceiling, not a threshold bug (pre-existing, documented in src/icons.rs).
-const SETTINGS_GEAR_BRAILLE_ALPHA_THRESHOLD: u8 = 89;
-static SETTINGS_GEAR_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        SETTINGS_GEAR_BRAILLE_RGBA,
-        SETTINGS_GEAR_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const SETTINGS_GEAR_COMPACT_RGBA: &[u8] = include_bytes!("settings_gear_compact.rgba");
 static SETTINGS_GEAR_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(SETTINGS_GEAR_COMPACT_RGBA));
-
-const SETTINGS_GEAR_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("settings_gear_compact_braille.rgba");
-/// ~30% coverage (77/255), auto-selected by bake_icons.py::choose_compact_threshold -- 4/16 dots lit at this threshold.
-const SETTINGS_GEAR_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 77;
-static SETTINGS_GEAR_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        SETTINGS_GEAR_COMPACT_BRAILLE_RGBA,
-        SETTINGS_GEAR_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const SETTINGS_GEAR_STRIP_RGBA: &[u8] = include_bytes!("settings_gear_strip.rgba");
 static SETTINGS_GEAR_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(SETTINGS_GEAR_STRIP_RGBA));
@@ -2136,8 +1736,8 @@ const CHEVRON_LEFT_RGBA: &[u8] = include_bytes!("chevron_left.rgba");
 static CHEVRON_LEFT_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(CHEVRON_LEFT_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const CHEVRON_LEFT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("chevron_left_gate_active.rgba");
 static CHEVRON_LEFT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CHEVRON_LEFT_GATE_ACTIVE_RGBA));
 
@@ -2146,34 +1746,8 @@ static CHEVRON_LEFT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build
 const CHEVRON_LEFT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("chevron_left_gate_accent.rgba");
 static CHEVRON_LEFT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CHEVRON_LEFT_GATE_ACCENT_RGBA));
 
-const CHEVRON_LEFT_BRAILLE_RGBA: &[u8] = include_bytes!("chevron_left_braille.rgba");
-/// ~30% coverage (77/255), override (replaying the pre-existing rail icon's own hand-tuned constant, unchanged) -- 12/96 dots lit at this threshold.
-const CHEVRON_LEFT_BRAILLE_ALPHA_THRESHOLD: u8 = 77;
-static CHEVRON_LEFT_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        CHEVRON_LEFT_BRAILLE_RGBA,
-        CHEVRON_LEFT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const CHEVRON_LEFT_COMPACT_RGBA: &[u8] = include_bytes!("chevron_left_compact.rgba");
 static CHEVRON_LEFT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(CHEVRON_LEFT_COMPACT_RGBA));
-
-const CHEVRON_LEFT_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("chevron_left_compact_braille.rgba");
-/// ~6% coverage (15/255), auto-selected by bake_icons.py::choose_compact_threshold -- 6/16 dots lit at this threshold.
-const CHEVRON_LEFT_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 15;
-static CHEVRON_LEFT_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        CHEVRON_LEFT_COMPACT_BRAILLE_RGBA,
-        CHEVRON_LEFT_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const CHEVRON_LEFT_STRIP_RGBA: &[u8] = include_bytes!("chevron_left_strip.rgba");
 static CHEVRON_LEFT_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(CHEVRON_LEFT_STRIP_RGBA));
@@ -2198,8 +1772,8 @@ const CHEVRON_RIGHT_RGBA: &[u8] = include_bytes!("chevron_right.rgba");
 static CHEVRON_RIGHT_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(CHEVRON_RIGHT_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const CHEVRON_RIGHT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("chevron_right_gate_active.rgba");
 static CHEVRON_RIGHT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CHEVRON_RIGHT_GATE_ACTIVE_RGBA));
 
@@ -2208,34 +1782,8 @@ static CHEVRON_RIGHT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| buil
 const CHEVRON_RIGHT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("chevron_right_gate_accent.rgba");
 static CHEVRON_RIGHT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CHEVRON_RIGHT_GATE_ACCENT_RGBA));
 
-const CHEVRON_RIGHT_BRAILLE_RGBA: &[u8] = include_bytes!("chevron_right_braille.rgba");
-/// ~30% coverage (77/255), override (replaying the pre-existing rail icon's own hand-tuned constant, unchanged) -- 12/96 dots lit at this threshold.
-const CHEVRON_RIGHT_BRAILLE_ALPHA_THRESHOLD: u8 = 77;
-static CHEVRON_RIGHT_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        CHEVRON_RIGHT_BRAILLE_RGBA,
-        CHEVRON_RIGHT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const CHEVRON_RIGHT_COMPACT_RGBA: &[u8] = include_bytes!("chevron_right_compact.rgba");
 static CHEVRON_RIGHT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(CHEVRON_RIGHT_COMPACT_RGBA));
-
-const CHEVRON_RIGHT_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("chevron_right_compact_braille.rgba");
-/// ~6% coverage (15/255), auto-selected by bake_icons.py::choose_compact_threshold -- 6/16 dots lit at this threshold.
-const CHEVRON_RIGHT_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 15;
-static CHEVRON_RIGHT_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        CHEVRON_RIGHT_COMPACT_BRAILLE_RGBA,
-        CHEVRON_RIGHT_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const CHEVRON_RIGHT_STRIP_RGBA: &[u8] = include_bytes!("chevron_right_strip.rgba");
 static CHEVRON_RIGHT_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(CHEVRON_RIGHT_STRIP_RGBA));
@@ -2260,8 +1808,8 @@ const CHEVRON_DOWN_RGBA: &[u8] = include_bytes!("chevron_down.rgba");
 static CHEVRON_DOWN_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(CHEVRON_DOWN_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const CHEVRON_DOWN_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("chevron_down_gate_active.rgba");
 static CHEVRON_DOWN_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CHEVRON_DOWN_GATE_ACTIVE_RGBA));
 
@@ -2270,34 +1818,8 @@ static CHEVRON_DOWN_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build
 const CHEVRON_DOWN_GATE_ACCENT_RGBA: &[u8] = include_bytes!("chevron_down_gate_accent.rgba");
 static CHEVRON_DOWN_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CHEVRON_DOWN_GATE_ACCENT_RGBA));
 
-const CHEVRON_DOWN_BRAILLE_RGBA: &[u8] = include_bytes!("chevron_down_braille.rgba");
-/// ~6% coverage (15/255), auto-selected by bake_icons.py::choose_threshold -- 14/96 dots lit at this threshold.
-const CHEVRON_DOWN_BRAILLE_ALPHA_THRESHOLD: u8 = 15;
-static CHEVRON_DOWN_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        CHEVRON_DOWN_BRAILLE_RGBA,
-        CHEVRON_DOWN_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const CHEVRON_DOWN_COMPACT_RGBA: &[u8] = include_bytes!("chevron_down_compact.rgba");
 static CHEVRON_DOWN_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(CHEVRON_DOWN_COMPACT_RGBA));
-
-const CHEVRON_DOWN_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("chevron_down_compact_braille.rgba");
-/// ~15% coverage (38/255), auto-selected by bake_icons.py::choose_compact_threshold -- 4/16 dots lit at this threshold.
-const CHEVRON_DOWN_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 38;
-static CHEVRON_DOWN_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        CHEVRON_DOWN_COMPACT_BRAILLE_RGBA,
-        CHEVRON_DOWN_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const CHEVRON_DOWN_STRIP_RGBA: &[u8] = include_bytes!("chevron_down_strip.rgba");
 static CHEVRON_DOWN_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(CHEVRON_DOWN_STRIP_RGBA));
@@ -2322,8 +1844,8 @@ const NEW_FILE_RGBA: &[u8] = include_bytes!("new_file.rgba");
 static NEW_FILE_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(NEW_FILE_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const NEW_FILE_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("new_file_gate_active.rgba");
 static NEW_FILE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(NEW_FILE_GATE_ACTIVE_RGBA));
 
@@ -2332,34 +1854,8 @@ static NEW_FILE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_six
 const NEW_FILE_GATE_ACCENT_RGBA: &[u8] = include_bytes!("new_file_gate_accent.rgba");
 static NEW_FILE_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(NEW_FILE_GATE_ACCENT_RGBA));
 
-const NEW_FILE_BRAILLE_RGBA: &[u8] = include_bytes!("new_file_braille.rgba");
-/// ~50% coverage (128/255), auto-selected by bake_icons.py::choose_threshold -- 23/96 dots lit at this threshold.
-const NEW_FILE_BRAILLE_ALPHA_THRESHOLD: u8 = 128;
-static NEW_FILE_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        NEW_FILE_BRAILLE_RGBA,
-        NEW_FILE_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const NEW_FILE_COMPACT_RGBA: &[u8] = include_bytes!("new_file_compact.rgba");
 static NEW_FILE_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(NEW_FILE_COMPACT_RGBA));
-
-const NEW_FILE_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("new_file_compact_braille.rgba");
-/// ~25% coverage (64/255), override, hand-picked after reviewing bake_icons.py's own printed report -- 10/16 dots lit at this threshold.
-const NEW_FILE_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
-static NEW_FILE_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        NEW_FILE_COMPACT_BRAILLE_RGBA,
-        NEW_FILE_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const NEW_FILE_STRIP_RGBA: &[u8] = include_bytes!("new_file_strip.rgba");
 static NEW_FILE_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(NEW_FILE_STRIP_RGBA));
@@ -2384,8 +1880,8 @@ const NEW_FOLDER_RGBA: &[u8] = include_bytes!("new_folder.rgba");
 static NEW_FOLDER_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(NEW_FOLDER_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const NEW_FOLDER_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("new_folder_gate_active.rgba");
 static NEW_FOLDER_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(NEW_FOLDER_GATE_ACTIVE_RGBA));
 
@@ -2394,34 +1890,8 @@ static NEW_FOLDER_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_s
 const NEW_FOLDER_GATE_ACCENT_RGBA: &[u8] = include_bytes!("new_folder_gate_accent.rgba");
 static NEW_FOLDER_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(NEW_FOLDER_GATE_ACCENT_RGBA));
 
-const NEW_FOLDER_BRAILLE_RGBA: &[u8] = include_bytes!("new_folder_braille.rgba");
-/// ~50% coverage (128/255), auto-selected by bake_icons.py::choose_threshold -- 27/96 dots lit at this threshold.
-const NEW_FOLDER_BRAILLE_ALPHA_THRESHOLD: u8 = 128;
-static NEW_FOLDER_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        NEW_FOLDER_BRAILLE_RGBA,
-        NEW_FOLDER_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const NEW_FOLDER_COMPACT_RGBA: &[u8] = include_bytes!("new_folder_compact.rgba");
 static NEW_FOLDER_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(NEW_FOLDER_COMPACT_RGBA));
-
-const NEW_FOLDER_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("new_folder_compact_braille.rgba");
-/// ~25% coverage (64/255), override, hand-picked after reviewing bake_icons.py's own printed report -- 10/16 dots lit at this threshold.
-const NEW_FOLDER_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
-static NEW_FOLDER_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        NEW_FOLDER_COMPACT_BRAILLE_RGBA,
-        NEW_FOLDER_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const NEW_FOLDER_STRIP_RGBA: &[u8] = include_bytes!("new_folder_strip.rgba");
 static NEW_FOLDER_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(NEW_FOLDER_STRIP_RGBA));
@@ -2446,8 +1916,8 @@ const FOLDER_RGBA: &[u8] = include_bytes!("folder.rgba");
 static FOLDER_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(FOLDER_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const FOLDER_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("folder_gate_active.rgba");
 static FOLDER_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(FOLDER_GATE_ACTIVE_RGBA));
 
@@ -2456,34 +1926,8 @@ static FOLDER_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel
 const FOLDER_GATE_ACCENT_RGBA: &[u8] = include_bytes!("folder_gate_accent.rgba");
 static FOLDER_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(FOLDER_GATE_ACCENT_RGBA));
 
-const FOLDER_BRAILLE_RGBA: &[u8] = include_bytes!("folder_braille.rgba");
-/// ~50% coverage (128/255), auto-selected by bake_icons.py::choose_threshold -- 20/96 dots lit at this threshold.
-const FOLDER_BRAILLE_ALPHA_THRESHOLD: u8 = 128;
-static FOLDER_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        FOLDER_BRAILLE_RGBA,
-        FOLDER_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const FOLDER_COMPACT_RGBA: &[u8] = include_bytes!("folder_compact.rgba");
 static FOLDER_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(FOLDER_COMPACT_RGBA));
-
-const FOLDER_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("folder_compact_braille.rgba");
-/// ~30% coverage (77/255), auto-selected by bake_icons.py::choose_compact_threshold -- 3/16 dots lit at this threshold.
-const FOLDER_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 77;
-static FOLDER_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        FOLDER_COMPACT_BRAILLE_RGBA,
-        FOLDER_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const FOLDER_STRIP_RGBA: &[u8] = include_bytes!("folder_strip.rgba");
 static FOLDER_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(FOLDER_STRIP_RGBA));
@@ -2508,8 +1952,8 @@ const FOLDER_OPENED_RGBA: &[u8] = include_bytes!("folder_opened.rgba");
 static FOLDER_OPENED_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(FOLDER_OPENED_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const FOLDER_OPENED_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("folder_opened_gate_active.rgba");
 static FOLDER_OPENED_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(FOLDER_OPENED_GATE_ACTIVE_RGBA));
 
@@ -2518,34 +1962,8 @@ static FOLDER_OPENED_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| buil
 const FOLDER_OPENED_GATE_ACCENT_RGBA: &[u8] = include_bytes!("folder_opened_gate_accent.rgba");
 static FOLDER_OPENED_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(FOLDER_OPENED_GATE_ACCENT_RGBA));
 
-const FOLDER_OPENED_BRAILLE_RGBA: &[u8] = include_bytes!("folder_opened_braille.rgba");
-/// ~50% coverage (128/255), auto-selected by bake_icons.py::choose_threshold -- 20/96 dots lit at this threshold.
-const FOLDER_OPENED_BRAILLE_ALPHA_THRESHOLD: u8 = 128;
-static FOLDER_OPENED_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        FOLDER_OPENED_BRAILLE_RGBA,
-        FOLDER_OPENED_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const FOLDER_OPENED_COMPACT_RGBA: &[u8] = include_bytes!("folder_opened_compact.rgba");
 static FOLDER_OPENED_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(FOLDER_OPENED_COMPACT_RGBA));
-
-const FOLDER_OPENED_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("folder_opened_compact_braille.rgba");
-/// ~35% coverage (89/255), auto-selected by bake_icons.py::choose_compact_threshold -- 3/16 dots lit at this threshold.
-const FOLDER_OPENED_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 89;
-static FOLDER_OPENED_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        FOLDER_OPENED_COMPACT_BRAILLE_RGBA,
-        FOLDER_OPENED_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const FOLDER_OPENED_STRIP_RGBA: &[u8] = include_bytes!("folder_opened_strip.rgba");
 static FOLDER_OPENED_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(FOLDER_OPENED_STRIP_RGBA));
@@ -2570,8 +1988,8 @@ const FILE_RGBA: &[u8] = include_bytes!("file.rgba");
 static FILE_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(FILE_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const FILE_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("file_gate_active.rgba");
 static FILE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(FILE_GATE_ACTIVE_RGBA));
 
@@ -2580,34 +1998,8 @@ static FILE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_g
 const FILE_GATE_ACCENT_RGBA: &[u8] = include_bytes!("file_gate_accent.rgba");
 static FILE_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(FILE_GATE_ACCENT_RGBA));
 
-const FILE_BRAILLE_RGBA: &[u8] = include_bytes!("file_braille.rgba");
-/// ~45% coverage (115/255), auto-selected by bake_icons.py::choose_threshold -- 20/96 dots lit at this threshold.
-const FILE_BRAILLE_ALPHA_THRESHOLD: u8 = 115;
-static FILE_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        FILE_BRAILLE_RGBA,
-        FILE_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const FILE_COMPACT_RGBA: &[u8] = include_bytes!("file_compact.rgba");
 static FILE_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(FILE_COMPACT_RGBA));
-
-const FILE_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("file_compact_braille.rgba");
-/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_compact_threshold -- 8/16 dots lit at this threshold.
-const FILE_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
-static FILE_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        FILE_COMPACT_BRAILLE_RGBA,
-        FILE_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const FILE_STRIP_RGBA: &[u8] = include_bytes!("file_strip.rgba");
 static FILE_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(FILE_STRIP_RGBA));
@@ -2632,8 +2024,8 @@ const SAVE_RGBA: &[u8] = include_bytes!("save.rgba");
 static SAVE_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(SAVE_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const SAVE_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("save_gate_active.rgba");
 static SAVE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SAVE_GATE_ACTIVE_RGBA));
 
@@ -2642,34 +2034,8 @@ static SAVE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_g
 const SAVE_GATE_ACCENT_RGBA: &[u8] = include_bytes!("save_gate_accent.rgba");
 static SAVE_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SAVE_GATE_ACCENT_RGBA));
 
-const SAVE_BRAILLE_RGBA: &[u8] = include_bytes!("save_braille.rgba");
-/// ~50% coverage (128/255), auto-selected by bake_icons.py::choose_threshold -- 24/96 dots lit at this threshold.
-const SAVE_BRAILLE_ALPHA_THRESHOLD: u8 = 128;
-static SAVE_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        SAVE_BRAILLE_RGBA,
-        SAVE_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const SAVE_COMPACT_RGBA: &[u8] = include_bytes!("save_compact.rgba");
 static SAVE_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(SAVE_COMPACT_RGBA));
-
-const SAVE_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("save_compact_braille.rgba");
-/// ~35% coverage (89/255), auto-selected by bake_icons.py::choose_compact_threshold -- 6/16 dots lit at this threshold.
-const SAVE_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 89;
-static SAVE_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        SAVE_COMPACT_BRAILLE_RGBA,
-        SAVE_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const SAVE_STRIP_RGBA: &[u8] = include_bytes!("save_strip.rgba");
 static SAVE_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(SAVE_STRIP_RGBA));
@@ -2694,8 +2060,8 @@ const REFRESH_RGBA: &[u8] = include_bytes!("refresh.rgba");
 static REFRESH_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(REFRESH_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const REFRESH_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("refresh_gate_active.rgba");
 static REFRESH_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(REFRESH_GATE_ACTIVE_RGBA));
 
@@ -2704,34 +2070,8 @@ static REFRESH_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixe
 const REFRESH_GATE_ACCENT_RGBA: &[u8] = include_bytes!("refresh_gate_accent.rgba");
 static REFRESH_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(REFRESH_GATE_ACCENT_RGBA));
 
-const REFRESH_BRAILLE_RGBA: &[u8] = include_bytes!("refresh_braille.rgba");
-/// ~10% coverage (26/255), auto-selected by bake_icons.py::choose_threshold -- 21/96 dots lit at this threshold.
-const REFRESH_BRAILLE_ALPHA_THRESHOLD: u8 = 26;
-static REFRESH_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        REFRESH_BRAILLE_RGBA,
-        REFRESH_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const REFRESH_COMPACT_RGBA: &[u8] = include_bytes!("refresh_compact.rgba");
 static REFRESH_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(REFRESH_COMPACT_RGBA));
-
-const REFRESH_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("refresh_compact_braille.rgba");
-/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_compact_threshold -- 6/16 dots lit at this threshold.
-const REFRESH_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
-static REFRESH_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        REFRESH_COMPACT_BRAILLE_RGBA,
-        REFRESH_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const REFRESH_STRIP_RGBA: &[u8] = include_bytes!("refresh_strip.rgba");
 static REFRESH_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(REFRESH_STRIP_RGBA));
@@ -2756,8 +2096,8 @@ const ADD_RGBA: &[u8] = include_bytes!("add.rgba");
 static ADD_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(ADD_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const ADD_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("add_gate_active.rgba");
 static ADD_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ADD_GATE_ACTIVE_RGBA));
 
@@ -2766,34 +2106,8 @@ static ADD_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_ga
 const ADD_GATE_ACCENT_RGBA: &[u8] = include_bytes!("add_gate_accent.rgba");
 static ADD_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ADD_GATE_ACCENT_RGBA));
 
-const ADD_BRAILLE_RGBA: &[u8] = include_bytes!("add_braille.rgba");
-/// ~6% coverage (15/255), auto-selected by bake_icons.py::choose_threshold -- 13/96 dots lit at this threshold.
-const ADD_BRAILLE_ALPHA_THRESHOLD: u8 = 15;
-static ADD_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        ADD_BRAILLE_RGBA,
-        ADD_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const ADD_COMPACT_RGBA: &[u8] = include_bytes!("add_compact.rgba");
 static ADD_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(ADD_COMPACT_RGBA));
-
-const ADD_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("add_compact_braille.rgba");
-/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_compact_threshold -- 3/16 dots lit at this threshold.
-const ADD_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
-static ADD_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        ADD_COMPACT_BRAILLE_RGBA,
-        ADD_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const ADD_STRIP_RGBA: &[u8] = include_bytes!("add_strip.rgba");
 static ADD_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(ADD_STRIP_RGBA));
@@ -2818,8 +2132,8 @@ const TRASH_RGBA: &[u8] = include_bytes!("trash.rgba");
 static TRASH_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(TRASH_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const TRASH_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("trash_gate_active.rgba");
 static TRASH_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(TRASH_GATE_ACTIVE_RGBA));
 
@@ -2828,34 +2142,8 @@ static TRASH_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_
 const TRASH_GATE_ACCENT_RGBA: &[u8] = include_bytes!("trash_gate_accent.rgba");
 static TRASH_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(TRASH_GATE_ACCENT_RGBA));
 
-const TRASH_BRAILLE_RGBA: &[u8] = include_bytes!("trash_braille.rgba");
-/// ~50% coverage (128/255), auto-selected by bake_icons.py::choose_threshold -- 18/96 dots lit at this threshold.
-const TRASH_BRAILLE_ALPHA_THRESHOLD: u8 = 128;
-static TRASH_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        TRASH_BRAILLE_RGBA,
-        TRASH_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const TRASH_COMPACT_RGBA: &[u8] = include_bytes!("trash_compact.rgba");
 static TRASH_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(TRASH_COMPACT_RGBA));
-
-const TRASH_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("trash_compact_braille.rgba");
-/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_compact_threshold -- 8/16 dots lit at this threshold.
-const TRASH_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
-static TRASH_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        TRASH_COMPACT_BRAILLE_RGBA,
-        TRASH_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const TRASH_STRIP_RGBA: &[u8] = include_bytes!("trash_strip.rgba");
 static TRASH_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(TRASH_STRIP_RGBA));
@@ -2880,8 +2168,8 @@ const SEARCH_RGBA: &[u8] = include_bytes!("search.rgba");
 static SEARCH_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(SEARCH_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const SEARCH_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("search_gate_active.rgba");
 static SEARCH_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SEARCH_GATE_ACTIVE_RGBA));
 
@@ -2890,34 +2178,8 @@ static SEARCH_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel
 const SEARCH_GATE_ACCENT_RGBA: &[u8] = include_bytes!("search_gate_accent.rgba");
 static SEARCH_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SEARCH_GATE_ACCENT_RGBA));
 
-const SEARCH_BRAILLE_RGBA: &[u8] = include_bytes!("search_braille.rgba");
-/// ~15% coverage (38/255), auto-selected by bake_icons.py::choose_threshold -- 21/96 dots lit at this threshold.
-const SEARCH_BRAILLE_ALPHA_THRESHOLD: u8 = 38;
-static SEARCH_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        SEARCH_BRAILLE_RGBA,
-        SEARCH_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const SEARCH_COMPACT_RGBA: &[u8] = include_bytes!("search_compact.rgba");
 static SEARCH_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(SEARCH_COMPACT_RGBA));
-
-const SEARCH_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("search_compact_braille.rgba");
-/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_compact_threshold -- 5/16 dots lit at this threshold.
-const SEARCH_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
-static SEARCH_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        SEARCH_COMPACT_BRAILLE_RGBA,
-        SEARCH_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const SEARCH_STRIP_RGBA: &[u8] = include_bytes!("search_strip.rgba");
 static SEARCH_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(SEARCH_STRIP_RGBA));
@@ -2942,8 +2204,8 @@ const CHECK_RGBA: &[u8] = include_bytes!("check.rgba");
 static CHECK_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(CHECK_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const CHECK_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("check_gate_active.rgba");
 static CHECK_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CHECK_GATE_ACTIVE_RGBA));
 
@@ -2952,34 +2214,8 @@ static CHECK_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_
 const CHECK_GATE_ACCENT_RGBA: &[u8] = include_bytes!("check_gate_accent.rgba");
 static CHECK_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CHECK_GATE_ACCENT_RGBA));
 
-const CHECK_BRAILLE_RGBA: &[u8] = include_bytes!("check_braille.rgba");
-/// ~6% coverage (15/255), auto-selected by bake_icons.py::choose_threshold -- 13/96 dots lit at this threshold.
-const CHECK_BRAILLE_ALPHA_THRESHOLD: u8 = 15;
-static CHECK_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        CHECK_BRAILLE_RGBA,
-        CHECK_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const CHECK_COMPACT_RGBA: &[u8] = include_bytes!("check_compact.rgba");
 static CHECK_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(CHECK_COMPACT_RGBA));
-
-const CHECK_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("check_compact_braille.rgba");
-/// ~10% coverage (26/255), override, hand-picked after reviewing bake_icons.py's own printed report -- 5/16 dots lit at this threshold.
-const CHECK_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 26;
-static CHECK_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        CHECK_COMPACT_BRAILLE_RGBA,
-        CHECK_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const CHECK_STRIP_RGBA: &[u8] = include_bytes!("check_strip.rgba");
 static CHECK_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(CHECK_STRIP_RGBA));
@@ -3004,8 +2240,8 @@ const CLOSE_RGBA: &[u8] = include_bytes!("close.rgba");
 static CLOSE_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(CLOSE_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const CLOSE_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("close_gate_active.rgba");
 static CLOSE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CLOSE_GATE_ACTIVE_RGBA));
 
@@ -3014,34 +2250,8 @@ static CLOSE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_
 const CLOSE_GATE_ACCENT_RGBA: &[u8] = include_bytes!("close_gate_accent.rgba");
 static CLOSE_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CLOSE_GATE_ACCENT_RGBA));
 
-const CLOSE_BRAILLE_RGBA: &[u8] = include_bytes!("close_braille.rgba");
-/// ~30% coverage (77/255), override, hand-picked after reviewing bake_icons.py's own auto-suggested preview -- 12/96 dots lit at this threshold.
-const CLOSE_BRAILLE_ALPHA_THRESHOLD: u8 = 77;
-static CLOSE_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        CLOSE_BRAILLE_RGBA,
-        CLOSE_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const CLOSE_COMPACT_RGBA: &[u8] = include_bytes!("close_compact.rgba");
 static CLOSE_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(CLOSE_COMPACT_RGBA));
-
-const CLOSE_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("close_compact_braille.rgba");
-/// ~30% coverage (77/255), auto-selected by bake_icons.py::choose_compact_threshold -- 4/16 dots lit at this threshold.
-const CLOSE_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 77;
-static CLOSE_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        CLOSE_COMPACT_BRAILLE_RGBA,
-        CLOSE_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const CLOSE_STRIP_RGBA: &[u8] = include_bytes!("close_strip.rgba");
 static CLOSE_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(CLOSE_STRIP_RGBA));
@@ -3066,8 +2276,8 @@ const ARROW_UP_RGBA: &[u8] = include_bytes!("arrow_up.rgba");
 static ARROW_UP_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(ARROW_UP_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const ARROW_UP_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("arrow_up_gate_active.rgba");
 static ARROW_UP_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ARROW_UP_GATE_ACTIVE_RGBA));
 
@@ -3076,34 +2286,8 @@ static ARROW_UP_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_six
 const ARROW_UP_GATE_ACCENT_RGBA: &[u8] = include_bytes!("arrow_up_gate_accent.rgba");
 static ARROW_UP_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ARROW_UP_GATE_ACCENT_RGBA));
 
-const ARROW_UP_BRAILLE_RGBA: &[u8] = include_bytes!("arrow_up_braille.rgba");
-/// ~6% coverage (15/255), auto-selected by bake_icons.py::choose_threshold -- 16/96 dots lit at this threshold.
-const ARROW_UP_BRAILLE_ALPHA_THRESHOLD: u8 = 15;
-static ARROW_UP_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        ARROW_UP_BRAILLE_RGBA,
-        ARROW_UP_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const ARROW_UP_COMPACT_RGBA: &[u8] = include_bytes!("arrow_up_compact.rgba");
 static ARROW_UP_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(ARROW_UP_COMPACT_RGBA));
-
-const ARROW_UP_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("arrow_up_compact_braille.rgba");
-/// ~15% coverage (38/255), override, hand-picked after reviewing bake_icons.py's own printed report -- 5/16 dots lit at this threshold.
-const ARROW_UP_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 38;
-static ARROW_UP_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        ARROW_UP_COMPACT_BRAILLE_RGBA,
-        ARROW_UP_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const ARROW_UP_STRIP_RGBA: &[u8] = include_bytes!("arrow_up_strip.rgba");
 static ARROW_UP_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(ARROW_UP_STRIP_RGBA));
@@ -3128,8 +2312,8 @@ const ARROW_DOWN_RGBA: &[u8] = include_bytes!("arrow_down.rgba");
 static ARROW_DOWN_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(ARROW_DOWN_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const ARROW_DOWN_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("arrow_down_gate_active.rgba");
 static ARROW_DOWN_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ARROW_DOWN_GATE_ACTIVE_RGBA));
 
@@ -3138,34 +2322,8 @@ static ARROW_DOWN_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_s
 const ARROW_DOWN_GATE_ACCENT_RGBA: &[u8] = include_bytes!("arrow_down_gate_accent.rgba");
 static ARROW_DOWN_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ARROW_DOWN_GATE_ACCENT_RGBA));
 
-const ARROW_DOWN_BRAILLE_RGBA: &[u8] = include_bytes!("arrow_down_braille.rgba");
-/// ~6% coverage (15/255), auto-selected by bake_icons.py::choose_threshold -- 16/96 dots lit at this threshold.
-const ARROW_DOWN_BRAILLE_ALPHA_THRESHOLD: u8 = 15;
-static ARROW_DOWN_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        ARROW_DOWN_BRAILLE_RGBA,
-        ARROW_DOWN_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const ARROW_DOWN_COMPACT_RGBA: &[u8] = include_bytes!("arrow_down_compact.rgba");
 static ARROW_DOWN_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(ARROW_DOWN_COMPACT_RGBA));
-
-const ARROW_DOWN_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("arrow_down_compact_braille.rgba");
-/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_compact_threshold -- 3/16 dots lit at this threshold.
-const ARROW_DOWN_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
-static ARROW_DOWN_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        ARROW_DOWN_COMPACT_BRAILLE_RGBA,
-        ARROW_DOWN_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const ARROW_DOWN_STRIP_RGBA: &[u8] = include_bytes!("arrow_down_strip.rgba");
 static ARROW_DOWN_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(ARROW_DOWN_STRIP_RGBA));
@@ -3190,8 +2348,8 @@ const ARROW_LEFT_RGBA: &[u8] = include_bytes!("arrow_left.rgba");
 static ARROW_LEFT_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(ARROW_LEFT_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const ARROW_LEFT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("arrow_left_gate_active.rgba");
 static ARROW_LEFT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ARROW_LEFT_GATE_ACTIVE_RGBA));
 
@@ -3200,34 +2358,8 @@ static ARROW_LEFT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_s
 const ARROW_LEFT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("arrow_left_gate_accent.rgba");
 static ARROW_LEFT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ARROW_LEFT_GATE_ACCENT_RGBA));
 
-const ARROW_LEFT_BRAILLE_RGBA: &[u8] = include_bytes!("arrow_left_braille.rgba");
-/// ~6% coverage (15/255), auto-selected by bake_icons.py::choose_threshold -- 16/96 dots lit at this threshold.
-const ARROW_LEFT_BRAILLE_ALPHA_THRESHOLD: u8 = 15;
-static ARROW_LEFT_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        ARROW_LEFT_BRAILLE_RGBA,
-        ARROW_LEFT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const ARROW_LEFT_COMPACT_RGBA: &[u8] = include_bytes!("arrow_left_compact.rgba");
 static ARROW_LEFT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(ARROW_LEFT_COMPACT_RGBA));
-
-const ARROW_LEFT_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("arrow_left_compact_braille.rgba");
-/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_compact_threshold -- 3/16 dots lit at this threshold.
-const ARROW_LEFT_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
-static ARROW_LEFT_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        ARROW_LEFT_COMPACT_BRAILLE_RGBA,
-        ARROW_LEFT_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const ARROW_LEFT_STRIP_RGBA: &[u8] = include_bytes!("arrow_left_strip.rgba");
 static ARROW_LEFT_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(ARROW_LEFT_STRIP_RGBA));
@@ -3252,8 +2384,8 @@ const ARROW_RIGHT_RGBA: &[u8] = include_bytes!("arrow_right.rgba");
 static ARROW_RIGHT_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(ARROW_RIGHT_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const ARROW_RIGHT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("arrow_right_gate_active.rgba");
 static ARROW_RIGHT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ARROW_RIGHT_GATE_ACTIVE_RGBA));
 
@@ -3262,34 +2394,8 @@ static ARROW_RIGHT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_
 const ARROW_RIGHT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("arrow_right_gate_accent.rgba");
 static ARROW_RIGHT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ARROW_RIGHT_GATE_ACCENT_RGBA));
 
-const ARROW_RIGHT_BRAILLE_RGBA: &[u8] = include_bytes!("arrow_right_braille.rgba");
-/// ~6% coverage (15/255), auto-selected by bake_icons.py::choose_threshold -- 16/96 dots lit at this threshold.
-const ARROW_RIGHT_BRAILLE_ALPHA_THRESHOLD: u8 = 15;
-static ARROW_RIGHT_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        ARROW_RIGHT_BRAILLE_RGBA,
-        ARROW_RIGHT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const ARROW_RIGHT_COMPACT_RGBA: &[u8] = include_bytes!("arrow_right_compact.rgba");
 static ARROW_RIGHT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(ARROW_RIGHT_COMPACT_RGBA));
-
-const ARROW_RIGHT_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("arrow_right_compact_braille.rgba");
-/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_compact_threshold -- 3/16 dots lit at this threshold.
-const ARROW_RIGHT_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
-static ARROW_RIGHT_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        ARROW_RIGHT_COMPACT_BRAILLE_RGBA,
-        ARROW_RIGHT_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const ARROW_RIGHT_STRIP_RGBA: &[u8] = include_bytes!("arrow_right_strip.rgba");
 static ARROW_RIGHT_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(ARROW_RIGHT_STRIP_RGBA));
@@ -3314,8 +2420,8 @@ const ARROW_SWAP_RGBA: &[u8] = include_bytes!("arrow_swap.rgba");
 static ARROW_SWAP_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(ARROW_SWAP_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const ARROW_SWAP_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("arrow_swap_gate_active.rgba");
 static ARROW_SWAP_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ARROW_SWAP_GATE_ACTIVE_RGBA));
 
@@ -3324,34 +2430,8 @@ static ARROW_SWAP_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_s
 const ARROW_SWAP_GATE_ACCENT_RGBA: &[u8] = include_bytes!("arrow_swap_gate_accent.rgba");
 static ARROW_SWAP_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ARROW_SWAP_GATE_ACCENT_RGBA));
 
-const ARROW_SWAP_BRAILLE_RGBA: &[u8] = include_bytes!("arrow_swap_braille.rgba");
-/// ~30% coverage (77/255), auto-selected by bake_icons.py::choose_threshold -- 18/96 dots lit at this threshold.
-const ARROW_SWAP_BRAILLE_ALPHA_THRESHOLD: u8 = 77;
-static ARROW_SWAP_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        ARROW_SWAP_BRAILLE_RGBA,
-        ARROW_SWAP_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const ARROW_SWAP_COMPACT_RGBA: &[u8] = include_bytes!("arrow_swap_compact.rgba");
 static ARROW_SWAP_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(ARROW_SWAP_COMPACT_RGBA));
-
-const ARROW_SWAP_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("arrow_swap_compact_braille.rgba");
-/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_compact_threshold -- 4/16 dots lit at this threshold.
-const ARROW_SWAP_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
-static ARROW_SWAP_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        ARROW_SWAP_COMPACT_BRAILLE_RGBA,
-        ARROW_SWAP_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const ARROW_SWAP_STRIP_RGBA: &[u8] = include_bytes!("arrow_swap_strip.rgba");
 static ARROW_SWAP_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(ARROW_SWAP_STRIP_RGBA));
@@ -3376,8 +2456,8 @@ const GIT_COMMIT_RGBA: &[u8] = include_bytes!("git_commit.rgba");
 static GIT_COMMIT_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(GIT_COMMIT_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const GIT_COMMIT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("git_commit_gate_active.rgba");
 static GIT_COMMIT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(GIT_COMMIT_GATE_ACTIVE_RGBA));
 
@@ -3386,34 +2466,8 @@ static GIT_COMMIT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_s
 const GIT_COMMIT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("git_commit_gate_accent.rgba");
 static GIT_COMMIT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(GIT_COMMIT_GATE_ACCENT_RGBA));
 
-const GIT_COMMIT_BRAILLE_RGBA: &[u8] = include_bytes!("git_commit_braille.rgba");
-/// ~10% coverage (26/255), auto-selected by bake_icons.py::choose_threshold -- 20/96 dots lit at this threshold.
-const GIT_COMMIT_BRAILLE_ALPHA_THRESHOLD: u8 = 26;
-static GIT_COMMIT_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        GIT_COMMIT_BRAILLE_RGBA,
-        GIT_COMMIT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const GIT_COMMIT_COMPACT_RGBA: &[u8] = include_bytes!("git_commit_compact.rgba");
 static GIT_COMMIT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(GIT_COMMIT_COMPACT_RGBA));
-
-const GIT_COMMIT_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("git_commit_compact_braille.rgba");
-/// ~30% coverage (77/255), auto-selected by bake_icons.py::choose_compact_threshold -- 4/16 dots lit at this threshold.
-const GIT_COMMIT_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 77;
-static GIT_COMMIT_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        GIT_COMMIT_COMPACT_BRAILLE_RGBA,
-        GIT_COMMIT_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const GIT_COMMIT_STRIP_RGBA: &[u8] = include_bytes!("git_commit_strip.rgba");
 static GIT_COMMIT_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(GIT_COMMIT_STRIP_RGBA));
@@ -3438,8 +2492,8 @@ const GIT_BRANCH_RGBA: &[u8] = include_bytes!("git_branch.rgba");
 static GIT_BRANCH_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(GIT_BRANCH_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const GIT_BRANCH_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("git_branch_gate_active.rgba");
 static GIT_BRANCH_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(GIT_BRANCH_GATE_ACTIVE_RGBA));
 
@@ -3448,34 +2502,8 @@ static GIT_BRANCH_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_s
 const GIT_BRANCH_GATE_ACCENT_RGBA: &[u8] = include_bytes!("git_branch_gate_accent.rgba");
 static GIT_BRANCH_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(GIT_BRANCH_GATE_ACCENT_RGBA));
 
-const GIT_BRANCH_BRAILLE_RGBA: &[u8] = include_bytes!("git_branch_braille.rgba");
-/// ~40% coverage (102/255), auto-selected by bake_icons.py::choose_threshold -- 20/96 dots lit at this threshold.
-const GIT_BRANCH_BRAILLE_ALPHA_THRESHOLD: u8 = 102;
-static GIT_BRANCH_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        GIT_BRANCH_BRAILLE_RGBA,
-        GIT_BRANCH_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const GIT_BRANCH_COMPACT_RGBA: &[u8] = include_bytes!("git_branch_compact.rgba");
 static GIT_BRANCH_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(GIT_BRANCH_COMPACT_RGBA));
-
-const GIT_BRANCH_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("git_branch_compact_braille.rgba");
-/// ~30% coverage (77/255), auto-selected by bake_icons.py::choose_compact_threshold -- 5/16 dots lit at this threshold.
-const GIT_BRANCH_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 77;
-static GIT_BRANCH_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        GIT_BRANCH_COMPACT_BRAILLE_RGBA,
-        GIT_BRANCH_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const GIT_BRANCH_STRIP_RGBA: &[u8] = include_bytes!("git_branch_strip.rgba");
 static GIT_BRANCH_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(GIT_BRANCH_STRIP_RGBA));
@@ -3500,8 +2528,8 @@ const DIFF_RGBA: &[u8] = include_bytes!("diff.rgba");
 static DIFF_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(DIFF_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const DIFF_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("diff_gate_active.rgba");
 static DIFF_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(DIFF_GATE_ACTIVE_RGBA));
 
@@ -3510,34 +2538,8 @@ static DIFF_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_g
 const DIFF_GATE_ACCENT_RGBA: &[u8] = include_bytes!("diff_gate_accent.rgba");
 static DIFF_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(DIFF_GATE_ACCENT_RGBA));
 
-const DIFF_BRAILLE_RGBA: &[u8] = include_bytes!("diff_braille.rgba");
-/// ~50% coverage (128/255), auto-selected by bake_icons.py::choose_threshold -- 28/96 dots lit at this threshold.
-const DIFF_BRAILLE_ALPHA_THRESHOLD: u8 = 128;
-static DIFF_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        DIFF_BRAILLE_RGBA,
-        DIFF_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const DIFF_COMPACT_RGBA: &[u8] = include_bytes!("diff_compact.rgba");
 static DIFF_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(DIFF_COMPACT_RGBA));
-
-const DIFF_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("diff_compact_braille.rgba");
-/// ~35% coverage (89/255), auto-selected by bake_icons.py::choose_compact_threshold -- 4/16 dots lit at this threshold.
-const DIFF_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 89;
-static DIFF_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        DIFF_COMPACT_BRAILLE_RGBA,
-        DIFF_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const DIFF_STRIP_RGBA: &[u8] = include_bytes!("diff_strip.rgba");
 static DIFF_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(DIFF_STRIP_RGBA));
@@ -3562,8 +2564,8 @@ const DIFF_ADDED_RGBA: &[u8] = include_bytes!("diff_added.rgba");
 static DIFF_ADDED_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(DIFF_ADDED_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const DIFF_ADDED_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("diff_added_gate_active.rgba");
 static DIFF_ADDED_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(DIFF_ADDED_GATE_ACTIVE_RGBA));
 
@@ -3572,34 +2574,8 @@ static DIFF_ADDED_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_s
 const DIFF_ADDED_GATE_ACCENT_RGBA: &[u8] = include_bytes!("diff_added_gate_accent.rgba");
 static DIFF_ADDED_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(DIFF_ADDED_GATE_ACCENT_RGBA));
 
-const DIFF_ADDED_BRAILLE_RGBA: &[u8] = include_bytes!("diff_added_braille.rgba");
-/// ~50% coverage (128/255), auto-selected by bake_icons.py::choose_threshold -- 22/96 dots lit at this threshold.
-const DIFF_ADDED_BRAILLE_ALPHA_THRESHOLD: u8 = 128;
-static DIFF_ADDED_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        DIFF_ADDED_BRAILLE_RGBA,
-        DIFF_ADDED_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const DIFF_ADDED_COMPACT_RGBA: &[u8] = include_bytes!("diff_added_compact.rgba");
 static DIFF_ADDED_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(DIFF_ADDED_COMPACT_RGBA));
-
-const DIFF_ADDED_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("diff_added_compact_braille.rgba");
-/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_compact_threshold -- 10/16 dots lit at this threshold.
-const DIFF_ADDED_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
-static DIFF_ADDED_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        DIFF_ADDED_COMPACT_BRAILLE_RGBA,
-        DIFF_ADDED_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const DIFF_ADDED_STRIP_RGBA: &[u8] = include_bytes!("diff_added_strip.rgba");
 static DIFF_ADDED_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(DIFF_ADDED_STRIP_RGBA));
@@ -3624,8 +2600,8 @@ const GIT_COMPARE_RGBA: &[u8] = include_bytes!("git_compare.rgba");
 static GIT_COMPARE_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(GIT_COMPARE_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const GIT_COMPARE_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("git_compare_gate_active.rgba");
 static GIT_COMPARE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(GIT_COMPARE_GATE_ACTIVE_RGBA));
 
@@ -3634,34 +2610,8 @@ static GIT_COMPARE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_
 const GIT_COMPARE_GATE_ACCENT_RGBA: &[u8] = include_bytes!("git_compare_gate_accent.rgba");
 static GIT_COMPARE_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(GIT_COMPARE_GATE_ACCENT_RGBA));
 
-const GIT_COMPARE_BRAILLE_RGBA: &[u8] = include_bytes!("git_compare_braille.rgba");
-/// ~40% coverage (102/255), auto-selected by bake_icons.py::choose_threshold -- 22/96 dots lit at this threshold.
-const GIT_COMPARE_BRAILLE_ALPHA_THRESHOLD: u8 = 102;
-static GIT_COMPARE_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        GIT_COMPARE_BRAILLE_RGBA,
-        GIT_COMPARE_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const GIT_COMPARE_COMPACT_RGBA: &[u8] = include_bytes!("git_compare_compact.rgba");
 static GIT_COMPARE_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(GIT_COMPARE_COMPACT_RGBA));
-
-const GIT_COMPARE_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("git_compare_compact_braille.rgba");
-/// ~30% coverage (77/255), auto-selected by bake_icons.py::choose_compact_threshold -- 4/16 dots lit at this threshold.
-const GIT_COMPARE_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 77;
-static GIT_COMPARE_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        GIT_COMPARE_COMPACT_BRAILLE_RGBA,
-        GIT_COMPARE_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const GIT_COMPARE_STRIP_RGBA: &[u8] = include_bytes!("git_compare_strip.rgba");
 static GIT_COMPARE_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(GIT_COMPARE_STRIP_RGBA));
@@ -3686,8 +2636,8 @@ const REPO_RGBA: &[u8] = include_bytes!("repo.rgba");
 static REPO_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(REPO_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const REPO_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("repo_gate_active.rgba");
 static REPO_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(REPO_GATE_ACTIVE_RGBA));
 
@@ -3696,34 +2646,8 @@ static REPO_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_g
 const REPO_GATE_ACCENT_RGBA: &[u8] = include_bytes!("repo_gate_accent.rgba");
 static REPO_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(REPO_GATE_ACCENT_RGBA));
 
-const REPO_BRAILLE_RGBA: &[u8] = include_bytes!("repo_braille.rgba");
-/// ~45% coverage (115/255), auto-selected by bake_icons.py::choose_threshold -- 24/96 dots lit at this threshold.
-const REPO_BRAILLE_ALPHA_THRESHOLD: u8 = 115;
-static REPO_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        REPO_BRAILLE_RGBA,
-        REPO_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const REPO_COMPACT_RGBA: &[u8] = include_bytes!("repo_compact.rgba");
 static REPO_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(REPO_COMPACT_RGBA));
-
-const REPO_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("repo_compact_braille.rgba");
-/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_compact_threshold -- 9/16 dots lit at this threshold.
-const REPO_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
-static REPO_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        REPO_COMPACT_BRAILLE_RGBA,
-        REPO_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const REPO_STRIP_RGBA: &[u8] = include_bytes!("repo_strip.rgba");
 static REPO_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(REPO_STRIP_RGBA));
@@ -3748,8 +2672,8 @@ const REPO_FORKED_RGBA: &[u8] = include_bytes!("repo_forked.rgba");
 static REPO_FORKED_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(REPO_FORKED_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const REPO_FORKED_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("repo_forked_gate_active.rgba");
 static REPO_FORKED_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(REPO_FORKED_GATE_ACTIVE_RGBA));
 
@@ -3758,34 +2682,8 @@ static REPO_FORKED_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_
 const REPO_FORKED_GATE_ACCENT_RGBA: &[u8] = include_bytes!("repo_forked_gate_accent.rgba");
 static REPO_FORKED_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(REPO_FORKED_GATE_ACCENT_RGBA));
 
-const REPO_FORKED_BRAILLE_RGBA: &[u8] = include_bytes!("repo_forked_braille.rgba");
-/// ~35% coverage (89/255), auto-selected by bake_icons.py::choose_threshold -- 19/96 dots lit at this threshold.
-const REPO_FORKED_BRAILLE_ALPHA_THRESHOLD: u8 = 89;
-static REPO_FORKED_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        REPO_FORKED_BRAILLE_RGBA,
-        REPO_FORKED_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const REPO_FORKED_COMPACT_RGBA: &[u8] = include_bytes!("repo_forked_compact.rgba");
 static REPO_FORKED_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(REPO_FORKED_COMPACT_RGBA));
-
-const REPO_FORKED_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("repo_forked_compact_braille.rgba");
-/// ~30% coverage (77/255), auto-selected by bake_icons.py::choose_compact_threshold -- 4/16 dots lit at this threshold.
-const REPO_FORKED_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 77;
-static REPO_FORKED_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        REPO_FORKED_COMPACT_BRAILLE_RGBA,
-        REPO_FORKED_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const REPO_FORKED_STRIP_RGBA: &[u8] = include_bytes!("repo_forked_strip.rgba");
 static REPO_FORKED_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(REPO_FORKED_STRIP_RGBA));
@@ -3810,8 +2708,8 @@ const DEBUG_STOP_RGBA: &[u8] = include_bytes!("debug_stop.rgba");
 static DEBUG_STOP_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(DEBUG_STOP_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const DEBUG_STOP_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("debug_stop_gate_active.rgba");
 static DEBUG_STOP_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(DEBUG_STOP_GATE_ACTIVE_RGBA));
 
@@ -3820,34 +2718,8 @@ static DEBUG_STOP_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_s
 const DEBUG_STOP_GATE_ACCENT_RGBA: &[u8] = include_bytes!("debug_stop_gate_accent.rgba");
 static DEBUG_STOP_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(DEBUG_STOP_GATE_ACCENT_RGBA));
 
-const DEBUG_STOP_BRAILLE_RGBA: &[u8] = include_bytes!("debug_stop_braille.rgba");
-/// ~58% coverage (148/255), auto-selected by bake_icons.py::choose_threshold -- 20/96 dots lit at this threshold.
-const DEBUG_STOP_BRAILLE_ALPHA_THRESHOLD: u8 = 148;
-static DEBUG_STOP_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        DEBUG_STOP_BRAILLE_RGBA,
-        DEBUG_STOP_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const DEBUG_STOP_COMPACT_RGBA: &[u8] = include_bytes!("debug_stop_compact.rgba");
 static DEBUG_STOP_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(DEBUG_STOP_COMPACT_RGBA));
-
-const DEBUG_STOP_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("debug_stop_compact_braille.rgba");
-/// ~35% coverage (89/255), auto-selected by bake_icons.py::choose_compact_threshold -- 8/16 dots lit at this threshold.
-const DEBUG_STOP_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 89;
-static DEBUG_STOP_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        DEBUG_STOP_COMPACT_BRAILLE_RGBA,
-        DEBUG_STOP_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const DEBUG_STOP_STRIP_RGBA: &[u8] = include_bytes!("debug_stop_strip.rgba");
 static DEBUG_STOP_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(DEBUG_STOP_STRIP_RGBA));
@@ -3872,8 +2744,8 @@ const DEBUG_RESTART_RGBA: &[u8] = include_bytes!("debug_restart.rgba");
 static DEBUG_RESTART_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(DEBUG_RESTART_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const DEBUG_RESTART_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("debug_restart_gate_active.rgba");
 static DEBUG_RESTART_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(DEBUG_RESTART_GATE_ACTIVE_RGBA));
 
@@ -3882,34 +2754,8 @@ static DEBUG_RESTART_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| buil
 const DEBUG_RESTART_GATE_ACCENT_RGBA: &[u8] = include_bytes!("debug_restart_gate_accent.rgba");
 static DEBUG_RESTART_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(DEBUG_RESTART_GATE_ACCENT_RGBA));
 
-const DEBUG_RESTART_BRAILLE_RGBA: &[u8] = include_bytes!("debug_restart_braille.rgba");
-/// ~45% coverage (115/255), auto-selected by bake_icons.py::choose_threshold -- 18/96 dots lit at this threshold.
-const DEBUG_RESTART_BRAILLE_ALPHA_THRESHOLD: u8 = 115;
-static DEBUG_RESTART_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        DEBUG_RESTART_BRAILLE_RGBA,
-        DEBUG_RESTART_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const DEBUG_RESTART_COMPACT_RGBA: &[u8] = include_bytes!("debug_restart_compact.rgba");
 static DEBUG_RESTART_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(DEBUG_RESTART_COMPACT_RGBA));
-
-const DEBUG_RESTART_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("debug_restart_compact_braille.rgba");
-/// ~30% coverage (77/255), auto-selected by bake_icons.py::choose_compact_threshold -- 8/16 dots lit at this threshold.
-const DEBUG_RESTART_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 77;
-static DEBUG_RESTART_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        DEBUG_RESTART_COMPACT_BRAILLE_RGBA,
-        DEBUG_RESTART_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const DEBUG_RESTART_STRIP_RGBA: &[u8] = include_bytes!("debug_restart_strip.rgba");
 static DEBUG_RESTART_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(DEBUG_RESTART_STRIP_RGBA));
@@ -3934,8 +2780,8 @@ const EDIT_RGBA: &[u8] = include_bytes!("edit.rgba");
 static EDIT_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(EDIT_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const EDIT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("edit_gate_active.rgba");
 static EDIT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(EDIT_GATE_ACTIVE_RGBA));
 
@@ -3944,34 +2790,8 @@ static EDIT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_g
 const EDIT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("edit_gate_accent.rgba");
 static EDIT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(EDIT_GATE_ACCENT_RGBA));
 
-const EDIT_BRAILLE_RGBA: &[u8] = include_bytes!("edit_braille.rgba");
-/// ~30% coverage (77/255), auto-selected by bake_icons.py::choose_threshold -- 24/96 dots lit at this threshold.
-const EDIT_BRAILLE_ALPHA_THRESHOLD: u8 = 77;
-static EDIT_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        EDIT_BRAILLE_RGBA,
-        EDIT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const EDIT_COMPACT_RGBA: &[u8] = include_bytes!("edit_compact.rgba");
 static EDIT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(EDIT_COMPACT_RGBA));
-
-const EDIT_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("edit_compact_braille.rgba");
-/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_compact_threshold -- 7/16 dots lit at this threshold.
-const EDIT_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
-static EDIT_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        EDIT_COMPACT_BRAILLE_RGBA,
-        EDIT_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const EDIT_STRIP_RGBA: &[u8] = include_bytes!("edit_strip.rgba");
 static EDIT_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(EDIT_STRIP_RGBA));
@@ -3996,8 +2816,8 @@ const HISTORY_RGBA: &[u8] = include_bytes!("history.rgba");
 static HISTORY_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(HISTORY_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const HISTORY_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("history_gate_active.rgba");
 static HISTORY_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(HISTORY_GATE_ACTIVE_RGBA));
 
@@ -4006,34 +2826,8 @@ static HISTORY_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixe
 const HISTORY_GATE_ACCENT_RGBA: &[u8] = include_bytes!("history_gate_accent.rgba");
 static HISTORY_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(HISTORY_GATE_ACCENT_RGBA));
 
-const HISTORY_BRAILLE_RGBA: &[u8] = include_bytes!("history_braille.rgba");
-/// ~45% coverage (115/255), auto-selected by bake_icons.py::choose_threshold -- 19/96 dots lit at this threshold.
-const HISTORY_BRAILLE_ALPHA_THRESHOLD: u8 = 115;
-static HISTORY_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        HISTORY_BRAILLE_RGBA,
-        HISTORY_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const HISTORY_COMPACT_RGBA: &[u8] = include_bytes!("history_compact.rgba");
 static HISTORY_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(HISTORY_COMPACT_RGBA));
-
-const HISTORY_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("history_compact_braille.rgba");
-/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_compact_threshold -- 7/16 dots lit at this threshold.
-const HISTORY_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
-static HISTORY_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        HISTORY_COMPACT_BRAILLE_RGBA,
-        HISTORY_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const HISTORY_STRIP_RGBA: &[u8] = include_bytes!("history_strip.rgba");
 static HISTORY_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(HISTORY_STRIP_RGBA));
@@ -4058,8 +2852,8 @@ const TERMINAL_RGBA: &[u8] = include_bytes!("terminal.rgba");
 static TERMINAL_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(TERMINAL_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const TERMINAL_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("terminal_gate_active.rgba");
 static TERMINAL_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(TERMINAL_GATE_ACTIVE_RGBA));
 
@@ -4068,34 +2862,8 @@ static TERMINAL_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_six
 const TERMINAL_GATE_ACCENT_RGBA: &[u8] = include_bytes!("terminal_gate_accent.rgba");
 static TERMINAL_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(TERMINAL_GATE_ACCENT_RGBA));
 
-const TERMINAL_BRAILLE_RGBA: &[u8] = include_bytes!("terminal_braille.rgba");
-/// ~50% coverage (128/255), auto-selected by bake_icons.py::choose_threshold -- 19/96 dots lit at this threshold.
-const TERMINAL_BRAILLE_ALPHA_THRESHOLD: u8 = 128;
-static TERMINAL_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        TERMINAL_BRAILLE_RGBA,
-        TERMINAL_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const TERMINAL_COMPACT_RGBA: &[u8] = include_bytes!("terminal_compact.rgba");
 static TERMINAL_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(TERMINAL_COMPACT_RGBA));
-
-const TERMINAL_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("terminal_compact_braille.rgba");
-/// ~30% coverage (77/255), auto-selected by bake_icons.py::choose_compact_threshold -- 4/16 dots lit at this threshold.
-const TERMINAL_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 77;
-static TERMINAL_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        TERMINAL_COMPACT_BRAILLE_RGBA,
-        TERMINAL_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const TERMINAL_STRIP_RGBA: &[u8] = include_bytes!("terminal_strip.rgba");
 static TERMINAL_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(TERMINAL_STRIP_RGBA));
@@ -4120,8 +2888,8 @@ const OUTPUT_RGBA: &[u8] = include_bytes!("output.rgba");
 static OUTPUT_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(OUTPUT_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const OUTPUT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("output_gate_active.rgba");
 static OUTPUT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(OUTPUT_GATE_ACTIVE_RGBA));
 
@@ -4130,34 +2898,8 @@ static OUTPUT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel
 const OUTPUT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("output_gate_accent.rgba");
 static OUTPUT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(OUTPUT_GATE_ACCENT_RGBA));
 
-const OUTPUT_BRAILLE_RGBA: &[u8] = include_bytes!("output_braille.rgba");
-/// ~45% coverage (115/255), auto-selected by bake_icons.py::choose_threshold -- 18/96 dots lit at this threshold.
-const OUTPUT_BRAILLE_ALPHA_THRESHOLD: u8 = 115;
-static OUTPUT_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        OUTPUT_BRAILLE_RGBA,
-        OUTPUT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const OUTPUT_COMPACT_RGBA: &[u8] = include_bytes!("output_compact.rgba");
 static OUTPUT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(OUTPUT_COMPACT_RGBA));
-
-const OUTPUT_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("output_compact_braille.rgba");
-/// ~30% coverage (77/255), auto-selected by bake_icons.py::choose_compact_threshold -- 4/16 dots lit at this threshold.
-const OUTPUT_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 77;
-static OUTPUT_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        OUTPUT_COMPACT_BRAILLE_RGBA,
-        OUTPUT_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const OUTPUT_STRIP_RGBA: &[u8] = include_bytes!("output_strip.rgba");
 static OUTPUT_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(OUTPUT_STRIP_RGBA));
@@ -4182,8 +2924,8 @@ const CLOUD_DOWNLOAD_RGBA: &[u8] = include_bytes!("cloud_download.rgba");
 static CLOUD_DOWNLOAD_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(CLOUD_DOWNLOAD_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const CLOUD_DOWNLOAD_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("cloud_download_gate_active.rgba");
 static CLOUD_DOWNLOAD_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CLOUD_DOWNLOAD_GATE_ACTIVE_RGBA));
 
@@ -4192,34 +2934,8 @@ static CLOUD_DOWNLOAD_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| bui
 const CLOUD_DOWNLOAD_GATE_ACCENT_RGBA: &[u8] = include_bytes!("cloud_download_gate_accent.rgba");
 static CLOUD_DOWNLOAD_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CLOUD_DOWNLOAD_GATE_ACCENT_RGBA));
 
-const CLOUD_DOWNLOAD_BRAILLE_RGBA: &[u8] = include_bytes!("cloud_download_braille.rgba");
-/// ~45% coverage (115/255), auto-selected by bake_icons.py::choose_threshold -- 19/96 dots lit at this threshold.
-const CLOUD_DOWNLOAD_BRAILLE_ALPHA_THRESHOLD: u8 = 115;
-static CLOUD_DOWNLOAD_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        CLOUD_DOWNLOAD_BRAILLE_RGBA,
-        CLOUD_DOWNLOAD_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const CLOUD_DOWNLOAD_COMPACT_RGBA: &[u8] = include_bytes!("cloud_download_compact.rgba");
 static CLOUD_DOWNLOAD_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(CLOUD_DOWNLOAD_COMPACT_RGBA));
-
-const CLOUD_DOWNLOAD_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("cloud_download_compact_braille.rgba");
-/// ~58% coverage (148/255), auto-selected by bake_icons.py::choose_compact_threshold -- 4/16 dots lit at this threshold.
-const CLOUD_DOWNLOAD_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 148;
-static CLOUD_DOWNLOAD_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        CLOUD_DOWNLOAD_COMPACT_BRAILLE_RGBA,
-        CLOUD_DOWNLOAD_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const CLOUD_DOWNLOAD_STRIP_RGBA: &[u8] = include_bytes!("cloud_download_strip.rgba");
 static CLOUD_DOWNLOAD_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(CLOUD_DOWNLOAD_STRIP_RGBA));
@@ -4244,8 +2960,8 @@ const ELLIPSIS_RGBA: &[u8] = include_bytes!("ellipsis.rgba");
 static ELLIPSIS_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(ELLIPSIS_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const ELLIPSIS_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("ellipsis_gate_active.rgba");
 static ELLIPSIS_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ELLIPSIS_GATE_ACTIVE_RGBA));
 
@@ -4254,35 +2970,8 @@ static ELLIPSIS_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_six
 const ELLIPSIS_GATE_ACCENT_RGBA: &[u8] = include_bytes!("ellipsis_gate_accent.rgba");
 static ELLIPSIS_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ELLIPSIS_GATE_ACCENT_RGBA));
 
-const ELLIPSIS_BRAILLE_RGBA: &[u8] = include_bytes!("ellipsis_braille.rgba");
-/// ~15% coverage (38/255), override, hand-picked after reviewing bake_icons.py's own auto-suggested preview -- 12/96 dots lit at this threshold.
-/// DEGRADED: the 3 dots merge into ONE solid horizontal band (verified: every alpha value in the baked buffer is 0, 48, or 49 -- no threshold separates them); reads as a short dash/bar, not 3 distinct dots.
-const ELLIPSIS_BRAILLE_ALPHA_THRESHOLD: u8 = 38;
-static ELLIPSIS_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        ELLIPSIS_BRAILLE_RGBA,
-        ELLIPSIS_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const ELLIPSIS_COMPACT_RGBA: &[u8] = include_bytes!("ellipsis_compact.rgba");
 static ELLIPSIS_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(ELLIPSIS_COMPACT_RGBA));
-
-const ELLIPSIS_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("ellipsis_compact_braille.rgba");
-/// ~6% coverage (15/255), auto-selected by bake_icons.py::choose_compact_threshold -- 4/16 dots lit at this threshold.
-const ELLIPSIS_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 15;
-static ELLIPSIS_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        ELLIPSIS_COMPACT_BRAILLE_RGBA,
-        ELLIPSIS_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const ELLIPSIS_STRIP_RGBA: &[u8] = include_bytes!("ellipsis_strip.rgba");
 static ELLIPSIS_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(ELLIPSIS_STRIP_RGBA));
@@ -4307,8 +2996,8 @@ const LINK_RGBA: &[u8] = include_bytes!("link.rgba");
 static LINK_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(LINK_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const LINK_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("link_gate_active.rgba");
 static LINK_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LINK_GATE_ACTIVE_RGBA));
 
@@ -4317,35 +3006,8 @@ static LINK_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_g
 const LINK_GATE_ACCENT_RGBA: &[u8] = include_bytes!("link_gate_accent.rgba");
 static LINK_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LINK_GATE_ACCENT_RGBA));
 
-const LINK_BRAILLE_RGBA: &[u8] = include_bytes!("link_braille.rgba");
-/// ~25% coverage (64/255), override, hand-picked after reviewing bake_icons.py's own auto-suggested preview -- 12/96 dots lit at this threshold.
-/// DEGRADED: the two interlocking chain ovals collapse into a single horizontal dot-row at every threshold; the 'two links' meaning does not survive, though the row itself is not noise.
-const LINK_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
-static LINK_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        LINK_BRAILLE_RGBA,
-        LINK_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const LINK_COMPACT_RGBA: &[u8] = include_bytes!("link_compact.rgba");
 static LINK_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LINK_COMPACT_RGBA));
-
-const LINK_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("link_compact_braille.rgba");
-/// ~20% coverage (51/255), auto-selected by bake_icons.py::choose_compact_threshold -- 4/16 dots lit at this threshold.
-const LINK_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 51;
-static LINK_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        LINK_COMPACT_BRAILLE_RGBA,
-        LINK_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const LINK_STRIP_RGBA: &[u8] = include_bytes!("link_strip.rgba");
 static LINK_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(LINK_STRIP_RGBA));
@@ -4370,8 +3032,8 @@ const CIRCLE_FILLED_RGBA: &[u8] = include_bytes!("circle_filled.rgba");
 static CIRCLE_FILLED_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(CIRCLE_FILLED_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const CIRCLE_FILLED_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("circle_filled_gate_active.rgba");
 static CIRCLE_FILLED_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CIRCLE_FILLED_GATE_ACTIVE_RGBA));
 
@@ -4380,34 +3042,8 @@ static CIRCLE_FILLED_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| buil
 const CIRCLE_FILLED_GATE_ACCENT_RGBA: &[u8] = include_bytes!("circle_filled_gate_accent.rgba");
 static CIRCLE_FILLED_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CIRCLE_FILLED_GATE_ACCENT_RGBA));
 
-const CIRCLE_FILLED_BRAILLE_RGBA: &[u8] = include_bytes!("circle_filled_braille.rgba");
-/// ~6% coverage (15/255), auto-selected by bake_icons.py::choose_threshold -- 16/96 dots lit at this threshold.
-const CIRCLE_FILLED_BRAILLE_ALPHA_THRESHOLD: u8 = 15;
-static CIRCLE_FILLED_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        CIRCLE_FILLED_BRAILLE_RGBA,
-        CIRCLE_FILLED_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const CIRCLE_FILLED_COMPACT_RGBA: &[u8] = include_bytes!("circle_filled_compact.rgba");
 static CIRCLE_FILLED_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(CIRCLE_FILLED_COMPACT_RGBA));
-
-const CIRCLE_FILLED_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("circle_filled_compact_braille.rgba");
-/// ~58% coverage (148/255), auto-selected by bake_icons.py::choose_compact_threshold -- 4/16 dots lit at this threshold.
-const CIRCLE_FILLED_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 148;
-static CIRCLE_FILLED_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        CIRCLE_FILLED_COMPACT_BRAILLE_RGBA,
-        CIRCLE_FILLED_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const CIRCLE_FILLED_STRIP_RGBA: &[u8] = include_bytes!("circle_filled_strip.rgba");
 static CIRCLE_FILLED_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(CIRCLE_FILLED_STRIP_RGBA));
@@ -4432,8 +3068,8 @@ const CIRCLE_SLASH_RGBA: &[u8] = include_bytes!("circle_slash.rgba");
 static CIRCLE_SLASH_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(CIRCLE_SLASH_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const CIRCLE_SLASH_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("circle_slash_gate_active.rgba");
 static CIRCLE_SLASH_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CIRCLE_SLASH_GATE_ACTIVE_RGBA));
 
@@ -4442,34 +3078,8 @@ static CIRCLE_SLASH_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build
 const CIRCLE_SLASH_GATE_ACCENT_RGBA: &[u8] = include_bytes!("circle_slash_gate_accent.rgba");
 static CIRCLE_SLASH_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CIRCLE_SLASH_GATE_ACCENT_RGBA));
 
-const CIRCLE_SLASH_BRAILLE_RGBA: &[u8] = include_bytes!("circle_slash_braille.rgba");
-/// ~40% coverage (102/255), auto-selected by bake_icons.py::choose_threshold -- 22/96 dots lit at this threshold.
-const CIRCLE_SLASH_BRAILLE_ALPHA_THRESHOLD: u8 = 102;
-static CIRCLE_SLASH_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        CIRCLE_SLASH_BRAILLE_RGBA,
-        CIRCLE_SLASH_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const CIRCLE_SLASH_COMPACT_RGBA: &[u8] = include_bytes!("circle_slash_compact.rgba");
 static CIRCLE_SLASH_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(CIRCLE_SLASH_COMPACT_RGBA));
-
-const CIRCLE_SLASH_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("circle_slash_compact_braille.rgba");
-/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_compact_threshold -- 10/16 dots lit at this threshold.
-const CIRCLE_SLASH_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
-static CIRCLE_SLASH_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        CIRCLE_SLASH_COMPACT_BRAILLE_RGBA,
-        CIRCLE_SLASH_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const CIRCLE_SLASH_STRIP_RGBA: &[u8] = include_bytes!("circle_slash_strip.rgba");
 static CIRCLE_SLASH_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(CIRCLE_SLASH_STRIP_RGBA));
@@ -4494,8 +3104,8 @@ const WARNING_RGBA: &[u8] = include_bytes!("warning.rgba");
 static WARNING_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(WARNING_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const WARNING_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("warning_gate_active.rgba");
 static WARNING_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(WARNING_GATE_ACTIVE_RGBA));
 
@@ -4504,34 +3114,8 @@ static WARNING_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixe
 const WARNING_GATE_ACCENT_RGBA: &[u8] = include_bytes!("warning_gate_accent.rgba");
 static WARNING_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(WARNING_GATE_ACCENT_RGBA));
 
-const WARNING_BRAILLE_RGBA: &[u8] = include_bytes!("warning_braille.rgba");
-/// ~35% coverage (89/255), auto-selected by bake_icons.py::choose_threshold -- 18/96 dots lit at this threshold.
-const WARNING_BRAILLE_ALPHA_THRESHOLD: u8 = 89;
-static WARNING_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        WARNING_BRAILLE_RGBA,
-        WARNING_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const WARNING_COMPACT_RGBA: &[u8] = include_bytes!("warning_compact.rgba");
 static WARNING_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(WARNING_COMPACT_RGBA));
-
-const WARNING_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("warning_compact_braille.rgba");
-/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_compact_threshold -- 6/16 dots lit at this threshold.
-const WARNING_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
-static WARNING_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        WARNING_COMPACT_BRAILLE_RGBA,
-        WARNING_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const WARNING_STRIP_RGBA: &[u8] = include_bytes!("warning_strip.rgba");
 static WARNING_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(WARNING_STRIP_RGBA));
@@ -4556,8 +3140,8 @@ const ERROR_RGBA: &[u8] = include_bytes!("error.rgba");
 static ERROR_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(ERROR_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const ERROR_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("error_gate_active.rgba");
 static ERROR_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ERROR_GATE_ACTIVE_RGBA));
 
@@ -4566,34 +3150,8 @@ static ERROR_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_
 const ERROR_GATE_ACCENT_RGBA: &[u8] = include_bytes!("error_gate_accent.rgba");
 static ERROR_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ERROR_GATE_ACCENT_RGBA));
 
-const ERROR_BRAILLE_RGBA: &[u8] = include_bytes!("error_braille.rgba");
-/// ~40% coverage (102/255), auto-selected by bake_icons.py::choose_threshold -- 20/96 dots lit at this threshold.
-const ERROR_BRAILLE_ALPHA_THRESHOLD: u8 = 102;
-static ERROR_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        ERROR_BRAILLE_RGBA,
-        ERROR_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const ERROR_COMPACT_RGBA: &[u8] = include_bytes!("error_compact.rgba");
 static ERROR_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(ERROR_COMPACT_RGBA));
-
-const ERROR_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("error_compact_braille.rgba");
-/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_compact_threshold -- 8/16 dots lit at this threshold.
-const ERROR_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
-static ERROR_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        ERROR_COMPACT_BRAILLE_RGBA,
-        ERROR_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const ERROR_STRIP_RGBA: &[u8] = include_bytes!("error_strip.rgba");
 static ERROR_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(ERROR_STRIP_RGBA));
@@ -4618,8 +3176,8 @@ const INFO_RGBA: &[u8] = include_bytes!("info.rgba");
 static INFO_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(INFO_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const INFO_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("info_gate_active.rgba");
 static INFO_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(INFO_GATE_ACTIVE_RGBA));
 
@@ -4628,34 +3186,8 @@ static INFO_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_g
 const INFO_GATE_ACCENT_RGBA: &[u8] = include_bytes!("info_gate_accent.rgba");
 static INFO_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(INFO_GATE_ACCENT_RGBA));
 
-const INFO_BRAILLE_RGBA: &[u8] = include_bytes!("info_braille.rgba");
-/// ~35% coverage (89/255), auto-selected by bake_icons.py::choose_threshold -- 20/96 dots lit at this threshold.
-const INFO_BRAILLE_ALPHA_THRESHOLD: u8 = 89;
-static INFO_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        INFO_BRAILLE_RGBA,
-        INFO_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const INFO_COMPACT_RGBA: &[u8] = include_bytes!("info_compact.rgba");
 static INFO_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(INFO_COMPACT_RGBA));
-
-const INFO_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("info_compact_braille.rgba");
-/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_compact_threshold -- 8/16 dots lit at this threshold.
-const INFO_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
-static INFO_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        INFO_COMPACT_BRAILLE_RGBA,
-        INFO_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const INFO_STRIP_RGBA: &[u8] = include_bytes!("info_strip.rgba");
 static INFO_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(INFO_STRIP_RGBA));
@@ -4680,8 +3212,8 @@ const RUN_ALL_RGBA: &[u8] = include_bytes!("run_all.rgba");
 static RUN_ALL_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(RUN_ALL_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const RUN_ALL_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("run_all_gate_active.rgba");
 static RUN_ALL_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(RUN_ALL_GATE_ACTIVE_RGBA));
 
@@ -4690,34 +3222,8 @@ static RUN_ALL_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixe
 const RUN_ALL_GATE_ACCENT_RGBA: &[u8] = include_bytes!("run_all_gate_accent.rgba");
 static RUN_ALL_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(RUN_ALL_GATE_ACCENT_RGBA));
 
-const RUN_ALL_BRAILLE_RGBA: &[u8] = include_bytes!("run_all_braille.rgba");
-/// ~45% coverage (115/255), auto-selected by bake_icons.py::choose_threshold -- 19/96 dots lit at this threshold.
-const RUN_ALL_BRAILLE_ALPHA_THRESHOLD: u8 = 115;
-static RUN_ALL_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        RUN_ALL_BRAILLE_RGBA,
-        RUN_ALL_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const RUN_ALL_COMPACT_RGBA: &[u8] = include_bytes!("run_all_compact.rgba");
 static RUN_ALL_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(RUN_ALL_COMPACT_RGBA));
-
-const RUN_ALL_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("run_all_compact_braille.rgba");
-/// ~35% coverage (89/255), auto-selected by bake_icons.py::choose_compact_threshold -- 4/16 dots lit at this threshold.
-const RUN_ALL_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 89;
-static RUN_ALL_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        RUN_ALL_COMPACT_BRAILLE_RGBA,
-        RUN_ALL_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const RUN_ALL_STRIP_RGBA: &[u8] = include_bytes!("run_all_strip.rgba");
 static RUN_ALL_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(RUN_ALL_STRIP_RGBA));
@@ -4742,8 +3248,8 @@ const PLAY_RGBA: &[u8] = include_bytes!("play.rgba");
 static PLAY_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(PLAY_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const PLAY_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("play_gate_active.rgba");
 static PLAY_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(PLAY_GATE_ACTIVE_RGBA));
 
@@ -4752,34 +3258,8 @@ static PLAY_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_g
 const PLAY_GATE_ACCENT_RGBA: &[u8] = include_bytes!("play_gate_accent.rgba");
 static PLAY_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(PLAY_GATE_ACCENT_RGBA));
 
-const PLAY_BRAILLE_RGBA: &[u8] = include_bytes!("play_braille.rgba");
-/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_threshold -- 18/96 dots lit at this threshold.
-const PLAY_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
-static PLAY_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        PLAY_BRAILLE_RGBA,
-        PLAY_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const PLAY_COMPACT_RGBA: &[u8] = include_bytes!("play_compact.rgba");
 static PLAY_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(PLAY_COMPACT_RGBA));
-
-const PLAY_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("play_compact_braille.rgba");
-/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_compact_threshold -- 4/16 dots lit at this threshold.
-const PLAY_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
-static PLAY_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        PLAY_COMPACT_BRAILLE_RGBA,
-        PLAY_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const PLAY_STRIP_RGBA: &[u8] = include_bytes!("play_strip.rgba");
 static PLAY_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(PLAY_STRIP_RGBA));
@@ -4804,8 +3284,8 @@ const SYNC_RGBA: &[u8] = include_bytes!("sync.rgba");
 static SYNC_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(SYNC_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const SYNC_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("sync_gate_active.rgba");
 static SYNC_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SYNC_GATE_ACTIVE_RGBA));
 
@@ -4814,34 +3294,8 @@ static SYNC_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_g
 const SYNC_GATE_ACCENT_RGBA: &[u8] = include_bytes!("sync_gate_accent.rgba");
 static SYNC_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SYNC_GATE_ACCENT_RGBA));
 
-const SYNC_BRAILLE_RGBA: &[u8] = include_bytes!("sync_braille.rgba");
-/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_threshold -- 18/96 dots lit at this threshold.
-const SYNC_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
-static SYNC_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        SYNC_BRAILLE_RGBA,
-        SYNC_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const SYNC_COMPACT_RGBA: &[u8] = include_bytes!("sync_compact.rgba");
 static SYNC_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(SYNC_COMPACT_RGBA));
-
-const SYNC_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("sync_compact_braille.rgba");
-/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_compact_threshold -- 4/16 dots lit at this threshold.
-const SYNC_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
-static SYNC_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        SYNC_COMPACT_BRAILLE_RGBA,
-        SYNC_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const SYNC_STRIP_RGBA: &[u8] = include_bytes!("sync_strip.rgba");
 static SYNC_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(SYNC_STRIP_RGBA));
@@ -4866,8 +3320,8 @@ const GO_TO_FILE_RGBA: &[u8] = include_bytes!("go_to_file.rgba");
 static GO_TO_FILE_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(GO_TO_FILE_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const GO_TO_FILE_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("go_to_file_gate_active.rgba");
 static GO_TO_FILE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(GO_TO_FILE_GATE_ACTIVE_RGBA));
 
@@ -4876,34 +3330,8 @@ static GO_TO_FILE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_s
 const GO_TO_FILE_GATE_ACCENT_RGBA: &[u8] = include_bytes!("go_to_file_gate_accent.rgba");
 static GO_TO_FILE_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(GO_TO_FILE_GATE_ACCENT_RGBA));
 
-const GO_TO_FILE_BRAILLE_RGBA: &[u8] = include_bytes!("go_to_file_braille.rgba");
-/// ~45% coverage (115/255), auto-selected by bake_icons.py::choose_threshold -- 21/96 dots lit at this threshold.
-const GO_TO_FILE_BRAILLE_ALPHA_THRESHOLD: u8 = 115;
-static GO_TO_FILE_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        GO_TO_FILE_BRAILLE_RGBA,
-        GO_TO_FILE_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const GO_TO_FILE_COMPACT_RGBA: &[u8] = include_bytes!("go_to_file_compact.rgba");
 static GO_TO_FILE_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(GO_TO_FILE_COMPACT_RGBA));
-
-const GO_TO_FILE_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("go_to_file_compact_braille.rgba");
-/// ~30% coverage (77/255), auto-selected by bake_icons.py::choose_compact_threshold -- 3/16 dots lit at this threshold.
-const GO_TO_FILE_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 77;
-static GO_TO_FILE_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        GO_TO_FILE_COMPACT_BRAILLE_RGBA,
-        GO_TO_FILE_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const GO_TO_FILE_STRIP_RGBA: &[u8] = include_bytes!("go_to_file_strip.rgba");
 static GO_TO_FILE_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(GO_TO_FILE_STRIP_RGBA));
@@ -4928,8 +3356,8 @@ const PULSE_RGBA: &[u8] = include_bytes!("pulse.rgba");
 static PULSE_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(PULSE_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const PULSE_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("pulse_gate_active.rgba");
 static PULSE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(PULSE_GATE_ACTIVE_RGBA));
 
@@ -4938,35 +3366,8 @@ static PULSE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_
 const PULSE_GATE_ACCENT_RGBA: &[u8] = include_bytes!("pulse_gate_accent.rgba");
 static PULSE_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(PULSE_GATE_ACCENT_RGBA));
 
-const PULSE_BRAILLE_RGBA: &[u8] = include_bytes!("pulse_braille.rgba");
-/// ~10% coverage (26/255), auto-selected by bake_icons.py::choose_threshold -- 20/96 dots lit at this threshold.
-/// DEGRADED: the heartbeat zig-zag's short segments partially merge; a general spike/wave shape survives, the fine zig-zag detail does not.
-const PULSE_BRAILLE_ALPHA_THRESHOLD: u8 = 26;
-static PULSE_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        PULSE_BRAILLE_RGBA,
-        PULSE_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const PULSE_COMPACT_RGBA: &[u8] = include_bytes!("pulse_compact.rgba");
 static PULSE_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(PULSE_COMPACT_RGBA));
-
-const PULSE_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("pulse_compact_braille.rgba");
-/// ~30% coverage (77/255), auto-selected by bake_icons.py::choose_compact_threshold -- 3/16 dots lit at this threshold.
-const PULSE_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 77;
-static PULSE_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        PULSE_COMPACT_BRAILLE_RGBA,
-        PULSE_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const PULSE_STRIP_RGBA: &[u8] = include_bytes!("pulse_strip.rgba");
 static PULSE_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(PULSE_STRIP_RGBA));
@@ -4991,8 +3392,8 @@ const CHECKLIST_RGBA: &[u8] = include_bytes!("checklist.rgba");
 static CHECKLIST_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(CHECKLIST_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const CHECKLIST_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("checklist_gate_active.rgba");
 static CHECKLIST_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CHECKLIST_GATE_ACTIVE_RGBA));
 
@@ -5001,35 +3402,8 @@ static CHECKLIST_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_si
 const CHECKLIST_GATE_ACCENT_RGBA: &[u8] = include_bytes!("checklist_gate_accent.rgba");
 static CHECKLIST_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CHECKLIST_GATE_ACCENT_RGBA));
 
-const CHECKLIST_BRAILLE_RGBA: &[u8] = include_bytes!("checklist_braille.rgba");
-/// ~25% coverage (64/255), override, hand-picked after reviewing bake_icons.py's own auto-suggested preview -- 21/96 dots lit at this threshold.
-/// DEGRADED: the checkmarks-in-a-list fine strokes read as a boxed/ruled texture, not legible individual ticks.
-const CHECKLIST_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
-static CHECKLIST_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        CHECKLIST_BRAILLE_RGBA,
-        CHECKLIST_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const CHECKLIST_COMPACT_RGBA: &[u8] = include_bytes!("checklist_compact.rgba");
 static CHECKLIST_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(CHECKLIST_COMPACT_RGBA));
-
-const CHECKLIST_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("checklist_compact_braille.rgba");
-/// ~20% coverage (51/255), auto-selected by bake_icons.py::choose_compact_threshold -- 3/16 dots lit at this threshold.
-const CHECKLIST_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 51;
-static CHECKLIST_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        CHECKLIST_COMPACT_BRAILLE_RGBA,
-        CHECKLIST_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const CHECKLIST_STRIP_RGBA: &[u8] = include_bytes!("checklist_strip.rgba");
 static CHECKLIST_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(CHECKLIST_STRIP_RGBA));
@@ -5054,8 +3428,8 @@ const EYE_RGBA: &[u8] = include_bytes!("eye.rgba");
 static EYE_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(EYE_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const EYE_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("eye_gate_active.rgba");
 static EYE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(EYE_GATE_ACTIVE_RGBA));
 
@@ -5064,34 +3438,8 @@ static EYE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_ga
 const EYE_GATE_ACCENT_RGBA: &[u8] = include_bytes!("eye_gate_accent.rgba");
 static EYE_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(EYE_GATE_ACCENT_RGBA));
 
-const EYE_BRAILLE_RGBA: &[u8] = include_bytes!("eye_braille.rgba");
-/// ~30% coverage (77/255), override, hand-picked after reviewing bake_icons.py's own auto-suggested preview -- 12/96 dots lit at this threshold.
-const EYE_BRAILLE_ALPHA_THRESHOLD: u8 = 77;
-static EYE_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        EYE_BRAILLE_RGBA,
-        EYE_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const EYE_COMPACT_RGBA: &[u8] = include_bytes!("eye_compact.rgba");
 static EYE_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(EYE_COMPACT_RGBA));
-
-const EYE_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("eye_compact_braille.rgba");
-/// ~30% coverage (77/255), auto-selected by bake_icons.py::choose_compact_threshold -- 4/16 dots lit at this threshold.
-const EYE_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 77;
-static EYE_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        EYE_COMPACT_BRAILLE_RGBA,
-        EYE_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const EYE_STRIP_RGBA: &[u8] = include_bytes!("eye_strip.rgba");
 static EYE_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(EYE_STRIP_RGBA));
@@ -5116,8 +3464,8 @@ const LAYOUT_RGBA: &[u8] = include_bytes!("layout.rgba");
 static LAYOUT_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(LAYOUT_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const LAYOUT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("layout_gate_active.rgba");
 static LAYOUT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LAYOUT_GATE_ACTIVE_RGBA));
 
@@ -5126,35 +3474,8 @@ static LAYOUT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel
 const LAYOUT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("layout_gate_accent.rgba");
 static LAYOUT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LAYOUT_GATE_ACCENT_RGBA));
 
-const LAYOUT_BRAILLE_RGBA: &[u8] = include_bytes!("layout_braille.rgba");
-/// ~45% coverage (115/255), auto-selected by bake_icons.py::choose_threshold -- 32/96 dots lit at this threshold.
-/// DEGRADED: 3 separate rounded-rect panels within one 16x16 viewBox collapse into a repeating texture; reads as hatching, not a distinguishable 2-or-3-panel grid.
-const LAYOUT_BRAILLE_ALPHA_THRESHOLD: u8 = 115;
-static LAYOUT_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        LAYOUT_BRAILLE_RGBA,
-        LAYOUT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const LAYOUT_COMPACT_RGBA: &[u8] = include_bytes!("layout_compact.rgba");
 static LAYOUT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LAYOUT_COMPACT_RGBA));
-
-const LAYOUT_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("layout_compact_braille.rgba");
-/// ~25% coverage (64/255), auto-selected by bake_icons.py::choose_compact_threshold -- 16/16 dots lit at this threshold.
-const LAYOUT_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
-static LAYOUT_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        LAYOUT_COMPACT_BRAILLE_RGBA,
-        LAYOUT_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const LAYOUT_STRIP_RGBA: &[u8] = include_bytes!("layout_strip.rgba");
 static LAYOUT_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(LAYOUT_STRIP_RGBA));
@@ -5179,8 +3500,8 @@ const SPLIT_HORIZONTAL_RGBA: &[u8] = include_bytes!("split_horizontal.rgba");
 static SPLIT_HORIZONTAL_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(SPLIT_HORIZONTAL_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const SPLIT_HORIZONTAL_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("split_horizontal_gate_active.rgba");
 static SPLIT_HORIZONTAL_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SPLIT_HORIZONTAL_GATE_ACTIVE_RGBA));
 
@@ -5189,34 +3510,8 @@ static SPLIT_HORIZONTAL_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| b
 const SPLIT_HORIZONTAL_GATE_ACCENT_RGBA: &[u8] = include_bytes!("split_horizontal_gate_accent.rgba");
 static SPLIT_HORIZONTAL_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SPLIT_HORIZONTAL_GATE_ACCENT_RGBA));
 
-const SPLIT_HORIZONTAL_BRAILLE_RGBA: &[u8] = include_bytes!("split_horizontal_braille.rgba");
-/// ~25% coverage (64/255), override, hand-picked after reviewing bake_icons.py's own auto-suggested preview -- 36/96 dots lit at this threshold.
-const SPLIT_HORIZONTAL_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
-static SPLIT_HORIZONTAL_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        SPLIT_HORIZONTAL_BRAILLE_RGBA,
-        SPLIT_HORIZONTAL_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const SPLIT_HORIZONTAL_COMPACT_RGBA: &[u8] = include_bytes!("split_horizontal_compact.rgba");
 static SPLIT_HORIZONTAL_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(SPLIT_HORIZONTAL_COMPACT_RGBA));
-
-const SPLIT_HORIZONTAL_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("split_horizontal_compact_braille.rgba");
-/// ~30% coverage (77/255), auto-selected by bake_icons.py::choose_compact_threshold -- 4/16 dots lit at this threshold.
-const SPLIT_HORIZONTAL_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 77;
-static SPLIT_HORIZONTAL_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        SPLIT_HORIZONTAL_COMPACT_BRAILLE_RGBA,
-        SPLIT_HORIZONTAL_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const SPLIT_HORIZONTAL_STRIP_RGBA: &[u8] = include_bytes!("split_horizontal_strip.rgba");
 static SPLIT_HORIZONTAL_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(SPLIT_HORIZONTAL_STRIP_RGBA));
@@ -5241,8 +3536,8 @@ const SPLIT_VERTICAL_RGBA: &[u8] = include_bytes!("split_vertical.rgba");
 static SPLIT_VERTICAL_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(SPLIT_VERTICAL_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const SPLIT_VERTICAL_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("split_vertical_gate_active.rgba");
 static SPLIT_VERTICAL_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SPLIT_VERTICAL_GATE_ACTIVE_RGBA));
 
@@ -5251,34 +3546,8 @@ static SPLIT_VERTICAL_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| bui
 const SPLIT_VERTICAL_GATE_ACCENT_RGBA: &[u8] = include_bytes!("split_vertical_gate_accent.rgba");
 static SPLIT_VERTICAL_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SPLIT_VERTICAL_GATE_ACCENT_RGBA));
 
-const SPLIT_VERTICAL_BRAILLE_RGBA: &[u8] = include_bytes!("split_vertical_braille.rgba");
-/// ~25% coverage (64/255), override, hand-picked after reviewing bake_icons.py's own auto-suggested preview -- 36/96 dots lit at this threshold.
-const SPLIT_VERTICAL_BRAILLE_ALPHA_THRESHOLD: u8 = 64;
-static SPLIT_VERTICAL_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        SPLIT_VERTICAL_BRAILLE_RGBA,
-        SPLIT_VERTICAL_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const SPLIT_VERTICAL_COMPACT_RGBA: &[u8] = include_bytes!("split_vertical_compact.rgba");
 static SPLIT_VERTICAL_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(SPLIT_VERTICAL_COMPACT_RGBA));
-
-const SPLIT_VERTICAL_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("split_vertical_compact_braille.rgba");
-/// ~30% coverage (77/255), auto-selected by bake_icons.py::choose_compact_threshold -- 4/16 dots lit at this threshold.
-const SPLIT_VERTICAL_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 77;
-static SPLIT_VERTICAL_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        SPLIT_VERTICAL_COMPACT_BRAILLE_RGBA,
-        SPLIT_VERTICAL_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const SPLIT_VERTICAL_STRIP_RGBA: &[u8] = include_bytes!("split_vertical_strip.rgba");
 static SPLIT_VERTICAL_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(SPLIT_VERTICAL_STRIP_RGBA));
@@ -5303,8 +3572,8 @@ const PREVIEW_RGBA: &[u8] = include_bytes!("preview.rgba");
 static PREVIEW_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(PREVIEW_RGBA));
 
 /// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, cause 1's own fix (see this crate's own `tools/
-/// bake_icons.py` module doc).
+/// opaque at bake time, gamma-correct linear blend (see this crate's own
+/// `tools/bake_icons.py` module doc, causes 1 and 3).
 const PREVIEW_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("preview_gate_active.rgba");
 static PREVIEW_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(PREVIEW_GATE_ACTIVE_RGBA));
 
@@ -5313,34 +3582,8 @@ static PREVIEW_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixe
 const PREVIEW_GATE_ACCENT_RGBA: &[u8] = include_bytes!("preview_gate_accent.rgba");
 static PREVIEW_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(PREVIEW_GATE_ACCENT_RGBA));
 
-const PREVIEW_BRAILLE_RGBA: &[u8] = include_bytes!("preview_braille.rgba");
-/// ~50% coverage (128/255), auto-selected by bake_icons.py::choose_threshold -- 25/96 dots lit at this threshold.
-const PREVIEW_BRAILLE_ALPHA_THRESHOLD: u8 = 128;
-static PREVIEW_BRAILLE: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        BRAILLE_ICON_CELLS_WIDE,
-        BRAILLE_ICON_CELLS_TALL,
-        PREVIEW_BRAILLE_RGBA,
-        PREVIEW_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
-
 const PREVIEW_COMPACT_RGBA: &[u8] = include_bytes!("preview_compact.rgba");
 static PREVIEW_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(PREVIEW_COMPACT_RGBA));
-
-const PREVIEW_COMPACT_BRAILLE_RGBA: &[u8] = include_bytes!("preview_compact_braille.rgba");
-/// ~45% coverage (115/255), auto-selected by bake_icons.py::choose_compact_threshold -- 3/16 dots lit at this threshold.
-const PREVIEW_COMPACT_BRAILLE_ALPHA_THRESHOLD: u8 = 115;
-static PREVIEW_BRAILLE_COMPACT: LazyLock<PixelCanvas> = LazyLock::new(|| {
-    rgba_to_canvas(
-        CanvasMode::Braille,
-        COMPACT_BRAILLE_ICON_CELLS_WIDE,
-        COMPACT_BRAILLE_ICON_CELLS_TALL,
-        PREVIEW_COMPACT_BRAILLE_RGBA,
-        PREVIEW_COMPACT_BRAILLE_ALPHA_THRESHOLD,
-    )
-});
 
 const PREVIEW_STRIP_RGBA: &[u8] = include_bytes!("preview_strip.rgba");
 static PREVIEW_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(PREVIEW_STRIP_RGBA));

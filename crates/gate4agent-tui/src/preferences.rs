@@ -15,7 +15,7 @@ use crate::app::{
 };
 use crate::surface::LayoutPreset;
 
-const CONFIG_VERSION: u16 = 8;
+const CONFIG_VERSION: u16 = 9;
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const MAX_COLLAPSED_DIRECTORY_PREFERENCES: usize = 512;
 
@@ -56,9 +56,11 @@ impl Default for UiPreferences {
             sidebar_presentation: SidebarPresentation::Activity,
             sidebar_collapsed: false,
             // D? tier toggle: sixel read as nearly ideal on the owner's
-            // own box, so it stays the fresh-install default -- braille
-            // and ascii are still fully selectable, just not the
-            // out-of-the-box choice.
+            // own box, so it stays the fresh-install default -- ascii is
+            // still fully selectable, just not the out-of-the-box
+            // choice. Braille was a third selectable tier here and was
+            // removed outright (unusably low quality) -- see
+            // `app::RailIcons`'s own doc comment.
             rail_icons: RailIcons::Sixel,
             control_section: ControlSection::Files,
             roster_mode: RosterMode::Agents,
@@ -430,12 +432,14 @@ fn parse(contents: &str) -> io::Result<UiPreferences> {
                 preferences.rail_icons = match value.trim() {
                     // "glyph" is the pre-v8 token for what is now the
                     // Sixel tier (the old two-state Glyph/Ascii toggle's
-                    // "real icon" side) -- kept as a permanent alias, the
+                    // "real icon" side); "braille" is the pre-v9 token
+                    // for the removed Braille tier (see `parse`'s own
+                    // CONFIG_VERSION 8 -> 9 migration doc comment below).
+                    // Both are kept as permanent aliases for `Sixel`, the
                     // same pattern `roster_mode`'s "native sessions"
                     // legacy token already uses, so an old config loads
                     // correctly under any `version=` that still has it.
-                    "sixel" | "glyph" => RailIcons::Sixel,
-                    "braille" => RailIcons::Braille,
+                    "sixel" | "glyph" | "braille" => RailIcons::Sixel,
                     "ascii" => RailIcons::Ascii,
                     _ => preferences.rail_icons,
                 }
@@ -530,9 +534,20 @@ fn parse(contents: &str) -> io::Result<UiPreferences> {
         // token itself carries the migration (`"glyph"` is a permanent
         // alias for `Sixel` in the per-line match above, the same
         // pattern `roster_mode`'s legacy "native sessions" token already
-        // uses), so v7 and v8 share the exact same tail here -- nothing
-        // else in the v7 shape changes.
-        Some(7) | Some(CONFIG_VERSION) => {
+        // uses).
+        //
+        // D? (CONFIG_VERSION 8 -> 9): the Braille rail-icons tier is
+        // removed outright (2x4 dots/cell reads as unusably low quality
+        // at the control strip's own 2x1-cell button footprint -- a 4x4
+        // dot grid with nothing left to improve, see `app::RailIcons`'s
+        // own doc comment). The stored `"braille"` token becomes a
+        // permanent alias for `Sixel` in the per-line match above too --
+        // same "legacy token survives forever" pattern -- so a v8 (or
+        // earlier) config that had the owner on Braille lands back on
+        // the tier that measured as "nearly ideal" rather than one that
+        // no longer exists. v7, v8, and v9 all share the exact same tail
+        // here -- nothing else in the v7 shape changes.
+        Some(7) | Some(8) | Some(CONFIG_VERSION) => {
             finish_with_collections(preferences, managed_agents, collapsed_directory_values)
         }
         Some(other) => Err(invalid_data(format!("unsupported preferences version {other}"))),
@@ -801,7 +816,7 @@ mod tests {
             menu_placement: MenuPlacement::Modal,
             sidebar_presentation: SidebarPresentation::Activity,
             sidebar_collapsed: true,
-            rail_icons: RailIcons::Braille,
+            rail_icons: RailIcons::Ascii,
             control_section: ControlSection::Workspaces,
             roster_mode: RosterMode::Workspaces,
             sidebar_width: 38,
@@ -894,13 +909,37 @@ mod tests {
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
+    /// D? Braille-tier removal (CONFIG_VERSION 8 -> 9): the pre-v9
+    /// `rail_icons=braille` token -- the removed tier's own stored value
+    /// -- migrates to `Sixel`, the tier that measured as "nearly ideal"
+    /// rather than the ascii fallback, same "legacy token stays a
+    /// permanent alias" pattern
+    /// `legacy_glyph_rail_icons_preference_migrates_to_sixel` above
+    /// already exercises for the still-earlier glyph/ascii toggle.
     #[test]
-    fn preferences_v1_through_v4_migrate_to_v8_with_empty_collections() {
+    fn legacy_braille_rail_icons_preference_migrates_to_sixel() {
+        let path = temp_path("legacy-braille-rail-icons");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "version=8\nrail_icons=braille\n").unwrap();
+
+        let loaded = UiPreferences::load(&path).unwrap();
+        assert_eq!(loaded.rail_icons, RailIcons::Sixel);
+        let mut app = App::default();
+        loaded.apply_to(&mut app);
+        assert_eq!(app.rail_icons, RailIcons::Sixel);
+        assert!(loaded.encode().unwrap().contains("rail_icons=sixel\n"));
+        assert!(!loaded.encode().unwrap().contains("braille"));
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn preferences_v1_through_v4_migrate_to_v9_with_empty_collections() {
         for version in 1..=4 {
             let loaded = parse(&format!("version={version}\nstyle=gate\n")).unwrap();
             assert!(loaded.managed_agents.is_empty(), "version {version}");
             assert!(loaded.collapsed_directories.is_empty(), "version {version}");
-            assert!(loaded.encode().unwrap().starts_with("version=8\n"), "version {version}");
+            assert!(loaded.encode().unwrap().starts_with("version=9\n"), "version {version}");
         }
     }
 
@@ -952,7 +991,7 @@ mod tests {
 
         let encoded = preferences.encode().unwrap();
         let decoded = parse(&encoded).unwrap();
-        assert!(encoded.starts_with("version=8\n"));
+        assert!(encoded.starts_with("version=9\n"));
         assert_eq!(decoded.collapsed_directories, vec![utf8.clone(), opaque.clone()]);
         assert_eq!(decoded.collapsed_directories[1].path.as_bytes(), opaque_bytes);
         assert_eq!(decoded.collapsed_directories[1].path.as_utf8(), None);
@@ -982,16 +1021,17 @@ mod tests {
 
         assert!(loaded.collapsed_directories.is_empty());
         assert_eq!(loaded.color_mode, PtyColorMode::GateOverride);
-        assert!(loaded.encode().unwrap().starts_with("version=8\n"));
+        assert!(loaded.encode().unwrap().starts_with("version=9\n"));
     }
 
     /// D1a's default-mode flip (CONFIG_VERSION 6 -> 7): a v6 config's
     /// `sidebar_presentation` is migrated to `Activity` exactly once, no
     /// matter what it was stored as, while every other field -- including
     /// managed agents and collapsed directories -- survives untouched. Once
-    /// re-saved (now at v8, CONFIG_VERSION's current value), the owner's
-    /// own choice sticks: a v7 OR v8 config that stores `Split` loads as
-    /// `Split`, proving the flip does not fire again on every load.
+    /// re-saved (now at CONFIG_VERSION's current value), the owner's own
+    /// choice sticks: a v7, v8, or current-version config that stores
+    /// `Split` loads as `Split`, proving the flip does not fire again on
+    /// every load.
     #[test]
     fn preferences_v6_migrates_presentation_to_activity_once_then_v7_choice_persists() {
         let managed_agent_line = format!(
@@ -1045,21 +1085,24 @@ mod tests {
             )],
         );
 
-        // Re-saved, the config now round-trips at v8 with the migrated
-        // presentation -- applying it to an App reflects the same flip.
+        // Re-saved, the config now round-trips at the current version with
+        // the migrated presentation -- applying it to an App reflects the
+        // same flip.
         let reencoded = loaded.encode().unwrap();
-        assert!(reencoded.starts_with("version=8\n"));
+        assert!(reencoded.starts_with("version=9\n"));
         let mut app = App::default();
         loaded.apply_to(&mut app);
         assert_eq!(app.sidebar_presentation, SidebarPresentation::Activity);
 
-        // Neither a v7 nor a v8 config is ever touched by the flip: an
+        // Neither a v7, v8, nor v9 config is ever touched by the flip: an
         // explicit `Split` choice made after migrating away from the new
-        // default persists at either version.
+        // default persists at any of the three.
         let v7_split = parse("version=7\nsidebar_presentation=split\n").unwrap();
         assert_eq!(v7_split.sidebar_presentation, SidebarPresentation::Split);
         let v8_split = parse("version=8\nsidebar_presentation=split\n").unwrap();
         assert_eq!(v8_split.sidebar_presentation, SidebarPresentation::Split);
+        let v9_split = parse("version=9\nsidebar_presentation=split\n").unwrap();
+        assert_eq!(v9_split.sidebar_presentation, SidebarPresentation::Split);
     }
 
     #[test]

@@ -1218,17 +1218,21 @@ impl SidebarPresentation {
 /// Activity-rail button rendering, cycled by the Settings row/key (see
 /// `App::toggle_rail_icons`): `Sixel` writes the baked raster icon
 /// (`icons::sixel`) straight to the terminal via `client::run`'s
-/// post-flush hook, `Braille` paints the baked `PixelCanvas`
-/// (`icons::braille`) straight into the cell buffer, `Ascii` draws the
-/// `[X]`-bracket fallback for terminals/fonts without reliable glyph or
-/// sixel coverage. `Sixel` is the default -- see D? owner verdict: tier 1
-/// (sixel) read as nearly ideal, tier 2 (braille) as decent-enough-to-
-/// keep, tier 3 (half-block) was rejected outright and removed.
+/// post-flush hook, `Ascii` draws the `[X]`-bracket fallback for
+/// terminals/fonts without reliable glyph or sixel coverage. `Sixel` is
+/// the default -- see D? owner verdict: tier 1 (sixel) read as nearly
+/// ideal, tier 3 (half-block) was rejected outright and removed. A third
+/// tier, `Braille` (a `uzor_tui::canvas::PixelCanvas` painted straight
+/// into the cell buffer), shipped in between and was later ALSO removed
+/// outright: braille's fixed 2x4 dots/cell density means the control
+/// strip's own 2x1-cell button is just a 4x4 dot grid, unusably low
+/// quality with nothing left to improve. A persisted `rail_icons=braille`
+/// preference migrates to `Sixel` -- see `preferences::parse`'s own
+/// CONFIG_VERSION 8 -> 9 migration doc comment.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RailIcons {
     #[default]
     Sixel,
-    Braille,
     Ascii,
 }
 
@@ -1236,7 +1240,6 @@ impl RailIcons {
     pub fn id(self) -> &'static str {
         match self {
             Self::Sixel => "sixel",
-            Self::Braille => "braille",
             Self::Ascii => "ascii",
         }
     }
@@ -1708,7 +1711,7 @@ pub enum SurfaceTab {
     HarnessGit(HarnessWorkspaceGitTabKey),
     /// FIX4's own icon gallery dev surface (`render::render_icon_gallery`)
     /// -- a read-only, singleton comparison grid (every catalog icon at
-    /// 20/40/60px sixel plus braille/ascii), reachable from the Settings
+    /// three sixel sizes plus ascii), reachable from the Settings
     /// dialog's own button/key (`HitTarget::SettingsIconGallery`, `App::
     /// open_icon_gallery`). No key payload: unlike `Preview`/`File`/`Git`
     /// there is only ever ONE gallery, the whole catalog at once, not one
@@ -2758,10 +2761,11 @@ pub struct HitRegion {
 /// -- see `render::render_compact_icon_button`; `Strip`: the sidebar
 /// content panels' own control-plane strip asset (`icons::sixel_strip`,
 /// 2 cells wide x 1 row) -- see `render::render_control_strip_button`;
-/// `Gallery`: the icon gallery dev surface's own 60x60 (6 cells wide x 3
-/// rows) comparison-column asset (`icons::sixel_gallery`) -- see
+/// `Gallery`: the icon gallery dev surface's own dedicated (6 cells wide
+/// x 3 rows) comparison-column asset (`icons::sixel_gallery`) -- see
 /// `render::render_icon_gallery`. The gallery's OTHER two comparison
-/// columns (20x20, 40x40) reuse `Strip`/`Rail` directly rather than
+/// columns (the strip/rail tiers' own pixel sizes) reuse `Strip`/`Rail`
+/// directly rather than
 /// getting their own variants: those are the EXACT SAME baked bytes the
 /// strip/rail already ship, not a new asset.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2804,22 +2808,61 @@ pub struct SurfacePaneLayout {
     pub viewport: Rect,
 }
 
+/// One overlay renderer's own outer paint frame for THIS frame -- border,
+/// plus any shadow/matte it fills -- registered via [`LayoutRects::
+/// note_overlay`] the moment that renderer computes it, before painting
+/// any of its own content. See [`LayoutRects::overlays`]'s own doc
+/// comment for who registers these and `render::render`'s own end-of-
+/// frame occlusion pass for how they get consumed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OverlayRegion {
+    pub rect: Rect,
+    /// `sixel_icons.len()` at the exact moment this overlay registered
+    /// `rect` -- how many placements already existed, i.e. were painted
+    /// strictly BEFORE this overlay claimed the cells under `rect`. See
+    /// `note_overlay`'s own doc comment for why this index, not draw
+    /// order alone, is what the occlusion pass keys off of: it is what
+    /// lets an overlay's OWN later-painted content (e.g. a control strip
+    /// hosted inside a modal) survive being occluded by its own rect,
+    /// while still correctly getting occluded by anything painted after
+    /// it (a menu popped over an already-open modal).
+    pub drawn_before: usize,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct LayoutRects {
     pub activity_rail: Rect,
     /// Every activity-rail button's own baked sixel icon placement this
     /// frame, populated by `render::render_rail_button` only when
-    /// `RailIcons::Sixel` and the rail is tall enough for the 3-row
-    /// button treatment (empty in `Braille`/`Ascii` mode, or on a
-    /// terminal too short for the tall rail -- nothing to draw this
+    /// `RailIcons::Sixel` and the rail is tall enough for the tall-body
+    /// button treatment (empty in `Ascii` mode, or on a terminal too
+    /// short for the tall rail -- nothing to draw this
     /// frame) -- consumed by `client::run`'s post-flush hook, which is
     /// the only place that actually writes the sixel bytes; a terminal
     /// cell cannot hold an escape sequence, so each such button's own
     /// body cells stay plain background-filled blanks in the buffer.
     /// `client::run` also uses this `Vec`, compared frame-to-frame, as
     /// the gating signature that skips re-emitting unchanged sixel bytes
-    /// -- see `client::flush_sixel_icon`'s own doc comment.
+    /// -- see `client::flush_sixel_icon`'s own doc comment. By the time
+    /// `render::render` returns this is already filtered against
+    /// `overlays` below -- see that field's own doc comment -- so
+    /// nothing downstream ever sees a placement a modal or popup is
+    /// sitting on top of.
     pub sixel_icons: Vec<SixelIconPlacement>,
+    /// Every overlay's own outer paint frame this frame -- registered by
+    /// `render_spawn`/`render_existing_session`/`render_settings`/every
+    /// other renderer in `render::render`'s own overlay chain (modals,
+    /// confirm dialogs, the agent/native-session context menus, the
+    /// harness links overlay) via `note_overlay`, at the exact point each
+    /// computes its own frame, before painting any of its own content. A
+    /// sixel image is raster painted directly over the terminal and obeys
+    /// no z-order of its own (see `sixel_icons`'s own doc comment above),
+    /// so this is the only record this program has of "something opaque
+    /// now sits on top of these cells" -- `render::render`'s own end-of-
+    /// frame occlusion pass drops every `sixel_icons` entry an overlay
+    /// registered here now covers, so `client::flush_sixel_icon_into`
+    /// never has to guess.
+    pub overlays: Vec<OverlayRegion>,
     pub spaces: Rect,
     pub agents: Rect,
     /// FIX4: the sidebar's own Board view content area -- set to the
@@ -2842,6 +2885,25 @@ pub struct LayoutRects {
     pub create_worktree_modal: Rect,
     pub surface_panes: Vec<SurfacePaneLayout>,
     pub hits: Vec<HitRegion>,
+}
+
+impl LayoutRects {
+    /// Registers `rect` as one overlay's own outer paint frame for this
+    /// frame's end-of-render occlusion pass (see `overlays`'s own doc
+    /// comment, and `render::render`'s own doc comment on that pass).
+    /// Every overlay renderer must call this the moment it computes its
+    /// own frame -- BEFORE painting any of its own content, including its
+    /// own icons -- so `drawn_before` correctly captures "nothing from
+    /// this overlay exists in `sixel_icons` yet." A zero-area rect is not
+    /// a real overlay (nothing was actually painted) and is not
+    /// registered, mirroring every other zero-area guard in this render
+    /// pipeline.
+    pub fn note_overlay(&mut self, rect: Rect) {
+        if rect.is_empty() {
+            return;
+        }
+        self.overlays.push(OverlayRegion { rect, drawn_before: self.sixel_icons.len() });
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -9608,6 +9670,23 @@ impl App {
             UiKey::Ctrl('w') => {
                 self.close_selected_tab();
                 AppAction::None
+            }
+            // `Ctrl+,` is the VS Code chord this shell is modelled on and
+            // Windows Terminal delivers it; a bare comma carries no
+            // control code on unix terminals, so `F2` carries the same
+            // action wherever the chord itself cannot arrive. Same
+            // dispatch the rail gear's own click uses (`App::
+            // activate_activity_section`, see its `ControlSection::
+            // Settings` branch) -- this is the keyboard entry FIX5 left
+            // out for the two chromes with no rail, (Sidebar, Split) and
+            // (Modal, _) (see `render::render_tabs`'s own FIX5 comment).
+            // Deliberately unreachable while `Focus::Viewport` holds the
+            // keyboard: that arm returns above, before this match ever
+            // runs, exactly like `Ctrl('q')`/`('n')`/`('t')`/`('w')`
+            // right above it -- a live PTY must receive its own Ctrl+,/
+            // F2 raw, never have it stolen by chrome.
+            UiKey::Ctrl(',') | UiKey::Function(2) => {
+                self.activate_activity_section(ControlSection::Settings)
             }
             UiKey::Tab | UiKey::BackTab
                 if self.focus == Focus::Agents && self.existing_session.is_some() =>
@@ -18781,13 +18860,23 @@ impl App {
 
     fn toggle_rail_icons(&mut self) {
         self.rail_icons = match self.rail_icons {
-            RailIcons::Sixel => RailIcons::Braille,
-            RailIcons::Braille => RailIcons::Ascii,
+            RailIcons::Sixel => RailIcons::Ascii,
             RailIcons::Ascii => RailIcons::Sixel,
         };
     }
 
     fn reduce_settings(&mut self, key: UiKey) -> AppAction {
+        // The same chord that opens Settings (see the global arm in
+        // `App::reduce`) closes it from in here too, through the exact
+        // Escape-equivalent `close_settings` every other close path
+        // already uses -- checked ahead of the `menu_placement` split
+        // below so it works identically in both, and neither inner
+        // match's own keys (`s`/`m`/`p`/`b`/`i`/`g`, `Left`/`Right`/
+        // `Tab`/`BackTab`/`Up`/`Down`/`Enter`) collide with a comma or F2.
+        if matches!(key, UiKey::Ctrl(',') | UiKey::Function(2)) {
+            self.close_settings();
+            return AppAction::None;
+        }
         if self.menu_placement == MenuPlacement::Sidebar {
             match key {
                 UiKey::Escape => self.close_settings(),
@@ -24898,6 +24987,36 @@ mod tests {
         // Closed -> click -> open again.
         assert_eq!(app.click(95, 0), AppAction::None);
         assert_eq!(app.focus, Focus::Settings);
+    }
+
+    /// Keyboard sibling of `gear_click_toggles_settings_open_and_closed`:
+    /// `Ctrl(',')`/`F2` (`App::reduce`'s own global arm, and its mirror
+    /// inside `reduce_settings` for the closing half) toggle exactly like
+    /// the gear's click does, both chords carrying the identical action.
+    /// `Focus::Tabs`, not `Focus::Viewport` -- the chord is deliberately
+    /// unreachable while a PTY viewport holds the keyboard (see the
+    /// global arm's own comment), so this starts from a focus where it
+    /// actually runs.
+    #[test]
+    fn settings_chord_toggles_open_and_closed() {
+        let mut app = fixture();
+        app.focus = Focus::Tabs;
+
+        // Closed -> chord -> open, same dispatch the gear's own click uses
+        // (`App::activate_activity_section`).
+        assert_eq!(app.reduce(UiKey::Ctrl(',')), AppAction::None);
+        assert_eq!(app.focus, Focus::Settings);
+
+        // Open -> SAME chord -> closed (`reduce_settings`'s own arm,
+        // `App::close_settings`) -- not re-opened.
+        assert_eq!(app.reduce(UiKey::Ctrl(',')), AppAction::None);
+        assert_eq!(app.focus, Focus::Tabs);
+
+        // F2 carries the identical toggle, both directions.
+        assert_eq!(app.reduce(UiKey::Function(2)), AppAction::None);
+        assert_eq!(app.focus, Focus::Settings);
+        assert_eq!(app.reduce(UiKey::Function(2)), AppAction::None);
+        assert_eq!(app.focus, Focus::Tabs);
     }
 
     /// Distinct from the gear toggle above: exercises the Settings-focused

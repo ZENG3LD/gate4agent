@@ -286,6 +286,7 @@ pub fn render(app: &App, buf: &mut TerminalBuffer) -> LayoutRects {
     let mut layout = LayoutRects {
         activity_rail,
         sixel_icons: Vec::new(),
+        overlays: Vec::new(),
         spaces,
         agents,
         board_sidebar,
@@ -422,7 +423,67 @@ pub fn render(app: &App, buf: &mut TerminalBuffer) -> LayoutRects {
         render_notice(notice, right[1], buf, theme);
     }
     render_context_usage_tooltip(app.context_usage_hover, area, buf, &layout, theme);
+    drop_sixel_icons_covered_by_overlays(&mut layout);
     layout
+}
+
+/// A sixel image is raster painted directly over the terminal and obeys
+/// no z-order of its own (see `LayoutRects::sixel_icons`'s own doc
+/// comment) -- nothing downstream can tell "this placement is now
+/// covered by a modal" on its own, `client::flush_sixel_icon_into` only
+/// ever sees whatever `render::render` hands it. So occlusion is decided
+/// HERE, once, at the very end of `render::render`, after every base-
+/// content and overlay renderer above has already run and registered
+/// whatever it painted (`LayoutRects::overlays`, via `LayoutRects::
+/// note_overlay`).
+///
+/// A placement survives unless some overlay registered AFTER it was
+/// pushed (the placement's own index in `sixel_icons` is STRICTLY LESS
+/// THAN that overlay's `OverlayRegion::drawn_before` -- i.e. fewer
+/// placements existed at the moment the overlay claimed its rect than
+/// this placement's own position, so the overlay's rect did not exist
+/// yet when this placement was painted, and necessarily painted on top
+/// of it afterward) has an intersecting rect. This is an index cutoff,
+/// not a draw-order guess dressed up: every overlay renderer calls
+/// `note_overlay` for its own frame BEFORE painting any of its own
+/// content (including its own icons, e.g. a control strip hosted inside
+/// the Settings modal -- see `render_settings`'s own `render_workspace_
+/// files`/`render_roster` dispatch), so an overlay's own placements
+/// always sit at an index >= its own `drawn_before` marker -- `index <
+/// drawn_before` is false for them, so they never match their own
+/// entry -- while a STILL LATER overlay (a context menu popped open
+/// over an already-open modal) has a HIGHER `drawn_before` than those
+/// placements' own index and so correctly keeps occluding them, matching
+/// what actually ends up on screen. Base content (pushed before any
+/// overlay ran) sits at the lowest indices, below every overlay's own
+/// `drawn_before`, and so is tested against all of them, as expected.
+///
+/// Partial intersection counts as covered -- there is no way to clip a
+/// sixel to a sub-rect, so a half-covered placement is dropped whole,
+/// never left to paint a corner that peeks out from under a modal.
+///
+/// Dropping a placement here removes it from `client::flush_sixel_icon_
+/// into`'s own `emitted` set for this frame; that function already
+/// treats any of its OWN remembered placements not reused at the exact
+/// same rect as vacated and explicitly repaints the real, already-
+/// correct content now sitting there (`clear_rect`, reading `screen.
+/// current()` -- the cell buffer `render::render` just finished writing,
+/// e.g. the modal's own border/text) -- no change needed there at all,
+/// this was simply the input it was never given.
+fn drop_sixel_icons_covered_by_overlays(layout: &mut LayoutRects) {
+    let overlays = std::mem::take(&mut layout.overlays);
+    let placements = std::mem::take(&mut layout.sixel_icons);
+    layout.sixel_icons = placements
+        .into_iter()
+        .enumerate()
+        .filter(|(index, placement)| {
+            !overlays.iter().any(|overlay| {
+                *index < overlay.drawn_before && !placement.rect.intersect(overlay.rect).is_empty()
+            })
+        })
+        .map(|(_, placement)| placement)
+        .collect();
+    layout.overlays = overlays;
 }
 
 /// One rail button on the activity rail: a view-select action plus the
@@ -430,13 +491,13 @@ pub fn render(app: &App, buf: &mut TerminalBuffer) -> LayoutRects {
 /// baked icon (`icons::IconId`) represents it. EVERY current rail
 /// button carries a real baked icon (see `render_activity_rail`'s own
 /// construction of `top` and the bottom group) -- there is no more
-/// block-art fallback tier; `app::RailIcons` picks WHICH baked tier
-/// (`Sixel`/`Braille`) paints `icon`, globally, for the whole rail, not
-/// per button (see `render_rail_button`'s own match). `glyph`/`ascii`
-/// stay plain single-character labels, used only where a real baked icon
-/// cannot fit: the short-terminal fallback (`block.height` shorter than
-/// [`rail_button_body_rows`]'s own tier, both raster tiers) and
-/// `RailIcons::Ascii` mode's own tall-body label.
+/// block-art fallback tier; `app::RailIcons` picks whether `icon` (the
+/// baked sixel raster) or `ascii` (the plain-text fallback) paints,
+/// globally, for the whole rail, not per button (see `render_rail_
+/// button`'s own match). `glyph`/`ascii` stay plain single-character
+/// labels, used only where the baked icon cannot fit: the short-terminal
+/// fallback (`block.height` shorter than [`rail_button_body_rows`]'s own
+/// tier) and `RailIcons::Ascii` mode's own tall-body label.
 struct RailButton {
     target: HitTarget,
     glyph: &'static str,
@@ -445,26 +506,31 @@ struct RailButton {
     icon: icons::IconId,
 }
 
+/// Ascii tier's own tall-body row count: a plain centered text label, not
+/// a baked asset with its own pixel footprint to derive a row count from
+/// the way `RailIcons::Sixel` does (see [`icons::SIXEL_ICON_CELLS_TALL`]),
+/// so this is a standalone constant rather than a re-exported bake-tool
+/// measurement. Kept at 3 -- the same body height this tier always had,
+/// now independent of the removed Braille tier's own former asset height
+/// it used to happen to match.
+const ASCII_RAIL_BODY_ROWS: u16 = 3;
+
 /// A rail button's own highlighted-body row count when there is room for
 /// the tall treatment, one tier at a time -- the fix for "a rail button
-/// is 3 rows tall but its 40x40 sixel occupies exactly 2 rows, leaving a
-/// dead row underneath" (icon size unchanged, still `icons::
-/// RAIL_ICON_SIZE_PX`/40x40 -- see that constant's own doc comment):
-/// `Sixel`'s own highlighted body now shrinks to EXACTLY [`icons::
-/// SIXEL_ICON_CELLS_TALL`] (2) rows, the icon's own real footprint, so
-/// there is no leftover accent-colored row the icon doesn't reach.
-/// `Braille`/`Ascii` are UNCHANGED at 3 rows ([`icons::
-/// BRAILLE_ICON_CELLS_TALL`]): the braille tier's own asset is baked to
-/// fill a full 4x3-cell body already (no dead row to fix there), and the
-/// ascii tier is a centered text label, not an image with its own
-/// pixel footprint to land evenly. The gap between two buttons (and the
-/// accent-bar column's own height) both derive from whatever this
-/// returns, never a second hand-tuned number -- see `render_activity_
-/// rail`'s own use of this fn.
+/// is 3 rows tall but its sixel icon occupies exactly 2 rows, leaving a
+/// dead row underneath" (icon size unchanged -- see [`icons::
+/// SIXEL_ICON_WIDTH_PX`]'s own doc comment): `Sixel`'s own highlighted
+/// body shrinks to EXACTLY [`icons::SIXEL_ICON_CELLS_TALL`] (2) rows, the
+/// icon's own real footprint, so there is no leftover accent-colored row
+/// the icon doesn't reach. `Ascii` stays at [`ASCII_RAIL_BODY_ROWS`] (3):
+/// a centered text label, not an image with its own pixel footprint to
+/// land evenly. The gap between two buttons (and the accent-bar column's
+/// own height) both derive from whatever this returns, never a second
+/// hand-tuned number -- see `render_activity_rail`'s own use of this fn.
 fn rail_button_body_rows(icons: RailIcons) -> u16 {
     match icons {
         RailIcons::Sixel => icons::SIXEL_ICON_CELLS_TALL,
-        RailIcons::Braille | RailIcons::Ascii => icons::BRAILLE_ICON_CELLS_TALL,
+        RailIcons::Ascii => ASCII_RAIL_BODY_ROWS,
     }
 }
 
@@ -494,7 +560,7 @@ fn render_rail_button(
         return;
     }
     let label = match icons {
-        RailIcons::Sixel | RailIcons::Braille => button.glyph,
+        RailIcons::Sixel => button.glyph,
         RailIcons::Ascii => button.ascii,
     };
 
@@ -553,10 +619,6 @@ fn render_rail_button(
             let variant = if button.selected { theme.sixel_accent_variant() } else { theme.sixel_active_variant() };
             layout.sixel_icons.push(SixelIconPlacement { icon: button.icon, rect: icon_area, variant, size: SixelIconSize::Rail });
         }
-        RailIcons::Braille => {
-            icons::braille(button.icon).flush(body, buf);
-            matte_canvas_background(body, bg, buf);
-        }
         RailIcons::Ascii => {
             let label_row = Rect::new(body.x, body.y + block.height / 2, body.width, 1);
             Paragraph::new(centered_label(label, label_row.width as usize))
@@ -574,26 +636,6 @@ fn render_rail_button(
     layout.hits.push(HitRegion { rect: block, target: button.target.clone() });
 }
 
-/// After [`PixelCanvas::flush`](uzor_tui::canvas::PixelCanvas::flush)
-/// paints `body` in braille mode, patch every cell the canvas itself left
-/// with no background of its own (`style.bg == Color::Reset` -- braille
-/// never sets a cell's `bg` at all) back to the button's own themed `bg`
-/// instead of the terminal's default background, so the icon reads as
-/// sitting on the button rather than punching a Reset-colored hole
-/// through it. Icon RGBA source pixels never decode to `Color::Reset`
-/// (see `icons::rgba_to_canvas`), so this check can't mistake real ink
-/// for "unpainted."
-fn matte_canvas_background(body: Rect, bg: Color, buf: &mut TerminalBuffer) {
-    for y in body.y..body.bottom() {
-        for x in body.x..body.right() {
-            let cell = buf.get_mut(x, y);
-            if cell.style.bg == Color::Reset {
-                cell.style.bg = bg;
-            }
-        }
-    }
-}
-
 /// Draws one inline, single-row icon (+ optional trailing text) button
 /// INSIDE `rect` -- `rect` is never resized or repositioned here, so
 /// every call site keeps registering the exact same [`HitRegion`] it
@@ -602,9 +644,8 @@ fn matte_canvas_background(body: Rect, bg: Color, buf: &mut TerminalBuffer) {
 /// buttons live in dense single-row panel lists (the Explorer/Git
 /// sidebar panels and their modals) where a rail-sized icon does not
 /// fit -- see `icons.rs`'s own "Compact tier" doc section for the baked
-/// asset sizes this draws (`icons::sixel_compact`/`icons::braille_
-/// compact`, distinct assets from the rail's own, not a runtime
-/// downscale).
+/// asset size this draws (`icons::sixel_compact`, a distinct asset from
+/// the rail's own, not a runtime downscale).
 ///
 /// `text`, when `Some`, is the MEANING-carrying remainder of the
 /// button's original label (e.g. `"workspace"`, `"Use this folder"`),
@@ -660,20 +701,13 @@ fn render_compact_icon_button(
             });
             render_compact_trailing_text(rect, icon_width, text, style, buf);
         }
-        RailIcons::Braille => {
-            let icon_width = icons::COMPACT_BRAILLE_ICON_CELLS_WIDE.min(rect.width);
-            let icon_area = Rect::new(rect.x, rect.y, icon_width, 1);
-            icons::braille_compact(icon).flush(icon_area, buf);
-            matte_canvas_background(icon_area, style.bg, buf);
-            render_compact_trailing_text(rect, icon_width, text, style, buf);
-        }
     }
 }
 
 /// Renders `text` (when present) immediately after a compact button's
 /// own icon footprint (`icon_width` cells, plus a 1-column gap),
-/// truncated to whatever room is left inside `rect` -- shared by the
-/// sixel/braille branches of [`render_compact_icon_button`].
+/// truncated to whatever room is left inside `rect` -- called by
+/// [`render_compact_icon_button`]'s own `RailIcons::Sixel` branch.
 fn render_compact_trailing_text(
     rect: Rect,
     icon_width: u16,
@@ -694,15 +728,11 @@ fn render_compact_trailing_text(
 
 /// Height, in cell rows, of one sidebar content panel's own dedicated
 /// control-plane strip (see [`render_control_strip`]): a single row of
-/// real buttons, each hosting the STRIP tier's own dedicated ~20x20px
-/// sixel asset (`icons::STRIP_SIXEL_ICON_CELLS_WIDE` x `_TALL` == 2x1,
-/// an exact fit) / the pre-existing COMPACT braille asset (`icons::
-/// COMPACT_BRAILLE_ICON_CELLS_WIDE` x `_TALL`, ALSO already 2x1 -- see
-/// `icons.rs`'s own "Strip tier" doc section for why no separate braille
-/// bake exists for this tier). Roughly a quarter the area of the 4-cell
-/// x 2-row body this strip used before its own resize (the rail itself
-/// is unchanged and still uses that original size -- see `render_rail_
-/// button`).
+/// real buttons, each hosting the STRIP tier's own dedicated sixel asset
+/// (`icons::STRIP_SIXEL_ICON_CELLS_WIDE` x `_TALL` == 2x1, an exact fit).
+/// Roughly a quarter the area of the 4-cell x 2-row body this strip used
+/// before its own resize (the rail itself is unchanged and still uses
+/// that original size -- see `render_rail_button`).
 const CONTROL_STRIP_BUTTON_ROWS: u16 = 1;
 /// One more row for the thin `─` separator painted directly under the
 /// strip's own button row -- see [`render_control_strip`]'s own body.
@@ -805,11 +835,8 @@ fn render_control_strip(
 /// Draws one action button inside a sidebar panel's own control-plane
 /// strip (see [`render_control_strip`]): a fixed [`CONTROL_STRIP_
 /// BUTTON_WIDTH`]-cell x [`CONTROL_STRIP_BUTTON_ROWS`]-row body hosting
-/// the STRIP tier's own dedicated `icons::sixel_strip` asset / the pre-
-/// existing `icons::braille_compact` asset (see this module's own
-/// `CONTROL_STRIP_BUTTON_ROWS` doc comment for why braille reuses the
-/// compact tier rather than a dedicated strip bake) -- an EXACT fit for
-/// both, no cropping. Background/bold treatment mirrors [`render_rail_
+/// the STRIP tier's own dedicated `icons::sixel_strip` asset -- an EXACT
+/// fit, no cropping. Background/bold treatment mirrors [`render_rail_
 /// button`]'s own `theme.active` at-rest body -- these are one-shot
 /// actions, never a persisted `selected` view the way `ControlSection`
 /// rail buttons are, the same "never shows as active" precedent as the
@@ -848,10 +875,6 @@ fn render_control_strip_button(
                 variant: theme.sixel_active_variant(),
                 size: SixelIconSize::Strip,
             });
-        }
-        RailIcons::Braille => {
-            icons::braille_compact(icon).flush(block, buf);
-            matte_canvas_background(block, bg, buf);
         }
         RailIcons::Ascii => {
             let row = Rect::new(block.x, block.y + block.height / 2, block.width, 1);
@@ -1133,46 +1156,76 @@ fn render_space_list(
         return;
     }
     fill_rect(area, theme.panel, buf);
-    let add_label = " + workspace ";
-    let add_width = (cell_width(add_label) as u16).min(area.width);
-    let add_rect = Rect::new(area.x, area.y, add_width, 1);
-    render_compact_icon_button(
-        add_rect,
-        icons::IconId::Add,
-        Some("workspace"),
-        add_label,
-        Style::default().fg(theme.teal).bg(theme.panel).add_modifier(Modifier::BOLD),
-        app.rail_icons,
-        buf,
-        layout,
-    );
-    layout.hits.push(HitRegion {
-        rect: add_rect,
-        target: HitTarget::AddSpace,
-    });
-    let remove_label = " - remove ";
-    let remove_width = (cell_width(remove_label) as u16).min(area.width.saturating_sub(add_width));
-    let remove_x = area.right().saturating_sub(remove_width);
-    if remove_width > 0 {
-        let remove_rect = Rect::new(remove_x, area.y, remove_width, 1);
+    // Same panel-level/row-level split Files/Git already drew: AddSpace
+    // acts on the roster as a whole and RemoveSpace on its own ambient
+    // cursor selection (`App::remove_selected_space`, mirroring
+    // RemoveWorktree's own strip button, never one specific row a click
+    // landed on), so both move into the strip; the per-row Space/
+    // SpawnSpace/HarnessLinks buttons in the list below stay exactly
+    // where they render today.
+    let use_strip = control_strip_fits(area);
+    let area = if use_strip {
+        render_control_strip(
+            area,
+            &[
+                ControlStripButton { icon: icons::IconId::Add, target: HitTarget::AddSpace, enabled: true },
+                ControlStripButton { icon: icons::IconId::Trash, target: HitTarget::RemoveSpace, enabled: true },
+            ],
+            theme,
+            app.rail_icons,
+            buf,
+            layout,
+        )
+    } else {
+        area
+    };
+    if !use_strip {
+        let add_label = " + workspace ";
+        let add_width = (cell_width(add_label) as u16).min(area.width);
+        let add_rect = Rect::new(area.x, area.y, add_width, 1);
         render_compact_icon_button(
-            remove_rect,
-            icons::IconId::Trash,
-            None,
-            remove_label,
-            Style::default().fg(theme.red).bg(theme.panel),
+            add_rect,
+            icons::IconId::Add,
+            Some("workspace"),
+            add_label,
+            Style::default().fg(theme.teal).bg(theme.panel).add_modifier(Modifier::BOLD),
             app.rail_icons,
             buf,
             layout,
         );
         layout.hits.push(HitRegion {
-            rect: remove_rect,
-            target: HitTarget::RemoveSpace,
+            rect: add_rect,
+            target: HitTarget::AddSpace,
         });
+        let remove_label = " - remove ";
+        let remove_width = (cell_width(remove_label) as u16).min(area.width.saturating_sub(add_width));
+        let remove_x = area.right().saturating_sub(remove_width);
+        if remove_width > 0 {
+            let remove_rect = Rect::new(remove_x, area.y, remove_width, 1);
+            render_compact_icon_button(
+                remove_rect,
+                icons::IconId::Trash,
+                None,
+                remove_label,
+                Style::default().fg(theme.red).bg(theme.panel),
+                app.rail_icons,
+                buf,
+                layout,
+            );
+            layout.hits.push(HitRegion {
+                rect: remove_rect,
+                target: HitTarget::RemoveSpace,
+            });
+        }
     }
 
+    // The strip already reserves its own button row (plus separator)
+    // above `area`, so unlike the fallback, list content has no add/
+    // remove row left to skip -- only the fallback's own inline row
+    // needs this offset.
+    let header_rows = if use_strip { 0 } else { 1 };
     let rows = app.space_rows();
-    let capacity = area.height.saturating_sub(1) as usize / 2;
+    let capacity = area.height.saturating_sub(header_rows) as usize / 2;
     let start = app
         .workspaces_scroll
         .min(rows.len().saturating_sub(capacity));
@@ -1183,7 +1236,7 @@ fn render_space_list(
         .take(capacity)
         .enumerate()
     {
-        let y = area.y + 1 + visible_index as u16 * 2;
+        let y = area.y + header_rows + visible_index as u16 * 2;
         let node = &app.nodes[node_index];
         let workspace = &node.workspaces[workspace_index];
         let selected = index == app.selected_space;
@@ -1465,6 +1518,7 @@ fn render_create_workspace_entry(
     let width = 76.min(area.width.saturating_sub(4));
     let height = 10.min(area.height.saturating_sub(2));
     let modal = positioned_modal(area, width, height, None);
+    layout.note_overlay(modal);
     fill_rect(modal, theme.modal, buf);
     let title = match dialog.kind {
         WorkspaceEntryKind::File => " create file ",
@@ -1844,14 +1898,33 @@ fn render_agents_surface(
     if area.height == 0 {
         return;
     }
+    // The panel-level half of the roster's own actions (only `AddAgent` --
+    // per-row actions like `AgentMore`/`AgentRun`/`NativeSessionsOpen` stay
+    // inline in whichever list below actually owns the row) gets the same
+    // strip Files/Git already carry, same `control_strip_fits` fallback so
+    // the button is never lost on a cramped sidebar -- see
+    // `render_workspace_files`'s own use of this pair.
+    let use_strip = control_strip_fits(area);
+    let area = if use_strip {
+        render_control_strip(
+            area,
+            &[ControlStripButton { icon: icons::IconId::Add, target: HitTarget::AddAgent, enabled: true }],
+            theme,
+            app.rail_icons,
+            buf,
+            layout,
+        )
+    } else {
+        area
+    };
     if app.existing_session.is_none() || area.height < 5 {
-        render_agent_list(app, area, buf, layout, theme);
+        render_agent_list(app, area, buf, layout, theme, use_strip);
         return;
     }
 
     // Native results remain a node-scoped subtree until the backend supplies stable
     // global identity annotations. Do not synthesize global rows or deduplicate here.
-    render_native_session_list(app, area, buf, layout, theme);
+    render_native_session_list(app, area, buf, layout, theme, use_strip);
 }
 
 fn render_agent_list(
@@ -1860,6 +1933,7 @@ fn render_agent_list(
     buf: &mut TerminalBuffer,
     layout: &mut LayoutRects,
     theme: Theme,
+    use_strip: bool,
 ) {
     if area.height == 0 {
         return;
@@ -1869,16 +1943,18 @@ fn render_agent_list(
     Paragraph::new(roster_label)
         .style(Style::default().fg(theme.muted).bg(theme.panel).add_modifier(Modifier::BOLD))
         .render(Rect::new(area.x, area.y, roster_width, 1), buf);
-    let add_label = " + agent ";
-    let add_width = (cell_width(add_label) as u16).min(area.width);
-    let add_x = area.right().saturating_sub(add_width);
-    Paragraph::new(add_label)
-        .style(Style::default().fg(theme.teal).bg(theme.panel).add_modifier(Modifier::BOLD))
-        .render(Rect::new(add_x, area.y, add_width, 1), buf);
-    layout.hits.push(HitRegion {
-        rect: Rect::new(add_x, area.y, add_width, 1),
-        target: HitTarget::AddAgent,
-    });
+    if !use_strip {
+        let add_label = " + agent ";
+        let add_width = (cell_width(add_label) as u16).min(area.width);
+        let add_x = area.right().saturating_sub(add_width);
+        Paragraph::new(add_label)
+            .style(Style::default().fg(theme.teal).bg(theme.panel).add_modifier(Modifier::BOLD))
+            .render(Rect::new(add_x, area.y, add_width, 1), buf);
+        layout.hits.push(HitRegion {
+            rect: Rect::new(add_x, area.y, add_width, 1),
+            target: HitTarget::AddAgent,
+        });
+    }
     let rows = app.agent_rows();
     let visible_rows = area.height.saturating_sub(1) as usize;
     let start = app
@@ -2230,6 +2306,7 @@ fn render_native_session_list(
     buf: &mut TerminalBuffer,
     layout: &mut LayoutRects,
     theme: Theme,
+    use_strip: bool,
 ) {
     let Some(dialog) = app.existing_session.as_ref() else {
         Paragraph::new(" Native sessions are not initialized")
@@ -2688,21 +2765,23 @@ fn render_native_session_list(
         rect: open,
         target: HitTarget::NativeSessionsOpen,
     });
-    let add_label = "+ agent";
-    let add_width = (cell_width(add_label) as u16).min(area.width);
-    let add = Rect::new(
-        area.right().saturating_sub(add_width),
-        area.bottom().saturating_sub(1),
-        add_width,
-        1,
-    );
-    Paragraph::new(add_label)
-        .style(Style::default().fg(theme.teal).bg(theme.panel).add_modifier(Modifier::BOLD))
-        .render(add, buf);
-    layout.hits.push(HitRegion {
-        rect: add,
-        target: HitTarget::AddAgent,
-    });
+    if !use_strip {
+        let add_label = "+ agent";
+        let add_width = (cell_width(add_label) as u16).min(area.width);
+        let add = Rect::new(
+            area.right().saturating_sub(add_width),
+            area.bottom().saturating_sub(1),
+            add_width,
+            1,
+        );
+        Paragraph::new(add_label)
+            .style(Style::default().fg(theme.teal).bg(theme.panel).add_modifier(Modifier::BOLD))
+            .render(add, buf);
+        layout.hits.push(HitRegion {
+            rect: add,
+            target: HitTarget::AddAgent,
+        });
+    }
 }
 
 fn render_native_route_selector(
@@ -2768,6 +2847,7 @@ fn render_agent_menu(
         .min(area.bottom().saturating_sub(height))
         .max(area.y);
     let menu_area = Rect::new(x, y, width, height);
+    layout.note_overlay(menu_area);
     fill_rect(menu_area, theme.modal, buf);
     Block::bordered()
         .title(" agent actions ")
@@ -2850,6 +2930,7 @@ fn render_native_session_menu(
         .min(area.bottom().saturating_sub(height))
         .max(area.y);
     let menu_area = Rect::new(x, y, width, height);
+    layout.note_overlay(menu_area);
     fill_rect(menu_area, theme.modal, buf);
     Block::bordered()
         .title(" provider history actions ")
@@ -2913,13 +2994,26 @@ fn render_tabs(
     layout: &mut LayoutRects,
     theme: Theme,
 ) {
-    // FIX5: the tab strip no longer carries its own "[S]" Settings
-    // button/hit target -- the activity rail's own bottom-anchored gear
-    // (`HitTarget::ActivitySection(ControlSection::Settings)`, see
-    // `render_activity_rail`) is now the single mouse entry point to the
-    // Settings dialog. `tabs_right` used to reserve `settings_width`
-    // columns for that button; the tab strip now gets the full row.
-    let tabs_right = area.right();
+    // FIX5 made the rail gear (`HitTarget::ActivitySection(ControlSection::
+    // Settings)`, see `render_activity_rail`) "the single mouse entry
+    // point" to Settings and dropped this strip's own "[S]" button on
+    // that assumption -- true only in (Sidebar, Activity), the one chrome
+    // that actually draws a rail (see `render::render`'s own chrome
+    // dispatch). (Sidebar, Split) and (Modal, _) have no rail at all, so
+    // FIX5 silently left both with no mouse entry to Settings whatsoever.
+    // This restores exactly the reservation `settings_width` used to make
+    // before FIX5 -- an icon button, not the rejected "[S]" text (owner
+    // call) -- gated to the two chromes that actually lost their gear;
+    // (Sidebar, Activity) draws nothing here, the rail still owns it
+    // there, so there is never more than one gear on screen at once.
+    let rail_present = app.menu_placement == MenuPlacement::Sidebar
+        && app.sidebar_presentation == SidebarPresentation::Activity;
+    // Same fixed width the pre-strip compact icon buttons elsewhere in
+    // this sidebar already use for an icon with no trailing text (see
+    // `pack_inline_button_left`'s own call sites) -- not a new size.
+    const GEAR_WIDTH: u16 = 4;
+    let gear_width = if rail_present { 0 } else { GEAR_WIDTH.min(area.width) };
+    let tabs_right = area.right().saturating_sub(gear_width);
     Paragraph::new("")
         .style(Style::default().bg(theme.active))
         .render(Rect::new(area.x, area.y, tabs_right.saturating_sub(area.x), 1), buf);
@@ -2986,6 +3080,28 @@ fn render_tabs(
             });
             x = x.saturating_add(width);
         }
+    }
+    if gear_width > 0 {
+        let gear = Rect::new(tabs_right, area.y, gear_width, 1);
+        render_compact_icon_button(
+            gear,
+            icons::IconId::SettingsGear,
+            None,
+            icons::ascii(icons::IconId::SettingsGear),
+            // Same "never shows as active" convention the rail's own
+            // gear uses (`render_activity_rail`'s own `RailButton` for
+            // Settings, `selected: false` always): Settings is an
+            // overlay dialog, not a persisted section, so this button
+            // does not highlight while the dialog is open either.
+            Style::default().fg(theme.muted).bg(theme.active),
+            app.rail_icons,
+            buf,
+            layout,
+        );
+        layout.hits.push(HitRegion {
+            rect: gear,
+            target: HitTarget::ActivitySection(ControlSection::Settings),
+        });
     }
 }
 
@@ -3236,26 +3352,26 @@ fn render_surface_pane(
 /// SurfaceTab::IconGallery`) -- a read-only comparison grid, one row per
 /// icon ([`GALLERY_ICON_IDS`], a representative dozen spanning the
 /// activity rail's own 7 plus a few file-op/status icons), one column
-/// per size/tier variant: 20x20 (`icons::STRIP_SIXEL_ICON_*` -- the SAME
-/// asset the control-plane strip already ships, not a new bake), 40x40
+/// per size/tier variant: the strip tier's own pixel size
+/// (`icons::STRIP_SIXEL_ICON_*` -- the SAME asset the control-plane strip
+/// already ships, not a new bake), the rail tier's own pixel size
 /// (`icons::SIXEL_ICON_*` -- the SAME asset the activity rail already
-/// ships, at whatever `icons::RAIL_ICON_SIZE_PX` currently is), 60x60
-/// (`icons::GALLERY_SIXEL_ICON_*` -- a NEW bake, this surface's own only
-/// consumer), then dedicated Braille and Ascii columns.
+/// ships), a third, larger size (`icons::GALLERY_SIXEL_ICON_*` -- a NEW
+/// bake, this surface's own only consumer), then a dedicated Ascii
+/// column.
 ///
 /// The three SIZE columns are the sixel tier's own size comparison; in
-/// `RailIcons::Braille`/`RailIcons::Ascii` (this crate's own single
-/// global icon-tier switch, not a per-surface setting -- see `app::
-/// RailIcons`) they simply paint THAT tier's own rendering instead of a
-/// sixel image, exactly like the dedicated Braille/Ascii columns already
-/// do -- there is no per-size braille/ascii asset to compare (only one
-/// braille bake exists at the rail's own 4x3-cell geometry), and forcing
-/// a sixel image regardless of the owner's own global tier choice would
-/// be new, untested behaviour no other icon site in this crate has (the
-/// rail/strip themselves only ever paint their own CURRENT tier too, see
-/// `render_rail_button`'s own match). This is a deliberate reading of
-/// this surface's own brief ("in Braille/Ascii tiers the sixel columns
-/// simply show the tier's own rendering"), not a gap.
+/// `RailIcons::Ascii` (this crate's own single global icon-tier switch,
+/// not a per-surface setting -- see `app::RailIcons`) they simply paint
+/// that tier's own rendering instead of a sixel image, exactly like the
+/// dedicated Ascii column already does -- there is no per-size ascii
+/// asset to compare, and forcing a sixel image regardless of the owner's
+/// own global tier choice would be new, untested behaviour no other icon
+/// site in this crate has (the rail/strip themselves only ever paint
+/// their own CURRENT tier too, see `render_rail_button`'s own match).
+/// This is a deliberate reading of this surface's own brief ("in the
+/// Ascii tier the sixel columns simply show the tier's own rendering"),
+/// not a gap.
 ///
 /// Wheel-scrollable (`App::scroll_terminal`'s own `SurfaceTab::
 /// IconGallery` arm, `app.icon_gallery_scroll`) since the full 12-row
@@ -3290,7 +3406,6 @@ fn render_icon_gallery(
     ];
     const NAME_COL_WIDTH: u16 = 15;
     const SIZE_COL_WIDTH: u16 = 12;
-    const BRAILLE_COL_WIDTH: u16 = 10;
     const ASCII_COL_WIDTH: u16 = 8;
     const COLUMN_GAP: u16 = 1;
     const HEADER_ROWS: u16 = 2;
@@ -3312,12 +3427,11 @@ fn render_icon_gallery(
         icons::GALLERY_SIXEL_ICON_WIDTH_PX, icons::GALLERY_SIXEL_ICON_HEIGHT_PX,
         icons::GALLERY_SIXEL_ICON_CELLS_WIDE, icons::GALLERY_SIXEL_ICON_CELLS_TALL,
     );
-    let headers: [(&str, u16); 6] = [
+    let headers: [(&str, u16); 5] = [
         ("icon", NAME_COL_WIDTH),
         (size_20_label.as_str(), SIZE_COL_WIDTH),
         (size_40_label.as_str(), SIZE_COL_WIDTH),
         (size_60_label.as_str(), SIZE_COL_WIDTH),
-        ("braille", BRAILLE_COL_WIDTH),
         ("ascii", ASCII_COL_WIDTH),
     ];
 
@@ -3385,18 +3499,7 @@ fn render_icon_gallery(
             render_gallery_size_swatch(swatch, id, cells_wide, cells_tall, size, variant, app.rail_icons, theme, buf, layout);
         }
 
-        let (braille_x, braille_width) = columns[4];
-        let braille_area = Rect::new(
-            braille_x,
-            y,
-            braille_width.min(area.right().saturating_sub(braille_x)).min(icons::BRAILLE_ICON_CELLS_WIDE),
-            row_height.min(icons::BRAILLE_ICON_CELLS_TALL),
-        );
-        fill_rect(braille_area, theme.active, buf);
-        icons::braille(id).flush(braille_area, buf);
-        matte_canvas_background(braille_area, theme.active, buf);
-
-        let (ascii_x, ascii_width) = columns[5];
+        let (ascii_x, ascii_width) = columns[4];
         let visible_ascii_width = ascii_width.min(area.right().saturating_sub(ascii_x));
         if visible_ascii_width > 0 {
             let ascii_bg = Rect::new(ascii_x, y, visible_ascii_width, 1);
@@ -3412,10 +3515,10 @@ fn render_icon_gallery(
 /// `RailIcons::Sixel` reserves `area`'s own cell footprint (already a
 /// plain `theme.active`-filled blank -- the real pixels are written by
 /// `client::run`'s post-flush hook, same split as `render_rail_button`'s
-/// own Sixel arm) and records the placement; `Braille`/`Ascii` paint that
-/// tier's OWN rendering directly (see [`render_icon_gallery`]'s own doc
-/// comment for why this collapses all three size columns to the SAME
-/// content in those two tiers).
+/// own Sixel arm) and records the placement; `Ascii` paints that tier's
+/// OWN rendering directly (see [`render_icon_gallery`]'s own doc comment
+/// for why this collapses all three size columns to the SAME content in
+/// that tier).
 fn render_gallery_size_swatch(
     area: Rect,
     id: icons::IconId,
@@ -3436,17 +3539,6 @@ fn render_gallery_size_swatch(
             let icon_area = Rect::new(area.x, area.y, area.width.min(cells_wide), area.height.min(cells_tall));
             fill_rect(icon_area, theme.active, buf);
             layout.sixel_icons.push(SixelIconPlacement { icon: id, rect: icon_area, variant, size });
-        }
-        RailIcons::Braille => {
-            let braille_area = Rect::new(
-                area.x,
-                area.y,
-                area.width.min(icons::BRAILLE_ICON_CELLS_WIDE),
-                area.height.min(icons::BRAILLE_ICON_CELLS_TALL),
-            );
-            fill_rect(braille_area, theme.active, buf);
-            icons::braille(id).flush(braille_area, buf);
-            matte_canvas_background(braille_area, theme.active, buf);
         }
         RailIcons::Ascii => {
             let label_area = Rect::new(area.x, area.y, area.width.min(2), 1);
@@ -6827,6 +6919,7 @@ fn render_harness_reverse_attribution(
         .min(8_u16.saturating_add(link_count.min(10) as u16))
         .max(3);
     let modal = centered(area, width, height);
+    layout.note_overlay(modal);
     fill_rect(modal, theme.modal, buf);
     Block::bordered()
         .title(" Harness links ")
@@ -8931,6 +9024,7 @@ fn render_existing_session(
     let height = 24.min(area.height);
     let dialog = positioned_modal(area, width, height, app.existing_session_modal_position);
     layout.existing_session_modal = dialog;
+    layout.note_overlay(dialog);
     fill_rect(dialog, theme.modal, buf);
     Block::bordered()
         .title(if session.mode == ExistingSessionMode::Catalog && session.preview.is_some() {
@@ -9281,6 +9375,7 @@ fn render_spawn(
     let height = 19.min(area.height);
     let dialog = positioned_modal(area, width, height, app.spawn_modal_position);
     layout.spawn_modal = dialog;
+    layout.note_overlay(dialog);
     fill_rect(dialog, theme.modal, buf);
     Block::bordered()
         .title(" session lab / launch ")
@@ -9575,6 +9670,7 @@ fn render_history(
     let width = 96.min(area.width.saturating_sub(4));
     let height = 22.min(area.height.saturating_sub(2));
     let dialog = centered(area, width, height);
+    layout.note_overlay(dialog);
     fill_rect(dialog, theme.modal, buf);
     Block::bordered()
         .title(" native session history ")
@@ -9927,6 +10023,7 @@ fn render_add_space(
     let height = 10.min(area.height.saturating_sub(2));
     let modal = positioned_modal(area, width, height, app.add_space_modal_position);
     layout.add_space_modal = modal;
+    layout.note_overlay(modal);
     fill_rect(modal, theme.modal, buf);
     Block::bordered()
         .title(" add workspace ")
@@ -10045,6 +10142,7 @@ fn render_folder_browser(
     let height = 26.min(area.height.saturating_sub(2));
     let modal = positioned_modal(area, width, height, app.folder_browser_modal_position);
     layout.folder_browser_modal = modal;
+    layout.note_overlay(modal);
     fill_rect(modal, theme.modal, buf);
     Block::bordered()
         .title(" browse directories on node ")
@@ -10215,6 +10313,7 @@ fn render_create_worktree(
     let height = 14.min(area.height.saturating_sub(2));
     let modal = positioned_modal(area, width, height, app.create_worktree_modal_position);
     layout.create_worktree_modal = modal;
+    layout.note_overlay(modal);
     fill_rect(modal, theme.modal, buf);
     let prefix = |field| if dialog.field == field { ">" } else { " " };
     let (lines, editable_fields, primary_label, primary_enabled, detail) = match dialog.kind {
@@ -10363,6 +10462,7 @@ fn render_remove_worktree(
     let width = 68.min(area.width.saturating_sub(4));
     let height = 8.min(area.height.saturating_sub(2));
     let modal = centered(area, width, height);
+    layout.note_overlay(modal);
     fill_rect(modal, theme.modal, buf);
     Paragraph::new(Text::from_lines(vec![
         Line::styled(
@@ -10397,6 +10497,7 @@ fn render_rename_session(
     let width = 58.min(area.width.saturating_sub(4));
     let height = 7.min(area.height.saturating_sub(2));
     let modal = centered(area, width, height);
+    layout.note_overlay(modal);
     fill_rect(modal, theme.modal, buf);
     Paragraph::new(Text::from_lines(vec![
         Line::styled(
@@ -10444,6 +10545,7 @@ fn render_task_id(
     let width = 62.min(area.width.saturating_sub(4));
     let height = 7.min(area.height.saturating_sub(2));
     let modal = centered(area, width, height);
+    layout.note_overlay(modal);
     fill_rect(modal, theme.modal, buf);
     Paragraph::new(Text::from_lines(vec![
         Line::styled(
@@ -10483,6 +10585,7 @@ fn render_forget_session(
     let width = 62.min(area.width.saturating_sub(4));
     let height = 8.min(area.height.saturating_sub(2));
     let modal = centered(area, width, height);
+    layout.note_overlay(modal);
     fill_rect(modal, theme.modal, buf);
     Paragraph::new(Text::from_lines(vec![
         Line::styled(
@@ -10535,6 +10638,7 @@ fn render_settings(
         .clamp(6.min(available_height), available_height);
     let modal = positioned_modal(area, width, height, app.control_modal_position);
     layout.control_modal = modal;
+    layout.note_overlay(modal);
     fill_rect(modal, theme.modal, buf);
     Block::bordered()
         .title(if expanded { " control " } else { " settings " })
@@ -10816,9 +10920,8 @@ fn render_settings_controls(
         return;
     }
     let icons_text = match app.rail_icons {
-        RailIcons::Sixel => " icons [sixel]|braille|ascii ",
-        RailIcons::Braille => " icons sixel|[braille]|ascii ",
-        RailIcons::Ascii => " icons sixel|braille|[ascii] ",
+        RailIcons::Sixel => " icons [sixel]|ascii ",
+        RailIcons::Ascii => " icons sixel|[ascii] ",
     };
     let icons_width = (cell_width(icons_text) as u16).min(area.width);
     Paragraph::new(icons_text)
@@ -13730,6 +13833,7 @@ mod tests {
             &mut buffer,
             &mut layout,
             Theme::for_mode(PtyColorMode::Inherited),
+            false,
         );
 
         let text = buffer_text(&buffer);
@@ -13966,10 +14070,13 @@ mod tests {
         assert!(!workspace_layout.hits.iter().any(|hit| hit.target == HitTarget::RosterMode(RosterMode::NativeSessions)));
         assert!(workspace_layout.hits.iter().any(|hit| hit.target == HitTarget::RosterMode(RosterMode::Workspaces)));
         assert!(workspace_layout.hits.iter().any(|hit| hit.target == HitTarget::AddTab));
-        // FIX5: the tab strip no longer carries its own "[S]" Settings
-        // button/hit target at all -- the activity rail's own gear is the
-        // single mouse entry point now (see `sidebar_gear_opens_only_
-        // compact_positioned_settings`).
+        // `fixture()` defaults to (Sidebar, Split): no activity rail, so
+        // the tab strip's own icon gear (never the rejected "[S]" bracket
+        // text) is this chrome's mouse entry to Settings -- see
+        // `file_surface_separates_global_controls_pane_title_actions_and_
+        // scrollbar`'s own assertion on that exact hit region, and
+        // `sidebar_gear_opens_only_compact_positioned_settings` for the
+        // (Sidebar, Activity) chrome where the rail alone carries it.
 
         app.roster_mode = RosterMode::Agents;
         let agent_layout = render(&app, &mut buf);
@@ -13977,10 +14084,13 @@ mod tests {
         assert!(agent_layout.hits.iter().all(|hit| !matches!(hit.target, HitTarget::Viewport) || hit.rect == agent_layout.viewport));
     }
 
-    /// Wave-1 icon labelling: AddSpace keeps its "workspace" text next to
+    /// The workspaces roster's own pre-strip fallback (panel too short
+    /// for `control_strip_fits`, see `space_list_control_strip_falls_
+    /// back_to_inline_buttons_when_the_panel_is_too_short` for the exact
+    /// threshold): AddSpace keeps its "workspace" text next to
     /// [`icons::IconId::Add`] (the label carries information the icon
     /// alone cannot); RemoveSpace, a plain remove action mirroring
-    /// RemoveWorktree, becomes icon-only. Same 3-tier + stable-hit-rect
+    /// RemoveWorktree, becomes icon-only. Same 2-tier + stable-hit-rect
     /// coverage as `workspace_files_create_buttons_render_in_the_
     /// control_strip_per_tier`. Renders `render_space_list` directly
     /// (not the full `render()`) -- the Explorer panel's own control-
@@ -13989,13 +14099,14 @@ mod tests {
     /// order`), and in the default Split presentation both panels are
     /// on screen at once, so a full render leaves two hit regions for
     /// each target; this test's own subject is `render_space_list`'s
-    /// OWN button specifically, not whichever one a full render's hit
-    /// list happens to list first.
+    /// OWN fallback button specifically, not whichever one a full
+    /// render's hit list happens to list first.
     #[test]
     fn space_list_add_and_remove_buttons_render_a_compact_icon_per_tier() {
         let mut app = fixture(PtyColorMode::GateOverride);
         app.roster_mode = RosterMode::Workspaces;
-        let area = Rect::new(0, 0, 40, 20);
+        let area = Rect::new(0, 0, 40, 4);
+        assert!(!control_strip_fits(area), "4 rows must be below the strip's own minimum");
         let theme = Theme::for_mode(app.color_mode);
 
         let hit_rect = |layout: &LayoutRects, target: HitTarget| {
@@ -14008,7 +14119,7 @@ mod tests {
         };
 
         assert_eq!(app.rail_icons, RailIcons::Sixel);
-        let mut sixel_buf = TerminalBuffer::new(40, 20);
+        let mut sixel_buf = TerminalBuffer::new(40, 4);
         let mut sixel_layout = LayoutRects::default();
         render_space_list(&app, area, &mut sixel_buf, &mut sixel_layout, theme);
         let add_rect = hit_rect(&sixel_layout, HitTarget::AddSpace);
@@ -14027,19 +14138,8 @@ mod tests {
         assert!(sixel_text.contains("workspace"), "{sixel_text:?}");
         assert!(!rect_text(&sixel_buf, remove_rect).contains("remove"));
 
-        app.rail_icons = RailIcons::Braille;
-        let mut braille_buf = TerminalBuffer::new(40, 20);
-        let mut braille_layout = LayoutRects::default();
-        render_space_list(&app, area, &mut braille_buf, &mut braille_layout, theme);
-        assert_eq!(hit_rect(&braille_layout, HitTarget::AddSpace), add_rect);
-        assert_eq!(hit_rect(&braille_layout, HitTarget::RemoveSpace), remove_rect);
-        assert!(braille_layout.sixel_icons.is_empty());
-        assert!(contains_braille_glyph(&rect_text(&braille_buf, add_rect)));
-        assert!(contains_braille_glyph(&rect_text(&braille_buf, remove_rect)));
-        assert!(rect_text(&braille_buf, add_rect).contains("workspace"));
-
         app.rail_icons = RailIcons::Ascii;
-        let mut ascii_buf = TerminalBuffer::new(40, 20);
+        let mut ascii_buf = TerminalBuffer::new(40, 4);
         let mut ascii_layout = LayoutRects::default();
         render_space_list(&app, area, &mut ascii_buf, &mut ascii_layout, theme);
         assert_eq!(hit_rect(&ascii_layout, HitTarget::AddSpace), add_rect);
@@ -15092,7 +15192,7 @@ mod tests {
     }
 
     /// Wave-1 icon labelling: AddSpaceBrowse keeps its "Browse…" text
-    /// next to [`icons::IconId::Search`]. Same 3-tier + stable-hit-rect
+    /// next to [`icons::IconId::Search`]. Same 2-tier + stable-hit-rect
     /// coverage as the sidebar panels' own compact-icon tests.
     #[test]
     fn add_space_browse_button_renders_a_compact_icon_per_tier() {
@@ -15127,14 +15227,6 @@ mod tests {
         }));
         assert!(rect_text(&sixel_buf, browse_rect).contains("Browse"));
 
-        app.rail_icons = RailIcons::Braille;
-        let mut braille_buf = TerminalBuffer::new(100, 24);
-        let braille_layout = render(&app, &mut braille_buf);
-        assert_eq!(hit_rect(&braille_layout, HitTarget::AddSpaceBrowse), browse_rect);
-        assert!(braille_layout.sixel_icons.is_empty());
-        assert!(contains_braille_glyph(&rect_text(&braille_buf, browse_rect)));
-        assert!(rect_text(&braille_buf, browse_rect).contains("Browse"));
-
         app.rail_icons = RailIcons::Ascii;
         let mut ascii_buf = TerminalBuffer::new(100, 24);
         let ascii_layout = render(&app, &mut ascii_buf);
@@ -15159,9 +15251,14 @@ mod tests {
             hit.target,
             HitTarget::SidebarMode(_) | HitTarget::RosterMode(_)
         )));
-        // FIX5: the tab strip's own "[S]" Settings button/hit target is
-        // gone entirely -- see `inspector_roster_and_tabs_have_compact_
-        // mode_and_action_hits`'s own doc comment.
+        // Modal placement has no rail (`spaces`/`agents` are both
+        // default above), so the tab strip's own gear is this chrome's
+        // only mouse entry to Settings -- see `render_tabs`'s own FIX5
+        // comment for why it was missing here before.
+        assert!(layout.hits.iter().any(|hit| {
+            hit.target == HitTarget::ActivitySection(ControlSection::Settings)
+                && layout.tabs.contains(hit.rect.x, hit.rect.y)
+        }));
     }
 
     #[test]
@@ -15213,6 +15310,64 @@ mod tests {
         app.layout = layout;
         assert_eq!(app.click(gear.x, gear.y), AppAction::None);
         assert_ne!(app.focus, Focus::Settings);
+    }
+
+    /// Settings has a real runtime entry in all three chrome combinations
+    /// this crate supports: (Sidebar, Activity) via the rail's own
+    /// bottom-anchored gear (unchanged), (Sidebar, Split) and
+    /// (Modal, _) via the tab strip's own gear (restored by the fix for
+    /// the owner's report that FIX5 had left both without ANY mouse or
+    /// keyboard entry -- see `render_tabs`'s own FIX5 comment). The same
+    /// `Ctrl(',')`/`F2` chord (`App::reduce`'s own global arm) opens the
+    /// dialog in all three regardless of which gear -- if any -- is even
+    /// on screen.
+    #[test]
+    fn settings_has_a_mouse_and_keyboard_entry_in_every_chrome() {
+        for (menu_placement, sidebar_presentation) in [
+            (MenuPlacement::Sidebar, SidebarPresentation::Activity),
+            (MenuPlacement::Sidebar, SidebarPresentation::Split),
+            (MenuPlacement::Modal, SidebarPresentation::Split),
+        ] {
+            let mut app = fixture(PtyColorMode::Inherited);
+            app.menu_placement = menu_placement;
+            app.sidebar_presentation = sidebar_presentation;
+            let mut buf = TerminalBuffer::new(100, 24);
+            let layout = render(&app, &mut buf);
+
+            assert!(
+                layout.hits.iter().any(|hit| {
+                    hit.target == HitTarget::ActivitySection(ControlSection::Settings)
+                }),
+                "no Settings gear hit region in ({menu_placement:?}, {sidebar_presentation:?})",
+            );
+
+            app.focus = Focus::Tabs;
+            assert_eq!(app.reduce(crate::UiKey::Ctrl(',')), AppAction::None);
+            assert_eq!(
+                app.focus,
+                Focus::Settings,
+                "the chord must open Settings in ({menu_placement:?}, {sidebar_presentation:?})",
+            );
+        }
+    }
+
+    /// (Sidebar, Activity) must never show two gears at once: the tab
+    /// strip's own restored gear is gated off exactly where the rail
+    /// already draws one (`render_tabs`'s own `rail_present` check).
+    #[test]
+    fn activity_presentation_draws_exactly_one_settings_gear() {
+        let mut app = fixture(PtyColorMode::Inherited);
+        app.sidebar_presentation = SidebarPresentation::Activity;
+        let mut buf = TerminalBuffer::new(100, 24);
+
+        let layout = render(&app, &mut buf);
+
+        let gears = layout
+            .hits
+            .iter()
+            .filter(|hit| hit.target == HitTarget::ActivitySection(ControlSection::Settings))
+            .count();
+        assert_eq!(gears, 1, "exactly one Settings gear must be on screen, never two");
     }
 
     #[test]
@@ -15349,7 +15504,7 @@ mod tests {
         // `fixture()` defaults to `RailIcons::Sixel` -- NewFile/NewDirectory
         // now paint a compact baked icon there (see
         // `workspace_files_create_buttons_render_a_compact_icon_per_tier`
-        // for the full 3-tier coverage), not the old literal "[+.]"/"[+>]"
+        // for the full 2-tier coverage), not the old literal "[+.]"/"[+>]"
         // text; that text is still exactly what `RailIcons::Ascii` paints.
         let files_text = buffer_text(&files);
         assert!(!files_text.contains("[+.]") && !files_text.contains("[+>]"), "{files_text}");
@@ -15406,14 +15561,14 @@ mod tests {
     }
 
     /// The control-plane strip's own NewFile/NewDirectory buttons: a
-    /// strip-tier baked icon (`icons::sixel_strip`/`icons::braille_
-    /// compact` -- see `render_control_strip_button`'s own doc comment)
-    /// in `Sixel`/`Braille` mode, and a short 2-char catalog label
-    /// (`icons::ascii`) in `Ascii` mode, NOT the pre-strip bracket text --
-    /// the strip's fixed 2-cell body cannot fit `"[+.]"`/`"[+>]"`. The
-    /// load-bearing invariant carried over from the pre-strip version:
-    /// their own [`HitRegion`] rect is BYTE-IDENTICAL across all three
-    /// tiers (same position, same target). The sixel tier's own asset
+    /// strip-tier baked icon (`icons::sixel_strip` -- see `render_
+    /// control_strip_button`'s own doc comment) in `Sixel` mode, and a
+    /// short 2-char catalog label (`icons::ascii`) in `Ascii` mode, NOT
+    /// the pre-strip bracket text -- the strip's fixed 2-cell body cannot
+    /// fit `"[+.]"`/`"[+>]"`. The load-bearing invariant carried over
+    /// from the pre-strip version: their own [`HitRegion`] rect is
+    /// BYTE-IDENTICAL across both tiers (same position, same target). The
+    /// sixel tier's own asset
     /// also resolves to `GateActive` (this fixture's `PtyColorMode::
     /// GateOverride`) -- cause 1's fix, see `icons::SixelVariant`'s own
     /// doc comment.
@@ -15453,15 +15608,6 @@ mod tests {
         }));
         let sixel_text = buffer_text(&sixel_buf);
         assert!(!sixel_text.contains("[+.]") && !sixel_text.contains("[+>]"), "{sixel_text}");
-
-        app.rail_icons = RailIcons::Braille;
-        let mut braille_buf = TerminalBuffer::new(100, 24);
-        let braille_layout = render(&app, &mut braille_buf);
-        assert_eq!(hit_rect(&braille_layout, HitTarget::NewFile), new_file_rect);
-        assert_eq!(hit_rect(&braille_layout, HitTarget::NewDirectory), new_directory_rect);
-        assert!(braille_layout.sixel_icons.is_empty());
-        assert!(contains_braille_glyph(&rect_text(&braille_buf, new_file_rect)));
-        assert!(contains_braille_glyph(&rect_text(&braille_buf, new_directory_rect)));
 
         app.rail_icons = RailIcons::Ascii;
         let mut ascii_buf = TerminalBuffer::new(100, 24);
@@ -15521,17 +15667,16 @@ mod tests {
 
     /// The control-plane strip's own CreateWorktree/RemoveWorktree
     /// buttons: strip-tier baked icons ([`icons::IconId::RepoForked`] /
-    /// [`icons::IconId::Trash`]) in `Sixel`/`Braille` mode, icon-only --
-    /// the strip's fixed 2-cell body has no room for CreateWorktree's
-    /// old "worktree" trailing text -- and a short 2-char catalog label
-    /// in `Ascii` mode. `RemoveWorktree`'s own strip button targets
-    /// whichever worktree `app.git_cursor` currently selects (the same
-    /// resolution the Delete key's own `remove_selected_git_worktree`
-    /// already used); this fixture's single worktree sits at cursor 0
-    /// and is removable, so the strip carries `RemoveWorktree(0)`, the
-    /// SAME target its own per-row list button also carries. Same
-    /// 3-tier + stable-hit-rect coverage as the Explorer panel's own
-    /// control-strip test.
+    /// [`icons::IconId::Trash`]) in `Sixel` mode, icon-only -- the strip's
+    /// fixed 2-cell body has no room for CreateWorktree's old "worktree"
+    /// trailing text -- and a short 2-char catalog label in `Ascii` mode.
+    /// `RemoveWorktree`'s own strip button targets whichever worktree
+    /// `app.git_cursor` currently selects (the same resolution the Delete
+    /// key's own `remove_selected_git_worktree` already used); this
+    /// fixture's single worktree sits at cursor 0 and is removable, so
+    /// the strip carries `RemoveWorktree(0)`, the SAME target its own
+    /// per-row list button also carries. Same 2-tier + stable-hit-rect
+    /// coverage as the Explorer panel's own control-strip test.
     #[test]
     fn git_worktree_create_and_remove_buttons_render_in_the_control_strip_per_tier() {
         let mut app = fixture(PtyColorMode::GateOverride);
@@ -15580,15 +15725,6 @@ mod tests {
                 && remove_rect.contains(placement.rect.x, placement.rect.y)
         }));
         assert!(!rect_text(&sixel_buf, create_rect).contains("worktree"));
-
-        app.rail_icons = RailIcons::Braille;
-        let mut braille_buf = TerminalBuffer::new(100, 24);
-        let braille_layout = render(&app, &mut braille_buf);
-        assert_eq!(hit_rect(&braille_layout, HitTarget::CreateWorktree), create_rect);
-        assert_eq!(hit_rect(&braille_layout, HitTarget::RemoveWorktree(0)), remove_rect);
-        assert!(braille_layout.sixel_icons.is_empty());
-        assert!(contains_braille_glyph(&rect_text(&braille_buf, create_rect)));
-        assert!(contains_braille_glyph(&rect_text(&braille_buf, remove_rect)));
 
         app.rail_icons = RailIcons::Ascii;
         let mut ascii_buf = TerminalBuffer::new(100, 24);
@@ -15859,6 +15995,160 @@ mod tests {
         render_workspace_git(&app, area, &mut buf, &mut layout, theme);
 
         for target in [HitTarget::CreateWorktree, HitTarget::RemoveWorktree(0), HitTarget::RefreshWorkspace] {
+            let hit = layout
+                .hits
+                .iter()
+                .find(|hit| hit.target == target)
+                .unwrap_or_else(|| panic!("fallback must still expose {target:?}"));
+            assert_eq!(hit.rect.height, 1, "the fallback keeps a single-row button, not the strip's 2-row body");
+            assert!(hit.rect.bottom() <= area.bottom());
+        }
+    }
+
+    /// The agents roster's own control-plane strip carries only
+    /// `AddAgent` -- spawning is the one action about the panel as a
+    /// whole; `AgentMore`/`AgentRun`/`AgentProgressToggle`/
+    /// `AgentOrderHandle`/`NativeSessionsOpen` all act on one selected
+    /// row and stay inline in `render_agent_list`/`render_native_
+    /// session_list`, unmoved. Same 2-tier + stable-hit-rect coverage as
+    /// `explorer_control_strip_carries_the_specified_buttons_in_order`.
+    /// Renders `render_agents_surface` directly, the same function both
+    /// chromes that show this panel call (`render_roster`'s Split
+    /// dispatch and `render::render`'s own Activity dispatch), so this
+    /// covers both without depending on either one's own header rows.
+    #[test]
+    fn agents_control_strip_carries_the_add_agent_button_per_tier() {
+        let mut app = fixture(PtyColorMode::GateOverride);
+        let area = Rect::new(0, 0, 40, 20);
+        let theme = Theme::for_mode(app.color_mode);
+
+        let hit_rect = |layout: &LayoutRects, target: HitTarget| {
+            layout
+                .hits
+                .iter()
+                .find(|hit| hit.target == target)
+                .unwrap_or_else(|| panic!("missing hit for {target:?}"))
+                .rect
+        };
+
+        assert_eq!(app.rail_icons, RailIcons::Sixel);
+        let mut sixel_buf = TerminalBuffer::new(40, 20);
+        let mut sixel_layout = LayoutRects::default();
+        render_agents_surface(&app, area, &mut sixel_buf, &mut sixel_layout, theme);
+        let add_rect = hit_rect(&sixel_layout, HitTarget::AddAgent);
+        assert_eq!(add_rect.y, area.y, "AddAgent must sit on the strip's own top row");
+        assert_eq!(add_rect.x, area.x, "the only strip button sits flush at the panel's own left edge");
+        assert_eq!(add_rect.width, CONTROL_STRIP_BUTTON_WIDTH);
+        assert_eq!(add_rect.height, CONTROL_STRIP_BUTTON_ROWS);
+        assert!(sixel_layout.sixel_icons.iter().any(|placement| {
+            placement.icon == icons::IconId::Add
+                && placement.size == crate::app::SixelIconSize::Strip
+                && add_rect.contains(placement.rect.x, placement.rect.y)
+        }));
+        assert!(!buffer_text(&sixel_buf).contains("+ agent"));
+
+        app.rail_icons = RailIcons::Ascii;
+        let mut ascii_buf = TerminalBuffer::new(40, 20);
+        let mut ascii_layout = LayoutRects::default();
+        render_agents_surface(&app, area, &mut ascii_buf, &mut ascii_layout, theme);
+        assert_eq!(hit_rect(&ascii_layout, HitTarget::AddAgent), add_rect);
+        assert!(ascii_layout.sixel_icons.is_empty());
+        assert!(rect_text(&ascii_buf, add_rect).contains(icons::ascii(icons::IconId::Add)));
+    }
+
+    /// The workspaces roster's own control-plane strip: AddSpace then
+    /// RemoveSpace left to right, same geometry invariants as
+    /// `explorer_control_strip_carries_the_specified_buttons_in_order`
+    /// (both icon-only in the strip -- the "workspace"/"remove" text
+    /// stays only in the pre-strip fallback, see `space_list_add_and_
+    /// remove_buttons_render_a_compact_icon_per_tier`). `SpawnSpace`/
+    /// `Space`/`HarnessLinks` are row-level (one workspace row each) and
+    /// stay in the list below, unmoved.
+    #[test]
+    fn workspaces_control_strip_carries_the_specified_buttons_in_order() {
+        let app = fixture(PtyColorMode::GateOverride);
+        let area = Rect::new(0, 0, 40, 20);
+        let theme = Theme::for_mode(app.color_mode);
+        let mut buf = TerminalBuffer::new(40, 20);
+        let mut layout = LayoutRects::default();
+
+        render_space_list(&app, area, &mut buf, &mut layout, theme);
+
+        let expected_order = [
+            (HitTarget::AddSpace, icons::IconId::Add),
+            (HitTarget::RemoveSpace, icons::IconId::Trash),
+        ];
+        let mut previous_right = None;
+        for (index, (target, icon)) in expected_order.into_iter().enumerate() {
+            let hit = layout
+                .hits
+                .iter()
+                .find(|hit| hit.target == target)
+                .unwrap_or_else(|| panic!("missing strip hit for {target:?}"));
+            assert_eq!(hit.rect.y, area.y, "{target:?} must sit on the strip's own top row");
+            assert_eq!(hit.rect.width, CONTROL_STRIP_BUTTON_WIDTH, "{target:?}");
+            assert_eq!(hit.rect.height, CONTROL_STRIP_BUTTON_ROWS, "{target:?}");
+            if index == 0 {
+                assert_eq!(hit.rect.x, area.x, "the first strip button sits flush at the panel's own left edge");
+            } else {
+                assert_eq!(
+                    hit.rect.x,
+                    previous_right.unwrap_or_default() + CONTROL_STRIP_BUTTON_GAP,
+                    "{target:?} must sit exactly one gap column after the previous button",
+                );
+            }
+            previous_right = Some(hit.rect.right());
+            assert!(
+                layout.sixel_icons.iter().any(|placement| {
+                    placement.icon == icon
+                        && placement.size == crate::app::SixelIconSize::Strip
+                        && hit.rect.contains(placement.rect.x, placement.rect.y)
+                }),
+                "{target:?} must place its strip-tier {icon:?} sixel icon inside its own hit rect: {:?}",
+                layout.sixel_icons,
+            );
+        }
+    }
+
+    /// Same fallback coverage as `explorer_control_strip_falls_back_to_
+    /// inline_buttons_when_the_panel_is_too_short`, for the agents
+    /// roster: `AddAgent` must still be reachable inline when the panel
+    /// is too short for the strip.
+    #[test]
+    fn agents_control_strip_falls_back_to_inline_buttons_when_the_panel_is_too_short() {
+        let app = fixture(PtyColorMode::GateOverride);
+        let area = Rect::new(0, 0, 80, 4);
+        assert!(!control_strip_fits(area), "4 rows must be below the strip's own minimum");
+        let mut buf = TerminalBuffer::new(80, 4);
+        let mut layout = LayoutRects::default();
+        let theme = Theme::for_mode(app.color_mode);
+
+        render_agents_surface(&app, area, &mut buf, &mut layout, theme);
+
+        let hit = layout
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::AddAgent)
+            .expect("fallback must still expose AddAgent");
+        assert_eq!(hit.rect.height, 1, "the fallback keeps the pre-strip single-row button, not the strip's 2-row body");
+        assert!(hit.rect.bottom() <= area.bottom());
+    }
+
+    /// Same fallback coverage, for the workspaces roster: `AddSpace` and
+    /// `RemoveSpace` must both still be reachable inline when the panel
+    /// is too short for the strip.
+    #[test]
+    fn workspaces_control_strip_falls_back_to_inline_buttons_when_the_panel_is_too_short() {
+        let app = fixture(PtyColorMode::GateOverride);
+        let area = Rect::new(0, 0, 80, 4);
+        assert!(!control_strip_fits(area), "4 rows must be below the strip's own minimum");
+        let mut buf = TerminalBuffer::new(80, 4);
+        let mut layout = LayoutRects::default();
+        let theme = Theme::for_mode(app.color_mode);
+
+        render_space_list(&app, area, &mut buf, &mut layout, theme);
+
+        for target in [HitTarget::AddSpace, HitTarget::RemoveSpace] {
             let hit = layout
                 .hits
                 .iter()
@@ -16625,6 +16915,7 @@ mod tests {
             &mut buf,
             &mut layout,
             Theme::for_mode(app.color_mode),
+            false,
         );
 
         let text = buffer_text(&buf);
@@ -16765,7 +17056,11 @@ mod tests {
                     .then_some("workspace missing".to_owned()),
             });
         }
-        let mut sidebar = TerminalBuffer::new(100, 24);
+        // 26, not 24: the agents panel's own control-plane strip now costs
+        // 2 rows out of the sidebar's roster half, and this test wants all
+        // 4 records actually on screen (not scrolled off) so the text
+        // assertions below cover every state, not whichever subset fits.
+        let mut sidebar = TerminalBuffer::new(100, 26);
         let sidebar_layout = render(&app, &mut sidebar);
         assert_eq!(
             sidebar_layout
@@ -17214,21 +17509,15 @@ mod tests {
         );
     }
 
-    fn contains_braille_glyph(text: &str) -> bool {
-        text.chars().any(|c| ('\u{2800}'..='\u{28FF}').contains(&c))
-    }
-
-    /// Covers all three `RailIcons` tiers end to end: `Sixel` records
-    /// every button's own placement in `layout.sixel_icons` and paints
-    /// NOTHING into the cell buffer for those bodies (a terminal cell
-    /// cannot hold a raster image -- see `client::flush_sixel_icon`'s own
-    /// doc comment for the step that actually draws pixels), `Braille`
-    /// paints real braille glyphs straight into the cell buffer and
-    /// records no sixel placements at all, and `Ascii` falls back to the
-    /// plain `F`/`G`/`A`/`K`/`S` bracket labels with neither of the
-    /// other two tiers' own markers present.
+    /// Covers both `RailIcons` tiers end to end: `Sixel` records every
+    /// button's own placement in `layout.sixel_icons` and paints NOTHING
+    /// into the cell buffer for those bodies (a terminal cell cannot hold
+    /// a raster image -- see `client::flush_sixel_icon`'s own doc comment
+    /// for the step that actually draws pixels), and `Ascii` falls back
+    /// to the plain `F`/`G`/`A`/`K`/`S` bracket labels with no sixel
+    /// placement recorded at all.
     #[test]
-    fn activity_rail_sixel_braille_and_ascii_modes_render_the_expected_output() {
+    fn activity_rail_sixel_and_ascii_modes_render_the_expected_output() {
         let mut app = fixture(PtyColorMode::Inherited);
         app.sidebar_presentation = SidebarPresentation::Activity;
         app.harness_kanban.enabled = true;
@@ -17283,23 +17572,8 @@ mod tests {
             "the default Files panel's own control-plane strip must also place a strip-tier NewFile sixel icon outside the rail: {:?}",
             sixel_layout.sixel_icons,
         );
-        assert!(!contains_braille_glyph(&sixel_text), "sixel mode must not paint braille cells: {sixel_text:?}");
         for ascii in ["F", "G", "A", "K", "S"] {
             assert!(!sixel_text.contains(ascii), "unexpected {ascii} in sixel mode: {sixel_text:?}");
-        }
-
-        app.rail_icons = RailIcons::Braille;
-        let mut braille_buf = TerminalBuffer::new(100, 24);
-        let braille_layout = render(&app, &mut braille_buf);
-        let braille_text = rect_text(&braille_buf, braille_layout.activity_rail);
-        assert!(
-            braille_layout.sixel_icons.is_empty(),
-            "braille mode must not place any sixel icon: {:?}",
-            braille_layout.sixel_icons,
-        );
-        assert!(contains_braille_glyph(&braille_text), "braille mode must paint braille cells: {braille_text:?}");
-        for ascii in ["F", "G", "A", "K", "S"] {
-            assert!(!braille_text.contains(ascii), "unexpected {ascii} in braille mode: {braille_text:?}");
         }
 
         app.rail_icons = RailIcons::Ascii;
@@ -17310,7 +17584,6 @@ mod tests {
         for ascii in ["F", "G", "A", "K", "S"] {
             assert!(ascii_text.contains(ascii), "missing {ascii}: {ascii_text:?}");
         }
-        assert!(!contains_braille_glyph(&ascii_text), "ascii mode must not paint braille cells: {ascii_text:?}");
     }
 
     /// FIX2: "the highlighted block is EXACTLY the icon's footprint" for
@@ -17341,7 +17614,7 @@ mod tests {
         assert_eq!(
             files_hit.rect.height,
             icons::SIXEL_ICON_CELLS_TALL,
-            "the rail button's own highlighted body must be exactly the 40x40 icon's own row footprint, not a row taller"
+            "the rail button's own highlighted body must be exactly the sixel icon's own row footprint, not a row taller"
         );
         assert_eq!(files_icon.rect.height, files_hit.rect.height, "the icon must fill the whole button body top to bottom -- no dead row");
         assert_eq!(files_icon.rect.width, icons::SIXEL_ICON_CELLS_WIDE);
@@ -17384,7 +17657,7 @@ mod tests {
             .expect("git rail button is inactive here");
         // FIX2: the fixture's default `RailIcons::Sixel` tier's own tall
         // body is now exactly `icons::SIXEL_ICON_CELLS_TALL` (2) rows, the
-        // 40x40 icon's own real footprint -- not the pre-FIX2 3.
+        // sixel icon's own real footprint -- not the pre-FIX2 3.
         assert_eq!(git_hit.rect.height, 2, "expected the tall button treatment at this height");
         // Sample the button body (inset past the left margin/accent
         // column, which stays the rail's own background either way).
@@ -17403,13 +17676,14 @@ mod tests {
         // body from 3 rows to 2 (see `rail_button_body_rows`), which on
         // its own now fits the tall treatment even at this app's own
         // minimum supported height (14, `render`'s own hard floor) -- so
-        // this test switches to `RailIcons::Braille` (UNCHANGED at 3 rows
-        // by FIX2, since its own baked asset already fills a full 3-row
-        // body) to keep exercising a genuine too-short-for-tall scenario.
+        // this test switches to `RailIcons::Ascii` (its own body height
+        // is [`ASCII_RAIL_BODY_ROWS`], 3, independent of the sixel tier's
+        // own 2 -- see `rail_button_body_rows`) to keep exercising a
+        // genuine too-short-for-tall scenario.
         let mut app = fixture(PtyColorMode::Inherited);
         app.sidebar_presentation = SidebarPresentation::Activity;
         app.harness_kanban.enabled = false;
-        app.rail_icons = RailIcons::Braille;
+        app.rail_icons = RailIcons::Ascii;
         let mut buf = TerminalBuffer::new(100, 14);
         let layout = render(&app, &mut buf);
 
@@ -17444,29 +17718,22 @@ mod tests {
             .find(|hit| hit.target == HitTarget::SettingsRailIcons)
             .expect("settings dialog exposes the rail-icons toggle");
         let row = rect_text(&buf, icons_hit.rect);
-        assert!(row.contains("icons [sixel]|braille|ascii"), "{row:?}");
+        assert!(row.contains("icons [sixel]|ascii"), "{row:?}");
 
-        // Mouse: Sixel -> Braille -> Ascii -> Sixel, one click per step at
-        // the SAME hit rect throughout -- every state's own label text is
-        // the same length, only the `[...]` bracket moves, so the hit
-        // region itself never needs to move to stay clickable.
+        // Mouse: Sixel -> Ascii -> Sixel, one click per step at the SAME
+        // hit rect throughout -- every state's own label text is the same
+        // length, only the `[...]` bracket moves, so the hit region
+        // itself never needs to move to stay clickable.
         app.layout = render(&app, &mut buf);
-        app.click(icons_hit.rect.x, icons_hit.rect.y);
-        assert_eq!(app.rail_icons, RailIcons::Braille);
-        app.layout = render(&app, &mut buf);
-        assert!(rect_text(&buf, icons_hit.rect).contains("icons sixel|[braille]|ascii"));
-
         app.click(icons_hit.rect.x, icons_hit.rect.y);
         assert_eq!(app.rail_icons, RailIcons::Ascii);
         app.layout = render(&app, &mut buf);
-        assert!(rect_text(&buf, icons_hit.rect).contains("icons sixel|braille|[ascii]"));
+        assert!(rect_text(&buf, icons_hit.rect).contains("icons sixel|[ascii]"));
 
         app.click(icons_hit.rect.x, icons_hit.rect.y);
         assert_eq!(app.rail_icons, RailIcons::Sixel);
 
-        // Keyboard: the same 3-state cycle via the 'i' shortcut.
-        assert_eq!(app.reduce(crate::UiKey::Char('i')), AppAction::None);
-        assert_eq!(app.rail_icons, RailIcons::Braille);
+        // Keyboard: the same 2-state cycle via the 'i' shortcut.
         assert_eq!(app.reduce(crate::UiKey::Char('i')), AppAction::None);
         assert_eq!(app.rail_icons, RailIcons::Ascii);
         assert_eq!(app.reduce(crate::UiKey::Char('i')), AppAction::None);
@@ -17521,11 +17788,11 @@ mod tests {
     }
 
     /// FIX4: the gallery renders the expected 12-icon grid in each of the
-    /// three `RailIcons` tiers (the sixel tier places three DIFFERENTLY
-    /// sized sixel icons per row -- 20x20/40x40/60x60 -- the braille/ascii
-    /// tiers paint that same tier's own rendering everywhere, per `render_
-    /// icon_gallery`'s own doc comment), and its tab opens and closes like
-    /// any other surface tab.
+    /// two `RailIcons` tiers (the sixel tier places three DIFFERENTLY
+    /// sized sixel icons per row -- the strip/rail/gallery pixel sizes --
+    /// the ascii tier paints that same tier's own rendering everywhere,
+    /// per `render_icon_gallery`'s own doc comment), and its tab opens
+    /// and closes like any other surface tab.
     #[test]
     fn icon_gallery_renders_the_expected_grid_in_each_tier_and_its_tab_opens_and_closes() {
         let mut app = fixture(PtyColorMode::Inherited);
@@ -17549,20 +17816,13 @@ mod tests {
         }
         let sixel_text = rect_text(&sixel_buf, sixel_layout.viewport);
         assert!(sixel_text.contains("Files"), "row must be labelled with the icon's own name: {sixel_text:?}");
-        assert!(sixel_text.contains("braille") && sixel_text.contains("ascii"), "header must label the dedicated comparison columns: {sixel_text:?}");
-        // The dedicated Braille/Ascii columns are UNCONDITIONAL (always
-        // "for comparison", regardless of the current global tier -- see
-        // `render_icon_gallery`'s own doc comment), so braille glyphs and
-        // the ascii label are both present here too, alongside the three
-        // real sixel placements just asserted above.
-        assert!(contains_braille_glyph(&sixel_text), "the dedicated braille column must still paint braille glyphs in sixel tier: {sixel_text:?}");
+        assert!(sixel_text.contains("ascii"), "header must label the dedicated comparison column: {sixel_text:?}");
+        // The dedicated Ascii column is UNCONDITIONAL (always "for
+        // comparison", regardless of the current global tier -- see
+        // `render_icon_gallery`'s own doc comment), so the ascii label is
+        // present here too, alongside the three real sixel placements
+        // just asserted above.
         assert!(sixel_text.contains(icons::ascii(icons::IconId::Files)), "the dedicated ascii column must still paint the Files label in sixel tier: {sixel_text:?}");
-
-        app.rail_icons = RailIcons::Braille;
-        let mut braille_buf = TerminalBuffer::new(120, 40);
-        let braille_layout = render(&app, &mut braille_buf);
-        assert!(braille_layout.sixel_icons.is_empty(), "braille tier must not place any sixel icon: {:?}", braille_layout.sixel_icons);
-        assert!(contains_braille_glyph(&rect_text(&braille_buf, braille_layout.viewport)), "braille tier must paint braille glyphs");
 
         app.rail_icons = RailIcons::Ascii;
         let mut ascii_buf = TerminalBuffer::new(120, 40);
@@ -17570,10 +17830,6 @@ mod tests {
         assert!(ascii_layout.sixel_icons.is_empty(), "ascii tier must not place any sixel icon: {:?}", ascii_layout.sixel_icons);
         let ascii_text = rect_text(&ascii_buf, ascii_layout.viewport);
         assert!(ascii_text.contains(icons::ascii(icons::IconId::Files)), "ascii tier must paint the Files ascii label: {ascii_text:?}");
-        // The dedicated Braille column is unconditional too (same as the
-        // sixel-tier check above), so braille glyphs are still present
-        // here alongside the ascii labels.
-        assert!(contains_braille_glyph(&ascii_text), "the dedicated braille column must still paint braille glyphs in ascii tier: {ascii_text:?}");
 
         // Closes like any other tab (`Ctrl+W`'s own production handler).
         app.close_selected_tab();
@@ -17606,6 +17862,138 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Reproduces the reported defect exactly: the icon gallery's own
+    /// sixel placements (base content, painted first) must not survive
+    /// underneath an overlay drawn on top of them -- a sixel is raster
+    /// painted directly over the terminal with no z-order of its own (see
+    /// `LayoutRects::sixel_icons`'s own doc comment), so nothing but
+    /// `render::render`'s own end-of-frame occlusion pass stops the old
+    /// ghosting/repaint-through-the-modal bug from recurring. Closing the
+    /// overlay afterward must bring the very same base placements back --
+    /// they are occluded for one frame, never actually lost.
+    #[test]
+    fn overlay_occludes_covered_base_sixel_placements_and_releases_them_on_close() {
+        let mut app = fixture(PtyColorMode::Inherited);
+        app.surface.open_in_focused(SurfaceTab::IconGallery);
+        assert_eq!(app.rail_icons, RailIcons::Sixel);
+
+        // Baseline: the gallery alone, no overlay -- proves real
+        // placements exist before asserting they get occluded.
+        let mut baseline_buf = TerminalBuffer::new(120, 40);
+        let baseline = render(&app, &mut baseline_buf);
+        assert!(
+            !baseline.sixel_icons.is_empty(),
+            "the gallery must place sixel icons for this test to mean anything",
+        );
+
+        app.focus = Focus::Spawn;
+        app.spawn = Some(SpawnDialog {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            provider: provider("codex"),
+            target: LaunchTarget::NewLinkedWorktree,
+            profile_id: "default".to_owned(),
+            worktree_profile_id: String::new(),
+            bundle_id: String::new(),
+            context_mode: LaunchContextMode::None,
+            field: LaunchField::Workspace,
+        });
+        let mut covered_buf = TerminalBuffer::new(120, 40);
+        let covered = render(&app, &mut covered_buf);
+
+        // The modal actually has to land on top of at least one baseline
+        // placement, or the assertion below proves nothing.
+        assert!(
+            baseline.sixel_icons.iter().any(|placement| {
+                !placement.rect.intersect(covered.spawn_modal).is_empty()
+            }),
+            "spawn modal {:?} must cover at least one gallery placement: {:?}",
+            covered.spawn_modal, baseline.sixel_icons,
+        );
+        assert!(
+            covered.sixel_icons.iter().all(|placement| {
+                placement.rect.intersect(covered.spawn_modal).is_empty()
+            }),
+            "no surviving placement may intersect the spawn modal: {:?} vs {:?}",
+            covered.sixel_icons, covered.spawn_modal,
+        );
+
+        // Close it: the same base placements repaint, unchanged -- they
+        // were occluded for one frame, not discarded.
+        app.focus = Focus::Viewport;
+        app.spawn = None;
+        let mut reopened_buf = TerminalBuffer::new(120, 40);
+        let reopened = render(&app, &mut reopened_buf);
+        assert_eq!(reopened.sixel_icons, baseline.sixel_icons);
+    }
+
+    /// Placements an overlay draws AS PART OF ITS OWN content must
+    /// survive that same overlay's own occlusion check -- the case the
+    /// naive "drop anything whose rect sits inside a registered overlay
+    /// rect" version of this fix would get wrong. Reuses a real, already-
+    /// shipped example: the Settings "control" modal (Modal placement)
+    /// hosts the Agents roster directly inside itself, control strip and
+    /// all (see `render_settings`'s own `ControlSection::Agents`
+    /// dispatch) -- its `AddAgent` strip icon sits geometrically INSIDE
+    /// `layout.control_modal`'s own rect, and must still be there after
+    /// the end-of-frame occlusion pass.
+    #[test]
+    fn overlay_hosted_icon_survives_its_own_overlays_occlusion() {
+        let mut app = fixture(PtyColorMode::Inherited);
+        app.menu_placement = MenuPlacement::Modal;
+        app.control_section = ControlSection::Agents;
+        app.roster_mode = RosterMode::Agents;
+        app.focus = Focus::Settings;
+        // `control_modal_default_size` sizes the modal to this fixture's
+        // own single agent row (height 7), which leaves the roster's own
+        // header (2 rows) and control strip (`control_strip_fits` needs
+        // >= 5) no room at all -- explicit size, same precedent as
+        // `control_modal_is_opaque_and_reuses_operational_sections`, so
+        // the strip this test is actually about has somewhere to render.
+        app.control_modal_size = Some((100, 20));
+        assert_eq!(app.rail_icons, RailIcons::Sixel);
+        let mut buf = TerminalBuffer::new(120, 40);
+
+        let layout = render(&app, &mut buf);
+
+        let add_agent = layout
+            .sixel_icons
+            .iter()
+            .find(|placement| placement.icon == icons::IconId::Add && placement.size == SixelIconSize::Strip)
+            .unwrap_or_else(|| panic!("the Agents roster's own AddAgent strip icon must survive: {:?}", layout.sixel_icons));
+        assert!(
+            layout.control_modal.contains(add_agent.rect.x, add_agent.rect.y),
+            "the surviving icon must actually sit inside its own overlay's rect: {:?} vs {:?}",
+            add_agent.rect, layout.control_modal,
+        );
+    }
+
+    /// A sixel cannot be clipped to a sub-rect, so an overlay covering
+    /// only PART of a placement's own rect must still drop it whole, not
+    /// leave a corner peeking out from under the modal. Exercises `drop_
+    /// sixel_icons_covered_by_overlays` directly for exact control over
+    /// the overlap geometry -- see that fn's own doc comment for the
+    /// `drawn_before` index-cutoff mechanism this also implicitly proves
+    /// (the placement here predates the overlay, so it is a candidate at
+    /// all).
+    #[test]
+    fn overlay_partially_covering_a_placement_drops_it_whole() {
+        let mut layout = LayoutRects::default();
+        layout.sixel_icons.push(SixelIconPlacement {
+            icon: icons::IconId::Files,
+            rect: Rect::new(10, 10, 4, 2),
+            variant: icons::SixelVariant::Transparent,
+            size: SixelIconSize::Rail,
+        });
+        // Overlaps only the placement's own right half (x=12..14 of the
+        // placement's own x=10..14), same two rows.
+        layout.note_overlay(Rect::new(12, 10, 20, 2));
+
+        drop_sixel_icons_covered_by_overlays(&mut layout);
+
+        assert!(layout.sixel_icons.is_empty(), "{:?}", layout.sixel_icons);
     }
 
     #[test]
@@ -17674,7 +18062,7 @@ mod tests {
     /// folder" next to [`icons::IconId::Check`] (both explicit "keep the
     /// text" examples in the task brief), and FolderBrowserCancel (a
     /// universal X = cancel/close convention) becomes icon-only
-    /// [`icons::IconId::Close`]. Same 3-tier + stable-hit-rect coverage
+    /// [`icons::IconId::Close`]. Same 2-tier + stable-hit-rect coverage
     /// as the other converted sites.
     #[test]
     fn folder_browser_parent_use_and_cancel_buttons_render_a_compact_icon_per_tier() {
@@ -17733,24 +18121,6 @@ mod tests {
         }));
         assert!(rect_text(&sixel_buf, parent_rect).contains("Parent"));
         assert!(rect_text(&sixel_buf, use_rect).contains("Use this folder"));
-
-        app.rail_icons = RailIcons::Braille;
-        let mut braille_buf = TerminalBuffer::new(110, 30);
-        let braille_layout = render(&app, &mut braille_buf);
-        assert_eq!(hit_rect(&braille_layout, HitTarget::FolderBrowserParent), parent_rect);
-        assert_eq!(hit_rect(&braille_layout, HitTarget::FolderBrowserUse), use_rect);
-        assert_eq!(hit_rect(&braille_layout, HitTarget::FolderBrowserCancel), cancel_rect);
-        assert!(braille_layout.sixel_icons.is_empty());
-        assert!(contains_braille_glyph(&rect_text(&braille_buf, parent_rect)));
-        assert!(contains_braille_glyph(&rect_text(&braille_buf, use_rect)));
-        assert!(contains_braille_glyph(&rect_text(&braille_buf, cancel_rect)));
-        assert!(rect_text(&braille_buf, parent_rect).contains("Parent"));
-        // Braille's own icon footprint is 2 cells wide (vs sixel's 1), one
-        // column narrower for trailing text in this specific 17-column
-        // button -- the full "Use this folder" (15 cells) no longer fits
-        // after it, so this asserts a shorter prefix that does, rather
-        // than the exact same string the sixel/ascii tiers can afford.
-        assert!(rect_text(&braille_buf, use_rect).contains("Use this"));
 
         app.rail_icons = RailIcons::Ascii;
         let mut ascii_buf = TerminalBuffer::new(110, 30);
@@ -17965,16 +18335,20 @@ mod tests {
             .collect::<String>();
 
         assert!(top.starts_with(" +  [#] "), "{top:?}");
-        // FIX5: the tab strip no longer registers a Settings hit target
-        // (or draws a "[S]" button) at all -- the activity rail's own
-        // gear is the single mouse entry point now.
+        // `fixture()` defaults to (Sidebar, Split), which has no activity
+        // rail at all -- the tab strip's own gear (an icon, never the
+        // rejected "[S]" bracket text, see `render_tabs`'s own FIX5
+        // comment) is this chrome's only mouse entry to Settings, so it
+        // MUST be here, unlike (Sidebar, Activity) where the rail alone
+        // carries it (see `sidebar_gear_opens_only_compact_positioned_
+        // settings`).
         assert!(!top.contains("[S]"), "{top:?}");
         assert!(
-            !layout.hits.iter().any(|hit| {
+            layout.hits.iter().any(|hit| {
                 hit.target == HitTarget::ActivitySection(ControlSection::Settings)
                     && layout.tabs.contains(hit.rect.x, hit.rect.y)
             }),
-            "the tab strip must not register the Settings hit target",
+            "the tab strip must carry the Settings gear in a rail-less chrome",
         );
         assert!(!top.contains(" file "), "{top:?}");
         assert!(header_text.contains(" lib.rs "), "{header_text:?}");
@@ -18077,9 +18451,10 @@ mod tests {
             .collect::<String>();
 
         assert!(global.starts_with(" +  [#] "), "{global:?}");
-        // FIX5: no "[S]" Settings button anywhere in the tab strip any
-        // more -- see `file_surface_separates_global_controls_pane_title_
-        // actions_and_scrollbar`'s own doc comment for the full reasoning.
+        // The tab strip's Settings entry is an icon button, never the
+        // rejected "[S]" bracket text -- see `file_surface_separates_
+        // global_controls_pane_title_actions_and_scrollbar`'s own
+        // assertion on the actual hit region this chrome carries.
         assert!(!global.contains("[S]"), "{global:?}");
         assert!(!global.to_ascii_lowercase().contains("empty"), "{global:?}");
         assert!(!pane_chrome.to_ascii_lowercase().contains("empty"), "{pane_chrome:?}");

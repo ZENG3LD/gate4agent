@@ -391,19 +391,19 @@ pub fn render(app: &App, buf: &mut TerminalBuffer) -> LayoutRects {
         render_create_worktree(app, area, buf, &mut layout, theme);
     }
     if app.focus == Focus::RemoveWorktree {
-        render_remove_worktree(app, area, buf, theme);
+        render_remove_worktree(app, area, buf, &mut layout, theme);
     }
     if app.focus == Focus::RenameSession {
-        render_rename_session(app, area, buf, theme);
+        render_rename_session(app, area, buf, &mut layout, theme);
     }
     if app.focus == Focus::TaskId {
-        render_task_id(app, area, buf, theme);
+        render_task_id(app, area, buf, &mut layout, theme);
     }
     if app.focus == Focus::ForgetSession {
-        render_forget_session(app, area, buf, theme);
+        render_forget_session(app, area, buf, &mut layout, theme);
     }
     if app.focus == Focus::History {
-        render_history(app, area, buf, theme);
+        render_history(app, area, buf, &mut layout, theme);
     }
     if app.focus == Focus::Settings {
         render_settings(app, area, buf, &mut layout, theme);
@@ -1475,6 +1475,7 @@ fn render_create_workspace_entry(
         .border_style(Style::default().fg(theme.accent))
         .style(Style::default().bg(theme.modal))
         .render(modal, buf);
+    render_modal_close(modal, buf, layout, theme);
     if modal.width < 3 || modal.height < 3 {
         return;
     }
@@ -6824,6 +6825,10 @@ fn render_harness_reverse_attribution(
         .border_style(Style::default().fg(theme.accent))
         .style(Style::default().bg(theme.modal))
         .render(modal, buf);
+    // In addition to (not instead of) this modal's own pre-existing
+    // `[Close]` content-row button just below -- see `render_modal_
+    // close`'s own doc comment.
+    render_modal_close(modal, buf, layout, theme);
     if modal.width < 3 || modal.height < 3 {
         return;
     }
@@ -8875,6 +8880,7 @@ fn render_existing_session(
         rect: Rect::new(dialog.x, dialog.y, dialog.width, 1),
         target: HitTarget::ExistingSessionDrag,
     });
+    render_modal_close(dialog, buf, layout, theme);
     if dialog.width < 3 || dialog.height < 3 {
         return;
     }
@@ -9220,6 +9226,7 @@ fn render_spawn(
         rect: Rect::new(dialog.x, dialog.y, dialog.width, 1),
         target: HitTarget::SpawnDrag,
     });
+    render_modal_close(dialog, buf, layout, theme);
     if dialog.width < 3 || dialog.height < 3 {
         return;
     }
@@ -9490,7 +9497,13 @@ fn render_inline_launch_action(
     }
 }
 
-fn render_history(app: &App, area: Rect, buf: &mut TerminalBuffer, theme: Theme) {
+fn render_history(
+    app: &App,
+    area: Rect,
+    buf: &mut TerminalBuffer,
+    layout: &mut LayoutRects,
+    theme: Theme,
+) {
     let Some(history) = &app.history else {
         return;
     };
@@ -9503,6 +9516,7 @@ fn render_history(app: &App, area: Rect, buf: &mut TerminalBuffer, theme: Theme)
         .border_style(Style::default().fg(theme.accent))
         .style(Style::default().bg(theme.modal))
         .render(dialog, buf);
+    render_modal_close(dialog, buf, layout, theme);
     if dialog.width < 3 || dialog.height < 3 {
         return;
     }
@@ -9790,6 +9804,50 @@ fn push_modal_hit(layout: &mut LayoutRects, rect: Rect, target: HitTarget) {
     }
 }
 
+/// The standard `[x]` close control every bordered modal/dialog in this
+/// crate carries, drawn once here rather than reimplemented per modal --
+/// the single shared place both this decoration and its hit region
+/// (`HitTarget::ModalClose`, dispatched by `App::close_focused_modal`)
+/// exist. Sits directly on `modal`'s own top border row, right-aligned
+/// against the top-right corner (flush against it, so the border stays
+/// visually continuous up to that corner glyph). Call once per modal,
+/// right after that modal's own border is drawn -- and after any drag hit
+/// region already covering that same row is pushed, so `App::click`'s
+/// last-pushed-wins scan (`.iter().rev().find(...)`) picks the cross over
+/// the drag region for that one cell.
+///
+/// Every modal/dialog surface in the crate calls this: `render_spawn`,
+/// `render_existing_session`, `render_add_space`, `render_folder_browser`,
+/// `render_create_worktree`, `render_create_workspace_entry`, `render_
+/// remove_worktree`, `render_rename_session`, `render_task_id`, `render_
+/// forget_session`, `render_history`, `render_settings` (covers BOTH the
+/// small `MenuPlacement::Sidebar` "settings" popup and the expanded
+/// `MenuPlacement::Modal` "control" modal -- both are the exact same
+/// bordered `modal` rect this one fn draws), and `render_harness_reverse_
+/// attribution` (HarnessLinks -- in addition to, not instead of, that
+/// modal's own pre-existing `[Close]` content-row button, which is
+/// untouched).
+fn render_modal_close(modal: Rect, buf: &mut TerminalBuffer, layout: &mut LayoutRects, theme: Theme) {
+    const CLOSE: &str = "[x]";
+    let width = CLOSE.len() as u16;
+    // Leave both top corners intact: `width + 2` reserves 1 column for
+    // the left corner (never touched by this fn) and 1 for the right
+    // corner the cross sits flush against.
+    if modal.width < width.saturating_add(2) || modal.height == 0 {
+        return;
+    }
+    let rect = Rect::new(
+        modal.right().saturating_sub(1).saturating_sub(width),
+        modal.y,
+        width,
+        1,
+    );
+    Paragraph::new(CLOSE)
+        .style(Style::default().fg(theme.teal).bg(theme.modal))
+        .render(rect, buf);
+    layout.hits.push(HitRegion { rect, target: HitTarget::ModalClose });
+}
+
 fn render_add_space(
     app: &App,
     area: Rect,
@@ -9814,6 +9872,7 @@ fn render_add_space(
         rect: Rect::new(modal.x, modal.y, modal.width, 1),
         target: HitTarget::AddSpaceDrag,
     });
+    render_modal_close(modal, buf, layout, theme);
     if modal.width < 3 || modal.height < 3 {
         return;
     }
@@ -9931,6 +9990,7 @@ fn render_folder_browser(
         rect: Rect::new(modal.x, modal.y, modal.width, 1),
         target: HitTarget::FolderBrowserDrag,
     });
+    render_modal_close(modal, buf, layout, theme);
     if modal.width < 3 || modal.height < 3 {
         return;
     }
@@ -10167,6 +10227,7 @@ fn render_create_worktree(
         rect: Rect::new(modal.x, modal.y, modal.width, 1),
         target: HitTarget::CreateWorktreeDrag,
     });
+    render_modal_close(modal, buf, layout, theme);
     if modal.width < 3 || modal.height < 3 {
         return;
     }
@@ -10224,7 +10285,13 @@ fn render_create_worktree(
     );
 }
 
-fn render_remove_worktree(app: &App, area: Rect, buf: &mut TerminalBuffer, theme: Theme) {
+fn render_remove_worktree(
+    app: &App,
+    area: Rect,
+    buf: &mut TerminalBuffer,
+    layout: &mut LayoutRects,
+    theme: Theme,
+) {
     let Some(dialog) = &app.remove_worktree else {
         return;
     };
@@ -10249,9 +10316,16 @@ fn render_remove_worktree(app: &App, area: Rect, buf: &mut TerminalBuffer, theme
     )
     .style(Style::default().fg(theme.text).bg(theme.modal))
     .render(modal, buf);
+    render_modal_close(modal, buf, layout, theme);
 }
 
-fn render_rename_session(app: &App, area: Rect, buf: &mut TerminalBuffer, theme: Theme) {
+fn render_rename_session(
+    app: &App,
+    area: Rect,
+    buf: &mut TerminalBuffer,
+    layout: &mut LayoutRects,
+    theme: Theme,
+) {
     let Some(dialog) = &app.rename_session else {
         return;
     };
@@ -10289,9 +10363,16 @@ fn render_rename_session(app: &App, area: Rect, buf: &mut TerminalBuffer, theme:
     )
     .style(Style::default().fg(theme.text).bg(theme.modal))
     .render(modal, buf);
+    render_modal_close(modal, buf, layout, theme);
 }
 
-fn render_task_id(app: &App, area: Rect, buf: &mut TerminalBuffer, theme: Theme) {
+fn render_task_id(
+    app: &App,
+    area: Rect,
+    buf: &mut TerminalBuffer,
+    layout: &mut LayoutRects,
+    theme: Theme,
+) {
     let Some(dialog) = &app.task_id_dialog else {
         return;
     };
@@ -10321,9 +10402,16 @@ fn render_task_id(app: &App, area: Rect, buf: &mut TerminalBuffer, theme: Theme)
     )
     .style(Style::default().fg(theme.text).bg(theme.modal))
     .render(modal, buf);
+    render_modal_close(modal, buf, layout, theme);
 }
 
-fn render_forget_session(app: &App, area: Rect, buf: &mut TerminalBuffer, theme: Theme) {
+fn render_forget_session(
+    app: &App,
+    area: Rect,
+    buf: &mut TerminalBuffer,
+    layout: &mut LayoutRects,
+    theme: Theme,
+) {
     let Some(dialog) = &app.forget_session else {
         return;
     };
@@ -10354,6 +10442,7 @@ fn render_forget_session(app: &App, area: Rect, buf: &mut TerminalBuffer, theme:
     )
     .style(Style::default().fg(theme.text).bg(theme.modal))
     .render(modal, buf);
+    render_modal_close(modal, buf, layout, theme);
 }
 
 fn render_settings(
@@ -10391,6 +10480,7 @@ fn render_settings(
         rect: Rect::new(modal.x, modal.y, modal.width, 1),
         target: HitTarget::ControlDrag,
     });
+    render_modal_close(modal, buf, layout, theme);
     if expanded && modal.width > 0 && modal.height > 0 {
         let resize = Rect::new(modal.right() - 1, modal.bottom() - 1, 1, 1);
         let cell = buf.get_mut(resize.x, resize.y);
@@ -14923,9 +15013,17 @@ mod tests {
             HitTarget::AddSpaceField(AddSpaceField::Root),
             HitTarget::AddSpaceCancel,
             HitTarget::AddSpaceRegister,
+            HitTarget::ModalClose,
         ] {
             assert!(layout.hits.iter().any(|hit| hit.target == target));
         }
+        let close = layout
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::ModalClose)
+            .unwrap()
+            .rect;
+        assert_eq!(close, Rect::new(modal.right() - 4, modal.y, 3, 1));
     }
 
     /// Wave-1 icon labelling: AddSpaceBrowse keeps its "Browse…" text
@@ -15006,6 +15104,11 @@ mod tests {
         let mut app = fixture(PtyColorMode::Inherited);
         app.focus = Focus::Settings;
         app.control_modal_position = Some((99, 99));
+        // Activity presentation is what actually draws the rail (and its
+        // gear) -- Split presentation renders the old inspector/roster
+        // strip instead, with no rail at all. The compact popover itself
+        // (asserted below) is independent of this switch.
+        app.sidebar_presentation = SidebarPresentation::Activity;
         let mut buf = TerminalBuffer::new(100, 24);
 
         let layout = render(&app, &mut buf);
@@ -15021,6 +15124,30 @@ mod tests {
         assert!(layout.hits.iter().any(|hit| hit.target == HitTarget::SettingsPlacement));
         assert!(!layout.hits.iter().any(|hit| matches!(hit.target, HitTarget::ControlSection(_))));
         assert_eq!(buf.get(layout.control_modal.x + 2, layout.control_modal.y + 4).style.bg, Color::Black);
+        let close = layout
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::ModalClose)
+            .expect("settings popover exposes the standard close cross")
+            .rect;
+        assert_eq!(
+            close,
+            Rect::new(layout.control_modal.right() - 4, layout.control_modal.y, 3, 1),
+        );
+        assert!(buffer_text(&buf).contains("[x]"));
+
+        // The rail's own gear stays clickable while Settings is open, and
+        // now closes it (CHANGE 1's toggle) -- both mouse paths, cross and
+        // gear, reach `App::close_settings`.
+        let gear = layout
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::ActivitySection(ControlSection::Settings))
+            .expect("activity rail gear hit region")
+            .rect;
+        app.layout = layout;
+        assert_eq!(app.click(gear.x, gear.y), AppAction::None);
+        assert_ne!(app.focus, Focus::Settings);
     }
 
     #[test]
@@ -15058,6 +15185,22 @@ mod tests {
         assert!(layout.hits.iter().any(|hit| hit.target == HitTarget::ControlResize));
         assert!(layout.control_modal.width < 96);
         assert!(layout.control_modal.height < 24);
+        // Same standard close cross as the compact "settings" popover --
+        // `render_settings` draws BOTH visual variants (compact vs this
+        // expanded "control" modal) through the exact same `modal` rect,
+        // so one call covers both. Top-right corner (this cross) and
+        // bottom-right corner (`ControlResize`'s own `\u{25e2}` handle,
+        // just asserted above) are opposite corners and never collide.
+        let close = layout
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::ModalClose)
+            .expect("expanded control modal exposes the standard close cross")
+            .rect;
+        assert_eq!(
+            close,
+            Rect::new(layout.control_modal.right() - 4, layout.control_modal.y, 3, 1),
+        );
         // The Explorer panel's own control-plane strip (or, on a modal
         // this compact, its pre-strip inline fallback -- see
         // `control_strip_fits`) is Refresh's only rendered home; it used
@@ -15181,6 +15324,7 @@ mod tests {
         for target in [
             HitTarget::CreateWorkspaceEntrySubmit,
             HitTarget::CreateWorkspaceEntryCancel,
+            HitTarget::ModalClose,
         ] {
             let hit = modal_layout
                 .hits
@@ -16003,9 +16147,23 @@ mod tests {
             HitTarget::SpawnConfigureGitLocation,
             HitTarget::SpawnCancel,
             HitTarget::SpawnLaunch,
+            HitTarget::ModalClose,
         ] {
             assert!(layout.hits.iter().any(|hit| hit.target == target));
         }
+        // The standard close cross sits flush against the modal's own
+        // top-right border corner, not inside `inner` -- it must not
+        // shift or collide with any of the field rows/buttons above.
+        let close = layout
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::ModalClose)
+            .unwrap()
+            .rect;
+        assert_eq!(
+            close,
+            Rect::new(layout.spawn_modal.right() - 4, layout.spawn_modal.y, 3, 1),
+        );
         let workspace_row = layout
             .hits
             .iter()
@@ -16066,6 +16224,7 @@ mod tests {
             HitTarget::SpawnConfigureGitLocation,
             HitTarget::SpawnCancel,
             HitTarget::SpawnLaunch,
+            HitTarget::ModalClose,
         ] {
             let hit = layout.hits.iter().find(|hit| hit.target == target).unwrap();
             assert!(layout.spawn_modal.contains(hit.rect.x, hit.rect.y));
@@ -16199,8 +16358,15 @@ mod tests {
         });
         app.last_spawn_receipt = Some(spawn_receipt());
         let mut buf = TerminalBuffer::new(120, 28);
+        let mut layout = LayoutRects::default();
 
-        render_history(&app, Rect::new(0, 0, 120, 28), &mut buf, Theme::for_mode(app.color_mode));
+        render_history(
+            &app,
+            Rect::new(0, 0, 120, 28),
+            &mut buf,
+            &mut layout,
+            Theme::for_mode(app.color_mode),
+        );
 
         let text = buffer_text(&buf);
         assert!(text.contains("source provider=codex address=node-a/workspace-a #11:2"));
@@ -16212,6 +16378,156 @@ mod tests {
         assert!(text.contains("exported message_count=7/9 truncated=true"));
         assert!(text.contains("Enter load | x export | f forget exported context | Esc close"));
         assert!(!text.contains("SECRET_HISTORY_MESSAGE"));
+        // History used to take no `LayoutRects` at all (no hit regions,
+        // see this fn's own updated signature) -- now it carries the
+        // standard close cross like every other modal.
+        let close = layout
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::ModalClose)
+            .expect("history modal exposes the standard close cross")
+            .rect;
+        let dialog = centered(Rect::new(0, 0, 120, 28), 96, 22);
+        assert_eq!(close, Rect::new(dialog.right() - 4, dialog.y, 3, 1));
+    }
+
+    #[test]
+    fn existing_session_modal_gets_the_standard_close_cross() {
+        let mut app = fixture(PtyColorMode::Inherited);
+        app.focus = Focus::ExistingSession;
+        app.existing_session = Some(empty_existing_session_dialog());
+        let mut buf = TerminalBuffer::new(100, 24);
+
+        let layout = render(&app, &mut buf);
+
+        let close = layout
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::ModalClose)
+            .expect("existing-session modal exposes the standard close cross")
+            .rect;
+        assert_eq!(
+            close,
+            Rect::new(
+                layout.existing_session_modal.right() - 4,
+                layout.existing_session_modal.y,
+                3,
+                1,
+            ),
+        );
+        assert!(buffer_text(&buf).contains("[x]"));
+    }
+
+    /// Confirm dialog: the cross must CANCEL the worktree removal, never
+    /// confirm it. Also proves the destructive-action semantics at the
+    /// full render + click level (the logic-only equivalent lives in
+    /// `app::tests`).
+    #[test]
+    fn remove_worktree_modal_close_cross_cancels_not_confirms() {
+        let mut app = fixture(PtyColorMode::GateOverride);
+        app.focus = Focus::RemoveWorktree;
+        app.remove_worktree = Some(crate::app::RemoveWorktreeDialog {
+            node_id: "node-a".to_owned(),
+            source_workspace_id: "workspace-a".to_owned(),
+            target_root: host_path(r"C:\work\acme\wt"),
+            branch: Some("feature".to_owned()),
+        });
+        let mut buf = TerminalBuffer::new(100, 24);
+        let layout = render(&app, &mut buf);
+        let close = layout
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::ModalClose)
+            .expect("remove-worktree modal exposes the standard close cross")
+            .rect;
+        let modal = centered(Rect::new(0, 0, 100, 24), 68, 8);
+        assert_eq!(close, Rect::new(modal.right() - 4, modal.y, 3, 1));
+        assert!(buffer_text(&buf).contains("[x]"));
+
+        let action = click_activity_rail_button(&mut app, HitTarget::ModalClose);
+        assert_eq!(action, AppAction::None);
+        assert_eq!(app.focus, Focus::Spaces);
+        assert!(app.remove_worktree.is_none());
+    }
+
+    #[test]
+    fn rename_session_modal_gets_the_standard_close_cross() {
+        let mut app = fixture(PtyColorMode::Inherited);
+        app.focus = Focus::RenameSession;
+        app.rename_session = Some(crate::app::RenameSessionDialog {
+            node_id: "node-a".to_owned(),
+            record_id: "record-a".to_owned(),
+            original_name: "original".to_owned(),
+            display_name: "original".to_owned(),
+            local_alias: false,
+        });
+        let mut buf = TerminalBuffer::new(100, 24);
+
+        let layout = render(&app, &mut buf);
+
+        let close = layout
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::ModalClose)
+            .expect("rename-session modal exposes the standard close cross")
+            .rect;
+        let modal = centered(Rect::new(0, 0, 100, 24), 58, 7);
+        assert_eq!(close, Rect::new(modal.right() - 4, modal.y, 3, 1));
+        assert!(buffer_text(&buf).contains("[x]"));
+    }
+
+    #[test]
+    fn task_id_modal_gets_the_standard_close_cross() {
+        let mut app = fixture(PtyColorMode::Inherited);
+        app.focus = Focus::TaskId;
+        app.task_id_dialog = Some(crate::app::TaskIdDialog {
+            node_id: "node-a".to_owned(),
+            record_id: "record-a".to_owned(),
+            expected_revision: 3,
+            value: "task-".to_owned(),
+        });
+        let mut buf = TerminalBuffer::new(100, 24);
+
+        let layout = render(&app, &mut buf);
+
+        let close = layout
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::ModalClose)
+            .expect("task-id modal exposes the standard close cross")
+            .rect;
+        let modal = centered(Rect::new(0, 0, 100, 24), 62, 7);
+        assert_eq!(close, Rect::new(modal.right() - 4, modal.y, 3, 1));
+        assert!(buffer_text(&buf).contains("[x]"));
+    }
+
+    /// Confirm dialog: the cross must CANCEL forgetting the session,
+    /// never confirm it.
+    #[test]
+    fn forget_session_modal_close_cross_cancels_not_confirms() {
+        let mut app = fixture(PtyColorMode::GateOverride);
+        app.focus = Focus::ForgetSession;
+        app.forget_session = Some(crate::app::ForgetSessionDialog {
+            node_id: "node-a".to_owned(),
+            record_id: "record-a".to_owned(),
+            display_name: "dormant session".to_owned(),
+        });
+        let mut buf = TerminalBuffer::new(100, 24);
+        let layout = render(&app, &mut buf);
+        let close = layout
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::ModalClose)
+            .expect("forget-session modal exposes the standard close cross")
+            .rect;
+        let modal = centered(Rect::new(0, 0, 100, 24), 62, 8);
+        assert_eq!(close, Rect::new(modal.right() - 4, modal.y, 3, 1));
+        assert!(buffer_text(&buf).contains("[x]"));
+
+        let action = click_activity_rail_button(&mut app, HitTarget::ModalClose);
+        assert_eq!(action, AppAction::None);
+        assert_eq!(app.focus, Focus::Agents);
+        assert!(app.forget_session.is_none());
     }
 
     #[test]
@@ -17267,9 +17583,25 @@ mod tests {
             HitTarget::FolderBrowserLoadMore,
             HitTarget::FolderBrowserUse,
             HitTarget::FolderBrowserCancel,
+            HitTarget::ModalClose,
         ] {
             assert!(layout.hits.iter().any(|hit| hit.target == target));
         }
+        let close = layout
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::ModalClose)
+            .unwrap()
+            .rect;
+        assert_eq!(
+            close,
+            Rect::new(
+                layout.folder_browser_modal.right() - 4,
+                layout.folder_browser_modal.y,
+                3,
+                1,
+            ),
+        );
     }
 
     /// Wave-1 icon labelling: FolderBrowserParent keeps "Parent" next to
@@ -17405,9 +17737,25 @@ mod tests {
             HitTarget::CreateWorktreeDrag,
             HitTarget::CreateWorktreeCancel,
             HitTarget::CreateWorktreeCreate,
+            HitTarget::ModalClose,
         ] {
             assert!(layout.hits.iter().any(|hit| hit.target == target));
         }
+        let close = layout
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::ModalClose)
+            .unwrap()
+            .rect;
+        assert_eq!(
+            close,
+            Rect::new(
+                layout.create_worktree_modal.right() - 4,
+                layout.create_worktree_modal.y,
+                3,
+                1,
+            ),
+        );
     }
 
     #[test]
@@ -18826,6 +19174,25 @@ mod tests {
         assert!(layout.hits.iter().any(|hit| {
             hit.target == HitTarget::HarnessAgentTask(task_id.clone(), run_id.clone())
         }));
+        // The standard `[x]` cross is an ADDITION alongside this modal's
+        // own pre-existing `[Close]` content-row button, not a
+        // replacement -- both close it, at two distinct, non-overlapping
+        // rects.
+        let cross = layout
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::ModalClose)
+            .expect("harness links modal exposes the standard close cross")
+            .rect;
+        let legacy_close = layout
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::HarnessLinksClose)
+            .unwrap()
+            .rect;
+        assert_ne!(cross, legacy_close);
+        assert!(text.contains("[x]"), "{text}");
+        assert!(text.contains("[Close]"), "{text}");
 
         app.harness_kanban.reverse_attribution = Some(
             crate::app::HarnessReverseAttributionDetail {

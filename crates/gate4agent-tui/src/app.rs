@@ -2713,6 +2713,18 @@ pub enum HitTarget {
     ControlResize,
     SidebarWidthDrag,
     SidebarSplitDrag,
+    /// The standard `[x]` close control every bordered modal/dialog in
+    /// this crate draws at its own top-right corner, right on its own top
+    /// border row (`render::render_modal_close`, called once per modal
+    /// immediately after that modal's own border is drawn -- see that
+    /// fn's own doc comment for the full list of call sites). Its click
+    /// handler (`App::close_focused_modal`) closes whichever modal
+    /// currently holds exclusive focus by reusing that modal's own
+    /// Escape-equivalent routine verbatim, so e.g. a confirm dialog
+    /// (Remove Worktree, Forget Session) cancels rather than confirms.
+    /// Every existing per-modal Escape/Cancel path is unchanged; this is
+    /// strictly an addition.
+    ModalClose,
     Viewport,
 }
 
@@ -9627,7 +9639,7 @@ impl App {
             .map(|hit| hit.target.clone());
         if self.harness_kanban.reverse_attribution.is_some() {
             return match target {
-                Some(HitTarget::HarnessLinksClose) => {
+                Some(HitTarget::HarnessLinksClose) | Some(HitTarget::ModalClose) => {
                     self.harness_kanban.reverse_attribution = None;
                     AppAction::None
                 }
@@ -10095,7 +10107,14 @@ impl App {
                 | Focus::ForgetSession
                 | Focus::History
         ) {
-            return AppAction::None;
+            // These five are otherwise pure keyboard dialogs (no other hit
+            // regions at all) -- the only click target that ever resolves
+            // here is their own new `[x]` close cross.
+            return if matches!(target, Some(HitTarget::ModalClose)) {
+                self.close_focused_modal()
+            } else {
+                AppAction::None
+            };
         }
         if self.focus == Focus::Settings {
             match target {
@@ -10105,6 +10124,14 @@ impl App {
                 Some(HitTarget::ControlDrag) => {
                     self.begin_control_drag(column, row);
                 }
+                Some(HitTarget::ActivitySection(ControlSection::Settings)) => {
+                    // The gear stays live while Settings is open -- same
+                    // toggle dispatch as the un-focused rail (`App::
+                    // activate_activity_section`'s own `Focus::Settings`
+                    // check), so a second click on it closes the dialog.
+                    return self.activate_activity_section(ControlSection::Settings);
+                }
+                Some(HitTarget::ModalClose) => return self.close_focused_modal(),
                 Some(HitTarget::ControlSection(section)) => {
                     return self.select_control_section(section);
                 }
@@ -10626,12 +10653,54 @@ impl App {
                 | HitTarget::ContextUsageSegment(_)
                 | HitTarget::AgentBoardTaskFilter
                 | HitTarget::AgentMenuAction(_)
-                | HitTarget::NativeSessionMenuAction(_),
+                | HitTarget::NativeSessionMenuAction(_)
+                // Only ever drawn while some modal (`Focus`-driven or
+                // `harness_kanban.reverse_attribution`) is active, all of
+                // which return earlier in this fn -- never actually
+                // reachable here, but the match must stay exhaustive.
+                | HitTarget::ModalClose,
             ) => {}
             Some(HitTarget::Viewport) => self.focus = Focus::Viewport,
             None => {}
         }
         AppAction::None
+    }
+
+    /// Closes whichever modal/dialog currently holds exclusive focus, by
+    /// calling that modal's own Escape-equivalent routine verbatim --
+    /// never a re-implementation of dismissal semantics, so e.g. Remove
+    /// Worktree/Forget Session cancel rather than confirm. This is the
+    /// click handler for every modal's new `[x]` close cross (`HitTarget::
+    /// ModalClose`, drawn by `render::render_modal_close`); every call
+    /// site sits exactly where the corresponding `Escape` key already
+    /// reaches the same routine from in `App::click`'s own dispatch chain
+    /// (inside a `click_*` helper, the `Focus::Settings` block, or the
+    /// keyboard-only confirm/rename dialogs' shared block) -- never from
+    /// the top of `click` itself, so a still-open `agent_menu`/`native_
+    /// session_menu` keeps eating the first click exactly as it does for
+    /// every other target (this fn is never reached while one is open).
+    /// The reverse-attribution (HarnessLinks) modal isn't `Focus`-driven
+    /// and closes through its own arm right where `HarnessLinksClose`
+    /// already does, not through here.
+    fn close_focused_modal(&mut self) -> AppAction {
+        match self.focus {
+            Focus::Spawn => self.reduce_spawn(UiKey::Escape),
+            Focus::ExistingSession => self.reduce_existing_session(UiKey::Escape),
+            Focus::AddSpace => self.reduce_add_space(UiKey::Escape),
+            Focus::FolderBrowser => self.close_folder_browser(),
+            Focus::CreateWorkspaceEntry => self.reduce_create_workspace_entry(UiKey::Escape),
+            Focus::CreateWorktree => self.reduce_create_worktree(UiKey::Escape),
+            Focus::RemoveWorktree => self.reduce_remove_worktree(UiKey::Escape),
+            Focus::RenameSession => self.reduce_rename_session(UiKey::Escape),
+            Focus::TaskId => self.reduce_task_id(UiKey::Escape),
+            Focus::ForgetSession => self.reduce_forget_session(UiKey::Escape),
+            Focus::History => self.reduce_history(UiKey::Escape),
+            Focus::Settings => {
+                self.close_settings();
+                AppAction::None
+            }
+            Focus::Spaces | Focus::Agents | Focus::Tabs | Focus::Viewport => AppAction::None,
+        }
     }
 
     pub fn hover(&mut self, column: u16, row: u16) -> AppAction {
@@ -10724,6 +10793,7 @@ impl App {
             }
             Some(HitTarget::SpawnCancel) => return self.reduce_spawn(UiKey::Escape),
             Some(HitTarget::SpawnLaunch) => return self.confirm_spawn(),
+            Some(HitTarget::ModalClose) => return self.close_focused_modal(),
             _ => {}
         }
         AppAction::None
@@ -10784,6 +10854,7 @@ impl App {
             Some(HitTarget::ExistingSessionImport) => {
                 return self.reduce_existing_session(UiKey::Enter);
             }
+            Some(HitTarget::ModalClose) => return self.close_focused_modal(),
             _ => {}
         }
         AppAction::None
@@ -10805,6 +10876,7 @@ impl App {
             Some(HitTarget::AddSpaceBrowse) => return self.begin_folder_browser(),
             Some(HitTarget::AddSpaceCancel) => return self.reduce_add_space(UiKey::Escape),
             Some(HitTarget::AddSpaceRegister) => return self.reduce_add_space(UiKey::Enter),
+            Some(HitTarget::ModalClose) => return self.close_focused_modal(),
             _ => {}
         }
         AppAction::None
@@ -10838,6 +10910,7 @@ impl App {
             Some(HitTarget::FolderBrowserLoadMore) => return self.load_more_host_directories(),
             Some(HitTarget::FolderBrowserUse) => return self.use_browsed_directory(),
             Some(HitTarget::FolderBrowserCancel) => return self.close_folder_browser(),
+            Some(HitTarget::ModalClose) => return self.close_focused_modal(),
             _ => {}
         }
         AppAction::None
@@ -10864,6 +10937,7 @@ impl App {
             Some(HitTarget::CreateWorktreeCreate) => {
                 return self.reduce_create_worktree(UiKey::Enter);
             }
+            Some(HitTarget::ModalClose) => return self.close_focused_modal(),
             _ => {}
         }
         AppAction::None
@@ -13170,7 +13244,14 @@ impl App {
 
     fn activate_activity_section(&mut self, section: ControlSection) -> AppAction {
         if section == ControlSection::Settings {
-            self.begin_settings();
+            // The gear is a toggle: a click while Settings is already
+            // open closes it via the exact same path Escape uses
+            // (`App::close_settings`) instead of re-opening it.
+            if self.focus == Focus::Settings {
+                self.close_settings();
+            } else {
+                self.begin_settings();
+            }
             return AppAction::None;
         }
         // FIX2: "already active" must also require the Board view is NOT
@@ -18207,6 +18288,7 @@ impl App {
             Some(HitTarget::CreateWorkspaceEntrySubmit) => {
                 self.reduce_create_workspace_entry(UiKey::Enter)
             }
+            Some(HitTarget::ModalClose) => self.close_focused_modal(),
             _ => AppAction::None,
         }
     }
@@ -24769,6 +24851,120 @@ mod tests {
         assert_eq!(app.focus, Focus::Tabs);
         assert_eq!(app.reduce(UiKey::Tab), AppAction::None);
         assert_eq!(app.focus, Focus::Viewport);
+    }
+
+    /// CHANGE 1: the gear is a toggle -- a click while Settings is already
+    /// open closes it (same rect, same `HitTarget::ActivitySection(Control
+    /// Section::Settings)`, same `App::activate_activity_section` dispatch)
+    /// instead of doing nothing/re-opening it.
+    #[test]
+    fn gear_click_toggles_settings_open_and_closed() {
+        let mut app = fixture();
+        app.focus = Focus::Viewport;
+        app.layout.hits.push(HitRegion {
+            rect: Rect::new(90, 0, 10, 1),
+            target: HitTarget::ActivitySection(ControlSection::Settings),
+        });
+
+        // Closed -> click -> open.
+        assert_eq!(app.click(95, 0), AppAction::None);
+        assert_eq!(app.focus, Focus::Settings);
+
+        // Open -> click the SAME gear hit region -> closed, via the exact
+        // same path Escape uses (`App::close_settings`) -- not re-opened.
+        assert_eq!(app.click(95, 0), AppAction::None);
+        assert_eq!(app.focus, Focus::Viewport);
+
+        // Closed -> click -> open again.
+        assert_eq!(app.click(95, 0), AppAction::None);
+        assert_eq!(app.focus, Focus::Settings);
+    }
+
+    /// Distinct from the gear toggle above: exercises the Settings-focused
+    /// click block's own `HitTarget::ModalClose` arm (the new `[x]` cross),
+    /// not `ActivitySection(Settings)` (the rail's gear, which stays live
+    /// and also closes it -- see `gear_click_toggles_settings_open_and_
+    /// closed`).
+    #[test]
+    fn modal_close_cross_closes_settings_via_dedicated_hit_target() {
+        let mut app = fixture();
+        app.focus = Focus::Viewport;
+        app.begin_settings();
+        assert_eq!(app.focus, Focus::Settings);
+        app.layout.hits.push(HitRegion {
+            rect: Rect::new(50, 2, 3, 1),
+            target: HitTarget::ModalClose,
+        });
+
+        assert_eq!(app.click(51, 2), AppAction::None);
+        assert_eq!(app.focus, Focus::Viewport);
+    }
+
+    /// Confirm dialog: the close cross must CANCEL the worktree removal
+    /// (`AppAction::None`), never confirm it (`AppAction::RemoveWorktree`).
+    #[test]
+    fn modal_close_cross_cancels_remove_worktree_confirm_dialog() {
+        let mut app = fixture();
+        app.focus = Focus::RemoveWorktree;
+        app.remove_worktree = Some(RemoveWorktreeDialog {
+            node_id: "node-a".to_owned(),
+            source_workspace_id: "workspace-a".to_owned(),
+            target_root: host_path(r"C:\work\acme\wt"),
+            branch: Some("feature".to_owned()),
+        });
+        app.layout.hits.push(HitRegion {
+            rect: Rect::new(50, 2, 3, 1),
+            target: HitTarget::ModalClose,
+        });
+
+        assert_eq!(app.click(51, 2), AppAction::None);
+        assert_eq!(app.focus, Focus::Spaces);
+        assert!(app.remove_worktree.is_none());
+    }
+
+    /// Confirm dialog: the close cross must CANCEL forgetting the session,
+    /// never confirm it (`AppAction::ForgetSessionRecord`).
+    #[test]
+    fn modal_close_cross_cancels_forget_session_confirm_dialog() {
+        let mut app = fixture();
+        app.focus = Focus::ForgetSession;
+        app.forget_session = Some(ForgetSessionDialog {
+            node_id: "node-a".to_owned(),
+            record_id: "record-a".to_owned(),
+            display_name: "dormant session".to_owned(),
+        });
+        app.layout.hits.push(HitRegion {
+            rect: Rect::new(50, 2, 3, 1),
+            target: HitTarget::ModalClose,
+        });
+
+        assert_eq!(app.click(51, 2), AppAction::None);
+        assert_eq!(app.focus, Focus::Agents);
+        assert!(app.forget_session.is_none());
+    }
+
+    /// HarnessLinks isn't `Focus`-driven (`harness_kanban.reverse_
+    /// attribution`) -- the cross closes it through its own arm, merged
+    /// with the pre-existing `HarnessLinksClose` target's arm.
+    #[test]
+    fn modal_close_cross_closes_harness_links_reverse_attribution() {
+        let mut app = fixture();
+        let workspace = HarnessReverseAttributionWorkspaceV1 {
+            node_id: HarnessSelectorV1::new("node-a").unwrap(),
+            node_incarnation_id: HarnessNodeIncarnationV1::new("ab".repeat(16)).unwrap(),
+            workspace_id: HarnessSelectorV1::new("workspace-a").unwrap(),
+        };
+        app.harness_kanban.reverse_attribution = Some(HarnessReverseAttributionDetail {
+            subject: HarnessReverseAttributionSubjectV1::Workspace { workspace },
+            state: HarnessReverseAttributionState::Loading { token: 1 },
+        });
+        app.layout.hits.push(HitRegion {
+            rect: Rect::new(50, 2, 3, 1),
+            target: HitTarget::ModalClose,
+        });
+
+        assert_eq!(app.click(51, 2), AppAction::None);
+        assert!(app.harness_kanban.reverse_attribution.is_none());
     }
 
     #[test]

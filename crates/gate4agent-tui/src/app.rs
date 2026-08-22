@@ -2664,6 +2664,22 @@ pub enum HitTarget {
     },
     SurfacePaneHeader(PaneId),
     SurfacePaneBody(PaneId),
+    /// FIX2 (owner report: viewport panes had no mouse close control): the
+    /// per-pane `[x]` overlay drawn at the top-right corner of a viewport
+    /// pane's own header/tab-strip row -- see `render::render_surface_
+    /// pane_close`'s own doc comment for its exact placement/narrow-pane
+    /// rule. Sibling of [`HitTarget::ModalClose`]'s own convention (same
+    /// `[x]` glyph, same `theme.teal` foreground) but a DIFFERENT hit
+    /// target because it must carry which pane it belongs to: a split
+    /// shows one cross per pane, and clicking one must close only THAT
+    /// pane's own active tab, never whichever pane happens to hold global
+    /// UI focus at the time. `App::click`'s own handler focuses this
+    /// specific pane first (`App::focus_surface_pane`) and then calls
+    /// `App::close_selected_tab` verbatim -- the exact same routine
+    /// `Ctrl+W` already uses, never a reimplementation, so this gets
+    /// whatever focus/rebalance behaviour that routine already has for
+    /// free.
+    SurfacePaneClose(PaneId),
     FileHistory(PaneId),
     FileSource(PaneId),
     FileHistoryCommit(PaneId, usize),
@@ -10361,6 +10377,10 @@ impl App {
             }
             Some(HitTarget::SurfacePaneBody(pane_id)) => {
                 self.begin_surface_body_interaction(pane_id, column, row);
+            }
+            Some(HitTarget::SurfacePaneClose(pane_id)) => {
+                self.focus_surface_pane(pane_id);
+                self.close_selected_tab();
             }
             Some(HitTarget::FileHistory(pane_id)) => {
                 self.focus_surface_pane(pane_id);
@@ -25332,6 +25352,81 @@ mod tests {
         assert_eq!(app.drop_at(20, 8), AppAction::None);
         assert_eq!(app.surface.leaf_ids(), vec![PaneId(0)]);
         assert_eq!(app.surface.all_tabs().iter().filter(|candidate| ***candidate == tab).count(), 1);
+    }
+
+    /// FIX2 (owner report: viewport panes had no mouse close control):
+    /// clicking a pane's own `[x]` cross closes its active tab through
+    /// `App::close_selected_tab` -- the exact same routine `Ctrl+W`
+    /// reaches (`UiKey::Ctrl('w')`'s own arm) -- proved here by asserting
+    /// the SAME observable effects that routine produces (the tab is
+    /// actually gone from the surface, and the SAME notice string
+    /// `close_selected_tab`'s own `SurfaceTab::Pty` arm sets), not a
+    /// separate reimplementation.
+    #[test]
+    fn surface_pane_close_cross_closes_the_active_tab_via_the_ctrl_w_routine() {
+        let mut app = fixture();
+        let address = add_session(&mut app, 8, provider("claude"));
+        app.surface.open_in_focused(SurfaceTab::Pty(address.clone()));
+        let pane_id = app.surface.leaf_ids()[0];
+        app.layout.hits.push(HitRegion {
+            rect: Rect::new(37, 2, 3, 1),
+            target: HitTarget::SurfacePaneClose(pane_id),
+        });
+
+        assert_eq!(app.click(38, 2), AppAction::None);
+
+        assert!(
+            app.surface.tab_location(&SurfaceTab::Pty(address)).is_none(),
+            "the pane's own active tab must be closed"
+        );
+        assert_eq!(app.notice.as_deref(), Some("tab detached; headless session continues"));
+    }
+
+    /// FIX2's own per-pane requirement: a two-pane split must show (and
+    /// honour) an independent cross per pane -- clicking the cross drawn
+    /// in a pane that is NOT the globally focused one must still close
+    /// THAT pane's own active tab, and must leave the other pane's tab
+    /// completely untouched, proving the click target carries its own
+    /// `PaneId` rather than always acting on `App::surface.focused`.
+    /// Also asserts the routine's own rebalance behaviour (closing a
+    /// split pane's only tab collapses the tree back to one leaf) rode
+    /// along for free, exactly as it would from `Ctrl+W`.
+    #[test]
+    fn surface_pane_close_cross_in_an_unfocused_pane_closes_only_that_panes_tab() {
+        let mut app = fixture();
+        let claude = add_session(&mut app, 8, provider("claude"));
+        let codex = add_session(&mut app, 9, provider("codex"));
+        app.surface.open_in_focused(SurfaceTab::Pty(claude.clone()));
+        let second_pane = app
+            .surface
+            .drop_tab(SurfaceTab::Pty(codex.clone()), PaneId(0), SurfaceDropZone::Right)
+            .unwrap();
+        assert_eq!(app.surface.leaf_ids().len(), 2);
+        // The split-drop above focused the NEW pane -- point global focus
+        // back at PaneId(0) (`claude`'s own pane) so this test genuinely
+        // proves the cross closes the CLICKED pane, never whichever one
+        // happens to hold global surface focus.
+        assert!(app.surface.set_focused(PaneId(0)).is_ok());
+
+        app.layout.hits.push(HitRegion {
+            rect: Rect::new(77, 2, 3, 1),
+            target: HitTarget::SurfacePaneClose(second_pane),
+        });
+        assert_eq!(app.click(78, 2), AppAction::None);
+
+        assert!(
+            app.surface.tab_location(&SurfaceTab::Pty(codex)).is_none(),
+            "the CLICKED pane's own tab must be closed"
+        );
+        assert!(
+            app.surface.tab_location(&SurfaceTab::Pty(claude)).is_some(),
+            "the OTHER pane's own tab must survive untouched"
+        );
+        assert_eq!(
+            app.surface.leaf_ids().len(),
+            1,
+            "closing a split pane's only tab must rebalance the tree exactly as Ctrl+W already does"
+        );
     }
 
     #[test]

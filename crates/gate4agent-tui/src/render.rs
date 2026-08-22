@@ -3083,7 +3083,15 @@ fn render_surface_pane(
         return;
     };
     let focused = app.surface.focused == pane_id;
-    render_surface_pane_tabs(app, pane_id, pane, focused, header, buf, layout, theme);
+    let tabs_right = render_surface_pane_tabs(app, pane_id, pane, focused, header, buf, layout, theme);
+    // FIX2 (owner report: viewport panes had no mouse close control): only
+    // drawn when there is an active tab to actually close -- an empty
+    // pane (the fresh-workspace default, the only way a pane can have
+    // zero tabs -- see `SurfaceState::remove_pane_if_empty`'s own doc
+    // comment) has nothing for it to do.
+    if pane.active_tab().is_some() {
+        render_surface_pane_close(pane_id, header, tabs_right, buf, layout, theme);
+    }
     render_surface_toolbar(
         app,
         pane_id,
@@ -7245,6 +7253,15 @@ fn agent_board_progress_summary(progress: &gate4agent_node_protocol::AgentProgre
     )
 }
 
+/// Renders this pane's own tab strip into `area` (its header row) and
+/// returns the column immediately after the last tab label actually
+/// drawn (`area.x` when nothing was drawn at all) -- FIX2's own close-
+/// cross overlay (`render_surface_pane_close`, called right after this
+/// in `render_surface_pane`) needs this exact, already-truncated value to
+/// know how much of the row is genuinely free background rather than a
+/// rendered label; a value recomputed from label widths alone would drift
+/// from what this loop's own truncation/scroll-to-selected logic (`start`
+/// below) actually painted.
 fn render_surface_pane_tabs(
     app: &App,
     pane_id: PaneId,
@@ -7254,10 +7271,10 @@ fn render_surface_pane_tabs(
     buf: &mut TerminalBuffer,
     layout: &mut LayoutRects,
     theme: Theme,
-) {
+) -> u16 {
     fill_rect(area, theme.active, buf);
     if area.width == 0 || pane.tabs.is_empty() {
-        return;
+        return area.x;
     }
     let labels = pane
         .tabs
@@ -7297,6 +7314,54 @@ fn render_surface_pane_tabs(
         });
         x = x.saturating_add(width);
     }
+    x
+}
+
+/// FIX2 (owner report: viewport panes had no mouse close control): the
+/// per-pane `[x]` overlay closing THAT pane's own active tab -- drawn at
+/// `header`'s own top-right corner, following [`render_modal_close`]'s
+/// own `[x]`/`theme.teal` visual convention, backgrounded with `theme.
+/// active` (the header/tab-strip row's own fill colour from `render_
+/// surface_pane_tabs`'s `fill_rect` call, regardless of `focused` -- see
+/// that fn's own doc comment) rather than `theme.modal`: a pane header is
+/// a plain tab strip, not a bordered dialog box, so there is no border
+/// corner glyph here to leave a margin column for either.
+///
+/// `tabs_right` is exactly what `render_surface_pane_tabs` just returned
+/// for THIS same header this THIS same frame -- the real column its tab
+/// labels actually stopped at, already accounting for truncation and the
+/// scroll-to-keep-the-active-tab-visible logic, not a guess. The
+/// candidate cross rect is flush against `header`'s own right edge; if it
+/// would start at or before `tabs_right` (the tab strip already reaches,
+/// or comes within the cross's own 3-cell width of, the corner), this
+/// draws nothing at all rather than truncating or sitting on top of a
+/// real label -- the narrow-pane rule this fix's own brief asked for.
+/// Every pane is rendered independently (`render_surface_node`'s own
+/// per-leaf recursion into `render_surface_pane`), so a split showing two
+/// (or more) panes gets one independently-computed cross per pane for
+/// free, each with its own [`HitTarget::SurfacePaneClose`] carrying that
+/// exact pane's own [`PaneId`].
+fn render_surface_pane_close(
+    pane_id: PaneId,
+    header: Rect,
+    tabs_right: u16,
+    buf: &mut TerminalBuffer,
+    layout: &mut LayoutRects,
+    theme: Theme,
+) {
+    const CLOSE: &str = "[x]";
+    let width = CLOSE.len() as u16;
+    if header.width < width || header.height == 0 {
+        return;
+    }
+    let rect = Rect::new(header.right().saturating_sub(width), header.y, width, 1);
+    if rect.x < tabs_right {
+        return;
+    }
+    Paragraph::new(CLOSE)
+        .style(Style::default().fg(theme.teal).bg(theme.active))
+        .render(rect, buf);
+    layout.hits.push(HitRegion { rect, target: HitTarget::SurfacePaneClose(pane_id) });
 }
 
 fn surface_pane_tab_title(app: &App, tab: &SurfaceTab) -> String {
@@ -18104,6 +18169,95 @@ mod tests {
         for row in left.frame.y..left.frame.bottom() {
             assert!(buffer.get(divider_x, row).symbol.is_ascii());
         }
+    }
+
+    /// FIX2 (owner report: viewport panes had no mouse close control): a
+    /// two-pane split renders one independent `[x]` cross per pane, each
+    /// carrying its own `PaneId` (`HitTarget::SurfacePaneClose`), UNLESS
+    /// that pane is too narrow for both its own tab label and the cross
+    /// -- in which case it drops the cross rather than crowd or truncate
+    /// the label. The left pane's own single tab label is sized (via a
+    /// deliberately lopsided split ratio) to fill its 22-cell header
+    /// EXACTLY wall to wall, leaving zero free cells; the right pane's
+    /// short label leaves plenty of room.
+    #[test]
+    fn surface_pane_close_cross_renders_per_pane_and_drops_when_the_pane_is_too_narrow() {
+        let mut app = App::default();
+        app.menu_placement = MenuPlacement::Modal;
+        let narrow_name = "x".repeat(20);
+        let narrow_key = crate::app::WorkspaceFileTabKey {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            path: repository_path(narrow_name.clone()),
+        };
+        app.file_tabs.insert(
+            narrow_key.clone(),
+            WorkspaceFileTabView {
+                editor: crate::text_editor::TextEditor::from_text("fn narrow() {}".to_owned()).unwrap(),
+                state: WorkspaceFileState::Ready,
+                edit_mode: false,
+                request_token: 1,
+                inline_history: None,
+            },
+        );
+        let wide_key = crate::app::WorkspaceFileTabKey {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            path: repository_path("wide.rs"),
+        };
+        app.file_tabs.insert(
+            wide_key.clone(),
+            WorkspaceFileTabView {
+                editor: crate::text_editor::TextEditor::from_text("fn wide() {}".to_owned()).unwrap(),
+                state: WorkspaceFileState::Ready,
+                edit_mode: false,
+                request_token: 1,
+                inline_history: None,
+            },
+        );
+        app.surface.open_in_focused(SurfaceTab::File(narrow_key));
+        let right_pane = app
+            .surface
+            .drop_tab(SurfaceTab::File(wide_key), PaneId(0), SurfaceDropZone::Right)
+            .unwrap();
+        // 40% of the 55 usable columns (56-wide terminal, 1 column spent
+        // on the divider) lands the left pane at exactly 22 cells wide --
+        // the tab label's own rendered width (`" " + 20 x's + " "`) below.
+        assert!(app.surface.set_split_ratio(&PaneSplitPath(Vec::new()), 4000));
+        let mut buffer = TerminalBuffer::new(56, 14);
+
+        let layout = render(&app, &mut buffer);
+        assert_eq!(layout.surface_panes.len(), 2);
+        let left = layout.surface_panes.iter().min_by_key(|pane| pane.frame.x).unwrap();
+        let right = layout.surface_panes.iter().max_by_key(|pane| pane.frame.x).unwrap();
+        assert_eq!(left.pane_id, PaneId(0));
+        assert_eq!(right.pane_id, right_pane);
+        assert_eq!(left.header.width, 22, "test fixture assumption: the ratio must land the narrow pane at exactly 22 cells");
+
+        let header_text = |pane: &SurfacePaneLayout| {
+            (pane.header.x..pane.header.right())
+                .map(|column| buffer.get(column, pane.header.y).symbol.as_str())
+                .collect::<String>()
+        };
+        let left_header = header_text(left);
+        let right_header = header_text(right);
+
+        assert!(
+            left_header.contains(&format!(" {narrow_name} ")),
+            "the narrow pane's own label must survive untruncated, not crowded to make room for a cross: {left_header:?}"
+        );
+        assert!(!left_header.contains("[x]"), "a too-narrow pane must render no close cross: {left_header:?}");
+        assert!(
+            !layout.hits.iter().any(|hit| hit.target == HitTarget::SurfacePaneClose(PaneId(0))),
+            "a too-narrow pane must register no close-cross hit region"
+        );
+
+        assert!(right_header.contains("wide.rs"), "{right_header:?}");
+        assert!(right_header.contains("[x]"), "a wide-enough pane must render its own close cross: {right_header:?}");
+        assert!(
+            layout.hits.iter().any(|hit| hit.target == HitTarget::SurfacePaneClose(right_pane)),
+            "a wide-enough pane must register its own close-cross hit region"
+        );
     }
 
     #[test]

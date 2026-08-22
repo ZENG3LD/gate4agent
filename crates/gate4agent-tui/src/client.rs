@@ -1,4 +1,6 @@
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{Hash, Hasher};
 use std::io::{self, stdout};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1666,35 +1668,68 @@ fn action_node_id(action: &AppAction) -> Option<&str> {
     }
 }
 
+/// One remembered emission: the placement actually painted (or
+/// re-confirmed unchanged) last call, plus a fingerprint of the CELLS it
+/// covers at that exact moment -- see [`SixelEmitState::last`] and
+/// `flush_sixel_icon_into`'s own doc comment for what this fingerprint
+/// gates and why identity alone (icon/rect/variant/size) is no longer
+/// enough on its own (FIX1: self-healing image regions).
+#[derive(Clone, Debug, PartialEq)]
+struct SixelPlacementRecord {
+    placement: SixelIconPlacement,
+    /// [`cell_rect_fingerprint`] of `screen_buffer` at `placement.rect`,
+    /// captured the moment this placement's sixel bytes were last
+    /// actually written or re-confirmed unchanged -- NOT a hash of the
+    /// raster itself, a hash of the plain CELLS underneath it. A sixel
+    /// image is painted entirely outside `uzor_tui`'s own cell buffer
+    /// (see `LayoutRects::sixel_icons`'s own doc comment), so as long as
+    /// nothing else repaints those cells this stays exactly the blank/
+    /// background content `render_rail_button` and friends leave there
+    /// for a live sixel placement; the instant something else legitimately
+    /// repaints them -- a modal opening or closing over the rect, an
+    /// unrelated pane redraw, sidebar content changing underneath a still
+    /// -active placement -- this fingerprint stops matching THIS frame's
+    /// `screen_buffer` at the same rect, which is exactly how `flush_
+    /// sixel_icon_into` tells "the raster is still intact" apart from
+    /// "the raster has been disturbed and needs repainting" without
+    /// re-emitting on every single frame regardless.
+    fingerprint: u64,
+}
+
 /// What `flush_sixel_icon` wrote to the terminal on its last actual
 /// emission, plus a one-shot override -- see `flush_sixel_icon`'s own
 /// doc comment for exactly what this gates.
 #[derive(Default)]
 struct SixelEmitState {
-    /// Every placement actually emitted (after the bottom-row filter --
-    /// see `flush_sixel_icon_into`'s own doc comment) on the last
-    /// non-skipped call. Deliberately the FULL placement -- icon,
-    /// absolute rect, variant, size -- not just a hash: `flush_sixel_
-    /// icon_into` needs each OLD rect back, on the very next call, to
-    /// know exactly which cells to explicitly repaint once they stop
-    /// being an image region. A raster image lives outside the cell
+    /// Every placement actually confirmed live (painted or re-confirmed
+    /// unchanged) on the last non-skipped call, each paired with the
+    /// fingerprint of the cells under it at that moment -- see
+    /// [`SixelPlacementRecord`]'s own doc comment. `flush_sixel_icon_
+    /// into` needs each OLD entry back, on the very next call, for two
+    /// independent reasons: (1) a placement that stops appearing in
+    /// `app.layout.sixel_icons` entirely (moved or vacated) needs its OLD
+    /// rect explicitly repainted -- a raster image lives outside the cell
     /// buffer entirely (see `LayoutRects::sixel_icons`'s own doc
     /// comment), so nothing else in this program ever notices, let alone
     /// erases, one that is still sitting on the real terminal after its
-    /// placement moves or disappears -- that is the ghosting/doubling
-    /// this state exists to close, not a hypothetical.
-    last: Vec<SixelIconPlacement>,
+    /// placement moves or disappears; (2) a placement that keeps
+    /// appearing at the exact same icon/rect/variant/size needs its OLD
+    /// fingerprint to detect that the cells under it were disturbed even
+    /// though nothing about the placement's OWN identity ever changed --
+    /// the ghosting/doubling/vanishing this state exists to close, not a
+    /// hypothetical.
+    last: Vec<SixelPlacementRecord>,
     /// Set by the run loop's own `TerminalEvent::Resize` handling
     /// whenever `Screen::resize` is about to actually redraw (its own
     /// debounced size-changed condition, mirrored there) -- consumed
     /// (reset to `false`) by the very next `flush_sixel_icon` call.
-    /// Widens the clear pass below from "only rects no longer claimed by
-    /// this frame's placements" to "every rect this state remembers,
-    /// unconditionally," and widens re-emission the same way: a real
-    /// terminal resize can discard or reposition already-drawn sixel
-    /// pixels even for a placement whose own rect comes out
-    /// pixel-identical to last frame's, which a placement-vs-placement
-    /// comparison alone can never detect.
+    /// Widens re-painting from "only a placement whose own fingerprint
+    /// disagrees with what's on screen now" to "every currently live
+    /// placement, unconditionally": a real terminal resize can discard or
+    /// reposition already-drawn sixel pixels even for a placement whose
+    /// own rect AND underlying cell content both come out identical to
+    /// last frame's, which neither a placement-vs-placement nor a
+    /// fingerprint comparison alone can ever detect.
     force_next: bool,
     /// Latches to `true` while at least one placement this frame is being
     /// dropped under the bottom-row rule, back to `false` once none are --
@@ -1702,6 +1737,25 @@ struct SixelEmitState {
     /// on the false -> true transition, never once per frame for as long
     /// as the terminal stays that exact height.
     bottom_row_skip_active: bool,
+}
+
+/// How one of this frame's placements compares to what `state` last
+/// painted there -- see `flush_sixel_icon_into`'s own doc comment for the
+/// full self-healing rationale behind each outcome.
+enum PlacementDisposition {
+    /// No matching identity (icon/rect/variant/size) in `state.last` at
+    /// all: paint it directly, no separate clear first -- there is
+    /// nothing stale to clear under a rect that was never previously an
+    /// image region.
+    New,
+    /// Matched an old entry, but its cells no longer fingerprint the same
+    /// as when it was last painted there (or `SixelEmitState::force_next`
+    /// widened this unconditionally): clear its rect first, then repaint,
+    /// exactly like a brand new placement.
+    Disturbed,
+    /// Matched an old entry and its cells still fingerprint exactly the
+    /// same: nothing to do.
+    Survivor,
 }
 
 /// Writes every activity-rail button's own baked sixel icon
@@ -1731,11 +1785,18 @@ struct SixelEmitState {
 /// encoded bytes to the terminal every single frame still costs a
 /// syscall plus the terminal's own decode/rasterize work on the far end,
 /// for a rail that visually changes on a small minority of frames. `state`
-/// tracks the placements actually written last time (icon identity,
-/// absolute rect, and selection -- see `SixelIconPlacement`'s own doc
-/// comment for why `selected` has to be part of this) and this function
-/// is a no-op whenever `app.layout.sixel_icons` is unchanged from that
-/// AND no resize forced a redraw since.
+/// tracks the placements actually confirmed live last time (icon
+/// identity, absolute rect, and selection -- see `SixelIconPlacement`'s
+/// own doc comment for why `selected` has to be part of this) PLUS a
+/// fingerprint of the cells each one covers (see `SixelPlacementRecord`'s
+/// own doc comment), and this function writes nothing at all whenever
+/// every current placement still matches both its own identity AND its
+/// own fingerprint from last time, no resize forced a redraw since, and
+/// nothing vacated a rect -- self-healing rather than pure signature-
+/// gating (FIX1): a placement whose cells get disturbed out from under it
+/// (a modal opening or closing over it, a pane redraw, sidebar content
+/// changing) is detected and repainted even though its OWN identity never
+/// changed.
 fn flush_sixel_icon(app: &App, screen_buffer: &TerminalBuffer, state: &mut SixelEmitState) -> io::Result<()> {
     flush_sixel_icon_into(&mut stdout(), app, screen_buffer, state)
 }
@@ -1753,18 +1814,37 @@ fn flush_sixel_icon(app: &App, screen_buffer: &TerminalBuffer, state: &mut Sixel
 /// to ghost: the vacated cells are "blank" on both sides of the diff
 /// (unchanged), so `screen.flush()` writes nothing there, and the stale
 /// raster from last frame keeps showing right next to the freshly
-/// emitted one at the new position. This function closes that gap: before
-/// emitting this frame's placements, every rect `state` remembers from
-/// last time that is NOT reused at the exact same coordinates this frame
-/// (or, under `state.force_next`, every remembered rect unconditionally --
-/// see that field's own doc comment) gets explicitly repainted first, via
-/// [`clear_rect`] from `screen_buffer` (`screen.current()`, the already-
-/// correct content `render::render` computed for this exact frame -- not
-/// a generic blank guess that could stomp real widget content that
-/// legitimately grew into that space, e.g. the viewport expanding into a
-/// just-collapsed sidebar's own icon column). An image region must be
-/// explicitly cleared before it stops being one; only once that clear is
-/// written does this emit the new placements.
+/// emitted one at the new position. This function closes that gap: every
+/// rect `state` remembers from last time that is NOT reused at the exact
+/// same coordinates by any of this frame's placements gets explicitly
+/// repainted first, via [`clear_rect`] from `screen_buffer` (`screen.
+/// current()`, the already-correct content `render::render` computed for
+/// this exact frame -- not a generic blank guess that could stomp real
+/// widget content that legitimately grew into that space, e.g. the
+/// viewport expanding into a just-collapsed sidebar's own icon column).
+/// An image region must be explicitly cleared before it stops being one.
+///
+/// FIX1 (self-healing, not just signature-gated): a placement that keeps
+/// the exact same icon/rect/variant/size frame over frame used to be
+/// treated as "still fine" purely because its OWN identity had not
+/// changed -- but the cells it covers can be disturbed by something that
+/// has nothing to do with that identity at all (a modal opening or
+/// closing over it, an unrelated pane redraw, sidebar content changing
+/// underneath a still-active rail icon), and a rect-only vacate check
+/// like the one above has nothing to key off of when the disturbance
+/// ISN'T a move -- content changing under a placement that never moved
+/// has no rect mismatch to notice in the first place. So every SURVIVING
+/// placement (same icon/rect/variant/size as last time) is additionally
+/// re-verified with [`cell_rect_fingerprint`] against `screen_buffer` at
+/// its own rect (see [`PlacementDisposition`]): a match means the cells
+/// are exactly what they were the moment this placement was last painted
+/// there, so nothing is written for it; a mismatch means something
+/// repainted them since, so its rect is explicitly cleared and the sixel
+/// is re-emitted, exactly like a brand-new placement. A placement that is
+/// brand new this frame (no matching identity in `state.last` at all) is
+/// emitted directly with no separate clear -- same as before this fix,
+/// since there is nothing stale under a rect that was never previously an
+/// image region.
 ///
 /// Also enforces the bottom-row rule: a placement whose bottom row is the
 /// terminal's own last row (or beyond it) is never emitted at all, and is
@@ -1808,21 +1888,39 @@ fn flush_sixel_icon_into<W: io::Write>(
     }
     state.bottom_row_skip_active = skipped_bottom_row;
 
-    if !force_all && emitted == state.last {
+    let disposition: Vec<PlacementDisposition> = emitted
+        .iter()
+        .map(|placement| match state.last.iter().find(|old| old.placement == *placement) {
+            None => PlacementDisposition::New,
+            Some(old) if !force_all && old.fingerprint == cell_rect_fingerprint(screen_buffer, placement.rect) => {
+                PlacementDisposition::Survivor
+            }
+            Some(_) => PlacementDisposition::Disturbed,
+        })
+        .collect();
+
+    let vacated_rects: Vec<Rect> = state
+        .last
+        .iter()
+        .filter(|old| !emitted.iter().any(|new| new.rect == old.placement.rect))
+        .map(|old| old.placement.rect)
+        .collect();
+
+    let all_survivors = disposition.iter().all(|d| matches!(d, PlacementDisposition::Survivor));
+    if vacated_rects.is_empty() && all_survivors {
         return Ok(());
     }
 
-    for stale in state
-        .last
-        .iter()
-        .filter(|old| force_all || !emitted.iter().any(|new| new.rect == old.rect))
-    {
-        clear_rect(writer, stale.rect, screen_buffer)?;
+    for rect in vacated_rects {
+        clear_rect(writer, rect, screen_buffer)?;
     }
 
-    state.last = emitted.clone();
-
-    for placement in &emitted {
+    for (placement, disposition) in emitted.iter().zip(&disposition) {
+        match disposition {
+            PlacementDisposition::Survivor => continue,
+            PlacementDisposition::Disturbed => clear_rect(writer, placement.rect, screen_buffer)?,
+            PlacementDisposition::New => {}
+        }
         let encoded = match placement.size {
             SixelIconSize::Rail => icons::sixel(placement.icon, placement.variant),
             SixelIconSize::Compact => icons::sixel_compact(placement.icon),
@@ -1837,6 +1935,14 @@ fn flush_sixel_icon_into<W: io::Write>(
             RestorePosition,
         )?;
     }
+
+    state.last = emitted
+        .iter()
+        .map(|placement| SixelPlacementRecord {
+            placement: *placement,
+            fingerprint: cell_rect_fingerprint(screen_buffer, placement.rect),
+        })
+        .collect();
     Ok(())
 }
 
@@ -1866,6 +1972,35 @@ fn clear_rect<W: io::Write>(writer: &mut W, rect: Rect, screen_buffer: &Terminal
     backend.flush()?;
     execute!(writer, RestorePosition)?;
     Ok(())
+}
+
+/// A cheap, order-sensitive hash of every cell's symbol + style within
+/// `rect` (clamped to `screen_buffer`'s own current bounds, same as
+/// [`clear_rect`]), read straight from `screen_buffer` -- the basis for
+/// [`flush_sixel_icon_into`]'s own self-healing gate (see that fn's own
+/// doc comment and [`SixelPlacementRecord::fingerprint`]'s own doc
+/// comment). A sixel raster lives entirely outside the cell buffer/diff,
+/// so this is the only way this program can tell "did something else
+/// just repaint the cells this image is sitting on" from one flush to the
+/// next. Cheap by construction: a placement's own rect is at most the
+/// gallery tier's 6x3 = 18 cells (see `icons::GALLERY_SIXEL_ICON_CELLS_
+/// WIDE`/`_TALL`), so this is a handful of hashed short strings + small
+/// `Copy` structs per placement per flush, not a scan of the whole
+/// terminal. A rect entirely outside `screen_buffer` (e.g. a remembered
+/// placement that outlived a shrink) clips to empty and hashes as "no
+/// cells written" -- a fixed, stable value like any other empty input,
+/// never a panic.
+fn cell_rect_fingerprint(screen_buffer: &TerminalBuffer, rect: Rect) -> u64 {
+    let clip = rect.intersect(screen_buffer.area());
+    let mut hasher = DefaultHasher::new();
+    for row in clip.y..clip.bottom() {
+        for col in clip.x..clip.right() {
+            let cell = screen_buffer.get(col, row);
+            cell.symbol.as_str().hash(&mut hasher);
+            cell.style.hash(&mut hasher);
+        }
+    }
+    hasher.finish()
 }
 
 fn sync_cursor(app: &App) -> io::Result<()> {
@@ -5656,6 +5791,138 @@ mod tests {
         assert!(written.is_empty(), "an unchanged placement set after the move must be a total no-op");
     }
 
+    /// FIX1 regression guard: failure mode (a) from the owner's own
+    /// report -- something legitimately repaints the cells under a still-
+    /// active icon (a pane redraw, sidebar content changing) while
+    /// `app.layout.sixel_icons` itself carries the EXACT same icon/rect/
+    /// variant/size as before, so the old pure-signature gate saw nothing
+    /// to react to and the icon stayed erased forever. The fingerprint
+    /// gate must react exactly once (clear the disturbed rect, re-emit
+    /// the icon), then settle back to a no-op once the disturbed content
+    /// itself stops changing -- proving this isn't a reintroduction of
+    /// per-frame emission, just a one-shot self-heal.
+    #[test]
+    fn flush_sixel_icon_repainted_cells_under_an_unchanged_placement_trigger_exactly_one_clear_and_reemit() {
+        let mut app = App::default();
+        app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 2, icons::SixelVariant::Transparent)];
+        let mut state = SixelEmitState::default();
+        let mut written = Vec::new();
+        let mut screen = blank_screen(&app);
+        flush_sixel_icon_into(&mut written, &app, &screen, &mut state).unwrap();
+        assert!(!written.is_empty(), "the first emission must write real bytes");
+
+        // Something else repaints a cell under the icon's own rect (2,1,4,2)
+        // -- `app.layout.sixel_icons` is left byte-for-byte unchanged.
+        screen.set(3, 1, uzor_tui::Cell::new("Z"));
+        written.clear();
+        flush_sixel_icon_into(&mut written, &app, &screen, &mut state).unwrap();
+        let output = String::from_utf8_lossy(&written);
+        assert!(output.contains('Z'), "the disturbed rect must be re-synced from the real screen content: {output}");
+        assert_eq!(
+            output.matches(icons::sixel(icons::IconId::Files, icons::SixelVariant::Transparent)).count(),
+            1,
+            "a disturbed-but-still-listed placement must be re-emitted exactly once, not zero and not twice: {output}"
+        );
+
+        // Settles: the SAME disturbed screen, unchanged again, is a total
+        // no-op on the next call -- the fingerprint just captured now
+        // matches, so this did not reintroduce per-frame emission.
+        written.clear();
+        flush_sixel_icon_into(&mut written, &app, &screen, &mut state).unwrap();
+        assert!(written.is_empty(), "once the fingerprint resyncs, a stable-but-disturbed screen must write nothing further");
+    }
+
+    /// FIX1 regression guard: failure mode (b) from the owner's own
+    /// report -- a placement moves to a new rect while the vacated old
+    /// rect is repainted with content that is INDISTINGUISHABLE from any
+    /// other untouched background cell (plain unstyled blanks), not a
+    /// special marker. The vacate step keys off RECT reuse, never
+    /// fingerprint/content, so it must still recognize the old rect as
+    /// vacated and clear it, and the icon must land at its new rect
+    /// exactly once -- never doubled up beside a surviving stale raster.
+    #[test]
+    fn flush_sixel_icon_move_with_indistinguishable_vacated_content_clears_old_rect_without_duplicating() {
+        let mut app = App::default();
+        app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 2, icons::SixelVariant::Transparent)];
+        let mut state = SixelEmitState::default();
+        let mut written = Vec::new();
+        let screen = blank_screen(&app);
+        flush_sixel_icon_into(&mut written, &app, &screen, &mut state).unwrap();
+
+        // The button moves from x=2 to x=9; the SAME plain blank screen
+        // stands in for the vacated x=2 cells looking exactly like every
+        // other never-used background cell.
+        let new_placement = sixel_placement(icons::IconId::Files, 9, icons::SixelVariant::Transparent);
+        app.layout.sixel_icons = vec![new_placement];
+        written.clear();
+        flush_sixel_icon_into(&mut written, &app, &screen, &mut state).unwrap();
+        let sixel_bytes = icons::sixel(icons::IconId::Files, icons::SixelVariant::Transparent);
+        let output = String::from_utf8_lossy(&written);
+        assert_eq!(
+            output.matches(sixel_bytes).count(),
+            1,
+            "the icon must appear at its new rect exactly once, never doubled beside the old one: {output}"
+        );
+        assert_eq!(
+            state.last,
+            vec![SixelPlacementRecord {
+                placement: new_placement,
+                fingerprint: cell_rect_fingerprint(&screen, new_placement.rect),
+            }],
+            "the vacated old rect must not be remembered as if it were still a live placement"
+        );
+
+        // Settling: a further call against the identical, unchanged
+        // screen stays a total no-op.
+        written.clear();
+        flush_sixel_icon_into(&mut written, &app, &screen, &mut state).unwrap();
+        assert!(written.is_empty(), "an unchanged placement set after the move must be a total no-op");
+    }
+
+    /// FIX1 regression guard: the exact scenario named in the owner's own
+    /// report -- a modal opens directly over the activity rail's own icon
+    /// rect. `render::render` keeps the rail's own placement in `app.
+    /// layout.sixel_icons` regardless of what draws over it (the rail is
+    /// not focus-gated), so the SIGNATURE alone never changes across
+    /// either transition; only the real screen content does. The
+    /// behaviour this locks in is the one named in the task: once the
+    /// modal closes and the rail's own cells revert, the icon must be
+    /// re-emitted -- under the old pure-signature gate it never was,
+    /// because `emitted == state.last` stayed true throughout and the
+    /// icon stayed gone until an unrelated change happened elsewhere.
+    #[test]
+    fn flush_sixel_icon_reemits_after_a_modal_that_covered_the_rail_closes() {
+        let mut app = App::default();
+        app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 2, icons::SixelVariant::Transparent)];
+        let mut state = SixelEmitState::default();
+        let mut written = Vec::new();
+        let mut screen = blank_screen(&app);
+        flush_sixel_icon_into(&mut written, &app, &screen, &mut state).unwrap();
+        assert!(!written.is_empty());
+
+        // The modal opens, drawn directly across the icon's own rect
+        // (2,1,4,2) -- the placement's own signature in `app.layout.
+        // sixel_icons` is left untouched.
+        for y in 1..3 {
+            for x in 2..6 {
+                screen.set(x, y, uzor_tui::Cell::styled("#", uzor_tui::Style::default().bg(uzor_tui::Color::Blue)));
+            }
+        }
+        written.clear();
+        flush_sixel_icon_into(&mut written, &app, &screen, &mut state).unwrap();
+
+        // The modal closes: the rail's own rect reverts to byte-for-byte
+        // the same content it held before the modal ever opened.
+        screen = blank_screen(&app);
+        written.clear();
+        flush_sixel_icon_into(&mut written, &app, &screen, &mut state).unwrap();
+        let output = String::from_utf8_lossy(&written);
+        assert!(
+            output.contains(icons::sixel(icons::IconId::Files, icons::SixelVariant::Transparent)),
+            "the rail icon must be re-emitted once the modal that covered it closes and the cells revert: {output}"
+        );
+    }
+
     #[test]
     fn flush_sixel_icon_tier_switch_away_clears_every_rect_and_emits_nothing() {
         let mut app = App::default();
@@ -5783,13 +6050,13 @@ mod tests {
         let mut written = Vec::new();
         flush_sixel_icon_into(&mut written, &app, &buf, &mut state).unwrap();
         assert!(
-            state.last.iter().any(|placement| placement.icon == icons::IconId::SettingsGear),
+            state.last.iter().any(|record| record.placement.icon == icons::IconId::SettingsGear),
             "the rail's Settings gear must actually be emitted, not silently dropped by the \
              bottom-row filter, in a normal 100x24 terminal: {:?}",
             state.last,
         );
         assert!(
-            state.last.iter().any(|placement| placement.icon == icons::IconId::Person),
+            state.last.iter().any(|record| record.placement.icon == icons::IconId::Person),
             "the Agents (person) rail button must also be emitted: {:?}",
             state.last,
         );

@@ -72,29 +72,35 @@
 //! ## Sixel background variants ([`SixelVariant`])
 //!
 //! `icy_sixel`'s own encoder applies a hard alpha>=128 opacity threshold
-//! per pixel with no blend information in the encoded stream, and Windows
-//! Terminal's own sixel decoder does not implement the DEC-spec
-//! "undrawn pixel stays transparent" semantics -- together this reads as
-//! dirty edges on any transparently-encoded icon. The fix (see `tools/
-//! bake_icons.py`'s own header doc comment for the full diagnosis) is to
-//! composite every sixel-tier icon over the EXACT background colour its
-//! button paints, fully opaque, wherever that background is a fixed,
-//! known constant (`PtyColorMode::GateOverride`'s own theme) -- there is
-//! then no transparent pixel left for either the encoder's threshold or
-//! the terminal's own decoder to mishandle. `PtyColorMode::Inherited` has
-//! no equivalent: the terminal's own actual background is not knowable
-//! at bake OR at render time (crossterm has no reliable query, the same
-//! epistemic gap [`ASSUMED_CELL_WIDTH_PX`]'s own doc comment already
-//! names for cell-pixel size), so it keeps the original transparent-
-//! encoded asset as its only available option (pre-corrected for gamma,
-//! see `tools/bake_icons.py::precorrect_transparent_alpha`'s own doc
-//! comment -- the SAME dark-background assumption this module's `ASSUMED_
-//! CELL_WIDTH_PX` doc already documents the shape of, applied to colour
-//! instead of geometry). The ascii tier needs no equivalent of this at
-//! all: it is plain themed text drawn directly with the button's own
-//! background style, not a raster image -- only a sixel image, a raster
-//! the terminal has no concept of "this pixel belongs to a themed panel"
-//! for, needs a pre-baked variant per background at all.
+//! per pixel with NO blend information in the encoded stream at all --
+//! every surviving pixel carries only its flat, un-blended ink colour, so
+//! anti-aliasing cannot survive this encoder in alpha, only in RGB (see
+//! `tools/bake_icons.py`'s own header doc comment, cause 1, for the full
+//! diagnosis). The fix is to composite every rail/strip/gallery sixel-tier
+//! icon over the EXACT background colour its button paints, fully opaque,
+//! so there is no transparent pixel left for the encoder's threshold to
+//! drop and the anti-aliasing this buys back rides in RGB instead, where
+//! that threshold cannot touch it. This USED to apply only where the
+//! background was a fixed, known constant (`PtyColorMode::GateOverride`'s
+//! own theme) -- `PtyColorMode::Inherited` read as having no knowable
+//! background at bake OR render time (crossterm has no reliable query,
+//! the same epistemic gap [`ASSUMED_CELL_WIDTH_PX`]'s own doc comment
+//! already names for cell-pixel size). That premise was the actual bug:
+//! the background was never unknowable at render time, only un-painted.
+//! `render::render_rail_button`/`render_control_strip_button`/the icon
+//! gallery swatches now paint an EXPLICIT truecolor background
+//! unconditionally, in every `PtyColorMode` -- the button states what its
+//! own background is instead of leaving it to the terminal, so it is
+//! always known at bake time too, and there is exactly one composited
+//! variant per background to request. [`SixelVariant`] now only spans
+//! those backgrounds (`GateActive`/`GateAccent`) -- there is no more
+//! `Transparent` case, and no more per-`PtyColorMode` branch, for the
+//! rail/strip/gallery tiers this covers. The compact tier stays out of
+//! scope (see `render::render_compact_icon_button`'s own doc comment) and
+//! keeps real transparency, encoded with `BackgroundMode::Transparent`,
+//! since it has no single known background to paint at all. The ascii
+//! tier needs no equivalent of any of this: it is plain themed text drawn
+//! directly with the button's own background style, not a raster image.
 
 use icy_sixel::{BackgroundMode, EncodeOptions, SixelImage};
 
@@ -102,23 +108,20 @@ mod catalog;
 
 pub use catalog::{ascii, sixel, sixel_compact, sixel_gallery, sixel_strip, IconId};
 
-/// Which pre-baked background a sixel-tier icon asset was composited
-/// against (or left transparent for) -- see this module's own "Sixel
-/// background variants" doc section above for the full cause-1 diagnosis
-/// and fix, and `render::Theme`'s own `mode` field for how a render call
-/// site picks one from `app.color_mode` (+ a rail button's own `selected`
-/// state).
+/// Which pre-baked, fully-opaque background a rail/strip/gallery sixel-
+/// tier icon asset was composited against -- see this module's own
+/// "Sixel background variants" doc section above for the full diagnosis
+/// and fix. Every icon-bearing button now paints one of these two
+/// backgrounds EXPLICITLY, in every `PtyColorMode` -- there is no more
+/// mode-dependent case, so a render call site picks a variant purely from
+/// the button's own `selected` state (`GateAccent` when selected,
+/// `GateActive` otherwise), never from `app.color_mode`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SixelVariant {
-    /// `PtyColorMode::Inherited`: no knowable exact background: the
-    /// source image keeps `icy_sixel`'s `BackgroundMode::Transparent`
-    /// semantics, byte-for-byte the same asset every tier shipped before
-    /// this variant existed.
-    Transparent,
-    /// `PtyColorMode::GateOverride`'s own fixed "at rest" colour
+    /// The icon-bearing button's own fixed "at rest" colour
     /// (`render::ACTIVE_BG`) -- pre-composited fully opaque at bake time.
     GateActive,
-    /// `PtyColorMode::GateOverride`'s own fixed "selected" accent colour
+    /// The icon-bearing button's own fixed "selected" accent colour
     /// (`render::MAUVE`) -- pre-composited fully opaque at bake time.
     /// Only the activity rail's own selected state ever requests this;
     /// [`sixel_strip`] folds it into the same asset as `GateActive` since
@@ -249,17 +252,13 @@ fn icon_encode_options() -> EncodeOptions {
     }
 }
 
-pub(crate) fn build_sixel(rgba: &[u8]) -> String {
-    build_sixel_sized(rgba, SIXEL_ICON_WIDTH_PX, SIXEL_ICON_HEIGHT_PX, BackgroundMode::Transparent)
-}
-
-/// Same source pixels as [`build_sixel`], for a `SixelVariant::GateActive`/
-/// `GateAccent` asset that was already pre-composited fully opaque at
-/// bake time (see [`SixelVariant`]'s own doc comment) -- `BackgroundMode::
-/// Opaque` here is a documentation choice, not a functional requirement:
-/// every pixel in such a buffer already has alpha 255, so `icy_sixel`'s
-/// own encoder would treat it identically either way (see `tools/
-/// bake_icons.py`'s own header doc comment for why).
+/// Same source pixels as [`build_sixel_gate`], for a `SixelVariant::
+/// GateActive`/`GateAccent` asset that was already pre-composited fully
+/// opaque at bake time (see [`SixelVariant`]'s own doc comment) --
+/// `BackgroundMode::Opaque` here is a documentation choice, not a
+/// functional requirement: every pixel in such a buffer already has alpha
+/// 255, so `icy_sixel`'s own encoder would treat it identically either
+/// way (see `tools/bake_icons.py`'s own header doc comment for why).
 pub(crate) fn build_sixel_gate(rgba: &[u8]) -> String {
     build_sixel_sized(rgba, SIXEL_ICON_WIDTH_PX, SIXEL_ICON_HEIGHT_PX, BackgroundMode::Opaque)
 }
@@ -270,25 +269,14 @@ pub(crate) fn build_sixel_compact(rgba: &[u8]) -> String {
     build_sixel_sized(rgba, COMPACT_SIXEL_ICON_WIDTH_PX, COMPACT_SIXEL_ICON_HEIGHT_PX, BackgroundMode::Transparent)
 }
 
-/// Same encoding as [`build_sixel`], for the strip tier's own per-icon
-/// asset (see this module's own "Strip tier" section above).
-pub(crate) fn build_sixel_strip(rgba: &[u8]) -> String {
-    build_sixel_sized(rgba, STRIP_SIXEL_ICON_WIDTH_PX, STRIP_SIXEL_ICON_HEIGHT_PX, BackgroundMode::Transparent)
-}
-
-/// Same relationship [`build_sixel_gate`] has to [`build_sixel`], for the
-/// strip tier's own pre-composited asset.
+/// Same relationship [`build_sixel_gate`] has to the rail tier, for the
+/// strip tier's own pre-composited asset -- the ONLY strip-tier sixel
+/// this crate ships (see [`SixelVariant`]'s own doc comment).
 pub(crate) fn build_sixel_strip_gate(rgba: &[u8]) -> String {
     build_sixel_sized(rgba, STRIP_SIXEL_ICON_WIDTH_PX, STRIP_SIXEL_ICON_HEIGHT_PX, BackgroundMode::Opaque)
 }
 
-/// Same encoding as [`build_sixel`], for the gallery tier's own dedicated
-/// per-icon asset (see this module's own "Gallery tier" section above).
-pub(crate) fn build_sixel_gallery(rgba: &[u8]) -> String {
-    build_sixel_sized(rgba, GALLERY_SIXEL_ICON_WIDTH_PX, GALLERY_SIXEL_ICON_HEIGHT_PX, BackgroundMode::Transparent)
-}
-
-/// Same relationship [`build_sixel_gate`] has to [`build_sixel`], for the
+/// Same relationship [`build_sixel_gate`] has to the rail tier, for the
 /// gallery tier's own pre-composited asset -- composited over the exact
 /// background `render::render_icon_gallery` paints each swatch cell with
 /// (`render::ACTIVE_BG`, the same fixed colour the rail/strip "at rest"
@@ -323,7 +311,7 @@ mod tests {
         }
     }
 
-    const SIXEL_VARIANTS: [SixelVariant; 3] = [SixelVariant::Transparent, SixelVariant::GateActive, SixelVariant::GateAccent];
+    const SIXEL_VARIANTS: [SixelVariant; 2] = [SixelVariant::GateActive, SixelVariant::GateAccent];
 
     #[test]
     fn every_icon_resolves_in_every_tier_without_panicking() {
@@ -369,24 +357,30 @@ mod tests {
         }
     }
 
-    /// The `Transparent` variant's own source bytes are UNTOUCHED by the
-    /// gate-compositing pass -- still a real transparent asset (at least
-    /// one alpha byte below 255), not accidentally overwritten with a
-    /// composited copy.
+    /// The raw pre-composite source bytes (test-only -- see `tools/
+    /// bake_icons.py::ensure_assets`'s own doc comment for why these are
+    /// no longer a shipped `SixelVariant`) are UNTOUCHED by the gate-
+    /// compositing pass -- still real TRUE coverage (at least one alpha
+    /// byte below 255), never accidentally overwritten with a composited
+    /// copy or pre-thresholded before `composite_over_background` ever
+    /// sees it. This is what [`gate_compositing_matches_the_background_
+    /// and_ink_colours_exactly_at_full_coverage`] below depends on: its
+    /// own "uncovered"/"fully covered" cases mean nothing if this source
+    /// never actually has a partial-coverage pixel in between.
     #[test]
-    fn transparent_variant_sources_still_carry_real_transparency() {
+    fn raw_precomposite_sources_still_carry_real_coverage_variation() {
         for id in IconId::ALL {
             assert!(
                 catalog::sixel_source_rgba(id).chunks_exact(4).any(|px| px[3] < 255),
-                "{id:?}'s rail Transparent source must still have transparent pixels"
+                "{id:?}'s rail raw source must still have partial-coverage pixels"
             );
             assert!(
                 catalog::sixel_strip_source_rgba(id).chunks_exact(4).any(|px| px[3] < 255),
-                "{id:?}'s strip Transparent source must still have transparent pixels"
+                "{id:?}'s strip raw source must still have partial-coverage pixels"
             );
             assert!(
                 catalog::sixel_gallery_source_rgba(id).chunks_exact(4).any(|px| px[3] < 255),
-                "{id:?}'s gallery Transparent source must still have transparent pixels"
+                "{id:?}'s gallery raw source must still have partial-coverage pixels"
             );
         }
     }
@@ -394,15 +388,15 @@ mod tests {
     /// The actual "over" compositing arithmetic `tools/bake_icons.py::
     /// composite_over_background` performs, verified pixel-for-pixel
     /// against the real baked assets rather than trusted by construction:
-    /// wherever the transparent source is fully uncovered (alpha 0), the
+    /// wherever the raw source is fully uncovered (alpha 0), the
     /// composited pixel must be EXACTLY the flat background colour;
     /// wherever it is fully covered (alpha 255), the composited pixel
     /// must be EXACTLY the source's own (already `#cdd6f4`-tinted, per
-    /// `patch_fill`) ink colour, unchanged. Both extremes survive `tools/
-    /// bake_icons.py::precorrect_transparent_alpha`'s own alpha remap
-    /// unchanged too (0 and 255 are its fixed points), so this holds for
-    /// the shipped `Transparent`-variant source bytes exactly as baked,
-    /// not just for some hypothetical unconverted buffer.
+    /// `patch_fill`) ink colour, unchanged. This holds for the exact raw
+    /// bytes `composite_over_background` was actually handed at bake time
+    /// (see `tools/bake_icons.py::ensure_assets`'s own doc comment for why
+    /// that source is checked in unmodified), not just for some
+    /// hypothetical buffer.
     #[test]
     fn gate_compositing_matches_the_background_and_ink_colours_exactly_at_full_coverage() {
         // Hand-synced to render.rs's own (private) ACTIVE_BG/MAUVE

@@ -2780,18 +2780,19 @@ pub enum SixelIconSize {
 /// cell coordinates for this frame -- see `LayoutRects::sixel_icons`'s
 /// own doc comment. `size` selects which tier's baked asset `client::
 /// flush_sixel_icon` prints for this placement; `variant` selects WHICH
-/// of that tier's own baked backgrounds (see `icons::SixelVariant`'s own
-/// doc comment) -- derived from `app.color_mode` plus, for the rail tier
-/// only, the button's own selected state (the control-plane strip has no
-/// selected state at all, so it only ever requests `GateActive`/
-/// `Transparent`). `variant` rides along as part of the gating signature
-/// (not just the icon identity and its rect) because a selection change
-/// in `PtyColorMode::GateOverride` selects a DIFFERENT pre-baked asset
-/// (`GateActive` vs `GateAccent`), and in `PtyColorMode::Inherited` the
-/// button body's own background still changes underneath a transparent-
-/// background sixel image via a plain cell-buffer diff invisible to this
-/// struct, which visually erases whatever sixel pixels were sitting
-/// there -- either way, a `variant`-carrying re-emission is required.
+/// of that tier's own two baked backgrounds (see `icons::SixelVariant`'s
+/// own doc comment) -- derived purely from the button's own `selected`
+/// state, the SAME in every `PtyColorMode` now that every icon-bearing
+/// button paints an explicit truecolor background unconditionally (the
+/// control-plane strip/gallery have no selected state at all, so they
+/// only ever request `GateActive`). `variant` rides along as part of the
+/// gating signature (not just the icon identity and its rect) because a
+/// selection change selects a DIFFERENT pre-baked asset (`GateActive` vs
+/// `GateAccent`) -- a `variant`-carrying re-emission is required so the
+/// terminal actually repaints the new asset. The compact tier is the one
+/// exception: its own resolution function (`icons::sixel_compact`) takes
+/// no `SixelVariant` at all and never reads this field (see `render::
+/// render_compact_icon_button`'s own doc comment).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SixelIconPlacement {
     pub icon: IconId,

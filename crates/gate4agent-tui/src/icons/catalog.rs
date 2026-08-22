@@ -12,8 +12,8 @@
 use std::sync::LazyLock;
 
 use super::{
-    build_sixel, build_sixel_compact, build_sixel_gallery, build_sixel_gallery_gate, build_sixel_gate,
-    build_sixel_strip, build_sixel_strip_gate, SixelVariant,
+    build_sixel_compact, build_sixel_gallery_gate, build_sixel_gate, build_sixel_strip_gate,
+    SixelVariant,
 };
 
 /// Every baked icon this crate ships, sixel + ascii tiers, one enum
@@ -145,294 +145,237 @@ impl IconId {
     ];
 }
 
-/// Encoded rail-tier sixel string for `id` at `variant`'s own background
-/// (see [`SixelVariant`]'s own doc comment) -- see `../icons.rs::build_sixel`'s
-/// own doc comment for why this is cached (`LazyLock`) rather than re-encoded
-/// per call.
+/// Encoded rail-tier sixel string for `id` at `variant`'s own explicit
+/// truecolor background (see [`SixelVariant`]'s own doc comment) -- see
+/// `../icons.rs::build_sixel_gate`'s own doc comment for why this is cached
+/// (`LazyLock`) rather than re-encoded per call.
 pub fn sixel(id: IconId, variant: SixelVariant) -> &'static str {
     match id {
         IconId::Files => match variant {
-            SixelVariant::Transparent => FILES_SIXEL.as_str(),
             SixelVariant::GateActive => FILES_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => FILES_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::SourceControl => match variant {
-            SixelVariant::Transparent => SOURCE_CONTROL_SIXEL.as_str(),
             SixelVariant::GateActive => SOURCE_CONTROL_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => SOURCE_CONTROL_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::Person => match variant {
-            SixelVariant::Transparent => PERSON_SIXEL.as_str(),
             SixelVariant::GateActive => PERSON_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => PERSON_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::Project => match variant {
-            SixelVariant::Transparent => PROJECT_SIXEL.as_str(),
             SixelVariant::GateActive => PROJECT_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => PROJECT_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::SettingsGear => match variant {
-            SixelVariant::Transparent => SETTINGS_GEAR_SIXEL.as_str(),
             SixelVariant::GateActive => SETTINGS_GEAR_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => SETTINGS_GEAR_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::ChevronLeft => match variant {
-            SixelVariant::Transparent => CHEVRON_LEFT_SIXEL.as_str(),
             SixelVariant::GateActive => CHEVRON_LEFT_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => CHEVRON_LEFT_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::ChevronRight => match variant {
-            SixelVariant::Transparent => CHEVRON_RIGHT_SIXEL.as_str(),
             SixelVariant::GateActive => CHEVRON_RIGHT_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => CHEVRON_RIGHT_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::ChevronDown => match variant {
-            SixelVariant::Transparent => CHEVRON_DOWN_SIXEL.as_str(),
             SixelVariant::GateActive => CHEVRON_DOWN_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => CHEVRON_DOWN_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::NewFile => match variant {
-            SixelVariant::Transparent => NEW_FILE_SIXEL.as_str(),
             SixelVariant::GateActive => NEW_FILE_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => NEW_FILE_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::NewFolder => match variant {
-            SixelVariant::Transparent => NEW_FOLDER_SIXEL.as_str(),
             SixelVariant::GateActive => NEW_FOLDER_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => NEW_FOLDER_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::Folder => match variant {
-            SixelVariant::Transparent => FOLDER_SIXEL.as_str(),
             SixelVariant::GateActive => FOLDER_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => FOLDER_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::FolderOpened => match variant {
-            SixelVariant::Transparent => FOLDER_OPENED_SIXEL.as_str(),
             SixelVariant::GateActive => FOLDER_OPENED_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => FOLDER_OPENED_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::File => match variant {
-            SixelVariant::Transparent => FILE_SIXEL.as_str(),
             SixelVariant::GateActive => FILE_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => FILE_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::Save => match variant {
-            SixelVariant::Transparent => SAVE_SIXEL.as_str(),
             SixelVariant::GateActive => SAVE_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => SAVE_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::Refresh => match variant {
-            SixelVariant::Transparent => REFRESH_SIXEL.as_str(),
             SixelVariant::GateActive => REFRESH_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => REFRESH_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::Add => match variant {
-            SixelVariant::Transparent => ADD_SIXEL.as_str(),
             SixelVariant::GateActive => ADD_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => ADD_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::Trash => match variant {
-            SixelVariant::Transparent => TRASH_SIXEL.as_str(),
             SixelVariant::GateActive => TRASH_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => TRASH_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::Search => match variant {
-            SixelVariant::Transparent => SEARCH_SIXEL.as_str(),
             SixelVariant::GateActive => SEARCH_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => SEARCH_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::Check => match variant {
-            SixelVariant::Transparent => CHECK_SIXEL.as_str(),
             SixelVariant::GateActive => CHECK_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => CHECK_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::Close => match variant {
-            SixelVariant::Transparent => CLOSE_SIXEL.as_str(),
             SixelVariant::GateActive => CLOSE_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => CLOSE_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::ArrowUp => match variant {
-            SixelVariant::Transparent => ARROW_UP_SIXEL.as_str(),
             SixelVariant::GateActive => ARROW_UP_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => ARROW_UP_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::ArrowDown => match variant {
-            SixelVariant::Transparent => ARROW_DOWN_SIXEL.as_str(),
             SixelVariant::GateActive => ARROW_DOWN_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => ARROW_DOWN_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::ArrowLeft => match variant {
-            SixelVariant::Transparent => ARROW_LEFT_SIXEL.as_str(),
             SixelVariant::GateActive => ARROW_LEFT_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => ARROW_LEFT_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::ArrowRight => match variant {
-            SixelVariant::Transparent => ARROW_RIGHT_SIXEL.as_str(),
             SixelVariant::GateActive => ARROW_RIGHT_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => ARROW_RIGHT_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::ArrowSwap => match variant {
-            SixelVariant::Transparent => ARROW_SWAP_SIXEL.as_str(),
             SixelVariant::GateActive => ARROW_SWAP_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => ARROW_SWAP_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::GitCommit => match variant {
-            SixelVariant::Transparent => GIT_COMMIT_SIXEL.as_str(),
             SixelVariant::GateActive => GIT_COMMIT_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => GIT_COMMIT_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::GitBranch => match variant {
-            SixelVariant::Transparent => GIT_BRANCH_SIXEL.as_str(),
             SixelVariant::GateActive => GIT_BRANCH_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => GIT_BRANCH_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::Diff => match variant {
-            SixelVariant::Transparent => DIFF_SIXEL.as_str(),
             SixelVariant::GateActive => DIFF_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => DIFF_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::DiffAdded => match variant {
-            SixelVariant::Transparent => DIFF_ADDED_SIXEL.as_str(),
             SixelVariant::GateActive => DIFF_ADDED_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => DIFF_ADDED_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::GitCompare => match variant {
-            SixelVariant::Transparent => GIT_COMPARE_SIXEL.as_str(),
             SixelVariant::GateActive => GIT_COMPARE_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => GIT_COMPARE_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::Repo => match variant {
-            SixelVariant::Transparent => REPO_SIXEL.as_str(),
             SixelVariant::GateActive => REPO_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => REPO_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::RepoForked => match variant {
-            SixelVariant::Transparent => REPO_FORKED_SIXEL.as_str(),
             SixelVariant::GateActive => REPO_FORKED_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => REPO_FORKED_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::DebugStop => match variant {
-            SixelVariant::Transparent => DEBUG_STOP_SIXEL.as_str(),
             SixelVariant::GateActive => DEBUG_STOP_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => DEBUG_STOP_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::DebugRestart => match variant {
-            SixelVariant::Transparent => DEBUG_RESTART_SIXEL.as_str(),
             SixelVariant::GateActive => DEBUG_RESTART_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => DEBUG_RESTART_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::Edit => match variant {
-            SixelVariant::Transparent => EDIT_SIXEL.as_str(),
             SixelVariant::GateActive => EDIT_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => EDIT_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::History => match variant {
-            SixelVariant::Transparent => HISTORY_SIXEL.as_str(),
             SixelVariant::GateActive => HISTORY_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => HISTORY_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::Terminal => match variant {
-            SixelVariant::Transparent => TERMINAL_SIXEL.as_str(),
             SixelVariant::GateActive => TERMINAL_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => TERMINAL_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::Output => match variant {
-            SixelVariant::Transparent => OUTPUT_SIXEL.as_str(),
             SixelVariant::GateActive => OUTPUT_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => OUTPUT_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::CloudDownload => match variant {
-            SixelVariant::Transparent => CLOUD_DOWNLOAD_SIXEL.as_str(),
             SixelVariant::GateActive => CLOUD_DOWNLOAD_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => CLOUD_DOWNLOAD_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::Ellipsis => match variant {
-            SixelVariant::Transparent => ELLIPSIS_SIXEL.as_str(),
             SixelVariant::GateActive => ELLIPSIS_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => ELLIPSIS_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::Link => match variant {
-            SixelVariant::Transparent => LINK_SIXEL.as_str(),
             SixelVariant::GateActive => LINK_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => LINK_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::CircleFilled => match variant {
-            SixelVariant::Transparent => CIRCLE_FILLED_SIXEL.as_str(),
             SixelVariant::GateActive => CIRCLE_FILLED_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => CIRCLE_FILLED_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::CircleSlash => match variant {
-            SixelVariant::Transparent => CIRCLE_SLASH_SIXEL.as_str(),
             SixelVariant::GateActive => CIRCLE_SLASH_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => CIRCLE_SLASH_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::Warning => match variant {
-            SixelVariant::Transparent => WARNING_SIXEL.as_str(),
             SixelVariant::GateActive => WARNING_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => WARNING_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::Error => match variant {
-            SixelVariant::Transparent => ERROR_SIXEL.as_str(),
             SixelVariant::GateActive => ERROR_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => ERROR_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::Info => match variant {
-            SixelVariant::Transparent => INFO_SIXEL.as_str(),
             SixelVariant::GateActive => INFO_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => INFO_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::RunAll => match variant {
-            SixelVariant::Transparent => RUN_ALL_SIXEL.as_str(),
             SixelVariant::GateActive => RUN_ALL_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => RUN_ALL_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::Play => match variant {
-            SixelVariant::Transparent => PLAY_SIXEL.as_str(),
             SixelVariant::GateActive => PLAY_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => PLAY_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::Sync => match variant {
-            SixelVariant::Transparent => SYNC_SIXEL.as_str(),
             SixelVariant::GateActive => SYNC_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => SYNC_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::GoToFile => match variant {
-            SixelVariant::Transparent => GO_TO_FILE_SIXEL.as_str(),
             SixelVariant::GateActive => GO_TO_FILE_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => GO_TO_FILE_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::Pulse => match variant {
-            SixelVariant::Transparent => PULSE_SIXEL.as_str(),
             SixelVariant::GateActive => PULSE_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => PULSE_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::Checklist => match variant {
-            SixelVariant::Transparent => CHECKLIST_SIXEL.as_str(),
             SixelVariant::GateActive => CHECKLIST_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => CHECKLIST_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::Eye => match variant {
-            SixelVariant::Transparent => EYE_SIXEL.as_str(),
             SixelVariant::GateActive => EYE_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => EYE_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::Layout => match variant {
-            SixelVariant::Transparent => LAYOUT_SIXEL.as_str(),
             SixelVariant::GateActive => LAYOUT_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => LAYOUT_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::SplitHorizontal => match variant {
-            SixelVariant::Transparent => SPLIT_HORIZONTAL_SIXEL.as_str(),
             SixelVariant::GateActive => SPLIT_HORIZONTAL_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => SPLIT_HORIZONTAL_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::SplitVertical => match variant {
-            SixelVariant::Transparent => SPLIT_VERTICAL_SIXEL.as_str(),
             SixelVariant::GateActive => SPLIT_VERTICAL_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => SPLIT_VERTICAL_SIXEL_GATE_ACCENT.as_str(),
         },
         IconId::Preview => match variant {
-            SixelVariant::Transparent => PREVIEW_SIXEL.as_str(),
             SixelVariant::GateActive => PREVIEW_SIXEL_GATE_ACTIVE.as_str(),
             SixelVariant::GateAccent => PREVIEW_SIXEL_GATE_ACCENT.as_str(),
         },
@@ -440,474 +383,361 @@ pub fn sixel(id: IconId, variant: SixelVariant) -> &'static str {
 }
 
 /// Encoded control-plane-strip-tier sixel string for `id` at `variant`'s
-/// own background -- the strip never shows a selected state (see `../
-/// render.rs::render_control_strip_button`'s own doc comment), so
-/// `GateAccent` resolves to the SAME asset as `GateActive` here.
+/// own explicit truecolor background -- the strip never shows a selected
+/// state (see `../render.rs::render_control_strip_button`'s own doc
+/// comment), so `GateAccent` resolves to the SAME asset as `GateActive`
+/// here.
 pub fn sixel_strip(id: IconId, variant: SixelVariant) -> &'static str {
     match id {
         IconId::Files => match variant {
-            SixelVariant::Transparent => FILES_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => FILES_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::SourceControl => match variant {
-            SixelVariant::Transparent => SOURCE_CONTROL_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => SOURCE_CONTROL_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::Person => match variant {
-            SixelVariant::Transparent => PERSON_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => PERSON_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::Project => match variant {
-            SixelVariant::Transparent => PROJECT_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => PROJECT_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::SettingsGear => match variant {
-            SixelVariant::Transparent => SETTINGS_GEAR_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => SETTINGS_GEAR_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::ChevronLeft => match variant {
-            SixelVariant::Transparent => CHEVRON_LEFT_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => CHEVRON_LEFT_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::ChevronRight => match variant {
-            SixelVariant::Transparent => CHEVRON_RIGHT_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => CHEVRON_RIGHT_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::ChevronDown => match variant {
-            SixelVariant::Transparent => CHEVRON_DOWN_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => CHEVRON_DOWN_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::NewFile => match variant {
-            SixelVariant::Transparent => NEW_FILE_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => NEW_FILE_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::NewFolder => match variant {
-            SixelVariant::Transparent => NEW_FOLDER_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => NEW_FOLDER_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::Folder => match variant {
-            SixelVariant::Transparent => FOLDER_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => FOLDER_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::FolderOpened => match variant {
-            SixelVariant::Transparent => FOLDER_OPENED_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => FOLDER_OPENED_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::File => match variant {
-            SixelVariant::Transparent => FILE_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => FILE_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::Save => match variant {
-            SixelVariant::Transparent => SAVE_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => SAVE_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::Refresh => match variant {
-            SixelVariant::Transparent => REFRESH_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => REFRESH_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::Add => match variant {
-            SixelVariant::Transparent => ADD_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => ADD_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::Trash => match variant {
-            SixelVariant::Transparent => TRASH_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => TRASH_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::Search => match variant {
-            SixelVariant::Transparent => SEARCH_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => SEARCH_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::Check => match variant {
-            SixelVariant::Transparent => CHECK_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => CHECK_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::Close => match variant {
-            SixelVariant::Transparent => CLOSE_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => CLOSE_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::ArrowUp => match variant {
-            SixelVariant::Transparent => ARROW_UP_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => ARROW_UP_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::ArrowDown => match variant {
-            SixelVariant::Transparent => ARROW_DOWN_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => ARROW_DOWN_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::ArrowLeft => match variant {
-            SixelVariant::Transparent => ARROW_LEFT_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => ARROW_LEFT_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::ArrowRight => match variant {
-            SixelVariant::Transparent => ARROW_RIGHT_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => ARROW_RIGHT_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::ArrowSwap => match variant {
-            SixelVariant::Transparent => ARROW_SWAP_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => ARROW_SWAP_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::GitCommit => match variant {
-            SixelVariant::Transparent => GIT_COMMIT_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => GIT_COMMIT_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::GitBranch => match variant {
-            SixelVariant::Transparent => GIT_BRANCH_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => GIT_BRANCH_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::Diff => match variant {
-            SixelVariant::Transparent => DIFF_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => DIFF_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::DiffAdded => match variant {
-            SixelVariant::Transparent => DIFF_ADDED_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => DIFF_ADDED_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::GitCompare => match variant {
-            SixelVariant::Transparent => GIT_COMPARE_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => GIT_COMPARE_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::Repo => match variant {
-            SixelVariant::Transparent => REPO_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => REPO_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::RepoForked => match variant {
-            SixelVariant::Transparent => REPO_FORKED_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => REPO_FORKED_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::DebugStop => match variant {
-            SixelVariant::Transparent => DEBUG_STOP_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => DEBUG_STOP_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::DebugRestart => match variant {
-            SixelVariant::Transparent => DEBUG_RESTART_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => DEBUG_RESTART_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::Edit => match variant {
-            SixelVariant::Transparent => EDIT_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => EDIT_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::History => match variant {
-            SixelVariant::Transparent => HISTORY_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => HISTORY_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::Terminal => match variant {
-            SixelVariant::Transparent => TERMINAL_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => TERMINAL_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::Output => match variant {
-            SixelVariant::Transparent => OUTPUT_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => OUTPUT_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::CloudDownload => match variant {
-            SixelVariant::Transparent => CLOUD_DOWNLOAD_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => CLOUD_DOWNLOAD_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::Ellipsis => match variant {
-            SixelVariant::Transparent => ELLIPSIS_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => ELLIPSIS_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::Link => match variant {
-            SixelVariant::Transparent => LINK_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => LINK_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::CircleFilled => match variant {
-            SixelVariant::Transparent => CIRCLE_FILLED_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => CIRCLE_FILLED_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::CircleSlash => match variant {
-            SixelVariant::Transparent => CIRCLE_SLASH_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => CIRCLE_SLASH_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::Warning => match variant {
-            SixelVariant::Transparent => WARNING_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => WARNING_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::Error => match variant {
-            SixelVariant::Transparent => ERROR_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => ERROR_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::Info => match variant {
-            SixelVariant::Transparent => INFO_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => INFO_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::RunAll => match variant {
-            SixelVariant::Transparent => RUN_ALL_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => RUN_ALL_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::Play => match variant {
-            SixelVariant::Transparent => PLAY_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => PLAY_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::Sync => match variant {
-            SixelVariant::Transparent => SYNC_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => SYNC_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::GoToFile => match variant {
-            SixelVariant::Transparent => GO_TO_FILE_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => GO_TO_FILE_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::Pulse => match variant {
-            SixelVariant::Transparent => PULSE_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => PULSE_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::Checklist => match variant {
-            SixelVariant::Transparent => CHECKLIST_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => CHECKLIST_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::Eye => match variant {
-            SixelVariant::Transparent => EYE_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => EYE_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::Layout => match variant {
-            SixelVariant::Transparent => LAYOUT_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => LAYOUT_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::SplitHorizontal => match variant {
-            SixelVariant::Transparent => SPLIT_HORIZONTAL_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => SPLIT_HORIZONTAL_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::SplitVertical => match variant {
-            SixelVariant::Transparent => SPLIT_VERTICAL_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => SPLIT_VERTICAL_SIXEL_STRIP_GATE.as_str(),
         },
         IconId::Preview => match variant {
-            SixelVariant::Transparent => PREVIEW_SIXEL_STRIP.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => PREVIEW_SIXEL_STRIP_GATE.as_str(),
         },
     }
 }
 
 /// Encoded icon-gallery-tier sixel string for `id` at `variant`'s own
-/// background -- the gallery is a read-only comparison grid with no
-/// selected state, so `GateAccent` resolves to the SAME asset as
-/// `GateActive` here (same fold as [`sixel_strip`]).
+/// explicit truecolor background -- the gallery is a read-only comparison
+/// grid with no selected state, so `GateAccent` resolves to the SAME asset
+/// as `GateActive` here (same fold as [`sixel_strip`]).
 pub fn sixel_gallery(id: IconId, variant: SixelVariant) -> &'static str {
     match id {
         IconId::Files => match variant {
-            SixelVariant::Transparent => FILES_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => FILES_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::SourceControl => match variant {
-            SixelVariant::Transparent => SOURCE_CONTROL_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => SOURCE_CONTROL_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::Person => match variant {
-            SixelVariant::Transparent => PERSON_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => PERSON_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::Project => match variant {
-            SixelVariant::Transparent => PROJECT_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => PROJECT_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::SettingsGear => match variant {
-            SixelVariant::Transparent => SETTINGS_GEAR_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => SETTINGS_GEAR_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::ChevronLeft => match variant {
-            SixelVariant::Transparent => CHEVRON_LEFT_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => CHEVRON_LEFT_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::ChevronRight => match variant {
-            SixelVariant::Transparent => CHEVRON_RIGHT_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => CHEVRON_RIGHT_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::ChevronDown => match variant {
-            SixelVariant::Transparent => CHEVRON_DOWN_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => CHEVRON_DOWN_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::NewFile => match variant {
-            SixelVariant::Transparent => NEW_FILE_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => NEW_FILE_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::NewFolder => match variant {
-            SixelVariant::Transparent => NEW_FOLDER_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => NEW_FOLDER_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::Folder => match variant {
-            SixelVariant::Transparent => FOLDER_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => FOLDER_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::FolderOpened => match variant {
-            SixelVariant::Transparent => FOLDER_OPENED_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => FOLDER_OPENED_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::File => match variant {
-            SixelVariant::Transparent => FILE_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => FILE_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::Save => match variant {
-            SixelVariant::Transparent => SAVE_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => SAVE_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::Refresh => match variant {
-            SixelVariant::Transparent => REFRESH_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => REFRESH_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::Add => match variant {
-            SixelVariant::Transparent => ADD_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => ADD_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::Trash => match variant {
-            SixelVariant::Transparent => TRASH_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => TRASH_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::Search => match variant {
-            SixelVariant::Transparent => SEARCH_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => SEARCH_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::Check => match variant {
-            SixelVariant::Transparent => CHECK_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => CHECK_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::Close => match variant {
-            SixelVariant::Transparent => CLOSE_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => CLOSE_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::ArrowUp => match variant {
-            SixelVariant::Transparent => ARROW_UP_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => ARROW_UP_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::ArrowDown => match variant {
-            SixelVariant::Transparent => ARROW_DOWN_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => ARROW_DOWN_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::ArrowLeft => match variant {
-            SixelVariant::Transparent => ARROW_LEFT_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => ARROW_LEFT_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::ArrowRight => match variant {
-            SixelVariant::Transparent => ARROW_RIGHT_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => ARROW_RIGHT_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::ArrowSwap => match variant {
-            SixelVariant::Transparent => ARROW_SWAP_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => ARROW_SWAP_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::GitCommit => match variant {
-            SixelVariant::Transparent => GIT_COMMIT_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => GIT_COMMIT_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::GitBranch => match variant {
-            SixelVariant::Transparent => GIT_BRANCH_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => GIT_BRANCH_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::Diff => match variant {
-            SixelVariant::Transparent => DIFF_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => DIFF_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::DiffAdded => match variant {
-            SixelVariant::Transparent => DIFF_ADDED_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => DIFF_ADDED_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::GitCompare => match variant {
-            SixelVariant::Transparent => GIT_COMPARE_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => GIT_COMPARE_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::Repo => match variant {
-            SixelVariant::Transparent => REPO_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => REPO_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::RepoForked => match variant {
-            SixelVariant::Transparent => REPO_FORKED_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => REPO_FORKED_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::DebugStop => match variant {
-            SixelVariant::Transparent => DEBUG_STOP_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => DEBUG_STOP_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::DebugRestart => match variant {
-            SixelVariant::Transparent => DEBUG_RESTART_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => DEBUG_RESTART_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::Edit => match variant {
-            SixelVariant::Transparent => EDIT_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => EDIT_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::History => match variant {
-            SixelVariant::Transparent => HISTORY_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => HISTORY_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::Terminal => match variant {
-            SixelVariant::Transparent => TERMINAL_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => TERMINAL_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::Output => match variant {
-            SixelVariant::Transparent => OUTPUT_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => OUTPUT_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::CloudDownload => match variant {
-            SixelVariant::Transparent => CLOUD_DOWNLOAD_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => CLOUD_DOWNLOAD_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::Ellipsis => match variant {
-            SixelVariant::Transparent => ELLIPSIS_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => ELLIPSIS_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::Link => match variant {
-            SixelVariant::Transparent => LINK_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => LINK_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::CircleFilled => match variant {
-            SixelVariant::Transparent => CIRCLE_FILLED_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => CIRCLE_FILLED_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::CircleSlash => match variant {
-            SixelVariant::Transparent => CIRCLE_SLASH_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => CIRCLE_SLASH_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::Warning => match variant {
-            SixelVariant::Transparent => WARNING_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => WARNING_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::Error => match variant {
-            SixelVariant::Transparent => ERROR_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => ERROR_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::Info => match variant {
-            SixelVariant::Transparent => INFO_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => INFO_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::RunAll => match variant {
-            SixelVariant::Transparent => RUN_ALL_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => RUN_ALL_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::Play => match variant {
-            SixelVariant::Transparent => PLAY_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => PLAY_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::Sync => match variant {
-            SixelVariant::Transparent => SYNC_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => SYNC_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::GoToFile => match variant {
-            SixelVariant::Transparent => GO_TO_FILE_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => GO_TO_FILE_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::Pulse => match variant {
-            SixelVariant::Transparent => PULSE_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => PULSE_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::Checklist => match variant {
-            SixelVariant::Transparent => CHECKLIST_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => CHECKLIST_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::Eye => match variant {
-            SixelVariant::Transparent => EYE_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => EYE_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::Layout => match variant {
-            SixelVariant::Transparent => LAYOUT_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => LAYOUT_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::SplitHorizontal => match variant {
-            SixelVariant::Transparent => SPLIT_HORIZONTAL_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => SPLIT_HORIZONTAL_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::SplitVertical => match variant {
-            SixelVariant::Transparent => SPLIT_VERTICAL_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => SPLIT_VERTICAL_SIXEL_GALLERY_GATE.as_str(),
         },
         IconId::Preview => match variant {
-            SixelVariant::Transparent => PREVIEW_SIXEL_GALLERY.as_str(),
             SixelVariant::GateActive | SixelVariant::GateAccent => PREVIEW_SIXEL_GALLERY_GATE.as_str(),
         },
     }
@@ -1044,8 +874,14 @@ pub fn ascii(id: IconId) -> &'static str {
     }
 }
 
-// Raw baked-source lookups by id -- used only by this crate's own unit
-// tests (byte-length assertions and the gate-compositing pixel checks).
+// Raw true-coverage baked-source lookups by id -- used ONLY by this
+// crate's own unit tests (byte-length assertions and the gate-compositing
+// pixel checks): the rail/strip/gallery raw sources are no longer a
+// shipped `SixelVariant` (cause 4's own retirement, `tools/bake_icons.py`'s
+// own header doc comment), so their underlying `_RGBA` consts below are
+// `#[cfg(test)]`-gated too -- nothing outside this test module ever reaches
+// for them. The compact tier's own raw source stays unconditional: it IS
+// the real, directly-shipped asset (see `sixel_compact` above).
 #[cfg(test)]
 pub(crate) fn sixel_source_rgba(id: IconId) -> &'static [u8] {
     match id {
@@ -1552,2053 +1388,2680 @@ pub(crate) fn sixel_gallery_gate_source_rgba(id: IconId) -> &'static [u8] {
 
 // ---- Files (files) --------------------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const FILES_RGBA: &[u8] = include_bytes!("files.rgba");
-static FILES_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(FILES_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const FILES_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("files_gate_active.rgba");
 static FILES_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(FILES_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const FILES_GATE_ACCENT_RGBA: &[u8] = include_bytes!("files_gate_accent.rgba");
 static FILES_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(FILES_GATE_ACCENT_RGBA));
 
 const FILES_COMPACT_RGBA: &[u8] = include_bytes!("files_compact.rgba");
 static FILES_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(FILES_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// FILES_RGBA above.
+#[cfg(test)]
 const FILES_STRIP_RGBA: &[u8] = include_bytes!("files_strip.rgba");
-static FILES_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(FILES_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const FILES_STRIP_GATE_RGBA: &[u8] = include_bytes!("files_strip_gate.rgba");
 static FILES_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(FILES_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// FILES_RGBA above.
+#[cfg(test)]
 const FILES_GALLERY_RGBA: &[u8] = include_bytes!("files_gallery.rgba");
-static FILES_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(FILES_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const FILES_GALLERY_GATE_RGBA: &[u8] = include_bytes!("files_gallery_gate.rgba");
 static FILES_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(FILES_GALLERY_GATE_RGBA));
 
 // ---- SourceControl (source-control) ---------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const SOURCE_CONTROL_RGBA: &[u8] = include_bytes!("source_control.rgba");
-static SOURCE_CONTROL_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(SOURCE_CONTROL_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const SOURCE_CONTROL_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("source_control_gate_active.rgba");
 static SOURCE_CONTROL_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SOURCE_CONTROL_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const SOURCE_CONTROL_GATE_ACCENT_RGBA: &[u8] = include_bytes!("source_control_gate_accent.rgba");
 static SOURCE_CONTROL_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SOURCE_CONTROL_GATE_ACCENT_RGBA));
 
 const SOURCE_CONTROL_COMPACT_RGBA: &[u8] = include_bytes!("source_control_compact.rgba");
 static SOURCE_CONTROL_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(SOURCE_CONTROL_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// SOURCE_CONTROL_RGBA above.
+#[cfg(test)]
 const SOURCE_CONTROL_STRIP_RGBA: &[u8] = include_bytes!("source_control_strip.rgba");
-static SOURCE_CONTROL_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(SOURCE_CONTROL_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const SOURCE_CONTROL_STRIP_GATE_RGBA: &[u8] = include_bytes!("source_control_strip_gate.rgba");
 static SOURCE_CONTROL_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(SOURCE_CONTROL_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// SOURCE_CONTROL_RGBA above.
+#[cfg(test)]
 const SOURCE_CONTROL_GALLERY_RGBA: &[u8] = include_bytes!("source_control_gallery.rgba");
-static SOURCE_CONTROL_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(SOURCE_CONTROL_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const SOURCE_CONTROL_GALLERY_GATE_RGBA: &[u8] = include_bytes!("source_control_gallery_gate.rgba");
 static SOURCE_CONTROL_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(SOURCE_CONTROL_GALLERY_GATE_RGBA));
 
 // ---- Person (person) ------------------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const PERSON_RGBA: &[u8] = include_bytes!("person.rgba");
-static PERSON_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(PERSON_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const PERSON_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("person_gate_active.rgba");
 static PERSON_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(PERSON_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const PERSON_GATE_ACCENT_RGBA: &[u8] = include_bytes!("person_gate_accent.rgba");
 static PERSON_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(PERSON_GATE_ACCENT_RGBA));
 
 const PERSON_COMPACT_RGBA: &[u8] = include_bytes!("person_compact.rgba");
 static PERSON_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(PERSON_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// PERSON_RGBA above.
+#[cfg(test)]
 const PERSON_STRIP_RGBA: &[u8] = include_bytes!("person_strip.rgba");
-static PERSON_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(PERSON_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const PERSON_STRIP_GATE_RGBA: &[u8] = include_bytes!("person_strip_gate.rgba");
 static PERSON_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(PERSON_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// PERSON_RGBA above.
+#[cfg(test)]
 const PERSON_GALLERY_RGBA: &[u8] = include_bytes!("person_gallery.rgba");
-static PERSON_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(PERSON_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const PERSON_GALLERY_GATE_RGBA: &[u8] = include_bytes!("person_gallery_gate.rgba");
 static PERSON_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(PERSON_GALLERY_GATE_RGBA));
 
 // ---- Project (project) ----------------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const PROJECT_RGBA: &[u8] = include_bytes!("project.rgba");
-static PROJECT_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(PROJECT_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const PROJECT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("project_gate_active.rgba");
 static PROJECT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(PROJECT_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const PROJECT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("project_gate_accent.rgba");
 static PROJECT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(PROJECT_GATE_ACCENT_RGBA));
 
 const PROJECT_COMPACT_RGBA: &[u8] = include_bytes!("project_compact.rgba");
 static PROJECT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(PROJECT_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// PROJECT_RGBA above.
+#[cfg(test)]
 const PROJECT_STRIP_RGBA: &[u8] = include_bytes!("project_strip.rgba");
-static PROJECT_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(PROJECT_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const PROJECT_STRIP_GATE_RGBA: &[u8] = include_bytes!("project_strip_gate.rgba");
 static PROJECT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(PROJECT_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// PROJECT_RGBA above.
+#[cfg(test)]
 const PROJECT_GALLERY_RGBA: &[u8] = include_bytes!("project_gallery.rgba");
-static PROJECT_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(PROJECT_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const PROJECT_GALLERY_GATE_RGBA: &[u8] = include_bytes!("project_gallery_gate.rgba");
 static PROJECT_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(PROJECT_GALLERY_GATE_RGBA));
 
 // ---- SettingsGear (settings-gear) -----------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const SETTINGS_GEAR_RGBA: &[u8] = include_bytes!("settings_gear.rgba");
-static SETTINGS_GEAR_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(SETTINGS_GEAR_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const SETTINGS_GEAR_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("settings_gear_gate_active.rgba");
 static SETTINGS_GEAR_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SETTINGS_GEAR_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const SETTINGS_GEAR_GATE_ACCENT_RGBA: &[u8] = include_bytes!("settings_gear_gate_accent.rgba");
 static SETTINGS_GEAR_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SETTINGS_GEAR_GATE_ACCENT_RGBA));
 
 const SETTINGS_GEAR_COMPACT_RGBA: &[u8] = include_bytes!("settings_gear_compact.rgba");
 static SETTINGS_GEAR_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(SETTINGS_GEAR_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// SETTINGS_GEAR_RGBA above.
+#[cfg(test)]
 const SETTINGS_GEAR_STRIP_RGBA: &[u8] = include_bytes!("settings_gear_strip.rgba");
-static SETTINGS_GEAR_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(SETTINGS_GEAR_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const SETTINGS_GEAR_STRIP_GATE_RGBA: &[u8] = include_bytes!("settings_gear_strip_gate.rgba");
 static SETTINGS_GEAR_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(SETTINGS_GEAR_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// SETTINGS_GEAR_RGBA above.
+#[cfg(test)]
 const SETTINGS_GEAR_GALLERY_RGBA: &[u8] = include_bytes!("settings_gear_gallery.rgba");
-static SETTINGS_GEAR_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(SETTINGS_GEAR_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const SETTINGS_GEAR_GALLERY_GATE_RGBA: &[u8] = include_bytes!("settings_gear_gallery_gate.rgba");
 static SETTINGS_GEAR_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(SETTINGS_GEAR_GALLERY_GATE_RGBA));
 
 // ---- ChevronLeft (chevron-left) -------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const CHEVRON_LEFT_RGBA: &[u8] = include_bytes!("chevron_left.rgba");
-static CHEVRON_LEFT_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(CHEVRON_LEFT_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const CHEVRON_LEFT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("chevron_left_gate_active.rgba");
 static CHEVRON_LEFT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CHEVRON_LEFT_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const CHEVRON_LEFT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("chevron_left_gate_accent.rgba");
 static CHEVRON_LEFT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CHEVRON_LEFT_GATE_ACCENT_RGBA));
 
 const CHEVRON_LEFT_COMPACT_RGBA: &[u8] = include_bytes!("chevron_left_compact.rgba");
 static CHEVRON_LEFT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(CHEVRON_LEFT_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// CHEVRON_LEFT_RGBA above.
+#[cfg(test)]
 const CHEVRON_LEFT_STRIP_RGBA: &[u8] = include_bytes!("chevron_left_strip.rgba");
-static CHEVRON_LEFT_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(CHEVRON_LEFT_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const CHEVRON_LEFT_STRIP_GATE_RGBA: &[u8] = include_bytes!("chevron_left_strip_gate.rgba");
 static CHEVRON_LEFT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(CHEVRON_LEFT_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// CHEVRON_LEFT_RGBA above.
+#[cfg(test)]
 const CHEVRON_LEFT_GALLERY_RGBA: &[u8] = include_bytes!("chevron_left_gallery.rgba");
-static CHEVRON_LEFT_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(CHEVRON_LEFT_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const CHEVRON_LEFT_GALLERY_GATE_RGBA: &[u8] = include_bytes!("chevron_left_gallery_gate.rgba");
 static CHEVRON_LEFT_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(CHEVRON_LEFT_GALLERY_GATE_RGBA));
 
 // ---- ChevronRight (chevron-right) -----------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const CHEVRON_RIGHT_RGBA: &[u8] = include_bytes!("chevron_right.rgba");
-static CHEVRON_RIGHT_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(CHEVRON_RIGHT_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const CHEVRON_RIGHT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("chevron_right_gate_active.rgba");
 static CHEVRON_RIGHT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CHEVRON_RIGHT_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const CHEVRON_RIGHT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("chevron_right_gate_accent.rgba");
 static CHEVRON_RIGHT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CHEVRON_RIGHT_GATE_ACCENT_RGBA));
 
 const CHEVRON_RIGHT_COMPACT_RGBA: &[u8] = include_bytes!("chevron_right_compact.rgba");
 static CHEVRON_RIGHT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(CHEVRON_RIGHT_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// CHEVRON_RIGHT_RGBA above.
+#[cfg(test)]
 const CHEVRON_RIGHT_STRIP_RGBA: &[u8] = include_bytes!("chevron_right_strip.rgba");
-static CHEVRON_RIGHT_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(CHEVRON_RIGHT_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const CHEVRON_RIGHT_STRIP_GATE_RGBA: &[u8] = include_bytes!("chevron_right_strip_gate.rgba");
 static CHEVRON_RIGHT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(CHEVRON_RIGHT_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// CHEVRON_RIGHT_RGBA above.
+#[cfg(test)]
 const CHEVRON_RIGHT_GALLERY_RGBA: &[u8] = include_bytes!("chevron_right_gallery.rgba");
-static CHEVRON_RIGHT_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(CHEVRON_RIGHT_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const CHEVRON_RIGHT_GALLERY_GATE_RGBA: &[u8] = include_bytes!("chevron_right_gallery_gate.rgba");
 static CHEVRON_RIGHT_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(CHEVRON_RIGHT_GALLERY_GATE_RGBA));
 
 // ---- ChevronDown (chevron-down) -------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const CHEVRON_DOWN_RGBA: &[u8] = include_bytes!("chevron_down.rgba");
-static CHEVRON_DOWN_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(CHEVRON_DOWN_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const CHEVRON_DOWN_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("chevron_down_gate_active.rgba");
 static CHEVRON_DOWN_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CHEVRON_DOWN_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const CHEVRON_DOWN_GATE_ACCENT_RGBA: &[u8] = include_bytes!("chevron_down_gate_accent.rgba");
 static CHEVRON_DOWN_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CHEVRON_DOWN_GATE_ACCENT_RGBA));
 
 const CHEVRON_DOWN_COMPACT_RGBA: &[u8] = include_bytes!("chevron_down_compact.rgba");
 static CHEVRON_DOWN_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(CHEVRON_DOWN_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// CHEVRON_DOWN_RGBA above.
+#[cfg(test)]
 const CHEVRON_DOWN_STRIP_RGBA: &[u8] = include_bytes!("chevron_down_strip.rgba");
-static CHEVRON_DOWN_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(CHEVRON_DOWN_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const CHEVRON_DOWN_STRIP_GATE_RGBA: &[u8] = include_bytes!("chevron_down_strip_gate.rgba");
 static CHEVRON_DOWN_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(CHEVRON_DOWN_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// CHEVRON_DOWN_RGBA above.
+#[cfg(test)]
 const CHEVRON_DOWN_GALLERY_RGBA: &[u8] = include_bytes!("chevron_down_gallery.rgba");
-static CHEVRON_DOWN_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(CHEVRON_DOWN_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const CHEVRON_DOWN_GALLERY_GATE_RGBA: &[u8] = include_bytes!("chevron_down_gallery_gate.rgba");
 static CHEVRON_DOWN_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(CHEVRON_DOWN_GALLERY_GATE_RGBA));
 
 // ---- NewFile (new-file) ---------------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const NEW_FILE_RGBA: &[u8] = include_bytes!("new_file.rgba");
-static NEW_FILE_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(NEW_FILE_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const NEW_FILE_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("new_file_gate_active.rgba");
 static NEW_FILE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(NEW_FILE_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const NEW_FILE_GATE_ACCENT_RGBA: &[u8] = include_bytes!("new_file_gate_accent.rgba");
 static NEW_FILE_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(NEW_FILE_GATE_ACCENT_RGBA));
 
 const NEW_FILE_COMPACT_RGBA: &[u8] = include_bytes!("new_file_compact.rgba");
 static NEW_FILE_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(NEW_FILE_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// NEW_FILE_RGBA above.
+#[cfg(test)]
 const NEW_FILE_STRIP_RGBA: &[u8] = include_bytes!("new_file_strip.rgba");
-static NEW_FILE_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(NEW_FILE_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const NEW_FILE_STRIP_GATE_RGBA: &[u8] = include_bytes!("new_file_strip_gate.rgba");
 static NEW_FILE_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(NEW_FILE_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// NEW_FILE_RGBA above.
+#[cfg(test)]
 const NEW_FILE_GALLERY_RGBA: &[u8] = include_bytes!("new_file_gallery.rgba");
-static NEW_FILE_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(NEW_FILE_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const NEW_FILE_GALLERY_GATE_RGBA: &[u8] = include_bytes!("new_file_gallery_gate.rgba");
 static NEW_FILE_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(NEW_FILE_GALLERY_GATE_RGBA));
 
 // ---- NewFolder (new-folder) -----------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const NEW_FOLDER_RGBA: &[u8] = include_bytes!("new_folder.rgba");
-static NEW_FOLDER_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(NEW_FOLDER_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const NEW_FOLDER_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("new_folder_gate_active.rgba");
 static NEW_FOLDER_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(NEW_FOLDER_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const NEW_FOLDER_GATE_ACCENT_RGBA: &[u8] = include_bytes!("new_folder_gate_accent.rgba");
 static NEW_FOLDER_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(NEW_FOLDER_GATE_ACCENT_RGBA));
 
 const NEW_FOLDER_COMPACT_RGBA: &[u8] = include_bytes!("new_folder_compact.rgba");
 static NEW_FOLDER_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(NEW_FOLDER_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// NEW_FOLDER_RGBA above.
+#[cfg(test)]
 const NEW_FOLDER_STRIP_RGBA: &[u8] = include_bytes!("new_folder_strip.rgba");
-static NEW_FOLDER_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(NEW_FOLDER_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const NEW_FOLDER_STRIP_GATE_RGBA: &[u8] = include_bytes!("new_folder_strip_gate.rgba");
 static NEW_FOLDER_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(NEW_FOLDER_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// NEW_FOLDER_RGBA above.
+#[cfg(test)]
 const NEW_FOLDER_GALLERY_RGBA: &[u8] = include_bytes!("new_folder_gallery.rgba");
-static NEW_FOLDER_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(NEW_FOLDER_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const NEW_FOLDER_GALLERY_GATE_RGBA: &[u8] = include_bytes!("new_folder_gallery_gate.rgba");
 static NEW_FOLDER_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(NEW_FOLDER_GALLERY_GATE_RGBA));
 
 // ---- Folder (folder) ------------------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const FOLDER_RGBA: &[u8] = include_bytes!("folder.rgba");
-static FOLDER_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(FOLDER_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const FOLDER_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("folder_gate_active.rgba");
 static FOLDER_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(FOLDER_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const FOLDER_GATE_ACCENT_RGBA: &[u8] = include_bytes!("folder_gate_accent.rgba");
 static FOLDER_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(FOLDER_GATE_ACCENT_RGBA));
 
 const FOLDER_COMPACT_RGBA: &[u8] = include_bytes!("folder_compact.rgba");
 static FOLDER_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(FOLDER_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// FOLDER_RGBA above.
+#[cfg(test)]
 const FOLDER_STRIP_RGBA: &[u8] = include_bytes!("folder_strip.rgba");
-static FOLDER_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(FOLDER_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const FOLDER_STRIP_GATE_RGBA: &[u8] = include_bytes!("folder_strip_gate.rgba");
 static FOLDER_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(FOLDER_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// FOLDER_RGBA above.
+#[cfg(test)]
 const FOLDER_GALLERY_RGBA: &[u8] = include_bytes!("folder_gallery.rgba");
-static FOLDER_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(FOLDER_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const FOLDER_GALLERY_GATE_RGBA: &[u8] = include_bytes!("folder_gallery_gate.rgba");
 static FOLDER_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(FOLDER_GALLERY_GATE_RGBA));
 
 // ---- FolderOpened (folder-opened) -----------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const FOLDER_OPENED_RGBA: &[u8] = include_bytes!("folder_opened.rgba");
-static FOLDER_OPENED_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(FOLDER_OPENED_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const FOLDER_OPENED_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("folder_opened_gate_active.rgba");
 static FOLDER_OPENED_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(FOLDER_OPENED_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const FOLDER_OPENED_GATE_ACCENT_RGBA: &[u8] = include_bytes!("folder_opened_gate_accent.rgba");
 static FOLDER_OPENED_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(FOLDER_OPENED_GATE_ACCENT_RGBA));
 
 const FOLDER_OPENED_COMPACT_RGBA: &[u8] = include_bytes!("folder_opened_compact.rgba");
 static FOLDER_OPENED_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(FOLDER_OPENED_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// FOLDER_OPENED_RGBA above.
+#[cfg(test)]
 const FOLDER_OPENED_STRIP_RGBA: &[u8] = include_bytes!("folder_opened_strip.rgba");
-static FOLDER_OPENED_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(FOLDER_OPENED_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const FOLDER_OPENED_STRIP_GATE_RGBA: &[u8] = include_bytes!("folder_opened_strip_gate.rgba");
 static FOLDER_OPENED_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(FOLDER_OPENED_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// FOLDER_OPENED_RGBA above.
+#[cfg(test)]
 const FOLDER_OPENED_GALLERY_RGBA: &[u8] = include_bytes!("folder_opened_gallery.rgba");
-static FOLDER_OPENED_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(FOLDER_OPENED_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const FOLDER_OPENED_GALLERY_GATE_RGBA: &[u8] = include_bytes!("folder_opened_gallery_gate.rgba");
 static FOLDER_OPENED_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(FOLDER_OPENED_GALLERY_GATE_RGBA));
 
 // ---- File (file) ----------------------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const FILE_RGBA: &[u8] = include_bytes!("file.rgba");
-static FILE_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(FILE_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const FILE_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("file_gate_active.rgba");
 static FILE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(FILE_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const FILE_GATE_ACCENT_RGBA: &[u8] = include_bytes!("file_gate_accent.rgba");
 static FILE_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(FILE_GATE_ACCENT_RGBA));
 
 const FILE_COMPACT_RGBA: &[u8] = include_bytes!("file_compact.rgba");
 static FILE_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(FILE_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// FILE_RGBA above.
+#[cfg(test)]
 const FILE_STRIP_RGBA: &[u8] = include_bytes!("file_strip.rgba");
-static FILE_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(FILE_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const FILE_STRIP_GATE_RGBA: &[u8] = include_bytes!("file_strip_gate.rgba");
 static FILE_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(FILE_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// FILE_RGBA above.
+#[cfg(test)]
 const FILE_GALLERY_RGBA: &[u8] = include_bytes!("file_gallery.rgba");
-static FILE_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(FILE_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const FILE_GALLERY_GATE_RGBA: &[u8] = include_bytes!("file_gallery_gate.rgba");
 static FILE_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(FILE_GALLERY_GATE_RGBA));
 
 // ---- Save (save) ----------------------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const SAVE_RGBA: &[u8] = include_bytes!("save.rgba");
-static SAVE_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(SAVE_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const SAVE_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("save_gate_active.rgba");
 static SAVE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SAVE_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const SAVE_GATE_ACCENT_RGBA: &[u8] = include_bytes!("save_gate_accent.rgba");
 static SAVE_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SAVE_GATE_ACCENT_RGBA));
 
 const SAVE_COMPACT_RGBA: &[u8] = include_bytes!("save_compact.rgba");
 static SAVE_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(SAVE_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// SAVE_RGBA above.
+#[cfg(test)]
 const SAVE_STRIP_RGBA: &[u8] = include_bytes!("save_strip.rgba");
-static SAVE_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(SAVE_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const SAVE_STRIP_GATE_RGBA: &[u8] = include_bytes!("save_strip_gate.rgba");
 static SAVE_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(SAVE_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// SAVE_RGBA above.
+#[cfg(test)]
 const SAVE_GALLERY_RGBA: &[u8] = include_bytes!("save_gallery.rgba");
-static SAVE_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(SAVE_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const SAVE_GALLERY_GATE_RGBA: &[u8] = include_bytes!("save_gallery_gate.rgba");
 static SAVE_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(SAVE_GALLERY_GATE_RGBA));
 
 // ---- Refresh (refresh) ----------------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const REFRESH_RGBA: &[u8] = include_bytes!("refresh.rgba");
-static REFRESH_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(REFRESH_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const REFRESH_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("refresh_gate_active.rgba");
 static REFRESH_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(REFRESH_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const REFRESH_GATE_ACCENT_RGBA: &[u8] = include_bytes!("refresh_gate_accent.rgba");
 static REFRESH_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(REFRESH_GATE_ACCENT_RGBA));
 
 const REFRESH_COMPACT_RGBA: &[u8] = include_bytes!("refresh_compact.rgba");
 static REFRESH_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(REFRESH_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// REFRESH_RGBA above.
+#[cfg(test)]
 const REFRESH_STRIP_RGBA: &[u8] = include_bytes!("refresh_strip.rgba");
-static REFRESH_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(REFRESH_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const REFRESH_STRIP_GATE_RGBA: &[u8] = include_bytes!("refresh_strip_gate.rgba");
 static REFRESH_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(REFRESH_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// REFRESH_RGBA above.
+#[cfg(test)]
 const REFRESH_GALLERY_RGBA: &[u8] = include_bytes!("refresh_gallery.rgba");
-static REFRESH_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(REFRESH_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const REFRESH_GALLERY_GATE_RGBA: &[u8] = include_bytes!("refresh_gallery_gate.rgba");
 static REFRESH_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(REFRESH_GALLERY_GATE_RGBA));
 
 // ---- Add (add) ------------------------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const ADD_RGBA: &[u8] = include_bytes!("add.rgba");
-static ADD_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(ADD_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const ADD_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("add_gate_active.rgba");
 static ADD_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ADD_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const ADD_GATE_ACCENT_RGBA: &[u8] = include_bytes!("add_gate_accent.rgba");
 static ADD_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ADD_GATE_ACCENT_RGBA));
 
 const ADD_COMPACT_RGBA: &[u8] = include_bytes!("add_compact.rgba");
 static ADD_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(ADD_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// ADD_RGBA above.
+#[cfg(test)]
 const ADD_STRIP_RGBA: &[u8] = include_bytes!("add_strip.rgba");
-static ADD_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(ADD_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const ADD_STRIP_GATE_RGBA: &[u8] = include_bytes!("add_strip_gate.rgba");
 static ADD_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(ADD_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// ADD_RGBA above.
+#[cfg(test)]
 const ADD_GALLERY_RGBA: &[u8] = include_bytes!("add_gallery.rgba");
-static ADD_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(ADD_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const ADD_GALLERY_GATE_RGBA: &[u8] = include_bytes!("add_gallery_gate.rgba");
 static ADD_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(ADD_GALLERY_GATE_RGBA));
 
 // ---- Trash (trash) --------------------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const TRASH_RGBA: &[u8] = include_bytes!("trash.rgba");
-static TRASH_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(TRASH_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const TRASH_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("trash_gate_active.rgba");
 static TRASH_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(TRASH_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const TRASH_GATE_ACCENT_RGBA: &[u8] = include_bytes!("trash_gate_accent.rgba");
 static TRASH_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(TRASH_GATE_ACCENT_RGBA));
 
 const TRASH_COMPACT_RGBA: &[u8] = include_bytes!("trash_compact.rgba");
 static TRASH_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(TRASH_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// TRASH_RGBA above.
+#[cfg(test)]
 const TRASH_STRIP_RGBA: &[u8] = include_bytes!("trash_strip.rgba");
-static TRASH_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(TRASH_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const TRASH_STRIP_GATE_RGBA: &[u8] = include_bytes!("trash_strip_gate.rgba");
 static TRASH_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(TRASH_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// TRASH_RGBA above.
+#[cfg(test)]
 const TRASH_GALLERY_RGBA: &[u8] = include_bytes!("trash_gallery.rgba");
-static TRASH_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(TRASH_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const TRASH_GALLERY_GATE_RGBA: &[u8] = include_bytes!("trash_gallery_gate.rgba");
 static TRASH_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(TRASH_GALLERY_GATE_RGBA));
 
 // ---- Search (search) ------------------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const SEARCH_RGBA: &[u8] = include_bytes!("search.rgba");
-static SEARCH_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(SEARCH_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const SEARCH_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("search_gate_active.rgba");
 static SEARCH_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SEARCH_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const SEARCH_GATE_ACCENT_RGBA: &[u8] = include_bytes!("search_gate_accent.rgba");
 static SEARCH_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SEARCH_GATE_ACCENT_RGBA));
 
 const SEARCH_COMPACT_RGBA: &[u8] = include_bytes!("search_compact.rgba");
 static SEARCH_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(SEARCH_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// SEARCH_RGBA above.
+#[cfg(test)]
 const SEARCH_STRIP_RGBA: &[u8] = include_bytes!("search_strip.rgba");
-static SEARCH_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(SEARCH_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const SEARCH_STRIP_GATE_RGBA: &[u8] = include_bytes!("search_strip_gate.rgba");
 static SEARCH_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(SEARCH_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// SEARCH_RGBA above.
+#[cfg(test)]
 const SEARCH_GALLERY_RGBA: &[u8] = include_bytes!("search_gallery.rgba");
-static SEARCH_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(SEARCH_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const SEARCH_GALLERY_GATE_RGBA: &[u8] = include_bytes!("search_gallery_gate.rgba");
 static SEARCH_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(SEARCH_GALLERY_GATE_RGBA));
 
 // ---- Check (check) --------------------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const CHECK_RGBA: &[u8] = include_bytes!("check.rgba");
-static CHECK_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(CHECK_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const CHECK_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("check_gate_active.rgba");
 static CHECK_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CHECK_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const CHECK_GATE_ACCENT_RGBA: &[u8] = include_bytes!("check_gate_accent.rgba");
 static CHECK_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CHECK_GATE_ACCENT_RGBA));
 
 const CHECK_COMPACT_RGBA: &[u8] = include_bytes!("check_compact.rgba");
 static CHECK_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(CHECK_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// CHECK_RGBA above.
+#[cfg(test)]
 const CHECK_STRIP_RGBA: &[u8] = include_bytes!("check_strip.rgba");
-static CHECK_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(CHECK_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const CHECK_STRIP_GATE_RGBA: &[u8] = include_bytes!("check_strip_gate.rgba");
 static CHECK_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(CHECK_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// CHECK_RGBA above.
+#[cfg(test)]
 const CHECK_GALLERY_RGBA: &[u8] = include_bytes!("check_gallery.rgba");
-static CHECK_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(CHECK_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const CHECK_GALLERY_GATE_RGBA: &[u8] = include_bytes!("check_gallery_gate.rgba");
 static CHECK_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(CHECK_GALLERY_GATE_RGBA));
 
 // ---- Close (close) --------------------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const CLOSE_RGBA: &[u8] = include_bytes!("close.rgba");
-static CLOSE_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(CLOSE_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const CLOSE_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("close_gate_active.rgba");
 static CLOSE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CLOSE_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const CLOSE_GATE_ACCENT_RGBA: &[u8] = include_bytes!("close_gate_accent.rgba");
 static CLOSE_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CLOSE_GATE_ACCENT_RGBA));
 
 const CLOSE_COMPACT_RGBA: &[u8] = include_bytes!("close_compact.rgba");
 static CLOSE_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(CLOSE_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// CLOSE_RGBA above.
+#[cfg(test)]
 const CLOSE_STRIP_RGBA: &[u8] = include_bytes!("close_strip.rgba");
-static CLOSE_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(CLOSE_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const CLOSE_STRIP_GATE_RGBA: &[u8] = include_bytes!("close_strip_gate.rgba");
 static CLOSE_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(CLOSE_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// CLOSE_RGBA above.
+#[cfg(test)]
 const CLOSE_GALLERY_RGBA: &[u8] = include_bytes!("close_gallery.rgba");
-static CLOSE_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(CLOSE_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const CLOSE_GALLERY_GATE_RGBA: &[u8] = include_bytes!("close_gallery_gate.rgba");
 static CLOSE_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(CLOSE_GALLERY_GATE_RGBA));
 
 // ---- ArrowUp (arrow-up) ---------------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const ARROW_UP_RGBA: &[u8] = include_bytes!("arrow_up.rgba");
-static ARROW_UP_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(ARROW_UP_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const ARROW_UP_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("arrow_up_gate_active.rgba");
 static ARROW_UP_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ARROW_UP_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const ARROW_UP_GATE_ACCENT_RGBA: &[u8] = include_bytes!("arrow_up_gate_accent.rgba");
 static ARROW_UP_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ARROW_UP_GATE_ACCENT_RGBA));
 
 const ARROW_UP_COMPACT_RGBA: &[u8] = include_bytes!("arrow_up_compact.rgba");
 static ARROW_UP_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(ARROW_UP_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// ARROW_UP_RGBA above.
+#[cfg(test)]
 const ARROW_UP_STRIP_RGBA: &[u8] = include_bytes!("arrow_up_strip.rgba");
-static ARROW_UP_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(ARROW_UP_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const ARROW_UP_STRIP_GATE_RGBA: &[u8] = include_bytes!("arrow_up_strip_gate.rgba");
 static ARROW_UP_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(ARROW_UP_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// ARROW_UP_RGBA above.
+#[cfg(test)]
 const ARROW_UP_GALLERY_RGBA: &[u8] = include_bytes!("arrow_up_gallery.rgba");
-static ARROW_UP_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(ARROW_UP_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const ARROW_UP_GALLERY_GATE_RGBA: &[u8] = include_bytes!("arrow_up_gallery_gate.rgba");
 static ARROW_UP_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(ARROW_UP_GALLERY_GATE_RGBA));
 
 // ---- ArrowDown (arrow-down) -----------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const ARROW_DOWN_RGBA: &[u8] = include_bytes!("arrow_down.rgba");
-static ARROW_DOWN_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(ARROW_DOWN_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const ARROW_DOWN_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("arrow_down_gate_active.rgba");
 static ARROW_DOWN_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ARROW_DOWN_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const ARROW_DOWN_GATE_ACCENT_RGBA: &[u8] = include_bytes!("arrow_down_gate_accent.rgba");
 static ARROW_DOWN_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ARROW_DOWN_GATE_ACCENT_RGBA));
 
 const ARROW_DOWN_COMPACT_RGBA: &[u8] = include_bytes!("arrow_down_compact.rgba");
 static ARROW_DOWN_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(ARROW_DOWN_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// ARROW_DOWN_RGBA above.
+#[cfg(test)]
 const ARROW_DOWN_STRIP_RGBA: &[u8] = include_bytes!("arrow_down_strip.rgba");
-static ARROW_DOWN_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(ARROW_DOWN_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const ARROW_DOWN_STRIP_GATE_RGBA: &[u8] = include_bytes!("arrow_down_strip_gate.rgba");
 static ARROW_DOWN_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(ARROW_DOWN_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// ARROW_DOWN_RGBA above.
+#[cfg(test)]
 const ARROW_DOWN_GALLERY_RGBA: &[u8] = include_bytes!("arrow_down_gallery.rgba");
-static ARROW_DOWN_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(ARROW_DOWN_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const ARROW_DOWN_GALLERY_GATE_RGBA: &[u8] = include_bytes!("arrow_down_gallery_gate.rgba");
 static ARROW_DOWN_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(ARROW_DOWN_GALLERY_GATE_RGBA));
 
 // ---- ArrowLeft (arrow-left) -----------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const ARROW_LEFT_RGBA: &[u8] = include_bytes!("arrow_left.rgba");
-static ARROW_LEFT_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(ARROW_LEFT_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const ARROW_LEFT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("arrow_left_gate_active.rgba");
 static ARROW_LEFT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ARROW_LEFT_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const ARROW_LEFT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("arrow_left_gate_accent.rgba");
 static ARROW_LEFT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ARROW_LEFT_GATE_ACCENT_RGBA));
 
 const ARROW_LEFT_COMPACT_RGBA: &[u8] = include_bytes!("arrow_left_compact.rgba");
 static ARROW_LEFT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(ARROW_LEFT_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// ARROW_LEFT_RGBA above.
+#[cfg(test)]
 const ARROW_LEFT_STRIP_RGBA: &[u8] = include_bytes!("arrow_left_strip.rgba");
-static ARROW_LEFT_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(ARROW_LEFT_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const ARROW_LEFT_STRIP_GATE_RGBA: &[u8] = include_bytes!("arrow_left_strip_gate.rgba");
 static ARROW_LEFT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(ARROW_LEFT_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// ARROW_LEFT_RGBA above.
+#[cfg(test)]
 const ARROW_LEFT_GALLERY_RGBA: &[u8] = include_bytes!("arrow_left_gallery.rgba");
-static ARROW_LEFT_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(ARROW_LEFT_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const ARROW_LEFT_GALLERY_GATE_RGBA: &[u8] = include_bytes!("arrow_left_gallery_gate.rgba");
 static ARROW_LEFT_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(ARROW_LEFT_GALLERY_GATE_RGBA));
 
 // ---- ArrowRight (arrow-right) ---------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const ARROW_RIGHT_RGBA: &[u8] = include_bytes!("arrow_right.rgba");
-static ARROW_RIGHT_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(ARROW_RIGHT_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const ARROW_RIGHT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("arrow_right_gate_active.rgba");
 static ARROW_RIGHT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ARROW_RIGHT_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const ARROW_RIGHT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("arrow_right_gate_accent.rgba");
 static ARROW_RIGHT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ARROW_RIGHT_GATE_ACCENT_RGBA));
 
 const ARROW_RIGHT_COMPACT_RGBA: &[u8] = include_bytes!("arrow_right_compact.rgba");
 static ARROW_RIGHT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(ARROW_RIGHT_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// ARROW_RIGHT_RGBA above.
+#[cfg(test)]
 const ARROW_RIGHT_STRIP_RGBA: &[u8] = include_bytes!("arrow_right_strip.rgba");
-static ARROW_RIGHT_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(ARROW_RIGHT_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const ARROW_RIGHT_STRIP_GATE_RGBA: &[u8] = include_bytes!("arrow_right_strip_gate.rgba");
 static ARROW_RIGHT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(ARROW_RIGHT_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// ARROW_RIGHT_RGBA above.
+#[cfg(test)]
 const ARROW_RIGHT_GALLERY_RGBA: &[u8] = include_bytes!("arrow_right_gallery.rgba");
-static ARROW_RIGHT_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(ARROW_RIGHT_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const ARROW_RIGHT_GALLERY_GATE_RGBA: &[u8] = include_bytes!("arrow_right_gallery_gate.rgba");
 static ARROW_RIGHT_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(ARROW_RIGHT_GALLERY_GATE_RGBA));
 
 // ---- ArrowSwap (arrow-swap) -----------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const ARROW_SWAP_RGBA: &[u8] = include_bytes!("arrow_swap.rgba");
-static ARROW_SWAP_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(ARROW_SWAP_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const ARROW_SWAP_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("arrow_swap_gate_active.rgba");
 static ARROW_SWAP_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ARROW_SWAP_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const ARROW_SWAP_GATE_ACCENT_RGBA: &[u8] = include_bytes!("arrow_swap_gate_accent.rgba");
 static ARROW_SWAP_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ARROW_SWAP_GATE_ACCENT_RGBA));
 
 const ARROW_SWAP_COMPACT_RGBA: &[u8] = include_bytes!("arrow_swap_compact.rgba");
 static ARROW_SWAP_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(ARROW_SWAP_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// ARROW_SWAP_RGBA above.
+#[cfg(test)]
 const ARROW_SWAP_STRIP_RGBA: &[u8] = include_bytes!("arrow_swap_strip.rgba");
-static ARROW_SWAP_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(ARROW_SWAP_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const ARROW_SWAP_STRIP_GATE_RGBA: &[u8] = include_bytes!("arrow_swap_strip_gate.rgba");
 static ARROW_SWAP_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(ARROW_SWAP_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// ARROW_SWAP_RGBA above.
+#[cfg(test)]
 const ARROW_SWAP_GALLERY_RGBA: &[u8] = include_bytes!("arrow_swap_gallery.rgba");
-static ARROW_SWAP_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(ARROW_SWAP_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const ARROW_SWAP_GALLERY_GATE_RGBA: &[u8] = include_bytes!("arrow_swap_gallery_gate.rgba");
 static ARROW_SWAP_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(ARROW_SWAP_GALLERY_GATE_RGBA));
 
 // ---- GitCommit (git-commit) -----------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const GIT_COMMIT_RGBA: &[u8] = include_bytes!("git_commit.rgba");
-static GIT_COMMIT_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(GIT_COMMIT_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const GIT_COMMIT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("git_commit_gate_active.rgba");
 static GIT_COMMIT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(GIT_COMMIT_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const GIT_COMMIT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("git_commit_gate_accent.rgba");
 static GIT_COMMIT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(GIT_COMMIT_GATE_ACCENT_RGBA));
 
 const GIT_COMMIT_COMPACT_RGBA: &[u8] = include_bytes!("git_commit_compact.rgba");
 static GIT_COMMIT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(GIT_COMMIT_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// GIT_COMMIT_RGBA above.
+#[cfg(test)]
 const GIT_COMMIT_STRIP_RGBA: &[u8] = include_bytes!("git_commit_strip.rgba");
-static GIT_COMMIT_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(GIT_COMMIT_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const GIT_COMMIT_STRIP_GATE_RGBA: &[u8] = include_bytes!("git_commit_strip_gate.rgba");
 static GIT_COMMIT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(GIT_COMMIT_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// GIT_COMMIT_RGBA above.
+#[cfg(test)]
 const GIT_COMMIT_GALLERY_RGBA: &[u8] = include_bytes!("git_commit_gallery.rgba");
-static GIT_COMMIT_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(GIT_COMMIT_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const GIT_COMMIT_GALLERY_GATE_RGBA: &[u8] = include_bytes!("git_commit_gallery_gate.rgba");
 static GIT_COMMIT_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(GIT_COMMIT_GALLERY_GATE_RGBA));
 
 // ---- GitBranch (git-branch) -----------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const GIT_BRANCH_RGBA: &[u8] = include_bytes!("git_branch.rgba");
-static GIT_BRANCH_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(GIT_BRANCH_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const GIT_BRANCH_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("git_branch_gate_active.rgba");
 static GIT_BRANCH_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(GIT_BRANCH_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const GIT_BRANCH_GATE_ACCENT_RGBA: &[u8] = include_bytes!("git_branch_gate_accent.rgba");
 static GIT_BRANCH_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(GIT_BRANCH_GATE_ACCENT_RGBA));
 
 const GIT_BRANCH_COMPACT_RGBA: &[u8] = include_bytes!("git_branch_compact.rgba");
 static GIT_BRANCH_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(GIT_BRANCH_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// GIT_BRANCH_RGBA above.
+#[cfg(test)]
 const GIT_BRANCH_STRIP_RGBA: &[u8] = include_bytes!("git_branch_strip.rgba");
-static GIT_BRANCH_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(GIT_BRANCH_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const GIT_BRANCH_STRIP_GATE_RGBA: &[u8] = include_bytes!("git_branch_strip_gate.rgba");
 static GIT_BRANCH_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(GIT_BRANCH_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// GIT_BRANCH_RGBA above.
+#[cfg(test)]
 const GIT_BRANCH_GALLERY_RGBA: &[u8] = include_bytes!("git_branch_gallery.rgba");
-static GIT_BRANCH_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(GIT_BRANCH_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const GIT_BRANCH_GALLERY_GATE_RGBA: &[u8] = include_bytes!("git_branch_gallery_gate.rgba");
 static GIT_BRANCH_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(GIT_BRANCH_GALLERY_GATE_RGBA));
 
 // ---- Diff (diff) ----------------------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const DIFF_RGBA: &[u8] = include_bytes!("diff.rgba");
-static DIFF_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(DIFF_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const DIFF_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("diff_gate_active.rgba");
 static DIFF_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(DIFF_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const DIFF_GATE_ACCENT_RGBA: &[u8] = include_bytes!("diff_gate_accent.rgba");
 static DIFF_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(DIFF_GATE_ACCENT_RGBA));
 
 const DIFF_COMPACT_RGBA: &[u8] = include_bytes!("diff_compact.rgba");
 static DIFF_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(DIFF_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// DIFF_RGBA above.
+#[cfg(test)]
 const DIFF_STRIP_RGBA: &[u8] = include_bytes!("diff_strip.rgba");
-static DIFF_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(DIFF_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const DIFF_STRIP_GATE_RGBA: &[u8] = include_bytes!("diff_strip_gate.rgba");
 static DIFF_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(DIFF_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// DIFF_RGBA above.
+#[cfg(test)]
 const DIFF_GALLERY_RGBA: &[u8] = include_bytes!("diff_gallery.rgba");
-static DIFF_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(DIFF_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const DIFF_GALLERY_GATE_RGBA: &[u8] = include_bytes!("diff_gallery_gate.rgba");
 static DIFF_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(DIFF_GALLERY_GATE_RGBA));
 
 // ---- DiffAdded (diff-added) -----------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const DIFF_ADDED_RGBA: &[u8] = include_bytes!("diff_added.rgba");
-static DIFF_ADDED_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(DIFF_ADDED_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const DIFF_ADDED_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("diff_added_gate_active.rgba");
 static DIFF_ADDED_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(DIFF_ADDED_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const DIFF_ADDED_GATE_ACCENT_RGBA: &[u8] = include_bytes!("diff_added_gate_accent.rgba");
 static DIFF_ADDED_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(DIFF_ADDED_GATE_ACCENT_RGBA));
 
 const DIFF_ADDED_COMPACT_RGBA: &[u8] = include_bytes!("diff_added_compact.rgba");
 static DIFF_ADDED_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(DIFF_ADDED_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// DIFF_ADDED_RGBA above.
+#[cfg(test)]
 const DIFF_ADDED_STRIP_RGBA: &[u8] = include_bytes!("diff_added_strip.rgba");
-static DIFF_ADDED_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(DIFF_ADDED_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const DIFF_ADDED_STRIP_GATE_RGBA: &[u8] = include_bytes!("diff_added_strip_gate.rgba");
 static DIFF_ADDED_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(DIFF_ADDED_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// DIFF_ADDED_RGBA above.
+#[cfg(test)]
 const DIFF_ADDED_GALLERY_RGBA: &[u8] = include_bytes!("diff_added_gallery.rgba");
-static DIFF_ADDED_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(DIFF_ADDED_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const DIFF_ADDED_GALLERY_GATE_RGBA: &[u8] = include_bytes!("diff_added_gallery_gate.rgba");
 static DIFF_ADDED_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(DIFF_ADDED_GALLERY_GATE_RGBA));
 
 // ---- GitCompare (git-compare) ---------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const GIT_COMPARE_RGBA: &[u8] = include_bytes!("git_compare.rgba");
-static GIT_COMPARE_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(GIT_COMPARE_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const GIT_COMPARE_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("git_compare_gate_active.rgba");
 static GIT_COMPARE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(GIT_COMPARE_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const GIT_COMPARE_GATE_ACCENT_RGBA: &[u8] = include_bytes!("git_compare_gate_accent.rgba");
 static GIT_COMPARE_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(GIT_COMPARE_GATE_ACCENT_RGBA));
 
 const GIT_COMPARE_COMPACT_RGBA: &[u8] = include_bytes!("git_compare_compact.rgba");
 static GIT_COMPARE_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(GIT_COMPARE_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// GIT_COMPARE_RGBA above.
+#[cfg(test)]
 const GIT_COMPARE_STRIP_RGBA: &[u8] = include_bytes!("git_compare_strip.rgba");
-static GIT_COMPARE_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(GIT_COMPARE_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const GIT_COMPARE_STRIP_GATE_RGBA: &[u8] = include_bytes!("git_compare_strip_gate.rgba");
 static GIT_COMPARE_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(GIT_COMPARE_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// GIT_COMPARE_RGBA above.
+#[cfg(test)]
 const GIT_COMPARE_GALLERY_RGBA: &[u8] = include_bytes!("git_compare_gallery.rgba");
-static GIT_COMPARE_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(GIT_COMPARE_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const GIT_COMPARE_GALLERY_GATE_RGBA: &[u8] = include_bytes!("git_compare_gallery_gate.rgba");
 static GIT_COMPARE_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(GIT_COMPARE_GALLERY_GATE_RGBA));
 
 // ---- Repo (repo) ----------------------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const REPO_RGBA: &[u8] = include_bytes!("repo.rgba");
-static REPO_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(REPO_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const REPO_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("repo_gate_active.rgba");
 static REPO_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(REPO_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const REPO_GATE_ACCENT_RGBA: &[u8] = include_bytes!("repo_gate_accent.rgba");
 static REPO_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(REPO_GATE_ACCENT_RGBA));
 
 const REPO_COMPACT_RGBA: &[u8] = include_bytes!("repo_compact.rgba");
 static REPO_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(REPO_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// REPO_RGBA above.
+#[cfg(test)]
 const REPO_STRIP_RGBA: &[u8] = include_bytes!("repo_strip.rgba");
-static REPO_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(REPO_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const REPO_STRIP_GATE_RGBA: &[u8] = include_bytes!("repo_strip_gate.rgba");
 static REPO_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(REPO_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// REPO_RGBA above.
+#[cfg(test)]
 const REPO_GALLERY_RGBA: &[u8] = include_bytes!("repo_gallery.rgba");
-static REPO_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(REPO_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const REPO_GALLERY_GATE_RGBA: &[u8] = include_bytes!("repo_gallery_gate.rgba");
 static REPO_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(REPO_GALLERY_GATE_RGBA));
 
 // ---- RepoForked (repo-forked) ---------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const REPO_FORKED_RGBA: &[u8] = include_bytes!("repo_forked.rgba");
-static REPO_FORKED_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(REPO_FORKED_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const REPO_FORKED_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("repo_forked_gate_active.rgba");
 static REPO_FORKED_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(REPO_FORKED_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const REPO_FORKED_GATE_ACCENT_RGBA: &[u8] = include_bytes!("repo_forked_gate_accent.rgba");
 static REPO_FORKED_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(REPO_FORKED_GATE_ACCENT_RGBA));
 
 const REPO_FORKED_COMPACT_RGBA: &[u8] = include_bytes!("repo_forked_compact.rgba");
 static REPO_FORKED_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(REPO_FORKED_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// REPO_FORKED_RGBA above.
+#[cfg(test)]
 const REPO_FORKED_STRIP_RGBA: &[u8] = include_bytes!("repo_forked_strip.rgba");
-static REPO_FORKED_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(REPO_FORKED_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const REPO_FORKED_STRIP_GATE_RGBA: &[u8] = include_bytes!("repo_forked_strip_gate.rgba");
 static REPO_FORKED_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(REPO_FORKED_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// REPO_FORKED_RGBA above.
+#[cfg(test)]
 const REPO_FORKED_GALLERY_RGBA: &[u8] = include_bytes!("repo_forked_gallery.rgba");
-static REPO_FORKED_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(REPO_FORKED_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const REPO_FORKED_GALLERY_GATE_RGBA: &[u8] = include_bytes!("repo_forked_gallery_gate.rgba");
 static REPO_FORKED_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(REPO_FORKED_GALLERY_GATE_RGBA));
 
 // ---- DebugStop (debug-stop) -----------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const DEBUG_STOP_RGBA: &[u8] = include_bytes!("debug_stop.rgba");
-static DEBUG_STOP_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(DEBUG_STOP_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const DEBUG_STOP_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("debug_stop_gate_active.rgba");
 static DEBUG_STOP_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(DEBUG_STOP_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const DEBUG_STOP_GATE_ACCENT_RGBA: &[u8] = include_bytes!("debug_stop_gate_accent.rgba");
 static DEBUG_STOP_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(DEBUG_STOP_GATE_ACCENT_RGBA));
 
 const DEBUG_STOP_COMPACT_RGBA: &[u8] = include_bytes!("debug_stop_compact.rgba");
 static DEBUG_STOP_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(DEBUG_STOP_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// DEBUG_STOP_RGBA above.
+#[cfg(test)]
 const DEBUG_STOP_STRIP_RGBA: &[u8] = include_bytes!("debug_stop_strip.rgba");
-static DEBUG_STOP_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(DEBUG_STOP_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const DEBUG_STOP_STRIP_GATE_RGBA: &[u8] = include_bytes!("debug_stop_strip_gate.rgba");
 static DEBUG_STOP_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(DEBUG_STOP_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// DEBUG_STOP_RGBA above.
+#[cfg(test)]
 const DEBUG_STOP_GALLERY_RGBA: &[u8] = include_bytes!("debug_stop_gallery.rgba");
-static DEBUG_STOP_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(DEBUG_STOP_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const DEBUG_STOP_GALLERY_GATE_RGBA: &[u8] = include_bytes!("debug_stop_gallery_gate.rgba");
 static DEBUG_STOP_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(DEBUG_STOP_GALLERY_GATE_RGBA));
 
 // ---- DebugRestart (debug-restart) -----------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const DEBUG_RESTART_RGBA: &[u8] = include_bytes!("debug_restart.rgba");
-static DEBUG_RESTART_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(DEBUG_RESTART_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const DEBUG_RESTART_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("debug_restart_gate_active.rgba");
 static DEBUG_RESTART_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(DEBUG_RESTART_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const DEBUG_RESTART_GATE_ACCENT_RGBA: &[u8] = include_bytes!("debug_restart_gate_accent.rgba");
 static DEBUG_RESTART_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(DEBUG_RESTART_GATE_ACCENT_RGBA));
 
 const DEBUG_RESTART_COMPACT_RGBA: &[u8] = include_bytes!("debug_restart_compact.rgba");
 static DEBUG_RESTART_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(DEBUG_RESTART_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// DEBUG_RESTART_RGBA above.
+#[cfg(test)]
 const DEBUG_RESTART_STRIP_RGBA: &[u8] = include_bytes!("debug_restart_strip.rgba");
-static DEBUG_RESTART_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(DEBUG_RESTART_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const DEBUG_RESTART_STRIP_GATE_RGBA: &[u8] = include_bytes!("debug_restart_strip_gate.rgba");
 static DEBUG_RESTART_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(DEBUG_RESTART_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// DEBUG_RESTART_RGBA above.
+#[cfg(test)]
 const DEBUG_RESTART_GALLERY_RGBA: &[u8] = include_bytes!("debug_restart_gallery.rgba");
-static DEBUG_RESTART_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(DEBUG_RESTART_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const DEBUG_RESTART_GALLERY_GATE_RGBA: &[u8] = include_bytes!("debug_restart_gallery_gate.rgba");
 static DEBUG_RESTART_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(DEBUG_RESTART_GALLERY_GATE_RGBA));
 
 // ---- Edit (edit) ----------------------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const EDIT_RGBA: &[u8] = include_bytes!("edit.rgba");
-static EDIT_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(EDIT_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const EDIT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("edit_gate_active.rgba");
 static EDIT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(EDIT_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const EDIT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("edit_gate_accent.rgba");
 static EDIT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(EDIT_GATE_ACCENT_RGBA));
 
 const EDIT_COMPACT_RGBA: &[u8] = include_bytes!("edit_compact.rgba");
 static EDIT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(EDIT_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// EDIT_RGBA above.
+#[cfg(test)]
 const EDIT_STRIP_RGBA: &[u8] = include_bytes!("edit_strip.rgba");
-static EDIT_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(EDIT_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const EDIT_STRIP_GATE_RGBA: &[u8] = include_bytes!("edit_strip_gate.rgba");
 static EDIT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(EDIT_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// EDIT_RGBA above.
+#[cfg(test)]
 const EDIT_GALLERY_RGBA: &[u8] = include_bytes!("edit_gallery.rgba");
-static EDIT_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(EDIT_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const EDIT_GALLERY_GATE_RGBA: &[u8] = include_bytes!("edit_gallery_gate.rgba");
 static EDIT_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(EDIT_GALLERY_GATE_RGBA));
 
 // ---- History (history) ----------------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const HISTORY_RGBA: &[u8] = include_bytes!("history.rgba");
-static HISTORY_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(HISTORY_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const HISTORY_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("history_gate_active.rgba");
 static HISTORY_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(HISTORY_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const HISTORY_GATE_ACCENT_RGBA: &[u8] = include_bytes!("history_gate_accent.rgba");
 static HISTORY_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(HISTORY_GATE_ACCENT_RGBA));
 
 const HISTORY_COMPACT_RGBA: &[u8] = include_bytes!("history_compact.rgba");
 static HISTORY_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(HISTORY_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// HISTORY_RGBA above.
+#[cfg(test)]
 const HISTORY_STRIP_RGBA: &[u8] = include_bytes!("history_strip.rgba");
-static HISTORY_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(HISTORY_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const HISTORY_STRIP_GATE_RGBA: &[u8] = include_bytes!("history_strip_gate.rgba");
 static HISTORY_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(HISTORY_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// HISTORY_RGBA above.
+#[cfg(test)]
 const HISTORY_GALLERY_RGBA: &[u8] = include_bytes!("history_gallery.rgba");
-static HISTORY_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(HISTORY_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const HISTORY_GALLERY_GATE_RGBA: &[u8] = include_bytes!("history_gallery_gate.rgba");
 static HISTORY_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(HISTORY_GALLERY_GATE_RGBA));
 
 // ---- Terminal (terminal) --------------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const TERMINAL_RGBA: &[u8] = include_bytes!("terminal.rgba");
-static TERMINAL_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(TERMINAL_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const TERMINAL_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("terminal_gate_active.rgba");
 static TERMINAL_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(TERMINAL_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const TERMINAL_GATE_ACCENT_RGBA: &[u8] = include_bytes!("terminal_gate_accent.rgba");
 static TERMINAL_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(TERMINAL_GATE_ACCENT_RGBA));
 
 const TERMINAL_COMPACT_RGBA: &[u8] = include_bytes!("terminal_compact.rgba");
 static TERMINAL_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(TERMINAL_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// TERMINAL_RGBA above.
+#[cfg(test)]
 const TERMINAL_STRIP_RGBA: &[u8] = include_bytes!("terminal_strip.rgba");
-static TERMINAL_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(TERMINAL_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const TERMINAL_STRIP_GATE_RGBA: &[u8] = include_bytes!("terminal_strip_gate.rgba");
 static TERMINAL_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(TERMINAL_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// TERMINAL_RGBA above.
+#[cfg(test)]
 const TERMINAL_GALLERY_RGBA: &[u8] = include_bytes!("terminal_gallery.rgba");
-static TERMINAL_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(TERMINAL_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const TERMINAL_GALLERY_GATE_RGBA: &[u8] = include_bytes!("terminal_gallery_gate.rgba");
 static TERMINAL_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(TERMINAL_GALLERY_GATE_RGBA));
 
 // ---- Output (output) ------------------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const OUTPUT_RGBA: &[u8] = include_bytes!("output.rgba");
-static OUTPUT_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(OUTPUT_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const OUTPUT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("output_gate_active.rgba");
 static OUTPUT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(OUTPUT_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const OUTPUT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("output_gate_accent.rgba");
 static OUTPUT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(OUTPUT_GATE_ACCENT_RGBA));
 
 const OUTPUT_COMPACT_RGBA: &[u8] = include_bytes!("output_compact.rgba");
 static OUTPUT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(OUTPUT_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// OUTPUT_RGBA above.
+#[cfg(test)]
 const OUTPUT_STRIP_RGBA: &[u8] = include_bytes!("output_strip.rgba");
-static OUTPUT_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(OUTPUT_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const OUTPUT_STRIP_GATE_RGBA: &[u8] = include_bytes!("output_strip_gate.rgba");
 static OUTPUT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(OUTPUT_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// OUTPUT_RGBA above.
+#[cfg(test)]
 const OUTPUT_GALLERY_RGBA: &[u8] = include_bytes!("output_gallery.rgba");
-static OUTPUT_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(OUTPUT_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const OUTPUT_GALLERY_GATE_RGBA: &[u8] = include_bytes!("output_gallery_gate.rgba");
 static OUTPUT_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(OUTPUT_GALLERY_GATE_RGBA));
 
 // ---- CloudDownload (cloud-download) ---------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const CLOUD_DOWNLOAD_RGBA: &[u8] = include_bytes!("cloud_download.rgba");
-static CLOUD_DOWNLOAD_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(CLOUD_DOWNLOAD_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const CLOUD_DOWNLOAD_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("cloud_download_gate_active.rgba");
 static CLOUD_DOWNLOAD_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CLOUD_DOWNLOAD_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const CLOUD_DOWNLOAD_GATE_ACCENT_RGBA: &[u8] = include_bytes!("cloud_download_gate_accent.rgba");
 static CLOUD_DOWNLOAD_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CLOUD_DOWNLOAD_GATE_ACCENT_RGBA));
 
 const CLOUD_DOWNLOAD_COMPACT_RGBA: &[u8] = include_bytes!("cloud_download_compact.rgba");
 static CLOUD_DOWNLOAD_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(CLOUD_DOWNLOAD_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// CLOUD_DOWNLOAD_RGBA above.
+#[cfg(test)]
 const CLOUD_DOWNLOAD_STRIP_RGBA: &[u8] = include_bytes!("cloud_download_strip.rgba");
-static CLOUD_DOWNLOAD_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(CLOUD_DOWNLOAD_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const CLOUD_DOWNLOAD_STRIP_GATE_RGBA: &[u8] = include_bytes!("cloud_download_strip_gate.rgba");
 static CLOUD_DOWNLOAD_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(CLOUD_DOWNLOAD_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// CLOUD_DOWNLOAD_RGBA above.
+#[cfg(test)]
 const CLOUD_DOWNLOAD_GALLERY_RGBA: &[u8] = include_bytes!("cloud_download_gallery.rgba");
-static CLOUD_DOWNLOAD_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(CLOUD_DOWNLOAD_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const CLOUD_DOWNLOAD_GALLERY_GATE_RGBA: &[u8] = include_bytes!("cloud_download_gallery_gate.rgba");
 static CLOUD_DOWNLOAD_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(CLOUD_DOWNLOAD_GALLERY_GATE_RGBA));
 
 // ---- Ellipsis (ellipsis) --------------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const ELLIPSIS_RGBA: &[u8] = include_bytes!("ellipsis.rgba");
-static ELLIPSIS_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(ELLIPSIS_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const ELLIPSIS_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("ellipsis_gate_active.rgba");
 static ELLIPSIS_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ELLIPSIS_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const ELLIPSIS_GATE_ACCENT_RGBA: &[u8] = include_bytes!("ellipsis_gate_accent.rgba");
 static ELLIPSIS_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ELLIPSIS_GATE_ACCENT_RGBA));
 
 const ELLIPSIS_COMPACT_RGBA: &[u8] = include_bytes!("ellipsis_compact.rgba");
 static ELLIPSIS_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(ELLIPSIS_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// ELLIPSIS_RGBA above.
+#[cfg(test)]
 const ELLIPSIS_STRIP_RGBA: &[u8] = include_bytes!("ellipsis_strip.rgba");
-static ELLIPSIS_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(ELLIPSIS_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const ELLIPSIS_STRIP_GATE_RGBA: &[u8] = include_bytes!("ellipsis_strip_gate.rgba");
 static ELLIPSIS_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(ELLIPSIS_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// ELLIPSIS_RGBA above.
+#[cfg(test)]
 const ELLIPSIS_GALLERY_RGBA: &[u8] = include_bytes!("ellipsis_gallery.rgba");
-static ELLIPSIS_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(ELLIPSIS_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const ELLIPSIS_GALLERY_GATE_RGBA: &[u8] = include_bytes!("ellipsis_gallery_gate.rgba");
 static ELLIPSIS_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(ELLIPSIS_GALLERY_GATE_RGBA));
 
 // ---- Link (link) ----------------------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const LINK_RGBA: &[u8] = include_bytes!("link.rgba");
-static LINK_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(LINK_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const LINK_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("link_gate_active.rgba");
 static LINK_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LINK_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const LINK_GATE_ACCENT_RGBA: &[u8] = include_bytes!("link_gate_accent.rgba");
 static LINK_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LINK_GATE_ACCENT_RGBA));
 
 const LINK_COMPACT_RGBA: &[u8] = include_bytes!("link_compact.rgba");
 static LINK_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LINK_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// LINK_RGBA above.
+#[cfg(test)]
 const LINK_STRIP_RGBA: &[u8] = include_bytes!("link_strip.rgba");
-static LINK_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(LINK_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const LINK_STRIP_GATE_RGBA: &[u8] = include_bytes!("link_strip_gate.rgba");
 static LINK_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LINK_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// LINK_RGBA above.
+#[cfg(test)]
 const LINK_GALLERY_RGBA: &[u8] = include_bytes!("link_gallery.rgba");
-static LINK_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(LINK_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const LINK_GALLERY_GATE_RGBA: &[u8] = include_bytes!("link_gallery_gate.rgba");
 static LINK_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LINK_GALLERY_GATE_RGBA));
 
 // ---- CircleFilled (circle-filled) -----------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const CIRCLE_FILLED_RGBA: &[u8] = include_bytes!("circle_filled.rgba");
-static CIRCLE_FILLED_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(CIRCLE_FILLED_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const CIRCLE_FILLED_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("circle_filled_gate_active.rgba");
 static CIRCLE_FILLED_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CIRCLE_FILLED_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const CIRCLE_FILLED_GATE_ACCENT_RGBA: &[u8] = include_bytes!("circle_filled_gate_accent.rgba");
 static CIRCLE_FILLED_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CIRCLE_FILLED_GATE_ACCENT_RGBA));
 
 const CIRCLE_FILLED_COMPACT_RGBA: &[u8] = include_bytes!("circle_filled_compact.rgba");
 static CIRCLE_FILLED_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(CIRCLE_FILLED_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// CIRCLE_FILLED_RGBA above.
+#[cfg(test)]
 const CIRCLE_FILLED_STRIP_RGBA: &[u8] = include_bytes!("circle_filled_strip.rgba");
-static CIRCLE_FILLED_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(CIRCLE_FILLED_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const CIRCLE_FILLED_STRIP_GATE_RGBA: &[u8] = include_bytes!("circle_filled_strip_gate.rgba");
 static CIRCLE_FILLED_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(CIRCLE_FILLED_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// CIRCLE_FILLED_RGBA above.
+#[cfg(test)]
 const CIRCLE_FILLED_GALLERY_RGBA: &[u8] = include_bytes!("circle_filled_gallery.rgba");
-static CIRCLE_FILLED_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(CIRCLE_FILLED_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const CIRCLE_FILLED_GALLERY_GATE_RGBA: &[u8] = include_bytes!("circle_filled_gallery_gate.rgba");
 static CIRCLE_FILLED_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(CIRCLE_FILLED_GALLERY_GATE_RGBA));
 
 // ---- CircleSlash (circle-slash) -------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const CIRCLE_SLASH_RGBA: &[u8] = include_bytes!("circle_slash.rgba");
-static CIRCLE_SLASH_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(CIRCLE_SLASH_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const CIRCLE_SLASH_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("circle_slash_gate_active.rgba");
 static CIRCLE_SLASH_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CIRCLE_SLASH_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const CIRCLE_SLASH_GATE_ACCENT_RGBA: &[u8] = include_bytes!("circle_slash_gate_accent.rgba");
 static CIRCLE_SLASH_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CIRCLE_SLASH_GATE_ACCENT_RGBA));
 
 const CIRCLE_SLASH_COMPACT_RGBA: &[u8] = include_bytes!("circle_slash_compact.rgba");
 static CIRCLE_SLASH_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(CIRCLE_SLASH_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// CIRCLE_SLASH_RGBA above.
+#[cfg(test)]
 const CIRCLE_SLASH_STRIP_RGBA: &[u8] = include_bytes!("circle_slash_strip.rgba");
-static CIRCLE_SLASH_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(CIRCLE_SLASH_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const CIRCLE_SLASH_STRIP_GATE_RGBA: &[u8] = include_bytes!("circle_slash_strip_gate.rgba");
 static CIRCLE_SLASH_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(CIRCLE_SLASH_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// CIRCLE_SLASH_RGBA above.
+#[cfg(test)]
 const CIRCLE_SLASH_GALLERY_RGBA: &[u8] = include_bytes!("circle_slash_gallery.rgba");
-static CIRCLE_SLASH_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(CIRCLE_SLASH_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const CIRCLE_SLASH_GALLERY_GATE_RGBA: &[u8] = include_bytes!("circle_slash_gallery_gate.rgba");
 static CIRCLE_SLASH_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(CIRCLE_SLASH_GALLERY_GATE_RGBA));
 
 // ---- Warning (warning) ----------------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const WARNING_RGBA: &[u8] = include_bytes!("warning.rgba");
-static WARNING_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(WARNING_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const WARNING_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("warning_gate_active.rgba");
 static WARNING_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(WARNING_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const WARNING_GATE_ACCENT_RGBA: &[u8] = include_bytes!("warning_gate_accent.rgba");
 static WARNING_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(WARNING_GATE_ACCENT_RGBA));
 
 const WARNING_COMPACT_RGBA: &[u8] = include_bytes!("warning_compact.rgba");
 static WARNING_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(WARNING_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// WARNING_RGBA above.
+#[cfg(test)]
 const WARNING_STRIP_RGBA: &[u8] = include_bytes!("warning_strip.rgba");
-static WARNING_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(WARNING_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const WARNING_STRIP_GATE_RGBA: &[u8] = include_bytes!("warning_strip_gate.rgba");
 static WARNING_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(WARNING_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// WARNING_RGBA above.
+#[cfg(test)]
 const WARNING_GALLERY_RGBA: &[u8] = include_bytes!("warning_gallery.rgba");
-static WARNING_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(WARNING_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const WARNING_GALLERY_GATE_RGBA: &[u8] = include_bytes!("warning_gallery_gate.rgba");
 static WARNING_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(WARNING_GALLERY_GATE_RGBA));
 
 // ---- Error (error) --------------------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const ERROR_RGBA: &[u8] = include_bytes!("error.rgba");
-static ERROR_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(ERROR_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const ERROR_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("error_gate_active.rgba");
 static ERROR_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ERROR_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const ERROR_GATE_ACCENT_RGBA: &[u8] = include_bytes!("error_gate_accent.rgba");
 static ERROR_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ERROR_GATE_ACCENT_RGBA));
 
 const ERROR_COMPACT_RGBA: &[u8] = include_bytes!("error_compact.rgba");
 static ERROR_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(ERROR_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// ERROR_RGBA above.
+#[cfg(test)]
 const ERROR_STRIP_RGBA: &[u8] = include_bytes!("error_strip.rgba");
-static ERROR_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(ERROR_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const ERROR_STRIP_GATE_RGBA: &[u8] = include_bytes!("error_strip_gate.rgba");
 static ERROR_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(ERROR_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// ERROR_RGBA above.
+#[cfg(test)]
 const ERROR_GALLERY_RGBA: &[u8] = include_bytes!("error_gallery.rgba");
-static ERROR_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(ERROR_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const ERROR_GALLERY_GATE_RGBA: &[u8] = include_bytes!("error_gallery_gate.rgba");
 static ERROR_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(ERROR_GALLERY_GATE_RGBA));
 
 // ---- Info (info) ----------------------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const INFO_RGBA: &[u8] = include_bytes!("info.rgba");
-static INFO_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(INFO_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const INFO_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("info_gate_active.rgba");
 static INFO_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(INFO_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const INFO_GATE_ACCENT_RGBA: &[u8] = include_bytes!("info_gate_accent.rgba");
 static INFO_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(INFO_GATE_ACCENT_RGBA));
 
 const INFO_COMPACT_RGBA: &[u8] = include_bytes!("info_compact.rgba");
 static INFO_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(INFO_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// INFO_RGBA above.
+#[cfg(test)]
 const INFO_STRIP_RGBA: &[u8] = include_bytes!("info_strip.rgba");
-static INFO_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(INFO_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const INFO_STRIP_GATE_RGBA: &[u8] = include_bytes!("info_strip_gate.rgba");
 static INFO_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(INFO_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// INFO_RGBA above.
+#[cfg(test)]
 const INFO_GALLERY_RGBA: &[u8] = include_bytes!("info_gallery.rgba");
-static INFO_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(INFO_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const INFO_GALLERY_GATE_RGBA: &[u8] = include_bytes!("info_gallery_gate.rgba");
 static INFO_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(INFO_GALLERY_GATE_RGBA));
 
 // ---- RunAll (run-all) -----------------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const RUN_ALL_RGBA: &[u8] = include_bytes!("run_all.rgba");
-static RUN_ALL_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(RUN_ALL_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const RUN_ALL_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("run_all_gate_active.rgba");
 static RUN_ALL_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(RUN_ALL_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const RUN_ALL_GATE_ACCENT_RGBA: &[u8] = include_bytes!("run_all_gate_accent.rgba");
 static RUN_ALL_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(RUN_ALL_GATE_ACCENT_RGBA));
 
 const RUN_ALL_COMPACT_RGBA: &[u8] = include_bytes!("run_all_compact.rgba");
 static RUN_ALL_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(RUN_ALL_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// RUN_ALL_RGBA above.
+#[cfg(test)]
 const RUN_ALL_STRIP_RGBA: &[u8] = include_bytes!("run_all_strip.rgba");
-static RUN_ALL_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(RUN_ALL_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const RUN_ALL_STRIP_GATE_RGBA: &[u8] = include_bytes!("run_all_strip_gate.rgba");
 static RUN_ALL_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(RUN_ALL_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// RUN_ALL_RGBA above.
+#[cfg(test)]
 const RUN_ALL_GALLERY_RGBA: &[u8] = include_bytes!("run_all_gallery.rgba");
-static RUN_ALL_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(RUN_ALL_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const RUN_ALL_GALLERY_GATE_RGBA: &[u8] = include_bytes!("run_all_gallery_gate.rgba");
 static RUN_ALL_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(RUN_ALL_GALLERY_GATE_RGBA));
 
 // ---- Play (play) ----------------------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const PLAY_RGBA: &[u8] = include_bytes!("play.rgba");
-static PLAY_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(PLAY_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const PLAY_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("play_gate_active.rgba");
 static PLAY_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(PLAY_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const PLAY_GATE_ACCENT_RGBA: &[u8] = include_bytes!("play_gate_accent.rgba");
 static PLAY_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(PLAY_GATE_ACCENT_RGBA));
 
 const PLAY_COMPACT_RGBA: &[u8] = include_bytes!("play_compact.rgba");
 static PLAY_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(PLAY_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// PLAY_RGBA above.
+#[cfg(test)]
 const PLAY_STRIP_RGBA: &[u8] = include_bytes!("play_strip.rgba");
-static PLAY_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(PLAY_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const PLAY_STRIP_GATE_RGBA: &[u8] = include_bytes!("play_strip_gate.rgba");
 static PLAY_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(PLAY_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// PLAY_RGBA above.
+#[cfg(test)]
 const PLAY_GALLERY_RGBA: &[u8] = include_bytes!("play_gallery.rgba");
-static PLAY_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(PLAY_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const PLAY_GALLERY_GATE_RGBA: &[u8] = include_bytes!("play_gallery_gate.rgba");
 static PLAY_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(PLAY_GALLERY_GATE_RGBA));
 
 // ---- Sync (sync) ----------------------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const SYNC_RGBA: &[u8] = include_bytes!("sync.rgba");
-static SYNC_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(SYNC_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const SYNC_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("sync_gate_active.rgba");
 static SYNC_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SYNC_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const SYNC_GATE_ACCENT_RGBA: &[u8] = include_bytes!("sync_gate_accent.rgba");
 static SYNC_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SYNC_GATE_ACCENT_RGBA));
 
 const SYNC_COMPACT_RGBA: &[u8] = include_bytes!("sync_compact.rgba");
 static SYNC_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(SYNC_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// SYNC_RGBA above.
+#[cfg(test)]
 const SYNC_STRIP_RGBA: &[u8] = include_bytes!("sync_strip.rgba");
-static SYNC_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(SYNC_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const SYNC_STRIP_GATE_RGBA: &[u8] = include_bytes!("sync_strip_gate.rgba");
 static SYNC_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(SYNC_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// SYNC_RGBA above.
+#[cfg(test)]
 const SYNC_GALLERY_RGBA: &[u8] = include_bytes!("sync_gallery.rgba");
-static SYNC_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(SYNC_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const SYNC_GALLERY_GATE_RGBA: &[u8] = include_bytes!("sync_gallery_gate.rgba");
 static SYNC_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(SYNC_GALLERY_GATE_RGBA));
 
 // ---- GoToFile (go-to-file) ------------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const GO_TO_FILE_RGBA: &[u8] = include_bytes!("go_to_file.rgba");
-static GO_TO_FILE_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(GO_TO_FILE_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const GO_TO_FILE_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("go_to_file_gate_active.rgba");
 static GO_TO_FILE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(GO_TO_FILE_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const GO_TO_FILE_GATE_ACCENT_RGBA: &[u8] = include_bytes!("go_to_file_gate_accent.rgba");
 static GO_TO_FILE_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(GO_TO_FILE_GATE_ACCENT_RGBA));
 
 const GO_TO_FILE_COMPACT_RGBA: &[u8] = include_bytes!("go_to_file_compact.rgba");
 static GO_TO_FILE_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(GO_TO_FILE_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// GO_TO_FILE_RGBA above.
+#[cfg(test)]
 const GO_TO_FILE_STRIP_RGBA: &[u8] = include_bytes!("go_to_file_strip.rgba");
-static GO_TO_FILE_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(GO_TO_FILE_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const GO_TO_FILE_STRIP_GATE_RGBA: &[u8] = include_bytes!("go_to_file_strip_gate.rgba");
 static GO_TO_FILE_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(GO_TO_FILE_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// GO_TO_FILE_RGBA above.
+#[cfg(test)]
 const GO_TO_FILE_GALLERY_RGBA: &[u8] = include_bytes!("go_to_file_gallery.rgba");
-static GO_TO_FILE_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(GO_TO_FILE_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const GO_TO_FILE_GALLERY_GATE_RGBA: &[u8] = include_bytes!("go_to_file_gallery_gate.rgba");
 static GO_TO_FILE_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(GO_TO_FILE_GALLERY_GATE_RGBA));
 
 // ---- Pulse (pulse) --------------------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const PULSE_RGBA: &[u8] = include_bytes!("pulse.rgba");
-static PULSE_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(PULSE_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const PULSE_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("pulse_gate_active.rgba");
 static PULSE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(PULSE_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const PULSE_GATE_ACCENT_RGBA: &[u8] = include_bytes!("pulse_gate_accent.rgba");
 static PULSE_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(PULSE_GATE_ACCENT_RGBA));
 
 const PULSE_COMPACT_RGBA: &[u8] = include_bytes!("pulse_compact.rgba");
 static PULSE_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(PULSE_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// PULSE_RGBA above.
+#[cfg(test)]
 const PULSE_STRIP_RGBA: &[u8] = include_bytes!("pulse_strip.rgba");
-static PULSE_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(PULSE_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const PULSE_STRIP_GATE_RGBA: &[u8] = include_bytes!("pulse_strip_gate.rgba");
 static PULSE_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(PULSE_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// PULSE_RGBA above.
+#[cfg(test)]
 const PULSE_GALLERY_RGBA: &[u8] = include_bytes!("pulse_gallery.rgba");
-static PULSE_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(PULSE_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const PULSE_GALLERY_GATE_RGBA: &[u8] = include_bytes!("pulse_gallery_gate.rgba");
 static PULSE_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(PULSE_GALLERY_GATE_RGBA));
 
 // ---- Checklist (checklist) ------------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const CHECKLIST_RGBA: &[u8] = include_bytes!("checklist.rgba");
-static CHECKLIST_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(CHECKLIST_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const CHECKLIST_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("checklist_gate_active.rgba");
 static CHECKLIST_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CHECKLIST_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const CHECKLIST_GATE_ACCENT_RGBA: &[u8] = include_bytes!("checklist_gate_accent.rgba");
 static CHECKLIST_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CHECKLIST_GATE_ACCENT_RGBA));
 
 const CHECKLIST_COMPACT_RGBA: &[u8] = include_bytes!("checklist_compact.rgba");
 static CHECKLIST_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(CHECKLIST_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// CHECKLIST_RGBA above.
+#[cfg(test)]
 const CHECKLIST_STRIP_RGBA: &[u8] = include_bytes!("checklist_strip.rgba");
-static CHECKLIST_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(CHECKLIST_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const CHECKLIST_STRIP_GATE_RGBA: &[u8] = include_bytes!("checklist_strip_gate.rgba");
 static CHECKLIST_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(CHECKLIST_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// CHECKLIST_RGBA above.
+#[cfg(test)]
 const CHECKLIST_GALLERY_RGBA: &[u8] = include_bytes!("checklist_gallery.rgba");
-static CHECKLIST_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(CHECKLIST_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const CHECKLIST_GALLERY_GATE_RGBA: &[u8] = include_bytes!("checklist_gallery_gate.rgba");
 static CHECKLIST_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(CHECKLIST_GALLERY_GATE_RGBA));
 
 // ---- Eye (eye) ------------------------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const EYE_RGBA: &[u8] = include_bytes!("eye.rgba");
-static EYE_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(EYE_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const EYE_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("eye_gate_active.rgba");
 static EYE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(EYE_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const EYE_GATE_ACCENT_RGBA: &[u8] = include_bytes!("eye_gate_accent.rgba");
 static EYE_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(EYE_GATE_ACCENT_RGBA));
 
 const EYE_COMPACT_RGBA: &[u8] = include_bytes!("eye_compact.rgba");
 static EYE_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(EYE_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// EYE_RGBA above.
+#[cfg(test)]
 const EYE_STRIP_RGBA: &[u8] = include_bytes!("eye_strip.rgba");
-static EYE_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(EYE_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const EYE_STRIP_GATE_RGBA: &[u8] = include_bytes!("eye_strip_gate.rgba");
 static EYE_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(EYE_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// EYE_RGBA above.
+#[cfg(test)]
 const EYE_GALLERY_RGBA: &[u8] = include_bytes!("eye_gallery.rgba");
-static EYE_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(EYE_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const EYE_GALLERY_GATE_RGBA: &[u8] = include_bytes!("eye_gallery_gate.rgba");
 static EYE_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(EYE_GALLERY_GATE_RGBA));
 
 // ---- Layout (layout) ------------------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const LAYOUT_RGBA: &[u8] = include_bytes!("layout.rgba");
-static LAYOUT_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(LAYOUT_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const LAYOUT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("layout_gate_active.rgba");
 static LAYOUT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LAYOUT_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const LAYOUT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("layout_gate_accent.rgba");
 static LAYOUT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LAYOUT_GATE_ACCENT_RGBA));
 
 const LAYOUT_COMPACT_RGBA: &[u8] = include_bytes!("layout_compact.rgba");
 static LAYOUT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LAYOUT_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// LAYOUT_RGBA above.
+#[cfg(test)]
 const LAYOUT_STRIP_RGBA: &[u8] = include_bytes!("layout_strip.rgba");
-static LAYOUT_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(LAYOUT_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const LAYOUT_STRIP_GATE_RGBA: &[u8] = include_bytes!("layout_strip_gate.rgba");
 static LAYOUT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LAYOUT_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// LAYOUT_RGBA above.
+#[cfg(test)]
 const LAYOUT_GALLERY_RGBA: &[u8] = include_bytes!("layout_gallery.rgba");
-static LAYOUT_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(LAYOUT_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const LAYOUT_GALLERY_GATE_RGBA: &[u8] = include_bytes!("layout_gallery_gate.rgba");
 static LAYOUT_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LAYOUT_GALLERY_GATE_RGBA));
 
 // ---- SplitHorizontal (split-horizontal) -----------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const SPLIT_HORIZONTAL_RGBA: &[u8] = include_bytes!("split_horizontal.rgba");
-static SPLIT_HORIZONTAL_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(SPLIT_HORIZONTAL_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const SPLIT_HORIZONTAL_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("split_horizontal_gate_active.rgba");
 static SPLIT_HORIZONTAL_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SPLIT_HORIZONTAL_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const SPLIT_HORIZONTAL_GATE_ACCENT_RGBA: &[u8] = include_bytes!("split_horizontal_gate_accent.rgba");
 static SPLIT_HORIZONTAL_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SPLIT_HORIZONTAL_GATE_ACCENT_RGBA));
 
 const SPLIT_HORIZONTAL_COMPACT_RGBA: &[u8] = include_bytes!("split_horizontal_compact.rgba");
 static SPLIT_HORIZONTAL_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(SPLIT_HORIZONTAL_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// SPLIT_HORIZONTAL_RGBA above.
+#[cfg(test)]
 const SPLIT_HORIZONTAL_STRIP_RGBA: &[u8] = include_bytes!("split_horizontal_strip.rgba");
-static SPLIT_HORIZONTAL_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(SPLIT_HORIZONTAL_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const SPLIT_HORIZONTAL_STRIP_GATE_RGBA: &[u8] = include_bytes!("split_horizontal_strip_gate.rgba");
 static SPLIT_HORIZONTAL_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(SPLIT_HORIZONTAL_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// SPLIT_HORIZONTAL_RGBA above.
+#[cfg(test)]
 const SPLIT_HORIZONTAL_GALLERY_RGBA: &[u8] = include_bytes!("split_horizontal_gallery.rgba");
-static SPLIT_HORIZONTAL_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(SPLIT_HORIZONTAL_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const SPLIT_HORIZONTAL_GALLERY_GATE_RGBA: &[u8] = include_bytes!("split_horizontal_gallery_gate.rgba");
 static SPLIT_HORIZONTAL_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(SPLIT_HORIZONTAL_GALLERY_GATE_RGBA));
 
 // ---- SplitVertical (split-vertical) ---------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const SPLIT_VERTICAL_RGBA: &[u8] = include_bytes!("split_vertical.rgba");
-static SPLIT_VERTICAL_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(SPLIT_VERTICAL_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const SPLIT_VERTICAL_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("split_vertical_gate_active.rgba");
 static SPLIT_VERTICAL_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SPLIT_VERTICAL_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const SPLIT_VERTICAL_GATE_ACCENT_RGBA: &[u8] = include_bytes!("split_vertical_gate_accent.rgba");
 static SPLIT_VERTICAL_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SPLIT_VERTICAL_GATE_ACCENT_RGBA));
 
 const SPLIT_VERTICAL_COMPACT_RGBA: &[u8] = include_bytes!("split_vertical_compact.rgba");
 static SPLIT_VERTICAL_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(SPLIT_VERTICAL_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// SPLIT_VERTICAL_RGBA above.
+#[cfg(test)]
 const SPLIT_VERTICAL_STRIP_RGBA: &[u8] = include_bytes!("split_vertical_strip.rgba");
-static SPLIT_VERTICAL_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(SPLIT_VERTICAL_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const SPLIT_VERTICAL_STRIP_GATE_RGBA: &[u8] = include_bytes!("split_vertical_strip_gate.rgba");
 static SPLIT_VERTICAL_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(SPLIT_VERTICAL_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// SPLIT_VERTICAL_RGBA above.
+#[cfg(test)]
 const SPLIT_VERTICAL_GALLERY_RGBA: &[u8] = include_bytes!("split_vertical_gallery.rgba");
-static SPLIT_VERTICAL_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(SPLIT_VERTICAL_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const SPLIT_VERTICAL_GALLERY_GATE_RGBA: &[u8] = include_bytes!("split_vertical_gallery_gate.rgba");
 static SPLIT_VERTICAL_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(SPLIT_VERTICAL_GALLERY_GATE_RGBA));
 
 // ---- Preview (preview) ----------------------------------------------
 
+/// Raw true-coverage source, test-only -- no longer a shipped
+/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
+/// cause 4's retirement); kept solely so this crate's own compositing-
+/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
+/// a real checked-in buffer.
+#[cfg(test)]
 const PREVIEW_RGBA: &[u8] = include_bytes!("preview.rgba");
-static PREVIEW_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel(PREVIEW_RGBA));
 
-/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited
-/// opaque at bake time, gamma-correct linear blend (see this crate's own
-/// `tools/bake_icons.py` module doc, causes 1 and 3).
+/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
+/// bake time, gamma-correct linear blend, painted by every icon-bearing
+/// button in every `PtyColorMode` (see this crate's own `tools/
+/// bake_icons.py` module doc, causes 1, 3 and 4).
 const PREVIEW_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("preview_gate_active.rgba");
 static PREVIEW_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(PREVIEW_GATE_ACTIVE_RGBA));
 
-/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,
-/// the rail's own selected-state background.
+/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
+/// own selected-state background.
 const PREVIEW_GATE_ACCENT_RGBA: &[u8] = include_bytes!("preview_gate_accent.rgba");
 static PREVIEW_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(PREVIEW_GATE_ACCENT_RGBA));
 
 const PREVIEW_COMPACT_RGBA: &[u8] = include_bytes!("preview_compact.rgba");
 static PREVIEW_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(PREVIEW_COMPACT_RGBA));
 
+/// Raw true-coverage strip-tier source, test-only -- same retirement as
+/// PREVIEW_RGBA above.
+#[cfg(test)]
 const PREVIEW_STRIP_RGBA: &[u8] = include_bytes!("preview_strip.rgba");
-static PREVIEW_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip(PREVIEW_STRIP_RGBA));
 
-/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail tier above.
+/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
+/// composited opaque at bake time, same fix as the rail tier above; the
+/// ONLY strip-tier sixel this crate ships.
 const PREVIEW_STRIP_GATE_RGBA: &[u8] = include_bytes!("preview_strip_gate.rgba");
 static PREVIEW_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(PREVIEW_STRIP_GATE_RGBA));
 
+/// Raw true-coverage gallery-tier source, test-only -- same retirement as
+/// PREVIEW_RGBA above.
+#[cfg(test)]
 const PREVIEW_GALLERY_RGBA: &[u8] = include_bytes!("preview_gallery.rgba");
-static PREVIEW_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery(PREVIEW_GALLERY_RGBA));
 
-/// GateOverride, the icon gallery's own single background (`render::
-/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the
-/// rail/strip tiers above.
+/// The icon gallery's own single background (`render::ACTIVE_BG`) --
+/// pre-composited opaque at bake time, same fix as the rail/strip tiers
+/// above; the ONLY gallery-tier sixel this crate ships.
 const PREVIEW_GALLERY_GATE_RGBA: &[u8] = include_bytes!("preview_gallery_gate.rgba");
 static PREVIEW_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(PREVIEW_GALLERY_GATE_RGBA));
 

@@ -5716,7 +5716,7 @@ mod tests {
     #[test]
     fn flush_sixel_icon_skips_a_second_emission_when_the_signature_is_unchanged() {
         let mut app = App::default();
-        app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 2, icons::SixelVariant::Transparent)];
+        app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 2, icons::SixelVariant::GateActive)];
         let mut state = SixelEmitState::default();
         let mut written = Vec::new();
         let screen = blank_screen(&app);
@@ -5736,7 +5736,7 @@ mod tests {
     #[test]
     fn flush_sixel_icon_reemits_when_the_rect_or_variant_changes() {
         let mut app = App::default();
-        app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 2, icons::SixelVariant::Transparent)];
+        app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 2, icons::SixelVariant::GateActive)];
         let mut state = SixelEmitState::default();
         let mut written = Vec::new();
         let screen = blank_screen(&app);
@@ -5744,14 +5744,14 @@ mod tests {
         let after_first = written.len();
 
         // Moved: same icon, different rect.
-        app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 9, icons::SixelVariant::Transparent)];
+        app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 9, icons::SixelVariant::GateActive)];
         flush_sixel_icon_into(&mut written, &app, &screen, &mut state).unwrap();
         assert!(written.len() > after_first, "a moved icon must trigger a fresh emission");
         let after_move = written.len();
 
-        // Selection flips (in `PtyColorMode::GateOverride`, a rail button
-        // going from at-rest to selected re-resolves to a DIFFERENT
-        // pre-baked asset): same icon, same rect, only `variant` differs.
+        // Selection flips (a rail button going from at-rest to selected
+        // re-resolves to a DIFFERENT pre-baked asset, in every
+        // `PtyColorMode`): same icon, same rect, only `variant` differs.
         app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 9, icons::SixelVariant::GateAccent)];
         flush_sixel_icon_into(&mut written, &app, &screen, &mut state).unwrap();
         assert!(written.len() > after_move, "a variant change must trigger a fresh emission even at the same rect");
@@ -5760,7 +5760,7 @@ mod tests {
     #[test]
     fn flush_sixel_icon_move_clears_the_old_rect_exactly_once_and_emits_the_new_one() {
         let mut app = App::default();
-        app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 2, icons::SixelVariant::Transparent)];
+        app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 2, icons::SixelVariant::GateActive)];
         let mut state = SixelEmitState::default();
         let mut written = Vec::new();
         flush_sixel_icon_into(&mut written, &app, &blank_screen(&app), &mut state).unwrap();
@@ -5774,13 +5774,13 @@ mod tests {
         // that could stomp it.
         let mut occupied = blank_screen(&app);
         occupied.set(2, 1, uzor_tui::Cell::new("Q"));
-        app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 9, icons::SixelVariant::Transparent)];
+        app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 9, icons::SixelVariant::GateActive)];
         written.clear();
         flush_sixel_icon_into(&mut written, &app, &occupied, &mut state).unwrap();
         let output = String::from_utf8_lossy(&written);
         assert!(output.contains('Q'), "the vacated old rect (x=2) must be cleared using the real screen content");
         assert!(
-            output.contains(icons::sixel(icons::IconId::Files, icons::SixelVariant::Transparent)),
+            output.contains(icons::sixel(icons::IconId::Files, icons::SixelVariant::GateActive)),
             "the new rect (x=9) must be emitted"
         );
 
@@ -5804,7 +5804,7 @@ mod tests {
     #[test]
     fn flush_sixel_icon_repainted_cells_under_an_unchanged_placement_trigger_exactly_one_clear_and_reemit() {
         let mut app = App::default();
-        app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 2, icons::SixelVariant::Transparent)];
+        app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 2, icons::SixelVariant::GateActive)];
         let mut state = SixelEmitState::default();
         let mut written = Vec::new();
         let mut screen = blank_screen(&app);
@@ -5819,7 +5819,7 @@ mod tests {
         let output = String::from_utf8_lossy(&written);
         assert!(output.contains('Z'), "the disturbed rect must be re-synced from the real screen content: {output}");
         assert_eq!(
-            output.matches(icons::sixel(icons::IconId::Files, icons::SixelVariant::Transparent)).count(),
+            output.matches(icons::sixel(icons::IconId::Files, icons::SixelVariant::GateActive)).count(),
             1,
             "a disturbed-but-still-listed placement must be re-emitted exactly once, not zero and not twice: {output}"
         );
@@ -5843,7 +5843,7 @@ mod tests {
     #[test]
     fn flush_sixel_icon_move_with_indistinguishable_vacated_content_clears_old_rect_without_duplicating() {
         let mut app = App::default();
-        app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 2, icons::SixelVariant::Transparent)];
+        app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 2, icons::SixelVariant::GateActive)];
         let mut state = SixelEmitState::default();
         let mut written = Vec::new();
         let screen = blank_screen(&app);
@@ -5852,11 +5852,11 @@ mod tests {
         // The button moves from x=2 to x=9; the SAME plain blank screen
         // stands in for the vacated x=2 cells looking exactly like every
         // other never-used background cell.
-        let new_placement = sixel_placement(icons::IconId::Files, 9, icons::SixelVariant::Transparent);
+        let new_placement = sixel_placement(icons::IconId::Files, 9, icons::SixelVariant::GateActive);
         app.layout.sixel_icons = vec![new_placement];
         written.clear();
         flush_sixel_icon_into(&mut written, &app, &screen, &mut state).unwrap();
-        let sixel_bytes = icons::sixel(icons::IconId::Files, icons::SixelVariant::Transparent);
+        let sixel_bytes = icons::sixel(icons::IconId::Files, icons::SixelVariant::GateActive);
         let output = String::from_utf8_lossy(&written);
         assert_eq!(
             output.matches(sixel_bytes).count(),
@@ -5893,7 +5893,7 @@ mod tests {
     #[test]
     fn flush_sixel_icon_reemits_after_a_modal_that_covered_the_rail_closes() {
         let mut app = App::default();
-        app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 2, icons::SixelVariant::Transparent)];
+        app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 2, icons::SixelVariant::GateActive)];
         let mut state = SixelEmitState::default();
         let mut written = Vec::new();
         let mut screen = blank_screen(&app);
@@ -5918,7 +5918,7 @@ mod tests {
         flush_sixel_icon_into(&mut written, &app, &screen, &mut state).unwrap();
         let output = String::from_utf8_lossy(&written);
         assert!(
-            output.contains(icons::sixel(icons::IconId::Files, icons::SixelVariant::Transparent)),
+            output.contains(icons::sixel(icons::IconId::Files, icons::SixelVariant::GateActive)),
             "the rail icon must be re-emitted once the modal that covered it closes and the cells revert: {output}"
         );
     }
@@ -5927,8 +5927,8 @@ mod tests {
     fn flush_sixel_icon_tier_switch_away_clears_every_rect_and_emits_nothing() {
         let mut app = App::default();
         app.layout.sixel_icons = vec![
-            sixel_placement(icons::IconId::Files, 2, icons::SixelVariant::Transparent),
-            sixel_placement(icons::IconId::Trash, 20, icons::SixelVariant::Transparent),
+            sixel_placement(icons::IconId::Files, 2, icons::SixelVariant::GateActive),
+            sixel_placement(icons::IconId::Trash, 20, icons::SixelVariant::GateActive),
         ];
         let mut state = SixelEmitState::default();
         let mut written = Vec::new();
@@ -5950,8 +5950,8 @@ mod tests {
             "every previously emitted rect must be cleared"
         );
         assert!(
-            !output.contains(icons::sixel(icons::IconId::Files, icons::SixelVariant::Transparent))
-                && !output.contains(icons::sixel(icons::IconId::Trash, icons::SixelVariant::Transparent)),
+            !output.contains(icons::sixel(icons::IconId::Files, icons::SixelVariant::GateActive))
+                && !output.contains(icons::sixel(icons::IconId::Trash, icons::SixelVariant::GateActive)),
             "nothing must be emitted once the tier switches away from sixel"
         );
         assert!(state.last.is_empty(), "a tier switch must forget every remembered placement");
@@ -5967,7 +5967,7 @@ mod tests {
         app.layout.sixel_icons = vec![SixelIconPlacement {
             icon: icons::IconId::Files,
             rect: uzor_tui::Rect::new(2, 8, 4, 2),
-            variant: icons::SixelVariant::Transparent,
+            variant: icons::SixelVariant::GateActive,
             size: SixelIconSize::Rail,
         }];
         let mut state = SixelEmitState::default();
@@ -6065,7 +6065,7 @@ mod tests {
     #[test]
     fn flush_sixel_icon_force_next_clears_every_remembered_rect_before_reemitting() {
         let mut app = App::default();
-        app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 2, icons::SixelVariant::Transparent)];
+        app.layout.sixel_icons = vec![sixel_placement(icons::IconId::Files, 2, icons::SixelVariant::GateActive)];
         let mut state = SixelEmitState::default();
         let mut written = Vec::new();
         flush_sixel_icon_into(&mut written, &app, &blank_screen(&app), &mut state).unwrap();
@@ -6086,7 +6086,7 @@ mod tests {
             "force_next must clear the remembered rect for real, reading the current screen content"
         );
         assert!(
-            output.contains(icons::sixel(icons::IconId::Files, icons::SixelVariant::Transparent)),
+            output.contains(icons::sixel(icons::IconId::Files, icons::SixelVariant::GateActive)),
             "force_next must also re-emit the placement even though nothing in sixel_icons changed"
         );
     }
@@ -6115,7 +6115,7 @@ mod tests {
         app.layout.sixel_icons = vec![SixelIconPlacement {
             icon: icons::IconId::NewFile,
             rect: uzor_tui::Rect::new(2, 1, 1, 1),
-            variant: icons::SixelVariant::Transparent,
+            variant: icons::SixelVariant::GateActive,
             size: SixelIconSize::Compact,
         }];
         let mut state = SixelEmitState::default();
@@ -6128,7 +6128,7 @@ mod tests {
             "compact placement must emit the compact-tier sixel bytes"
         );
         assert!(
-            !output.contains(icons::sixel(icons::IconId::NewFile, icons::SixelVariant::Transparent)),
+            !output.contains(icons::sixel(icons::IconId::NewFile, icons::SixelVariant::GateActive)),
             "compact placement must NOT emit the rail-tier sixel bytes"
         );
     }
@@ -6143,7 +6143,7 @@ mod tests {
         app.layout.sixel_icons = vec![SixelIconPlacement {
             icon: icons::IconId::NewFile,
             rect: uzor_tui::Rect::new(2, 1, 2, 1),
-            variant: icons::SixelVariant::Transparent,
+            variant: icons::SixelVariant::GateActive,
             size: SixelIconSize::Strip,
         }];
         let mut state = SixelEmitState::default();
@@ -6152,11 +6152,11 @@ mod tests {
         flush_sixel_icon_into(&mut written, &app, &screen, &mut state).unwrap();
         let output = String::from_utf8_lossy(&written);
         assert!(
-            output.contains(icons::sixel_strip(icons::IconId::NewFile, icons::SixelVariant::Transparent)),
+            output.contains(icons::sixel_strip(icons::IconId::NewFile, icons::SixelVariant::GateActive)),
             "strip placement must emit the strip-tier sixel bytes"
         );
         assert!(
-            !output.contains(icons::sixel(icons::IconId::NewFile, icons::SixelVariant::Transparent)),
+            !output.contains(icons::sixel(icons::IconId::NewFile, icons::SixelVariant::GateActive)),
             "strip placement must NOT emit the rail-tier sixel bytes"
         );
         assert!(
@@ -6174,7 +6174,7 @@ mod tests {
         app.layout.sixel_icons = vec![SixelIconPlacement {
             icon: icons::IconId::NewFile,
             rect: uzor_tui::Rect::new(2, 1, 6, 3),
-            variant: icons::SixelVariant::Transparent,
+            variant: icons::SixelVariant::GateActive,
             size: SixelIconSize::Gallery,
         }];
         let mut state = SixelEmitState::default();
@@ -6183,15 +6183,15 @@ mod tests {
         flush_sixel_icon_into(&mut written, &app, &screen, &mut state).unwrap();
         let output = String::from_utf8_lossy(&written);
         assert!(
-            output.contains(icons::sixel_gallery(icons::IconId::NewFile, icons::SixelVariant::Transparent)),
+            output.contains(icons::sixel_gallery(icons::IconId::NewFile, icons::SixelVariant::GateActive)),
             "gallery placement must emit the gallery-tier sixel bytes"
         );
         assert!(
-            !output.contains(icons::sixel(icons::IconId::NewFile, icons::SixelVariant::Transparent)),
+            !output.contains(icons::sixel(icons::IconId::NewFile, icons::SixelVariant::GateActive)),
             "gallery placement must NOT emit the rail-tier sixel bytes"
         );
         assert!(
-            !output.contains(icons::sixel_strip(icons::IconId::NewFile, icons::SixelVariant::Transparent)),
+            !output.contains(icons::sixel_strip(icons::IconId::NewFile, icons::SixelVariant::GateActive)),
             "gallery placement must NOT emit the strip-tier sixel bytes"
         );
     }
@@ -6199,9 +6199,10 @@ mod tests {
     #[test]
     fn flush_sixel_icon_prints_the_gate_variant_matching_the_placement() {
         // `SixelVariant::GateActive`/`GateAccent` are DIFFERENT (pre-
-        // composited opaque) bytes from `Transparent` for the same icon
-        // and the same tier -- this proves `flush_sixel_icon_into` keys
-        // off `placement.variant`, not just `placement.size`.
+        // composited opaque, against two different backgrounds) bytes for
+        // the same icon and the same tier -- this proves `flush_sixel_
+        // icon_into` keys off `placement.variant`, not just
+        // `placement.size`.
         let mut app = App::default();
         app.layout.sixel_icons = vec![SixelIconPlacement {
             icon: icons::IconId::Files,
@@ -6219,8 +6220,8 @@ mod tests {
             "GateAccent placement must emit the GateAccent-variant sixel bytes"
         );
         assert!(
-            !output.contains(icons::sixel(icons::IconId::Files, icons::SixelVariant::Transparent)),
-            "GateAccent placement must NOT emit the Transparent-variant sixel bytes"
+            !output.contains(icons::sixel(icons::IconId::Files, icons::SixelVariant::GateActive)),
+            "GateAccent placement must NOT emit the GateActive-variant sixel bytes"
         );
     }
 

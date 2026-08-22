@@ -56,10 +56,14 @@ once, offline, from a developer's own PATH, producing checked-in
 `.rgba` files `include_bytes!`'d at compile time (see `src/icons.rs`).
 
 ## Quality pass (dirty edges / blurred strokes / gamma-space compositing /
-## cell-height mismatch / control-strip resize)
+## cell-height mismatch / control-strip resize / strip-tier glyph clutter)
 
-Five defects diagnosed against the running TUI, each verified against
-this tool's own pipeline (not taken on faith) before fixing.
+Seven defects diagnosed against the running TUI, each verified against
+this tool's own pipeline (not taken on faith) before fixing. Cause 4
+below was RETIRED once cause 1's own fix was widened to cover every
+`PtyColorMode`, not just `GateOverride` -- its own entry stays in place,
+marked retired, so the numbering below still lines up with `icons.rs`'s
+own doc comments and this crate's own git history.
 
 1. DIRTY EDGES -- CONFIRMED, root cause identified precisely. Every sixel
    asset was baked with a transparent background and encoded via
@@ -70,26 +74,40 @@ this tool's own pipeline (not taken on faith) before fixing.
    flat ink colour" or "fully undrawn". Windows Terminal's own sixel
    decoder does not implement the "undrawn -> show whatever is already
    there" transparency semantics DEC's P2=1 mode specifies, so "undrawn"
-   pixels do not read as transparent in practice. FIX: composite every
-   icon over the EXACT background colour the button paints (`GATE_ACTIVE_
-   BG_RGB`/`GATE_ACCENT_BG_RGB` below, hand-synced to `render.rs`'s own
+   pixels do not read as transparent in practice, and even where a
+   partial-coverage pixel DOES survive the threshold, the only RGB this
+   encoder ever sees for it is the flat, un-blended ink colour (see
+   `../icons.rs`'s own module doc on straight alpha) -- so anti-aliasing
+   cannot survive this encoder in alpha at all, only in RGB. FIX:
+   composite EVERY sixel-tier icon (rail/strip/gallery -- compact is out
+   of scope, see `ensure_compact_assets`'s own doc comment) over the EXACT
+   background colour the button paints (`GATE_ACTIVE_BG_RGB`/
+   `GATE_ACCENT_BG_RGB` below, hand-synced to `render.rs`'s own
    `ACTIVE_BG`/`MAUVE`), fully opaque, so the encoder's threshold and the
    terminal's transparency support both become irrelevant -- there is no
-   transparent pixel left to mishandle. This is done as a SEPARATE, pure-
-   Python compositing pass (`composite_over_background`) over an already-
+   transparent pixel left to mishandle, and the anti-aliasing this buys
+   back rides in the RGB channels instead, where the encoder's own hard
+   threshold cannot touch it. This is done as a SEPARATE, pure-Python
+   compositing pass (`composite_over_background`) over an already-
    rasterized buffer -- never a second resvg/ffmpeg call -- so it can
-   never regress into cause 2's own double-resampling anti-pattern. Only
-   possible for `PtyColorMode::GateOverride`, whose panel/rail colours are
-   fixed, known constants; `PtyColorMode::Inherited` has no knowable exact
-   background (crossterm has no reliable query for the terminal's own
-   background colour, the same gap `icons.rs::ASSUMED_CELL_WIDTH_PX`'s own
-   doc comment already names for cell-pixel size) and keeps the original
-   transparent-encoded asset (see cause 4 below for what "keeps" now
-   means) as its only available option. The rail tier has two backgrounds
-   (`theme.active` at rest, `theme.accent` selected) so it gets two
-   composited variants (`SixelVariant::GateActive`/`GateAccent`); the
-   strip/gallery tiers below have exactly one (neither ever shows a
-   selected state), so each gets one.
+   never regress into cause 2's own double-resampling anti-pattern. This
+   USED to be possible only for `PtyColorMode::GateOverride`, whose panel/
+   rail colours are fixed, known constants -- `PtyColorMode::Inherited`
+   read as having no knowable exact background (crossterm has no reliable
+   query for the terminal's own background colour, the same gap
+   `icons.rs::ASSUMED_CELL_WIDTH_PX`'s own doc comment already names for
+   cell-pixel size). That premise was the actual bug: the background was
+   never unknowable at RENDER time, only un-PAINTED -- `render_rail_
+   button`/`render_control_strip_button`/the icon gallery swatches simply
+   left it to the terminal's own default instead of stating one. Now every
+   icon-bearing button paints this SAME explicit truecolor background in
+   EVERY `PtyColorMode` (see cause 4 below, retired), so there is exactly
+   ONE composited asset per background to bake, never a mode-dependent
+   pair. The rail tier has two backgrounds (`theme.active` at rest,
+   `theme.accent` selected) so it gets two composited variants
+   (`SixelVariant::GateActive`/`GateAccent`); the strip/gallery tiers below
+   have exactly one (neither ever shows a selected state), so each gets
+   one.
 
 2. BLURRED STROKES -- diagnosed as "rasterized on a non-integer scale from
    a 24-unit source grid"; PARTIALLY CONFIRMED, PARTIALLY REFUTED once
@@ -136,32 +154,37 @@ this tool's own pipeline (not taken on faith) before fixing.
    linear (`srgb_to_linear`, the exact piecewise transfer function -- the
    0.04045 / 12.92 / 2.4 form, NOT a 2.2-power approximation), blends by
    the pixel's own TRUE coverage in linear space, then converts back
-   (`linear_to_srgb`). Governs the `GateActive`/`GateAccent` (and strip/
-   gallery `_gate`) pre-composited variants, where the exact background is
-   known at bake time.
+   (`linear_to_srgb`). Governs every rail/strip/gallery sixel-tier output
+   this tool ships now (`GateActive`/`GateAccent`, strip `_gate`, gallery
+   `_gate`) -- since cause 4 below was retired, those pre-composited
+   variants are the ONLY sixel-tier output those three tiers have, so this
+   exact (never approximated) blend is what every anti-aliased pixel a
+   user actually sees goes through, not a special case for one mode.
 
-4. THE SAME PROBLEM FOR `Transparent` VARIANTS -- the terminal, not this
-   tool, performs that composite (see cause 1 above), so this tool cannot
-   fix the blend itself; instead it pre-corrects the ALPHA it hands the
-   terminal so that terminal's own (naive, gamma-space) blend lands close
-   to the gamma-CORRECT result. `precorrect_transparent_alpha` replaces
-   each transparent-tier pixel's TRUE coverage `a` with `a' = 255 *
-   (a/255)**(1/2.4)` -- e.g. 50% true coverage bakes to alpha 191, not
-   128. This is only EXACT against a fully black background (there, a
-   naive gamma-space blend of `ink` and `0` reduces to `ink * (a'/255)`,
-   the same product a linear-space blend against a TRUE black background
-   would also produce, since black's own linear value is 0 either way);
-   against a lighter background it is an approximation, and there is no
-   way to do better without knowing the terminal's own actual background
-   at bake time -- the SAME epistemic gap `../icons.rs::ASSUMED_CELL_
-   WIDTH_PX`'s own doc comment already names for cell-pixel size, and
-   `SixelVariant`'s own doc comment already names for why `PtyColorMode::
-   Inherited` gets no exact-background compositing at all. Applied ONLY
-   to the transparent-tier `.rgba` outputs actually shipped to the
-   terminal -- NEVER to the buffer fed into `composite_over_background`,
-   which always gets true coverage and does its own correct linear blend
-   against a KNOWN background (cause 3 above) -- see `ensure_assets`'s
-   own doc comment for the ordering this depends on.
+4. RETIRED -- "approximate the alpha for an unknown background" turned out
+   not to be a real case. This tool used to ship a SECOND, `Transparent`
+   sixel variant per rail/strip/gallery icon for `PtyColorMode::Inherited`
+   (whose background it could not know at bake time), pre-correcting that
+   variant's own ALPHA channel (`a' = 255 * (a/255)**(1/2.4)`) so a
+   terminal's own naive gamma-space blend against an unknown background
+   would land close to the gamma-correct result cause 3 above computes
+   exactly. That whole approach solved the wrong problem: the background
+   was never actually unknowable at RENDER time, only un-PAINTED --
+   `render_rail_button`/`render_control_strip_button`/the icon gallery
+   swatches simply left an icon-bearing button's own background to
+   whatever the terminal already had there instead of stating one, the
+   same gap cause 1 above now closes by removing it rather than
+   approximating around it. With every icon-bearing button painting the
+   SAME explicit truecolor background in every `PtyColorMode`, cause 3's
+   own EXACT linear-light compositing applies universally and there is no
+   more unknown-background asset left to approximate for at all --
+   `SixelVariant::Transparent` (the Rust-side selector for that retired
+   asset) no longer exists for the rail/strip/gallery tiers this fix
+   covers, and this tool's own `precorrect_transparent_alpha` function
+   went with it. The one tier this does NOT touch is `compact` (`ensure_
+   compact_assets`) -- see that function's own doc comment for why it
+   keeps real transparency and a real, still-necessary encoder-side
+   BackgroundMode::Transparent, unrelated to this retired approximation.
 
 5. CELL HEIGHT MISMATCH ("iconки неравномерно располагаются относительно
    подсветок" / rail icons overflow their own row) -- CONFIRMED. Every
@@ -243,10 +266,42 @@ this tool's own pipeline (not taken on faith) before fixing.
    scale/offset arithmetic feeding the SAME single resvg AA pass cause 2
    already established, never resvg's own anti-aliasing, and a curve
    cannot sit on an axis-aligned pixel lattice by definition. Gamma-
-   correct compositing (cause 3) and the transparent-variant alpha pre-
-   correction (cause 4) both run AFTER this, completely unchanged, on
+   correct compositing (cause 3) runs AFTER this, completely unchanged, on
    whatever buffer this produces -- this fix only changes WHERE the ink
    pixels land, never how they get colored.
+
+7. STRIP-TIER GLYPH CLUTTER (owner: the 2x1 control-plane buttons read as
+   having "какие-то полосы или линии... там просто что-то кроме
+   необходимого" -- something beyond the necessary shape) -- CONFIRMED for
+   `new-file`/`new-folder`. Both source SVGs carry codicons' own filled
+   circle-with-plus "add" badge overlapping the file/folder body outline
+   (verified against the cached source: the badge is a second, separately
+   readable shape, not a decorative stroke inside one shape) -- at the
+   strip tier's own 16px lattice-fit render (cause 6 above) the badge
+   covers roughly a third of the glyph and collides with the body outline,
+   reading as clutter rather than a single recognizable icon; this is the
+   icon's own design, not a rasterization defect, so no pixel-pipeline fix
+   applies. FIX: `IconSpec.strip_slug` lets a spec's STRIP-tier bake pull
+   from a DIFFERENT source codicon than its rail/compact/gallery tiers --
+   `NewFile`/`NewFolder` point their own strip bake at `file`/`folder`
+   (the plain, badge-free glyphs this manifest already ships for
+   `IconId::File`/`IconId::Folder`), while every other tier keeps the
+   badge version, which reads fine at the rail/compact/gallery tiers'
+   own larger sizes -- see `render::render_compact_icon_button`'s own doc
+   comment for why the compact tier is large enough to keep the badge.
+   This changes ONLY the strip-tier PIXELS for these two icons, never the
+   Rust-side `IconId::NewFile`/`NewFolder` identity, their ascii labels,
+   or what their buttons do. Every other icon actually used at the strip
+   tier (`Add`, `Trash`, `Refresh`, `RepoForked`, `GoToFile` -- see
+   `render.rs`'s own `ControlStripButton` call sites) was checked against
+   the same "a glyph whose detail cannot survive 16px" question: `add`/
+   `trash`/`refresh` are each a single coherent shape at the codicon
+   set's own native 16px design size and read fine; `repo-forked`'s three
+   small fork-node circles and `go-to-file`'s own compound file+arrow
+   glyph are busier by design and worth the owner's own judgment call, but
+   neither carries a SEPARATE overlapping badge the way `new-file`/`new-
+   folder` did, so neither is substituted here -- flagged, not silently
+   changed.
 
 Also: every sixel encode (all tiers, all variants) goes through
 `icons.rs::icon_encode_options()` -- `max_colors: 32` (the library's own
@@ -338,12 +393,13 @@ GALLERY_SIXEL_RGBA_LEN = GALLERY_SIXEL_PX_W * GALLERY_SIXEL_PX_H * 4
 # per-tier constant -- see `glyph_lattice_size`/`rasterize_lattice_fit`.
 LATTICE_STEP_PX = 16
 
-# ---- GateOverride compositing (cause 1's fix -- see this module's own
-# header doc comment). Hand-synced to render.rs's own fixed theme
-# constants: `ACTIVE_BG` (the rail/strip button body's own "at rest"
+# ---- Icon-button compositing background (cause 1's fix -- see this
+# module's own header doc comment). Hand-synced to render.rs's own fixed
+# theme constants: `ACTIVE_BG` (the rail/strip button body's own "at rest"
 # colour) and `MAUVE` (`theme.accent`, the rail's own "selected" colour).
-# `PtyColorMode::GateOverride` only -- see `icons::SixelVariant`'s own doc
-# comment for why `PtyColorMode::Inherited` has no equivalent.
+# Every icon-bearing button paints one of these two, EXPLICITLY, in every
+# `PtyColorMode` -- there is no longer a mode this pair does not cover
+# (see cause 4's own retirement note above).
 GATE_ACTIVE_BG_RGB = (30, 30, 46)  # render.rs::ACTIVE_BG
 GATE_ACCENT_BG_RGB = (203, 166, 247)  # render.rs::MAUVE / theme.accent
 
@@ -354,9 +410,18 @@ class IconSpec:
     slug: str  # codicon file stem, e.g. "source-control"
     ascii: str  # 1-2 char ASCII label
     file_stem: str = field(default="")  # snake_case asset stem; derived if empty
+    # cause 7 (this module's own header doc comment): overrides `slug` for
+    # the STRIP tier's own bake only, when that tier needs a different
+    # source codicon than the rail/compact/gallery tiers (e.g. a badge-
+    # free glyph at 16px where the badge version reads as clutter).
+    # `""` (the default) means "use `slug`, same as every other tier".
+    strip_slug: str = field(default="")
 
     def stem(self) -> str:
         return self.file_stem or self.slug.replace("-", "_")
+
+    def strip_source_slug(self) -> str:
+        return self.strip_slug or self.slug
 
 
 MANIFEST: list[IconSpec] = [
@@ -370,8 +435,12 @@ MANIFEST: list[IconSpec] = [
     IconSpec("ChevronRight", "chevron-right", ">"),
     IconSpec("ChevronDown", "chevron-down", "v"),
     # -- File ops --------------------------------------------------------
-    IconSpec("NewFile", "new-file", "N+"),
-    IconSpec("NewFolder", "new-folder", "Nd"),
+    # NewFile/NewFolder: cause 7 (this module's own header doc comment) --
+    # the badge codicons read as clutter at the strip tier's own 16px
+    # lattice render, so that tier alone bakes from the plain `file`/
+    # `folder` glyphs this manifest already ships below.
+    IconSpec("NewFile", "new-file", "N+", strip_slug="file"),
+    IconSpec("NewFolder", "new-folder", "Nd", strip_slug="folder"),
     IconSpec("Folder", "folder", "Fd"),
     IconSpec("FolderOpened", "folder-opened", "Fo"),
     IconSpec("File", "file", "Fl"),
@@ -747,58 +816,38 @@ def composite_over_background(rgba: bytes, bg: tuple[int, int, int]) -> bytes:
     return bytes(out)
 
 
-def precorrect_transparent_alpha(rgba: bytes) -> bytes:
-    """Cause 4's fix (see this module's own header doc comment): the
-    `Transparent`-variant `.rgba` outputs are composited by the TERMINAL
-    at render time, not by this tool -- there is no known background to
-    blend against at bake time at all, so `composite_over_background`
-    above does not apply here -- and the terminal's own blend is a naive
-    gamma-space one this tool cannot change. Instead, this pre-corrects
-    the ALPHA baked into the asset so that the terminal's naive blend
-    lands close to the gamma-CORRECT result: replaces each pixel's TRUE
-    coverage `a` with `a' = 255 * (a/255)**(1/2.4)` (e.g. 50% true
-    coverage bakes to alpha 191, not 128). RGB channels are untouched --
-    straight alpha, per `patch_fill`'s own already-tinted ink colour. The
-    dark-background assumption this approximation rests on is spelled out
-    in full in this module's own header doc comment, cause 4.
-
-    Applied ONLY to the shipped `Transparent`-variant bytes, AFTER
-    `composite_over_background` (where one exists for this tier) has
-    already derived the exact-background `_gate*` variant(s) from the
-    SAME buffer's own true coverage -- see `ensure_assets`'s own doc
-    comment for the ordering this depends on: composited FIRST from true
-    coverage, alpha-precorrected SECOND for the plain asset, never the
-    other way around."""
-    out = bytearray(rgba)
-    for i in range(3, len(out), 4):
-        coverage = out[i] / 255.0
-        out[i] = max(0, min(255, round(255.0 * (coverage ** (1.0 / 2.4)))))
-    return bytes(out)
-
-
 def ensure_assets(spec: IconSpec, cache_dir: Path, force: bool) -> tuple[Path, Path, Path]:
     """Ensure every rail-tier `.rgba` output for `spec` exists on disk,
     baking whatever is missing (or everything, if `force`). Returns
-    (sixel, gate_active, gate_accent) paths. This is the idempotency
+    (raw_source, gate_active, gate_accent) paths. This is the idempotency
     boundary: a normal re-run with nothing new to bake touches no
     network and spawns no subprocess at all.
 
-    ORDERING (load-bearing for cause 3/4's own correctness -- see this
+    `raw_source` (`<stem>.rgba`) is NOT a shipped `SixelVariant` any more
+    (cause 4's own retirement note, this module's own header doc comment):
+    `GateActive`/`GateAccent` are the ONLY rail-tier sixel this crate ships
+    now, since every icon-bearing button paints an explicit truecolor
+    background unconditionally. This file stays on disk and gets rebaked
+    like any other output purely so `icons.rs`'s own `#[cfg(test)]`
+    compositing-correctness tests (`gate_compositing_matches_the_
+    background_and_ink_colours_exactly_at_full_coverage` and friends) can
+    verify `composite_over_background` against a REAL checked-in true-
+    coverage buffer rather than trusting the arithmetic by construction --
+    Rust never reaches for it outside `#[cfg(test)]`.
+
+    ORDERING (load-bearing for cause 3's own correctness -- see this
     module's own header doc comment): whenever ANY of the three outputs
     needs rebuilding, this rasterizes ONE fresh TRUE-coverage buffer in
-    memory (`raw`) and derives EVERYTHING from that SAME buffer --
-    `composite_over_background` (cause 3: exact background, exact linear
-    blend) for the two `_gate_*` variants, THEN `precorrect_transparent_
-    alpha` (cause 4: approximate, unknown background) for the plain
-    `.rgba` this stem's own `Transparent` variant ships. Deriving the
-    `_gate_*` variants from anything OTHER than a just-rasterized `raw`
-    -- e.g. reading the already-alpha-precorrected `.rgba` back off disk
-    -- would double-apply cause 4's own approximation on top of cause 3's
-    own exact blend, so this never reads the transparent asset back off
-    disk to feed compositing, even on an idempotent re-run that only
-    needs to rebuild the gate variants (the small correctness cost: such
-    a re-run re-rasterizes even though the sixel output itself did not
-    need it, trading a little idempotency for never risking that bug)."""
+    memory (`raw`) and derives EVERYTHING from that SAME buffer via
+    `composite_over_background` (exact background, exact linear blend),
+    writing `raw` itself to `raw_source`'s own path unchanged. Re-deriving
+    the `_gate_*` variants from anything OTHER than a just-rasterized
+    `raw` -- e.g. reading `raw_source` back off disk -- would be
+    pointless indirection for the exact same bytes, so this never reads
+    it back off disk to feed compositing, even on an idempotent re-run
+    that only needs to rebuild the gate variants (the small correctness
+    cost: such a re-run re-rasterizes even though `raw_source` itself did
+    not need it, trading a little idempotency for one less code path)."""
     sixel_path = ICONS_DIR / f"{spec.stem()}.rgba"
     active_path = ICONS_DIR / f"{spec.stem()}_gate_active.rgba"
     accent_path = ICONS_DIR / f"{spec.stem()}_gate_accent.rgba"
@@ -816,47 +865,55 @@ def ensure_assets(spec: IconSpec, cache_dir: Path, force: bool) -> tuple[Path, P
         if need_accent:
             accent_path.write_bytes(composite_over_background(raw, GATE_ACCENT_BG_RGB))
         if need_sixel:
-            sixel_path.write_bytes(precorrect_transparent_alpha(raw))
+            sixel_path.write_bytes(raw)
 
     return sixel_path, active_path, accent_path
 
 
 def ensure_strip_assets(spec: IconSpec, cache_dir: Path, force: bool) -> tuple[Path, Path]:
     """Ensure the control-plane strip's own two sixel-tier outputs:
-    `<stem>_strip.rgba` (the `Transparent` variant, alpha-precorrected --
-    see `precorrect_transparent_alpha`) and `<stem>_strip_gate.rgba` (the
-    SAME raw pixels alpha-composited over `GATE_ACTIVE_BG_RGB` in linear
-    light -- see `composite_over_background`). Same "derive both from one
-    freshly-rasterized `raw` buffer, never read the precorrected asset
-    back for compositing" ordering as `ensure_assets` above -- see that
-    function's own doc comment. The strip never shows a `selected` state
-    (see `render::render_control_strip_button`'s own doc comment), so
-    there is no `_strip_gate_accent` variant."""
+    `<stem>_strip.rgba` (the raw true-coverage source, test-only -- see
+    `ensure_assets`'s own doc comment for why this stays on disk) and
+    `<stem>_strip_gate.rgba` (the SAME raw pixels alpha-composited over
+    `GATE_ACTIVE_BG_RGB` in linear light -- see `composite_over_
+    background`; the ONLY strip-tier sixel this crate ships). Same "derive
+    both from one freshly-rasterized `raw` buffer" precedent as `ensure_
+    assets` above. The strip never shows a `selected` state (see `render::
+    render_control_strip_button`'s own doc comment), so there is no
+    `_strip_gate_accent` variant.
+
+    Sources from `spec.strip_source_slug()`, NOT `spec.slug` -- cause 7
+    (this module's own header doc comment): `NewFile`/`NewFolder` bake
+    their own strip tier from a different, badge-free codicon than their
+    rail/compact/gallery tiers; every other icon's `strip_source_slug()`
+    is just `slug` unchanged."""
     transparent_path = ICONS_DIR / f"{spec.stem()}_strip.rgba"
     gate_path = ICONS_DIR / f"{spec.stem()}_strip_gate.rgba"
     need_transparent = force or not transparent_path.exists() or transparent_path.stat().st_size != STRIP_SIXEL_RGBA_LEN
     need_gate = force or not gate_path.exists() or gate_path.stat().st_size != STRIP_SIXEL_RGBA_LEN
 
     if need_transparent or need_gate:
-        svg = fetch_svg(spec.slug, cache_dir)
-        patched = patch_fill(svg, spec.slug, cache_dir)
+        slug = spec.strip_source_slug()
+        svg = fetch_svg(slug, cache_dir)
+        patched = patch_fill(svg, slug, cache_dir)
         raw = rasterize_strip_sixel(patched)
         if need_gate:
             gate_path.write_bytes(composite_over_background(raw, GATE_ACTIVE_BG_RGB))
         if need_transparent:
-            transparent_path.write_bytes(precorrect_transparent_alpha(raw))
+            transparent_path.write_bytes(raw)
 
     return transparent_path, gate_path
 
 
 def ensure_gallery_assets(spec: IconSpec, cache_dir: Path, force: bool) -> tuple[Path, Path]:
     """Ensure the icon gallery's own two dedicated sixel-tier outputs:
-    `<stem>_gallery.rgba` (the `Transparent` variant, alpha-precorrected)
-    and `<stem>_gallery_gate.rgba` (the same raw pixels composited over
-    `GATE_ACTIVE_BG_RGB` in linear light). Same ordering precedent as
-    `ensure_assets`/`ensure_strip_assets` above. Same "no selected state,
-    so no `_gallery_gate_accent` variant" precedent as `ensure_strip_
-    assets` -- the gallery is a read-only comparison grid."""
+    `<stem>_gallery.rgba` (the raw true-coverage source, test-only -- see
+    `ensure_assets`'s own doc comment) and `<stem>_gallery_gate.rgba` (the
+    same raw pixels composited over `GATE_ACTIVE_BG_RGB` in linear light;
+    the ONLY gallery-tier sixel this crate ships). Same ordering precedent
+    as `ensure_assets`/`ensure_strip_assets` above. Same "no selected
+    state, so no `_gallery_gate_accent` variant" precedent as `ensure_
+    strip_assets` -- the gallery is a read-only comparison grid."""
     transparent_path = ICONS_DIR / f"{spec.stem()}_gallery.rgba"
     gate_path = ICONS_DIR / f"{spec.stem()}_gallery_gate.rgba"
     need_transparent = force or not transparent_path.exists() or transparent_path.stat().st_size != GALLERY_SIXEL_RGBA_LEN
@@ -869,26 +926,30 @@ def ensure_gallery_assets(spec: IconSpec, cache_dir: Path, force: bool) -> tuple
         if need_gate:
             gate_path.write_bytes(composite_over_background(raw, GATE_ACTIVE_BG_RGB))
         if need_transparent:
-            transparent_path.write_bytes(precorrect_transparent_alpha(raw))
+            transparent_path.write_bytes(raw)
 
     return transparent_path, gate_path
 
 
 def ensure_compact_assets(spec: IconSpec, cache_dir: Path, force: bool) -> Path:
     """Ensure the compact tier's own single sixel-tier output (`<stem>_
-    compact.rgba`, alpha-precorrected -- see `precorrect_transparent_
-    alpha`). This tier is `Transparent`-only -- out of scope for cause 1/
-    3's own background-compositing fix (see `render::render_compact_icon_
-    button`'s own doc comment: dense panel/modal content with 3+ distinct
-    backgrounds, unlike the rail's 2 and the strip's 1) -- so there is no
-    gate variant to derive here at all."""
+    compact.rgba`, real straight-alpha true coverage). This tier is
+    `Transparent`-only -- out of scope for cause 1/3's own background-
+    compositing fix (see `render::render_compact_icon_button`'s own doc
+    comment: dense panel/modal content with 3+ distinct backgrounds,
+    unlike the rail's 2 and the strip's 1) -- so there is no gate variant
+    to derive here at all, and this tier's own `.rgba` IS the real,
+    directly-shipped asset (`icons::build_sixel_compact` still encodes it
+    with `BackgroundMode::Transparent`), not a test-only source the way
+    `ensure_assets`/`ensure_strip_assets`/`ensure_gallery_assets`'s own
+    raw outputs now are."""
     sixel_path = ICONS_DIR / f"{spec.stem()}_compact.rgba"
     need_sixel = force or not sixel_path.exists() or sixel_path.stat().st_size != COMPACT_SIXEL_RGBA_LEN
     if need_sixel:
         svg = fetch_svg(spec.slug, cache_dir)
         patched = patch_fill(svg, spec.slug, cache_dir)
         raw = rasterize_compact_sixel(patched)
-        sixel_path.write_bytes(precorrect_transparent_alpha(raw))
+        sixel_path.write_bytes(raw)
     return sixel_path
 
 
@@ -913,8 +974,8 @@ def generate_catalog() -> str:
     lines.append("use std::sync::LazyLock;")
     lines.append("")
     lines.append("use super::{")
-    lines.append("    build_sixel, build_sixel_compact, build_sixel_gallery, build_sixel_gallery_gate, build_sixel_gate,")
-    lines.append("    build_sixel_strip, build_sixel_strip_gate, SixelVariant,")
+    lines.append("    build_sixel_compact, build_sixel_gallery_gate, build_sixel_gate, build_sixel_strip_gate,")
+    lines.append("    SixelVariant,")
     lines.append("};")
     lines.append("")
     lines.append("/// Every baked icon this crate ships, sixel + ascii tiers, one enum")
@@ -936,16 +997,15 @@ def generate_catalog() -> str:
     lines.append("    ];")
     lines.append("}")
     lines.append("")
-    lines.append("/// Encoded rail-tier sixel string for `id` at `variant`'s own background")
-    lines.append("/// (see [`SixelVariant`]'s own doc comment) -- see `../icons.rs::build_sixel`'s")
-    lines.append("/// own doc comment for why this is cached (`LazyLock`) rather than re-encoded")
-    lines.append("/// per call.")
+    lines.append("/// Encoded rail-tier sixel string for `id` at `variant`'s own explicit")
+    lines.append("/// truecolor background (see [`SixelVariant`]'s own doc comment) -- see")
+    lines.append("/// `../icons.rs::build_sixel_gate`'s own doc comment for why this is cached")
+    lines.append("/// (`LazyLock`) rather than re-encoded per call.")
     lines.append("pub fn sixel(id: IconId, variant: SixelVariant) -> &'static str {")
     lines.append("    match id {")
     for spec in MANIFEST:
         upper = to_screaming_snake(spec.rust_name)
         lines.append(f"        IconId::{spec.rust_name} => match variant {{")
-        lines.append(f"            SixelVariant::Transparent => {upper}_SIXEL.as_str(),")
         lines.append(f"            SixelVariant::GateActive => {upper}_SIXEL_GATE_ACTIVE.as_str(),")
         lines.append(f"            SixelVariant::GateAccent => {upper}_SIXEL_GATE_ACCENT.as_str(),")
         lines.append("        },")
@@ -953,30 +1013,29 @@ def generate_catalog() -> str:
     lines.append("}")
     lines.append("")
     lines.append("/// Encoded control-plane-strip-tier sixel string for `id` at `variant`'s")
-    lines.append("/// own background -- the strip never shows a selected state (see `../")
-    lines.append("/// render.rs::render_control_strip_button`'s own doc comment), so")
-    lines.append("/// `GateAccent` resolves to the SAME asset as `GateActive` here.")
+    lines.append("/// own explicit truecolor background -- the strip never shows a selected")
+    lines.append("/// state (see `../render.rs::render_control_strip_button`'s own doc")
+    lines.append("/// comment), so `GateAccent` resolves to the SAME asset as `GateActive`")
+    lines.append("/// here.")
     lines.append("pub fn sixel_strip(id: IconId, variant: SixelVariant) -> &'static str {")
     lines.append("    match id {")
     for spec in MANIFEST:
         upper = to_screaming_snake(spec.rust_name)
         lines.append(f"        IconId::{spec.rust_name} => match variant {{")
-        lines.append(f"            SixelVariant::Transparent => {upper}_SIXEL_STRIP.as_str(),")
         lines.append(f"            SixelVariant::GateActive | SixelVariant::GateAccent => {upper}_SIXEL_STRIP_GATE.as_str(),")
         lines.append("        },")
     lines.append("    }")
     lines.append("}")
     lines.append("")
     lines.append("/// Encoded icon-gallery-tier sixel string for `id` at `variant`'s own")
-    lines.append("/// background -- the gallery is a read-only comparison grid with no")
-    lines.append("/// selected state, so `GateAccent` resolves to the SAME asset as")
-    lines.append("/// `GateActive` here (same fold as [`sixel_strip`]).")
+    lines.append("/// explicit truecolor background -- the gallery is a read-only comparison")
+    lines.append("/// grid with no selected state, so `GateAccent` resolves to the SAME asset")
+    lines.append("/// as `GateActive` here (same fold as [`sixel_strip`]).")
     lines.append("pub fn sixel_gallery(id: IconId, variant: SixelVariant) -> &'static str {")
     lines.append("    match id {")
     for spec in MANIFEST:
         upper = to_screaming_snake(spec.rust_name)
         lines.append(f"        IconId::{spec.rust_name} => match variant {{")
-        lines.append(f"            SixelVariant::Transparent => {upper}_SIXEL_GALLERY.as_str(),")
         lines.append(f"            SixelVariant::GateActive | SixelVariant::GateAccent => {upper}_SIXEL_GALLERY_GATE.as_str(),")
         lines.append("        },")
     lines.append("    }")
@@ -1003,8 +1062,14 @@ def generate_catalog() -> str:
     lines.append("    }")
     lines.append("}")
     lines.append("")
-    lines.append("// Raw baked-source lookups by id -- used only by this crate's own unit")
-    lines.append("// tests (byte-length assertions and the gate-compositing pixel checks).")
+    lines.append("// Raw true-coverage baked-source lookups by id -- used ONLY by this")
+    lines.append("// crate's own unit tests (byte-length assertions and the gate-compositing")
+    lines.append("// pixel checks): the rail/strip/gallery raw sources are no longer a")
+    lines.append("// shipped `SixelVariant` (cause 4's own retirement, `tools/bake_icons.py`'s")
+    lines.append("// own header doc comment), so their underlying `_RGBA` consts below are")
+    lines.append("// `#[cfg(test)]`-gated too -- nothing outside this test module ever reaches")
+    lines.append("// for them. The compact tier's own raw source stays unconditional: it IS")
+    lines.append("// the real, directly-shipped asset (see `sixel_compact` above).")
     lines.append("#[cfg(test)]")
     lines.append("pub(crate) fn sixel_source_rgba(id: IconId) -> &'static [u8] {")
     lines.append("    match id {")
@@ -1074,37 +1139,48 @@ def generate_catalog() -> str:
         upper = to_screaming_snake(spec.rust_name)
         lines.append(f"// ---- {spec.rust_name} ({spec.slug}) " + "-" * max(1, 60 - len(spec.rust_name) - len(spec.slug)))
         lines.append("")
+        lines.append("/// Raw true-coverage source, test-only -- no longer a shipped")
+        lines.append("/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,")
+        lines.append("/// cause 4's retirement); kept solely so this crate's own compositing-")
+        lines.append("/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against")
+        lines.append("/// a real checked-in buffer.")
+        lines.append("#[cfg(test)]")
         lines.append(f'const {upper}_RGBA: &[u8] = include_bytes!("{spec.stem()}.rgba");')
-        lines.append(f"static {upper}_SIXEL: LazyLock<String> = LazyLock::new(|| build_sixel({upper}_RGBA));")
         lines.append("")
-        lines.append("/// GateOverride, at-rest background (`render::ACTIVE_BG`) -- pre-composited")
-        lines.append("/// opaque at bake time, gamma-correct linear blend (see this crate's own")
-        lines.append("/// `tools/bake_icons.py` module doc, causes 1 and 3).")
+        lines.append("/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at")
+        lines.append("/// bake time, gamma-correct linear blend, painted by every icon-bearing")
+        lines.append("/// button in every `PtyColorMode` (see this crate's own `tools/")
+        lines.append("/// bake_icons.py` module doc, causes 1, 3 and 4).")
         lines.append(f'const {upper}_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("{spec.stem()}_gate_active.rgba");')
         lines.append(f"static {upper}_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate({upper}_GATE_ACTIVE_RGBA));")
         lines.append("")
-        lines.append("/// GateOverride, selected/accent background (`render::MAUVE`) -- same fix,")
-        lines.append("/// the rail's own selected-state background.")
+        lines.append("/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's")
+        lines.append("/// own selected-state background.")
         lines.append(f'const {upper}_GATE_ACCENT_RGBA: &[u8] = include_bytes!("{spec.stem()}_gate_accent.rgba");')
         lines.append(f"static {upper}_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate({upper}_GATE_ACCENT_RGBA));")
         lines.append("")
         lines.append(f'const {upper}_COMPACT_RGBA: &[u8] = include_bytes!("{spec.stem()}_compact.rgba");')
         lines.append(f"static {upper}_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact({upper}_COMPACT_RGBA));")
         lines.append("")
+        lines.append("/// Raw true-coverage strip-tier source, test-only -- same retirement as")
+        lines.append(f"/// {upper}_RGBA above.")
+        lines.append("#[cfg(test)]")
         lines.append(f'const {upper}_STRIP_RGBA: &[u8] = include_bytes!("{spec.stem()}_strip.rgba");')
-        lines.append(f"static {upper}_SIXEL_STRIP: LazyLock<String> = LazyLock::new(|| build_sixel_strip({upper}_STRIP_RGBA));")
         lines.append("")
-        lines.append("/// GateOverride, the strip's own single background (`render::ACTIVE_BG`) --")
-        lines.append("/// pre-composited opaque at bake time, same fix as the rail tier above.")
+        lines.append("/// The strip's own single background (`render::ACTIVE_BG`) -- pre-")
+        lines.append("/// composited opaque at bake time, same fix as the rail tier above; the")
+        lines.append("/// ONLY strip-tier sixel this crate ships.")
         lines.append(f'const {upper}_STRIP_GATE_RGBA: &[u8] = include_bytes!("{spec.stem()}_strip_gate.rgba");')
         lines.append(f"static {upper}_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate({upper}_STRIP_GATE_RGBA));")
         lines.append("")
+        lines.append("/// Raw true-coverage gallery-tier source, test-only -- same retirement as")
+        lines.append(f"/// {upper}_RGBA above.")
+        lines.append("#[cfg(test)]")
         lines.append(f'const {upper}_GALLERY_RGBA: &[u8] = include_bytes!("{spec.stem()}_gallery.rgba");')
-        lines.append(f"static {upper}_SIXEL_GALLERY: LazyLock<String> = LazyLock::new(|| build_sixel_gallery({upper}_GALLERY_RGBA));")
         lines.append("")
-        lines.append("/// GateOverride, the icon gallery's own single background (`render::")
-        lines.append("/// ACTIVE_BG`) -- pre-composited opaque at bake time, same fix as the")
-        lines.append("/// rail/strip tiers above.")
+        lines.append("/// The icon gallery's own single background (`render::ACTIVE_BG`) --")
+        lines.append("/// pre-composited opaque at bake time, same fix as the rail/strip tiers")
+        lines.append("/// above; the ONLY gallery-tier sixel this crate ships.")
         lines.append(f'const {upper}_GALLERY_GATE_RGBA: &[u8] = include_bytes!("{spec.stem()}_gallery_gate.rgba");')
         lines.append(f"static {upper}_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate({upper}_GALLERY_GATE_RGBA));")
         lines.append("")

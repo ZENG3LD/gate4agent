@@ -4887,6 +4887,7 @@ impl PendingContextPackExport {
             Err(failure) => Ok(ExportContextPackOutcome::Rejected {
                 prepared: self.prepared,
                 code: failure.code,
+                message: failure.message,
             }),
             Ok(_) => Ok(ExportContextPackOutcome::OutcomeUnknown {
                 prepared: self.prepared,
@@ -4961,6 +4962,7 @@ impl PendingDurableContextPackResolve {
             Err(failure) => Ok(ExportContextPackOutcome::Rejected {
                 prepared: self.prepared,
                 code: failure.code,
+                message: failure.message,
             }),
             Ok(_) => Ok(ExportContextPackOutcome::OutcomeUnknown {
                 prepared: self.prepared,
@@ -5056,6 +5058,11 @@ pub(crate) enum ExportContextPackOutcome {
     Rejected {
         prepared: crate::PreparedContinuationExport,
         code: NodeFailureCode,
+        /// The Node names its own refusal in prose and only the code
+        /// crosses the wire type -- carried here so the expiry this
+        /// causes can say which of the export path's many refusals it
+        /// was, since the expired continuation keeps no field for it.
+        message: String,
     },
     OutcomeUnknown {
         prepared: crate::PreparedContinuationExport,

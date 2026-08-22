@@ -2239,8 +2239,25 @@ impl HarnessService {
                     completed_at_unix_ms,
                 )
             }
-            c2::ExportContextPackOutcome::Rejected { prepared, .. }
-            | c2::ExportContextPackOutcome::ExpiredBeforeSend { prepared, .. } => {
+            // Both shapes expire the continuation identically, and the
+            // expired record keeps no field for why -- so the node's own
+            // refusal code, or the reason the export never left, survives
+            // only here.
+            c2::ExportContextPackOutcome::Rejected { prepared, code, message } => {
+                tracing::warn!(
+                    continuation = %prepared.continuation.continuation_ref,
+                    node_failure_code = ?code,
+                    node_message = %message,
+                    "node rejected the context-pack export: the continuation expires",
+                );
+                self.expire_continuation_export(&prepared, completed_at_unix_ms)
+            }
+            c2::ExportContextPackOutcome::ExpiredBeforeSend { prepared, reason } => {
+                tracing::warn!(
+                    continuation = %prepared.continuation.continuation_ref,
+                    ?reason,
+                    "context-pack export never reached the node: the continuation expires",
+                );
                 self.expire_continuation_export(&prepared, completed_at_unix_ms)
             }
         }

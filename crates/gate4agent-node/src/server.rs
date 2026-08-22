@@ -6485,7 +6485,7 @@ impl NodeShared {
     fn revalidate_session_record_context_export(
         &self,
         expected: &ManagedSessionRecord,
-        identity: &ProviderSessionIdentity,
+        identity: Option<&ProviderSessionIdentity>,
         session: &SessionAddress,
         allow_clean_detachment: bool,
     ) -> Result<(), NodeFailure> {
@@ -9903,50 +9903,113 @@ impl NodeShared {
         session: &SessionAddress,
         allow_clean_detachment: bool,
     ) -> Result<ResolvedContextPackReceipt, NodeFailure> {
-        let record = self.record(record_id)?;
-        let identity = record.provider_session.clone().ok_or_else(|| {
-            failure(
-                NodeFailureCode::BackendOperationFailed,
-                "managed session has no verified provider session identity",
-            )
-        })?;
-        if identity.key != ProviderSessionKey::SessionId {
-            return Err(failure(
-                NodeFailureCode::BackendOperationFailed,
-                "managed session provider identity cannot bind history exactly",
-            ));
+        // C2 replaces a relayed failure's prose with a canned per-code
+        // string (`C2NodeFailure`'s own `From`), so this path's dozen
+        // distinct refusals are indistinguishable to anyone downstream --
+        // and a refusal here expires a continuation, which keeps no field
+        // for why. The prose stays on the node, where it was written.
+        let outcome = self
+            .export_context_pack_for_session_record_inner(record_id, session, allow_clean_detachment)
+            .await;
+        if let Err(failure) = &outcome {
+            tracing::warn!(
+                record = %record_id,
+                code = ?failure.code,
+                reason = %failure.message,
+                "session-record context-pack export refused",
+            );
         }
+        outcome
+    }
+
+    async fn export_context_pack_for_session_record_inner(
+        &self,
+        record_id: &SessionRecordId,
+        session: &SessionAddress,
+        allow_clean_detachment: bool,
+    ) -> Result<ResolvedContextPackReceipt, NodeFailure> {
+        // Several steps here refuse with the same BackendOperationFailed
+        // code and no prose of their own, so which step failed is
+        // otherwise unrecoverable -- and a refusal here expires a
+        // continuation.
+        let step = |name: &'static str| move |failure: NodeFailure| {
+            tracing::warn!(step = name, code = ?failure.code, "context-pack export step refused");
+            failure
+        };
+        let record = self.record(record_id).map_err(step("record-lookup"))?;
+        // `provider_session` is `Some` only for a provider whose resolved
+        // runtime policy admits live identity verification (raw PTY plus a
+        // semantic PTY adapter -- `provider_runtime::policy_from_capability_flags`).
+        // The PTY-sidecar-observation shape (currently qwen-code) hardcodes
+        // `provider_session_identity: false` in `provider_runtime::evaluate`,
+        // so its records go straight to `Live` with `provider_session: None`
+        // and stay that way for the record's entire life -- that is this
+        // shape's permanent resting state, not a race with observation, and
+        // `discover_history`/`load_history` below do not need an identity to
+        // do their job for it. `IdentityPending` is the actual race (an
+        // identity-admitted provider whose observation has not landed yet):
+        // it keeps refusing here rather than falling back, because that
+        // provider's own history the fallback would otherwise trust is not
+        // guaranteed to be exact without the identity it is still waiting on.
+        let identity = match record.provider_session.clone() {
+            Some(identity) => {
+                if identity.key != ProviderSessionKey::SessionId {
+                    return Err(step("provider-identity-key")(failure(
+                        NodeFailureCode::BackendOperationFailed,
+                        "managed session provider identity cannot bind history exactly",
+                    )));
+                }
+                Some(identity)
+            }
+            None if record.state == ManagedSessionState::IdentityPending => {
+                return Err(step("provider-session-identity")(failure(
+                    NodeFailureCode::BackendOperationFailed,
+                    "managed session has not yet observed its provider session identity",
+                )));
+            }
+            None => None,
+        };
         self.revalidate_session_record_context_export(
             &record,
-            &identity,
+            identity.as_ref(),
             session,
             allow_clean_detachment,
-        )?;
+        ).map_err(step("revalidate-before-discovery"))?;
         let candidates = self
             .discover_history(session, HISTORY_DISCOVERY_LIMIT_MAX)
-            .await?;
-        let candidate_id = unique_history_candidate_for_provider_session(
+            .await
+            .map_err(step("discover-history"))?;
+        // With no verified identity to filter by, the discovered set must
+        // still resolve to exactly one candidate: the same ambiguity refusal
+        // an identity filter would otherwise produce is the only safety
+        // property left available for this shape.
+        let candidate_id = select_history_candidate(
             &candidates,
-            &identity.id,
-        )?;
-        let loaded = self.load_history(session, candidate_id.clone()).await?;
-        if loaded.session_id != identity.id {
-            return Err(failure(
-                NodeFailureCode::SessionRecordConflict,
-                "loaded history identity does not match the managed session record",
-            ));
+            identity.as_ref().map(|identity| identity.id.as_str()),
+        ).map_err(step("unique-candidate"))?;
+        let loaded = self.load_history(session, candidate_id.clone()).await
+            .map_err(step("load-history"))?;
+        if let Some(identity) = identity.as_ref() {
+            if loaded.session_id != identity.id {
+                return Err(failure(
+                    NodeFailureCode::SessionRecordConflict,
+                    "loaded history identity does not match the managed session record",
+                ));
+            }
         }
         self.revalidate_session_record_context_export(
             &record,
-            &identity,
+            identity.as_ref(),
             session,
             allow_clean_detachment,
         )?;
-        self.revalidate_loaded_history(session, &candidate_id, &loaded)?;
-        let pack = self.materialize_context_pack(session).await?;
+        self.revalidate_loaded_history(session, &candidate_id, &loaded)
+            .map_err(step("revalidate-loaded-history"))?;
+        let pack = self.materialize_context_pack(session).await
+            .map_err(step("materialize-context-pack"))?;
         self.commit_context_pack_for_session_record(
             &record,
-            &identity,
+            identity.as_ref(),
             session,
             &candidate_id,
             &loaded,
@@ -10063,7 +10126,7 @@ impl NodeShared {
     fn commit_context_pack_for_session_record(
         &self,
         expected: &ManagedSessionRecord,
-        identity: &ProviderSessionIdentity,
+        identity: Option<&ProviderSessionIdentity>,
         session: &SessionAddress,
         candidate_id: &str,
         loaded: &HistorySessionRecord,
@@ -14351,23 +14414,37 @@ fn controlled_session(shared: &NodeShared, connection_id: u64, role: ClientRole,
     shared.validate_address(session)
 }
 
-fn unique_history_candidate_for_provider_session(
+/// Selects the sole history candidate matching `provider_session_id` when
+/// the managed record carries a verified identity, or the sole candidate in
+/// the discovered set at all when it does not (see
+/// `export_context_pack_for_session_record_inner`'s identity match). Either
+/// way, more than one match refuses instead of guessing which one is exact.
+fn select_history_candidate(
     candidates: &[HistoryCandidateSummary],
-    provider_session_id: &str,
+    provider_session_id: Option<&str>,
 ) -> Result<String, NodeFailure> {
-    let mut matches = candidates
-        .iter()
-        .filter(|candidate| candidate.session_id_hint == provider_session_id);
+    let mut matches = candidates.iter().filter(|candidate| match provider_session_id {
+        Some(id) => candidate.session_id_hint == id,
+        None => true,
+    });
     let candidate = matches.next().ok_or_else(|| {
         failure(
             NodeFailureCode::SessionRecordConflict,
-            "no history candidate matches the managed provider session",
+            if provider_session_id.is_some() {
+                "no history candidate matches the managed provider session"
+            } else {
+                "no history candidate exists for the managed session"
+            },
         )
     })?;
     if matches.next().is_some() {
         return Err(failure(
             NodeFailureCode::SessionRecordConflict,
-            "history identity is ambiguous for the managed provider session",
+            if provider_session_id.is_some() {
+                "history identity is ambiguous for the managed provider session"
+            } else {
+                "history is ambiguous without a verified provider session identity"
+            },
         ));
     }
     Ok(candidate.id.clone())
@@ -14449,7 +14526,7 @@ fn session_record_export_target_matches(
 fn session_record_context_export_binding_is_exact(
     expected: &ManagedSessionRecord,
     current: &ManagedSessionRecord,
-    identity: &ProviderSessionIdentity,
+    identity: Option<&ProviderSessionIdentity>,
     session: &SessionAddress,
     binding: &SessionBinding,
     provider: &AgentId,
@@ -14457,7 +14534,7 @@ fn session_record_context_export_binding_is_exact(
     allow_clean_detachment: bool,
 ) -> bool {
     session_record_export_target_matches(expected, current, session, allow_clean_detachment)
-        && current.provider_session.as_ref() == Some(identity)
+        && current.provider_session.as_ref() == identity
         && current.workspace_id == session.workspace_id
         && provider == &current.provider
         && binding.workspace_id == session.workspace_id
@@ -19982,8 +20059,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            unique_history_candidate_for_provider_session(&candidates, "provider-exact")
-                .unwrap(),
+            select_history_candidate(&candidates, Some("provider-exact")).unwrap(),
             "candidate-exact",
         );
     }
@@ -19995,18 +20071,49 @@ mod tests {
             session_id_hint: hint.to_owned(),
             modified_at_unix_ms: None,
         };
-        let missing = unique_history_candidate_for_provider_session(
+        let missing = select_history_candidate(
             &[candidate("candidate-other", "provider-other")],
-            "provider-exact",
+            Some("provider-exact"),
         )
         .unwrap_err();
         assert_eq!(missing.code, NodeFailureCode::SessionRecordConflict);
-        let ambiguous = unique_history_candidate_for_provider_session(
+        let ambiguous = select_history_candidate(
             &[
                 candidate("candidate-a", "provider-exact"),
                 candidate("candidate-b", "provider-exact"),
             ],
-            "provider-exact",
+            Some("provider-exact"),
+        )
+        .unwrap_err();
+        assert_eq!(ambiguous.code, NodeFailureCode::SessionRecordConflict);
+    }
+
+    /// The PTY-sidecar-observation shape (qwen-code) never carries a
+    /// verified `provider_session`; its record-bound export instead falls
+    /// back to "exactly one discovered candidate" (see
+    /// `export_context_pack_for_session_record_inner`). This is the same
+    /// ambiguity refusal as the identity-filtered path, just without an
+    /// identity to filter by.
+    #[test]
+    fn session_record_context_export_selects_sole_history_candidate_without_identity() {
+        let candidate = |id: &str, hint: &str| HistoryCandidateSummary {
+            id: id.to_owned(),
+            session_id_hint: hint.to_owned(),
+            modified_at_unix_ms: None,
+        };
+        assert_eq!(
+            select_history_candidate(&[candidate("candidate-sole", "qwen-session")], None)
+                .unwrap(),
+            "candidate-sole",
+        );
+        let missing = select_history_candidate(&[], None).unwrap_err();
+        assert_eq!(missing.code, NodeFailureCode::SessionRecordConflict);
+        let ambiguous = select_history_candidate(
+            &[
+                candidate("candidate-a", "qwen-session-a"),
+                candidate("candidate-b", "qwen-session-b"),
+            ],
+            None,
         )
         .unwrap_err();
         assert_eq!(ambiguous.code, NodeFailureCode::SessionRecordConflict);
@@ -20040,7 +20147,7 @@ mod tests {
         assert!(session_record_context_export_binding_is_exact(
             &expected,
             &expected,
-            &identity,
+            Some(&identity),
             &session,
             &binding,
             &expected.provider,
@@ -20052,7 +20159,7 @@ mod tests {
         assert!(!session_record_context_export_binding_is_exact(
             &expected,
             &changed,
-            &identity,
+            Some(&identity),
             &session,
             &binding,
             &expected.provider,
@@ -20066,7 +20173,7 @@ mod tests {
         assert!(!session_record_context_export_binding_is_exact(
             &expected,
             &changed,
-            &identity,
+            Some(&identity),
             &session,
             &binding,
             &expected.provider,
@@ -20080,7 +20187,7 @@ mod tests {
         assert!(!session_record_context_export_binding_is_exact(
             &expected,
             &detached,
-            &identity,
+            Some(&identity),
             &session,
             &binding,
             &expected.provider,
@@ -20090,12 +20197,67 @@ mod tests {
         assert!(session_record_context_export_binding_is_exact(
             &expected,
             &detached,
-            &identity,
+            Some(&identity),
             &session,
             &binding,
             &expected.provider,
             &current_root,
             true,
+        ));
+    }
+
+    /// Mirrors `session_record_context_export_revalidation_rejects_record_change`
+    /// for a record whose provider never carries a verified identity (the
+    /// PTY-sidecar-observation shape, e.g. qwen-code): `identity` is `None`
+    /// throughout, and the exactness check falls back to comparing
+    /// `provider_session` itself, which must still be `None` on both sides.
+    #[test]
+    fn session_record_context_export_binding_is_exact_without_identity() {
+        let session = terminal_address(1);
+        let mut expected = record("qwen-code", "record-context-export-no-identity");
+        expected.state = ManagedSessionState::Live;
+        expected.active_session = Some(session.clone());
+        let binding = SessionBinding {
+            workspace_id: session.workspace_id.clone(),
+            generation: session.session.generation,
+            runtime_policy: ProviderRuntimePolicy::raw_pty(),
+            pending_resume: None,
+            record_id: Some(expected.record_id.clone()),
+            managed_worktree_lease_id: None,
+            environment_profile: None,
+            bundle: None,
+            context: None,
+            materialization_id: None,
+        };
+        let current_root = windows_path_text(&expected.canonical_root).to_owned();
+        assert!(session_record_context_export_binding_is_exact(
+            &expected,
+            &expected,
+            None,
+            &session,
+            &binding,
+            &expected.provider,
+            &current_root,
+            false,
+        ));
+        // A record that gained an identity between the initial lookup and
+        // this recheck no longer matches the `None` this shape expects to
+        // keep seeing -- treated the same as any other mid-export drift.
+        let mut drifted = expected.clone();
+        drifted.provider_session = Some(ProviderSessionIdentity {
+            key: ProviderSessionKey::SessionId,
+            id: "unexpected-identity".to_owned(),
+            transcript_path: None,
+        });
+        assert!(!session_record_context_export_binding_is_exact(
+            &expected,
+            &drifted,
+            None,
+            &session,
+            &binding,
+            &expected.provider,
+            &current_root,
+            false,
         ));
     }
 
@@ -20197,7 +20359,7 @@ mod tests {
         let error = shared
             .commit_context_pack_for_session_record(
                 &expected,
-                &identity,
+                Some(&identity),
                 &session,
                 "candidate-exact",
                 &history,

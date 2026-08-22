@@ -189,6 +189,65 @@ this tool's own pipeline (not taken on faith) before fixing.
    used for their own already-non-square boxes) rather than relying on
    resvg's own `-w`/`-h` fit the way the old truly-square 40x40 box could.
 
+6. FRACTIONAL-PIXEL STROKE LATTICE ("иконки читаются как точки, не линии"
+   / icons read as dots, not lines, not a font glyph's own crisp bar) --
+   CONFIRMED, exact mechanism identified. Every codicon in this manifest
+   is built on a stroke lattice with EXACTLY 16 steps across its own
+   viewBox: the 4 icons on a 24x24 viewBox (files/settings-gear/source-
+   control/terminal) use a 1.5-unit stroke width (24/1.5 = 16 steps --
+   verified against `files.svg`'s own structural path coordinates, every
+   straight-segment endpoint a multiple of 1.5 except the rounded-corner
+   arc control points, off-lattice by construction and meant to stay
+   anti-aliased); the 52 icons on a 16x16 viewBox use a 1-unit stroke
+   width (16/1 = 16 steps -- verified against `add.svg`: its plus-sign
+   bar spans x=7..8 and y=7..8, both plain integers -- the SAME 16-step
+   lattice at a different absolute scale, not a coincidence: codicons
+   are one design system at two viewBox sizes). None of this tool's own
+   per-tier target pixel sizes (`SIXEL_PX_W`x`_H` 40x38, `STRIP_SIXEL_PX_
+   W`x`_H` 20x19, `GALLERY_SIXEL_PX_W`x`_H` 60x57) is a whole multiple of
+   16, so the old single resvg pass fit directly to that size always
+   landed the stroke lattice on a FRACTIONAL pixel -- measured on the
+   actual shipped assets, alpha across a stroke: rail middle row 191,
+   255, 227; strip middle row 227, 191, 191, 227 -- a smeared band, never
+   a solid full-alpha core (no pixel boundary coincides with a stroke
+   edge, so no pixel gets full coverage). Compare the strip/rail's own
+   `─`/`│` divider glyphs elsewhere in this crate's UI: those are FONT
+   glyphs, and DirectWrite grid-fits a font's stems to whole device
+   pixels -- the difference the owner is seeing is grid fitting, not
+   resolution. FIX: `rasterize_lattice_fit` renders the glyph at the
+   LARGEST whole multiple of 16px that fits the tier's own canvas
+   (`glyph_lattice_size`) -- 16px for the strip tier (1px strokes), 32px
+   for the rail tier (2px strokes), 48px for the gallery tier (3px
+   strokes) -- where the render scale (glyph_px / viewBox) is itself an
+   exact multiple or reciprocal of 16, so every lattice-aligned stroke
+   boundary maps to a whole pixel; the glyph is then padded onto the
+   tier's own full canvas at an EXPLICIT, hand-computed INTEGER pixel
+   offset -- never ffmpeg's own symbolic `(ow-iw)/2` expression, which
+   this tool has no guarantee rounds to the SAME integer this fix's own
+   correctness depends on (see `rasterize_lattice_fit`'s own doc
+   comment). The one non-square source (`output.svg`, 24x25 -- cause 2
+   above) cannot land both axes on the lattice at once: fitting within a
+   SQUARE glyph box scales both axes by the SAME factor, dictated by
+   whichever dimension is tighter (here, height), so its width axis ends
+   up scaled by 16/25 rather than the lattice-exact 16/24 -- it keeps its
+   own aspect ratio (never distorted to force alignment) at the cost of
+   a slightly softer width-axis stroke; the one accepted, documented
+   exception, same precedent as cause 2's own `output.svg` note. The
+   compact tier's own canvas (10x19) cannot host a single 16px lattice
+   step in its narrower dimension AT ALL (10 < 16), so `rasterize_
+   compact_sixel` is UNCHANGED by this fix -- same single-pass-at-canvas-
+   size treatment causes 2 and 5 already established for it; inventing a
+   smaller lattice unit with no basis in the source design would be
+   worse than leaving it as it already was. Curved and diagonal segments
+   stay anti-aliased exactly as before -- this fix only ever changes
+   scale/offset arithmetic feeding the SAME single resvg AA pass cause 2
+   already established, never resvg's own anti-aliasing, and a curve
+   cannot sit on an axis-aligned pixel lattice by definition. Gamma-
+   correct compositing (cause 3) and the transparent-variant alpha pre-
+   correction (cause 4) both run AFTER this, completely unchanged, on
+   whatever buffer this produces -- this fix only changes WHERE the ink
+   pixels land, never how they get colored.
+
 Also: every sixel encode (all tiers, all variants) goes through
 `icons.rs::icon_encode_options()` -- `max_colors: 32` (the library's own
 default is 256) and `diffusion: 0.0` (the library's own default is
@@ -269,6 +328,15 @@ STRIP_SIXEL_RGBA_LEN = STRIP_SIXEL_PX_W * STRIP_SIXEL_PX_H * 4
 GALLERY_SIXEL_PX_W = ASSUMED_CELL_WIDTH_PX * 6
 GALLERY_SIXEL_PX_H = ASSUMED_CELL_HEIGHT_PX * 3
 GALLERY_SIXEL_RGBA_LEN = GALLERY_SIXEL_PX_W * GALLERY_SIXEL_PX_H * 4
+
+# ---- Stroke lattice (cause 6's fix -- see this module's own header doc
+# comment). Every codicon's own stroke lattice divides its viewBox into
+# EXACTLY 16 steps (24-unit viewBox / 1.5-unit stroke, or 16-unit viewBox
+# / 1-unit stroke -- the same design grid at two absolute scales), so
+# rendering the glyph itself at any whole multiple of this many pixels
+# maps every lattice-aligned stroke edge onto a whole device pixel. Not a
+# per-tier constant -- see `glyph_lattice_size`/`rasterize_lattice_fit`.
+LATTICE_STEP_PX = 16
 
 # ---- GateOverride compositing (cause 1's fix -- see this module's own
 # header doc comment). Hand-synced to render.rs's own fixed theme
@@ -472,40 +540,14 @@ _SRGB_TO_LINEAR_LUT: list[float] = [srgb_to_linear(v) for v in range(256)]
 
 
 def rasterize_sixel(patched_svg: Path) -> bytes:
-    """Rail tier: fit-within `SIXEL_PX_W` x `SIXEL_PX_H`, computed by hand
-    (`svg_intrinsic_size`/`fit_within`) rather than left to resvg's own
-    `-w`/`-h` rounding -- the SAME reasoning `rasterize_strip_sixel`
-    already documents (see `svg_intrinsic_size`'s own doc comment), now
-    needed here too since the correct 10x19 cell makes this tier's own
-    box non-square (cause 5 in this module's own header doc comment) for
-    the first time; the old, truly-square 40x40 box had no rounding
-    ambiguity to avoid. Returns the TRUE-coverage raw RGBA8 bytes -- NOT
-    written to `ICONS_DIR` directly, see `ensure_assets`'s own doc
-    comment for why.
-
-    Equivalent hand-run commands (for a square 16x16-viewBox source, the
-    most common case in this manifest -- fit-within lands such a source
-    on 38x38, the box's own height twice, since the box is wider than it
-    is tall; a non-square source like `output.svg` fits within the box
-    first, same as `rasterize_strip_sixel`):
-        resvg -w 38 -h 38 <slug>.patched.svg <slug>_raw.png
-        ffmpeg -i <slug>_raw.png \\
-            -vf "pad=40:38:(ow-iw)/2:(oh-ih)/2:color=black@0.0" \\
-            -f rawvideo -pix_fmt rgba <slug>.rgba
+    """Rail tier: `rasterize_lattice_fit` at `SIXEL_PX_W`x`_H` (40x38) --
+    see that function's own doc comment (and cause 6 in this module's own
+    header doc comment) for why the glyph itself renders at 32x32 (the
+    largest whole multiple of 16 that fits 40x38), not 40x38 directly.
+    Returns the TRUE-coverage raw RGBA8 bytes -- NOT written to `ICONS_
+    DIR` directly, see `ensure_assets`'s own doc comment for why.
     """
-    fit_w, fit_h = fit_within(*svg_intrinsic_size(patched_svg), SIXEL_PX_W, SIXEL_PX_H)
-    with tempfile.TemporaryDirectory() as tmp:
-        raw_png = Path(tmp) / "raw.png"
-        raw_rgba = Path(tmp) / "raw.rgba"
-        run_tool(["resvg", "-w", str(fit_w), "-h", str(fit_h), str(patched_svg), str(raw_png)])
-        run_tool([
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            "-i", str(raw_png),
-            "-vf", f"pad={SIXEL_PX_W}:{SIXEL_PX_H}:(ow-iw)/2:(oh-ih)/2:color=black@0.0",
-            "-f", "rawvideo", "-pix_fmt", "rgba",
-            str(raw_rgba),
-        ])
-        data = raw_rgba.read_bytes()
+    data = rasterize_lattice_fit(patched_svg, SIXEL_PX_W, SIXEL_PX_H)
     if len(data) != SIXEL_RGBA_LEN:
         die(f"sixel raster for {patched_svg} produced {len(data)} bytes, expected {SIXEL_RGBA_LEN}")
     return data
@@ -580,32 +622,53 @@ def fit_within(src_w: int, src_h: int, box_w: int, box_h: int) -> tuple[int, int
     return max(1, int(src_w * scale)), max(1, int(src_h * scale))
 
 
-def rasterize_strip_sixel(patched_svg: Path) -> bytes:
-    """Control-plane strip tier: fit-within `STRIP_SIXEL_PX_W`x`_H` (2
-    cells wide x 1 row tall, exactly the button's own full body -- unlike
-    the rail tier's own square crop of a taller body, see `../icons.rs`'s
-    own `SIXEL_ICON_WIDTH_PX` doc comment). Single resvg pass DIRECTLY at
-    the target size -- the same "rasterize once, at the target size, with
-    resvg's own high-quality AA" recipe `rasterize_sixel`/`rasterize_
-    compact_sixel` already use (see this module's own header doc
-    comment's cause-2 note: there is no larger intermediate render and no
-    second ffmpeg scale here, only a same-size pad) -- except the exact
-    fit-within pixel size handed to resvg is precomputed by hand (`svg_
-    intrinsic_size`/`fit_within`) rather than resvg's own `-w`/`-h`, to
-    sidestep a rounding edge case at this tier's own small absolute size
-    (see `svg_intrinsic_size`'s own doc comment). Returns the TRUE-
-    coverage raw RGBA8 bytes -- see `rasterize_sixel`'s own doc comment
-    for why this is not written to disk here.
+def glyph_lattice_size(canvas_w: int, canvas_h: int) -> int:
+    """Largest whole multiple of `LATTICE_STEP_PX` that fits inside BOTH
+    canvas dimensions -- the render size at which every codicon lattice
+    coordinate (a whole multiple of 1/16th its own viewBox) lands on a
+    whole device pixel, so a straight stroke gets hard, fully-opaque
+    edges instead of the smeared, sub-pixel band cause 6 (this module's
+    own header doc comment) measures on the pre-fix assets. Returns 0
+    when the canvas itself is smaller than one lattice step in its own
+    shorter dimension -- the compact tier's own 10x19 canvas, where no
+    multiple of 16 fits at all; `rasterize_compact_sixel` never calls
+    this and keeps its own pre-existing single-pass-at-canvas-size
+    treatment, per this fix's own explicit scope."""
+    return (min(canvas_w, canvas_h) // LATTICE_STEP_PX) * LATTICE_STEP_PX
 
-    Equivalent hand-run commands (for a square 16x16-viewBox source; a
-    non-square source like `output.svg` fits within the box first, see
-    above):
-        resvg -w 19 -h 19 <slug>.patched.svg <slug>_raw.png
-        ffmpeg -i <slug>_raw.png \\
-            -vf "pad=20:19:(ow-iw)/2:(oh-ih)/2:color=black@0.0" \\
-            -f rawvideo -pix_fmt rgba <slug>_strip.rgba
-    """
-    fit_w, fit_h = fit_within(*svg_intrinsic_size(patched_svg), STRIP_SIXEL_PX_W, STRIP_SIXEL_PX_H)
+
+def rasterize_lattice_fit(patched_svg: Path, canvas_w: int, canvas_h: int) -> bytes:
+    """Shared recipe for the rail/strip/gallery tiers (cause 6, this
+    module's own header doc comment): render the glyph at `glyph_lattice_
+    size(canvas_w, canvas_h)` -- 16/32/48px for the strip/rail/gallery
+    canvases respectively -- fit-within that square preserving the
+    source's own aspect ratio (`fit_within`, same non-square-safe
+    computation every other tier already used before this fix), THEN pad
+    onto the tier's own full canvas at an offset THIS FUNCTION computes
+    itself as a plain integer (`//`) and hands to ffmpeg as a literal,
+    rather than ffmpeg's own symbolic `(ow-iw)/2` expression -- the
+    previous recipe every rasterize function here used, and still
+    correct for tiers this fix does not touch, but this fix's own
+    correctness depends on the offset being EXACTLY an integer number of
+    pixels (see this function's own cause-6 doc comment: a half-pixel
+    offset would silently destroy the lattice alignment the larger glyph
+    render size just bought), which a symbolic expression evaluated
+    somewhere inside ffmpeg is not a documented guarantee of. For the 56
+    of 57 sources with a square viewBox, `fit_within` returns exactly
+    `glyph_lattice_size` on both axes and every lattice coordinate lands
+    on a whole pixel; for the one non-square exception (`output.svg`,
+    24x25 -- cause 2 above), fitting within a SQUARE glyph box scales
+    both axes by the SAME factor (dictated by the taller dimension), so
+    its own width axis ends up slightly short of the lattice-exact
+    scale -- aspect is preserved (never distorted to force alignment),
+    at the cost of a softer width-axis stroke on that one icon only.
+    Returns the TRUE-coverage raw RGBA8 bytes at `canvas_w`x`canvas_h`,
+    caller-length-checked -- see `rasterize_sixel`'s own doc comment for
+    why this is not written to `ICONS_DIR` directly."""
+    glyph = glyph_lattice_size(canvas_w, canvas_h)
+    fit_w, fit_h = fit_within(*svg_intrinsic_size(patched_svg), glyph, glyph)
+    pad_x = (canvas_w - fit_w) // 2
+    pad_y = (canvas_h - fit_h) // 2
     with tempfile.TemporaryDirectory() as tmp:
         raw_png = Path(tmp) / "raw.png"
         raw_rgba = Path(tmp) / "raw.rgba"
@@ -613,48 +676,36 @@ def rasterize_strip_sixel(patched_svg: Path) -> bytes:
         run_tool([
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
             "-i", str(raw_png),
-            "-vf", f"pad={STRIP_SIXEL_PX_W}:{STRIP_SIXEL_PX_H}:(ow-iw)/2:(oh-ih)/2:color=black@0.0",
+            "-vf", f"pad={canvas_w}:{canvas_h}:{pad_x}:{pad_y}:color=black@0.0",
             "-f", "rawvideo", "-pix_fmt", "rgba",
             str(raw_rgba),
         ])
-        data = raw_rgba.read_bytes()
+        return raw_rgba.read_bytes()
+
+
+def rasterize_strip_sixel(patched_svg: Path) -> bytes:
+    """Control-plane strip tier: `rasterize_lattice_fit` at `STRIP_SIXEL_
+    PX_W`x`_H` (20x19) -- see that function's own doc comment (and cause
+    6 in this module's own header doc comment) for why the glyph itself
+    renders at 16x16, not 20x19 directly. Returns the TRUE-coverage raw
+    RGBA8 bytes -- see `rasterize_sixel`'s own doc comment for why this
+    is not written to disk here.
+    """
+    data = rasterize_lattice_fit(patched_svg, STRIP_SIXEL_PX_W, STRIP_SIXEL_PX_H)
     if len(data) != STRIP_SIXEL_RGBA_LEN:
         die(f"strip sixel raster for {patched_svg} produced {len(data)} bytes, expected {STRIP_SIXEL_RGBA_LEN}")
     return data
 
 
 def rasterize_gallery_sixel(patched_svg: Path) -> bytes:
-    """Gallery tier: fit-within `GALLERY_SIXEL_PX_W`x`_H` (6 cells wide x
-    3 rows tall -- the icon gallery's own comparison column, see `icons::
-    GALLERY_SIXEL_ICON_WIDTH_PX`'s own doc comment). Single resvg pass
-    DIRECTLY at the target size -- the exact same recipe `rasterize_
-    strip_sixel` already uses (see this module's own header doc comment's
-    cause-2 note), including the same precomputed fit-within pixel size
-    (`svg_intrinsic_size`/`fit_within`) rather than resvg's own `-w`/`-h`.
-    Returns the TRUE-coverage raw RGBA8 bytes -- see `rasterize_sixel`'s
-    own doc comment for why this is not written to disk here.
-
-    Equivalent hand-run commands (for a square 16x16-viewBox source; a
-    non-square source like `output.svg` fits within the box first, see
-    above):
-        resvg -w 57 -h 57 <slug>.patched.svg <slug>_raw.png
-        ffmpeg -i <slug>_raw.png \\
-            -vf "pad=60:57:(ow-iw)/2:(oh-ih)/2:color=black@0.0" \\
-            -f rawvideo -pix_fmt rgba <slug>_gallery.rgba
+    """Gallery tier: `rasterize_lattice_fit` at `GALLERY_SIXEL_PX_W`x`_H`
+    (60x57) -- see that function's own doc comment (and cause 6 in this
+    module's own header doc comment) for why the glyph itself renders at
+    48x48, not 60x57 directly. Returns the TRUE-coverage raw RGBA8 bytes
+    -- see `rasterize_sixel`'s own doc comment for why this is not
+    written to disk here.
     """
-    fit_w, fit_h = fit_within(*svg_intrinsic_size(patched_svg), GALLERY_SIXEL_PX_W, GALLERY_SIXEL_PX_H)
-    with tempfile.TemporaryDirectory() as tmp:
-        raw_png = Path(tmp) / "raw.png"
-        raw_rgba = Path(tmp) / "raw.rgba"
-        run_tool(["resvg", "-w", str(fit_w), "-h", str(fit_h), str(patched_svg), str(raw_png)])
-        run_tool([
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            "-i", str(raw_png),
-            "-vf", f"pad={GALLERY_SIXEL_PX_W}:{GALLERY_SIXEL_PX_H}:(ow-iw)/2:(oh-ih)/2:color=black@0.0",
-            "-f", "rawvideo", "-pix_fmt", "rgba",
-            str(raw_rgba),
-        ])
-        data = raw_rgba.read_bytes()
+    data = rasterize_lattice_fit(patched_svg, GALLERY_SIXEL_PX_W, GALLERY_SIXEL_PX_H)
     if len(data) != GALLERY_SIXEL_RGBA_LEN:
         die(f"gallery sixel raster for {patched_svg} produced {len(data)} bytes, expected {GALLERY_SIXEL_RGBA_LEN}")
     return data

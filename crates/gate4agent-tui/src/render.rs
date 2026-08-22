@@ -3519,6 +3519,26 @@ fn render_icon_gallery(
 /// OWN rendering directly (see [`render_icon_gallery`]'s own doc comment
 /// for why this collapses all three size columns to the SAME content in
 /// that tier).
+///
+/// DEFECT 2 (owner: gallery icons overflow onto the pane's own frame):
+/// `client::flush_sixel_icon_into` prints whichever of `icons::sixel*`
+/// matches `size` UNCONDITIONALLY at that asset's own fixed native pixel
+/// size (`cells_wide` x `cells_tall` cells' worth) -- `placement.rect` is
+/// bookkeeping for cursor position and occlusion, never a crop box (a
+/// sixel image cannot be cropped to a sub-rect at all, only dropped
+/// whole -- see `render::render`'s own `drop_sixel_icons_covered_by_
+/// overlays` doc comment for the same constraint elsewhere). The former
+/// `area.width.min(cells_wide)` here shrank the RESERVED rect to fit a
+/// narrow pane, which looked safe (the bookkeeping rect always landed
+/// inside `area`), but `flush_sixel_icon_into` still painted the FULL,
+/// un-shrunk asset at that rect's origin -- the real pixels beyond the
+/// shrunk width/height bled straight past `area`'s own edge onto
+/// whatever the pane's frame or neighbor painted there. Reproduced (see
+/// `render::tests::gallery_swatch_drops_a_placement_that_does_not_fit_
+/// its_own_column_instead_of_shrinking_it`) at gallery pane widths where
+/// the rightmost (Gallery-tier) column's own available width lands
+/// strictly between 1 and `cells_wide - 1`. The fix: a placement is
+/// emitted at its full native size or not at all.
 fn render_gallery_size_swatch(
     area: Rect,
     id: icons::IconId,
@@ -3536,7 +3556,15 @@ fn render_gallery_size_swatch(
     }
     match tier {
         RailIcons::Sixel => {
-            let icon_area = Rect::new(area.x, area.y, area.width.min(cells_wide), area.height.min(cells_tall));
+            if area.width < cells_wide || area.height < cells_tall {
+                // Does not fit whole: drop it (never crop it -- see this
+                // fn's own doc comment). Still paint a plain background
+                // patch over whatever room IS available so a too-narrow
+                // column reads as an empty swatch, not stale content.
+                fill_rect(area, theme.active, buf);
+                return;
+            }
+            let icon_area = Rect::new(area.x, area.y, cells_wide, cells_tall);
             fill_rect(icon_area, theme.active, buf);
             layout.sixel_icons.push(SixelIconPlacement { icon: id, rect: icon_area, variant, size });
         }
@@ -15191,6 +15219,437 @@ mod tests {
         assert_eq!(close, Rect::new(modal.right() - 4, modal.y, 3, 1));
     }
 
+    /// DEFECT 1 (owner: "модалы прозрачные фоном, поэтому через них
+    /// просвечивает" -- modals are transparent in the background, so
+    /// content shows through them): every overlay must own EVERY cell
+    /// inside its own registered frame, border included -- not just the
+    /// cells its border-drawing and populated rows happen to touch.
+    /// `inherited_modals_are_opaque_over_provider_output` above spot-
+    /// checks one AddSpace interior cell; this is the exhaustive version
+    /// across all 15 renderers that call `note_overlay` in `render::
+    /// render`'s own overlay chain (see that field's own doc comment for
+    /// the authoritative list), checked cell-by-cell rather than at one
+    /// sampled coordinate.
+    ///
+    /// Poisoning the whole buffer and calling each overlay renderer
+    /// DIRECTLY -- bypassing `render::render`'s base layers, the same
+    /// call pattern this file's own `render_create_workspace_entry` unit
+    /// test above already uses -- is the only way to prove every cell was
+    /// actually WRITTEN, rather than merely differing from whatever a
+    /// particular base layout happened to leave behind at that spot.
+    /// `PtyColorMode::Inherited` is used throughout: it is the mode named
+    /// in the owner's report, and the one where `theme.modal` resolves to
+    /// a plain `Color::Black` rather than one of the `GateOverride`
+    /// palette's own named constants -- still a real, explicit color, and
+    /// distinct from the poison marker below, but the closest this crate
+    /// gets to "a colour that could be mistaken for the terminal's own
+    /// background" (see this fn's own overlay_leaks doc comment, and
+    /// `Theme::for_mode`'s `Inherited` arm).
+    #[test]
+    fn every_registered_overlay_paints_its_entire_frame_opaque() {
+        const POISON_SYMBOL: &str = "\u{2593}";
+        fn poison_style() -> Style {
+            Style {
+                fg: Color::Rgb(255, 0, 254),
+                bg: Color::Rgb(255, 0, 254),
+                modifiers: Modifier::empty(),
+            }
+        }
+
+        /// Fills a fresh `width`x`height` buffer with a marker no real
+        /// renderer in this crate ever paints (checked against this
+        /// file's own source), runs `paint` directly against it, and
+        /// returns the LAST overlay `paint` registered via `note_overlay`
+        /// (its own outer frame -- every renderer under test here calls
+        /// `note_overlay` exactly once, for itself, so `last` is
+        /// unambiguous) together with every poisoned cell still sitting
+        /// inside that frame. An empty `Vec` proves the renderer wrote
+        /// every single cell of its own frame; any survivor is a cell the
+        /// surface underneath would show through.
+        fn overlay_leaks(
+            width: u16,
+            height: u16,
+            paint: impl FnOnce(Rect, &mut TerminalBuffer, &mut LayoutRects),
+        ) -> (Rect, Vec<(u16, u16)>) {
+            let style = poison_style();
+            let mut buf = TerminalBuffer::new(width, height);
+            for row in 0..height {
+                for column in 0..width {
+                    let cell = buf.get_mut(column, row);
+                    cell.symbol = POISON_SYMBOL.into();
+                    cell.style = style;
+                }
+            }
+            let mut layout = LayoutRects::default();
+            paint(Rect::new(0, 0, width, height), &mut buf, &mut layout);
+            let rect = layout
+                .overlays
+                .last()
+                .unwrap_or_else(|| panic!("render fn registered no overlay via note_overlay"))
+                .rect;
+            let leaked: Vec<(u16, u16)> = (rect.y..rect.bottom())
+                .flat_map(|row| (rect.x..rect.right()).map(move |column| (column, row)))
+                .filter(|&(column, row)| {
+                    let cell = buf.get(column, row);
+                    cell.symbol.as_str() == POISON_SYMBOL && cell.style == style
+                })
+                .collect();
+            (rect, leaked)
+        }
+
+        let mut failures: Vec<String> = Vec::new();
+        let mut record = |label: &str, outcome: (Rect, Vec<(u16, u16)>)| {
+            let (rect, leaked) = outcome;
+            if !leaked.is_empty() {
+                failures.push(format!(
+                    "{label}: {}/{} cells inside its own overlay rect {rect:?} still show \
+                     the surface underneath, first at {:?}",
+                    leaked.len(),
+                    rect.area(),
+                    leaked[0],
+                ));
+            }
+        };
+
+        {
+            let mut app = fixture(PtyColorMode::Inherited);
+            app.focus = Focus::Spawn;
+            app.spawn = Some(SpawnDialog {
+                node_id: "node-a".to_owned(),
+                workspace_id: "workspace-a".to_owned(),
+                provider: provider("codex"),
+                target: LaunchTarget::NewLinkedWorktree,
+                profile_id: "default".to_owned(),
+                worktree_profile_id: String::new(),
+                bundle_id: String::new(),
+                context_mode: LaunchContextMode::None,
+                field: LaunchField::Workspace,
+            });
+            let theme = Theme::for_mode(app.color_mode);
+            record(
+                "spawn",
+                overlay_leaks(100, 24, |area, buf, layout| {
+                    render_spawn(&app, area, buf, layout, theme);
+                }),
+            );
+        }
+
+        {
+            let mut app = fixture(PtyColorMode::Inherited);
+            app.focus = Focus::ExistingSession;
+            app.existing_session = Some(empty_existing_session_dialog());
+            let theme = Theme::for_mode(app.color_mode);
+            record(
+                "existing_session",
+                overlay_leaks(100, 24, |area, buf, layout| {
+                    render_existing_session(&app, area, buf, layout, theme);
+                }),
+            );
+        }
+
+        {
+            let mut app = fixture(PtyColorMode::Inherited);
+            app.focus = Focus::AddSpace;
+            app.add_space = Some(crate::app::AddSpaceDialog {
+                node_id: "node-a".to_owned(),
+                workspace_id: "scratch".to_owned(),
+                root: r"C:\work\scratch".to_owned(),
+                original_root: None,
+                root_edited: true,
+                field: AddSpaceField::WorkspaceId,
+            });
+            let theme = Theme::for_mode(app.color_mode);
+            record(
+                "add_space",
+                overlay_leaks(100, 24, |area, buf, layout| {
+                    render_add_space(&app, area, buf, layout, theme);
+                }),
+            );
+        }
+
+        {
+            let mut app = fixture(PtyColorMode::Inherited);
+            app.focus = Focus::FolderBrowser;
+            app.folder_browser = Some(FolderBrowserDialog {
+                node_id: "node-a".to_owned(),
+                directory: Some(host_path(r"C:\work")),
+                parent: Some(host_path(r"C:\")),
+                entries: vec![HostDirectoryEntry {
+                    path: host_path(r"C:\work\acme"),
+                    display_name: "acme".to_owned(),
+                    is_link: false,
+                }],
+                next_after: Some(host_path(r"C:\work\acme")),
+                incomplete: false,
+                selected: 0,
+                scroll: 0,
+                filter: "acm".to_owned(),
+                field: FolderBrowserField::Entries,
+                pending: false,
+                append_pending: false,
+                request_token: 7,
+                error: None,
+            });
+            let theme = Theme::for_mode(app.color_mode);
+            record(
+                "folder_browser",
+                overlay_leaks(100, 24, |area, buf, layout| {
+                    render_folder_browser(&app, area, buf, layout, theme);
+                }),
+            );
+        }
+
+        {
+            let mut app = fixture(PtyColorMode::Inherited);
+            app.focus = Focus::CreateWorkspaceEntry;
+            app.create_workspace_entry = Some(CreateWorkspaceEntryDialog {
+                node_id: "node-a".to_owned(),
+                workspace_id: "workspace-a".to_owned(),
+                kind: WorkspaceEntryKind::File,
+                path: "notes/new.md".to_owned(),
+                pending: false,
+                token: 0,
+                error: None,
+            });
+            let theme = Theme::for_mode(app.color_mode);
+            record(
+                "create_workspace_entry",
+                overlay_leaks(100, 24, |area, buf, layout| {
+                    render_create_workspace_entry(&app, area, buf, layout, theme);
+                }),
+            );
+        }
+
+        {
+            let mut app = fixture(PtyColorMode::Inherited);
+            app.focus = Focus::CreateWorktree;
+            app.create_worktree = Some(CreateWorktreeDialog {
+                node_id: "node-a".to_owned(),
+                source_workspace_id: "workspace-a".to_owned(),
+                workspace_id: "wt-a".to_owned(),
+                target_root: r"C:\work\wt-a".to_owned(),
+                branch: "feature".to_owned(),
+                base: String::new(),
+                field: CreateWorktreeField::WorkspaceId,
+                return_to_spawn: false,
+                kind: GitLocationDialogKind::ManualLinked,
+            });
+            let theme = Theme::for_mode(app.color_mode);
+            record(
+                "create_worktree",
+                overlay_leaks(100, 24, |area, buf, layout| {
+                    render_create_worktree(&app, area, buf, layout, theme);
+                }),
+            );
+        }
+
+        {
+            let mut app = fixture(PtyColorMode::Inherited);
+            app.focus = Focus::RemoveWorktree;
+            app.remove_worktree = Some(crate::app::RemoveWorktreeDialog {
+                node_id: "node-a".to_owned(),
+                source_workspace_id: "workspace-a".to_owned(),
+                target_root: host_path(r"C:\work\acme\wt"),
+                branch: Some("feature".to_owned()),
+            });
+            let theme = Theme::for_mode(app.color_mode);
+            record(
+                "remove_worktree",
+                overlay_leaks(100, 24, |area, buf, layout| {
+                    render_remove_worktree(&app, area, buf, layout, theme);
+                }),
+            );
+        }
+
+        {
+            let mut app = fixture(PtyColorMode::Inherited);
+            app.focus = Focus::RenameSession;
+            app.rename_session = Some(crate::app::RenameSessionDialog {
+                node_id: "node-a".to_owned(),
+                record_id: "record-a".to_owned(),
+                original_name: "original".to_owned(),
+                display_name: "original".to_owned(),
+                local_alias: false,
+            });
+            let theme = Theme::for_mode(app.color_mode);
+            record(
+                "rename_session",
+                overlay_leaks(100, 24, |area, buf, layout| {
+                    render_rename_session(&app, area, buf, layout, theme);
+                }),
+            );
+        }
+
+        {
+            let mut app = fixture(PtyColorMode::Inherited);
+            app.focus = Focus::TaskId;
+            app.task_id_dialog = Some(crate::app::TaskIdDialog {
+                node_id: "node-a".to_owned(),
+                record_id: "record-a".to_owned(),
+                expected_revision: 3,
+                value: "task-".to_owned(),
+            });
+            let theme = Theme::for_mode(app.color_mode);
+            record(
+                "task_id",
+                overlay_leaks(100, 24, |area, buf, layout| {
+                    render_task_id(&app, area, buf, layout, theme);
+                }),
+            );
+        }
+
+        {
+            let mut app = fixture(PtyColorMode::Inherited);
+            app.focus = Focus::ForgetSession;
+            app.forget_session = Some(crate::app::ForgetSessionDialog {
+                node_id: "node-a".to_owned(),
+                record_id: "record-a".to_owned(),
+                display_name: "dormant session".to_owned(),
+            });
+            let theme = Theme::for_mode(app.color_mode);
+            record(
+                "forget_session",
+                overlay_leaks(100, 24, |area, buf, layout| {
+                    render_forget_session(&app, area, buf, layout, theme);
+                }),
+            );
+        }
+
+        {
+            let mut app = fixture(PtyColorMode::Inherited);
+            app.history = Some(HistoryDialog {
+                source: SessionAddress {
+                    node_id: "node-a".to_owned(),
+                    workspace_id: "workspace-a".to_owned(),
+                    instance_id: 1,
+                    generation: 1,
+                },
+                source_provider: provider("codex"),
+                source_workspace_root: host_path(r"C:\work\acme"),
+                candidates: Vec::new(),
+                selected: 0,
+                loaded: None,
+                context: None,
+                pending_label: None,
+            });
+            let theme = Theme::for_mode(app.color_mode);
+            record(
+                "history",
+                overlay_leaks(100, 24, |area, buf, layout| {
+                    render_history(&app, area, buf, layout, theme);
+                }),
+            );
+        }
+
+        {
+            let mut app = fixture(PtyColorMode::Inherited);
+            app.focus = Focus::Settings;
+            let theme = Theme::for_mode(app.color_mode);
+            record(
+                "settings",
+                overlay_leaks(100, 24, |area, buf, layout| {
+                    render_settings(&app, area, buf, layout, theme);
+                }),
+            );
+        }
+
+        {
+            let mut app = fixture(PtyColorMode::Inherited);
+            let key = AgentRowKey::Legacy(active_pty_address(&app));
+            app.agent_menu = Some(AgentMenuState {
+                key,
+                anchor_column: 5,
+                anchor_row: 5,
+                selected: 0,
+            });
+            let theme = Theme::for_mode(app.color_mode);
+            record(
+                "agent_menu",
+                overlay_leaks(100, 24, |area, buf, layout| {
+                    render_agent_menu(&app, area, buf, layout, theme);
+                }),
+            );
+        }
+
+        {
+            let mut app = fixture(PtyColorMode::Inherited);
+            let route = crate::app::NativeSessionCatalogRoute::workspace(
+                "workspace-a".to_owned(),
+                provider("codex"),
+            );
+            let key = crate::app::PreviewTabKey::NativeSelection {
+                node_id: "node-a".to_owned(),
+                route: route.clone(),
+                catalog_revision: 7,
+                recent_cutoff_unix_ms: 10,
+                selection_id: "native-history-1".to_owned(),
+            };
+            let mut dialog = empty_existing_session_dialog();
+            dialog.rows.push(crate::app::NativeSessionCatalogRowView {
+                node_id: "node-a".to_owned(),
+                route,
+                catalog_revision: 7,
+                recent_cutoff_unix_ms: 10,
+                selection_id: "native-history-1".to_owned(),
+                title: Some("Prior Codex session".to_owned()),
+                modified_at: None,
+                model: None,
+                message_count: Some(12),
+                completed_turn_count: Some(4),
+                external_group: None,
+                record_id: None,
+            });
+            app.existing_session = Some(dialog);
+            app.native_session_menu = Some(NativeSessionMenuState {
+                key,
+                anchor_column: 5,
+                anchor_row: 5,
+                selected: 0,
+            });
+            let theme = Theme::for_mode(app.color_mode);
+            record(
+                "native_session_menu",
+                overlay_leaks(100, 24, |area, buf, layout| {
+                    render_native_session_menu(&app, area, buf, layout, theme);
+                }),
+            );
+        }
+
+        {
+            let mut app = fixture(PtyColorMode::Inherited);
+            let workspace = gate4agent_harness_client::HarnessReverseAttributionWorkspaceV1 {
+                node_id: HarnessSelectorV1::new("node-a").unwrap(),
+                node_incarnation_id: gate4agent_harness_client::HarnessNodeIncarnationV1::new(
+                    "ab".repeat(16),
+                )
+                .unwrap(),
+                workspace_id: HarnessSelectorV1::new("workspace-a").unwrap(),
+            };
+            let subject = HarnessReverseAttributionSubjectV1::FileScope {
+                workspace,
+                relative_path: gate4agent_harness_client::HarnessRepositoryPathV1::new(
+                    "src/lib.rs",
+                )
+                .unwrap(),
+            };
+            app.harness_kanban.reverse_attribution = Some(
+                crate::app::HarnessReverseAttributionDetail {
+                    subject,
+                    state: HarnessReverseAttributionState::Loading { token: 1 },
+                },
+            );
+            let theme = Theme::for_mode(app.color_mode);
+            record(
+                "harness_reverse_attribution",
+                overlay_leaks(100, 24, |area, buf, layout| {
+                    render_harness_reverse_attribution(&app, area, buf, layout, theme);
+                }),
+            );
+        }
+
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
     /// Wave-1 icon labelling: AddSpaceBrowse keeps its "Browse…" text
     /// next to [`icons::IconId::Search`]. Same 2-tier + stable-hit-rect
     /// coverage as the sidebar panels' own compact-icon tests.
@@ -17862,6 +18321,94 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// DEFECT 2 (owner: "в иконка галери иконки вылазят за предел
+    /// панели (ну прямо на рамку)" -- gallery icons overflow the panel,
+    /// right onto its frame): `client::flush_sixel_icon_into` always
+    /// paints a sixel placement at its OWN tier's fixed native pixel
+    /// size, ignoring `rect.width`/`rect.height` entirely -- see
+    /// `render_gallery_size_swatch`'s own doc comment for the full
+    /// mechanism. The escaping edge was NOT the pane's bottom row (that
+    /// was already correctly guarded, see `icon_gallery_sixel_rows_
+    /// never_land_on_the_terminals_last_row_even_fully_scrolled` above)
+    /// -- it was the RIGHT edge of the Gallery-tier column: the former
+    /// `render_gallery_size_swatch` shrank the RESERVED rect to whatever
+    /// room a narrow pane left, which looked safe (the bookkeeping rect
+    /// always landed inside the pane), but `flush_sixel_icon_into` still
+    /// painted the full, un-shrunk asset at that rect's origin -- the
+    /// real pixels beyond the shrunk width bled straight past the pane's
+    /// own edge onto its frame.
+    ///
+    /// Sweeping the sidebar width (holding the terminal width fixed and
+    /// comfortably above `render`'s own 56-column floor) walks the
+    /// gallery pane's own viewport width through every value, including
+    /// the ones where the Gallery-tier column's own available width
+    /// lands strictly between 1 and `GALLERY_SIXEL_ICON_CELLS_WIDE - 1`
+    /// -- the exact reproduction. Every EMITTED placement must be its
+    /// own tier's exact native size (the fix: too-narrow means dropped,
+    /// never shrunk) and must stay inside the pane's own content rect.
+    #[test]
+    fn gallery_swatch_drops_a_placement_that_does_not_fit_its_own_column_instead_of_shrinking_it() {
+        let mut app = fixture(PtyColorMode::GateOverride);
+        app.surface.open_in_focused(SurfaceTab::IconGallery);
+        app.sidebar_collapsed = false;
+        assert_eq!(app.rail_icons, RailIcons::Sixel);
+
+        let native_size = |size: SixelIconSize| -> (u16, u16) {
+            match size {
+                SixelIconSize::Strip => {
+                    (icons::STRIP_SIXEL_ICON_CELLS_WIDE, icons::STRIP_SIXEL_ICON_CELLS_TALL)
+                }
+                SixelIconSize::Rail => (icons::SIXEL_ICON_CELLS_WIDE, icons::SIXEL_ICON_CELLS_TALL),
+                SixelIconSize::Gallery => {
+                    (icons::GALLERY_SIXEL_ICON_CELLS_WIDE, icons::GALLERY_SIXEL_ICON_CELLS_TALL)
+                }
+                SixelIconSize::Compact => {
+                    (icons::COMPACT_SIXEL_ICON_CELLS_WIDE, icons::COMPACT_SIXEL_ICON_CELLS_TALL)
+                }
+            }
+        };
+
+        // 63 == the gallery's own total column span (name + 4 gaps +
+        // strip + rail + gallery + ascii, see `render_icon_gallery`'s own
+        // `headers` construction) -- below it, at least one column no
+        // longer has its full width to work with.
+        let mut narrowed_below_full_column_width = false;
+        for sidebar_width in 18..70u16 {
+            app.sidebar_width = sidebar_width;
+            let mut buf = TerminalBuffer::new(100, 30);
+            let layout = render(&app, &mut buf);
+            let Some(pane) = layout.surface_panes.first() else { continue };
+            if pane.viewport.width < 63 {
+                narrowed_below_full_column_width = true;
+            }
+            for placement in layout.sixel_icons.iter() {
+                if placement.rect.intersect(pane.frame).is_empty() {
+                    continue;
+                }
+                let (native_w, native_h) = native_size(placement.size);
+                assert_eq!(
+                    (placement.rect.width, placement.rect.height),
+                    (native_w, native_h),
+                    "sidebar_width={sidebar_width}: {:?} placement {:?} was emitted smaller than \
+                     its own tier's native size -- client::flush_sixel_icon_into paints the full \
+                     asset regardless, so this bleeds real pixels past its own reserved rect",
+                    placement.icon, placement.rect,
+                );
+                assert!(
+                    placement.rect.right() <= pane.viewport.right()
+                        && placement.rect.bottom() <= pane.viewport.bottom(),
+                    "sidebar_width={sidebar_width}: placement {:?} escapes the pane's own content rect {:?}",
+                    placement.rect, pane.viewport,
+                );
+            }
+        }
+        assert!(
+            narrowed_below_full_column_width,
+            "this sweep must actually narrow the gallery pane below its own full column width \
+             (63 cells) for the test to mean anything",
+        );
     }
 
     /// Reproduces the reported defect exactly: the icon gallery's own

@@ -3069,6 +3069,7 @@ mod tests {
                 CapabilityId::new(C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_HISTORY_CONTEXT_PACK_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_SESSION_RECORD_CONTEXT_EXPORT_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_NATIVE_SESSION_CATALOG_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_NATIVE_SESSION_CATALOG_PAGING_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_NATIVE_SESSION_INDEX_CAPABILITY).unwrap(),
@@ -3443,6 +3444,7 @@ mod tests {
             bundle: None,
             context_id: None,
             context: None,
+            exported_context: None,
             task_binding: Some(gate4agent_node_protocol::SessionTaskBindingV1 {
                 revision: 1,
                 task_id: Some(gate4agent_node_protocol::TaskId::from_nonce([1; 12])),
@@ -3698,6 +3700,11 @@ mod tests {
             provider_runtime_status: true,
             provider_ids_open: true,
             spawn_spec_defaults_overrides: true,
+            // Every spec built by `spawn_spec` carries an expected
+            // profile revision, so this gate sits between the request and
+            // the bundle gate under test -- leaving it unnegotiated makes
+            // the request fail for the wrong reason.
+            spawn_profile_revision: true,
             worktree_selection: true,
             managed_worktree_lifecycle: true,
             child_environment_profile: true,

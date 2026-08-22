@@ -3236,19 +3236,43 @@ fn turn_readiness_counts_ready_samples_independently_of_frame_changes() {
 
 #[test]
 fn source_history_progression_requires_two_new_messages_per_turn() {
-    assert_eq!(required_source_message_count(None), 2);
+    let codex = |selected: Option<&SourceHistorySelection>| {
+        required_source_history_progress(Provider::Codex, selected).message_count
+    };
+    assert_eq!(codex(None), 2);
     let first = SourceHistorySelection {
         candidate_id: "candidate".to_owned(),
         native_session_id: "01234567-89ab-cdef-0123-456789abcdef".to_owned(),
         message_count: 6,
+        completed_turn_count: None,
     };
-    assert_eq!(required_source_message_count(Some(&first)), 8);
-    assert!(first.message_count < required_source_message_count(Some(&first)));
+    assert_eq!(codex(Some(&first)), 8);
+    assert!(first.message_count < codex(Some(&first)));
     let second = SourceHistorySelection {
         message_count: 8,
-        ..first
+        ..first.clone()
     };
-    assert_eq!(required_source_message_count(Some(&second)), 10);
+    assert_eq!(codex(Some(&second)), 10);
+}
+
+/// Claude's progression is counted in completed turns, not messages --
+/// the branch that has no message-count requirement at all, so the
+/// message-based assertions above cannot cover it.
+#[test]
+fn claude_source_history_progression_requires_one_new_completed_turn() {
+    let claude = |selected: Option<&SourceHistorySelection>| {
+        required_source_history_progress(Provider::Claude, selected)
+    };
+    assert_eq!(claude(None).completed_turn_count, Some(1));
+    assert_eq!(claude(None).message_count, 0);
+    let retained = SourceHistorySelection {
+        candidate_id: "candidate".to_owned(),
+        native_session_id: "01234567-89ab-cdef-0123-456789abcdef".to_owned(),
+        message_count: 6,
+        completed_turn_count: Some(3),
+    };
+    assert_eq!(claude(Some(&retained)).completed_turn_count, Some(4));
+    assert_eq!(claude(Some(&retained)).message_count, 0);
 }
 
 #[test]

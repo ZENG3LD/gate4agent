@@ -578,8 +578,23 @@ fn assert_private_bytes_absent(root: &Path, canaries: &[&str]) {
     }
 }
 
+/// The host's terminal-failure paths name their cause only in a
+/// `tracing` event (`HarnessFailureV1` carries a category, not a reason),
+/// so without a subscriber a red run here reports the end state and
+/// nothing about which stage refused.
+fn install_diagnostic_tracing() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_max_level(tracing::Level::WARN)
+            .try_init();
+    });
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn schedule_next_continuation_exports_restores_and_restart_does_not_repeat() {
+    install_diagnostic_tracing();
     require_headless_supervisor();
     let fixture = FixturePaths::new();
     let node_endpoint = pipe("node");

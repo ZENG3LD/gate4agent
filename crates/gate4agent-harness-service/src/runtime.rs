@@ -93,7 +93,7 @@ use gate4agent_harness_protocol::{
     HarnessOutcomeUnknownReasonV1, HarnessResultDispositionV1, HarnessResultRef, HarnessRevision,
     HarnessRunGitFactsOutcomeV1, HarnessRunGitFactsV1, HarnessRunGitCommitSummaryV1,
     HarnessRunGitStatusCodeV1, HarnessRunGitStatusEntryV1, HarnessRunGitSummaryV1,
-    HarnessRunLifecycleV1, HarnessSelectorV1, HarnessTaskStateV1,
+    HarnessRunLifecycleV1, HarnessRunV1, HarnessSelectorV1, HarnessTaskStateV1, HarnessTaskV1,
     HarnessRuntimeIdentityV1, HarnessSessionBindingV1, HarnessSessionIdentityV1,
     HarnessContextSourceSelectionV1, HarnessContextSourceAvailabilityV1, HarnessRequestDigest,
     HarnessWorktreeIntentV1, HarnessContinuationV1, HarnessDeliveryV1,
@@ -1349,13 +1349,23 @@ fn accepted_spawn_transition(
     let issued_ordinary = plan.is_ordinary_dispatch()
         && matches!(plan.grant, crate::dispatch::HarnessGrantPolicyV1::Operator)
         && issued_operator_transfer_authority;
-    if !issued_ordinary
-        && (plan.delivery.is_some() != has_delivery
-            || (plan.continuation
-                == crate::dispatch::HarnessContinuationPolicyV1::ParentRun)
-                != has_continuation)
-    {
-        return Err(HarnessRuntimeError::DispatchPreparation);
+    // Two independent reasons an accepted spawn may not match its launch
+    // plan once the operator-issuance exception is out of the way: checked
+    // one at a time so the refusal names which one fired instead of
+    // collapsing delivery and continuation mismatches into one disjunction.
+    if !issued_ordinary {
+        if plan.delivery.is_some() != has_delivery {
+            return Err(HarnessRuntimeError::DispatchPreparation(
+                "accepted spawn's delivery presence does not match the launch plan",
+            ));
+        }
+        if (plan.continuation == crate::dispatch::HarnessContinuationPolicyV1::ParentRun)
+            != has_continuation
+        {
+            return Err(HarnessRuntimeError::DispatchPreparation(
+                "accepted spawn's continuation presence does not match the launch plan's continuation policy",
+            ));
+        }
     }
     let harness_mcp = plan.harness_mcp == crate::dispatch::HarnessMcpPolicyV1::GrantBound;
     Ok(match (harness_mcp, has_delivery, has_continuation) {
@@ -1430,8 +1440,12 @@ impl ActiveDispatchJob {
 
 fn next_runtime_revision(revision: HarnessRevision) -> Result<HarnessRevision, HarnessRuntimeError> {
     HarnessRevision::new(
-        revision.get().checked_add(1).ok_or(HarnessRuntimeError::DispatchPreparation)?,
-    ).map_err(|_| HarnessRuntimeError::DispatchPreparation)
+        revision.get().checked_add(1).ok_or(HarnessRuntimeError::DispatchPreparation(
+            "harness revision counter overflowed u64",
+        ))?,
+    ).map_err(|_| HarnessRuntimeError::DispatchPreparation(
+        "incremented harness revision is zero",
+    ))
 }
 
 fn specialized_spawn_spec(
@@ -1442,18 +1456,26 @@ fn specialized_spawn_spec(
 ) -> Result<gate4agent_node_protocol::SpawnSpec, HarnessRuntimeError> {
     if let Some(delivery) = harness.engine().delivery_for_run(run_id) {
         let stage = delivery.stage_receipt.as_ref()
-            .ok_or(HarnessRuntimeError::DispatchPreparation)?;
+            .ok_or(HarnessRuntimeError::DispatchPreparation(
+                "delivery has no stage receipt",
+            ))?;
         spec.overrides.bundle_id = gate4agent_node_protocol::SpawnOverride::Set {
             value: SpawnBundleId::new(stage.bundle.bundle_id.as_str())
-                .map_err(|_| HarnessRuntimeError::DispatchPreparation)?,
+                .map_err(|_| HarnessRuntimeError::DispatchPreparation(
+                    "stage receipt bundle id is not a valid spawn bundle id",
+                ))?,
         };
     }
     if let Some(continuation) = harness.engine().continuation_for_run(run_id) {
         let context = continuation.context.as_ref()
-            .ok_or(HarnessRuntimeError::DispatchPreparation)?;
+            .ok_or(HarnessRuntimeError::DispatchPreparation(
+                "continuation has no context",
+            ))?;
         spec.overrides.context_id = gate4agent_node_protocol::SpawnOverride::Set {
             value: SpawnContextId::new(context.id.as_str())
-                .map_err(|_| HarnessRuntimeError::DispatchPreparation)?,
+                .map_err(|_| HarnessRuntimeError::DispatchPreparation(
+                    "continuation context id is not a valid spawn context id",
+                ))?,
         };
     }
     Ok(spec)
@@ -1507,20 +1529,33 @@ fn apply_spawn_result(
     now_unix_ms: u64,
 ) -> Result<Option<HarnessMcpReservationId>, HarnessRuntimeError> {
     let operation = harness.engine().operation(operation_id)
-        .ok_or(HarnessRuntimeError::DispatchPreparation)?.clone();
+        .ok_or(HarnessRuntimeError::DispatchPreparation("operation is missing"))?.clone();
     let run_id = operation.run_id.as_ref()
-        .ok_or(HarnessRuntimeError::DispatchPreparation)?;
+        .ok_or(HarnessRuntimeError::DispatchPreparation("operation carries no run id"))?;
     let task_id = operation.task_id.as_ref()
-        .ok_or(HarnessRuntimeError::DispatchPreparation)?;
+        .ok_or(HarnessRuntimeError::DispatchPreparation("operation carries no task id"))?;
     let run = harness.engine().run(run_id)
-        .ok_or(HarnessRuntimeError::DispatchPreparation)?.clone();
+        .ok_or(HarnessRuntimeError::DispatchPreparation("run is missing"))?.clone();
     let task = harness.engine().task(task_id)
-        .ok_or(HarnessRuntimeError::DispatchPreparation)?.clone();
-    if run.lifecycle != HarnessRunLifecycleV1::Dispatching
-        || operation.state != HarnessOperationStateV1::Dispatching
-        || task.state != HarnessTaskStateV1::Running
-    {
-        return Err(HarnessRuntimeError::DispatchPreparation);
+        .ok_or(HarnessRuntimeError::DispatchPreparation("task is missing"))?.clone();
+    // Three independent reasons a completing spawn may no longer match the
+    // state this function expects: checked one at a time so the refusal
+    // names which one fired instead of collapsing them into "state
+    // mismatch".
+    if run.lifecycle != HarnessRunLifecycleV1::Dispatching {
+        return Err(HarnessRuntimeError::DispatchPreparation(
+            "run is not in the Dispatching lifecycle",
+        ));
+    }
+    if operation.state != HarnessOperationStateV1::Dispatching {
+        return Err(HarnessRuntimeError::DispatchPreparation(
+            "operation is not in the Dispatching state",
+        ));
+    }
+    if task.state != HarnessTaskStateV1::Running {
+        return Err(HarnessRuntimeError::DispatchPreparation(
+            "task is not in the Running state",
+        ));
     }
 
     let mut next_run = run.clone();
@@ -1536,17 +1571,25 @@ fn apply_spawn_result(
             next_run.binding = Some(HarnessSessionBindingV1 {
                 node_id: gate4agent_harness_protocol::HarnessSelectorV1::new(
                     proof.node_id().as_str(),
-                ).map_err(|_| HarnessRuntimeError::DispatchPreparation)?,
+                ).map_err(|_| HarnessRuntimeError::DispatchPreparation(
+                    "spawn proof node id is not a valid harness selector",
+                ))?,
                 node_incarnation: gate4agent_harness_protocol::HarnessSelectorV1::new(
                     proof.incarnation_id().to_string(),
-                ).map_err(|_| HarnessRuntimeError::DispatchPreparation)?,
+                ).map_err(|_| HarnessRuntimeError::DispatchPreparation(
+                    "spawn proof incarnation id is not a valid harness selector",
+                ))?,
                 workspace_id: gate4agent_harness_protocol::HarnessSelectorV1::new(
                     proof.workspace_id().as_str(),
-                ).map_err(|_| HarnessRuntimeError::DispatchPreparation)?,
+                ).map_err(|_| HarnessRuntimeError::DispatchPreparation(
+                    "spawn proof workspace id is not a valid harness selector",
+                ))?,
                 session: HarnessSessionIdentityV1::Managed {
                     record_id: gate4agent_harness_protocol::HarnessSelectorV1::new(
                         proof.record_id().as_str(),
-                    ).map_err(|_| HarnessRuntimeError::DispatchPreparation)?,
+                    ).map_err(|_| HarnessRuntimeError::DispatchPreparation(
+                        "spawn proof record id is not a valid harness selector",
+                    ))?,
                     active_session: Some(HarnessRuntimeIdentityV1 {
                         instance_id,
                         generation,
@@ -1556,9 +1599,13 @@ fn apply_spawn_result(
             next_operation.state = HarnessOperationStateV1::Succeeded;
             next_operation.finished_at_unix_ms = Some(now_unix_ms);
             let scheduled = harness.scheduled_launch(operation_id)
-                .ok_or(HarnessRuntimeError::DispatchPreparation)?;
+                .ok_or(HarnessRuntimeError::DispatchPreparation(
+                    "operation has no scheduled launch",
+                ))?;
             let plan = launch_catalog.resolve_scheduled(scheduled)
-                .map_err(|_| HarnessRuntimeError::DispatchPreparation)?;
+                .map_err(|_| HarnessRuntimeError::DispatchPreparation(
+                    "scheduled launch does not resolve against the launch catalog",
+                ))?;
             let delivery = harness.engine().delivery_for_run(run_id).cloned();
             let continuation = harness.engine().continuation_for_run(run_id).cloned();
             let has_delivery = delivery.is_some();
@@ -1576,16 +1623,22 @@ fn apply_spawn_result(
                 operation_id,
                 has_delivery,
                 has_continuation,
-            ).map_err(|_| HarnessRuntimeError::DispatchPreparation)?;
+            ).map_err(|_| HarnessRuntimeError::DispatchPreparation(
+                "operation id fails deterministic dispatch id derivation",
+            ))?;
             if let Some(continuation) = &continuation {
                 next_run.continuation_receipt = Some(continuation.receipt_ref.clone());
             }
             let committed_delivery = if let Some(mut delivery) = delivery {
                 let receipt_ref = ids.delivery_receipt_ref
-                    .ok_or(HarnessRuntimeError::DispatchPreparation)?;
+                    .ok_or(HarnessRuntimeError::DispatchPreparation(
+                        "dispatch ids carry no delivery receipt ref",
+                    ))?;
                 next_run.delivery_receipt = Some(receipt_ref.clone());
                 let binding = next_run.binding.clone()
-                    .ok_or(HarnessRuntimeError::DispatchPreparation)?;
+                    .ok_or(HarnessRuntimeError::DispatchPreparation(
+                        "run carries no session binding",
+                    ))?;
                 let expected_delivery_revision = delivery.revision;
                 delivery.revision = next_runtime_revision(delivery.revision)?;
                 delivery.state = gate4agent_harness_protocol::HarnessDeliveryStateV1::Committed;
@@ -1610,7 +1663,9 @@ fn apply_spawn_result(
                 ).map(|()| None).map_err(HarnessRuntimeError::Harness),
                 AcceptedSpawnTransition::Delivery => {
                     let (expected_delivery_revision, delivery) = committed_delivery
-                        .ok_or(HarnessRuntimeError::DispatchPreparation)?;
+                        .ok_or(HarnessRuntimeError::DispatchPreparation(
+                            "committed delivery is missing for the Delivery transition",
+                        ))?;
                     harness.transition_run_with_accepted_spawn_and_delivery(
                         run.revision,
                         next_run,
@@ -1623,7 +1678,9 @@ fn apply_spawn_result(
                 }
                 AcceptedSpawnTransition::Continuation => {
                     let continuation = continuation.as_ref()
-                        .ok_or(HarnessRuntimeError::DispatchPreparation)?;
+                        .ok_or(HarnessRuntimeError::DispatchPreparation(
+                            "continuation is missing for the Continuation transition",
+                        ))?;
                     harness.transition_run_with_accepted_spawn_and_continuation(
                         run.revision,
                         next_run,
@@ -1637,9 +1694,13 @@ fn apply_spawn_result(
                 }
                 AcceptedSpawnTransition::DeliveryAndContinuation => {
                     let (expected_delivery_revision, delivery) = committed_delivery
-                        .ok_or(HarnessRuntimeError::DispatchPreparation)?;
+                        .ok_or(HarnessRuntimeError::DispatchPreparation(
+                            "committed delivery is missing for the DeliveryAndContinuation transition",
+                        ))?;
                     let continuation = continuation.as_ref()
-                        .ok_or(HarnessRuntimeError::DispatchPreparation)?;
+                        .ok_or(HarnessRuntimeError::DispatchPreparation(
+                            "continuation is missing for the DeliveryAndContinuation transition",
+                        ))?;
                     harness.transition_run_with_accepted_spawn_delivery_and_continuation(
                         run.revision,
                         next_run,
@@ -1665,7 +1726,9 @@ fn apply_spawn_result(
                 }
                 AcceptedSpawnTransition::HarnessMcpDelivery => {
                     let (expected_delivery_revision, delivery) = committed_delivery
-                        .ok_or(HarnessRuntimeError::DispatchPreparation)?;
+                        .ok_or(HarnessRuntimeError::DispatchPreparation(
+                            "committed delivery is missing for the HarnessMcpDelivery transition",
+                        ))?;
                     harness.transition_run_with_accepted_harness_mcp_spawn_and_delivery(
                         run.revision,
                         next_run,
@@ -1679,7 +1742,9 @@ fn apply_spawn_result(
                 }
                 AcceptedSpawnTransition::HarnessMcpContinuation => {
                     let continuation = continuation.as_ref()
-                        .ok_or(HarnessRuntimeError::DispatchPreparation)?;
+                        .ok_or(HarnessRuntimeError::DispatchPreparation(
+                            "continuation is missing for the HarnessMcpContinuation transition",
+                        ))?;
                     harness.transition_run_with_accepted_harness_mcp_spawn_and_continuation(
                         run.revision,
                         next_run,
@@ -1693,9 +1758,13 @@ fn apply_spawn_result(
                 }
                 AcceptedSpawnTransition::HarnessMcpDeliveryAndContinuation => {
                     let (expected_delivery_revision, delivery) = committed_delivery
-                        .ok_or(HarnessRuntimeError::DispatchPreparation)?;
+                        .ok_or(HarnessRuntimeError::DispatchPreparation(
+                            "committed delivery is missing for the HarnessMcpDeliveryAndContinuation transition",
+                        ))?;
                     let continuation = continuation.as_ref()
-                        .ok_or(HarnessRuntimeError::DispatchPreparation)?;
+                        .ok_or(HarnessRuntimeError::DispatchPreparation(
+                            "continuation is missing for the HarnessMcpDeliveryAndContinuation transition",
+                        ))?;
                     harness.transition_run_with_accepted_harness_mcp_spawn_delivery_and_continuation(
                         run.revision,
                         next_run,
@@ -1711,31 +1780,45 @@ fn apply_spawn_result(
                 }
             }
         }
-        CoordinatorSpawnResult::Rejected(_) | CoordinatorSpawnResult::Failed => {
-            let failure = HarnessFailureV1 {
-                category: HarnessFailureCategoryV1::Rejected,
-                retryable: false,
-            };
-            next_run.lifecycle = HarnessRunLifecycleV1::Failed;
-            next_run.result_disposition = Some(HarnessResultDispositionV1::Failed);
-            next_run.failure = Some(failure.clone());
-            next_operation.state = HarnessOperationStateV1::Failed;
-            next_operation.failure = Some(failure);
-            next_operation.finished_at_unix_ms = Some(now_unix_ms);
-            let mut next_task = task.clone();
-            next_task.revision = next_runtime_revision(task.revision)?;
-            next_task.state = HarnessTaskStateV1::Failed;
-            next_task.updated_at_unix_ms = now_unix_ms;
-            let reservation = harness.commit_scheduled_pre_dispatch_outcome(
-                run.revision,
+        CoordinatorSpawnResult::Rejected(code) => {
+            // `HarnessFailureV1` carries only the category, so the node's
+            // own code is the sole record of WHY the spawn was refused --
+            // dropping it leaves a terminal Failed run whose cause exists
+            // nowhere. Named here, at the transition that makes it
+            // terminal.
+            tracing::warn!(
+                operation = %operation_id,
+                run = %run_id,
+                task = %task_id,
+                node_failure_code = ?code,
+                "node rejected the spawn: run and task go terminal Failed",
+            );
+            apply_rejected_spawn(
+                harness,
+                &run,
                 next_run,
-                operation.revision,
+                &operation,
                 next_operation,
-                task.revision,
-                next_task,
-            ).map_err(HarnessRuntimeError::Harness)?;
-            reconcile_task_result_refs(harness, now_unix_ms)?;
-            Ok(reservation)
+                &task,
+                now_unix_ms,
+            )
+        }
+        CoordinatorSpawnResult::Failed => {
+            tracing::warn!(
+                operation = %operation_id,
+                run = %run_id,
+                task = %task_id,
+                "spawn dispatch failed before the node answered: run and task go terminal Failed",
+            );
+            apply_rejected_spawn(
+                harness,
+                &run,
+                next_run,
+                &operation,
+                next_operation,
+                &task,
+                now_unix_ms,
+            )
         }
         CoordinatorSpawnResult::OutcomeUnknown => {
             next_run.lifecycle = HarnessRunLifecycleV1::OutcomeUnknown;
@@ -1759,6 +1842,47 @@ fn apply_spawn_result(
     }
 }
 
+/// Commits the terminal-Failed outcome both refusal shapes share: the
+/// node answered with a rejection code, or the dispatch never got an
+/// answer worth trusting. Both land on the same `Rejected`/non-retryable
+/// `HarnessFailureV1` — the distinction between them lives in the caller's
+/// own log line, which is where the node's code is named, not in the
+/// state written here.
+fn apply_rejected_spawn(
+    harness: &mut HarnessService,
+    run: &HarnessRunV1,
+    mut next_run: HarnessRunV1,
+    operation: &HarnessOperationV1,
+    mut next_operation: HarnessOperationV1,
+    task: &HarnessTaskV1,
+    now_unix_ms: u64,
+) -> Result<Option<HarnessMcpReservationId>, HarnessRuntimeError> {
+    let failure = HarnessFailureV1 {
+        category: HarnessFailureCategoryV1::Rejected,
+        retryable: false,
+    };
+    next_run.lifecycle = HarnessRunLifecycleV1::Failed;
+    next_run.result_disposition = Some(HarnessResultDispositionV1::Failed);
+    next_run.failure = Some(failure.clone());
+    next_operation.state = HarnessOperationStateV1::Failed;
+    next_operation.failure = Some(failure);
+    next_operation.finished_at_unix_ms = Some(now_unix_ms);
+    let mut next_task = task.clone();
+    next_task.revision = next_runtime_revision(task.revision)?;
+    next_task.state = HarnessTaskStateV1::Failed;
+    next_task.updated_at_unix_ms = now_unix_ms;
+    let reservation = harness.commit_scheduled_pre_dispatch_outcome(
+        run.revision,
+        next_run,
+        operation.revision,
+        next_operation,
+        task.revision,
+        next_task,
+    ).map_err(HarnessRuntimeError::Harness)?;
+    reconcile_task_result_refs(harness, now_unix_ms)?;
+    Ok(reservation)
+}
+
 fn apply_pre_dispatch_result(
     harness: &mut HarnessService,
     operation_id: &HarnessOperationId,
@@ -1766,21 +1890,34 @@ fn apply_pre_dispatch_result(
     now_unix_ms: u64,
 ) -> Result<Option<HarnessMcpReservationId>, HarnessRuntimeError> {
     let operation = harness.engine().operation(operation_id)
-        .ok_or(HarnessRuntimeError::DispatchPreparation)?
+        .ok_or(HarnessRuntimeError::DispatchPreparation("operation is missing"))?
         .clone();
     let run_id = operation.run_id.as_ref()
-        .ok_or(HarnessRuntimeError::DispatchPreparation)?;
+        .ok_or(HarnessRuntimeError::DispatchPreparation("operation carries no run id"))?;
     let run = harness.engine().run(run_id)
-        .ok_or(HarnessRuntimeError::DispatchPreparation)?
+        .ok_or(HarnessRuntimeError::DispatchPreparation("run is missing"))?
         .clone();
     let task = harness.engine().task(&run.task_id)
-        .ok_or(HarnessRuntimeError::DispatchPreparation)?
+        .ok_or(HarnessRuntimeError::DispatchPreparation("task is missing"))?
         .clone();
-    if run.lifecycle != HarnessRunLifecycleV1::Requested
-        || operation.state != HarnessOperationStateV1::Prepared
-        || task.state != HarnessTaskStateV1::Running
-    {
-        return Err(HarnessRuntimeError::DispatchPreparation);
+    // Three independent reasons a pre-dispatch outcome may no longer match
+    // the state this function expects: checked one at a time so the
+    // refusal names which one fired instead of collapsing them into "state
+    // mismatch".
+    if run.lifecycle != HarnessRunLifecycleV1::Requested {
+        return Err(HarnessRuntimeError::DispatchPreparation(
+            "run is not in the Requested lifecycle",
+        ));
+    }
+    if operation.state != HarnessOperationStateV1::Prepared {
+        return Err(HarnessRuntimeError::DispatchPreparation(
+            "operation is not in the Prepared state",
+        ));
+    }
+    if task.state != HarnessTaskStateV1::Running {
+        return Err(HarnessRuntimeError::DispatchPreparation(
+            "task is not in the Running state",
+        ));
     }
     let mut next_run = run.clone();
     next_run.revision = next_runtime_revision(run.revision)?;
@@ -1793,6 +1930,15 @@ fn apply_pre_dispatch_result(
     next_task.updated_at_unix_ms = now_unix_ms;
     match result {
         CoordinatorPreDispatchResult::Failed => {
+            // Not every path here comes through one of the classifiers
+            // that name the underlying error, so this is the one line
+            // guaranteed to mark WHICH run went terminal.
+            tracing::warn!(
+                operation = %operation_id,
+                run = %run.run_id,
+                task = %task.task_id,
+                "pre-dispatch outcome is terminal: run and task go Failed/Rejected",
+            );
             let failure = HarnessFailureV1 {
                 category: HarnessFailureCategoryV1::Rejected,
                 retryable: false,
@@ -1826,10 +1972,26 @@ fn apply_pre_dispatch_result(
     Ok(reservation)
 }
 
+/// The four classifiers below are the choke point where one pre-dispatch
+/// error becomes either a retryable `OutcomeUnknown` or a terminal
+/// `Failed`. `CoordinatorPreDispatchResult` carries no payload and
+/// `HarnessFailureV1` records only a category, so the error itself
+/// survives nowhere past this decision -- a terminal run would otherwise
+/// report "Rejected" with its cause existing in no log, no wire field and
+/// no store row. Named here, where the decision is made.
+fn note_terminal_pre_dispatch(stage: &str, error: &dyn std::fmt::Debug) {
+    tracing::warn!(
+        stage,
+        error = ?error,
+        "pre-dispatch error is terminal: the run and its task go Failed/Rejected",
+    );
+}
+
 fn delivery_pre_dispatch_result(error: &HarnessC2Error) -> CoordinatorPreDispatchResult {
     if matches!(error, HarnessC2Error::DeliveryTransport(_)) {
         CoordinatorPreDispatchResult::OutcomeUnknown
     } else {
+        note_terminal_pre_dispatch("delivery", error);
         CoordinatorPreDispatchResult::Failed
     }
 }
@@ -1844,11 +2006,13 @@ fn delivery_stage_completion_result(
     ) {
         CoordinatorPreDispatchResult::OutcomeUnknown
     } else {
+        note_terminal_pre_dispatch("delivery-stage-completion", error);
         CoordinatorPreDispatchResult::Failed
     }
 }
 
-fn preflight_pre_dispatch_result(_error: &HarnessC2Error) -> CoordinatorPreDispatchResult {
+fn preflight_pre_dispatch_result(error: &HarnessC2Error) -> CoordinatorPreDispatchResult {
+    note_terminal_pre_dispatch("preflight", error);
     CoordinatorPreDispatchResult::Failed
 }
 
@@ -1876,7 +2040,7 @@ fn delivery_needs_staging(
         gate4agent_harness_protocol::HarnessDeliveryStateV1::Prepared => Ok(true),
         gate4agent_harness_protocol::HarnessDeliveryStateV1::Staged => Ok(false),
         gate4agent_harness_protocol::HarnessDeliveryStateV1::Committed => {
-            Err(HarnessRuntimeError::DispatchPreparation)
+            Err(HarnessRuntimeError::DispatchPreparation("delivery is already Committed"))
         }
     }
 }
@@ -1892,12 +2056,12 @@ fn commit_lifecycle_projection(
     now_unix_ms: u64,
 ) -> Result<(), HarnessRuntimeError> {
     let run = harness.engine().run(run_id)
-        .ok_or(HarnessRuntimeError::DispatchPreparation)?.clone();
+        .ok_or(HarnessRuntimeError::DispatchPreparation("run is missing"))?.clone();
     if !matches!(run.lifecycle, HarnessRunLifecycleV1::Running | HarnessRunLifecycleV1::Waiting) {
         return Ok(());
     }
     let task = harness.engine().task(&run.task_id)
-        .ok_or(HarnessRuntimeError::DispatchPreparation)?.clone();
+        .ok_or(HarnessRuntimeError::DispatchPreparation("task is missing"))?.clone();
     let projected_run_lifecycle = match projection {
         HarnessLifecycleProjectionV1::Running => HarnessRunLifecycleV1::Running,
         HarnessLifecycleProjectionV1::Waiting => HarnessRunLifecycleV1::Waiting,
@@ -1921,7 +2085,9 @@ fn commit_lifecycle_projection(
         &incarnation_id,
         event_sequence,
         kind,
-    ).map_err(|_| HarnessRuntimeError::DispatchPreparation)?;
+    ).map_err(|_| HarnessRuntimeError::DispatchPreparation(
+        "lifecycle authority ids failed to derive for run",
+    ))?;
     if harness.engine().operation(&ids.operation_id).is_some() {
         return Ok(());
     }
@@ -1953,7 +2119,9 @@ fn commit_lifecycle_projection(
     let operation = HarnessOperationV1 {
         operation_id: ids.operation_id,
         revision: HarnessRevision::new(1)
-            .map_err(|_| HarnessRuntimeError::DispatchPreparation)?,
+            .map_err(|_| HarnessRuntimeError::DispatchPreparation(
+                "new operation revision is zero",
+            ))?,
         actor: HarnessActorV1::ParentRun { run_id: run.run_id.clone() },
         kind: HarnessOperationKindV1::MutateRun,
         state: HarnessOperationStateV1::Succeeded,
@@ -1997,7 +2165,9 @@ fn apply_exact_control_lifecycle(
         })
     }).collect::<Vec<_>>();
     if matches.len() > 1 {
-        return Err(HarnessRuntimeError::DispatchPreparation);
+        return Err(HarnessRuntimeError::DispatchPreparation(
+            "control lifecycle event matches more than one run",
+        ));
     }
     let Some((run_id, task_id, sequence, kind, projection)) = matches.into_iter().next() else {
         return Ok(EngineTouch::default());
@@ -2060,10 +2230,14 @@ fn start_dispatch_preflight(
     intent: HarnessDispatchIntentV1,
 ) -> Result<(), HarnessRuntimeError> {
     let node_id = gate4agent_node_protocol::NodeId::new(intent.intent.node_id.as_str())
-        .map_err(|_| HarnessRuntimeError::DispatchPreparation)?;
+        .map_err(|_| HarnessRuntimeError::DispatchPreparation(
+            "dispatch intent node id is not a valid node id",
+        ))?;
     let route = adapter.exact_route(&node_id)?;
     let profile_id = SpawnProfileId::new(intent.intent.provider_profile.as_str())
-        .map_err(|_| HarnessRuntimeError::DispatchPreparation)?;
+        .map_err(|_| HarnessRuntimeError::DispatchPreparation(
+            "dispatch intent provider profile is not a valid spawn profile id",
+        ))?;
     let adapter = adapter.clone();
     let commands = commands.clone();
     tokio::spawn(async move {
@@ -3790,9 +3964,11 @@ fn start_or_resume_dispatch_job(
     // current as of this call -- see `effective_launch_catalog`.
     let (launch, _truncated) = effective_launch_catalog(&catalogs.launch, runtime_inventory);
     let scheduled = harness.scheduled_launch(&intent.operation_id)
-        .ok_or(HarnessRuntimeError::DispatchPreparation)?;
+        .ok_or(HarnessRuntimeError::DispatchPreparation("operation has no scheduled launch"))?;
     let plan = launch.resolve_scheduled(scheduled)
-        .map_err(|_| HarnessRuntimeError::DispatchPreparation)?
+        .map_err(|_| HarnessRuntimeError::DispatchPreparation(
+            "scheduled launch does not resolve against the launch catalog",
+        ))?
         .clone();
     let has_delivery = harness.engine().delivery_for_run(&intent.run_id).is_some();
     let has_continuation = harness.engine().continuation_for_run(&intent.run_id).is_some();
@@ -3816,12 +3992,18 @@ fn start_or_resume_dispatch_job(
         if delivery_needs_staging(delivery.state)? {
             let delivery_ref = delivery.delivery_ref.clone();
             let bundle_id = SpawnBundleId::new(delivery.bundle.bundle_id.as_str())
-                .map_err(|_| HarnessRuntimeError::DispatchPreparation)?;
+                .map_err(|_| HarnessRuntimeError::DispatchPreparation(
+                    "delivery bundle id is not a valid spawn bundle id",
+                ))?;
             let compiled = catalogs.delivery.get(&bundle_id)
-                .ok_or(HarnessRuntimeError::DispatchPreparation)?
+                .ok_or(HarnessRuntimeError::DispatchPreparation(
+                    "delivery bundle id is missing from the delivery catalog",
+                ))?
                 .clone();
             let node_id = NodeId::new(intent.intent.node_id.as_str())
-                .map_err(|_| HarnessRuntimeError::DispatchPreparation)?;
+                .map_err(|_| HarnessRuntimeError::DispatchPreparation(
+                    "dispatch intent node id is not a valid node id",
+                ))?;
             let route = adapter.exact_route(&node_id)?;
             let operation_id = intent.operation_id.clone();
             let lease = harness.issue_delivery_staging_lease(
@@ -3854,7 +4036,9 @@ fn start_or_resume_dispatch_job(
                     Ok(start) => start,
                     Err(_) => {
                         let exporting = harness.engine().continuation_for_run(&intent.run_id)
-                            .ok_or(HarnessRuntimeError::DispatchPreparation)?
+                            .ok_or(HarnessRuntimeError::DispatchPreparation(
+                                "run has no continuation record",
+                            ))?
                             .clone();
                         harness.recover_exporting_continuation_outcome_unknown(
                             &exporting.continuation_ref,
@@ -3916,7 +4100,9 @@ fn start_or_resume_dispatch_job(
             }
             ContinuationResumeAction::Preflight => {}
             ContinuationResumeAction::Reject => {
-                return Err(HarnessRuntimeError::DispatchPreparation);
+                return Err(HarnessRuntimeError::DispatchPreparation(
+                    "continuation is already Bound",
+                ));
             }
         }
     }
@@ -3936,7 +4122,10 @@ fn dispatch_start_pre_dispatch_result(
             HarnessC2Error::DeliveryTransport(_)
             | HarnessC2Error::ContextExportTransport(_),
         ) => CoordinatorPreDispatchResult::OutcomeUnknown,
-        _ => CoordinatorPreDispatchResult::Failed,
+        _ => {
+            note_terminal_pre_dispatch("dispatch-start", error);
+            CoordinatorPreDispatchResult::Failed
+        }
     }
 }
 
@@ -3983,7 +4172,7 @@ fn start_or_terminalize_dispatch_job(
                     | HarnessOperationStateV1::OutcomeUnknown
                     | HarnessOperationStateV1::Reconciled,
                 ) => None,
-                None => return Err(HarnessRuntimeError::DispatchPreparation),
+                None => return Err(HarnessRuntimeError::DispatchPreparation("operation is missing")),
             };
             if let Some(reservation_id) = reservation_id {
                 if let Some(cleanup) = harness
@@ -5016,15 +5205,19 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                             );
                             let preparation = (|| -> Result<_, HarnessRuntimeError> {
                             let run = harness.engine().run(&intent.run_id)
-                                .ok_or(HarnessRuntimeError::DispatchPreparation)?.clone();
+                                .ok_or(HarnessRuntimeError::DispatchPreparation("run is missing"))?.clone();
                             let operation = harness.engine().operation(&intent.operation_id)
-                                .ok_or(HarnessRuntimeError::DispatchPreparation)?.clone();
+                                .ok_or(HarnessRuntimeError::DispatchPreparation("operation is missing"))?.clone();
                             let task = harness.engine().task(&intent.task_id)
-                                .ok_or(HarnessRuntimeError::DispatchPreparation)?.clone();
+                                .ok_or(HarnessRuntimeError::DispatchPreparation("task is missing"))?.clone();
                             let scheduled = harness.scheduled_launch(&intent.operation_id)
-                                .ok_or(HarnessRuntimeError::DispatchPreparation)?.clone();
+                                .ok_or(HarnessRuntimeError::DispatchPreparation(
+                                    "operation has no scheduled launch",
+                                ))?.clone();
                             let plan = effective_launch.resolve_scheduled(&scheduled)
-                                .map_err(|_| HarnessRuntimeError::DispatchPreparation)?;
+                                .map_err(|_| HarnessRuntimeError::DispatchPreparation(
+                                    "scheduled launch does not resolve against the launch catalog",
+                                ))?;
                             let issued_dispatch = (
                                 matches!(intent.intent.worktree, HarnessWorktreeIntentV1::ManagedProfile { .. })
                                     || harness.engine().delivery_for_run(&intent.run_id).is_some()
@@ -5036,12 +5229,34 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                     ordinary.intent.continuation = None;
                                     ordinary
                                 });
-                            let spec = plan.spawn_spec(
+                            // The intent above is reduced to what the node
+                            // is actually asked to run, so the plan it is
+                            // validated against has to be reduced the same
+                            // way -- see `HarnessLaunchPlanV1::issued_
+                            // view`. The specialized fields come back as
+                            // node overrides in `specialized_spawn_spec`
+                            // immediately below.
+                            let issued_plan = issued_dispatch.as_ref().map(|_| plan.issued_view());
+                            let spec = issued_plan.as_ref().unwrap_or(plan).spawn_spec(
                                 issued_dispatch.as_ref().unwrap_or(&intent),
                                 &task,
                                 profile.revision().clone(),
                             )
-                                .map_err(|_| HarnessRuntimeError::DispatchPreparation)?;
+                                .map_err(|error| HarnessRuntimeError::DispatchPreparation({
+                                    // `DispatchPreparation` carries only a
+                                    // static reason, so the dispatch
+                                    // error's own detail survives in the
+                                    // log -- and it must, since
+                                    // `spawn_spec` refuses for a dozen
+                                    // different reasons that are not
+                                    // interchangeable.
+                                    tracing::warn!(
+                                        ?error,
+                                        "launch plan refused to produce a spawn spec for the dispatch intent",
+                                    );
+                                    "dispatch intent fails to produce a spawn spec from the launch plan"
+                                }
+                                ))?;
                             let spec = specialized_spawn_spec(
                                 &harness,
                                 plan,
@@ -5049,24 +5264,34 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                 spec,
                             )?;
                             let spec = profile.bind_spec(spec)
-                                .map_err(|_| HarnessRuntimeError::DispatchPreparation)?;
+                                .map_err(|_| HarnessRuntimeError::DispatchPreparation(
+                                    "spawn spec fails to bind to the resolved spawn profile revision",
+                                ))?;
                             let fingerprint = crate::c2::spawn_spec_fingerprint(&spec)
-                                .map_err(|_| HarnessRuntimeError::DispatchPreparation)?;
+                                .map_err(|_| HarnessRuntimeError::DispatchPreparation(
+                                    "spawn spec fingerprint failed to derive",
+                                ))?;
                             let now = unix_time_ms();
                             let route = profile.route().clone();
                             let context = crate::HarnessDispatchContextV1 {
                                 operation_id: intent.operation_id.clone(),
                                 node_id: gate4agent_harness_protocol::HarnessSelectorV1::new(
                                     route.node_id.as_str(),
-                                ).map_err(|_| HarnessRuntimeError::DispatchPreparation)?,
+                                ).map_err(|_| HarnessRuntimeError::DispatchPreparation(
+                                    "profile route node id is not a valid harness selector",
+                                ))?,
                                 node_incarnation_id: gate4agent_harness_protocol::HarnessSelectorV1::new(
                                     route.expected_incarnation_id.to_string(),
-                                ).map_err(|_| HarnessRuntimeError::DispatchPreparation)?,
+                                ).map_err(|_| HarnessRuntimeError::DispatchPreparation(
+                                    "profile route incarnation id is not a valid harness selector",
+                                ))?,
                                 workspace_id: intent.intent.workspace_id.clone(),
                                 provider_profile: intent.intent.provider_profile.clone(),
                                 expected_provider: gate4agent_harness_protocol::HarnessSelectorV1::new(
                                     plan.provider.as_str(),
-                                ).map_err(|_| HarnessRuntimeError::DispatchPreparation)?,
+                                ).map_err(|_| HarnessRuntimeError::DispatchPreparation(
+                                    "launch plan provider is not a valid harness selector",
+                                ))?,
                                 mode: intent.intent.mode,
                                 baseline_record_ids: Vec::new(),
                                 spawn_spec_fingerprint: fingerprint,
@@ -5091,23 +5316,31 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                 let ids = deterministic_dispatch_ids(
                                     &intent.operation_id,
                                     plan,
-                                ).map_err(|_| HarnessRuntimeError::DispatchPreparation)?;
+                                ).map_err(|_| HarnessRuntimeError::DispatchPreparation(
+                                    "operation id or launch plan fails deterministic dispatch id derivation",
+                                ))?;
                                 let reservation_id = ids.harness_mcp_reservation_id
-                                    .ok_or(HarnessRuntimeError::DispatchPreparation)?;
+                                    .ok_or(HarnessRuntimeError::DispatchPreparation(
+                                        "dispatch ids carry no harness mcp reservation id",
+                                    ))?;
                                 let (grant_id, grant_revision) = match &plan.grant {
                                     crate::dispatch::HarnessGrantPolicyV1::Exact {
                                         grant_id,
                                         revision,
                                     } => (grant_id.clone(), *revision),
                                     crate::dispatch::HarnessGrantPolicyV1::Operator => {
-                                        return Err(HarnessRuntimeError::DispatchPreparation);
+                                        return Err(HarnessRuntimeError::DispatchPreparation(
+                                            "harness mcp grant policy is Operator, not an Exact grant",
+                                        ));
                                     }
                                 };
                                 let expires_at_unix_ms = now.checked_add(
                                     plan.deadline_ms.min(
                                         gate4agent_node_protocol::MAX_HARNESS_MCP_RESERVATION_TTL_MS,
                                     ),
-                                ).ok_or(HarnessRuntimeError::DispatchPreparation)?;
+                                ).ok_or(HarnessRuntimeError::DispatchPreparation(
+                                    "harness mcp reservation expiry overflowed u64",
+                                ))?;
                                 let prepared = harness.begin_run_dispatch_with_harness_mcp(
                                     run.revision,
                                     dispatching_run,
@@ -5211,19 +5444,28 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                                     .or_insert(cleanup);
                                             }
                                         }
-                                    } else if let Some(reservation_id) = apply_pre_dispatch_result(
-                                        &mut harness,
-                                        &intent.operation_id,
-                                        CoordinatorPreDispatchResult::Failed,
-                                        unix_time_ms(),
-                                    )? {
-                                        if let Some(cleanup) = harness
-                                            .harness_mcp_reservation(&reservation_id)
-                                            .and_then(pending_harness_mcp_abort)
-                                        {
-                                            pending_harness_mcp_aborts
-                                                .entry(reservation_id)
-                                                .or_insert(cleanup);
+                                    } else {
+                                        // The sibling arm above routes its
+                                        // error through a classifier that
+                                        // names it; this one discarded it
+                                        // outright, which is how a run could
+                                        // end terminal-Failed with its cause
+                                        // recorded nowhere at all.
+                                        note_terminal_pre_dispatch("dispatch-job", &error);
+                                        if let Some(reservation_id) = apply_pre_dispatch_result(
+                                            &mut harness,
+                                            &intent.operation_id,
+                                            CoordinatorPreDispatchResult::Failed,
+                                            unix_time_ms(),
+                                        )? {
+                                            if let Some(cleanup) = harness
+                                                .harness_mcp_reservation(&reservation_id)
+                                                .and_then(pending_harness_mcp_abort)
+                                            {
+                                                pending_harness_mcp_aborts
+                                                    .entry(reservation_id)
+                                                    .or_insert(cleanup);
+                                            }
                                         }
                                     }
                                 }
@@ -5346,7 +5588,9 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                             // Re-deriving here raced that invalidation and lost.
                             let resolved_plan = active_dispatch.take()
                                 .map(|job| job.plan)
-                                .ok_or(HarnessRuntimeError::DispatchPreparation)?;
+                                .ok_or(HarnessRuntimeError::DispatchPreparation(
+                                    "active dispatch job is missing for the finished spawn",
+                                ))?;
                             let resolved_launch = HarnessLaunchCatalog::new([resolved_plan])
                                 .unwrap_or_default();
                             if let Some(reservation_id) = apply_spawn_result(
@@ -5428,7 +5672,9 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                                 .and_then(|scheduled| {
                                                     effective_launch.resolve_scheduled(scheduled).ok()
                                                 })
-                                                .ok_or(HarnessRuntimeError::DispatchPreparation)?
+                                                .ok_or(HarnessRuntimeError::DispatchPreparation(
+                                                    "operation has no scheduled launch resolving against the launch catalog",
+                                                ))?
                                                 .clone();
                                             active_dispatch = Some(ActiveDispatchJob::new(
                                                 operation_id,
@@ -5491,7 +5737,9 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                             .find(|delivery| {
                                                 delivery.operation_id == operation_id
                                             })
-                                            .ok_or(HarnessRuntimeError::DispatchPreparation)?
+                                            .ok_or(HarnessRuntimeError::DispatchPreparation(
+                                                "no delivery record matches the finished stage operation",
+                                            ))?
                                             .clone();
                                         harness.stage_delivery_with_proof(
                                             delivery.revision,
@@ -5522,7 +5770,9 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                     }
                                     let intent = harness.pending_scheduled_dispatch()?
                                         .filter(|intent| intent.operation_id == operation_id)
-                                        .ok_or(HarnessRuntimeError::DispatchPreparation)?;
+                                        .ok_or(HarnessRuntimeError::DispatchPreparation(
+                                            "no pending scheduled dispatch for this operation",
+                                        ))?;
                                     active_dispatch = start_or_terminalize_dispatch_job(
                                         &mut harness,
                                         &adapter,
@@ -5568,11 +5818,15 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                     )?;
                                     let run_id = harness.engine().operation(&operation_id)
                                         .and_then(|operation| operation.run_id.as_ref())
-                                        .ok_or(HarnessRuntimeError::DispatchPreparation)?
+                                        .ok_or(HarnessRuntimeError::DispatchPreparation(
+                                            "operation carries no run id",
+                                        ))?
                                         .clone();
                                     let continuation = harness.engine()
                                         .continuation_for_run(&run_id)
-                                        .ok_or(HarnessRuntimeError::DispatchPreparation)?
+                                        .ok_or(HarnessRuntimeError::DispatchPreparation(
+                                            "run has no continuation record",
+                                        ))?
                                         .clone();
                                     match continuation.state {
                                         gate4agent_harness_protocol::HarnessContinuationStateV1::Exported => {
@@ -5580,7 +5834,9 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                                 .filter(|intent| {
                                                     intent.operation_id == operation_id
                                                 })
-                                                .ok_or(HarnessRuntimeError::DispatchPreparation)?;
+                                                .ok_or(HarnessRuntimeError::DispatchPreparation(
+                                                    "no pending scheduled dispatch for this operation",
+                                                ))?;
                                             active_dispatch = start_or_terminalize_dispatch_job(
                                                 &mut harness,
                                                 &adapter,
@@ -5625,17 +5881,23 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                                 }
                                             }
                                         }
-                                        _ => return Err(HarnessRuntimeError::DispatchPreparation),
+                                        _ => return Err(HarnessRuntimeError::DispatchPreparation(
+                                            "continuation is neither Exported, OutcomeUnknown nor Expired after export finished",
+                                        )),
                                     }
                                 }
                                 Err(_) => {
                                     let run_id = harness.engine().operation(&operation_id)
                                         .and_then(|operation| operation.run_id.as_ref())
-                                        .ok_or(HarnessRuntimeError::DispatchPreparation)?
+                                        .ok_or(HarnessRuntimeError::DispatchPreparation(
+                                            "operation carries no run id",
+                                        ))?
                                         .clone();
                                     let continuation = harness.engine()
                                         .continuation_for_run(&run_id)
-                                        .ok_or(HarnessRuntimeError::DispatchPreparation)?
+                                        .ok_or(HarnessRuntimeError::DispatchPreparation(
+                                            "run has no continuation record",
+                                        ))?
                                         .clone();
                                     if continuation.state
                                         == gate4agent_harness_protocol::HarnessContinuationStateV1::Exporting
@@ -10074,8 +10336,8 @@ pub enum HarnessRuntimeError {
     Harness(#[from] HarnessServiceError),
     #[error("Harness launch catalog is invalid")]
     LaunchCatalog,
-    #[error("Harness dispatch preparation failed")]
-    DispatchPreparation,
+    #[error("Harness dispatch preparation failed: {0}")]
+    DispatchPreparation(&'static str),
     #[error(transparent)]
     Credential(#[from] CredentialError),
     #[error("read host must bind exact IPv4 loopback")]
@@ -10380,7 +10642,7 @@ mod tests {
             if !has_delivery && !has_continuation {
                 assert_eq!(result.unwrap(), AcceptedSpawnTransition::Plain);
             } else {
-                assert!(matches!(result, Err(HarnessRuntimeError::DispatchPreparation)));
+                assert!(matches!(result, Err(HarnessRuntimeError::DispatchPreparation(_))));
             }
         }
 
@@ -10391,11 +10653,11 @@ mod tests {
         );
         assert!(matches!(
             accepted_spawn_transition(&legacy_delivery, false, false, false),
-            Err(HarnessRuntimeError::DispatchPreparation),
+            Err(HarnessRuntimeError::DispatchPreparation(_)),
         ));
         assert!(matches!(
             accepted_spawn_transition(&legacy_delivery, false, true, true),
-            Err(HarnessRuntimeError::DispatchPreparation),
+            Err(HarnessRuntimeError::DispatchPreparation(_)),
         ));
         let mut legacy_exact = accepted_transition_plan(
             false,
@@ -10412,7 +10674,7 @@ mod tests {
         legacy_exact.validate().unwrap();
         assert!(matches!(
             accepted_spawn_transition(&legacy_exact, false, true, false),
-            Err(HarnessRuntimeError::DispatchPreparation),
+            Err(HarnessRuntimeError::DispatchPreparation(_)),
         ));
     }
 
@@ -12335,7 +12597,9 @@ mod tests {
             CoordinatorPreDispatchResult::OutcomeUnknown,
         );
         assert_eq!(
-            delivery_stage_completion_result(&HarnessRuntimeError::DispatchPreparation),
+            delivery_stage_completion_result(&HarnessRuntimeError::DispatchPreparation(
+                "test fixture: unrelated terminal cause",
+            )),
             CoordinatorPreDispatchResult::Failed,
         );
     }

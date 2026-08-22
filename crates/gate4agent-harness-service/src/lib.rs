@@ -1636,20 +1636,40 @@ impl HarnessService {
                 ),
             ),
         };
-        if grant.revision != grant_revision
-            || grant.state
-                != gate4agent_harness_protocol::SessionGrantStateV1::Active
-            || grant.actor_run_id != *actor_run_id
-            || run.parent_run_id.as_ref() != Some(actor_run_id)
-            || !grant.allows_target(
-                &run.intent.node_id,
-                &run.intent.workspace_id,
-                &run.intent.provider_profile,
-                run.intent.mode,
-            )
-        {
+        // Five independent reasons a scheduled launch may no longer be
+        // dispatchable. They are checked one at a time so the refusal
+        // names which one fired: collapsed into a single disjunction the
+        // error said only "grant, route, or profile changed", which is
+        // indistinguishable from a stale revision, a revoked grant, a
+        // re-parented run and a workspace the grant never covered.
+        if grant.revision != grant_revision {
             return Err(HarnessServiceError::InvalidDispatchContext(
-                "scheduled exact grant, route, or profile changed",
+                "scheduled exact grant revision moved since the launch was scheduled",
+            ));
+        }
+        if grant.state != gate4agent_harness_protocol::SessionGrantStateV1::Active {
+            return Err(HarnessServiceError::InvalidDispatchContext(
+                "scheduled exact grant is no longer Active",
+            ));
+        }
+        if grant.actor_run_id != *actor_run_id {
+            return Err(HarnessServiceError::InvalidDispatchContext(
+                "scheduled exact grant belongs to a different actor run",
+            ));
+        }
+        if run.parent_run_id.as_ref() != Some(actor_run_id) {
+            return Err(HarnessServiceError::InvalidDispatchContext(
+                "scheduled run's parent is not the grant's actor run",
+            ));
+        }
+        if !grant.allows_target(
+            &run.intent.node_id,
+            &run.intent.workspace_id,
+            &run.intent.provider_profile,
+            run.intent.mode,
+        ) {
+            return Err(HarnessServiceError::InvalidDispatchContext(
+                "scheduled exact grant does not cover the run's node, workspace, profile or mode",
             ));
         }
         let ids = dispatch::deterministic_dispatch_ids(operation_id, plan)?;

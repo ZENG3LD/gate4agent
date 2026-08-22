@@ -397,8 +397,23 @@ fn assert_private_bytes_absent(paths: &[PathBuf], canaries: &[&str]) {
     }
 }
 
+/// The host's terminal-failure paths name their cause only in a
+/// `tracing` event (`HarnessFailureV1` carries a category, not a node
+/// failure code), so without a subscriber a red run here reports "did not
+/// reach Running" and nothing about why the node refused.
+fn install_diagnostic_tracing() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_max_level(tracing::Level::WARN)
+            .try_init();
+    });
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn schedule_next_delivery_stages_materializes_and_does_not_resend() {
+    install_diagnostic_tracing();
     assert_eq!(
         std::env::var_os("GATE4AGENT_HEADLESS_SUPERVISOR").as_deref(),
         Some(std::ffi::OsStr::new("1")),

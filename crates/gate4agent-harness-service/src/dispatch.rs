@@ -350,6 +350,29 @@ impl HarnessLaunchPlanV1 {
         Ok((actor, parent_run_id, intent))
     }
 
+    /// This plan as the node is actually asked to run it: worktree
+    /// `Existing`, no delivery, no continuation.
+    ///
+    /// A specialized launch never reaches the node as a specialized spawn.
+    /// The caller issues an ORDINARY spawn and then re-applies the
+    /// delivery bundle and the continuation context as node-level
+    /// `SpawnSpec` overrides once the durable staging receipts exist
+    /// (`runtime::specialized_spawn_spec`). To do that it must hand
+    /// [`Self::spawn_spec`] an intent with those same fields cleared —
+    /// and [`Self::validate_intent`] compares plan against intent field
+    /// by field, so validating a cleared intent against an uncleared
+    /// plan rejects every specialized launch outright. Both sides are
+    /// reduced to the issued shape here so the comparison is like for
+    /// like; nothing about what the node ends up running changes.
+    pub fn issued_view(&self) -> Self {
+        Self {
+            worktree: HarnessWorktreeIntentV1::Existing,
+            delivery: None,
+            continuation: HarnessContinuationPolicyV1::None,
+            ..self.clone()
+        }
+    }
+
     pub fn spawn_spec(
         &self,
         dispatch: &HarnessDispatchIntentV1,
@@ -373,14 +396,38 @@ impl HarnessLaunchPlanV1 {
                 })
             }
         };
-        if dispatch.task_id != task.task_id
-            || dispatch.task_revision != task.revision
-            || task.state != HarnessTaskStateV1::Running
-            || task.run_ids.binary_search(&dispatch.run_id).is_err()
-            || !grant_matches
-            || !continuation_matches
-        {
-            return Err(HarnessDispatchError::TaskMismatch);
+        // Six independent reasons a dispatch intent may no longer match
+        // the task it was frozen against, checked one at a time so the
+        // refusal names which one fired. They are not interchangeable:
+        // five are identity/shape facts that cannot change across a
+        // dispatch, while `task_revision` is a counter that goes stale
+        // simply by elapsed time, and a single collapsed message cannot
+        // tell a caller which kind of failure it is looking at.
+        if dispatch.task_id != task.task_id {
+            return Err(HarnessDispatchError::TaskMismatch("dispatch names a different task"));
+        }
+        if dispatch.task_revision != task.revision {
+            return Err(HarnessDispatchError::TaskMismatch(
+                "task revision moved after the dispatch intent was frozen",
+            ));
+        }
+        if task.state != HarnessTaskStateV1::Running {
+            return Err(HarnessDispatchError::TaskMismatch("task is no longer Running"));
+        }
+        if task.run_ids.binary_search(&dispatch.run_id).is_err() {
+            return Err(HarnessDispatchError::TaskMismatch(
+                "task does not list the dispatch's own run",
+            ));
+        }
+        if !grant_matches {
+            return Err(HarnessDispatchError::TaskMismatch(
+                "launch plan grant policy disagrees with the dispatch's parent run",
+            ));
+        }
+        if !continuation_matches {
+            return Err(HarnessDispatchError::TaskMismatch(
+                "launch plan continuation policy disagrees with the dispatch's continuation",
+            ));
         }
         let prompt = match self.prompt_source {
             HarnessPromptSourceV1::TaskBody => SpawnOverride::Set {
@@ -758,8 +805,8 @@ pub enum HarnessDispatchError {
     PlanIdentityMismatch,
     #[error("launch plan does not exactly match the durable run intent")]
     IntentMismatch,
-    #[error("scheduled task does not match the dispatch intent")]
-    TaskMismatch,
+    #[error("scheduled task does not match the dispatch intent: {0}")]
+    TaskMismatch(&'static str),
     #[error("scheduler selected a task that is not Ready")]
     TaskNotReady,
     #[error("launch plan grant policy does not match the selected task creator")]
@@ -1580,7 +1627,7 @@ mod tests {
                 &task("operator child"),
                 SpawnProfileRevision::new("r1").unwrap(),
             ),
-            Err(HarnessDispatchError::TaskMismatch),
+            Err(HarnessDispatchError::TaskMismatch(_)),
         ));
     }
 

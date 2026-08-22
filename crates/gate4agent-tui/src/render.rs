@@ -1142,6 +1142,40 @@ fn render_activity_rail(
             theme,
         );
     }
+
+    // The icon gallery sits directly above Settings in the same bottom
+    // group: it is a surface you open and look at, so it needs a button
+    // where the other views have theirs. It reuses the Settings dialog's
+    // own hit target rather than adding a second one -- one action, one
+    // target, two places that can reach it. Drawn only when the group has
+    // a whole extra button's worth of rows above the reserved
+    // health-dot row, so it never displaces Settings on a short terminal.
+    let gallery_group_rows = bottom_group_rows.saturating_add(bottom_rows);
+    if usable_height >= top_rows_tall.saturating_add(gallery_group_rows) {
+        render_rail_button(
+            Rect::new(
+                area.x,
+                usable_bottom.saturating_sub(gallery_group_rows),
+                area.width,
+                bottom_rows,
+            ),
+            &RailButton {
+                target: HitTarget::SettingsIconGallery,
+                glyph: "▦",
+                ascii: "I",
+                // A surface tab, not a persistent sidebar view, so the
+                // rail never marks it active -- same treatment as
+                // Settings directly below it.
+                selected: false,
+                icon: icons::IconId::Layout,
+            },
+            app.rail_icons,
+            app.icon_family,
+            buf,
+            layout,
+            theme,
+        );
+    }
 }
 
 fn render_inspector(

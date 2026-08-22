@@ -10425,6 +10425,11 @@ impl App {
             Some(HitTarget::ActivitySection(section)) => {
                 return self.activate_activity_section(section);
             }
+            // The rail carries this target too, not just the Settings
+            // dialog: the gallery is a surface you open to look at, so it
+            // belongs on the toolbar next to the other views rather than
+            // two levels down inside a dialog.
+            Some(HitTarget::SettingsIconGallery) => return self.open_icon_gallery(),
             Some(HitTarget::ActivityBoard) => {
                 return self.activate_board_view();
             }
@@ -10758,7 +10763,6 @@ impl App {
                 | HitTarget::SettingsRailIcons
                 | HitTarget::SettingsIconFamily
                 | HitTarget::SettingsLucideStrokeWidth
-                | HitTarget::SettingsIconGallery
                 | HitTarget::ControlDrag
                 | HitTarget::ControlResize
                 | HitTarget::SpawnDrag

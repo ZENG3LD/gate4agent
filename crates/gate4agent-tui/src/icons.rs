@@ -314,7 +314,13 @@ fn cached_composited_sixel(
     let mut cache = SIXEL_CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     Arc::clone(cache.entry(key).or_insert_with(|| {
         let composited = composite_over_background(raw, background);
-        Arc::from(build_sixel_sized(&composited, width, height, BackgroundMode::Opaque))
+        // Transparent, not opaque: `composite_over_background` leaves the
+        // untouched pixels at alpha 0 precisely so the encoder drops them
+        // and the terminal keeps painting its own background there. Every
+        // pixel that carries any of the glyph is already opaque with its
+        // colour blended, so nothing the eye reads as the icon is at risk
+        // from the encoder's threshold.
+        Arc::from(build_sixel_sized(&composited, width, height, BackgroundMode::Transparent))
     }))
 }
 
@@ -595,7 +601,15 @@ pub(crate) fn composite_over_background(rgba: &[u8], background: (u8, u8, u8)) -
             let blended = ink_linear * coverage + background_linear[channel] * inverse_coverage;
             target[channel] = linear_to_srgb(blended);
         }
-        target[3] = 255;
+        // A pixel the glyph does not touch at all stays transparent, so
+        // the encoder's own one-bit threshold drops it and the terminal's
+        // real background shows through untouched. Painting it instead
+        // would put the background colour through the palette quantizer,
+        // which lands it a couple of levels off and draws the icon on a
+        // faintly visible square. Every pixel with ANY coverage is opaque:
+        // that is where the anti-aliasing lives, and the threshold must
+        // never reach it.
+        target[3] = if source[3] == 0 { 0 } else { 255 };
     }
     out
 }
@@ -674,8 +688,10 @@ mod tests {
                 for background in TEST_BACKGROUNDS {
                     let composited = composite_over_background(raw, background);
                     assert!(
-                        composited.chunks_exact(4).all(|px| px[3] == 255),
-                        "{id:?}'s {label} source composited against {background:?} must be fully opaque (every alpha byte 255)"
+                        composited.chunks_exact(4).zip(raw.chunks_exact(4)).all(|(px, src)| {
+                            px[3] == if src[3] == 0 { 0 } else { 255 }
+                        }),
+                        "{id:?}'s {label} source composited against {background:?} must be opaque wherever the glyph has coverage and transparent only where it has none"
                     );
                 }
             }
@@ -791,7 +807,10 @@ mod tests {
             terminal_background,
             "a background pixel must equal the queried terminal background exactly"
         );
-        assert_eq!(uncovered_pixel[3], 255, "a background pixel must be fully opaque after compositing");
+        // ...and stay transparent, so the encoder drops it rather than
+        // sending the background colour through the palette quantizer,
+        // which is what drew the icon on a faintly visible square.
+        assert_eq!(uncovered_pixel[3], 0, "a pixel the glyph never touches must not be painted at all");
         assert_eq!(
             (covered_pixel[0], covered_pixel[1], covered_pixel[2]),
             (source_covered_pixel[0], source_covered_pixel[1], source_covered_pixel[2]),
@@ -1029,8 +1048,10 @@ mod tests {
                 for background in TEST_BACKGROUNDS {
                     let composited = composite_over_background(raw, background);
                     assert!(
-                        composited.chunks_exact(4).all(|px| px[3] == 255),
-                        "{id:?}'s lucide {label} source composited against {background:?} must be fully opaque (every alpha byte 255)"
+                        composited.chunks_exact(4).zip(raw.chunks_exact(4)).all(|(px, src)| {
+                            px[3] == if src[3] == 0 { 0 } else { 255 }
+                        }),
+                        "{id:?}'s lucide {label} source composited against {background:?} must be opaque wherever the glyph has coverage and transparent only where it has none"
                     );
                 }
             }

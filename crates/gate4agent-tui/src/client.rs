@@ -685,12 +685,29 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
     let RunOptions { operator, kanban_default, color_mode_override } = options;
     // MUST run before `TerminalGuard::enter()` below (raw mode + the
     // alternate screen + mouse capture + bracketed paste) ever touches
-    // the console -- see `terminal_bg`'s own module doc comment for the
-    // full OSC 11 exchange and why this exact ordering is load-bearing.
-    // `resolve_background` applies `terminal_bg::FALLBACK_BACKGROUND`
-    // whenever the terminal never answers (or answers something
-    // malformed) -- never blocks past `terminal_bg::QUERY_TIMEOUT`.
-    let terminal_background = terminal_bg::resolve_background(terminal_bg::query_osc11_background(terminal_bg::QUERY_TIMEOUT));
+    // the console -- see `terminal_bg`'s own module doc comment for why
+    // this exact ordering is load-bearing (the OSC 11 exchange briefly
+    // owns the console's own input mode, restored before this call
+    // returns either way -- see `terminal_bg::ConsoleModeScope`).
+    // `detect_background` tries OSC 11 first, then the console's own
+    // screen-buffer colour table, and only applies
+    // `terminal_bg::FALLBACK_BACKGROUND` (via `resolve_background`, still
+    // the ONE place that decision is made) if both fail -- never blocks
+    // past `terminal_bg::QUERY_TIMEOUT`.
+    let (background_source, terminal_background) = terminal_bg::detect_background(terminal_bg::QUERY_TIMEOUT);
+    // Diagnostic, not a themed/user-facing message: which source actually
+    // resolved the background this run, and the exact RGB every icon
+    // composites against. Stderr, and strictly before `TerminalGuard::
+    // enter()` swaps to the alternate screen below, so this line lands on
+    // the PRIMARY screen buffer and survives in the owner's own
+    // scrollback instead of being swallowed on alt-screen exit.
+    eprintln!(
+        "gate4agent-tui: terminal background source={} rgb=({}, {}, {})",
+        background_source.label(),
+        terminal_background.0,
+        terminal_background.1,
+        terminal_background.2,
+    );
     let preferences_path = preferences::default_path();
     let loaded_preferences = preferences_path.as_deref().and_then(|path| match UiPreferences::load(path) {
         Ok(preferences) => Some(preferences),

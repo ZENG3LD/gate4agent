@@ -3127,7 +3127,7 @@ pub struct App {
     pub color_mode: PtyColorMode,
     /// The terminal's own real background colour -- resolved exactly
     /// once, before this `App` is even constructed (`client::run` calls
-    /// `terminal_bg::resolve_background` ahead of `App::default()`, then
+    /// `terminal_bg::detect_background` ahead of `App::default()`, then
     /// overwrites this field with the real result) -- see `terminal_bg`'s
     /// own module doc comment for the OSC 11 exchange and `icons::
     /// resolve_variant_background`'s own doc comment for how a sixel

@@ -297,7 +297,7 @@ install them.
 - **0.2.33** — **fix(capabilities)**: correct context windows and model IDs for all 4 CLIs — Claude Opus/Sonnet 4.6 → 1M tokens, Codex all → 272K, Gemini preview IDs fixed, OpenCode models updated to current.
 - **0.2.32** — **Fix context_percent always 0%**: Initialize `ContextTracker` from model capabilities at `SessionStart` (matches model ID → `context_window`). Reset tracker on new session spawn so stale data doesn't persist across sessions.
 
-See [ROADMAP.md](ROADMAP.md) for what's next and [DEBUGGING.md](DEBUGGING.md) for known issues and mitigations.
+See [ROADMAP.md](ROADMAP.md) for what's next.
 
 ## Migration guide
 

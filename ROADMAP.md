@@ -38,5 +38,4 @@ every operation, input-controller arbitration, and event push fan-out to every
 attached client. This is the multi-user backbone the earlier phases build
 toward.
 
-See [README.md](README.md) for the current architecture and
-[DEBUGGING.md](DEBUGGING.md) for known issues.
+See [README.md](README.md) for the current architecture.

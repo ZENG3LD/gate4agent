@@ -153,6 +153,21 @@ pub enum ConnectionState {
     Disconnected(String),
 }
 
+/// The status bar's own LEFT-zone summary (`App::network_summary`) --
+/// worst-state-wins across every `NodeView` this `App` currently holds,
+/// never a per-node detail (the zone is fixed-width; the LEFT modal
+/// (`Focus::StatusBarLeft`) is where the per-node breakdown lives). Ranked
+/// worst-first so a mixed fleet (e.g. one node connected, one
+/// disconnected) reads as the state that actually needs attention rather
+/// than an average that hides it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NetworkSummary {
+    NoNodes,
+    Disconnected,
+    Transitioning,
+    Connected,
+}
+
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct SessionAddress {
     pub node_id: String,
@@ -1148,6 +1163,25 @@ pub enum Focus {
     ForgetSession,
     History,
     Settings,
+    /// The bottom status bar's own three zones -- each is its own `Focus`
+    /// so the keyboard/mouse dispatch chain (`App::reduce`/`App::click`)
+    /// treats an open zone modal exactly like every other overlay: one
+    /// owns input capture at a time, `Escape`/`HitTarget::ModalClose` both
+    /// reach `App::close_status_bar_zone` (see that fn's own doc comment),
+    /// and `status_bar_return_focus` restores wherever focus was before
+    /// the click that opened it -- the same shape `Focus::Settings` /
+    /// `settings_return_focus` already use for a global, click-from-
+    /// anywhere entry point.
+    StatusBarLeft,
+    StatusBarCenter,
+    StatusBarRight,
+    /// The global quick search living in the tab strip (`render::
+    /// render_tabs`, not a per-pane control -- see `GlobalSearchState`'s
+    /// own doc comment). A real `Focus` (not just a bool) for the same
+    /// reason `Focus::FolderBrowser` is: once expanded it must capture
+    /// character keys for its own query buffer rather than letting them
+    /// fall through to pane/session input.
+    GlobalSearch,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2821,6 +2855,28 @@ pub enum HitTarget {
     /// Every existing per-modal Escape/Cancel path is unchanged; this is
     /// strictly an addition.
     ModalClose,
+    /// The bottom status bar's own three zones -- clicking any of them
+    /// opens that zone's own modal (`App::begin_status_bar_zone`). See
+    /// `Focus::StatusBarLeft`'s own doc comment.
+    StatusBarLeft,
+    StatusBarCenter,
+    StatusBarRight,
+    /// The CENTRE zone modal's own marquee on/off row -- see `App::
+    /// toggle_marquee`.
+    StatusBarMarqueeToggle,
+    /// The global search's own collapsed-or-expanding frame in the tab
+    /// strip -- clicking it opens (`App::begin_global_search`) when
+    /// collapsed, closes (`App::close_global_search`) when expanded. See
+    /// `Focus::GlobalSearch`'s own doc comment.
+    GlobalSearchToggle,
+    /// One row of the global search's own results dropdown, carrying its
+    /// position in that frame's `App::global_search_results` -- resolved
+    /// fresh against the SAME call at activation time (`App::
+    /// activate_global_search_result`), never a stored identity, so a
+    /// result list that changed underneath a stale click (the query
+    /// changed) simply activates whatever is at that position now rather
+    /// than reaching for a target that may no longer exist.
+    GlobalSearchResult(usize),
     Viewport,
 }
 
@@ -2980,6 +3036,25 @@ pub struct LayoutRects {
     pub add_space_modal: Rect,
     pub folder_browser_modal: Rect,
     pub create_worktree_modal: Rect,
+    /// The bottom status bar's own three zones, in the frame's own last
+    /// row -- see `render::render_status_bar`'s own doc comment for the
+    /// geometry. Zero-area (`Rect::default()`) on a terminal too small to
+    /// pass `render::render`'s own minimum-size guard, the same "not
+    /// drawn this frame" convention every other conditional rect here
+    /// already uses.
+    pub status_bar_left: Rect,
+    pub status_bar_center: Rect,
+    pub status_bar_right: Rect,
+    /// The global search's own expanding field, inside the GLOBAL tab
+    /// strip -- `Rect::default()` while collapsed (nothing to hit-test:
+    /// the magnifier frame itself is a `HitTarget::GlobalSearchToggle`
+    /// hit region, tracked in `hits` like every other click target, not
+    /// here).
+    pub global_search_field: Rect,
+    /// The global search's own results dropdown -- `Rect::default()`
+    /// whenever it is not open (see `render::render_global_search`'s own
+    /// doc comment for exactly when that is).
+    pub global_search_dropdown: Rect,
     pub surface_panes: Vec<SurfacePaneLayout>,
     pub hits: Vec<HitRegion>,
 }
@@ -3001,6 +3076,109 @@ impl LayoutRects {
         }
         self.overlays.push(OverlayRegion { rect, drawn_before: self.sixel_icons.len() });
     }
+}
+
+/// Status bar geometry shared between layout (`render::render_status_bar`)
+/// and the animation gate (`App::marquee_needs_scroll`, which has no
+/// render-time `Rect` to measure against and must approximate the CENTRE
+/// zone's own width the same way the renderer computes it) -- one source
+/// of truth so the two can never disagree about how much room the marquee
+/// actually has.
+pub(crate) const STATUS_BAR_LEFT_WIDTH: u16 = 14;
+pub(crate) const STATUS_BAR_RIGHT_WIDTH: u16 = 5;
+
+/// Steps `App::advance_animation_frame` moves `GlobalSearchState::
+/// expand_step` toward its target by, one per call -- `client::run`'s own
+/// `ANIMATION_TICKS_PER_FRAME` (4) calls per redraw, so this reaches full
+/// expansion in 5 visible redraw frames (`ANIMATION_FRAME_INTERVAL` each,
+/// 80ms): "several animation frames", not one instant jump and not a
+/// crawl.
+pub(crate) const SEARCH_EXPAND_STEPS: u8 = 20;
+
+/// How many raw animation ticks the marquee holds one scroll column for
+/// (`App::marquee_scroll_offset`) -- `ANIMATION_TICKS_PER_FRAME` (4) ticks
+/// per redraw, so 12 ticks is 3 redraws (~240ms) per column: slow enough
+/// to actually read, fast enough not to feel stalled.
+const MARQUEE_SCROLL_TICKS_PER_COLUMN: usize = 12;
+
+/// Bounds how much notice/log history the CENTRE zone's marquee can ever
+/// carry (`App::push_marquee_line`) -- this is chrome, not an audit trail:
+/// old lines simply scroll out and are dropped, never persisted.
+const MARQUEE_LOG_CAPACITY: usize = 24;
+
+/// Bounds the global search's own results dropdown (`App::global_search_
+/// results`) -- a quick-jump list, not a paginated search surface.
+const MAX_GLOBAL_SEARCH_RESULTS: usize = 20;
+
+/// The app-wide quick search living in the GLOBAL tab strip (`render::
+/// render_tabs`), never the per-pane toolbar -- a split surface has many
+/// panes but must only ever have ONE of these. Always present on `App`
+/// (never `Option`, unlike the centered dialogs): collapsed is its own
+/// steady state, not an absent one, the same convention `layout_menu_open`
+/// already uses for the neighbouring Layout-preset dropdown in this same
+/// strip.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GlobalSearchState {
+    pub query: String,
+    /// 0 == fully collapsed (just the magnifier frame) .. `SEARCH_EXPAND_
+    /// STEPS` == fully expanded (field + dropdown). Driven by `App::
+    /// advance_animation_frame` stepping toward `expand_target_open`'s own
+    /// target every tick -- see that fn's own doc comment. Never jumps
+    /// straight to its target: the owner's own brief asks for an actual
+    /// multi-frame expand, not a toggle that happens to be drawn as one.
+    pub expand_step: u8,
+    pub expand_target_open: bool,
+    pub selected: usize,
+}
+
+impl GlobalSearchState {
+    /// The `expand_step` value `expand_target_open` is currently heading
+    /// toward -- `App::has_active_animation`/`App::advance_animation_
+    /// frame` both key off comparing `expand_step` to this, never a
+    /// separate "is it mid-transition" bool that could drift out of sync
+    /// with the two step endpoints.
+    fn target_step(&self) -> u8 {
+        if self.expand_target_open {
+            SEARCH_EXPAND_STEPS
+        } else {
+            0
+        }
+    }
+
+    /// True once `expand_step` has actually settled at `target_step`
+    /// (either endpoint, not mid-animation) -- the exact condition that
+    /// must hold before `App::has_active_animation` may stop reporting
+    /// this state as active, so a fully collapsed OR fully expanded search
+    /// box never keeps the redraw loop spinning for nothing.
+    fn expand_settled(&self) -> bool {
+        self.expand_step == self.target_step()
+    }
+}
+
+/// One entry in the global search's own results dropdown -- `label` is
+/// what's drawn, `target` is what activating it (`Enter` or a mouse click,
+/// both reaching `App::activate_global_search_result`) actually jumps to.
+/// Built fresh from whatever `App` already holds every time the query
+/// changes (`App::global_search_results`), never cached: the brief this
+/// feature shipped under is explicit that this is not a new index or a
+/// background scanner, just a live read of state that already exists.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GlobalSearchResult {
+    pub label: String,
+    pub target: GlobalSearchTarget,
+}
+
+/// See [`GlobalSearchResult`]'s own doc comment. Every source category the
+/// task's own brief names: open surface tabs, registered workspaces, the
+/// currently loaded Explorer entries, agents/sessions, and the rail's own
+/// views.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GlobalSearchTarget {
+    SurfaceTab { pane_id: PaneId, index: usize },
+    Workspace { index: usize },
+    WorkspaceEntry { index: usize },
+    Agent { key: AgentRowKey },
+    RailView { section: ControlSection },
 }
 
 #[derive(Clone, Debug)]
@@ -3091,6 +3269,14 @@ pub struct App {
     /// comment.
     pub board_sidebar_scroll: u16,
     pub settings_return_focus: Focus,
+    /// Where to send focus back once whichever status bar zone modal
+    /// (`Focus::StatusBarLeft`/`Center`/`Right`) currently open closes --
+    /// see `App::begin_status_bar_zone`/`close_status_bar_zone`. The
+    /// status bar is global chrome reachable by a click from ANY focus, so
+    /// this cannot hardcode a single return target the way e.g. `Focus::
+    /// History` does; same "remember where we came from" shape `settings_
+    /// return_focus` already uses for the same reason.
+    pub status_bar_return_focus: Focus,
     pub control_modal_position: Option<(u16, u16)>,
     pub control_modal_size: Option<(u16, u16)>,
     pub spawn_modal_position: Option<(u16, u16)>,
@@ -3141,6 +3327,26 @@ pub struct App {
     /// never left at some OTHER, unrelated placeholder colour.
     pub terminal_background: (u8, u8, u8),
     pub notice: Option<String>,
+    /// Persisted (`preferences::UiPreferences::marquee_enabled`). The
+    /// CENTRE status bar zone's own on/off switch -- disabled leaves the
+    /// zone blank rather than scrolling, and `App::marquee_needs_scroll`
+    /// (part of `has_active_animation`) checks this FIRST so a disabled
+    /// marquee never keeps the redraw loop spinning for content nobody is
+    /// looking at.
+    pub marquee_enabled: bool,
+    /// Bounded log the CENTRE zone's marquee scrolls through -- see
+    /// `MARQUEE_LOG_CAPACITY`'s own doc comment for why this is never
+    /// persisted. Populated from exactly one place: `client::run`'s own
+    /// `app.notice` transition detector (the SAME choke point that already
+    /// drives the 3-second notice-dismiss timer), via `App::push_marquee_
+    /// line` -- never written to from anywhere else, so every one of this
+    /// crate's ~230 existing `self.notice = Some(...)` call sites keeps
+    /// working completely unchanged and still ends up on the marquee for
+    /// free.
+    pub marquee_log: VecDeque<String>,
+    /// The app-wide quick search living in the GLOBAL tab strip -- see
+    /// [`GlobalSearchState`]'s own doc comment.
+    pub global_search: GlobalSearchState,
     pub terminal_rows: u16,
     pub terminal_cols: u16,
     pub layout: LayoutRects,
@@ -3213,6 +3419,7 @@ impl Default for App {
             board_view_active: false,
             board_sidebar_scroll: 0,
             settings_return_focus: Focus::Tabs,
+            status_bar_return_focus: Focus::Tabs,
             control_modal_position: None,
             control_modal_size: None,
             spawn_modal_position: None,
@@ -3253,6 +3460,9 @@ impl Default for App {
             color_mode: PtyColorMode::Inherited,
             terminal_background: crate::terminal_bg::FALLBACK_BACKGROUND,
             notice: None,
+            marquee_enabled: true,
+            marquee_log: VecDeque::new(),
+            global_search: GlobalSearchState::default(),
             terminal_rows: 24,
             terminal_cols: 80,
             layout: LayoutRects::default(),
@@ -3381,10 +3591,22 @@ fn observation_session_monitor_target(target: &ObservationTarget) -> SessionMoni
 impl App {
     pub(crate) fn advance_animation_frame(&mut self) {
         self.animation_tick = self.animation_tick.wrapping_add(1);
+        // Steps toward, never past, `target_step()` -- settling exactly AT
+        // it (not overshooting) is what lets `has_active_animation` notice
+        // the transition finished and stop asking for further frames. See
+        // `GlobalSearchState::expand_settled`'s own doc comment.
+        let target = self.global_search.target_step();
+        if self.global_search.expand_step < target {
+            self.global_search.expand_step += 1;
+        } else if self.global_search.expand_step > target {
+            self.global_search.expand_step -= 1;
+        }
     }
 
     pub(crate) fn has_active_animation(&self) -> bool {
-        self.create_workspace_entry
+        self.marquee_needs_scroll()
+            || !self.global_search.expand_settled()
+            || self.create_workspace_entry
             .as_ref()
             .is_some_and(|dialog| dialog.pending)
             || self.surface.leaf_ids().into_iter().any(|pane_id| {
@@ -3430,6 +3652,332 @@ impl App {
     pub(crate) fn activity_spinner(&self) -> char {
         const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
         FRAMES[(usize::from(self.animation_tick) / 4) % FRAMES.len()]
+    }
+
+    /// The status bar's own LEFT-zone summary -- worst-state-wins across
+    /// every node this `App` currently holds. See [`NetworkSummary`]'s own
+    /// doc comment.
+    pub fn network_summary(&self) -> NetworkSummary {
+        if self.nodes.is_empty() {
+            return NetworkSummary::NoNodes;
+        }
+        if self
+            .nodes
+            .iter()
+            .any(|node| matches!(node.connection, ConnectionState::Disconnected(_)))
+        {
+            return NetworkSummary::Disconnected;
+        }
+        if self
+            .nodes
+            .iter()
+            .all(|node| node.connection == ConnectionState::Connected)
+        {
+            return NetworkSummary::Connected;
+        }
+        NetworkSummary::Transitioning
+    }
+
+    /// Appends `line` to the CENTRE status bar zone's own marquee log,
+    /// dropping the oldest entry once `MARQUEE_LOG_CAPACITY` is reached --
+    /// see `marquee_log`'s own doc comment for the single call site
+    /// (`client::run`'s own notice-transition detector) this is meant to
+    /// be driven from.
+    pub(crate) fn push_marquee_line(&mut self, line: String) {
+        if line.is_empty() {
+            return;
+        }
+        if self.marquee_log.len() >= MARQUEE_LOG_CAPACITY {
+            self.marquee_log.pop_front();
+        }
+        self.marquee_log.push_back(line);
+    }
+
+    /// The CENTRE zone's own display text -- every held log line joined
+    /// into one scrolling ticker, or a static placeholder once nothing has
+    /// happened yet. Never truncated here: `render::render_status_bar_
+    /// center` is the one place that knows the zone's actual on-screen
+    /// width this frame.
+    pub fn marquee_content(&self) -> String {
+        if self.marquee_log.is_empty() {
+            return "no recent activity".to_owned();
+        }
+        self.marquee_log.iter().cloned().collect::<Vec<_>>().join("   \u{2022}   ")
+    }
+
+    /// Approximates the CENTRE zone's own on-screen width from `terminal_
+    /// cols` alone -- `has_active_animation` has no render-time `Rect` to
+    /// measure against (rendering hasn't happened yet for this frame), so
+    /// this mirrors `render::render_status_bar`'s own zone-split
+    /// arithmetic against the SAME two width constants rather than
+    /// guessing independently.
+    fn marquee_zone_width(&self) -> u16 {
+        self.terminal_cols
+            .saturating_sub(STATUS_BAR_LEFT_WIDTH)
+            .saturating_sub(STATUS_BAR_RIGHT_WIDTH)
+    }
+
+    /// Whether the marquee has anything left to gain by scrolling right
+    /// now -- disabled, or content that already fits the zone at rest,
+    /// both report `false`. This is the exact gate `has_active_animation`
+    /// relies on to stop asking for redraw frames once scrolling would be
+    /// pure motion with no new information (a marquee toggled off, or one
+    /// whose content is shorter than its own zone) -- see this crate's own
+    /// "assert the idle case in a test" requirement.
+    fn marquee_needs_scroll(&self) -> bool {
+        if !self.marquee_enabled {
+            return false;
+        }
+        let content_width = self.marquee_content().chars().count() as u32;
+        content_width > u32::from(self.marquee_zone_width())
+    }
+
+    /// The marquee's own scroll position, in characters, derived from the
+    /// SAME shared `animation_tick` clock `activity_spinner` already reads
+    /// -- see `MARQUEE_SCROLL_TICKS_PER_COLUMN`'s own doc comment for the
+    /// speed. `render::render_status_bar_center` is the only caller.
+    pub(crate) fn marquee_scroll_offset(&self) -> usize {
+        let len = self.marquee_content().chars().count();
+        if len == 0 {
+            return 0;
+        }
+        (usize::from(self.animation_tick) / MARQUEE_SCROLL_TICKS_PER_COLUMN) % len
+    }
+
+    /// The CENTRE zone modal's own on/off row (`HitTarget::
+    /// StatusBarMarqueeToggle`) and its `m`/`M` key -- the marquee's own
+    /// setting, per this feature's own brief.
+    fn toggle_marquee(&mut self) {
+        self.marquee_enabled = !self.marquee_enabled;
+    }
+
+    /// Opens whichever status bar zone modal `focus` names, remembering
+    /// where to return to -- the click handler for all three zones
+    /// (`HitTarget::StatusBarLeft`/`Center`/`Right`), reachable from any
+    /// focus (global chrome), so this always records `status_bar_return_
+    /// focus` fresh rather than assuming a fixed prior state. See `Focus::
+    /// StatusBarLeft`'s own doc comment.
+    fn begin_status_bar_zone(&mut self, focus: Focus) -> AppAction {
+        self.status_bar_return_focus = self.focus;
+        self.focus = focus;
+        AppAction::None
+    }
+
+    /// Closes whichever status bar zone modal currently holds focus --
+    /// the `[x]`/`Escape` target for all three (`App::close_focused_
+    /// modal`'s own `Focus::StatusBarLeft | Center | Right` arm).
+    fn close_status_bar_zone(&mut self) -> AppAction {
+        self.focus = self.status_bar_return_focus;
+        AppAction::None
+    }
+
+    fn click_status_bar_zone(&mut self, target: Option<HitTarget>) -> AppAction {
+        match target {
+            Some(HitTarget::ModalClose) => self.close_status_bar_zone(),
+            Some(HitTarget::StatusBarMarqueeToggle) if self.focus == Focus::StatusBarCenter => {
+                self.toggle_marquee();
+                AppAction::None
+            }
+            _ => AppAction::None,
+        }
+    }
+
+    fn reduce_status_bar_zone(&mut self, key: UiKey) -> AppAction {
+        match key {
+            UiKey::Escape => self.close_status_bar_zone(),
+            UiKey::Char('m') | UiKey::Char('M') if self.focus == Focus::StatusBarCenter => {
+                self.toggle_marquee();
+                AppAction::None
+            }
+            _ => AppAction::None,
+        }
+    }
+
+    /// Opens the global search, expanding it over several animation
+    /// frames (`App::advance_animation_frame` steps `global_search.
+    /// expand_step` toward `SEARCH_EXPAND_STEPS` from here on) and giving
+    /// it exclusive keyboard capture -- the click handler for `HitTarget::
+    /// GlobalSearchToggle` while collapsed.
+    fn begin_global_search(&mut self) -> AppAction {
+        self.status_bar_return_focus = self.focus;
+        self.focus = Focus::GlobalSearch;
+        self.global_search.expand_target_open = true;
+        AppAction::None
+    }
+
+    /// Begins collapsing the global search (the field/dropdown animate
+    /// shut over the same several frames they opened over) and returns
+    /// keyboard focus to wherever it was before -- `Escape`, `HitTarget::
+    /// ModalClose`, and re-clicking the toggle while expanded all reach
+    /// this. The query itself is left as typed (not cleared): reopening
+    /// mid-session resumes the same search rather than discarding it.
+    fn close_global_search(&mut self) -> AppAction {
+        self.global_search.expand_target_open = false;
+        self.focus = self.status_bar_return_focus;
+        AppAction::None
+    }
+
+    fn click_global_search(&mut self, target: Option<HitTarget>) -> AppAction {
+        match target {
+            Some(HitTarget::GlobalSearchToggle) => self.close_global_search(),
+            Some(HitTarget::GlobalSearchResult(index)) => self.activate_global_search_result(index),
+            Some(HitTarget::ModalClose) => self.close_global_search(),
+            _ => AppAction::None,
+        }
+    }
+
+    fn reduce_global_search(&mut self, key: UiKey) -> AppAction {
+        match key {
+            UiKey::Escape => self.close_global_search(),
+            UiKey::Enter => {
+                let selected = self.global_search.selected;
+                self.activate_global_search_result(selected)
+            }
+            UiKey::Up => {
+                self.global_search.selected = self.global_search.selected.saturating_sub(1);
+                AppAction::None
+            }
+            UiKey::Down => {
+                let count = self.global_search_results().len();
+                self.global_search.selected = self
+                    .global_search
+                    .selected
+                    .saturating_add(1)
+                    .min(count.saturating_sub(1));
+                AppAction::None
+            }
+            UiKey::Backspace => {
+                self.global_search.query.pop();
+                self.global_search.selected = 0;
+                AppAction::None
+            }
+            UiKey::Char(ch) if !ch.is_control() => {
+                if self.global_search.query.len() + ch.len_utf8() <= 256 {
+                    self.global_search.query.push(ch);
+                    self.global_search.selected = 0;
+                }
+                AppAction::None
+            }
+            _ => AppAction::None,
+        }
+    }
+
+    /// Live results for the global search's current query -- built fresh
+    /// from state this `App` already holds every call, never cached (see
+    /// [`GlobalSearchResult`]'s own doc comment). Bounded to keep the
+    /// dropdown itself bounded; every source category this feature's own
+    /// brief names is represented once, in a fixed order, so the list is
+    /// stable frame to frame for the same query.
+    pub fn global_search_results(&self) -> Vec<GlobalSearchResult> {
+        let mut results = Vec::new();
+        let query = self.global_search.query.trim().to_lowercase();
+        if query.is_empty() {
+            return results;
+        }
+        for section in ControlSection::ALL {
+            if section.id().contains(&query) {
+                results.push(GlobalSearchResult {
+                    label: format!("view: {}", section.id()),
+                    target: GlobalSearchTarget::RailView { section },
+                });
+            }
+        }
+        for pane_id in self.surface.leaf_ids() {
+            let Some(pane) = self.surface.panes.get(&pane_id) else {
+                continue;
+            };
+            for (index, tab) in pane.tabs.iter().enumerate() {
+                let label = self.surface_tab_title(tab);
+                if label.to_lowercase().contains(&query) {
+                    results.push(GlobalSearchResult {
+                        label: format!("tab: {label}"),
+                        target: GlobalSearchTarget::SurfaceTab { pane_id, index },
+                    });
+                }
+            }
+        }
+        for (index, (node_index, workspace_index)) in self.space_rows().iter().enumerate() {
+            let Some(workspace) = self
+                .nodes
+                .get(*node_index)
+                .and_then(|node| node.workspaces.get(*workspace_index))
+            else {
+                continue;
+            };
+            if workspace.label.to_lowercase().contains(&query) {
+                results.push(GlobalSearchResult {
+                    label: format!("workspace: {}", workspace.label),
+                    target: GlobalSearchTarget::Workspace { index },
+                });
+            }
+        }
+        if let Some(inspection) = self.selected_workspace_inspection() {
+            for (index, entry) in inspection.entries.iter().enumerate() {
+                let name = repository_path_file_name_display(&entry.relative_path);
+                if name.to_lowercase().contains(&query) {
+                    results.push(GlobalSearchResult {
+                        label: format!("file: {name}"),
+                        target: GlobalSearchTarget::WorkspaceEntry { index },
+                    });
+                }
+            }
+        }
+        for key in self.agent_rows() {
+            let label = match &key {
+                AgentRowKey::Managed { record_id, .. } => record_id.clone(),
+                AgentRowKey::Legacy(address) => {
+                    format!("{} #{}", address.workspace_id, address.instance_id)
+                }
+            };
+            if label.to_lowercase().contains(&query) {
+                results.push(GlobalSearchResult {
+                    label: format!("agent: {label}"),
+                    target: GlobalSearchTarget::Agent { key },
+                });
+            }
+        }
+        results.truncate(MAX_GLOBAL_SEARCH_RESULTS);
+        results
+    }
+
+    /// Jumps to the result at `index` (resolved fresh against `App::
+    /// global_search_results`, see that fn's own doc comment) and closes
+    /// the search -- the `Enter`/click activation path for every result
+    /// category this feature's own brief names.
+    fn activate_global_search_result(&mut self, index: usize) -> AppAction {
+        let Some(result) = self.global_search_results().into_iter().nth(index) else {
+            return AppAction::None;
+        };
+        let action = match result.target {
+            GlobalSearchTarget::SurfaceTab { pane_id, index } => {
+                let _ = self.surface.set_focused(pane_id);
+                if let Some(pane) = self.surface.panes.get_mut(&pane_id) {
+                    if index < pane.tabs.len() {
+                        pane.active = index;
+                    }
+                }
+                self.focus = Focus::Viewport;
+                AppAction::None
+            }
+            GlobalSearchTarget::Workspace { index } => {
+                self.control_section = ControlSection::Workspaces;
+                self.select_workspace(index)
+            }
+            GlobalSearchTarget::WorkspaceEntry { index } => {
+                self.control_section = ControlSection::Files;
+                self.sidebar_mode = SidebarMode::Files;
+                self.select_inspector_item(SidebarMode::Files, index)
+            }
+            GlobalSearchTarget::Agent { key } => {
+                self.roster_mode = RosterMode::Agents;
+                self.control_section = ControlSection::Agents;
+                self.select_agent_key(&key);
+                AppAction::None
+            }
+            GlobalSearchTarget::RailView { section } => self.activate_activity_section(section),
+        };
+        self.close_global_search();
+        action
     }
 
     pub fn space_rows(&self) -> Vec<(usize, usize)> {
@@ -9773,6 +10321,15 @@ impl App {
         if self.focus == Focus::Settings {
             return self.reduce_settings(key);
         }
+        if matches!(
+            self.focus,
+            Focus::StatusBarLeft | Focus::StatusBarCenter | Focus::StatusBarRight
+        ) {
+            return self.reduce_status_bar_zone(key);
+        }
+        if self.focus == Focus::GlobalSearch {
+            return self.reduce_global_search(key);
+        }
         if self.focus == Focus::Viewport {
             return self.reduce_viewport(key);
         }
@@ -9836,7 +10393,11 @@ impl App {
                 | Focus::TaskId
                 | Focus::ForgetSession
                 | Focus::History
-                | Focus::Settings => {
+                | Focus::Settings
+                | Focus::StatusBarLeft
+                | Focus::StatusBarCenter
+                | Focus::StatusBarRight
+                | Focus::GlobalSearch => {
                     AppAction::None
                 }
             },
@@ -9917,6 +10478,15 @@ impl App {
         }
         if self.focus == Focus::CreateWorktree {
             return self.click_create_worktree(target, column, row);
+        }
+        if matches!(
+            self.focus,
+            Focus::StatusBarLeft | Focus::StatusBarCenter | Focus::StatusBarRight
+        ) {
+            return self.click_status_bar_zone(target);
+        }
+        if self.focus == Focus::GlobalSearch {
+            return self.click_global_search(target);
         }
         match target.as_ref() {
             Some(HitTarget::HarnessLinks(subject)) => {
@@ -10560,6 +11130,10 @@ impl App {
                 self.focus = Focus::Tabs;
             }
             Some(HitTarget::LayoutPreset(preset)) => self.set_layout_preset(preset),
+            Some(HitTarget::StatusBarLeft) => return self.begin_status_bar_zone(Focus::StatusBarLeft),
+            Some(HitTarget::StatusBarCenter) => return self.begin_status_bar_zone(Focus::StatusBarCenter),
+            Some(HitTarget::StatusBarRight) => return self.begin_status_bar_zone(Focus::StatusBarRight),
+            Some(HitTarget::GlobalSearchToggle) => return self.begin_global_search(),
             Some(HitTarget::SurfaceDivider { path, axis, area }) => {
                 self.drag_state = Some(DragState::SurfaceDivider { path, axis, area });
             }
@@ -10880,6 +11454,14 @@ impl App {
                 | HitTarget::AgentBoardTaskFilter
                 | HitTarget::AgentMenuAction(_)
                 | HitTarget::NativeSessionMenuAction(_)
+                // Only ever drawn while `Focus::StatusBarCenter` holds
+                // focus, which returns earlier in this fn via its own
+                // `click_status_bar_zone` guard -- never actually
+                // reachable here.
+                | HitTarget::StatusBarMarqueeToggle
+                // Same shape, for `Focus::GlobalSearch`'s own `click_
+                // global_search` guard.
+                | HitTarget::GlobalSearchResult(_)
                 // Only ever drawn while some modal (`Focus`-driven or
                 // `harness_kanban.reverse_attribution`) is active, all of
                 // which return earlier in this fn -- never actually
@@ -10925,6 +11507,10 @@ impl App {
                 self.close_settings();
                 AppAction::None
             }
+            Focus::StatusBarLeft | Focus::StatusBarCenter | Focus::StatusBarRight => {
+                self.close_status_bar_zone()
+            }
+            Focus::GlobalSearch => self.close_global_search(),
             Focus::Spaces | Focus::Agents | Focus::Tabs | Focus::Viewport => AppAction::None,
         }
     }
@@ -11208,6 +11794,10 @@ impl App {
                 | Focus::TaskId
                 | Focus::ForgetSession
                 | Focus::History
+                | Focus::StatusBarLeft
+                | Focus::StatusBarCenter
+                | Focus::StatusBarRight
+                | Focus::GlobalSearch
         ) {
             return AppAction::None;
         }
@@ -19189,7 +19779,11 @@ impl App {
                 | Focus::TaskId
                 | Focus::ForgetSession
                 | Focus::History
-                | Focus::Settings => self.focus,
+                | Focus::Settings
+                | Focus::StatusBarLeft
+                | Focus::StatusBarCenter
+                | Focus::StatusBarRight
+                | Focus::GlobalSearch => self.focus,
             };
         }
         if self.sidebar_presentation == SidebarPresentation::Activity {
@@ -19211,7 +19805,11 @@ impl App {
                 | Focus::TaskId
                 | Focus::ForgetSession
                 | Focus::History
-                | Focus::Settings => self.focus,
+                | Focus::Settings
+                | Focus::StatusBarLeft
+                | Focus::StatusBarCenter
+                | Focus::StatusBarRight
+                | Focus::GlobalSearch => self.focus,
             };
         }
         match self.focus {
@@ -19230,7 +19828,11 @@ impl App {
             | Focus::TaskId
             | Focus::ForgetSession
             | Focus::History
-            | Focus::Settings => self.focus,
+            | Focus::Settings
+            | Focus::StatusBarLeft
+            | Focus::StatusBarCenter
+            | Focus::StatusBarRight
+            | Focus::GlobalSearch => self.focus,
         }
     }
 
@@ -19251,7 +19853,11 @@ impl App {
                 | Focus::TaskId
                 | Focus::ForgetSession
                 | Focus::History
-                | Focus::Settings => self.focus,
+                | Focus::Settings
+                | Focus::StatusBarLeft
+                | Focus::StatusBarCenter
+                | Focus::StatusBarRight
+                | Focus::GlobalSearch => self.focus,
             };
         }
         if self.sidebar_presentation == SidebarPresentation::Activity {
@@ -19273,7 +19879,11 @@ impl App {
                 | Focus::TaskId
                 | Focus::ForgetSession
                 | Focus::History
-                | Focus::Settings => self.focus,
+                | Focus::Settings
+                | Focus::StatusBarLeft
+                | Focus::StatusBarCenter
+                | Focus::StatusBarRight
+                | Focus::GlobalSearch => self.focus,
             };
         }
         match self.focus {
@@ -19292,7 +19902,11 @@ impl App {
             | Focus::TaskId
             | Focus::ForgetSession
             | Focus::History
-            | Focus::Settings => self.focus,
+            | Focus::Settings
+            | Focus::StatusBarLeft
+            | Focus::StatusBarCenter
+            | Focus::StatusBarRight
+            | Focus::GlobalSearch => self.focus,
         }
     }
 
@@ -27447,6 +28061,99 @@ mod tests {
             app.advance_animation_frame();
         }
         assert_eq!(app.activity_spinner(), '⠋');
+    }
+
+    /// The exact "difference between an animation and a busy loop" this
+    /// crate's own brief for the status bar calls out: a marquee that is
+    /// toggled OFF must never keep `has_active_animation` (and therefore
+    /// `client::run`'s own 80ms redraw loop) spinning, no matter how much
+    /// content it is sitting on top of.
+    #[test]
+    fn marquee_toggled_off_reports_no_active_animation_even_with_long_content() {
+        let mut app = App::default();
+        app.push_marquee_line("a".repeat(48));
+        app.push_marquee_line("b".repeat(48));
+        assert!(
+            app.marquee_content().chars().count() as u16 > app.marquee_zone_width(),
+            "fixture assumption: this content must not fit the default zone width at rest",
+        );
+
+        // Enabled: too wide to fit at rest, so this is a real, scrolling
+        // animation.
+        assert!(app.marquee_needs_scroll());
+        assert!(app.has_active_animation());
+
+        // The CENTRE zone modal's own toggle -- disabled, the SAME
+        // oversized content must go completely idle.
+        app.marquee_enabled = false;
+        assert!(!app.marquee_needs_scroll());
+        assert!(!app.has_active_animation());
+    }
+
+    /// The idle side of the SAME requirement for content that already fits
+    /// its zone: scrolling it would be pure motion with no new information
+    /// ever revealed, so it must not animate even while enabled.
+    #[test]
+    fn marquee_enabled_but_short_content_reports_no_active_animation() {
+        let mut app = App::default();
+        assert!(app.marquee_enabled);
+        assert_eq!(app.marquee_content(), "no recent activity");
+        assert!(!app.marquee_needs_scroll());
+        assert!(!app.has_active_animation());
+
+        app.push_marquee_line("short".to_owned());
+        assert!(!app.marquee_needs_scroll());
+        assert!(!app.has_active_animation());
+    }
+
+    /// The animating case actually moves: `advance_animation_frame` (the
+    /// SAME shared clock `client::run` drives every redraw with, see
+    /// `ANIMATION_FRAME_INTERVAL`) must change `marquee_scroll_offset` over
+    /// time, not just leave the "is it active" bool permanently true for
+    /// nothing.
+    #[test]
+    fn marquee_scroll_offset_advances_with_the_shared_animation_clock() {
+        let mut app = App::default();
+        app.push_marquee_line("c".repeat(80));
+        assert!(app.marquee_needs_scroll());
+        let start = app.marquee_scroll_offset();
+        for _ in 0..MARQUEE_SCROLL_TICKS_PER_COLUMN {
+            app.advance_animation_frame();
+        }
+        assert_ne!(
+            app.marquee_scroll_offset(),
+            start,
+            "one column's worth of ticks must move the marquee's own scroll position",
+        );
+    }
+
+    /// The search field's own side of the same requirement: fully
+    /// collapsed (the steady state every fresh `App` starts in) reports no
+    /// active animation, becomes active for exactly the transition once
+    /// opened, and returns to idle once it settles fully expanded -- never
+    /// left spinning at either endpoint.
+    #[test]
+    fn global_search_expand_animates_only_between_its_two_settled_endpoints() {
+        let mut app = App::default();
+        assert_eq!(app.global_search.expand_step, 0);
+        assert!(!app.global_search.expand_target_open);
+        assert!(!app.has_active_animation(), "fully collapsed must be idle");
+
+        app.global_search.expand_target_open = true;
+        assert!(app.has_active_animation(), "mid-transition must be active");
+        for _ in 0..SEARCH_EXPAND_STEPS {
+            app.advance_animation_frame();
+        }
+        assert_eq!(app.global_search.expand_step, SEARCH_EXPAND_STEPS);
+        assert!(!app.has_active_animation(), "fully expanded (settled) must be idle again");
+
+        app.global_search.expand_target_open = false;
+        assert!(app.has_active_animation(), "collapsing back down must be active");
+        for _ in 0..SEARCH_EXPAND_STEPS {
+            app.advance_animation_frame();
+        }
+        assert_eq!(app.global_search.expand_step, 0);
+        assert!(!app.has_active_animation(), "fully collapsed (settled) must be idle again");
     }
 
     #[test]

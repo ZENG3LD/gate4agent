@@ -27,7 +27,7 @@ use crate::app::{
     ContextUsageHover, ContextUsageSegment, ContextUsageSegmentHit,
     ExistingSessionMode, ExistingSessionOperation, Focus, FolderBrowserField,
     AgentRunGitScopeView, GitLocationDialogKind, HitRegion, HitTarget, LaunchContextMode, LaunchField, LaunchTarget,
-    IconFamily, LayoutRects, MenuPlacement, NativeSessionGroupKey, NativeSessionTreeItem, NodeView, PreviewTabPhase, PreviewTabView, PtyColorMode, RailIcons, RosterMode, SessionView,
+    IconFamily, LayoutRects, MenuPlacement, NativeSessionGroupKey, NativeSessionTreeItem, NetworkSummary, NodeView, PreviewTabPhase, PreviewTabView, PtyColorMode, RailIcons, RosterMode, SessionView,
     SixelIconPlacement, SixelIconSize,
     ObservationPersistenceState, SessionMonitorKey, SessionMonitorSection, SessionMonitorTarget,
     SessionMonitorView, SidebarMode, SurfaceTab,
@@ -144,14 +144,25 @@ impl Theme {
 
 pub fn render(app: &App, buf: &mut TerminalBuffer) -> LayoutRects {
     buf.clear();
-    let area = Rect::new(0, 0, buf.width(), buf.height());
+    let full_area = Rect::new(0, 0, buf.width(), buf.height());
     let theme = Theme::for_mode(app.color_mode);
-    if area.width < 56 || area.height < 14 {
+    if full_area.width < 56 || full_area.height < 14 {
         Paragraph::new("gate4agent operator needs at least 56x14")
             .style(Style::default().fg(theme.yellow).bg(theme.surface))
-            .render(area, buf);
+            .render(full_area, buf);
         return LayoutRects::default();
     }
+
+    // The status bar (`render_status_bar`, below) owns the terminal's own
+    // last row unconditionally -- every layout consumer in this function
+    // reads `area`, already one row shorter than `full_area`, so nothing
+    // computed from it (rail, sidebar, tab strip, viewport, or any of the
+    // centered modals further down, which all take `area` too) can ever
+    // overlap that row rather than silently painting under the bar. Only
+    // `full_area` itself, threaded through to `render_status_bar`
+    // separately, ever touches the true last row. `full_area.height >= 14`
+    // is already guaranteed by the guard above, so this never underflows.
+    let area = Rect::new(full_area.x, full_area.y, full_area.width, full_area.height - 1);
 
     Paragraph::new("")
         .style(Style::default().fg(theme.text).bg(theme.surface))
@@ -267,6 +278,11 @@ pub fn render(app: &App, buf: &mut TerminalBuffer) -> LayoutRects {
         add_space_modal: Rect::default(),
         folder_browser_modal: Rect::default(),
         create_worktree_modal: Rect::default(),
+        status_bar_left: Rect::default(),
+        status_bar_center: Rect::default(),
+        status_bar_right: Rect::default(),
+        global_search_field: Rect::default(),
+        global_search_dropdown: Rect::default(),
         surface_panes: Vec::new(),
         hits: Vec::new(),
     };
@@ -340,6 +356,7 @@ pub fn render(app: &App, buf: &mut TerminalBuffer) -> LayoutRects {
     }
     render_tabs(app, right[0], buf, &mut layout, theme);
     render_surface(app, right[1], buf, &mut layout, theme);
+    render_status_bar(app, full_area, buf, &mut layout, theme);
 
     if app.focus == Focus::Spawn {
         render_spawn(app, area, buf, &mut layout, theme);
@@ -377,6 +394,15 @@ pub fn render(app: &App, buf: &mut TerminalBuffer) -> LayoutRects {
     if app.focus == Focus::Settings {
         render_settings(app, area, buf, &mut layout, theme);
     }
+    if app.focus == Focus::StatusBarLeft {
+        render_status_bar_left_modal(app, area, buf, &mut layout, theme);
+    }
+    if app.focus == Focus::StatusBarCenter {
+        render_status_bar_center_modal(app, area, buf, &mut layout, theme);
+    }
+    if app.focus == Focus::StatusBarRight {
+        render_status_bar_right_modal(app, area, buf, &mut layout, theme);
+    }
     if app.agent_menu.is_some() {
         render_agent_menu(app, area, buf, &mut layout, theme);
     }
@@ -393,6 +419,246 @@ pub fn render(app: &App, buf: &mut TerminalBuffer) -> LayoutRects {
     render_context_usage_tooltip(app.context_usage_hover, area, buf, &layout, theme);
     drop_sixel_icons_covered_by_overlays(&mut layout);
     layout
+}
+
+/// Fixed width of the status bar's own LEFT zone -- see `app::STATUS_BAR_
+/// LEFT_WIDTH`'s own doc comment for why this constant lives in `app.rs`
+/// (the animation gate needs the exact same number with no `Rect` to
+/// measure against).
+const STATUS_BAR_LEFT_WIDTH: u16 = crate::app::STATUS_BAR_LEFT_WIDTH;
+/// Fixed width of the status bar's own RIGHT (pet) zone -- see `app::
+/// STATUS_BAR_RIGHT_WIDTH`'s own doc comment.
+const STATUS_BAR_RIGHT_WIDTH: u16 = crate::app::STATUS_BAR_RIGHT_WIDTH;
+
+/// Draws the bottom status bar into `full_area`'s own true last row (see
+/// `render::render`'s own doc comment on why every other renderer in this
+/// module reads the SHRUNK `area` instead): three zones, LEFT and RIGHT
+/// fixed-width, CENTRE taking whatever is left. Each zone is a single
+/// `HitTarget` covering its own whole rect -- clicking anywhere in a zone
+/// opens that zone's own modal (`App::begin_status_bar_zone`), never a
+/// finer-grained per-pixel target.
+fn render_status_bar(
+    app: &App,
+    full_area: Rect,
+    buf: &mut TerminalBuffer,
+    layout: &mut LayoutRects,
+    theme: Theme,
+) {
+    if full_area.height == 0 {
+        return;
+    }
+    let row = Rect::new(full_area.x, full_area.bottom() - 1, full_area.width, 1);
+    fill_rect(row, theme.panel, buf);
+    let left_width = STATUS_BAR_LEFT_WIDTH.min(row.width);
+    let right_width = STATUS_BAR_RIGHT_WIDTH.min(row.width.saturating_sub(left_width));
+    let center_width = row
+        .width
+        .saturating_sub(left_width)
+        .saturating_sub(right_width);
+    let left = Rect::new(row.x, row.y, left_width, 1);
+    let center = Rect::new(left.right(), row.y, center_width, 1);
+    let right = Rect::new(center.right(), row.y, right_width, 1);
+    render_status_bar_left(app, left, buf, theme);
+    render_status_bar_center(app, center, buf, theme);
+    render_status_bar_right(app, right, buf, theme);
+    layout.status_bar_left = left;
+    layout.status_bar_center = center;
+    layout.status_bar_right = right;
+    if left.width > 0 {
+        layout.hits.push(HitRegion { rect: left, target: HitTarget::StatusBarLeft });
+    }
+    if center.width > 0 {
+        layout.hits.push(HitRegion { rect: center, target: HitTarget::StatusBarCenter });
+    }
+    if right.width > 0 {
+        layout.hits.push(HitRegion { rect: right, target: HitTarget::StatusBarRight });
+    }
+}
+
+fn status_bar_network_label(summary: NetworkSummary, theme: Theme) -> (&'static str, Color) {
+    match summary {
+        NetworkSummary::NoNodes => ("no nodes", theme.muted),
+        NetworkSummary::Connected => ("connected", theme.green),
+        NetworkSummary::Transitioning => ("connecting", theme.yellow),
+        NetworkSummary::Disconnected => ("disconnected", theme.red),
+    }
+}
+
+fn render_status_bar_left(app: &App, area: Rect, buf: &mut TerminalBuffer, theme: Theme) {
+    if area.width == 0 {
+        return;
+    }
+    let (label, color) = status_bar_network_label(app.network_summary(), theme);
+    Paragraph::new(truncate_cells(&format!(" {label}"), area.width as usize))
+        .style(Style::default().fg(color).bg(theme.panel))
+        .render(area, buf);
+}
+
+/// The marquee: while `App::marquee_enabled` is false this stays blank
+/// (its own on/off setting lives in `render_status_bar_center_modal`, one
+/// click away); while it fits the zone at rest it is shown static with no
+/// scroll; otherwise it scrolls through `App::marquee_scroll_offset`'s own
+/// position, wrapping the joined log around rather than stopping dead at
+/// its own end.
+fn render_status_bar_center(app: &App, area: Rect, buf: &mut TerminalBuffer, theme: Theme) {
+    if area.width == 0 || !app.marquee_enabled {
+        return;
+    }
+    let content = app.marquee_content();
+    let chars: Vec<char> = content.chars().collect();
+    let width = area.width as usize;
+    let display: String = if chars.len() <= width {
+        content
+    } else {
+        let offset = app.marquee_scroll_offset();
+        (0..width)
+            .map(|column| chars[(offset + column) % chars.len()])
+            .collect()
+    };
+    Paragraph::new(display)
+        .style(Style::default().fg(theme.muted).bg(theme.panel))
+        .render(area, buf);
+}
+
+// `_app`: kept for signature parity with the other two zone renderers
+// (every one of the three takes `&App` even though this one -- a minimal,
+// static placeholder occupant -- has nothing of the app's own state to
+// read yet).
+fn render_status_bar_right(_app: &App, area: Rect, buf: &mut TerminalBuffer, theme: Theme) {
+    if area.width == 0 {
+        return;
+    }
+    // Plain themed text, never a sixel asset (nothing here is a clickable
+    // icon of its own; the whole zone is one `HitTarget::StatusBarRight`
+    // hit region), so it needs no `RailIcons` branch: the SAME glyphs
+    // render in both tiers already.
+    const PET: &str = "^,,^";
+    Paragraph::new(centered_label(PET, area.width as usize))
+        .style(Style::default().fg(theme.text).bg(theme.panel))
+        .render(area, buf);
+}
+
+fn render_status_bar_left_modal(
+    app: &App,
+    area: Rect,
+    buf: &mut TerminalBuffer,
+    layout: &mut LayoutRects,
+    theme: Theme,
+) {
+    let width = 48.min(area.width.saturating_sub(4));
+    let height = (4 + app.nodes.len() as u16).clamp(4, area.height.saturating_sub(2));
+    let dialog = centered(area, width, height);
+    layout.note_overlay(dialog);
+    fill_rect(dialog, theme.modal, buf);
+    Block::bordered()
+        .title(" network ")
+        .border_style(Style::default().fg(theme.accent))
+        .style(Style::default().bg(theme.modal))
+        .render(dialog, buf);
+    render_modal_close(dialog, buf, layout, theme);
+    if dialog.width < 3 || dialog.height < 3 {
+        return;
+    }
+    let inner = Rect::new(dialog.x + 1, dialog.y + 1, dialog.width - 2, dialog.height - 2);
+    let (label, color) = status_bar_network_label(app.network_summary(), theme);
+    render_modal_line(
+        format!("summary: {label}"),
+        inner,
+        0,
+        Style::default().fg(color).bg(theme.modal).add_modifier(Modifier::BOLD),
+        buf,
+    );
+    if app.nodes.is_empty() {
+        render_modal_line("no nodes registered", inner, 2, Style::default().fg(theme.muted).bg(theme.modal), buf);
+    } else {
+        for (row, node) in app.nodes.iter().enumerate() {
+            let (node_label, node_color) = status_bar_network_label(node_connection_summary(node), theme);
+            render_modal_line(
+                format!("{} -- {node_label}", node.node_id),
+                inner,
+                2 + row as u16,
+                Style::default().fg(node_color).bg(theme.modal),
+                buf,
+            );
+        }
+    }
+}
+
+fn node_connection_summary(node: &NodeView) -> NetworkSummary {
+    match node.connection {
+        ConnectionState::Connected => NetworkSummary::Connected,
+        ConnectionState::Connecting | ConnectionState::Resyncing => NetworkSummary::Transitioning,
+        ConnectionState::Disconnected(_) => NetworkSummary::Disconnected,
+    }
+}
+
+fn render_status_bar_center_modal(
+    app: &App,
+    area: Rect,
+    buf: &mut TerminalBuffer,
+    layout: &mut LayoutRects,
+    theme: Theme,
+) {
+    let width = 44.min(area.width.saturating_sub(4));
+    let height = 6.min(area.height.saturating_sub(2));
+    let dialog = centered(area, width, height);
+    layout.note_overlay(dialog);
+    fill_rect(dialog, theme.modal, buf);
+    Block::bordered()
+        .title(" marquee ")
+        .border_style(Style::default().fg(theme.accent))
+        .style(Style::default().bg(theme.modal))
+        .render(dialog, buf);
+    render_modal_close(dialog, buf, layout, theme);
+    if dialog.width < 3 || dialog.height < 3 {
+        return;
+    }
+    let inner = Rect::new(dialog.x + 1, dialog.y + 1, dialog.width - 2, dialog.height - 2);
+    let toggle_label = if app.marquee_enabled { "[x] marquee enabled" } else { "[ ] marquee enabled" };
+    render_modal_line(
+        toggle_label,
+        inner,
+        0,
+        Style::default().fg(theme.text).bg(theme.modal).add_modifier(Modifier::BOLD),
+        buf,
+    );
+    push_modal_hit(layout, modal_row(inner, 0), HitTarget::StatusBarMarqueeToggle);
+    render_modal_line(
+        "scrolls open log lines and notices across the CENTRE zone",
+        inner,
+        2,
+        Style::default().fg(theme.muted).bg(theme.modal),
+        buf,
+    );
+    render_modal_line("click, or m, toggles | Esc close", inner, 4, Style::default().fg(theme.muted).bg(theme.modal), buf);
+}
+
+// `_app`: kept for signature parity with the other two zone modals -- this
+// one has nothing of the app's own state to show yet (see
+// `render_status_bar_right`'s own doc comment).
+fn render_status_bar_right_modal(
+    _app: &App,
+    area: Rect,
+    buf: &mut TerminalBuffer,
+    layout: &mut LayoutRects,
+    theme: Theme,
+) {
+    let width = 32.min(area.width.saturating_sub(4));
+    let height = 4.min(area.height.saturating_sub(2));
+    let dialog = centered(area, width, height);
+    layout.note_overlay(dialog);
+    fill_rect(dialog, theme.modal, buf);
+    Block::bordered()
+        .title(" pet ")
+        .border_style(Style::default().fg(theme.accent))
+        .style(Style::default().bg(theme.modal))
+        .render(dialog, buf);
+    render_modal_close(dialog, buf, layout, theme);
+    if dialog.width < 3 || dialog.height < 3 {
+        return;
+    }
+    let inner = Rect::new(dialog.x + 1, dialog.y + 1, dialog.width - 2, dialog.height - 2);
+    render_modal_line("nothing here yet", inner, 0, Style::default().fg(theme.muted).bg(theme.modal), buf);
 }
 
 /// A sixel image is raster painted directly over the terminal and obeys
@@ -3230,6 +3496,14 @@ fn render_tabs(
             x = x.saturating_add(width);
         }
     }
+    // The app-wide quick search: centred in this WHOLE strip (`area.x` ..
+    // `tabs_right`, before the gear's own reservation), but never at the
+    // cost of anything already drawn above -- `x` is exactly where the
+    // Add/Layout controls (and, if open, the layout-preset labels) really
+    // stopped this frame, so the search can only ever use the leftover
+    // span from there to `tabs_right`. Labels win; search only ever gets
+    // what nothing else claimed.
+    render_global_search(app, area.x, x, tabs_right, area.y, buf, layout, theme);
     if gear_width > 0 {
         let gear = Rect::new(tabs_right, area.y, gear_width, 1);
         render_compact_icon_button(
@@ -3252,6 +3526,144 @@ fn render_tabs(
             target: HitTarget::ActivitySection(ControlSection::Settings),
         });
     }
+}
+
+/// Collapsed width of the global search's own magnifier frame -- same
+/// "icon in a frame" footprint `render_tabs`'s own `GEAR_WIDTH` already
+/// uses for a single icon with margin either side, not a new size.
+const SEARCH_COLLAPSED_WIDTH: u16 = 4;
+/// Widest the search field is ever allowed to grow to, fully expanded and
+/// with room to spare -- a quick-jump box, not a full-row omnibox.
+const SEARCH_MAX_EXPANDED_WIDTH: u16 = 34;
+
+/// The app-wide quick search living in the GLOBAL tab strip (`render_
+/// tabs`'s own call site) -- collapsed, this is a magnifier icon in a
+/// frame; clicking it (`HitTarget::GlobalSearchToggle`) expands it over
+/// several animation frames (`App::advance_animation_frame` stepping
+/// `app.global_search.expand_step`) into a text field, with a results
+/// dropdown appearing once that expansion actually settles (avoids a
+/// dropdown reflowing under a still-growing field, which reads as noise
+/// rather than a list). `strip_left`/`strip_right` are the WHOLE tab
+/// strip's own ends (before the gear reservation) -- used only to compute
+/// where "centred" actually is; `controls_end` is the hard left boundary
+/// nothing here may cross (see this fn's own call site doc comment).
+fn render_global_search(
+    app: &App,
+    strip_left: u16,
+    controls_end: u16,
+    strip_right: u16,
+    row_y: u16,
+    buf: &mut TerminalBuffer,
+    layout: &mut LayoutRects,
+    theme: Theme,
+) {
+    let available = strip_right.saturating_sub(controls_end);
+    if available < SEARCH_COLLAPSED_WIDTH {
+        // Narrow-row rule: existing controls/labels already claimed every
+        // column this strip has -- there is truly nothing left, not even
+        // for the magnifier alone.
+        return;
+    }
+    let target_extra = u32::from(SEARCH_MAX_EXPANDED_WIDTH.saturating_sub(SEARCH_COLLAPSED_WIDTH))
+        * u32::from(app.global_search.expand_step)
+        / u32::from(crate::app::SEARCH_EXPAND_STEPS);
+    let desired_width = SEARCH_COLLAPSED_WIDTH.saturating_add(target_extra as u16);
+    let width = desired_width.min(available);
+    let ideal_center = strip_left + strip_right.saturating_sub(strip_left) / 2;
+    let left = ideal_center
+        .saturating_sub(width / 2)
+        .max(controls_end)
+        .min(strip_right.saturating_sub(width));
+    let block = Rect::new(left, row_y, width, 1);
+    fill_rect(block, theme.active, buf);
+    let icon_x = block.x + 1;
+    let icon_width = icons::STRIP_SIXEL_ICON_CELLS_WIDE.min(block.width.saturating_sub(1));
+    match app.rail_icons {
+        RailIcons::Sixel => {
+            layout.sixel_icons.push(SixelIconPlacement {
+                icon: icons::IconId::Search,
+                rect: Rect::new(icon_x, block.y, icon_width, 1),
+                variant: icons::SixelVariant::GateActive,
+                size: SixelIconSize::Strip,
+                family: app.icon_family,
+            });
+        }
+        RailIcons::Ascii => {
+            Paragraph::new(truncate_cells(icons::ascii(icons::IconId::Search), icon_width as usize))
+                .style(Style::default().fg(theme.muted).bg(theme.active))
+                .render(Rect::new(icon_x, block.y, icon_width, 1), buf);
+        }
+    }
+    layout.hits.push(HitRegion { rect: block, target: HitTarget::GlobalSearchToggle });
+    let expanded = width > SEARCH_COLLAPSED_WIDTH;
+    if !expanded {
+        return;
+    }
+    let field_x = icon_x.saturating_add(icon_width).saturating_add(1);
+    if field_x >= block.right() {
+        return;
+    }
+    let field = Rect::new(field_x, block.y, block.right() - field_x, 1);
+    let (display, style) = if app.global_search.query.is_empty() {
+        ("search...".to_owned(), Style::default().fg(theme.muted).bg(theme.active))
+    } else {
+        (app.global_search.query.clone(), Style::default().fg(theme.text).bg(theme.active))
+    };
+    Paragraph::new(truncate_cells(&display, field.width as usize))
+        .style(style)
+        .render(field, buf);
+    layout.global_search_field = field;
+    if app.focus == Focus::GlobalSearch && app.global_search.expand_step == crate::app::SEARCH_EXPAND_STEPS {
+        render_global_search_dropdown(app, block, buf, layout, theme);
+    }
+}
+
+/// The global search's own results dropdown -- opens directly under the
+/// magnifier/field frame, left-aligned with it. An overlay like any other
+/// (`note_overlay`, opaque full-frame fill), so a sixel icon in the
+/// viewport underneath never bleeds through it.
+fn render_global_search_dropdown(
+    app: &App,
+    anchor: Rect,
+    buf: &mut TerminalBuffer,
+    layout: &mut LayoutRects,
+    theme: Theme,
+) {
+    let results = app.global_search_results();
+    const MAX_VISIBLE_RESULTS: u16 = 8;
+    let rows = (results.len() as u16).clamp(1, MAX_VISIBLE_RESULTS);
+    let width = anchor.width.max(28);
+    let dropdown = Rect::new(anchor.x, anchor.bottom(), width, rows + 2);
+    layout.note_overlay(dropdown);
+    fill_rect(dropdown, theme.modal, buf);
+    Block::bordered()
+        .border_style(Style::default().fg(theme.accent))
+        .style(Style::default().bg(theme.modal))
+        .render(dropdown, buf);
+    if dropdown.width < 3 || dropdown.height < 3 {
+        return;
+    }
+    let inner = Rect::new(dropdown.x + 1, dropdown.y + 1, dropdown.width - 2, dropdown.height - 2);
+    if results.is_empty() {
+        let hint = if app.global_search.query.is_empty() {
+            "type to search tabs, workspaces, files, agents, views"
+        } else {
+            "no matches"
+        };
+        render_modal_line(hint, inner, 0, Style::default().fg(theme.muted).bg(theme.modal), buf);
+    } else {
+        for (index, result) in results.iter().enumerate().take(inner.height as usize) {
+            let selected = index == app.global_search.selected;
+            let style = if selected {
+                Style::default().fg(theme.active_tab_text).bg(theme.accent).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.text).bg(theme.modal)
+            };
+            render_modal_line(result.label.as_str(), inner, index as u16, style, buf);
+            push_modal_hit(layout, modal_row(inner, index as u16), HitTarget::GlobalSearchResult(index));
+        }
+    }
+    layout.global_search_dropdown = dropdown;
 }
 
 fn render_surface(
@@ -14317,9 +14729,12 @@ mod tests {
         assert_eq!(layout.spaces.width, 31);
         assert_eq!(layout.agents.width, 31);
         assert_eq!(layout.spaces.height, 9);
-        assert_eq!(layout.agents.height, 15);
+        // 14, not 24 - 9 = 15: the status bar's own last row (see
+        // `render::render`'s own doc comment on `area` vs `full_area`)
+        // leaves the sidebar's own content one row shorter to split.
+        assert_eq!(layout.agents.height, 14);
         assert_eq!(layout.tabs.height, 1);
-        assert_eq!(layout.viewport, Rect::new(32, 1, 68, 23));
+        assert_eq!(layout.viewport, Rect::new(32, 1, 68, 22));
         assert_eq!(buf.get(31, 0).symbol, "│");
         assert!(layout.hits.iter().any(|hit| hit.target == HitTarget::SidebarWidthDrag));
         assert!(layout.hits.iter().any(|hit| hit.target == HitTarget::SidebarSplitDrag));
@@ -16181,7 +16596,11 @@ mod tests {
         assert_eq!(layout.spaces, Rect::default());
         assert_eq!(layout.agents, Rect::default());
         assert_eq!(layout.tabs, Rect::new(0, 0, 100, 1));
-        assert_eq!(layout.viewport, Rect::new(0, 1, 100, 23));
+        // 22, not 24 - 1 = 23: the status bar's own last row (see
+        // `render::render`'s own doc comment on `area` vs `full_area`)
+        // takes one more row off the content area before the tabs row
+        // takes its own.
+        assert_eq!(layout.viewport, Rect::new(0, 1, 100, 22));
         assert!(!layout.hits.iter().any(|hit| matches!(
             hit.target,
             HitTarget::SidebarMode(_) | HitTarget::RosterMode(_)
@@ -16215,8 +16634,11 @@ mod tests {
         // popover from 44x8 to 44x10 -- `control_modal_position`'s own
         // clamp (`positioned_modal`, `y.clamp(area.y, area.bottom() -
         // height)`) against the out-of-bounds requested (99, 99) above
-        // therefore lands 2 rows higher (16 -> 14) than before.
-        assert_eq!(layout.control_modal, Rect::new(56, 14, 44, 10));
+        // therefore lands 2 rows higher (16 -> 14) than before. The status
+        // bar's own last row (see `render::render`'s own doc comment on
+        // `area` vs `full_area`) takes one more off `area.bottom()`,
+        // landing this at 13.
+        assert_eq!(layout.control_modal, Rect::new(56, 13, 44, 10));
         assert_eq!(layout.control_content, Rect::default());
         assert!(layout.hits.iter().any(|hit| hit.target == HitTarget::ControlDrag));
         assert!(layout.hits.iter().any(|hit| hit.target == HitTarget::SettingsStyle));
@@ -17546,7 +17968,11 @@ mod tests {
 
         let layout = render(&app, &mut buf);
 
-        assert_eq!(layout.spawn_modal, Rect::new(0, 0, 56, 14));
+        // One row shorter than the real 56x14 buffer: the status bar's own
+        // last row (see `render::render`'s own doc comment on `area` vs
+        // `full_area`) leaves 13 rows for everything else, including this
+        // modal, at this crate's own minimum supported terminal size.
+        assert_eq!(layout.spawn_modal, Rect::new(0, 0, 56, 13));
         for target in [
             HitTarget::SpawnRegisterWorkspace,
             HitTarget::SpawnConfigureGitLocation,
@@ -17768,7 +18194,9 @@ mod tests {
             .find(|hit| hit.target == HitTarget::ModalClose)
             .expect("remove-worktree modal exposes the standard close cross")
             .rect;
-        let modal = centered(Rect::new(0, 0, 100, 24), 68, 8);
+        // See `forget_session_modal_close_cross_cancels_not_confirms`'s own
+        // comment on why this is `23`, not the buffer's real `24`.
+        let modal = centered(Rect::new(0, 0, 100, 23), 68, 8);
         assert_eq!(close, Rect::new(modal.right() - 4, modal.y, 3, 1));
         assert!(buffer_text(&buf).contains("[x]"));
 
@@ -17848,7 +18276,11 @@ mod tests {
             .find(|hit| hit.target == HitTarget::ModalClose)
             .expect("forget-session modal exposes the standard close cross")
             .rect;
-        let modal = centered(Rect::new(0, 0, 100, 24), 62, 8);
+        // The status bar's own last row means `render::render` centers
+        // every modal against a content area one row shorter than the
+        // real 100x24 buffer -- see `render::render`'s own doc comment on
+        // `area` vs `full_area`.
+        let modal = centered(Rect::new(0, 0, 100, 23), 62, 8);
         assert_eq!(close, Rect::new(modal.right() - 4, modal.y, 3, 1));
         assert!(buffer_text(&buf).contains("[x]"));
 

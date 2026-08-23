@@ -886,6 +886,17 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
         if app.notice != last_notice {
             last_notice = app.notice.clone();
             notice_deadline = app.notice.as_ref().map(|_| Instant::now() + Duration::from_secs(3));
+            // The status bar's CENTRE-zone marquee has no notice history of
+            // its own to scroll through -- this is the single choke point
+            // every one of this crate's `self.notice = Some(...)` call
+            // sites already funnels through (the 3-second auto-dismiss
+            // timer above already relies on that same property), so it is
+            // also the one place that can feed the marquee's bounded log
+            // without touching any of those call sites. See `App::
+            // marquee_log`'s own doc comment.
+            if let Some(notice) = app.notice.clone() {
+                app.push_marquee_line(notice);
+            }
             state_changed = true;
         } else if notice_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             app.notice = None;
@@ -1795,9 +1806,10 @@ impl std::fmt::Display for RenderedSixel {
 /// full self-healing rationale behind each outcome.
 enum PlacementDisposition {
     /// No matching identity (icon/rect/variant/size) in `state.last` at
-    /// all: paint it directly, no separate clear first -- there is
-    /// nothing stale to clear under a rect that was never previously an
-    /// image region.
+    /// all. Painted directly with no separate clear ONLY when its rect is
+    /// untouched by every remembered placement; if it overlaps one (even
+    /// partially -- see [`flush_sixel_icon_into`]'s own transparency-bleed
+    /// doc comment), it is cleared first exactly like [`Self::Disturbed`].
     New,
     /// Matched an old entry, but its cells no longer fingerprint the same
     /// as when it was last painted there (or `SixelEmitState::force_next`
@@ -1891,11 +1903,24 @@ fn flush_sixel_icon(app: &App, screen_buffer: &TerminalBuffer, state: &mut Sixel
 /// are exactly what they were the moment this placement was last painted
 /// there, so nothing is written for it; a mismatch means something
 /// repainted them since, so its rect is explicitly cleared and the sixel
-/// is re-emitted, exactly like a brand-new placement. A placement that is
-/// brand new this frame (no matching identity in `state.last` at all) is
-/// emitted directly with no separate clear -- same as before this fix,
-/// since there is nothing stale under a rect that was never previously an
-/// image region.
+/// is re-emitted, exactly like a brand-new placement.
+///
+/// A placement with no matching identity in `state.last` at all
+/// ([`PlacementDisposition::New`]) is NOT automatically clear-free: every
+/// baked icon is a transparent stencil (see this crate's own "icons never
+/// paint their own background" rule), so a zero-coverage pixel leaves
+/// whatever the terminal already has there alone rather than overwriting
+/// it. Painting a structurally different icon directly over a rect a
+/// DIFFERENT placement covered last frame lets that old icon's own opaque
+/// pixels bleed through the new one's transparent ones -- two rasters
+/// showing through each other in the same cells. So `New` clears first
+/// too, whenever its rect overlaps ANY rect `state.last` remembers; only a
+/// rect nothing painted last frame is genuinely clear-free. This is also
+/// why both this check and the vacated-rect set below key off rect
+/// INTERSECTION rather than exact equality: a placement that shifts by
+/// even one cell (e.g. the tab strip sliding left when the sidebar
+/// collapses) still leaves a stale rect only partially reclaimed, and
+/// exact equality would miss that overlap entirely.
 ///
 /// Also enforces the bottom-row rule: a placement whose bottom row is the
 /// terminal's own last row (or beyond it) is never emitted at all, and is
@@ -1950,10 +1975,16 @@ fn flush_sixel_icon_into<W: io::Write>(
         })
         .collect();
 
+    // Intersection, not equality: a placement that only SHIFTS (the tab
+    // strip sliding left when the sidebar collapses) still leaves part of
+    // its old rect uncovered by any current one, and that leftover sliver
+    // is exactly as stale as a rect nobody reuses at all -- see
+    // `flush_sixel_icon_into`'s own transparency-bleed doc comment for why
+    // an exact-match-only check misses it.
     let vacated_rects: Vec<Rect> = state
         .last
         .iter()
-        .filter(|old| !emitted.iter().any(|new| new.rect == old.placement.rect))
+        .filter(|old| !emitted.iter().any(|new| !new.rect.intersect(old.placement.rect).is_empty()))
         .map(|old| old.placement.rect)
         .collect();
 
@@ -1970,7 +2001,19 @@ fn flush_sixel_icon_into<W: io::Write>(
         match disposition {
             PlacementDisposition::Survivor => continue,
             PlacementDisposition::Disturbed => clear_rect(writer, placement.rect, screen_buffer)?,
-            PlacementDisposition::New => {}
+            // A `New` identity can still land on cells a DIFFERENT
+            // placement owned last frame (e.g. a different icon claims
+            // the exact rect one that just disappeared used to fill) --
+            // that old raster's opaque pixels would otherwise bleed
+            // through this one's own transparent ones. Clear first
+            // whenever any remembered rect overlaps this one at all;
+            // untouched cells need no clear, matching `New`'s own
+            // original "nothing stale under it" case.
+            PlacementDisposition::New => {
+                if state.last.iter().any(|old| !old.placement.rect.intersect(placement.rect).is_empty()) {
+                    clear_rect(writer, placement.rect, screen_buffer)?;
+                }
+            }
         }
         // `icons::sixel_*_family` (never the bare, codicon-only `icons::
         // sixel*`) so `placement.family` -- `IconFamily::Codicons` at
@@ -5989,6 +6032,91 @@ mod tests {
         written.clear();
         flush_sixel_icon_into(&mut written, &app, &screen, &mut state).unwrap();
         assert!(written.is_empty(), "an unchanged placement set after the move must be a total no-op");
+    }
+
+    /// Owner report: collapsing (or expanding) the sidebar makes the
+    /// sidebar's own control-plane icons and the tab strip's own icons
+    /// come out dirty/overlapping. Reproduced through the SAME two
+    /// `render::render` calls the real event loop makes (`client::run`'s
+    /// own `app.layout = render::render(...)` line), not through hand-
+    /// built placements, so this proves the actual layout collision, not
+    /// just the clearing arithmetic. With the sidebar expanded (`Sidebar`
+    /// + `Activity`, the one chrome with both a rail and a control-plane
+    /// strip -- see `render::render`'s own layout match), the Files
+    /// panel's own control strip places `Trash` at `(9,0,2,1)` (`Add` at
+    /// the rail's own edge, then `Trash`, then `Refresh`, each 2 cells
+    /// wide with a 1-cell gap -- see `render_control_strip`). Once
+    /// collapsed, the sidebar content vanishes and the tab strip slides
+    /// onto the rail's own edge instead: `render_tabs`'s `AddTab` control
+    /// is 2 cells wide starting there, so `LayoutMenuToggle`'s own icon
+    /// (a DIFFERENT identity) lands exactly 3 cells further right -- the
+    /// SAME `(9,0,2,1)` rect Trash used to own (`layout_control_width`
+    /// reserves 1 extra leading column for the "▎" open-menu marker before
+    /// its own icon). Nothing in `app.layout.sixel_icons` ever marks that
+    /// rect as needing a clear under the old equality-only bookkeeping --
+    /// see `flush_sixel_icon_into`'s own transparency-bleed doc comment
+    /// for why a `New` identity landing on a rect a DIFFERENT placement
+    /// covered last frame is not automatically clear-free.
+    #[test]
+    fn flush_sixel_icon_clears_a_prior_different_icon_when_the_sidebar_collapse_shifts_the_tab_strip_onto_it() {
+        let mut app = App::default();
+        app.sidebar_presentation = SidebarPresentation::Activity;
+        app.terminal_cols = 80;
+        app.terminal_rows = 24;
+        let mut expanded_buf = uzor_tui::TerminalBuffer::new(app.terminal_cols, app.terminal_rows);
+        app.layout = render::render(&app, &mut expanded_buf);
+
+        let claimed_rect = uzor_tui::Rect::new(9, 0, 2, 1);
+        assert!(
+            app.layout
+                .sixel_icons
+                .iter()
+                .any(|placement| placement.icon == icons::IconId::Trash && placement.rect == claimed_rect),
+            "fixture assumption: the expanded Files strip must place Trash at {claimed_rect:?}: {:?}",
+            app.layout.sixel_icons,
+        );
+
+        let mut state = SixelEmitState::default();
+        let mut written = Vec::new();
+        flush_sixel_icon_into(&mut written, &app, &expanded_buf, &mut state).unwrap();
+        assert!(!written.is_empty(), "the first (expanded) emission must write real bytes");
+
+        app.sidebar_collapsed = true;
+        let mut collapsed_buf = uzor_tui::TerminalBuffer::new(app.terminal_cols, app.terminal_rows);
+        app.layout = render::render(&app, &mut collapsed_buf);
+        assert!(
+            app.layout
+                .sixel_icons
+                .iter()
+                .any(|placement| placement.icon == icons::IconId::Layout && placement.rect == claimed_rect),
+            "fixture assumption: the collapsed tab strip's own Layout icon must claim the vacated {claimed_rect:?}: {:?}",
+            app.layout.sixel_icons,
+        );
+
+        // Stands in for whatever real content the collapsed frame actually
+        // computed for those cells -- same technique as `flush_sixel_icon_
+        // move_clears_the_old_rect_exactly_once_and_emits_the_new_one`:
+        // proves a real clear happened (reading the CURRENT screen
+        // content, not a generic blank) and makes it directly observable
+        // in the written bytes, ordered against the icon it precedes.
+        collapsed_buf.set(claimed_rect.x, claimed_rect.y, uzor_tui::Cell::new("Q"));
+        written.clear();
+        flush_sixel_icon_into(&mut written, &app, &collapsed_buf, &mut state).unwrap();
+        let output = String::from_utf8_lossy(&written);
+        let layout_bytes = expected_strip_sixel(&app, icons::IconId::Layout, icons::SixelVariant::GateActive);
+        let clear_at = output.find('Q');
+        let paint_at = output.find(layout_bytes.as_ref());
+        assert!(
+            clear_at.is_some(),
+            "the rect Trash vacated must be cleared from the collapsed frame's real content before a \
+             different icon paints over it -- old Trash pixels would otherwise bleed through Layout's own \
+             transparent ones: {output}"
+        );
+        assert!(paint_at.is_some(), "the tab strip's own Layout icon must still be emitted at the claimed rect: {output}");
+        assert!(
+            clear_at < paint_at,
+            "the clear must happen BEFORE the new icon paints over the same cells, not after: {output}"
+        );
     }
 
     /// FIX1 regression guard: the exact scenario named in the owner's own

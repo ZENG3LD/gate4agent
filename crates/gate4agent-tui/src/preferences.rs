@@ -15,7 +15,7 @@ use crate::app::{
 };
 use crate::surface::LayoutPreset;
 
-const CONFIG_VERSION: u16 = 10;
+const CONFIG_VERSION: u16 = 11;
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const MAX_COLLAPSED_DIRECTORY_PREFERENCES: usize = 512;
 
@@ -42,6 +42,12 @@ pub struct UiPreferences {
     pub control_modal_position: Option<(u16, u16)>,
     pub control_modal_size: Option<(u16, u16)>,
     pub surface_layout: LayoutPreset,
+    /// D? status bar (CONFIG_VERSION 10 -> 11): the CENTRE zone's own
+    /// marquee on/off switch -- see `App::marquee_enabled`'s own doc
+    /// comment. The clock-vs-network LEFT-zone choice is NOT a preference:
+    /// this wave ships the LEFT zone as network state only (see `App::
+    /// network_summary`), so there is no second mode to persist.
+    pub marquee_enabled: bool,
     pub managed_agents: Vec<ManagedAgentPreference>,
     pub collapsed_directories: Vec<CollapsedDirectoryPreference>,
 }
@@ -78,6 +84,7 @@ impl Default for UiPreferences {
             control_modal_position: None,
             control_modal_size: None,
             surface_layout: LayoutPreset::OneByOne,
+            marquee_enabled: true,
             managed_agents: Vec::new(),
             collapsed_directories: Vec::new(),
         }
@@ -108,6 +115,7 @@ impl UiPreferences {
             control_modal_position: app.control_modal_position,
             control_modal_size: app.control_modal_size.map(sanitize_modal_size),
             surface_layout: app.surface.preset.unwrap_or(LayoutPreset::OneByOne),
+            marquee_enabled: app.marquee_enabled,
             managed_agents: app.managed_agent_preferences.values().cloned().collect(),
             collapsed_directories: app
                 .collapsed_directories
@@ -132,6 +140,7 @@ impl UiPreferences {
         // Applying preferences must accept exactly the same bounded state that can be
         // persisted. This check happens before any App field is mutated.
         let _ = self.encode()?;
+        app.marquee_enabled = self.marquee_enabled;
         app.color_mode = self.color_mode;
         app.menu_placement = self.menu_placement;
         app.sidebar_presentation = self.sidebar_presentation;
@@ -230,7 +239,7 @@ impl UiPreferences {
         validate_managed_agents(&self.managed_agents)?;
         validate_collapsed_directories(&self.collapsed_directories)?;
         let mut encoded = format!(
-            "version={CONFIG_VERSION}\nstyle={}\nmenu={}\nsidebar_presentation={}\nsidebar_collapsed={}\nrail_icons={}\nicon_family={}\nlucide_stroke_width={}\ncontrol_section={}\nroster_mode={}\nsidebar_width={}\nsidebar_split_percent={}\ncontrol_modal_position={}\ncontrol_modal_size={}\nsurface_layout={}\n",
+            "version={CONFIG_VERSION}\nstyle={}\nmenu={}\nsidebar_presentation={}\nsidebar_collapsed={}\nrail_icons={}\nicon_family={}\nlucide_stroke_width={}\ncontrol_section={}\nroster_mode={}\nsidebar_width={}\nsidebar_split_percent={}\ncontrol_modal_position={}\ncontrol_modal_size={}\nsurface_layout={}\nmarquee_enabled={}\n",
             self.color_mode.id(),
             self.menu_placement.id(),
             self.sidebar_presentation.id(),
@@ -248,6 +257,7 @@ impl UiPreferences {
             encode_pair(self.control_modal_position),
             encode_pair(self.control_modal_size),
             self.surface_layout.id(),
+            self.marquee_enabled,
         );
         let mut managed_agents = self.managed_agents.clone();
         managed_agents.sort_by(|left, right| {
@@ -517,6 +527,13 @@ fn parse(contents: &str) -> io::Result<UiPreferences> {
                 preferences.surface_layout = parse_layout_preset(value.trim())
                     .unwrap_or(preferences.surface_layout);
             }
+            "marquee_enabled" => {
+                preferences.marquee_enabled = match value.trim() {
+                    "true" => true,
+                    "false" => false,
+                    _ => preferences.marquee_enabled,
+                }
+            }
             "managed_agent" => {
                 if managed_agents.len() >= MAX_MANAGED_AGENT_PREFERENCES {
                     return Err(invalid_data("too many managed agent preferences"));
@@ -593,7 +610,15 @@ fn parse(contents: &str) -> io::Result<UiPreferences> {
         // config lands on Codicons" per this wave's own brief, achieved
         // by there being nothing stored to override the default with,
         // the same shape `rail_icons`'s own v6 gap above already uses.
-        Some(7) | Some(8) | Some(9) | Some(CONFIG_VERSION) => {
+        // D? status bar (CONFIG_VERSION 10 -> 11): `marquee_enabled` is a
+        // new key, not a migrated field -- a v10 (or earlier) config has
+        // no `marquee_enabled=` line at all, so the per-line match above
+        // never touches it and it keeps the struct default (`true`)
+        // `UiPreferences::default()` already set before this loop ran --
+        // the exact same "new key just wasn't there yet" shape `icon_
+        // family`'s own v9 -> v10 migration doc comment above already
+        // uses.
+        Some(7) | Some(8) | Some(9) | Some(10) | Some(CONFIG_VERSION) => {
             finish_with_collections(preferences, managed_agents, collapsed_directory_values)
         }
         Some(other) => Err(invalid_data(format!("unsupported preferences version {other}"))),
@@ -821,6 +846,7 @@ mod tests {
             control_modal_position: Some((17, 9)),
             control_modal_size: Some((102, 37)),
             surface_layout: LayoutPreset::OneByFour,
+            marquee_enabled: false,
             managed_agents: Vec::new(),
             collapsed_directories: Vec::new(),
         };
@@ -874,6 +900,7 @@ mod tests {
             control_modal_position: Some((12, 8)),
             control_modal_size: Some((90, 28)),
             surface_layout: LayoutPreset::FourByOne,
+            marquee_enabled: false,
             managed_agents: Vec::new(),
             collapsed_directories: Vec::new(),
         };
@@ -1004,20 +1031,49 @@ mod tests {
         assert_eq!(app.lucide_stroke_width, LucideStrokeWidth::OnePointFive);
 
         let reencoded = loaded.encode().unwrap();
-        assert!(reencoded.starts_with("version=10\n"));
+        assert!(reencoded.starts_with(&format!("version={CONFIG_VERSION}\n")));
         assert!(reencoded.contains("icon_family=codicons\n"));
         assert!(reencoded.contains("lucide_stroke_width=1.5\n"));
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
+    /// D? status bar (CONFIG_VERSION 10 -> 11): a v10 config has no
+    /// `marquee_enabled=` line at all (the key is new at v11) -- same
+    /// "new key, not a migrated field" shape as `preferences_v9_config_
+    /// with_no_icon_family_key_lands_on_codicons` above. Proves the
+    /// landing is a real, re-savable value, not just a struct default that
+    /// happens to look right once.
     #[test]
-    fn preferences_v1_through_v4_migrate_to_v10_with_empty_collections() {
+    fn preferences_v10_config_with_no_marquee_enabled_key_lands_on_true() {
+        let path = temp_path("v10-lands-on-marquee-enabled");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "version=10\nstyle=gate\nrail_icons=ascii\n").unwrap();
+
+        let loaded = UiPreferences::load(&path).unwrap();
+        assert!(loaded.marquee_enabled);
+        let mut app = App::default();
+        app.marquee_enabled = false;
+        loaded.apply_to(&mut app);
+        assert!(app.marquee_enabled);
+
+        let reencoded = loaded.encode().unwrap();
+        assert!(reencoded.starts_with(&format!("version={CONFIG_VERSION}\n")));
+        assert!(reencoded.contains("marquee_enabled=true\n"));
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn preferences_v1_through_v4_migrate_to_the_current_version_with_empty_collections() {
         for version in 1..=4 {
             let loaded = parse(&format!("version={version}\nstyle=gate\n")).unwrap();
             assert!(loaded.managed_agents.is_empty(), "version {version}");
             assert!(loaded.collapsed_directories.is_empty(), "version {version}");
-            assert!(loaded.encode().unwrap().starts_with("version=10\n"), "version {version}");
+            assert!(
+                loaded.encode().unwrap().starts_with(&format!("version={CONFIG_VERSION}\n")),
+                "version {version}"
+            );
         }
     }
 
@@ -1069,7 +1125,7 @@ mod tests {
 
         let encoded = preferences.encode().unwrap();
         let decoded = parse(&encoded).unwrap();
-        assert!(encoded.starts_with("version=10\n"));
+        assert!(encoded.starts_with(&format!("version={CONFIG_VERSION}\n")));
         assert_eq!(decoded.collapsed_directories, vec![utf8.clone(), opaque.clone()]);
         assert_eq!(decoded.collapsed_directories[1].path.as_bytes(), opaque_bytes);
         assert_eq!(decoded.collapsed_directories[1].path.as_utf8(), None);
@@ -1099,7 +1155,7 @@ mod tests {
 
         assert!(loaded.collapsed_directories.is_empty());
         assert_eq!(loaded.color_mode, PtyColorMode::GateOverride);
-        assert!(loaded.encode().unwrap().starts_with("version=10\n"));
+        assert!(loaded.encode().unwrap().starts_with(&format!("version={CONFIG_VERSION}\n")));
     }
 
     /// D1a's default-mode flip (CONFIG_VERSION 6 -> 7): a v6 config's
@@ -1167,14 +1223,15 @@ mod tests {
         // the migrated presentation -- applying it to an App reflects the
         // same flip.
         let reencoded = loaded.encode().unwrap();
-        assert!(reencoded.starts_with("version=10\n"));
+        assert!(reencoded.starts_with(&format!("version={CONFIG_VERSION}\n")));
         let mut app = App::default();
         loaded.apply_to(&mut app);
         assert_eq!(app.sidebar_presentation, SidebarPresentation::Activity);
 
-        // Neither a v7, v8, nor v9 config is ever touched by the flip: an
-        // explicit `Split` choice made after migrating away from the new
-        // default persists at any of the four.
+        // Neither a v7, v8, v9, v10, nor the current version is ever
+        // touched by the flip: an explicit `Split` choice made after
+        // migrating away from the new default persists at any of the
+        // five.
         let v7_split = parse("version=7\nsidebar_presentation=split\n").unwrap();
         assert_eq!(v7_split.sidebar_presentation, SidebarPresentation::Split);
         let v8_split = parse("version=8\nsidebar_presentation=split\n").unwrap();
@@ -1183,6 +1240,8 @@ mod tests {
         assert_eq!(v9_split.sidebar_presentation, SidebarPresentation::Split);
         let v10_split = parse("version=10\nsidebar_presentation=split\n").unwrap();
         assert_eq!(v10_split.sidebar_presentation, SidebarPresentation::Split);
+        let current_split = parse(&format!("version={CONFIG_VERSION}\nsidebar_presentation=split\n")).unwrap();
+        assert_eq!(current_split.sidebar_presentation, SidebarPresentation::Split);
     }
 
     #[test]

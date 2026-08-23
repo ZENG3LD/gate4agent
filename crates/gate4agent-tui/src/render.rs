@@ -3084,6 +3084,11 @@ fn render_tabs(
     Paragraph::new("")
         .style(Style::default().bg(theme.active))
         .render(Rect::new(area.x, area.y, tabs_right.saturating_sub(area.x), 1), buf);
+    // Read only by the `RailIcons::Ascii` arms below now -- that tier
+    // keeps this exact old literal, padded label unchanged (no raster to
+    // swap in, see this crate's own "RailIcons::Ascii must keep the
+    // current text look exactly" requirement), while `RailIcons::Sixel`
+    // draws `icons::IconId::Layout` at the STRIP tier instead.
     let layout_label = " [#] ";
     let preset_width = if app.layout_menu_open {
         LayoutPreset::ALL
@@ -3093,36 +3098,113 @@ fn render_tabs(
     } else {
         0
     };
-    let controls_width = 3_u16
-        .saturating_add(cell_width(layout_label) as u16)
+    // Both controls' own real per-tier footprint -- for `RailIcons::
+    // Sixel` this is the STRIP tier's own real icon width (`icons::
+    // STRIP_SIXEL_ICON_CELLS_WIDE`, 2 cells: the same asset/size `render_
+    // control_strip_button` already draws for `IconId::Add` elsewhere in
+    // this sidebar) instead of the old padded-text widths (3 for `" + "`,
+    // 5 for `" [#] "`); `RailIcons::Ascii` keeps those exact old numbers,
+    // unchanged. `layout_control_width` additionally reserves ONE
+    // leading column purely for the toggle's own open/closed marker
+    // (painted below): that marker used to be a `theme.accent` plate
+    // under the glyph itself; a real icon has no glyph colour of its own
+    // to swap, so it needs a marker that lives beside the icon instead
+    // -- see this fn's own "▎" comment below for why and what replaces
+    // it.
+    let add_control_width = match app.rail_icons {
+        RailIcons::Sixel => icons::STRIP_SIXEL_ICON_CELLS_WIDE,
+        RailIcons::Ascii => 3,
+    };
+    let layout_control_width = match app.rail_icons {
+        RailIcons::Sixel => 1_u16.saturating_add(icons::STRIP_SIXEL_ICON_CELLS_WIDE),
+        RailIcons::Ascii => cell_width(layout_label) as u16,
+    };
+    let controls_width = add_control_width
+        .saturating_add(layout_control_width)
         .saturating_add(preset_width);
     let controls_right = tabs_right.min(area.x.saturating_add(controls_width));
     let mut x = area.x;
     if x < controls_right {
-        let width = 3.min(controls_right - x);
-        Paragraph::new(" + ")
-            .style(Style::default().fg(theme.muted).bg(theme.active))
-            .render(Rect::new(x, area.y, width, 1), buf);
-        layout.hits.push(HitRegion {
-            rect: Rect::new(x, area.y, width, 1),
-            target: HitTarget::AddTab,
-        });
+        let width = add_control_width.min(controls_right - x);
+        let block = Rect::new(x, area.y, width, 1);
+        match app.rail_icons {
+            RailIcons::Sixel => {
+                // Never a distinct-accent case, the same "one-shot action,
+                // never a persisted selected view" precedent `render_
+                // control_strip_button` already documents for this SAME
+                // icon/tier elsewhere in this sidebar -- so this only ever
+                // requests `GateActive`, never a variant of its own.
+                layout.sixel_icons.push(SixelIconPlacement {
+                    icon: icons::IconId::Add,
+                    rect: Rect::new(
+                        block.x,
+                        block.y,
+                        block.width.min(icons::STRIP_SIXEL_ICON_CELLS_WIDE),
+                        1,
+                    ),
+                    variant: icons::SixelVariant::GateActive,
+                    size: SixelIconSize::Strip,
+                    family: app.icon_family,
+                });
+            }
+            RailIcons::Ascii => {
+                Paragraph::new(" + ")
+                    .style(Style::default().fg(theme.muted).bg(theme.active))
+                    .render(block, buf);
+            }
+        }
+        layout.hits.push(HitRegion { rect: block, target: HitTarget::AddTab });
         x = x.saturating_add(width);
     }
-    let layout_width = (cell_width(layout_label) as u16).min(controls_right.saturating_sub(x));
+    let layout_width = layout_control_width.min(controls_right.saturating_sub(x));
     if layout_width > 0 {
-        Paragraph::new(truncate_cells(layout_label, layout_width as usize))
-            .style(
-                Style::default()
-                    .fg(if app.layout_menu_open { theme.active_tab_text } else { theme.muted })
-                    .bg(if app.layout_menu_open { theme.accent } else { theme.active })
-                    .add_modifier(Modifier::BOLD),
-            )
-            .render(Rect::new(x, area.y, layout_width, 1), buf);
-        layout.hits.push(HitRegion {
-            rect: Rect::new(x, area.y, layout_width, 1),
-            target: HitTarget::LayoutMenuToggle,
-        });
+        let block = Rect::new(x, area.y, layout_width, 1);
+        match app.rail_icons {
+            RailIcons::Sixel => {
+                // `render_rail_button`'s own lesson, reused verbatim: no
+                // button states a background of its own, selected or not
+                // -- a second, louder marker for the same state reads as
+                // a coloured plate under the icon rather than as
+                // selection (see that fn's own doc comment). So the body
+                // here never changes colour either; the ONLY thing that
+                // marks the preset menu as open is that same fn's own "▎"
+                // accent bar, painted into the leading margin column
+                // `layout_control_width` reserved above -- a column the
+                // icon itself never occupies (a sixel image cannot share
+                // a cell with a text glyph, see `icons.rs`'s own module
+                // doc comment), so painting it never touches the icon.
+                if app.layout_menu_open {
+                    let cell = buf.get_mut(block.x, block.y);
+                    cell.symbol = "▎".into();
+                    cell.style = Style::default().fg(theme.active_tab_text).bg(theme.active);
+                }
+                let icon_x = block.x.saturating_add(1).min(block.right());
+                let icon_width = block
+                    .right()
+                    .saturating_sub(icon_x)
+                    .min(icons::STRIP_SIXEL_ICON_CELLS_WIDE);
+                if icon_width > 0 {
+                    layout.sixel_icons.push(SixelIconPlacement {
+                        icon: icons::IconId::Layout,
+                        rect: Rect::new(icon_x, block.y, icon_width, 1),
+                        variant: icons::SixelVariant::GateActive,
+                        size: SixelIconSize::Strip,
+                        family: app.icon_family,
+                    });
+                }
+            }
+            RailIcons::Ascii => {
+                Paragraph::new(truncate_cells(layout_label, layout_width as usize))
+                    .style(
+                        Style::default()
+                            .fg(if app.layout_menu_open { theme.active_tab_text } else { theme.muted })
+                            .bg(if app.layout_menu_open { theme.accent } else { theme.active })
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .render(block, buf);
+            }
+        }
+        layout.hits.push(HitRegion { rect: block, target: HitTarget::LayoutMenuToggle });
         x = x.saturating_add(layout_width);
     }
     if app.layout_menu_open {
@@ -14272,6 +14354,240 @@ mod tests {
         assert!(agent_layout.hits.iter().all(|hit| !matches!(hit.target, HitTarget::Viewport) || hit.rect == agent_layout.viewport));
     }
 
+    /// The tab strip's own AddTab/LayoutMenuToggle controls: the STRIP
+    /// tier's real icon footprint now drives their own width instead of
+    /// the old literal `" + "`/`" [#] "` text widths (3/5 cells) --
+    /// `IconId::Add` at 2 cells (`icons::STRIP_SIXEL_ICON_CELLS_WIDE`, no
+    /// accent margin -- like `render_control_strip_button`'s own
+    /// `AddSpace`/`AddAgent`, a one-shot action, never a persisted
+    /// selected view), `IconId::Layout` at 3 (that same 2-cell icon plus
+    /// ONE leading margin column reserved for its own open/closed marker
+    /// -- see `tab_strip_layout_toggle_marks_open_state_with_an_accent_
+    /// bar_not_a_plate` for that marker itself). Both push a real STRIP-
+    /// tier sixel placement now, not the old bracket text.
+    #[test]
+    fn tab_strip_add_and_layout_controls_render_strip_icons_in_sixel_tier() {
+        let app = fixture(PtyColorMode::GateOverride);
+        assert_eq!(app.rail_icons, RailIcons::Sixel);
+        let mut buf = TerminalBuffer::new(100, 24);
+        let layout = render(&app, &mut buf);
+
+        let add_rect = layout
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::AddTab)
+            .expect("AddTab hit")
+            .rect;
+        let layout_rect = layout
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::LayoutMenuToggle)
+            .expect("LayoutMenuToggle hit")
+            .rect;
+
+        assert_eq!(add_rect.height, 1);
+        assert_eq!(add_rect.width, icons::STRIP_SIXEL_ICON_CELLS_WIDE);
+        assert_eq!(layout_rect.height, 1);
+        assert_eq!(layout_rect.width, 1 + icons::STRIP_SIXEL_ICON_CELLS_WIDE);
+        assert_eq!(
+            layout_rect.x,
+            add_rect.right(),
+            "the toggle sits immediately after the add control, no gap, matching the old adjacent text",
+        );
+
+        assert!(
+            layout.sixel_icons.iter().any(|placement| {
+                placement.icon == icons::IconId::Add
+                    && placement.size == SixelIconSize::Strip
+                    && placement.variant == icons::SixelVariant::GateActive
+                    && add_rect.contains(placement.rect.x, placement.rect.y)
+            }),
+            "{:?}",
+            layout.sixel_icons,
+        );
+        assert!(
+            layout.sixel_icons.iter().any(|placement| {
+                placement.icon == icons::IconId::Layout
+                    && placement.size == SixelIconSize::Strip
+                    && placement.variant == icons::SixelVariant::GateActive
+                    // The icon itself sits one column INSIDE the toggle's
+                    // own rect -- the leading column is the accent-bar
+                    // margin, never part of the icon (see this fn's own
+                    // doc comment above).
+                    && placement.rect.x == layout_rect.x + 1
+            }),
+            "{:?}",
+            layout.sixel_icons,
+        );
+
+        // Neither control paints its own old glyph as text any more --
+        // the real pixels are the flush hook's job, invisible to a
+        // `render()`-only cell-buffer inspection like this one.
+        let add_text = rect_text(&buf, add_rect);
+        assert!(!add_text.contains('+'), "{add_text:?}");
+        let layout_text = rect_text(&buf, layout_rect);
+        assert!(!layout_text.contains('#'), "{layout_text:?}");
+    }
+
+    /// `render_rail_button`'s own lesson, reused for this toggle: a
+    /// selected/open control never states a background of its own --
+    /// only `render_rail_button`'s own "▎" accent-bar marker (`theme.
+    /// active_tab_text` on the SAME `theme.active` every other cell on
+    /// this row already shows) marks it, painted into the leading margin
+    /// column the toggle's own width reserves for exactly this. The old
+    /// `theme.accent` plate under the `" [#] "` glyph is gone outright,
+    /// not just moved -- this asserts both that the marker appears when
+    /// open and that the control's body never states `theme.accent`
+    /// either way.
+    #[test]
+    fn tab_strip_layout_toggle_marks_open_state_with_an_accent_bar_not_a_plate() {
+        let mut app = fixture(PtyColorMode::GateOverride);
+        assert_eq!(app.rail_icons, RailIcons::Sixel);
+        let theme = Theme::for_mode(app.color_mode);
+
+        app.layout_menu_open = false;
+        let mut closed_buf = TerminalBuffer::new(100, 24);
+        let closed_layout = render(&app, &mut closed_buf);
+        let closed_rect = closed_layout
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::LayoutMenuToggle)
+            .expect("LayoutMenuToggle hit")
+            .rect;
+        assert_ne!(closed_buf.get(closed_rect.x, closed_rect.y).symbol, "▎");
+        assert_eq!(closed_buf.get(closed_rect.x, closed_rect.y).style.bg, theme.active);
+
+        app.layout_menu_open = true;
+        let mut open_buf = TerminalBuffer::new(100, 24);
+        let open_layout = render(&app, &mut open_buf);
+        let open_rect = open_layout
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::LayoutMenuToggle)
+            .expect("LayoutMenuToggle hit")
+            .rect;
+        // Same geometry whether open or closed -- the toggle never
+        // resizes itself to make room for its own marker.
+        assert_eq!(open_rect, closed_rect);
+        assert_eq!(open_buf.get(open_rect.x, open_rect.y).symbol, "▎");
+        assert_eq!(open_buf.get(open_rect.x, open_rect.y).style.fg, theme.active_tab_text);
+        // The bar is the ONLY marker: the body never states a background
+        // of its own, open or not -- never the old `theme.accent` plate.
+        assert_eq!(open_buf.get(open_rect.x, open_rect.y).style.bg, theme.active);
+        assert_ne!(open_buf.get(open_rect.x, open_rect.y).style.bg, theme.accent);
+    }
+
+    /// `RailIcons::Ascii` has no raster to swap in for these two controls
+    /// (see `icons.rs`'s own module doc comment: "no raster in that
+    /// tier") -- it must keep painting the EXACT old literal, padded
+    /// labels this fn always drew before today, at their old widths (3
+    /// for `" + "`, 5 for `" [#] "`), with the old `theme.accent` open-
+    /// state plate untouched; only `RailIcons::Sixel`'s own geometry and
+    /// marker changed. Both `HitTarget`s still resolve in EITHER tier --
+    /// only their own rect WIDTH differs, which is the expected effect of
+    /// `RailIcons::Sixel` now sizing off the icon's real width instead of
+    /// the old text.
+    #[test]
+    fn tab_strip_ascii_tier_keeps_its_old_text_and_both_controls_keep_their_hit_targets() {
+        let mut app = fixture(PtyColorMode::GateOverride);
+        app.rail_icons = RailIcons::Ascii;
+        let theme = Theme::for_mode(app.color_mode);
+        let mut buf = TerminalBuffer::new(100, 24);
+        let layout = render(&app, &mut buf);
+
+        let add_rect = layout
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::AddTab)
+            .expect("AddTab hit in Ascii tier")
+            .rect;
+        let layout_rect = layout
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::LayoutMenuToggle)
+            .expect("LayoutMenuToggle hit in Ascii tier")
+            .rect;
+        assert_eq!(add_rect.width, 3);
+        assert_eq!(layout_rect.width, 5);
+        assert_eq!(rect_text(&buf, add_rect), " + ");
+        assert_eq!(rect_text(&buf, layout_rect), " [#] ");
+        assert_eq!(buf.get(layout_rect.x, layout_rect.y).style.bg, theme.active);
+        assert!(layout.sixel_icons.is_empty());
+
+        app.layout_menu_open = true;
+        let mut open_buf = TerminalBuffer::new(100, 24);
+        let open_layout = render(&app, &mut open_buf);
+        let open_rect = open_layout
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::LayoutMenuToggle)
+            .expect("LayoutMenuToggle hit in Ascii tier while open")
+            .rect;
+        assert_eq!(rect_text(&open_buf, open_rect), " [#] ");
+        // Ascii keeps the OLD marker exactly -- a `theme.accent` plate
+        // under the glyph, never the sixel tier's own "▎" accent bar.
+        assert_eq!(open_buf.get(open_rect.x, open_rect.y).style.bg, theme.accent);
+        assert!(open_layout.sixel_icons.is_empty());
+    }
+
+    /// The layout-preset list drawn to the right of the toggle when open
+    /// keeps its own text-based entries unchanged (`format!(" {} ",
+    /// preset.id())`) but now starts wherever the NEW, narrower `Sixel`
+    /// tier control group actually ends, not the old wider text-based
+    /// one -- this is `controls_width`/`controls_right`'s own real
+    /// effect, not a separate code path of its own. Comparing the two
+    /// tiers' own first-preset start column is the actual proof the
+    /// geometry recompute reached the preset list at all: the `Sixel`
+    /// tier's own start must sit STRICTLY to the LEFT of `Ascii`'s (the
+    /// icons are narrower than the old padded text), and in both tiers
+    /// the first preset must start EXACTLY at the toggle's own right
+    /// edge (no gap, matching the pre-existing adjacency every other
+    /// control on this row already has).
+    #[test]
+    fn tab_strip_layout_preset_menu_starts_at_the_new_control_width_when_open() {
+        let mut app = fixture(PtyColorMode::GateOverride);
+        app.layout_menu_open = true;
+        assert_eq!(app.rail_icons, RailIcons::Sixel);
+
+        let mut sixel_buf = TerminalBuffer::new(100, 24);
+        let sixel_layout = render(&app, &mut sixel_buf);
+        let sixel_toggle_rect = sixel_layout
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::LayoutMenuToggle)
+            .expect("LayoutMenuToggle hit")
+            .rect;
+        let sixel_first_preset_rect = sixel_layout
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::LayoutPreset(LayoutPreset::ALL[0]))
+            .expect("first LayoutPreset hit")
+            .rect;
+        assert_eq!(sixel_first_preset_rect.x, sixel_toggle_rect.right());
+
+        app.rail_icons = RailIcons::Ascii;
+        let mut ascii_buf = TerminalBuffer::new(100, 24);
+        let ascii_layout = render(&app, &mut ascii_buf);
+        let ascii_toggle_rect = ascii_layout
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::LayoutMenuToggle)
+            .expect("LayoutMenuToggle hit")
+            .rect;
+        let ascii_first_preset_rect = ascii_layout
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::LayoutPreset(LayoutPreset::ALL[0]))
+            .expect("first LayoutPreset hit")
+            .rect;
+        assert_eq!(ascii_first_preset_rect.x, ascii_toggle_rect.right());
+
+        assert!(
+            sixel_first_preset_rect.x < ascii_first_preset_rect.x,
+            "the icon tier's own narrower controls must free up room, moving the preset list left: sixel={sixel_first_preset_rect:?} ascii={ascii_first_preset_rect:?}",
+        );
+    }
+
     /// The workspaces roster's own pre-strip fallback (panel too short
     /// for `control_strip_fits`, see `space_list_control_strip_falls_
     /// back_to_inline_buttons_when_the_panel_is_too_short` for the exact
@@ -18970,11 +19286,28 @@ mod tests {
 
         let layout = render(&app, &mut buf);
 
+        // The containment clause disambiguates from `render_tabs`'s own
+        // AddTab strip icon -- the SAME `IconId::Add` + `SixelIconSize::
+        // Strip` pair, drawn unconditionally in every chrome including
+        // `MenuPlacement::Modal` (see that fn's own always-run call in
+        // `render::render`) -- so this only ever matches the Agents
+        // roster's OWN AddAgent icon, the one this test is actually
+        // about, never whichever `IconId::Add` placement happens to sit
+        // first in `sixel_icons` this frame.
         let add_agent = layout
             .sixel_icons
             .iter()
-            .find(|placement| placement.icon == icons::IconId::Add && placement.size == SixelIconSize::Strip)
-            .unwrap_or_else(|| panic!("the Agents roster's own AddAgent strip icon must survive: {:?}", layout.sixel_icons));
+            .find(|placement| {
+                placement.icon == icons::IconId::Add
+                    && placement.size == SixelIconSize::Strip
+                    && layout.control_modal.contains(placement.rect.x, placement.rect.y)
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "the Agents roster's own AddAgent strip icon must survive inside {:?}: {:?}",
+                    layout.control_modal, layout.sixel_icons,
+                )
+            });
         assert!(
             layout.control_modal.contains(add_agent.rect.x, add_agent.rect.y),
             "the surviving icon must actually sit inside its own overlay's rect: {:?} vs {:?}",
@@ -19347,7 +19680,26 @@ mod tests {
             .map(|column| buffer.get(column, header.y + 1).symbol.as_str())
             .collect::<String>();
 
-        assert!(top.starts_with(" +  [#] "), "{top:?}");
+        // `fixture()` defaults to `RailIcons::Sixel` -- AddTab/
+        // LayoutMenuToggle now paint real STRIP-tier icons at the very
+        // start of this row (see `tab_strip_add_and_layout_controls_
+        // render_strip_icons_in_sixel_tier` for that coverage), not the
+        // old literal `" +  [#] "` text; that text is still exactly what
+        // `RailIcons::Ascii` paints (see `tab_strip_ascii_tier_keeps_its_
+        // old_text_and_both_controls_keep_their_hit_targets`).
+        assert!(!top.starts_with(" +  [#] "), "{top:?}");
+        assert!(
+            layout.hits.iter().any(|hit| {
+                hit.target == HitTarget::AddTab && layout.tabs.contains(hit.rect.x, hit.rect.y)
+            }),
+            "the tab strip must still carry its own AddTab control: {top:?}",
+        );
+        assert!(
+            layout.hits.iter().any(|hit| {
+                hit.target == HitTarget::LayoutMenuToggle && layout.tabs.contains(hit.rect.x, hit.rect.y)
+            }),
+            "the tab strip must still carry its own LayoutMenuToggle control: {top:?}",
+        );
         // `fixture()` defaults to (Sidebar, Split), which has no activity
         // rail at all -- the tab strip's own gear (an icon, never the
         // rejected "[S]" bracket text, see `render_tabs`'s own FIX5
@@ -19463,7 +19815,17 @@ mod tests {
             })
             .collect::<String>();
 
-        assert!(global.starts_with(" +  [#] "), "{global:?}");
+        // `App::default()` defaults to `RailIcons::Sixel` -- see
+        // `file_surface_separates_global_controls_pane_title_actions_and_
+        // scrollbar`'s own matching assertion for why this must no longer
+        // start with the old literal `" +  [#] "` text.
+        assert!(!global.starts_with(" +  [#] "), "{global:?}");
+        assert!(
+            layout.hits.iter().any(|hit| {
+                hit.target == HitTarget::AddTab && layout.tabs.contains(hit.rect.x, hit.rect.y)
+            }),
+            "the tab strip must still carry its own AddTab control: {global:?}",
+        );
         // The tab strip's Settings entry is an icon button, never the
         // rejected "[S]" bracket text -- see `file_surface_separates_
         // global_controls_pane_title_actions_and_scrollbar`'s own

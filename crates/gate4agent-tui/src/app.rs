@@ -2837,8 +2837,10 @@ pub struct HitRegion {
 /// single-row buttons in the Explorer/Git sidebar panels and their modals
 /// -- see `render::render_compact_icon_button`; `Strip`: the sidebar
 /// content panels' own control-plane strip asset (`icons::sixel_strip`,
-/// 2 cells wide x 1 row) -- see `render::render_control_strip_button`;
-/// `Gallery`: the icon gallery dev surface's own dedicated (6 cells wide
+/// 2 cells wide x 1 row) -- see `render::render_control_strip_button`,
+/// plus `render::render_tabs`'s own AddTab/LayoutMenuToggle controls,
+/// the SAME asset size reused rather than a new tier; `Gallery`: the
+/// icon gallery dev surface's own dedicated (6 cells wide
 /// x 3 rows) comparison-column asset (`icons::sixel_gallery`) -- see
 /// `render::render_icon_gallery`. The gallery's OTHER two comparison
 /// columns (the strip/rail tiers' own pixel sizes) reuse `Strip`/`Rail`
@@ -2876,8 +2878,10 @@ pub enum SixelIconSize {
 /// pusher from `app.icon_family` at every real button site (see `render::
 /// render_rail_button`/`render_control_strip_button`/`render_compact_
 /// icon_button`, each threaded an `IconFamily` alongside their existing
-/// `RailIcons` parameter), except the icon gallery's own dedicated
-/// comparison columns (`render::render_icon_gallery`), which push ONE
+/// `RailIcons` parameter; `render::render_tabs` reads `app.icon_family`
+/// directly instead, already having the full `App` in scope), except the
+/// icon gallery's own dedicated comparison columns (`render::render_icon_
+/// gallery`), which push ONE
 /// placement per family explicitly so both render side by side regardless
 /// of the owner's live preference. Included in this struct's own
 /// `PartialEq` (part of `client::flush_sixel_icon_into`'s gating

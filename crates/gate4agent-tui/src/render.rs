@@ -546,7 +546,7 @@ fn render_rail_button(
 
     if block.height < rail_button_body_rows(icons) {
         // Short-terminal fallback: the original thin single-row button.
-        let bg = if button.selected { theme.accent } else { theme.panel };
+        let bg = theme.panel;
         fill_rect(block, bg, buf);
         let has_accent_column = block.width >= 2;
         let label_area = if has_accent_column {
@@ -557,7 +557,7 @@ fn render_rail_button(
         Paragraph::new(centered_label(label, label_area.width as usize))
             .style(
                 Style::default()
-                    .fg(if button.selected { theme.active_tab_text } else { theme.muted })
+                    .fg(if button.selected { theme.text } else { theme.muted })
                     .bg(bg)
                     .add_modifier(if button.selected { Modifier::BOLD } else { Modifier::empty() }),
             )
@@ -571,43 +571,17 @@ fn render_rail_button(
         return;
     }
 
-    // An UN-selected button reads as flat with its own column -- it is
-    // not a real, deliberate state the owner needs to see, so it no
-    // longer states a background of its own at all: `theme.active`, the
-    // SAME colour `render_activity_rail`'s own panel fill already uses
-    // (`Color::Reset` in `PtyColorMode::Inherited`, so the button
-    // vanishes into whatever the terminal's real background is;
+    // No button states a background of its own, selected or not. The
+    // active view is already marked by the accent bar in the button's own
+    // left margin column, and a second, louder marker for the same state
+    // reads as a coloured plate under the icon rather than as selection.
+    // `theme.active` is the SAME colour `render_activity_rail`'s own
+    // panel fill uses -- `Color::Reset` in `PtyColorMode::Inherited`, so
+    // the button body is whatever the terminal's real background is;
     // `ACTIVE_BG` in `PtyColorMode::GateOverride`, that mode's own
-    // deliberate stated theme, unchanged). A SELECTED button IS a real
-    // state worth seeing, so it keeps its own accent regardless of mode.
-    // The sixel tier's selected accent must be the FIXED `MAUVE`
-    // constant specifically (never `theme.accent`, which is `Color::
-    // Magenta` -- an ANSI colour, not this exact truecolor -- in
-    // `PtyColorMode::Inherited`): `client::flush_sixel_icon_into`
-    // resolves the icon's own composited background via `icons::
-    // resolve_variant_background`, which always returns `icons::
-    // ACCENT_BG` (== `MAUVE`) for a selected sixel placement regardless
-    // of `PtyColorMode` -- this cell fill must match that exactly, in
-    // every mode, or the icon's own opaque rect reads as a plate against
-    // a differently-rendered accent underneath it. `Ascii` has no raster
-    // to keep in sync with, so it keeps using the mode-appropriate
-    // `theme.accent` exactly as it always did.
-    let bg = match icons {
-        RailIcons::Sixel => {
-            if button.selected {
-                MAUVE
-            } else {
-                theme.active
-            }
-        }
-        RailIcons::Ascii => {
-            if button.selected {
-                theme.accent
-            } else {
-                theme.active
-            }
-        }
-    };
+    // deliberate stated theme. Because the body never changes colour, the
+    // sixel placement never needs a second composited variant either.
+    let bg = theme.active;
     let body = Rect::new(
         block.x.saturating_add(1),
         block.y,
@@ -615,7 +589,7 @@ fn render_rail_button(
         block.height,
     );
     fill_rect(body, bg, buf);
-    let fg = if button.selected { theme.active_tab_text } else { theme.text };
+    let fg = theme.text;
     let style = Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD);
     match icons {
         RailIcons::Sixel => {
@@ -632,7 +606,7 @@ fn render_rail_button(
                 body.width.min(icons::SIXEL_ICON_CELLS_WIDE),
                 body.height.min(icons::SIXEL_ICON_CELLS_TALL),
             );
-            let variant = if button.selected { icons::SixelVariant::GateAccent } else { icons::SixelVariant::GateActive };
+            let variant = icons::SixelVariant::GateActive;
             layout.sixel_icons.push(SixelIconPlacement { icon: button.icon, rect: icon_area, variant, size: SixelIconSize::Rail, family });
         }
         RailIcons::Ascii => {
@@ -17825,8 +17799,9 @@ mod tests {
         let agents_hit = native_layout.hits.iter().find(|hit| {
             hit.target == HitTarget::ActivitySection(ControlSection::Agents)
         }).unwrap();
-        let accent = Theme::for_mode(app.color_mode).accent;
-        assert_eq!(native_selected.get(agents_hit.rect.x, agents_hit.rect.y).style.bg, accent);
+        // Selection shows as the accent bar in the margin column, not as
+        // a background under the button.
+        assert_eq!(native_selected.get(agents_hit.rect.x, agents_hit.rect.y).symbol, "▎");
         assert!(!native_layout.hits.iter().any(|hit| {
             hit.target == HitTarget::RosterMode(RosterMode::NativeSessions)
         }));
@@ -17893,8 +17868,16 @@ mod tests {
             .find(|hit| hit.target == HitTarget::ActivitySection(ControlSection::Git))
             .expect("git rail button");
         assert_eq!(buf.get(git_hit.rect.x, git_hit.rect.y).symbol, "▎");
-        let accent = Theme::for_mode(app.color_mode).accent;
-        assert_eq!(buf.get(git_hit.rect.x, git_hit.rect.y).style.bg, accent);
+        // The bar is the ONLY marker: an active button's body stays the
+        // same colour as an inactive one, so selection never reads as a
+        // coloured plate under the icon.
+        let theme = Theme::for_mode(app.color_mode);
+        assert_eq!(buf.get(git_hit.rect.x, git_hit.rect.y).style.bg, theme.active);
+        assert_eq!(
+            buf.get(git_hit.rect.x + 1, git_hit.rect.y).style.bg,
+            theme.active,
+            "an active button's body must not state a background of its own",
+        );
 
         // FIX3: Agents now shares `ActivitySection` with Files/Git.
         // FIX2/FIX4: Board (`ActivityBoard`) is included here too, so this
@@ -18436,14 +18419,20 @@ mod tests {
             "an inactive button's own body must be indistinguishable from the rail column around it, not a plate"
         );
 
-        // The selected Files button's own accent must stay inside its
-        // own rect -- the inactive Git button's margin column sampled
-        // above already proves this stayed `Color::Reset`, not `MAUVE`.
+        // The SELECTED button's body is the same background as every
+        // other one. Selection is carried by the accent bar in the
+        // margin column alone; a second marker under the icon reads as a
+        // plate, which is the whole defect this rail has been chasing.
         let selected_margin_y = files_hit.rect.y + files_hit.rect.height / 2;
         assert_eq!(
             buf.get(files_hit.rect.x + 1, selected_margin_y).style.bg,
-            MAUVE,
-            "the selected button's own body must carry the fixed accent background, even in Inherited mode"
+            Color::Reset,
+            "a selected button's body must be indistinguishable from an inactive one",
+        );
+        assert_eq!(
+            buf.get(files_hit.rect.x, selected_margin_y).symbol,
+            "▎",
+            "which leaves the accent bar as the only thing marking it selected",
         );
     }
 

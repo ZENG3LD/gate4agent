@@ -3418,11 +3418,10 @@ fn render_surface_pane(
 /// FIX4's own main deliverable, widened by a later wave to be the Lucide-
 /// vs-codicons comparison surface: the icon gallery dev surface (`app::
 /// SurfaceTab::IconGallery`) -- a read-only comparison grid, one row per
-/// icon ([`GALLERY_ICON_IDS`], a representative set spanning the activity
-/// rail's own 7, a few file-op/status icons, and the two documented
-/// Lucide mapping gaps `CircleFilled`/`RunAll` -- see `icons.rs`'s own
-/// "Lucide" doc section -- so the gap itself is visible here, not just
-/// asserted in a report), one column PAIR per size/tier variant: the
+/// icon ([`GALLERY_ICON_IDS`], the WHOLE catalog -- this surface is where
+/// the owner decides which glyph belongs on which control, and that
+/// cannot be decided about icons it does not show), one column PAIR per
+/// size/tier variant: the
 /// strip tier's own pixel size (`icons::STRIP_SIXEL_ICON_*` -- the SAME
 /// asset the control-plane strip already ships), the rail tier's own
 /// pixel size (`icons::SIXEL_ICON_*` -- ditto the activity rail), a
@@ -3462,29 +3461,14 @@ fn render_icon_gallery(
     if area.width == 0 || area.height == 0 {
         return;
     }
-    const GALLERY_ICON_IDS: [icons::IconId; 14] = [
-        icons::IconId::Files,
-        icons::IconId::SourceControl,
-        icons::IconId::Person,
-        icons::IconId::Project,
-        icons::IconId::SettingsGear,
-        icons::IconId::NewFile,
-        icons::IconId::NewFolder,
-        icons::IconId::Refresh,
-        icons::IconId::Trash,
-        icons::IconId::Add,
-        icons::IconId::Play,
-        icons::IconId::Warning,
-        // The two reported Lucide mapping gaps (see `icons.rs`'s own
-        // "Lucide" doc section: `CircleFilled` -- Lucide ships no solid-
-        // fill glyph at all, a style gap, not a naming one; `RunAll` --
-        // no Lucide glyph distinctly means "run everything" rather than
-        // colliding with `Play`'s own meaning) -- included here so their
-        // own `n/a` swatch (`render_gallery_size_swatch`) is something
-        // the owner can actually see, not just read about.
-        icons::IconId::CircleFilled,
-        icons::IconId::RunAll,
-    ];
+    // Every icon the catalog ships, not a curated subset: this surface
+    // exists so the owner can decide which glyph belongs on which
+    // control, and a decision cannot be made about icons that are not on
+    // screen. The two documented Lucide mapping gaps (`CircleFilled`,
+    // `RunAll` -- see `icons.rs`'s own "Lucide" doc section) come along
+    // with the rest and show their own `n/a` swatch, so the gap is
+    // something to look at rather than something to read about.
+    const GALLERY_ICON_IDS: [icons::IconId; icons::IconId::ALL.len()] = icons::IconId::ALL;
     const NAME_COL_WIDTH: u16 = 15;
     const SIZE_COL_WIDTH: u16 = 11;
     const ASCII_COL_WIDTH: u16 = 8;
@@ -18687,12 +18671,17 @@ mod tests {
         assert_eq!(app.reduce(crate::UiKey::Char('g')), AppAction::None);
         assert_eq!(app.rail_icons, RailIcons::Sixel);
 
-        // Tall enough to show every one of the 14 `GALLERY_ICON_IDS` rows
-        // (including the two gap icons appended at the end) without
-        // scrolling -- this test checks a row near the top (Files) and
-        // the last two rows (the gap icons) in the SAME render.
+        // The gallery lists the WHOLE catalog, which no terminal shows at
+        // once, so the two halves of this check need two renders: the
+        // rows near the top unscrolled, and the Lucide gap icons after
+        // scrolling far enough to reach them. A scroll past the end
+        // clamps, so this asks for the last page without computing it.
         let mut buf = TerminalBuffer::new(160, 70);
         let layout = render(&app, &mut buf);
+        let mut tail_app = app.clone();
+        tail_app.icon_gallery_scroll = u16::MAX;
+        let mut tail_buf = TerminalBuffer::new(160, 70);
+        let tail_layout = render(&tail_app, &mut tail_buf);
         // Same whole-viewport text blob `icon_gallery_renders_the_
         // expected_grid_in_each_tier_and_its_tab_opens_and_closes` already
         // scans above -- the gallery's own header row sits below the pane's
@@ -18724,16 +18713,16 @@ mod tests {
             // `CircleFilled` is a documented Lucide mapping gap (see
             // `icons.rs`'s own "Lucide" doc section) -- exactly one
             // placement (Codicons), never a silently-missing Lucide one.
-            let gap_placements: Vec<_> = layout
+            let gap_placements: Vec<_> = tail_layout
                 .sixel_icons
                 .iter()
-                .filter(|placement| placement.icon == icons::IconId::CircleFilled && placement.size == size)
+                .filter(|placement| placement.icon == icons::IconId::RunAll && placement.size == size)
                 .collect();
-            assert_eq!(gap_placements.len(), 1, "{size:?}: CircleFilled must get exactly one placement (Codicons only): {gap_placements:?}");
+            assert_eq!(gap_placements.len(), 1, "{size:?}: RunAll must get exactly one placement (Codicons only): {gap_placements:?}");
             assert_eq!(gap_placements[0].family, IconFamily::Codicons);
         }
-        let gallery_text = rect_text(&buf, layout.viewport);
-        assert!(gallery_text.contains("n/a"), "the CircleFilled/RunAll gap rows must show a visible n/a label: {gallery_text:?}");
+        let gallery_text = rect_text(&tail_buf, tail_layout.viewport);
+        assert!(gallery_text.contains("n/a"), "the RunAll gap row must show a visible n/a label: {gallery_text:?}");
     }
 
     /// FIX1's own reservation generalized: the icon gallery is a

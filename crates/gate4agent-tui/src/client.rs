@@ -96,6 +96,7 @@ use crate::diagnostics::RuntimeDiagnostic;
 use crate::icons;
 use crate::preferences::{self, UiPreferences};
 use crate::render;
+use crate::terminal_bg;
 
 #[cfg(test)]
 use crate::app::{SurfaceTab, WorkspaceGitTabKey};
@@ -682,6 +683,14 @@ impl Drop for TerminalGuard {
 
 pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
     let RunOptions { operator, kanban_default, color_mode_override } = options;
+    // MUST run before `TerminalGuard::enter()` below (raw mode + the
+    // alternate screen + mouse capture + bracketed paste) ever touches
+    // the console -- see `terminal_bg`'s own module doc comment for the
+    // full OSC 11 exchange and why this exact ordering is load-bearing.
+    // `resolve_background` applies `terminal_bg::FALLBACK_BACKGROUND`
+    // whenever the terminal never answers (or answers something
+    // malformed) -- never blocks past `terminal_bg::QUERY_TIMEOUT`.
+    let terminal_background = terminal_bg::resolve_background(terminal_bg::query_osc11_background(terminal_bg::QUERY_TIMEOUT));
     let preferences_path = preferences::default_path();
     let loaded_preferences = preferences_path.as_deref().and_then(|path| match UiPreferences::load(path) {
         Ok(preferences) => Some(preferences),
@@ -707,6 +716,7 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
     if let Some(color_mode) = color_mode_override {
         app.color_mode = color_mode;
     }
+    app.terminal_background = terminal_background;
     app.terminal_cols = cols;
     app.terminal_rows = rows;
     // Set by `harness_event_subscription_worker` the moment a subscription
@@ -1739,6 +1749,30 @@ struct SixelEmitState {
     bottom_row_skip_active: bool,
 }
 
+/// Unifies the two shapes `flush_sixel_icon_into` can resolve a placement
+/// to under one `Display` impl, purely so a single `Print(encoded)` call
+/// site can print either -- `icons::sixel_compact_family` returns a
+/// `&'static str` straight out of a `LazyLock` (never re-encoded, never
+/// allocated per call), while `icons::sixel_family`/`sixel_strip_family`/
+/// `sixel_gallery_family` return an `Arc<str>` out of the runtime
+/// compositing cache (see `icons.rs`'s own "Sixel background variants"
+/// doc section) -- wrapping the `&'static str` case in a fresh `Arc`
+/// just to match the other three would allocate and copy on every single
+/// compact-tier placement, every frame, for no reason at all.
+enum RenderedSixel {
+    Cached(std::sync::Arc<str>),
+    Static(&'static str),
+}
+
+impl std::fmt::Display for RenderedSixel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cached(encoded) => f.write_str(encoded),
+            Self::Static(encoded) => f.write_str(encoded),
+        }
+    }
+}
+
 /// How one of this frame's placements compares to what `state` last
 /// painted there -- see `flush_sixel_icon_into`'s own doc comment for the
 /// full self-healing rationale behind each outcome.
@@ -1932,11 +1966,27 @@ fn flush_sixel_icon_into<W: io::Write>(
         // glyph here just leaves that body without its icon for the one
         // (icon, family) pair with no asset to resolve, never a panic and
         // never a silent fall-back to the other family's own asset.
+        //
+        // Every sixel-compositing size (Rail/Strip/Gallery) resolves
+        // `placement.variant` to a concrete background FIRST (`icons::
+        // resolve_variant_background`, see that fn's own doc comment) --
+        // Compact never composites against a background at all (real
+        // transparency, see `icons::sixel_compact_family`'s own doc
+        // comment), so it skips this resolution entirely.
         let encoded = match placement.size {
-            SixelIconSize::Rail => icons::sixel_family(placement.icon, placement.family, placement.variant),
-            SixelIconSize::Compact => icons::sixel_compact_family(placement.icon, placement.family),
-            SixelIconSize::Strip => icons::sixel_strip_family(placement.icon, placement.family, placement.variant),
-            SixelIconSize::Gallery => icons::sixel_gallery_family(placement.icon, placement.family, placement.variant),
+            SixelIconSize::Rail => {
+                let background = icons::resolve_variant_background(placement.variant, app.color_mode, app.terminal_background);
+                icons::sixel_family(placement.icon, placement.family, background).map(RenderedSixel::Cached)
+            }
+            SixelIconSize::Compact => icons::sixel_compact_family(placement.icon, placement.family).map(RenderedSixel::Static),
+            SixelIconSize::Strip => {
+                let background = icons::resolve_variant_background(placement.variant, app.color_mode, app.terminal_background);
+                icons::sixel_strip_family(placement.icon, placement.family, background).map(RenderedSixel::Cached)
+            }
+            SixelIconSize::Gallery => {
+                let background = icons::resolve_variant_background(placement.variant, app.color_mode, app.terminal_background);
+                icons::sixel_gallery_family(placement.icon, placement.family, background).map(RenderedSixel::Cached)
+            }
         };
         let Some(encoded) = encoded else {
             continue;
@@ -5723,6 +5773,31 @@ mod tests {
         }
     }
 
+    /// Mirrors exactly what `flush_sixel_icon_into` itself computes for a
+    /// rail-tier placement (`icons::resolve_variant_background` then
+    /// `icons::sixel_family`) -- these tests assert against the SAME
+    /// resolved background production code would actually use for
+    /// `app`'s own `color_mode`/`terminal_background` (every fixture
+    /// below is `App::default()`, so this is always `terminal_bg::
+    /// FALLBACK_BACKGROUND` for `GateActive`, `icons::ACCENT_BG` for
+    /// `GateAccent`), never a background this test picked independently.
+    fn expected_rail_sixel(app: &App, id: icons::IconId, variant: icons::SixelVariant) -> std::sync::Arc<str> {
+        let background = icons::resolve_variant_background(variant, app.color_mode, app.terminal_background);
+        icons::sixel_family(id, IconFamily::Codicons, background).expect("codicons never gap")
+    }
+
+    /// Strip-tier equivalent of [`expected_rail_sixel`].
+    fn expected_strip_sixel(app: &App, id: icons::IconId, variant: icons::SixelVariant) -> std::sync::Arc<str> {
+        let background = icons::resolve_variant_background(variant, app.color_mode, app.terminal_background);
+        icons::sixel_strip_family(id, IconFamily::Codicons, background).expect("codicons never gap")
+    }
+
+    /// Gallery-tier equivalent of [`expected_rail_sixel`].
+    fn expected_gallery_sixel(app: &App, id: icons::IconId, variant: icons::SixelVariant) -> std::sync::Arc<str> {
+        let background = icons::resolve_variant_background(variant, app.color_mode, app.terminal_background);
+        icons::sixel_gallery_family(id, IconFamily::Codicons, background).expect("codicons never gap")
+    }
+
     /// A `TerminalBuffer` sized to `app`'s own terminal dimensions, filled
     /// with nothing but default (space, unstyled) cells -- stands in for
     /// `screen.current()` in tests that don't care what the "real" screen
@@ -5800,7 +5875,7 @@ mod tests {
         let output = String::from_utf8_lossy(&written);
         assert!(output.contains('Q'), "the vacated old rect (x=2) must be cleared using the real screen content");
         assert!(
-            output.contains(icons::sixel(icons::IconId::Files, icons::SixelVariant::GateActive)),
+            output.contains(expected_rail_sixel(&app, icons::IconId::Files, icons::SixelVariant::GateActive).as_ref()),
             "the new rect (x=9) must be emitted"
         );
 
@@ -5839,7 +5914,7 @@ mod tests {
         let output = String::from_utf8_lossy(&written);
         assert!(output.contains('Z'), "the disturbed rect must be re-synced from the real screen content: {output}");
         assert_eq!(
-            output.matches(icons::sixel(icons::IconId::Files, icons::SixelVariant::GateActive)).count(),
+            output.matches(expected_rail_sixel(&app, icons::IconId::Files, icons::SixelVariant::GateActive).as_ref()).count(),
             1,
             "a disturbed-but-still-listed placement must be re-emitted exactly once, not zero and not twice: {output}"
         );
@@ -5876,10 +5951,10 @@ mod tests {
         app.layout.sixel_icons = vec![new_placement];
         written.clear();
         flush_sixel_icon_into(&mut written, &app, &screen, &mut state).unwrap();
-        let sixel_bytes = icons::sixel(icons::IconId::Files, icons::SixelVariant::GateActive);
+        let sixel_bytes = expected_rail_sixel(&app, icons::IconId::Files, icons::SixelVariant::GateActive);
         let output = String::from_utf8_lossy(&written);
         assert_eq!(
-            output.matches(sixel_bytes).count(),
+            output.matches(sixel_bytes.as_ref()).count(),
             1,
             "the icon must appear at its new rect exactly once, never doubled beside the old one: {output}"
         );
@@ -5938,7 +6013,7 @@ mod tests {
         flush_sixel_icon_into(&mut written, &app, &screen, &mut state).unwrap();
         let output = String::from_utf8_lossy(&written);
         assert!(
-            output.contains(icons::sixel(icons::IconId::Files, icons::SixelVariant::GateActive)),
+            output.contains(expected_rail_sixel(&app, icons::IconId::Files, icons::SixelVariant::GateActive).as_ref()),
             "the rail icon must be re-emitted once the modal that covered it closes and the cells revert: {output}"
         );
     }
@@ -5970,8 +6045,8 @@ mod tests {
             "every previously emitted rect must be cleared"
         );
         assert!(
-            !output.contains(icons::sixel(icons::IconId::Files, icons::SixelVariant::GateActive))
-                && !output.contains(icons::sixel(icons::IconId::Trash, icons::SixelVariant::GateActive)),
+            !output.contains(expected_rail_sixel(&app, icons::IconId::Files, icons::SixelVariant::GateActive).as_ref())
+                && !output.contains(expected_rail_sixel(&app, icons::IconId::Trash, icons::SixelVariant::GateActive).as_ref()),
             "nothing must be emitted once the tier switches away from sixel"
         );
         assert!(state.last.is_empty(), "a tier switch must forget every remembered placement");
@@ -6107,7 +6182,7 @@ mod tests {
             "force_next must clear the remembered rect for real, reading the current screen content"
         );
         assert!(
-            output.contains(icons::sixel(icons::IconId::Files, icons::SixelVariant::GateActive)),
+            output.contains(expected_rail_sixel(&app, icons::IconId::Files, icons::SixelVariant::GateActive).as_ref()),
             "force_next must also re-emit the placement even though nothing in sixel_icons changed"
         );
     }
@@ -6150,7 +6225,7 @@ mod tests {
             "compact placement must emit the compact-tier sixel bytes"
         );
         assert!(
-            !output.contains(icons::sixel(icons::IconId::NewFile, icons::SixelVariant::GateActive)),
+            !output.contains(expected_rail_sixel(&app, icons::IconId::NewFile, icons::SixelVariant::GateActive).as_ref()),
             "compact placement must NOT emit the rail-tier sixel bytes"
         );
     }
@@ -6175,11 +6250,11 @@ mod tests {
         flush_sixel_icon_into(&mut written, &app, &screen, &mut state).unwrap();
         let output = String::from_utf8_lossy(&written);
         assert!(
-            output.contains(icons::sixel_strip(icons::IconId::NewFile, icons::SixelVariant::GateActive)),
+            output.contains(expected_strip_sixel(&app, icons::IconId::NewFile, icons::SixelVariant::GateActive).as_ref()),
             "strip placement must emit the strip-tier sixel bytes"
         );
         assert!(
-            !output.contains(icons::sixel(icons::IconId::NewFile, icons::SixelVariant::GateActive)),
+            !output.contains(expected_rail_sixel(&app, icons::IconId::NewFile, icons::SixelVariant::GateActive).as_ref()),
             "strip placement must NOT emit the rail-tier sixel bytes"
         );
         assert!(
@@ -6207,15 +6282,15 @@ mod tests {
         flush_sixel_icon_into(&mut written, &app, &screen, &mut state).unwrap();
         let output = String::from_utf8_lossy(&written);
         assert!(
-            output.contains(icons::sixel_gallery(icons::IconId::NewFile, icons::SixelVariant::GateActive)),
+            output.contains(expected_gallery_sixel(&app, icons::IconId::NewFile, icons::SixelVariant::GateActive).as_ref()),
             "gallery placement must emit the gallery-tier sixel bytes"
         );
         assert!(
-            !output.contains(icons::sixel(icons::IconId::NewFile, icons::SixelVariant::GateActive)),
+            !output.contains(expected_rail_sixel(&app, icons::IconId::NewFile, icons::SixelVariant::GateActive).as_ref()),
             "gallery placement must NOT emit the rail-tier sixel bytes"
         );
         assert!(
-            !output.contains(icons::sixel_strip(icons::IconId::NewFile, icons::SixelVariant::GateActive)),
+            !output.contains(expected_strip_sixel(&app, icons::IconId::NewFile, icons::SixelVariant::GateActive).as_ref()),
             "gallery placement must NOT emit the strip-tier sixel bytes"
         );
     }
@@ -6241,11 +6316,11 @@ mod tests {
         flush_sixel_icon_into(&mut written, &app, &screen, &mut state).unwrap();
         let output = String::from_utf8_lossy(&written);
         assert!(
-            output.contains(icons::sixel(icons::IconId::Files, icons::SixelVariant::GateAccent)),
+            output.contains(expected_rail_sixel(&app, icons::IconId::Files, icons::SixelVariant::GateAccent).as_ref()),
             "GateAccent placement must emit the GateAccent-variant sixel bytes"
         );
         assert!(
-            !output.contains(icons::sixel(icons::IconId::Files, icons::SixelVariant::GateActive)),
+            !output.contains(expected_rail_sixel(&app, icons::IconId::Files, icons::SixelVariant::GateActive).as_ref()),
             "GateAccent placement must NOT emit the GateActive-variant sixel bytes"
         );
     }

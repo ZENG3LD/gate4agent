@@ -68,24 +68,30 @@ What this does, every run:
      `rasterize_gallery_sixel` below for the exact filter graphs,
      reproduced in each function's own doc comment so a human can re-run
      the equivalent `resvg`/`ffmpeg` CLI invocations by hand without
-     reading Python. Each tier's own rail/strip/gallery variant then
-     derives its `_gate`/`_gate_active`/`_gate_accent` (exact background,
-     gamma-correct blend) and plain `Transparent` (alpha-precorrected)
-     outputs from that SAME rasterized buffer -- see `ensure_assets`'s
-     own doc comment for why the ordering there matters. SKIPPED
-     (idempotent, no network/subprocess work at all) for any icon whose
-     outputs already exist on disk at the expected byte length, unless
-     `--force`. Lucide reuses these EXACT SAME rasterize functions
-     unchanged (see `ensure_lucide_assets` and friends, right below the
-     codicon `ensure_*` functions) -- the lattice-fit machinery cause 6
-     below describes is family-agnostic, only the fetch/patch step
-     (step 1/2 above) differs.
+     reading Python. This tool writes ONLY that raw, TRUE-coverage buffer
+     to disk (`<stem>.rgba`/`<stem>_strip.rgba`/`<stem>_gallery.rgba`/
+     `<stem>_compact.rgba`) -- it no longer derives any background-
+     composited variant at all (see cause 1 below for why baking a fixed
+     background here was itself the defect this tool used to ship: the
+     button's own real background is a RUNTIME fact -- either a live OSC
+     11 terminal query or the app's own override theme, decided per RUN,
+     never knowable at bake time -- so compositing now happens in Rust,
+     on demand, against whichever background is actually in play; see
+     `../src/icons.rs::composite_over_background`). SKIPPED (idempotent,
+     no network/subprocess work at all) for any icon whose raw outputs
+     already exist on disk at the expected byte length, unless `--force`.
+     Lucide reuses these EXACT SAME rasterize functions unchanged (see
+     `ensure_lucide_assets` and friends, right below the codicon `ensure_
+     *` functions) -- the lattice-fit machinery cause 6 below describes is
+     family-agnostic, only the fetch/patch step (step 1/2 above) differs.
   4. Regenerate `src/icons/catalog.rs` from the FULL manifest (only when
      not restricted by `--only`) -- one `IconId` enum variant (shared by
-     both families), one codicon sixel `LazyLock<String>` per tier/
-     variant, one Lucide `Option`-wrapped equivalent per tier/variant
-     (`None` for the two `LUCIDE_GAPS` icons), one ascii literal, per
-     icon.
+     both families), one raw-bytes lookup per tier/family (the compact
+     tier ALSO keeps its own pre-encoded `LazyLock<String>`, see cause 1
+     below for why compact is the one tier that stays exactly as it was),
+     one Lucide `Option`-wrapped raw-bytes lookup per tier (`None` for the
+     two `LUCIDE_GAPS` icons), one ascii literal, one `lucide_slug`
+     mapping entry, per icon.
   5. Bake `LUCIDE_SLUGS`' own assets (skipping `LUCIDE_GAPS` entirely --
      no file, no catalog entry, a real gap, not an invented substitute).
   6. Print a report: the full `IconId` -> Lucide slug mapping, the
@@ -118,36 +124,57 @@ own doc comments and this crate's own git history.
    partial-coverage pixel DOES survive the threshold, the only RGB this
    encoder ever sees for it is the flat, un-blended ink colour (see
    `../icons.rs`'s own module doc on straight alpha) -- so anti-aliasing
-   cannot survive this encoder in alpha at all, only in RGB. FIX:
-   composite EVERY sixel-tier icon (rail/strip/gallery -- compact is out
-   of scope, see `ensure_compact_assets`'s own doc comment) over the EXACT
-   background colour the button paints (`GATE_ACTIVE_BG_RGB`/
-   `GATE_ACCENT_BG_RGB` below, hand-synced to `render.rs`'s own
-   `ACTIVE_BG`/`MAUVE`), fully opaque, so the encoder's threshold and the
-   terminal's transparency support both become irrelevant -- there is no
-   transparent pixel left to mishandle, and the anti-aliasing this buys
-   back rides in the RGB channels instead, where the encoder's own hard
-   threshold cannot touch it. This is done as a SEPARATE, pure-Python
-   compositing pass (`composite_over_background`) over an already-
-   rasterized buffer -- never a second resvg/ffmpeg call -- so it can
-   never regress into cause 2's own double-resampling anti-pattern. This
-   USED to be possible only for `PtyColorMode::GateOverride`, whose panel/
-   rail colours are fixed, known constants -- `PtyColorMode::Inherited`
-   read as having no knowable exact background (crossterm has no reliable
-   query for the terminal's own background colour, the same gap
-   `icons.rs::ASSUMED_CELL_WIDTH_PX`'s own doc comment already names for
-   cell-pixel size). That premise was the actual bug: the background was
-   never unknowable at RENDER time, only un-PAINTED -- `render_rail_
-   button`/`render_control_strip_button`/the icon gallery swatches simply
-   left it to the terminal's own default instead of stating one. Now every
-   icon-bearing button paints this SAME explicit truecolor background in
-   EVERY `PtyColorMode` (see cause 4 below, retired), so there is exactly
-   ONE composited asset per background to bake, never a mode-dependent
-   pair. The rail tier has two backgrounds (`theme.active` at rest,
-   `theme.accent` selected) so it gets two composited variants
-   (`SixelVariant::GateActive`/`GateAccent`); the strip/gallery tiers below
-   have exactly one (neither ever shows a selected state), so each gets
-   one.
+   cannot survive this encoder in alpha at all, only in RGB. FIX: composite
+   EVERY sixel-tier icon (rail/strip/gallery -- compact is out of scope,
+   see `ensure_compact_assets`'s own doc comment) over the EXACT
+   background colour the button actually shows there, fully opaque, so
+   the encoder's threshold and the terminal's transparency support both
+   become irrelevant -- there is no transparent pixel left to mishandle,
+   and the anti-aliasing this buys back rides in the RGB channels
+   instead, where the encoder's own hard threshold cannot touch it.
+
+   FIRST ITERATION (retired) -- baked a FIXED composite per background at
+   THIS tool's own bake time (`composite_over_background`, a pure-Python
+   pass over an already-rasterized buffer -- never a second resvg/ffmpeg
+   call, so it could never regress into cause 2's own double-resampling
+   anti-pattern), against two hand-picked constants
+   (`GATE_ACTIVE_BG_RGB`/`GATE_ACCENT_BG_RGB`, hand-synced to `render.rs`'s
+   own `ACTIVE_BG`/`MAUVE`) written into every icon-bearing button's own
+   cell background UNCONDITIONALLY, in every `PtyColorMode` (see cause 4
+   below, retired). That traded the dirty-edge defect for a NEW one: in
+   `PtyColorMode::Inherited` the terminal's own real background is neither
+   of those two constants (measured on the owner's own Windows Terminal:
+   (12,12,12), nowhere close to `ACTIVE_BG`'s (30,30,46)), so every icon-
+   bearing surface now painted a visibly LIGHTER, "standing out" plate
+   against the actually-darker terminal around it -- the button's own
+   stated background was simply wrong, not merely un-painted. The
+   underlying premise ("the background is unknowable at bake time, so
+   fix ONE and paint it everywhere") was itself the mistake: a terminal's
+   real background is not a build-time fact at all, it is whatever THAT
+   terminal reports at THAT run, over OSC 11 (`ESC ] 11 ; ? BEL`) --
+   knowable at RUNTIME, never at bake time, and never a single constant
+   across every environment this binary ships to.
+
+   CURRENT FIX -- compositing moved OUT of this tool entirely and into
+   Rust, at RUNTIME (`../src/icons.rs::composite_over_background`, the
+   exact same linear-light arithmetic cause 3 below established, ported
+   byte-for-byte rather than re-derived): the client queries the real
+   terminal background once at startup (`client.rs`, before the alternate
+   screen takes over stdin) and composites each icon on demand against
+   whichever concrete background is actually live for that placement --
+   the queried terminal colour (or a documented dark fallback if the
+   terminal never answers) for an UN-selected button in `PtyColorMode::
+   Inherited`, the app's own fixed `GateOverride` theme colour for that
+   same mode, and the fixed selected-state accent (`render.rs`'s own
+   `MAUVE`) wherever a button is genuinely selected -- cached by (icon,
+   tier, family, background RGB) so the encode itself still only happens
+   once per distinct combination actually seen, never per frame. This
+   tool's OWN job shrank accordingly: it rasterizes and ships ONLY the
+   raw, TRUE-coverage source buffer per icon/tier/family (`ensure_assets`/
+   `ensure_strip_assets`/`ensure_gallery_assets` and their Lucide
+   equivalents below) -- there is no more `_gate`/`_gate_active`/
+   `_gate_accent` variant baked here at all, and no more `GATE_ACTIVE_BG_
+   RGB`/`GATE_ACCENT_BG_RGB`/`composite_over_background` in this file.
 
 2. BLURRED STROKES -- diagnosed as "rasterized on a non-integer scale from
    a 24-unit source grid"; PARTIALLY CONFIRMED, PARTIALLY REFUTED once
@@ -174,32 +201,34 @@ own doc comments and this crate's own git history.
      pixel-size fix, orthogonal to this one).
 
 3. GAMMA-SPACE COMPOSITING (anti-aliased edges read grainy/washed-out,
-   worst at the smallest tier) -- CONFIRMED. `composite_over_background`
-   used to blend the straight 8-bit sRGB channel bytes directly (`out =
-   ink*(a/255) + bg*(1-a/255)`), which is wrong: sRGB is a non-linear
-   encoding of light, so a coverage weight (what `a` actually is here --
-   resvg's own straight-alpha convention, see `../icons.rs`'s own module
-   doc) must be blended in LINEAR light, not in the gamma-encoded byte
-   domain. Against this crate's own ink `#cdd6f4` (204,214,242) on a
-   near-black terminal background (12,12,12) the error is large and
-   systematic (R channel): 25% coverage -> naive 60, correct 109; 50% ->
-   naive 108, correct 150; 75% -> naive 156, correct 180 -- every
-   anti-aliased edge pixel lands 24-49 levels too dark. A codicon stroke
-   is ~1.5 units in a 24-unit viewBox -- at the strip tier's own ~19px
-   height that is barely more than one device pixel, i.e. ALMOST ENTIRELY
-   edge pixels, which is exactly why the small tier reads as grainy and
-   washed out while the rail tier (a wider stroke in device pixels,
-   surviving core ink pixels) reads acceptable. FIX: `composite_over_
-   background` now converts both the ink and the background from sRGB to
-   linear (`srgb_to_linear`, the exact piecewise transfer function -- the
-   0.04045 / 12.92 / 2.4 form, NOT a 2.2-power approximation), blends by
-   the pixel's own TRUE coverage in linear space, then converts back
-   (`linear_to_srgb`). Governs every rail/strip/gallery sixel-tier output
-   this tool ships now (`GateActive`/`GateAccent`, strip `_gate`, gallery
-   `_gate`) -- since cause 4 below was retired, those pre-composited
-   variants are the ONLY sixel-tier output those three tiers have, so this
-   exact (never approximated) blend is what every anti-aliased pixel a
-   user actually sees goes through, not a special case for one mode.
+   worst at the smallest tier) -- CONFIRMED. A naive compositor blends the
+   straight 8-bit sRGB channel bytes directly (`out = ink*(a/255) +
+   bg*(1-a/255)`), which is wrong: sRGB is a non-linear encoding of
+   light, so a coverage weight (what `a` actually is here -- resvg's own
+   straight-alpha convention, see `../icons.rs`'s own module doc) must be
+   blended in LINEAR light, not in the gamma-encoded byte domain. Against
+   this crate's own ink `#cdd6f4` (204,214,242) on a near-black terminal
+   background (12,12,12) the error is large and systematic (R channel):
+   25% coverage -> naive 60, correct 109; 50% -> naive 108, correct 150;
+   75% -> naive 156, correct 180 -- every anti-aliased edge pixel lands
+   24-49 levels too dark. A codicon stroke is ~1.5 units in a 24-unit
+   viewBox -- at the strip tier's own ~19px height that is barely more
+   than one device pixel, i.e. ALMOST ENTIRELY edge pixels, which is
+   exactly why the small tier reads as grainy and washed out while the
+   rail tier (a wider stroke in device pixels, surviving core ink pixels)
+   reads acceptable. FIX: convert both the ink and the background from
+   sRGB to linear (`srgb_to_linear`, the exact piecewise transfer
+   function -- the 0.04045 / 12.92 / 2.4 form, NOT a 2.2-power
+   approximation), blend by the pixel's own TRUE coverage in linear
+   space, then convert back (`linear_to_srgb`). This arithmetic now lives
+   in `../src/icons.rs::composite_over_background` (see cause 1 above's
+   own "CURRENT FIX" note for why it moved out of this file), NOT here
+   any more -- this tool's own `srgb_to_linear`/`linear_to_srgb` were
+   ported byte-for-byte into that Rust function and then deleted from
+   this file so there is exactly one implementation, never two that could
+   drift; every anti-aliased pixel a user actually sees goes through that
+   ONE exact (never approximated) blend, regardless of which background
+   it happens to composite against.
 
 4. RETIRED -- "approximate the alpha for an unknown background" turned out
    not to be a real case. This tool used to ship a SECOND, `Transparent`
@@ -438,15 +467,11 @@ GALLERY_SIXEL_RGBA_LEN = GALLERY_SIXEL_PX_W * GALLERY_SIXEL_PX_H * 4
 # per-tier constant -- see `glyph_lattice_size`/`rasterize_lattice_fit`.
 LATTICE_STEP_PX = 16
 
-# ---- Icon-button compositing background (cause 1's fix -- see this
-# module's own header doc comment). Hand-synced to render.rs's own fixed
-# theme constants: `ACTIVE_BG` (the rail/strip button body's own "at rest"
-# colour) and `MAUVE` (`theme.accent`, the rail's own "selected" colour).
-# Every icon-bearing button paints one of these two, EXPLICITLY, in every
-# `PtyColorMode` -- there is no longer a mode this pair does not cover
-# (see cause 4's own retirement note above).
-GATE_ACTIVE_BG_RGB = (30, 30, 46)  # render.rs::ACTIVE_BG
-GATE_ACCENT_BG_RGB = (203, 166, 247)  # render.rs::MAUVE / theme.accent
+# No icon-button compositing background lives here any more (cause 1's own
+# "CURRENT FIX" note, this module's own header doc comment): which RGB an
+# icon composites against is a RUNTIME decision now (a live OSC 11 query,
+# an override theme constant, or the selected-state accent), made in
+# `../src/icons.rs`/`../src/render.rs`, never a bake-time Python constant.
 
 
 # ---- Lucide (owner-visible ALONGSIDE codicons, never a replacement --
@@ -834,38 +859,6 @@ def patch_lucide(svg_path: Path, slug: str, cache_dir: Path) -> Path:
     return dest
 
 
-def srgb_to_linear(channel: int) -> float:
-    """Piecewise sRGB EOTF (IEC 61966-2-1), one 8-bit channel value ->
-    linear light in [0, 1]. NOT a 2.2-power approximation -- the exact
-    two-segment curve, so `composite_over_background`'s own linear-space
-    blend round-trips EXACTLY back to the original byte at full/zero
-    coverage (verified by this crate's own `icons.rs::tests::gate_
-    compositing_matches_the_background_and_ink_colours_exactly_at_full_
-    coverage`, which compares composited output against source bytes for
-    bit-exact equality at those two extremes)."""
-    c = channel / 255.0
-    if c <= 0.04045:
-        return c / 12.92
-    return ((c + 0.055) / 1.055) ** 2.4
-
-
-def linear_to_srgb(value: float) -> int:
-    """Inverse of `srgb_to_linear` -- linear light in [0, 1] -> an 8-bit
-    sRGB channel byte, rounded to the nearest integer (clamped: floating-
-    point round-trip error could in principle push a value a hair outside
-    [0, 255])."""
-    if value <= 0.0031308:
-        srgb = value * 12.92
-    else:
-        srgb = 1.055 * (value ** (1.0 / 2.4)) - 0.055
-    return max(0, min(255, round(srgb * 255.0)))
-
-
-# Every ink byte this crate ever bakes is looked up through this table
-# rather than recomputing `srgb_to_linear` per pixel per channel -- the
-# hot loop in `composite_over_background` below.
-_SRGB_TO_LINEAR_LUT: list[float] = [srgb_to_linear(v) for v in range(256)]
-
 
 def rasterize_sixel(patched_svg: Path) -> bytes:
     """Rail tier: `rasterize_lattice_fit` at `SIXEL_PX_W`x`_H` (40x38) --
@@ -1039,169 +1032,77 @@ def rasterize_gallery_sixel(patched_svg: Path) -> bytes:
     return data
 
 
-def composite_over_background(rgba: bytes, bg: tuple[int, int, int]) -> bytes:
-    """This function is BOTH cause 1's own fix (composite over the
-    button's exact background instead of leaving the pixel transparent,
-    so `icy_sixel`'s hard alpha threshold and Windows Terminal's own lack
-    of sixel transparency support both become irrelevant -- see this
-    module's own header doc comment) AND cause 3's own fix (the actual
-    arithmetic below is gamma-correct, not a naive byte-domain blend --
-    same doc comment, cause 3): alpha-composite a straight (non-
-    premultiplied) RGBA buffer -- resvg's own convention, where a
-    partially-covered "ink" pixel's RGB channels stay at the flat fill
-    colour regardless of alpha, verified in `../icons.rs`'s own module
-    doc -- over a flat, fully opaque `bg` colour, IN LINEAR LIGHT: per
-    pixel, convert both `ink` and `bg` to linear (`srgb_to_linear`), blend
-    by the pixel's own TRUE coverage `a/255`, convert back (`linear_to_
-    srgb`). `out_alpha = 255` throughout. Pure arithmetic over an
-    ALREADY-rasterized buffer -- same width/height in and out, no
-    interpolation -- so this can never become a second resampling pass
-    (see this module's own header doc comment on why that distinction
-    matters for cause 2). The icon's own ink colour is already `#cdd6f4`
-    from `patch_fill` above, so no separate "tint to the theme
-    foreground" step is needed here -- the source is already the right
-    colour, this only decides what shows through where it is not fully
-    opaque."""
-    bg_linear = tuple(srgb_to_linear(channel) for channel in bg)
-    out = bytearray(len(rgba))
-    for i in range(0, len(rgba), 4):
-        coverage = rgba[i + 3] / 255.0
-        inv = 1.0 - coverage
-        for channel in range(3):
-            ink_linear = _SRGB_TO_LINEAR_LUT[rgba[i + channel]]
-            blended = ink_linear * coverage + bg_linear[channel] * inv
-            out[i + channel] = linear_to_srgb(blended)
-        out[i + 3] = 255
-    return bytes(out)
+def ensure_assets(spec: IconSpec, cache_dir: Path, force: bool) -> Path:
+    """Ensure the rail-tier `.rgba` raw source for `spec` exists on disk
+    (baking it if missing, or unconditionally if `force`) and return its
+    path. This is the idempotency boundary: a normal re-run with nothing
+    new to bake touches no network and spawns no subprocess at all.
 
-
-def ensure_assets(spec: IconSpec, cache_dir: Path, force: bool) -> tuple[Path, Path, Path]:
-    """Ensure every rail-tier `.rgba` output for `spec` exists on disk,
-    baking whatever is missing (or everything, if `force`). Returns
-    (raw_source, gate_active, gate_accent) paths. This is the idempotency
-    boundary: a normal re-run with nothing new to bake touches no
-    network and spawns no subprocess at all.
-
-    `raw_source` (`<stem>.rgba`) is NOT a shipped `SixelVariant` any more
-    (cause 4's own retirement note, this module's own header doc comment):
-    `GateActive`/`GateAccent` are the ONLY rail-tier sixel this crate ships
-    now, since every icon-bearing button paints an explicit truecolor
-    background unconditionally. This file stays on disk and gets rebaked
-    like any other output purely so `icons.rs`'s own `#[cfg(test)]`
-    compositing-correctness tests (`gate_compositing_matches_the_
-    background_and_ink_colours_exactly_at_full_coverage` and friends) can
-    verify `composite_over_background` against a REAL checked-in true-
-    coverage buffer rather than trusting the arithmetic by construction --
-    Rust never reaches for it outside `#[cfg(test)]`.
-
-    ORDERING (load-bearing for cause 3's own correctness -- see this
-    module's own header doc comment): whenever ANY of the three outputs
-    needs rebuilding, this rasterizes ONE fresh TRUE-coverage buffer in
-    memory (`raw`) and derives EVERYTHING from that SAME buffer via
-    `composite_over_background` (exact background, exact linear blend),
-    writing `raw` itself to `raw_source`'s own path unchanged. Re-deriving
-    the `_gate_*` variants from anything OTHER than a just-rasterized
-    `raw` -- e.g. reading `raw_source` back off disk -- would be
-    pointless indirection for the exact same bytes, so this never reads
-    it back off disk to feed compositing, even on an idempotent re-run
-    that only needs to rebuild the gate variants (the small correctness
-    cost: such a re-run re-rasterizes even though `raw_source` itself did
-    not need it, trading a little idempotency for one less code path)."""
+    This is the ONLY rail-tier asset this tool ships now (cause 1's own
+    "CURRENT FIX" note, this module's own header doc comment): there is
+    no more `_gate`/`_gate_active`/`_gate_accent` variant baked here --
+    compositing against a concrete background happens in Rust, at
+    runtime, against whichever background is actually live for a given
+    placement (`../src/icons.rs::composite_over_background`), so this
+    tool has nothing left to precompute beyond the raw, TRUE-coverage
+    buffer resvg itself produces."""
     sixel_path = ICONS_DIR / f"{spec.stem()}.rgba"
-    active_path = ICONS_DIR / f"{spec.stem()}_gate_active.rgba"
-    accent_path = ICONS_DIR / f"{spec.stem()}_gate_accent.rgba"
-
     need_sixel = force or not sixel_path.exists() or sixel_path.stat().st_size != SIXEL_RGBA_LEN
-    need_active = force or not active_path.exists() or active_path.stat().st_size != SIXEL_RGBA_LEN
-    need_accent = force or not accent_path.exists() or accent_path.stat().st_size != SIXEL_RGBA_LEN
-
-    if need_sixel or need_active or need_accent:
+    if need_sixel:
         svg = fetch_svg(spec.slug, cache_dir)
         patched = patch_fill(svg, spec.slug, cache_dir)
         raw = rasterize_sixel(patched)
-        if need_active:
-            active_path.write_bytes(composite_over_background(raw, GATE_ACTIVE_BG_RGB))
-        if need_accent:
-            accent_path.write_bytes(composite_over_background(raw, GATE_ACCENT_BG_RGB))
-        if need_sixel:
-            sixel_path.write_bytes(raw)
-
-    return sixel_path, active_path, accent_path
+        sixel_path.write_bytes(raw)
+    return sixel_path
 
 
-def ensure_strip_assets(spec: IconSpec, cache_dir: Path, force: bool) -> tuple[Path, Path]:
-    """Ensure the control-plane strip's own two sixel-tier outputs:
-    `<stem>_strip.rgba` (the raw true-coverage source, test-only -- see
-    `ensure_assets`'s own doc comment for why this stays on disk) and
-    `<stem>_strip_gate.rgba` (the SAME raw pixels alpha-composited over
-    `GATE_ACTIVE_BG_RGB` in linear light -- see `composite_over_
-    background`; the ONLY strip-tier sixel this crate ships). Same "derive
-    both from one freshly-rasterized `raw` buffer" precedent as `ensure_
-    assets` above. The strip never shows a `selected` state (see `render::
-    render_control_strip_button`'s own doc comment), so there is no
-    `_strip_gate_accent` variant.
+def ensure_strip_assets(spec: IconSpec, cache_dir: Path, force: bool) -> Path:
+    """Ensure the control-plane strip's own single sixel-tier output
+    (`<stem>_strip.rgba`, raw true-coverage) exists on disk and return its
+    path -- see `ensure_assets`'s own doc comment for why there is no
+    separate `_gate` variant here any more.
 
     Sources from `spec.strip_source_slug()`, NOT `spec.slug` -- cause 7
     (this module's own header doc comment): `NewFile`/`NewFolder` bake
     their own strip tier from a different, badge-free codicon than their
     rail/compact/gallery tiers; every other icon's `strip_source_slug()`
     is just `slug` unchanged."""
-    transparent_path = ICONS_DIR / f"{spec.stem()}_strip.rgba"
-    gate_path = ICONS_DIR / f"{spec.stem()}_strip_gate.rgba"
-    need_transparent = force or not transparent_path.exists() or transparent_path.stat().st_size != STRIP_SIXEL_RGBA_LEN
-    need_gate = force or not gate_path.exists() or gate_path.stat().st_size != STRIP_SIXEL_RGBA_LEN
-
-    if need_transparent or need_gate:
+    sixel_path = ICONS_DIR / f"{spec.stem()}_strip.rgba"
+    need_sixel = force or not sixel_path.exists() or sixel_path.stat().st_size != STRIP_SIXEL_RGBA_LEN
+    if need_sixel:
         slug = spec.strip_source_slug()
         svg = fetch_svg(slug, cache_dir)
         patched = patch_fill(svg, slug, cache_dir)
         raw = rasterize_strip_sixel(patched)
-        if need_gate:
-            gate_path.write_bytes(composite_over_background(raw, GATE_ACTIVE_BG_RGB))
-        if need_transparent:
-            transparent_path.write_bytes(raw)
-
-    return transparent_path, gate_path
+        sixel_path.write_bytes(raw)
+    return sixel_path
 
 
-def ensure_gallery_assets(spec: IconSpec, cache_dir: Path, force: bool) -> tuple[Path, Path]:
-    """Ensure the icon gallery's own two dedicated sixel-tier outputs:
-    `<stem>_gallery.rgba` (the raw true-coverage source, test-only -- see
-    `ensure_assets`'s own doc comment) and `<stem>_gallery_gate.rgba` (the
-    same raw pixels composited over `GATE_ACTIVE_BG_RGB` in linear light;
-    the ONLY gallery-tier sixel this crate ships). Same ordering precedent
-    as `ensure_assets`/`ensure_strip_assets` above. Same "no selected
-    state, so no `_gallery_gate_accent` variant" precedent as `ensure_
-    strip_assets` -- the gallery is a read-only comparison grid."""
-    transparent_path = ICONS_DIR / f"{spec.stem()}_gallery.rgba"
-    gate_path = ICONS_DIR / f"{spec.stem()}_gallery_gate.rgba"
-    need_transparent = force or not transparent_path.exists() or transparent_path.stat().st_size != GALLERY_SIXEL_RGBA_LEN
-    need_gate = force or not gate_path.exists() or gate_path.stat().st_size != GALLERY_SIXEL_RGBA_LEN
-
-    if need_transparent or need_gate:
+def ensure_gallery_assets(spec: IconSpec, cache_dir: Path, force: bool) -> Path:
+    """Ensure the icon gallery's own single dedicated sixel-tier output
+    (`<stem>_gallery.rgba`, raw true-coverage) exists on disk and return
+    its path -- see `ensure_assets`'s own doc comment for why there is no
+    separate `_gate` variant here any more."""
+    sixel_path = ICONS_DIR / f"{spec.stem()}_gallery.rgba"
+    need_sixel = force or not sixel_path.exists() or sixel_path.stat().st_size != GALLERY_SIXEL_RGBA_LEN
+    if need_sixel:
         svg = fetch_svg(spec.slug, cache_dir)
         patched = patch_fill(svg, spec.slug, cache_dir)
         raw = rasterize_gallery_sixel(patched)
-        if need_gate:
-            gate_path.write_bytes(composite_over_background(raw, GATE_ACTIVE_BG_RGB))
-        if need_transparent:
-            transparent_path.write_bytes(raw)
-
-    return transparent_path, gate_path
+        sixel_path.write_bytes(raw)
+    return sixel_path
 
 
 def ensure_compact_assets(spec: IconSpec, cache_dir: Path, force: bool) -> Path:
     """Ensure the compact tier's own single sixel-tier output (`<stem>_
     compact.rgba`, real straight-alpha true coverage). This tier is
-    `Transparent`-only -- out of scope for cause 1/3's own background-
-    compositing fix (see `render::render_compact_icon_button`'s own doc
-    comment: dense panel/modal content with 3+ distinct backgrounds,
-    unlike the rail's 2 and the strip's 1) -- so there is no gate variant
-    to derive here at all, and this tier's own `.rgba` IS the real,
-    directly-shipped asset (`icons::build_sixel_compact` still encodes it
-    with `BackgroundMode::Transparent`), not a test-only source the way
-    `ensure_assets`/`ensure_strip_assets`/`ensure_gallery_assets`'s own
-    raw outputs now are."""
+    `Transparent`-only -- out of scope for the runtime background-
+    compositing fix cause 1 describes (see `render::render_compact_icon_
+    button`'s own doc comment: dense panel/modal content with 3+ distinct
+    backgrounds, unlike the rail's 2 and the strip's 1) -- this tier's own
+    `.rgba` IS, and always was, the real, directly-shipped asset
+    (`icons::build_sixel_compact` still encodes it with `BackgroundMode::
+    Transparent`), unchanged by any of cause 1's iterations."""
     sixel_path = ICONS_DIR / f"{spec.stem()}_compact.rgba"
     need_sixel = force or not sixel_path.exists() or sixel_path.stat().st_size != COMPACT_SIXEL_RGBA_LEN
     if need_sixel:
@@ -1212,10 +1113,9 @@ def ensure_compact_assets(spec: IconSpec, cache_dir: Path, force: bool) -> Path:
     return sixel_path
 
 
-# ---- Lucide bakes -- reuse EVERY rasterize_*/composite_over_background
-# function above completely unchanged (cause 6's own lattice-fit fix
-# included): those functions only ever take "a patched SVG path" + "a
-# target canvas size" + (for compositing) "a background colour", never
+# ---- Lucide bakes -- reuse EVERY rasterize_* function above completely
+# unchanged (cause 6's own lattice-fit fix included): those functions
+# only ever take "a patched SVG path" + "a target canvas size", never
 # anything codicon-specific, so the SAME 16px/32px/48px lattice-fit
 # machinery this module's own header doc comment describes for codicons
 # applies to Lucide's own 24-unit viewBox identically -- only the FETCH
@@ -1223,83 +1123,55 @@ def ensure_compact_assets(spec: IconSpec, cache_dir: Path, force: bool) -> Path:
 # fill`) steps differ, plus the `lucide_` filename prefix so neither
 # family's own `.rgba` outputs can collide on disk. Mirrors `ensure_
 # assets`/`ensure_strip_assets`/`ensure_gallery_assets`/`ensure_compact_
-# assets` one-for-one -- same ordering precedent (one fresh raw rasterize
-# feeds every derived variant), same "raw source stays on disk test-only,
-# gate variants are the only shipped asset" split, same compact-tier
-# exception (real transparency, no gate variant, no lattice-fit -- the
-# compact canvas is 10x19, too small to host even one 16px lattice step
-# in its own narrower dimension, same reasoning `glyph_lattice_size`'s own
-# doc comment gives for why codicons' compact tier is unchanged by cause
-# 6 either).
+# assets` one-for-one -- same "raw source is the only shipped asset, no
+# gate variant baked here" shape, same compact-tier exception (real
+# transparency, no lattice-fit -- the compact canvas is 10x19, too small
+# to host even one 16px lattice step in its own narrower dimension, same
+# reasoning `glyph_lattice_size`'s own doc comment gives for why
+# codicons' compact tier is unchanged by cause 6 either).
 
 
-def ensure_lucide_assets(spec: IconSpec, slug: str, cache_dir: Path, force: bool) -> tuple[Path, Path, Path]:
+def ensure_lucide_assets(spec: IconSpec, slug: str, cache_dir: Path, force: bool) -> Path:
     """Lucide's own `ensure_assets` -- see that function's own doc
     comment; `slug` is `LUCIDE_SLUGS[spec.rust_name]` (the Lucide slug),
     NOT `spec.slug` (the codicon slug `spec` was authored around)."""
     sixel_path = ICONS_DIR / f"lucide_{spec.stem()}.rgba"
-    active_path = ICONS_DIR / f"lucide_{spec.stem()}_gate_active.rgba"
-    accent_path = ICONS_DIR / f"lucide_{spec.stem()}_gate_accent.rgba"
-
     need_sixel = force or not sixel_path.exists() or sixel_path.stat().st_size != SIXEL_RGBA_LEN
-    need_active = force or not active_path.exists() or active_path.stat().st_size != SIXEL_RGBA_LEN
-    need_accent = force or not accent_path.exists() or accent_path.stat().st_size != SIXEL_RGBA_LEN
-
-    if need_sixel or need_active or need_accent:
+    if need_sixel:
         svg = fetch_lucide_svg(slug, cache_dir)
         patched = patch_lucide(svg, slug, cache_dir)
         raw = rasterize_sixel(patched)
-        if need_active:
-            active_path.write_bytes(composite_over_background(raw, GATE_ACTIVE_BG_RGB))
-        if need_accent:
-            accent_path.write_bytes(composite_over_background(raw, GATE_ACCENT_BG_RGB))
-        if need_sixel:
-            sixel_path.write_bytes(raw)
-
-    return sixel_path, active_path, accent_path
+        sixel_path.write_bytes(raw)
+    return sixel_path
 
 
-def ensure_lucide_strip_assets(spec: IconSpec, slug: str, cache_dir: Path, force: bool) -> tuple[Path, Path]:
+def ensure_lucide_strip_assets(spec: IconSpec, slug: str, cache_dir: Path, force: bool) -> Path:
     """Lucide's own `ensure_strip_assets` -- see that function's own doc
     comment. Always sources from `slug` directly (Lucide has no
     equivalent of cause 7's own codicon-only `strip_slug` badge-swap --
     every `LUCIDE_SLUGS` glyph is a single coherent shape at this tier's
     own 16px lattice render, verified at authoring time)."""
-    transparent_path = ICONS_DIR / f"lucide_{spec.stem()}_strip.rgba"
-    gate_path = ICONS_DIR / f"lucide_{spec.stem()}_strip_gate.rgba"
-    need_transparent = force or not transparent_path.exists() or transparent_path.stat().st_size != STRIP_SIXEL_RGBA_LEN
-    need_gate = force or not gate_path.exists() or gate_path.stat().st_size != STRIP_SIXEL_RGBA_LEN
-
-    if need_transparent or need_gate:
+    sixel_path = ICONS_DIR / f"lucide_{spec.stem()}_strip.rgba"
+    need_sixel = force or not sixel_path.exists() or sixel_path.stat().st_size != STRIP_SIXEL_RGBA_LEN
+    if need_sixel:
         svg = fetch_lucide_svg(slug, cache_dir)
         patched = patch_lucide(svg, slug, cache_dir)
         raw = rasterize_strip_sixel(patched)
-        if need_gate:
-            gate_path.write_bytes(composite_over_background(raw, GATE_ACTIVE_BG_RGB))
-        if need_transparent:
-            transparent_path.write_bytes(raw)
-
-    return transparent_path, gate_path
+        sixel_path.write_bytes(raw)
+    return sixel_path
 
 
-def ensure_lucide_gallery_assets(spec: IconSpec, slug: str, cache_dir: Path, force: bool) -> tuple[Path, Path]:
+def ensure_lucide_gallery_assets(spec: IconSpec, slug: str, cache_dir: Path, force: bool) -> Path:
     """Lucide's own `ensure_gallery_assets` -- see that function's own doc
     comment."""
-    transparent_path = ICONS_DIR / f"lucide_{spec.stem()}_gallery.rgba"
-    gate_path = ICONS_DIR / f"lucide_{spec.stem()}_gallery_gate.rgba"
-    need_transparent = force or not transparent_path.exists() or transparent_path.stat().st_size != GALLERY_SIXEL_RGBA_LEN
-    need_gate = force or not gate_path.exists() or gate_path.stat().st_size != GALLERY_SIXEL_RGBA_LEN
-
-    if need_transparent or need_gate:
+    sixel_path = ICONS_DIR / f"lucide_{spec.stem()}_gallery.rgba"
+    need_sixel = force or not sixel_path.exists() or sixel_path.stat().st_size != GALLERY_SIXEL_RGBA_LEN
+    if need_sixel:
         svg = fetch_lucide_svg(slug, cache_dir)
         patched = patch_lucide(svg, slug, cache_dir)
         raw = rasterize_gallery_sixel(patched)
-        if need_gate:
-            gate_path.write_bytes(composite_over_background(raw, GATE_ACTIVE_BG_RGB))
-        if need_transparent:
-            transparent_path.write_bytes(raw)
-
-    return transparent_path, gate_path
+        sixel_path.write_bytes(raw)
+    return sixel_path
 
 
 def ensure_lucide_compact_assets(spec: IconSpec, slug: str, cache_dir: Path, force: bool) -> Path:
@@ -1344,22 +1216,27 @@ def generate_catalog() -> str:
     lines.append("//!")
     lines.append("//! See `../icons.rs`'s own module doc for the full tier/pipeline")
     lines.append("//! explanation and `tools/bake_icons.py`'s own header for the exact bake")
-    lines.append("//! recipe (shared by both families -- only fetch/patch differ).")
+    lines.append("//! recipe (shared by both families -- only fetch/patch differ). This")
+    lines.append("//! module ships ONLY raw, TRUE-coverage source buffers (plus the compact")
+    lines.append("//! tier's own pre-encoded sixel, which never composites against a")
+    lines.append("//! background at all) -- every OTHER tier's background compositing is a")
+    lines.append("//! RUNTIME decision made by `../icons.rs::composite_over_background`, not")
+    lines.append("//! something this generated file bakes in (see `tools/bake_icons.py`'s own")
+    lines.append("//! header doc comment, cause 1's \"CURRENT FIX\" note).")
     lines.append("")
     lines.append("use std::sync::LazyLock;")
     lines.append("")
-    lines.append("use super::{")
-    lines.append("    build_sixel_compact, build_sixel_gallery_gate, build_sixel_gate, build_sixel_strip_gate,")
-    lines.append("    SixelVariant,")
-    lines.append("};")
+    lines.append("use super::build_sixel_compact;")
     lines.append("")
     lines.append("/// Every baked icon this crate ships, sixel + ascii tiers, one enum")
     lines.append("/// covering the full catalog (not just the activity rail -- see `../")
     lines.append("/// icons.rs`'s own module doc). Only the activity rail's original 7")
     lines.append("/// variants are wired into a UI site today; the rest are baked and tested")
     lines.append("/// but not yet drawn anywhere -- a deliberate, scoped-out next slice, not")
-    lines.append("/// an oversight.")
-    lines.append("#[derive(Clone, Copy, Debug, Eq, PartialEq)]")
+    lines.append("/// an oversight. `Hash` (alongside `Eq`) so `IconId` can key the runtime")
+    lines.append("/// sixel cache (`../icons.rs`'s own module doc, \"Sixel background")
+    lines.append("/// variants\" section).")
+    lines.append("#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]")
     lines.append("pub enum IconId {")
     for spec in MANIFEST:
         lines.append(f"    {spec.rust_name},")
@@ -1372,53 +1249,45 @@ def generate_catalog() -> str:
     lines.append("    ];")
     lines.append("}")
     lines.append("")
-    lines.append("/// Encoded rail-tier sixel string for `id` at `variant`'s own explicit")
-    lines.append("/// truecolor background (see [`SixelVariant`]'s own doc comment) -- see")
-    lines.append("/// `../icons.rs::build_sixel_gate`'s own doc comment for why this is cached")
-    lines.append("/// (`LazyLock`) rather than re-encoded per call.")
-    lines.append("pub fn sixel(id: IconId, variant: SixelVariant) -> &'static str {")
+    lines.append("/// Raw, TRUE-coverage rail-tier source bytes for `id` -- straight (non-")
+    lines.append("/// premultiplied) RGBA8, `icons::SIXEL_ICON_WIDTH_PX` x `_HEIGHT_PX`. The")
+    lines.append("/// ONLY rail-tier asset this crate ships (see this module's own header doc")
+    lines.append("/// comment): `../icons.rs::composite_over_background` composites this on")
+    lines.append("/// demand against whichever background a given placement actually needs,")
+    lines.append("/// cached by (icon, tier, family, background RGB) rather than pre-baked")
+    lines.append("/// per background here.")
+    lines.append("pub(crate) fn sixel_source_rgba(id: IconId) -> &'static [u8] {")
     lines.append("    match id {")
     for spec in MANIFEST:
-        upper = to_screaming_snake(spec.rust_name)
-        lines.append(f"        IconId::{spec.rust_name} => match variant {{")
-        lines.append(f"            SixelVariant::GateActive => {upper}_SIXEL_GATE_ACTIVE.as_str(),")
-        lines.append(f"            SixelVariant::GateAccent => {upper}_SIXEL_GATE_ACCENT.as_str(),")
-        lines.append("        },")
+        lines.append(f"        IconId::{spec.rust_name} => {to_screaming_snake(spec.rust_name)}_RGBA,")
     lines.append("    }")
     lines.append("}")
     lines.append("")
-    lines.append("/// Encoded control-plane-strip-tier sixel string for `id` at `variant`'s")
-    lines.append("/// own explicit truecolor background -- the strip never shows a selected")
-    lines.append("/// state (see `../render.rs::render_control_strip_button`'s own doc")
-    lines.append("/// comment), so `GateAccent` resolves to the SAME asset as `GateActive`")
-    lines.append("/// here.")
-    lines.append("pub fn sixel_strip(id: IconId, variant: SixelVariant) -> &'static str {")
+    lines.append("/// Strip-tier equivalent of [`sixel_source_rgba`] -- `icons::STRIP_SIXEL_")
+    lines.append("/// ICON_WIDTH_PX` x `_HEIGHT_PX`.")
+    lines.append("pub(crate) fn sixel_strip_source_rgba(id: IconId) -> &'static [u8] {")
     lines.append("    match id {")
     for spec in MANIFEST:
-        upper = to_screaming_snake(spec.rust_name)
-        lines.append(f"        IconId::{spec.rust_name} => match variant {{")
-        lines.append(f"            SixelVariant::GateActive | SixelVariant::GateAccent => {upper}_SIXEL_STRIP_GATE.as_str(),")
-        lines.append("        },")
+        lines.append(f"        IconId::{spec.rust_name} => {to_screaming_snake(spec.rust_name)}_STRIP_RGBA,")
     lines.append("    }")
     lines.append("}")
     lines.append("")
-    lines.append("/// Encoded icon-gallery-tier sixel string for `id` at `variant`'s own")
-    lines.append("/// explicit truecolor background -- the gallery is a read-only comparison")
-    lines.append("/// grid with no selected state, so `GateAccent` resolves to the SAME asset")
-    lines.append("/// as `GateActive` here (same fold as [`sixel_strip`]).")
-    lines.append("pub fn sixel_gallery(id: IconId, variant: SixelVariant) -> &'static str {")
+    lines.append("/// Gallery-tier equivalent of [`sixel_source_rgba`] -- `icons::GALLERY_")
+    lines.append("/// SIXEL_ICON_WIDTH_PX` x `_HEIGHT_PX`.")
+    lines.append("pub(crate) fn sixel_gallery_source_rgba(id: IconId) -> &'static [u8] {")
     lines.append("    match id {")
     for spec in MANIFEST:
-        upper = to_screaming_snake(spec.rust_name)
-        lines.append(f"        IconId::{spec.rust_name} => match variant {{")
-        lines.append(f"            SixelVariant::GateActive | SixelVariant::GateAccent => {upper}_SIXEL_GALLERY_GATE.as_str(),")
-        lines.append("        },")
+        lines.append(f"        IconId::{spec.rust_name} => {to_screaming_snake(spec.rust_name)}_GALLERY_RGBA,")
     lines.append("    }")
     lines.append("}")
     lines.append("")
     lines.append("/// Encoded COMPACT-tier sixel string for `id` (exactly one assumed")
     lines.append("/// terminal cell -- see `../icons.rs`'s own module doc) -- for dense")
-    lines.append("/// single-row buttons where the rail's own icon does not fit.")
+    lines.append("/// single-row buttons where the rail's own icon does not fit. Unlike every")
+    lines.append("/// other tier above, this one stays pre-encoded at MODULE LOAD (`LazyLock`)")
+    lines.append("/// rather than composited on demand: it ships real transparency")
+    lines.append("/// (`BackgroundMode::Transparent`), never a background to composite")
+    lines.append("/// against at all (see `icons.rs`'s own \"Compact tier\" doc section).")
     lines.append("pub fn sixel_compact(id: IconId) -> &'static str {")
     lines.append("    match id {")
     for spec in MANIFEST:
@@ -1437,22 +1306,9 @@ def generate_catalog() -> str:
     lines.append("    }")
     lines.append("}")
     lines.append("")
-    lines.append("// Raw true-coverage baked-source lookups by id -- used ONLY by this")
-    lines.append("// crate's own unit tests (byte-length assertions and the gate-compositing")
-    lines.append("// pixel checks): the rail/strip/gallery raw sources are no longer a")
-    lines.append("// shipped `SixelVariant` (cause 4's own retirement, `tools/bake_icons.py`'s")
-    lines.append("// own header doc comment), so their underlying `_RGBA` consts below are")
-    lines.append("// `#[cfg(test)]`-gated too -- nothing outside this test module ever reaches")
-    lines.append("// for them. The compact tier's own raw source stays unconditional: it IS")
-    lines.append("// the real, directly-shipped asset (see `sixel_compact` above).")
-    lines.append("#[cfg(test)]")
-    lines.append("pub(crate) fn sixel_source_rgba(id: IconId) -> &'static [u8] {")
-    lines.append("    match id {")
-    for spec in MANIFEST:
-        lines.append(f"        IconId::{spec.rust_name} => {to_screaming_snake(spec.rust_name)}_RGBA,")
-    lines.append("    }")
-    lines.append("}")
-    lines.append("")
+    lines.append("// Compact tier's own raw source, test-only (byte-length assertions) --")
+    lines.append("// production code only ever reaches for the pre-encoded `sixel_compact`")
+    lines.append("// above; this tier never composites against a background at runtime.")
     lines.append("#[cfg(test)]")
     lines.append("pub(crate) fn sixel_compact_source_rgba(id: IconId) -> &'static [u8] {")
     lines.append("    match id {")
@@ -1461,165 +1317,69 @@ def generate_catalog() -> str:
     lines.append("    }")
     lines.append("}")
     lines.append("")
-    lines.append("#[cfg(test)]")
-    lines.append("pub(crate) fn sixel_gate_active_source_rgba(id: IconId) -> &'static [u8] {")
-    lines.append("    match id {")
-    for spec in MANIFEST:
-        lines.append(f"        IconId::{spec.rust_name} => {to_screaming_snake(spec.rust_name)}_GATE_ACTIVE_RGBA,")
-    lines.append("    }")
-    lines.append("}")
-    lines.append("")
-    lines.append("#[cfg(test)]")
-    lines.append("pub(crate) fn sixel_gate_accent_source_rgba(id: IconId) -> &'static [u8] {")
-    lines.append("    match id {")
-    for spec in MANIFEST:
-        lines.append(f"        IconId::{spec.rust_name} => {to_screaming_snake(spec.rust_name)}_GATE_ACCENT_RGBA,")
-    lines.append("    }")
-    lines.append("}")
-    lines.append("")
-    lines.append("#[cfg(test)]")
-    lines.append("pub(crate) fn sixel_strip_source_rgba(id: IconId) -> &'static [u8] {")
-    lines.append("    match id {")
-    for spec in MANIFEST:
-        lines.append(f"        IconId::{spec.rust_name} => {to_screaming_snake(spec.rust_name)}_STRIP_RGBA,")
-    lines.append("    }")
-    lines.append("}")
-    lines.append("")
-    lines.append("#[cfg(test)]")
-    lines.append("pub(crate) fn sixel_strip_gate_source_rgba(id: IconId) -> &'static [u8] {")
-    lines.append("    match id {")
-    for spec in MANIFEST:
-        lines.append(f"        IconId::{spec.rust_name} => {to_screaming_snake(spec.rust_name)}_STRIP_GATE_RGBA,")
-    lines.append("    }")
-    lines.append("}")
-    lines.append("")
-    lines.append("#[cfg(test)]")
-    lines.append("pub(crate) fn sixel_gallery_source_rgba(id: IconId) -> &'static [u8] {")
-    lines.append("    match id {")
-    for spec in MANIFEST:
-        lines.append(f"        IconId::{spec.rust_name} => {to_screaming_snake(spec.rust_name)}_GALLERY_RGBA,")
-    lines.append("    }")
-    lines.append("}")
-    lines.append("")
-    lines.append("#[cfg(test)]")
-    lines.append("pub(crate) fn sixel_gallery_gate_source_rgba(id: IconId) -> &'static [u8] {")
-    lines.append("    match id {")
-    for spec in MANIFEST:
-        lines.append(f"        IconId::{spec.rust_name} => {to_screaming_snake(spec.rust_name)}_GALLERY_GATE_RGBA,")
-    lines.append("    }")
-    lines.append("}")
-    lines.append("")
 
     for spec in MANIFEST:
         upper = to_screaming_snake(spec.rust_name)
         lines.append(f"// ---- {spec.rust_name} ({spec.slug}) " + "-" * max(1, 60 - len(spec.rust_name) - len(spec.slug)))
         lines.append("")
-        lines.append("/// Raw true-coverage source, test-only -- no longer a shipped")
-        lines.append("/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,")
-        lines.append("/// cause 4's retirement); kept solely so this crate's own compositing-")
-        lines.append("/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against")
-        lines.append("/// a real checked-in buffer.")
-        lines.append("#[cfg(test)]")
         lines.append(f'const {upper}_RGBA: &[u8] = include_bytes!("{spec.stem()}.rgba");')
-        lines.append("")
-        lines.append("/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at")
-        lines.append("/// bake time, gamma-correct linear blend, painted by every icon-bearing")
-        lines.append("/// button in every `PtyColorMode` (see this crate's own `tools/")
-        lines.append("/// bake_icons.py` module doc, causes 1, 3 and 4).")
-        lines.append(f'const {upper}_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("{spec.stem()}_gate_active.rgba");')
-        lines.append(f"static {upper}_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate({upper}_GATE_ACTIVE_RGBA));")
-        lines.append("")
-        lines.append("/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's")
-        lines.append("/// own selected-state background.")
-        lines.append(f'const {upper}_GATE_ACCENT_RGBA: &[u8] = include_bytes!("{spec.stem()}_gate_accent.rgba");')
-        lines.append(f"static {upper}_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate({upper}_GATE_ACCENT_RGBA));")
-        lines.append("")
         lines.append(f'const {upper}_COMPACT_RGBA: &[u8] = include_bytes!("{spec.stem()}_compact.rgba");')
         lines.append(f"static {upper}_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact({upper}_COMPACT_RGBA));")
-        lines.append("")
-        lines.append("/// Raw true-coverage strip-tier source, test-only -- same retirement as")
-        lines.append(f"/// {upper}_RGBA above.")
-        lines.append("#[cfg(test)]")
         lines.append(f'const {upper}_STRIP_RGBA: &[u8] = include_bytes!("{spec.stem()}_strip.rgba");')
-        lines.append("")
-        lines.append("/// The strip's own single background (`render::ACTIVE_BG`) -- pre-")
-        lines.append("/// composited opaque at bake time, same fix as the rail tier above; the")
-        lines.append("/// ONLY strip-tier sixel this crate ships.")
-        lines.append(f'const {upper}_STRIP_GATE_RGBA: &[u8] = include_bytes!("{spec.stem()}_strip_gate.rgba");')
-        lines.append(f"static {upper}_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate({upper}_STRIP_GATE_RGBA));")
-        lines.append("")
-        lines.append("/// Raw true-coverage gallery-tier source, test-only -- same retirement as")
-        lines.append(f"/// {upper}_RGBA above.")
-        lines.append("#[cfg(test)]")
         lines.append(f'const {upper}_GALLERY_RGBA: &[u8] = include_bytes!("{spec.stem()}_gallery.rgba");')
-        lines.append("")
-        lines.append("/// The icon gallery's own single background (`render::ACTIVE_BG`) --")
-        lines.append("/// pre-composited opaque at bake time, same fix as the rail/strip tiers")
-        lines.append("/// above; the ONLY gallery-tier sixel this crate ships.")
-        lines.append(f'const {upper}_GALLERY_GATE_RGBA: &[u8] = include_bytes!("{spec.stem()}_gallery_gate.rgba");')
-        lines.append(f"static {upper}_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate({upper}_GALLERY_GATE_RGBA));")
         lines.append("")
 
     # ---- Lucide dispatch -- alongside every codicon fn above, never
     # replacing it (see `app::IconFamily`'s own doc comment: `Codicons`
     # stays the default, unchanged). `Option` (never a bare `&'static
-    # str`) because the two `LUCIDE_GAPS` icons have no asset to resolve
+    # [u8]`) because the two `LUCIDE_GAPS` icons have no asset to resolve
     # at all -- a reported gap, not a panic and not a silent codicon
     # fallback (see `render::render_gallery_size_swatch`'s own doc
     # comment for how the ONE call site that can hit `None` today, the
     # icon gallery, handles it).
-    lines.append("/// Encoded rail-tier Lucide sixel string for `id` at `variant`'s own")
-    lines.append("/// explicit truecolor background -- `None` for the two documented")
-    lines.append("/// mapping gaps (`tools/bake_icons.py::LUCIDE_GAPS`); every other `IconId`")
-    lines.append("/// is always `Some`. Mirrors [`sixel`], the codicon equivalent.")
-    lines.append("pub fn sixel_lucide(id: IconId, variant: SixelVariant) -> Option<&'static str> {")
+    lines.append("/// Lucide equivalent of [`sixel_source_rgba`] -- `None` for the two")
+    lines.append("/// documented mapping gaps (`tools/bake_icons.py::LUCIDE_GAPS`); every")
+    lines.append("/// other `IconId` is always `Some`.")
+    lines.append("pub(crate) fn lucide_sixel_source_rgba(id: IconId) -> Option<&'static [u8]> {")
     lines.append("    match id {")
     for spec in MANIFEST:
         upper = to_screaming_snake(spec.rust_name)
         if spec.rust_name in LUCIDE_SLUGS:
-            lines.append(f"        IconId::{spec.rust_name} => Some(match variant {{")
-            lines.append(f"            SixelVariant::GateActive => LUCIDE_{upper}_SIXEL_GATE_ACTIVE.as_str(),")
-            lines.append(f"            SixelVariant::GateAccent => LUCIDE_{upper}_SIXEL_GATE_ACCENT.as_str(),")
-            lines.append("        }),")
+            lines.append(f"        IconId::{spec.rust_name} => Some(LUCIDE_{upper}_RGBA),")
         else:
             lines.append(f"        IconId::{spec.rust_name} => None,")
     lines.append("    }")
     lines.append("}")
     lines.append("")
-    lines.append("/// Lucide equivalent of [`sixel_strip`] -- same `None`-for-gaps contract")
-    lines.append("/// as [`sixel_lucide`], same `GateAccent` fold into `GateActive` (the")
-    lines.append("/// strip has no selected state either family needs a distinct asset for).")
-    lines.append("pub fn sixel_strip_lucide(id: IconId, variant: SixelVariant) -> Option<&'static str> {")
+    lines.append("/// Lucide equivalent of [`sixel_strip_source_rgba`] -- same `None`-for-")
+    lines.append("/// gaps contract as [`lucide_sixel_source_rgba`].")
+    lines.append("pub(crate) fn lucide_sixel_strip_source_rgba(id: IconId) -> Option<&'static [u8]> {")
     lines.append("    match id {")
     for spec in MANIFEST:
         upper = to_screaming_snake(spec.rust_name)
         if spec.rust_name in LUCIDE_SLUGS:
-            lines.append(f"        IconId::{spec.rust_name} => Some(match variant {{")
-            lines.append(f"            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_{upper}_SIXEL_STRIP_GATE.as_str(),")
-            lines.append("        }),")
+            lines.append(f"        IconId::{spec.rust_name} => Some(LUCIDE_{upper}_STRIP_RGBA),")
         else:
             lines.append(f"        IconId::{spec.rust_name} => None,")
     lines.append("    }")
     lines.append("}")
     lines.append("")
-    lines.append("/// Lucide equivalent of [`sixel_gallery`] -- same `None`-for-gaps")
-    lines.append("/// contract, same `GateAccent` fold as [`sixel_strip_lucide`].")
-    lines.append("pub fn sixel_gallery_lucide(id: IconId, variant: SixelVariant) -> Option<&'static str> {")
+    lines.append("/// Lucide equivalent of [`sixel_gallery_source_rgba`] -- same `None`-for-")
+    lines.append("/// gaps contract as [`lucide_sixel_source_rgba`].")
+    lines.append("pub(crate) fn lucide_sixel_gallery_source_rgba(id: IconId) -> Option<&'static [u8]> {")
     lines.append("    match id {")
     for spec in MANIFEST:
         upper = to_screaming_snake(spec.rust_name)
         if spec.rust_name in LUCIDE_SLUGS:
-            lines.append(f"        IconId::{spec.rust_name} => Some(match variant {{")
-            lines.append(f"            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_{upper}_SIXEL_GALLERY_GATE.as_str(),")
-            lines.append("        }),")
+            lines.append(f"        IconId::{spec.rust_name} => Some(LUCIDE_{upper}_GALLERY_RGBA),")
         else:
             lines.append(f"        IconId::{spec.rust_name} => None,")
     lines.append("    }")
     lines.append("}")
     lines.append("")
     lines.append("/// Lucide equivalent of [`sixel_compact`] -- same `None`-for-gaps")
-    lines.append("/// contract; no `SixelVariant` parameter, same reason `sixel_compact`")
-    lines.append("/// has none (real transparency, no pre-composited background variant).")
+    lines.append("/// contract; pre-encoded (real transparency), same reason `sixel_compact`")
+    lines.append("/// never composites against a background either.")
     lines.append("pub fn sixel_compact_lucide(id: IconId) -> Option<&'static str> {")
     lines.append("    match id {")
     for spec in MANIFEST:
@@ -1645,31 +1405,20 @@ def generate_catalog() -> str:
     lines.append("    }")
     lines.append("}")
     lines.append("")
-    lines.append("// Raw true-coverage Lucide sources, test-only -- same retirement/")
-    lines.append("// `#[cfg(test)]`-gating precedent as the codicon accessors above;")
-    lines.append("// `Option` for the same `LUCIDE_GAPS` reason every dispatch fn above has.")
-    for test_fn_name, field_suffix in [
-        ("lucide_sixel_source_rgba", "_RGBA"),
-        ("lucide_sixel_compact_source_rgba", "_COMPACT_RGBA"),
-        ("lucide_sixel_gate_active_source_rgba", "_GATE_ACTIVE_RGBA"),
-        ("lucide_sixel_gate_accent_source_rgba", "_GATE_ACCENT_RGBA"),
-        ("lucide_sixel_strip_source_rgba", "_STRIP_RGBA"),
-        ("lucide_sixel_strip_gate_source_rgba", "_STRIP_GATE_RGBA"),
-        ("lucide_sixel_gallery_source_rgba", "_GALLERY_RGBA"),
-        ("lucide_sixel_gallery_gate_source_rgba", "_GALLERY_GATE_RGBA"),
-    ]:
-        lines.append("#[cfg(test)]")
-        lines.append(f"pub(crate) fn {test_fn_name}(id: IconId) -> Option<&'static [u8]> {{")
-        lines.append("    match id {")
-        for spec in MANIFEST:
-            upper = to_screaming_snake(spec.rust_name)
-            if spec.rust_name in LUCIDE_SLUGS:
-                lines.append(f"        IconId::{spec.rust_name} => Some(LUCIDE_{upper}{field_suffix}),")
-            else:
-                lines.append(f"        IconId::{spec.rust_name} => None,")
-        lines.append("    }")
-        lines.append("}")
-        lines.append("")
+    lines.append("// Compact tier's own raw Lucide source, test-only -- same precedent as")
+    lines.append("// the codicon `sixel_compact_source_rgba` above.")
+    lines.append("#[cfg(test)]")
+    lines.append("pub(crate) fn lucide_sixel_compact_source_rgba(id: IconId) -> Option<&'static [u8]> {")
+    lines.append("    match id {")
+    for spec in MANIFEST:
+        upper = to_screaming_snake(spec.rust_name)
+        if spec.rust_name in LUCIDE_SLUGS:
+            lines.append(f"        IconId::{spec.rust_name} => Some(LUCIDE_{upper}_COMPACT_RGBA),")
+        else:
+            lines.append(f"        IconId::{spec.rust_name} => None,")
+    lines.append("    }")
+    lines.append("}")
+    lines.append("")
 
     for spec in MANIFEST:
         if spec.rust_name not in LUCIDE_SLUGS:
@@ -1678,29 +1427,11 @@ def generate_catalog() -> str:
         slug = LUCIDE_SLUGS[spec.rust_name]
         lines.append(f"// ---- Lucide {spec.rust_name} ({slug}) " + "-" * max(1, 52 - len(spec.rust_name) - len(slug)))
         lines.append("")
-        lines.append("#[cfg(test)]")
         lines.append(f'const LUCIDE_{upper}_RGBA: &[u8] = include_bytes!("lucide_{spec.stem()}.rgba");')
-        lines.append("")
-        lines.append(f'const LUCIDE_{upper}_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_{spec.stem()}_gate_active.rgba");')
-        lines.append(f"static LUCIDE_{upper}_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_{upper}_GATE_ACTIVE_RGBA));")
-        lines.append("")
-        lines.append(f'const LUCIDE_{upper}_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_{spec.stem()}_gate_accent.rgba");')
-        lines.append(f"static LUCIDE_{upper}_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_{upper}_GATE_ACCENT_RGBA));")
-        lines.append("")
         lines.append(f'const LUCIDE_{upper}_COMPACT_RGBA: &[u8] = include_bytes!("lucide_{spec.stem()}_compact.rgba");')
         lines.append(f"static LUCIDE_{upper}_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_{upper}_COMPACT_RGBA));")
-        lines.append("")
-        lines.append("#[cfg(test)]")
         lines.append(f'const LUCIDE_{upper}_STRIP_RGBA: &[u8] = include_bytes!("lucide_{spec.stem()}_strip.rgba");')
-        lines.append("")
-        lines.append(f'const LUCIDE_{upper}_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_{spec.stem()}_strip_gate.rgba");')
-        lines.append(f"static LUCIDE_{upper}_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_{upper}_STRIP_GATE_RGBA));")
-        lines.append("")
-        lines.append("#[cfg(test)]")
         lines.append(f'const LUCIDE_{upper}_GALLERY_RGBA: &[u8] = include_bytes!("lucide_{spec.stem()}_gallery.rgba");')
-        lines.append("")
-        lines.append(f'const LUCIDE_{upper}_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_{spec.stem()}_gallery_gate.rgba");')
-        lines.append(f"static LUCIDE_{upper}_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_{upper}_GALLERY_GATE_RGBA));")
         lines.append("")
 
     return "\n".join(lines) + "\n"
@@ -1714,11 +1445,10 @@ def to_screaming_snake(pascal: str) -> str:
 
 def print_report(
     asset_sizes: dict[str, tuple[int, bool]],
-    gate_asset_sizes: dict[str, tuple[int, int, bool]],
     compact_asset_sizes: dict[str, tuple[int, bool]],
-    strip_asset_sizes: dict[str, tuple[int, int, bool]],
-    gallery_asset_sizes: dict[str, tuple[int, int, bool]],
-    lucide_asset_sizes: dict[str, tuple[int, int, int, int, int, bool]],
+    strip_asset_sizes: dict[str, tuple[int, bool]],
+    gallery_asset_sizes: dict[str, tuple[int, bool]],
+    lucide_asset_sizes: dict[str, tuple[int, int, int, int, bool]],
 ) -> None:
     print()
     print("=" * 78)
@@ -1734,49 +1464,46 @@ def print_report(
         print(f"  {name}: {reason}")
     print()
     print("=" * 78)
-    print("ASSET SIZE TOTALS")
+    print("ASSET SIZE TOTALS (raw, TRUE-coverage sources only -- background")
+    print("compositing is a Rust-side runtime decision now, nothing more to bake)")
     print("=" * 78)
     total_sixel = sum(s for s, _ in asset_sizes.values())
     newly_baked_sixel = sum(s for s, new in asset_sizes.values() if new)
     n_new = sum(1 for _, new in asset_sizes.values() if new)
     print(f"Icons total: {len(MANIFEST)}  (newly baked this run: {n_new})")
-    print(f"Sixel tier:   {total_sixel:>9} bytes total ({total_sixel / 1024:.1f} KiB)  -- {newly_baked_sixel} bytes newly added")
-    total_gate = total_compact_sixel = total_strip = total_gallery = 0
-    if gate_asset_sizes:
-        total_gate = sum(a + c for a, c, _ in gate_asset_sizes.values())
-        newly_baked_gate = sum(a + c for a, c, new in gate_asset_sizes.values() if new)
-        print(f"Rail GateOverride variants (active+accent): {total_gate:>9} bytes total ({total_gate / 1024:.1f} KiB) -- {newly_baked_gate} bytes newly added")
+    print(f"Rail sixel tier:      {total_sixel:>9} bytes total ({total_sixel / 1024:.1f} KiB)  -- {newly_baked_sixel} bytes newly added")
+    total_compact_sixel = total_strip = total_gallery = 0
     if compact_asset_sizes:
         total_compact_sixel = sum(s for s, _ in compact_asset_sizes.values())
         newly_baked_compact_sixel = sum(s for s, new in compact_asset_sizes.values() if new)
         print(f"Compact sixel tier:   {total_compact_sixel:>9} bytes total ({total_compact_sixel / 1024:.1f} KiB)  -- {newly_baked_compact_sixel} bytes newly added")
     if strip_asset_sizes:
-        total_strip = sum(t + g for t, g, _ in strip_asset_sizes.values())
-        newly_baked_strip = sum(t + g for t, g, new in strip_asset_sizes.values() if new)
-        print(f"Strip sixel tier (transparent+gate): {total_strip:>9} bytes total ({total_strip / 1024:.1f} KiB) -- {newly_baked_strip} bytes newly added")
+        total_strip = sum(s for s, _ in strip_asset_sizes.values())
+        newly_baked_strip = sum(s for s, new in strip_asset_sizes.values() if new)
+        print(f"Strip sixel tier:     {total_strip:>9} bytes total ({total_strip / 1024:.1f} KiB)  -- {newly_baked_strip} bytes newly added")
     if gallery_asset_sizes:
-        total_gallery = sum(t + g for t, g, _ in gallery_asset_sizes.values())
-        newly_baked_gallery = sum(t + g for t, g, new in gallery_asset_sizes.values() if new)
-        print(f"Gallery sixel tier (transparent+gate): {total_gallery:>9} bytes total ({total_gallery / 1024:.1f} KiB) -- {newly_baked_gallery} bytes newly added")
-    codicon_combined = total_sixel + total_gate + total_compact_sixel + total_strip + total_gallery
+        total_gallery = sum(s for s, _ in gallery_asset_sizes.values())
+        newly_baked_gallery = sum(s for s, new in gallery_asset_sizes.values() if new)
+        print(f"Gallery sixel tier:   {total_gallery:>9} bytes total ({total_gallery / 1024:.1f} KiB)  -- {newly_baked_gallery} bytes newly added")
+    codicon_combined = total_sixel + total_compact_sixel + total_strip + total_gallery
     print(f"Combined (codicons):     {codicon_combined:>9} bytes total ({codicon_combined / 1024:.1f} KiB)")
     lucide_combined = 0
     if lucide_asset_sizes:
-        total_lucide_gate = sum(gate for gate, _, _, _, _, _ in lucide_asset_sizes.values())
-        total_lucide_compact = sum(compact for _, compact, _, _, _, _ in lucide_asset_sizes.values())
-        total_lucide_strip = sum(strip for _, _, strip, _, _, _ in lucide_asset_sizes.values())
-        total_lucide_gallery = sum(gallery for _, _, _, gallery, _, _ in lucide_asset_sizes.values())
+        total_lucide_rail = sum(rail for rail, _, _, _, _ in lucide_asset_sizes.values())
+        total_lucide_compact = sum(compact for _, compact, _, _, _ in lucide_asset_sizes.values())
+        total_lucide_strip = sum(strip for _, _, strip, _, _ in lucide_asset_sizes.values())
+        total_lucide_gallery = sum(gallery for _, _, _, gallery, _ in lucide_asset_sizes.values())
         newly_baked_lucide = sum(
-            gate + compact + strip + gallery
-            for gate, compact, strip, gallery, _, new in lucide_asset_sizes.values()
+            rail + compact + strip + gallery
+            for rail, compact, strip, gallery, new in lucide_asset_sizes.values()
             if new
         )
-        lucide_combined = total_lucide_gate + total_lucide_compact + total_lucide_strip + total_lucide_gallery
+        lucide_combined = total_lucide_rail + total_lucide_compact + total_lucide_strip + total_lucide_gallery
         print(f"Lucide icons total: {len(lucide_asset_sizes)}  (of {len(MANIFEST)} in MANIFEST, {len(LUCIDE_GAPS)} reported gaps)")
-        print(f"Lucide rail GateActive+GateAccent:  {total_lucide_gate:>9} bytes total ({total_lucide_gate / 1024:.1f} KiB)")
-        print(f"Lucide compact tier:                {total_lucide_compact:>9} bytes total ({total_lucide_compact / 1024:.1f} KiB)")
-        print(f"Lucide strip tier (gate):           {total_lucide_strip:>9} bytes total ({total_lucide_strip / 1024:.1f} KiB)")
-        print(f"Lucide gallery tier (gate):         {total_lucide_gallery:>9} bytes total ({total_lucide_gallery / 1024:.1f} KiB)")
+        print(f"Lucide rail sixel tier:              {total_lucide_rail:>9} bytes total ({total_lucide_rail / 1024:.1f} KiB)")
+        print(f"Lucide compact tier:                 {total_lucide_compact:>9} bytes total ({total_lucide_compact / 1024:.1f} KiB)")
+        print(f"Lucide strip tier:                   {total_lucide_strip:>9} bytes total ({total_lucide_strip / 1024:.1f} KiB)")
+        print(f"Lucide gallery tier:                 {total_lucide_gallery:>9} bytes total ({total_lucide_gallery / 1024:.1f} KiB)")
         print(f"Combined (Lucide):        {lucide_combined:>9} bytes total ({lucide_combined / 1024:.1f} KiB) -- {newly_baked_lucide} bytes newly added")
     print(
         f"Combined (codicons + Lucide): {codicon_combined + lucide_combined:>9} bytes total "
@@ -1830,75 +1557,49 @@ def main(argv: list[str]) -> int:
             die(f"--only names not in MANIFEST: {sorted(missing)}")
 
     asset_sizes: dict[str, tuple[int, bool]] = {}
-    gate_asset_sizes: dict[str, tuple[int, int, bool]] = {}
     compact_asset_sizes: dict[str, tuple[int, bool]] = {}
-    strip_asset_sizes: dict[str, tuple[int, int, bool]] = {}
-    gallery_asset_sizes: dict[str, tuple[int, int, bool]] = {}
+    strip_asset_sizes: dict[str, tuple[int, bool]] = {}
+    gallery_asset_sizes: dict[str, tuple[int, bool]] = {}
     for spec in selected:
         sixel_existed = (ICONS_DIR / f"{spec.stem()}.rgba").exists()
-        active_existed = (ICONS_DIR / f"{spec.stem()}_gate_active.rgba").exists()
-        accent_existed = (ICONS_DIR / f"{spec.stem()}_gate_accent.rgba").exists()
-        sixel_path, active_path, accent_path = ensure_assets(spec, args.cache_dir, args.force)
+        sixel_path = ensure_assets(spec, args.cache_dir, args.force)
         asset_sizes[spec.slug] = (sixel_path.stat().st_size, args.force or not sixel_existed)
-        gate_asset_sizes[spec.slug] = (
-            active_path.stat().st_size,
-            accent_path.stat().st_size,
-            args.force or not active_existed or not accent_existed,
-        )
 
         compact_sixel_existed = (ICONS_DIR / f"{spec.stem()}_compact.rgba").exists()
         compact_sixel_path = ensure_compact_assets(spec, args.cache_dir, args.force)
         compact_asset_sizes[spec.slug] = (compact_sixel_path.stat().st_size, args.force or not compact_sixel_existed)
 
         strip_existed = (ICONS_DIR / f"{spec.stem()}_strip.rgba").exists()
-        strip_gate_existed = (ICONS_DIR / f"{spec.stem()}_strip_gate.rgba").exists()
-        strip_path, strip_gate_path = ensure_strip_assets(spec, args.cache_dir, args.force)
-        strip_asset_sizes[spec.slug] = (
-            strip_path.stat().st_size,
-            strip_gate_path.stat().st_size,
-            args.force or not strip_existed or not strip_gate_existed,
-        )
+        strip_path = ensure_strip_assets(spec, args.cache_dir, args.force)
+        strip_asset_sizes[spec.slug] = (strip_path.stat().st_size, args.force or not strip_existed)
 
         gallery_existed = (ICONS_DIR / f"{spec.stem()}_gallery.rgba").exists()
-        gallery_gate_existed = (ICONS_DIR / f"{spec.stem()}_gallery_gate.rgba").exists()
-        gallery_path, gallery_gate_path = ensure_gallery_assets(spec, args.cache_dir, args.force)
-        gallery_asset_sizes[spec.slug] = (
-            gallery_path.stat().st_size,
-            gallery_gate_path.stat().st_size,
-            args.force or not gallery_existed or not gallery_gate_existed,
-        )
+        gallery_path = ensure_gallery_assets(spec, args.cache_dir, args.force)
+        gallery_asset_sizes[spec.slug] = (gallery_path.stat().st_size, args.force or not gallery_existed)
 
-    lucide_asset_sizes: dict[str, tuple[int, int, int, int, int, bool]] = {}
+    lucide_asset_sizes: dict[str, tuple[int, int, int, int, bool]] = {}
     for spec in selected:
         lucide_slug = LUCIDE_SLUGS.get(spec.rust_name)
         if lucide_slug is None:
             continue  # LUCIDE_GAPS -- no asset to bake, see that dict's own doc comment.
         sixel_existed = (ICONS_DIR / f"lucide_{spec.stem()}.rgba").exists()
-        active_existed = (ICONS_DIR / f"lucide_{spec.stem()}_gate_active.rgba").exists()
-        accent_existed = (ICONS_DIR / f"lucide_{spec.stem()}_gate_accent.rgba").exists()
-        _, active_path, accent_path = ensure_lucide_assets(spec, lucide_slug, DEFAULT_LUCIDE_CACHE_DIR, args.force)
+        sixel_path = ensure_lucide_assets(spec, lucide_slug, DEFAULT_LUCIDE_CACHE_DIR, args.force)
 
         compact_existed = (ICONS_DIR / f"lucide_{spec.stem()}_compact.rgba").exists()
         compact_path = ensure_lucide_compact_assets(spec, lucide_slug, DEFAULT_LUCIDE_CACHE_DIR, args.force)
 
         strip_existed = (ICONS_DIR / f"lucide_{spec.stem()}_strip.rgba").exists()
-        strip_gate_existed = (ICONS_DIR / f"lucide_{spec.stem()}_strip_gate.rgba").exists()
-        _, strip_gate_path = ensure_lucide_strip_assets(spec, lucide_slug, DEFAULT_LUCIDE_CACHE_DIR, args.force)
+        strip_path = ensure_lucide_strip_assets(spec, lucide_slug, DEFAULT_LUCIDE_CACHE_DIR, args.force)
 
         gallery_existed = (ICONS_DIR / f"lucide_{spec.stem()}_gallery.rgba").exists()
-        gallery_gate_existed = (ICONS_DIR / f"lucide_{spec.stem()}_gallery_gate.rgba").exists()
-        _, gallery_gate_path = ensure_lucide_gallery_assets(spec, lucide_slug, DEFAULT_LUCIDE_CACHE_DIR, args.force)
+        gallery_path = ensure_lucide_gallery_assets(spec, lucide_slug, DEFAULT_LUCIDE_CACHE_DIR, args.force)
 
         lucide_asset_sizes[spec.rust_name] = (
-            active_path.stat().st_size + accent_path.stat().st_size,
+            sixel_path.stat().st_size,
             compact_path.stat().st_size,
-            strip_gate_path.stat().st_size,
-            gallery_gate_path.stat().st_size,
-            0,
-            args.force or not (
-                sixel_existed and active_existed and accent_existed and compact_existed
-                and strip_existed and strip_gate_existed and gallery_existed and gallery_gate_existed
-            ),
+            strip_path.stat().st_size,
+            gallery_path.stat().st_size,
+            args.force or not (sixel_existed and compact_existed and strip_existed and gallery_existed),
         )
 
     if only is None:
@@ -1909,7 +1610,7 @@ def main(argv: list[str]) -> int:
     else:
         print(f"--only restricted this run to {sorted(only)} -- catalog.rs NOT regenerated (needs the full manifest)")
 
-    print_report(asset_sizes, gate_asset_sizes, compact_asset_sizes, strip_asset_sizes, gallery_asset_sizes, lucide_asset_sizes)
+    print_report(asset_sizes, compact_asset_sizes, strip_asset_sizes, gallery_asset_sizes, lucide_asset_sizes)
     return 0
 
 

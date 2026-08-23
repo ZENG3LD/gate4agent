@@ -1249,16 +1249,18 @@ impl RailIcons {
 /// orthogonal to `RailIcons` itself (this has no effect at all in
 /// `RailIcons::Ascii`, which paints plain themed text with no raster to
 /// pick a family for). `Codicons` is the pre-existing, still-default
-/// catalog (`icons::sixel`/`sixel_strip`/`sixel_gallery`/`sixel_compact`,
-/// unchanged); `Lucide` is a second, alongside bake of the SAME `IconId`
-/// set from a stroke-based source instead of codicons' filled-outline one
-/// -- see `icons.rs`'s own "Lucide" doc section for the licence, mapping,
-/// and stroke-lattice reasoning. Owner-visible (Settings row, next to the
-/// `RailIcons` toggle) and persisted the same way (`preferences::
-/// UiPreferences::icon_family`), so it lives here next to `RailIcons`
-/// rather than in `icons.rs` alongside the render-detail-only
-/// `SixelVariant`.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// catalog (`icons::sixel_family`/`sixel_strip_family`/`sixel_gallery_
+/// family`/`sixel_compact_family`, unchanged); `Lucide` is a second,
+/// alongside bake of the SAME `IconId` set from a stroke-based source
+/// instead of codicons' filled-outline one -- see `icons.rs`'s own
+/// "Lucide" doc section for the licence, mapping, and stroke-lattice
+/// reasoning. Owner-visible (Settings row, next to the `RailIcons`
+/// toggle) and persisted the same way (`preferences::UiPreferences::
+/// icon_family`), so it lives here next to `RailIcons` rather than in
+/// `icons.rs` alongside the render-detail-only `SixelVariant`. `Hash`
+/// (alongside `Eq`) so `IconFamily` can be part of `icons.rs`'s own
+/// runtime sixel cache key.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum IconFamily {
     #[default]
     Codicons,
@@ -3123,6 +3125,17 @@ pub struct App {
     pub last_managed_worktree_lease: Option<ManagedWorktreeLeaseSnapshot>,
     pub last_managed_worktree_removed: Option<String>,
     pub color_mode: PtyColorMode,
+    /// The terminal's own real background colour -- resolved exactly
+    /// once, before this `App` is even constructed (`client::run` calls
+    /// `terminal_bg::resolve_background` ahead of `App::default()`, then
+    /// overwrites this field with the real result) -- see `terminal_bg`'s
+    /// own module doc comment for the OSC 11 exchange and `icons::
+    /// resolve_variant_background`'s own doc comment for how a sixel
+    /// placement actually uses this. Defaults to `terminal_bg::FALLBACK_
+    /// BACKGROUND` purely so `App::default()` (used pervasively by this
+    /// crate's own tests, which never run the real startup query) is
+    /// never left at some OTHER, unrelated placeholder colour.
+    pub terminal_background: (u8, u8, u8),
     pub notice: Option<String>,
     pub terminal_rows: u16,
     pub terminal_cols: u16,
@@ -3234,6 +3247,7 @@ impl Default for App {
             last_managed_worktree_lease: None,
             last_managed_worktree_removed: None,
             color_mode: PtyColorMode::Inherited,
+            terminal_background: crate::terminal_bg::FALLBACK_BACKGROUND,
             notice: None,
             terminal_rows: 24,
             terminal_cols: 80,

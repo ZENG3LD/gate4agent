@@ -19,22 +19,27 @@
 //!
 //! See `../icons.rs`'s own module doc for the full tier/pipeline
 //! explanation and `tools/bake_icons.py`'s own header for the exact bake
-//! recipe (shared by both families -- only fetch/patch differ).
+//! recipe (shared by both families -- only fetch/patch differ). This
+//! module ships ONLY raw, TRUE-coverage source buffers (plus the compact
+//! tier's own pre-encoded sixel, which never composites against a
+//! background at all) -- every OTHER tier's background compositing is a
+//! RUNTIME decision made by `../icons.rs::composite_over_background`, not
+//! something this generated file bakes in (see `tools/bake_icons.py`'s own
+//! header doc comment, cause 1's "CURRENT FIX" note).
 
 use std::sync::LazyLock;
 
-use super::{
-    build_sixel_compact, build_sixel_gallery_gate, build_sixel_gate, build_sixel_strip_gate,
-    SixelVariant,
-};
+use super::build_sixel_compact;
 
 /// Every baked icon this crate ships, sixel + ascii tiers, one enum
 /// covering the full catalog (not just the activity rail -- see `../
 /// icons.rs`'s own module doc). Only the activity rail's original 7
 /// variants are wired into a UI site today; the rest are baked and tested
 /// but not yet drawn anywhere -- a deliberate, scoped-out next slice, not
-/// an oversight.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// an oversight. `Hash` (alongside `Eq`) so `IconId` can key the runtime
+/// sixel cache (`../icons.rs`'s own module doc, "Sixel background
+/// variants" section).
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum IconId {
     Files,
     SourceControl,
@@ -157,607 +162,210 @@ impl IconId {
     ];
 }
 
-/// Encoded rail-tier sixel string for `id` at `variant`'s own explicit
-/// truecolor background (see [`SixelVariant`]'s own doc comment) -- see
-/// `../icons.rs::build_sixel_gate`'s own doc comment for why this is cached
-/// (`LazyLock`) rather than re-encoded per call.
-pub fn sixel(id: IconId, variant: SixelVariant) -> &'static str {
+/// Raw, TRUE-coverage rail-tier source bytes for `id` -- straight (non-
+/// premultiplied) RGBA8, `icons::SIXEL_ICON_WIDTH_PX` x `_HEIGHT_PX`. The
+/// ONLY rail-tier asset this crate ships (see this module's own header doc
+/// comment): `../icons.rs::composite_over_background` composites this on
+/// demand against whichever background a given placement actually needs,
+/// cached by (icon, tier, family, background RGB) rather than pre-baked
+/// per background here.
+pub(crate) fn sixel_source_rgba(id: IconId) -> &'static [u8] {
     match id {
-        IconId::Files => match variant {
-            SixelVariant::GateActive => FILES_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => FILES_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::SourceControl => match variant {
-            SixelVariant::GateActive => SOURCE_CONTROL_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => SOURCE_CONTROL_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::Person => match variant {
-            SixelVariant::GateActive => PERSON_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => PERSON_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::Project => match variant {
-            SixelVariant::GateActive => PROJECT_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => PROJECT_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::SettingsGear => match variant {
-            SixelVariant::GateActive => SETTINGS_GEAR_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => SETTINGS_GEAR_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::ChevronLeft => match variant {
-            SixelVariant::GateActive => CHEVRON_LEFT_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => CHEVRON_LEFT_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::ChevronRight => match variant {
-            SixelVariant::GateActive => CHEVRON_RIGHT_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => CHEVRON_RIGHT_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::ChevronDown => match variant {
-            SixelVariant::GateActive => CHEVRON_DOWN_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => CHEVRON_DOWN_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::NewFile => match variant {
-            SixelVariant::GateActive => NEW_FILE_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => NEW_FILE_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::NewFolder => match variant {
-            SixelVariant::GateActive => NEW_FOLDER_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => NEW_FOLDER_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::Folder => match variant {
-            SixelVariant::GateActive => FOLDER_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => FOLDER_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::FolderOpened => match variant {
-            SixelVariant::GateActive => FOLDER_OPENED_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => FOLDER_OPENED_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::File => match variant {
-            SixelVariant::GateActive => FILE_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => FILE_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::Save => match variant {
-            SixelVariant::GateActive => SAVE_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => SAVE_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::Refresh => match variant {
-            SixelVariant::GateActive => REFRESH_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => REFRESH_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::Add => match variant {
-            SixelVariant::GateActive => ADD_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => ADD_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::Trash => match variant {
-            SixelVariant::GateActive => TRASH_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => TRASH_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::Search => match variant {
-            SixelVariant::GateActive => SEARCH_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => SEARCH_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::Check => match variant {
-            SixelVariant::GateActive => CHECK_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => CHECK_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::Close => match variant {
-            SixelVariant::GateActive => CLOSE_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => CLOSE_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::ArrowUp => match variant {
-            SixelVariant::GateActive => ARROW_UP_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => ARROW_UP_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::ArrowDown => match variant {
-            SixelVariant::GateActive => ARROW_DOWN_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => ARROW_DOWN_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::ArrowLeft => match variant {
-            SixelVariant::GateActive => ARROW_LEFT_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => ARROW_LEFT_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::ArrowRight => match variant {
-            SixelVariant::GateActive => ARROW_RIGHT_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => ARROW_RIGHT_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::ArrowSwap => match variant {
-            SixelVariant::GateActive => ARROW_SWAP_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => ARROW_SWAP_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::GitCommit => match variant {
-            SixelVariant::GateActive => GIT_COMMIT_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => GIT_COMMIT_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::GitBranch => match variant {
-            SixelVariant::GateActive => GIT_BRANCH_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => GIT_BRANCH_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::Diff => match variant {
-            SixelVariant::GateActive => DIFF_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => DIFF_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::DiffAdded => match variant {
-            SixelVariant::GateActive => DIFF_ADDED_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => DIFF_ADDED_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::GitCompare => match variant {
-            SixelVariant::GateActive => GIT_COMPARE_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => GIT_COMPARE_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::Repo => match variant {
-            SixelVariant::GateActive => REPO_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => REPO_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::RepoForked => match variant {
-            SixelVariant::GateActive => REPO_FORKED_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => REPO_FORKED_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::DebugStop => match variant {
-            SixelVariant::GateActive => DEBUG_STOP_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => DEBUG_STOP_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::DebugRestart => match variant {
-            SixelVariant::GateActive => DEBUG_RESTART_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => DEBUG_RESTART_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::Edit => match variant {
-            SixelVariant::GateActive => EDIT_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => EDIT_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::History => match variant {
-            SixelVariant::GateActive => HISTORY_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => HISTORY_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::Terminal => match variant {
-            SixelVariant::GateActive => TERMINAL_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => TERMINAL_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::Output => match variant {
-            SixelVariant::GateActive => OUTPUT_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => OUTPUT_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::CloudDownload => match variant {
-            SixelVariant::GateActive => CLOUD_DOWNLOAD_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => CLOUD_DOWNLOAD_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::Ellipsis => match variant {
-            SixelVariant::GateActive => ELLIPSIS_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => ELLIPSIS_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::Link => match variant {
-            SixelVariant::GateActive => LINK_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LINK_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::CircleFilled => match variant {
-            SixelVariant::GateActive => CIRCLE_FILLED_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => CIRCLE_FILLED_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::CircleSlash => match variant {
-            SixelVariant::GateActive => CIRCLE_SLASH_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => CIRCLE_SLASH_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::Warning => match variant {
-            SixelVariant::GateActive => WARNING_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => WARNING_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::Error => match variant {
-            SixelVariant::GateActive => ERROR_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => ERROR_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::Info => match variant {
-            SixelVariant::GateActive => INFO_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => INFO_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::RunAll => match variant {
-            SixelVariant::GateActive => RUN_ALL_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => RUN_ALL_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::Play => match variant {
-            SixelVariant::GateActive => PLAY_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => PLAY_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::Sync => match variant {
-            SixelVariant::GateActive => SYNC_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => SYNC_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::GoToFile => match variant {
-            SixelVariant::GateActive => GO_TO_FILE_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => GO_TO_FILE_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::Pulse => match variant {
-            SixelVariant::GateActive => PULSE_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => PULSE_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::Checklist => match variant {
-            SixelVariant::GateActive => CHECKLIST_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => CHECKLIST_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::Eye => match variant {
-            SixelVariant::GateActive => EYE_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => EYE_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::Layout => match variant {
-            SixelVariant::GateActive => LAYOUT_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LAYOUT_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::SplitHorizontal => match variant {
-            SixelVariant::GateActive => SPLIT_HORIZONTAL_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => SPLIT_HORIZONTAL_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::SplitVertical => match variant {
-            SixelVariant::GateActive => SPLIT_VERTICAL_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => SPLIT_VERTICAL_SIXEL_GATE_ACCENT.as_str(),
-        },
-        IconId::Preview => match variant {
-            SixelVariant::GateActive => PREVIEW_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => PREVIEW_SIXEL_GATE_ACCENT.as_str(),
-        },
+        IconId::Files => FILES_RGBA,
+        IconId::SourceControl => SOURCE_CONTROL_RGBA,
+        IconId::Person => PERSON_RGBA,
+        IconId::Project => PROJECT_RGBA,
+        IconId::SettingsGear => SETTINGS_GEAR_RGBA,
+        IconId::ChevronLeft => CHEVRON_LEFT_RGBA,
+        IconId::ChevronRight => CHEVRON_RIGHT_RGBA,
+        IconId::ChevronDown => CHEVRON_DOWN_RGBA,
+        IconId::NewFile => NEW_FILE_RGBA,
+        IconId::NewFolder => NEW_FOLDER_RGBA,
+        IconId::Folder => FOLDER_RGBA,
+        IconId::FolderOpened => FOLDER_OPENED_RGBA,
+        IconId::File => FILE_RGBA,
+        IconId::Save => SAVE_RGBA,
+        IconId::Refresh => REFRESH_RGBA,
+        IconId::Add => ADD_RGBA,
+        IconId::Trash => TRASH_RGBA,
+        IconId::Search => SEARCH_RGBA,
+        IconId::Check => CHECK_RGBA,
+        IconId::Close => CLOSE_RGBA,
+        IconId::ArrowUp => ARROW_UP_RGBA,
+        IconId::ArrowDown => ARROW_DOWN_RGBA,
+        IconId::ArrowLeft => ARROW_LEFT_RGBA,
+        IconId::ArrowRight => ARROW_RIGHT_RGBA,
+        IconId::ArrowSwap => ARROW_SWAP_RGBA,
+        IconId::GitCommit => GIT_COMMIT_RGBA,
+        IconId::GitBranch => GIT_BRANCH_RGBA,
+        IconId::Diff => DIFF_RGBA,
+        IconId::DiffAdded => DIFF_ADDED_RGBA,
+        IconId::GitCompare => GIT_COMPARE_RGBA,
+        IconId::Repo => REPO_RGBA,
+        IconId::RepoForked => REPO_FORKED_RGBA,
+        IconId::DebugStop => DEBUG_STOP_RGBA,
+        IconId::DebugRestart => DEBUG_RESTART_RGBA,
+        IconId::Edit => EDIT_RGBA,
+        IconId::History => HISTORY_RGBA,
+        IconId::Terminal => TERMINAL_RGBA,
+        IconId::Output => OUTPUT_RGBA,
+        IconId::CloudDownload => CLOUD_DOWNLOAD_RGBA,
+        IconId::Ellipsis => ELLIPSIS_RGBA,
+        IconId::Link => LINK_RGBA,
+        IconId::CircleFilled => CIRCLE_FILLED_RGBA,
+        IconId::CircleSlash => CIRCLE_SLASH_RGBA,
+        IconId::Warning => WARNING_RGBA,
+        IconId::Error => ERROR_RGBA,
+        IconId::Info => INFO_RGBA,
+        IconId::RunAll => RUN_ALL_RGBA,
+        IconId::Play => PLAY_RGBA,
+        IconId::Sync => SYNC_RGBA,
+        IconId::GoToFile => GO_TO_FILE_RGBA,
+        IconId::Pulse => PULSE_RGBA,
+        IconId::Checklist => CHECKLIST_RGBA,
+        IconId::Eye => EYE_RGBA,
+        IconId::Layout => LAYOUT_RGBA,
+        IconId::SplitHorizontal => SPLIT_HORIZONTAL_RGBA,
+        IconId::SplitVertical => SPLIT_VERTICAL_RGBA,
+        IconId::Preview => PREVIEW_RGBA,
     }
 }
 
-/// Encoded control-plane-strip-tier sixel string for `id` at `variant`'s
-/// own explicit truecolor background -- the strip never shows a selected
-/// state (see `../render.rs::render_control_strip_button`'s own doc
-/// comment), so `GateAccent` resolves to the SAME asset as `GateActive`
-/// here.
-pub fn sixel_strip(id: IconId, variant: SixelVariant) -> &'static str {
+/// Strip-tier equivalent of [`sixel_source_rgba`] -- `icons::STRIP_SIXEL_
+/// ICON_WIDTH_PX` x `_HEIGHT_PX`.
+pub(crate) fn sixel_strip_source_rgba(id: IconId) -> &'static [u8] {
     match id {
-        IconId::Files => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => FILES_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::SourceControl => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => SOURCE_CONTROL_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::Person => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => PERSON_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::Project => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => PROJECT_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::SettingsGear => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => SETTINGS_GEAR_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::ChevronLeft => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => CHEVRON_LEFT_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::ChevronRight => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => CHEVRON_RIGHT_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::ChevronDown => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => CHEVRON_DOWN_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::NewFile => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => NEW_FILE_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::NewFolder => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => NEW_FOLDER_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::Folder => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => FOLDER_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::FolderOpened => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => FOLDER_OPENED_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::File => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => FILE_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::Save => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => SAVE_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::Refresh => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => REFRESH_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::Add => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => ADD_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::Trash => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => TRASH_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::Search => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => SEARCH_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::Check => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => CHECK_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::Close => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => CLOSE_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::ArrowUp => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => ARROW_UP_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::ArrowDown => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => ARROW_DOWN_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::ArrowLeft => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => ARROW_LEFT_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::ArrowRight => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => ARROW_RIGHT_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::ArrowSwap => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => ARROW_SWAP_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::GitCommit => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => GIT_COMMIT_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::GitBranch => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => GIT_BRANCH_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::Diff => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => DIFF_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::DiffAdded => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => DIFF_ADDED_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::GitCompare => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => GIT_COMPARE_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::Repo => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => REPO_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::RepoForked => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => REPO_FORKED_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::DebugStop => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => DEBUG_STOP_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::DebugRestart => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => DEBUG_RESTART_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::Edit => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => EDIT_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::History => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => HISTORY_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::Terminal => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => TERMINAL_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::Output => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => OUTPUT_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::CloudDownload => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => CLOUD_DOWNLOAD_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::Ellipsis => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => ELLIPSIS_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::Link => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LINK_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::CircleFilled => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => CIRCLE_FILLED_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::CircleSlash => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => CIRCLE_SLASH_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::Warning => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => WARNING_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::Error => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => ERROR_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::Info => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => INFO_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::RunAll => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => RUN_ALL_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::Play => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => PLAY_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::Sync => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => SYNC_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::GoToFile => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => GO_TO_FILE_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::Pulse => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => PULSE_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::Checklist => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => CHECKLIST_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::Eye => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => EYE_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::Layout => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LAYOUT_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::SplitHorizontal => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => SPLIT_HORIZONTAL_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::SplitVertical => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => SPLIT_VERTICAL_SIXEL_STRIP_GATE.as_str(),
-        },
-        IconId::Preview => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => PREVIEW_SIXEL_STRIP_GATE.as_str(),
-        },
+        IconId::Files => FILES_STRIP_RGBA,
+        IconId::SourceControl => SOURCE_CONTROL_STRIP_RGBA,
+        IconId::Person => PERSON_STRIP_RGBA,
+        IconId::Project => PROJECT_STRIP_RGBA,
+        IconId::SettingsGear => SETTINGS_GEAR_STRIP_RGBA,
+        IconId::ChevronLeft => CHEVRON_LEFT_STRIP_RGBA,
+        IconId::ChevronRight => CHEVRON_RIGHT_STRIP_RGBA,
+        IconId::ChevronDown => CHEVRON_DOWN_STRIP_RGBA,
+        IconId::NewFile => NEW_FILE_STRIP_RGBA,
+        IconId::NewFolder => NEW_FOLDER_STRIP_RGBA,
+        IconId::Folder => FOLDER_STRIP_RGBA,
+        IconId::FolderOpened => FOLDER_OPENED_STRIP_RGBA,
+        IconId::File => FILE_STRIP_RGBA,
+        IconId::Save => SAVE_STRIP_RGBA,
+        IconId::Refresh => REFRESH_STRIP_RGBA,
+        IconId::Add => ADD_STRIP_RGBA,
+        IconId::Trash => TRASH_STRIP_RGBA,
+        IconId::Search => SEARCH_STRIP_RGBA,
+        IconId::Check => CHECK_STRIP_RGBA,
+        IconId::Close => CLOSE_STRIP_RGBA,
+        IconId::ArrowUp => ARROW_UP_STRIP_RGBA,
+        IconId::ArrowDown => ARROW_DOWN_STRIP_RGBA,
+        IconId::ArrowLeft => ARROW_LEFT_STRIP_RGBA,
+        IconId::ArrowRight => ARROW_RIGHT_STRIP_RGBA,
+        IconId::ArrowSwap => ARROW_SWAP_STRIP_RGBA,
+        IconId::GitCommit => GIT_COMMIT_STRIP_RGBA,
+        IconId::GitBranch => GIT_BRANCH_STRIP_RGBA,
+        IconId::Diff => DIFF_STRIP_RGBA,
+        IconId::DiffAdded => DIFF_ADDED_STRIP_RGBA,
+        IconId::GitCompare => GIT_COMPARE_STRIP_RGBA,
+        IconId::Repo => REPO_STRIP_RGBA,
+        IconId::RepoForked => REPO_FORKED_STRIP_RGBA,
+        IconId::DebugStop => DEBUG_STOP_STRIP_RGBA,
+        IconId::DebugRestart => DEBUG_RESTART_STRIP_RGBA,
+        IconId::Edit => EDIT_STRIP_RGBA,
+        IconId::History => HISTORY_STRIP_RGBA,
+        IconId::Terminal => TERMINAL_STRIP_RGBA,
+        IconId::Output => OUTPUT_STRIP_RGBA,
+        IconId::CloudDownload => CLOUD_DOWNLOAD_STRIP_RGBA,
+        IconId::Ellipsis => ELLIPSIS_STRIP_RGBA,
+        IconId::Link => LINK_STRIP_RGBA,
+        IconId::CircleFilled => CIRCLE_FILLED_STRIP_RGBA,
+        IconId::CircleSlash => CIRCLE_SLASH_STRIP_RGBA,
+        IconId::Warning => WARNING_STRIP_RGBA,
+        IconId::Error => ERROR_STRIP_RGBA,
+        IconId::Info => INFO_STRIP_RGBA,
+        IconId::RunAll => RUN_ALL_STRIP_RGBA,
+        IconId::Play => PLAY_STRIP_RGBA,
+        IconId::Sync => SYNC_STRIP_RGBA,
+        IconId::GoToFile => GO_TO_FILE_STRIP_RGBA,
+        IconId::Pulse => PULSE_STRIP_RGBA,
+        IconId::Checklist => CHECKLIST_STRIP_RGBA,
+        IconId::Eye => EYE_STRIP_RGBA,
+        IconId::Layout => LAYOUT_STRIP_RGBA,
+        IconId::SplitHorizontal => SPLIT_HORIZONTAL_STRIP_RGBA,
+        IconId::SplitVertical => SPLIT_VERTICAL_STRIP_RGBA,
+        IconId::Preview => PREVIEW_STRIP_RGBA,
     }
 }
 
-/// Encoded icon-gallery-tier sixel string for `id` at `variant`'s own
-/// explicit truecolor background -- the gallery is a read-only comparison
-/// grid with no selected state, so `GateAccent` resolves to the SAME asset
-/// as `GateActive` here (same fold as [`sixel_strip`]).
-pub fn sixel_gallery(id: IconId, variant: SixelVariant) -> &'static str {
+/// Gallery-tier equivalent of [`sixel_source_rgba`] -- `icons::GALLERY_
+/// SIXEL_ICON_WIDTH_PX` x `_HEIGHT_PX`.
+pub(crate) fn sixel_gallery_source_rgba(id: IconId) -> &'static [u8] {
     match id {
-        IconId::Files => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => FILES_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::SourceControl => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => SOURCE_CONTROL_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::Person => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => PERSON_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::Project => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => PROJECT_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::SettingsGear => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => SETTINGS_GEAR_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::ChevronLeft => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => CHEVRON_LEFT_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::ChevronRight => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => CHEVRON_RIGHT_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::ChevronDown => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => CHEVRON_DOWN_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::NewFile => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => NEW_FILE_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::NewFolder => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => NEW_FOLDER_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::Folder => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => FOLDER_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::FolderOpened => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => FOLDER_OPENED_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::File => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => FILE_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::Save => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => SAVE_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::Refresh => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => REFRESH_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::Add => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => ADD_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::Trash => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => TRASH_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::Search => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => SEARCH_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::Check => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => CHECK_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::Close => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => CLOSE_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::ArrowUp => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => ARROW_UP_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::ArrowDown => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => ARROW_DOWN_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::ArrowLeft => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => ARROW_LEFT_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::ArrowRight => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => ARROW_RIGHT_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::ArrowSwap => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => ARROW_SWAP_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::GitCommit => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => GIT_COMMIT_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::GitBranch => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => GIT_BRANCH_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::Diff => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => DIFF_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::DiffAdded => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => DIFF_ADDED_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::GitCompare => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => GIT_COMPARE_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::Repo => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => REPO_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::RepoForked => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => REPO_FORKED_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::DebugStop => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => DEBUG_STOP_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::DebugRestart => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => DEBUG_RESTART_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::Edit => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => EDIT_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::History => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => HISTORY_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::Terminal => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => TERMINAL_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::Output => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => OUTPUT_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::CloudDownload => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => CLOUD_DOWNLOAD_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::Ellipsis => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => ELLIPSIS_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::Link => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LINK_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::CircleFilled => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => CIRCLE_FILLED_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::CircleSlash => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => CIRCLE_SLASH_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::Warning => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => WARNING_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::Error => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => ERROR_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::Info => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => INFO_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::RunAll => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => RUN_ALL_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::Play => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => PLAY_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::Sync => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => SYNC_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::GoToFile => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => GO_TO_FILE_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::Pulse => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => PULSE_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::Checklist => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => CHECKLIST_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::Eye => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => EYE_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::Layout => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LAYOUT_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::SplitHorizontal => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => SPLIT_HORIZONTAL_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::SplitVertical => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => SPLIT_VERTICAL_SIXEL_GALLERY_GATE.as_str(),
-        },
-        IconId::Preview => match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => PREVIEW_SIXEL_GALLERY_GATE.as_str(),
-        },
+        IconId::Files => FILES_GALLERY_RGBA,
+        IconId::SourceControl => SOURCE_CONTROL_GALLERY_RGBA,
+        IconId::Person => PERSON_GALLERY_RGBA,
+        IconId::Project => PROJECT_GALLERY_RGBA,
+        IconId::SettingsGear => SETTINGS_GEAR_GALLERY_RGBA,
+        IconId::ChevronLeft => CHEVRON_LEFT_GALLERY_RGBA,
+        IconId::ChevronRight => CHEVRON_RIGHT_GALLERY_RGBA,
+        IconId::ChevronDown => CHEVRON_DOWN_GALLERY_RGBA,
+        IconId::NewFile => NEW_FILE_GALLERY_RGBA,
+        IconId::NewFolder => NEW_FOLDER_GALLERY_RGBA,
+        IconId::Folder => FOLDER_GALLERY_RGBA,
+        IconId::FolderOpened => FOLDER_OPENED_GALLERY_RGBA,
+        IconId::File => FILE_GALLERY_RGBA,
+        IconId::Save => SAVE_GALLERY_RGBA,
+        IconId::Refresh => REFRESH_GALLERY_RGBA,
+        IconId::Add => ADD_GALLERY_RGBA,
+        IconId::Trash => TRASH_GALLERY_RGBA,
+        IconId::Search => SEARCH_GALLERY_RGBA,
+        IconId::Check => CHECK_GALLERY_RGBA,
+        IconId::Close => CLOSE_GALLERY_RGBA,
+        IconId::ArrowUp => ARROW_UP_GALLERY_RGBA,
+        IconId::ArrowDown => ARROW_DOWN_GALLERY_RGBA,
+        IconId::ArrowLeft => ARROW_LEFT_GALLERY_RGBA,
+        IconId::ArrowRight => ARROW_RIGHT_GALLERY_RGBA,
+        IconId::ArrowSwap => ARROW_SWAP_GALLERY_RGBA,
+        IconId::GitCommit => GIT_COMMIT_GALLERY_RGBA,
+        IconId::GitBranch => GIT_BRANCH_GALLERY_RGBA,
+        IconId::Diff => DIFF_GALLERY_RGBA,
+        IconId::DiffAdded => DIFF_ADDED_GALLERY_RGBA,
+        IconId::GitCompare => GIT_COMPARE_GALLERY_RGBA,
+        IconId::Repo => REPO_GALLERY_RGBA,
+        IconId::RepoForked => REPO_FORKED_GALLERY_RGBA,
+        IconId::DebugStop => DEBUG_STOP_GALLERY_RGBA,
+        IconId::DebugRestart => DEBUG_RESTART_GALLERY_RGBA,
+        IconId::Edit => EDIT_GALLERY_RGBA,
+        IconId::History => HISTORY_GALLERY_RGBA,
+        IconId::Terminal => TERMINAL_GALLERY_RGBA,
+        IconId::Output => OUTPUT_GALLERY_RGBA,
+        IconId::CloudDownload => CLOUD_DOWNLOAD_GALLERY_RGBA,
+        IconId::Ellipsis => ELLIPSIS_GALLERY_RGBA,
+        IconId::Link => LINK_GALLERY_RGBA,
+        IconId::CircleFilled => CIRCLE_FILLED_GALLERY_RGBA,
+        IconId::CircleSlash => CIRCLE_SLASH_GALLERY_RGBA,
+        IconId::Warning => WARNING_GALLERY_RGBA,
+        IconId::Error => ERROR_GALLERY_RGBA,
+        IconId::Info => INFO_GALLERY_RGBA,
+        IconId::RunAll => RUN_ALL_GALLERY_RGBA,
+        IconId::Play => PLAY_GALLERY_RGBA,
+        IconId::Sync => SYNC_GALLERY_RGBA,
+        IconId::GoToFile => GO_TO_FILE_GALLERY_RGBA,
+        IconId::Pulse => PULSE_GALLERY_RGBA,
+        IconId::Checklist => CHECKLIST_GALLERY_RGBA,
+        IconId::Eye => EYE_GALLERY_RGBA,
+        IconId::Layout => LAYOUT_GALLERY_RGBA,
+        IconId::SplitHorizontal => SPLIT_HORIZONTAL_GALLERY_RGBA,
+        IconId::SplitVertical => SPLIT_VERTICAL_GALLERY_RGBA,
+        IconId::Preview => PREVIEW_GALLERY_RGBA,
     }
 }
 
 /// Encoded COMPACT-tier sixel string for `id` (exactly one assumed
 /// terminal cell -- see `../icons.rs`'s own module doc) -- for dense
-/// single-row buttons where the rail's own icon does not fit.
+/// single-row buttons where the rail's own icon does not fit. Unlike every
+/// other tier above, this one stays pre-encoded at MODULE LOAD (`LazyLock`)
+/// rather than composited on demand: it ships real transparency
+/// (`BackgroundMode::Transparent`), never a background to composite
+/// against at all (see `icons.rs`'s own "Compact tier" doc section).
 pub fn sixel_compact(id: IconId) -> &'static str {
     match id {
         IconId::Files => FILES_SIXEL_COMPACT.as_str(),
@@ -886,77 +494,9 @@ pub fn ascii(id: IconId) -> &'static str {
     }
 }
 
-// Raw true-coverage baked-source lookups by id -- used ONLY by this
-// crate's own unit tests (byte-length assertions and the gate-compositing
-// pixel checks): the rail/strip/gallery raw sources are no longer a
-// shipped `SixelVariant` (cause 4's own retirement, `tools/bake_icons.py`'s
-// own header doc comment), so their underlying `_RGBA` consts below are
-// `#[cfg(test)]`-gated too -- nothing outside this test module ever reaches
-// for them. The compact tier's own raw source stays unconditional: it IS
-// the real, directly-shipped asset (see `sixel_compact` above).
-#[cfg(test)]
-pub(crate) fn sixel_source_rgba(id: IconId) -> &'static [u8] {
-    match id {
-        IconId::Files => FILES_RGBA,
-        IconId::SourceControl => SOURCE_CONTROL_RGBA,
-        IconId::Person => PERSON_RGBA,
-        IconId::Project => PROJECT_RGBA,
-        IconId::SettingsGear => SETTINGS_GEAR_RGBA,
-        IconId::ChevronLeft => CHEVRON_LEFT_RGBA,
-        IconId::ChevronRight => CHEVRON_RIGHT_RGBA,
-        IconId::ChevronDown => CHEVRON_DOWN_RGBA,
-        IconId::NewFile => NEW_FILE_RGBA,
-        IconId::NewFolder => NEW_FOLDER_RGBA,
-        IconId::Folder => FOLDER_RGBA,
-        IconId::FolderOpened => FOLDER_OPENED_RGBA,
-        IconId::File => FILE_RGBA,
-        IconId::Save => SAVE_RGBA,
-        IconId::Refresh => REFRESH_RGBA,
-        IconId::Add => ADD_RGBA,
-        IconId::Trash => TRASH_RGBA,
-        IconId::Search => SEARCH_RGBA,
-        IconId::Check => CHECK_RGBA,
-        IconId::Close => CLOSE_RGBA,
-        IconId::ArrowUp => ARROW_UP_RGBA,
-        IconId::ArrowDown => ARROW_DOWN_RGBA,
-        IconId::ArrowLeft => ARROW_LEFT_RGBA,
-        IconId::ArrowRight => ARROW_RIGHT_RGBA,
-        IconId::ArrowSwap => ARROW_SWAP_RGBA,
-        IconId::GitCommit => GIT_COMMIT_RGBA,
-        IconId::GitBranch => GIT_BRANCH_RGBA,
-        IconId::Diff => DIFF_RGBA,
-        IconId::DiffAdded => DIFF_ADDED_RGBA,
-        IconId::GitCompare => GIT_COMPARE_RGBA,
-        IconId::Repo => REPO_RGBA,
-        IconId::RepoForked => REPO_FORKED_RGBA,
-        IconId::DebugStop => DEBUG_STOP_RGBA,
-        IconId::DebugRestart => DEBUG_RESTART_RGBA,
-        IconId::Edit => EDIT_RGBA,
-        IconId::History => HISTORY_RGBA,
-        IconId::Terminal => TERMINAL_RGBA,
-        IconId::Output => OUTPUT_RGBA,
-        IconId::CloudDownload => CLOUD_DOWNLOAD_RGBA,
-        IconId::Ellipsis => ELLIPSIS_RGBA,
-        IconId::Link => LINK_RGBA,
-        IconId::CircleFilled => CIRCLE_FILLED_RGBA,
-        IconId::CircleSlash => CIRCLE_SLASH_RGBA,
-        IconId::Warning => WARNING_RGBA,
-        IconId::Error => ERROR_RGBA,
-        IconId::Info => INFO_RGBA,
-        IconId::RunAll => RUN_ALL_RGBA,
-        IconId::Play => PLAY_RGBA,
-        IconId::Sync => SYNC_RGBA,
-        IconId::GoToFile => GO_TO_FILE_RGBA,
-        IconId::Pulse => PULSE_RGBA,
-        IconId::Checklist => CHECKLIST_RGBA,
-        IconId::Eye => EYE_RGBA,
-        IconId::Layout => LAYOUT_RGBA,
-        IconId::SplitHorizontal => SPLIT_HORIZONTAL_RGBA,
-        IconId::SplitVertical => SPLIT_VERTICAL_RGBA,
-        IconId::Preview => PREVIEW_RGBA,
-    }
-}
-
+// Compact tier's own raw source, test-only (byte-length assertions) --
+// production code only ever reaches for the pre-encoded `sixel_compact`
+// above; this tier never composites against a background at runtime.
 #[cfg(test)]
 pub(crate) fn sixel_compact_source_rgba(id: IconId) -> &'static [u8] {
     match id {
@@ -1020,3646 +560,658 @@ pub(crate) fn sixel_compact_source_rgba(id: IconId) -> &'static [u8] {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn sixel_gate_active_source_rgba(id: IconId) -> &'static [u8] {
-    match id {
-        IconId::Files => FILES_GATE_ACTIVE_RGBA,
-        IconId::SourceControl => SOURCE_CONTROL_GATE_ACTIVE_RGBA,
-        IconId::Person => PERSON_GATE_ACTIVE_RGBA,
-        IconId::Project => PROJECT_GATE_ACTIVE_RGBA,
-        IconId::SettingsGear => SETTINGS_GEAR_GATE_ACTIVE_RGBA,
-        IconId::ChevronLeft => CHEVRON_LEFT_GATE_ACTIVE_RGBA,
-        IconId::ChevronRight => CHEVRON_RIGHT_GATE_ACTIVE_RGBA,
-        IconId::ChevronDown => CHEVRON_DOWN_GATE_ACTIVE_RGBA,
-        IconId::NewFile => NEW_FILE_GATE_ACTIVE_RGBA,
-        IconId::NewFolder => NEW_FOLDER_GATE_ACTIVE_RGBA,
-        IconId::Folder => FOLDER_GATE_ACTIVE_RGBA,
-        IconId::FolderOpened => FOLDER_OPENED_GATE_ACTIVE_RGBA,
-        IconId::File => FILE_GATE_ACTIVE_RGBA,
-        IconId::Save => SAVE_GATE_ACTIVE_RGBA,
-        IconId::Refresh => REFRESH_GATE_ACTIVE_RGBA,
-        IconId::Add => ADD_GATE_ACTIVE_RGBA,
-        IconId::Trash => TRASH_GATE_ACTIVE_RGBA,
-        IconId::Search => SEARCH_GATE_ACTIVE_RGBA,
-        IconId::Check => CHECK_GATE_ACTIVE_RGBA,
-        IconId::Close => CLOSE_GATE_ACTIVE_RGBA,
-        IconId::ArrowUp => ARROW_UP_GATE_ACTIVE_RGBA,
-        IconId::ArrowDown => ARROW_DOWN_GATE_ACTIVE_RGBA,
-        IconId::ArrowLeft => ARROW_LEFT_GATE_ACTIVE_RGBA,
-        IconId::ArrowRight => ARROW_RIGHT_GATE_ACTIVE_RGBA,
-        IconId::ArrowSwap => ARROW_SWAP_GATE_ACTIVE_RGBA,
-        IconId::GitCommit => GIT_COMMIT_GATE_ACTIVE_RGBA,
-        IconId::GitBranch => GIT_BRANCH_GATE_ACTIVE_RGBA,
-        IconId::Diff => DIFF_GATE_ACTIVE_RGBA,
-        IconId::DiffAdded => DIFF_ADDED_GATE_ACTIVE_RGBA,
-        IconId::GitCompare => GIT_COMPARE_GATE_ACTIVE_RGBA,
-        IconId::Repo => REPO_GATE_ACTIVE_RGBA,
-        IconId::RepoForked => REPO_FORKED_GATE_ACTIVE_RGBA,
-        IconId::DebugStop => DEBUG_STOP_GATE_ACTIVE_RGBA,
-        IconId::DebugRestart => DEBUG_RESTART_GATE_ACTIVE_RGBA,
-        IconId::Edit => EDIT_GATE_ACTIVE_RGBA,
-        IconId::History => HISTORY_GATE_ACTIVE_RGBA,
-        IconId::Terminal => TERMINAL_GATE_ACTIVE_RGBA,
-        IconId::Output => OUTPUT_GATE_ACTIVE_RGBA,
-        IconId::CloudDownload => CLOUD_DOWNLOAD_GATE_ACTIVE_RGBA,
-        IconId::Ellipsis => ELLIPSIS_GATE_ACTIVE_RGBA,
-        IconId::Link => LINK_GATE_ACTIVE_RGBA,
-        IconId::CircleFilled => CIRCLE_FILLED_GATE_ACTIVE_RGBA,
-        IconId::CircleSlash => CIRCLE_SLASH_GATE_ACTIVE_RGBA,
-        IconId::Warning => WARNING_GATE_ACTIVE_RGBA,
-        IconId::Error => ERROR_GATE_ACTIVE_RGBA,
-        IconId::Info => INFO_GATE_ACTIVE_RGBA,
-        IconId::RunAll => RUN_ALL_GATE_ACTIVE_RGBA,
-        IconId::Play => PLAY_GATE_ACTIVE_RGBA,
-        IconId::Sync => SYNC_GATE_ACTIVE_RGBA,
-        IconId::GoToFile => GO_TO_FILE_GATE_ACTIVE_RGBA,
-        IconId::Pulse => PULSE_GATE_ACTIVE_RGBA,
-        IconId::Checklist => CHECKLIST_GATE_ACTIVE_RGBA,
-        IconId::Eye => EYE_GATE_ACTIVE_RGBA,
-        IconId::Layout => LAYOUT_GATE_ACTIVE_RGBA,
-        IconId::SplitHorizontal => SPLIT_HORIZONTAL_GATE_ACTIVE_RGBA,
-        IconId::SplitVertical => SPLIT_VERTICAL_GATE_ACTIVE_RGBA,
-        IconId::Preview => PREVIEW_GATE_ACTIVE_RGBA,
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn sixel_gate_accent_source_rgba(id: IconId) -> &'static [u8] {
-    match id {
-        IconId::Files => FILES_GATE_ACCENT_RGBA,
-        IconId::SourceControl => SOURCE_CONTROL_GATE_ACCENT_RGBA,
-        IconId::Person => PERSON_GATE_ACCENT_RGBA,
-        IconId::Project => PROJECT_GATE_ACCENT_RGBA,
-        IconId::SettingsGear => SETTINGS_GEAR_GATE_ACCENT_RGBA,
-        IconId::ChevronLeft => CHEVRON_LEFT_GATE_ACCENT_RGBA,
-        IconId::ChevronRight => CHEVRON_RIGHT_GATE_ACCENT_RGBA,
-        IconId::ChevronDown => CHEVRON_DOWN_GATE_ACCENT_RGBA,
-        IconId::NewFile => NEW_FILE_GATE_ACCENT_RGBA,
-        IconId::NewFolder => NEW_FOLDER_GATE_ACCENT_RGBA,
-        IconId::Folder => FOLDER_GATE_ACCENT_RGBA,
-        IconId::FolderOpened => FOLDER_OPENED_GATE_ACCENT_RGBA,
-        IconId::File => FILE_GATE_ACCENT_RGBA,
-        IconId::Save => SAVE_GATE_ACCENT_RGBA,
-        IconId::Refresh => REFRESH_GATE_ACCENT_RGBA,
-        IconId::Add => ADD_GATE_ACCENT_RGBA,
-        IconId::Trash => TRASH_GATE_ACCENT_RGBA,
-        IconId::Search => SEARCH_GATE_ACCENT_RGBA,
-        IconId::Check => CHECK_GATE_ACCENT_RGBA,
-        IconId::Close => CLOSE_GATE_ACCENT_RGBA,
-        IconId::ArrowUp => ARROW_UP_GATE_ACCENT_RGBA,
-        IconId::ArrowDown => ARROW_DOWN_GATE_ACCENT_RGBA,
-        IconId::ArrowLeft => ARROW_LEFT_GATE_ACCENT_RGBA,
-        IconId::ArrowRight => ARROW_RIGHT_GATE_ACCENT_RGBA,
-        IconId::ArrowSwap => ARROW_SWAP_GATE_ACCENT_RGBA,
-        IconId::GitCommit => GIT_COMMIT_GATE_ACCENT_RGBA,
-        IconId::GitBranch => GIT_BRANCH_GATE_ACCENT_RGBA,
-        IconId::Diff => DIFF_GATE_ACCENT_RGBA,
-        IconId::DiffAdded => DIFF_ADDED_GATE_ACCENT_RGBA,
-        IconId::GitCompare => GIT_COMPARE_GATE_ACCENT_RGBA,
-        IconId::Repo => REPO_GATE_ACCENT_RGBA,
-        IconId::RepoForked => REPO_FORKED_GATE_ACCENT_RGBA,
-        IconId::DebugStop => DEBUG_STOP_GATE_ACCENT_RGBA,
-        IconId::DebugRestart => DEBUG_RESTART_GATE_ACCENT_RGBA,
-        IconId::Edit => EDIT_GATE_ACCENT_RGBA,
-        IconId::History => HISTORY_GATE_ACCENT_RGBA,
-        IconId::Terminal => TERMINAL_GATE_ACCENT_RGBA,
-        IconId::Output => OUTPUT_GATE_ACCENT_RGBA,
-        IconId::CloudDownload => CLOUD_DOWNLOAD_GATE_ACCENT_RGBA,
-        IconId::Ellipsis => ELLIPSIS_GATE_ACCENT_RGBA,
-        IconId::Link => LINK_GATE_ACCENT_RGBA,
-        IconId::CircleFilled => CIRCLE_FILLED_GATE_ACCENT_RGBA,
-        IconId::CircleSlash => CIRCLE_SLASH_GATE_ACCENT_RGBA,
-        IconId::Warning => WARNING_GATE_ACCENT_RGBA,
-        IconId::Error => ERROR_GATE_ACCENT_RGBA,
-        IconId::Info => INFO_GATE_ACCENT_RGBA,
-        IconId::RunAll => RUN_ALL_GATE_ACCENT_RGBA,
-        IconId::Play => PLAY_GATE_ACCENT_RGBA,
-        IconId::Sync => SYNC_GATE_ACCENT_RGBA,
-        IconId::GoToFile => GO_TO_FILE_GATE_ACCENT_RGBA,
-        IconId::Pulse => PULSE_GATE_ACCENT_RGBA,
-        IconId::Checklist => CHECKLIST_GATE_ACCENT_RGBA,
-        IconId::Eye => EYE_GATE_ACCENT_RGBA,
-        IconId::Layout => LAYOUT_GATE_ACCENT_RGBA,
-        IconId::SplitHorizontal => SPLIT_HORIZONTAL_GATE_ACCENT_RGBA,
-        IconId::SplitVertical => SPLIT_VERTICAL_GATE_ACCENT_RGBA,
-        IconId::Preview => PREVIEW_GATE_ACCENT_RGBA,
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn sixel_strip_source_rgba(id: IconId) -> &'static [u8] {
-    match id {
-        IconId::Files => FILES_STRIP_RGBA,
-        IconId::SourceControl => SOURCE_CONTROL_STRIP_RGBA,
-        IconId::Person => PERSON_STRIP_RGBA,
-        IconId::Project => PROJECT_STRIP_RGBA,
-        IconId::SettingsGear => SETTINGS_GEAR_STRIP_RGBA,
-        IconId::ChevronLeft => CHEVRON_LEFT_STRIP_RGBA,
-        IconId::ChevronRight => CHEVRON_RIGHT_STRIP_RGBA,
-        IconId::ChevronDown => CHEVRON_DOWN_STRIP_RGBA,
-        IconId::NewFile => NEW_FILE_STRIP_RGBA,
-        IconId::NewFolder => NEW_FOLDER_STRIP_RGBA,
-        IconId::Folder => FOLDER_STRIP_RGBA,
-        IconId::FolderOpened => FOLDER_OPENED_STRIP_RGBA,
-        IconId::File => FILE_STRIP_RGBA,
-        IconId::Save => SAVE_STRIP_RGBA,
-        IconId::Refresh => REFRESH_STRIP_RGBA,
-        IconId::Add => ADD_STRIP_RGBA,
-        IconId::Trash => TRASH_STRIP_RGBA,
-        IconId::Search => SEARCH_STRIP_RGBA,
-        IconId::Check => CHECK_STRIP_RGBA,
-        IconId::Close => CLOSE_STRIP_RGBA,
-        IconId::ArrowUp => ARROW_UP_STRIP_RGBA,
-        IconId::ArrowDown => ARROW_DOWN_STRIP_RGBA,
-        IconId::ArrowLeft => ARROW_LEFT_STRIP_RGBA,
-        IconId::ArrowRight => ARROW_RIGHT_STRIP_RGBA,
-        IconId::ArrowSwap => ARROW_SWAP_STRIP_RGBA,
-        IconId::GitCommit => GIT_COMMIT_STRIP_RGBA,
-        IconId::GitBranch => GIT_BRANCH_STRIP_RGBA,
-        IconId::Diff => DIFF_STRIP_RGBA,
-        IconId::DiffAdded => DIFF_ADDED_STRIP_RGBA,
-        IconId::GitCompare => GIT_COMPARE_STRIP_RGBA,
-        IconId::Repo => REPO_STRIP_RGBA,
-        IconId::RepoForked => REPO_FORKED_STRIP_RGBA,
-        IconId::DebugStop => DEBUG_STOP_STRIP_RGBA,
-        IconId::DebugRestart => DEBUG_RESTART_STRIP_RGBA,
-        IconId::Edit => EDIT_STRIP_RGBA,
-        IconId::History => HISTORY_STRIP_RGBA,
-        IconId::Terminal => TERMINAL_STRIP_RGBA,
-        IconId::Output => OUTPUT_STRIP_RGBA,
-        IconId::CloudDownload => CLOUD_DOWNLOAD_STRIP_RGBA,
-        IconId::Ellipsis => ELLIPSIS_STRIP_RGBA,
-        IconId::Link => LINK_STRIP_RGBA,
-        IconId::CircleFilled => CIRCLE_FILLED_STRIP_RGBA,
-        IconId::CircleSlash => CIRCLE_SLASH_STRIP_RGBA,
-        IconId::Warning => WARNING_STRIP_RGBA,
-        IconId::Error => ERROR_STRIP_RGBA,
-        IconId::Info => INFO_STRIP_RGBA,
-        IconId::RunAll => RUN_ALL_STRIP_RGBA,
-        IconId::Play => PLAY_STRIP_RGBA,
-        IconId::Sync => SYNC_STRIP_RGBA,
-        IconId::GoToFile => GO_TO_FILE_STRIP_RGBA,
-        IconId::Pulse => PULSE_STRIP_RGBA,
-        IconId::Checklist => CHECKLIST_STRIP_RGBA,
-        IconId::Eye => EYE_STRIP_RGBA,
-        IconId::Layout => LAYOUT_STRIP_RGBA,
-        IconId::SplitHorizontal => SPLIT_HORIZONTAL_STRIP_RGBA,
-        IconId::SplitVertical => SPLIT_VERTICAL_STRIP_RGBA,
-        IconId::Preview => PREVIEW_STRIP_RGBA,
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn sixel_strip_gate_source_rgba(id: IconId) -> &'static [u8] {
-    match id {
-        IconId::Files => FILES_STRIP_GATE_RGBA,
-        IconId::SourceControl => SOURCE_CONTROL_STRIP_GATE_RGBA,
-        IconId::Person => PERSON_STRIP_GATE_RGBA,
-        IconId::Project => PROJECT_STRIP_GATE_RGBA,
-        IconId::SettingsGear => SETTINGS_GEAR_STRIP_GATE_RGBA,
-        IconId::ChevronLeft => CHEVRON_LEFT_STRIP_GATE_RGBA,
-        IconId::ChevronRight => CHEVRON_RIGHT_STRIP_GATE_RGBA,
-        IconId::ChevronDown => CHEVRON_DOWN_STRIP_GATE_RGBA,
-        IconId::NewFile => NEW_FILE_STRIP_GATE_RGBA,
-        IconId::NewFolder => NEW_FOLDER_STRIP_GATE_RGBA,
-        IconId::Folder => FOLDER_STRIP_GATE_RGBA,
-        IconId::FolderOpened => FOLDER_OPENED_STRIP_GATE_RGBA,
-        IconId::File => FILE_STRIP_GATE_RGBA,
-        IconId::Save => SAVE_STRIP_GATE_RGBA,
-        IconId::Refresh => REFRESH_STRIP_GATE_RGBA,
-        IconId::Add => ADD_STRIP_GATE_RGBA,
-        IconId::Trash => TRASH_STRIP_GATE_RGBA,
-        IconId::Search => SEARCH_STRIP_GATE_RGBA,
-        IconId::Check => CHECK_STRIP_GATE_RGBA,
-        IconId::Close => CLOSE_STRIP_GATE_RGBA,
-        IconId::ArrowUp => ARROW_UP_STRIP_GATE_RGBA,
-        IconId::ArrowDown => ARROW_DOWN_STRIP_GATE_RGBA,
-        IconId::ArrowLeft => ARROW_LEFT_STRIP_GATE_RGBA,
-        IconId::ArrowRight => ARROW_RIGHT_STRIP_GATE_RGBA,
-        IconId::ArrowSwap => ARROW_SWAP_STRIP_GATE_RGBA,
-        IconId::GitCommit => GIT_COMMIT_STRIP_GATE_RGBA,
-        IconId::GitBranch => GIT_BRANCH_STRIP_GATE_RGBA,
-        IconId::Diff => DIFF_STRIP_GATE_RGBA,
-        IconId::DiffAdded => DIFF_ADDED_STRIP_GATE_RGBA,
-        IconId::GitCompare => GIT_COMPARE_STRIP_GATE_RGBA,
-        IconId::Repo => REPO_STRIP_GATE_RGBA,
-        IconId::RepoForked => REPO_FORKED_STRIP_GATE_RGBA,
-        IconId::DebugStop => DEBUG_STOP_STRIP_GATE_RGBA,
-        IconId::DebugRestart => DEBUG_RESTART_STRIP_GATE_RGBA,
-        IconId::Edit => EDIT_STRIP_GATE_RGBA,
-        IconId::History => HISTORY_STRIP_GATE_RGBA,
-        IconId::Terminal => TERMINAL_STRIP_GATE_RGBA,
-        IconId::Output => OUTPUT_STRIP_GATE_RGBA,
-        IconId::CloudDownload => CLOUD_DOWNLOAD_STRIP_GATE_RGBA,
-        IconId::Ellipsis => ELLIPSIS_STRIP_GATE_RGBA,
-        IconId::Link => LINK_STRIP_GATE_RGBA,
-        IconId::CircleFilled => CIRCLE_FILLED_STRIP_GATE_RGBA,
-        IconId::CircleSlash => CIRCLE_SLASH_STRIP_GATE_RGBA,
-        IconId::Warning => WARNING_STRIP_GATE_RGBA,
-        IconId::Error => ERROR_STRIP_GATE_RGBA,
-        IconId::Info => INFO_STRIP_GATE_RGBA,
-        IconId::RunAll => RUN_ALL_STRIP_GATE_RGBA,
-        IconId::Play => PLAY_STRIP_GATE_RGBA,
-        IconId::Sync => SYNC_STRIP_GATE_RGBA,
-        IconId::GoToFile => GO_TO_FILE_STRIP_GATE_RGBA,
-        IconId::Pulse => PULSE_STRIP_GATE_RGBA,
-        IconId::Checklist => CHECKLIST_STRIP_GATE_RGBA,
-        IconId::Eye => EYE_STRIP_GATE_RGBA,
-        IconId::Layout => LAYOUT_STRIP_GATE_RGBA,
-        IconId::SplitHorizontal => SPLIT_HORIZONTAL_STRIP_GATE_RGBA,
-        IconId::SplitVertical => SPLIT_VERTICAL_STRIP_GATE_RGBA,
-        IconId::Preview => PREVIEW_STRIP_GATE_RGBA,
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn sixel_gallery_source_rgba(id: IconId) -> &'static [u8] {
-    match id {
-        IconId::Files => FILES_GALLERY_RGBA,
-        IconId::SourceControl => SOURCE_CONTROL_GALLERY_RGBA,
-        IconId::Person => PERSON_GALLERY_RGBA,
-        IconId::Project => PROJECT_GALLERY_RGBA,
-        IconId::SettingsGear => SETTINGS_GEAR_GALLERY_RGBA,
-        IconId::ChevronLeft => CHEVRON_LEFT_GALLERY_RGBA,
-        IconId::ChevronRight => CHEVRON_RIGHT_GALLERY_RGBA,
-        IconId::ChevronDown => CHEVRON_DOWN_GALLERY_RGBA,
-        IconId::NewFile => NEW_FILE_GALLERY_RGBA,
-        IconId::NewFolder => NEW_FOLDER_GALLERY_RGBA,
-        IconId::Folder => FOLDER_GALLERY_RGBA,
-        IconId::FolderOpened => FOLDER_OPENED_GALLERY_RGBA,
-        IconId::File => FILE_GALLERY_RGBA,
-        IconId::Save => SAVE_GALLERY_RGBA,
-        IconId::Refresh => REFRESH_GALLERY_RGBA,
-        IconId::Add => ADD_GALLERY_RGBA,
-        IconId::Trash => TRASH_GALLERY_RGBA,
-        IconId::Search => SEARCH_GALLERY_RGBA,
-        IconId::Check => CHECK_GALLERY_RGBA,
-        IconId::Close => CLOSE_GALLERY_RGBA,
-        IconId::ArrowUp => ARROW_UP_GALLERY_RGBA,
-        IconId::ArrowDown => ARROW_DOWN_GALLERY_RGBA,
-        IconId::ArrowLeft => ARROW_LEFT_GALLERY_RGBA,
-        IconId::ArrowRight => ARROW_RIGHT_GALLERY_RGBA,
-        IconId::ArrowSwap => ARROW_SWAP_GALLERY_RGBA,
-        IconId::GitCommit => GIT_COMMIT_GALLERY_RGBA,
-        IconId::GitBranch => GIT_BRANCH_GALLERY_RGBA,
-        IconId::Diff => DIFF_GALLERY_RGBA,
-        IconId::DiffAdded => DIFF_ADDED_GALLERY_RGBA,
-        IconId::GitCompare => GIT_COMPARE_GALLERY_RGBA,
-        IconId::Repo => REPO_GALLERY_RGBA,
-        IconId::RepoForked => REPO_FORKED_GALLERY_RGBA,
-        IconId::DebugStop => DEBUG_STOP_GALLERY_RGBA,
-        IconId::DebugRestart => DEBUG_RESTART_GALLERY_RGBA,
-        IconId::Edit => EDIT_GALLERY_RGBA,
-        IconId::History => HISTORY_GALLERY_RGBA,
-        IconId::Terminal => TERMINAL_GALLERY_RGBA,
-        IconId::Output => OUTPUT_GALLERY_RGBA,
-        IconId::CloudDownload => CLOUD_DOWNLOAD_GALLERY_RGBA,
-        IconId::Ellipsis => ELLIPSIS_GALLERY_RGBA,
-        IconId::Link => LINK_GALLERY_RGBA,
-        IconId::CircleFilled => CIRCLE_FILLED_GALLERY_RGBA,
-        IconId::CircleSlash => CIRCLE_SLASH_GALLERY_RGBA,
-        IconId::Warning => WARNING_GALLERY_RGBA,
-        IconId::Error => ERROR_GALLERY_RGBA,
-        IconId::Info => INFO_GALLERY_RGBA,
-        IconId::RunAll => RUN_ALL_GALLERY_RGBA,
-        IconId::Play => PLAY_GALLERY_RGBA,
-        IconId::Sync => SYNC_GALLERY_RGBA,
-        IconId::GoToFile => GO_TO_FILE_GALLERY_RGBA,
-        IconId::Pulse => PULSE_GALLERY_RGBA,
-        IconId::Checklist => CHECKLIST_GALLERY_RGBA,
-        IconId::Eye => EYE_GALLERY_RGBA,
-        IconId::Layout => LAYOUT_GALLERY_RGBA,
-        IconId::SplitHorizontal => SPLIT_HORIZONTAL_GALLERY_RGBA,
-        IconId::SplitVertical => SPLIT_VERTICAL_GALLERY_RGBA,
-        IconId::Preview => PREVIEW_GALLERY_RGBA,
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn sixel_gallery_gate_source_rgba(id: IconId) -> &'static [u8] {
-    match id {
-        IconId::Files => FILES_GALLERY_GATE_RGBA,
-        IconId::SourceControl => SOURCE_CONTROL_GALLERY_GATE_RGBA,
-        IconId::Person => PERSON_GALLERY_GATE_RGBA,
-        IconId::Project => PROJECT_GALLERY_GATE_RGBA,
-        IconId::SettingsGear => SETTINGS_GEAR_GALLERY_GATE_RGBA,
-        IconId::ChevronLeft => CHEVRON_LEFT_GALLERY_GATE_RGBA,
-        IconId::ChevronRight => CHEVRON_RIGHT_GALLERY_GATE_RGBA,
-        IconId::ChevronDown => CHEVRON_DOWN_GALLERY_GATE_RGBA,
-        IconId::NewFile => NEW_FILE_GALLERY_GATE_RGBA,
-        IconId::NewFolder => NEW_FOLDER_GALLERY_GATE_RGBA,
-        IconId::Folder => FOLDER_GALLERY_GATE_RGBA,
-        IconId::FolderOpened => FOLDER_OPENED_GALLERY_GATE_RGBA,
-        IconId::File => FILE_GALLERY_GATE_RGBA,
-        IconId::Save => SAVE_GALLERY_GATE_RGBA,
-        IconId::Refresh => REFRESH_GALLERY_GATE_RGBA,
-        IconId::Add => ADD_GALLERY_GATE_RGBA,
-        IconId::Trash => TRASH_GALLERY_GATE_RGBA,
-        IconId::Search => SEARCH_GALLERY_GATE_RGBA,
-        IconId::Check => CHECK_GALLERY_GATE_RGBA,
-        IconId::Close => CLOSE_GALLERY_GATE_RGBA,
-        IconId::ArrowUp => ARROW_UP_GALLERY_GATE_RGBA,
-        IconId::ArrowDown => ARROW_DOWN_GALLERY_GATE_RGBA,
-        IconId::ArrowLeft => ARROW_LEFT_GALLERY_GATE_RGBA,
-        IconId::ArrowRight => ARROW_RIGHT_GALLERY_GATE_RGBA,
-        IconId::ArrowSwap => ARROW_SWAP_GALLERY_GATE_RGBA,
-        IconId::GitCommit => GIT_COMMIT_GALLERY_GATE_RGBA,
-        IconId::GitBranch => GIT_BRANCH_GALLERY_GATE_RGBA,
-        IconId::Diff => DIFF_GALLERY_GATE_RGBA,
-        IconId::DiffAdded => DIFF_ADDED_GALLERY_GATE_RGBA,
-        IconId::GitCompare => GIT_COMPARE_GALLERY_GATE_RGBA,
-        IconId::Repo => REPO_GALLERY_GATE_RGBA,
-        IconId::RepoForked => REPO_FORKED_GALLERY_GATE_RGBA,
-        IconId::DebugStop => DEBUG_STOP_GALLERY_GATE_RGBA,
-        IconId::DebugRestart => DEBUG_RESTART_GALLERY_GATE_RGBA,
-        IconId::Edit => EDIT_GALLERY_GATE_RGBA,
-        IconId::History => HISTORY_GALLERY_GATE_RGBA,
-        IconId::Terminal => TERMINAL_GALLERY_GATE_RGBA,
-        IconId::Output => OUTPUT_GALLERY_GATE_RGBA,
-        IconId::CloudDownload => CLOUD_DOWNLOAD_GALLERY_GATE_RGBA,
-        IconId::Ellipsis => ELLIPSIS_GALLERY_GATE_RGBA,
-        IconId::Link => LINK_GALLERY_GATE_RGBA,
-        IconId::CircleFilled => CIRCLE_FILLED_GALLERY_GATE_RGBA,
-        IconId::CircleSlash => CIRCLE_SLASH_GALLERY_GATE_RGBA,
-        IconId::Warning => WARNING_GALLERY_GATE_RGBA,
-        IconId::Error => ERROR_GALLERY_GATE_RGBA,
-        IconId::Info => INFO_GALLERY_GATE_RGBA,
-        IconId::RunAll => RUN_ALL_GALLERY_GATE_RGBA,
-        IconId::Play => PLAY_GALLERY_GATE_RGBA,
-        IconId::Sync => SYNC_GALLERY_GATE_RGBA,
-        IconId::GoToFile => GO_TO_FILE_GALLERY_GATE_RGBA,
-        IconId::Pulse => PULSE_GALLERY_GATE_RGBA,
-        IconId::Checklist => CHECKLIST_GALLERY_GATE_RGBA,
-        IconId::Eye => EYE_GALLERY_GATE_RGBA,
-        IconId::Layout => LAYOUT_GALLERY_GATE_RGBA,
-        IconId::SplitHorizontal => SPLIT_HORIZONTAL_GALLERY_GATE_RGBA,
-        IconId::SplitVertical => SPLIT_VERTICAL_GALLERY_GATE_RGBA,
-        IconId::Preview => PREVIEW_GALLERY_GATE_RGBA,
-    }
-}
-
 // ---- Files (files) --------------------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const FILES_RGBA: &[u8] = include_bytes!("files.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const FILES_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("files_gate_active.rgba");
-static FILES_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(FILES_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const FILES_GATE_ACCENT_RGBA: &[u8] = include_bytes!("files_gate_accent.rgba");
-static FILES_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(FILES_GATE_ACCENT_RGBA));
-
 const FILES_COMPACT_RGBA: &[u8] = include_bytes!("files_compact.rgba");
 static FILES_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(FILES_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// FILES_RGBA above.
-#[cfg(test)]
 const FILES_STRIP_RGBA: &[u8] = include_bytes!("files_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const FILES_STRIP_GATE_RGBA: &[u8] = include_bytes!("files_strip_gate.rgba");
-static FILES_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(FILES_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// FILES_RGBA above.
-#[cfg(test)]
 const FILES_GALLERY_RGBA: &[u8] = include_bytes!("files_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const FILES_GALLERY_GATE_RGBA: &[u8] = include_bytes!("files_gallery_gate.rgba");
-static FILES_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(FILES_GALLERY_GATE_RGBA));
 
 // ---- SourceControl (source-control) ---------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const SOURCE_CONTROL_RGBA: &[u8] = include_bytes!("source_control.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const SOURCE_CONTROL_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("source_control_gate_active.rgba");
-static SOURCE_CONTROL_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SOURCE_CONTROL_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const SOURCE_CONTROL_GATE_ACCENT_RGBA: &[u8] = include_bytes!("source_control_gate_accent.rgba");
-static SOURCE_CONTROL_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SOURCE_CONTROL_GATE_ACCENT_RGBA));
-
 const SOURCE_CONTROL_COMPACT_RGBA: &[u8] = include_bytes!("source_control_compact.rgba");
 static SOURCE_CONTROL_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(SOURCE_CONTROL_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// SOURCE_CONTROL_RGBA above.
-#[cfg(test)]
 const SOURCE_CONTROL_STRIP_RGBA: &[u8] = include_bytes!("source_control_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const SOURCE_CONTROL_STRIP_GATE_RGBA: &[u8] = include_bytes!("source_control_strip_gate.rgba");
-static SOURCE_CONTROL_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(SOURCE_CONTROL_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// SOURCE_CONTROL_RGBA above.
-#[cfg(test)]
 const SOURCE_CONTROL_GALLERY_RGBA: &[u8] = include_bytes!("source_control_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const SOURCE_CONTROL_GALLERY_GATE_RGBA: &[u8] = include_bytes!("source_control_gallery_gate.rgba");
-static SOURCE_CONTROL_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(SOURCE_CONTROL_GALLERY_GATE_RGBA));
 
 // ---- Person (person) ------------------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const PERSON_RGBA: &[u8] = include_bytes!("person.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const PERSON_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("person_gate_active.rgba");
-static PERSON_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(PERSON_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const PERSON_GATE_ACCENT_RGBA: &[u8] = include_bytes!("person_gate_accent.rgba");
-static PERSON_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(PERSON_GATE_ACCENT_RGBA));
-
 const PERSON_COMPACT_RGBA: &[u8] = include_bytes!("person_compact.rgba");
 static PERSON_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(PERSON_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// PERSON_RGBA above.
-#[cfg(test)]
 const PERSON_STRIP_RGBA: &[u8] = include_bytes!("person_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const PERSON_STRIP_GATE_RGBA: &[u8] = include_bytes!("person_strip_gate.rgba");
-static PERSON_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(PERSON_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// PERSON_RGBA above.
-#[cfg(test)]
 const PERSON_GALLERY_RGBA: &[u8] = include_bytes!("person_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const PERSON_GALLERY_GATE_RGBA: &[u8] = include_bytes!("person_gallery_gate.rgba");
-static PERSON_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(PERSON_GALLERY_GATE_RGBA));
 
 // ---- Project (project) ----------------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const PROJECT_RGBA: &[u8] = include_bytes!("project.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const PROJECT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("project_gate_active.rgba");
-static PROJECT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(PROJECT_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const PROJECT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("project_gate_accent.rgba");
-static PROJECT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(PROJECT_GATE_ACCENT_RGBA));
-
 const PROJECT_COMPACT_RGBA: &[u8] = include_bytes!("project_compact.rgba");
 static PROJECT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(PROJECT_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// PROJECT_RGBA above.
-#[cfg(test)]
 const PROJECT_STRIP_RGBA: &[u8] = include_bytes!("project_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const PROJECT_STRIP_GATE_RGBA: &[u8] = include_bytes!("project_strip_gate.rgba");
-static PROJECT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(PROJECT_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// PROJECT_RGBA above.
-#[cfg(test)]
 const PROJECT_GALLERY_RGBA: &[u8] = include_bytes!("project_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const PROJECT_GALLERY_GATE_RGBA: &[u8] = include_bytes!("project_gallery_gate.rgba");
-static PROJECT_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(PROJECT_GALLERY_GATE_RGBA));
 
 // ---- SettingsGear (settings-gear) -----------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const SETTINGS_GEAR_RGBA: &[u8] = include_bytes!("settings_gear.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const SETTINGS_GEAR_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("settings_gear_gate_active.rgba");
-static SETTINGS_GEAR_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SETTINGS_GEAR_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const SETTINGS_GEAR_GATE_ACCENT_RGBA: &[u8] = include_bytes!("settings_gear_gate_accent.rgba");
-static SETTINGS_GEAR_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SETTINGS_GEAR_GATE_ACCENT_RGBA));
-
 const SETTINGS_GEAR_COMPACT_RGBA: &[u8] = include_bytes!("settings_gear_compact.rgba");
 static SETTINGS_GEAR_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(SETTINGS_GEAR_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// SETTINGS_GEAR_RGBA above.
-#[cfg(test)]
 const SETTINGS_GEAR_STRIP_RGBA: &[u8] = include_bytes!("settings_gear_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const SETTINGS_GEAR_STRIP_GATE_RGBA: &[u8] = include_bytes!("settings_gear_strip_gate.rgba");
-static SETTINGS_GEAR_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(SETTINGS_GEAR_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// SETTINGS_GEAR_RGBA above.
-#[cfg(test)]
 const SETTINGS_GEAR_GALLERY_RGBA: &[u8] = include_bytes!("settings_gear_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const SETTINGS_GEAR_GALLERY_GATE_RGBA: &[u8] = include_bytes!("settings_gear_gallery_gate.rgba");
-static SETTINGS_GEAR_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(SETTINGS_GEAR_GALLERY_GATE_RGBA));
 
 // ---- ChevronLeft (chevron-left) -------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const CHEVRON_LEFT_RGBA: &[u8] = include_bytes!("chevron_left.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const CHEVRON_LEFT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("chevron_left_gate_active.rgba");
-static CHEVRON_LEFT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CHEVRON_LEFT_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const CHEVRON_LEFT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("chevron_left_gate_accent.rgba");
-static CHEVRON_LEFT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CHEVRON_LEFT_GATE_ACCENT_RGBA));
-
 const CHEVRON_LEFT_COMPACT_RGBA: &[u8] = include_bytes!("chevron_left_compact.rgba");
 static CHEVRON_LEFT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(CHEVRON_LEFT_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// CHEVRON_LEFT_RGBA above.
-#[cfg(test)]
 const CHEVRON_LEFT_STRIP_RGBA: &[u8] = include_bytes!("chevron_left_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const CHEVRON_LEFT_STRIP_GATE_RGBA: &[u8] = include_bytes!("chevron_left_strip_gate.rgba");
-static CHEVRON_LEFT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(CHEVRON_LEFT_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// CHEVRON_LEFT_RGBA above.
-#[cfg(test)]
 const CHEVRON_LEFT_GALLERY_RGBA: &[u8] = include_bytes!("chevron_left_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const CHEVRON_LEFT_GALLERY_GATE_RGBA: &[u8] = include_bytes!("chevron_left_gallery_gate.rgba");
-static CHEVRON_LEFT_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(CHEVRON_LEFT_GALLERY_GATE_RGBA));
 
 // ---- ChevronRight (chevron-right) -----------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const CHEVRON_RIGHT_RGBA: &[u8] = include_bytes!("chevron_right.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const CHEVRON_RIGHT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("chevron_right_gate_active.rgba");
-static CHEVRON_RIGHT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CHEVRON_RIGHT_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const CHEVRON_RIGHT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("chevron_right_gate_accent.rgba");
-static CHEVRON_RIGHT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CHEVRON_RIGHT_GATE_ACCENT_RGBA));
-
 const CHEVRON_RIGHT_COMPACT_RGBA: &[u8] = include_bytes!("chevron_right_compact.rgba");
 static CHEVRON_RIGHT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(CHEVRON_RIGHT_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// CHEVRON_RIGHT_RGBA above.
-#[cfg(test)]
 const CHEVRON_RIGHT_STRIP_RGBA: &[u8] = include_bytes!("chevron_right_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const CHEVRON_RIGHT_STRIP_GATE_RGBA: &[u8] = include_bytes!("chevron_right_strip_gate.rgba");
-static CHEVRON_RIGHT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(CHEVRON_RIGHT_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// CHEVRON_RIGHT_RGBA above.
-#[cfg(test)]
 const CHEVRON_RIGHT_GALLERY_RGBA: &[u8] = include_bytes!("chevron_right_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const CHEVRON_RIGHT_GALLERY_GATE_RGBA: &[u8] = include_bytes!("chevron_right_gallery_gate.rgba");
-static CHEVRON_RIGHT_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(CHEVRON_RIGHT_GALLERY_GATE_RGBA));
 
 // ---- ChevronDown (chevron-down) -------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const CHEVRON_DOWN_RGBA: &[u8] = include_bytes!("chevron_down.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const CHEVRON_DOWN_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("chevron_down_gate_active.rgba");
-static CHEVRON_DOWN_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CHEVRON_DOWN_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const CHEVRON_DOWN_GATE_ACCENT_RGBA: &[u8] = include_bytes!("chevron_down_gate_accent.rgba");
-static CHEVRON_DOWN_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CHEVRON_DOWN_GATE_ACCENT_RGBA));
-
 const CHEVRON_DOWN_COMPACT_RGBA: &[u8] = include_bytes!("chevron_down_compact.rgba");
 static CHEVRON_DOWN_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(CHEVRON_DOWN_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// CHEVRON_DOWN_RGBA above.
-#[cfg(test)]
 const CHEVRON_DOWN_STRIP_RGBA: &[u8] = include_bytes!("chevron_down_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const CHEVRON_DOWN_STRIP_GATE_RGBA: &[u8] = include_bytes!("chevron_down_strip_gate.rgba");
-static CHEVRON_DOWN_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(CHEVRON_DOWN_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// CHEVRON_DOWN_RGBA above.
-#[cfg(test)]
 const CHEVRON_DOWN_GALLERY_RGBA: &[u8] = include_bytes!("chevron_down_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const CHEVRON_DOWN_GALLERY_GATE_RGBA: &[u8] = include_bytes!("chevron_down_gallery_gate.rgba");
-static CHEVRON_DOWN_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(CHEVRON_DOWN_GALLERY_GATE_RGBA));
 
 // ---- NewFile (new-file) ---------------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const NEW_FILE_RGBA: &[u8] = include_bytes!("new_file.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const NEW_FILE_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("new_file_gate_active.rgba");
-static NEW_FILE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(NEW_FILE_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const NEW_FILE_GATE_ACCENT_RGBA: &[u8] = include_bytes!("new_file_gate_accent.rgba");
-static NEW_FILE_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(NEW_FILE_GATE_ACCENT_RGBA));
-
 const NEW_FILE_COMPACT_RGBA: &[u8] = include_bytes!("new_file_compact.rgba");
 static NEW_FILE_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(NEW_FILE_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// NEW_FILE_RGBA above.
-#[cfg(test)]
 const NEW_FILE_STRIP_RGBA: &[u8] = include_bytes!("new_file_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const NEW_FILE_STRIP_GATE_RGBA: &[u8] = include_bytes!("new_file_strip_gate.rgba");
-static NEW_FILE_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(NEW_FILE_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// NEW_FILE_RGBA above.
-#[cfg(test)]
 const NEW_FILE_GALLERY_RGBA: &[u8] = include_bytes!("new_file_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const NEW_FILE_GALLERY_GATE_RGBA: &[u8] = include_bytes!("new_file_gallery_gate.rgba");
-static NEW_FILE_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(NEW_FILE_GALLERY_GATE_RGBA));
 
 // ---- NewFolder (new-folder) -----------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const NEW_FOLDER_RGBA: &[u8] = include_bytes!("new_folder.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const NEW_FOLDER_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("new_folder_gate_active.rgba");
-static NEW_FOLDER_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(NEW_FOLDER_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const NEW_FOLDER_GATE_ACCENT_RGBA: &[u8] = include_bytes!("new_folder_gate_accent.rgba");
-static NEW_FOLDER_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(NEW_FOLDER_GATE_ACCENT_RGBA));
-
 const NEW_FOLDER_COMPACT_RGBA: &[u8] = include_bytes!("new_folder_compact.rgba");
 static NEW_FOLDER_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(NEW_FOLDER_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// NEW_FOLDER_RGBA above.
-#[cfg(test)]
 const NEW_FOLDER_STRIP_RGBA: &[u8] = include_bytes!("new_folder_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const NEW_FOLDER_STRIP_GATE_RGBA: &[u8] = include_bytes!("new_folder_strip_gate.rgba");
-static NEW_FOLDER_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(NEW_FOLDER_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// NEW_FOLDER_RGBA above.
-#[cfg(test)]
 const NEW_FOLDER_GALLERY_RGBA: &[u8] = include_bytes!("new_folder_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const NEW_FOLDER_GALLERY_GATE_RGBA: &[u8] = include_bytes!("new_folder_gallery_gate.rgba");
-static NEW_FOLDER_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(NEW_FOLDER_GALLERY_GATE_RGBA));
 
 // ---- Folder (folder) ------------------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const FOLDER_RGBA: &[u8] = include_bytes!("folder.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const FOLDER_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("folder_gate_active.rgba");
-static FOLDER_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(FOLDER_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const FOLDER_GATE_ACCENT_RGBA: &[u8] = include_bytes!("folder_gate_accent.rgba");
-static FOLDER_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(FOLDER_GATE_ACCENT_RGBA));
-
 const FOLDER_COMPACT_RGBA: &[u8] = include_bytes!("folder_compact.rgba");
 static FOLDER_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(FOLDER_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// FOLDER_RGBA above.
-#[cfg(test)]
 const FOLDER_STRIP_RGBA: &[u8] = include_bytes!("folder_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const FOLDER_STRIP_GATE_RGBA: &[u8] = include_bytes!("folder_strip_gate.rgba");
-static FOLDER_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(FOLDER_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// FOLDER_RGBA above.
-#[cfg(test)]
 const FOLDER_GALLERY_RGBA: &[u8] = include_bytes!("folder_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const FOLDER_GALLERY_GATE_RGBA: &[u8] = include_bytes!("folder_gallery_gate.rgba");
-static FOLDER_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(FOLDER_GALLERY_GATE_RGBA));
 
 // ---- FolderOpened (folder-opened) -----------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const FOLDER_OPENED_RGBA: &[u8] = include_bytes!("folder_opened.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const FOLDER_OPENED_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("folder_opened_gate_active.rgba");
-static FOLDER_OPENED_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(FOLDER_OPENED_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const FOLDER_OPENED_GATE_ACCENT_RGBA: &[u8] = include_bytes!("folder_opened_gate_accent.rgba");
-static FOLDER_OPENED_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(FOLDER_OPENED_GATE_ACCENT_RGBA));
-
 const FOLDER_OPENED_COMPACT_RGBA: &[u8] = include_bytes!("folder_opened_compact.rgba");
 static FOLDER_OPENED_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(FOLDER_OPENED_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// FOLDER_OPENED_RGBA above.
-#[cfg(test)]
 const FOLDER_OPENED_STRIP_RGBA: &[u8] = include_bytes!("folder_opened_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const FOLDER_OPENED_STRIP_GATE_RGBA: &[u8] = include_bytes!("folder_opened_strip_gate.rgba");
-static FOLDER_OPENED_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(FOLDER_OPENED_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// FOLDER_OPENED_RGBA above.
-#[cfg(test)]
 const FOLDER_OPENED_GALLERY_RGBA: &[u8] = include_bytes!("folder_opened_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const FOLDER_OPENED_GALLERY_GATE_RGBA: &[u8] = include_bytes!("folder_opened_gallery_gate.rgba");
-static FOLDER_OPENED_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(FOLDER_OPENED_GALLERY_GATE_RGBA));
 
 // ---- File (file) ----------------------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const FILE_RGBA: &[u8] = include_bytes!("file.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const FILE_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("file_gate_active.rgba");
-static FILE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(FILE_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const FILE_GATE_ACCENT_RGBA: &[u8] = include_bytes!("file_gate_accent.rgba");
-static FILE_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(FILE_GATE_ACCENT_RGBA));
-
 const FILE_COMPACT_RGBA: &[u8] = include_bytes!("file_compact.rgba");
 static FILE_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(FILE_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// FILE_RGBA above.
-#[cfg(test)]
 const FILE_STRIP_RGBA: &[u8] = include_bytes!("file_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const FILE_STRIP_GATE_RGBA: &[u8] = include_bytes!("file_strip_gate.rgba");
-static FILE_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(FILE_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// FILE_RGBA above.
-#[cfg(test)]
 const FILE_GALLERY_RGBA: &[u8] = include_bytes!("file_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const FILE_GALLERY_GATE_RGBA: &[u8] = include_bytes!("file_gallery_gate.rgba");
-static FILE_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(FILE_GALLERY_GATE_RGBA));
 
 // ---- Save (save) ----------------------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const SAVE_RGBA: &[u8] = include_bytes!("save.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const SAVE_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("save_gate_active.rgba");
-static SAVE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SAVE_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const SAVE_GATE_ACCENT_RGBA: &[u8] = include_bytes!("save_gate_accent.rgba");
-static SAVE_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SAVE_GATE_ACCENT_RGBA));
-
 const SAVE_COMPACT_RGBA: &[u8] = include_bytes!("save_compact.rgba");
 static SAVE_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(SAVE_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// SAVE_RGBA above.
-#[cfg(test)]
 const SAVE_STRIP_RGBA: &[u8] = include_bytes!("save_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const SAVE_STRIP_GATE_RGBA: &[u8] = include_bytes!("save_strip_gate.rgba");
-static SAVE_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(SAVE_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// SAVE_RGBA above.
-#[cfg(test)]
 const SAVE_GALLERY_RGBA: &[u8] = include_bytes!("save_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const SAVE_GALLERY_GATE_RGBA: &[u8] = include_bytes!("save_gallery_gate.rgba");
-static SAVE_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(SAVE_GALLERY_GATE_RGBA));
 
 // ---- Refresh (refresh) ----------------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const REFRESH_RGBA: &[u8] = include_bytes!("refresh.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const REFRESH_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("refresh_gate_active.rgba");
-static REFRESH_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(REFRESH_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const REFRESH_GATE_ACCENT_RGBA: &[u8] = include_bytes!("refresh_gate_accent.rgba");
-static REFRESH_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(REFRESH_GATE_ACCENT_RGBA));
-
 const REFRESH_COMPACT_RGBA: &[u8] = include_bytes!("refresh_compact.rgba");
 static REFRESH_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(REFRESH_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// REFRESH_RGBA above.
-#[cfg(test)]
 const REFRESH_STRIP_RGBA: &[u8] = include_bytes!("refresh_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const REFRESH_STRIP_GATE_RGBA: &[u8] = include_bytes!("refresh_strip_gate.rgba");
-static REFRESH_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(REFRESH_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// REFRESH_RGBA above.
-#[cfg(test)]
 const REFRESH_GALLERY_RGBA: &[u8] = include_bytes!("refresh_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const REFRESH_GALLERY_GATE_RGBA: &[u8] = include_bytes!("refresh_gallery_gate.rgba");
-static REFRESH_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(REFRESH_GALLERY_GATE_RGBA));
 
 // ---- Add (add) ------------------------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const ADD_RGBA: &[u8] = include_bytes!("add.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const ADD_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("add_gate_active.rgba");
-static ADD_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ADD_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const ADD_GATE_ACCENT_RGBA: &[u8] = include_bytes!("add_gate_accent.rgba");
-static ADD_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ADD_GATE_ACCENT_RGBA));
-
 const ADD_COMPACT_RGBA: &[u8] = include_bytes!("add_compact.rgba");
 static ADD_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(ADD_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// ADD_RGBA above.
-#[cfg(test)]
 const ADD_STRIP_RGBA: &[u8] = include_bytes!("add_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const ADD_STRIP_GATE_RGBA: &[u8] = include_bytes!("add_strip_gate.rgba");
-static ADD_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(ADD_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// ADD_RGBA above.
-#[cfg(test)]
 const ADD_GALLERY_RGBA: &[u8] = include_bytes!("add_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const ADD_GALLERY_GATE_RGBA: &[u8] = include_bytes!("add_gallery_gate.rgba");
-static ADD_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(ADD_GALLERY_GATE_RGBA));
 
 // ---- Trash (trash) --------------------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const TRASH_RGBA: &[u8] = include_bytes!("trash.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const TRASH_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("trash_gate_active.rgba");
-static TRASH_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(TRASH_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const TRASH_GATE_ACCENT_RGBA: &[u8] = include_bytes!("trash_gate_accent.rgba");
-static TRASH_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(TRASH_GATE_ACCENT_RGBA));
-
 const TRASH_COMPACT_RGBA: &[u8] = include_bytes!("trash_compact.rgba");
 static TRASH_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(TRASH_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// TRASH_RGBA above.
-#[cfg(test)]
 const TRASH_STRIP_RGBA: &[u8] = include_bytes!("trash_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const TRASH_STRIP_GATE_RGBA: &[u8] = include_bytes!("trash_strip_gate.rgba");
-static TRASH_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(TRASH_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// TRASH_RGBA above.
-#[cfg(test)]
 const TRASH_GALLERY_RGBA: &[u8] = include_bytes!("trash_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const TRASH_GALLERY_GATE_RGBA: &[u8] = include_bytes!("trash_gallery_gate.rgba");
-static TRASH_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(TRASH_GALLERY_GATE_RGBA));
 
 // ---- Search (search) ------------------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const SEARCH_RGBA: &[u8] = include_bytes!("search.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const SEARCH_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("search_gate_active.rgba");
-static SEARCH_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SEARCH_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const SEARCH_GATE_ACCENT_RGBA: &[u8] = include_bytes!("search_gate_accent.rgba");
-static SEARCH_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SEARCH_GATE_ACCENT_RGBA));
-
 const SEARCH_COMPACT_RGBA: &[u8] = include_bytes!("search_compact.rgba");
 static SEARCH_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(SEARCH_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// SEARCH_RGBA above.
-#[cfg(test)]
 const SEARCH_STRIP_RGBA: &[u8] = include_bytes!("search_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const SEARCH_STRIP_GATE_RGBA: &[u8] = include_bytes!("search_strip_gate.rgba");
-static SEARCH_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(SEARCH_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// SEARCH_RGBA above.
-#[cfg(test)]
 const SEARCH_GALLERY_RGBA: &[u8] = include_bytes!("search_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const SEARCH_GALLERY_GATE_RGBA: &[u8] = include_bytes!("search_gallery_gate.rgba");
-static SEARCH_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(SEARCH_GALLERY_GATE_RGBA));
 
 // ---- Check (check) --------------------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const CHECK_RGBA: &[u8] = include_bytes!("check.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const CHECK_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("check_gate_active.rgba");
-static CHECK_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CHECK_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const CHECK_GATE_ACCENT_RGBA: &[u8] = include_bytes!("check_gate_accent.rgba");
-static CHECK_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CHECK_GATE_ACCENT_RGBA));
-
 const CHECK_COMPACT_RGBA: &[u8] = include_bytes!("check_compact.rgba");
 static CHECK_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(CHECK_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// CHECK_RGBA above.
-#[cfg(test)]
 const CHECK_STRIP_RGBA: &[u8] = include_bytes!("check_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const CHECK_STRIP_GATE_RGBA: &[u8] = include_bytes!("check_strip_gate.rgba");
-static CHECK_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(CHECK_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// CHECK_RGBA above.
-#[cfg(test)]
 const CHECK_GALLERY_RGBA: &[u8] = include_bytes!("check_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const CHECK_GALLERY_GATE_RGBA: &[u8] = include_bytes!("check_gallery_gate.rgba");
-static CHECK_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(CHECK_GALLERY_GATE_RGBA));
 
 // ---- Close (close) --------------------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const CLOSE_RGBA: &[u8] = include_bytes!("close.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const CLOSE_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("close_gate_active.rgba");
-static CLOSE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CLOSE_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const CLOSE_GATE_ACCENT_RGBA: &[u8] = include_bytes!("close_gate_accent.rgba");
-static CLOSE_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CLOSE_GATE_ACCENT_RGBA));
-
 const CLOSE_COMPACT_RGBA: &[u8] = include_bytes!("close_compact.rgba");
 static CLOSE_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(CLOSE_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// CLOSE_RGBA above.
-#[cfg(test)]
 const CLOSE_STRIP_RGBA: &[u8] = include_bytes!("close_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const CLOSE_STRIP_GATE_RGBA: &[u8] = include_bytes!("close_strip_gate.rgba");
-static CLOSE_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(CLOSE_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// CLOSE_RGBA above.
-#[cfg(test)]
 const CLOSE_GALLERY_RGBA: &[u8] = include_bytes!("close_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const CLOSE_GALLERY_GATE_RGBA: &[u8] = include_bytes!("close_gallery_gate.rgba");
-static CLOSE_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(CLOSE_GALLERY_GATE_RGBA));
 
 // ---- ArrowUp (arrow-up) ---------------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const ARROW_UP_RGBA: &[u8] = include_bytes!("arrow_up.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const ARROW_UP_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("arrow_up_gate_active.rgba");
-static ARROW_UP_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ARROW_UP_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const ARROW_UP_GATE_ACCENT_RGBA: &[u8] = include_bytes!("arrow_up_gate_accent.rgba");
-static ARROW_UP_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ARROW_UP_GATE_ACCENT_RGBA));
-
 const ARROW_UP_COMPACT_RGBA: &[u8] = include_bytes!("arrow_up_compact.rgba");
 static ARROW_UP_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(ARROW_UP_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// ARROW_UP_RGBA above.
-#[cfg(test)]
 const ARROW_UP_STRIP_RGBA: &[u8] = include_bytes!("arrow_up_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const ARROW_UP_STRIP_GATE_RGBA: &[u8] = include_bytes!("arrow_up_strip_gate.rgba");
-static ARROW_UP_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(ARROW_UP_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// ARROW_UP_RGBA above.
-#[cfg(test)]
 const ARROW_UP_GALLERY_RGBA: &[u8] = include_bytes!("arrow_up_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const ARROW_UP_GALLERY_GATE_RGBA: &[u8] = include_bytes!("arrow_up_gallery_gate.rgba");
-static ARROW_UP_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(ARROW_UP_GALLERY_GATE_RGBA));
 
 // ---- ArrowDown (arrow-down) -----------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const ARROW_DOWN_RGBA: &[u8] = include_bytes!("arrow_down.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const ARROW_DOWN_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("arrow_down_gate_active.rgba");
-static ARROW_DOWN_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ARROW_DOWN_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const ARROW_DOWN_GATE_ACCENT_RGBA: &[u8] = include_bytes!("arrow_down_gate_accent.rgba");
-static ARROW_DOWN_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ARROW_DOWN_GATE_ACCENT_RGBA));
-
 const ARROW_DOWN_COMPACT_RGBA: &[u8] = include_bytes!("arrow_down_compact.rgba");
 static ARROW_DOWN_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(ARROW_DOWN_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// ARROW_DOWN_RGBA above.
-#[cfg(test)]
 const ARROW_DOWN_STRIP_RGBA: &[u8] = include_bytes!("arrow_down_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const ARROW_DOWN_STRIP_GATE_RGBA: &[u8] = include_bytes!("arrow_down_strip_gate.rgba");
-static ARROW_DOWN_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(ARROW_DOWN_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// ARROW_DOWN_RGBA above.
-#[cfg(test)]
 const ARROW_DOWN_GALLERY_RGBA: &[u8] = include_bytes!("arrow_down_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const ARROW_DOWN_GALLERY_GATE_RGBA: &[u8] = include_bytes!("arrow_down_gallery_gate.rgba");
-static ARROW_DOWN_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(ARROW_DOWN_GALLERY_GATE_RGBA));
 
 // ---- ArrowLeft (arrow-left) -----------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const ARROW_LEFT_RGBA: &[u8] = include_bytes!("arrow_left.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const ARROW_LEFT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("arrow_left_gate_active.rgba");
-static ARROW_LEFT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ARROW_LEFT_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const ARROW_LEFT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("arrow_left_gate_accent.rgba");
-static ARROW_LEFT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ARROW_LEFT_GATE_ACCENT_RGBA));
-
 const ARROW_LEFT_COMPACT_RGBA: &[u8] = include_bytes!("arrow_left_compact.rgba");
 static ARROW_LEFT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(ARROW_LEFT_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// ARROW_LEFT_RGBA above.
-#[cfg(test)]
 const ARROW_LEFT_STRIP_RGBA: &[u8] = include_bytes!("arrow_left_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const ARROW_LEFT_STRIP_GATE_RGBA: &[u8] = include_bytes!("arrow_left_strip_gate.rgba");
-static ARROW_LEFT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(ARROW_LEFT_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// ARROW_LEFT_RGBA above.
-#[cfg(test)]
 const ARROW_LEFT_GALLERY_RGBA: &[u8] = include_bytes!("arrow_left_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const ARROW_LEFT_GALLERY_GATE_RGBA: &[u8] = include_bytes!("arrow_left_gallery_gate.rgba");
-static ARROW_LEFT_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(ARROW_LEFT_GALLERY_GATE_RGBA));
 
 // ---- ArrowRight (arrow-right) ---------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const ARROW_RIGHT_RGBA: &[u8] = include_bytes!("arrow_right.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const ARROW_RIGHT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("arrow_right_gate_active.rgba");
-static ARROW_RIGHT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ARROW_RIGHT_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const ARROW_RIGHT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("arrow_right_gate_accent.rgba");
-static ARROW_RIGHT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ARROW_RIGHT_GATE_ACCENT_RGBA));
-
 const ARROW_RIGHT_COMPACT_RGBA: &[u8] = include_bytes!("arrow_right_compact.rgba");
 static ARROW_RIGHT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(ARROW_RIGHT_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// ARROW_RIGHT_RGBA above.
-#[cfg(test)]
 const ARROW_RIGHT_STRIP_RGBA: &[u8] = include_bytes!("arrow_right_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const ARROW_RIGHT_STRIP_GATE_RGBA: &[u8] = include_bytes!("arrow_right_strip_gate.rgba");
-static ARROW_RIGHT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(ARROW_RIGHT_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// ARROW_RIGHT_RGBA above.
-#[cfg(test)]
 const ARROW_RIGHT_GALLERY_RGBA: &[u8] = include_bytes!("arrow_right_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const ARROW_RIGHT_GALLERY_GATE_RGBA: &[u8] = include_bytes!("arrow_right_gallery_gate.rgba");
-static ARROW_RIGHT_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(ARROW_RIGHT_GALLERY_GATE_RGBA));
 
 // ---- ArrowSwap (arrow-swap) -----------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const ARROW_SWAP_RGBA: &[u8] = include_bytes!("arrow_swap.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const ARROW_SWAP_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("arrow_swap_gate_active.rgba");
-static ARROW_SWAP_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ARROW_SWAP_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const ARROW_SWAP_GATE_ACCENT_RGBA: &[u8] = include_bytes!("arrow_swap_gate_accent.rgba");
-static ARROW_SWAP_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ARROW_SWAP_GATE_ACCENT_RGBA));
-
 const ARROW_SWAP_COMPACT_RGBA: &[u8] = include_bytes!("arrow_swap_compact.rgba");
 static ARROW_SWAP_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(ARROW_SWAP_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// ARROW_SWAP_RGBA above.
-#[cfg(test)]
 const ARROW_SWAP_STRIP_RGBA: &[u8] = include_bytes!("arrow_swap_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const ARROW_SWAP_STRIP_GATE_RGBA: &[u8] = include_bytes!("arrow_swap_strip_gate.rgba");
-static ARROW_SWAP_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(ARROW_SWAP_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// ARROW_SWAP_RGBA above.
-#[cfg(test)]
 const ARROW_SWAP_GALLERY_RGBA: &[u8] = include_bytes!("arrow_swap_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const ARROW_SWAP_GALLERY_GATE_RGBA: &[u8] = include_bytes!("arrow_swap_gallery_gate.rgba");
-static ARROW_SWAP_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(ARROW_SWAP_GALLERY_GATE_RGBA));
 
 // ---- GitCommit (git-commit) -----------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const GIT_COMMIT_RGBA: &[u8] = include_bytes!("git_commit.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const GIT_COMMIT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("git_commit_gate_active.rgba");
-static GIT_COMMIT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(GIT_COMMIT_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const GIT_COMMIT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("git_commit_gate_accent.rgba");
-static GIT_COMMIT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(GIT_COMMIT_GATE_ACCENT_RGBA));
-
 const GIT_COMMIT_COMPACT_RGBA: &[u8] = include_bytes!("git_commit_compact.rgba");
 static GIT_COMMIT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(GIT_COMMIT_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// GIT_COMMIT_RGBA above.
-#[cfg(test)]
 const GIT_COMMIT_STRIP_RGBA: &[u8] = include_bytes!("git_commit_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const GIT_COMMIT_STRIP_GATE_RGBA: &[u8] = include_bytes!("git_commit_strip_gate.rgba");
-static GIT_COMMIT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(GIT_COMMIT_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// GIT_COMMIT_RGBA above.
-#[cfg(test)]
 const GIT_COMMIT_GALLERY_RGBA: &[u8] = include_bytes!("git_commit_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const GIT_COMMIT_GALLERY_GATE_RGBA: &[u8] = include_bytes!("git_commit_gallery_gate.rgba");
-static GIT_COMMIT_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(GIT_COMMIT_GALLERY_GATE_RGBA));
 
 // ---- GitBranch (git-branch) -----------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const GIT_BRANCH_RGBA: &[u8] = include_bytes!("git_branch.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const GIT_BRANCH_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("git_branch_gate_active.rgba");
-static GIT_BRANCH_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(GIT_BRANCH_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const GIT_BRANCH_GATE_ACCENT_RGBA: &[u8] = include_bytes!("git_branch_gate_accent.rgba");
-static GIT_BRANCH_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(GIT_BRANCH_GATE_ACCENT_RGBA));
-
 const GIT_BRANCH_COMPACT_RGBA: &[u8] = include_bytes!("git_branch_compact.rgba");
 static GIT_BRANCH_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(GIT_BRANCH_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// GIT_BRANCH_RGBA above.
-#[cfg(test)]
 const GIT_BRANCH_STRIP_RGBA: &[u8] = include_bytes!("git_branch_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const GIT_BRANCH_STRIP_GATE_RGBA: &[u8] = include_bytes!("git_branch_strip_gate.rgba");
-static GIT_BRANCH_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(GIT_BRANCH_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// GIT_BRANCH_RGBA above.
-#[cfg(test)]
 const GIT_BRANCH_GALLERY_RGBA: &[u8] = include_bytes!("git_branch_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const GIT_BRANCH_GALLERY_GATE_RGBA: &[u8] = include_bytes!("git_branch_gallery_gate.rgba");
-static GIT_BRANCH_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(GIT_BRANCH_GALLERY_GATE_RGBA));
 
 // ---- Diff (diff) ----------------------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const DIFF_RGBA: &[u8] = include_bytes!("diff.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const DIFF_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("diff_gate_active.rgba");
-static DIFF_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(DIFF_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const DIFF_GATE_ACCENT_RGBA: &[u8] = include_bytes!("diff_gate_accent.rgba");
-static DIFF_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(DIFF_GATE_ACCENT_RGBA));
-
 const DIFF_COMPACT_RGBA: &[u8] = include_bytes!("diff_compact.rgba");
 static DIFF_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(DIFF_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// DIFF_RGBA above.
-#[cfg(test)]
 const DIFF_STRIP_RGBA: &[u8] = include_bytes!("diff_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const DIFF_STRIP_GATE_RGBA: &[u8] = include_bytes!("diff_strip_gate.rgba");
-static DIFF_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(DIFF_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// DIFF_RGBA above.
-#[cfg(test)]
 const DIFF_GALLERY_RGBA: &[u8] = include_bytes!("diff_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const DIFF_GALLERY_GATE_RGBA: &[u8] = include_bytes!("diff_gallery_gate.rgba");
-static DIFF_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(DIFF_GALLERY_GATE_RGBA));
 
 // ---- DiffAdded (diff-added) -----------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const DIFF_ADDED_RGBA: &[u8] = include_bytes!("diff_added.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const DIFF_ADDED_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("diff_added_gate_active.rgba");
-static DIFF_ADDED_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(DIFF_ADDED_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const DIFF_ADDED_GATE_ACCENT_RGBA: &[u8] = include_bytes!("diff_added_gate_accent.rgba");
-static DIFF_ADDED_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(DIFF_ADDED_GATE_ACCENT_RGBA));
-
 const DIFF_ADDED_COMPACT_RGBA: &[u8] = include_bytes!("diff_added_compact.rgba");
 static DIFF_ADDED_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(DIFF_ADDED_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// DIFF_ADDED_RGBA above.
-#[cfg(test)]
 const DIFF_ADDED_STRIP_RGBA: &[u8] = include_bytes!("diff_added_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const DIFF_ADDED_STRIP_GATE_RGBA: &[u8] = include_bytes!("diff_added_strip_gate.rgba");
-static DIFF_ADDED_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(DIFF_ADDED_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// DIFF_ADDED_RGBA above.
-#[cfg(test)]
 const DIFF_ADDED_GALLERY_RGBA: &[u8] = include_bytes!("diff_added_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const DIFF_ADDED_GALLERY_GATE_RGBA: &[u8] = include_bytes!("diff_added_gallery_gate.rgba");
-static DIFF_ADDED_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(DIFF_ADDED_GALLERY_GATE_RGBA));
 
 // ---- GitCompare (git-compare) ---------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const GIT_COMPARE_RGBA: &[u8] = include_bytes!("git_compare.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const GIT_COMPARE_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("git_compare_gate_active.rgba");
-static GIT_COMPARE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(GIT_COMPARE_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const GIT_COMPARE_GATE_ACCENT_RGBA: &[u8] = include_bytes!("git_compare_gate_accent.rgba");
-static GIT_COMPARE_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(GIT_COMPARE_GATE_ACCENT_RGBA));
-
 const GIT_COMPARE_COMPACT_RGBA: &[u8] = include_bytes!("git_compare_compact.rgba");
 static GIT_COMPARE_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(GIT_COMPARE_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// GIT_COMPARE_RGBA above.
-#[cfg(test)]
 const GIT_COMPARE_STRIP_RGBA: &[u8] = include_bytes!("git_compare_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const GIT_COMPARE_STRIP_GATE_RGBA: &[u8] = include_bytes!("git_compare_strip_gate.rgba");
-static GIT_COMPARE_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(GIT_COMPARE_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// GIT_COMPARE_RGBA above.
-#[cfg(test)]
 const GIT_COMPARE_GALLERY_RGBA: &[u8] = include_bytes!("git_compare_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const GIT_COMPARE_GALLERY_GATE_RGBA: &[u8] = include_bytes!("git_compare_gallery_gate.rgba");
-static GIT_COMPARE_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(GIT_COMPARE_GALLERY_GATE_RGBA));
 
 // ---- Repo (repo) ----------------------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const REPO_RGBA: &[u8] = include_bytes!("repo.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const REPO_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("repo_gate_active.rgba");
-static REPO_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(REPO_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const REPO_GATE_ACCENT_RGBA: &[u8] = include_bytes!("repo_gate_accent.rgba");
-static REPO_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(REPO_GATE_ACCENT_RGBA));
-
 const REPO_COMPACT_RGBA: &[u8] = include_bytes!("repo_compact.rgba");
 static REPO_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(REPO_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// REPO_RGBA above.
-#[cfg(test)]
 const REPO_STRIP_RGBA: &[u8] = include_bytes!("repo_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const REPO_STRIP_GATE_RGBA: &[u8] = include_bytes!("repo_strip_gate.rgba");
-static REPO_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(REPO_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// REPO_RGBA above.
-#[cfg(test)]
 const REPO_GALLERY_RGBA: &[u8] = include_bytes!("repo_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const REPO_GALLERY_GATE_RGBA: &[u8] = include_bytes!("repo_gallery_gate.rgba");
-static REPO_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(REPO_GALLERY_GATE_RGBA));
 
 // ---- RepoForked (repo-forked) ---------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const REPO_FORKED_RGBA: &[u8] = include_bytes!("repo_forked.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const REPO_FORKED_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("repo_forked_gate_active.rgba");
-static REPO_FORKED_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(REPO_FORKED_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const REPO_FORKED_GATE_ACCENT_RGBA: &[u8] = include_bytes!("repo_forked_gate_accent.rgba");
-static REPO_FORKED_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(REPO_FORKED_GATE_ACCENT_RGBA));
-
 const REPO_FORKED_COMPACT_RGBA: &[u8] = include_bytes!("repo_forked_compact.rgba");
 static REPO_FORKED_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(REPO_FORKED_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// REPO_FORKED_RGBA above.
-#[cfg(test)]
 const REPO_FORKED_STRIP_RGBA: &[u8] = include_bytes!("repo_forked_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const REPO_FORKED_STRIP_GATE_RGBA: &[u8] = include_bytes!("repo_forked_strip_gate.rgba");
-static REPO_FORKED_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(REPO_FORKED_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// REPO_FORKED_RGBA above.
-#[cfg(test)]
 const REPO_FORKED_GALLERY_RGBA: &[u8] = include_bytes!("repo_forked_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const REPO_FORKED_GALLERY_GATE_RGBA: &[u8] = include_bytes!("repo_forked_gallery_gate.rgba");
-static REPO_FORKED_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(REPO_FORKED_GALLERY_GATE_RGBA));
 
 // ---- DebugStop (debug-stop) -----------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const DEBUG_STOP_RGBA: &[u8] = include_bytes!("debug_stop.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const DEBUG_STOP_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("debug_stop_gate_active.rgba");
-static DEBUG_STOP_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(DEBUG_STOP_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const DEBUG_STOP_GATE_ACCENT_RGBA: &[u8] = include_bytes!("debug_stop_gate_accent.rgba");
-static DEBUG_STOP_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(DEBUG_STOP_GATE_ACCENT_RGBA));
-
 const DEBUG_STOP_COMPACT_RGBA: &[u8] = include_bytes!("debug_stop_compact.rgba");
 static DEBUG_STOP_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(DEBUG_STOP_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// DEBUG_STOP_RGBA above.
-#[cfg(test)]
 const DEBUG_STOP_STRIP_RGBA: &[u8] = include_bytes!("debug_stop_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const DEBUG_STOP_STRIP_GATE_RGBA: &[u8] = include_bytes!("debug_stop_strip_gate.rgba");
-static DEBUG_STOP_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(DEBUG_STOP_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// DEBUG_STOP_RGBA above.
-#[cfg(test)]
 const DEBUG_STOP_GALLERY_RGBA: &[u8] = include_bytes!("debug_stop_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const DEBUG_STOP_GALLERY_GATE_RGBA: &[u8] = include_bytes!("debug_stop_gallery_gate.rgba");
-static DEBUG_STOP_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(DEBUG_STOP_GALLERY_GATE_RGBA));
 
 // ---- DebugRestart (debug-restart) -----------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const DEBUG_RESTART_RGBA: &[u8] = include_bytes!("debug_restart.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const DEBUG_RESTART_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("debug_restart_gate_active.rgba");
-static DEBUG_RESTART_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(DEBUG_RESTART_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const DEBUG_RESTART_GATE_ACCENT_RGBA: &[u8] = include_bytes!("debug_restart_gate_accent.rgba");
-static DEBUG_RESTART_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(DEBUG_RESTART_GATE_ACCENT_RGBA));
-
 const DEBUG_RESTART_COMPACT_RGBA: &[u8] = include_bytes!("debug_restart_compact.rgba");
 static DEBUG_RESTART_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(DEBUG_RESTART_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// DEBUG_RESTART_RGBA above.
-#[cfg(test)]
 const DEBUG_RESTART_STRIP_RGBA: &[u8] = include_bytes!("debug_restart_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const DEBUG_RESTART_STRIP_GATE_RGBA: &[u8] = include_bytes!("debug_restart_strip_gate.rgba");
-static DEBUG_RESTART_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(DEBUG_RESTART_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// DEBUG_RESTART_RGBA above.
-#[cfg(test)]
 const DEBUG_RESTART_GALLERY_RGBA: &[u8] = include_bytes!("debug_restart_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const DEBUG_RESTART_GALLERY_GATE_RGBA: &[u8] = include_bytes!("debug_restart_gallery_gate.rgba");
-static DEBUG_RESTART_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(DEBUG_RESTART_GALLERY_GATE_RGBA));
 
 // ---- Edit (edit) ----------------------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const EDIT_RGBA: &[u8] = include_bytes!("edit.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const EDIT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("edit_gate_active.rgba");
-static EDIT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(EDIT_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const EDIT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("edit_gate_accent.rgba");
-static EDIT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(EDIT_GATE_ACCENT_RGBA));
-
 const EDIT_COMPACT_RGBA: &[u8] = include_bytes!("edit_compact.rgba");
 static EDIT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(EDIT_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// EDIT_RGBA above.
-#[cfg(test)]
 const EDIT_STRIP_RGBA: &[u8] = include_bytes!("edit_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const EDIT_STRIP_GATE_RGBA: &[u8] = include_bytes!("edit_strip_gate.rgba");
-static EDIT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(EDIT_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// EDIT_RGBA above.
-#[cfg(test)]
 const EDIT_GALLERY_RGBA: &[u8] = include_bytes!("edit_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const EDIT_GALLERY_GATE_RGBA: &[u8] = include_bytes!("edit_gallery_gate.rgba");
-static EDIT_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(EDIT_GALLERY_GATE_RGBA));
 
 // ---- History (history) ----------------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const HISTORY_RGBA: &[u8] = include_bytes!("history.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const HISTORY_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("history_gate_active.rgba");
-static HISTORY_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(HISTORY_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const HISTORY_GATE_ACCENT_RGBA: &[u8] = include_bytes!("history_gate_accent.rgba");
-static HISTORY_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(HISTORY_GATE_ACCENT_RGBA));
-
 const HISTORY_COMPACT_RGBA: &[u8] = include_bytes!("history_compact.rgba");
 static HISTORY_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(HISTORY_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// HISTORY_RGBA above.
-#[cfg(test)]
 const HISTORY_STRIP_RGBA: &[u8] = include_bytes!("history_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const HISTORY_STRIP_GATE_RGBA: &[u8] = include_bytes!("history_strip_gate.rgba");
-static HISTORY_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(HISTORY_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// HISTORY_RGBA above.
-#[cfg(test)]
 const HISTORY_GALLERY_RGBA: &[u8] = include_bytes!("history_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const HISTORY_GALLERY_GATE_RGBA: &[u8] = include_bytes!("history_gallery_gate.rgba");
-static HISTORY_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(HISTORY_GALLERY_GATE_RGBA));
 
 // ---- Terminal (terminal) --------------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const TERMINAL_RGBA: &[u8] = include_bytes!("terminal.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const TERMINAL_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("terminal_gate_active.rgba");
-static TERMINAL_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(TERMINAL_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const TERMINAL_GATE_ACCENT_RGBA: &[u8] = include_bytes!("terminal_gate_accent.rgba");
-static TERMINAL_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(TERMINAL_GATE_ACCENT_RGBA));
-
 const TERMINAL_COMPACT_RGBA: &[u8] = include_bytes!("terminal_compact.rgba");
 static TERMINAL_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(TERMINAL_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// TERMINAL_RGBA above.
-#[cfg(test)]
 const TERMINAL_STRIP_RGBA: &[u8] = include_bytes!("terminal_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const TERMINAL_STRIP_GATE_RGBA: &[u8] = include_bytes!("terminal_strip_gate.rgba");
-static TERMINAL_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(TERMINAL_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// TERMINAL_RGBA above.
-#[cfg(test)]
 const TERMINAL_GALLERY_RGBA: &[u8] = include_bytes!("terminal_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const TERMINAL_GALLERY_GATE_RGBA: &[u8] = include_bytes!("terminal_gallery_gate.rgba");
-static TERMINAL_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(TERMINAL_GALLERY_GATE_RGBA));
 
 // ---- Output (output) ------------------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const OUTPUT_RGBA: &[u8] = include_bytes!("output.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const OUTPUT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("output_gate_active.rgba");
-static OUTPUT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(OUTPUT_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const OUTPUT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("output_gate_accent.rgba");
-static OUTPUT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(OUTPUT_GATE_ACCENT_RGBA));
-
 const OUTPUT_COMPACT_RGBA: &[u8] = include_bytes!("output_compact.rgba");
 static OUTPUT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(OUTPUT_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// OUTPUT_RGBA above.
-#[cfg(test)]
 const OUTPUT_STRIP_RGBA: &[u8] = include_bytes!("output_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const OUTPUT_STRIP_GATE_RGBA: &[u8] = include_bytes!("output_strip_gate.rgba");
-static OUTPUT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(OUTPUT_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// OUTPUT_RGBA above.
-#[cfg(test)]
 const OUTPUT_GALLERY_RGBA: &[u8] = include_bytes!("output_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const OUTPUT_GALLERY_GATE_RGBA: &[u8] = include_bytes!("output_gallery_gate.rgba");
-static OUTPUT_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(OUTPUT_GALLERY_GATE_RGBA));
 
 // ---- CloudDownload (cloud-download) ---------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const CLOUD_DOWNLOAD_RGBA: &[u8] = include_bytes!("cloud_download.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const CLOUD_DOWNLOAD_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("cloud_download_gate_active.rgba");
-static CLOUD_DOWNLOAD_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CLOUD_DOWNLOAD_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const CLOUD_DOWNLOAD_GATE_ACCENT_RGBA: &[u8] = include_bytes!("cloud_download_gate_accent.rgba");
-static CLOUD_DOWNLOAD_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CLOUD_DOWNLOAD_GATE_ACCENT_RGBA));
-
 const CLOUD_DOWNLOAD_COMPACT_RGBA: &[u8] = include_bytes!("cloud_download_compact.rgba");
 static CLOUD_DOWNLOAD_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(CLOUD_DOWNLOAD_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// CLOUD_DOWNLOAD_RGBA above.
-#[cfg(test)]
 const CLOUD_DOWNLOAD_STRIP_RGBA: &[u8] = include_bytes!("cloud_download_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const CLOUD_DOWNLOAD_STRIP_GATE_RGBA: &[u8] = include_bytes!("cloud_download_strip_gate.rgba");
-static CLOUD_DOWNLOAD_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(CLOUD_DOWNLOAD_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// CLOUD_DOWNLOAD_RGBA above.
-#[cfg(test)]
 const CLOUD_DOWNLOAD_GALLERY_RGBA: &[u8] = include_bytes!("cloud_download_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const CLOUD_DOWNLOAD_GALLERY_GATE_RGBA: &[u8] = include_bytes!("cloud_download_gallery_gate.rgba");
-static CLOUD_DOWNLOAD_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(CLOUD_DOWNLOAD_GALLERY_GATE_RGBA));
 
 // ---- Ellipsis (ellipsis) --------------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const ELLIPSIS_RGBA: &[u8] = include_bytes!("ellipsis.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const ELLIPSIS_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("ellipsis_gate_active.rgba");
-static ELLIPSIS_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ELLIPSIS_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const ELLIPSIS_GATE_ACCENT_RGBA: &[u8] = include_bytes!("ellipsis_gate_accent.rgba");
-static ELLIPSIS_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ELLIPSIS_GATE_ACCENT_RGBA));
-
 const ELLIPSIS_COMPACT_RGBA: &[u8] = include_bytes!("ellipsis_compact.rgba");
 static ELLIPSIS_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(ELLIPSIS_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// ELLIPSIS_RGBA above.
-#[cfg(test)]
 const ELLIPSIS_STRIP_RGBA: &[u8] = include_bytes!("ellipsis_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const ELLIPSIS_STRIP_GATE_RGBA: &[u8] = include_bytes!("ellipsis_strip_gate.rgba");
-static ELLIPSIS_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(ELLIPSIS_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// ELLIPSIS_RGBA above.
-#[cfg(test)]
 const ELLIPSIS_GALLERY_RGBA: &[u8] = include_bytes!("ellipsis_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const ELLIPSIS_GALLERY_GATE_RGBA: &[u8] = include_bytes!("ellipsis_gallery_gate.rgba");
-static ELLIPSIS_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(ELLIPSIS_GALLERY_GATE_RGBA));
 
 // ---- Link (link) ----------------------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const LINK_RGBA: &[u8] = include_bytes!("link.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const LINK_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("link_gate_active.rgba");
-static LINK_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LINK_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const LINK_GATE_ACCENT_RGBA: &[u8] = include_bytes!("link_gate_accent.rgba");
-static LINK_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LINK_GATE_ACCENT_RGBA));
-
 const LINK_COMPACT_RGBA: &[u8] = include_bytes!("link_compact.rgba");
 static LINK_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LINK_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// LINK_RGBA above.
-#[cfg(test)]
 const LINK_STRIP_RGBA: &[u8] = include_bytes!("link_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const LINK_STRIP_GATE_RGBA: &[u8] = include_bytes!("link_strip_gate.rgba");
-static LINK_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LINK_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// LINK_RGBA above.
-#[cfg(test)]
 const LINK_GALLERY_RGBA: &[u8] = include_bytes!("link_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const LINK_GALLERY_GATE_RGBA: &[u8] = include_bytes!("link_gallery_gate.rgba");
-static LINK_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LINK_GALLERY_GATE_RGBA));
 
 // ---- CircleFilled (circle-filled) -----------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const CIRCLE_FILLED_RGBA: &[u8] = include_bytes!("circle_filled.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const CIRCLE_FILLED_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("circle_filled_gate_active.rgba");
-static CIRCLE_FILLED_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CIRCLE_FILLED_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const CIRCLE_FILLED_GATE_ACCENT_RGBA: &[u8] = include_bytes!("circle_filled_gate_accent.rgba");
-static CIRCLE_FILLED_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CIRCLE_FILLED_GATE_ACCENT_RGBA));
-
 const CIRCLE_FILLED_COMPACT_RGBA: &[u8] = include_bytes!("circle_filled_compact.rgba");
 static CIRCLE_FILLED_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(CIRCLE_FILLED_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// CIRCLE_FILLED_RGBA above.
-#[cfg(test)]
 const CIRCLE_FILLED_STRIP_RGBA: &[u8] = include_bytes!("circle_filled_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const CIRCLE_FILLED_STRIP_GATE_RGBA: &[u8] = include_bytes!("circle_filled_strip_gate.rgba");
-static CIRCLE_FILLED_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(CIRCLE_FILLED_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// CIRCLE_FILLED_RGBA above.
-#[cfg(test)]
 const CIRCLE_FILLED_GALLERY_RGBA: &[u8] = include_bytes!("circle_filled_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const CIRCLE_FILLED_GALLERY_GATE_RGBA: &[u8] = include_bytes!("circle_filled_gallery_gate.rgba");
-static CIRCLE_FILLED_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(CIRCLE_FILLED_GALLERY_GATE_RGBA));
 
 // ---- CircleSlash (circle-slash) -------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const CIRCLE_SLASH_RGBA: &[u8] = include_bytes!("circle_slash.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const CIRCLE_SLASH_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("circle_slash_gate_active.rgba");
-static CIRCLE_SLASH_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CIRCLE_SLASH_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const CIRCLE_SLASH_GATE_ACCENT_RGBA: &[u8] = include_bytes!("circle_slash_gate_accent.rgba");
-static CIRCLE_SLASH_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CIRCLE_SLASH_GATE_ACCENT_RGBA));
-
 const CIRCLE_SLASH_COMPACT_RGBA: &[u8] = include_bytes!("circle_slash_compact.rgba");
 static CIRCLE_SLASH_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(CIRCLE_SLASH_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// CIRCLE_SLASH_RGBA above.
-#[cfg(test)]
 const CIRCLE_SLASH_STRIP_RGBA: &[u8] = include_bytes!("circle_slash_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const CIRCLE_SLASH_STRIP_GATE_RGBA: &[u8] = include_bytes!("circle_slash_strip_gate.rgba");
-static CIRCLE_SLASH_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(CIRCLE_SLASH_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// CIRCLE_SLASH_RGBA above.
-#[cfg(test)]
 const CIRCLE_SLASH_GALLERY_RGBA: &[u8] = include_bytes!("circle_slash_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const CIRCLE_SLASH_GALLERY_GATE_RGBA: &[u8] = include_bytes!("circle_slash_gallery_gate.rgba");
-static CIRCLE_SLASH_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(CIRCLE_SLASH_GALLERY_GATE_RGBA));
 
 // ---- Warning (warning) ----------------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const WARNING_RGBA: &[u8] = include_bytes!("warning.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const WARNING_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("warning_gate_active.rgba");
-static WARNING_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(WARNING_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const WARNING_GATE_ACCENT_RGBA: &[u8] = include_bytes!("warning_gate_accent.rgba");
-static WARNING_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(WARNING_GATE_ACCENT_RGBA));
-
 const WARNING_COMPACT_RGBA: &[u8] = include_bytes!("warning_compact.rgba");
 static WARNING_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(WARNING_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// WARNING_RGBA above.
-#[cfg(test)]
 const WARNING_STRIP_RGBA: &[u8] = include_bytes!("warning_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const WARNING_STRIP_GATE_RGBA: &[u8] = include_bytes!("warning_strip_gate.rgba");
-static WARNING_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(WARNING_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// WARNING_RGBA above.
-#[cfg(test)]
 const WARNING_GALLERY_RGBA: &[u8] = include_bytes!("warning_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const WARNING_GALLERY_GATE_RGBA: &[u8] = include_bytes!("warning_gallery_gate.rgba");
-static WARNING_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(WARNING_GALLERY_GATE_RGBA));
 
 // ---- Error (error) --------------------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const ERROR_RGBA: &[u8] = include_bytes!("error.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const ERROR_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("error_gate_active.rgba");
-static ERROR_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ERROR_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const ERROR_GATE_ACCENT_RGBA: &[u8] = include_bytes!("error_gate_accent.rgba");
-static ERROR_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(ERROR_GATE_ACCENT_RGBA));
-
 const ERROR_COMPACT_RGBA: &[u8] = include_bytes!("error_compact.rgba");
 static ERROR_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(ERROR_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// ERROR_RGBA above.
-#[cfg(test)]
 const ERROR_STRIP_RGBA: &[u8] = include_bytes!("error_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const ERROR_STRIP_GATE_RGBA: &[u8] = include_bytes!("error_strip_gate.rgba");
-static ERROR_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(ERROR_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// ERROR_RGBA above.
-#[cfg(test)]
 const ERROR_GALLERY_RGBA: &[u8] = include_bytes!("error_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const ERROR_GALLERY_GATE_RGBA: &[u8] = include_bytes!("error_gallery_gate.rgba");
-static ERROR_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(ERROR_GALLERY_GATE_RGBA));
 
 // ---- Info (info) ----------------------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const INFO_RGBA: &[u8] = include_bytes!("info.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const INFO_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("info_gate_active.rgba");
-static INFO_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(INFO_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const INFO_GATE_ACCENT_RGBA: &[u8] = include_bytes!("info_gate_accent.rgba");
-static INFO_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(INFO_GATE_ACCENT_RGBA));
-
 const INFO_COMPACT_RGBA: &[u8] = include_bytes!("info_compact.rgba");
 static INFO_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(INFO_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// INFO_RGBA above.
-#[cfg(test)]
 const INFO_STRIP_RGBA: &[u8] = include_bytes!("info_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const INFO_STRIP_GATE_RGBA: &[u8] = include_bytes!("info_strip_gate.rgba");
-static INFO_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(INFO_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// INFO_RGBA above.
-#[cfg(test)]
 const INFO_GALLERY_RGBA: &[u8] = include_bytes!("info_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const INFO_GALLERY_GATE_RGBA: &[u8] = include_bytes!("info_gallery_gate.rgba");
-static INFO_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(INFO_GALLERY_GATE_RGBA));
 
 // ---- RunAll (run-all) -----------------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const RUN_ALL_RGBA: &[u8] = include_bytes!("run_all.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const RUN_ALL_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("run_all_gate_active.rgba");
-static RUN_ALL_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(RUN_ALL_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const RUN_ALL_GATE_ACCENT_RGBA: &[u8] = include_bytes!("run_all_gate_accent.rgba");
-static RUN_ALL_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(RUN_ALL_GATE_ACCENT_RGBA));
-
 const RUN_ALL_COMPACT_RGBA: &[u8] = include_bytes!("run_all_compact.rgba");
 static RUN_ALL_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(RUN_ALL_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// RUN_ALL_RGBA above.
-#[cfg(test)]
 const RUN_ALL_STRIP_RGBA: &[u8] = include_bytes!("run_all_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const RUN_ALL_STRIP_GATE_RGBA: &[u8] = include_bytes!("run_all_strip_gate.rgba");
-static RUN_ALL_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(RUN_ALL_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// RUN_ALL_RGBA above.
-#[cfg(test)]
 const RUN_ALL_GALLERY_RGBA: &[u8] = include_bytes!("run_all_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const RUN_ALL_GALLERY_GATE_RGBA: &[u8] = include_bytes!("run_all_gallery_gate.rgba");
-static RUN_ALL_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(RUN_ALL_GALLERY_GATE_RGBA));
 
 // ---- Play (play) ----------------------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const PLAY_RGBA: &[u8] = include_bytes!("play.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const PLAY_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("play_gate_active.rgba");
-static PLAY_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(PLAY_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const PLAY_GATE_ACCENT_RGBA: &[u8] = include_bytes!("play_gate_accent.rgba");
-static PLAY_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(PLAY_GATE_ACCENT_RGBA));
-
 const PLAY_COMPACT_RGBA: &[u8] = include_bytes!("play_compact.rgba");
 static PLAY_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(PLAY_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// PLAY_RGBA above.
-#[cfg(test)]
 const PLAY_STRIP_RGBA: &[u8] = include_bytes!("play_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const PLAY_STRIP_GATE_RGBA: &[u8] = include_bytes!("play_strip_gate.rgba");
-static PLAY_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(PLAY_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// PLAY_RGBA above.
-#[cfg(test)]
 const PLAY_GALLERY_RGBA: &[u8] = include_bytes!("play_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const PLAY_GALLERY_GATE_RGBA: &[u8] = include_bytes!("play_gallery_gate.rgba");
-static PLAY_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(PLAY_GALLERY_GATE_RGBA));
 
 // ---- Sync (sync) ----------------------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const SYNC_RGBA: &[u8] = include_bytes!("sync.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const SYNC_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("sync_gate_active.rgba");
-static SYNC_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SYNC_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const SYNC_GATE_ACCENT_RGBA: &[u8] = include_bytes!("sync_gate_accent.rgba");
-static SYNC_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SYNC_GATE_ACCENT_RGBA));
-
 const SYNC_COMPACT_RGBA: &[u8] = include_bytes!("sync_compact.rgba");
 static SYNC_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(SYNC_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// SYNC_RGBA above.
-#[cfg(test)]
 const SYNC_STRIP_RGBA: &[u8] = include_bytes!("sync_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const SYNC_STRIP_GATE_RGBA: &[u8] = include_bytes!("sync_strip_gate.rgba");
-static SYNC_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(SYNC_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// SYNC_RGBA above.
-#[cfg(test)]
 const SYNC_GALLERY_RGBA: &[u8] = include_bytes!("sync_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const SYNC_GALLERY_GATE_RGBA: &[u8] = include_bytes!("sync_gallery_gate.rgba");
-static SYNC_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(SYNC_GALLERY_GATE_RGBA));
 
 // ---- GoToFile (go-to-file) ------------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const GO_TO_FILE_RGBA: &[u8] = include_bytes!("go_to_file.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const GO_TO_FILE_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("go_to_file_gate_active.rgba");
-static GO_TO_FILE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(GO_TO_FILE_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const GO_TO_FILE_GATE_ACCENT_RGBA: &[u8] = include_bytes!("go_to_file_gate_accent.rgba");
-static GO_TO_FILE_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(GO_TO_FILE_GATE_ACCENT_RGBA));
-
 const GO_TO_FILE_COMPACT_RGBA: &[u8] = include_bytes!("go_to_file_compact.rgba");
 static GO_TO_FILE_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(GO_TO_FILE_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// GO_TO_FILE_RGBA above.
-#[cfg(test)]
 const GO_TO_FILE_STRIP_RGBA: &[u8] = include_bytes!("go_to_file_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const GO_TO_FILE_STRIP_GATE_RGBA: &[u8] = include_bytes!("go_to_file_strip_gate.rgba");
-static GO_TO_FILE_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(GO_TO_FILE_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// GO_TO_FILE_RGBA above.
-#[cfg(test)]
 const GO_TO_FILE_GALLERY_RGBA: &[u8] = include_bytes!("go_to_file_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const GO_TO_FILE_GALLERY_GATE_RGBA: &[u8] = include_bytes!("go_to_file_gallery_gate.rgba");
-static GO_TO_FILE_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(GO_TO_FILE_GALLERY_GATE_RGBA));
 
 // ---- Pulse (pulse) --------------------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const PULSE_RGBA: &[u8] = include_bytes!("pulse.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const PULSE_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("pulse_gate_active.rgba");
-static PULSE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(PULSE_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const PULSE_GATE_ACCENT_RGBA: &[u8] = include_bytes!("pulse_gate_accent.rgba");
-static PULSE_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(PULSE_GATE_ACCENT_RGBA));
-
 const PULSE_COMPACT_RGBA: &[u8] = include_bytes!("pulse_compact.rgba");
 static PULSE_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(PULSE_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// PULSE_RGBA above.
-#[cfg(test)]
 const PULSE_STRIP_RGBA: &[u8] = include_bytes!("pulse_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const PULSE_STRIP_GATE_RGBA: &[u8] = include_bytes!("pulse_strip_gate.rgba");
-static PULSE_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(PULSE_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// PULSE_RGBA above.
-#[cfg(test)]
 const PULSE_GALLERY_RGBA: &[u8] = include_bytes!("pulse_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const PULSE_GALLERY_GATE_RGBA: &[u8] = include_bytes!("pulse_gallery_gate.rgba");
-static PULSE_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(PULSE_GALLERY_GATE_RGBA));
 
 // ---- Checklist (checklist) ------------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const CHECKLIST_RGBA: &[u8] = include_bytes!("checklist.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const CHECKLIST_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("checklist_gate_active.rgba");
-static CHECKLIST_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CHECKLIST_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const CHECKLIST_GATE_ACCENT_RGBA: &[u8] = include_bytes!("checklist_gate_accent.rgba");
-static CHECKLIST_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(CHECKLIST_GATE_ACCENT_RGBA));
-
 const CHECKLIST_COMPACT_RGBA: &[u8] = include_bytes!("checklist_compact.rgba");
 static CHECKLIST_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(CHECKLIST_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// CHECKLIST_RGBA above.
-#[cfg(test)]
 const CHECKLIST_STRIP_RGBA: &[u8] = include_bytes!("checklist_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const CHECKLIST_STRIP_GATE_RGBA: &[u8] = include_bytes!("checklist_strip_gate.rgba");
-static CHECKLIST_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(CHECKLIST_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// CHECKLIST_RGBA above.
-#[cfg(test)]
 const CHECKLIST_GALLERY_RGBA: &[u8] = include_bytes!("checklist_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const CHECKLIST_GALLERY_GATE_RGBA: &[u8] = include_bytes!("checklist_gallery_gate.rgba");
-static CHECKLIST_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(CHECKLIST_GALLERY_GATE_RGBA));
 
 // ---- Eye (eye) ------------------------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const EYE_RGBA: &[u8] = include_bytes!("eye.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const EYE_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("eye_gate_active.rgba");
-static EYE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(EYE_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const EYE_GATE_ACCENT_RGBA: &[u8] = include_bytes!("eye_gate_accent.rgba");
-static EYE_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(EYE_GATE_ACCENT_RGBA));
-
 const EYE_COMPACT_RGBA: &[u8] = include_bytes!("eye_compact.rgba");
 static EYE_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(EYE_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// EYE_RGBA above.
-#[cfg(test)]
 const EYE_STRIP_RGBA: &[u8] = include_bytes!("eye_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const EYE_STRIP_GATE_RGBA: &[u8] = include_bytes!("eye_strip_gate.rgba");
-static EYE_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(EYE_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// EYE_RGBA above.
-#[cfg(test)]
 const EYE_GALLERY_RGBA: &[u8] = include_bytes!("eye_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const EYE_GALLERY_GATE_RGBA: &[u8] = include_bytes!("eye_gallery_gate.rgba");
-static EYE_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(EYE_GALLERY_GATE_RGBA));
 
 // ---- Layout (layout) ------------------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const LAYOUT_RGBA: &[u8] = include_bytes!("layout.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const LAYOUT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("layout_gate_active.rgba");
-static LAYOUT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LAYOUT_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const LAYOUT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("layout_gate_accent.rgba");
-static LAYOUT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LAYOUT_GATE_ACCENT_RGBA));
-
 const LAYOUT_COMPACT_RGBA: &[u8] = include_bytes!("layout_compact.rgba");
 static LAYOUT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LAYOUT_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// LAYOUT_RGBA above.
-#[cfg(test)]
 const LAYOUT_STRIP_RGBA: &[u8] = include_bytes!("layout_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const LAYOUT_STRIP_GATE_RGBA: &[u8] = include_bytes!("layout_strip_gate.rgba");
-static LAYOUT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LAYOUT_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// LAYOUT_RGBA above.
-#[cfg(test)]
 const LAYOUT_GALLERY_RGBA: &[u8] = include_bytes!("layout_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const LAYOUT_GALLERY_GATE_RGBA: &[u8] = include_bytes!("layout_gallery_gate.rgba");
-static LAYOUT_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LAYOUT_GALLERY_GATE_RGBA));
 
 // ---- SplitHorizontal (split-horizontal) -----------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const SPLIT_HORIZONTAL_RGBA: &[u8] = include_bytes!("split_horizontal.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const SPLIT_HORIZONTAL_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("split_horizontal_gate_active.rgba");
-static SPLIT_HORIZONTAL_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SPLIT_HORIZONTAL_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const SPLIT_HORIZONTAL_GATE_ACCENT_RGBA: &[u8] = include_bytes!("split_horizontal_gate_accent.rgba");
-static SPLIT_HORIZONTAL_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SPLIT_HORIZONTAL_GATE_ACCENT_RGBA));
-
 const SPLIT_HORIZONTAL_COMPACT_RGBA: &[u8] = include_bytes!("split_horizontal_compact.rgba");
 static SPLIT_HORIZONTAL_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(SPLIT_HORIZONTAL_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// SPLIT_HORIZONTAL_RGBA above.
-#[cfg(test)]
 const SPLIT_HORIZONTAL_STRIP_RGBA: &[u8] = include_bytes!("split_horizontal_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const SPLIT_HORIZONTAL_STRIP_GATE_RGBA: &[u8] = include_bytes!("split_horizontal_strip_gate.rgba");
-static SPLIT_HORIZONTAL_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(SPLIT_HORIZONTAL_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// SPLIT_HORIZONTAL_RGBA above.
-#[cfg(test)]
 const SPLIT_HORIZONTAL_GALLERY_RGBA: &[u8] = include_bytes!("split_horizontal_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const SPLIT_HORIZONTAL_GALLERY_GATE_RGBA: &[u8] = include_bytes!("split_horizontal_gallery_gate.rgba");
-static SPLIT_HORIZONTAL_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(SPLIT_HORIZONTAL_GALLERY_GATE_RGBA));
 
 // ---- SplitVertical (split-vertical) ---------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const SPLIT_VERTICAL_RGBA: &[u8] = include_bytes!("split_vertical.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const SPLIT_VERTICAL_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("split_vertical_gate_active.rgba");
-static SPLIT_VERTICAL_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SPLIT_VERTICAL_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const SPLIT_VERTICAL_GATE_ACCENT_RGBA: &[u8] = include_bytes!("split_vertical_gate_accent.rgba");
-static SPLIT_VERTICAL_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(SPLIT_VERTICAL_GATE_ACCENT_RGBA));
-
 const SPLIT_VERTICAL_COMPACT_RGBA: &[u8] = include_bytes!("split_vertical_compact.rgba");
 static SPLIT_VERTICAL_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(SPLIT_VERTICAL_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// SPLIT_VERTICAL_RGBA above.
-#[cfg(test)]
 const SPLIT_VERTICAL_STRIP_RGBA: &[u8] = include_bytes!("split_vertical_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const SPLIT_VERTICAL_STRIP_GATE_RGBA: &[u8] = include_bytes!("split_vertical_strip_gate.rgba");
-static SPLIT_VERTICAL_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(SPLIT_VERTICAL_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// SPLIT_VERTICAL_RGBA above.
-#[cfg(test)]
 const SPLIT_VERTICAL_GALLERY_RGBA: &[u8] = include_bytes!("split_vertical_gallery.rgba");
-
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const SPLIT_VERTICAL_GALLERY_GATE_RGBA: &[u8] = include_bytes!("split_vertical_gallery_gate.rgba");
-static SPLIT_VERTICAL_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(SPLIT_VERTICAL_GALLERY_GATE_RGBA));
 
 // ---- Preview (preview) ----------------------------------------------
 
-/// Raw true-coverage source, test-only -- no longer a shipped
-/// `SixelVariant` (see `tools/bake_icons.py`'s own header doc comment,
-/// cause 4's retirement); kept solely so this crate's own compositing-
-/// correctness tests can check `GATE_ACTIVE`/`GATE_ACCENT` below against
-/// a real checked-in buffer.
-#[cfg(test)]
 const PREVIEW_RGBA: &[u8] = include_bytes!("preview.rgba");
-
-/// At-rest background (`render::ACTIVE_BG`) -- pre-composited opaque at
-/// bake time, gamma-correct linear blend, painted by every icon-bearing
-/// button in every `PtyColorMode` (see this crate's own `tools/
-/// bake_icons.py` module doc, causes 1, 3 and 4).
-const PREVIEW_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("preview_gate_active.rgba");
-static PREVIEW_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(PREVIEW_GATE_ACTIVE_RGBA));
-
-/// Selected/accent background (`render::MAUVE`) -- same fix, the rail's
-/// own selected-state background.
-const PREVIEW_GATE_ACCENT_RGBA: &[u8] = include_bytes!("preview_gate_accent.rgba");
-static PREVIEW_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(PREVIEW_GATE_ACCENT_RGBA));
-
 const PREVIEW_COMPACT_RGBA: &[u8] = include_bytes!("preview_compact.rgba");
 static PREVIEW_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(PREVIEW_COMPACT_RGBA));
-
-/// Raw true-coverage strip-tier source, test-only -- same retirement as
-/// PREVIEW_RGBA above.
-#[cfg(test)]
 const PREVIEW_STRIP_RGBA: &[u8] = include_bytes!("preview_strip.rgba");
-
-/// The strip's own single background (`render::ACTIVE_BG`) -- pre-
-/// composited opaque at bake time, same fix as the rail tier above; the
-/// ONLY strip-tier sixel this crate ships.
-const PREVIEW_STRIP_GATE_RGBA: &[u8] = include_bytes!("preview_strip_gate.rgba");
-static PREVIEW_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(PREVIEW_STRIP_GATE_RGBA));
-
-/// Raw true-coverage gallery-tier source, test-only -- same retirement as
-/// PREVIEW_RGBA above.
-#[cfg(test)]
 const PREVIEW_GALLERY_RGBA: &[u8] = include_bytes!("preview_gallery.rgba");
 
-/// The icon gallery's own single background (`render::ACTIVE_BG`) --
-/// pre-composited opaque at bake time, same fix as the rail/strip tiers
-/// above; the ONLY gallery-tier sixel this crate ships.
-const PREVIEW_GALLERY_GATE_RGBA: &[u8] = include_bytes!("preview_gallery_gate.rgba");
-static PREVIEW_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(PREVIEW_GALLERY_GATE_RGBA));
-
-/// Encoded rail-tier Lucide sixel string for `id` at `variant`'s own
-/// explicit truecolor background -- `None` for the two documented
-/// mapping gaps (`tools/bake_icons.py::LUCIDE_GAPS`); every other `IconId`
-/// is always `Some`. Mirrors [`sixel`], the codicon equivalent.
-pub fn sixel_lucide(id: IconId, variant: SixelVariant) -> Option<&'static str> {
+/// Lucide equivalent of [`sixel_source_rgba`] -- `None` for the two
+/// documented mapping gaps (`tools/bake_icons.py::LUCIDE_GAPS`); every
+/// other `IconId` is always `Some`.
+pub(crate) fn lucide_sixel_source_rgba(id: IconId) -> Option<&'static [u8]> {
     match id {
-        IconId::Files => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_FILES_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_FILES_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::SourceControl => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_SOURCE_CONTROL_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_SOURCE_CONTROL_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::Person => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_PERSON_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_PERSON_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::Project => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_PROJECT_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_PROJECT_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::SettingsGear => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_SETTINGS_GEAR_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_SETTINGS_GEAR_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::ChevronLeft => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_CHEVRON_LEFT_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_CHEVRON_LEFT_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::ChevronRight => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_CHEVRON_RIGHT_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_CHEVRON_RIGHT_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::ChevronDown => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_CHEVRON_DOWN_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_CHEVRON_DOWN_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::NewFile => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_NEW_FILE_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_NEW_FILE_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::NewFolder => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_NEW_FOLDER_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_NEW_FOLDER_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::Folder => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_FOLDER_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_FOLDER_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::FolderOpened => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_FOLDER_OPENED_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_FOLDER_OPENED_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::File => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_FILE_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_FILE_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::Save => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_SAVE_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_SAVE_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::Refresh => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_REFRESH_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_REFRESH_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::Add => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_ADD_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_ADD_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::Trash => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_TRASH_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_TRASH_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::Search => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_SEARCH_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_SEARCH_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::Check => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_CHECK_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_CHECK_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::Close => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_CLOSE_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_CLOSE_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::ArrowUp => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_ARROW_UP_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_ARROW_UP_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::ArrowDown => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_ARROW_DOWN_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_ARROW_DOWN_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::ArrowLeft => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_ARROW_LEFT_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_ARROW_LEFT_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::ArrowRight => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_ARROW_RIGHT_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_ARROW_RIGHT_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::ArrowSwap => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_ARROW_SWAP_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_ARROW_SWAP_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::GitCommit => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_GIT_COMMIT_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_GIT_COMMIT_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::GitBranch => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_GIT_BRANCH_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_GIT_BRANCH_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::Diff => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_DIFF_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_DIFF_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::DiffAdded => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_DIFF_ADDED_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_DIFF_ADDED_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::GitCompare => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_GIT_COMPARE_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_GIT_COMPARE_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::Repo => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_REPO_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_REPO_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::RepoForked => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_REPO_FORKED_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_REPO_FORKED_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::DebugStop => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_DEBUG_STOP_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_DEBUG_STOP_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::DebugRestart => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_DEBUG_RESTART_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_DEBUG_RESTART_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::Edit => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_EDIT_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_EDIT_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::History => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_HISTORY_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_HISTORY_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::Terminal => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_TERMINAL_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_TERMINAL_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::Output => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_OUTPUT_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_OUTPUT_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::CloudDownload => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_CLOUD_DOWNLOAD_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_CLOUD_DOWNLOAD_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::Ellipsis => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_ELLIPSIS_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_ELLIPSIS_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::Link => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_LINK_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_LINK_SIXEL_GATE_ACCENT.as_str(),
-        }),
+        IconId::Files => Some(LUCIDE_FILES_RGBA),
+        IconId::SourceControl => Some(LUCIDE_SOURCE_CONTROL_RGBA),
+        IconId::Person => Some(LUCIDE_PERSON_RGBA),
+        IconId::Project => Some(LUCIDE_PROJECT_RGBA),
+        IconId::SettingsGear => Some(LUCIDE_SETTINGS_GEAR_RGBA),
+        IconId::ChevronLeft => Some(LUCIDE_CHEVRON_LEFT_RGBA),
+        IconId::ChevronRight => Some(LUCIDE_CHEVRON_RIGHT_RGBA),
+        IconId::ChevronDown => Some(LUCIDE_CHEVRON_DOWN_RGBA),
+        IconId::NewFile => Some(LUCIDE_NEW_FILE_RGBA),
+        IconId::NewFolder => Some(LUCIDE_NEW_FOLDER_RGBA),
+        IconId::Folder => Some(LUCIDE_FOLDER_RGBA),
+        IconId::FolderOpened => Some(LUCIDE_FOLDER_OPENED_RGBA),
+        IconId::File => Some(LUCIDE_FILE_RGBA),
+        IconId::Save => Some(LUCIDE_SAVE_RGBA),
+        IconId::Refresh => Some(LUCIDE_REFRESH_RGBA),
+        IconId::Add => Some(LUCIDE_ADD_RGBA),
+        IconId::Trash => Some(LUCIDE_TRASH_RGBA),
+        IconId::Search => Some(LUCIDE_SEARCH_RGBA),
+        IconId::Check => Some(LUCIDE_CHECK_RGBA),
+        IconId::Close => Some(LUCIDE_CLOSE_RGBA),
+        IconId::ArrowUp => Some(LUCIDE_ARROW_UP_RGBA),
+        IconId::ArrowDown => Some(LUCIDE_ARROW_DOWN_RGBA),
+        IconId::ArrowLeft => Some(LUCIDE_ARROW_LEFT_RGBA),
+        IconId::ArrowRight => Some(LUCIDE_ARROW_RIGHT_RGBA),
+        IconId::ArrowSwap => Some(LUCIDE_ARROW_SWAP_RGBA),
+        IconId::GitCommit => Some(LUCIDE_GIT_COMMIT_RGBA),
+        IconId::GitBranch => Some(LUCIDE_GIT_BRANCH_RGBA),
+        IconId::Diff => Some(LUCIDE_DIFF_RGBA),
+        IconId::DiffAdded => Some(LUCIDE_DIFF_ADDED_RGBA),
+        IconId::GitCompare => Some(LUCIDE_GIT_COMPARE_RGBA),
+        IconId::Repo => Some(LUCIDE_REPO_RGBA),
+        IconId::RepoForked => Some(LUCIDE_REPO_FORKED_RGBA),
+        IconId::DebugStop => Some(LUCIDE_DEBUG_STOP_RGBA),
+        IconId::DebugRestart => Some(LUCIDE_DEBUG_RESTART_RGBA),
+        IconId::Edit => Some(LUCIDE_EDIT_RGBA),
+        IconId::History => Some(LUCIDE_HISTORY_RGBA),
+        IconId::Terminal => Some(LUCIDE_TERMINAL_RGBA),
+        IconId::Output => Some(LUCIDE_OUTPUT_RGBA),
+        IconId::CloudDownload => Some(LUCIDE_CLOUD_DOWNLOAD_RGBA),
+        IconId::Ellipsis => Some(LUCIDE_ELLIPSIS_RGBA),
+        IconId::Link => Some(LUCIDE_LINK_RGBA),
         IconId::CircleFilled => None,
-        IconId::CircleSlash => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_CIRCLE_SLASH_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_CIRCLE_SLASH_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::Warning => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_WARNING_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_WARNING_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::Error => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_ERROR_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_ERROR_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::Info => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_INFO_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_INFO_SIXEL_GATE_ACCENT.as_str(),
-        }),
+        IconId::CircleSlash => Some(LUCIDE_CIRCLE_SLASH_RGBA),
+        IconId::Warning => Some(LUCIDE_WARNING_RGBA),
+        IconId::Error => Some(LUCIDE_ERROR_RGBA),
+        IconId::Info => Some(LUCIDE_INFO_RGBA),
         IconId::RunAll => None,
-        IconId::Play => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_PLAY_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_PLAY_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::Sync => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_SYNC_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_SYNC_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::GoToFile => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_GO_TO_FILE_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_GO_TO_FILE_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::Pulse => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_PULSE_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_PULSE_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::Checklist => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_CHECKLIST_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_CHECKLIST_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::Eye => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_EYE_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_EYE_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::Layout => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_LAYOUT_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_LAYOUT_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::SplitHorizontal => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_SPLIT_HORIZONTAL_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_SPLIT_HORIZONTAL_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::SplitVertical => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_SPLIT_VERTICAL_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_SPLIT_VERTICAL_SIXEL_GATE_ACCENT.as_str(),
-        }),
-        IconId::Preview => Some(match variant {
-            SixelVariant::GateActive => LUCIDE_PREVIEW_SIXEL_GATE_ACTIVE.as_str(),
-            SixelVariant::GateAccent => LUCIDE_PREVIEW_SIXEL_GATE_ACCENT.as_str(),
-        }),
+        IconId::Play => Some(LUCIDE_PLAY_RGBA),
+        IconId::Sync => Some(LUCIDE_SYNC_RGBA),
+        IconId::GoToFile => Some(LUCIDE_GO_TO_FILE_RGBA),
+        IconId::Pulse => Some(LUCIDE_PULSE_RGBA),
+        IconId::Checklist => Some(LUCIDE_CHECKLIST_RGBA),
+        IconId::Eye => Some(LUCIDE_EYE_RGBA),
+        IconId::Layout => Some(LUCIDE_LAYOUT_RGBA),
+        IconId::SplitHorizontal => Some(LUCIDE_SPLIT_HORIZONTAL_RGBA),
+        IconId::SplitVertical => Some(LUCIDE_SPLIT_VERTICAL_RGBA),
+        IconId::Preview => Some(LUCIDE_PREVIEW_RGBA),
     }
 }
 
-/// Lucide equivalent of [`sixel_strip`] -- same `None`-for-gaps contract
-/// as [`sixel_lucide`], same `GateAccent` fold into `GateActive` (the
-/// strip has no selected state either family needs a distinct asset for).
-pub fn sixel_strip_lucide(id: IconId, variant: SixelVariant) -> Option<&'static str> {
+/// Lucide equivalent of [`sixel_strip_source_rgba`] -- same `None`-for-
+/// gaps contract as [`lucide_sixel_source_rgba`].
+pub(crate) fn lucide_sixel_strip_source_rgba(id: IconId) -> Option<&'static [u8]> {
     match id {
-        IconId::Files => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_FILES_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::SourceControl => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_SOURCE_CONTROL_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::Person => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_PERSON_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::Project => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_PROJECT_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::SettingsGear => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_SETTINGS_GEAR_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::ChevronLeft => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_CHEVRON_LEFT_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::ChevronRight => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_CHEVRON_RIGHT_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::ChevronDown => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_CHEVRON_DOWN_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::NewFile => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_NEW_FILE_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::NewFolder => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_NEW_FOLDER_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::Folder => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_FOLDER_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::FolderOpened => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_FOLDER_OPENED_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::File => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_FILE_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::Save => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_SAVE_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::Refresh => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_REFRESH_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::Add => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_ADD_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::Trash => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_TRASH_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::Search => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_SEARCH_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::Check => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_CHECK_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::Close => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_CLOSE_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::ArrowUp => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_ARROW_UP_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::ArrowDown => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_ARROW_DOWN_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::ArrowLeft => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_ARROW_LEFT_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::ArrowRight => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_ARROW_RIGHT_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::ArrowSwap => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_ARROW_SWAP_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::GitCommit => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_GIT_COMMIT_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::GitBranch => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_GIT_BRANCH_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::Diff => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_DIFF_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::DiffAdded => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_DIFF_ADDED_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::GitCompare => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_GIT_COMPARE_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::Repo => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_REPO_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::RepoForked => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_REPO_FORKED_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::DebugStop => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_DEBUG_STOP_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::DebugRestart => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_DEBUG_RESTART_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::Edit => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_EDIT_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::History => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_HISTORY_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::Terminal => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_TERMINAL_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::Output => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_OUTPUT_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::CloudDownload => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_CLOUD_DOWNLOAD_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::Ellipsis => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_ELLIPSIS_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::Link => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_LINK_SIXEL_STRIP_GATE.as_str(),
-        }),
+        IconId::Files => Some(LUCIDE_FILES_STRIP_RGBA),
+        IconId::SourceControl => Some(LUCIDE_SOURCE_CONTROL_STRIP_RGBA),
+        IconId::Person => Some(LUCIDE_PERSON_STRIP_RGBA),
+        IconId::Project => Some(LUCIDE_PROJECT_STRIP_RGBA),
+        IconId::SettingsGear => Some(LUCIDE_SETTINGS_GEAR_STRIP_RGBA),
+        IconId::ChevronLeft => Some(LUCIDE_CHEVRON_LEFT_STRIP_RGBA),
+        IconId::ChevronRight => Some(LUCIDE_CHEVRON_RIGHT_STRIP_RGBA),
+        IconId::ChevronDown => Some(LUCIDE_CHEVRON_DOWN_STRIP_RGBA),
+        IconId::NewFile => Some(LUCIDE_NEW_FILE_STRIP_RGBA),
+        IconId::NewFolder => Some(LUCIDE_NEW_FOLDER_STRIP_RGBA),
+        IconId::Folder => Some(LUCIDE_FOLDER_STRIP_RGBA),
+        IconId::FolderOpened => Some(LUCIDE_FOLDER_OPENED_STRIP_RGBA),
+        IconId::File => Some(LUCIDE_FILE_STRIP_RGBA),
+        IconId::Save => Some(LUCIDE_SAVE_STRIP_RGBA),
+        IconId::Refresh => Some(LUCIDE_REFRESH_STRIP_RGBA),
+        IconId::Add => Some(LUCIDE_ADD_STRIP_RGBA),
+        IconId::Trash => Some(LUCIDE_TRASH_STRIP_RGBA),
+        IconId::Search => Some(LUCIDE_SEARCH_STRIP_RGBA),
+        IconId::Check => Some(LUCIDE_CHECK_STRIP_RGBA),
+        IconId::Close => Some(LUCIDE_CLOSE_STRIP_RGBA),
+        IconId::ArrowUp => Some(LUCIDE_ARROW_UP_STRIP_RGBA),
+        IconId::ArrowDown => Some(LUCIDE_ARROW_DOWN_STRIP_RGBA),
+        IconId::ArrowLeft => Some(LUCIDE_ARROW_LEFT_STRIP_RGBA),
+        IconId::ArrowRight => Some(LUCIDE_ARROW_RIGHT_STRIP_RGBA),
+        IconId::ArrowSwap => Some(LUCIDE_ARROW_SWAP_STRIP_RGBA),
+        IconId::GitCommit => Some(LUCIDE_GIT_COMMIT_STRIP_RGBA),
+        IconId::GitBranch => Some(LUCIDE_GIT_BRANCH_STRIP_RGBA),
+        IconId::Diff => Some(LUCIDE_DIFF_STRIP_RGBA),
+        IconId::DiffAdded => Some(LUCIDE_DIFF_ADDED_STRIP_RGBA),
+        IconId::GitCompare => Some(LUCIDE_GIT_COMPARE_STRIP_RGBA),
+        IconId::Repo => Some(LUCIDE_REPO_STRIP_RGBA),
+        IconId::RepoForked => Some(LUCIDE_REPO_FORKED_STRIP_RGBA),
+        IconId::DebugStop => Some(LUCIDE_DEBUG_STOP_STRIP_RGBA),
+        IconId::DebugRestart => Some(LUCIDE_DEBUG_RESTART_STRIP_RGBA),
+        IconId::Edit => Some(LUCIDE_EDIT_STRIP_RGBA),
+        IconId::History => Some(LUCIDE_HISTORY_STRIP_RGBA),
+        IconId::Terminal => Some(LUCIDE_TERMINAL_STRIP_RGBA),
+        IconId::Output => Some(LUCIDE_OUTPUT_STRIP_RGBA),
+        IconId::CloudDownload => Some(LUCIDE_CLOUD_DOWNLOAD_STRIP_RGBA),
+        IconId::Ellipsis => Some(LUCIDE_ELLIPSIS_STRIP_RGBA),
+        IconId::Link => Some(LUCIDE_LINK_STRIP_RGBA),
         IconId::CircleFilled => None,
-        IconId::CircleSlash => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_CIRCLE_SLASH_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::Warning => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_WARNING_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::Error => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_ERROR_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::Info => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_INFO_SIXEL_STRIP_GATE.as_str(),
-        }),
+        IconId::CircleSlash => Some(LUCIDE_CIRCLE_SLASH_STRIP_RGBA),
+        IconId::Warning => Some(LUCIDE_WARNING_STRIP_RGBA),
+        IconId::Error => Some(LUCIDE_ERROR_STRIP_RGBA),
+        IconId::Info => Some(LUCIDE_INFO_STRIP_RGBA),
         IconId::RunAll => None,
-        IconId::Play => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_PLAY_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::Sync => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_SYNC_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::GoToFile => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_GO_TO_FILE_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::Pulse => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_PULSE_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::Checklist => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_CHECKLIST_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::Eye => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_EYE_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::Layout => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_LAYOUT_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::SplitHorizontal => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_SPLIT_HORIZONTAL_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::SplitVertical => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_SPLIT_VERTICAL_SIXEL_STRIP_GATE.as_str(),
-        }),
-        IconId::Preview => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_PREVIEW_SIXEL_STRIP_GATE.as_str(),
-        }),
+        IconId::Play => Some(LUCIDE_PLAY_STRIP_RGBA),
+        IconId::Sync => Some(LUCIDE_SYNC_STRIP_RGBA),
+        IconId::GoToFile => Some(LUCIDE_GO_TO_FILE_STRIP_RGBA),
+        IconId::Pulse => Some(LUCIDE_PULSE_STRIP_RGBA),
+        IconId::Checklist => Some(LUCIDE_CHECKLIST_STRIP_RGBA),
+        IconId::Eye => Some(LUCIDE_EYE_STRIP_RGBA),
+        IconId::Layout => Some(LUCIDE_LAYOUT_STRIP_RGBA),
+        IconId::SplitHorizontal => Some(LUCIDE_SPLIT_HORIZONTAL_STRIP_RGBA),
+        IconId::SplitVertical => Some(LUCIDE_SPLIT_VERTICAL_STRIP_RGBA),
+        IconId::Preview => Some(LUCIDE_PREVIEW_STRIP_RGBA),
     }
 }
 
-/// Lucide equivalent of [`sixel_gallery`] -- same `None`-for-gaps
-/// contract, same `GateAccent` fold as [`sixel_strip_lucide`].
-pub fn sixel_gallery_lucide(id: IconId, variant: SixelVariant) -> Option<&'static str> {
+/// Lucide equivalent of [`sixel_gallery_source_rgba`] -- same `None`-for-
+/// gaps contract as [`lucide_sixel_source_rgba`].
+pub(crate) fn lucide_sixel_gallery_source_rgba(id: IconId) -> Option<&'static [u8]> {
     match id {
-        IconId::Files => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_FILES_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::SourceControl => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_SOURCE_CONTROL_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::Person => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_PERSON_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::Project => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_PROJECT_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::SettingsGear => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_SETTINGS_GEAR_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::ChevronLeft => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_CHEVRON_LEFT_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::ChevronRight => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_CHEVRON_RIGHT_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::ChevronDown => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_CHEVRON_DOWN_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::NewFile => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_NEW_FILE_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::NewFolder => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_NEW_FOLDER_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::Folder => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_FOLDER_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::FolderOpened => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_FOLDER_OPENED_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::File => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_FILE_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::Save => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_SAVE_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::Refresh => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_REFRESH_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::Add => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_ADD_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::Trash => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_TRASH_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::Search => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_SEARCH_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::Check => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_CHECK_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::Close => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_CLOSE_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::ArrowUp => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_ARROW_UP_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::ArrowDown => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_ARROW_DOWN_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::ArrowLeft => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_ARROW_LEFT_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::ArrowRight => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_ARROW_RIGHT_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::ArrowSwap => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_ARROW_SWAP_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::GitCommit => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_GIT_COMMIT_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::GitBranch => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_GIT_BRANCH_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::Diff => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_DIFF_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::DiffAdded => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_DIFF_ADDED_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::GitCompare => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_GIT_COMPARE_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::Repo => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_REPO_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::RepoForked => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_REPO_FORKED_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::DebugStop => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_DEBUG_STOP_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::DebugRestart => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_DEBUG_RESTART_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::Edit => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_EDIT_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::History => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_HISTORY_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::Terminal => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_TERMINAL_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::Output => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_OUTPUT_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::CloudDownload => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_CLOUD_DOWNLOAD_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::Ellipsis => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_ELLIPSIS_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::Link => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_LINK_SIXEL_GALLERY_GATE.as_str(),
-        }),
+        IconId::Files => Some(LUCIDE_FILES_GALLERY_RGBA),
+        IconId::SourceControl => Some(LUCIDE_SOURCE_CONTROL_GALLERY_RGBA),
+        IconId::Person => Some(LUCIDE_PERSON_GALLERY_RGBA),
+        IconId::Project => Some(LUCIDE_PROJECT_GALLERY_RGBA),
+        IconId::SettingsGear => Some(LUCIDE_SETTINGS_GEAR_GALLERY_RGBA),
+        IconId::ChevronLeft => Some(LUCIDE_CHEVRON_LEFT_GALLERY_RGBA),
+        IconId::ChevronRight => Some(LUCIDE_CHEVRON_RIGHT_GALLERY_RGBA),
+        IconId::ChevronDown => Some(LUCIDE_CHEVRON_DOWN_GALLERY_RGBA),
+        IconId::NewFile => Some(LUCIDE_NEW_FILE_GALLERY_RGBA),
+        IconId::NewFolder => Some(LUCIDE_NEW_FOLDER_GALLERY_RGBA),
+        IconId::Folder => Some(LUCIDE_FOLDER_GALLERY_RGBA),
+        IconId::FolderOpened => Some(LUCIDE_FOLDER_OPENED_GALLERY_RGBA),
+        IconId::File => Some(LUCIDE_FILE_GALLERY_RGBA),
+        IconId::Save => Some(LUCIDE_SAVE_GALLERY_RGBA),
+        IconId::Refresh => Some(LUCIDE_REFRESH_GALLERY_RGBA),
+        IconId::Add => Some(LUCIDE_ADD_GALLERY_RGBA),
+        IconId::Trash => Some(LUCIDE_TRASH_GALLERY_RGBA),
+        IconId::Search => Some(LUCIDE_SEARCH_GALLERY_RGBA),
+        IconId::Check => Some(LUCIDE_CHECK_GALLERY_RGBA),
+        IconId::Close => Some(LUCIDE_CLOSE_GALLERY_RGBA),
+        IconId::ArrowUp => Some(LUCIDE_ARROW_UP_GALLERY_RGBA),
+        IconId::ArrowDown => Some(LUCIDE_ARROW_DOWN_GALLERY_RGBA),
+        IconId::ArrowLeft => Some(LUCIDE_ARROW_LEFT_GALLERY_RGBA),
+        IconId::ArrowRight => Some(LUCIDE_ARROW_RIGHT_GALLERY_RGBA),
+        IconId::ArrowSwap => Some(LUCIDE_ARROW_SWAP_GALLERY_RGBA),
+        IconId::GitCommit => Some(LUCIDE_GIT_COMMIT_GALLERY_RGBA),
+        IconId::GitBranch => Some(LUCIDE_GIT_BRANCH_GALLERY_RGBA),
+        IconId::Diff => Some(LUCIDE_DIFF_GALLERY_RGBA),
+        IconId::DiffAdded => Some(LUCIDE_DIFF_ADDED_GALLERY_RGBA),
+        IconId::GitCompare => Some(LUCIDE_GIT_COMPARE_GALLERY_RGBA),
+        IconId::Repo => Some(LUCIDE_REPO_GALLERY_RGBA),
+        IconId::RepoForked => Some(LUCIDE_REPO_FORKED_GALLERY_RGBA),
+        IconId::DebugStop => Some(LUCIDE_DEBUG_STOP_GALLERY_RGBA),
+        IconId::DebugRestart => Some(LUCIDE_DEBUG_RESTART_GALLERY_RGBA),
+        IconId::Edit => Some(LUCIDE_EDIT_GALLERY_RGBA),
+        IconId::History => Some(LUCIDE_HISTORY_GALLERY_RGBA),
+        IconId::Terminal => Some(LUCIDE_TERMINAL_GALLERY_RGBA),
+        IconId::Output => Some(LUCIDE_OUTPUT_GALLERY_RGBA),
+        IconId::CloudDownload => Some(LUCIDE_CLOUD_DOWNLOAD_GALLERY_RGBA),
+        IconId::Ellipsis => Some(LUCIDE_ELLIPSIS_GALLERY_RGBA),
+        IconId::Link => Some(LUCIDE_LINK_GALLERY_RGBA),
         IconId::CircleFilled => None,
-        IconId::CircleSlash => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_CIRCLE_SLASH_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::Warning => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_WARNING_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::Error => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_ERROR_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::Info => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_INFO_SIXEL_GALLERY_GATE.as_str(),
-        }),
+        IconId::CircleSlash => Some(LUCIDE_CIRCLE_SLASH_GALLERY_RGBA),
+        IconId::Warning => Some(LUCIDE_WARNING_GALLERY_RGBA),
+        IconId::Error => Some(LUCIDE_ERROR_GALLERY_RGBA),
+        IconId::Info => Some(LUCIDE_INFO_GALLERY_RGBA),
         IconId::RunAll => None,
-        IconId::Play => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_PLAY_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::Sync => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_SYNC_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::GoToFile => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_GO_TO_FILE_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::Pulse => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_PULSE_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::Checklist => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_CHECKLIST_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::Eye => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_EYE_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::Layout => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_LAYOUT_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::SplitHorizontal => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_SPLIT_HORIZONTAL_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::SplitVertical => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_SPLIT_VERTICAL_SIXEL_GALLERY_GATE.as_str(),
-        }),
-        IconId::Preview => Some(match variant {
-            SixelVariant::GateActive | SixelVariant::GateAccent => LUCIDE_PREVIEW_SIXEL_GALLERY_GATE.as_str(),
-        }),
+        IconId::Play => Some(LUCIDE_PLAY_GALLERY_RGBA),
+        IconId::Sync => Some(LUCIDE_SYNC_GALLERY_RGBA),
+        IconId::GoToFile => Some(LUCIDE_GO_TO_FILE_GALLERY_RGBA),
+        IconId::Pulse => Some(LUCIDE_PULSE_GALLERY_RGBA),
+        IconId::Checklist => Some(LUCIDE_CHECKLIST_GALLERY_RGBA),
+        IconId::Eye => Some(LUCIDE_EYE_GALLERY_RGBA),
+        IconId::Layout => Some(LUCIDE_LAYOUT_GALLERY_RGBA),
+        IconId::SplitHorizontal => Some(LUCIDE_SPLIT_HORIZONTAL_GALLERY_RGBA),
+        IconId::SplitVertical => Some(LUCIDE_SPLIT_VERTICAL_GALLERY_RGBA),
+        IconId::Preview => Some(LUCIDE_PREVIEW_GALLERY_RGBA),
     }
 }
 
 /// Lucide equivalent of [`sixel_compact`] -- same `None`-for-gaps
-/// contract; no `SixelVariant` parameter, same reason `sixel_compact`
-/// has none (real transparency, no pre-composited background variant).
+/// contract; pre-encoded (real transparency), same reason `sixel_compact`
+/// never composites against a background either.
 pub fn sixel_compact_lucide(id: IconId) -> Option<&'static str> {
     match id {
         IconId::Files => Some(LUCIDE_FILES_SIXEL_COMPACT.as_str()),
@@ -4788,72 +1340,8 @@ pub fn lucide_slug(id: IconId) -> Option<&'static str> {
     }
 }
 
-// Raw true-coverage Lucide sources, test-only -- same retirement/
-// `#[cfg(test)]`-gating precedent as the codicon accessors above;
-// `Option` for the same `LUCIDE_GAPS` reason every dispatch fn above has.
-#[cfg(test)]
-pub(crate) fn lucide_sixel_source_rgba(id: IconId) -> Option<&'static [u8]> {
-    match id {
-        IconId::Files => Some(LUCIDE_FILES_RGBA),
-        IconId::SourceControl => Some(LUCIDE_SOURCE_CONTROL_RGBA),
-        IconId::Person => Some(LUCIDE_PERSON_RGBA),
-        IconId::Project => Some(LUCIDE_PROJECT_RGBA),
-        IconId::SettingsGear => Some(LUCIDE_SETTINGS_GEAR_RGBA),
-        IconId::ChevronLeft => Some(LUCIDE_CHEVRON_LEFT_RGBA),
-        IconId::ChevronRight => Some(LUCIDE_CHEVRON_RIGHT_RGBA),
-        IconId::ChevronDown => Some(LUCIDE_CHEVRON_DOWN_RGBA),
-        IconId::NewFile => Some(LUCIDE_NEW_FILE_RGBA),
-        IconId::NewFolder => Some(LUCIDE_NEW_FOLDER_RGBA),
-        IconId::Folder => Some(LUCIDE_FOLDER_RGBA),
-        IconId::FolderOpened => Some(LUCIDE_FOLDER_OPENED_RGBA),
-        IconId::File => Some(LUCIDE_FILE_RGBA),
-        IconId::Save => Some(LUCIDE_SAVE_RGBA),
-        IconId::Refresh => Some(LUCIDE_REFRESH_RGBA),
-        IconId::Add => Some(LUCIDE_ADD_RGBA),
-        IconId::Trash => Some(LUCIDE_TRASH_RGBA),
-        IconId::Search => Some(LUCIDE_SEARCH_RGBA),
-        IconId::Check => Some(LUCIDE_CHECK_RGBA),
-        IconId::Close => Some(LUCIDE_CLOSE_RGBA),
-        IconId::ArrowUp => Some(LUCIDE_ARROW_UP_RGBA),
-        IconId::ArrowDown => Some(LUCIDE_ARROW_DOWN_RGBA),
-        IconId::ArrowLeft => Some(LUCIDE_ARROW_LEFT_RGBA),
-        IconId::ArrowRight => Some(LUCIDE_ARROW_RIGHT_RGBA),
-        IconId::ArrowSwap => Some(LUCIDE_ARROW_SWAP_RGBA),
-        IconId::GitCommit => Some(LUCIDE_GIT_COMMIT_RGBA),
-        IconId::GitBranch => Some(LUCIDE_GIT_BRANCH_RGBA),
-        IconId::Diff => Some(LUCIDE_DIFF_RGBA),
-        IconId::DiffAdded => Some(LUCIDE_DIFF_ADDED_RGBA),
-        IconId::GitCompare => Some(LUCIDE_GIT_COMPARE_RGBA),
-        IconId::Repo => Some(LUCIDE_REPO_RGBA),
-        IconId::RepoForked => Some(LUCIDE_REPO_FORKED_RGBA),
-        IconId::DebugStop => Some(LUCIDE_DEBUG_STOP_RGBA),
-        IconId::DebugRestart => Some(LUCIDE_DEBUG_RESTART_RGBA),
-        IconId::Edit => Some(LUCIDE_EDIT_RGBA),
-        IconId::History => Some(LUCIDE_HISTORY_RGBA),
-        IconId::Terminal => Some(LUCIDE_TERMINAL_RGBA),
-        IconId::Output => Some(LUCIDE_OUTPUT_RGBA),
-        IconId::CloudDownload => Some(LUCIDE_CLOUD_DOWNLOAD_RGBA),
-        IconId::Ellipsis => Some(LUCIDE_ELLIPSIS_RGBA),
-        IconId::Link => Some(LUCIDE_LINK_RGBA),
-        IconId::CircleFilled => None,
-        IconId::CircleSlash => Some(LUCIDE_CIRCLE_SLASH_RGBA),
-        IconId::Warning => Some(LUCIDE_WARNING_RGBA),
-        IconId::Error => Some(LUCIDE_ERROR_RGBA),
-        IconId::Info => Some(LUCIDE_INFO_RGBA),
-        IconId::RunAll => None,
-        IconId::Play => Some(LUCIDE_PLAY_RGBA),
-        IconId::Sync => Some(LUCIDE_SYNC_RGBA),
-        IconId::GoToFile => Some(LUCIDE_GO_TO_FILE_RGBA),
-        IconId::Pulse => Some(LUCIDE_PULSE_RGBA),
-        IconId::Checklist => Some(LUCIDE_CHECKLIST_RGBA),
-        IconId::Eye => Some(LUCIDE_EYE_RGBA),
-        IconId::Layout => Some(LUCIDE_LAYOUT_RGBA),
-        IconId::SplitHorizontal => Some(LUCIDE_SPLIT_HORIZONTAL_RGBA),
-        IconId::SplitVertical => Some(LUCIDE_SPLIT_VERTICAL_RGBA),
-        IconId::Preview => Some(LUCIDE_PREVIEW_RGBA),
-    }
-}
-
+// Compact tier's own raw Lucide source, test-only -- same precedent as
+// the codicon `sixel_compact_source_rgba` above.
 #[cfg(test)]
 pub(crate) fn lucide_sixel_compact_source_rgba(id: IconId) -> Option<&'static [u8]> {
     match id {
@@ -4917,1811 +1405,443 @@ pub(crate) fn lucide_sixel_compact_source_rgba(id: IconId) -> Option<&'static [u
     }
 }
 
-#[cfg(test)]
-pub(crate) fn lucide_sixel_gate_active_source_rgba(id: IconId) -> Option<&'static [u8]> {
-    match id {
-        IconId::Files => Some(LUCIDE_FILES_GATE_ACTIVE_RGBA),
-        IconId::SourceControl => Some(LUCIDE_SOURCE_CONTROL_GATE_ACTIVE_RGBA),
-        IconId::Person => Some(LUCIDE_PERSON_GATE_ACTIVE_RGBA),
-        IconId::Project => Some(LUCIDE_PROJECT_GATE_ACTIVE_RGBA),
-        IconId::SettingsGear => Some(LUCIDE_SETTINGS_GEAR_GATE_ACTIVE_RGBA),
-        IconId::ChevronLeft => Some(LUCIDE_CHEVRON_LEFT_GATE_ACTIVE_RGBA),
-        IconId::ChevronRight => Some(LUCIDE_CHEVRON_RIGHT_GATE_ACTIVE_RGBA),
-        IconId::ChevronDown => Some(LUCIDE_CHEVRON_DOWN_GATE_ACTIVE_RGBA),
-        IconId::NewFile => Some(LUCIDE_NEW_FILE_GATE_ACTIVE_RGBA),
-        IconId::NewFolder => Some(LUCIDE_NEW_FOLDER_GATE_ACTIVE_RGBA),
-        IconId::Folder => Some(LUCIDE_FOLDER_GATE_ACTIVE_RGBA),
-        IconId::FolderOpened => Some(LUCIDE_FOLDER_OPENED_GATE_ACTIVE_RGBA),
-        IconId::File => Some(LUCIDE_FILE_GATE_ACTIVE_RGBA),
-        IconId::Save => Some(LUCIDE_SAVE_GATE_ACTIVE_RGBA),
-        IconId::Refresh => Some(LUCIDE_REFRESH_GATE_ACTIVE_RGBA),
-        IconId::Add => Some(LUCIDE_ADD_GATE_ACTIVE_RGBA),
-        IconId::Trash => Some(LUCIDE_TRASH_GATE_ACTIVE_RGBA),
-        IconId::Search => Some(LUCIDE_SEARCH_GATE_ACTIVE_RGBA),
-        IconId::Check => Some(LUCIDE_CHECK_GATE_ACTIVE_RGBA),
-        IconId::Close => Some(LUCIDE_CLOSE_GATE_ACTIVE_RGBA),
-        IconId::ArrowUp => Some(LUCIDE_ARROW_UP_GATE_ACTIVE_RGBA),
-        IconId::ArrowDown => Some(LUCIDE_ARROW_DOWN_GATE_ACTIVE_RGBA),
-        IconId::ArrowLeft => Some(LUCIDE_ARROW_LEFT_GATE_ACTIVE_RGBA),
-        IconId::ArrowRight => Some(LUCIDE_ARROW_RIGHT_GATE_ACTIVE_RGBA),
-        IconId::ArrowSwap => Some(LUCIDE_ARROW_SWAP_GATE_ACTIVE_RGBA),
-        IconId::GitCommit => Some(LUCIDE_GIT_COMMIT_GATE_ACTIVE_RGBA),
-        IconId::GitBranch => Some(LUCIDE_GIT_BRANCH_GATE_ACTIVE_RGBA),
-        IconId::Diff => Some(LUCIDE_DIFF_GATE_ACTIVE_RGBA),
-        IconId::DiffAdded => Some(LUCIDE_DIFF_ADDED_GATE_ACTIVE_RGBA),
-        IconId::GitCompare => Some(LUCIDE_GIT_COMPARE_GATE_ACTIVE_RGBA),
-        IconId::Repo => Some(LUCIDE_REPO_GATE_ACTIVE_RGBA),
-        IconId::RepoForked => Some(LUCIDE_REPO_FORKED_GATE_ACTIVE_RGBA),
-        IconId::DebugStop => Some(LUCIDE_DEBUG_STOP_GATE_ACTIVE_RGBA),
-        IconId::DebugRestart => Some(LUCIDE_DEBUG_RESTART_GATE_ACTIVE_RGBA),
-        IconId::Edit => Some(LUCIDE_EDIT_GATE_ACTIVE_RGBA),
-        IconId::History => Some(LUCIDE_HISTORY_GATE_ACTIVE_RGBA),
-        IconId::Terminal => Some(LUCIDE_TERMINAL_GATE_ACTIVE_RGBA),
-        IconId::Output => Some(LUCIDE_OUTPUT_GATE_ACTIVE_RGBA),
-        IconId::CloudDownload => Some(LUCIDE_CLOUD_DOWNLOAD_GATE_ACTIVE_RGBA),
-        IconId::Ellipsis => Some(LUCIDE_ELLIPSIS_GATE_ACTIVE_RGBA),
-        IconId::Link => Some(LUCIDE_LINK_GATE_ACTIVE_RGBA),
-        IconId::CircleFilled => None,
-        IconId::CircleSlash => Some(LUCIDE_CIRCLE_SLASH_GATE_ACTIVE_RGBA),
-        IconId::Warning => Some(LUCIDE_WARNING_GATE_ACTIVE_RGBA),
-        IconId::Error => Some(LUCIDE_ERROR_GATE_ACTIVE_RGBA),
-        IconId::Info => Some(LUCIDE_INFO_GATE_ACTIVE_RGBA),
-        IconId::RunAll => None,
-        IconId::Play => Some(LUCIDE_PLAY_GATE_ACTIVE_RGBA),
-        IconId::Sync => Some(LUCIDE_SYNC_GATE_ACTIVE_RGBA),
-        IconId::GoToFile => Some(LUCIDE_GO_TO_FILE_GATE_ACTIVE_RGBA),
-        IconId::Pulse => Some(LUCIDE_PULSE_GATE_ACTIVE_RGBA),
-        IconId::Checklist => Some(LUCIDE_CHECKLIST_GATE_ACTIVE_RGBA),
-        IconId::Eye => Some(LUCIDE_EYE_GATE_ACTIVE_RGBA),
-        IconId::Layout => Some(LUCIDE_LAYOUT_GATE_ACTIVE_RGBA),
-        IconId::SplitHorizontal => Some(LUCIDE_SPLIT_HORIZONTAL_GATE_ACTIVE_RGBA),
-        IconId::SplitVertical => Some(LUCIDE_SPLIT_VERTICAL_GATE_ACTIVE_RGBA),
-        IconId::Preview => Some(LUCIDE_PREVIEW_GATE_ACTIVE_RGBA),
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn lucide_sixel_gate_accent_source_rgba(id: IconId) -> Option<&'static [u8]> {
-    match id {
-        IconId::Files => Some(LUCIDE_FILES_GATE_ACCENT_RGBA),
-        IconId::SourceControl => Some(LUCIDE_SOURCE_CONTROL_GATE_ACCENT_RGBA),
-        IconId::Person => Some(LUCIDE_PERSON_GATE_ACCENT_RGBA),
-        IconId::Project => Some(LUCIDE_PROJECT_GATE_ACCENT_RGBA),
-        IconId::SettingsGear => Some(LUCIDE_SETTINGS_GEAR_GATE_ACCENT_RGBA),
-        IconId::ChevronLeft => Some(LUCIDE_CHEVRON_LEFT_GATE_ACCENT_RGBA),
-        IconId::ChevronRight => Some(LUCIDE_CHEVRON_RIGHT_GATE_ACCENT_RGBA),
-        IconId::ChevronDown => Some(LUCIDE_CHEVRON_DOWN_GATE_ACCENT_RGBA),
-        IconId::NewFile => Some(LUCIDE_NEW_FILE_GATE_ACCENT_RGBA),
-        IconId::NewFolder => Some(LUCIDE_NEW_FOLDER_GATE_ACCENT_RGBA),
-        IconId::Folder => Some(LUCIDE_FOLDER_GATE_ACCENT_RGBA),
-        IconId::FolderOpened => Some(LUCIDE_FOLDER_OPENED_GATE_ACCENT_RGBA),
-        IconId::File => Some(LUCIDE_FILE_GATE_ACCENT_RGBA),
-        IconId::Save => Some(LUCIDE_SAVE_GATE_ACCENT_RGBA),
-        IconId::Refresh => Some(LUCIDE_REFRESH_GATE_ACCENT_RGBA),
-        IconId::Add => Some(LUCIDE_ADD_GATE_ACCENT_RGBA),
-        IconId::Trash => Some(LUCIDE_TRASH_GATE_ACCENT_RGBA),
-        IconId::Search => Some(LUCIDE_SEARCH_GATE_ACCENT_RGBA),
-        IconId::Check => Some(LUCIDE_CHECK_GATE_ACCENT_RGBA),
-        IconId::Close => Some(LUCIDE_CLOSE_GATE_ACCENT_RGBA),
-        IconId::ArrowUp => Some(LUCIDE_ARROW_UP_GATE_ACCENT_RGBA),
-        IconId::ArrowDown => Some(LUCIDE_ARROW_DOWN_GATE_ACCENT_RGBA),
-        IconId::ArrowLeft => Some(LUCIDE_ARROW_LEFT_GATE_ACCENT_RGBA),
-        IconId::ArrowRight => Some(LUCIDE_ARROW_RIGHT_GATE_ACCENT_RGBA),
-        IconId::ArrowSwap => Some(LUCIDE_ARROW_SWAP_GATE_ACCENT_RGBA),
-        IconId::GitCommit => Some(LUCIDE_GIT_COMMIT_GATE_ACCENT_RGBA),
-        IconId::GitBranch => Some(LUCIDE_GIT_BRANCH_GATE_ACCENT_RGBA),
-        IconId::Diff => Some(LUCIDE_DIFF_GATE_ACCENT_RGBA),
-        IconId::DiffAdded => Some(LUCIDE_DIFF_ADDED_GATE_ACCENT_RGBA),
-        IconId::GitCompare => Some(LUCIDE_GIT_COMPARE_GATE_ACCENT_RGBA),
-        IconId::Repo => Some(LUCIDE_REPO_GATE_ACCENT_RGBA),
-        IconId::RepoForked => Some(LUCIDE_REPO_FORKED_GATE_ACCENT_RGBA),
-        IconId::DebugStop => Some(LUCIDE_DEBUG_STOP_GATE_ACCENT_RGBA),
-        IconId::DebugRestart => Some(LUCIDE_DEBUG_RESTART_GATE_ACCENT_RGBA),
-        IconId::Edit => Some(LUCIDE_EDIT_GATE_ACCENT_RGBA),
-        IconId::History => Some(LUCIDE_HISTORY_GATE_ACCENT_RGBA),
-        IconId::Terminal => Some(LUCIDE_TERMINAL_GATE_ACCENT_RGBA),
-        IconId::Output => Some(LUCIDE_OUTPUT_GATE_ACCENT_RGBA),
-        IconId::CloudDownload => Some(LUCIDE_CLOUD_DOWNLOAD_GATE_ACCENT_RGBA),
-        IconId::Ellipsis => Some(LUCIDE_ELLIPSIS_GATE_ACCENT_RGBA),
-        IconId::Link => Some(LUCIDE_LINK_GATE_ACCENT_RGBA),
-        IconId::CircleFilled => None,
-        IconId::CircleSlash => Some(LUCIDE_CIRCLE_SLASH_GATE_ACCENT_RGBA),
-        IconId::Warning => Some(LUCIDE_WARNING_GATE_ACCENT_RGBA),
-        IconId::Error => Some(LUCIDE_ERROR_GATE_ACCENT_RGBA),
-        IconId::Info => Some(LUCIDE_INFO_GATE_ACCENT_RGBA),
-        IconId::RunAll => None,
-        IconId::Play => Some(LUCIDE_PLAY_GATE_ACCENT_RGBA),
-        IconId::Sync => Some(LUCIDE_SYNC_GATE_ACCENT_RGBA),
-        IconId::GoToFile => Some(LUCIDE_GO_TO_FILE_GATE_ACCENT_RGBA),
-        IconId::Pulse => Some(LUCIDE_PULSE_GATE_ACCENT_RGBA),
-        IconId::Checklist => Some(LUCIDE_CHECKLIST_GATE_ACCENT_RGBA),
-        IconId::Eye => Some(LUCIDE_EYE_GATE_ACCENT_RGBA),
-        IconId::Layout => Some(LUCIDE_LAYOUT_GATE_ACCENT_RGBA),
-        IconId::SplitHorizontal => Some(LUCIDE_SPLIT_HORIZONTAL_GATE_ACCENT_RGBA),
-        IconId::SplitVertical => Some(LUCIDE_SPLIT_VERTICAL_GATE_ACCENT_RGBA),
-        IconId::Preview => Some(LUCIDE_PREVIEW_GATE_ACCENT_RGBA),
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn lucide_sixel_strip_source_rgba(id: IconId) -> Option<&'static [u8]> {
-    match id {
-        IconId::Files => Some(LUCIDE_FILES_STRIP_RGBA),
-        IconId::SourceControl => Some(LUCIDE_SOURCE_CONTROL_STRIP_RGBA),
-        IconId::Person => Some(LUCIDE_PERSON_STRIP_RGBA),
-        IconId::Project => Some(LUCIDE_PROJECT_STRIP_RGBA),
-        IconId::SettingsGear => Some(LUCIDE_SETTINGS_GEAR_STRIP_RGBA),
-        IconId::ChevronLeft => Some(LUCIDE_CHEVRON_LEFT_STRIP_RGBA),
-        IconId::ChevronRight => Some(LUCIDE_CHEVRON_RIGHT_STRIP_RGBA),
-        IconId::ChevronDown => Some(LUCIDE_CHEVRON_DOWN_STRIP_RGBA),
-        IconId::NewFile => Some(LUCIDE_NEW_FILE_STRIP_RGBA),
-        IconId::NewFolder => Some(LUCIDE_NEW_FOLDER_STRIP_RGBA),
-        IconId::Folder => Some(LUCIDE_FOLDER_STRIP_RGBA),
-        IconId::FolderOpened => Some(LUCIDE_FOLDER_OPENED_STRIP_RGBA),
-        IconId::File => Some(LUCIDE_FILE_STRIP_RGBA),
-        IconId::Save => Some(LUCIDE_SAVE_STRIP_RGBA),
-        IconId::Refresh => Some(LUCIDE_REFRESH_STRIP_RGBA),
-        IconId::Add => Some(LUCIDE_ADD_STRIP_RGBA),
-        IconId::Trash => Some(LUCIDE_TRASH_STRIP_RGBA),
-        IconId::Search => Some(LUCIDE_SEARCH_STRIP_RGBA),
-        IconId::Check => Some(LUCIDE_CHECK_STRIP_RGBA),
-        IconId::Close => Some(LUCIDE_CLOSE_STRIP_RGBA),
-        IconId::ArrowUp => Some(LUCIDE_ARROW_UP_STRIP_RGBA),
-        IconId::ArrowDown => Some(LUCIDE_ARROW_DOWN_STRIP_RGBA),
-        IconId::ArrowLeft => Some(LUCIDE_ARROW_LEFT_STRIP_RGBA),
-        IconId::ArrowRight => Some(LUCIDE_ARROW_RIGHT_STRIP_RGBA),
-        IconId::ArrowSwap => Some(LUCIDE_ARROW_SWAP_STRIP_RGBA),
-        IconId::GitCommit => Some(LUCIDE_GIT_COMMIT_STRIP_RGBA),
-        IconId::GitBranch => Some(LUCIDE_GIT_BRANCH_STRIP_RGBA),
-        IconId::Diff => Some(LUCIDE_DIFF_STRIP_RGBA),
-        IconId::DiffAdded => Some(LUCIDE_DIFF_ADDED_STRIP_RGBA),
-        IconId::GitCompare => Some(LUCIDE_GIT_COMPARE_STRIP_RGBA),
-        IconId::Repo => Some(LUCIDE_REPO_STRIP_RGBA),
-        IconId::RepoForked => Some(LUCIDE_REPO_FORKED_STRIP_RGBA),
-        IconId::DebugStop => Some(LUCIDE_DEBUG_STOP_STRIP_RGBA),
-        IconId::DebugRestart => Some(LUCIDE_DEBUG_RESTART_STRIP_RGBA),
-        IconId::Edit => Some(LUCIDE_EDIT_STRIP_RGBA),
-        IconId::History => Some(LUCIDE_HISTORY_STRIP_RGBA),
-        IconId::Terminal => Some(LUCIDE_TERMINAL_STRIP_RGBA),
-        IconId::Output => Some(LUCIDE_OUTPUT_STRIP_RGBA),
-        IconId::CloudDownload => Some(LUCIDE_CLOUD_DOWNLOAD_STRIP_RGBA),
-        IconId::Ellipsis => Some(LUCIDE_ELLIPSIS_STRIP_RGBA),
-        IconId::Link => Some(LUCIDE_LINK_STRIP_RGBA),
-        IconId::CircleFilled => None,
-        IconId::CircleSlash => Some(LUCIDE_CIRCLE_SLASH_STRIP_RGBA),
-        IconId::Warning => Some(LUCIDE_WARNING_STRIP_RGBA),
-        IconId::Error => Some(LUCIDE_ERROR_STRIP_RGBA),
-        IconId::Info => Some(LUCIDE_INFO_STRIP_RGBA),
-        IconId::RunAll => None,
-        IconId::Play => Some(LUCIDE_PLAY_STRIP_RGBA),
-        IconId::Sync => Some(LUCIDE_SYNC_STRIP_RGBA),
-        IconId::GoToFile => Some(LUCIDE_GO_TO_FILE_STRIP_RGBA),
-        IconId::Pulse => Some(LUCIDE_PULSE_STRIP_RGBA),
-        IconId::Checklist => Some(LUCIDE_CHECKLIST_STRIP_RGBA),
-        IconId::Eye => Some(LUCIDE_EYE_STRIP_RGBA),
-        IconId::Layout => Some(LUCIDE_LAYOUT_STRIP_RGBA),
-        IconId::SplitHorizontal => Some(LUCIDE_SPLIT_HORIZONTAL_STRIP_RGBA),
-        IconId::SplitVertical => Some(LUCIDE_SPLIT_VERTICAL_STRIP_RGBA),
-        IconId::Preview => Some(LUCIDE_PREVIEW_STRIP_RGBA),
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn lucide_sixel_strip_gate_source_rgba(id: IconId) -> Option<&'static [u8]> {
-    match id {
-        IconId::Files => Some(LUCIDE_FILES_STRIP_GATE_RGBA),
-        IconId::SourceControl => Some(LUCIDE_SOURCE_CONTROL_STRIP_GATE_RGBA),
-        IconId::Person => Some(LUCIDE_PERSON_STRIP_GATE_RGBA),
-        IconId::Project => Some(LUCIDE_PROJECT_STRIP_GATE_RGBA),
-        IconId::SettingsGear => Some(LUCIDE_SETTINGS_GEAR_STRIP_GATE_RGBA),
-        IconId::ChevronLeft => Some(LUCIDE_CHEVRON_LEFT_STRIP_GATE_RGBA),
-        IconId::ChevronRight => Some(LUCIDE_CHEVRON_RIGHT_STRIP_GATE_RGBA),
-        IconId::ChevronDown => Some(LUCIDE_CHEVRON_DOWN_STRIP_GATE_RGBA),
-        IconId::NewFile => Some(LUCIDE_NEW_FILE_STRIP_GATE_RGBA),
-        IconId::NewFolder => Some(LUCIDE_NEW_FOLDER_STRIP_GATE_RGBA),
-        IconId::Folder => Some(LUCIDE_FOLDER_STRIP_GATE_RGBA),
-        IconId::FolderOpened => Some(LUCIDE_FOLDER_OPENED_STRIP_GATE_RGBA),
-        IconId::File => Some(LUCIDE_FILE_STRIP_GATE_RGBA),
-        IconId::Save => Some(LUCIDE_SAVE_STRIP_GATE_RGBA),
-        IconId::Refresh => Some(LUCIDE_REFRESH_STRIP_GATE_RGBA),
-        IconId::Add => Some(LUCIDE_ADD_STRIP_GATE_RGBA),
-        IconId::Trash => Some(LUCIDE_TRASH_STRIP_GATE_RGBA),
-        IconId::Search => Some(LUCIDE_SEARCH_STRIP_GATE_RGBA),
-        IconId::Check => Some(LUCIDE_CHECK_STRIP_GATE_RGBA),
-        IconId::Close => Some(LUCIDE_CLOSE_STRIP_GATE_RGBA),
-        IconId::ArrowUp => Some(LUCIDE_ARROW_UP_STRIP_GATE_RGBA),
-        IconId::ArrowDown => Some(LUCIDE_ARROW_DOWN_STRIP_GATE_RGBA),
-        IconId::ArrowLeft => Some(LUCIDE_ARROW_LEFT_STRIP_GATE_RGBA),
-        IconId::ArrowRight => Some(LUCIDE_ARROW_RIGHT_STRIP_GATE_RGBA),
-        IconId::ArrowSwap => Some(LUCIDE_ARROW_SWAP_STRIP_GATE_RGBA),
-        IconId::GitCommit => Some(LUCIDE_GIT_COMMIT_STRIP_GATE_RGBA),
-        IconId::GitBranch => Some(LUCIDE_GIT_BRANCH_STRIP_GATE_RGBA),
-        IconId::Diff => Some(LUCIDE_DIFF_STRIP_GATE_RGBA),
-        IconId::DiffAdded => Some(LUCIDE_DIFF_ADDED_STRIP_GATE_RGBA),
-        IconId::GitCompare => Some(LUCIDE_GIT_COMPARE_STRIP_GATE_RGBA),
-        IconId::Repo => Some(LUCIDE_REPO_STRIP_GATE_RGBA),
-        IconId::RepoForked => Some(LUCIDE_REPO_FORKED_STRIP_GATE_RGBA),
-        IconId::DebugStop => Some(LUCIDE_DEBUG_STOP_STRIP_GATE_RGBA),
-        IconId::DebugRestart => Some(LUCIDE_DEBUG_RESTART_STRIP_GATE_RGBA),
-        IconId::Edit => Some(LUCIDE_EDIT_STRIP_GATE_RGBA),
-        IconId::History => Some(LUCIDE_HISTORY_STRIP_GATE_RGBA),
-        IconId::Terminal => Some(LUCIDE_TERMINAL_STRIP_GATE_RGBA),
-        IconId::Output => Some(LUCIDE_OUTPUT_STRIP_GATE_RGBA),
-        IconId::CloudDownload => Some(LUCIDE_CLOUD_DOWNLOAD_STRIP_GATE_RGBA),
-        IconId::Ellipsis => Some(LUCIDE_ELLIPSIS_STRIP_GATE_RGBA),
-        IconId::Link => Some(LUCIDE_LINK_STRIP_GATE_RGBA),
-        IconId::CircleFilled => None,
-        IconId::CircleSlash => Some(LUCIDE_CIRCLE_SLASH_STRIP_GATE_RGBA),
-        IconId::Warning => Some(LUCIDE_WARNING_STRIP_GATE_RGBA),
-        IconId::Error => Some(LUCIDE_ERROR_STRIP_GATE_RGBA),
-        IconId::Info => Some(LUCIDE_INFO_STRIP_GATE_RGBA),
-        IconId::RunAll => None,
-        IconId::Play => Some(LUCIDE_PLAY_STRIP_GATE_RGBA),
-        IconId::Sync => Some(LUCIDE_SYNC_STRIP_GATE_RGBA),
-        IconId::GoToFile => Some(LUCIDE_GO_TO_FILE_STRIP_GATE_RGBA),
-        IconId::Pulse => Some(LUCIDE_PULSE_STRIP_GATE_RGBA),
-        IconId::Checklist => Some(LUCIDE_CHECKLIST_STRIP_GATE_RGBA),
-        IconId::Eye => Some(LUCIDE_EYE_STRIP_GATE_RGBA),
-        IconId::Layout => Some(LUCIDE_LAYOUT_STRIP_GATE_RGBA),
-        IconId::SplitHorizontal => Some(LUCIDE_SPLIT_HORIZONTAL_STRIP_GATE_RGBA),
-        IconId::SplitVertical => Some(LUCIDE_SPLIT_VERTICAL_STRIP_GATE_RGBA),
-        IconId::Preview => Some(LUCIDE_PREVIEW_STRIP_GATE_RGBA),
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn lucide_sixel_gallery_source_rgba(id: IconId) -> Option<&'static [u8]> {
-    match id {
-        IconId::Files => Some(LUCIDE_FILES_GALLERY_RGBA),
-        IconId::SourceControl => Some(LUCIDE_SOURCE_CONTROL_GALLERY_RGBA),
-        IconId::Person => Some(LUCIDE_PERSON_GALLERY_RGBA),
-        IconId::Project => Some(LUCIDE_PROJECT_GALLERY_RGBA),
-        IconId::SettingsGear => Some(LUCIDE_SETTINGS_GEAR_GALLERY_RGBA),
-        IconId::ChevronLeft => Some(LUCIDE_CHEVRON_LEFT_GALLERY_RGBA),
-        IconId::ChevronRight => Some(LUCIDE_CHEVRON_RIGHT_GALLERY_RGBA),
-        IconId::ChevronDown => Some(LUCIDE_CHEVRON_DOWN_GALLERY_RGBA),
-        IconId::NewFile => Some(LUCIDE_NEW_FILE_GALLERY_RGBA),
-        IconId::NewFolder => Some(LUCIDE_NEW_FOLDER_GALLERY_RGBA),
-        IconId::Folder => Some(LUCIDE_FOLDER_GALLERY_RGBA),
-        IconId::FolderOpened => Some(LUCIDE_FOLDER_OPENED_GALLERY_RGBA),
-        IconId::File => Some(LUCIDE_FILE_GALLERY_RGBA),
-        IconId::Save => Some(LUCIDE_SAVE_GALLERY_RGBA),
-        IconId::Refresh => Some(LUCIDE_REFRESH_GALLERY_RGBA),
-        IconId::Add => Some(LUCIDE_ADD_GALLERY_RGBA),
-        IconId::Trash => Some(LUCIDE_TRASH_GALLERY_RGBA),
-        IconId::Search => Some(LUCIDE_SEARCH_GALLERY_RGBA),
-        IconId::Check => Some(LUCIDE_CHECK_GALLERY_RGBA),
-        IconId::Close => Some(LUCIDE_CLOSE_GALLERY_RGBA),
-        IconId::ArrowUp => Some(LUCIDE_ARROW_UP_GALLERY_RGBA),
-        IconId::ArrowDown => Some(LUCIDE_ARROW_DOWN_GALLERY_RGBA),
-        IconId::ArrowLeft => Some(LUCIDE_ARROW_LEFT_GALLERY_RGBA),
-        IconId::ArrowRight => Some(LUCIDE_ARROW_RIGHT_GALLERY_RGBA),
-        IconId::ArrowSwap => Some(LUCIDE_ARROW_SWAP_GALLERY_RGBA),
-        IconId::GitCommit => Some(LUCIDE_GIT_COMMIT_GALLERY_RGBA),
-        IconId::GitBranch => Some(LUCIDE_GIT_BRANCH_GALLERY_RGBA),
-        IconId::Diff => Some(LUCIDE_DIFF_GALLERY_RGBA),
-        IconId::DiffAdded => Some(LUCIDE_DIFF_ADDED_GALLERY_RGBA),
-        IconId::GitCompare => Some(LUCIDE_GIT_COMPARE_GALLERY_RGBA),
-        IconId::Repo => Some(LUCIDE_REPO_GALLERY_RGBA),
-        IconId::RepoForked => Some(LUCIDE_REPO_FORKED_GALLERY_RGBA),
-        IconId::DebugStop => Some(LUCIDE_DEBUG_STOP_GALLERY_RGBA),
-        IconId::DebugRestart => Some(LUCIDE_DEBUG_RESTART_GALLERY_RGBA),
-        IconId::Edit => Some(LUCIDE_EDIT_GALLERY_RGBA),
-        IconId::History => Some(LUCIDE_HISTORY_GALLERY_RGBA),
-        IconId::Terminal => Some(LUCIDE_TERMINAL_GALLERY_RGBA),
-        IconId::Output => Some(LUCIDE_OUTPUT_GALLERY_RGBA),
-        IconId::CloudDownload => Some(LUCIDE_CLOUD_DOWNLOAD_GALLERY_RGBA),
-        IconId::Ellipsis => Some(LUCIDE_ELLIPSIS_GALLERY_RGBA),
-        IconId::Link => Some(LUCIDE_LINK_GALLERY_RGBA),
-        IconId::CircleFilled => None,
-        IconId::CircleSlash => Some(LUCIDE_CIRCLE_SLASH_GALLERY_RGBA),
-        IconId::Warning => Some(LUCIDE_WARNING_GALLERY_RGBA),
-        IconId::Error => Some(LUCIDE_ERROR_GALLERY_RGBA),
-        IconId::Info => Some(LUCIDE_INFO_GALLERY_RGBA),
-        IconId::RunAll => None,
-        IconId::Play => Some(LUCIDE_PLAY_GALLERY_RGBA),
-        IconId::Sync => Some(LUCIDE_SYNC_GALLERY_RGBA),
-        IconId::GoToFile => Some(LUCIDE_GO_TO_FILE_GALLERY_RGBA),
-        IconId::Pulse => Some(LUCIDE_PULSE_GALLERY_RGBA),
-        IconId::Checklist => Some(LUCIDE_CHECKLIST_GALLERY_RGBA),
-        IconId::Eye => Some(LUCIDE_EYE_GALLERY_RGBA),
-        IconId::Layout => Some(LUCIDE_LAYOUT_GALLERY_RGBA),
-        IconId::SplitHorizontal => Some(LUCIDE_SPLIT_HORIZONTAL_GALLERY_RGBA),
-        IconId::SplitVertical => Some(LUCIDE_SPLIT_VERTICAL_GALLERY_RGBA),
-        IconId::Preview => Some(LUCIDE_PREVIEW_GALLERY_RGBA),
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn lucide_sixel_gallery_gate_source_rgba(id: IconId) -> Option<&'static [u8]> {
-    match id {
-        IconId::Files => Some(LUCIDE_FILES_GALLERY_GATE_RGBA),
-        IconId::SourceControl => Some(LUCIDE_SOURCE_CONTROL_GALLERY_GATE_RGBA),
-        IconId::Person => Some(LUCIDE_PERSON_GALLERY_GATE_RGBA),
-        IconId::Project => Some(LUCIDE_PROJECT_GALLERY_GATE_RGBA),
-        IconId::SettingsGear => Some(LUCIDE_SETTINGS_GEAR_GALLERY_GATE_RGBA),
-        IconId::ChevronLeft => Some(LUCIDE_CHEVRON_LEFT_GALLERY_GATE_RGBA),
-        IconId::ChevronRight => Some(LUCIDE_CHEVRON_RIGHT_GALLERY_GATE_RGBA),
-        IconId::ChevronDown => Some(LUCIDE_CHEVRON_DOWN_GALLERY_GATE_RGBA),
-        IconId::NewFile => Some(LUCIDE_NEW_FILE_GALLERY_GATE_RGBA),
-        IconId::NewFolder => Some(LUCIDE_NEW_FOLDER_GALLERY_GATE_RGBA),
-        IconId::Folder => Some(LUCIDE_FOLDER_GALLERY_GATE_RGBA),
-        IconId::FolderOpened => Some(LUCIDE_FOLDER_OPENED_GALLERY_GATE_RGBA),
-        IconId::File => Some(LUCIDE_FILE_GALLERY_GATE_RGBA),
-        IconId::Save => Some(LUCIDE_SAVE_GALLERY_GATE_RGBA),
-        IconId::Refresh => Some(LUCIDE_REFRESH_GALLERY_GATE_RGBA),
-        IconId::Add => Some(LUCIDE_ADD_GALLERY_GATE_RGBA),
-        IconId::Trash => Some(LUCIDE_TRASH_GALLERY_GATE_RGBA),
-        IconId::Search => Some(LUCIDE_SEARCH_GALLERY_GATE_RGBA),
-        IconId::Check => Some(LUCIDE_CHECK_GALLERY_GATE_RGBA),
-        IconId::Close => Some(LUCIDE_CLOSE_GALLERY_GATE_RGBA),
-        IconId::ArrowUp => Some(LUCIDE_ARROW_UP_GALLERY_GATE_RGBA),
-        IconId::ArrowDown => Some(LUCIDE_ARROW_DOWN_GALLERY_GATE_RGBA),
-        IconId::ArrowLeft => Some(LUCIDE_ARROW_LEFT_GALLERY_GATE_RGBA),
-        IconId::ArrowRight => Some(LUCIDE_ARROW_RIGHT_GALLERY_GATE_RGBA),
-        IconId::ArrowSwap => Some(LUCIDE_ARROW_SWAP_GALLERY_GATE_RGBA),
-        IconId::GitCommit => Some(LUCIDE_GIT_COMMIT_GALLERY_GATE_RGBA),
-        IconId::GitBranch => Some(LUCIDE_GIT_BRANCH_GALLERY_GATE_RGBA),
-        IconId::Diff => Some(LUCIDE_DIFF_GALLERY_GATE_RGBA),
-        IconId::DiffAdded => Some(LUCIDE_DIFF_ADDED_GALLERY_GATE_RGBA),
-        IconId::GitCompare => Some(LUCIDE_GIT_COMPARE_GALLERY_GATE_RGBA),
-        IconId::Repo => Some(LUCIDE_REPO_GALLERY_GATE_RGBA),
-        IconId::RepoForked => Some(LUCIDE_REPO_FORKED_GALLERY_GATE_RGBA),
-        IconId::DebugStop => Some(LUCIDE_DEBUG_STOP_GALLERY_GATE_RGBA),
-        IconId::DebugRestart => Some(LUCIDE_DEBUG_RESTART_GALLERY_GATE_RGBA),
-        IconId::Edit => Some(LUCIDE_EDIT_GALLERY_GATE_RGBA),
-        IconId::History => Some(LUCIDE_HISTORY_GALLERY_GATE_RGBA),
-        IconId::Terminal => Some(LUCIDE_TERMINAL_GALLERY_GATE_RGBA),
-        IconId::Output => Some(LUCIDE_OUTPUT_GALLERY_GATE_RGBA),
-        IconId::CloudDownload => Some(LUCIDE_CLOUD_DOWNLOAD_GALLERY_GATE_RGBA),
-        IconId::Ellipsis => Some(LUCIDE_ELLIPSIS_GALLERY_GATE_RGBA),
-        IconId::Link => Some(LUCIDE_LINK_GALLERY_GATE_RGBA),
-        IconId::CircleFilled => None,
-        IconId::CircleSlash => Some(LUCIDE_CIRCLE_SLASH_GALLERY_GATE_RGBA),
-        IconId::Warning => Some(LUCIDE_WARNING_GALLERY_GATE_RGBA),
-        IconId::Error => Some(LUCIDE_ERROR_GALLERY_GATE_RGBA),
-        IconId::Info => Some(LUCIDE_INFO_GALLERY_GATE_RGBA),
-        IconId::RunAll => None,
-        IconId::Play => Some(LUCIDE_PLAY_GALLERY_GATE_RGBA),
-        IconId::Sync => Some(LUCIDE_SYNC_GALLERY_GATE_RGBA),
-        IconId::GoToFile => Some(LUCIDE_GO_TO_FILE_GALLERY_GATE_RGBA),
-        IconId::Pulse => Some(LUCIDE_PULSE_GALLERY_GATE_RGBA),
-        IconId::Checklist => Some(LUCIDE_CHECKLIST_GALLERY_GATE_RGBA),
-        IconId::Eye => Some(LUCIDE_EYE_GALLERY_GATE_RGBA),
-        IconId::Layout => Some(LUCIDE_LAYOUT_GALLERY_GATE_RGBA),
-        IconId::SplitHorizontal => Some(LUCIDE_SPLIT_HORIZONTAL_GALLERY_GATE_RGBA),
-        IconId::SplitVertical => Some(LUCIDE_SPLIT_VERTICAL_GALLERY_GATE_RGBA),
-        IconId::Preview => Some(LUCIDE_PREVIEW_GALLERY_GATE_RGBA),
-    }
-}
-
 // ---- Lucide Files (files) ------------------------------------------
 
-#[cfg(test)]
 const LUCIDE_FILES_RGBA: &[u8] = include_bytes!("lucide_files.rgba");
-
-const LUCIDE_FILES_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_files_gate_active.rgba");
-static LUCIDE_FILES_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_FILES_GATE_ACTIVE_RGBA));
-
-const LUCIDE_FILES_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_files_gate_accent.rgba");
-static LUCIDE_FILES_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_FILES_GATE_ACCENT_RGBA));
-
 const LUCIDE_FILES_COMPACT_RGBA: &[u8] = include_bytes!("lucide_files_compact.rgba");
 static LUCIDE_FILES_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_FILES_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_FILES_STRIP_RGBA: &[u8] = include_bytes!("lucide_files_strip.rgba");
-
-const LUCIDE_FILES_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_files_strip_gate.rgba");
-static LUCIDE_FILES_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_FILES_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_FILES_GALLERY_RGBA: &[u8] = include_bytes!("lucide_files_gallery.rgba");
-
-const LUCIDE_FILES_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_files_gallery_gate.rgba");
-static LUCIDE_FILES_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_FILES_GALLERY_GATE_RGBA));
 
 // ---- Lucide SourceControl (git-branch) -----------------------------
 
-#[cfg(test)]
 const LUCIDE_SOURCE_CONTROL_RGBA: &[u8] = include_bytes!("lucide_source_control.rgba");
-
-const LUCIDE_SOURCE_CONTROL_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_source_control_gate_active.rgba");
-static LUCIDE_SOURCE_CONTROL_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_SOURCE_CONTROL_GATE_ACTIVE_RGBA));
-
-const LUCIDE_SOURCE_CONTROL_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_source_control_gate_accent.rgba");
-static LUCIDE_SOURCE_CONTROL_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_SOURCE_CONTROL_GATE_ACCENT_RGBA));
-
 const LUCIDE_SOURCE_CONTROL_COMPACT_RGBA: &[u8] = include_bytes!("lucide_source_control_compact.rgba");
 static LUCIDE_SOURCE_CONTROL_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_SOURCE_CONTROL_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_SOURCE_CONTROL_STRIP_RGBA: &[u8] = include_bytes!("lucide_source_control_strip.rgba");
-
-const LUCIDE_SOURCE_CONTROL_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_source_control_strip_gate.rgba");
-static LUCIDE_SOURCE_CONTROL_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_SOURCE_CONTROL_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_SOURCE_CONTROL_GALLERY_RGBA: &[u8] = include_bytes!("lucide_source_control_gallery.rgba");
-
-const LUCIDE_SOURCE_CONTROL_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_source_control_gallery_gate.rgba");
-static LUCIDE_SOURCE_CONTROL_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_SOURCE_CONTROL_GALLERY_GATE_RGBA));
 
 // ---- Lucide Person (user) ------------------------------------------
 
-#[cfg(test)]
 const LUCIDE_PERSON_RGBA: &[u8] = include_bytes!("lucide_person.rgba");
-
-const LUCIDE_PERSON_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_person_gate_active.rgba");
-static LUCIDE_PERSON_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_PERSON_GATE_ACTIVE_RGBA));
-
-const LUCIDE_PERSON_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_person_gate_accent.rgba");
-static LUCIDE_PERSON_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_PERSON_GATE_ACCENT_RGBA));
-
 const LUCIDE_PERSON_COMPACT_RGBA: &[u8] = include_bytes!("lucide_person_compact.rgba");
 static LUCIDE_PERSON_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_PERSON_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_PERSON_STRIP_RGBA: &[u8] = include_bytes!("lucide_person_strip.rgba");
-
-const LUCIDE_PERSON_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_person_strip_gate.rgba");
-static LUCIDE_PERSON_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_PERSON_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_PERSON_GALLERY_RGBA: &[u8] = include_bytes!("lucide_person_gallery.rgba");
-
-const LUCIDE_PERSON_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_person_gallery_gate.rgba");
-static LUCIDE_PERSON_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_PERSON_GALLERY_GATE_RGBA));
 
 // ---- Lucide Project (kanban) ---------------------------------------
 
-#[cfg(test)]
 const LUCIDE_PROJECT_RGBA: &[u8] = include_bytes!("lucide_project.rgba");
-
-const LUCIDE_PROJECT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_project_gate_active.rgba");
-static LUCIDE_PROJECT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_PROJECT_GATE_ACTIVE_RGBA));
-
-const LUCIDE_PROJECT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_project_gate_accent.rgba");
-static LUCIDE_PROJECT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_PROJECT_GATE_ACCENT_RGBA));
-
 const LUCIDE_PROJECT_COMPACT_RGBA: &[u8] = include_bytes!("lucide_project_compact.rgba");
 static LUCIDE_PROJECT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_PROJECT_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_PROJECT_STRIP_RGBA: &[u8] = include_bytes!("lucide_project_strip.rgba");
-
-const LUCIDE_PROJECT_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_project_strip_gate.rgba");
-static LUCIDE_PROJECT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_PROJECT_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_PROJECT_GALLERY_RGBA: &[u8] = include_bytes!("lucide_project_gallery.rgba");
-
-const LUCIDE_PROJECT_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_project_gallery_gate.rgba");
-static LUCIDE_PROJECT_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_PROJECT_GALLERY_GATE_RGBA));
 
 // ---- Lucide SettingsGear (settings) --------------------------------
 
-#[cfg(test)]
 const LUCIDE_SETTINGS_GEAR_RGBA: &[u8] = include_bytes!("lucide_settings_gear.rgba");
-
-const LUCIDE_SETTINGS_GEAR_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_settings_gear_gate_active.rgba");
-static LUCIDE_SETTINGS_GEAR_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_SETTINGS_GEAR_GATE_ACTIVE_RGBA));
-
-const LUCIDE_SETTINGS_GEAR_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_settings_gear_gate_accent.rgba");
-static LUCIDE_SETTINGS_GEAR_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_SETTINGS_GEAR_GATE_ACCENT_RGBA));
-
 const LUCIDE_SETTINGS_GEAR_COMPACT_RGBA: &[u8] = include_bytes!("lucide_settings_gear_compact.rgba");
 static LUCIDE_SETTINGS_GEAR_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_SETTINGS_GEAR_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_SETTINGS_GEAR_STRIP_RGBA: &[u8] = include_bytes!("lucide_settings_gear_strip.rgba");
-
-const LUCIDE_SETTINGS_GEAR_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_settings_gear_strip_gate.rgba");
-static LUCIDE_SETTINGS_GEAR_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_SETTINGS_GEAR_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_SETTINGS_GEAR_GALLERY_RGBA: &[u8] = include_bytes!("lucide_settings_gear_gallery.rgba");
-
-const LUCIDE_SETTINGS_GEAR_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_settings_gear_gallery_gate.rgba");
-static LUCIDE_SETTINGS_GEAR_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_SETTINGS_GEAR_GALLERY_GATE_RGBA));
 
 // ---- Lucide ChevronLeft (chevron-left) -----------------------------
 
-#[cfg(test)]
 const LUCIDE_CHEVRON_LEFT_RGBA: &[u8] = include_bytes!("lucide_chevron_left.rgba");
-
-const LUCIDE_CHEVRON_LEFT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_chevron_left_gate_active.rgba");
-static LUCIDE_CHEVRON_LEFT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_CHEVRON_LEFT_GATE_ACTIVE_RGBA));
-
-const LUCIDE_CHEVRON_LEFT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_chevron_left_gate_accent.rgba");
-static LUCIDE_CHEVRON_LEFT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_CHEVRON_LEFT_GATE_ACCENT_RGBA));
-
 const LUCIDE_CHEVRON_LEFT_COMPACT_RGBA: &[u8] = include_bytes!("lucide_chevron_left_compact.rgba");
 static LUCIDE_CHEVRON_LEFT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_CHEVRON_LEFT_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_CHEVRON_LEFT_STRIP_RGBA: &[u8] = include_bytes!("lucide_chevron_left_strip.rgba");
-
-const LUCIDE_CHEVRON_LEFT_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_chevron_left_strip_gate.rgba");
-static LUCIDE_CHEVRON_LEFT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_CHEVRON_LEFT_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_CHEVRON_LEFT_GALLERY_RGBA: &[u8] = include_bytes!("lucide_chevron_left_gallery.rgba");
-
-const LUCIDE_CHEVRON_LEFT_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_chevron_left_gallery_gate.rgba");
-static LUCIDE_CHEVRON_LEFT_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_CHEVRON_LEFT_GALLERY_GATE_RGBA));
 
 // ---- Lucide ChevronRight (chevron-right) ---------------------------
 
-#[cfg(test)]
 const LUCIDE_CHEVRON_RIGHT_RGBA: &[u8] = include_bytes!("lucide_chevron_right.rgba");
-
-const LUCIDE_CHEVRON_RIGHT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_chevron_right_gate_active.rgba");
-static LUCIDE_CHEVRON_RIGHT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_CHEVRON_RIGHT_GATE_ACTIVE_RGBA));
-
-const LUCIDE_CHEVRON_RIGHT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_chevron_right_gate_accent.rgba");
-static LUCIDE_CHEVRON_RIGHT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_CHEVRON_RIGHT_GATE_ACCENT_RGBA));
-
 const LUCIDE_CHEVRON_RIGHT_COMPACT_RGBA: &[u8] = include_bytes!("lucide_chevron_right_compact.rgba");
 static LUCIDE_CHEVRON_RIGHT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_CHEVRON_RIGHT_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_CHEVRON_RIGHT_STRIP_RGBA: &[u8] = include_bytes!("lucide_chevron_right_strip.rgba");
-
-const LUCIDE_CHEVRON_RIGHT_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_chevron_right_strip_gate.rgba");
-static LUCIDE_CHEVRON_RIGHT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_CHEVRON_RIGHT_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_CHEVRON_RIGHT_GALLERY_RGBA: &[u8] = include_bytes!("lucide_chevron_right_gallery.rgba");
-
-const LUCIDE_CHEVRON_RIGHT_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_chevron_right_gallery_gate.rgba");
-static LUCIDE_CHEVRON_RIGHT_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_CHEVRON_RIGHT_GALLERY_GATE_RGBA));
 
 // ---- Lucide ChevronDown (chevron-down) -----------------------------
 
-#[cfg(test)]
 const LUCIDE_CHEVRON_DOWN_RGBA: &[u8] = include_bytes!("lucide_chevron_down.rgba");
-
-const LUCIDE_CHEVRON_DOWN_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_chevron_down_gate_active.rgba");
-static LUCIDE_CHEVRON_DOWN_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_CHEVRON_DOWN_GATE_ACTIVE_RGBA));
-
-const LUCIDE_CHEVRON_DOWN_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_chevron_down_gate_accent.rgba");
-static LUCIDE_CHEVRON_DOWN_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_CHEVRON_DOWN_GATE_ACCENT_RGBA));
-
 const LUCIDE_CHEVRON_DOWN_COMPACT_RGBA: &[u8] = include_bytes!("lucide_chevron_down_compact.rgba");
 static LUCIDE_CHEVRON_DOWN_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_CHEVRON_DOWN_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_CHEVRON_DOWN_STRIP_RGBA: &[u8] = include_bytes!("lucide_chevron_down_strip.rgba");
-
-const LUCIDE_CHEVRON_DOWN_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_chevron_down_strip_gate.rgba");
-static LUCIDE_CHEVRON_DOWN_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_CHEVRON_DOWN_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_CHEVRON_DOWN_GALLERY_RGBA: &[u8] = include_bytes!("lucide_chevron_down_gallery.rgba");
-
-const LUCIDE_CHEVRON_DOWN_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_chevron_down_gallery_gate.rgba");
-static LUCIDE_CHEVRON_DOWN_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_CHEVRON_DOWN_GALLERY_GATE_RGBA));
 
 // ---- Lucide NewFile (file-plus) ------------------------------------
 
-#[cfg(test)]
 const LUCIDE_NEW_FILE_RGBA: &[u8] = include_bytes!("lucide_new_file.rgba");
-
-const LUCIDE_NEW_FILE_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_new_file_gate_active.rgba");
-static LUCIDE_NEW_FILE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_NEW_FILE_GATE_ACTIVE_RGBA));
-
-const LUCIDE_NEW_FILE_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_new_file_gate_accent.rgba");
-static LUCIDE_NEW_FILE_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_NEW_FILE_GATE_ACCENT_RGBA));
-
 const LUCIDE_NEW_FILE_COMPACT_RGBA: &[u8] = include_bytes!("lucide_new_file_compact.rgba");
 static LUCIDE_NEW_FILE_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_NEW_FILE_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_NEW_FILE_STRIP_RGBA: &[u8] = include_bytes!("lucide_new_file_strip.rgba");
-
-const LUCIDE_NEW_FILE_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_new_file_strip_gate.rgba");
-static LUCIDE_NEW_FILE_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_NEW_FILE_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_NEW_FILE_GALLERY_RGBA: &[u8] = include_bytes!("lucide_new_file_gallery.rgba");
-
-const LUCIDE_NEW_FILE_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_new_file_gallery_gate.rgba");
-static LUCIDE_NEW_FILE_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_NEW_FILE_GALLERY_GATE_RGBA));
 
 // ---- Lucide NewFolder (folder-plus) --------------------------------
 
-#[cfg(test)]
 const LUCIDE_NEW_FOLDER_RGBA: &[u8] = include_bytes!("lucide_new_folder.rgba");
-
-const LUCIDE_NEW_FOLDER_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_new_folder_gate_active.rgba");
-static LUCIDE_NEW_FOLDER_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_NEW_FOLDER_GATE_ACTIVE_RGBA));
-
-const LUCIDE_NEW_FOLDER_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_new_folder_gate_accent.rgba");
-static LUCIDE_NEW_FOLDER_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_NEW_FOLDER_GATE_ACCENT_RGBA));
-
 const LUCIDE_NEW_FOLDER_COMPACT_RGBA: &[u8] = include_bytes!("lucide_new_folder_compact.rgba");
 static LUCIDE_NEW_FOLDER_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_NEW_FOLDER_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_NEW_FOLDER_STRIP_RGBA: &[u8] = include_bytes!("lucide_new_folder_strip.rgba");
-
-const LUCIDE_NEW_FOLDER_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_new_folder_strip_gate.rgba");
-static LUCIDE_NEW_FOLDER_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_NEW_FOLDER_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_NEW_FOLDER_GALLERY_RGBA: &[u8] = include_bytes!("lucide_new_folder_gallery.rgba");
-
-const LUCIDE_NEW_FOLDER_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_new_folder_gallery_gate.rgba");
-static LUCIDE_NEW_FOLDER_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_NEW_FOLDER_GALLERY_GATE_RGBA));
 
 // ---- Lucide Folder (folder) ----------------------------------------
 
-#[cfg(test)]
 const LUCIDE_FOLDER_RGBA: &[u8] = include_bytes!("lucide_folder.rgba");
-
-const LUCIDE_FOLDER_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_folder_gate_active.rgba");
-static LUCIDE_FOLDER_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_FOLDER_GATE_ACTIVE_RGBA));
-
-const LUCIDE_FOLDER_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_folder_gate_accent.rgba");
-static LUCIDE_FOLDER_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_FOLDER_GATE_ACCENT_RGBA));
-
 const LUCIDE_FOLDER_COMPACT_RGBA: &[u8] = include_bytes!("lucide_folder_compact.rgba");
 static LUCIDE_FOLDER_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_FOLDER_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_FOLDER_STRIP_RGBA: &[u8] = include_bytes!("lucide_folder_strip.rgba");
-
-const LUCIDE_FOLDER_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_folder_strip_gate.rgba");
-static LUCIDE_FOLDER_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_FOLDER_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_FOLDER_GALLERY_RGBA: &[u8] = include_bytes!("lucide_folder_gallery.rgba");
-
-const LUCIDE_FOLDER_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_folder_gallery_gate.rgba");
-static LUCIDE_FOLDER_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_FOLDER_GALLERY_GATE_RGBA));
 
 // ---- Lucide FolderOpened (folder-open) -----------------------------
 
-#[cfg(test)]
 const LUCIDE_FOLDER_OPENED_RGBA: &[u8] = include_bytes!("lucide_folder_opened.rgba");
-
-const LUCIDE_FOLDER_OPENED_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_folder_opened_gate_active.rgba");
-static LUCIDE_FOLDER_OPENED_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_FOLDER_OPENED_GATE_ACTIVE_RGBA));
-
-const LUCIDE_FOLDER_OPENED_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_folder_opened_gate_accent.rgba");
-static LUCIDE_FOLDER_OPENED_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_FOLDER_OPENED_GATE_ACCENT_RGBA));
-
 const LUCIDE_FOLDER_OPENED_COMPACT_RGBA: &[u8] = include_bytes!("lucide_folder_opened_compact.rgba");
 static LUCIDE_FOLDER_OPENED_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_FOLDER_OPENED_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_FOLDER_OPENED_STRIP_RGBA: &[u8] = include_bytes!("lucide_folder_opened_strip.rgba");
-
-const LUCIDE_FOLDER_OPENED_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_folder_opened_strip_gate.rgba");
-static LUCIDE_FOLDER_OPENED_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_FOLDER_OPENED_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_FOLDER_OPENED_GALLERY_RGBA: &[u8] = include_bytes!("lucide_folder_opened_gallery.rgba");
-
-const LUCIDE_FOLDER_OPENED_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_folder_opened_gallery_gate.rgba");
-static LUCIDE_FOLDER_OPENED_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_FOLDER_OPENED_GALLERY_GATE_RGBA));
 
 // ---- Lucide File (file) --------------------------------------------
 
-#[cfg(test)]
 const LUCIDE_FILE_RGBA: &[u8] = include_bytes!("lucide_file.rgba");
-
-const LUCIDE_FILE_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_file_gate_active.rgba");
-static LUCIDE_FILE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_FILE_GATE_ACTIVE_RGBA));
-
-const LUCIDE_FILE_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_file_gate_accent.rgba");
-static LUCIDE_FILE_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_FILE_GATE_ACCENT_RGBA));
-
 const LUCIDE_FILE_COMPACT_RGBA: &[u8] = include_bytes!("lucide_file_compact.rgba");
 static LUCIDE_FILE_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_FILE_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_FILE_STRIP_RGBA: &[u8] = include_bytes!("lucide_file_strip.rgba");
-
-const LUCIDE_FILE_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_file_strip_gate.rgba");
-static LUCIDE_FILE_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_FILE_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_FILE_GALLERY_RGBA: &[u8] = include_bytes!("lucide_file_gallery.rgba");
-
-const LUCIDE_FILE_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_file_gallery_gate.rgba");
-static LUCIDE_FILE_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_FILE_GALLERY_GATE_RGBA));
 
 // ---- Lucide Save (save) --------------------------------------------
 
-#[cfg(test)]
 const LUCIDE_SAVE_RGBA: &[u8] = include_bytes!("lucide_save.rgba");
-
-const LUCIDE_SAVE_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_save_gate_active.rgba");
-static LUCIDE_SAVE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_SAVE_GATE_ACTIVE_RGBA));
-
-const LUCIDE_SAVE_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_save_gate_accent.rgba");
-static LUCIDE_SAVE_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_SAVE_GATE_ACCENT_RGBA));
-
 const LUCIDE_SAVE_COMPACT_RGBA: &[u8] = include_bytes!("lucide_save_compact.rgba");
 static LUCIDE_SAVE_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_SAVE_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_SAVE_STRIP_RGBA: &[u8] = include_bytes!("lucide_save_strip.rgba");
-
-const LUCIDE_SAVE_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_save_strip_gate.rgba");
-static LUCIDE_SAVE_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_SAVE_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_SAVE_GALLERY_RGBA: &[u8] = include_bytes!("lucide_save_gallery.rgba");
-
-const LUCIDE_SAVE_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_save_gallery_gate.rgba");
-static LUCIDE_SAVE_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_SAVE_GALLERY_GATE_RGBA));
 
 // ---- Lucide Refresh (refresh-cw) -----------------------------------
 
-#[cfg(test)]
 const LUCIDE_REFRESH_RGBA: &[u8] = include_bytes!("lucide_refresh.rgba");
-
-const LUCIDE_REFRESH_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_refresh_gate_active.rgba");
-static LUCIDE_REFRESH_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_REFRESH_GATE_ACTIVE_RGBA));
-
-const LUCIDE_REFRESH_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_refresh_gate_accent.rgba");
-static LUCIDE_REFRESH_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_REFRESH_GATE_ACCENT_RGBA));
-
 const LUCIDE_REFRESH_COMPACT_RGBA: &[u8] = include_bytes!("lucide_refresh_compact.rgba");
 static LUCIDE_REFRESH_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_REFRESH_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_REFRESH_STRIP_RGBA: &[u8] = include_bytes!("lucide_refresh_strip.rgba");
-
-const LUCIDE_REFRESH_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_refresh_strip_gate.rgba");
-static LUCIDE_REFRESH_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_REFRESH_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_REFRESH_GALLERY_RGBA: &[u8] = include_bytes!("lucide_refresh_gallery.rgba");
-
-const LUCIDE_REFRESH_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_refresh_gallery_gate.rgba");
-static LUCIDE_REFRESH_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_REFRESH_GALLERY_GATE_RGBA));
 
 // ---- Lucide Add (plus) ---------------------------------------------
 
-#[cfg(test)]
 const LUCIDE_ADD_RGBA: &[u8] = include_bytes!("lucide_add.rgba");
-
-const LUCIDE_ADD_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_add_gate_active.rgba");
-static LUCIDE_ADD_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_ADD_GATE_ACTIVE_RGBA));
-
-const LUCIDE_ADD_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_add_gate_accent.rgba");
-static LUCIDE_ADD_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_ADD_GATE_ACCENT_RGBA));
-
 const LUCIDE_ADD_COMPACT_RGBA: &[u8] = include_bytes!("lucide_add_compact.rgba");
 static LUCIDE_ADD_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_ADD_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_ADD_STRIP_RGBA: &[u8] = include_bytes!("lucide_add_strip.rgba");
-
-const LUCIDE_ADD_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_add_strip_gate.rgba");
-static LUCIDE_ADD_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_ADD_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_ADD_GALLERY_RGBA: &[u8] = include_bytes!("lucide_add_gallery.rgba");
-
-const LUCIDE_ADD_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_add_gallery_gate.rgba");
-static LUCIDE_ADD_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_ADD_GALLERY_GATE_RGBA));
 
 // ---- Lucide Trash (trash-2) ----------------------------------------
 
-#[cfg(test)]
 const LUCIDE_TRASH_RGBA: &[u8] = include_bytes!("lucide_trash.rgba");
-
-const LUCIDE_TRASH_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_trash_gate_active.rgba");
-static LUCIDE_TRASH_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_TRASH_GATE_ACTIVE_RGBA));
-
-const LUCIDE_TRASH_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_trash_gate_accent.rgba");
-static LUCIDE_TRASH_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_TRASH_GATE_ACCENT_RGBA));
-
 const LUCIDE_TRASH_COMPACT_RGBA: &[u8] = include_bytes!("lucide_trash_compact.rgba");
 static LUCIDE_TRASH_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_TRASH_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_TRASH_STRIP_RGBA: &[u8] = include_bytes!("lucide_trash_strip.rgba");
-
-const LUCIDE_TRASH_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_trash_strip_gate.rgba");
-static LUCIDE_TRASH_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_TRASH_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_TRASH_GALLERY_RGBA: &[u8] = include_bytes!("lucide_trash_gallery.rgba");
-
-const LUCIDE_TRASH_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_trash_gallery_gate.rgba");
-static LUCIDE_TRASH_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_TRASH_GALLERY_GATE_RGBA));
 
 // ---- Lucide Search (search) ----------------------------------------
 
-#[cfg(test)]
 const LUCIDE_SEARCH_RGBA: &[u8] = include_bytes!("lucide_search.rgba");
-
-const LUCIDE_SEARCH_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_search_gate_active.rgba");
-static LUCIDE_SEARCH_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_SEARCH_GATE_ACTIVE_RGBA));
-
-const LUCIDE_SEARCH_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_search_gate_accent.rgba");
-static LUCIDE_SEARCH_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_SEARCH_GATE_ACCENT_RGBA));
-
 const LUCIDE_SEARCH_COMPACT_RGBA: &[u8] = include_bytes!("lucide_search_compact.rgba");
 static LUCIDE_SEARCH_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_SEARCH_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_SEARCH_STRIP_RGBA: &[u8] = include_bytes!("lucide_search_strip.rgba");
-
-const LUCIDE_SEARCH_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_search_strip_gate.rgba");
-static LUCIDE_SEARCH_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_SEARCH_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_SEARCH_GALLERY_RGBA: &[u8] = include_bytes!("lucide_search_gallery.rgba");
-
-const LUCIDE_SEARCH_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_search_gallery_gate.rgba");
-static LUCIDE_SEARCH_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_SEARCH_GALLERY_GATE_RGBA));
 
 // ---- Lucide Check (check) ------------------------------------------
 
-#[cfg(test)]
 const LUCIDE_CHECK_RGBA: &[u8] = include_bytes!("lucide_check.rgba");
-
-const LUCIDE_CHECK_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_check_gate_active.rgba");
-static LUCIDE_CHECK_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_CHECK_GATE_ACTIVE_RGBA));
-
-const LUCIDE_CHECK_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_check_gate_accent.rgba");
-static LUCIDE_CHECK_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_CHECK_GATE_ACCENT_RGBA));
-
 const LUCIDE_CHECK_COMPACT_RGBA: &[u8] = include_bytes!("lucide_check_compact.rgba");
 static LUCIDE_CHECK_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_CHECK_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_CHECK_STRIP_RGBA: &[u8] = include_bytes!("lucide_check_strip.rgba");
-
-const LUCIDE_CHECK_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_check_strip_gate.rgba");
-static LUCIDE_CHECK_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_CHECK_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_CHECK_GALLERY_RGBA: &[u8] = include_bytes!("lucide_check_gallery.rgba");
-
-const LUCIDE_CHECK_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_check_gallery_gate.rgba");
-static LUCIDE_CHECK_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_CHECK_GALLERY_GATE_RGBA));
 
 // ---- Lucide Close (x) ----------------------------------------------
 
-#[cfg(test)]
 const LUCIDE_CLOSE_RGBA: &[u8] = include_bytes!("lucide_close.rgba");
-
-const LUCIDE_CLOSE_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_close_gate_active.rgba");
-static LUCIDE_CLOSE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_CLOSE_GATE_ACTIVE_RGBA));
-
-const LUCIDE_CLOSE_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_close_gate_accent.rgba");
-static LUCIDE_CLOSE_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_CLOSE_GATE_ACCENT_RGBA));
-
 const LUCIDE_CLOSE_COMPACT_RGBA: &[u8] = include_bytes!("lucide_close_compact.rgba");
 static LUCIDE_CLOSE_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_CLOSE_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_CLOSE_STRIP_RGBA: &[u8] = include_bytes!("lucide_close_strip.rgba");
-
-const LUCIDE_CLOSE_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_close_strip_gate.rgba");
-static LUCIDE_CLOSE_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_CLOSE_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_CLOSE_GALLERY_RGBA: &[u8] = include_bytes!("lucide_close_gallery.rgba");
-
-const LUCIDE_CLOSE_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_close_gallery_gate.rgba");
-static LUCIDE_CLOSE_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_CLOSE_GALLERY_GATE_RGBA));
 
 // ---- Lucide ArrowUp (arrow-up) -------------------------------------
 
-#[cfg(test)]
 const LUCIDE_ARROW_UP_RGBA: &[u8] = include_bytes!("lucide_arrow_up.rgba");
-
-const LUCIDE_ARROW_UP_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_arrow_up_gate_active.rgba");
-static LUCIDE_ARROW_UP_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_ARROW_UP_GATE_ACTIVE_RGBA));
-
-const LUCIDE_ARROW_UP_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_arrow_up_gate_accent.rgba");
-static LUCIDE_ARROW_UP_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_ARROW_UP_GATE_ACCENT_RGBA));
-
 const LUCIDE_ARROW_UP_COMPACT_RGBA: &[u8] = include_bytes!("lucide_arrow_up_compact.rgba");
 static LUCIDE_ARROW_UP_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_ARROW_UP_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_ARROW_UP_STRIP_RGBA: &[u8] = include_bytes!("lucide_arrow_up_strip.rgba");
-
-const LUCIDE_ARROW_UP_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_arrow_up_strip_gate.rgba");
-static LUCIDE_ARROW_UP_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_ARROW_UP_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_ARROW_UP_GALLERY_RGBA: &[u8] = include_bytes!("lucide_arrow_up_gallery.rgba");
-
-const LUCIDE_ARROW_UP_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_arrow_up_gallery_gate.rgba");
-static LUCIDE_ARROW_UP_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_ARROW_UP_GALLERY_GATE_RGBA));
 
 // ---- Lucide ArrowDown (arrow-down) ---------------------------------
 
-#[cfg(test)]
 const LUCIDE_ARROW_DOWN_RGBA: &[u8] = include_bytes!("lucide_arrow_down.rgba");
-
-const LUCIDE_ARROW_DOWN_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_arrow_down_gate_active.rgba");
-static LUCIDE_ARROW_DOWN_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_ARROW_DOWN_GATE_ACTIVE_RGBA));
-
-const LUCIDE_ARROW_DOWN_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_arrow_down_gate_accent.rgba");
-static LUCIDE_ARROW_DOWN_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_ARROW_DOWN_GATE_ACCENT_RGBA));
-
 const LUCIDE_ARROW_DOWN_COMPACT_RGBA: &[u8] = include_bytes!("lucide_arrow_down_compact.rgba");
 static LUCIDE_ARROW_DOWN_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_ARROW_DOWN_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_ARROW_DOWN_STRIP_RGBA: &[u8] = include_bytes!("lucide_arrow_down_strip.rgba");
-
-const LUCIDE_ARROW_DOWN_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_arrow_down_strip_gate.rgba");
-static LUCIDE_ARROW_DOWN_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_ARROW_DOWN_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_ARROW_DOWN_GALLERY_RGBA: &[u8] = include_bytes!("lucide_arrow_down_gallery.rgba");
-
-const LUCIDE_ARROW_DOWN_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_arrow_down_gallery_gate.rgba");
-static LUCIDE_ARROW_DOWN_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_ARROW_DOWN_GALLERY_GATE_RGBA));
 
 // ---- Lucide ArrowLeft (arrow-left) ---------------------------------
 
-#[cfg(test)]
 const LUCIDE_ARROW_LEFT_RGBA: &[u8] = include_bytes!("lucide_arrow_left.rgba");
-
-const LUCIDE_ARROW_LEFT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_arrow_left_gate_active.rgba");
-static LUCIDE_ARROW_LEFT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_ARROW_LEFT_GATE_ACTIVE_RGBA));
-
-const LUCIDE_ARROW_LEFT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_arrow_left_gate_accent.rgba");
-static LUCIDE_ARROW_LEFT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_ARROW_LEFT_GATE_ACCENT_RGBA));
-
 const LUCIDE_ARROW_LEFT_COMPACT_RGBA: &[u8] = include_bytes!("lucide_arrow_left_compact.rgba");
 static LUCIDE_ARROW_LEFT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_ARROW_LEFT_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_ARROW_LEFT_STRIP_RGBA: &[u8] = include_bytes!("lucide_arrow_left_strip.rgba");
-
-const LUCIDE_ARROW_LEFT_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_arrow_left_strip_gate.rgba");
-static LUCIDE_ARROW_LEFT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_ARROW_LEFT_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_ARROW_LEFT_GALLERY_RGBA: &[u8] = include_bytes!("lucide_arrow_left_gallery.rgba");
-
-const LUCIDE_ARROW_LEFT_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_arrow_left_gallery_gate.rgba");
-static LUCIDE_ARROW_LEFT_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_ARROW_LEFT_GALLERY_GATE_RGBA));
 
 // ---- Lucide ArrowRight (arrow-right) -------------------------------
 
-#[cfg(test)]
 const LUCIDE_ARROW_RIGHT_RGBA: &[u8] = include_bytes!("lucide_arrow_right.rgba");
-
-const LUCIDE_ARROW_RIGHT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_arrow_right_gate_active.rgba");
-static LUCIDE_ARROW_RIGHT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_ARROW_RIGHT_GATE_ACTIVE_RGBA));
-
-const LUCIDE_ARROW_RIGHT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_arrow_right_gate_accent.rgba");
-static LUCIDE_ARROW_RIGHT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_ARROW_RIGHT_GATE_ACCENT_RGBA));
-
 const LUCIDE_ARROW_RIGHT_COMPACT_RGBA: &[u8] = include_bytes!("lucide_arrow_right_compact.rgba");
 static LUCIDE_ARROW_RIGHT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_ARROW_RIGHT_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_ARROW_RIGHT_STRIP_RGBA: &[u8] = include_bytes!("lucide_arrow_right_strip.rgba");
-
-const LUCIDE_ARROW_RIGHT_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_arrow_right_strip_gate.rgba");
-static LUCIDE_ARROW_RIGHT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_ARROW_RIGHT_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_ARROW_RIGHT_GALLERY_RGBA: &[u8] = include_bytes!("lucide_arrow_right_gallery.rgba");
-
-const LUCIDE_ARROW_RIGHT_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_arrow_right_gallery_gate.rgba");
-static LUCIDE_ARROW_RIGHT_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_ARROW_RIGHT_GALLERY_GATE_RGBA));
 
 // ---- Lucide ArrowSwap (arrow-left-right) ---------------------------
 
-#[cfg(test)]
 const LUCIDE_ARROW_SWAP_RGBA: &[u8] = include_bytes!("lucide_arrow_swap.rgba");
-
-const LUCIDE_ARROW_SWAP_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_arrow_swap_gate_active.rgba");
-static LUCIDE_ARROW_SWAP_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_ARROW_SWAP_GATE_ACTIVE_RGBA));
-
-const LUCIDE_ARROW_SWAP_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_arrow_swap_gate_accent.rgba");
-static LUCIDE_ARROW_SWAP_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_ARROW_SWAP_GATE_ACCENT_RGBA));
-
 const LUCIDE_ARROW_SWAP_COMPACT_RGBA: &[u8] = include_bytes!("lucide_arrow_swap_compact.rgba");
 static LUCIDE_ARROW_SWAP_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_ARROW_SWAP_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_ARROW_SWAP_STRIP_RGBA: &[u8] = include_bytes!("lucide_arrow_swap_strip.rgba");
-
-const LUCIDE_ARROW_SWAP_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_arrow_swap_strip_gate.rgba");
-static LUCIDE_ARROW_SWAP_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_ARROW_SWAP_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_ARROW_SWAP_GALLERY_RGBA: &[u8] = include_bytes!("lucide_arrow_swap_gallery.rgba");
-
-const LUCIDE_ARROW_SWAP_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_arrow_swap_gallery_gate.rgba");
-static LUCIDE_ARROW_SWAP_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_ARROW_SWAP_GALLERY_GATE_RGBA));
 
 // ---- Lucide GitCommit (git-commit-horizontal) ----------------------
 
-#[cfg(test)]
 const LUCIDE_GIT_COMMIT_RGBA: &[u8] = include_bytes!("lucide_git_commit.rgba");
-
-const LUCIDE_GIT_COMMIT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_git_commit_gate_active.rgba");
-static LUCIDE_GIT_COMMIT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_GIT_COMMIT_GATE_ACTIVE_RGBA));
-
-const LUCIDE_GIT_COMMIT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_git_commit_gate_accent.rgba");
-static LUCIDE_GIT_COMMIT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_GIT_COMMIT_GATE_ACCENT_RGBA));
-
 const LUCIDE_GIT_COMMIT_COMPACT_RGBA: &[u8] = include_bytes!("lucide_git_commit_compact.rgba");
 static LUCIDE_GIT_COMMIT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_GIT_COMMIT_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_GIT_COMMIT_STRIP_RGBA: &[u8] = include_bytes!("lucide_git_commit_strip.rgba");
-
-const LUCIDE_GIT_COMMIT_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_git_commit_strip_gate.rgba");
-static LUCIDE_GIT_COMMIT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_GIT_COMMIT_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_GIT_COMMIT_GALLERY_RGBA: &[u8] = include_bytes!("lucide_git_commit_gallery.rgba");
-
-const LUCIDE_GIT_COMMIT_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_git_commit_gallery_gate.rgba");
-static LUCIDE_GIT_COMMIT_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_GIT_COMMIT_GALLERY_GATE_RGBA));
 
 // ---- Lucide GitBranch (git-branch) ---------------------------------
 
-#[cfg(test)]
 const LUCIDE_GIT_BRANCH_RGBA: &[u8] = include_bytes!("lucide_git_branch.rgba");
-
-const LUCIDE_GIT_BRANCH_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_git_branch_gate_active.rgba");
-static LUCIDE_GIT_BRANCH_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_GIT_BRANCH_GATE_ACTIVE_RGBA));
-
-const LUCIDE_GIT_BRANCH_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_git_branch_gate_accent.rgba");
-static LUCIDE_GIT_BRANCH_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_GIT_BRANCH_GATE_ACCENT_RGBA));
-
 const LUCIDE_GIT_BRANCH_COMPACT_RGBA: &[u8] = include_bytes!("lucide_git_branch_compact.rgba");
 static LUCIDE_GIT_BRANCH_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_GIT_BRANCH_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_GIT_BRANCH_STRIP_RGBA: &[u8] = include_bytes!("lucide_git_branch_strip.rgba");
-
-const LUCIDE_GIT_BRANCH_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_git_branch_strip_gate.rgba");
-static LUCIDE_GIT_BRANCH_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_GIT_BRANCH_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_GIT_BRANCH_GALLERY_RGBA: &[u8] = include_bytes!("lucide_git_branch_gallery.rgba");
-
-const LUCIDE_GIT_BRANCH_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_git_branch_gallery_gate.rgba");
-static LUCIDE_GIT_BRANCH_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_GIT_BRANCH_GALLERY_GATE_RGBA));
 
 // ---- Lucide Diff (file-diff) ---------------------------------------
 
-#[cfg(test)]
 const LUCIDE_DIFF_RGBA: &[u8] = include_bytes!("lucide_diff.rgba");
-
-const LUCIDE_DIFF_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_diff_gate_active.rgba");
-static LUCIDE_DIFF_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_DIFF_GATE_ACTIVE_RGBA));
-
-const LUCIDE_DIFF_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_diff_gate_accent.rgba");
-static LUCIDE_DIFF_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_DIFF_GATE_ACCENT_RGBA));
-
 const LUCIDE_DIFF_COMPACT_RGBA: &[u8] = include_bytes!("lucide_diff_compact.rgba");
 static LUCIDE_DIFF_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_DIFF_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_DIFF_STRIP_RGBA: &[u8] = include_bytes!("lucide_diff_strip.rgba");
-
-const LUCIDE_DIFF_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_diff_strip_gate.rgba");
-static LUCIDE_DIFF_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_DIFF_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_DIFF_GALLERY_RGBA: &[u8] = include_bytes!("lucide_diff_gallery.rgba");
-
-const LUCIDE_DIFF_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_diff_gallery_gate.rgba");
-static LUCIDE_DIFF_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_DIFF_GALLERY_GATE_RGBA));
 
 // ---- Lucide DiffAdded (file-plus) ----------------------------------
 
-#[cfg(test)]
 const LUCIDE_DIFF_ADDED_RGBA: &[u8] = include_bytes!("lucide_diff_added.rgba");
-
-const LUCIDE_DIFF_ADDED_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_diff_added_gate_active.rgba");
-static LUCIDE_DIFF_ADDED_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_DIFF_ADDED_GATE_ACTIVE_RGBA));
-
-const LUCIDE_DIFF_ADDED_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_diff_added_gate_accent.rgba");
-static LUCIDE_DIFF_ADDED_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_DIFF_ADDED_GATE_ACCENT_RGBA));
-
 const LUCIDE_DIFF_ADDED_COMPACT_RGBA: &[u8] = include_bytes!("lucide_diff_added_compact.rgba");
 static LUCIDE_DIFF_ADDED_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_DIFF_ADDED_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_DIFF_ADDED_STRIP_RGBA: &[u8] = include_bytes!("lucide_diff_added_strip.rgba");
-
-const LUCIDE_DIFF_ADDED_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_diff_added_strip_gate.rgba");
-static LUCIDE_DIFF_ADDED_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_DIFF_ADDED_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_DIFF_ADDED_GALLERY_RGBA: &[u8] = include_bytes!("lucide_diff_added_gallery.rgba");
-
-const LUCIDE_DIFF_ADDED_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_diff_added_gallery_gate.rgba");
-static LUCIDE_DIFF_ADDED_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_DIFF_ADDED_GALLERY_GATE_RGBA));
 
 // ---- Lucide GitCompare (git-compare) -------------------------------
 
-#[cfg(test)]
 const LUCIDE_GIT_COMPARE_RGBA: &[u8] = include_bytes!("lucide_git_compare.rgba");
-
-const LUCIDE_GIT_COMPARE_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_git_compare_gate_active.rgba");
-static LUCIDE_GIT_COMPARE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_GIT_COMPARE_GATE_ACTIVE_RGBA));
-
-const LUCIDE_GIT_COMPARE_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_git_compare_gate_accent.rgba");
-static LUCIDE_GIT_COMPARE_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_GIT_COMPARE_GATE_ACCENT_RGBA));
-
 const LUCIDE_GIT_COMPARE_COMPACT_RGBA: &[u8] = include_bytes!("lucide_git_compare_compact.rgba");
 static LUCIDE_GIT_COMPARE_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_GIT_COMPARE_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_GIT_COMPARE_STRIP_RGBA: &[u8] = include_bytes!("lucide_git_compare_strip.rgba");
-
-const LUCIDE_GIT_COMPARE_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_git_compare_strip_gate.rgba");
-static LUCIDE_GIT_COMPARE_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_GIT_COMPARE_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_GIT_COMPARE_GALLERY_RGBA: &[u8] = include_bytes!("lucide_git_compare_gallery.rgba");
-
-const LUCIDE_GIT_COMPARE_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_git_compare_gallery_gate.rgba");
-static LUCIDE_GIT_COMPARE_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_GIT_COMPARE_GALLERY_GATE_RGBA));
 
 // ---- Lucide Repo (book-marked) -------------------------------------
 
-#[cfg(test)]
 const LUCIDE_REPO_RGBA: &[u8] = include_bytes!("lucide_repo.rgba");
-
-const LUCIDE_REPO_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_repo_gate_active.rgba");
-static LUCIDE_REPO_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_REPO_GATE_ACTIVE_RGBA));
-
-const LUCIDE_REPO_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_repo_gate_accent.rgba");
-static LUCIDE_REPO_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_REPO_GATE_ACCENT_RGBA));
-
 const LUCIDE_REPO_COMPACT_RGBA: &[u8] = include_bytes!("lucide_repo_compact.rgba");
 static LUCIDE_REPO_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_REPO_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_REPO_STRIP_RGBA: &[u8] = include_bytes!("lucide_repo_strip.rgba");
-
-const LUCIDE_REPO_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_repo_strip_gate.rgba");
-static LUCIDE_REPO_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_REPO_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_REPO_GALLERY_RGBA: &[u8] = include_bytes!("lucide_repo_gallery.rgba");
-
-const LUCIDE_REPO_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_repo_gallery_gate.rgba");
-static LUCIDE_REPO_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_REPO_GALLERY_GATE_RGBA));
 
 // ---- Lucide RepoForked (git-fork) ----------------------------------
 
-#[cfg(test)]
 const LUCIDE_REPO_FORKED_RGBA: &[u8] = include_bytes!("lucide_repo_forked.rgba");
-
-const LUCIDE_REPO_FORKED_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_repo_forked_gate_active.rgba");
-static LUCIDE_REPO_FORKED_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_REPO_FORKED_GATE_ACTIVE_RGBA));
-
-const LUCIDE_REPO_FORKED_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_repo_forked_gate_accent.rgba");
-static LUCIDE_REPO_FORKED_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_REPO_FORKED_GATE_ACCENT_RGBA));
-
 const LUCIDE_REPO_FORKED_COMPACT_RGBA: &[u8] = include_bytes!("lucide_repo_forked_compact.rgba");
 static LUCIDE_REPO_FORKED_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_REPO_FORKED_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_REPO_FORKED_STRIP_RGBA: &[u8] = include_bytes!("lucide_repo_forked_strip.rgba");
-
-const LUCIDE_REPO_FORKED_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_repo_forked_strip_gate.rgba");
-static LUCIDE_REPO_FORKED_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_REPO_FORKED_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_REPO_FORKED_GALLERY_RGBA: &[u8] = include_bytes!("lucide_repo_forked_gallery.rgba");
-
-const LUCIDE_REPO_FORKED_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_repo_forked_gallery_gate.rgba");
-static LUCIDE_REPO_FORKED_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_REPO_FORKED_GALLERY_GATE_RGBA));
 
 // ---- Lucide DebugStop (square) -------------------------------------
 
-#[cfg(test)]
 const LUCIDE_DEBUG_STOP_RGBA: &[u8] = include_bytes!("lucide_debug_stop.rgba");
-
-const LUCIDE_DEBUG_STOP_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_debug_stop_gate_active.rgba");
-static LUCIDE_DEBUG_STOP_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_DEBUG_STOP_GATE_ACTIVE_RGBA));
-
-const LUCIDE_DEBUG_STOP_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_debug_stop_gate_accent.rgba");
-static LUCIDE_DEBUG_STOP_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_DEBUG_STOP_GATE_ACCENT_RGBA));
-
 const LUCIDE_DEBUG_STOP_COMPACT_RGBA: &[u8] = include_bytes!("lucide_debug_stop_compact.rgba");
 static LUCIDE_DEBUG_STOP_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_DEBUG_STOP_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_DEBUG_STOP_STRIP_RGBA: &[u8] = include_bytes!("lucide_debug_stop_strip.rgba");
-
-const LUCIDE_DEBUG_STOP_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_debug_stop_strip_gate.rgba");
-static LUCIDE_DEBUG_STOP_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_DEBUG_STOP_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_DEBUG_STOP_GALLERY_RGBA: &[u8] = include_bytes!("lucide_debug_stop_gallery.rgba");
-
-const LUCIDE_DEBUG_STOP_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_debug_stop_gallery_gate.rgba");
-static LUCIDE_DEBUG_STOP_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_DEBUG_STOP_GALLERY_GATE_RGBA));
 
 // ---- Lucide DebugRestart (rotate-ccw) ------------------------------
 
-#[cfg(test)]
 const LUCIDE_DEBUG_RESTART_RGBA: &[u8] = include_bytes!("lucide_debug_restart.rgba");
-
-const LUCIDE_DEBUG_RESTART_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_debug_restart_gate_active.rgba");
-static LUCIDE_DEBUG_RESTART_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_DEBUG_RESTART_GATE_ACTIVE_RGBA));
-
-const LUCIDE_DEBUG_RESTART_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_debug_restart_gate_accent.rgba");
-static LUCIDE_DEBUG_RESTART_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_DEBUG_RESTART_GATE_ACCENT_RGBA));
-
 const LUCIDE_DEBUG_RESTART_COMPACT_RGBA: &[u8] = include_bytes!("lucide_debug_restart_compact.rgba");
 static LUCIDE_DEBUG_RESTART_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_DEBUG_RESTART_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_DEBUG_RESTART_STRIP_RGBA: &[u8] = include_bytes!("lucide_debug_restart_strip.rgba");
-
-const LUCIDE_DEBUG_RESTART_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_debug_restart_strip_gate.rgba");
-static LUCIDE_DEBUG_RESTART_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_DEBUG_RESTART_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_DEBUG_RESTART_GALLERY_RGBA: &[u8] = include_bytes!("lucide_debug_restart_gallery.rgba");
-
-const LUCIDE_DEBUG_RESTART_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_debug_restart_gallery_gate.rgba");
-static LUCIDE_DEBUG_RESTART_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_DEBUG_RESTART_GALLERY_GATE_RGBA));
 
 // ---- Lucide Edit (pencil) ------------------------------------------
 
-#[cfg(test)]
 const LUCIDE_EDIT_RGBA: &[u8] = include_bytes!("lucide_edit.rgba");
-
-const LUCIDE_EDIT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_edit_gate_active.rgba");
-static LUCIDE_EDIT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_EDIT_GATE_ACTIVE_RGBA));
-
-const LUCIDE_EDIT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_edit_gate_accent.rgba");
-static LUCIDE_EDIT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_EDIT_GATE_ACCENT_RGBA));
-
 const LUCIDE_EDIT_COMPACT_RGBA: &[u8] = include_bytes!("lucide_edit_compact.rgba");
 static LUCIDE_EDIT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_EDIT_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_EDIT_STRIP_RGBA: &[u8] = include_bytes!("lucide_edit_strip.rgba");
-
-const LUCIDE_EDIT_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_edit_strip_gate.rgba");
-static LUCIDE_EDIT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_EDIT_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_EDIT_GALLERY_RGBA: &[u8] = include_bytes!("lucide_edit_gallery.rgba");
-
-const LUCIDE_EDIT_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_edit_gallery_gate.rgba");
-static LUCIDE_EDIT_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_EDIT_GALLERY_GATE_RGBA));
 
 // ---- Lucide History (clock-fading) ---------------------------------
 
-#[cfg(test)]
 const LUCIDE_HISTORY_RGBA: &[u8] = include_bytes!("lucide_history.rgba");
-
-const LUCIDE_HISTORY_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_history_gate_active.rgba");
-static LUCIDE_HISTORY_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_HISTORY_GATE_ACTIVE_RGBA));
-
-const LUCIDE_HISTORY_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_history_gate_accent.rgba");
-static LUCIDE_HISTORY_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_HISTORY_GATE_ACCENT_RGBA));
-
 const LUCIDE_HISTORY_COMPACT_RGBA: &[u8] = include_bytes!("lucide_history_compact.rgba");
 static LUCIDE_HISTORY_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_HISTORY_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_HISTORY_STRIP_RGBA: &[u8] = include_bytes!("lucide_history_strip.rgba");
-
-const LUCIDE_HISTORY_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_history_strip_gate.rgba");
-static LUCIDE_HISTORY_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_HISTORY_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_HISTORY_GALLERY_RGBA: &[u8] = include_bytes!("lucide_history_gallery.rgba");
-
-const LUCIDE_HISTORY_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_history_gallery_gate.rgba");
-static LUCIDE_HISTORY_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_HISTORY_GALLERY_GATE_RGBA));
 
 // ---- Lucide Terminal (terminal) ------------------------------------
 
-#[cfg(test)]
 const LUCIDE_TERMINAL_RGBA: &[u8] = include_bytes!("lucide_terminal.rgba");
-
-const LUCIDE_TERMINAL_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_terminal_gate_active.rgba");
-static LUCIDE_TERMINAL_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_TERMINAL_GATE_ACTIVE_RGBA));
-
-const LUCIDE_TERMINAL_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_terminal_gate_accent.rgba");
-static LUCIDE_TERMINAL_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_TERMINAL_GATE_ACCENT_RGBA));
-
 const LUCIDE_TERMINAL_COMPACT_RGBA: &[u8] = include_bytes!("lucide_terminal_compact.rgba");
 static LUCIDE_TERMINAL_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_TERMINAL_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_TERMINAL_STRIP_RGBA: &[u8] = include_bytes!("lucide_terminal_strip.rgba");
-
-const LUCIDE_TERMINAL_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_terminal_strip_gate.rgba");
-static LUCIDE_TERMINAL_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_TERMINAL_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_TERMINAL_GALLERY_RGBA: &[u8] = include_bytes!("lucide_terminal_gallery.rgba");
-
-const LUCIDE_TERMINAL_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_terminal_gallery_gate.rgba");
-static LUCIDE_TERMINAL_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_TERMINAL_GALLERY_GATE_RGBA));
 
 // ---- Lucide Output (file-text) -------------------------------------
 
-#[cfg(test)]
 const LUCIDE_OUTPUT_RGBA: &[u8] = include_bytes!("lucide_output.rgba");
-
-const LUCIDE_OUTPUT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_output_gate_active.rgba");
-static LUCIDE_OUTPUT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_OUTPUT_GATE_ACTIVE_RGBA));
-
-const LUCIDE_OUTPUT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_output_gate_accent.rgba");
-static LUCIDE_OUTPUT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_OUTPUT_GATE_ACCENT_RGBA));
-
 const LUCIDE_OUTPUT_COMPACT_RGBA: &[u8] = include_bytes!("lucide_output_compact.rgba");
 static LUCIDE_OUTPUT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_OUTPUT_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_OUTPUT_STRIP_RGBA: &[u8] = include_bytes!("lucide_output_strip.rgba");
-
-const LUCIDE_OUTPUT_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_output_strip_gate.rgba");
-static LUCIDE_OUTPUT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_OUTPUT_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_OUTPUT_GALLERY_RGBA: &[u8] = include_bytes!("lucide_output_gallery.rgba");
-
-const LUCIDE_OUTPUT_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_output_gallery_gate.rgba");
-static LUCIDE_OUTPUT_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_OUTPUT_GALLERY_GATE_RGBA));
 
 // ---- Lucide CloudDownload (cloud-download) -------------------------
 
-#[cfg(test)]
 const LUCIDE_CLOUD_DOWNLOAD_RGBA: &[u8] = include_bytes!("lucide_cloud_download.rgba");
-
-const LUCIDE_CLOUD_DOWNLOAD_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_cloud_download_gate_active.rgba");
-static LUCIDE_CLOUD_DOWNLOAD_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_CLOUD_DOWNLOAD_GATE_ACTIVE_RGBA));
-
-const LUCIDE_CLOUD_DOWNLOAD_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_cloud_download_gate_accent.rgba");
-static LUCIDE_CLOUD_DOWNLOAD_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_CLOUD_DOWNLOAD_GATE_ACCENT_RGBA));
-
 const LUCIDE_CLOUD_DOWNLOAD_COMPACT_RGBA: &[u8] = include_bytes!("lucide_cloud_download_compact.rgba");
 static LUCIDE_CLOUD_DOWNLOAD_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_CLOUD_DOWNLOAD_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_CLOUD_DOWNLOAD_STRIP_RGBA: &[u8] = include_bytes!("lucide_cloud_download_strip.rgba");
-
-const LUCIDE_CLOUD_DOWNLOAD_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_cloud_download_strip_gate.rgba");
-static LUCIDE_CLOUD_DOWNLOAD_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_CLOUD_DOWNLOAD_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_CLOUD_DOWNLOAD_GALLERY_RGBA: &[u8] = include_bytes!("lucide_cloud_download_gallery.rgba");
-
-const LUCIDE_CLOUD_DOWNLOAD_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_cloud_download_gallery_gate.rgba");
-static LUCIDE_CLOUD_DOWNLOAD_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_CLOUD_DOWNLOAD_GALLERY_GATE_RGBA));
 
 // ---- Lucide Ellipsis (ellipsis) ------------------------------------
 
-#[cfg(test)]
 const LUCIDE_ELLIPSIS_RGBA: &[u8] = include_bytes!("lucide_ellipsis.rgba");
-
-const LUCIDE_ELLIPSIS_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_ellipsis_gate_active.rgba");
-static LUCIDE_ELLIPSIS_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_ELLIPSIS_GATE_ACTIVE_RGBA));
-
-const LUCIDE_ELLIPSIS_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_ellipsis_gate_accent.rgba");
-static LUCIDE_ELLIPSIS_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_ELLIPSIS_GATE_ACCENT_RGBA));
-
 const LUCIDE_ELLIPSIS_COMPACT_RGBA: &[u8] = include_bytes!("lucide_ellipsis_compact.rgba");
 static LUCIDE_ELLIPSIS_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_ELLIPSIS_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_ELLIPSIS_STRIP_RGBA: &[u8] = include_bytes!("lucide_ellipsis_strip.rgba");
-
-const LUCIDE_ELLIPSIS_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_ellipsis_strip_gate.rgba");
-static LUCIDE_ELLIPSIS_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_ELLIPSIS_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_ELLIPSIS_GALLERY_RGBA: &[u8] = include_bytes!("lucide_ellipsis_gallery.rgba");
-
-const LUCIDE_ELLIPSIS_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_ellipsis_gallery_gate.rgba");
-static LUCIDE_ELLIPSIS_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_ELLIPSIS_GALLERY_GATE_RGBA));
 
 // ---- Lucide Link (link) --------------------------------------------
 
-#[cfg(test)]
 const LUCIDE_LINK_RGBA: &[u8] = include_bytes!("lucide_link.rgba");
-
-const LUCIDE_LINK_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_link_gate_active.rgba");
-static LUCIDE_LINK_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_LINK_GATE_ACTIVE_RGBA));
-
-const LUCIDE_LINK_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_link_gate_accent.rgba");
-static LUCIDE_LINK_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_LINK_GATE_ACCENT_RGBA));
-
 const LUCIDE_LINK_COMPACT_RGBA: &[u8] = include_bytes!("lucide_link_compact.rgba");
 static LUCIDE_LINK_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_LINK_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_LINK_STRIP_RGBA: &[u8] = include_bytes!("lucide_link_strip.rgba");
-
-const LUCIDE_LINK_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_link_strip_gate.rgba");
-static LUCIDE_LINK_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_LINK_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_LINK_GALLERY_RGBA: &[u8] = include_bytes!("lucide_link_gallery.rgba");
-
-const LUCIDE_LINK_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_link_gallery_gate.rgba");
-static LUCIDE_LINK_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_LINK_GALLERY_GATE_RGBA));
 
 // ---- Lucide CircleSlash (circle-slash) -----------------------------
 
-#[cfg(test)]
 const LUCIDE_CIRCLE_SLASH_RGBA: &[u8] = include_bytes!("lucide_circle_slash.rgba");
-
-const LUCIDE_CIRCLE_SLASH_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_circle_slash_gate_active.rgba");
-static LUCIDE_CIRCLE_SLASH_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_CIRCLE_SLASH_GATE_ACTIVE_RGBA));
-
-const LUCIDE_CIRCLE_SLASH_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_circle_slash_gate_accent.rgba");
-static LUCIDE_CIRCLE_SLASH_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_CIRCLE_SLASH_GATE_ACCENT_RGBA));
-
 const LUCIDE_CIRCLE_SLASH_COMPACT_RGBA: &[u8] = include_bytes!("lucide_circle_slash_compact.rgba");
 static LUCIDE_CIRCLE_SLASH_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_CIRCLE_SLASH_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_CIRCLE_SLASH_STRIP_RGBA: &[u8] = include_bytes!("lucide_circle_slash_strip.rgba");
-
-const LUCIDE_CIRCLE_SLASH_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_circle_slash_strip_gate.rgba");
-static LUCIDE_CIRCLE_SLASH_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_CIRCLE_SLASH_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_CIRCLE_SLASH_GALLERY_RGBA: &[u8] = include_bytes!("lucide_circle_slash_gallery.rgba");
-
-const LUCIDE_CIRCLE_SLASH_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_circle_slash_gallery_gate.rgba");
-static LUCIDE_CIRCLE_SLASH_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_CIRCLE_SLASH_GALLERY_GATE_RGBA));
 
 // ---- Lucide Warning (triangle-alert) -------------------------------
 
-#[cfg(test)]
 const LUCIDE_WARNING_RGBA: &[u8] = include_bytes!("lucide_warning.rgba");
-
-const LUCIDE_WARNING_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_warning_gate_active.rgba");
-static LUCIDE_WARNING_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_WARNING_GATE_ACTIVE_RGBA));
-
-const LUCIDE_WARNING_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_warning_gate_accent.rgba");
-static LUCIDE_WARNING_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_WARNING_GATE_ACCENT_RGBA));
-
 const LUCIDE_WARNING_COMPACT_RGBA: &[u8] = include_bytes!("lucide_warning_compact.rgba");
 static LUCIDE_WARNING_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_WARNING_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_WARNING_STRIP_RGBA: &[u8] = include_bytes!("lucide_warning_strip.rgba");
-
-const LUCIDE_WARNING_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_warning_strip_gate.rgba");
-static LUCIDE_WARNING_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_WARNING_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_WARNING_GALLERY_RGBA: &[u8] = include_bytes!("lucide_warning_gallery.rgba");
-
-const LUCIDE_WARNING_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_warning_gallery_gate.rgba");
-static LUCIDE_WARNING_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_WARNING_GALLERY_GATE_RGBA));
 
 // ---- Lucide Error (octagon-alert) ----------------------------------
 
-#[cfg(test)]
 const LUCIDE_ERROR_RGBA: &[u8] = include_bytes!("lucide_error.rgba");
-
-const LUCIDE_ERROR_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_error_gate_active.rgba");
-static LUCIDE_ERROR_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_ERROR_GATE_ACTIVE_RGBA));
-
-const LUCIDE_ERROR_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_error_gate_accent.rgba");
-static LUCIDE_ERROR_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_ERROR_GATE_ACCENT_RGBA));
-
 const LUCIDE_ERROR_COMPACT_RGBA: &[u8] = include_bytes!("lucide_error_compact.rgba");
 static LUCIDE_ERROR_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_ERROR_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_ERROR_STRIP_RGBA: &[u8] = include_bytes!("lucide_error_strip.rgba");
-
-const LUCIDE_ERROR_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_error_strip_gate.rgba");
-static LUCIDE_ERROR_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_ERROR_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_ERROR_GALLERY_RGBA: &[u8] = include_bytes!("lucide_error_gallery.rgba");
-
-const LUCIDE_ERROR_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_error_gallery_gate.rgba");
-static LUCIDE_ERROR_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_ERROR_GALLERY_GATE_RGBA));
 
 // ---- Lucide Info (info) --------------------------------------------
 
-#[cfg(test)]
 const LUCIDE_INFO_RGBA: &[u8] = include_bytes!("lucide_info.rgba");
-
-const LUCIDE_INFO_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_info_gate_active.rgba");
-static LUCIDE_INFO_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_INFO_GATE_ACTIVE_RGBA));
-
-const LUCIDE_INFO_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_info_gate_accent.rgba");
-static LUCIDE_INFO_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_INFO_GATE_ACCENT_RGBA));
-
 const LUCIDE_INFO_COMPACT_RGBA: &[u8] = include_bytes!("lucide_info_compact.rgba");
 static LUCIDE_INFO_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_INFO_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_INFO_STRIP_RGBA: &[u8] = include_bytes!("lucide_info_strip.rgba");
-
-const LUCIDE_INFO_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_info_strip_gate.rgba");
-static LUCIDE_INFO_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_INFO_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_INFO_GALLERY_RGBA: &[u8] = include_bytes!("lucide_info_gallery.rgba");
-
-const LUCIDE_INFO_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_info_gallery_gate.rgba");
-static LUCIDE_INFO_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_INFO_GALLERY_GATE_RGBA));
 
 // ---- Lucide Play (play) --------------------------------------------
 
-#[cfg(test)]
 const LUCIDE_PLAY_RGBA: &[u8] = include_bytes!("lucide_play.rgba");
-
-const LUCIDE_PLAY_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_play_gate_active.rgba");
-static LUCIDE_PLAY_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_PLAY_GATE_ACTIVE_RGBA));
-
-const LUCIDE_PLAY_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_play_gate_accent.rgba");
-static LUCIDE_PLAY_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_PLAY_GATE_ACCENT_RGBA));
-
 const LUCIDE_PLAY_COMPACT_RGBA: &[u8] = include_bytes!("lucide_play_compact.rgba");
 static LUCIDE_PLAY_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_PLAY_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_PLAY_STRIP_RGBA: &[u8] = include_bytes!("lucide_play_strip.rgba");
-
-const LUCIDE_PLAY_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_play_strip_gate.rgba");
-static LUCIDE_PLAY_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_PLAY_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_PLAY_GALLERY_RGBA: &[u8] = include_bytes!("lucide_play_gallery.rgba");
-
-const LUCIDE_PLAY_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_play_gallery_gate.rgba");
-static LUCIDE_PLAY_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_PLAY_GALLERY_GATE_RGBA));
 
 // ---- Lucide Sync (refresh-ccw) -------------------------------------
 
-#[cfg(test)]
 const LUCIDE_SYNC_RGBA: &[u8] = include_bytes!("lucide_sync.rgba");
-
-const LUCIDE_SYNC_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_sync_gate_active.rgba");
-static LUCIDE_SYNC_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_SYNC_GATE_ACTIVE_RGBA));
-
-const LUCIDE_SYNC_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_sync_gate_accent.rgba");
-static LUCIDE_SYNC_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_SYNC_GATE_ACCENT_RGBA));
-
 const LUCIDE_SYNC_COMPACT_RGBA: &[u8] = include_bytes!("lucide_sync_compact.rgba");
 static LUCIDE_SYNC_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_SYNC_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_SYNC_STRIP_RGBA: &[u8] = include_bytes!("lucide_sync_strip.rgba");
-
-const LUCIDE_SYNC_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_sync_strip_gate.rgba");
-static LUCIDE_SYNC_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_SYNC_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_SYNC_GALLERY_RGBA: &[u8] = include_bytes!("lucide_sync_gallery.rgba");
-
-const LUCIDE_SYNC_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_sync_gallery_gate.rgba");
-static LUCIDE_SYNC_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_SYNC_GALLERY_GATE_RGBA));
 
 // ---- Lucide GoToFile (file-symlink) --------------------------------
 
-#[cfg(test)]
 const LUCIDE_GO_TO_FILE_RGBA: &[u8] = include_bytes!("lucide_go_to_file.rgba");
-
-const LUCIDE_GO_TO_FILE_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_go_to_file_gate_active.rgba");
-static LUCIDE_GO_TO_FILE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_GO_TO_FILE_GATE_ACTIVE_RGBA));
-
-const LUCIDE_GO_TO_FILE_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_go_to_file_gate_accent.rgba");
-static LUCIDE_GO_TO_FILE_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_GO_TO_FILE_GATE_ACCENT_RGBA));
-
 const LUCIDE_GO_TO_FILE_COMPACT_RGBA: &[u8] = include_bytes!("lucide_go_to_file_compact.rgba");
 static LUCIDE_GO_TO_FILE_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_GO_TO_FILE_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_GO_TO_FILE_STRIP_RGBA: &[u8] = include_bytes!("lucide_go_to_file_strip.rgba");
-
-const LUCIDE_GO_TO_FILE_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_go_to_file_strip_gate.rgba");
-static LUCIDE_GO_TO_FILE_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_GO_TO_FILE_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_GO_TO_FILE_GALLERY_RGBA: &[u8] = include_bytes!("lucide_go_to_file_gallery.rgba");
-
-const LUCIDE_GO_TO_FILE_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_go_to_file_gallery_gate.rgba");
-static LUCIDE_GO_TO_FILE_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_GO_TO_FILE_GALLERY_GATE_RGBA));
 
 // ---- Lucide Pulse (activity) ---------------------------------------
 
-#[cfg(test)]
 const LUCIDE_PULSE_RGBA: &[u8] = include_bytes!("lucide_pulse.rgba");
-
-const LUCIDE_PULSE_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_pulse_gate_active.rgba");
-static LUCIDE_PULSE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_PULSE_GATE_ACTIVE_RGBA));
-
-const LUCIDE_PULSE_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_pulse_gate_accent.rgba");
-static LUCIDE_PULSE_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_PULSE_GATE_ACCENT_RGBA));
-
 const LUCIDE_PULSE_COMPACT_RGBA: &[u8] = include_bytes!("lucide_pulse_compact.rgba");
 static LUCIDE_PULSE_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_PULSE_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_PULSE_STRIP_RGBA: &[u8] = include_bytes!("lucide_pulse_strip.rgba");
-
-const LUCIDE_PULSE_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_pulse_strip_gate.rgba");
-static LUCIDE_PULSE_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_PULSE_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_PULSE_GALLERY_RGBA: &[u8] = include_bytes!("lucide_pulse_gallery.rgba");
-
-const LUCIDE_PULSE_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_pulse_gallery_gate.rgba");
-static LUCIDE_PULSE_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_PULSE_GALLERY_GATE_RGBA));
 
 // ---- Lucide Checklist (list-checks) --------------------------------
 
-#[cfg(test)]
 const LUCIDE_CHECKLIST_RGBA: &[u8] = include_bytes!("lucide_checklist.rgba");
-
-const LUCIDE_CHECKLIST_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_checklist_gate_active.rgba");
-static LUCIDE_CHECKLIST_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_CHECKLIST_GATE_ACTIVE_RGBA));
-
-const LUCIDE_CHECKLIST_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_checklist_gate_accent.rgba");
-static LUCIDE_CHECKLIST_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_CHECKLIST_GATE_ACCENT_RGBA));
-
 const LUCIDE_CHECKLIST_COMPACT_RGBA: &[u8] = include_bytes!("lucide_checklist_compact.rgba");
 static LUCIDE_CHECKLIST_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_CHECKLIST_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_CHECKLIST_STRIP_RGBA: &[u8] = include_bytes!("lucide_checklist_strip.rgba");
-
-const LUCIDE_CHECKLIST_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_checklist_strip_gate.rgba");
-static LUCIDE_CHECKLIST_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_CHECKLIST_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_CHECKLIST_GALLERY_RGBA: &[u8] = include_bytes!("lucide_checklist_gallery.rgba");
-
-const LUCIDE_CHECKLIST_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_checklist_gallery_gate.rgba");
-static LUCIDE_CHECKLIST_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_CHECKLIST_GALLERY_GATE_RGBA));
 
 // ---- Lucide Eye (eye) ----------------------------------------------
 
-#[cfg(test)]
 const LUCIDE_EYE_RGBA: &[u8] = include_bytes!("lucide_eye.rgba");
-
-const LUCIDE_EYE_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_eye_gate_active.rgba");
-static LUCIDE_EYE_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_EYE_GATE_ACTIVE_RGBA));
-
-const LUCIDE_EYE_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_eye_gate_accent.rgba");
-static LUCIDE_EYE_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_EYE_GATE_ACCENT_RGBA));
-
 const LUCIDE_EYE_COMPACT_RGBA: &[u8] = include_bytes!("lucide_eye_compact.rgba");
 static LUCIDE_EYE_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_EYE_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_EYE_STRIP_RGBA: &[u8] = include_bytes!("lucide_eye_strip.rgba");
-
-const LUCIDE_EYE_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_eye_strip_gate.rgba");
-static LUCIDE_EYE_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_EYE_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_EYE_GALLERY_RGBA: &[u8] = include_bytes!("lucide_eye_gallery.rgba");
-
-const LUCIDE_EYE_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_eye_gallery_gate.rgba");
-static LUCIDE_EYE_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_EYE_GALLERY_GATE_RGBA));
 
 // ---- Lucide Layout (layout-grid) -----------------------------------
 
-#[cfg(test)]
 const LUCIDE_LAYOUT_RGBA: &[u8] = include_bytes!("lucide_layout.rgba");
-
-const LUCIDE_LAYOUT_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_layout_gate_active.rgba");
-static LUCIDE_LAYOUT_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_LAYOUT_GATE_ACTIVE_RGBA));
-
-const LUCIDE_LAYOUT_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_layout_gate_accent.rgba");
-static LUCIDE_LAYOUT_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_LAYOUT_GATE_ACCENT_RGBA));
-
 const LUCIDE_LAYOUT_COMPACT_RGBA: &[u8] = include_bytes!("lucide_layout_compact.rgba");
 static LUCIDE_LAYOUT_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_LAYOUT_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_LAYOUT_STRIP_RGBA: &[u8] = include_bytes!("lucide_layout_strip.rgba");
-
-const LUCIDE_LAYOUT_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_layout_strip_gate.rgba");
-static LUCIDE_LAYOUT_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_LAYOUT_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_LAYOUT_GALLERY_RGBA: &[u8] = include_bytes!("lucide_layout_gallery.rgba");
-
-const LUCIDE_LAYOUT_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_layout_gallery_gate.rgba");
-static LUCIDE_LAYOUT_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_LAYOUT_GALLERY_GATE_RGBA));
 
 // ---- Lucide SplitHorizontal (square-split-horizontal) --------------
 
-#[cfg(test)]
 const LUCIDE_SPLIT_HORIZONTAL_RGBA: &[u8] = include_bytes!("lucide_split_horizontal.rgba");
-
-const LUCIDE_SPLIT_HORIZONTAL_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_split_horizontal_gate_active.rgba");
-static LUCIDE_SPLIT_HORIZONTAL_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_SPLIT_HORIZONTAL_GATE_ACTIVE_RGBA));
-
-const LUCIDE_SPLIT_HORIZONTAL_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_split_horizontal_gate_accent.rgba");
-static LUCIDE_SPLIT_HORIZONTAL_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_SPLIT_HORIZONTAL_GATE_ACCENT_RGBA));
-
 const LUCIDE_SPLIT_HORIZONTAL_COMPACT_RGBA: &[u8] = include_bytes!("lucide_split_horizontal_compact.rgba");
 static LUCIDE_SPLIT_HORIZONTAL_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_SPLIT_HORIZONTAL_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_SPLIT_HORIZONTAL_STRIP_RGBA: &[u8] = include_bytes!("lucide_split_horizontal_strip.rgba");
-
-const LUCIDE_SPLIT_HORIZONTAL_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_split_horizontal_strip_gate.rgba");
-static LUCIDE_SPLIT_HORIZONTAL_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_SPLIT_HORIZONTAL_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_SPLIT_HORIZONTAL_GALLERY_RGBA: &[u8] = include_bytes!("lucide_split_horizontal_gallery.rgba");
-
-const LUCIDE_SPLIT_HORIZONTAL_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_split_horizontal_gallery_gate.rgba");
-static LUCIDE_SPLIT_HORIZONTAL_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_SPLIT_HORIZONTAL_GALLERY_GATE_RGBA));
 
 // ---- Lucide SplitVertical (square-split-vertical) ------------------
 
-#[cfg(test)]
 const LUCIDE_SPLIT_VERTICAL_RGBA: &[u8] = include_bytes!("lucide_split_vertical.rgba");
-
-const LUCIDE_SPLIT_VERTICAL_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_split_vertical_gate_active.rgba");
-static LUCIDE_SPLIT_VERTICAL_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_SPLIT_VERTICAL_GATE_ACTIVE_RGBA));
-
-const LUCIDE_SPLIT_VERTICAL_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_split_vertical_gate_accent.rgba");
-static LUCIDE_SPLIT_VERTICAL_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_SPLIT_VERTICAL_GATE_ACCENT_RGBA));
-
 const LUCIDE_SPLIT_VERTICAL_COMPACT_RGBA: &[u8] = include_bytes!("lucide_split_vertical_compact.rgba");
 static LUCIDE_SPLIT_VERTICAL_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_SPLIT_VERTICAL_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_SPLIT_VERTICAL_STRIP_RGBA: &[u8] = include_bytes!("lucide_split_vertical_strip.rgba");
-
-const LUCIDE_SPLIT_VERTICAL_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_split_vertical_strip_gate.rgba");
-static LUCIDE_SPLIT_VERTICAL_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_SPLIT_VERTICAL_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_SPLIT_VERTICAL_GALLERY_RGBA: &[u8] = include_bytes!("lucide_split_vertical_gallery.rgba");
-
-const LUCIDE_SPLIT_VERTICAL_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_split_vertical_gallery_gate.rgba");
-static LUCIDE_SPLIT_VERTICAL_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_SPLIT_VERTICAL_GALLERY_GATE_RGBA));
 
 // ---- Lucide Preview (monitor) --------------------------------------
 
-#[cfg(test)]
 const LUCIDE_PREVIEW_RGBA: &[u8] = include_bytes!("lucide_preview.rgba");
-
-const LUCIDE_PREVIEW_GATE_ACTIVE_RGBA: &[u8] = include_bytes!("lucide_preview_gate_active.rgba");
-static LUCIDE_PREVIEW_SIXEL_GATE_ACTIVE: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_PREVIEW_GATE_ACTIVE_RGBA));
-
-const LUCIDE_PREVIEW_GATE_ACCENT_RGBA: &[u8] = include_bytes!("lucide_preview_gate_accent.rgba");
-static LUCIDE_PREVIEW_SIXEL_GATE_ACCENT: LazyLock<String> = LazyLock::new(|| build_sixel_gate(LUCIDE_PREVIEW_GATE_ACCENT_RGBA));
-
 const LUCIDE_PREVIEW_COMPACT_RGBA: &[u8] = include_bytes!("lucide_preview_compact.rgba");
 static LUCIDE_PREVIEW_SIXEL_COMPACT: LazyLock<String> = LazyLock::new(|| build_sixel_compact(LUCIDE_PREVIEW_COMPACT_RGBA));
-
-#[cfg(test)]
 const LUCIDE_PREVIEW_STRIP_RGBA: &[u8] = include_bytes!("lucide_preview_strip.rgba");
-
-const LUCIDE_PREVIEW_STRIP_GATE_RGBA: &[u8] = include_bytes!("lucide_preview_strip_gate.rgba");
-static LUCIDE_PREVIEW_SIXEL_STRIP_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_strip_gate(LUCIDE_PREVIEW_STRIP_GATE_RGBA));
-
-#[cfg(test)]
 const LUCIDE_PREVIEW_GALLERY_RGBA: &[u8] = include_bytes!("lucide_preview_gallery.rgba");
-
-const LUCIDE_PREVIEW_GALLERY_GATE_RGBA: &[u8] = include_bytes!("lucide_preview_gallery_gate.rgba");
-static LUCIDE_PREVIEW_SIXEL_GALLERY_GATE: LazyLock<String> = LazyLock::new(|| build_sixel_gallery_gate(LUCIDE_PREVIEW_GALLERY_GATE_RGBA));
 

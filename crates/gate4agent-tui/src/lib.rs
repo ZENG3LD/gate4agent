@@ -7,6 +7,7 @@ pub mod platform;
 pub mod preferences;
 pub mod render;
 pub mod surface;
+pub mod terminal_bg;
 pub mod text_editor;
 
 pub use app::{

@@ -77,30 +77,65 @@
 //! anti-aliasing cannot survive this encoder in alpha, only in RGB (see
 //! `tools/bake_icons.py`'s own header doc comment, cause 1, for the full
 //! diagnosis). The fix is to composite every rail/strip/gallery sixel-tier
-//! icon over the EXACT background colour its button paints, fully opaque,
-//! so there is no transparent pixel left for the encoder's threshold to
-//! drop and the anti-aliasing this buys back rides in RGB instead, where
-//! that threshold cannot touch it. This USED to apply only where the
-//! background was a fixed, known constant (`PtyColorMode::GateOverride`'s
-//! own theme) -- `PtyColorMode::Inherited` read as having no knowable
-//! background at bake OR render time (crossterm has no reliable query,
-//! the same epistemic gap [`ASSUMED_CELL_WIDTH_PX`]'s own doc comment
-//! already names for cell-pixel size). That premise was the actual bug:
-//! the background was never unknowable at render time, only un-painted.
-//! `render::render_rail_button`/`render_control_strip_button`/the icon
-//! gallery swatches now paint an EXPLICIT truecolor background
-//! unconditionally, in every `PtyColorMode` -- the button states what its
-//! own background is instead of leaving it to the terminal, so it is
-//! always known at bake time too, and there is exactly one composited
-//! variant per background to request. [`SixelVariant`] now only spans
-//! those backgrounds (`GateActive`/`GateAccent`) -- there is no more
-//! `Transparent` case, and no more per-`PtyColorMode` branch, for the
-//! rail/strip/gallery tiers this covers. The compact tier stays out of
-//! scope (see `render::render_compact_icon_button`'s own doc comment) and
-//! keeps real transparency, encoded with `BackgroundMode::Transparent`,
-//! since it has no single known background to paint at all. The ascii
-//! tier needs no equivalent of any of this: it is plain themed text drawn
-//! directly with the button's own background style, not a raster image.
+//! icon over the EXACT background colour its button actually shows there,
+//! fully opaque, so there is no transparent pixel left for the encoder's
+//! threshold to drop and the anti-aliasing this buys back rides in RGB
+//! instead, where that threshold cannot touch it.
+//!
+//! FIRST ITERATION (retired) painted an EXPLICIT truecolor background
+//! (`SIDEBAR_BG`/`ACTIVE_BG`) unconditionally across the rail column, the
+//! control-plane strip row, and the icon gallery's own swatch band, in
+//! EVERY `PtyColorMode` -- including `PtyColorMode::Inherited`, where the
+//! terminal's own real background had never actually been stated before.
+//! That traded the original dirty-edge defect for a NEW one: on the
+//! owner's own terminal the real background measured (12,12,12), nowhere
+//! close to `ACTIVE_BG`'s (30,30,46), so the rail read as a visibly
+//! LIGHTER "plate" standing out against the actually-darker surface
+//! around it -- correct compositing arithmetic against the WRONG colour.
+//!
+//! CURRENT FIX: [`crate::terminal_bg`] queries the terminal's own real
+//! background once at startup (OSC 11, before `client::run` ever touches
+//! raw mode or the alternate screen -- see that module's own doc comment
+//! for the full exchange and why it must run that early), and the rail
+//! column/strip row/gallery band go back to INHERITING their surrounding
+//! panel's own background (`theme.panel`/`theme.surface`) instead of
+//! stating one -- see `render::render_activity_rail`/`render_control_
+//! strip`/`render_icon_gallery`'s own doc comments. A sixel icon still
+//! needs a concrete, known RGB to composite against (real transparency
+//! is not achievable through this encoder at all -- the whole reason this
+//! section exists), so [`composite_over_background`] now runs at RENDER
+//! time, in Rust, against whichever concrete background a given
+//! placement's [`SixelVariant`] actually resolves to right now
+//! (`resolve_variant_background`) -- the queried/fallback terminal colour
+//! for an un-selected button in `PtyColorMode::Inherited` (matching
+//! `theme.active`'s own `Color::Reset`), `PtyColorMode::GateOverride`'s
+//! own fixed, deliberate theme colour for that same un-selected case
+//! (matching `theme.active`'s own stated `ACTIVE_BG` there), or the fixed
+//! selected-state accent (`MAUVE`) wherever a button genuinely IS
+//! selected, in either mode -- never a bake-time constant. Every icon's
+//! encode is cached (keyed by icon, tier, family, and the resolved
+//! background RGB, [`cached_composited_sixel`]) so this still only costs
+//! real work once per distinct combination actually seen, not once per
+//! frame -- see that function's own doc comment.
+//!
+//! An UN-SELECTED button reading as visually flat with its own column is
+//! the point, not a regression: only a SELECTED rail button is a real,
+//! deliberate state the owner should be able to see at a glance, so only
+//! that state states a colour of its own ([`SixelVariant::GateAccent`]);
+//! an at-rest button asking for anything OTHER than what its own column
+//! already shows is the exact same plate defect one level down. The
+//! control-plane strip (no selected state at all) and the icon gallery (a
+//! read-only comparison grid, also no selected state) follow the SAME
+//! rule for the SAME reason -- every placement they push is
+//! [`SixelVariant::GateActive`], resolved the identical way.
+//!
+//! The compact tier stays out of scope (see `render::render_compact_icon_
+//! button`'s own doc comment) and keeps real transparency, encoded with
+//! `BackgroundMode::Transparent`, since it has no single known background
+//! to paint at all -- unaffected by any of this, unchanged since before
+//! cause 1's own first iteration. The ascii tier needs no equivalent of
+//! any of this either: it is plain themed text drawn directly with the
+//! button's own background style, not a raster image.
 //!
 //! ## Lucide (a second family, alongside codicons -- [`IconFamily`])
 //!
@@ -133,10 +168,11 @@
 //! Lucide glyph distinctly means "run everything" rather than colliding
 //! with `Play`'s own meaning) are a REPORTED gap
 //! (`tools/bake_icons.py::LUCIDE_GAPS`), never an approximate
-//! substitution -- [`sixel_lucide`]/[`sixel_strip_lucide`]/
-//! [`sixel_gallery_lucide`]/[`sixel_compact_lucide`] return `None` for
-//! them rather than silently resolving to something the wrong shape
-//! implies. `render::render_gallery_size_swatch` is the one call site
+//! substitution -- [`sixel_family`]/[`sixel_strip_family`]/
+//! [`sixel_gallery_family`]/[`sixel_compact_family`] (called with
+//! `family: IconFamily::Lucide`) return `None` for them rather than
+//! silently resolving to something the wrong shape implies.
+//! `render::render_gallery_size_swatch` is the one call site
 //! that can actually observe a `None` today (the icon gallery includes
 //! both gap icons specifically so the gap itself is visible, not just
 //! documented) -- it paints a plain `n/a` label instead of a placement.
@@ -158,13 +194,16 @@
 //! knob this constant feeds -- see that type's own doc comment for why
 //! only this ONE value is offered today.
 
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
+
 use icy_sixel::{BackgroundMode, EncodeOptions, SixelImage};
 
-use crate::app::IconFamily;
+use crate::app::{IconFamily, PtyColorMode};
 
 mod catalog;
 
-pub use catalog::{ascii, lucide_slug, sixel, sixel_compact, sixel_gallery, sixel_strip, IconId};
+pub use catalog::{ascii, lucide_slug, sixel_compact, IconId};
 
 /// Hand-synced with `tools/bake_icons.py::LUCIDE_STROKE_WIDTH` -- see
 /// this module's own "Lucide" doc section above for the exact arithmetic
@@ -177,46 +216,149 @@ pub use catalog::{ascii, lucide_slug, sixel, sixel_compact, sixel_gallery, sixel
 /// without hand-copying the number a second time into a test literal.
 pub const LUCIDE_STROKE_WIDTH: f32 = 1.5;
 
-/// Resolves `id`'s rail-tier sixel string in `family` -- `Codicons`
-/// always resolves ([`sixel`] has no gap to report); `Lucide` resolves
-/// via [`catalog::sixel_lucide`], `None` for the two documented mapping
-/// gaps (see this module's own "Lucide" doc section). The ONLY place
-/// `family` actually changes which catalog a sixel-tier placement reads
-/// from -- `client::flush_sixel_icon_into` calls this (and its `_strip`/
-/// `_gallery`/`_compact` siblings below) instead of the bare, codicon-
-/// only [`sixel`]/[`sixel_strip`]/[`sixel_gallery`]/[`sixel_compact`],
-/// which stay exactly as they were (still used directly by this crate's
-/// own pre-existing tests) for exactly that reason: adding a family
-/// dimension must never change what a codicon-only call already resolved
-/// to, byte for byte.
-pub fn sixel_family(id: IconId, family: IconFamily, variant: SixelVariant) -> Option<&'static str> {
-    match family {
-        IconFamily::Codicons => Some(sixel(id, variant)),
-        IconFamily::Lucide => catalog::sixel_lucide(id, variant),
+/// The rail's own fixed "selected" accent colour (hand-synced to
+/// `render::MAUVE`/`theme.accent` -- see this crate's own "Sixel
+/// background variants" doc section above for why this one stays a
+/// stated constant in every `PtyColorMode` while the at-rest case does
+/// not: a selected button reading as selected is a real, deliberate
+/// state the owner should see, regardless of which mode is active).
+pub(crate) const ACCENT_BG: (u8, u8, u8) = (203, 166, 247);
+
+/// `PtyColorMode::GateOverride`'s own fixed, deliberate "at rest"
+/// background (hand-synced to `render::ACTIVE_BG`/`theme.active` in that
+/// mode) -- this mode never defers to the terminal's own real background
+/// at all, so this is a real stated constant, never resolved from a
+/// query. `PtyColorMode::Inherited`'s own at-rest case has no equivalent
+/// constant here: it resolves to whatever `crate::terminal_bg` already
+/// determined the terminal's own real background to be (queried or
+/// [`crate::terminal_bg::FALLBACK_BACKGROUND`]) -- see
+/// [`resolve_variant_background`].
+pub(crate) const OVERRIDE_ACTIVE_BG: (u8, u8, u8) = (30, 30, 46);
+
+/// Resolves `variant` to the concrete RGB an icon-bearing button must be
+/// composited against RIGHT NOW -- see this module's own "Sixel
+/// background variants" doc section above for the full reasoning.
+/// `terminal_background` is the app's own already-resolved
+/// `crate::terminal_bg` result (a live OSC 11 query or its dark
+/// fallback, decided once at startup); this function never queries
+/// anything itself; it only decides which of the state's own known
+/// colours applies to `variant` given `mode`.
+pub fn resolve_variant_background(
+    variant: SixelVariant,
+    mode: PtyColorMode,
+    terminal_background: (u8, u8, u8),
+) -> (u8, u8, u8) {
+    match variant {
+        SixelVariant::GateAccent => ACCENT_BG,
+        SixelVariant::GateActive => match mode {
+            PtyColorMode::GateOverride => OVERRIDE_ACTIVE_BG,
+            PtyColorMode::Inherited => terminal_background,
+        },
     }
+}
+
+/// Rail/strip/gallery -- the three sixel tiers that composite against a
+/// caller-supplied background at all (the compact tier stays real-
+/// transparent, see [`sixel_compact_family`]) -- distinguished here
+/// purely as a [`SIXEL_CACHE`] key component, so the SAME `(id, family,
+/// background)` triple at two different tiers (different pixel
+/// dimensions, different raw source bytes) never collides on one cache
+/// entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+enum CacheTier {
+    Rail,
+    Strip,
+    Gallery,
+}
+
+type SixelCacheKey = (IconId, CacheTier, IconFamily, (u8, u8, u8));
+
+/// The runtime compositing cache this module's own "Sixel background
+/// variants" doc section promises: "only a handful of distinct
+/// backgrounds ever occur, so this costs almost nothing" holds because
+/// every entry is computed AT MOST once per `(icon, tier, family,
+/// background)` combination actually requested, ever, for the lifetime
+/// of the process -- a repaint that re-requests an already-cached
+/// combination (the overwhelmingly common case: the terminal's own real
+/// background does not change mid-session, and there are only ever two
+/// live background values at once, [`OVERRIDE_ACTIVE_BG`]-or-queried and
+/// [`ACCENT_BG`]) is an `Arc::clone`, not a re-composite-and-re-encode.
+/// `std::sync::Mutex`, not `tokio::sync::Mutex`: every access happens
+/// synchronously inside `client::flush_sixel_icon_into`'s own call chain
+/// (never awaited across), the same single-threaded render loop that
+/// already owns every other piece of this crate's own mutable UI state.
+static SIXEL_CACHE: LazyLock<Mutex<HashMap<SixelCacheKey, Arc<str>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Composites `raw` (a `width`x`height` straight-alpha true-coverage
+/// buffer -- see [`composite_over_background`]) against `background` and
+/// sixel-encodes the result, or returns the already-cached encode for
+/// this exact `(id, tier, family, background)` combination -- see
+/// [`SIXEL_CACHE`]'s own doc comment for why a cache hit is cheap and how
+/// rarely a miss actually happens. Recovers from a poisoned lock via
+/// `into_inner` rather than propagating the panic that poisoned it: this
+/// cache holds no invariant a poisoned insert could violate (a `HashMap`
+/// entry is either present and valid or absent, nothing in between), so
+/// treating "some other caller panicked while holding this lock" as "the
+/// cache looks exactly like it did just before that" is safe.
+fn cached_composited_sixel(
+    id: IconId,
+    tier: CacheTier,
+    family: IconFamily,
+    background: (u8, u8, u8),
+    raw: &[u8],
+    width: u32,
+    height: u32,
+) -> Arc<str> {
+    let key = (id, tier, family, background);
+    let mut cache = SIXEL_CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    Arc::clone(cache.entry(key).or_insert_with(|| {
+        let composited = composite_over_background(raw, background);
+        Arc::from(build_sixel_sized(&composited, width, height, BackgroundMode::Opaque))
+    }))
+}
+
+/// Resolves `id`'s rail-tier sixel string in `family`, composited against
+/// `background` -- `Codicons` always resolves (no gap to report);
+/// `Lucide` resolves via [`catalog::lucide_sixel_source_rgba`], `None`
+/// for the two documented mapping gaps (see this module's own "Lucide"
+/// doc section). The ONLY place `family` actually changes which catalog
+/// a sixel-tier placement reads from -- `client::flush_sixel_icon_into`
+/// calls this (and its `_strip`/`_gallery`/`_compact` siblings below)
+/// after resolving the placement's own [`SixelVariant`] to a concrete
+/// `background` via [`resolve_variant_background`].
+pub fn sixel_family(id: IconId, family: IconFamily, background: (u8, u8, u8)) -> Option<Arc<str>> {
+    let raw = match family {
+        IconFamily::Codicons => Some(catalog::sixel_source_rgba(id)),
+        IconFamily::Lucide => catalog::lucide_sixel_source_rgba(id),
+    }?;
+    Some(cached_composited_sixel(id, CacheTier::Rail, family, background, raw, SIXEL_ICON_WIDTH_PX, SIXEL_ICON_HEIGHT_PX))
 }
 
 /// Strip-tier equivalent of [`sixel_family`] -- see that function's own
 /// doc comment.
-pub fn sixel_strip_family(id: IconId, family: IconFamily, variant: SixelVariant) -> Option<&'static str> {
-    match family {
-        IconFamily::Codicons => Some(sixel_strip(id, variant)),
-        IconFamily::Lucide => catalog::sixel_strip_lucide(id, variant),
-    }
+pub fn sixel_strip_family(id: IconId, family: IconFamily, background: (u8, u8, u8)) -> Option<Arc<str>> {
+    let raw = match family {
+        IconFamily::Codicons => Some(catalog::sixel_strip_source_rgba(id)),
+        IconFamily::Lucide => catalog::lucide_sixel_strip_source_rgba(id),
+    }?;
+    Some(cached_composited_sixel(id, CacheTier::Strip, family, background, raw, STRIP_SIXEL_ICON_WIDTH_PX, STRIP_SIXEL_ICON_HEIGHT_PX))
 }
 
 /// Gallery-tier equivalent of [`sixel_family`] -- see that function's own
 /// doc comment.
-pub fn sixel_gallery_family(id: IconId, family: IconFamily, variant: SixelVariant) -> Option<&'static str> {
-    match family {
-        IconFamily::Codicons => Some(sixel_gallery(id, variant)),
-        IconFamily::Lucide => catalog::sixel_gallery_lucide(id, variant),
-    }
+pub fn sixel_gallery_family(id: IconId, family: IconFamily, background: (u8, u8, u8)) -> Option<Arc<str>> {
+    let raw = match family {
+        IconFamily::Codicons => Some(catalog::sixel_gallery_source_rgba(id)),
+        IconFamily::Lucide => catalog::lucide_sixel_gallery_source_rgba(id),
+    }?;
+    Some(cached_composited_sixel(id, CacheTier::Gallery, family, background, raw, GALLERY_SIXEL_ICON_WIDTH_PX, GALLERY_SIXEL_ICON_HEIGHT_PX))
 }
 
-/// Compact-tier equivalent of [`sixel_family`] -- no `SixelVariant`, same
-/// reason [`sixel_compact`] has none (real transparency, no pre-
-/// composited background variant to pick between).
+/// Compact-tier equivalent of [`sixel_family`] -- no background
+/// parameter, same reason [`sixel_compact`] has none: real transparency,
+/// no compositing at all (see this module's own "Sixel background
+/// variants" doc section on why the compact tier stays out of scope).
 pub fn sixel_compact_family(id: IconId, family: IconFamily) -> Option<&'static str> {
     match family {
         IconFamily::Codicons => Some(sixel_compact(id)),
@@ -224,24 +366,28 @@ pub fn sixel_compact_family(id: IconId, family: IconFamily) -> Option<&'static s
     }
 }
 
-/// Which pre-baked, fully-opaque background a rail/strip/gallery sixel-
-/// tier icon asset was composited against -- see this module's own
-/// "Sixel background variants" doc section above for the full diagnosis
-/// and fix. Every icon-bearing button now paints one of these two
-/// backgrounds EXPLICITLY, in every `PtyColorMode` -- there is no more
-/// mode-dependent case, so a render call site picks a variant purely from
-/// the button's own `selected` state (`GateAccent` when selected,
-/// `GateActive` otherwise), never from `app.color_mode`.
+/// Which of an icon-bearing button's own two contextual states a given
+/// sixel-tier placement is in -- see this module's own "Sixel background
+/// variants" doc section above for how each one resolves to a concrete
+/// RGB ([`resolve_variant_background`]) and why only `GateAccent` ever
+/// states a colour of its own regardless of `PtyColorMode`. A render call
+/// site still picks a variant purely from the button's own `selected`
+/// state (`GateAccent` when selected, `GateActive` otherwise), never
+/// from `app.color_mode` directly -- `color_mode` only enters the picture
+/// later, when [`resolve_variant_background`] resolves `GateActive`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SixelVariant {
-    /// The icon-bearing button's own fixed "at rest" colour
-    /// (`render::ACTIVE_BG`) -- pre-composited fully opaque at bake time.
+    /// The icon-bearing button's own "at rest" state -- resolves to
+    /// whatever background its own column/row/band ACTUALLY shows right
+    /// now (see [`resolve_variant_background`]), never a background
+    /// stated independently of that.
     GateActive,
     /// The icon-bearing button's own fixed "selected" accent colour
-    /// (`render::MAUVE`) -- pre-composited fully opaque at bake time.
-    /// Only the activity rail's own selected state ever requests this;
-    /// [`sixel_strip`] folds it into the same asset as `GateActive` since
-    /// the control-plane strip has no selected state at all (see
+    /// ([`ACCENT_BG`]) -- a real, deliberate state the owner should see,
+    /// so it stays a stated colour in every `PtyColorMode`. Only the
+    /// activity rail's own selected state ever requests this; the
+    /// control-plane strip and the icon gallery push `GateActive`
+    /// exclusively (neither has a selected state at all -- see
     /// `render::render_control_strip_button`'s own doc comment).
     GateAccent,
 }
@@ -368,38 +514,90 @@ fn icon_encode_options() -> EncodeOptions {
     }
 }
 
-/// Same source pixels as [`build_sixel_gate`], for a `SixelVariant::
-/// GateActive`/`GateAccent` asset that was already pre-composited fully
-/// opaque at bake time (see [`SixelVariant`]'s own doc comment) --
-/// `BackgroundMode::Opaque` here is a documentation choice, not a
-/// functional requirement: every pixel in such a buffer already has alpha
-/// 255, so `icy_sixel`'s own encoder would treat it identically either
-/// way (see `tools/bake_icons.py`'s own header doc comment for why).
-pub(crate) fn build_sixel_gate(rgba: &[u8]) -> String {
-    build_sixel_sized(rgba, SIXEL_ICON_WIDTH_PX, SIXEL_ICON_HEIGHT_PX, BackgroundMode::Opaque)
-}
-
-/// Same encoding as [`build_sixel`], for the compact tier's own smaller
-/// per-icon asset (see this module's own "Compact tier" section above).
+/// Same encoding as [`build_sixel_sized`], for the compact tier's own
+/// smaller per-icon asset (see this module's own "Compact tier" section
+/// above) -- real transparency, never composited against a background.
 pub(crate) fn build_sixel_compact(rgba: &[u8]) -> String {
     build_sixel_sized(rgba, COMPACT_SIXEL_ICON_WIDTH_PX, COMPACT_SIXEL_ICON_HEIGHT_PX, BackgroundMode::Transparent)
 }
 
-/// Same relationship [`build_sixel_gate`] has to the rail tier, for the
-/// strip tier's own pre-composited asset -- the ONLY strip-tier sixel
-/// this crate ships (see [`SixelVariant`]'s own doc comment).
-pub(crate) fn build_sixel_strip_gate(rgba: &[u8]) -> String {
-    build_sixel_sized(rgba, STRIP_SIXEL_ICON_WIDTH_PX, STRIP_SIXEL_ICON_HEIGHT_PX, BackgroundMode::Opaque)
+/// Piecewise sRGB EOTF (IEC 61966-2-1), one 8-bit channel value -> linear
+/// light in `[0, 1]`. NOT a 2.2-power approximation -- the exact two-
+/// segment curve, so [`composite_over_background`]'s own linear-space
+/// blend round-trips EXACTLY back to the original byte at full/zero
+/// coverage (verified by this module's own `gate_compositing_matches_
+/// the_background_and_ink_colours_exactly_at_full_coverage` test below,
+/// which compares composited output against source bytes for bit-exact
+/// equality at those two extremes). Ported byte-for-byte from `tools/
+/// bake_icons.py::srgb_to_linear`, which no longer exists in that file --
+/// see this module's own "Sixel background variants" doc section for why
+/// this arithmetic moved from a Python bake-time pass to this Rust
+/// runtime one, and never exists in both places at once.
+fn srgb_to_linear(channel: u8) -> f64 {
+    let c = f64::from(channel) / 255.0;
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
 }
 
-/// Same relationship [`build_sixel_gate`] has to the rail tier, for the
-/// gallery tier's own pre-composited asset -- composited over the exact
-/// background `render::render_icon_gallery` paints each swatch cell with
-/// (`render::ACTIVE_BG`, the same fixed colour the rail/strip "at rest"
-/// bodies already use), per this tier's own "composite over the exact
-/// background the gallery paints" brief.
-pub(crate) fn build_sixel_gallery_gate(rgba: &[u8]) -> String {
-    build_sixel_sized(rgba, GALLERY_SIXEL_ICON_WIDTH_PX, GALLERY_SIXEL_ICON_HEIGHT_PX, BackgroundMode::Opaque)
+/// Inverse of [`srgb_to_linear`] -- linear light in `[0, 1]` -> an 8-bit
+/// sRGB channel byte, rounded to the nearest integer (clamped: floating-
+/// point round-trip error could in principle push a value a hair outside
+/// `[0, 255]`).
+fn linear_to_srgb(value: f64) -> u8 {
+    let srgb = if value <= 0.0031308 {
+        value * 12.92
+    } else {
+        1.055 * value.powf(1.0 / 2.4) - 0.055
+    };
+    (srgb * 255.0).round().clamp(0.0, 255.0) as u8
+}
+
+/// Alpha-composites a straight (non-premultiplied) RGBA buffer -- resvg's
+/// own convention, where a partially-covered "ink" pixel's RGB channels
+/// stay at the flat fill colour regardless of alpha, verified in this
+/// module's own doc comment above -- over a flat, fully opaque
+/// `background` colour, IN LINEAR LIGHT: per pixel, convert both `ink`
+/// and `background` to linear ([`srgb_to_linear`]), blend by the pixel's
+/// own TRUE coverage `a/255`, convert back ([`linear_to_srgb`]). Output
+/// alpha is 255 throughout. Pure arithmetic over an already-rasterized
+/// buffer -- same width/height in and out, no interpolation, no second
+/// resampling pass. The icon's own ink colour is already `#cdd6f4` from
+/// `tools/bake_icons.py::patch_fill`/`patch_lucide`, so no separate "tint
+/// to the theme foreground" step is needed here -- this only decides
+/// what shows through where a pixel is not fully opaque. Called at
+/// RENDER time now, against whatever `background` [`resolve_variant_
+/// background`] resolves to for a given placement -- see this module's
+/// own "Sixel background variants" doc section for why this is no
+/// longer a bake-time pass over a fixed constant. Ported from `tools/
+/// bake_icons.py::composite_over_background` without that Python
+/// version's own `_SRGB_TO_LINEAR_LUT` micro-optimization (recomputing
+/// [`srgb_to_linear`] per byte, unmemoized): every call here runs at
+/// most once per distinct `(icon, tier, family, background)` combination
+/// EVER, cached by [`cached_composited_sixel`], against a single small
+/// icon buffer (at most 60x57 pixels) -- a 256-entry lookup table would
+/// shave microseconds off a call that already only happens a handful of
+/// times per process lifetime, not per frame.
+pub(crate) fn composite_over_background(rgba: &[u8], background: (u8, u8, u8)) -> Vec<u8> {
+    let background_linear = [
+        srgb_to_linear(background.0),
+        srgb_to_linear(background.1),
+        srgb_to_linear(background.2),
+    ];
+    let mut out = vec![0u8; rgba.len()];
+    for (source, target) in rgba.chunks_exact(4).zip(out.chunks_exact_mut(4)) {
+        let coverage = f64::from(source[3]) / 255.0;
+        let inverse_coverage = 1.0 - coverage;
+        for channel in 0..3 {
+            let ink_linear = srgb_to_linear(source[channel]);
+            let blended = ink_linear * coverage + background_linear[channel] * inverse_coverage;
+            target[channel] = linear_to_srgb(blended);
+        }
+        target[3] = 255;
+    }
+    out
 }
 
 fn build_sixel_sized(rgba: &[u8], width: u32, height: u32, background_mode: BackgroundMode) -> String {
@@ -419,6 +617,15 @@ fn build_sixel_sized(rgba: &[u8], width: u32, height: u32, background_mode: Back
 mod tests {
     use super::*;
 
+    /// Exercised across every compositing/cache test below in place of
+    /// the two old bake-time-fixed constants alone -- proves the runtime
+    /// compositor genuinely works for an ARBITRARY background, not just
+    /// [`OVERRIDE_ACTIVE_BG`]/[`ACCENT_BG`]. The third entry is the
+    /// owner's own measured real terminal background (see `terminal_bg`
+    /// module doc comment, and this crate's own regression report) --
+    /// standing in for a live OSC 11 query result.
+    const TEST_BACKGROUNDS: [(u8, u8, u8); 3] = [OVERRIDE_ACTIVE_BG, ACCENT_BG, (12, 12, 12)];
+
     #[test]
     fn every_sixel_rgba_matches_its_own_declared_dimensions() {
         let expected = (SIXEL_ICON_WIDTH_PX * SIXEL_ICON_HEIGHT_PX * 4) as usize;
@@ -427,13 +634,11 @@ mod tests {
         }
     }
 
-    const SIXEL_VARIANTS: [SixelVariant; 2] = [SixelVariant::GateActive, SixelVariant::GateAccent];
-
     #[test]
     fn every_icon_resolves_in_every_tier_without_panicking() {
         for id in IconId::ALL {
-            for variant in SIXEL_VARIANTS {
-                let _sixel = sixel(id, variant);
+            for background in TEST_BACKGROUNDS {
+                let _sixel = sixel_family(id, IconFamily::Codicons, background);
             }
             let _ascii = ascii(id);
         }
@@ -442,47 +647,47 @@ mod tests {
     #[test]
     fn every_sixel_encodes_to_a_non_empty_dcs_sequence() {
         for id in IconId::ALL {
-            for variant in SIXEL_VARIANTS {
-                let encoded = sixel(id, variant);
-                assert!(encoded.starts_with('\u{1b}'), "{id:?}/{variant:?} sixel output must start with the DCS introducer ESC");
-                assert!(encoded.len() > 16, "{id:?}/{variant:?} sixel output for a real icon with real ink must not be a near-empty stub");
+            for background in TEST_BACKGROUNDS {
+                let encoded = sixel_family(id, IconFamily::Codicons, background).expect("codicons never gap");
+                assert!(encoded.starts_with('\u{1b}'), "{id:?}/{background:?} sixel output must start with the DCS introducer ESC");
+                assert!(encoded.len() > 16, "{id:?}/{background:?} sixel output for a real icon with real ink must not be a near-empty stub");
             }
         }
     }
 
-    /// Cause 1's actual fix, locked in at the asset level: a `GateActive`/
-    /// `GateAccent` rail-tier source buffer must be FULLY opaque (every
-    /// alpha byte 255) -- there must be no transparent pixel left at all
-    /// for `icy_sixel`'s own hard alpha threshold or Windows Terminal's
-    /// own lack of sixel transparency support to mishandle (see this
-    /// module's own "Sixel background variants" doc section).
+    /// Cause 1's actual fix, locked in at the compositing function itself
+    /// rather than at any one pre-baked asset: [`composite_over_
+    /// background`]'s own output must be FULLY opaque (every alpha byte
+    /// 255) regardless of WHICH background it is handed -- there must be
+    /// no transparent pixel left at all for `icy_sixel`'s own hard alpha
+    /// threshold or Windows Terminal's own lack of sixel transparency
+    /// support to mishandle (see this module's own "Sixel background
+    /// variants" doc section).
     #[test]
-    fn every_gate_composited_sixel_source_is_fully_opaque() {
+    fn every_composited_sixel_is_fully_opaque_for_any_background() {
         for id in IconId::ALL {
-            for (label, rgba) in [
-                ("gate_active", catalog::sixel_gate_active_source_rgba(id)),
-                ("gate_accent", catalog::sixel_gate_accent_source_rgba(id)),
-                ("strip_gate", catalog::sixel_strip_gate_source_rgba(id)),
-                ("gallery_gate", catalog::sixel_gallery_gate_source_rgba(id)),
+            for (label, raw) in [
+                ("rail", catalog::sixel_source_rgba(id)),
+                ("strip", catalog::sixel_strip_source_rgba(id)),
+                ("gallery", catalog::sixel_gallery_source_rgba(id)),
             ] {
-                assert!(
-                    rgba.chunks_exact(4).all(|px| px[3] == 255),
-                    "{id:?}'s {label} source must be fully opaque (every alpha byte 255)"
-                );
+                for background in TEST_BACKGROUNDS {
+                    let composited = composite_over_background(raw, background);
+                    assert!(
+                        composited.chunks_exact(4).all(|px| px[3] == 255),
+                        "{id:?}'s {label} source composited against {background:?} must be fully opaque (every alpha byte 255)"
+                    );
+                }
             }
         }
     }
 
-    /// The raw pre-composite source bytes (test-only -- see `tools/
-    /// bake_icons.py::ensure_assets`'s own doc comment for why these are
-    /// no longer a shipped `SixelVariant`) are UNTOUCHED by the gate-
-    /// compositing pass -- still real TRUE coverage (at least one alpha
-    /// byte below 255), never accidentally overwritten with a composited
-    /// copy or pre-thresholded before `composite_over_background` ever
-    /// sees it. This is what [`gate_compositing_matches_the_background_
-    /// and_ink_colours_exactly_at_full_coverage`] below depends on: its
-    /// own "uncovered"/"fully covered" cases mean nothing if this source
-    /// never actually has a partial-coverage pixel in between.
+    /// The raw pre-composite source bytes still carry real TRUE coverage
+    /// (at least one alpha byte below 255) -- this is what [`gate_
+    /// compositing_matches_the_background_and_ink_colours_exactly_at_
+    /// full_coverage`] below depends on: its own "uncovered"/"fully
+    /// covered" cases mean nothing if this source never actually has a
+    /// partial-coverage pixel in between.
     #[test]
     fn raw_precomposite_sources_still_carry_real_coverage_variation() {
         for id in IconId::ALL {
@@ -501,34 +706,27 @@ mod tests {
         }
     }
 
-    /// The actual "over" compositing arithmetic `tools/bake_icons.py::
-    /// composite_over_background` performs, verified pixel-for-pixel
-    /// against the real baked assets rather than trusted by construction:
-    /// wherever the raw source is fully uncovered (alpha 0), the
-    /// composited pixel must be EXACTLY the flat background colour;
-    /// wherever it is fully covered (alpha 255), the composited pixel
-    /// must be EXACTLY the source's own (already `#cdd6f4`-tinted, per
-    /// `patch_fill`) ink colour, unchanged. This holds for the exact raw
-    /// bytes `composite_over_background` was actually handed at bake time
-    /// (see `tools/bake_icons.py::ensure_assets`'s own doc comment for why
-    /// that source is checked in unmodified), not just for some
-    /// hypothetical buffer.
+    /// The actual "over" compositing arithmetic [`composite_over_
+    /// background`] performs, verified pixel-for-pixel against the real
+    /// baked raw sources rather than trusted by construction: wherever
+    /// the raw source is fully uncovered (alpha 0), the composited pixel
+    /// must be EXACTLY the flat background colour; wherever it is fully
+    /// covered (alpha 255), the composited pixel must be EXACTLY the
+    /// source's own (already `#cdd6f4`-tinted, per `patch_fill`) ink
+    /// colour, unchanged. Checked against every one of [`TEST_
+    /// BACKGROUNDS`], not just one fixed pair -- this is the general
+    /// runtime compositor now, not a bake-time pass over two hard-coded
+    /// constants.
     #[test]
     fn gate_compositing_matches_the_background_and_ink_colours_exactly_at_full_coverage() {
-        // Hand-synced to render.rs's own (private) ACTIVE_BG/MAUVE
-        // constants and tools/bake_icons.py's own GATE_ACTIVE_BG_RGB/
-        // GATE_ACCENT_BG_RGB -- see this module's own "Sixel background
-        // variants" doc section.
-        const GATE_ACTIVE_BG: (u8, u8, u8) = (30, 30, 46);
-        const GATE_ACCENT_BG: (u8, u8, u8) = (203, 166, 247);
-
-        fn assert_matches_at_extremes(id: IconId, label: &str, source: &[u8], composited: &[u8], bg: (u8, u8, u8)) {
+        fn assert_matches_at_extremes(id: IconId, label: &str, source: &[u8], background: (u8, u8, u8)) {
+            let composited = composite_over_background(source, background);
             assert_eq!(source.len(), composited.len(), "{id:?}/{label} source/composited length mismatch");
             for (source_px, composited_px) in source.chunks_exact(4).zip(composited.chunks_exact(4)) {
                 match source_px[3] {
                     0 => assert_eq!(
                         (composited_px[0], composited_px[1], composited_px[2]),
-                        bg,
+                        background,
                         "{id:?}/{label}: an uncovered source pixel must composite to the flat background colour exactly"
                     ),
                     255 => assert_eq!(
@@ -542,20 +740,96 @@ mod tests {
         }
 
         for id in IconId::ALL {
-            assert_matches_at_extremes(id, "rail_gate_active", catalog::sixel_source_rgba(id), catalog::sixel_gate_active_source_rgba(id), GATE_ACTIVE_BG);
-            assert_matches_at_extremes(id, "rail_gate_accent", catalog::sixel_source_rgba(id), catalog::sixel_gate_accent_source_rgba(id), GATE_ACCENT_BG);
-            assert_matches_at_extremes(id, "strip_gate", catalog::sixel_strip_source_rgba(id), catalog::sixel_strip_gate_source_rgba(id), GATE_ACTIVE_BG);
-            assert_matches_at_extremes(id, "gallery_gate", catalog::sixel_gallery_source_rgba(id), catalog::sixel_gallery_gate_source_rgba(id), GATE_ACTIVE_BG);
+            for background in TEST_BACKGROUNDS {
+                assert_matches_at_extremes(id, "rail", catalog::sixel_source_rgba(id), background);
+                assert_matches_at_extremes(id, "strip", catalog::sixel_strip_source_rgba(id), background);
+                assert_matches_at_extremes(id, "gallery", catalog::sixel_gallery_source_rgba(id), background);
+            }
         }
     }
 
+    /// THE headline verification for this crate's own OSC 11 background
+    /// fix: compositing a real icon's real fully-covered ink pixel and a
+    /// real fully-UNcovered background pixel against an INJECTED
+    /// "terminal answered with this" colour, through the EXACT SAME
+    /// function chain `client::run`'s own live path calls
+    /// (`terminal_bg::resolve_background` -> [`resolve_variant_
+    /// background`] -> [`composite_over_background`]) -- never a
+    /// parallel/duplicate implementation for tests. The background pixel
+    /// must equal the injected queried colour EXACTLY (proving the
+    /// composite genuinely tracks whatever the terminal reports, not a
+    /// stated constant), and the ink pixel must equal the source's own
+    /// untouched ink colour EXACTLY (proving compositing never touches
+    /// fully-opaque ink). `IconId::Files` is not special -- any icon with
+    /// real partial coverage would do; it is simply this manifest's
+    /// first entry.
     #[test]
-    fn every_gate_sixel_rgba_matches_its_own_declared_dimensions() {
-        let expected = (SIXEL_ICON_WIDTH_PX * SIXEL_ICON_HEIGHT_PX * 4) as usize;
-        for id in IconId::ALL {
-            assert_eq!(catalog::sixel_gate_active_source_rgba(id).len(), expected, "{id:?} gate_active rgba length");
-            assert_eq!(catalog::sixel_gate_accent_source_rgba(id).len(), expected, "{id:?} gate_accent rgba length");
-        }
+    fn composited_background_pixel_equals_the_injected_queried_terminal_colour_exactly() {
+        let raw = catalog::sixel_source_rgba(IconId::Files);
+        let uncovered_index = raw.chunks_exact(4).position(|px| px[3] == 0).expect("a real icon has background pixels");
+        let covered_index = raw.chunks_exact(4).position(|px| px[3] == 255).expect("a real icon has fully-covered ink pixels");
+
+        // The SAME injection point a test would use instead of a live OSC
+        // 11 round-trip (`terminal_bg::query_osc11_background`) -- see
+        // that module's own doc comment: only WHERE this `Option` comes
+        // from differs between a test and production, never the code
+        // downstream of it.
+        let queried: Option<(u8, u8, u8)> = Some((12, 12, 12));
+        let terminal_background = crate::terminal_bg::resolve_background(queried);
+        assert_eq!(terminal_background, (12, 12, 12));
+
+        let background = resolve_variant_background(SixelVariant::GateActive, PtyColorMode::Inherited, terminal_background);
+        assert_eq!(background, terminal_background, "an un-selected button in Inherited mode must composite against exactly the resolved terminal background");
+
+        let composited = composite_over_background(raw, background);
+        let uncovered_pixel = &composited[uncovered_index * 4..uncovered_index * 4 + 4];
+        let covered_pixel = &composited[covered_index * 4..covered_index * 4 + 4];
+        let source_covered_pixel = &raw[covered_index * 4..covered_index * 4 + 4];
+
+        assert_eq!(
+            (uncovered_pixel[0], uncovered_pixel[1], uncovered_pixel[2]),
+            terminal_background,
+            "a background pixel must equal the queried terminal background exactly"
+        );
+        assert_eq!(uncovered_pixel[3], 255, "a background pixel must be fully opaque after compositing");
+        assert_eq!(
+            (covered_pixel[0], covered_pixel[1], covered_pixel[2]),
+            (source_covered_pixel[0], source_covered_pixel[1], source_covered_pixel[2]),
+            "a fully-covered ink pixel must survive compositing unchanged"
+        );
+    }
+
+    /// [`resolve_variant_background`]'s full documented truth table --
+    /// see this module's own "Sixel background variants" doc section.
+    #[test]
+    fn resolve_variant_background_matches_the_documented_rules() {
+        let queried = (12, 12, 12);
+        assert_eq!(resolve_variant_background(SixelVariant::GateAccent, PtyColorMode::Inherited, queried), ACCENT_BG);
+        assert_eq!(resolve_variant_background(SixelVariant::GateAccent, PtyColorMode::GateOverride, queried), ACCENT_BG);
+        assert_eq!(resolve_variant_background(SixelVariant::GateActive, PtyColorMode::Inherited, queried), queried);
+        assert_eq!(resolve_variant_background(SixelVariant::GateActive, PtyColorMode::GateOverride, queried), OVERRIDE_ACTIVE_BG);
+        // GateOverride's own at-rest colour is a stated constant, wholly
+        // independent of whatever the terminal happens to report.
+        assert_eq!(
+            resolve_variant_background(SixelVariant::GateActive, PtyColorMode::GateOverride, (200, 200, 200)),
+            OVERRIDE_ACTIVE_BG,
+        );
+    }
+
+    /// [`SIXEL_CACHE`]'s own documented key shape: the SAME `(icon,
+    /// family, background)` request returns byte-identical output every
+    /// time (a cache hit, not a fresh re-composite that happened to land
+    /// on the same bytes), and a DIFFERENT `background` genuinely changes
+    /// the encoded output -- the whole reason background is part of the
+    /// cache key at all rather than caching by `(icon, family)` alone.
+    #[test]
+    fn sixel_family_output_is_keyed_by_the_requested_background() {
+        let same_background = sixel_family(IconId::Files, IconFamily::Codicons, OVERRIDE_ACTIVE_BG).expect("codicons never gap");
+        let same_background_again = sixel_family(IconId::Files, IconFamily::Codicons, OVERRIDE_ACTIVE_BG).expect("codicons never gap");
+        assert_eq!(same_background, same_background_again, "the same (icon, family, background) request must return identical bytes");
+
+        let different_background = sixel_family(IconId::Files, IconFamily::Codicons, ACCENT_BG).expect("codicons never gap");
+        assert_ne!(same_background, different_background, "a different requested background must change the encoded sixel bytes");
     }
 
     #[test]
@@ -563,15 +837,14 @@ mod tests {
         let expected = (STRIP_SIXEL_ICON_WIDTH_PX * STRIP_SIXEL_ICON_HEIGHT_PX * 4) as usize;
         for id in IconId::ALL {
             assert_eq!(catalog::sixel_strip_source_rgba(id).len(), expected, "{id:?} strip rgba length");
-            assert_eq!(catalog::sixel_strip_gate_source_rgba(id).len(), expected, "{id:?} strip_gate rgba length");
         }
     }
 
     #[test]
     fn every_icon_resolves_in_the_strip_tier_without_panicking() {
         for id in IconId::ALL {
-            for variant in SIXEL_VARIANTS {
-                let _strip = sixel_strip(id, variant);
+            for background in TEST_BACKGROUNDS {
+                let _strip = sixel_strip_family(id, IconFamily::Codicons, background);
             }
         }
     }
@@ -579,20 +852,10 @@ mod tests {
     #[test]
     fn every_strip_sixel_encodes_to_a_non_empty_dcs_sequence() {
         for id in IconId::ALL {
-            for variant in SIXEL_VARIANTS {
-                let encoded = sixel_strip(id, variant);
-                assert!(encoded.starts_with('\u{1b}'), "{id:?}/{variant:?} strip sixel output must start with the DCS introducer ESC");
+            for background in TEST_BACKGROUNDS {
+                let encoded = sixel_strip_family(id, IconFamily::Codicons, background).expect("codicons never gap");
+                assert!(encoded.starts_with('\u{1b}'), "{id:?}/{background:?} strip sixel output must start with the DCS introducer ESC");
             }
-        }
-    }
-
-    /// [`sixel_strip`]'s own documented fold: the strip tier has no
-    /// selected state at all, so `GateAccent` must resolve to the exact
-    /// same bytes as `GateActive`, byte-for-byte, not a distinct asset.
-    #[test]
-    fn strip_gate_accent_folds_into_the_same_bytes_as_gate_active() {
-        for id in IconId::ALL {
-            assert_eq!(sixel_strip(id, SixelVariant::GateAccent), sixel_strip(id, SixelVariant::GateActive), "{id:?}");
         }
     }
 
@@ -601,15 +864,14 @@ mod tests {
         let expected = (GALLERY_SIXEL_ICON_WIDTH_PX * GALLERY_SIXEL_ICON_HEIGHT_PX * 4) as usize;
         for id in IconId::ALL {
             assert_eq!(catalog::sixel_gallery_source_rgba(id).len(), expected, "{id:?} gallery rgba length");
-            assert_eq!(catalog::sixel_gallery_gate_source_rgba(id).len(), expected, "{id:?} gallery_gate rgba length");
         }
     }
 
     #[test]
     fn every_icon_resolves_in_the_gallery_tier_without_panicking() {
         for id in IconId::ALL {
-            for variant in SIXEL_VARIANTS {
-                let _gallery = sixel_gallery(id, variant);
+            for background in TEST_BACKGROUNDS {
+                let _gallery = sixel_gallery_family(id, IconFamily::Codicons, background);
             }
         }
     }
@@ -617,21 +879,10 @@ mod tests {
     #[test]
     fn every_gallery_sixel_encodes_to_a_non_empty_dcs_sequence() {
         for id in IconId::ALL {
-            for variant in SIXEL_VARIANTS {
-                let encoded = sixel_gallery(id, variant);
-                assert!(encoded.starts_with('\u{1b}'), "{id:?}/{variant:?} gallery sixel output must start with the DCS introducer ESC");
+            for background in TEST_BACKGROUNDS {
+                let encoded = sixel_gallery_family(id, IconFamily::Codicons, background).expect("codicons never gap");
+                assert!(encoded.starts_with('\u{1b}'), "{id:?}/{background:?} gallery sixel output must start with the DCS introducer ESC");
             }
-        }
-    }
-
-    /// Same fold as [`strip_gate_accent_folds_into_the_same_bytes_as_gate_active`]:
-    /// the gallery tier is a read-only comparison grid, never a selected
-    /// button state, so `GateAccent` resolves to the same bytes as
-    /// `GateActive`.
-    #[test]
-    fn gallery_gate_accent_folds_into_the_same_bytes_as_gate_active() {
-        for id in IconId::ALL {
-            assert_eq!(sixel_gallery(id, SixelVariant::GateAccent), sixel_gallery(id, SixelVariant::GateActive), "{id:?}");
         }
     }
 
@@ -686,11 +937,9 @@ mod tests {
         );
     }
 
-    /// Every raw Lucide source (test-only, same retirement precedent as
-    /// the codicon `_RGBA` consts -- see `tools/bake_icons.py::ensure_
-    /// lucide_assets`'s own doc comment) is present with the tier's own
-    /// declared byte length wherever `lucide_slug` says an asset exists,
-    /// and absent (`None`) everywhere it says it does not -- the SAME
+    /// Every raw Lucide source is present with the tier's own declared
+    /// byte length wherever `lucide_slug` says an asset exists, and
+    /// absent (`None`) everywhere it says it does not -- the SAME
     /// `Some`/`None` split as [`lucide_slug`] itself, checked against the
     /// real baked bytes rather than just the mapping table.
     #[test]
@@ -703,13 +952,9 @@ mod tests {
             let mapped = lucide_slug(id).is_some();
             for (label, actual, expected) in [
                 ("sixel", catalog::lucide_sixel_source_rgba(id), sixel_expected),
-                ("gate_active", catalog::lucide_sixel_gate_active_source_rgba(id), sixel_expected),
-                ("gate_accent", catalog::lucide_sixel_gate_accent_source_rgba(id), sixel_expected),
                 ("compact", catalog::lucide_sixel_compact_source_rgba(id), compact_expected),
                 ("strip", catalog::lucide_sixel_strip_source_rgba(id), strip_expected),
-                ("strip_gate", catalog::lucide_sixel_strip_gate_source_rgba(id), strip_expected),
                 ("gallery", catalog::lucide_sixel_gallery_source_rgba(id), gallery_expected),
-                ("gallery_gate", catalog::lucide_sixel_gallery_gate_source_rgba(id), gallery_expected),
             ] {
                 match actual {
                     Some(bytes) => {
@@ -734,16 +979,16 @@ mod tests {
         for id in IconId::ALL {
             let mapped = lucide_slug(id).is_some();
             assert_eq!(mapped, !LUCIDE_GAP_IDS.contains(&id), "{id:?}");
-            for variant in SIXEL_VARIANTS {
-                assert_eq!(sixel_family(id, IconFamily::Lucide, variant).is_some(), mapped, "{id:?}/{variant:?} rail");
-                assert_eq!(sixel_strip_family(id, IconFamily::Lucide, variant).is_some(), mapped, "{id:?}/{variant:?} strip");
-                assert_eq!(sixel_gallery_family(id, IconFamily::Lucide, variant).is_some(), mapped, "{id:?}/{variant:?} gallery");
+            for background in TEST_BACKGROUNDS {
+                assert_eq!(sixel_family(id, IconFamily::Lucide, background).is_some(), mapped, "{id:?}/{background:?} rail");
+                assert_eq!(sixel_strip_family(id, IconFamily::Lucide, background).is_some(), mapped, "{id:?}/{background:?} strip");
+                assert_eq!(sixel_gallery_family(id, IconFamily::Lucide, background).is_some(), mapped, "{id:?}/{background:?} gallery");
             }
             assert_eq!(sixel_compact_family(id, IconFamily::Lucide).is_some(), mapped, "{id:?} compact");
             // `Codicons` never has a gap -- every `IconId` was baked from
             // the original 57-icon codicon manifest with no exceptions.
-            for variant in SIXEL_VARIANTS {
-                assert!(sixel_family(id, IconFamily::Codicons, variant).is_some(), "{id:?}/{variant:?} codicons rail");
+            for background in TEST_BACKGROUNDS {
+                assert!(sixel_family(id, IconFamily::Codicons, background).is_some(), "{id:?}/{background:?} codicons rail");
             }
         }
     }
@@ -754,39 +999,40 @@ mod tests {
             if lucide_slug(id).is_none() {
                 continue;
             }
-            for variant in SIXEL_VARIANTS {
-                let rail = sixel_family(id, IconFamily::Lucide, variant).expect("mapped icon");
-                assert!(rail.starts_with('\u{1b}'), "{id:?}/{variant:?} lucide rail sixel must start with the DCS introducer ESC");
-                let strip = sixel_strip_family(id, IconFamily::Lucide, variant).expect("mapped icon");
-                assert!(strip.starts_with('\u{1b}'), "{id:?}/{variant:?} lucide strip sixel must start with the DCS introducer ESC");
-                let gallery = sixel_gallery_family(id, IconFamily::Lucide, variant).expect("mapped icon");
-                assert!(gallery.starts_with('\u{1b}'), "{id:?}/{variant:?} lucide gallery sixel must start with the DCS introducer ESC");
+            for background in TEST_BACKGROUNDS {
+                let rail = sixel_family(id, IconFamily::Lucide, background).expect("mapped icon");
+                assert!(rail.starts_with('\u{1b}'), "{id:?}/{background:?} lucide rail sixel must start with the DCS introducer ESC");
+                let strip = sixel_strip_family(id, IconFamily::Lucide, background).expect("mapped icon");
+                assert!(strip.starts_with('\u{1b}'), "{id:?}/{background:?} lucide strip sixel must start with the DCS introducer ESC");
+                let gallery = sixel_gallery_family(id, IconFamily::Lucide, background).expect("mapped icon");
+                assert!(gallery.starts_with('\u{1b}'), "{id:?}/{background:?} lucide gallery sixel must start with the DCS introducer ESC");
             }
             let compact = sixel_compact_family(id, IconFamily::Lucide).expect("mapped icon");
             assert!(compact.starts_with('\u{1b}'), "{id:?} lucide compact sixel must start with the DCS introducer ESC");
         }
     }
 
-    /// Same lock-in as [`tests::every_gate_composited_sixel_source_is_
-    /// fully_opaque`] (cause 1's own fix), for Lucide: a rail/strip/
-    /// gallery gate-composited source must be fully opaque, no exception
+    /// Same lock-in as [`tests::every_composited_sixel_is_fully_opaque_
+    /// for_any_background`] (cause 1's own fix), for Lucide: no exception
     /// for the stroke-based family -- `composite_over_background` runs
     /// the identical arithmetic regardless of which family's raw buffer
     /// it is handed.
     #[test]
-    fn every_lucide_gate_composited_sixel_source_is_fully_opaque() {
+    fn every_lucide_composited_sixel_is_fully_opaque_for_any_background() {
         for id in IconId::ALL {
             let Some(_) = lucide_slug(id) else { continue };
-            for (label, rgba) in [
-                ("gate_active", catalog::lucide_sixel_gate_active_source_rgba(id).expect("mapped icon")),
-                ("gate_accent", catalog::lucide_sixel_gate_accent_source_rgba(id).expect("mapped icon")),
-                ("strip_gate", catalog::lucide_sixel_strip_gate_source_rgba(id).expect("mapped icon")),
-                ("gallery_gate", catalog::lucide_sixel_gallery_gate_source_rgba(id).expect("mapped icon")),
+            for (label, raw) in [
+                ("rail", catalog::lucide_sixel_source_rgba(id).expect("mapped icon")),
+                ("strip", catalog::lucide_sixel_strip_source_rgba(id).expect("mapped icon")),
+                ("gallery", catalog::lucide_sixel_gallery_source_rgba(id).expect("mapped icon")),
             ] {
-                assert!(
-                    rgba.chunks_exact(4).all(|px| px[3] == 255),
-                    "{id:?}'s lucide {label} source must be fully opaque (every alpha byte 255)"
-                );
+                for background in TEST_BACKGROUNDS {
+                    let composited = composite_over_background(raw, background);
+                    assert!(
+                        composited.chunks_exact(4).all(|px| px[3] == 255),
+                        "{id:?}'s lucide {label} source composited against {background:?} must be fully opaque (every alpha byte 255)"
+                    );
+                }
             }
         }
     }
@@ -816,16 +1062,14 @@ mod tests {
     /// which family's buffer it is compositing.
     #[test]
     fn lucide_gate_compositing_matches_the_background_and_ink_colours_exactly_at_full_coverage() {
-        const GATE_ACTIVE_BG: (u8, u8, u8) = (30, 30, 46);
-        const GATE_ACCENT_BG: (u8, u8, u8) = (203, 166, 247);
-
-        fn assert_matches_at_extremes(id: IconId, label: &str, source: &[u8], composited: &[u8], bg: (u8, u8, u8)) {
+        fn assert_matches_at_extremes(id: IconId, label: &str, source: &[u8], background: (u8, u8, u8)) {
+            let composited = composite_over_background(source, background);
             assert_eq!(source.len(), composited.len(), "{id:?}/{label} source/composited length mismatch");
             for (source_px, composited_px) in source.chunks_exact(4).zip(composited.chunks_exact(4)) {
                 match source_px[3] {
                     0 => assert_eq!(
                         (composited_px[0], composited_px[1], composited_px[2]),
-                        bg,
+                        background,
                         "{id:?}/{label}: an uncovered lucide source pixel must composite to the flat background colour exactly"
                     ),
                     255 => assert_eq!(
@@ -840,30 +1084,11 @@ mod tests {
 
         for id in IconId::ALL {
             let Some(_) = lucide_slug(id) else { continue };
-            assert_matches_at_extremes(
-                id, "lucide_rail_gate_active",
-                catalog::lucide_sixel_source_rgba(id).expect("mapped icon"),
-                catalog::lucide_sixel_gate_active_source_rgba(id).expect("mapped icon"),
-                GATE_ACTIVE_BG,
-            );
-            assert_matches_at_extremes(
-                id, "lucide_rail_gate_accent",
-                catalog::lucide_sixel_source_rgba(id).expect("mapped icon"),
-                catalog::lucide_sixel_gate_accent_source_rgba(id).expect("mapped icon"),
-                GATE_ACCENT_BG,
-            );
-            assert_matches_at_extremes(
-                id, "lucide_strip_gate",
-                catalog::lucide_sixel_strip_source_rgba(id).expect("mapped icon"),
-                catalog::lucide_sixel_strip_gate_source_rgba(id).expect("mapped icon"),
-                GATE_ACTIVE_BG,
-            );
-            assert_matches_at_extremes(
-                id, "lucide_gallery_gate",
-                catalog::lucide_sixel_gallery_source_rgba(id).expect("mapped icon"),
-                catalog::lucide_sixel_gallery_gate_source_rgba(id).expect("mapped icon"),
-                GATE_ACTIVE_BG,
-            );
+            for background in TEST_BACKGROUNDS {
+                assert_matches_at_extremes(id, "lucide_rail", catalog::lucide_sixel_source_rgba(id).expect("mapped icon"), background);
+                assert_matches_at_extremes(id, "lucide_strip", catalog::lucide_sixel_strip_source_rgba(id).expect("mapped icon"), background);
+                assert_matches_at_extremes(id, "lucide_gallery", catalog::lucide_sixel_gallery_source_rgba(id).expect("mapped icon"), background);
+            }
         }
     }
 

@@ -506,21 +506,27 @@ fn rail_button_body_rows(icons: RailIcons) -> u16 {
 /// room (`block.height >= rail_button_body_rows(icons)`) this paints a
 /// body exactly that many rows tall -- `block` inset by 1 column on each
 /// side so it reads as a filled button block rather than a thin accent
-/// stripe -- with the glyph/ascii label centered on the middle row: an
-/// "at rest" background when inactive (deliberately different from the
-/// rail's own `theme.panel` background so an at-rest button stays visible
-/// instead of vanishing into the rail), an accent background when
-/// selected, bold in both states, and a `▎` accent bar down `block`'s
-/// leftmost column on every body row while selected. The `RailIcons::
-/// Sixel` tier paints its body with the SAME explicit truecolor
-/// (`ACTIVE_BG`/`MAUVE`) its baked asset was composited against, in every
-/// `PtyColorMode` -- see `icons::SixelVariant`'s own doc comment; `Ascii`
-/// keeps `theme.active`/`theme.accent` (plain text, no raster to align).
-/// Below `rail_button_body_rows(icons)` it falls back to the original
-/// thin single row so every button and its hit region still exist on a
-/// cramped terminal. Always registers `button.target` as a hit region
-/// across the full block (including the margin/accent column) so the
-/// accent bar is clickable too.
+/// stripe -- with the glyph/ascii label centered on the middle row:
+/// `theme.active` at rest, `theme.accent` when selected, bold in both
+/// states, and a `▎` accent bar down `block`'s leftmost column on every
+/// body row while selected. `theme.active` at rest is DELIBERATELY the
+/// SAME colour the rail column itself paints (`Color::Reset` in
+/// `PtyColorMode::Inherited`, so the button is genuinely invisible until
+/// selected; `ACTIVE_BG` in `PtyColorMode::GateOverride`, that mode's
+/// own stated theme, still distinct from `theme.panel` there) -- an
+/// UN-selected button is not a real state the owner needs to see, only a
+/// SELECTED one is. The `RailIcons::Sixel` tier's own body must track
+/// this EXACT SAME rule (never a fixed constant of its own) because
+/// `client::flush_sixel_icon_into` composites that placement's icon
+/// against whichever concrete RGB `icons::resolve_variant_background`
+/// resolves for it using this SAME `PtyColorMode`-dependent logic -- see
+/// that fn's own doc comment and `icons::SixelVariant`'s own doc comment
+/// for the full reasoning; `Ascii` needs no such care (plain text, no
+/// raster to keep in sync). Below `rail_button_body_rows(icons)` it falls
+/// back to the original thin single row so every button and its hit
+/// region still exist on a cramped terminal. Always registers `button.
+/// target` as a hit region across the full block (including the margin/
+/// accent column) so the accent bar is clickable too.
 fn render_rail_button(
     block: Rect,
     button: &RailButton,
@@ -565,19 +571,33 @@ fn render_rail_button(
         return;
     }
 
-    // The sixel tier paints its body with the SAME explicit truecolor
-    // background (`ACTIVE_BG`/`MAUVE`) its baked asset was composited
-    // against, regardless of `theme`'s own `PtyColorMode` -- see
-    // `icons::SixelVariant`'s own doc comment: the raster and the cell
-    // underneath it must agree exactly, in every mode, or the button's
-    // own real background shows through the baked asset's edges. The
-    // ascii tier stays theme-driven (plain text, no raster to align).
+    // An UN-selected button reads as flat with its own column -- it is
+    // not a real, deliberate state the owner needs to see, so it no
+    // longer states a background of its own at all: `theme.active`, the
+    // SAME colour `render_activity_rail`'s own panel fill already uses
+    // (`Color::Reset` in `PtyColorMode::Inherited`, so the button
+    // vanishes into whatever the terminal's real background is;
+    // `ACTIVE_BG` in `PtyColorMode::GateOverride`, that mode's own
+    // deliberate stated theme, unchanged). A SELECTED button IS a real
+    // state worth seeing, so it keeps its own accent regardless of mode.
+    // The sixel tier's selected accent must be the FIXED `MAUVE`
+    // constant specifically (never `theme.accent`, which is `Color::
+    // Magenta` -- an ANSI colour, not this exact truecolor -- in
+    // `PtyColorMode::Inherited`): `client::flush_sixel_icon_into`
+    // resolves the icon's own composited background via `icons::
+    // resolve_variant_background`, which always returns `icons::
+    // ACCENT_BG` (== `MAUVE`) for a selected sixel placement regardless
+    // of `PtyColorMode` -- this cell fill must match that exactly, in
+    // every mode, or the icon's own opaque rect reads as a plate against
+    // a differently-rendered accent underneath it. `Ascii` has no raster
+    // to keep in sync with, so it keeps using the mode-appropriate
+    // `theme.accent` exactly as it always did.
     let bg = match icons {
         RailIcons::Sixel => {
             if button.selected {
                 MAUVE
             } else {
-                ACTIVE_BG
+                theme.active
             }
         }
         RailIcons::Ascii => {
@@ -804,18 +824,18 @@ fn render_control_strip(
     layout: &mut LayoutRects,
 ) -> Rect {
     let strip = Rect::new(area.x, area.y, area.width, CONTROL_STRIP_BUTTON_ROWS.min(area.height));
-    // Same reasoning as `render_activity_rail`'s own panel fill: the
-    // strip's own button bodies already paint `ACTIVE_BG` explicitly in
-    // `Sixel` mode, so the row they sit in (including the gaps between
-    // buttons) must state that same background too, in every
-    // `PtyColorMode`, or an icon's own opaque rect reads as a plate
-    // against `theme.panel`'s inherited colour. `Ascii` hosts no raster,
-    // so it keeps `theme.panel` unchanged.
-    let strip_bg = match tier {
-        RailIcons::Sixel => SIDEBAR_BG,
-        RailIcons::Ascii => theme.panel,
-    };
-    fill_rect(strip, strip_bg, buf);
+    // Inherits `theme.panel`, same as every other panel row -- a strip
+    // button is never selected (see `render_control_strip_button`'s own
+    // doc comment), so it never states a background distinct from its
+    // own row either (see that function's own doc comment for the
+    // matching fix on the button body itself). Stating `SIDEBAR_BG` here
+    // unconditionally used to be this crate's own plate defect one level
+    // up: in `PtyColorMode::Inherited`, `theme.panel` is `Color::Reset`
+    // (the terminal's own real background), and `SIDEBAR_BG` is a
+    // visibly LIGHTER constant than that on the owner's own terminal --
+    // stating it painted the whole strip row as a plate, not just each
+    // button.
+    fill_rect(strip, theme.panel, buf);
     let mut x = strip.x;
     for button in buttons {
         if !button.enabled {
@@ -849,21 +869,24 @@ fn render_control_strip(
 /// Draws one action button inside a sidebar panel's own control-plane
 /// strip (see [`render_control_strip`]): a fixed [`CONTROL_STRIP_
 /// BUTTON_WIDTH`]-cell x [`CONTROL_STRIP_BUTTON_ROWS`]-row body hosting
-/// the STRIP tier's own dedicated `icons::sixel_strip` asset -- an EXACT
-/// fit, no cropping. In `Sixel` mode the body paints the SAME explicit
-/// truecolor (`ACTIVE_BG`) that tier's baked asset was composited
-/// against, in every `PtyColorMode` (see [`icons::SixelVariant`]'s own
-/// doc comment); `Ascii` keeps `theme.active` (plain text, no raster to
-/// align) -- both read as [`render_rail_button`]'s own at-rest body,
-/// since these are one-shot actions, never a persisted `selected` view
-/// the way `ControlSection` rail buttons are, the same "never shows as
-/// active" precedent as the rail's own Settings button; in `Sixel` mode
-/// that also means this button only ever requests `SixelVariant::
-/// GateActive`, never `GateAccent`. `RailIcons::Ascii` paints [`icons::
-/// ascii`]'s short (<=2 char) catalog label centered on the block, not
-/// the long bracket-text labels the pre-strip inline buttons used --
-/// those were sized for a much wider single-row rect and cannot fit this
-/// fixed narrow body.
+/// the STRIP tier's own dedicated `icons::sixel_strip_family` asset -- an
+/// EXACT fit, no cropping. The body paints `theme.active` in every tier
+/// and `PtyColorMode` now (`Color::Reset` in `PtyColorMode::Inherited`,
+/// so it vanishes into the strip row exactly like [`render_rail_button`]'s
+/// own at-rest body does -- see that function's own doc comment for the
+/// matching fix and why an un-selected sixel body's cell fill must track
+/// `theme.active` exactly, never a fixed constant): these are one-shot
+/// actions, never a persisted `selected` view the way `ControlSection`
+/// rail buttons are, the same "never shows as active" precedent as the
+/// rail's own Settings button, so there is no distinct-accent case here
+/// at all -- in `Sixel` mode this button only ever requests
+/// `SixelVariant::GateActive`, never `GateAccent`, and `client::flush_
+/// sixel_icon_into` resolves that to the exact same `theme.active`-
+/// matching background this cell fill paints (`icons::resolve_variant_
+/// background`). `RailIcons::Ascii` paints [`icons::ascii`]'s short
+/// (<=2 char) catalog label centered on the block, not the long bracket-
+/// text labels the pre-strip inline buttons used -- those were sized for
+/// a much wider single-row rect and cannot fit this fixed narrow body.
 fn render_control_strip_button(
     block: Rect,
     icon: icons::IconId,
@@ -877,10 +900,7 @@ fn render_control_strip_button(
     if block.width == 0 || block.height == 0 {
         return;
     }
-    let bg = match tier {
-        RailIcons::Sixel => ACTIVE_BG,
-        RailIcons::Ascii => theme.active,
-    };
+    let bg = theme.active;
     fill_rect(block, bg, buf);
     match tier {
         RailIcons::Sixel => {
@@ -953,25 +973,23 @@ fn render_activity_rail(
     if area.width == 0 || area.height == 0 {
         return;
     }
-    // The whole rail column, not just each button's own body, must state
-    // an explicit truecolor background whenever this frame can host a
-    // sixel icon: a button's body already paints `ACTIVE_BG`/`MAUVE`
-    // explicitly (see `render_rail_button`), and if the column around it
-    // is left to `theme.panel`'s `Color::Reset` in `PtyColorMode::
-    // Inherited`, the icon's own opaque rect reads as a plate against
-    // whatever the terminal's own inherited background actually is --
-    // measured distinctly darker than `ACTIVE_BG` on the owner's own
-    // terminal. `SIDEBAR_BG` is the SAME colour `PtyColorMode::
-    // GateOverride`'s own `theme.panel` already resolves to, so this only
-    // widens which mode states it, never introduces a new colour pairing.
-    // `RailIcons::Ascii` hosts no raster at all (plain text painted
-    // directly with `theme.*`), so it keeps `theme.panel` unchanged --
-    // no compositing risk, no reason to stop inheriting there.
-    let panel_bg = match app.rail_icons {
-        RailIcons::Sixel => SIDEBAR_BG,
-        RailIcons::Ascii => theme.panel,
-    };
-    fill_rect(area, panel_bg, buf);
+    // Inherits `theme.panel`, in every `RailIcons` mode: this USED to
+    // state an explicit `SIDEBAR_BG` here whenever the rail could host a
+    // sixel icon, on the premise that a sixel button's own body already
+    // paints an explicit truecolor background (`ACTIVE_BG`/`MAUVE`), so
+    // the column around it had to match. That premise produced the
+    // actual regression: in `PtyColorMode::Inherited`, `theme.panel` is
+    // `Color::Reset` -- the terminal's own REAL background -- and
+    // `SIDEBAR_BG` is a visibly LIGHTER constant than that on the
+    // owner's own terminal (measured (12,12,12) vs `SIDEBAR_BG`'s
+    // (24,24,37)), so the whole rail read as a lighter plate standing out
+    // against the rest of the screen. The actual fix does not touch this
+    // column at all: `render_rail_button`'s own body now tracks
+    // `theme.active` at rest instead of a fixed constant (see that
+    // function's own doc comment), so it already matches whatever THIS
+    // fill paints, in every `PtyColorMode`, without this column ever
+    // needing to state a colour of its own.
+    fill_rect(area, theme.panel, buf);
 
     // Top group: primary views. Board only exists once the harness kanban
     // is enabled -- light mode never renders it (same invariant enforced
@@ -3579,24 +3597,25 @@ fn render_icon_gallery(
                 .render(Rect::new(name_x, y, visible_name_width, 1), buf);
         }
 
-        // Same reasoning as `render_activity_rail`/`render_control_strip`'s
-        // own panel fills: every size column's own swatch already paints
-        // `ACTIVE_BG` explicitly in `Sixel` mode (see `render_gallery_
-        // size_swatch`), so the WHOLE icon-columns band -- the gaps
-        // between the strip/rail/gallery/family columns AND any padding a
-        // swatch's own smaller icon footprint leaves inside its wider
-        // column -- must state that same background too, in every
-        // `PtyColorMode`, or an icon's own opaque rect reads as a plate
-        // against `theme.surface`'s inherited colour. `Ascii` hosts no
-        // raster in these columns (see `render_gallery_size_swatch`'s own
-        // `Ascii` arm), so it is left alone.
-        if app.rail_icons == RailIcons::Sixel {
-            let (band_x, _) = columns[1];
-            let (last_x, last_width) = columns[6];
-            let band_right = last_x.saturating_add(last_width).min(area.right());
-            if band_right > band_x {
-                fill_rect(Rect::new(band_x, y, band_right - band_x, row_height), SIDEBAR_BG, buf);
-            }
+        // Inherits `theme.surface`, in every `RailIcons` mode -- same fix
+        // as `render_activity_rail`'s own panel fill (see that function's
+        // own doc comment for the full regression this reverts): stating
+        // `SIDEBAR_BG` here unconditionally used to paint the WHOLE icon-
+        // columns band as a lighter plate against the terminal's own real
+        // background in `PtyColorMode::Inherited`. `render_gallery_size_
+        // swatch`'s own body now tracks `theme.active` at rest instead of
+        // a fixed constant (same fix as `render_rail_button`'s own body),
+        // so repainting this band with the pane's own `theme.surface`
+        // first -- covering the gaps between the strip/rail/gallery/
+        // family columns and any padding a swatch's own smaller icon
+        // footprint leaves inside its wider column -- keeps the whole row
+        // visually flat again, without ever stating a colour distinct
+        // from what the pane already shows.
+        let (band_x, _) = columns[1];
+        let (last_x, last_width) = columns[6];
+        let band_right = last_x.saturating_add(last_width).min(area.right());
+        if band_right > band_x {
+            fill_rect(Rect::new(band_x, y, band_right - band_x, row_height), theme.surface, buf);
         }
 
         for (col_index, cells_wide, cells_tall, size, family) in [
@@ -3627,11 +3646,12 @@ fn render_icon_gallery(
 /// One "size" swatch cell inside [`render_icon_gallery`]'s own grid, now
 /// one per (tier, `family`) PAIR rather than one per tier: `RailIcons::
 /// Sixel` reserves `area`'s own cell footprint (already a plain,
-/// explicit-truecolor `ACTIVE_BG`-filled blank -- the SAME background the
-/// swatch's own baked asset was composited against, in every
-/// `PtyColorMode` (see [`icons::SixelVariant`]'s own doc comment); the
-/// real pixels are written by `client::run`'s post-flush hook, same split
-/// as `render_rail_button`'s own Sixel arm) and records the placement, OR
+/// `theme.active`-filled blank -- the SAME background `icons::resolve_
+/// variant_background` resolves for this swatch's own placement, in
+/// every `PtyColorMode` (see [`icons::SixelVariant`]'s own doc comment);
+/// the real pixels are written by `client::run`'s post-flush hook, same
+/// split as `render_rail_button`'s own Sixel arm) and records the
+/// placement, OR
 /// -- when `family` is `Lucide` and `id` is one of the two documented
 /// mapping gaps (`icons::lucide_slug(id).is_none()`) -- paints a plain
 /// `n/a` label instead of pushing a placement at all: `client::
@@ -3685,18 +3705,22 @@ fn render_gallery_size_swatch(
                 // fn's own doc comment). Still paint a plain background
                 // patch over whatever room IS available so a too-narrow
                 // column reads as an empty swatch, not stale content --
-                // `ACTIVE_BG`, not `theme.active`: see this fn's own doc
-                // comment for why the Sixel arm never uses the theme-
-                // dependent colour.
-                fill_rect(area, ACTIVE_BG, buf);
+                // `theme.active`, matching every other at-rest sixel body
+                // now (see `render_rail_button`'s own doc comment for why
+                // this tracks the theme instead of a fixed constant): the
+                // gallery is a read-only comparison grid, `variant` is
+                // always `GateActive` here (`render_icon_gallery`'s own
+                // caller), so this is the ONE background this swatch ever
+                // needs.
+                fill_rect(area, theme.active, buf);
                 return;
             }
             let icon_area = Rect::new(area.x, area.y, cells_wide, cells_tall);
-            fill_rect(icon_area, ACTIVE_BG, buf);
+            fill_rect(icon_area, theme.active, buf);
             if family == IconFamily::Lucide && icons::lucide_slug(id).is_none() {
                 let label_row = Rect::new(icon_area.x, icon_area.y + icon_area.height / 2, icon_area.width, 1);
                 Paragraph::new(centered_label("n/a", label_row.width as usize))
-                    .style(Style::default().fg(theme.muted).bg(ACTIVE_BG))
+                    .style(Style::default().fg(theme.muted).bg(theme.active))
                     .render(label_row, buf);
                 return;
             }
@@ -16260,16 +16284,20 @@ mod tests {
         assert!(rect_text(&ascii_buf, new_directory_rect).contains(icons::ascii(icons::IconId::NewFolder)));
     }
 
-    /// FIX1 follow-up regression guard, strip's own analogue of
-    /// `activity_rail_column_states_an_explicit_background_around_every_
-    /// button_in_every_mode`: the gap column BETWEEN two strip buttons
-    /// must state the same explicit `SIDEBAR_BG` a button's own body
-    /// (`ACTIVE_BG`) is composited against, in `PtyColorMode::Inherited`,
-    /// not `theme.panel`'s `Color::Reset` -- otherwise each button's own
-    /// opaque icon reads as a plate against whatever the terminal's own
-    /// inherited background actually is.
+    /// The actual fix, strip's own analogue of `activity_rail_column_
+    /// inherits_the_panel_background_in_every_mode`: the gap column
+    /// BETWEEN two strip buttons and a button's own body must read as
+    /// the EXACT SAME background in `PtyColorMode::Inherited` (`Color::
+    /// Reset`, the terminal's own real background) -- an un-selected
+    /// strip button is not a real, deliberate state the owner needs to
+    /// see, so it states no background distinct from its own row.
+    /// Stating an explicit `SIDEBAR_BG`/`ACTIVE_BG` pair here used to be
+    /// this crate's own plate defect: `SIDEBAR_BG` reads as a visibly
+    /// LIGHTER column than the terminal's own real (usually darker)
+    /// background, and painting `ACTIVE_BG` under every button regardless
+    /// of selection compounded it one level further.
     #[test]
-    fn control_strip_row_states_an_explicit_background_between_buttons_in_inherited_mode() {
+    fn control_strip_row_and_button_body_inherit_the_same_background_in_inherited_mode() {
         let mut app = fixture(PtyColorMode::Inherited);
         app.apply_workspace_inspection("node-a".to_owned(), inspection());
         app.sidebar_mode = SidebarMode::Files;
@@ -16287,13 +16315,9 @@ mod tests {
         // `CONTROL_STRIP_BUTTON_GAP` before NewFolder starts -- never
         // painted by any button's own body fill.
         let gap_cell = buf.get(new_file_rect.right(), new_file_rect.y);
-        assert_eq!(
-            gap_cell.style.bg,
-            SIDEBAR_BG,
-            "the gap between two strip buttons must state an explicit truecolor background in Inherited mode"
-        );
         let body_cell = buf.get(new_file_rect.x, new_file_rect.y);
-        assert_eq!(body_cell.style.bg, ACTIVE_BG, "the button's own body must still read distinctly from the strip row around it");
+        assert_eq!(gap_cell.style.bg, Color::Reset, "the gap between two strip buttons must inherit the terminal's own real background in Inherited mode");
+        assert_eq!(body_cell.style.bg, Color::Reset, "an un-selected strip button's own body must be indistinguishable from the row around it");
     }
 
     #[test]
@@ -18210,12 +18234,27 @@ mod tests {
         // rect, the invariant this test actually covers (the strip's own
         // coverage lives in `workspace_files_render_create_actions_and_
         // entry_dialog` and the `explorer_control_strip_*`/`git_control_
-        // strip_*` tests).
+        // strip_*` tests). Pre-existing bug fixed in place, unrelated to
+        // this module's own sixel-background work: this fixture's 24 rows
+        // (with Board's own 4th top-group entry counted in) already
+        // clears `render_activity_rail`'s own documented "a whole extra
+        // button's worth of rows" gate for its bottom-group icon-gallery
+        // button (`HitTarget::SettingsIconGallery`, baked from `icons::
+        // IconId::Layout`) -- that button legitimately places a 6th rail
+        // placement here, verified against this exact fixture on the
+        // pre-existing code (unchanged by this module's own edits) before
+        // this fix, not just asserted. This test's own coverage is
+        // specifically the five NAMED views below, so it excludes that
+        // icon by identity rather than widening its own strict count --
+        // the gallery button's own presence/absence is `settings_icon_
+        // gallery_button_and_key_open_the_icon_gallery_tab`'s concern,
+        // not this test's.
         let rail_sixel_icons = sixel_layout
             .sixel_icons
             .iter()
             .filter(|placement| {
                 placement.size == crate::app::SixelIconSize::Rail
+                    && placement.icon != icons::IconId::Layout
                     && sixel_layout.activity_rail.contains(placement.rect.x, placement.rect.y)
             })
             .collect::<Vec<_>>();
@@ -18342,26 +18381,24 @@ mod tests {
         assert_ne!(buf.get(body_x, body_y).style.bg, theme.panel);
     }
 
-    /// FIX1 follow-up regression guard: an icon-bearing button's own
-    /// opaque sixel raster is composited against `ACTIVE_BG`/`MAUVE` at
-    /// bake time (see `icons::SixelVariant`'s own doc comment) -- if the
-    /// rail COLUMN around that button's own rect is left at `theme.
-    /// panel`'s `Color::Reset` in `PtyColorMode::Inherited`, the icon
-    /// reads as an opaque plate against whatever the terminal's own
-    /// inherited background actually is, not a themed button. This
-    /// checks the SAME margin/accent column
-    /// `activity_rail_inactive_button_paints_a_background_distinct_from_
-    /// the_rail` above already establishes stays the rail's own
-    /// background (never the button body's) -- here in `Inherited` mode,
-    /// where that background must now be the SAME explicit `SIDEBAR_BG`
-    /// `PtyColorMode::GateOverride`'s own `theme.panel` already used, not
-    /// `Color::Reset`. Also checks the selected button's own `MAUVE`
-    /// accent stays scoped to its own rect, never bleeding into a
-    /// neighboring inactive button's margin column, so the contrast
-    /// stays deliberate (this button is selected) rather than accidental
-    /// (the whole rail turned accent-coloured).
+    /// The actual OSC 11 background fix, locked in at the cell level: in
+    /// `PtyColorMode::Inherited`, the rail's own margin column AND an
+    /// UN-selected button's own body must be the EXACT SAME `Color::
+    /// Reset` -- the terminal's own real background, never a stated
+    /// constant -- so an at-rest button is genuinely indistinguishable
+    /// from the column it sits in. Stating an explicit `SIDEBAR_BG` for
+    /// the column and a DIFFERENT `ACTIVE_BG` for every button's own
+    /// body regardless of selection (the previous, retired fix) is
+    /// exactly the "icons sit on a different, standing-out background"
+    /// defect this test now guards against, one level further than just
+    /// the column alone. A SELECTED button is the one real, deliberate
+    /// state the owner should still see: this also checks the selected
+    /// Files button's own `MAUVE` accent stays scoped to its own rect,
+    /// never bleeding into a neighboring inactive button's margin column,
+    /// and that it never collapses to `Color::Reset` the way the
+    /// inactive case now correctly does.
     #[test]
-    fn activity_rail_column_states_an_explicit_background_around_every_button_in_every_mode() {
+    fn activity_rail_column_and_inactive_button_body_share_the_real_background_in_inherited_mode() {
         let mut app = fixture(PtyColorMode::Inherited);
         app.sidebar_presentation = SidebarPresentation::Activity;
         app.control_section = ControlSection::Files;
@@ -18383,31 +18420,30 @@ mod tests {
         let margin_y = git_hit.rect.y + git_hit.rect.height / 2;
         assert_eq!(
             buf.get(git_hit.rect.x, margin_y).style.bg,
-            SIDEBAR_BG,
-            "the rail's own margin column must state an explicit truecolor background in Inherited mode, not inherit the terminal's own"
+            Color::Reset,
+            "the rail's own margin column must inherit the terminal's own real background in Inherited mode"
         );
         assert_eq!(
             buf.get(git_hit.rect.right() - 1, margin_y).style.bg,
-            SIDEBAR_BG,
-            "the trailing margin column on the OTHER side of the button body must state the same explicit background"
+            Color::Reset,
+            "the trailing margin column on the OTHER side of the button body must inherit the same real background"
         );
 
         let body_x = git_hit.rect.x + 1;
         assert_eq!(
             buf.get(body_x, margin_y).style.bg,
-            ACTIVE_BG,
-            "the inactive button's own body must still read distinctly from the rail column around it"
+            Color::Reset,
+            "an inactive button's own body must be indistinguishable from the rail column around it, not a plate"
         );
-        assert_ne!(ACTIVE_BG, SIDEBAR_BG, "fixture sanity: the two stated colours must actually differ");
 
         // The selected Files button's own accent must stay inside its
         // own rect -- the inactive Git button's margin column sampled
-        // above already proves this stayed `SIDEBAR_BG`, not `MAUVE`.
+        // above already proves this stayed `Color::Reset`, not `MAUVE`.
         let selected_margin_y = files_hit.rect.y + files_hit.rect.height / 2;
         assert_eq!(
             buf.get(files_hit.rect.x + 1, selected_margin_y).style.bg,
             MAUVE,
-            "the selected button's own body must carry the accent background"
+            "the selected button's own body must carry the fixed accent background, even in Inherited mode"
         );
     }
 
@@ -18826,18 +18862,20 @@ mod tests {
         );
     }
 
-    /// FIX1 follow-up regression guard, the gallery's own analogue of
-    /// `activity_rail_column_states_an_explicit_background_around_every_
-    /// button_in_every_mode`: a swatch's own reserved column is wider
-    /// than its icon's own footprint (see `render_gallery_size_swatch`'s
-    /// own doc comment), so the padding around the icon within that same
-    /// column must state the same explicit `SIDEBAR_BG` the icon itself
-    /// is composited against, in `PtyColorMode::Inherited`, not `theme.
-    /// surface`'s `Color::Reset` -- otherwise the icon's own opaque rect
-    /// reads as a plate against whatever the terminal's own inherited
-    /// background actually is.
+    /// The actual OSC 11 background fix, the gallery's own analogue of
+    /// `activity_rail_column_and_inactive_button_body_share_the_real_
+    /// background_in_inherited_mode`: a swatch's own reserved column is
+    /// wider than its icon's own footprint (see `render_gallery_size_
+    /// swatch`'s own doc comment), so the padding around the icon within
+    /// that same column and the icon's own reserved cells must be the
+    /// EXACT SAME `Color::Reset` in `PtyColorMode::Inherited` -- the
+    /// gallery is a read-only comparison grid with no selected state at
+    /// all, so nothing about it should ever stand out from the pane
+    /// around it. Stating an explicit `SIDEBAR_BG`/`ACTIVE_BG` pair here
+    /// (the previous, retired fix) is exactly the plate defect this test
+    /// now guards against.
     #[test]
-    fn gallery_swatch_column_states_an_explicit_background_around_the_icon_in_inherited_mode() {
+    fn gallery_swatch_column_and_icon_share_the_real_background_in_inherited_mode() {
         let mut app = fixture(PtyColorMode::Inherited);
         app.surface.open_in_focused(SurfaceTab::IconGallery);
         assert_eq!(app.rail_icons, RailIcons::Sixel);
@@ -18855,13 +18893,9 @@ mod tests {
         // Rail-size column does not start until well past that either.
         let padding_x = strip_placement.rect.right();
         let padding_cell = buf.get(padding_x, strip_placement.rect.y);
-        assert_eq!(
-            padding_cell.style.bg,
-            SIDEBAR_BG,
-            "the swatch column's own padding around the icon must state an explicit truecolor background in Inherited mode"
-        );
         let icon_cell = buf.get(strip_placement.rect.x, strip_placement.rect.y);
-        assert_eq!(icon_cell.style.bg, ACTIVE_BG, "the icon's own reserved cells must still read as the same background its baked asset was composited against");
+        assert_eq!(padding_cell.style.bg, Color::Reset, "the swatch column's own padding around the icon must inherit the terminal's own real background in Inherited mode");
+        assert_eq!(icon_cell.style.bg, Color::Reset, "the icon's own reserved cells must be indistinguishable from the padding around them, not a plate");
     }
 
     /// Reproduces the reported defect exactly: the icon gallery's own

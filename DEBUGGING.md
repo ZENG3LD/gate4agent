@@ -105,15 +105,19 @@ cargo test --lib pipe::session::tests
 ```
 
 Node/c2/harness/observation Windows E2E tests do not run under plain
-`cargo test`. They build to an isolated `--target-dir` (so parallel test runs
-never collide on Cargo's build lock) and execute through the headless
-supervisor binary, which suppresses Windows fault dialogs and enforces a hard
-per-test timeout:
+`cargo test`. They execute through the headless supervisor binary, which
+suppresses Windows fault dialogs and enforces a hard per-test timeout:
 
 ```
-cargo build --release -p <crate> --test <test_file> --target-dir target-<scenario>
-target-<scenario>\release\windows-headless-supervisor.exe <timeout_ms> <ABS path to test exe> --exact <test_fn>
+cargo build --release -p <crate> --test <test_file>
+target\release\windows-headless-supervisor.exe <timeout_ms> <ABS path to test exe> --exact <test_fn>
 ```
+
+Build into the workspace's own `target/`. Do not give a run its own
+`--target-dir`: each one is a full copy of the dependency build, and they
+accumulate into tens of gigabytes. If two builds overlap, Cargo's build lock
+makes the second WAIT -- that is the lock working, not a problem to route
+around.
 
 If any test fails on a clean checkout with a released version, file an issue with:
 - OS + version

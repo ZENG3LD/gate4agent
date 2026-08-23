@@ -102,9 +102,9 @@ plain `cargo test` cannot:
 target\release\windows-headless-supervisor.exe <timeout_ms> <ABS path to test exe> --exact <test_fn>
 ```
 
-Parallel test arcs build against isolated `--target-dir` values
-(`target-<scenario>`) instead of sharing `target/`, so independent runs never
-collide on Cargo's build lock. Tests gated by
+All builds share the workspace's own `target/`. A per-run `--target-dir` is
+a full copy of the dependency build and they pile up fast; when two builds
+overlap, Cargo's build lock simply makes the second wait. Tests gated by
 `require_windows_headless_supervisor_for_test()` reject themselves outright if
 run any other way.
 

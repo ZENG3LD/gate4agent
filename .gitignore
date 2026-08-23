@@ -1,9 +1,8 @@
-# Every cargo build-output directory, not just `target/`: this repo's own
-# build tooling routinely points --target-dir at renamed/agent-scoped
-# directories (`target-a2`, `target-a2-tui`, `target-monitor-release-v20`,
-# `target-task-workbench-*`, ...) both at the repo root and inside the
-# nested `crates/gate4agent-tui` workspace. Matches
-# `is_skipped_workspace_directory`'s CACHEDIR.TAG-based node-side walk skip
+# Build output. The pattern is `target*/` rather than `target/` as a safety
+# net for scenario-scoped directories that already exist -- NOT as licence
+# to create them: one target per workspace, see CLAUDE.md's own "Build
+# output" section for why. Matches `is_skipped_workspace_directory`'s
+# CACHEDIR.TAG-based node-side walk skip
 # (crates/gate4agent-node/src/server.rs) in intent, not just by name.
 target*/
 Cargo.lock

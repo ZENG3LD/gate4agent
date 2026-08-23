@@ -1,9 +1,12 @@
 # gate4agent — agent harness / thin C2
 
 Node (owns PTY/processes/workspaces/worktrees) + C2 (relay) + Harness
-(task kernel, SQLite SWC) + TUI (`gate4agent-tui` harness mode,
-`gate4agent-tui-light` direct-C2). Plans/handoffs/audits live in the
-owner's private workspace documentation tree, not in this repository.
+(task kernel, SQLite SWC) + TUI. Both clients speak ONLY the harness
+operator wire: `gate4agent-tui` against a durable harness, and
+`gate4agent-tui-light` against `gate4agent-harness-light`, which it hosts
+in-process over c2 with no task kernel behind it. Neither app speaks c2
+itself. Plans/handoffs/audits live in the owner's private workspace
+documentation tree, not in this repository.
 
 ## Local endpoints & credentials
 

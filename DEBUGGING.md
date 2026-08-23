@@ -11,7 +11,7 @@ If a session produces no events:
 1. **Is the CLI binary on `PATH`?** Run it manually first (`claude --version`, `codex --version`, etc.).
 2. **Is the CLI logged in?** gate4agent doesn't handle auth. Each CLI manages its own credentials.
 3. **Capture raw stdout** — before blaming the parser, spawn the exact argv gate4agent uses and pipe to a file. Compare against the fixture NDJSON in `tests/` for that CLI.
-4. **Check for interactive prompts** — headless mode must not prompt. Codex needs `--full-auto --skip-git-repo-check` (gate4agent adds these automatically).
+4. **Check for interactive prompts** — headless mode must not prompt. gate4agent always adds `--skip-git-repo-check` for Codex, and always passes an explicit sandbox mode, which defaults to `read-only` (`src/pipe/cli/codex.rs`). It never passes `--full-auto`: that name survives only as an alias a caller may set in `permission_mode` to select `danger-full-access`.
 5. **Check exit code** — `SessionEnd { result: "exit_code=N", is_error: ... }` tells you if the child crashed. `exit_code=0` without real events usually means the CLI wrote something we don't parse.
 
 ## Per-CLI issues
@@ -19,8 +19,8 @@ If a session produces no events:
 ### Claude Code
 
 - **Prompt is delivered via stdin**, not argv. If stdin is closed before the prompt is written, Claude will exit with no output.
-- **`--dangerously-skip-permissions`** is always passed. Without it, headless mode blocks on permission prompts.
-- **`--append-system-prompt`** containing double quotes: gate4agent's Windows shell-wrapper (`argv_to_windows_shell_string`) handles escaping, but complex prompts with nested quotes can still break. If that happens, write the prompt to a file and reference it.
+- **`--permission-mode`** is always passed and defaults to `plan` (`src/pipe/cli/claude.rs`). `--dangerously-skip-permissions` is never passed. A session that produces no edits is usually not stuck on a prompt — it is planning, because plan mode is read-only by design.
+- **`--append-system-prompt`** containing double quotes: arguments are passed as separate elements rather than joined into a shell string, so quoting is `CreateProcess`'s job, not ours. If a prompt with nested quotes still misbehaves, write it to a file and reference it.
 - **Resume session id**: UUID string from previous session's `SessionStart` event. Must be exact.
 
 ### Codex
@@ -41,7 +41,7 @@ If a session produces no events:
 
 ### OpenCode (sst/opencode)
 
-- **5-event schema**: `step_start`, `tool_use`, `text`, `step_finish`, `error`. Some versions use `tool_use` as an alias for `step_start` — parser accepts both.
+- **6-event schema**: `step_start`, `tool_use`, `text`, `reasoning`, `step_finish`, `error`. Some versions use `tool_use` as an alias for `step_start` — parser accepts both.
 - **Session id prefix**: `ses_XXXX`. Parser tracks this automatically; use with `SpawnOptions::resume_session_id` to resume.
 - **Parser is doc-based**. If real output differs, file an issue with raw stdout.
 - **Don't confuse with `charmbracelet/crush`** or `opencode-ai/opencode`. gate4agent targets `sst/opencode` v1.4.0+.
@@ -56,13 +56,14 @@ If a session produces no events:
 
 ### Windows-specific
 
-- **Spawn uses `cmd /C <shell_string>`** on Windows. The shell string is built by `argv_to_windows_shell_string` which wraps each token in `"..."` with `\"` escaping. If you pass a prompt containing backticks, `%var%`, or `^` escapes, `cmd.exe` may interpret them — use `extra_args` cautiously.
+- **Spawn does not go through `cmd.exe` when it can be avoided.** For Claude/Codex/Kimi, `build_command_with_options` (`src/pipe/process.rs`) first resolves the direct `.exe`/JS entrypoint via `windows_direct_npm_command`; every argument is then passed as its own element, never joined into a shell string. Where `cmd.exe` IS still involved, a prompt containing backticks, `%var%` or `^` can be interpreted by it — use `extra_args` cautiously.
 - **PTY path uses ConPTY**. If you see corrupt output in PTY mode, verify your Windows version supports ConPTY (Windows 10 1809+).
 
 ### Reader thread deadlocks
 
-- Reader thread blocks on `child.stdout.read_line()`. If the CLI never closes stdout and never exits, the thread hangs forever. Kill the session via `TransportSession::kill()` or `PipeSession::kill()` to force cleanup.
-- On kill, gate4agent drops the stdin handle first (which usually causes the CLI to exit cleanly), then waits up to 2s, then `child.kill()` if needed.
+- The reader thread does raw `read` into an 8KB buffer (`src/pipe/process.rs`), not line-based reads, so a CLI that never emits a newline is not by itself a hang.
+- It cannot hang forever: `reader_loop` fixes a deadline of `PIPE_TIMEOUT_SECONDS` (60) at loop start and force-terminates once it elapses, with no manual `kill()` needed.
+- `kill()` is not graceful. Both `PipeSession::kill()` and `PipeProcess::kill()` go straight to `kill_tree()` — `taskkill /PID <id> /T /F` on Windows, `kill -KILL -- -<pid>` on unix — an immediate hard kill of the whole process tree. There is no drop-stdin-then-wait step.
 
 ## Node / C2 / Harness
 

@@ -8,7 +8,7 @@ file browser, local git, worktrees); c2 relays any number of nodes to their
 clients; a harness — light or full — is the one stateful backend a client app
 talks to, behind a single app-facing protocol, adding task kanban, session
 context, and delivery on top of the c2 transport; the TUI is the current
-client, running in harness mode or in a direct-c2 light mode. The library that
+client, and it speaks only the harness operator wire in either mode. The library that
 started this repo — spawn, stream, resume CLI-agent subprocesses through one
 API — is still here, still usable standalone, and is now the substrate the
 rest of the stack builds on; see [Transport core](#transport-core) below.
@@ -40,10 +40,13 @@ crate names below are prefixed `gate4agent-` (e.g. `-node` = `gate4agent-node`).
   skills/plugins/MCP config, an operator surface: `-harness-protocol`,
   `-harness-engine`, `-harness-service` (bin `gate4agent-harness`),
   `-harness-api`, `-harness-client` (bin `gate4agent-harnessctl`),
-  `-harness-mcp` (bin `gate4agent-harness-mcp`), `-harness-delivery`.
+  `-harness-mcp` (bin `gate4agent-harness-mcp`), `-harness-delivery`,
+  `-harness-light` (stateless, serves the same operator wire straight over
+  c2 with no task kernel behind it).
 - **Client** — `crates/gate4agent-tui`, its own nested cargo workspace: bins
-  `gate4agent-tui` (harness mode) and `gate4agent-tui-light` (direct-c2 light
-  mode).
+  `gate4agent-tui` (against a durable harness) and `gate4agent-tui-light`
+  (hosts `gate4agent-harness-light` in-process). Neither app speaks c2
+  itself.
 - **Testing** — `gate4agent-testkit`: authentication-free provider fixtures
   and the Windows headless test supervisor.
 
@@ -78,7 +81,17 @@ changes only when the transport core itself does.
 | C2 | `\\.\pipe\gate4agent-c2` (Unix: local socket) | `127.0.0.1:18320` |
 | Harness | — | operator surface on `127.0.0.1:18330` |
 
-All three are loopback/local-only; nothing here is reachable off the host by
+The harness does not share the primary c2 — it connects out through a second
+c2 instance of its own, on pipe `gate4agent-c2-harness` with API
+`127.0.0.1:18321`. A live stack is therefore **four** processes: node, two
+c2, harness. Bring one up without that second instance and the harness fails
+at startup with a bare connect error.
+
+Only node's `18310` and c2's `18320` are compiled-in defaults. `18321` and
+`18330` are conventions passed on the command line (`--api-listen`,
+`--read-bind`), so grepping the source for them finds nothing.
+
+All of it is loopback/local-only; nothing here is reachable off the host by
 default.
 
 ## Credentials

@@ -3207,6 +3207,14 @@ fn render_agent_menu(
         .border_style(Style::default().fg(theme.accent))
         .style(Style::default().bg(theme.modal))
         .render(menu_area, buf);
+    // Slice 1 of the uniform overlay-close contract: this menu had no
+    // `[x]` at all before -- outside-click and `Escape` were its only
+    // close paths. `App::click`'s own top-priority `_ => { self.
+    // agent_menu = None; }` fallback (right above the `Focus` dispatch
+    // chain) already closes on ANY unmatched target, so this cross's own
+    // hit region needs no dedicated match arm there; it rides that same
+    // fallback for free.
+    render_modal_close(menu_area, buf, layout, theme);
     let inner = Rect::new(
         menu_area.x.saturating_add(1),
         menu_area.y.saturating_add(1),
@@ -3290,6 +3298,10 @@ fn render_native_session_menu(
         .border_style(Style::default().fg(theme.accent))
         .style(Style::default().bg(theme.modal))
         .render(menu_area, buf);
+    // Same addition, same reasoning, as `render_agent_menu`'s own `render_
+    // modal_close` call just above it in this file -- see that call
+    // site's doc comment.
+    render_modal_close(menu_area, buf, layout, theme);
     let inner = Rect::new(
         menu_area.x.saturating_add(1),
         menu_area.y.saturating_add(1),
@@ -3494,6 +3506,7 @@ fn render_tabs(
         x = x.saturating_add(layout_width);
     }
     if app.layout_menu_open {
+        let presets_start_x = x;
         for preset in LayoutPreset::ALL {
             if x >= controls_right {
                 break;
@@ -3515,6 +3528,19 @@ fn render_tabs(
             });
             x = x.saturating_add(width);
         }
+        // Slice 1 of the uniform overlay-close contract: this is the ONE
+        // overlay in the crate with no bordered frame at all -- a run of
+        // plain preset labels inline in the tab strip, deliberately
+        // excluded from `render_modal_close`'s `[x]` (see that fn's own
+        // doc comment) because there is no frame to hang a cross on. It
+        // still needs a rect registered here so `App::click`'s outside-
+        // click guard can tell "click landed on one of these labels" from
+        // "click landed elsewhere" -- covers only the preset labels just
+        // painted above, deliberately NOT the toggle button that opened
+        // them (`HitTarget::LayoutMenuToggle`, painted before this block):
+        // that button is the opener, not overlay content, exactly like
+        // every other overlay's opener control sits outside its own rect.
+        layout.note_overlay(Rect::new(presets_start_x, area.y, x.saturating_sub(presets_start_x), 1));
     }
     // The app-wide quick search: centred in this WHOLE strip (`area.x` ..
     // `tabs_right`, before the gear's own reservation), but never at the
@@ -3711,6 +3737,12 @@ fn render_global_search_dropdown(
         .border_style(Style::default().fg(theme.accent))
         .style(Style::default().bg(theme.modal))
         .render(dropdown, buf);
+    // Slice 1 of the uniform overlay-close contract: this dropdown had no
+    // `[x]` before -- `App::click_global_search` already carries a `Some(
+    // HitTarget::ModalClose) => self.close_global_search()` arm (added
+    // ahead of there being anywhere to paint the cross), so this call is
+    // what actually makes that arm reachable.
+    render_modal_close(dropdown, buf, layout, theme);
     if dropdown.width < 3 || dropdown.height < 3 {
         return;
     }
@@ -10696,7 +10728,13 @@ fn push_modal_hit(layout: &mut LayoutRects, rect: Rect, target: HitTarget) {
 /// bordered `modal` rect this one fn draws), and `render_harness_reverse_
 /// attribution` (HarnessLinks -- in addition to, not instead of, that
 /// modal's own pre-existing `[Close]` content-row button, which is
-/// untouched).
+/// untouched). Slice 1 of the uniform overlay-close contract
+/// (`docs/gate4agent/plans/gate4agent-tui-overlay-uniform-contract-
+/// 2026-08-24.md`) added three more callers that used to have no cross at
+/// all: `render_agent_menu`, `render_native_session_menu`, and `render_
+/// global_search_dropdown`. The layout-preset menu (`render_tabs`) is the
+/// one overlay deliberately left out -- it renders as inline labels with
+/// no frame to hang a cross on, see its own call site's doc comment.
 fn render_modal_close(modal: Rect, buf: &mut TerminalBuffer, layout: &mut LayoutRects, theme: Theme) {
     const CLOSE: &str = "[x]";
     let width = CLOSE.len() as u16;
@@ -16261,9 +16299,14 @@ mod tests {
     /// cells its border-drawing and populated rows happen to touch.
     /// `inherited_modals_are_opaque_over_provider_output` above spot-
     /// checks one AddSpace interior cell; this is the exhaustive version
-    /// across all 15 renderers that call `note_overlay` in `render::
-    /// render`'s own overlay chain (see that field's own doc comment for
-    /// the authoritative list), checked cell-by-cell rather than at one
+    /// across all 15 BORDERED/FILLED renderers that call `note_overlay` in
+    /// `render::render`'s own overlay chain (see that field's own doc
+    /// comment for the authoritative list) -- the layout-preset menu also
+    /// calls `note_overlay` now (slice 1 of the uniform overlay-close
+    /// contract) but paints inline labels over the tab strip's own
+    /// existing fill rather than an opaque frame of its own, so it has
+    /// nothing for THIS invariant to check and is deliberately not one of
+    /// the 15, checked cell-by-cell rather than at one
     /// sampled coordinate.
     ///
     /// Poisoning the whole buffer and calling each overlay renderer

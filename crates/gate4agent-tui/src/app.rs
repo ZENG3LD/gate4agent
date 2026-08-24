@@ -3006,15 +3006,28 @@ pub struct LayoutRects {
     /// `render_spawn`/`render_existing_session`/`render_settings`/every
     /// other renderer in `render::render`'s own overlay chain (modals,
     /// confirm dialogs, the agent/native-session context menus, the
-    /// harness links overlay) via `note_overlay`, at the exact point each
-    /// computes its own frame, before painting any of its own content. A
-    /// sixel image is raster painted directly over the terminal and obeys
-    /// no z-order of its own (see `sixel_icons`'s own doc comment above),
-    /// so this is the only record this program has of "something opaque
-    /// now sits on top of these cells" -- `render::render`'s own end-of-
-    /// frame occlusion pass drops every `sixel_icons` entry an overlay
+    /// harness links overlay, the global-search dropdown, and -- as of
+    /// slice 1 of the uniform overlay-close contract -- the layout-preset
+    /// menu, rendered inline in the tab strip with no frame of its own)
+    /// via `note_overlay`, at the exact point each computes its own frame,
+    /// before painting any of its own content. A sixel image is raster
+    /// painted directly over the terminal and obeys no z-order of its own
+    /// (see `sixel_icons`'s own doc comment above), so this was originally
+    /// the only record this program had of "something opaque now sits on
+    /// top of these cells" -- `render::render`'s own end-of-frame
+    /// occlusion pass drops every `sixel_icons` entry an overlay
     /// registered here now covers, so `client::flush_sixel_icon_into`
-    /// never has to guess.
+    /// never has to guess. `App::click`'s own outside-click guard (see
+    /// that fn's own doc comment) is this field's SECOND reader: before
+    /// slice 1, nothing in input routing ever compared a click's
+    /// coordinates against an open overlay's own rect at all -- every
+    /// `click_*` handler matched purely on `HitTarget`, so a background
+    /// hit region still live in `hits` while a modal was open (the rail,
+    /// sidebar, tab strip, and status bar all render unconditionally
+    /// every frame, modal or not) either fired unguarded (`Focus::
+    /// Settings`) or was silently swallowed by a `_ => {}` fallback (every
+    /// other overlay). This field already had the geometry the guard
+    /// needed; slice 1 is what finally read it for that purpose.
     pub overlays: Vec<OverlayRegion>,
     pub spaces: Rect,
     pub agents: Rect,
@@ -10301,6 +10314,20 @@ impl App {
         if self.agent_menu.is_some() {
             return self.reduce_agent_menu(key);
         }
+        // Slice 1 of the uniform overlay-close contract: the layout-preset
+        // menu had NO `Escape` arm anywhere before this -- confirmed by
+        // grepping every `UiKey::Escape =>` site in this file, none of
+        // them touched `layout_menu_open`. Unlike the checks above, this
+        // one only intercepts `Escape`/`OperatorEscape` and falls through
+        // for every other key: `layout_menu_open` is an inline tab-strip
+        // expansion, not a focus-capturing dialog (it never changes
+        // `self.focus`), so it must not swallow keys the rest of the
+        // chrome still needs (tab navigation, etc.) the way a real modal's
+        // exclusive-focus block does.
+        if self.layout_menu_open && matches!(key, UiKey::Escape | UiKey::OperatorEscape) {
+            self.layout_menu_open = false;
+            return AppAction::None;
+        }
         if self.focus == Focus::Spawn {
             return self.reduce_spawn(key);
         }
@@ -10420,6 +10447,86 @@ impl App {
         }
     }
 
+    /// Slice 1 of the uniform overlay-close contract (`docs/gate4agent/
+    /// plans/gate4agent-tui-overlay-uniform-contract-2026-08-24.md`): the
+    /// ONE place in `App::click` that ever compares a click's coordinates
+    /// against an open overlay's own painted rect, replacing nineteen
+    /// overlays' worth of ad hoc, inconsistent handling with one geometry
+    /// test. Before this existed, every `click_*` handler decided purely
+    /// by matching a `HitTarget` -- never by asking "is this click even
+    /// inside the thing that's open" -- because the rail, sidebar, tab
+    /// strip, and status bar all render (and push their own hit regions)
+    /// unconditionally every frame, modal or not, so a background target
+    /// was always still live in `hits` while an overlay had focus. The
+    /// result was either a swallowed click (every `click_*` helper's own
+    /// `_ => {}`/`AppAction::None` fallback) or, for `Focus::Settings`
+    /// specifically, an UNGUARDED one (its click block re-lists several
+    /// background targets with no rect test at all -- fixed separately,
+    /// see that block's own doc comment on the `menu_placement` guard).
+    ///
+    /// Called BEFORE the reverse-attribution / native-session-menu /
+    /// agent-menu top-priority checks right below, and before the whole
+    /// `self.focus` dispatch chain further down -- every one of those is
+    /// keyed on STATE (is this overlay's `Option`/`Focus` set), never on
+    /// geometry, so this must run first to have any effect at all. It is
+    /// intentionally a no-op whenever `layout.overlays` is empty (nothing
+    /// open this frame -- the overwhelmingly common case) or the click
+    /// falls inside some registered overlay rect: in EITHER case control
+    /// falls through to the exact same dispatch chain as before this
+    /// existed, so an inside click still reaches an overlay's own handler
+    /// unchanged -- see the agent-menu/native-session-menu checks' own
+    /// doc comment right below for why that matters there specifically.
+    ///
+    /// Closing "the topmost open overlay" needs no separate bookkeeping:
+    /// `render::render`'s own overlay sequence (the layout-preset menu,
+    /// then the global search, then the `Focus`-gated modal/status-bar
+    /// family, then the agent menu, then the native-session menu, then
+    /// harness reverse-attribution, each conditional on its own state)
+    /// already fixes a z-order, and the checks below walk it topmost-
+    /// first -- the exact priority the three checks right after this fn
+    /// already used before slice 1, now extended down through the
+    /// `Focus`-gated family (via the existing `close_focused_modal`
+    /// dispatcher, which already covers all of it) and the layout-preset
+    /// menu. Two or more of these CAN be open at once (e.g. the agent
+    /// menu can pop up while `Focus::Settings` still holds the roster
+    /// underneath it, app.rs's own Settings-focused click block reaches
+    /// `open_agent_menu` without changing focus) -- the order below is
+    /// what picks the one actually on top.
+    fn close_overlay_outside_click(&mut self, column: u16, row: u16) -> Option<AppAction> {
+        if self.layout.overlays.is_empty() {
+            return None;
+        }
+        if self.layout.overlays.iter().any(|overlay| overlay.rect.contains(column, row)) {
+            return None;
+        }
+        if self.harness_kanban.reverse_attribution.is_some() {
+            self.harness_kanban.reverse_attribution = None;
+            return Some(AppAction::None);
+        }
+        if self.native_session_menu.is_some() {
+            self.native_session_menu = None;
+            return Some(AppAction::None);
+        }
+        if self.agent_menu.is_some() {
+            self.agent_menu = None;
+            return Some(AppAction::None);
+        }
+        // Every `Focus` value that owns an overlay (the eleven `*Dialog`
+        // modals, the three status-bar zones, and `GlobalSearch`) routes
+        // through the exact same dispatcher its own `[x]`/`Escape` already
+        // use -- `close_focused_modal` is a `match self.focus` that is
+        // already exhaustive over this, so there is nothing left to
+        // reimplement here.
+        if !matches!(self.focus, Focus::Spaces | Focus::Agents | Focus::Tabs | Focus::Viewport) {
+            return Some(self.close_focused_modal());
+        }
+        if self.layout_menu_open {
+            self.layout_menu_open = false;
+            return Some(AppAction::None);
+        }
+        None
+    }
+
     pub fn click(&mut self, column: u16, row: u16) -> AppAction {
         let target = self
             .layout
@@ -10428,6 +10535,25 @@ impl App {
             .rev()
             .find(|hit| hit.rect.contains(column, row))
             .map(|hit| hit.target.clone());
+        if let Some(action) = self.close_overlay_outside_click(column, row) {
+            return action;
+        }
+        // Both of these already close on ANY click their own match below
+        // doesn't recognize (`_ => { self.agent_menu = None; }` and its
+        // `native_session_menu` twin) -- the best-behaved overlays in the
+        // crate even before slice 1. The guard just above this now beats
+        // them to that same close for every click OUTSIDE the menu's own
+        // rect, so their own fallback only still fires for a click that's
+        // geometrically INSIDE the menu but matches no `Some(...)` arm --
+        // which does not happen in practice (every cell inside either
+        // menu's rect is either its border/title, covered by its own new
+        // `[x]`, or one of its own `AgentMenuAction`/`NativeSessionMenuAction`
+        // rows), so in effect the guard now owns the close for both, and
+        // these blocks are left exactly as they were only so an INSIDE
+        // click keeps reaching `AgentMenuAction`/`NativeSessionMenuAction`/
+        // the re-click-to-reposition `AgentMore`/`NativeSessionMore` arms
+        // unchanged -- never double-firing with the guard, since the guard
+        // already returned for any click that lands there.
         if self.harness_kanban.reverse_attribution.is_some() {
             return match target {
                 Some(HitTarget::HarnessLinksClose) | Some(HitTarget::ModalClose) => {
@@ -10966,6 +11092,39 @@ impl App {
                 Some(HitTarget::SettingsIconFamily) => self.toggle_icon_family(),
                 Some(HitTarget::SettingsLucideStrokeWidth) => self.cycle_lucide_stroke_width(),
                 Some(HitTarget::SettingsIconGallery) => return self.open_icon_gallery(),
+                // FIX (slice 1, item 5): every arm from here down only
+                // exists as Settings' OWN painted content when `menu_
+                // placement == Modal` -- `render_settings`'s own `expanded`
+                // branch is the ONLY place any of Roster/Files/Git content
+                // (Agent/Space/Worktree/RosterMode/SidebarItem/etc. rows)
+                // is rendered INSIDE `modal`; the compact `MenuPlacement::
+                // Sidebar` popover renders nothing but `render_settings_
+                // controls`' own 8 rows (`SettingsStyle`..`SettingsIcon
+                // Gallery`, all matched above, all unaffected by this
+                // guard), each hit-tested only across its own label's
+                // width (see that fn's own per-row `Rect::new(area.x,
+                // area.y+N, LABEL_WIDTH, 1)` hits) -- every cell past a
+                // label is blank, with no hit of Settings' own pushed for
+                // it. Because the STILL-VISIBLE background sidebar
+                // underneath keeps its own Agent/Space/Worktree/RosterMode/
+                // etc. hits live in the very same flat `hits` list (unlike
+                // the expanded form, which suppresses the background
+                // entirely -- `render::render`'s own chrome dispatch), a
+                // click on one of those blank popover cells used to fall
+                // through to whatever background row happened to occupy
+                // that exact terminal cell -- background bleeding through
+                // an open dialog with no rect test at all, the owner's
+                // "Focus::Settings pass-through" defect. Gating every
+                // roster-shaped arm below on `expanded` ties each one to
+                // the ONE mode where it is genuinely Settings' own content
+                // AND where nothing is rendered underneath it to bleed
+                // through (background suppressed, per the same chrome
+                // dispatch above) -- an inside click on a popover's blank
+                // cell now falls all the way to this match's own `_ =>
+                // {}`, exactly like a click outside the whole dialog now
+                // does via `close_overlay_outside_click` above `click`'s
+                // own top.
+                _ if self.menu_placement != MenuPlacement::Modal => {}
                 Some(HitTarget::SidebarItem(index)) => {
                     let mode = match self.control_section {
                         ControlSection::Files => SidebarMode::Files,
@@ -11142,6 +11301,24 @@ impl App {
             }
             Some(HitTarget::AddTab) => return self.begin_spawn(),
             Some(HitTarget::LayoutMenuToggle) => {
+                // The `!` here already reads as the real opener-toggle the
+                // uniform overlay-close contract (slice 1, item 3) asks
+                // for, but in practice `click`'s own new outside-click
+                // guard (`close_overlay_outside_click`, called ahead of
+                // this whole match) now owns the CLOSE direction: this
+                // toggle sits outside the preset labels' own registered
+                // rect (`render_tabs`'s own `note_overlay` call covers only
+                // the labels, not this button -- see that call site's doc
+                // comment), so a re-click while the menu is open is an
+                // outside click and never reaches this arm at all -- the
+                // guard's own `if self.layout_menu_open { ... = false; }`
+                // fires first and returns. This arm still runs the OPEN
+                // direction (`layout.overlays` has nothing to close when
+                // the menu starts closed) and is left as a real toggle
+                // rather than a plain `= true` so it keeps behaving
+                // correctly on the one path that could still reach it with
+                // the menu already open: no overlay registered at all this
+                // frame (nothing else open either).
                 self.layout_menu_open = !self.layout_menu_open;
                 self.focus = Focus::Tabs;
             }
@@ -11495,17 +11672,23 @@ impl App {
     /// never a re-implementation of dismissal semantics, so e.g. Remove
     /// Worktree/Forget Session cancel rather than confirm. This is the
     /// click handler for every modal's new `[x]` close cross (`HitTarget::
-    /// ModalClose`, drawn by `render::render_modal_close`); every call
+    /// ModalClose`, drawn by `render::render_modal_close`); every such call
     /// site sits exactly where the corresponding `Escape` key already
     /// reaches the same routine from in `App::click`'s own dispatch chain
     /// (inside a `click_*` helper, the `Focus::Settings` block, or the
-    /// keyboard-only confirm/rename dialogs' shared block) -- never from
-    /// the top of `click` itself, so a still-open `agent_menu`/`native_
-    /// session_menu` keeps eating the first click exactly as it does for
-    /// every other target (this fn is never reached while one is open).
-    /// The reverse-attribution (HarnessLinks) modal isn't `Focus`-driven
-    /// and closes through its own arm right where `HarnessLinksClose`
-    /// already does, not through here.
+    /// keyboard-only confirm/rename dialogs' shared block).
+    ///
+    /// As of slice 1 of the uniform overlay-close contract, this IS also
+    /// reachable from the top of `click` -- `close_overlay_outside_click`'s
+    /// own guard calls it directly for any click outside the focused
+    /// overlay's own rect, for exactly the `Focus` values this match is
+    /// already exhaustive over. That guard runs before the `agent_menu`/
+    /// `native_session_menu` checks right below it in `click`, so a still-
+    /// open one of those still eats the first click exactly as before --
+    /// this fn is only reached from the guard when NEITHER is open, never
+    /// racing them. The reverse-attribution (HarnessLinks) modal isn't
+    /// `Focus`-driven either and closes through its own arm right where
+    /// `HarnessLinksClose` already does, not through here.
     fn close_focused_modal(&mut self) -> AppAction {
         match self.focus {
             Focus::Spawn => self.reduce_spawn(UiKey::Escape),
@@ -25892,6 +26075,166 @@ mod tests {
 
         assert_eq!(app.click(51, 2), AppAction::None);
         assert!(app.harness_kanban.reverse_attribution.is_none());
+    }
+
+    /// Slice 1 of the uniform overlay-close contract: pins `App::click`'s
+    /// new `close_overlay_outside_click` guard for the modal family. A
+    /// click on a background hit region still live in `hits` while `Focus::
+    /// Spawn` holds the dialog -- before this guard existed, `click_spawn`'s
+    /// own `_ => {}` fallback swallowed it, leaving both the click's real
+    /// target AND the dialog untouched (see that fn's own doc comment).
+    #[test]
+    fn click_outside_an_open_modal_closes_it_instead_of_being_swallowed() {
+        let mut app = fixture();
+        assert_eq!(app.begin_spawn(), AppAction::None);
+        assert_eq!(app.focus, Focus::Spawn);
+        assert!(app.spawn.is_some());
+        app.layout.overlays.push(OverlayRegion { rect: Rect::new(20, 5, 40, 10), drawn_before: 0 });
+        app.layout.hits = vec![HitRegion {
+            rect: Rect::new(0, 0, 5, 1),
+            target: HitTarget::RemoveSpace,
+        }];
+
+        assert_eq!(app.click(1, 0), AppAction::None);
+        assert_eq!(app.focus, Focus::Agents);
+        assert!(app.spawn.is_none());
+    }
+
+    /// Same guard, dropdown family: the global search has no border/title
+    /// at all (`render_global_search_dropdown`'s own doc comment), but it
+    /// registers a rect via `note_overlay` just like every modal, so the
+    /// guard closes it the same way.
+    #[test]
+    fn click_outside_an_open_dropdown_closes_it() {
+        let mut app = fixture();
+        assert_eq!(app.begin_global_search(), AppAction::None);
+        assert_eq!(app.focus, Focus::GlobalSearch);
+        assert!(app.global_search.expand_target_open);
+        app.layout.overlays.push(OverlayRegion { rect: Rect::new(30, 2, 28, 6), drawn_before: 0 });
+        app.layout.hits = vec![HitRegion {
+            rect: Rect::new(0, 0, 5, 1),
+            target: HitTarget::RemoveSpace,
+        }];
+
+        assert_eq!(app.click(1, 0), AppAction::None);
+        assert!(!app.global_search.expand_target_open);
+        assert_ne!(app.focus, Focus::GlobalSearch);
+    }
+
+    /// Slice 1, item 3: for the modal family the opener's own `HitTarget`
+    /// (`AddAgent`, the rail's button) was dead code while its dialog held
+    /// focus -- `click_spawn`'s dispatch never even looked at it. It sits
+    /// outside the centered modal's own rect, same as every opener in the
+    /// crate, so `close_overlay_outside_click` closes on a second click
+    /// there with no per-opener toggle code at all.
+    #[test]
+    fn opener_clicked_a_second_time_leaves_the_overlay_closed() {
+        let mut app = fixture();
+        assert_eq!(app.begin_spawn(), AppAction::None);
+        assert_eq!(app.focus, Focus::Spawn);
+        assert!(app.spawn.is_some());
+        app.layout.overlays.push(OverlayRegion { rect: Rect::new(20, 5, 40, 10), drawn_before: 0 });
+        app.layout.hits = vec![HitRegion {
+            rect: Rect::new(0, 0, 5, 1),
+            target: HitTarget::AddAgent,
+        }];
+
+        assert_eq!(app.click(1, 0), AppAction::None);
+        assert!(app.spawn.is_none());
+        assert_eq!(app.focus, Focus::Agents);
+    }
+
+    /// The complement of the two tests above: a click INSIDE the open
+    /// modal's own registered rect must be a no-op for the new guard and
+    /// fall all the way through to the modal's own handler exactly as
+    /// before slice 1 -- here, `click_spawn`'s `SpawnField` arm.
+    #[test]
+    fn click_inside_an_open_overlay_still_reaches_its_own_handler_and_does_not_close_it() {
+        let mut app = fixture();
+        assert_eq!(app.begin_spawn(), AppAction::None);
+        assert_eq!(app.spawn.as_ref().unwrap().field, LaunchField::Node);
+        let modal = Rect::new(20, 5, 40, 10);
+        app.layout.overlays.push(OverlayRegion { rect: modal, drawn_before: 0 });
+        app.layout.hits = vec![HitRegion {
+            rect: Rect::new(modal.x + 2, modal.y + 3, 10, 1),
+            target: HitTarget::SpawnField(LaunchField::Provider),
+        }];
+
+        assert_eq!(app.click(modal.x + 3, modal.y + 3), AppAction::None);
+        assert_eq!(app.focus, Focus::Spawn);
+        assert!(app.spawn.is_some());
+        assert_eq!(app.spawn.as_ref().unwrap().field, LaunchField::Provider);
+    }
+
+    /// The agent menu's new `[x]` (`render_agent_menu`'s own `render_modal_
+    /// close` call, slice 1 item 4) closes it -- via the SAME top-priority
+    /// `_ => { self.agent_menu = None; }` fallback that already closed on
+    /// any unmatched click, now reachable because there is finally
+    /// something painted at `HitTarget::ModalClose` to resolve to.
+    #[test]
+    fn modal_close_cross_closes_agent_menu() {
+        let mut app = fixture();
+        let key = AgentRowKey::Legacy(active_pty_address(&app));
+        app.agent_menu = Some(AgentMenuState {
+            key,
+            anchor_column: 10,
+            anchor_row: 7,
+            selected: 0,
+        });
+        let menu_area = Rect::new(10, 7, 30, 6);
+        app.layout.overlays.push(OverlayRegion { rect: menu_area, drawn_before: 0 });
+        app.layout.hits = vec![HitRegion {
+            rect: Rect::new(menu_area.right() - 4, menu_area.y, 3, 1),
+            target: HitTarget::ModalClose,
+        }];
+
+        assert_eq!(app.click(menu_area.right() - 3, menu_area.y), AppAction::None);
+        assert!(app.agent_menu.is_none());
+    }
+
+    /// Same addition, same fallback, for the native-session menu.
+    #[test]
+    fn modal_close_cross_closes_native_session_menu() {
+        let mut app = fixture();
+        app.native_session_menu = Some(NativeSessionMenuState {
+            key: PreviewTabKey::ManagedRecord {
+                node_id: "node-a".to_owned(),
+                record_id: "record-a".to_owned(),
+            },
+            anchor_column: 10,
+            anchor_row: 7,
+            selected: 0,
+        });
+        let menu_area = Rect::new(10, 7, 30, 6);
+        app.layout.overlays.push(OverlayRegion { rect: menu_area, drawn_before: 0 });
+        app.layout.hits = vec![HitRegion {
+            rect: Rect::new(menu_area.right() - 4, menu_area.y, 3, 1),
+            target: HitTarget::ModalClose,
+        }];
+
+        assert_eq!(app.click(menu_area.right() - 3, menu_area.y), AppAction::None);
+        assert!(app.native_session_menu.is_none());
+    }
+
+    /// The global-search dropdown's new `[x]` reaches `click_global_search`'s
+    /// pre-existing `Some(HitTarget::ModalClose) => self.close_global_
+    /// search()` arm -- that arm predates this wave; `render_global_search_
+    /// dropdown`'s new `render_modal_close` call is what finally makes it
+    /// reachable (see that call site's own doc comment).
+    #[test]
+    fn modal_close_cross_closes_global_search_dropdown() {
+        let mut app = fixture();
+        assert_eq!(app.begin_global_search(), AppAction::None);
+        let dropdown = Rect::new(30, 2, 28, 6);
+        app.layout.overlays.push(OverlayRegion { rect: dropdown, drawn_before: 0 });
+        app.layout.hits = vec![HitRegion {
+            rect: Rect::new(dropdown.right() - 4, dropdown.y, 3, 1),
+            target: HitTarget::ModalClose,
+        }];
+
+        assert_eq!(app.click(dropdown.right() - 3, dropdown.y), AppAction::None);
+        assert!(!app.global_search.expand_target_open);
+        assert_ne!(app.focus, Focus::GlobalSearch);
     }
 
     #[test]

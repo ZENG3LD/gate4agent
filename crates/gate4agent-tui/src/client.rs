@@ -85,7 +85,7 @@ use tokio::sync::{mpsc, watch};
 use uzor_tui::{Backend, CrosstermBackend, Rect, Screen, TerminalBuffer};
 
 use crate::app::{
-    App, AppAction, ConnectionState, NodeView, Provider, ProviderInventory, PtyColorMode,
+    App, AppAction, ConnectionState, EventSeverity, EventSource, NodeView, Provider, ProviderInventory, PtyColorMode,
     ManagedSessionView, NativeSessionCatalogRoute, NativeSessionCatalogRowView, NativeSessionPreviewMessageView,
     NativeSessionPreviewView, SessionAddress, SessionView, UiKey, GitCommitView,
     HarnessReadFailure, HarnessRunOrigin, HarnessRunRef, HarnessWorkspaceFileTabKey,
@@ -997,23 +997,21 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
                 queue_action(&mut app, &commands, &inspection_commands, &mut pending_raw, action);
             }
         }
-        if app.notice != last_notice {
-            last_notice = app.notice.clone();
-            notice_deadline = app.notice.as_ref().map(|_| Instant::now() + Duration::from_secs(3));
-            // The status bar's CENTRE-zone marquee has no notice history of
-            // its own to scroll through -- this is the single choke point
-            // every one of this crate's `self.notice = Some(...)` call
-            // sites already funnels through (the 3-second auto-dismiss
-            // timer above already relies on that same property), so it is
-            // also the one place that can feed the marquee's bounded log
-            // without touching any of those call sites. See `App::
-            // marquee_log`'s own doc comment.
-            if let Some(notice) = app.notice.clone() {
-                app.push_marquee_line(notice);
-            }
+        if app.notice() != last_notice.as_deref() {
+            last_notice = app.notice().map(str::to_owned);
+            notice_deadline = app.notice().map(|_| Instant::now() + Duration::from_secs(3));
+            // The CENTRE zone's event strip no longer rides this generic
+            // transition detector at all (see `App::emit_event`'s own doc
+            // comment) -- every `self.notice = Some(...)` site, regardless
+            // of which of this crate's own inventory's six groups it
+            // belongs to, used to land here unconditionally, which is
+            // exactly how a guard refusal and a real reconnect ended up in
+            // the same looping ticker. Producers that belong on the bus
+            // now call `emit_event` themselves, at the exact call site, so
+            // only that classified subset ever reaches `event_queue`.
             state_changed = true;
         } else if notice_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            app.notice = None;
+            app.dismiss_notice();
             last_notice = None;
             notice_deadline = None;
             state_changed = true;
@@ -1318,9 +1316,10 @@ fn send_operator_action(
         && !harness_resource_mutation
     {
         if !reject_history_refresh_action(app, &action, "Harness-owned session action unavailable") {
-            app.notice = Some(
-                "Harness-owned session action unavailable: no typed Harness intent exists"
-                    .to_owned(),
+            app.report_event(
+                EventSeverity::Warn,
+                EventSource::Connectivity,
+                "Harness-owned session action unavailable: no typed Harness intent exists",
             );
         }
         return;
@@ -1342,7 +1341,7 @@ fn send_operator_action(
             return;
         }
         if !reject_history_refresh_action(app, &action, "node unavailable") {
-            app.notice = Some(format!("unknown node {node_id}"));
+            app.report_event(EventSeverity::Warn, EventSource::Connectivity, format!("unknown node {node_id}"));
         }
         return;
     };
@@ -1353,7 +1352,11 @@ fn send_operator_action(
                 return;
             }
             if !reject_history_refresh_action(app, &action, "command queue busy") {
-                app.notice = Some(format!("{node_id}: command queue busy"));
+                app.report_event(
+                    EventSeverity::Warn,
+                    EventSource::Connectivity,
+                    format!("{node_id}: command queue busy"),
+                );
             }
         }
         Err(mpsc::error::TrySendError::Closed(action)) => {
@@ -1361,7 +1364,11 @@ fn send_operator_action(
                 return;
             }
             if !reject_history_refresh_action(app, &action, "command queue unavailable") {
-                app.notice = Some(format!("{node_id}: command queue unavailable"));
+                app.report_event(
+                    EventSeverity::Warn,
+                    EventSource::Connectivity,
+                    format!("{node_id}: command queue unavailable"),
+                );
             }
         }
     }
@@ -1534,7 +1541,7 @@ fn reject_harness_queue_action(
             }
         }.to_owned();
         app.fail_harness_monitor(run, message.clone());
-        app.notice = Some(message);
+        app.report_event(EventSeverity::Warn, EventSource::Connectivity, message);
         return true;
     }
     if let AppAction::HarnessLoadTaskCorrelations { task, launch_token, .. } = action {
@@ -1549,7 +1556,7 @@ fn reject_harness_queue_action(
         app.fail_harness_task_correlations(&task.task_id, message.clone());
         app.fail_harness_task_observations(&task.task_id, message.clone());
         app.fail_harness_launch_options(task, *launch_token, message.clone());
-        app.notice = Some(message);
+        app.report_event(EventSeverity::Warn, EventSource::Connectivity, message);
         return true;
     }
     if let AppAction::HarnessSaveTaskLaunchSpec { token, task, .. }
@@ -1580,12 +1587,13 @@ fn reject_harness_queue_action(
             app.restore_harness_composer(title.clone(), body.clone());
         }
     }
-    app.notice = Some(match rejection {
+    let message = match rejection {
         HarnessQueueRejection::Busy => "Harness operator busy: command queue is full",
         HarnessQueueRejection::Unavailable => {
             "Harness operator unavailable: command queue is closed"
         }
-    }.to_owned());
+    }.to_owned();
+    app.report_event(EventSeverity::Warn, EventSource::Connectivity, message);
     true
 }
 
@@ -1739,21 +1747,19 @@ fn reject_history_refresh_action(app: &mut App, action: &AppAction, reason: &str
         return true;
     }
     if matches!(action, AppAction::SpawnManagedWorktree { .. }) {
-        app.notice = Some(
+        app.flash(
             "Harness-owned session action unavailable: SpawnManagedWorktree has no typed \
              harness-operator verb -- it requires a full SpawnSpec construction (profile/\
-             bundle/context resolution) this wire does not expose outside a Task"
-                .to_owned(),
+             bundle/context resolution) this wire does not expose outside a Task",
         );
         return true;
     }
     if !matches!(action, AppAction::DiscoverHistory { .. } | AppAction::LoadHistory { .. }) {
         return false;
     }
-    app.notice = Some(
+    app.flash(
         "Harness-owned session action unavailable: native session-history discovery has no \
-         harness-operator wire mapping (light-mode direct-C2 only)"
-            .to_owned(),
+         harness-operator wire mapping (light-mode direct-C2 only)",
     );
     true
 }
@@ -4985,7 +4991,7 @@ fn apply_update(app: &mut App, terminal: &mut TerminalWatermarks, update: Worker
         WorkerUpdate::HarnessNodeWorkspaceFileRead { node_id: expected_node_id, token, file } => {
             match project_harness_node_workspace_file(file) {
                 Ok((node_id, file)) => app.apply_workspace_file_read(node_id, token, file),
-                Err(message) => app.notice = Some(format!("{expected_node_id}: {message}")),
+                Err(message) => app.report_failure(EventSource::Workspace, format!("{expected_node_id}: {message}")),
             }
         }
         WorkerUpdate::HarnessNodeWorkspaceFileFailed { key, token, message } => {
@@ -4994,7 +5000,7 @@ fn apply_update(app: &mut App, terminal: &mut TerminalWatermarks, update: Worker
         WorkerUpdate::HarnessNodeWorkspaceFileWritten { node_id: expected_node_id, token, file } => {
             match project_harness_node_workspace_file(file) {
                 Ok((node_id, file)) => app.apply_workspace_file_written(node_id, token, file),
-                Err(message) => app.notice = Some(format!("{expected_node_id}: {message}")),
+                Err(message) => app.report_failure(EventSource::Workspace, format!("{expected_node_id}: {message}")),
             }
         }
         WorkerUpdate::HarnessNodeWorkspaceFileWriteFailed { key, token, message } => {
@@ -5005,7 +5011,7 @@ fn apply_update(app: &mut App, terminal: &mut TerminalWatermarks, update: Worker
                 Ok((node_id, file)) => {
                     follow_up = app.apply_workspace_file_created(node_id, token, file);
                 }
-                Err(message) => app.notice = Some(format!("{expected_node_id}: {message}")),
+                Err(message) => app.report_failure(EventSource::Workspace, format!("{expected_node_id}: {message}")),
             }
         }
         WorkerUpdate::HarnessNodeWorkspaceDirectoryCreated { token, directory } => {
@@ -5069,7 +5075,18 @@ fn apply_update(app: &mut App, terminal: &mut TerminalWatermarks, update: Worker
                 }
             }
         }
-        WorkerUpdate::Notice(notice) => app.notice = Some(notice),
+        // The single choke point every background-worker-thread notice
+        // (21 construction sites across this file, all "X failed: {error}"
+        // or a connectivity-adjacent confirmation) already funnels through
+        // -- routed onto the bus instead of straight into `notice`, per
+        // this crate's own event-and-message-sinks inventory. Severity is
+        // `Info` here rather than sniffed from the text: the producer side
+        // is not being restructured into severity-typed `WorkerUpdate`
+        // variants in this slice, so this is a known, accepted
+        // approximation (a background failure still reaches the retained
+        // log, just not tinted red) -- see this crate's own handoff report
+        // for the explicit call-out.
+        WorkerUpdate::Notice(notice) => app.emit_event(EventSeverity::Info, EventSource::Worker, notice),
     }
     follow_up
 }
@@ -5676,7 +5693,6 @@ fn project_harness_inventory_managed_session(
             instance_id: address.instance_id,
             generation: address.generation,
         }),
-        last_error: None,
     })
 }
 
@@ -6817,7 +6833,6 @@ mod tests {
             record.bundle.is_none()
                 && record.context.is_none()
                 && record.task_binding.is_none()
-                && record.last_error.is_none()
         }));
     }
 
@@ -7453,7 +7468,6 @@ mod tests {
             context: None,
             task_binding: None,
             active_session: None,
-            last_error: None,
         });
         let agent = crate::app::AgentRowKey::Managed {
             node_id: "node-a".to_owned(),
@@ -7470,7 +7484,7 @@ mod tests {
         send_operator_action(&mut app, &routes, action);
 
         assert_eq!(
-            app.notice.as_deref(),
+            app.notice(),
             Some("Session Monitor history refresh failed: command queue busy"),
         );
         assert!(matches!(
@@ -7588,7 +7602,7 @@ mod tests {
             Err(mpsc::error::TryRecvError::Empty),
         ));
         assert_eq!(
-            app.notice.as_deref(),
+            app.notice(),
             Some(
                 "Harness-owned session action unavailable: SpawnManagedWorktree has no typed \
                  harness-operator verb -- it requires a full SpawnSpec construction (profile/\
@@ -7668,7 +7682,7 @@ mod tests {
 
         assert!(matches!(harness_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
         assert!(matches!(history_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
-        assert_eq!(app.notice, None);
+        assert_eq!(app.notice(), None);
     }
 
     #[test]
@@ -7726,7 +7740,15 @@ mod tests {
         // honest failure into the file tab's own error state (rendered
         // inline where the user tried to save), the same division of labor
         // `reject_history_refresh_action` uses for history refresh.
-        assert_eq!(app.notice, None);
+        assert_eq!(app.notice(), None);
+        // But it MUST reach the central feed. Not flashing is a statement
+        // about where the detail belongs, not permission to keep a real
+        // backend failure invisible outside one panel -- which is exactly
+        // what it used to be.
+        assert!(
+            app.event_queue.iter().any(|event| event.text.contains("command queue is full")),
+            "a busy-lane write rejection must be recorded centrally even though it does not flash",
+        );
         assert!(matches!(
             app.file_tabs.get(&file_key).unwrap().editor.sync_state(),
             crate::text_editor::SyncState::Error(_),
@@ -7757,7 +7779,7 @@ mod tests {
         // surfaces a notice (the create dialog is a modal, not a background
         // save) — both channels carry the same honest, non-generic message.
         assert_eq!(
-            app.notice.as_deref(),
+            app.notice(),
             Some("busy: Harness detail/read command queue is full"),
         );
         let dialog = app.create_workspace_entry.as_ref().unwrap();
@@ -7861,7 +7883,7 @@ mod tests {
             history_rx.try_recv(),
             Err(mpsc::error::TryRecvError::Empty),
         ));
-        assert_eq!(app.notice, None);
+        assert_eq!(app.notice(), None);
     }
 
     #[test]
@@ -7934,7 +7956,7 @@ mod tests {
                 inspection: mismatched,
             },
         );
-        assert!(app.notice.as_deref().unwrap_or_default().contains("workspace-b"));
+        assert!(app.notice().unwrap_or_default().contains("workspace-b"));
         let still_valid = app.workspace_inspections
             .get(&("node-a".to_owned(), "workspace-a".to_owned()))
             .expect("the earlier valid inspection is not clobbered by a mismatched reply");
@@ -7971,7 +7993,7 @@ mod tests {
         assert!(app.harness_kanban.execution_mutation.is_none());
         assert_eq!(app.harness_kanban.pending_refresh, None);
         assert_eq!(
-            app.notice.as_deref(),
+            app.notice(),
             Some("Harness launch action failed: Harness operator unavailable: execution mutation queue is closed"),
         );
     }
@@ -8049,7 +8071,7 @@ mod tests {
         assert!(app.harness_kanban.execution_mutation.is_none());
         assert_eq!(app.harness_kanban.pending_refresh, None);
         assert_eq!(
-            app.notice.as_deref(),
+            app.notice(),
             Some("Harness launch action failed: Harness operator busy: execution mutation queue is full"),
         );
     }
@@ -8213,7 +8235,7 @@ mod tests {
         assert!(matches!(harness_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
         assert!(matches!(history_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
         assert_eq!(
-            app.notice.as_deref(),
+            app.notice(),
             Some(
                 "Harness-owned session action unavailable: native session-history discovery has no harness-operator wire mapping (light-mode direct-C2 only)",
             ),
@@ -8251,7 +8273,7 @@ mod tests {
         assert_eq!(composer.body, "Keep this body");
         assert_eq!(composer.field, HarnessTaskComposerField::Body);
         assert_eq!(
-            app.notice.as_deref(),
+            app.notice(),
             Some("Harness operator busy: command queue is full"),
         );
         assert!(matches!(harness_rx.try_recv(), Ok(AppAction::None)));
@@ -8273,7 +8295,7 @@ mod tests {
         );
         assert_eq!(app.harness_kanban.pending_refresh, None);
         assert_eq!(
-            app.notice.as_deref(),
+            app.notice(),
             Some("Harness operator unavailable: command queue is closed"),
         );
     }
@@ -8313,7 +8335,7 @@ mod tests {
         assert!(!app.harness_kanban.correlation_pending.contains(&run.run_id));
         assert!(app.harness_kanban.correlation_failures.contains_key(&run.run_id));
         assert_eq!(
-            app.notice.as_deref(),
+            app.notice(),
             Some("Harness operator busy: correlation command queue is full"),
         );
         assert!(matches!(detail_rx.try_recv(), Ok(AppAction::None)));

@@ -212,7 +212,6 @@ pub struct ManagedSessionView {
     pub context: Option<ResolvedContextPackReceipt>,
     pub task_binding: Option<SessionTaskBindingV1>,
     pub active_session: Option<SessionAddress>,
-    pub last_error: Option<String>,
 }
 
 impl ManagedSessionView {
@@ -2928,6 +2927,14 @@ pub enum HitTarget {
     /// The CENTRE zone modal's own marquee on/off row -- see `App::
     /// toggle_marquee`.
     StatusBarMarqueeToggle,
+    /// The CENTRE zone modal's own retained-log controls -- `App::click_
+    /// status_bar_zone`'s own guard (`Focus::StatusBarCenter`) handles all
+    /// three, the same "one control, both directions" `[Up]`/`[Down]` shape
+    /// `HarnessRunMonitorScrollUp`/`Down` already use for that panel's own
+    /// scrollable section, plus a `[Clear]` -- see `App::clear_event_log`.
+    StatusBarCenterLogScrollUp,
+    StatusBarCenterLogScrollDown,
+    StatusBarCenterLogClear,
     /// The LEFT zone modal's own clock settings rows -- see `App::
     /// toggle_clock_follow_system`/`toggle_clock_use_24h`/`toggle_clock_
     /// show_utc_prefix`/`step_clock_manual_offset`. `Previous`/`Next` are
@@ -3214,11 +3221,11 @@ impl LayoutRects {
 const CLOCK_MAX_WIDTH: u16 = 20;
 
 /// Status bar geometry shared between layout (`render::render_status_bar`)
-/// and the animation gate (`App::marquee_needs_scroll`, which has no
+/// and the animation gate (`App::marquee_zone_width`, which has no
 /// render-time `Rect` to measure against and must approximate the CENTRE
 /// zone's own width the same way the renderer computes it) -- one source
-/// of truth so the two can never disagree about how much room the marquee
-/// actually has.
+/// of truth so the two can never disagree about how much room the event
+/// strip actually has.
 ///
 /// Slice A of `docs/gate4agent/plans/gate4agent-tui-status-bar-clock-
 /// shimmer-and-pet-2026-08-24.md` re-budgets this from its original 14
@@ -3717,16 +3724,102 @@ pub struct StatusBarHover {
 /// crawl.
 pub(crate) const SEARCH_EXPAND_STEPS: u8 = 20;
 
-/// How many raw animation ticks the marquee holds one scroll column for
-/// (`App::marquee_scroll_offset`) -- `ANIMATION_TICKS_PER_FRAME` (4) ticks
-/// per redraw, so 12 ticks is 3 redraws (~240ms) per column: slow enough
-/// to actually read, fast enough not to feel stalled.
+/// How many raw animation ticks the CENTRE zone's strip holds one scroll
+/// column for (`App::event_strip_display`) -- `ANIMATION_TICKS_PER_FRAME`
+/// (4) ticks per redraw, so 12 ticks is 3 redraws (~240ms) per column: slow
+/// enough to actually read, fast enough not to feel stalled. Also the unit
+/// `EVENT_STRIP_DWELL_TICKS` is expressed in, below.
 const MARQUEE_SCROLL_TICKS_PER_COLUMN: usize = 12;
 
-/// Bounds how much notice/log history the CENTRE zone's marquee can ever
-/// carry (`App::push_marquee_line`) -- this is chrome, not an audit trail:
-/// old lines simply scroll out and are dropped, never persisted.
-const MARQUEE_LOG_CAPACITY: usize = 24;
+/// How many ticks a SHORT event -- one that already fits the CENTRE zone
+/// at rest, with nothing to scroll -- is held on the strip before handing
+/// off to whatever is next in `App::event_queue`. Without this, `App::
+/// advance_event_strip` would see a short event as "finished" on the very
+/// next tick after it was set (there is no scroll distance to cover), so
+/// it would never actually be shown -- playing an event once still means
+/// SHOWING it, not just touching it. 150 ticks is ~3s at this crate's own
+/// ~20ms/tick rate (`ANIMATION_FRAME_INTERVAL` / `ANIMATION_TICKS_PER_
+/// FRAME`, `client.rs`) -- long enough to read a short status line without
+/// the strip feeling like it is stalling, short enough that several
+/// genuine events emitted in a burst do not back up `event_queue` for long.
+const EVENT_STRIP_DWELL_TICKS: u16 = 150;
+
+/// Bounds the CENTRE zone's own retained event history (`App::event_log`,
+/// `App::push_event_log`) -- unlike the ring this replaces (formerly
+/// `MARQUEE_LOG_CAPACITY`, 24, sized purely to feed a scrolling ticker and
+/// treated as chrome nobody was meant to read back), this is a history a
+/// person actually opens the CENTRE zone modal to read. 500 is deliberately
+/// far larger than the routed producer set (Group A's ~27 sites, the
+/// client.rs connectivity/queue sites, and the diagnostic-bearing Group E
+/// failures -- see `docs/gate4agent/research/gate4agent-tui-event-and-
+/// message-sinks-2026-08-25.md`) is likely to produce in one interactive
+/// session, while still evicting oldest-first (`App::push_event_log`)
+/// rather than growing without bound across a session left open for days.
+const EVENT_LOG_CAPACITY: usize = 500;
+
+/// How serious an `AppEvent` is -- the ONLY thing severity drives is the
+/// retained log's own colour coding (`render::event_severity_color`); the
+/// strip itself renders every event in the same neutral style regardless,
+/// exactly as the old marquee always did. Two are the hard minimum this
+/// feature's own brief asks for (`Info`, `Error`); `Warn` earns its place
+/// because several routed producers genuinely sit between the two -- e.g.
+/// a C2 topology node disappearing (`app.rs`'s own `remove_node` call
+/// sites) is neither a plain confirmation nor a hard failure, it is "look
+/// at this."
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EventSeverity {
+    Info,
+    Warn,
+    Error,
+}
+
+/// Which subsystem produced an `AppEvent` -- shown alongside the time and
+/// text in the retained log (`render::render_status_bar_center_modal`) so
+/// a session-lifecycle line and a connectivity line are visually
+/// distinguishable even before reading the text itself. Deliberately as
+/// small a set as the routed producers (see `App::emit_event`'s own call
+/// sites) actually need -- not a speculative taxonomy for producers this
+/// slice does not touch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EventSource {
+    Session,
+    Workspace,
+    ContextPack,
+    Topology,
+    Harness,
+    Connectivity,
+    Worker,
+}
+
+impl EventSource {
+    fn label(self) -> &'static str {
+        match self {
+            EventSource::Session => "session",
+            EventSource::Workspace => "workspace",
+            EventSource::ContextPack => "context",
+            EventSource::Topology => "topology",
+            EventSource::Harness => "harness",
+            EventSource::Connectivity => "link",
+            EventSource::Worker => "worker",
+        }
+    }
+}
+
+/// One entry the CENTRE zone's event bus carries -- see `App::emit_event`'s
+/// own doc comment for the single place these are constructed, and `App::
+/// event_queue`/`event_current`/`event_log`'s own doc comments for the two
+/// jobs (not-yet-shown, retained) an event moves through in order. `at` is
+/// wall-clock time captured AT EMISSION (`SystemTime::now()`, inside
+/// `emit_event`), never `App::animation_tick` -- that field is a redraw-
+/// frame counter with no relationship to real time, see its own doc
+/// comment.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppEvent {
+    pub at: SystemTime,
+    pub severity: EventSeverity,
+    pub source: EventSource,
+    pub text: String,
+}
 
 /// Bounds the global search's own results dropdown (`App::global_search_
 /// results`) -- a quick-jump list, not a paginated search surface.
@@ -3950,24 +4043,72 @@ pub struct App {
     /// crate's own tests, which never run the real startup query) is
     /// never left at some OTHER, unrelated placeholder colour.
     pub terminal_background: (u8, u8, u8),
-    pub notice: Option<String>,
+    /// The transient corner-popup notice -- cleared 3 seconds after it last
+    /// changed by `client::run`'s own dismiss timer (`App::dismiss_notice`
+    /// is the one place outside this module that clears it). Deliberately
+    /// PRIVATE, not `pub(crate)`: every producer in this crate must go
+    /// through `App::flash`/`App::report_failure`/`App::report_event` to
+    /// set it, because a raw assignment is exactly the defect this field's
+    /// own history reproduced -- a real backend failure
+    /// (`App::fail_workspace_inspection`) printed into this corner and
+    /// never reached the central event feed, because nothing forced the
+    /// call site to decide which of the two it was. Privacy alone cannot
+    /// close every path (this struct and its three sanctioned setters live
+    /// in the same module, so nothing stops a fourth method in THIS file
+    /// from also assigning it directly), which is exactly why this crate
+    /// also carries a source-scanning test,
+    /// `no_raw_notice_assignment_outside_the_three_sanctioned_methods`,
+    /// as the second half of this invariant's enforcement. Reads from
+    /// outside this module go through `App::notice`.
+    notice: Option<String>,
     /// Persisted (`preferences::UiPreferences::marquee_enabled`). The
     /// CENTRE status bar zone's own on/off switch -- disabled leaves the
-    /// zone blank rather than scrolling, and `App::marquee_needs_scroll`
+    /// zone blank rather than scrolling, and `App::event_strip_active`
     /// (part of `has_active_animation`) checks this FIRST so a disabled
-    /// marquee never keeps the redraw loop spinning for content nobody is
-    /// looking at.
+    /// strip never keeps the redraw loop spinning for content nobody is
+    /// looking at. Disabling also freezes playback (`App::advance_event_
+    /// strip` returns immediately while this is `false`) rather than just
+    /// hiding it -- events keep arriving in `event_queue` but do not
+    /// silently drain into `event_log` while nobody can see them play.
     pub marquee_enabled: bool,
-    /// Bounded log the CENTRE zone's marquee scrolls through -- see
-    /// `MARQUEE_LOG_CAPACITY`'s own doc comment for why this is never
-    /// persisted. Populated from exactly one place: `client::run`'s own
-    /// `app.notice` transition detector (the SAME choke point that already
-    /// drives the 3-second notice-dismiss timer), via `App::push_marquee_
-    /// line` -- never written to from anywhere else, so every one of this
-    /// crate's ~230 existing `self.notice = Some(...)` call sites keeps
-    /// working completely unchanged and still ends up on the marquee for
-    /// free.
-    pub marquee_log: VecDeque<String>,
+    /// Every `AppEvent` emitted (`App::emit_event`) but not yet played
+    /// across the CENTRE zone's strip -- see `App::advance_event_strip`'s
+    /// own doc comment for how one moves from here to `event_current` and
+    /// then to `event_log`. Deliberately unbounded: unlike the old
+    /// `marquee_log` ring this whole mechanism replaces, nothing here is
+    /// chrome to be thrown away before being shown at least once.
+    pub(crate) event_queue: VecDeque<AppEvent>,
+    /// The one `AppEvent`, if any, currently crossing the CENTRE zone's
+    /// strip -- `None` is the strip's own rest state. `render::render_
+    /// status_bar_center` renders nothing while this is `None`: holding the
+    /// last-played event on screen forever would silently misrepresent it
+    /// as still current, defeating the "played exactly once" contract this
+    /// whole mechanism exists for, and the retained `event_log` (one click
+    /// away, in this same zone's modal) is exactly where a finished event
+    /// still lives -- nothing is lost, only stops being re-displayed as if
+    /// it were live.
+    pub(crate) event_current: Option<AppEvent>,
+    /// The `animation_tick` value `event_current` started playing at --
+    /// `App::event_strip_display`/`advance_event_strip` both derive elapsed
+    /// playback time as `animation_tick.wrapping_sub(this)`, the wrapping
+    /// form because `animation_tick` itself wraps (`u16`) over a long
+    /// enough session.
+    event_strip_started_tick: u16,
+    /// The retained history the CENTRE zone modal shows -- see `EVENT_LOG_
+    /// CAPACITY`'s own doc comment for the bound and why it is nothing like
+    /// the old `MARQUEE_LOG_CAPACITY` ring it replaces. Oldest-first
+    /// insertion order (`App::push_event_log`); `render::render_status_bar_
+    /// center_modal` iterates it reversed to show newest first. Not
+    /// persisted, same as `marquee_enabled`'s own predecessor never was --
+    /// this is a live session's own history, not a setting.
+    pub event_log: VecDeque<AppEvent>,
+    /// The CENTRE zone modal's own scroll position into `event_log` --
+    /// `0` shows the newest entries; `App::click_status_bar_zone`'s
+    /// `StatusBarCenterLogScrollUp`/`Down` arms and `App::reduce_status_bar_
+    /// zone`'s `Up`/`Down` keys both move it, the same one-row-per-step
+    /// convention `HarnessRunMonitorScrollUp`/`Down` already use for that
+    /// panel's own scrollable section.
+    pub(crate) event_log_scroll: usize,
     /// The LEFT status bar zone's own clock settings -- see
     /// [`ClockSettings`]'s own doc comment. Persisted (`preferences::
     /// UiPreferences::clock_follow_system`/`clock_manual_offset_hours`/
@@ -4108,7 +4249,11 @@ impl Default for App {
             terminal_background: crate::terminal_bg::FALLBACK_BACKGROUND,
             notice: None,
             marquee_enabled: true,
-            marquee_log: VecDeque::new(),
+            event_queue: VecDeque::new(),
+            event_current: None,
+            event_strip_started_tick: 0,
+            event_log: VecDeque::new(),
+            event_log_scroll: 0,
             clock_settings: ClockSettings::default(),
             pet_settings: PetSettings::default(),
             pet_motion: PetMotionState::default(),
@@ -4239,6 +4384,37 @@ fn observation_session_monitor_target(target: &ObservationTarget) -> SessionMoni
     }
 }
 
+/// Pure scroll-position arithmetic for the CENTRE zone's event strip --
+/// see `App::event_strip_display`'s own doc comment for the one caller.
+/// Unlike the ticker this replaces (`tick / TICKS_PER_COLUMN % len`, a
+/// plain modulo with no notion of "done"), this CLAMPS at `text_len -
+/// zone_width`: once the tail of the text has been drawn, the offset
+/// simply stops advancing rather than wrapping back to the start.
+fn event_scroll_offset(text_len: usize, zone_width: usize, elapsed_ticks: u16) -> usize {
+    if text_len <= zone_width {
+        return 0;
+    }
+    let max_offset = text_len - zone_width;
+    (usize::from(elapsed_ticks) / MARQUEE_SCROLL_TICKS_PER_COLUMN).min(max_offset)
+}
+
+/// Whether an event's own playback (`event_scroll_offset`'s sibling) is
+/// over -- a SHORT event (fits the zone, never scrolls) is done once it
+/// has been held for `EVENT_STRIP_DWELL_TICKS`; a WIDE one is done once
+/// `elapsed_ticks` has run one column-hold PAST the offset that put its
+/// own tail flush with the zone's right edge, so the last few characters
+/// get the same per-column dwell every other column already got, rather
+/// than being visible for a single tick before the event retires into
+/// `App::event_log`. See `App::advance_event_strip`'s own doc comment for
+/// the one caller.
+fn event_scroll_finished(text_len: usize, zone_width: usize, elapsed_ticks: u16) -> bool {
+    if text_len <= zone_width {
+        return elapsed_ticks >= EVENT_STRIP_DWELL_TICKS;
+    }
+    let max_offset = text_len - zone_width;
+    usize::from(elapsed_ticks) / MARQUEE_SCROLL_TICKS_PER_COLUMN > max_offset
+}
+
 impl App {
     pub(crate) fn advance_animation_frame(&mut self) {
         self.animation_tick = self.animation_tick.wrapping_add(1);
@@ -4252,10 +4428,44 @@ impl App {
         } else if self.global_search.expand_step > target {
             self.global_search.expand_step -= 1;
         }
+        self.advance_event_strip();
+    }
+
+    /// Moves one step through the CENTRE zone's own queue -> current ->
+    /// log pipeline -- called once per `advance_animation_frame` tick,
+    /// which itself only runs while `has_active_animation` (and therefore
+    /// `event_strip_active`) reports `true`, so this never spins the redraw
+    /// loop on its own once both `event_current` and `event_queue` are
+    /// empty. A disabled strip (`!marquee_enabled`) freezes here rather
+    /// than continuing to drain in the background -- see `App::marquee_
+    /// enabled`'s own doc comment for why that matters.
+    fn advance_event_strip(&mut self) {
+        if !self.marquee_enabled {
+            return;
+        }
+        if self.event_current.is_none() {
+            self.event_current = self.event_queue.pop_front();
+            self.event_strip_started_tick = self.animation_tick;
+            return;
+        }
+        let zone_width = usize::from(self.marquee_zone_width());
+        let text_len = self
+            .event_current
+            .as_ref()
+            .map_or(0, |event| event.text.chars().count());
+        let elapsed = self.animation_tick.wrapping_sub(self.event_strip_started_tick);
+        if !event_scroll_finished(text_len, zone_width, elapsed) {
+            return;
+        }
+        if let Some(event) = self.event_current.take() {
+            self.push_event_log(event);
+        }
+        self.event_current = self.event_queue.pop_front();
+        self.event_strip_started_tick = self.animation_tick;
     }
 
     pub(crate) fn has_active_animation(&self) -> bool {
-        self.marquee_needs_scroll()
+        self.event_strip_active()
             || !self.global_search.expand_settled()
             || self.create_workspace_entry
             .as_ref()
@@ -4364,31 +4574,61 @@ impl App {
         NetworkSummary::Transitioning
     }
 
-    /// Appends `line` to the CENTRE status bar zone's own marquee log,
-    /// dropping the oldest entry once `MARQUEE_LOG_CAPACITY` is reached --
-    /// see `marquee_log`'s own doc comment for the single call site
-    /// (`client::run`'s own notice-transition detector) this is meant to
-    /// be driven from.
-    pub(crate) fn push_marquee_line(&mut self, line: String) {
-        if line.is_empty() {
+    /// The one place any producer in this crate creates an `AppEvent` --
+    /// see this crate's own event-and-message-sinks inventory (`docs/
+    /// gate4agent/research/gate4agent-tui-event-and-message-sinks-2026-08-
+    /// 25.md`) for why a single emit path matters: 234+13 sites write
+    /// `self.notice = Some(...)` today with no shared classification at the
+    /// point of writing, which is exactly how every kind of message ended
+    /// up in the same looping ticker. Callers that belong on the bus
+    /// (Group A genuine events, the client.rs connectivity/queue sites, and
+    /// the diagnostic-bearing Group E failures) call this ADDITIONALLY to
+    /// their existing `self.notice = Some(...)` write -- the corner popup
+    /// and its 3-second auto-dismiss are untouched, unrelated chrome fed by
+    /// `notice` alone. Guard refusals, field validation, and keystroke
+    /// acknowledgements (Groups B/C/D) must never call this, by the same
+    /// inventory's own classification -- that is what stops them reaching
+    /// the retained log. Empty text is dropped, the same "nothing to show"
+    /// guard the old `push_marquee_line` used.
+    pub(crate) fn emit_event(
+        &mut self,
+        severity: EventSeverity,
+        source: EventSource,
+        text: impl Into<String>,
+    ) {
+        let text = text.into();
+        if text.is_empty() {
             return;
         }
-        if self.marquee_log.len() >= MARQUEE_LOG_CAPACITY {
-            self.marquee_log.pop_front();
-        }
-        self.marquee_log.push_back(line);
+        self.event_queue.push_back(AppEvent {
+            at: SystemTime::now(),
+            severity,
+            source,
+            text,
+        });
     }
 
-    /// The CENTRE zone's own display text -- every held log line joined
-    /// into one scrolling ticker, or a static placeholder once nothing has
-    /// happened yet. Never truncated here: `render::render_status_bar_
-    /// center` is the one place that knows the zone's actual on-screen
-    /// width this frame.
-    pub fn marquee_content(&self) -> String {
-        if self.marquee_log.is_empty() {
-            return "no recent activity".to_owned();
+    /// Moves `event` into the retained log, evicting the oldest entry once
+    /// `EVENT_LOG_CAPACITY` is reached -- the one place `event_log` is
+    /// written to, mirroring the old `push_marquee_line`'s own single-
+    /// writer discipline.
+    fn push_event_log(&mut self, event: AppEvent) {
+        if self.event_log.len() >= EVENT_LOG_CAPACITY {
+            self.event_log.pop_front();
         }
-        self.marquee_log.iter().cloned().collect::<Vec<_>>().join("   \u{2022}   ")
+        self.event_log.push_back(event);
+    }
+
+    /// The CENTRE zone modal's own `[Clear]` control -- empties the
+    /// retained log only. `event_queue`/`event_current` (what has not
+    /// finished playing yet) are untouched, so clearing history can never
+    /// skip or truncate an event still mid-playback on the strip above it.
+    /// Also resets the log's own scroll position back to "newest," the
+    /// same "nothing left to have scrolled into" reset every other cleared
+    /// list in this crate performs.
+    fn clear_event_log(&mut self) {
+        self.event_log.clear();
+        self.event_log_scroll = 0;
     }
 
     /// Approximates the CENTRE zone's own on-screen width from `terminal_
@@ -4403,31 +4643,61 @@ impl App {
             .saturating_sub(STATUS_BAR_RIGHT_WIDTH)
     }
 
-    /// Whether the marquee has anything left to gain by scrolling right
-    /// now -- disabled, or content that already fits the zone at rest,
-    /// both report `false`. This is the exact gate `has_active_animation`
-    /// relies on to stop asking for redraw frames once scrolling would be
-    /// pure motion with no new information (a marquee toggled off, or one
-    /// whose content is shorter than its own zone) -- see this crate's own
-    /// "assert the idle case in a test" requirement.
-    fn marquee_needs_scroll(&self) -> bool {
-        if !self.marquee_enabled {
-            return false;
-        }
-        let content_width = self.marquee_content().chars().count() as u32;
-        content_width > u32::from(self.marquee_zone_width())
+    /// Whether the CENTRE zone's strip still has anything to gain from
+    /// another redraw frame right now -- an event mid-playback, or a
+    /// queued one waiting to be picked up next. Disabled (`!marquee_
+    /// enabled`) always reports `false`, the same "checked first"
+    /// convention the old `marquee_needs_scroll` used: a disabled strip
+    /// must never keep `client::run`'s redraw loop spinning for content
+    /// nobody is looking at. This is `has_active_animation`'s own
+    /// replacement for the old modulo ticker's "is there ANY content"
+    /// check -- an empty queue with no current event correctly reports
+    /// idle, which is the exact property the old ticker could never have
+    /// (its own doc comment admitted it "wraps... rather than stopping
+    /// dead").
+    fn event_strip_active(&self) -> bool {
+        self.marquee_enabled && (self.event_current.is_some() || !self.event_queue.is_empty())
     }
 
-    /// The marquee's own scroll position, in characters, derived from the
-    /// SAME shared `animation_tick` clock `activity_spinner` already reads
-    /// -- see `MARQUEE_SCROLL_TICKS_PER_COLUMN`'s own doc comment for the
-    /// speed. `render::render_status_bar_center` is the only caller.
-    pub(crate) fn marquee_scroll_offset(&self) -> usize {
-        let len = self.marquee_content().chars().count();
-        if len == 0 {
-            return 0;
+    /// The CENTRE zone's own display text for THIS frame, or `None` while
+    /// the strip is resting (`marquee_enabled` off, or nothing playing) --
+    /// `render::render_status_bar_center` renders nothing in that case, see
+    /// `App::event_current`'s own doc comment for why resting is blank
+    /// rather than holding the last event. `zone_width` is the REAL,
+    /// render-time width (unlike `marquee_zone_width`'s pre-render
+    /// estimate used by `advance_event_strip`'s own finished-check) -- the
+    /// same estimate-vs-real split the old marquee already had between
+    /// `marquee_needs_scroll` and `render_status_bar_center`.
+    pub(crate) fn event_strip_display(&self, zone_width: u16) -> Option<String> {
+        let event = self.event_current.as_ref()?;
+        let chars: Vec<char> = event.text.chars().collect();
+        let width = usize::from(zone_width);
+        if chars.len() <= width {
+            return Some(event.text.clone());
         }
-        (usize::from(self.animation_tick) / MARQUEE_SCROLL_TICKS_PER_COLUMN) % len
+        let elapsed = self.animation_tick.wrapping_sub(self.event_strip_started_tick);
+        let offset = event_scroll_offset(chars.len(), width, elapsed);
+        Some(chars[offset..offset + width].iter().collect())
+    }
+
+    /// One retained-log entry's own display line -- `"HH:MM:SS [source]
+    /// text"`, reusing the SAME `clock_display_text` pipeline the LEFT
+    /// status bar clock already uses (so both surfaces read time the same
+    /// way) rather than inventing a second, unrelated timestamp format.
+    /// `render::render_status_bar_center_modal` is the one caller.
+    pub(crate) fn event_log_line(&self, event: &AppEvent) -> String {
+        let utc_seconds = event
+            .at
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(0);
+        let system_offset_seconds = self
+            .clock_settings
+            .follow_system
+            .then(|| crate::platform::local_utc_offset_seconds().ok())
+            .flatten();
+        let time = clock_display_text(self.clock_settings, system_offset_seconds, utc_seconds);
+        format!("{time} [{}] {}", event.source.label(), event.text)
     }
 
     /// The CENTRE zone modal's own on/off row (`HitTarget::
@@ -4523,6 +4793,18 @@ impl App {
                 self.toggle_marquee();
                 AppAction::None
             }
+            Some(HitTarget::StatusBarCenterLogScrollUp) if self.focus == Focus::StatusBarCenter => {
+                self.event_log_scroll = self.event_log_scroll.saturating_sub(1);
+                AppAction::None
+            }
+            Some(HitTarget::StatusBarCenterLogScrollDown) if self.focus == Focus::StatusBarCenter => {
+                self.event_log_scroll = self.event_log_scroll.saturating_add(1);
+                AppAction::None
+            }
+            Some(HitTarget::StatusBarCenterLogClear) if self.focus == Focus::StatusBarCenter => {
+                self.clear_event_log();
+                AppAction::None
+            }
             Some(HitTarget::StatusBarClockFollowSystem) if self.focus == Focus::StatusBarLeft => {
                 self.toggle_clock_follow_system();
                 AppAction::None
@@ -4579,6 +4861,18 @@ impl App {
             UiKey::Escape => self.close_status_bar_zone(),
             UiKey::Char('m') | UiKey::Char('M') if self.focus == Focus::StatusBarCenter => {
                 self.toggle_marquee();
+                AppAction::None
+            }
+            UiKey::Up if self.focus == Focus::StatusBarCenter => {
+                self.event_log_scroll = self.event_log_scroll.saturating_sub(1);
+                AppAction::None
+            }
+            UiKey::Down if self.focus == Focus::StatusBarCenter => {
+                self.event_log_scroll = self.event_log_scroll.saturating_add(1);
+                AppAction::None
+            }
+            UiKey::Char('c') | UiKey::Char('C') if self.focus == Focus::StatusBarCenter => {
+                self.clear_event_log();
                 AppAction::None
             }
             _ => AppAction::None,
@@ -4904,7 +5198,101 @@ impl App {
         {
             self.inspection_pending = None;
         }
-        self.notice = Some(format!("{node_id}/{workspace_id}: {message}"));
+        // A backend refusal carrying a real reason -- it flashes locally
+        // AND goes on the central feed. It was missed in the first sweep
+        // because that sweep worked from a hand-picked list; see
+        // `App::report_failure`'s own doc comment for why picking sites
+        // by hand is the defect rather than this one line.
+        self.report_failure(EventSource::Workspace, format!("{node_id}/{workspace_id}: {message}"));
+    }
+
+    /// Sets the local flash AND puts the same text on the central event
+    /// feed, for anything that is a real failure rather than a "not right
+    /// now" refusal.
+    ///
+    /// This exists because the first pass routed producers onto the feed
+    /// one call site at a time, from a list, and a list of two hundred
+    /// hand-classified sites is wrong the moment anyone adds the two
+    /// hundred and first -- `fail_workspace_inspection` was exactly that:
+    /// a genuine backend failure that printed its line into the corner of
+    /// a panel and never reached the feed at all. A caller should have to
+    /// choose between "flash" and "report", not remember to do both.
+    pub(crate) fn report_failure(&mut self, source: EventSource, text: impl Into<String>) {
+        let text = text.into();
+        self.emit_event(EventSeverity::Error, source, text.clone());
+        self.notice = Some(text);
+    }
+
+    /// Sets the local flash AND puts the same text on the central event
+    /// feed, for a genuine state change worth a history entry -- spawned,
+    /// resumed, created, saved, exported, removed, connected, disconnected,
+    /// and the background progress narration this crate already treats the
+    /// same way (indexing/requesting/reconnecting). Unlike `report_failure`,
+    /// severity is the caller's choice: most of these are `Info`, but a
+    /// handful (a C2 topology node disappearing, a launch cancelled because
+    /// its workspace vanished underneath it) are neither a plain
+    /// confirmation nor a hard failure -- `Warn` earns its keep for exactly
+    /// that "look at this" middle ground. A real failure with a reason
+    /// belongs in `report_failure`, not here, so `Error` is deliberately
+    /// not an option this method accepts.
+    /// Puts a real failure on the central feed WITHOUT the corner popup,
+    /// for the case where a local surface already shows it exactly where
+    /// the user acted -- a file tab's own inline error line, a git pane's
+    /// own failure row. Those surfaces are the better place for the
+    /// detail, and duplicating the same sentence into the corner as well
+    /// is the noise this whole feature exists to remove; what was missing
+    /// was never a second popup, it was the CENTRAL record, which this
+    /// supplies.
+    ///
+    /// This is the honest third case between `report_failure` (flash and
+    /// record) and `flash` (flash only): record only.
+    pub(crate) fn record_failure(&mut self, source: EventSource, text: impl Into<String>) {
+        self.emit_event(EventSeverity::Error, source, text);
+    }
+
+    pub(crate) fn report_event(
+        &mut self,
+        severity: EventSeverity,
+        source: EventSource,
+        text: impl Into<String>,
+    ) {
+        let text = text.into();
+        self.emit_event(severity, source, text.clone());
+        self.notice = Some(text);
+    }
+
+    /// Sets the transient corner-popup notice and nothing else -- for a
+    /// guard/precondition refusal ("cannot do that right now"), a keystroke
+    /// acknowledgement (copy/cut/paste/mode-toggle), or field-level
+    /// validation. None of these are a state change worth a permanent
+    /// history entry (see this crate's own event-and-message-sinks
+    /// inventory, `docs/gate4agent/research/gate4agent-tui-event-and-
+    /// message-sinks-2026-08-25.md`, groups B/C/D): nothing happened, an
+    /// action was refused before it started, or the same action can recur
+    /// many times a minute without anyone wanting each repetition kept.
+    /// This is the one place besides `report_failure`/`report_event`
+    /// allowed to touch `notice` directly -- see `notice`'s own doc
+    /// comment and this crate's source-scanning test
+    /// (`no_raw_notice_assignment_outside_the_three_sanctioned_methods`)
+    /// for how that boundary is enforced.
+    pub(crate) fn flash(&mut self, text: impl Into<String>) {
+        self.notice = Some(text.into());
+    }
+
+    /// Read access to the corner-popup notice for `render`/`client` --
+    /// those two modules only ever display or time out what is already
+    /// there, never decide what belongs there, so they get a borrowed read
+    /// rather than the field itself.
+    pub(crate) fn notice(&self) -> Option<&str> {
+        self.notice.as_deref()
+    }
+
+    /// The one legitimate external clear: `client::run`'s own 3-second
+    /// dismiss timer. Clearing is not "printing a message" -- there is no
+    /// text to classify -- so it does not go through
+    /// `flash`/`report_failure`/`report_event`, only through this.
+    pub(crate) fn dismiss_notice(&mut self) {
+        self.notice = None;
     }
 
     pub fn visible_host_directory_indices(&self) -> Vec<usize> {
@@ -5009,10 +5397,12 @@ impl App {
         history.loaded = None;
         history.context = None;
         history.pending_label = None;
-        self.notice = Some(format!(
-            "history discovery returned {} candidate(s)",
-            history.candidates.len(),
-        ));
+        let candidate_count = history.candidates.len();
+        self.report_event(
+            EventSeverity::Info,
+            EventSource::Session,
+            format!("history discovery returned {candidate_count} candidate(s)"),
+        );
     }
 
     pub fn apply_history_loaded(
@@ -5032,7 +5422,11 @@ impl App {
         });
         history.context = None;
         history.pending_label = None;
-        self.notice = Some(format!("loaded bounded history metadata: {message_count} message(s)"));
+        self.report_event(
+            EventSeverity::Info,
+            EventSource::Session,
+            format!("loaded bounded history metadata: {message_count} message(s)"),
+        );
     }
 
     pub fn apply_context_exported(&mut self, receipt: ResolvedContextPackReceipt) {
@@ -5046,13 +5440,17 @@ impl App {
             && lineage.source_session.session.instance_id.0 == history.source.instance_id
             && lineage.source_session.session.generation.0 == history.source.generation;
         if !matches_source {
-            self.notice = Some("context receipt does not match the selected history source".to_owned());
+            self.flash("context receipt does not match the selected history source".to_owned());
             return;
         }
         let id = receipt.id.to_string();
         history.context = Some(receipt);
         history.pending_label = None;
-        self.notice = Some(format!("ContextPack {id} is ready for launch"));
+        self.report_event(
+            EventSeverity::Info,
+            EventSource::ContextPack,
+            format!("ContextPack {id} is ready for launch"),
+        );
     }
 
     pub fn apply_context_forgotten(&mut self, id: SpawnContextId) {
@@ -5062,17 +5460,25 @@ impl App {
         if history.context.as_ref().is_some_and(|context| context.id == id) {
             history.context = None;
             history.pending_label = None;
-            self.notice = Some(format!("ContextPack {id} forgotten"));
+            self.report_event(
+                EventSeverity::Info,
+                EventSource::ContextPack,
+                format!("ContextPack {id} forgotten"),
+            );
         }
     }
 
     pub fn apply_spawn_receipt(&mut self, receipt: ResolvedSpawnReceipt) {
-        self.notice = Some(format!(
-            "launch accepted: {} #{}:{}",
-            receipt.session.workspace_id,
-            receipt.session.session.instance_id.0,
-            receipt.session.session.generation.0,
-        ));
+        self.report_event(
+            EventSeverity::Info,
+            EventSource::Session,
+            format!(
+                "launch accepted: {} #{}:{}",
+                receipt.session.workspace_id,
+                receipt.session.session.instance_id.0,
+                receipt.session.session.generation.0,
+            ),
+        );
         self.last_managed_spawn_receipt = None;
         self.last_managed_worktree_lease = None;
         self.last_managed_worktree_removed = None;
@@ -5080,12 +5486,16 @@ impl App {
     }
 
     pub fn apply_managed_spawn_receipt(&mut self, receipt: ManagedWorktreeSpawnReceipt) {
-        self.notice = Some(format!(
-            "managed worktree launch accepted: {} #{}:{}",
-            receipt.lease.workspace_id,
-            receipt.spawn.session.session.instance_id.0,
-            receipt.spawn.session.session.generation.0,
-        ));
+        self.report_event(
+            EventSeverity::Info,
+            EventSource::Session,
+            format!(
+                "managed worktree launch accepted: {} #{}:{}",
+                receipt.lease.workspace_id,
+                receipt.spawn.session.session.instance_id.0,
+                receipt.spawn.session.session.generation.0,
+            ),
+        );
         self.last_spawn_receipt = None;
         self.last_managed_worktree_lease = Some(receipt.lease.clone());
         self.last_managed_worktree_removed = None;
@@ -5360,7 +5770,7 @@ impl App {
                     .iter()
                     .position(|candidate| !open.contains(candidate))
                 else {
-                    self.notice = Some(
+                    self.flash(
                         "Session Monitor capacity reached; close a monitor tab before observing another session"
                             .to_owned(),
                     );
@@ -5411,11 +5821,11 @@ impl App {
             ),
         };
         let Some(target) = target else {
-            self.notice = Some("Session Monitor waits for an exact node incarnation".to_owned());
+            self.flash("Session Monitor waits for an exact node incarnation".to_owned());
             return AppAction::None;
         };
         if !self.nodes.iter().any(|node| node.node_id == node_id) {
-            self.notice = Some("Session Monitor waits for the managed node inventory".to_owned());
+            self.flash("Session Monitor waits for the managed node inventory".to_owned());
             return AppAction::None;
         }
         if self.ensure_session_monitor(agent.clone(), target.clone()).is_none() {
@@ -5488,7 +5898,10 @@ impl App {
     ) {
         let key = (node_id, record_id, incarnation_id);
         if self.session_history_refresh_pending.remove(&key) {
-            self.notice = Some(format!("Session Monitor history refresh failed: {reason}"));
+            self.report_failure(
+                EventSource::Session,
+                format!("Session Monitor history refresh failed: {reason}"),
+            );
         }
     }
 
@@ -5510,7 +5923,7 @@ impl App {
         reason: String,
         resync_after: Option<u64>,
     ) -> SessionObservationIngressOutcome {
-        self.notice = Some(format!("{node_id}: {reason}"));
+        self.report_failure(EventSource::Session, format!("{node_id}: {reason}"));
         SessionObservationIngressOutcome::Rejected {
             reason,
             resync_after,
@@ -5591,7 +6004,10 @@ impl App {
 
     pub fn mark_observation_persistence_unavailable(&mut self, reason: String) {
         self.observation_persistence = ObservationPersistenceState::Unavailable(reason.clone());
-        self.notice = Some(format!("Session Monitor persistence unavailable: {reason}"));
+        self.report_failure(
+            EventSource::Session,
+            format!("Session Monitor persistence unavailable: {reason}"),
+        );
     }
 
     pub fn durable_observation_cursor(
@@ -5761,7 +6177,10 @@ impl App {
                 true
             }
             Err(error) => {
-                self.notice = Some(format!("Session Monitor resync rejected: {error}"));
+                self.report_failure(
+                    EventSource::Session,
+                    format!("Session Monitor resync rejected: {error}"),
+                );
                 false
             }
         }
@@ -5818,7 +6237,10 @@ impl App {
             Ok(Some(inventory)) => inventory,
             Ok(None) => return false,
             Err(error) => {
-                self.notice = Some(format!("Session Monitor record inventory rejected: {error}"));
+                self.report_failure(
+                    EventSource::Session,
+                    format!("Session Monitor record inventory rejected: {error}"),
+                );
                 return false;
             }
         };
@@ -5833,7 +6255,10 @@ impl App {
                 true
             }
             Err(error) => {
-                self.notice = Some(format!("Session Monitor record inventory rejected: {error}"));
+                self.report_failure(
+                    EventSource::Session,
+                    format!("Session Monitor record inventory rejected: {error}"),
+                );
                 false
             }
         }
@@ -6019,7 +6444,7 @@ impl App {
         }
         let Some((node_id, workspace_id)) = self.agent_workspace_route(&key) else {
             self.clear_agent_run_lens();
-            self.notice = Some("workspace route unavailable".to_owned());
+            self.flash("workspace route unavailable".to_owned());
             return AppAction::None;
         };
         let Some(node_incarnation_id) = self
@@ -6029,7 +6454,7 @@ impl App {
             .map(|node| node.incarnation_id)
         else {
             self.clear_agent_run_lens();
-            self.notice = Some("node absent from topology".to_owned());
+            self.flash("node absent from topology".to_owned());
             return AppAction::None;
         };
         let original = self.agent_run_lens.as_ref().map(|lens| (
@@ -6047,7 +6472,7 @@ impl App {
             ));
         if !self.select_workspace_route_without_inspection(&node_id, &workspace_id) {
             self.clear_agent_run_lens();
-            self.notice = Some("session workspace is not registered on its node".to_owned());
+            self.flash("session workspace is not registered on its node".to_owned());
             return AppAction::None;
         }
         self.agent_run_lens = Some(AgentRunLens {
@@ -6705,7 +7130,11 @@ impl App {
                 .is_some_and(|task| task.revision == pending.task.task_revision)
         }) {
             self.harness_kanban.execution_mutation = None;
-            self.notice = Some("Harness launch action became stale after task refresh".to_owned());
+            self.report_event(
+                EventSeverity::Warn,
+                EventSource::Harness,
+                "Harness launch action became stale after task refresh",
+            );
         }
         self.reconcile_harness_kanban();
     }
@@ -7012,17 +7441,22 @@ impl App {
                     );
                 }
             }
-            self.notice = Some("Harness context source observed; authoritative task state is refreshing".to_owned());
+            self.report_event(
+                EventSeverity::Info,
+                EventSource::Harness,
+                "Harness context source observed; authoritative task state is refreshing",
+            );
             return self.request_harness_refresh();
         }
         self.harness_kanban.run_context_sources.insert(
             run,
             HarnessRunContextSourceState::Unavailable { token, feature_state },
         );
-        self.notice = Some(format!(
-            "Harness context source unavailable: {:?}",
-            feature_state,
-        ));
+        self.report_event(
+            EventSeverity::Warn,
+            EventSource::Harness,
+            format!("Harness context source unavailable: {feature_state:?}"),
+        );
         AppAction::None
     }
 
@@ -7042,7 +7476,10 @@ impl App {
                 run.clone(),
                 HarnessRunContextSourceState::Error { token, message: message.clone() },
             );
-            self.notice = Some("Harness context observation failed; retry from the exact run".to_owned());
+            self.report_failure(
+                EventSource::Harness,
+                "Harness context observation failed; retry from the exact run",
+            );
         }
     }
 
@@ -7213,7 +7650,7 @@ impl App {
 
     fn harness_save_launch_spec(&mut self) -> AppAction {
         if !self.harness_launch_save_enabled() {
-            self.notice = Some("Save spec unavailable: load options and select a plan".to_owned());
+            self.flash("Save spec unavailable: load options and select a plan".to_owned());
             return AppAction::None;
         }
         let task = self.harness_detail_task_ref().expect("enabled save has exact task");
@@ -7230,7 +7667,7 @@ impl App {
                             && profile.source_workspace_id == plan.source_workspace_id
                     })
                 else {
-                    self.notice = Some(
+                    self.flash(
                         "Save spec unavailable: managed profile does not match selected plan"
                             .to_owned(),
                     );
@@ -7249,7 +7686,7 @@ impl App {
             review_policy: HarnessTaskReviewPolicyV1::OperatorReview,
         };
         if selection.validate().is_err() {
-            self.notice = Some("Save spec unavailable: reviewed selection is inconsistent".to_owned());
+            self.flash("Save spec unavailable: reviewed selection is inconsistent".to_owned());
             return AppAction::None;
         }
         let expected_execution_spec_revision = view.options.current_issued_spec.as_ref()
@@ -7282,7 +7719,7 @@ impl App {
 
     fn harness_start_launch(&mut self) -> AppAction {
         if !self.harness_launch_start_enabled() {
-            self.notice = Some(
+            self.flash(
                 "Start task unavailable: task must be Ready with a current issued spec"
                     .to_owned(),
             );
@@ -7331,7 +7768,7 @@ impl App {
             },
             HarnessLaunchOptionsState::Ready(HarnessLaunchOptionsView::from_options(options)),
         );
-        self.notice = Some(format!("Launch spec saved ({outcome:?}); task not started"));
+        self.report_event(EventSeverity::Info, EventSource::Harness, format!("Launch spec saved ({outcome:?}); task not started"));
     }
 
     pub fn apply_harness_task_started_v2(
@@ -7392,11 +7829,15 @@ impl App {
                 );
             }
         }
-        self.notice = Some(format!(
-            "Task started: run {}{}",
-            outcome.dispatch.run_id,
-            if outcome.replayed { " (replayed)" } else { "" },
-        ));
+        self.report_event(
+            EventSeverity::Info,
+            EventSource::Harness,
+            format!(
+                "Task started: run {}{}",
+                outcome.dispatch.run_id,
+                if outcome.replayed { " (replayed)" } else { "" },
+            ),
+        );
         self.harness_kanban.last_start = Some(outcome);
     }
 
@@ -7435,7 +7876,7 @@ impl App {
             }
         }
         self.fail_harness_refresh(token, message.clone());
-        self.notice = Some(format!("Harness launch action failed: {message}"));
+        self.report_failure(EventSource::Harness, format!("Harness launch action failed: {message}"));
     }
 
     fn harness_reverse_attribution_workspace(
@@ -7896,7 +8337,7 @@ impl App {
             return AppAction::None;
         };
         if !harness_operator_move_allowed(task.state, state) {
-            self.notice = Some(format!(
+            self.flash(format!(
                 "Harness operator move {:?} -> {:?} is not allowed",
                 task.state, state,
             ));
@@ -7943,7 +8384,7 @@ impl App {
 
     pub fn harness_schedule_next(&mut self) -> AppAction {
         let Some(plan_id) = self.harness_schedule_plan.clone() else {
-            self.notice = Some("Harness schedule next is disabled: no launch plan is configured".to_owned());
+            self.flash("Harness schedule next is disabled: no launch plan is configured".to_owned());
             return AppAction::None;
         };
         let token = self.begin_harness_mutation_refresh();
@@ -7960,7 +8401,7 @@ impl App {
         let title = composer.title.trim().to_owned();
         if title.is_empty() {
             self.harness_kanban.composer = Some(composer);
-            self.notice = Some("Harness task title is required".to_owned());
+            self.flash("Harness task title is required".to_owned());
             return AppAction::None;
         }
         let token = self.begin_harness_mutation_refresh();
@@ -7974,7 +8415,7 @@ impl App {
 
     fn open_selected_harness_monitor(&mut self) -> AppAction {
         let Some(run) = self.harness_selected_bound_run().cloned() else {
-            self.notice = Some("details unavailable: selected task has no bound run".to_owned());
+            self.flash("details unavailable: selected task has no bound run".to_owned());
             return AppAction::None;
         };
         self.harness_kanban.monitor = Some(HarnessRunMonitorView {
@@ -8070,7 +8511,7 @@ impl App {
             return AppAction::None;
         };
         if run.binding == RedactedBindingStateV1::None {
-            self.notice = Some("run monitor unavailable: run has no Harness binding".to_owned());
+            self.flash("run monitor unavailable: run has no Harness binding".to_owned());
             return AppAction::None;
         }
         self.harness_kanban.monitor = Some(HarnessRunMonitorView {
@@ -8108,7 +8549,7 @@ impl App {
             return AppAction::None;
         }
         let Some(address) = self.harness_run_terminal_address(&run_id) else {
-            self.notice = Some(
+            self.flash(
                 "Harness terminal unavailable: run has no live managed session".to_owned(),
             );
             return AppAction::None;
@@ -8128,7 +8569,7 @@ impl App {
         let Some(run) = self.harness_kanban.runs.get(&run_id).cloned()
             .filter(|run| run.task_id.as_ref() == Some(&detail.task_id))
         else {
-            self.notice = Some(
+            self.flash(
                 "Harness transfers unavailable: run does not belong to this task".to_owned(),
             );
             return AppAction::None;
@@ -8171,14 +8612,14 @@ impl App {
         let Some(run) = self.harness_kanban.runs.get(&run_id)
             .filter(|run| run.task_id.as_ref() == Some(&task_ref.task_id))
         else {
-            self.notice = Some(
+            self.flash(
                 "Harness context observation unavailable: run does not belong to this task"
                     .to_owned(),
             );
             return AppAction::None;
         };
         if run.binding == RedactedBindingStateV1::None {
-            self.notice = Some(
+            self.flash(
                 "Harness context observation unavailable: run has no Harness binding".to_owned(),
             );
             return AppAction::None;
@@ -8332,7 +8773,7 @@ impl App {
         section: HarnessTaskDetailSection,
     ) -> AppAction {
         let Some(run) = self.harness_run_ref(&run_id) else {
-            self.notice = Some("Harness workspace unavailable: run is not loaded".to_owned());
+            self.flash("Harness workspace unavailable: run is not loaded".to_owned());
             return AppAction::None;
         };
         if let Some(detail) = self.harness_kanban.detail.as_mut() {
@@ -8371,7 +8812,7 @@ impl App {
                 })
         });
         if !valid_file {
-            self.notice = Some(
+            self.flash(
                 "Harness file unavailable: path is not an inspected run-relative file".to_owned(),
             );
             return AppAction::None;
@@ -8404,7 +8845,7 @@ impl App {
         pending_diff: Option<WorkspaceGitDiffTarget>,
     ) -> AppAction {
         if !self.harness_kanban.workspaces.contains_key(&origin) {
-            self.notice = Some("Harness Git unavailable: run workspace is not inspected".to_owned());
+            self.flash("Harness Git unavailable: run workspace is not inspected".to_owned());
             return AppAction::None;
         }
         self.harness_read_token = self.harness_read_token.wrapping_add(1).max(1);
@@ -8598,7 +9039,7 @@ impl App {
             self.agent_board.task_filter = Some(task_id);
             self.reconcile_agent_board();
         } else {
-            self.notice = Some("selected managed run has no task ID".to_owned());
+            self.flash("selected managed run has no task ID".to_owned());
         }
     }
 
@@ -9201,7 +9642,7 @@ impl App {
             return true;
         }
         if self.managed_agent_preferences.len() >= MAX_MANAGED_AGENT_PREFERENCES {
-            self.notice = Some("local agent preference limit reached".to_owned());
+            self.flash("local agent preference limit reached".to_owned());
             return false;
         }
         self.managed_agent_preferences.insert(
@@ -9266,7 +9707,7 @@ impl App {
             .filter(|key| matches!(key, AgentRowKey::Managed { .. }))
             .collect::<Vec<_>>();
         if all.len() > MAX_MANAGED_AGENT_PREFERENCES {
-            self.notice = Some("too many managed agents for local ordering".to_owned());
+            self.flash("too many managed agents for local ordering".to_owned());
             return false;
         }
         let Some(source_index) = all.iter().position(|key| key == source) else {
@@ -9283,7 +9724,7 @@ impl App {
         if self.managed_agent_preferences.len().saturating_add(missing)
             > MAX_MANAGED_AGENT_PREFERENCES
         {
-            self.notice = Some("local agent preference limit reached".to_owned());
+            self.flash("local agent preference limit reached".to_owned());
             return false;
         }
         let source_key = all.remove(source_index);
@@ -9444,10 +9885,14 @@ impl App {
             self.pending_open.retain(|address| address.node_id != node.node_id);
             self.terminal_scroll_offsets
                 .retain(|address, _| address.node_id != node.node_id);
-            self.notice = Some(format!(
-                "{} restarted; stale PTY targets were detached",
-                node.node_id,
-            ));
+            self.report_event(
+                EventSeverity::Warn,
+                EventSource::Topology,
+                format!(
+                    "{} restarted; stale PTY targets were detached",
+                    node.node_id,
+                ),
+            );
         }
         let previous_scrollback = self
             .terminal_scroll_offsets
@@ -9527,15 +9972,22 @@ impl App {
                     } else {
                         Focus::Tabs
                     };
-                    self.notice = Some("active PTY disappeared; input target cleared".to_owned());
+                    self.report_event(
+                        EventSeverity::Warn,
+                        EventSource::Session,
+                        "active PTY disappeared; input target cleared",
+                    );
                 }
                 Some(current)
                     if current != previous
                         && self.find_session(previous).is_none()
                         && self.focus == Focus::Viewport =>
                 {
-                    self.notice =
-                        Some("active PTY disappeared; nearest pane focused".to_owned());
+                    self.report_event(
+                        EventSeverity::Warn,
+                        EventSource::Session,
+                        "active PTY disappeared; nearest pane focused",
+                    );
                 }
                 _ => {}
             }
@@ -9583,7 +10035,11 @@ impl App {
             if self.focus == Focus::Spawn {
                 self.focus = Focus::Agents;
             }
-            self.notice = Some("launch cancelled because its workspace was removed".to_owned());
+            self.report_event(
+                EventSeverity::Warn,
+                EventSource::Workspace,
+                "launch cancelled because its workspace was removed",
+            );
         } else if let Some(mut spawn) = self.spawn.take() {
             self.reconcile_spawn_inventory(&mut spawn);
             self.spawn = Some(spawn);
@@ -9605,7 +10061,11 @@ impl App {
             if self.focus == Focus::CreateWorkspaceEntry {
                 self.focus = self.sidebar_focus();
             }
-            self.notice = Some("entry creation cancelled because its workspace was removed".to_owned());
+            self.report_event(
+                EventSeverity::Warn,
+                EventSource::Workspace,
+                "entry creation cancelled because its workspace was removed",
+            );
         }
         self.prune_file_git_surfaces(|node_id, workspace_id| {
             !live_workspaces
@@ -9962,18 +10422,22 @@ impl App {
         self.reconcile_agent_board();
         if self.focus == Focus::Viewport && active_target_removed {
             if self.focused_address().is_some() {
-                self.notice = Some(format!(
-                    "{node_id} removed from C2 topology; nearest surface tab focused"
-                ));
+                self.report_event(
+                    EventSeverity::Warn,
+                    EventSource::Topology,
+                    format!("{node_id} removed from C2 topology; nearest surface tab focused"),
+                );
             } else {
                 self.focus = if self.menu_placement == MenuPlacement::Sidebar {
                     self.sidebar_focus()
                 } else {
                     Focus::Tabs
                 };
-                self.notice = Some(format!(
-                    "{node_id} removed from C2 topology; active PTY input target cleared"
-                ));
+                self.report_event(
+                    EventSeverity::Warn,
+                    EventSource::Topology,
+                    format!("{node_id} removed from C2 topology; active PTY input target cleared"),
+                );
             }
         } else if removed_modal_focus {
             self.focus = if self.focused_address().is_none()
@@ -9983,7 +10447,11 @@ impl App {
             } else {
                 Focus::Tabs
             };
-            self.notice = Some(format!("{node_id} removed from C2 topology; dialog closed"));
+            self.report_event(
+                EventSeverity::Warn,
+                EventSource::Topology,
+                format!("{node_id} removed from C2 topology; dialog closed"),
+            );
         }
     }
 
@@ -10054,8 +10522,10 @@ impl App {
                 self.cancelled_preview_resumes.remove(&oldest);
             }
             self.preview_resume = None;
-            self.notice = Some(
-                "session record was removed; pending reconnect result will be ignored".to_owned(),
+            self.report_event(
+                EventSeverity::Warn,
+                EventSource::Session,
+                "session record was removed; pending reconnect result will be ignored",
             );
         }
         let selected = self.agent_rows().get(self.selected_agent).cloned();
@@ -10163,7 +10633,7 @@ impl App {
                 let record = record.clone();
                 return self.start_managed_session_preview(record);
             }
-            self.notice = Some(format!("{} is {}; preview unavailable",
+            self.flash(format!("{} is {}; preview unavailable",
                 record.display_name, managed_state_label(record.state)));
         }
         AppAction::None
@@ -10262,7 +10732,7 @@ impl App {
             return AppAction::None;
         };
         if !item.enabled {
-            self.notice = Some(format!(
+            self.flash(format!(
                 "{} unavailable: {}",
                 action.label(),
                 item.disabled_reason.unwrap_or_else(|| "unsupported".to_owned())
@@ -10271,12 +10741,12 @@ impl App {
         }
         let Some(row) = self.native_session_row_for_key(&menu.key).cloned() else {
             self.native_session_menu = None;
-            self.notice = Some("session is no longer in this catalog snapshot".to_owned());
+            self.flash("session is no longer in this catalog snapshot".to_owned());
             return AppAction::None;
         };
         if !self.select_native_session_key(&menu.key) {
             self.native_session_menu = None;
-            self.notice = Some("session is no longer in this catalog snapshot".to_owned());
+            self.flash("session is no longer in this catalog snapshot".to_owned());
             return AppAction::None;
         }
         self.native_session_menu = None;
@@ -10296,7 +10766,7 @@ impl App {
                     return AppAction::None;
                 };
                 if !self.select_workspace_route_without_inspection(&row.node_id, workspace_id) {
-                    self.notice = Some("session workspace is not registered on its node".to_owned());
+                    self.flash("session workspace is not registered on its node".to_owned());
                     return AppAction::None;
                 }
                 self.sidebar_mode = SidebarMode::Files;
@@ -10319,7 +10789,7 @@ impl App {
                     record_id,
                 };
                 if !self.select_agent_key(&key) {
-                    self.notice = Some("linked managed record disappeared".to_owned());
+                    self.flash("linked managed record disappeared".to_owned());
                     return AppAction::None;
                 }
                 self.focus = Focus::Agents;
@@ -10396,7 +10866,7 @@ impl App {
     fn inspect_agent_workspace(&mut self, key: &AgentRowKey) -> AppAction {
         self.clear_agent_run_lens();
         let Some((node_id, workspace_id)) = self.agent_workspace_route(key) else {
-            self.notice = Some("workspace route unavailable".to_owned());
+            self.flash("workspace route unavailable".to_owned());
             return AppAction::None;
         };
         let Some(index) = self.space_rows().iter().position(|(node_index, workspace_index)| {
@@ -10404,7 +10874,7 @@ impl App {
             node.node_id == node_id
                 && node.workspaces[*workspace_index].workspace_id == workspace_id
         }) else {
-            self.notice = Some("session workspace is not registered on its node".to_owned());
+            self.flash("session workspace is not registered on its node".to_owned());
             return AppAction::None;
         };
         self.select_workspace_without_inspection(index);
@@ -10416,23 +10886,23 @@ impl App {
 
     fn stop_selected_agent(&mut self) -> AppAction {
         let Some(key) = self.agent_rows().get(self.selected_agent).cloned() else {
-            self.notice = Some("no session selected".to_owned());
+            self.flash("no session selected".to_owned());
             return AppAction::None;
         };
         let Some(address) = self.agent_row_active_address(&key) else {
-            self.notice = Some("selected record has no live PTY".to_owned());
+            self.flash("selected record has no live PTY".to_owned());
             return AppAction::None;
         };
         if !self.address_is_connected(&address) {
-            self.notice = Some(format!("{} is disconnected; stop unavailable", address.node_id));
+            self.flash(format!("{} is disconnected; stop unavailable", address.node_id));
             return AppAction::None;
         }
         let Some(session) = self.find_session(&address) else {
-            self.notice = Some("selected PTY is absent from the node snapshot".to_owned());
+            self.flash("selected PTY is absent from the node snapshot".to_owned());
             return AppAction::None;
         };
         if !session.stoppable {
-            self.notice = Some("selected PTY is not stoppable".to_owned());
+            self.flash("selected PTY is not stoppable".to_owned());
             return AppAction::None;
         }
         AppAction::Stop { address, force: false }
@@ -10450,7 +10920,7 @@ impl App {
             return AppAction::None;
         };
         if !item.enabled {
-            self.notice = Some(format!(
+            self.flash(format!(
                 "{} unavailable: {}",
                 action.label(),
                 item.disabled_reason.unwrap_or_else(|| "unsupported".to_owned())
@@ -10459,7 +10929,7 @@ impl App {
         }
         if !self.select_agent_key(&menu.key) {
             self.agent_menu = None;
-            self.notice = Some("session record disappeared from the roster".to_owned());
+            self.flash("session record disappeared from the roster".to_owned());
             return AppAction::None;
         }
         self.agent_menu = None;
@@ -10624,7 +11094,7 @@ impl App {
             return;
         }
         if !self.address_is_connected(&address) {
-            self.notice = Some(format!("{} is disconnected; PTY cannot be opened", address.node_id));
+            self.flash(format!("{} is disconnected; PTY cannot be opened", address.node_id));
             return;
         }
         let opening_active_run = self.agent_run_lens.as_ref().is_some_and(|lens| {
@@ -10721,7 +11191,7 @@ impl App {
                 self.focus = Focus::Tabs;
             }
             Err(SurfaceError::PresetCapacityExceeded { leaves, .. }) => {
-                self.notice = Some(format!(
+                self.flash(format!(
                     "{} cannot contain {leaves} open panes",
                     preset.id(),
                 ));
@@ -10771,7 +11241,7 @@ impl App {
                 true
             }
             Err(SurfaceError::MaximumLeavesReached { maximum }) => {
-                self.notice = Some(format!(
+                self.flash(format!(
                     "surface is full ({maximum} panes); merge or detach a tab first",
                 ));
                 false
@@ -11025,7 +11495,7 @@ impl App {
         } else {
             Focus::Tabs
         };
-        self.notice = Some(match tab {
+        self.flash(match tab {
             SurfaceTab::AgentBoard => "Agent board tab closed".to_owned(),
             SurfaceTab::SessionMonitor(_) => "Session Monitor tab closed; observations retained".to_owned(),
             SurfaceTab::Pty(_) => "tab detached; headless session continues".to_owned(),
@@ -11062,7 +11532,7 @@ impl App {
 
     pub fn reduce(&mut self, key: UiKey) -> AppAction {
         if key == UiKey::UnsupportedModifier {
-            self.notice = Some("unsupported key modifier; no input sent".to_owned());
+            self.flash("unsupported key modifier; no input sent".to_owned());
             return AppAction::None;
         }
         if self.harness_kanban.reverse_attribution.is_some() {
@@ -11485,7 +11955,7 @@ impl App {
                     if let Some(run_id) = selected_run {
                         return self.open_harness_workspace_section(run_id, *section);
                     }
-                    self.notice = Some(
+                    self.flash(
                         "Harness workspace unavailable: Task Detail has no selected run".to_owned(),
                     );
                 }
@@ -11493,7 +11963,7 @@ impl App {
                     if let Some(run_id) = selected_run {
                         return self.open_harness_run_transfers(run_id, false);
                     }
-                    self.notice = Some(
+                    self.flash(
                         "Harness transfers unavailable: Task Detail has no selected run".to_owned(),
                     );
                 }
@@ -12238,10 +12708,11 @@ impl App {
                 if let Some(key) = self.active_file_key_in_pane(pane_id) {
                     if let Some(file) = self.file_tabs.get_mut(&key) {
                         file.edit_mode = !file.edit_mode;
-                        self.notice = Some(if file.edit_mode {
-                            "edit mode; Ctrl+S saves, Esc returns to viewer".to_owned()
+                        let edit_mode = file.edit_mode;
+                        self.flash(if edit_mode {
+                            "edit mode; Ctrl+S saves, Esc returns to viewer"
                         } else {
-                            "view mode".to_owned()
+                            "view mode"
                         });
                     }
                 }
@@ -12475,6 +12946,9 @@ impl App {
                 // `click_status_bar_zone` guard -- never actually
                 // reachable here.
                 | HitTarget::StatusBarMarqueeToggle
+                | HitTarget::StatusBarCenterLogScrollUp
+                | HitTarget::StatusBarCenterLogScrollDown
+                | HitTarget::StatusBarCenterLogClear
                 // Same shape, for `Focus::StatusBarLeft`'s own `click_
                 // status_bar_zone` guard covering the clock settings rows.
                 | HitTarget::StatusBarClockFollowSystem
@@ -12708,7 +13182,7 @@ impl App {
                 return self.start_native_session_resume();
             }
             Some(HitTarget::ExistingSessionRestoreViaSkill) => {
-                self.notice = Some(RESTORE_VIA_SKILL_DISABLED_REASON.to_owned());
+                self.flash(RESTORE_VIA_SKILL_DISABLED_REASON.to_owned());
             }
             Some(HitTarget::ExistingSessionAdvancedImport) => {
                 self.set_existing_session_mode(ExistingSessionMode::AdvancedImport);
@@ -13541,7 +14015,7 @@ impl App {
             return AppAction::None;
         };
         if !matches!(file.state, WorkspaceFileState::Ready) {
-            self.notice = Some("file is not ready for Git history".to_owned());
+            self.flash("file is not ready for Git history".to_owned());
             return AppAction::None;
         }
         self.git_request_token = self.git_request_token.wrapping_add(1).max(1);
@@ -13604,7 +14078,7 @@ impl App {
                 .map(|browser| browser.filter.len())
                 .unwrap_or(0);
             if text.contains(['\r', '\n', '\0']) || filter_len.saturating_add(text.len()) > 256 {
-                self.notice = Some("folder filter paste is invalid".to_owned());
+                self.flash("folder filter paste is invalid".to_owned());
             } else if let Some(browser) = self.folder_browser.as_mut() {
                 browser.field = FolderBrowserField::Filter;
                 browser.filter.push_str(&text);
@@ -13631,22 +14105,22 @@ impl App {
         if let Some((key, tab)) = self.focused_file() {
             let key = key.clone();
             if !tab.edit_mode || !matches!(tab.state, WorkspaceFileState::Ready) {
-                self.notice = Some("file viewer is read-only; press e before pasting".to_owned());
+                self.flash("file viewer is read-only; press e before pasting".to_owned());
                 return AppAction::None;
             }
             if let Some(tab) = self.file_tabs.get_mut(&key) {
                 if let Err(error) = tab.editor.insert_str(&text) {
-                    self.notice = Some(format!("file paste rejected: {error:?}"));
+                    self.report_failure(EventSource::Workspace, format!("file paste rejected: {error:?}"));
                 }
             }
             return AppAction::None;
         }
         if !self.focused_session().is_some_and(|session| session.running) {
-            self.notice = Some("stopped PTY is read-only; use r from agents to restart".to_owned());
+            self.flash("stopped PTY is read-only; use r from agents to restart".to_owned());
             return AppAction::None;
         }
         if text.len() > TERMINAL_INPUT_MAX_BYTES {
-            self.notice = Some("PTY paste exceeds terminal input limit; nothing sent".to_owned());
+            self.flash("PTY paste exceeds terminal input limit; nothing sent".to_owned());
             return AppAction::None;
         }
         self.for_active(|address| AppAction::Paste { address, text })
@@ -13654,11 +14128,11 @@ impl App {
 
     fn begin_spawn(&mut self) -> AppAction {
         let Some((node, workspace)) = self.selected_workspace() else {
-            self.notice = Some("select a workspace before spawning".to_owned());
+            self.flash("select a workspace before spawning".to_owned());
             return AppAction::None;
         };
         if !matches!(node.connection, ConnectionState::Connected) {
-            self.notice = Some(format!("{} is disconnected; spawn unavailable", node.node_id));
+            self.flash(format!("{} is disconnected; spawn unavailable", node.node_id));
             return AppAction::None;
         }
         let Some(provider) = workspace
@@ -13667,7 +14141,7 @@ impl App {
             .find(|inventory| inventory.enabled)
             .map(|inventory| inventory.provider.clone())
         else {
-            self.notice = Some("selected workspace has no enabled provider".to_owned());
+            self.flash("selected workspace has no enabled provider".to_owned());
             return AppAction::None;
         };
         let mut spawn = SpawnDialog {
@@ -13703,7 +14177,7 @@ impl App {
                     .find(|node_id| !self.catalog_routes_for_node(node_id).is_empty())
             });
         let Some(node_id) = selected_node_id else {
-            self.notice = Some(
+            self.flash(
                 "no connected Node has an enabled provider with native history".to_owned(),
             );
             return AppAction::None;
@@ -14416,7 +14890,7 @@ impl App {
             .map(|(node, _)| node.node_id.clone())
             .or_else(|| self.nodes.iter().find(|node| matches!(node.connection, ConnectionState::Connected)).map(|node| node.node_id.clone()));
         let Some(node_id) = node_id else {
-            self.notice = Some("no connected node available for a new space".to_owned());
+            self.flash("no connected node available for a new space".to_owned());
             return AppAction::None;
         };
         self.begin_add_space_on_node(node_id)
@@ -14432,7 +14906,7 @@ impl App {
 
     fn begin_add_space_on_node(&mut self, node_id: String) -> AppAction {
         if !self.node_is_connected(&node_id) {
-            self.notice = Some(format!("{node_id} is disconnected; workspace registration unavailable"));
+            self.flash(format!("{node_id} is disconnected; workspace registration unavailable"));
             self.focus = Focus::Agents;
             return AppAction::None;
         }
@@ -14571,7 +15045,7 @@ impl App {
             .filter(|browser| !browser.pending)
             .and_then(|browser| browser.directory.clone())
         else {
-            self.notice = Some("choose a real directory before using it".to_owned());
+            self.flash("choose a real directory before using it".to_owned());
             return AppAction::None;
         };
         if let Some(add_space) = self.add_space.as_mut() {
@@ -14588,15 +15062,15 @@ impl App {
 
     fn begin_create_worktree(&mut self) -> AppAction {
         let Some((node, workspace)) = self.selected_workspace() else {
-            self.notice = Some("select a workspace before creating a worktree".to_owned());
+            self.flash("select a workspace before creating a worktree".to_owned());
             return AppAction::None;
         };
         if !matches!(node.connection, ConnectionState::Connected) {
-            self.notice = Some(format!("{} is disconnected; worktree creation unavailable", node.node_id));
+            self.flash(format!("{} is disconnected; worktree creation unavailable", node.node_id));
             return AppAction::None;
         }
         if workspace.worktree_service_mode != Some(WorktreeServiceMode::Manual) {
-            self.notice = Some(
+            self.flash(
                 "selected workspace does not allow manual Git worktree creation".to_owned(),
             );
             return AppAction::None;
@@ -14617,7 +15091,7 @@ impl App {
             return AppAction::None;
         };
         if !self.manual_worktree_available(&spawn.node_id, &spawn.workspace_id) {
-            self.notice = Some(
+            self.flash(
                 "selected workspace does not allow manual Git worktree creation".to_owned(),
             );
             return AppAction::None;
@@ -14633,7 +15107,7 @@ impl App {
                     .map(|workspace| (workspace.workspace_id.clone(), workspace.canonical_root.clone()))
             })
         else {
-            self.notice = Some("selected workspace is unavailable for manual worktree creation".to_owned());
+            self.flash("selected workspace is unavailable for manual worktree creation".to_owned());
             return AppAction::None;
         };
         self.begin_create_worktree_for(
@@ -14808,7 +15282,7 @@ impl App {
             return AppAction::None;
         };
         if !worktree_can_be_removed(&worktree) {
-            self.notice = Some("main, bare, locked, or prunable worktrees cannot be removed here".to_owned());
+            self.flash("main, bare, locked, or prunable worktrees cannot be removed here".to_owned());
             return AppAction::None;
         }
         self.remove_worktree = Some(RemoveWorktreeDialog {
@@ -14823,7 +15297,7 @@ impl App {
 
     fn begin_rename_selected_agent(&mut self) -> AppAction {
         let Some(record) = self.selected_managed_session() else {
-            self.notice = Some("rename requires a node-owned session record".to_owned());
+            self.flash("rename requires a node-owned session record".to_owned());
             return AppAction::None;
         };
         self.rename_session = Some(RenameSessionDialog {
@@ -14839,7 +15313,7 @@ impl App {
 
     fn begin_local_alias(&mut self, key: &AgentRowKey) -> AppAction {
         let Some((node_id, record_id)) = Self::managed_preference_key(key) else {
-            self.notice = Some("local alias requires a durable managed record".to_owned());
+            self.flash("local alias requires a durable managed record".to_owned());
             return AppAction::None;
         };
         let alias = self.agent_local_alias(key).unwrap_or_default().to_owned();
@@ -14868,7 +15342,7 @@ impl App {
 
     fn set_selected_task(&mut self, target: SessionTaskTargetV1) -> AppAction {
         let Some(record) = self.selected_managed_session() else {
-            self.notice = Some("task correlation requires a durable managed record".to_owned());
+            self.flash("task correlation requires a durable managed record".to_owned());
             return AppAction::None;
         };
         Self::task_action_for_record(record, target)
@@ -14876,7 +15350,7 @@ impl App {
 
     fn begin_assign_task_id(&mut self, key: &AgentRowKey) -> AppAction {
         let Some(record) = self.find_managed_session(key) else {
-            self.notice = Some("task correlation requires a durable managed record".to_owned());
+            self.flash("task correlation requires a durable managed record".to_owned());
             return AppAction::None;
         };
         self.task_id_dialog = Some(TaskIdDialog {
@@ -14895,10 +15369,10 @@ impl App {
             .and_then(|binding| binding.task_id.as_ref())
             .map(ToString::to_string)
         else {
-            self.notice = Some("task ID is unassigned".to_owned());
+            self.flash("task ID is unassigned".to_owned());
             return;
         };
-        self.notice = Some(match write_clipboard_text(&task_id) {
+        self.flash(match write_clipboard_text(&task_id) {
             Ok(()) => format!("copied task ID {task_id}"),
             Err(message) => format!("task ID copy failed: {message}"),
         });
@@ -14906,11 +15380,11 @@ impl App {
 
     fn begin_forget_selected_agent(&mut self) -> AppAction {
         let Some(record) = self.selected_managed_session() else {
-            self.notice = Some("forget requires a node-owned session record".to_owned());
+            self.flash("forget requires a node-owned session record".to_owned());
             return AppAction::None;
         };
         if record.active_session.is_some() || matches!(record.state, ManagedSessionState::Live) {
-            self.notice = Some("stop the live PTY before forgetting its session record".to_owned());
+            self.flash("stop the live PTY before forgetting its session record".to_owned());
             return AppAction::None;
         }
         self.forget_session = Some(ForgetSessionDialog {
@@ -14924,15 +15398,15 @@ impl App {
 
     fn begin_history_selected_agent(&mut self) -> AppAction {
         let Some(key) = self.agent_rows().get(self.selected_agent).cloned() else {
-            self.notice = Some("select an active session before opening history".to_owned());
+            self.flash("select an active session before opening history".to_owned());
             return AppAction::None;
         };
         let Some(address) = self.agent_row_active_address(&key) else {
-            self.notice = Some("history requires an active managed or legacy session".to_owned());
+            self.flash("history requires an active managed or legacy session".to_owned());
             return AppAction::None;
         };
         if !self.address_is_connected(&address) {
-            self.notice = Some(format!("{} is disconnected; history unavailable", address.node_id));
+            self.flash(format!("{} is disconnected; history unavailable", address.node_id));
             return AppAction::None;
         }
         let Some((source_provider, source_workspace_root, running)) = self
@@ -14958,11 +15432,11 @@ impl App {
                     })
             })
         else {
-            self.notice = Some("selected active session is absent from the node snapshot".to_owned());
+            self.flash("selected active session is absent from the node snapshot".to_owned());
             return AppAction::None;
         };
         if !running {
-            self.notice = Some("history opens from an active PTY session".to_owned());
+            self.flash("history opens from an active PTY session".to_owned());
             return AppAction::None;
         }
         self.history = Some(HistoryDialog {
@@ -15646,11 +16120,11 @@ impl App {
 
     pub fn inspect_selected_workspace(&mut self) -> AppAction {
         let Some((node, workspace)) = self.selected_workspace() else {
-            self.notice = Some("select a workspace before inspection".to_owned());
+            self.flash("select a workspace before inspection".to_owned());
             return AppAction::None;
         };
         if !matches!(node.connection, ConnectionState::Connected) {
-            self.notice = Some(format!(
+            self.flash(format!(
                 "{} is disconnected; workspace inspection unavailable",
                 node.node_id
             ));
@@ -15937,7 +16411,7 @@ impl App {
             return AppAction::None;
         };
         if !matches!(node.connection, ConnectionState::Connected) {
-            self.notice = Some(format!(
+            self.flash(format!(
                 "{} is disconnected; space removal unavailable",
                 node.node_id
             ));
@@ -16090,7 +16564,7 @@ impl App {
 
     fn remove_selected_git_worktree(&mut self) -> AppAction {
         let Some((index, _)) = self.selected_git_worktree() else {
-            self.notice = Some("select a removable worktree".to_owned());
+            self.flash("select a removable worktree".to_owned());
             return AppAction::None;
         };
         self.begin_remove_worktree(index)
@@ -16230,12 +16704,12 @@ impl App {
             UiKey::Enter => return self.open_selected_agent(),
             UiKey::Delete => {
                 let Some(key) = self.agent_rows().get(self.selected_agent).cloned() else {
-                    self.notice = Some("no managed session selected".to_owned());
+                    self.flash("no managed session selected".to_owned());
                     return AppAction::None;
                 };
                 if let Some(address) = self.agent_row_active_address(&key) {
                     if !self.address_is_connected(&address) {
-                        self.notice = Some(format!("{} is disconnected; lifecycle action unavailable", address.node_id));
+                        self.flash(format!("{} is disconnected; lifecycle action unavailable", address.node_id));
                         return AppAction::None;
                     }
                     let Some(session) = self.find_session(&address) else {
@@ -16267,7 +16741,7 @@ impl App {
 
     fn restart_selected_agent(&mut self) -> AppAction {
         let Some(key) = self.agent_rows().get(self.selected_agent).cloned() else {
-            self.notice = Some("no managed session selected".to_owned());
+            self.flash("no managed session selected".to_owned());
             return AppAction::None;
         };
         if let Some(record) = self.find_managed_session(&key).cloned() {
@@ -16278,22 +16752,22 @@ impl App {
             let resumable = record.has_provider_session_identity;
             let active = record.active_session.clone();
             if !self.node_is_connected(&node_id) {
-                self.notice = Some(format!("{node_id} is disconnected; resume unavailable"));
+                self.flash(format!("{node_id} is disconnected; resume unavailable"));
                 return AppAction::None;
             }
             if state == ManagedSessionState::Live || active.is_some() {
-                self.notice = Some(format!("{display_name} is already live"));
+                self.flash(format!("{display_name} is already live"));
                 return AppAction::None;
             }
             if state != ManagedSessionState::Dormant || !resumable {
-                self.notice = Some(format!(
+                self.flash(format!(
                     "{display_name} cannot resume: {}",
                     managed_state_label(state)
                 ));
                 return AppAction::None;
             }
             if self.preview_resume.is_some() {
-                self.notice = Some("another session reconnect is already in progress".to_owned());
+                self.flash("another session reconnect is already in progress".to_owned());
                 return AppAction::None;
             }
             let preview_key = PreviewTabKey::ManagedRecord {
@@ -16327,7 +16801,7 @@ impl App {
                 record_id: Some(record_id.clone()),
                 operation_token,
             });
-            self.notice = Some(format!("reconnecting {display_name}..."));
+            self.report_event(EventSeverity::Info, EventSource::Session, format!("reconnecting {display_name}..."));
             return AppAction::ResumeSessionRecord {
                 node_id,
                 record_id,
@@ -16341,18 +16815,18 @@ impl App {
             return AppAction::None;
         };
         if !self.address_is_connected(&address) {
-            self.notice = Some(format!("{} is disconnected; restart unavailable", address.node_id));
+            self.flash(format!("{} is disconnected; restart unavailable", address.node_id));
             return AppAction::None;
         }
         let Some(session) = self.find_session(&address) else {
             return AppAction::None;
         };
         if session.running {
-            self.notice = Some("selected PTY is already running".to_owned());
+            self.flash("selected PTY is already running".to_owned());
             return AppAction::None;
         }
         if !session.restartable || !session.has_provider_session_identity {
-            self.notice = Some("restart unavailable; provider session identity was not observed".to_owned());
+            self.flash("restart unavailable; provider session identity was not observed".to_owned());
             return AppAction::None;
         }
         AppAction::Resume {
@@ -16444,7 +16918,7 @@ impl App {
                     UiKey::Home => preview.scroll = 0,
                     UiKey::End => preview.scroll = usize::MAX,
                     _ => {
-                        self.notice = Some(
+                        self.flash(
                             "session is hydrated; press r to reconnect its provider PTY"
                                 .to_owned(),
                         );
@@ -16461,7 +16935,7 @@ impl App {
         if !self.focused_session().is_some_and(|session| session.running)
             && !matches!(key, UiKey::Ctrl('c') | UiKey::Ctrl('x'))
         {
-            self.notice = Some("stopped PTY is read-only; use r from agents to restart".to_owned());
+            self.flash("stopped PTY is read-only; use r from agents to restart".to_owned());
             return AppAction::None;
         }
         match key {
@@ -16474,8 +16948,8 @@ impl App {
                     .map(|selection| selection.text.clone())
                     .unwrap_or_default();
                 match write_clipboard_text(&text) {
-                    Ok(()) => self.notice = Some("terminal selection copied".to_owned()),
-                    Err(error) => self.notice = Some(format!("copy failed: {error}")),
+                    Ok(()) => self.flash("terminal selection copied".to_owned()),
+                    Err(error) => self.flash(format!("copy failed: {error}")),
                 }
                 AppAction::None
             }
@@ -16485,11 +16959,11 @@ impl App {
                     self.for_active(|address| AppAction::Paste { address, text })
                 }
                 Ok(_) => {
-                    self.notice = Some("clipboard exceeds the PTY input limit".to_owned());
+                    self.flash("clipboard exceeds the PTY input limit".to_owned());
                     AppAction::None
                 }
                 Err(error) => {
-                    self.notice = Some(format!("paste failed: {error}"));
+                    self.flash(format!("paste failed: {error}"));
                     AppAction::None
                 }
             },
@@ -16540,7 +17014,7 @@ impl App {
             UiKey::ShiftPageUp => self.terminal_control(TerminalControl::PageUp),
             UiKey::ShiftPageDown => self.terminal_control(TerminalControl::PageDown),
             UiKey::ModifiedEnter => {
-                self.notice = Some("unsupported key modifier; no input sent".to_owned());
+                self.flash("unsupported key modifier; no input sent".to_owned());
                 AppAction::None
             }
             UiKey::UnsupportedModifier => AppAction::None,
@@ -16605,7 +17079,7 @@ impl App {
             return AppAction::None;
         };
         if !matches!(file.state, WorkspaceFileState::Ready) {
-            self.notice = Some("file is not editable until it has loaded".to_owned());
+            self.flash("file is not editable until it has loaded".to_owned());
             return AppAction::None;
         }
         if file.inline_history.is_some() {
@@ -16621,7 +17095,7 @@ impl App {
             match input {
                 UiKey::Char('e') | UiKey::Enter => {
                     tab.edit_mode = true;
-                    self.notice = Some("edit mode; Ctrl+S saves, Esc returns to viewer".to_owned());
+                    self.flash("edit mode; Ctrl+S saves, Esc returns to viewer".to_owned());
                 }
                 UiKey::Up => tab.editor.scroll_vertical(-1),
                 UiKey::Down => tab.editor.scroll_vertical(1),
@@ -16640,8 +17114,8 @@ impl App {
                 UiKey::Ctrl('c') => {
                     if let Some(text) = tab.editor.selected_text() {
                         match write_clipboard_text(text) {
-                            Ok(()) => self.notice = Some("selection copied".to_owned()),
-                            Err(error) => self.notice = Some(format!("copy failed: {error}")),
+                            Ok(()) => self.flash("selection copied".to_owned()),
+                            Err(error) => self.flash(format!("copy failed: {error}")),
                         }
                     }
                 }
@@ -16651,23 +17125,23 @@ impl App {
                             Ok(()) => {
                                 let _ = tab.editor.replace_selection("");
                                 tab.edit_mode = true;
-                                self.notice = Some("selection cut".to_owned());
+                                self.flash("selection cut".to_owned());
                             }
-                            Err(error) => self.notice = Some(format!("cut failed: {error}")),
+                            Err(error) => self.flash(format!("cut failed: {error}")),
                         }
                     }
                 }
                 UiKey::Ctrl('v') => match read_clipboard_text() {
                     Ok(text) => {
                         if let Err(error) = tab.editor.replace_selection(&text) {
-                            self.notice = Some(format!("paste rejected: {error:?}"));
+                            self.report_failure(EventSource::Workspace, format!("paste rejected: {error:?}"));
                         } else {
                             tab.edit_mode = true;
                         }
                     }
-                    Err(error) => self.notice = Some(format!("paste failed: {error}")),
+                    Err(error) => self.flash(format!("paste failed: {error}")),
                 },
-                _ => self.notice = Some("file viewer; press e to edit".to_owned()),
+                _ => self.flash("file viewer; press e to edit".to_owned()),
             }
             return AppAction::None;
         }
@@ -16678,11 +17152,11 @@ impl App {
             }
             UiKey::Ctrl('s') => {
                 if !tab.editor.dirty() {
-                    self.notice = Some("file has no unsaved changes".to_owned());
+                    self.flash("file has no unsaved changes".to_owned());
                     return AppAction::None;
                 }
                 let Some(revision) = tab.editor.saved_revision().map(str::to_owned) else {
-                    self.notice = Some("file revision is unavailable; reload before saving".to_owned());
+                    self.flash("file revision is unavailable; reload before saving".to_owned());
                     return AppAction::None;
                 };
                 tab.editor.mark_saving();
@@ -16702,8 +17176,8 @@ impl App {
             UiKey::Ctrl('c') => {
                 if let Some(text) = tab.editor.selected_text() {
                     match write_clipboard_text(text) {
-                        Ok(()) => self.notice = Some("selection copied".to_owned()),
-                        Err(error) => self.notice = Some(format!("copy failed: {error}")),
+                        Ok(()) => self.flash("selection copied".to_owned()),
+                        Err(error) => self.flash(format!("copy failed: {error}")),
                     }
                 }
                 AppAction::None
@@ -16713,9 +17187,9 @@ impl App {
                     match write_clipboard_text(&text) {
                         Ok(()) => {
                             let _ = tab.editor.replace_selection("");
-                            self.notice = Some("selection cut".to_owned());
+                            self.flash("selection cut".to_owned());
                         }
-                        Err(error) => self.notice = Some(format!("cut failed: {error}")),
+                        Err(error) => self.flash(format!("cut failed: {error}")),
                     }
                 }
                 AppAction::None
@@ -16724,10 +17198,10 @@ impl App {
                 match read_clipboard_text() {
                     Ok(text) => {
                         if let Err(error) = tab.editor.replace_selection(&text) {
-                            self.notice = Some(format!("paste rejected: {error:?}"));
+                            self.report_failure(EventSource::Workspace, format!("paste rejected: {error:?}"));
                         }
                     }
-                    Err(error) => self.notice = Some(format!("paste failed: {error}")),
+                    Err(error) => self.flash(format!("paste failed: {error}")),
                 }
                 AppAction::None
             }
@@ -16738,23 +17212,25 @@ impl App {
                 return self.open_workspace_file_history(key, Some(target));
             }
             UiKey::Char(ch) => {
-                if let Err(error) = tab.editor.insert_char(ch) {
-                    self.notice = Some(format!("file edit rejected: {error:?}"));
-                }
+                let insert_result = tab.editor.insert_char(ch);
                 tab.editor.ensure_cursor_visible(
                     self.terminal_rows.saturating_sub(1) as usize,
                     self.terminal_cols as usize,
                 );
+                if let Err(error) = insert_result {
+                    self.report_failure(EventSource::Workspace, format!("file edit rejected: {error:?}"));
+                }
                 AppAction::None
             }
             UiKey::Enter | UiKey::ModifiedEnter => {
-                if let Err(error) = tab.editor.insert_newline() {
-                    self.notice = Some(format!("file edit rejected: {error:?}"));
-                }
+                let insert_result = tab.editor.insert_newline();
                 tab.editor.ensure_cursor_visible(
                     self.terminal_rows.saturating_sub(1) as usize,
                     self.terminal_cols as usize,
                 );
+                if let Err(error) = insert_result {
+                    self.report_failure(EventSource::Workspace, format!("file edit rejected: {error:?}"));
+                }
                 AppAction::None
             }
             UiKey::Backspace => {
@@ -16851,7 +17327,7 @@ impl App {
             }
             UiKey::Tab => {
                 if let Err(error) = tab.editor.insert_str("    ") {
-                    self.notice = Some(format!("file edit rejected: {error:?}"));
+                    self.report_failure(EventSource::Workspace, format!("file edit rejected: {error:?}"));
                 }
                 AppAction::None
             }
@@ -16890,13 +17366,13 @@ impl App {
             UiKey::Ctrl('c') => {
                 if let Some(text) = tab.editor.selected_text() {
                     match write_clipboard_text(text) {
-                        Ok(()) => self.notice = Some("selection copied".to_owned()),
-                        Err(error) => self.notice = Some(format!("copy failed: {error}")),
+                        Ok(()) => self.flash("selection copied".to_owned()),
+                        Err(error) => self.flash(format!("copy failed: {error}")),
                     }
                 }
             }
             UiKey::Char('e') | UiKey::Ctrl('s') | UiKey::Ctrl('x') | UiKey::Ctrl('v') => {
-                self.notice = Some(
+                self.flash(
                     "Harness run file is read-only; edit, save, cut, and paste are unavailable"
                         .to_owned(),
                 );
@@ -17366,7 +17842,14 @@ impl App {
                         tab.state = WorkspaceFileState::Ready;
                         tab.edit_mode = false;
                     }
-                    Err(error) => tab.state = WorkspaceFileState::Error(format!("{error:?}")),
+                    Err(error) => {
+                        let message = format!("{error:?}");
+                        tab.state = WorkspaceFileState::Error(message.clone());
+                        self.report_failure(
+                            EventSource::Workspace,
+                            format!("{}: {message}", repository_path_display(&key.path)),
+                        );
+                    }
                 }
             }
             gate4agent_node_protocol::WorkspaceFileContent::NonUtf8 { byte_len } => {
@@ -17458,6 +17941,14 @@ impl App {
                     .to_owned(),
             );
             tab.edit_mode = false;
+            self.report_failure(
+                EventSource::Harness,
+                format!(
+                    "{}/{}: origin-mismatch: Harness file reply did not match the exact run origin and path",
+                    key.origin.label(),
+                    repository_path_display(&key.path),
+                ),
+            );
             return;
         }
         match content {
@@ -17469,9 +17960,12 @@ impl App {
                         tab.edit_mode = false;
                     }
                     Err(error) => {
-                        tab.state = WorkspaceFileState::Error(format!(
-                            "projection: {error:?}",
-                        ));
+                        let message = format!("projection: {error:?}");
+                        tab.state = WorkspaceFileState::Error(message.clone());
+                        self.report_failure(
+                            EventSource::Harness,
+                            format!("{}/{}: {message}", key.origin.label(), repository_path_display(&key.path)),
+                        );
                     }
                 }
             }
@@ -17494,8 +17988,13 @@ impl App {
             return;
         };
         if tab.request_token == token {
-            tab.state = WorkspaceFileState::Error(failure.display());
+            let message = failure.display();
+            tab.state = WorkspaceFileState::Error(message.clone());
             tab.edit_mode = false;
+            self.report_failure(
+                EventSource::Harness,
+                format!("{}/{}: {message}", key.origin.label(), repository_path_display(&key.path)),
+            );
         }
     }
 
@@ -17524,6 +18023,13 @@ impl App {
                         .to_owned(),
                 );
                 tab.pending_diff = None;
+                self.report_failure(
+                    EventSource::Harness,
+                    format!(
+                        "{}: origin-mismatch: Harness Git history reply did not match the exact run origin and scope",
+                        key.origin.label(),
+                    ),
+                );
                 return None;
             }
             let append = !tab.commits.is_empty() && tab.next_before.is_some();
@@ -17565,12 +18071,16 @@ impl App {
         token: u64,
         failure: HarnessReadFailure,
     ) {
+        let HarnessWorkspaceGitRequestDestination::Surface(key) = destination;
+        let origin_label = key.origin.label();
         let Some(tab) = self.harness_git_view_mut(destination) else {
             return;
         };
         if tab.history_token == token {
-            tab.state = WorkspaceGitState::Error(failure.display());
+            let message = failure.display();
+            tab.state = WorkspaceGitState::Error(message.clone());
             tab.pending_diff = None;
+            self.report_failure(EventSource::Harness, format!("{origin_label}: {message}"));
         }
     }
 
@@ -17631,10 +18141,20 @@ impl App {
             return;
         }
         if save {
-            tab.editor.mark_error(message);
+            tab.editor.mark_error(message.clone());
         } else {
-            tab.state = WorkspaceFileState::Error(message);
+            tab.state = WorkspaceFileState::Error(message.clone());
         }
+        // This local `WorkspaceFileState::Error`/`SyncState::Error` is the
+        // Files pane's own inline red line -- see that render site's own
+        // doc comment. It used to be the ONLY place a real file read/save
+        // failure ever showed up: never on the central feed, so a backend
+        // failure here was invisible outside this one panel. Reported
+        // additionally, keeping the local display exactly as it was.
+        self.record_failure(
+            EventSource::Workspace,
+            format!("{}: {message}", repository_path_display(&key.path)),
+        );
     }
 
     pub fn apply_workspace_file_written(
@@ -17660,9 +18180,25 @@ impl App {
                     file.revision.map(|revision| revision.as_str().to_owned()),
                 );
                 tab.state = WorkspaceFileState::Ready;
-                self.notice = Some(format!("saved {}", repository_path_display(&key.path)));
+                self.report_event(
+                    EventSeverity::Info,
+                    EventSource::Workspace,
+                    format!("saved {}", repository_path_display(&key.path)),
+                );
             } else {
                 tab.editor.mark_conflict("saved response did not match the editor buffer");
+                // The file editor's own `SyncState::Conflict` message text
+                // used to be captured and then discarded at render time in
+                // favour of a bare "save conflict" label (see `render.rs`'s
+                // two `sync_state()` read sites) -- reported here so a real
+                // save conflict is visible somewhere besides that label.
+                self.report_failure(
+                    EventSource::Workspace,
+                    format!(
+                        "{}: saved response did not match the editor buffer",
+                        repository_path_display(&key.path),
+                    ),
+                );
             }
         }
     }
@@ -17755,7 +18291,11 @@ impl App {
         );
         self.surface.open_in_focused(SurfaceTab::File(key));
         self.focus = Focus::Viewport;
-        self.notice = Some(format!("created {}", repository_path_display(&path)));
+        self.report_event(
+            EventSeverity::Info,
+            EventSource::Workspace,
+            format!("created {}", repository_path_display(&path)),
+        );
         AppAction::InspectWorkspace { node_id, workspace_id }
     }
 
@@ -17783,7 +18323,11 @@ impl App {
         let path = entry.relative_path;
         self.create_workspace_entry = None;
         self.focus = Focus::Spaces;
-        self.notice = Some(format!("created directory {}", repository_path_display(&path)));
+        self.report_event(
+            EventSeverity::Info,
+            EventSource::Workspace,
+            format!("created directory {}", repository_path_display(&path)),
+        );
         AppAction::InspectWorkspace { node_id, workspace_id }
     }
 
@@ -17810,7 +18354,7 @@ impl App {
         }
         dialog.pending = false;
         dialog.error = Some(message.clone());
-        self.notice = Some(message);
+        self.report_failure(EventSource::Workspace, message);
     }
 
     pub fn apply_git_history(
@@ -17889,12 +18433,20 @@ impl App {
         token: u64,
         message: String,
     ) {
-        let Some(tab) = self.git_view_mut(destination) else {
+        let matches_token = self
+            .git_view_mut(destination)
+            .is_some_and(|tab| tab.history_token == token);
+        if !matches_token {
             return;
-        };
-        if tab.history_token == token {
-            tab.state = WorkspaceGitState::Error(message);
         }
+        if let Some(tab) = self.git_view_mut(destination) {
+            tab.state = WorkspaceGitState::Error(message.clone());
+        }
+        // The Git pane's own inline red line (`render.rs`'s Git-history
+        // render site) used to be the only place this ever showed up --
+        // reported here too, the same fix as `fail_workspace_file`'s own.
+        let (node_id, workspace_id, _) = Self::git_destination_route(destination);
+        self.report_failure(EventSource::Workspace, format!("{node_id}/{workspace_id}: {message}"));
     }
 
     pub fn apply_git_diff(
@@ -17949,16 +18501,16 @@ impl App {
             UiKey::Down | UiKey::Right => self.cycle_launch_value(&mut spawn, true),
             UiKey::Backspace => {
                 if self.launch_field_uses_inventory(&spawn, spawn.field) {
-                    self.notice = Some("use arrows or click to select an advertised launch resource".to_owned());
+                    self.flash("use arrows or click to select an advertised launch resource".to_owned());
                 } else if let Some(target) = launch_text_target(&mut spawn) {
                     target.pop();
                 }
             }
             UiKey::Char(ch) => {
                 if self.launch_field_uses_inventory(&spawn, spawn.field) {
-                    self.notice = Some("use arrows or click to select an advertised launch resource".to_owned());
+                    self.flash("use arrows or click to select an advertised launch resource".to_owned());
                 } else if let Err(message) = append_launch_text(&mut spawn, &ch.to_string()) {
-                    self.notice = Some(message);
+                    self.flash(message);
                 }
             }
             UiKey::Enter if spawn.field == LaunchField::GitLocation
@@ -17972,7 +18524,7 @@ impl App {
                         self.focus = Focus::Agents;
                         return action;
                     }
-                    Err(message) => self.notice = Some(message),
+                    Err(message) => self.flash(message),
                 }
             }
             _ => {}
@@ -18063,7 +18615,7 @@ impl App {
             }
             UiKey::Char('r') if dialog.mode == ExistingSessionMode::Catalog
                 && dialog.field != ExistingSessionField::AskAfterResume => {
-                self.notice = Some(RESTORE_VIA_SKILL_DISABLED_REASON.to_owned());
+                self.flash(RESTORE_VIA_SKILL_DISABLED_REASON.to_owned());
             }
             UiKey::Char(ch) => {
                 let result = match dialog.field {
@@ -18082,7 +18634,7 @@ impl App {
                     | ExistingSessionField::Sessions => Ok(()),
                 };
                 if let Err(message) = result {
-                    self.notice = Some(message);
+                    self.flash(message);
                 }
             }
             UiKey::Enter if dialog.mode == ExistingSessionMode::Catalog => {
@@ -18092,12 +18644,12 @@ impl App {
             UiKey::Enter => {
                 let name = dialog.display_name.trim().to_owned();
                 if let Err(message) = validate_session_name(&name) {
-                    self.notice = Some(message);
+                    self.flash(message);
                     self.existing_session = Some(dialog);
                     return AppAction::None;
                 }
                 if !provider_is_importable(&dialog.provider) {
-                    self.notice = Some(
+                    self.flash(
                         "native resume references are supported for Claude, Codex, Grok, and Kimi"
                             .to_owned(),
                     );
@@ -18110,7 +18662,7 @@ impl App {
                     transcript_path: None,
                 };
                 if let Err(error) = identity.validate() {
-                    self.notice = Some(format!("invalid native session ID: {error}"));
+                    self.flash(format!("invalid native session ID: {error}"));
                     self.existing_session = Some(dialog);
                     return AppAction::None;
                 }
@@ -18120,7 +18672,7 @@ impl App {
                         && route.1 == dialog.workspace_id
                         && route.2 == dialog.provider
                 }) {
-                    self.notice = Some("selected Node/workspace/provider route is unavailable".to_owned());
+                    self.flash("selected Node/workspace/provider route is unavailable".to_owned());
                     self.existing_session = Some(dialog);
                     return AppAction::None;
                 }
@@ -18136,7 +18688,7 @@ impl App {
                 });
                 dialog.operation_error = None;
                 self.existing_session = Some(dialog.clone());
-                self.notice = Some("indexing provider session reference...".to_owned());
+                self.report_event(EventSeverity::Info, EventSource::Session, "indexing provider session reference...");
                 return AppAction::IndexProviderSession {
                     node_id: dialog.node_id,
                     workspace_id: dialog.workspace_id,
@@ -18170,7 +18722,7 @@ impl App {
                     | Some(NativeSessionPreviewState::Empty(_)))
         });
         if !can_resume {
-            self.notice = Some("load a native session preview before resuming".to_owned());
+            self.flash("load a native session preview before resuming".to_owned());
             return AppAction::None;
         }
         self.existing_session_operation_token = self.existing_session_operation_token.wrapping_add(1).max(1);
@@ -18179,15 +18731,16 @@ impl App {
             return AppAction::None;
         };
         let Some(row) = dialog.rows.get(dialog.selected).cloned() else {
-            self.notice = Some(match &dialog.catalog {
+            let message = match &dialog.catalog {
                 NativeSessionCatalogState::Loading => "native sessions are still loading",
                 NativeSessionCatalogState::Unavailable(_) => "native session catalog is unavailable",
                 _ => "select a native session first",
-            }.to_owned());
+            };
+            self.flash(message);
             return AppAction::None;
         };
         if row.route.scope != NativeSessionCatalogScope::Workspace {
-            self.notice = Some(
+            self.flash(
                 "register this project as a workspace before resuming its session".to_owned(),
             );
             return AppAction::None;
@@ -18200,7 +18753,7 @@ impl App {
                 operation_token,
             });
             dialog.operation_error = None;
-            self.notice = Some("requesting native resume...".to_owned());
+            self.report_event(EventSeverity::Info, EventSource::Session, "requesting native resume...");
             return AppAction::ResumeSessionRecord {
                 node_id,
                 record_id,
@@ -18211,7 +18764,7 @@ impl App {
             };
         }
         if !provider_supports_native_resume(&row.route.provider) {
-            self.notice = Some(format!(
+            self.flash(format!(
                 "{} native history is available, but native resume is not supported",
                 row.route.provider,
             ));
@@ -18234,7 +18787,7 @@ impl App {
             operation_token,
         });
         dialog.operation_error = None;
-        self.notice = Some("indexing selected native session before resume...".to_owned());
+        self.report_event(EventSeverity::Info, EventSource::Session, "indexing selected native session before resume...");
         AppAction::IndexNativeSession {
             node_id: row.node_id,
             route: row.route,
@@ -18254,14 +18807,14 @@ impl App {
             return AppAction::None;
         };
         if self.preview_resume.is_some() || tab.phase != PreviewTabPhase::Hydrated {
-            self.notice = Some("session reconnect is already in progress".to_owned());
+            self.flash("session reconnect is already in progress".to_owned());
             return AppAction::None;
         }
         if !self.node_is_connected(match &origin {
             PreviewTabKey::ManagedRecord { node_id, .. }
             | PreviewTabKey::NativeSelection { node_id, .. } => node_id,
         }) {
-            self.notice = Some("session node is disconnected; reconnect unavailable".to_owned());
+            self.flash("session node is disconnected; reconnect unavailable".to_owned());
             return AppAction::None;
         }
         self.existing_session_operation_token = self
@@ -18276,14 +18829,14 @@ impl App {
                     record_id: record_id.clone(),
                 };
                 let Some(record) = self.find_managed_session(&key).cloned() else {
-                    self.notice = Some("managed session record disappeared".to_owned());
+                    self.flash("managed session record disappeared".to_owned());
                     return AppAction::None;
                 };
                 if record.state != ManagedSessionState::Dormant
                     || !record.has_provider_session_identity
                     || record.active_session.is_some()
                 {
-                    self.notice = Some("session is not eligible for provider resume".to_owned());
+                    self.flash("session is not eligible for provider resume".to_owned());
                     return AppAction::None;
                 }
                 if let Some(view) = self.preview_tabs.get_mut(&origin) {
@@ -18300,7 +18853,7 @@ impl App {
                     record_id: Some(record.record_id.clone()),
                     operation_token,
                 });
-                self.notice = Some("reconnecting session PTY...".to_owned());
+                self.report_event(EventSeverity::Info, EventSource::Session, "reconnecting session PTY...");
                 AppAction::ResumeSessionRecord {
                     node_id: record.node_id,
                     record_id: record.record_id,
@@ -18318,14 +18871,14 @@ impl App {
                 selection_id,
             } => {
                 if !tab.resume_available || route.scope != NativeSessionCatalogScope::Workspace {
-                    self.notice = Some(
+                    self.flash(
                         "register this project as a workspace before resuming its session"
                             .to_owned(),
                     );
                     return AppAction::None;
                 }
                 if !provider_supports_native_resume(&route.provider) {
-                    self.notice = Some(format!(
+                    self.flash(format!(
                         "{} native history is available, but native resume is not supported",
                         route.provider,
                     ));
@@ -18353,7 +18906,7 @@ impl App {
                     operation_token,
                 });
                 if let Some(record_id) = tab.record_id {
-                    self.notice = Some("reconnecting linked native session...".to_owned());
+                    self.report_event(EventSeverity::Info, EventSource::Session, "reconnecting linked native session...");
                     AppAction::ResumeSessionRecord {
                         node_id: node_id.clone(),
                         record_id,
@@ -18363,7 +18916,7 @@ impl App {
                         operation_token,
                     }
                 } else {
-                    self.notice = Some("linking native session before reconnect...".to_owned());
+                    self.report_event(EventSeverity::Info, EventSource::Session, "linking native session before reconnect...");
                     AppAction::IndexNativeSession {
                         node_id: node_id.clone(),
                         route: route.clone(),
@@ -18387,7 +18940,7 @@ impl App {
             return AppAction::None;
         };
         let Some(row) = dialog.rows.get(dialog.selected).cloned() else {
-            self.notice = Some("select a native session before opening details".to_owned());
+            self.flash("select a native session before opening details".to_owned());
             return AppAction::None;
         };
         let node_id = row.node_id.clone();
@@ -18654,11 +19207,15 @@ impl App {
             );
             return self.refresh_stale_native_session_catalog(node_id, route);
         }
-        tab.preview = if unavailable {
-            NativeSessionPreviewState::Unavailable(message)
+        if unavailable {
+            tab.preview = NativeSessionPreviewState::Unavailable(message);
         } else {
-            NativeSessionPreviewState::Error(message)
-        };
+            // A real preview-load failure -- the tab's own inline red line
+            // (`render.rs`'s native-session-preview render sites) used to
+            // be the only place this ever showed up.
+            tab.preview = NativeSessionPreviewState::Error(message.clone());
+            self.report_failure(EventSource::Session, format!("{node_id}: {message}"));
+        }
         AppAction::None
     }
 
@@ -18696,18 +19253,19 @@ impl App {
         message: String,
         unavailable: bool,
     ) {
-        let key = PreviewTabKey::ManagedRecord { node_id, record_id };
+        let key = PreviewTabKey::ManagedRecord { node_id: node_id.clone(), record_id };
         let Some(tab) = self.preview_tabs.get_mut(&key) else {
             return;
         };
         if tab.request_token != token {
             return;
         }
-        tab.preview = if unavailable {
-            NativeSessionPreviewState::Unavailable(message)
+        if unavailable {
+            tab.preview = NativeSessionPreviewState::Unavailable(message);
         } else {
-            NativeSessionPreviewState::Error(message)
-        };
+            tab.preview = NativeSessionPreviewState::Error(message.clone());
+            self.report_failure(EventSource::Session, format!("{node_id}: {message}"));
+        }
     }
 
     pub fn apply_native_session_catalog(
@@ -18798,18 +19356,22 @@ impl App {
             ) == selected)
         }).unwrap_or_else(|| dialog.selected.min(dialog.rows.len().saturating_sub(1)));
         dialog.scroll = dialog.scroll.min(dialog.selected);
-        dialog.catalog = if !dialog.pending_routes.is_empty() {
-            NativeSessionCatalogState::Loading
+        if !dialog.pending_routes.is_empty() {
+            dialog.catalog = NativeSessionCatalogState::Loading;
         } else if !dialog.rows.is_empty() {
-            NativeSessionCatalogState::Ready
+            dialog.catalog = NativeSessionCatalogState::Ready;
         } else if let Some((message, unavailable)) = dialog.catalog_failure.take() {
             if unavailable {
-                NativeSessionCatalogState::Unavailable(message)
+                dialog.catalog = NativeSessionCatalogState::Unavailable(message);
             } else {
-                NativeSessionCatalogState::Error(message)
+                dialog.catalog = NativeSessionCatalogState::Error(message.clone());
+                self.report_failure(EventSource::Session, message);
             }
         } else {
-            NativeSessionCatalogState::Empty
+            dialog.catalog = NativeSessionCatalogState::Empty;
+        }
+        let Some(dialog) = self.existing_session.as_mut() else {
+            return;
         };
         populate_selected_catalog_row(dialog);
     }
@@ -18920,7 +19482,7 @@ impl App {
         {
             state.pending = None;
         }
-        self.notice = Some(message);
+        self.report_failure(EventSource::Session, message);
         AppAction::None
     }
 
@@ -18961,7 +19523,7 @@ impl App {
         dialog.preview_record_id = None;
         dialog.preview_selection_id = None;
         populate_selected_catalog_row(dialog);
-        self.notice = Some("catalog refreshed; select session again".to_owned());
+        self.report_event(EventSeverity::Info, EventSource::Session, "catalog refreshed; select session again");
         AppAction::CatalogNativeSessions {
             node_id,
             routes: vec![route],
@@ -18995,15 +19557,16 @@ impl App {
         }
         self.native_catalog_route_tokens.remove(&route_token_key);
         dialog.catalog_failure = Some((format!("{provider}: {message}"), unavailable));
-        dialog.catalog = if !dialog.pending_routes.is_empty() {
-            NativeSessionCatalogState::Loading
+        if !dialog.pending_routes.is_empty() {
+            dialog.catalog = NativeSessionCatalogState::Loading;
         } else if !dialog.rows.is_empty() {
-            NativeSessionCatalogState::Ready
+            dialog.catalog = NativeSessionCatalogState::Ready;
         } else if unavailable {
-            NativeSessionCatalogState::Unavailable(format!("{provider}: {message}"))
+            dialog.catalog = NativeSessionCatalogState::Unavailable(format!("{provider}: {message}"));
         } else {
-            NativeSessionCatalogState::Error(format!("{provider}: {message}"))
-        };
+            dialog.catalog = NativeSessionCatalogState::Error(format!("{provider}: {message}"));
+            self.report_failure(EventSource::Session, format!("{provider}: {message}"));
+        }
     }
 
     fn paste_existing_session(&mut self, text: String) -> AppAction {
@@ -19024,7 +19587,7 @@ impl App {
             }
         };
         if let Err(message) = result {
-            self.notice = Some(message);
+            self.flash(message);
         }
         AppAction::None
     }
@@ -19240,13 +19803,17 @@ impl App {
         let returned_node_id = record.node_id.clone();
         self.upsert_managed_session(record);
         if resume_after_index {
+            self.report_event(
+                EventSeverity::Info,
+                EventSource::Session,
+                "native session indexed; requesting native resume...",
+            );
             let dialog = self.existing_session.as_mut().expect("checked existing session dialog");
             dialog.operation = Some(ExistingSessionOperation::Resuming {
                 node_id: returned_node_id,
                 record_id: returned_record_id.clone(),
                 operation_token,
             });
-            self.notice = Some("native session indexed; requesting native resume...".to_owned());
             return AppAction::ResumeSessionRecord {
                 node_id: dialog.node_id.clone(),
                 record_id: returned_record_id,
@@ -19259,7 +19826,11 @@ impl App {
         self.existing_session = None;
         self.focus = Focus::Agents;
         self.roster_mode = RosterMode::Agents;
-        self.notice = Some("provider session reference indexed; Resume remains an explicit action".to_owned());
+        self.report_event(
+            EventSeverity::Info,
+            EventSource::Session,
+            "provider session reference indexed; Resume remains an explicit action",
+        );
         AppAction::None
     }
 
@@ -19331,7 +19902,7 @@ impl App {
                     }
                 }
                 self.preview_resume = None;
-                self.notice = Some(
+                self.flash(
                     "session reconnect result no longer matches the managed record".to_owned(),
                 );
                 return SessionRecordResumeDisposition::RejectRecord;
@@ -19348,7 +19919,7 @@ impl App {
                     }
                 }
                 self.preview_resume = None;
-                self.notice = Some(
+                self.flash(
                     "session PTY is already open; hydrated tab was left unchanged".to_owned(),
                 );
                 return SessionRecordResumeDisposition::UpsertRecord;
@@ -19356,7 +19927,7 @@ impl App {
             let Some(origin) = pending.origin.clone() else {
                 self.preview_resume = None;
                 self.existing_session = None;
-                self.notice = Some(format!("session reconnected: {}", record.display_name));
+                self.report_event(EventSeverity::Info, EventSource::Session, format!("session reconnected: {}", record.display_name));
                 return SessionRecordResumeDisposition::UpsertRecordAndOpen(address);
             };
             if !self.surface.replace_tab(
@@ -19371,13 +19942,13 @@ impl App {
                     tab.scroll = usize::MAX;
                 }
                 self.preview_resume = None;
-                self.notice = Some("hydrated session tab disappeared during reconnect".to_owned());
+                self.flash("hydrated session tab disappeared during reconnect".to_owned());
                 return SessionRecordResumeDisposition::RejectRecord;
             }
             self.preview_tabs.remove(&origin);
             self.preview_resume = None;
             self.existing_session = None;
-            self.notice = Some(format!("session reconnected: {}", record.display_name));
+            self.report_event(EventSeverity::Info, EventSource::Session, format!("session reconnected: {}", record.display_name));
             return SessionRecordResumeDisposition::UpsertRecordAndOpen(address);
         }
         let completed = self.existing_session.as_ref().is_some_and(|dialog| {
@@ -19395,7 +19966,7 @@ impl App {
             self.existing_session = None;
             self.focus = Focus::Agents;
             self.roster_mode = RosterMode::Agents;
-            self.notice = Some(format!("native resume started: {}", record.display_name));
+            self.report_event(EventSeverity::Info, EventSource::Session, format!("native resume started: {}", record.display_name));
             return address.map_or(
                 SessionRecordResumeDisposition::RejectRecord,
                 SessionRecordResumeDisposition::UpsertRecordAndOpen,
@@ -19453,7 +20024,7 @@ impl App {
             if let Some(route) = stale_route {
                 return self.refresh_stale_native_session_catalog(node_id.to_owned(), route);
             }
-            self.notice = Some(format!("session reconnect failed: {safe_message}"));
+            self.report_failure(EventSource::Session, format!("session reconnect failed: {safe_message}"));
             return AppAction::None;
         }
         let Some(dialog) = self.existing_session.as_mut() else {
@@ -19503,7 +20074,7 @@ impl App {
         if let Some(route) = stale_route {
             return self.refresh_stale_native_session_catalog(node_id.to_owned(), route);
         }
-        self.notice = Some(message);
+        self.report_failure(EventSource::Session, message);
         AppAction::None
     }
 
@@ -19512,9 +20083,9 @@ impl App {
             return AppAction::None;
         };
         if self.launch_field_uses_inventory(&spawn, spawn.field) {
-            self.notice = Some("use arrows or click to select an advertised launch resource".to_owned());
+            self.flash("use arrows or click to select an advertised launch resource".to_owned());
         } else if let Err(message) = append_launch_text(&mut spawn, &text) {
-            self.notice = Some(message);
+            self.flash(message);
         }
         self.spawn = Some(spawn);
         AppAction::None
@@ -19567,7 +20138,7 @@ impl App {
                     };
                 } else {
                     spawn.context_mode = LaunchContextMode::None;
-                    self.notice = Some(
+                    self.flash(
                         "export a ContextPack from session history before attaching it".to_owned(),
                     );
                 }
@@ -19716,7 +20287,7 @@ impl App {
                 action
             }
             Err(message) => {
-                self.notice = Some(message);
+                self.flash(message);
                 AppAction::None
             }
         }
@@ -19772,7 +20343,7 @@ impl App {
                     dialog.root.clear();
                     dialog.original_root = None;
                     dialog.root_edited = false;
-                    self.notice = Some(
+                    self.flash(
                         "node changed; browse or enter a root on the selected node".to_owned(),
                     );
                 }
@@ -19787,14 +20358,14 @@ impl App {
             UiKey::Char(ch) => {
                 let result = append_modal_char(&mut dialog, ch);
                 if let Err(message) = result {
-                    self.notice = Some(message);
+                    self.flash(message);
                 }
             }
             UiKey::Enter => {
                 if dialog.workspace_id.trim().is_empty() || dialog.root.is_empty() {
-                    self.notice = Some("workspace ID and root are required".to_owned());
+                    self.flash("workspace ID and root are required".to_owned());
                 } else if let Err(error) = WorkspaceId::new(dialog.workspace_id.clone()) {
-                    self.notice = Some(format!("invalid workspace ID: {error}"));
+                    self.flash(format!("invalid workspace ID: {error}"));
                 } else {
                     let root = if !dialog.root_edited {
                         dialog.original_root.clone()
@@ -19805,7 +20376,7 @@ impl App {
                         Some(root) => root,
                         None => {
                             let Ok(root) = OpaqueHostPath::utf8(dialog.root.clone()) else {
-                                self.notice = Some("workspace root is invalid".to_owned());
+                                self.flash("workspace root is invalid".to_owned());
                                 self.add_space = Some(dialog);
                                 return AppAction::None;
                             };
@@ -19931,7 +20502,7 @@ impl App {
     fn paste_add_space(&mut self, text: String) -> AppAction {
         if let Some(dialog) = self.add_space.as_mut() {
             if let Err(message) = append_modal_paste(dialog, &text) {
-                self.notice = Some(message);
+                self.flash(message);
             }
         }
         AppAction::None
@@ -19939,7 +20510,7 @@ impl App {
 
     fn begin_create_workspace_entry(&mut self, kind: WorkspaceEntryKind) -> AppAction {
         let Some((node_id, workspace_id)) = self.selected_workspace_route() else {
-            self.notice = Some("select a connected workspace first".to_owned());
+            self.flash("select a connected workspace first".to_owned());
             return AppAction::None;
         };
         let path = self
@@ -20116,9 +20687,9 @@ impl App {
             }
             UiKey::Char(ch) => {
                 if !matches!(dialog.kind, GitLocationDialogKind::ManualLinked | GitLocationDialogKind::Standalone) {
-                    self.notice = Some("this Git location policy is read-only".to_owned());
+                    self.flash("this Git location policy is read-only".to_owned());
                 } else if let Err(message) = append_create_worktree_char(&mut dialog, ch) {
-                    self.notice = Some(message);
+                    self.flash(message);
                 }
             }
             UiKey::Enter => {
@@ -20132,13 +20703,13 @@ impl App {
                             self.focus = Focus::Agents;
                             return action;
                         }
-                        Err(message) => self.notice = Some(message),
+                        Err(message) => self.flash(message),
                     }
                     self.create_worktree = Some(dialog);
                     return AppAction::None;
                 }
                 if dialog.kind == GitLocationDialogKind::LinkedDisabled {
-                    self.notice = Some(
+                    self.flash(
                         "linked worktrees are disabled by the selected workspace policy".to_owned(),
                     );
                     self.create_worktree = Some(dialog);
@@ -20149,12 +20720,12 @@ impl App {
                     || (dialog.kind == GitLocationDialogKind::ManualLinked
                         && dialog.branch.trim().is_empty())
                 {
-                    self.notice = Some("workspace ID and root are required; linked worktrees also require a branch".to_owned());
+                    self.flash("workspace ID and root are required; linked worktrees also require a branch".to_owned());
                 } else if let Err(error) = WorkspaceId::new(dialog.workspace_id.clone()) {
-                    self.notice = Some(format!("invalid workspace ID: {error}"));
+                    self.flash(format!("invalid workspace ID: {error}"));
                 } else {
                     let Ok(target_root) = OpaqueHostPath::utf8(dialog.target_root.clone()) else {
-                        self.notice = Some("worktree target root is invalid".to_owned());
+                        self.flash("worktree target root is invalid".to_owned());
                         self.create_worktree = Some(dialog);
                         return AppAction::None;
                     };
@@ -20204,11 +20775,11 @@ impl App {
             return AppAction::None;
         };
         if !matches!(dialog.kind, GitLocationDialogKind::ManualLinked | GitLocationDialogKind::Standalone) {
-            self.notice = Some("this Git location policy is read-only".to_owned());
+            self.flash("this Git location policy is read-only".to_owned());
             return AppAction::None;
         }
         if text.contains(['\r', '\n', '\0']) {
-            self.notice = Some("worktree field cannot contain control characters".to_owned());
+            self.flash("worktree field cannot contain control characters".to_owned());
             return AppAction::None;
         }
         let field = dialog.field;
@@ -20219,13 +20790,13 @@ impl App {
             CreateWorktreeField::Branch | CreateWorktreeField::Base => MAX_NODE_TEXT_BYTES,
         };
         if current.len().saturating_add(text.len()) > limit {
-            self.notice = Some("worktree field exceeds protocol limit".to_owned());
+            self.flash("worktree field exceeds protocol limit".to_owned());
             return AppAction::None;
         }
         if field == CreateWorktreeField::WorkspaceId
             && text.chars().any(|ch| !workspace_id_char(ch))
         {
-            self.notice = Some("workspace ID contains unsupported characters".to_owned());
+            self.flash("workspace ID contains unsupported characters".to_owned());
             return AppAction::None;
         }
         current.push_str(&text);
@@ -20279,7 +20850,7 @@ impl App {
                     append_session_name(&mut dialog.display_name, ch.to_string())
                 };
                 if let Err(message) = result {
-                    self.notice = Some(message);
+                    self.flash(message);
                 }
                 self.rename_session = Some(dialog);
                 AppAction::None
@@ -20296,7 +20867,7 @@ impl App {
                     return AppAction::None;
                 }
                 if let Err(message) = validate_session_name(&name) {
-                    self.notice = Some(message);
+                    self.flash(message);
                     self.rename_session = Some(dialog);
                     return AppAction::None;
                 }
@@ -20338,7 +20909,7 @@ impl App {
                     &mut dialog.value,
                     ch.encode_utf8(&mut encoded),
                 ) {
-                    self.notice = Some(message);
+                    self.flash(message);
                 }
                 self.task_id_dialog = Some(dialog);
                 AppAction::None
@@ -20354,7 +20925,7 @@ impl App {
                     }
                 }
                 Err(message) => {
-                    self.notice = Some(message.to_string());
+                    self.flash(message.to_string());
                     self.task_id_dialog = Some(dialog);
                     AppAction::None
                 }
@@ -20375,7 +20946,7 @@ impl App {
             };
             match append_task_id_input(&mut candidate, &text) {
                 Ok(()) => dialog.value = candidate,
-                Err(message) => self.notice = Some(message),
+                Err(message) => self.flash(message),
             }
         }
         AppAction::None
@@ -20391,7 +20962,7 @@ impl App {
             append_session_name(&mut dialog.display_name, text)
         };
         if let Err(message) = result {
-            self.notice = Some(message);
+            self.flash(message);
         }
         AppAction::None
     }
@@ -20448,7 +21019,7 @@ impl App {
                     .get(history.selected)
                     .map(|candidate| candidate.id.clone())
                 else {
-                    self.notice = Some("history discovery returned no selectable session".to_owned());
+                    self.flash("history discovery returned no selectable session".to_owned());
                     self.history = Some(history);
                     return AppAction::None;
                 };
@@ -20461,7 +21032,7 @@ impl App {
             }
             UiKey::Char('x') => {
                 if history.loaded.is_none() {
-                    self.notice = Some("load a history candidate before exporting ContextPack".to_owned());
+                    self.flash("load a history candidate before exporting ContextPack".to_owned());
                     self.history = Some(history);
                     return AppAction::None;
                 }
@@ -20472,7 +21043,7 @@ impl App {
             }
             UiKey::Char('f') => {
                 let Some(context_id) = history.context.as_ref().map(|context| context.id.to_string()) else {
-                    self.notice = Some("no exported ContextPack to forget".to_owned());
+                    self.flash("no exported ContextPack to forget".to_owned());
                     self.history = Some(history);
                     return AppAction::None;
                 };
@@ -20490,7 +21061,7 @@ impl App {
 
     fn cycle_color_mode(&mut self) {
         self.color_mode = self.color_mode.cycle();
-        self.notice = Some(format!("terminal style: {}", self.color_mode));
+        self.flash(format!("terminal style: {}", self.color_mode));
     }
 
     fn begin_settings(&mut self) {
@@ -20905,7 +21476,7 @@ impl App {
 
     fn for_active(&mut self, make: impl FnOnce(SessionAddress) -> AppAction) -> AppAction {
         let Some(address) = self.focused_session().map(|session| session.address.clone()) else {
-            self.notice = Some("no PTY selected".to_owned());
+            self.flash("no PTY selected".to_owned());
             return AppAction::None;
         };
         self.terminal_scroll_offsets.remove(&address);
@@ -23778,7 +24349,6 @@ mod tests {
             context: None,
             task_binding: None,
             active_session: None,
-            last_error: None,
         }, operation_token, "node-a", "workspace-a", &provider("codex"), "019f-session-native", true);
         assert!(app.existing_session.is_none());
         assert_eq!(app.focus, Focus::Agents);
@@ -24412,7 +24982,6 @@ mod tests {
             context: None,
             task_binding: None,
             active_session: None,
-            last_error: None,
         }];
         app.nodes.push(other_node);
 
@@ -25149,7 +25718,7 @@ mod tests {
             mode: SessionMode::Pty, state: ManagedSessionState::Live,
             workspace_id: "workspace-a".to_owned(), canonical_root: None,
             has_provider_session_identity: true, bundle: None, context_id: None,
-            context: None, task_binding: None, active_session: Some(address.clone()), last_error: None,
+            context: None, task_binding: None, active_session: Some(address.clone()),
         };
         assert_eq!(
             app.complete_existing_session_resume(&record("node-b"), 91),
@@ -25174,7 +25743,7 @@ mod tests {
             mode: SessionMode::Pty, state: ManagedSessionState::Dormant,
             workspace_id: "workspace-a".to_owned(), canonical_root: None,
             has_provider_session_identity: true, bundle: None, context_id: None,
-            context: None, task_binding: None, active_session: None, last_error: None,
+            context: None, task_binding: None, active_session: None,
         };
         app.upsert_managed_session(record);
         app.selected_agent = app
@@ -25227,7 +25796,7 @@ mod tests {
             mode: SessionMode::Pty, state: ManagedSessionState::Dormant,
             workspace_id: "workspace-a".to_owned(), canonical_root: None,
             has_provider_session_identity: true, bundle: None, context_id: None,
-            context: None, task_binding: None, active_session: None, last_error: None,
+            context: None, task_binding: None, active_session: None,
         };
         let action = app.complete_existing_session_import(
             record, 55, "node-a", "workspace-a", &provider("codex"), "native-7", true,
@@ -25257,7 +25826,7 @@ mod tests {
             mode: SessionMode::Pty, state: ManagedSessionState::Dormant,
             workspace_id: "workspace-a".to_owned(), canonical_root: None,
             has_provider_session_identity: true, bundle: None, context_id: None,
-            context: None, task_binding: None, active_session: None, last_error: None,
+            context: None, task_binding: None, active_session: None,
         };
         let action = app.complete_existing_session_import(
             stale, 54, "node-a", "workspace-a", &provider("codex"), "native-7", true,
@@ -25300,7 +25869,6 @@ mod tests {
             context: None,
             task_binding: None,
             active_session,
-            last_error: None,
         });
         AgentRowKey::Managed {
             node_id: "node-a".to_owned(),
@@ -28503,7 +29071,6 @@ mod tests {
             context: None,
             task_binding: None,
             active_session: None,
-            last_error: None,
         };
         let token = match app.start_managed_session_preview(record) {
             AppAction::PreviewSessionRecord { token, .. } => token,
@@ -28616,7 +29183,6 @@ mod tests {
             context: None,
             task_binding: None,
             active_session: None,
-            last_error: None,
         };
         assert!(matches!(
             app.complete_native_session_index(
@@ -28752,7 +29318,6 @@ mod tests {
             context: None,
             task_binding: None,
             active_session: None,
-            last_error: None,
         };
         let records_before = app.nodes[0].session_records.clone();
 
@@ -28828,7 +29393,6 @@ mod tests {
             context: None,
             task_binding: None,
             active_session: None,
-            last_error: None,
         };
         assert_eq!(
             app.complete_native_session_index(
@@ -29032,7 +29596,6 @@ mod tests {
             context: None,
             task_binding: None,
             active_session: None,
-            last_error: None,
         };
         assert_eq!(
             app.complete_native_session_index(
@@ -29444,67 +30007,356 @@ mod tests {
     }
 
     /// The exact "difference between an animation and a busy loop" this
-    /// crate's own brief for the status bar calls out: a marquee that is
+    /// crate's own brief for the status bar calls out: a strip that is
     /// toggled OFF must never keep `has_active_animation` (and therefore
-    /// `client::run`'s own 80ms redraw loop) spinning, no matter how much
-    /// content it is sitting on top of.
+    /// `client::run`'s own 80ms redraw loop) spinning, no matter how many
+    /// events are sitting in `event_queue`.
     #[test]
-    fn marquee_toggled_off_reports_no_active_animation_even_with_long_content() {
+    fn event_strip_toggled_off_reports_no_active_animation_even_with_queued_events() {
         let mut app = App::default();
-        app.push_marquee_line("a".repeat(48));
-        app.push_marquee_line("b".repeat(48));
-        assert!(
-            app.marquee_content().chars().count() as u16 > app.marquee_zone_width(),
-            "fixture assumption: this content must not fit the default zone width at rest",
-        );
+        app.emit_event(EventSeverity::Info, EventSource::Session, "a".repeat(48));
+        app.emit_event(EventSeverity::Info, EventSource::Session, "b".repeat(48));
 
-        // Enabled: too wide to fit at rest, so this is a real, scrolling
-        // animation.
-        assert!(app.marquee_needs_scroll());
+        // Enabled: a queued event is real work still to be played.
+        assert!(app.event_strip_active());
         assert!(app.has_active_animation());
 
-        // The CENTRE zone modal's own toggle -- disabled, the SAME
-        // oversized content must go completely idle.
+        // The CENTRE zone modal's own toggle -- disabled, the SAME queued
+        // events must go completely idle rather than draining in the
+        // background.
         app.marquee_enabled = false;
-        assert!(!app.marquee_needs_scroll());
+        assert!(!app.event_strip_active());
         assert!(!app.has_active_animation());
     }
 
-    /// The idle side of the SAME requirement for content that already fits
-    /// its zone: scrolling it would be pure motion with no new information
-    /// ever revealed, so it must not animate even while enabled.
+    /// The idle side of the SAME requirement: a fresh `App`, before any
+    /// event has ever been emitted, must rest -- no active animation, and
+    /// the strip itself renders nothing (`App::event_strip_display`
+    /// returns `None`), per that fn's own "resting is blank" doc comment.
     #[test]
-    fn marquee_enabled_but_short_content_reports_no_active_animation() {
-        let mut app = App::default();
+    fn event_strip_rests_with_nothing_queued() {
+        let app = App::default();
         assert!(app.marquee_enabled);
-        assert_eq!(app.marquee_content(), "no recent activity");
-        assert!(!app.marquee_needs_scroll());
+        assert!(!app.event_strip_active());
         assert!(!app.has_active_animation());
-
-        app.push_marquee_line("short".to_owned());
-        assert!(!app.marquee_needs_scroll());
-        assert!(!app.has_active_animation());
+        assert_eq!(app.event_strip_display(80), None);
     }
 
     /// The animating case actually moves: `advance_animation_frame` (the
     /// SAME shared clock `client::run` drives every redraw with, see
-    /// `ANIMATION_FRAME_INTERVAL`) must change `marquee_scroll_offset` over
-    /// time, not just leave the "is it active" bool permanently true for
+    /// `ANIMATION_FRAME_INTERVAL`) must change `App::event_strip_display`'s
+    /// own visible window over time for an event too wide to fit at rest,
+    /// not just leave the "is it active" bool permanently true for
     /// nothing.
     #[test]
-    fn marquee_scroll_offset_advances_with_the_shared_animation_clock() {
+    fn event_strip_scroll_position_advances_with_the_shared_animation_clock() {
         let mut app = App::default();
-        app.push_marquee_line("c".repeat(80));
-        assert!(app.marquee_needs_scroll());
-        let start = app.marquee_scroll_offset();
+        // Distinguishable per-position text (unlike a single repeated
+        // character) so two different scroll offsets are guaranteed to
+        // produce two different visible windows.
+        let text: String = (0..80).map(|index| char::from(b'a' + (index % 26) as u8)).collect();
+        app.emit_event(EventSeverity::Info, EventSource::Session, text);
+        // Primes `event_current` from `event_queue` -- the first tick after
+        // an emit only picks the event up, it does not yet advance its
+        // scroll (see `App::advance_event_strip`'s own doc comment).
+        app.advance_animation_frame();
+        let width = app.marquee_zone_width();
+        assert!(
+            80 > width,
+            "fixture assumption: this event must not fit the default zone width at rest",
+        );
+        let start = app.event_strip_display(width);
         for _ in 0..MARQUEE_SCROLL_TICKS_PER_COLUMN {
             app.advance_animation_frame();
         }
         assert_ne!(
-            app.marquee_scroll_offset(),
+            app.event_strip_display(width),
             start,
-            "one column's worth of ticks must move the marquee's own scroll position",
+            "one column's worth of ticks must move the strip's own scroll position",
         );
+    }
+
+    /// Complaint 1's own fix, pinned directly: an event plays across the
+    /// strip and then is retired into `event_log` EXACTLY ONCE -- never
+    /// replayed, never left looping. A short event (fits the zone, no
+    /// scrolling) is the simplest case to drive to completion
+    /// deterministically: `EVENT_STRIP_DWELL_TICKS` ticks is its own whole
+    /// playback.
+    #[test]
+    fn event_plays_once_then_retires_into_the_log_and_is_not_replayed() {
+        let mut app = App::default();
+        app.emit_event(EventSeverity::Info, EventSource::Session, "short event");
+        assert_eq!(app.event_queue.len(), 1);
+        assert!(app.event_log.is_empty());
+
+        app.advance_animation_frame(); // primes event_current
+        assert!(app.event_current.is_some());
+        assert!(app.event_queue.is_empty());
+        assert!(app.event_log.is_empty(), "not finished playing yet");
+
+        for _ in 0..EVENT_STRIP_DWELL_TICKS {
+            app.advance_animation_frame();
+        }
+        assert!(app.event_current.is_none(), "strip must rest once playback finishes");
+        assert_eq!(app.event_log.len(), 1);
+        assert_eq!(app.event_log.back().map(|event| event.text.as_str()), Some("short event"));
+
+        // Further ticks with nothing queued must never duplicate the entry
+        // or resurrect it onto the strip -- this is the exact property the
+        // old modulo ticker never had.
+        for _ in 0..EVENT_STRIP_DWELL_TICKS {
+            app.advance_animation_frame();
+        }
+        assert_eq!(app.event_log.len(), 1);
+        assert!(app.event_current.is_none());
+        assert!(!app.has_active_animation(), "queue drained, strip must stop claiming animation");
+        assert_eq!(app.event_strip_display(80), None);
+    }
+
+    /// The retained log keeps what the strip finished with, severity and
+    /// all -- not just the text. Drives the SAME short-event playback to
+    /// completion and inspects the retired `AppEvent` directly.
+    #[test]
+    fn event_log_retains_severity_and_source_of_what_the_strip_finished_with() {
+        let mut app = App::default();
+        app.emit_event(EventSeverity::Error, EventSource::Harness, "diagnostic failure");
+        for _ in 0..=EVENT_STRIP_DWELL_TICKS {
+            app.advance_animation_frame();
+        }
+        let retained = app.event_log.back().expect("event must have retired into the log");
+        assert_eq!(retained.text, "diagnostic failure");
+        assert_eq!(retained.severity, EventSeverity::Error);
+        assert_eq!(retained.source, EventSource::Harness);
+    }
+
+    /// Complaint 3's own fix, pinned directly: a guard refusal (Group B --
+    /// "you cannot do that right now") sets `App::notice` for its own
+    /// transient corner popup exactly as it always has, but must NEVER
+    /// reach `event_queue`/`event_log` -- only `App::emit_event`'s own
+    /// explicit call sites (Group A/connectivity/E) do that. Simulated
+    /// here exactly as a guard site would: `App::flash`, the vocabulary's
+    /// own local-only method, with no `emit_event` call anywhere near it.
+    #[test]
+    fn guard_refusal_notice_never_enters_the_event_queue_or_log() {
+        let mut app = App::default();
+        app.flash("no session selected".to_owned());
+        assert!(app.event_queue.is_empty());
+        assert!(app.event_log.is_empty());
+        assert!(!app.event_strip_active());
+    }
+
+    /// Finds the byte span `[start, end)` of `needle`'s own function body
+    /// (from its opening `{` through the matching closing `}`) inside
+    /// `source` -- a small brace counter, not a real Rust parser, so it
+    /// trusts that none of this file's own three sanctioned setters ever
+    /// puts a `{`/`}` inside a string or char literal in their own bodies
+    /// (true today; if that ever changes, this test's own failure mode is
+    /// a panic here, not a false pass).
+    fn function_body_span(source: &str, needle: &str) -> (usize, usize) {
+        let start = source
+            .find(needle)
+            .unwrap_or_else(|| panic!("expected to find {needle:?} in this crate's own source"));
+        let open_brace = source[start..]
+            .find('{')
+            .map(|offset| start + offset)
+            .unwrap_or_else(|| panic!("expected a body after {needle:?}"));
+        let mut depth = 0usize;
+        for (offset, ch) in source[open_brace..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return (open_brace, open_brace + offset + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unterminated function body for {needle:?}");
+    }
+
+    /// True if `line` assigns `.notice` directly (`self.notice = Some(...)`,
+    /// `app.notice = None`, or any other RHS) -- deliberately NOT matching
+    /// `.notice()` (the read-only getter, no `=` follows `.notice` at all)
+    /// or `.notice ==`/`.notice !=` (comparisons, a second `=` or a
+    /// non-`=` character immediately follows what would otherwise look
+    /// like an assignment).
+    fn line_has_raw_notice_write(line: &str) -> bool {
+        // Strip string literals first. This test's own `assert!` messages
+        // quote `.notice = ` as prose so the failure reads usefully, and
+        // `function_body_span`'s own needles are string literals too --
+        // without this the guard reports itself as the offender and can
+        // never go green, which is exactly what it did when first written.
+        let mut unquoted = String::with_capacity(line.len());
+        let mut in_string = false;
+        let mut escaped = false;
+        for ch in line.chars() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            if ch == '"' {
+                in_string = true;
+                continue;
+            }
+            unquoted.push(ch);
+        }
+        let mut rest = unquoted.as_str();
+        while let Some(dot_notice) = rest.find(".notice") {
+            let after = &rest[dot_notice + ".notice".len()..];
+            let trimmed = after.trim_start();
+            if let Some(tail) = trimmed.strip_prefix('=') {
+                if !tail.starts_with('=') {
+                    return true;
+                }
+            }
+            rest = &rest[dot_notice + ".notice".len()..];
+        }
+        false
+    }
+
+    /// Every line in `source` that raw-assigns `.notice` and whose own
+    /// byte offset does not fall inside one of `allowed_spans` -- doc
+    /// comment lines (`///`/`//`) are never counted, since this crate's
+    /// own doc comments (`App::emit_event`'s, `App::report_failure`'s)
+    /// deliberately quote the old `self.notice = Some(...)` shape as
+    /// prose, not as code.
+    fn raw_notice_write_lines(source: &str, allowed_spans: &[(usize, usize)]) -> Vec<String> {
+        let mut offenders = Vec::new();
+        let mut offset = 0usize;
+        for line in source.split_inclusive('\n') {
+            let line_start = offset;
+            offset += line.len();
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            if !line_has_raw_notice_write(line) {
+                continue;
+            }
+            if allowed_spans
+                .iter()
+                .any(|(start, end)| line_start >= *start && line_start < *end)
+            {
+                continue;
+            }
+            offenders.push(line.trim_end().to_owned());
+        }
+        offenders
+    }
+
+    /// This is the second half of closing complaint 1's defect class,
+    /// alongside `App::notice`'s own privacy: privacy stops `client`/
+    /// `render`/`text_editor` from ever writing `App::notice` directly
+    /// (confirmed by this very file compiling once the field lost its
+    /// `pub(crate)`), but it CANNOT stop a fourth method added anywhere
+    /// in `app.rs` itself from doing the same, because `App` and its
+    /// three sanctioned setters (`flash`/`report_failure`/`report_event`)
+    /// all live in this one module -- see `notice`'s own doc comment. A
+    /// test that reads this crate's own source files is an unusual thing
+    /// to write, but it is exactly the right tool for an invariant the
+    /// type system cannot express: "no producer may print without
+    /// classifying" is precisely the kind of rule that regresses silently
+    /// the moment someone adds the next call site, which is the whole
+    /// history this feature exists to close -- the first sweep routed
+    /// producers one call site at a time, from a hand-picked list, and a
+    /// list of 249 sites is wrong the instant anyone adds the 250th.
+    #[test]
+    fn no_raw_notice_assignment_outside_the_three_sanctioned_methods() {
+        let app_source = include_str!("app.rs");
+        for (file, source) in [
+            ("client.rs", include_str!("client.rs")),
+            ("render.rs", include_str!("render.rs")),
+            ("text_editor.rs", include_str!("text_editor.rs")),
+        ] {
+            let offenders = raw_notice_write_lines(source, &[]);
+            assert!(
+                offenders.is_empty(),
+                "found a raw `.notice =` write in {file}, outside `App::flash`/\
+                 `report_failure`/`report_event`: {offenders:?}",
+            );
+        }
+        // `dismiss_notice` is the fourth allowed writer and deliberately
+        // NOT a fourth classifier: it only ever writes `None`. Clearing is
+        // not printing -- there is no text to classify -- so forcing it
+        // through one of the three would mean inventing a severity and a
+        // source for the absence of a message.
+        let sanctioned = [
+            ("flash", function_body_span(app_source, "fn flash(")),
+            ("report_failure", function_body_span(app_source, "fn report_failure(")),
+            ("report_event", function_body_span(app_source, "fn report_event(")),
+            ("dismiss_notice", function_body_span(app_source, "fn dismiss_notice(")),
+        ];
+        for (name, span) in sanctioned {
+            let body = &app_source[span.0..span.1];
+            assert!(
+                body.contains(".notice = "),
+                "expected App::{name}'s own body to still assign `notice` directly -- \
+                 if it no longer does, this test's own allow-list is stale",
+            );
+        }
+        let allowed_spans: Vec<(usize, usize)> =
+            sanctioned.iter().map(|(_, span)| *span).collect();
+        let offenders = raw_notice_write_lines(app_source, &allowed_spans);
+        assert!(
+            offenders.is_empty(),
+            "found a raw `.notice =` write in app.rs outside `App::flash`/\
+             `report_failure`/`report_event` -- route it through one of those three \
+             instead of assigning `notice` directly: {offenders:?}",
+        );
+    }
+
+    /// Severity and the captured timestamp both survive into the exact
+    /// string the CENTRE zone modal renders (`App::event_log_line`, the
+    /// one fn `render::render_status_bar_center_modal` calls per row).
+    /// Pinned against a fixed `ClockSettings`/`SystemTime` pair (manual,
+    /// UTC+0 offset) rather than the live OS clock, so this is
+    /// deterministic on any host regardless of its own timezone.
+    #[test]
+    fn event_log_line_carries_timestamp_severity_source_and_text() {
+        let mut app = App::default();
+        app.clock_settings = ClockSettings {
+            follow_system: false,
+            manual_offset_hours: 0,
+            use_24h: true,
+            show_utc_prefix: false,
+        };
+        let event = AppEvent {
+            at: UNIX_EPOCH + Duration::from_secs(3661), // 01:01:01 UTC
+            severity: EventSeverity::Warn,
+            source: EventSource::Topology,
+            text: "node-1 removed from C2 topology; dialog closed".to_owned(),
+        };
+        assert_eq!(
+            app.event_log_line(&event),
+            "01:01:01 [topology] node-1 removed from C2 topology; dialog closed",
+        );
+    }
+
+    /// `EVENT_LOG_CAPACITY`'s own bound, pinned: pushing one more entry
+    /// than the cap evicts the OLDEST retained event, never the newest --
+    /// the same FIFO discipline the old `MARQUEE_LOG_CAPACITY` ring used,
+    /// just at a size meant to be read back rather than scrolled past.
+    #[test]
+    fn event_log_evicts_oldest_first_once_capacity_is_reached() {
+        let mut app = App::default();
+        for index in 0..=EVENT_LOG_CAPACITY {
+            app.emit_event(EventSeverity::Info, EventSource::Session, format!("event {index}"));
+            app.advance_animation_frame();
+            for _ in 0..=EVENT_STRIP_DWELL_TICKS {
+                app.advance_animation_frame();
+            }
+        }
+        let newest_expected = format!("event {EVENT_LOG_CAPACITY}");
+        assert_eq!(app.event_log.len(), EVENT_LOG_CAPACITY);
+        assert_eq!(app.event_log.front().map(|event| event.text.as_str()), Some("event 1"));
+        assert_eq!(app.event_log.back().map(|event| event.text.as_str()), Some(newest_expected.as_str()));
     }
 
     /// The search field's own side of the same requirement: fully
@@ -31483,7 +32335,6 @@ mod tests {
             context: None,
             task_binding: None,
             active_session: Some(address.clone()),
-            last_error: None,
         });
         let managed_key = AgentRowKey::Managed {
             node_id: "node-a".to_owned(),

@@ -24,8 +24,8 @@ use crate::app::{
     clock_offset_label, compact_task_id, host_path_display, managed_state_label, repository_path_display,
     normalize_workspace_entry_input, provider_supports_native_resume,
     repository_path_file_name_display, surface_drop_zone, AddSpaceField, AgentBoardCard,
-    AgentBoardColumn, AgentRowKey, App,
-    ConnectionState, ControlSection, CreateWorktreeField, DragState, ExistingSessionField,
+    AgentBoardColumn, AgentRowKey, App, AppEvent,
+    ConnectionState, ControlSection, CreateWorktreeField, DragState, EventSeverity, ExistingSessionField,
     ContextUsageHover, ContextUsageSegment, ContextUsageSegmentHit,
     ExistingSessionMode, ExistingSessionOperation, Focus, FolderBrowserField,
     AgentRunGitScopeView, GitLocationDialogKind, HitRegion, HitTarget, LaunchContextMode, LaunchField, LaunchTarget,
@@ -448,7 +448,7 @@ pub fn render(app: &App, buf: &mut TerminalBuffer) -> LayoutRects {
         render_harness_reverse_attribution(app, area, buf, &mut layout, theme);
     }
     render_drag_preview(app, area, buf, &layout, theme);
-    if let Some(notice) = &app.notice {
+    if let Some(notice) = app.notice() {
         render_notice(notice, right[1], buf, theme);
     }
     render_context_usage_tooltip(app.context_usage_hover, area, buf, &layout, theme);
@@ -643,31 +643,38 @@ fn render_status_bar_left(app: &App, area: Rect, buf: &mut TerminalBuffer, theme
     render_status_bar_slot(chars, theme.text, area, buf, hover_local);
 }
 
-/// The marquee: while `App::marquee_enabled` is false this stays blank
-/// (its own on/off setting lives in `render_status_bar_center_modal`, one
-/// click away); while it fits the zone at rest it is shown static with no
-/// scroll; otherwise it scrolls through `App::marquee_scroll_offset`'s own
-/// position, wrapping the joined log around rather than stopping dead at
-/// its own end. Not one of the two shimmer/engine slots (only the clock
-/// and the pet are, per slice B's own scope) -- unchanged from slice A.
+/// The CENTRE zone's own event strip: while `App::marquee_enabled` is
+/// false, or nothing is currently playing (`App::event_current` is
+/// `None`), this stays blank -- the on/off setting and the retained log
+/// both live in `render_status_bar_center_modal`, one click away. Plays
+/// the current `AppEvent`'s own text across the zone EXACTLY ONCE (`App::
+/// event_strip_display` clamps its own scroll position rather than
+/// wrapping it), then rests blank again until `App::advance_event_strip`
+/// hands it the next queued event. Not one of the two shimmer/engine slots
+/// (only the clock and the pet are, per slice B's own scope).
 fn render_status_bar_center(app: &App, area: Rect, buf: &mut TerminalBuffer, theme: Theme) {
     if area.width == 0 || !app.marquee_enabled {
         return;
     }
-    let content = app.marquee_content();
-    let chars: Vec<char> = content.chars().collect();
-    let width = area.width as usize;
-    let display: String = if chars.len() <= width {
-        content
-    } else {
-        let offset = app.marquee_scroll_offset();
-        (0..width)
-            .map(|column| chars[(offset + column) % chars.len()])
-            .collect()
+    let Some(display) = app.event_strip_display(area.width) else {
+        return;
     };
     Paragraph::new(display)
         .style(Style::default().fg(theme.muted).bg(theme.panel))
         .render(area, buf);
+}
+
+/// Colour-codes an `AppEvent` by its own `EventSeverity` for the CENTRE
+/// zone modal's retained-log rows (`render_status_bar_center_modal`) --
+/// the strip above it stays severity-neutral (`theme.muted`), same as the
+/// old marquee always was; only the retained log a person actually reads
+/// back gets the distinction.
+fn event_severity_color(severity: EventSeverity, theme: Theme) -> Color {
+    match severity {
+        EventSeverity::Info => theme.green,
+        EventSeverity::Warn => theme.yellow,
+        EventSeverity::Error => theme.red,
+    }
 }
 
 /// The RIGHT zone's own live ASCII pet -- see `docs/gate4agent/research/
@@ -910,6 +917,14 @@ fn node_connection_summary(node: &NodeView) -> NetworkSummary {
     }
 }
 
+/// The CENTRE zone's own modal -- the strip's on/off toggle (unchanged),
+/// plus (new, replacing the old static and already-inaccurate description
+/// line) the retained event log itself: newest first, scrollable with the
+/// same `[Up]`/`[Down]` toolbar-segment convention `render_harness_task_
+/// detail_run_monitor` already uses for its own scrollable section, each
+/// row coloured by severity (`event_severity_color`) and carrying its own
+/// captured time (`App::event_log_line`). A taller default size than the
+/// old six-row modal -- a log view needs real height to be worth opening.
 fn render_status_bar_center_modal(
     app: &App,
     area: Rect,
@@ -917,8 +932,8 @@ fn render_status_bar_center_modal(
     layout: &mut LayoutRects,
     theme: Theme,
 ) {
-    let width = 44.min(area.width.saturating_sub(4));
-    let height = 6.min(area.height.saturating_sub(2));
+    let width = 64.min(area.width.saturating_sub(4));
+    let height = 18.min(area.height.saturating_sub(2));
     let dialog = positioned_modal(area, width, height, app.overlay_positions.get(&OverlayId::StatusBarCenter).copied());
     layout.status_bar_center_modal = dialog;
     layout.note_overlay(dialog);
@@ -946,14 +961,72 @@ fn render_status_bar_center_modal(
         buf,
     );
     push_modal_hit(layout, modal_row(inner, 0), HitTarget::StatusBarMarqueeToggle);
+    if inner.height < 4 {
+        return;
+    }
+    let entries: Vec<&AppEvent> = app.event_log.iter().rev().collect();
+    let capacity = inner.height.saturating_sub(3) as usize;
+    let offset = app.event_log_scroll.min(entries.len().saturating_sub(capacity.max(1)));
+    let end = offset.saturating_add(capacity).min(entries.len());
+    let controls_row = Rect::new(inner.x, inner.y + 1, inner.width, 1);
+    let mut x = controls_row.x;
+    x = render_toolbar_segment(
+        "[Up]",
+        x,
+        controls_row,
+        Style::default().fg(if offset > 0 { theme.teal } else { theme.muted }).bg(theme.modal),
+        (offset > 0).then_some(HitTarget::StatusBarCenterLogScrollUp),
+        buf,
+        layout,
+    ).saturating_add(1);
+    let more = entries.len().saturating_sub(end);
+    x = render_toolbar_segment(
+        "[Down]",
+        x,
+        controls_row,
+        Style::default().fg(if more > 0 { theme.teal } else { theme.muted }).bg(theme.modal),
+        (more > 0).then_some(HitTarget::StatusBarCenterLogScrollDown),
+        buf,
+        layout,
+    ).saturating_add(1);
+    x = render_toolbar_segment(
+        "[Clear]",
+        x,
+        controls_row,
+        Style::default().fg(if entries.is_empty() { theme.muted } else { theme.teal }).bg(theme.modal),
+        (!entries.is_empty()).then_some(HitTarget::StatusBarCenterLogClear),
+        buf,
+        layout,
+    ).saturating_add(1);
+    let count = format!("{} entries", entries.len());
+    Paragraph::new(truncate_cells(&count, controls_row.right().saturating_sub(x) as usize))
+        .style(Style::default().fg(theme.muted).bg(theme.modal))
+        .render(Rect::new(x, controls_row.y, controls_row.right().saturating_sub(x), 1), buf);
+    if entries.is_empty() {
+        render_modal_line(
+            "no retained events yet",
+            inner,
+            2,
+            Style::default().fg(theme.dim).bg(theme.modal),
+            buf,
+        );
+    }
+    for (row, event) in entries[offset..end].iter().enumerate() {
+        render_modal_line(
+            app.event_log_line(event),
+            inner,
+            2 + row as u16,
+            Style::default().fg(event_severity_color(event.severity, theme)).bg(theme.modal),
+            buf,
+        );
+    }
     render_modal_line(
-        "scrolls open log lines and notices across the CENTRE zone",
+        "click, or m, toggles | Up/Down scrolls log | Esc close",
         inner,
-        2,
+        inner.height.saturating_sub(1),
         Style::default().fg(theme.muted).bg(theme.modal),
         buf,
     );
-    render_modal_line("click, or m, toggles | Esc close", inner, 4, Style::default().fg(theme.muted).bg(theme.modal), buf);
 }
 
 fn render_status_bar_right_modal(
@@ -14738,7 +14811,6 @@ mod tests {
                 context: None,
                 task_binding: None,
                 active_session: address,
-                last_error: Some("PRIVATE RAW ERROR".to_owned()),
             }];
             app.nodes.push(node);
         }
@@ -15094,7 +15166,6 @@ mod tests {
             context: None,
             task_binding: None,
             active_session: None,
-            last_error: None,
         });
 
         assert_eq!(
@@ -15125,7 +15196,6 @@ mod tests {
             context: None,
             task_binding: None,
             active_session: None,
-            last_error: None,
         });
         app.managed_agent_preferences.insert(
             ("node-a".to_owned(), "record-local-render".to_owned()),
@@ -16453,7 +16523,6 @@ mod tests {
             context: None,
             task_binding: None,
             active_session: None,
-            last_error: None,
         });
         let key = crate::app::PreviewTabKey::ManagedRecord {
             node_id: "node-a".to_owned(),
@@ -18950,7 +19019,6 @@ mod tests {
             context: receipt.context,
             task_binding: None,
             active_session: None,
-            last_error: None,
         });
         let mut buf = TerminalBuffer::new(120, 6);
         let mut layout = LayoutRects::default();
@@ -19098,8 +19166,6 @@ mod tests {
                     ManagedSessionState::Live | ManagedSessionState::IdentityPending
                 )
                     .then_some(live_address.clone()),
-                last_error: (state == ManagedSessionState::Unavailable)
-                    .then_some("workspace missing".to_owned()),
             });
         }
         // 26, not 24: the agents panel's own control-plane strip now costs
@@ -21563,7 +21629,6 @@ mod tests {
             context: None,
             task_binding: None,
             active_session: None,
-            last_error: None,
         });
         assert!(app.apply_managed_record_inventory("node-a", incarnation, true));
         app.open_session_monitor(AgentRowKey::Managed {

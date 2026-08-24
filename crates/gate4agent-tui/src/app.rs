@@ -1388,39 +1388,73 @@ impl ControlSection {
     }
 }
 
+/// Identifies one draggable modal for [`App::overlay_positions`] and
+/// [`DragState::OverlayMove`] -- slice 2 of the uniform overlay contract
+/// (`docs/gate4agent/plans/gate4agent-tui-overlay-uniform-contract-
+/// 2026-08-24.md`). Before this existed, exactly six modals (`Spawn`,
+/// `ExistingSession`, `AddSpace`, `FolderBrowser`, `CreateWorktree`,
+/// `Control`) each carried their own `Option<(u16,u16)>` field on `App`
+/// and their own `DragState` variant, and the other ten bordered modals
+/// in the crate had neither -- that six-bespoke-pairs shape is exactly
+/// what let ten overlays get left out of dragging in the first place, so
+/// growing it to sixteen pairs would repeat the mistake at more than
+/// double the size. One keyed map plus one keyed `DragState` variant
+/// covers all sixteen instead.
+///
+/// Every bordered modal gets a variant here EXCEPT the crate's four
+/// dropdowns -- the global-search dropdown, the agent context menu, the
+/// native-session context menu, and the layout-preset menu. That
+/// exclusion is deliberate, not an oversight left for a later slice: none
+/// of the four has a header row (a title bar with nothing else on it) to
+/// grab, each is anchored to whatever control opened it (the search
+/// field, the right-clicked row, the tab strip toggle) rather than
+/// free-floating on the screen, and letting one drag away from its own
+/// anchor would leave it pointing at nothing.
+///
+/// A position, once set by a drag, is never cleared when its modal
+/// closes -- `App::overlay_positions` only grows or is overwritten by
+/// another drag, exactly like the six original position fields it
+/// replaces (none of their `begin_*` openers ever reset them). So a modal
+/// dragged, closed, and reopened comes back exactly where it was left,
+/// for the same reason the six originals already behaved that way: a
+/// modal the owner just spent effort moving out of the way of something
+/// underneath should stay out of the way the next time it opens, not
+/// snap back to centre and force the same drag again.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum OverlayId {
+    Spawn,
+    ExistingSession,
+    AddSpace,
+    FolderBrowser,
+    CreateWorktree,
+    Control,
+    CreateWorkspaceEntry,
+    RemoveWorktree,
+    RenameSession,
+    TaskId,
+    ForgetSession,
+    History,
+    StatusBarLeft,
+    StatusBarCenter,
+    StatusBarRight,
+    HarnessReverseAttribution,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DragState {
-    SpawnModal {
-        grab_column: u16,
-        grab_row: u16,
-        origin_x: u16,
-        origin_y: u16,
-    },
-    ExistingSessionModal {
-        grab_column: u16,
-        grab_row: u16,
-        origin_x: u16,
-        origin_y: u16,
-    },
-    AddSpaceModal {
-        grab_column: u16,
-        grab_row: u16,
-        origin_x: u16,
-        origin_y: u16,
-    },
-    FolderBrowserModal {
-        grab_column: u16,
-        grab_row: u16,
-        origin_x: u16,
-        origin_y: u16,
-    },
-    CreateWorktreeModal {
-        grab_column: u16,
-        grab_row: u16,
-        origin_x: u16,
-        origin_y: u16,
-    },
-    ControlModal {
+    /// Replaces the six former per-modal variants `SpawnModal`,
+    /// `ExistingSessionModal`, `AddSpaceModal`, `FolderBrowserModal`,
+    /// `CreateWorktreeModal`, and `ControlModal` -- each held the exact
+    /// same four fields and differed only in which modal it moved.
+    /// `id` (see [`OverlayId`]'s own doc comment for the full "why one
+    /// instead of sixteen" rationale) carries that difference now, so
+    /// `App::drag`'s own per-tick move arm and the position it writes
+    /// (`App::overlay_positions`) are each a single shared implementation
+    /// instead of one hand-rolled copy per modal. `ControlModalResize`
+    /// stays its own variant -- it resizes rather than moves, and has no
+    /// counterpart among the other fifteen overlays.
+    OverlayMove {
+        id: OverlayId,
         grab_column: u16,
         grab_row: u16,
         origin_x: u16,
@@ -2685,11 +2719,30 @@ pub enum HitTarget {
     Worktree(usize),
     RegisterWorktree(usize),
     RemoveWorktree(usize),
+    /// Slice 2 of the uniform overlay contract: the confirm dialog's own
+    /// header-row drag target (`OverlayId::RemoveWorktree`) -- this modal
+    /// used to have no `DragState`/position of its own at all, computing
+    /// its rect fresh from `centered()` every frame.
+    RemoveWorktreeDrag,
     SidebarItem(usize),
     NewFile,
     NewDirectory,
     CreateWorkspaceEntryCancel,
     CreateWorkspaceEntrySubmit,
+    /// Slice 2: see `RemoveWorktreeDrag`'s own doc comment -- same
+    /// addition, `OverlayId::CreateWorkspaceEntry`.
+    CreateWorkspaceEntryDrag,
+    /// Slice 2: `RenameSession`/`TaskId`/`ForgetSession`/`History` were
+    /// "pure keyboard dialogs" before this -- their own shared click block
+    /// (`App::click`'s `Focus::RemoveWorktree | RenameSession | TaskId |
+    /// ForgetSession | History` arm) only ever matched `HitTarget::
+    /// ModalClose`, because none of these four had any OTHER hit region at
+    /// all. These four `*Drag` variants are each dialog's first hit region
+    /// besides that cross.
+    RenameSessionDrag,
+    TaskIdDrag,
+    ForgetSessionDrag,
+    HistoryDrag,
     Agent(usize),
     AgentMore(usize),
     NativeSessionMore(usize),
@@ -2739,6 +2792,9 @@ pub enum HitTarget {
     HarnessAgentTask(HarnessTaskId, HarnessRunId),
     HarnessLinks(HarnessReverseAttributionSubjectV1),
     HarnessLinksClose,
+    /// Slice 2: see `RemoveWorktreeDrag`'s own doc comment --
+    /// `OverlayId::HarnessReverseAttribution`.
+    HarnessReverseAttributionDrag,
     HarnessLaunchRefresh,
     HarnessLaunchPlan(usize),
     HarnessLaunchWorktreeExisting,
@@ -2861,6 +2917,14 @@ pub enum HitTarget {
     StatusBarLeft,
     StatusBarCenter,
     StatusBarRight,
+    /// Slice 2: each zone modal's own header-row drag target -- see
+    /// `RemoveWorktreeDrag`'s own doc comment. Distinct per zone (rather
+    /// than one shared target disambiguated by `self.focus`) because that
+    /// is exactly how every other `*Drag` target in the crate already
+    /// works: the `HitTarget` itself names which overlay it belongs to.
+    StatusBarLeftDrag,
+    StatusBarCenterDrag,
+    StatusBarRightDrag,
     /// The CENTRE zone modal's own marquee on/off row -- see `App::
     /// toggle_marquee`.
     StatusBarMarqueeToggle,
@@ -3049,6 +3113,25 @@ pub struct LayoutRects {
     pub add_space_modal: Rect,
     pub folder_browser_modal: Rect,
     pub create_worktree_modal: Rect,
+    /// Slice 2 of the uniform overlay contract: the ten modals that used
+    /// to compute their rect fresh from `centered()` every frame now go
+    /// through `render::positioned_modal` and record it here too, exactly
+    /// like `spawn_modal`/`control_modal`/etc. above -- the same rect
+    /// `App::overlay_rect` reads to grab a drag's starting position/size
+    /// and clamp its move. Named for the `OverlayId` each corresponds to;
+    /// distinct from `status_bar_left`/`center`/`right` below, which are
+    /// the STATUS BAR's own bottom-row zones, not the modal a click on one
+    /// of them opens.
+    pub create_workspace_entry_modal: Rect,
+    pub remove_worktree_modal: Rect,
+    pub rename_session_modal: Rect,
+    pub task_id_modal: Rect,
+    pub forget_session_modal: Rect,
+    pub history_modal: Rect,
+    pub status_bar_left_modal: Rect,
+    pub status_bar_center_modal: Rect,
+    pub status_bar_right_modal: Rect,
+    pub harness_reverse_attribution_modal: Rect,
     /// The bottom status bar's own three zones, in the frame's own last
     /// row -- see `render::render_status_bar`'s own doc comment for the
     /// geometry. Zero-area (`Rect::default()`) on a terminal too small to
@@ -3306,13 +3389,15 @@ pub struct App {
     /// History` does; same "remember where we came from" shape `settings_
     /// return_focus` already uses for the same reason.
     pub status_bar_return_focus: Focus,
-    pub control_modal_position: Option<(u16, u16)>,
     pub control_modal_size: Option<(u16, u16)>,
-    pub spawn_modal_position: Option<(u16, u16)>,
-    pub existing_session_modal_position: Option<(u16, u16)>,
-    pub add_space_modal_position: Option<(u16, u16)>,
-    pub folder_browser_modal_position: Option<(u16, u16)>,
-    pub create_worktree_modal_position: Option<(u16, u16)>,
+    /// Every draggable modal's own persisted top-left corner, keyed by
+    /// [`OverlayId`] -- see that type's own doc comment for what this
+    /// replaced (six separate `Option<(u16,u16)>` fields) and why a
+    /// position survives its modal closing. Absent entries fall back to
+    /// centred placement (`render::positioned_modal`'s own `None` arm),
+    /// so a fresh `App` -- nothing dragged yet -- renders every modal
+    /// centred exactly as before this map existed.
+    pub overlay_positions: BTreeMap<OverlayId, (u16, u16)>,
     pub sidebar_width: u16,
     pub sidebar_split_percent: u16,
     pub drag_state: Option<DragState>,
@@ -3449,13 +3534,8 @@ impl Default for App {
             board_sidebar_scroll: 0,
             settings_return_focus: Focus::Tabs,
             status_bar_return_focus: Focus::Tabs,
-            control_modal_position: None,
             control_modal_size: None,
-            spawn_modal_position: None,
-            existing_session_modal_position: None,
-            add_space_modal_position: None,
-            folder_browser_modal_position: None,
-            create_worktree_modal_position: None,
+            overlay_positions: BTreeMap::new(),
             sidebar_width: 26,
             sidebar_split_percent: 50,
             drag_state: None,
@@ -3800,11 +3880,38 @@ impl App {
         AppAction::None
     }
 
-    fn click_status_bar_zone(&mut self, target: Option<HitTarget>) -> AppAction {
+    fn click_status_bar_zone(&mut self, target: Option<HitTarget>, column: u16, row: u16) -> AppAction {
         match target {
             Some(HitTarget::ModalClose) => self.close_status_bar_zone(),
             Some(HitTarget::StatusBarMarqueeToggle) if self.focus == Focus::StatusBarCenter => {
                 self.toggle_marquee();
+                AppAction::None
+            }
+            Some(HitTarget::StatusBarLeftDrag) => {
+                self.begin_overlay_drag(
+                    OverlayId::StatusBarLeft,
+                    self.layout.status_bar_left_modal,
+                    column,
+                    row,
+                );
+                AppAction::None
+            }
+            Some(HitTarget::StatusBarCenterDrag) => {
+                self.begin_overlay_drag(
+                    OverlayId::StatusBarCenter,
+                    self.layout.status_bar_center_modal,
+                    column,
+                    row,
+                );
+                AppAction::None
+            }
+            Some(HitTarget::StatusBarRightDrag) => {
+                self.begin_overlay_drag(
+                    OverlayId::StatusBarRight,
+                    self.layout.status_bar_right_modal,
+                    column,
+                    row,
+                );
                 AppAction::None
             }
             _ => AppAction::None,
@@ -10560,6 +10667,15 @@ impl App {
                     self.harness_kanban.reverse_attribution = None;
                     AppAction::None
                 }
+                Some(HitTarget::HarnessReverseAttributionDrag) => {
+                    self.begin_overlay_drag(
+                        OverlayId::HarnessReverseAttribution,
+                        self.layout.harness_reverse_attribution_modal,
+                        column,
+                        row,
+                    );
+                    AppAction::None
+                }
                 Some(HitTarget::HarnessAgentTask(task_id, run_id)) => {
                     self.harness_kanban.reverse_attribution = None;
                     let action = self.open_harness_task_detail(task_id);
@@ -10616,7 +10732,7 @@ impl App {
             return self.click_folder_browser(target, column, row);
         }
         if self.focus == Focus::CreateWorkspaceEntry {
-            return self.click_create_workspace_entry(target);
+            return self.click_create_workspace_entry(target, column, row);
         }
         if self.focus == Focus::CreateWorktree {
             return self.click_create_worktree(target, column, row);
@@ -10625,7 +10741,7 @@ impl App {
             self.focus,
             Focus::StatusBarLeft | Focus::StatusBarCenter | Focus::StatusBarRight
         ) {
-            return self.click_status_bar_zone(target);
+            return self.click_status_bar_zone(target, column, row);
         }
         if self.focus == Focus::GlobalSearch {
             return self.click_global_search(target);
@@ -11033,13 +11149,50 @@ impl App {
                 | Focus::ForgetSession
                 | Focus::History
         ) {
-            // These five are otherwise pure keyboard dialogs (no other hit
-            // regions at all) -- the only click target that ever resolves
-            // here is their own new `[x]` close cross.
-            return if matches!(target, Some(HitTarget::ModalClose)) {
-                self.close_focused_modal()
-            } else {
-                AppAction::None
+            // These five used to be pure keyboard dialogs (no other hit
+            // regions at all) -- their `[x]` close cross was the only
+            // click target that ever resolved here. Slice 2 gives each its
+            // own header-row drag target (`OverlayId::RemoveWorktree`/
+            // `RenameSession`/`TaskId`/`ForgetSession`/`History`), the
+            // first hit region any of them has had besides that cross.
+            return match target {
+                Some(HitTarget::ModalClose) => self.close_focused_modal(),
+                Some(HitTarget::RemoveWorktreeDrag) => {
+                    self.begin_overlay_drag(
+                        OverlayId::RemoveWorktree,
+                        self.layout.remove_worktree_modal,
+                        column,
+                        row,
+                    );
+                    AppAction::None
+                }
+                Some(HitTarget::RenameSessionDrag) => {
+                    self.begin_overlay_drag(
+                        OverlayId::RenameSession,
+                        self.layout.rename_session_modal,
+                        column,
+                        row,
+                    );
+                    AppAction::None
+                }
+                Some(HitTarget::TaskIdDrag) => {
+                    self.begin_overlay_drag(OverlayId::TaskId, self.layout.task_id_modal, column, row);
+                    AppAction::None
+                }
+                Some(HitTarget::ForgetSessionDrag) => {
+                    self.begin_overlay_drag(
+                        OverlayId::ForgetSession,
+                        self.layout.forget_session_modal,
+                        column,
+                        row,
+                    );
+                    AppAction::None
+                }
+                Some(HitTarget::HistoryDrag) => {
+                    self.begin_overlay_drag(OverlayId::History, self.layout.history_modal, column, row);
+                    AppAction::None
+                }
+                _ => AppAction::None,
             };
         }
         if self.focus == Focus::Settings {
@@ -11048,7 +11201,7 @@ impl App {
                     self.begin_control_resize(column, row);
                 }
                 Some(HitTarget::ControlDrag) => {
-                    self.begin_control_drag(column, row);
+                    self.begin_overlay_drag(OverlayId::Control, self.layout.control_modal, column, row);
                 }
                 Some(HitTarget::ActivitySection(ControlSection::Settings)) => {
                     // The gear stays live while Settings is open -- same
@@ -11580,12 +11733,22 @@ impl App {
                 | HitTarget::FolderBrowserLoadMore
                 | HitTarget::FolderBrowserUse
                 | HitTarget::FolderBrowserCancel
+                | HitTarget::CreateWorkspaceEntryDrag
                 | HitTarget::CreateWorkspaceEntryCancel
                 | HitTarget::CreateWorkspaceEntrySubmit
                 | HitTarget::CreateWorktreeDrag
                 | HitTarget::CreateWorktreeField(_)
                 | HitTarget::CreateWorktreeCancel
                 | HitTarget::CreateWorktreeCreate
+                // Slice 2: each only ever drawn while the matching `Focus`
+                // (`RemoveWorktree`/`RenameSession`/`TaskId`/`ForgetSession`/
+                // `History`) holds focus, which returns earlier in this fn
+                // via the shared five-dialog block's own drag arms.
+                | HitTarget::RemoveWorktreeDrag
+                | HitTarget::RenameSessionDrag
+                | HitTarget::TaskIdDrag
+                | HitTarget::ForgetSessionDrag
+                | HitTarget::HistoryDrag
                 | HitTarget::AgentBoardOpen
                 | HitTarget::AgentBoardCard(_)
                 | HitTarget::AgentBoardCardOpen(_)
@@ -11629,6 +11792,10 @@ impl App {
                 | HitTarget::HarnessAgentTask(_, _)
                 | HitTarget::HarnessLinks(_)
                 | HitTarget::HarnessLinksClose
+                // Slice 2: only ever drawn while `harness_kanban.reverse_
+                // attribution` is set, which returns earlier in this fn via
+                // its own drag arm.
+                | HitTarget::HarnessReverseAttributionDrag
                 | HitTarget::HarnessLaunchRefresh
                 | HitTarget::HarnessLaunchPlan(_)
                 | HitTarget::HarnessLaunchWorktreeExisting
@@ -11652,6 +11819,12 @@ impl App {
                 // `click_status_bar_zone` guard -- never actually
                 // reachable here.
                 | HitTarget::StatusBarMarqueeToggle
+                // Same shape, for the other two zones' own drag rows --
+                // `click_status_bar_zone` handles all three regardless of
+                // which `Focus::StatusBar*` is active.
+                | HitTarget::StatusBarLeftDrag
+                | HitTarget::StatusBarCenterDrag
+                | HitTarget::StatusBarRightDrag
                 // Same shape, for `Focus::GlobalSearch`'s own `click_
                 // global_search` guard.
                 | HitTarget::GlobalSearchResult(_)
@@ -11772,7 +11945,9 @@ impl App {
         row: u16,
     ) -> AppAction {
         match target {
-            Some(HitTarget::SpawnDrag) => self.begin_spawn_drag(column, row),
+            Some(HitTarget::SpawnDrag) => {
+                self.begin_overlay_drag(OverlayId::Spawn, self.layout.spawn_modal, column, row)
+            }
             Some(HitTarget::SpawnField(field)) => {
                 if let Some(spawn) = self.spawn.as_mut() {
                     spawn.field = field;
@@ -11817,9 +11992,12 @@ impl App {
         row: u16,
     ) -> AppAction {
         match target {
-            Some(HitTarget::ExistingSessionDrag) => {
-                self.begin_existing_session_drag(column, row)
-            }
+            Some(HitTarget::ExistingSessionDrag) => self.begin_overlay_drag(
+                OverlayId::ExistingSession,
+                self.layout.existing_session_modal,
+                column,
+                row,
+            ),
             Some(HitTarget::ExistingSessionField(field)) => {
                 if let Some(dialog) = self.existing_session.as_mut() {
                     dialog.field = field;
@@ -11878,7 +12056,9 @@ impl App {
         row: u16,
     ) -> AppAction {
         match target {
-            Some(HitTarget::AddSpaceDrag) => self.begin_add_space_drag(column, row),
+            Some(HitTarget::AddSpaceDrag) => {
+                self.begin_overlay_drag(OverlayId::AddSpace, self.layout.add_space_modal, column, row)
+            }
             Some(HitTarget::AddSpaceField(field)) => {
                 if let Some(dialog) = self.add_space.as_mut() {
                     dialog.field = field;
@@ -11900,7 +12080,12 @@ impl App {
         row: u16,
     ) -> AppAction {
         match target {
-            Some(HitTarget::FolderBrowserDrag) => self.begin_folder_browser_drag(column, row),
+            Some(HitTarget::FolderBrowserDrag) => self.begin_overlay_drag(
+                OverlayId::FolderBrowser,
+                self.layout.folder_browser_modal,
+                column,
+                row,
+            ),
             Some(HitTarget::FolderBrowserParent) => return self.browse_parent_directory(),
             Some(HitTarget::FolderBrowserFilter) => {
                 if let Some(browser) = self.folder_browser.as_mut() {
@@ -11934,9 +12119,12 @@ impl App {
         row: u16,
     ) -> AppAction {
         match target {
-            Some(HitTarget::CreateWorktreeDrag) => {
-                self.begin_create_worktree_drag(column, row)
-            }
+            Some(HitTarget::CreateWorktreeDrag) => self.begin_overlay_drag(
+                OverlayId::CreateWorktree,
+                self.layout.create_worktree_modal,
+                column,
+                row,
+            ),
             Some(HitTarget::CreateWorktreeField(field)) => {
                 if let Some(dialog) = self.create_worktree.as_mut() {
                     dialog.field = field;
@@ -12049,107 +12237,35 @@ impl App {
             return AppAction::None;
         };
         match drag {
-            DragState::SpawnModal {
+            // Single shared move handler for all sixteen draggable modals --
+            // replaces the six near-identical arms this used to be (one per
+            // `*Modal` variant, differing only in which `App` field and
+            // which `layout` rect they read/wrote) -- see `OverlayId`'s own
+            // doc comment for why. `overlay_rect` resolves `id` to that
+            // modal's current painted size (its width/height do not change
+            // during a move, only during `ControlModalResize`), and the
+            // clamp keeps the WHOLE modal on screen, so its header row --
+            // the only thing this contract requires stay reachable -- is
+            // trivially still inside the buffer.
+            DragState::OverlayMove {
+                id,
                 grab_column,
                 grab_row,
                 origin_x,
                 origin_y,
             } => {
+                let modal = self.overlay_rect(id);
                 let x = i32::from(origin_x) + i32::from(column) - i32::from(grab_column);
                 let y = i32::from(origin_y) + i32::from(row) - i32::from(grab_row);
-                let max_x = self.terminal_cols.saturating_sub(self.layout.spawn_modal.width);
-                let max_y = self.terminal_rows.saturating_sub(self.layout.spawn_modal.height);
-                self.spawn_modal_position = Some((
-                    x.clamp(0, i32::from(max_x)) as u16,
-                    y.clamp(0, i32::from(max_y)) as u16,
-                ));
-            }
-            DragState::ExistingSessionModal {
-                grab_column,
-                grab_row,
-                origin_x,
-                origin_y,
-            } => {
-                let x = i32::from(origin_x) + i32::from(column) - i32::from(grab_column);
-                let y = i32::from(origin_y) + i32::from(row) - i32::from(grab_row);
-                let max_x = self
-                    .terminal_cols
-                    .saturating_sub(self.layout.existing_session_modal.width);
-                let max_y = self
-                    .terminal_rows
-                    .saturating_sub(self.layout.existing_session_modal.height);
-                self.existing_session_modal_position = Some((
-                    x.clamp(0, i32::from(max_x)) as u16,
-                    y.clamp(0, i32::from(max_y)) as u16,
-                ));
-            }
-            DragState::AddSpaceModal {
-                grab_column,
-                grab_row,
-                origin_x,
-                origin_y,
-            } => {
-                let x = i32::from(origin_x) + i32::from(column) - i32::from(grab_column);
-                let y = i32::from(origin_y) + i32::from(row) - i32::from(grab_row);
-                let max_x = self.terminal_cols.saturating_sub(self.layout.add_space_modal.width);
-                let max_y = self.terminal_rows.saturating_sub(self.layout.add_space_modal.height);
-                self.add_space_modal_position = Some((
-                    x.clamp(0, i32::from(max_x)) as u16,
-                    y.clamp(0, i32::from(max_y)) as u16,
-                ));
-            }
-            DragState::FolderBrowserModal {
-                grab_column,
-                grab_row,
-                origin_x,
-                origin_y,
-            } => {
-                let x = i32::from(origin_x) + i32::from(column) - i32::from(grab_column);
-                let y = i32::from(origin_y) + i32::from(row) - i32::from(grab_row);
-                let max_x = self
-                    .terminal_cols
-                    .saturating_sub(self.layout.folder_browser_modal.width);
-                let max_y = self
-                    .terminal_rows
-                    .saturating_sub(self.layout.folder_browser_modal.height);
-                self.folder_browser_modal_position = Some((
-                    x.clamp(0, i32::from(max_x)) as u16,
-                    y.clamp(0, i32::from(max_y)) as u16,
-                ));
-            }
-            DragState::CreateWorktreeModal {
-                grab_column,
-                grab_row,
-                origin_x,
-                origin_y,
-            } => {
-                let x = i32::from(origin_x) + i32::from(column) - i32::from(grab_column);
-                let y = i32::from(origin_y) + i32::from(row) - i32::from(grab_row);
-                let max_x = self
-                    .terminal_cols
-                    .saturating_sub(self.layout.create_worktree_modal.width);
-                let max_y = self
-                    .terminal_rows
-                    .saturating_sub(self.layout.create_worktree_modal.height);
-                self.create_worktree_modal_position = Some((
-                    x.clamp(0, i32::from(max_x)) as u16,
-                    y.clamp(0, i32::from(max_y)) as u16,
-                ));
-            }
-            DragState::ControlModal {
-                grab_column,
-                grab_row,
-                origin_x,
-                origin_y,
-            } => {
-                let x = i32::from(origin_x) + i32::from(column) - i32::from(grab_column);
-                let y = i32::from(origin_y) + i32::from(row) - i32::from(grab_row);
-                let max_x = self.terminal_cols.saturating_sub(self.layout.control_modal.width);
-                let max_y = self.terminal_rows.saturating_sub(self.layout.control_modal.height);
-                self.control_modal_position = Some((
-                    x.clamp(0, i32::from(max_x)) as u16,
-                    y.clamp(0, i32::from(max_y)) as u16,
-                ));
+                let max_x = self.terminal_cols.saturating_sub(modal.width);
+                let max_y = self.terminal_rows.saturating_sub(modal.height);
+                self.overlay_positions.insert(
+                    id,
+                    (
+                        x.clamp(0, i32::from(max_x)) as u16,
+                        y.clamp(0, i32::from(max_y)) as u16,
+                    ),
+                );
             }
             DragState::ControlModalResize {
                 start_column,
@@ -12157,18 +12273,17 @@ impl App {
                 origin_width,
                 origin_height,
             } => {
-                let width = i32::from(origin_width) + i32::from(column) - i32::from(start_column);
-                let height = i32::from(origin_height) + i32::from(row) - i32::from(start_row);
-                let max_width = self
-                    .control_modal_position
+                let control_modal_position = self.overlay_positions.get(&OverlayId::Control).copied();
+                let max_width = control_modal_position
                     .map(|(x, _)| self.terminal_cols.saturating_sub(x))
                     .unwrap_or(self.terminal_cols)
                     .max(1);
-                let max_height = self
-                    .control_modal_position
+                let max_height = control_modal_position
                     .map(|(_, y)| self.terminal_rows.saturating_sub(y))
                     .unwrap_or(self.terminal_rows)
                     .max(1);
+                let width = i32::from(origin_width) + i32::from(column) - i32::from(start_column);
+                let height = i32::from(origin_height) + i32::from(row) - i32::from(start_row);
                 self.control_modal_size = Some((
                     width.clamp(
                         i32::from(MIN_CONTROL_MODAL_WIDTH.min(max_width)),
@@ -12455,87 +12570,56 @@ impl App {
         self.drag_state = None;
     }
 
-    fn begin_spawn_drag(&mut self, column: u16, row: u16) {
-        let modal = self.layout.spawn_modal;
-        if modal.width == 0 || modal.height == 0 {
-            return;
+    /// Resolves an [`OverlayId`] to that modal's own rect as painted THIS
+    /// frame -- the one place the shared move handler (`App::drag`'s own
+    /// `DragState::OverlayMove` arm) and the shared drag-start helper
+    /// (`App::begin_overlay_drag`) go to find a modal's current size/
+    /// position without sixteen copies of the same lookup. Every arm here
+    /// mirrors one of `render::render`'s own overlay renderers, which is
+    /// the only thing that ever writes these `layout` fields.
+    fn overlay_rect(&self, id: OverlayId) -> Rect {
+        match id {
+            OverlayId::Spawn => self.layout.spawn_modal,
+            OverlayId::ExistingSession => self.layout.existing_session_modal,
+            OverlayId::AddSpace => self.layout.add_space_modal,
+            OverlayId::FolderBrowser => self.layout.folder_browser_modal,
+            OverlayId::CreateWorktree => self.layout.create_worktree_modal,
+            OverlayId::Control => self.layout.control_modal,
+            OverlayId::CreateWorkspaceEntry => self.layout.create_workspace_entry_modal,
+            OverlayId::RemoveWorktree => self.layout.remove_worktree_modal,
+            OverlayId::RenameSession => self.layout.rename_session_modal,
+            OverlayId::TaskId => self.layout.task_id_modal,
+            OverlayId::ForgetSession => self.layout.forget_session_modal,
+            OverlayId::History => self.layout.history_modal,
+            OverlayId::StatusBarLeft => self.layout.status_bar_left_modal,
+            OverlayId::StatusBarCenter => self.layout.status_bar_center_modal,
+            OverlayId::StatusBarRight => self.layout.status_bar_right_modal,
+            OverlayId::HarnessReverseAttribution => self.layout.harness_reverse_attribution_modal,
         }
-        self.spawn_modal_position = Some((modal.x, modal.y));
-        self.drag_state = Some(DragState::SpawnModal {
-            grab_column: column,
-            grab_row: row,
-            origin_x: modal.x,
-            origin_y: modal.y,
-        });
     }
 
-    fn begin_existing_session_drag(&mut self, column: u16, row: u16) {
-        let modal = self.layout.existing_session_modal;
-        if modal.width == 0 || modal.height == 0 {
+    /// Starts dragging whichever modal `id` names by its header row --
+    /// replaces the six former `begin_*_drag` functions (`begin_spawn_
+    /// drag`, `begin_existing_session_drag`, `begin_add_space_drag`,
+    /// `begin_folder_browser_drag`, `begin_create_worktree_drag`, `begin_
+    /// control_drag`), each of which did exactly this against its own
+    /// hardcoded field pair -- see `OverlayId`'s own doc comment. Every
+    /// `HitTarget::*Drag` click handler in the crate now reaches this one
+    /// function instead. A zero-size rect means this modal has not been
+    /// painted this frame (nothing to grab); every caller already has its
+    /// own rect in hand from `App::overlay_rect`/its own `layout` field, so
+    /// this never re-derives it.
+    fn begin_overlay_drag(&mut self, id: OverlayId, rect: Rect, column: u16, row: u16) {
+        if rect.width == 0 || rect.height == 0 {
             return;
         }
-        self.existing_session_modal_position = Some((modal.x, modal.y));
-        self.drag_state = Some(DragState::ExistingSessionModal {
+        self.overlay_positions.insert(id, (rect.x, rect.y));
+        self.drag_state = Some(DragState::OverlayMove {
+            id,
             grab_column: column,
             grab_row: row,
-            origin_x: modal.x,
-            origin_y: modal.y,
-        });
-    }
-
-    fn begin_add_space_drag(&mut self, column: u16, row: u16) {
-        let modal = self.layout.add_space_modal;
-        if modal.width == 0 || modal.height == 0 {
-            return;
-        }
-        self.add_space_modal_position = Some((modal.x, modal.y));
-        self.drag_state = Some(DragState::AddSpaceModal {
-            grab_column: column,
-            grab_row: row,
-            origin_x: modal.x,
-            origin_y: modal.y,
-        });
-    }
-
-    fn begin_folder_browser_drag(&mut self, column: u16, row: u16) {
-        let modal = self.layout.folder_browser_modal;
-        if modal.width == 0 || modal.height == 0 {
-            return;
-        }
-        self.folder_browser_modal_position = Some((modal.x, modal.y));
-        self.drag_state = Some(DragState::FolderBrowserModal {
-            grab_column: column,
-            grab_row: row,
-            origin_x: modal.x,
-            origin_y: modal.y,
-        });
-    }
-
-    fn begin_create_worktree_drag(&mut self, column: u16, row: u16) {
-        let modal = self.layout.create_worktree_modal;
-        if modal.width == 0 || modal.height == 0 {
-            return;
-        }
-        self.create_worktree_modal_position = Some((modal.x, modal.y));
-        self.drag_state = Some(DragState::CreateWorktreeModal {
-            grab_column: column,
-            grab_row: row,
-            origin_x: modal.x,
-            origin_y: modal.y,
-        });
-    }
-
-    fn begin_control_drag(&mut self, column: u16, row: u16) {
-        let modal = self.layout.control_modal;
-        if modal.width == 0 || modal.height == 0 {
-            return;
-        }
-        self.control_modal_position = Some((modal.x, modal.y));
-        self.drag_state = Some(DragState::ControlModal {
-            grab_column: column,
-            grab_row: row,
-            origin_x: modal.x,
-            origin_y: modal.y,
+            origin_x: rect.x,
+            origin_y: rect.y,
         });
     }
 
@@ -12544,7 +12628,7 @@ impl App {
         if modal.width == 0 || modal.height == 0 {
             return;
         }
-        self.control_modal_position = Some((modal.x, modal.y));
+        self.overlay_positions.insert(OverlayId::Control, (modal.x, modal.y));
         self.control_modal_size = Some((modal.width, modal.height));
         self.drag_state = Some(DragState::ControlModalResize {
             start_column: column,
@@ -19295,8 +19379,22 @@ impl App {
         AppAction::None
     }
 
-    fn click_create_workspace_entry(&mut self, target: Option<HitTarget>) -> AppAction {
+    fn click_create_workspace_entry(
+        &mut self,
+        target: Option<HitTarget>,
+        column: u16,
+        row: u16,
+    ) -> AppAction {
         match target {
+            Some(HitTarget::CreateWorkspaceEntryDrag) => {
+                self.begin_overlay_drag(
+                    OverlayId::CreateWorkspaceEntry,
+                    self.layout.create_workspace_entry_modal,
+                    column,
+                    row,
+                );
+                AppAction::None
+            }
             Some(HitTarget::CreateWorkspaceEntryCancel) => {
                 self.reduce_create_workspace_entry(UiKey::Escape)
             }
@@ -24962,9 +25060,12 @@ mod tests {
             target: HitTarget::SpawnDrag,
         });
         assert_eq!(app.click(30, 4), AppAction::None);
-        assert!(matches!(app.drag_state, Some(DragState::SpawnModal { .. })));
+        assert!(matches!(
+            app.drag_state,
+            Some(DragState::OverlayMove { id: OverlayId::Spawn, .. })
+        ));
         assert_eq!(app.drag(45, 10), AppAction::None);
-        assert_eq!(app.spawn_modal_position, Some((35, 10)));
+        assert_eq!(app.overlay_positions.get(&OverlayId::Spawn).copied(), Some((35, 10)));
         app.end_drag();
 
         assert_eq!(app.reduce(UiKey::Ctrl('r')), AppAction::None);
@@ -24975,9 +25076,12 @@ mod tests {
             target: HitTarget::AddSpaceDrag,
         });
         assert_eq!(app.click(35, 8), AppAction::None);
-        assert!(matches!(app.drag_state, Some(DragState::AddSpaceModal { .. })));
+        assert!(matches!(
+            app.drag_state,
+            Some(DragState::OverlayMove { id: OverlayId::AddSpace, .. })
+        ));
         assert_eq!(app.drag(99, 29), AppAction::None);
-        assert_eq!(app.add_space_modal_position, Some((60, 18)));
+        assert_eq!(app.overlay_positions.get(&OverlayId::AddSpace).copied(), Some((60, 18)));
         assert_eq!(app.drop_at(99, 29), AppAction::None);
         assert!(app.drag_state.is_none());
     }
@@ -26166,77 +26270,6 @@ mod tests {
         assert_eq!(app.spawn.as_ref().unwrap().field, LaunchField::Provider);
     }
 
-    /// The agent menu's new `[x]` (`render_agent_menu`'s own `render_modal_
-    /// close` call, slice 1 item 4) closes it -- via the SAME top-priority
-    /// `_ => { self.agent_menu = None; }` fallback that already closed on
-    /// any unmatched click, now reachable because there is finally
-    /// something painted at `HitTarget::ModalClose` to resolve to.
-    #[test]
-    fn modal_close_cross_closes_agent_menu() {
-        let mut app = fixture();
-        let key = AgentRowKey::Legacy(active_pty_address(&app));
-        app.agent_menu = Some(AgentMenuState {
-            key,
-            anchor_column: 10,
-            anchor_row: 7,
-            selected: 0,
-        });
-        let menu_area = Rect::new(10, 7, 30, 6);
-        app.layout.overlays.push(OverlayRegion { rect: menu_area, drawn_before: 0 });
-        app.layout.hits = vec![HitRegion {
-            rect: Rect::new(menu_area.right() - 4, menu_area.y, 3, 1),
-            target: HitTarget::ModalClose,
-        }];
-
-        assert_eq!(app.click(menu_area.right() - 3, menu_area.y), AppAction::None);
-        assert!(app.agent_menu.is_none());
-    }
-
-    /// Same addition, same fallback, for the native-session menu.
-    #[test]
-    fn modal_close_cross_closes_native_session_menu() {
-        let mut app = fixture();
-        app.native_session_menu = Some(NativeSessionMenuState {
-            key: PreviewTabKey::ManagedRecord {
-                node_id: "node-a".to_owned(),
-                record_id: "record-a".to_owned(),
-            },
-            anchor_column: 10,
-            anchor_row: 7,
-            selected: 0,
-        });
-        let menu_area = Rect::new(10, 7, 30, 6);
-        app.layout.overlays.push(OverlayRegion { rect: menu_area, drawn_before: 0 });
-        app.layout.hits = vec![HitRegion {
-            rect: Rect::new(menu_area.right() - 4, menu_area.y, 3, 1),
-            target: HitTarget::ModalClose,
-        }];
-
-        assert_eq!(app.click(menu_area.right() - 3, menu_area.y), AppAction::None);
-        assert!(app.native_session_menu.is_none());
-    }
-
-    /// The global-search dropdown's new `[x]` reaches `click_global_search`'s
-    /// pre-existing `Some(HitTarget::ModalClose) => self.close_global_
-    /// search()` arm -- that arm predates this wave; `render_global_search_
-    /// dropdown`'s new `render_modal_close` call is what finally makes it
-    /// reachable (see that call site's own doc comment).
-    #[test]
-    fn modal_close_cross_closes_global_search_dropdown() {
-        let mut app = fixture();
-        assert_eq!(app.begin_global_search(), AppAction::None);
-        let dropdown = Rect::new(30, 2, 28, 6);
-        app.layout.overlays.push(OverlayRegion { rect: dropdown, drawn_before: 0 });
-        app.layout.hits = vec![HitRegion {
-            rect: Rect::new(dropdown.right() - 4, dropdown.y, 3, 1),
-            target: HitTarget::ModalClose,
-        }];
-
-        assert_eq!(app.click(dropdown.right() - 3, dropdown.y), AppAction::None);
-        assert!(!app.global_search.expand_target_open);
-        assert_ne!(app.focus, Focus::GlobalSearch);
-    }
-
     #[test]
     fn split_to_activity_preserves_operational_section_and_normalizes_settings() {
         let mut app = fixture();
@@ -26300,9 +26333,12 @@ mod tests {
         });
 
         assert_eq!(app.click(30, 5), AppAction::None);
-        assert!(matches!(app.drag_state, Some(DragState::ControlModal { .. })));
+        assert!(matches!(
+            app.drag_state,
+            Some(DragState::OverlayMove { id: OverlayId::Control, .. })
+        ));
         assert_eq!(app.drag(42, 11), AppAction::None);
-        assert_eq!(app.control_modal_position, Some((32, 11)));
+        assert_eq!(app.overlay_positions.get(&OverlayId::Control).copied(), Some((32, 11)));
         app.end_drag();
         assert!(app.drag_state.is_none());
 
@@ -26326,6 +26362,94 @@ mod tests {
         assert_eq!(app.drag(10, 28), AppAction::None);
         assert_eq!(app.sidebar_split_percent, 70);
         app.end_drag();
+    }
+
+    /// Slice 2 of the uniform overlay contract: `RemoveWorktree` was one
+    /// of the ten modals that used to compute its rect fresh from
+    /// `centered()` every frame, with no `DragState`/position of its own
+    /// at all -- this pins that it now drags exactly like the six modals
+    /// that always could (`OverlayId::RemoveWorktree`, `HitTarget::
+    /// RemoveWorktreeDrag`, the shared `DragState::OverlayMove` arm), and
+    /// that the shared clamp in `App::drag` keeps it fully inside the
+    /// buffer no matter how far the gesture overshoots.
+    #[test]
+    fn remove_worktree_modal_now_drags_by_header_and_clamps_to_the_buffer() {
+        let mut app = fixture();
+        app.terminal_cols = 100;
+        app.terminal_rows = 30;
+        app.focus = Focus::RemoveWorktree;
+        app.remove_worktree = Some(RemoveWorktreeDialog {
+            node_id: "node-a".to_owned(),
+            source_workspace_id: "workspace-a".to_owned(),
+            target_root: host_path(r"C:\work\acme\wt"),
+            branch: Some("feature".to_owned()),
+        });
+        app.layout.remove_worktree_modal = Rect::new(16, 11, 68, 8);
+        app.layout.hits.push(HitRegion {
+            rect: Rect::new(16, 11, 68, 1),
+            target: HitTarget::RemoveWorktreeDrag,
+        });
+
+        assert!(app.overlay_positions.get(&OverlayId::RemoveWorktree).is_none());
+        assert_eq!(app.click(20, 11), AppAction::None);
+        assert!(matches!(
+            app.drag_state,
+            Some(DragState::OverlayMove { id: OverlayId::RemoveWorktree, .. })
+        ));
+        assert_eq!(app.drag(30, 15), AppAction::None);
+        assert_eq!(
+            app.overlay_positions.get(&OverlayId::RemoveWorktree).copied(),
+            Some((26, 15)),
+            "a modal that could never move before now follows the header drag",
+        );
+
+        // Same continuous gesture, overshooting far past either edge --
+        // the WHOLE 68x8 modal must stay on the 100x30 buffer, so x can
+        // never exceed 32 and y can never exceed 22. The header row (this
+        // contract's own minimum bar: it must stay reachable) is trivially
+        // still on screen once the whole modal is.
+        assert_eq!(app.drag(9_999, 9_999), AppAction::None);
+        let (x, y) = app.overlay_positions.get(&OverlayId::RemoveWorktree).copied().unwrap();
+        assert!(x + 68 <= app.terminal_cols, "clamp let the modal past the right edge");
+        assert!(y + 8 <= app.terminal_rows, "clamp let the modal past the bottom edge");
+        app.end_drag();
+    }
+
+    /// The `[x]` hit region is always pushed AFTER the header drag row
+    /// (`render::render_modal_close`'s own doc comment on call order,
+    /// which `render_remove_worktree` and every other modal renderer
+    /// follow) so `App::click`'s last-pushed-wins scan resolves their
+    /// shared cells to the cross, never the drag. Pinned here for one of
+    /// the ten modals slice 2 newly made draggable, using the exact push
+    /// order/geometry the real renderer produces.
+    #[test]
+    fn remove_worktree_close_cross_wins_over_header_drag_on_overlap() {
+        let mut app = fixture();
+        app.focus = Focus::RemoveWorktree;
+        app.remove_worktree = Some(RemoveWorktreeDialog {
+            node_id: "node-a".to_owned(),
+            source_workspace_id: "workspace-a".to_owned(),
+            target_root: host_path(r"C:\work\acme\wt"),
+            branch: Some("feature".to_owned()),
+        });
+        let modal = Rect::new(16, 11, 68, 8);
+        app.layout.remove_worktree_modal = modal;
+        app.layout.hits.push(HitRegion {
+            rect: Rect::new(modal.x, modal.y, modal.width, 1),
+            target: HitTarget::RemoveWorktreeDrag,
+        });
+        let close_rect = Rect::new(modal.right() - 4, modal.y, 3, 1);
+        app.layout.hits.push(HitRegion {
+            rect: close_rect,
+            target: HitTarget::ModalClose,
+        });
+
+        // Same row, inside the cross's own 3 columns -- covered by BOTH
+        // hit regions.
+        assert_eq!(app.click(close_rect.x + 1, modal.y), AppAction::None);
+        assert!(app.drag_state.is_none(), "the close cross must win, not a drag");
+        assert!(app.remove_worktree.is_none(), "the cross cancels the confirm dialog");
+        assert_eq!(app.focus, Focus::Spaces);
     }
 
     #[test]

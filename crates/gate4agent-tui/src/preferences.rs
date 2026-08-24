@@ -10,7 +10,7 @@ use gate4agent_node_protocol::{
 
 use crate::app::{
     App, ControlSection, IconFamily, LucideStrokeWidth, ManagedAgentPreference, MenuPlacement,
-    PtyColorMode, RailIcons, RosterMode, SidebarMode, SidebarPresentation,
+    OverlayId, PtyColorMode, RailIcons, RosterMode, SidebarMode, SidebarPresentation,
     MAX_LOCAL_AGENT_ALIAS_BYTES, MAX_MANAGED_AGENT_PREFERENCES, MAX_MANAGED_AGENT_RECORD_ID_BYTES,
 };
 use crate::surface::LayoutPreset;
@@ -112,7 +112,7 @@ impl UiPreferences {
             },
             sidebar_width: app.sidebar_width,
             sidebar_split_percent: app.sidebar_split_percent,
-            control_modal_position: app.control_modal_position,
+            control_modal_position: app.overlay_positions.get(&OverlayId::Control).copied(),
             control_modal_size: app.control_modal_size.map(sanitize_modal_size),
             surface_layout: app.surface.preset.unwrap_or(LayoutPreset::OneByOne),
             marquee_enabled: app.marquee_enabled,
@@ -166,7 +166,14 @@ impl UiPreferences {
         }
         app.sidebar_width = self.sidebar_width.clamp(18, 60);
         app.sidebar_split_percent = self.sidebar_split_percent.clamp(25, 75);
-        app.control_modal_position = self.control_modal_position;
+        match self.control_modal_position {
+            Some(position) => {
+                app.overlay_positions.insert(OverlayId::Control, position);
+            }
+            None => {
+                app.overlay_positions.remove(&OverlayId::Control);
+            }
+        }
         app.control_modal_size = self.control_modal_size.map(sanitize_modal_size);
         let _ = app.surface.apply_layout_preset(self.surface_layout);
         app.managed_agent_preferences = managed_agent_preferences;

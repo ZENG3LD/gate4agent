@@ -5806,7 +5806,7 @@ mod tests {
     };
     use crate::app::{
         ContextUsageSegment, ContextUsageSegmentHit, ControlSection, DragState, Focus, HitRegion, HitTarget, IconFamily, LaunchContextMode, LaunchField,
-        HarnessTaskComposerField, HarnessTaskRef, LaunchTarget, PtyColorMode, SidebarPresentation, SpawnDialog,
+        HarnessTaskComposerField, HarnessTaskRef, LaunchTarget, OverlayId, PtyColorMode, SidebarPresentation, SpawnDialog,
         SurfacePaneLayout,
     };
     use crate::surface::PaneId;
@@ -7200,7 +7200,10 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
         assert_eq!(map_mouse(&mut app, down), AppAction::None);
-        assert!(matches!(app.drag_state, Some(DragState::SpawnModal { .. })));
+        assert!(matches!(
+            app.drag_state,
+            Some(DragState::OverlayMove { id: OverlayId::Spawn, .. })
+        ));
 
         let drag = MouseEvent {
             kind: MouseEventKind::Drag(MouseButton::Left),
@@ -7209,7 +7212,7 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
         assert_eq!(map_mouse(&mut app, drag), AppAction::None);
-        assert_eq!(app.spawn_modal_position, Some((30, 10)));
+        assert_eq!(app.overlay_positions.get(&OverlayId::Spawn).copied(), Some((30, 10)));
 
         let up = MouseEvent {
             kind: MouseEventKind::Up(MouseButton::Left),

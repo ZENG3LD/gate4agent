@@ -27,7 +27,7 @@ use crate::app::{
     ContextUsageHover, ContextUsageSegment, ContextUsageSegmentHit,
     ExistingSessionMode, ExistingSessionOperation, Focus, FolderBrowserField,
     AgentRunGitScopeView, GitLocationDialogKind, HitRegion, HitTarget, LaunchContextMode, LaunchField, LaunchTarget,
-    IconFamily, LayoutRects, MenuPlacement, NativeSessionGroupKey, NativeSessionTreeItem, NetworkSummary, NodeView, PreviewTabPhase, PreviewTabView, PtyColorMode, RailIcons, RosterMode, SessionView,
+    IconFamily, LayoutRects, MenuPlacement, NativeSessionGroupKey, NativeSessionTreeItem, NetworkSummary, NodeView, OverlayId, PreviewTabPhase, PreviewTabView, PtyColorMode, RailIcons, RosterMode, SessionView,
     SixelIconPlacement, SixelIconSize,
     ObservationPersistenceState, SessionMonitorKey, SessionMonitorSection, SessionMonitorTarget,
     SessionMonitorView, SidebarMode, SurfaceTab,
@@ -278,6 +278,16 @@ pub fn render(app: &App, buf: &mut TerminalBuffer) -> LayoutRects {
         add_space_modal: Rect::default(),
         folder_browser_modal: Rect::default(),
         create_worktree_modal: Rect::default(),
+        create_workspace_entry_modal: Rect::default(),
+        remove_worktree_modal: Rect::default(),
+        rename_session_modal: Rect::default(),
+        task_id_modal: Rect::default(),
+        forget_session_modal: Rect::default(),
+        history_modal: Rect::default(),
+        status_bar_left_modal: Rect::default(),
+        status_bar_center_modal: Rect::default(),
+        status_bar_right_modal: Rect::default(),
+        harness_reverse_attribution_modal: Rect::default(),
         status_bar_left: Rect::default(),
         status_bar_center: Rect::default(),
         status_bar_right: Rect::default(),
@@ -567,7 +577,8 @@ fn render_status_bar_left_modal(
 ) {
     let width = 48.min(area.width.saturating_sub(4));
     let height = (4 + app.nodes.len() as u16).clamp(4, area.height.saturating_sub(2));
-    let dialog = centered(area, width, height);
+    let dialog = positioned_modal(area, width, height, app.overlay_positions.get(&OverlayId::StatusBarLeft).copied());
+    layout.status_bar_left_modal = dialog;
     layout.note_overlay(dialog);
     fill_rect(dialog, theme.modal, buf);
     Block::bordered()
@@ -575,6 +586,10 @@ fn render_status_bar_left_modal(
         .border_style(Style::default().fg(theme.accent))
         .style(Style::default().bg(theme.modal))
         .render(dialog, buf);
+    layout.hits.push(HitRegion {
+        rect: Rect::new(dialog.x, dialog.y, dialog.width, 1),
+        target: HitTarget::StatusBarLeftDrag,
+    });
     render_modal_close(dialog, buf, layout, theme);
     if dialog.width < 3 || dialog.height < 3 {
         return;
@@ -621,7 +636,8 @@ fn render_status_bar_center_modal(
 ) {
     let width = 44.min(area.width.saturating_sub(4));
     let height = 6.min(area.height.saturating_sub(2));
-    let dialog = centered(area, width, height);
+    let dialog = positioned_modal(area, width, height, app.overlay_positions.get(&OverlayId::StatusBarCenter).copied());
+    layout.status_bar_center_modal = dialog;
     layout.note_overlay(dialog);
     fill_rect(dialog, theme.modal, buf);
     Block::bordered()
@@ -629,6 +645,10 @@ fn render_status_bar_center_modal(
         .border_style(Style::default().fg(theme.accent))
         .style(Style::default().bg(theme.modal))
         .render(dialog, buf);
+    layout.hits.push(HitRegion {
+        rect: Rect::new(dialog.x, dialog.y, dialog.width, 1),
+        target: HitTarget::StatusBarCenterDrag,
+    });
     render_modal_close(dialog, buf, layout, theme);
     if dialog.width < 3 || dialog.height < 3 {
         return;
@@ -653,11 +673,8 @@ fn render_status_bar_center_modal(
     render_modal_line("click, or m, toggles | Esc close", inner, 4, Style::default().fg(theme.muted).bg(theme.modal), buf);
 }
 
-// `_app`: kept for signature parity with the other two zone modals -- this
-// one has nothing of the app's own state to show yet (see
-// `render_status_bar_right`'s own doc comment).
 fn render_status_bar_right_modal(
-    _app: &App,
+    app: &App,
     area: Rect,
     buf: &mut TerminalBuffer,
     layout: &mut LayoutRects,
@@ -665,7 +682,8 @@ fn render_status_bar_right_modal(
 ) {
     let width = 32.min(area.width.saturating_sub(4));
     let height = 4.min(area.height.saturating_sub(2));
-    let dialog = centered(area, width, height);
+    let dialog = positioned_modal(area, width, height, app.overlay_positions.get(&OverlayId::StatusBarRight).copied());
+    layout.status_bar_right_modal = dialog;
     layout.note_overlay(dialog);
     fill_rect(dialog, theme.modal, buf);
     Block::bordered()
@@ -673,6 +691,10 @@ fn render_status_bar_right_modal(
         .border_style(Style::default().fg(theme.accent))
         .style(Style::default().bg(theme.modal))
         .render(dialog, buf);
+    layout.hits.push(HitRegion {
+        rect: Rect::new(dialog.x, dialog.y, dialog.width, 1),
+        target: HitTarget::StatusBarRightDrag,
+    });
     render_modal_close(dialog, buf, layout, theme);
     if dialog.width < 3 || dialog.height < 3 {
         return;
@@ -1870,7 +1892,13 @@ fn render_create_workspace_entry(
     };
     let width = 76.min(area.width.saturating_sub(4));
     let height = 10.min(area.height.saturating_sub(2));
-    let modal = positioned_modal(area, width, height, None);
+    let modal = positioned_modal(
+        area,
+        width,
+        height,
+        app.overlay_positions.get(&OverlayId::CreateWorkspaceEntry).copied(),
+    );
+    layout.create_workspace_entry_modal = modal;
     layout.note_overlay(modal);
     fill_rect(modal, theme.modal, buf);
     let title = match dialog.kind {
@@ -1882,6 +1910,10 @@ fn render_create_workspace_entry(
         .border_style(Style::default().fg(theme.accent))
         .style(Style::default().bg(theme.modal))
         .render(modal, buf);
+    layout.hits.push(HitRegion {
+        rect: Rect::new(modal.x, modal.y, modal.width, 1),
+        target: HitTarget::CreateWorkspaceEntryDrag,
+    });
     render_modal_close(modal, buf, layout, theme);
     if modal.width < 3 || modal.height < 3 {
         return;
@@ -3207,14 +3239,12 @@ fn render_agent_menu(
         .border_style(Style::default().fg(theme.accent))
         .style(Style::default().bg(theme.modal))
         .render(menu_area, buf);
-    // Slice 1 of the uniform overlay-close contract: this menu had no
-    // `[x]` at all before -- outside-click and `Escape` were its only
-    // close paths. `App::click`'s own top-priority `_ => { self.
-    // agent_menu = None; }` fallback (right above the `Focus` dispatch
-    // chain) already closes on ANY unmatched target, so this cross's own
-    // hit region needs no dedicated match arm there; it rides that same
-    // fallback for free.
-    render_modal_close(menu_area, buf, layout, theme);
+    // No `[x]` here, deliberately. A popup is not a modal: it has no
+    // header to hang a cross on and it is anchored to the control that
+    // opened it, so its close paths are that same control and a click
+    // outside it -- both of which `App::close_overlay_outside_click`
+    // already owns, plus `Escape`. A cross was briefly painted here and
+    // removed: it read as a modal's chrome on something that is not one.
     let inner = Rect::new(
         menu_area.x.saturating_add(1),
         menu_area.y.saturating_add(1),
@@ -3298,10 +3328,8 @@ fn render_native_session_menu(
         .border_style(Style::default().fg(theme.accent))
         .style(Style::default().bg(theme.modal))
         .render(menu_area, buf);
-    // Same addition, same reasoning, as `render_agent_menu`'s own `render_
-    // modal_close` call just above it in this file -- see that call
-    // site's doc comment.
-    render_modal_close(menu_area, buf, layout, theme);
+    // No `[x]`, same reasoning as `render_agent_menu` just above -- see
+    // that call site's own comment.
     let inner = Rect::new(
         menu_area.x.saturating_add(1),
         menu_area.y.saturating_add(1),
@@ -3737,12 +3765,11 @@ fn render_global_search_dropdown(
         .border_style(Style::default().fg(theme.accent))
         .style(Style::default().bg(theme.modal))
         .render(dropdown, buf);
-    // Slice 1 of the uniform overlay-close contract: this dropdown had no
-    // `[x]` before -- `App::click_global_search` already carries a `Some(
-    // HitTarget::ModalClose) => self.close_global_search()` arm (added
-    // ahead of there being anywhere to paint the cross), so this call is
-    // what actually makes that arm reachable.
-    render_modal_close(dropdown, buf, layout, theme);
+    // No `[x]`: a dropdown is not a modal. It hangs off the search field
+    // and closes by that same field, by a click outside it, or by
+    // `Escape` -- `App::click_global_search`'s own `HitTarget::ModalClose`
+    // arm stays, harmless and unreachable, for the day this grows a
+    // header. A cross was briefly painted here and removed.
     if dropdown.width < 3 || dropdown.height < 3 {
         return;
     }
@@ -7659,7 +7686,13 @@ fn render_harness_reverse_attribution(
     let height = area.height.saturating_sub(2)
         .min(8_u16.saturating_add(link_count.min(10) as u16))
         .max(3);
-    let modal = centered(area, width, height);
+    let modal = positioned_modal(
+        area,
+        width,
+        height,
+        app.overlay_positions.get(&OverlayId::HarnessReverseAttribution).copied(),
+    );
+    layout.harness_reverse_attribution_modal = modal;
     layout.note_overlay(modal);
     fill_rect(modal, theme.modal, buf);
     Block::bordered()
@@ -7667,6 +7700,10 @@ fn render_harness_reverse_attribution(
         .border_style(Style::default().fg(theme.accent))
         .style(Style::default().bg(theme.modal))
         .render(modal, buf);
+    layout.hits.push(HitRegion {
+        rect: Rect::new(modal.x, modal.y, modal.width, 1),
+        target: HitTarget::HarnessReverseAttributionDrag,
+    });
     // In addition to (not instead of) this modal's own pre-existing
     // `[Close]` content-row button just below -- see `render_modal_
     // close`'s own doc comment.
@@ -9763,7 +9800,7 @@ fn render_existing_session(
     };
     let width = 112.min(area.width);
     let height = 24.min(area.height);
-    let dialog = positioned_modal(area, width, height, app.existing_session_modal_position);
+    let dialog = positioned_modal(area, width, height, app.overlay_positions.get(&OverlayId::ExistingSession).copied());
     layout.existing_session_modal = dialog;
     layout.note_overlay(dialog);
     fill_rect(dialog, theme.modal, buf);
@@ -10114,7 +10151,7 @@ fn render_spawn(
     };
     let width = 86.min(area.width);
     let height = 19.min(area.height);
-    let dialog = positioned_modal(area, width, height, app.spawn_modal_position);
+    let dialog = positioned_modal(area, width, height, app.overlay_positions.get(&OverlayId::Spawn).copied());
     layout.spawn_modal = dialog;
     layout.note_overlay(dialog);
     fill_rect(dialog, theme.modal, buf);
@@ -10410,7 +10447,8 @@ fn render_history(
     };
     let width = 96.min(area.width.saturating_sub(4));
     let height = 22.min(area.height.saturating_sub(2));
-    let dialog = centered(area, width, height);
+    let dialog = positioned_modal(area, width, height, app.overlay_positions.get(&OverlayId::History).copied());
+    layout.history_modal = dialog;
     layout.note_overlay(dialog);
     fill_rect(dialog, theme.modal, buf);
     Block::bordered()
@@ -10418,6 +10456,10 @@ fn render_history(
         .border_style(Style::default().fg(theme.accent))
         .style(Style::default().bg(theme.modal))
         .render(dialog, buf);
+    layout.hits.push(HitRegion {
+        rect: Rect::new(dialog.x, dialog.y, dialog.width, 1),
+        target: HitTarget::HistoryDrag,
+    });
     render_modal_close(dialog, buf, layout, theme);
     if dialog.width < 3 || dialog.height < 3 {
         return;
@@ -10768,7 +10810,7 @@ fn render_add_space(
     };
     let width = 72.min(area.width.saturating_sub(4));
     let height = 10.min(area.height.saturating_sub(2));
-    let modal = positioned_modal(area, width, height, app.add_space_modal_position);
+    let modal = positioned_modal(area, width, height, app.overlay_positions.get(&OverlayId::AddSpace).copied());
     layout.add_space_modal = modal;
     layout.note_overlay(modal);
     fill_rect(modal, theme.modal, buf);
@@ -10887,7 +10929,7 @@ fn render_folder_browser(
     };
     let width = 92.min(area.width.saturating_sub(2));
     let height = 26.min(area.height.saturating_sub(2));
-    let modal = positioned_modal(area, width, height, app.folder_browser_modal_position);
+    let modal = positioned_modal(area, width, height, app.overlay_positions.get(&OverlayId::FolderBrowser).copied());
     layout.folder_browser_modal = modal;
     layout.note_overlay(modal);
     fill_rect(modal, theme.modal, buf);
@@ -11058,7 +11100,7 @@ fn render_create_worktree(
     };
     let width = 72.min(area.width.saturating_sub(4));
     let height = 14.min(area.height.saturating_sub(2));
-    let modal = positioned_modal(area, width, height, app.create_worktree_modal_position);
+    let modal = positioned_modal(area, width, height, app.overlay_positions.get(&OverlayId::CreateWorktree).copied());
     layout.create_worktree_modal = modal;
     layout.note_overlay(modal);
     fill_rect(modal, theme.modal, buf);
@@ -11208,7 +11250,8 @@ fn render_remove_worktree(
     };
     let width = 68.min(area.width.saturating_sub(4));
     let height = 8.min(area.height.saturating_sub(2));
-    let modal = centered(area, width, height);
+    let modal = positioned_modal(area, width, height, app.overlay_positions.get(&OverlayId::RemoveWorktree).copied());
+    layout.remove_worktree_modal = modal;
     layout.note_overlay(modal);
     fill_rect(modal, theme.modal, buf);
     Paragraph::new(Text::from_lines(vec![
@@ -11228,6 +11271,10 @@ fn render_remove_worktree(
     )
     .style(Style::default().fg(theme.text).bg(theme.modal))
     .render(modal, buf);
+    layout.hits.push(HitRegion {
+        rect: Rect::new(modal.x, modal.y, modal.width, 1),
+        target: HitTarget::RemoveWorktreeDrag,
+    });
     render_modal_close(modal, buf, layout, theme);
 }
 
@@ -11243,7 +11290,8 @@ fn render_rename_session(
     };
     let width = 58.min(area.width.saturating_sub(4));
     let height = 7.min(area.height.saturating_sub(2));
-    let modal = centered(area, width, height);
+    let modal = positioned_modal(area, width, height, app.overlay_positions.get(&OverlayId::RenameSession).copied());
+    layout.rename_session_modal = modal;
     layout.note_overlay(modal);
     fill_rect(modal, theme.modal, buf);
     Paragraph::new(Text::from_lines(vec![
@@ -11276,6 +11324,10 @@ fn render_rename_session(
     )
     .style(Style::default().fg(theme.text).bg(theme.modal))
     .render(modal, buf);
+    layout.hits.push(HitRegion {
+        rect: Rect::new(modal.x, modal.y, modal.width, 1),
+        target: HitTarget::RenameSessionDrag,
+    });
     render_modal_close(modal, buf, layout, theme);
 }
 
@@ -11291,7 +11343,8 @@ fn render_task_id(
     };
     let width = 62.min(area.width.saturating_sub(4));
     let height = 7.min(area.height.saturating_sub(2));
-    let modal = centered(area, width, height);
+    let modal = positioned_modal(area, width, height, app.overlay_positions.get(&OverlayId::TaskId).copied());
+    layout.task_id_modal = modal;
     layout.note_overlay(modal);
     fill_rect(modal, theme.modal, buf);
     Paragraph::new(Text::from_lines(vec![
@@ -11316,6 +11369,10 @@ fn render_task_id(
     )
     .style(Style::default().fg(theme.text).bg(theme.modal))
     .render(modal, buf);
+    layout.hits.push(HitRegion {
+        rect: Rect::new(modal.x, modal.y, modal.width, 1),
+        target: HitTarget::TaskIdDrag,
+    });
     render_modal_close(modal, buf, layout, theme);
 }
 
@@ -11331,7 +11388,8 @@ fn render_forget_session(
     };
     let width = 62.min(area.width.saturating_sub(4));
     let height = 8.min(area.height.saturating_sub(2));
-    let modal = centered(area, width, height);
+    let modal = positioned_modal(area, width, height, app.overlay_positions.get(&OverlayId::ForgetSession).copied());
+    layout.forget_session_modal = modal;
     layout.note_overlay(modal);
     fill_rect(modal, theme.modal, buf);
     Paragraph::new(Text::from_lines(vec![
@@ -11357,6 +11415,10 @@ fn render_forget_session(
     )
     .style(Style::default().fg(theme.text).bg(theme.modal))
     .render(modal, buf);
+    layout.hits.push(HitRegion {
+        rect: Rect::new(modal.x, modal.y, modal.width, 1),
+        target: HitTarget::ForgetSessionDrag,
+    });
     render_modal_close(modal, buf, layout, theme);
 }
 
@@ -11385,7 +11447,7 @@ fn render_settings(
         .clamp(36.min(available_width), available_width);
     let height = requested_height
         .clamp(6.min(available_height), available_height);
-    let modal = positioned_modal(area, width, height, app.control_modal_position);
+    let modal = positioned_modal(area, width, height, app.overlay_positions.get(&OverlayId::Control).copied());
     layout.control_modal = modal;
     layout.note_overlay(modal);
     fill_rect(modal, theme.modal, buf);
@@ -16255,7 +16317,7 @@ mod tests {
     fn inherited_modals_are_opaque_over_provider_output() {
         let mut app = fixture(PtyColorMode::Inherited);
         app.focus = Focus::AddSpace;
-        app.add_space_modal_position = Some((7, 4));
+        app.overlay_positions.insert(OverlayId::AddSpace, (7, 4));
         app.add_space = Some(crate::app::AddSpaceDialog {
             node_id: "node-a".to_owned(),
             workspace_id: "scratch".to_owned(),
@@ -16806,7 +16868,7 @@ mod tests {
     fn sidebar_gear_opens_only_compact_positioned_settings() {
         let mut app = fixture(PtyColorMode::Inherited);
         app.focus = Focus::Settings;
-        app.control_modal_position = Some((99, 99));
+        app.overlay_positions.insert(OverlayId::Control, (99, 99));
         // Activity presentation is what actually draws the rail (and its
         // gear) -- Split presentation renders the old inspector/roster
         // strip instead, with no rail at all. The compact popover itself
@@ -18006,7 +18068,7 @@ mod tests {
     fn launch_product_ux_rows_and_hits_hide_internal_fields_and_do_not_overlap() {
         let mut app = fixture(PtyColorMode::GateOverride);
         app.focus = Focus::Spawn;
-        app.spawn_modal_position = Some((6, 3));
+        app.overlay_positions.insert(OverlayId::Spawn, (6, 3));
         app.spawn = Some(SpawnDialog {
             node_id: "node-a".to_owned(),
             workspace_id: "workspace-a".to_owned(),
@@ -18332,6 +18394,32 @@ mod tests {
         assert_eq!(close, Rect::new(dialog.right() - 4, dialog.y, 3, 1));
     }
 
+    /// A popup is not a modal, and must not wear a modal's chrome. The
+    /// global search's dropdown hangs off the search field, the two
+    /// context menus hang off the row that was clicked -- none of them has
+    /// a header, so none of them gets a `[x]`. Their close paths are the
+    /// control that opened them, a click outside them, and `Escape`; the
+    /// first two are `App::close_overlay_outside_click`'s, which needs no
+    /// painted target at all. A cross was briefly painted on all three and
+    /// removed, so this pins the absence rather than leaving it to drift
+    /// back in.
+    #[test]
+    fn popups_carry_no_close_cross_because_they_have_no_header() {
+        let mut app = fixture(PtyColorMode::Inherited);
+        app.focus = Focus::GlobalSearch;
+        app.global_search.expand_target_open = true;
+        app.global_search.expand_step = crate::app::SEARCH_EXPAND_STEPS;
+        let mut buf = TerminalBuffer::new(100, 24);
+
+        let layout = render(&app, &mut buf);
+
+        assert_ne!(layout.global_search_dropdown, Rect::default(), "dropdown should be open this frame");
+        assert!(
+            !layout.hits.iter().any(|hit| hit.target == HitTarget::ModalClose),
+            "an open search dropdown must not paint a modal close cross",
+        );
+    }
+
     #[test]
     fn existing_session_modal_gets_the_standard_close_cross() {
         let mut app = fixture(PtyColorMode::Inherited);
@@ -18391,6 +18479,50 @@ mod tests {
         assert_eq!(action, AppAction::None);
         assert_eq!(app.focus, Focus::Spaces);
         assert!(app.remove_worktree.is_none());
+    }
+
+    /// Slice 2: `OverlayId::RemoveWorktree`'s stored position is never
+    /// cleared when the modal closes -- see `OverlayId`'s own doc comment
+    /// for why (a modal the owner just moved out of the way should stay
+    /// out of the way the next time it opens, not snap back to centre,
+    /// exactly like the six modals that already behaved this way before
+    /// this slice). Proven through the real render pipeline -- `render::
+    /// positioned_modal` reading `app.overlay_positions` back -- not just
+    /// the map in isolation.
+    #[test]
+    fn remove_worktree_modal_position_persists_across_close_and_reopen() {
+        fn dialog() -> crate::app::RemoveWorktreeDialog {
+            crate::app::RemoveWorktreeDialog {
+                node_id: "node-a".to_owned(),
+                source_workspace_id: "workspace-a".to_owned(),
+                target_root: host_path(r"C:\work\acme\wt"),
+                branch: Some("feature".to_owned()),
+            }
+        }
+        let mut app = fixture(PtyColorMode::Inherited);
+        app.focus = Focus::RemoveWorktree;
+        app.remove_worktree = Some(dialog());
+        let mut buf = TerminalBuffer::new(100, 24);
+        let centred = render(&app, &mut buf).remove_worktree_modal;
+
+        // Drag it away from centre (mirrors what `App::begin_overlay_
+        // drag`/`App::drag` would store -- the render-level input tests
+        // above already cover the gesture itself).
+        app.overlay_positions.insert(OverlayId::RemoveWorktree, (centred.x + 10, centred.y + 5));
+
+        // Close it -- mirrors `reduce_remove_worktree`'s own `Escape` arm:
+        // drop the dialog, return focus to `Spaces`.
+        app.remove_worktree = None;
+        app.focus = Focus::Spaces;
+
+        // Reopen it.
+        app.remove_worktree = Some(dialog());
+        app.focus = Focus::RemoveWorktree;
+
+        let reopened = render(&app, &mut buf).remove_worktree_modal;
+        assert_eq!(reopened.x, centred.x + 10);
+        assert_eq!(reopened.y, centred.y + 5);
+        assert_ne!(reopened, centred, "reopening must not snap the modal back to centre");
     }
 
     #[test]

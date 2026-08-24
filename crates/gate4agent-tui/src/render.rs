@@ -1,12 +1,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use uzor_text::ascii::{
-    AsciiGrid, Cell as AsciiCell, CellShader, Coord as AsciiCoord, Cursor as AsciiCursor,
-    GridContext,
-};
 use uzor_tui::{
-    blit_ascii_grid, split, Block, Color, Constraint, Direction, Line, Modifier, Paragraph, Rect,
-    Span, Style, TerminalBuffer, Text, Widget,
+    split, Block, Color, Constraint, Direction, Line, Modifier, Paragraph, Rect, Span, Style,
+    TerminalBuffer, Text, Widget,
 };
 use gate4agent_c2_protocol::C2RelayRoute;
 use gate4agent_harness_protocol::HarnessRunGitFactsOutcomeV1;
@@ -526,111 +522,14 @@ fn status_bar_network_label(summary: NetworkSummary, theme: Theme) -> (&'static 
 /// Reads a free-running wall-clock millisecond value directly -- section
 /// 1.7's own requirement ("does not advance a frame counter or accumulate
 /// an elapsed-time delta of its own"). Feeds BOTH the shimmer's own 72ms
-/// tick (`shimmer::shimmer_tick_for_millis`) and the ASCII engine's own
-/// `AsciiGrid::step` `time` argument (as seconds) -- there is no separate
-/// frame-counter clock anywhere in this pairing.
+/// tick (`shimmer::shimmer_tick_for_millis`) and the pet's own blink
+/// phase -- there is no separate frame-counter clock anywhere in this
+/// pairing.
 fn wall_clock_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as u64)
         .unwrap_or(0)
-}
-
-/// Converts this crate's own terminal `Color` into the uzor ASCII engine's
-/// `Cell.color: [u8; 3]` -- **a reported, honest gap, not a silent
-/// workaround**: the engine's per-cell model is RGB-only, with no
-/// `Reset`/named-16/indexed-256 concept at all, while `Color::Reset` and
-/// the sixteen named variants exist SPECIFICALLY so `PtyColorMode::
-/// Inherited` (this app's own default colour mode) can defer entirely to
-/// whatever palette the user's real terminal already has. Routing a
-/// `Reset`/named/indexed colour through the engine necessarily replaces
-/// that deferral with a literal, best-effort RGB guess (a standard xterm
-/// 16/256-cube palette below) -- the engine genuinely cannot express "use
-/// the terminal's own colour," so this is named here rather than silently
-/// approximated and left unreported. `PtyColorMode::GateOverride`'s own
-/// theme (`Theme::for_mode`) already uses `Color::Rgb` exclusively for
-/// every colour the clock/pet ever paint with in that mode, so the
-/// approximation only actually bites in `Inherited` mode.
-fn color_to_rgb(color: Color) -> [u8; 3] {
-    match color {
-        Color::Rgb(r, g, b) => [r, g, b],
-        Color::Reset => [224, 224, 224],
-        Color::Black => [0, 0, 0],
-        Color::Red => [205, 0, 0],
-        Color::Green => [0, 205, 0],
-        Color::Yellow => [205, 205, 0],
-        Color::Blue => [0, 0, 238],
-        Color::Magenta => [205, 0, 205],
-        Color::Cyan => [0, 205, 205],
-        Color::White => [229, 229, 229],
-        Color::Gray => [192, 192, 192],
-        Color::DarkGray => [128, 128, 128],
-        Color::LightRed => [255, 0, 0],
-        Color::LightGreen => [0, 255, 0],
-        Color::LightYellow => [255, 255, 0],
-        Color::LightBlue => [92, 92, 255],
-        Color::LightMagenta => [255, 0, 255],
-        Color::LightCyan => [0, 255, 255],
-        Color::Indexed(index) => indexed_color_to_rgb(index),
-    }
-}
-
-/// Standard xterm 256-colour palette: 0..16 the named basic colours
-/// (matching `color_to_rgb`'s own literals above so the two never
-/// disagree about e.g. "red"), 16..232 the 6x6x6 colour cube, 232..256 the
-/// 24-step grayscale ramp.
-fn indexed_color_to_rgb(index: u8) -> [u8; 3] {
-    const BASE_16: [[u8; 3]; 16] = [
-        [0, 0, 0],
-        [205, 0, 0],
-        [0, 205, 0],
-        [205, 205, 0],
-        [0, 0, 238],
-        [205, 0, 205],
-        [0, 205, 205],
-        [229, 229, 229],
-        [128, 128, 128],
-        [255, 0, 0],
-        [0, 255, 0],
-        [255, 255, 0],
-        [92, 92, 255],
-        [255, 0, 255],
-        [0, 255, 255],
-        [255, 255, 255],
-    ];
-    if index < 16 {
-        return BASE_16[index as usize];
-    }
-    if index >= 232 {
-        let level = 8 + (index - 232) * 10;
-        return [level, level, level];
-    }
-    let cube = index - 16;
-    let channel = |value: u8| if value == 0 { 0 } else { value * 40 + 55 };
-    [channel(cube / 36), channel((cube / 6) % 6), channel(cube % 6)]
-}
-
-/// The engine's own per-cell program for a status bar text slot -- a thin
-/// "echo this already-resolved character, in this already-resolved
-/// colour" shader. All of the actual text/shimmer decision-making already
-/// happened in the caller (`render_status_bar_slot`); this exists purely
-/// so the clock/pet slots are genuinely painted through `AsciiGrid` +
-/// `CellShader` + `blit_ascii_grid` (item 1 of slice B) rather than a
-/// plain `Paragraph`.
-struct StatusBarEchoShader {
-    chars: Vec<char>,
-    color: [u8; 3],
-}
-
-impl CellShader for StatusBarEchoShader {
-    fn main(&self, coord: AsciiCoord, _ctx: &GridContext, _cursor: &AsciiCursor) -> AsciiCell {
-        AsciiCell {
-            ch: self.chars.get(coord.x).copied().unwrap_or(' '),
-            color: self.color,
-            alpha: 1.0,
-            scale: 1.0,
-        }
-    }
 }
 
 /// Pads (with trailing spaces) or truncates `text` to EXACTLY `width`
@@ -654,16 +553,41 @@ fn local_hover_coords(column: u16, row: u16, area: Rect) -> (u16, u16) {
 }
 
 /// Paints one status-bar text slot (the LEFT clock or the RIGHT pet's
-/// face row) through the uzor ASCII cell-shader engine rather than a
-/// plain `Paragraph` -- item 1 of slice B. `chars` must already be fit/
-/// padded to EXACTLY `area.width` (see [`pad_chars_to_width`]), index 0 =
-/// the slot's own leftmost cell. `hover_local`, when `Some`, is the
-/// pointer's position local to `area` (section 1.4's `cx`/`cy`) -- every
-/// ASCII-alphanumeric character whose cell falls inside the brush is
-/// re-rolled through `shimmer::apply_shimmer_char` before painting;
-/// `None` paints `chars` completely unchanged, so the effect reverts the
-/// instant the pointer leaves (section 1.2's own "immediately and
-/// completely", no settle phase).
+/// face row). `chars` must already be fit/padded to EXACTLY `area.width`
+/// (see [`pad_chars_to_width`]), index 0 = the slot's own leftmost cell.
+/// `hover_local`, when `Some`, is the pointer's position local to `area`
+/// (section 1.4's `cx`/`cy`) -- every ASCII-alphanumeric character whose
+/// cell falls inside the brush is re-rolled through `shimmer::apply_
+/// shimmer_char` before painting; `None` paints `chars` completely
+/// unchanged, so the effect reverts the instant the pointer leaves
+/// (section 1.2's own "immediately and completely", no settle phase).
+///
+/// These cells are written STRAIGHT INTO THE BUFFER, deliberately, and
+/// not through the ASCII cell-shader engine, even though routing them
+/// through it was the shape this slice was first built to. The engine's
+/// cell colour is three absolute sRGB channels with no reset, no named
+/// and no indexed variant, and its blit emits a truecolour SGR
+/// unconditionally, with no capability detection and no fallback. This
+/// app's default colour mode INHERITS the terminal's own palette, which
+/// is exactly what an absolute channel value cannot express -- there is
+/// no honest approximation of "whatever this terminal calls default",
+/// because a terminal never tells a program what that is. Routed through
+/// the engine, the clock and the pet stopped following the terminal
+/// theme and started emitting truecolour on terminals that may not have
+/// it.
+///
+/// The engine bought nothing in exchange: the shader it was given was a
+/// pure echo of a `char` and a colour this function had already decided,
+/// so the whole per-cell shading model was doing no shading. The shimmer
+/// is a pure function of index, tick and pointer position (`shimmer`,
+/// which has no engine dependency at all), and it only ever substitutes
+/// GLYPHS -- it never touches colour -- so nothing about the effect
+/// needed the engine either.
+///
+/// The engine stays linked (the `ascii` feature is on) for the thing it
+/// is actually good at: a panel that genuinely computes a colour per
+/// cell per frame, where naming absolute channels is the point rather
+/// than the cost.
 fn render_status_bar_slot(
     mut chars: Vec<char>,
     color: Color,
@@ -683,10 +607,16 @@ fn render_status_bar_slot(
             *ch = shimmer::apply_shimmer_char(*ch, index, cursor_col, cursor_row, tick);
         }
     }
-    let shader = StatusBarEchoShader { chars, color: color_to_rgb(color) };
-    let mut grid = AsciiGrid::new(area.width as usize, 1);
-    grid.step(&shader, now_millis as f64 / 1000.0, 1.0);
-    blit_ascii_grid(buf, area, &grid);
+    let style = Style::default().fg(color).bg(Color::Reset);
+    for (index, ch) in chars.into_iter().enumerate() {
+        let Ok(offset) = u16::try_from(index) else { break };
+        if offset >= area.width {
+            break;
+        }
+        let cell = buf.get_mut(area.x + offset, area.y);
+        cell.symbol = ch.to_string().into();
+        cell.style = style;
+    }
 }
 
 /// The clock is painted across the WHOLE zone width -- slice A's own

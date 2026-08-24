@@ -1,6 +1,12 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use uzor_text::ascii::{
+    AsciiGrid, Cell as AsciiCell, CellShader, Coord as AsciiCoord, Cursor as AsciiCursor,
+    GridContext,
+};
 use uzor_tui::{
-    split, Block, Color, Constraint, Direction, Line, Modifier, Paragraph, Rect, Span, Style,
-    TerminalBuffer, Text, Widget,
+    blit_ascii_grid, split, Block, Color, Constraint, Direction, Line, Modifier, Paragraph, Rect,
+    Span, Style, TerminalBuffer, Text, Widget,
 };
 use gate4agent_c2_protocol::C2RelayRoute;
 use gate4agent_harness_protocol::HarnessRunGitFactsOutcomeV1;
@@ -19,7 +25,7 @@ use gate4agent_harness_client::{
 };
 
 use crate::app::{
-    compact_task_id, host_path_display, managed_state_label, repository_path_display,
+    clock_offset_label, compact_task_id, host_path_display, managed_state_label, repository_path_display,
     normalize_workspace_entry_input, provider_supports_native_resume,
     repository_path_file_name_display, surface_drop_zone, AddSpaceField, AgentBoardCard,
     AgentBoardColumn, AgentRowKey, App,
@@ -29,6 +35,8 @@ use crate::app::{
     AgentRunGitScopeView, GitLocationDialogKind, HitRegion, HitTarget, LaunchContextMode, LaunchField, LaunchTarget,
     IconFamily, LayoutRects, MenuPlacement, NativeSessionGroupKey, NativeSessionTreeItem, NetworkSummary, NodeView, OverlayId, PreviewTabPhase, PreviewTabView, PtyColorMode, RailIcons, RosterMode, SessionView,
     SixelIconPlacement, SixelIconSize,
+    pet_blink_suspended_for_connection, pet_connection_color_key, PetConnectionColor,
+    StatusBarHoverZone,
     ObservationPersistenceState, SessionMonitorKey, SessionMonitorSection, SessionMonitorTarget,
     SessionMonitorView, SidebarMode, SurfaceTab,
     HarnessReverseAttributionState,
@@ -39,6 +47,7 @@ use crate::app::{
 };
 use crate::icons;
 use crate::pty_palette::{apply_pty_palette, GATE_FG, TERM_BG};
+use crate::shimmer;
 use crate::surface::{
     LayoutPreset, PaneBranch, PaneId, PaneNode, PaneSplitPath, SplitAxis, SurfaceDropZone,
 };
@@ -514,14 +523,194 @@ fn status_bar_network_label(summary: NetworkSummary, theme: Theme) -> (&'static 
     }
 }
 
+/// Reads a free-running wall-clock millisecond value directly -- section
+/// 1.7's own requirement ("does not advance a frame counter or accumulate
+/// an elapsed-time delta of its own"). Feeds BOTH the shimmer's own 72ms
+/// tick (`shimmer::shimmer_tick_for_millis`) and the ASCII engine's own
+/// `AsciiGrid::step` `time` argument (as seconds) -- there is no separate
+/// frame-counter clock anywhere in this pairing.
+fn wall_clock_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Converts this crate's own terminal `Color` into the uzor ASCII engine's
+/// `Cell.color: [u8; 3]` -- **a reported, honest gap, not a silent
+/// workaround**: the engine's per-cell model is RGB-only, with no
+/// `Reset`/named-16/indexed-256 concept at all, while `Color::Reset` and
+/// the sixteen named variants exist SPECIFICALLY so `PtyColorMode::
+/// Inherited` (this app's own default colour mode) can defer entirely to
+/// whatever palette the user's real terminal already has. Routing a
+/// `Reset`/named/indexed colour through the engine necessarily replaces
+/// that deferral with a literal, best-effort RGB guess (a standard xterm
+/// 16/256-cube palette below) -- the engine genuinely cannot express "use
+/// the terminal's own colour," so this is named here rather than silently
+/// approximated and left unreported. `PtyColorMode::GateOverride`'s own
+/// theme (`Theme::for_mode`) already uses `Color::Rgb` exclusively for
+/// every colour the clock/pet ever paint with in that mode, so the
+/// approximation only actually bites in `Inherited` mode.
+fn color_to_rgb(color: Color) -> [u8; 3] {
+    match color {
+        Color::Rgb(r, g, b) => [r, g, b],
+        Color::Reset => [224, 224, 224],
+        Color::Black => [0, 0, 0],
+        Color::Red => [205, 0, 0],
+        Color::Green => [0, 205, 0],
+        Color::Yellow => [205, 205, 0],
+        Color::Blue => [0, 0, 238],
+        Color::Magenta => [205, 0, 205],
+        Color::Cyan => [0, 205, 205],
+        Color::White => [229, 229, 229],
+        Color::Gray => [192, 192, 192],
+        Color::DarkGray => [128, 128, 128],
+        Color::LightRed => [255, 0, 0],
+        Color::LightGreen => [0, 255, 0],
+        Color::LightYellow => [255, 255, 0],
+        Color::LightBlue => [92, 92, 255],
+        Color::LightMagenta => [255, 0, 255],
+        Color::LightCyan => [0, 255, 255],
+        Color::Indexed(index) => indexed_color_to_rgb(index),
+    }
+}
+
+/// Standard xterm 256-colour palette: 0..16 the named basic colours
+/// (matching `color_to_rgb`'s own literals above so the two never
+/// disagree about e.g. "red"), 16..232 the 6x6x6 colour cube, 232..256 the
+/// 24-step grayscale ramp.
+fn indexed_color_to_rgb(index: u8) -> [u8; 3] {
+    const BASE_16: [[u8; 3]; 16] = [
+        [0, 0, 0],
+        [205, 0, 0],
+        [0, 205, 0],
+        [205, 205, 0],
+        [0, 0, 238],
+        [205, 0, 205],
+        [0, 205, 205],
+        [229, 229, 229],
+        [128, 128, 128],
+        [255, 0, 0],
+        [0, 255, 0],
+        [255, 255, 0],
+        [92, 92, 255],
+        [255, 0, 255],
+        [0, 255, 255],
+        [255, 255, 255],
+    ];
+    if index < 16 {
+        return BASE_16[index as usize];
+    }
+    if index >= 232 {
+        let level = 8 + (index - 232) * 10;
+        return [level, level, level];
+    }
+    let cube = index - 16;
+    let channel = |value: u8| if value == 0 { 0 } else { value * 40 + 55 };
+    [channel(cube / 36), channel((cube / 6) % 6), channel(cube % 6)]
+}
+
+/// The engine's own per-cell program for a status bar text slot -- a thin
+/// "echo this already-resolved character, in this already-resolved
+/// colour" shader. All of the actual text/shimmer decision-making already
+/// happened in the caller (`render_status_bar_slot`); this exists purely
+/// so the clock/pet slots are genuinely painted through `AsciiGrid` +
+/// `CellShader` + `blit_ascii_grid` (item 1 of slice B) rather than a
+/// plain `Paragraph`.
+struct StatusBarEchoShader {
+    chars: Vec<char>,
+    color: [u8; 3],
+}
+
+impl CellShader for StatusBarEchoShader {
+    fn main(&self, coord: AsciiCoord, _ctx: &GridContext, _cursor: &AsciiCursor) -> AsciiCell {
+        AsciiCell {
+            ch: self.chars.get(coord.x).copied().unwrap_or(' '),
+            color: self.color,
+            alpha: 1.0,
+            scale: 1.0,
+        }
+    }
+}
+
+/// Pads (with trailing spaces) or truncates `text` to EXACTLY `width`
+/// `char`s -- the engine's grid is one `char` per cell with no double-width
+/// concept at all (a real, separate gap from `color_to_rgb`'s own: see
+/// this crate's own slice B report), so this is only exact for the
+/// single-width ASCII content the clock/pet slots actually ever hold
+/// (digits, `:`, `[`/`]`, the pet's own single-width figure glyphs) --
+/// exactly what `truncate_cells`/`cell_width` already assumed at this
+/// call site before the engine existed.
+fn pad_chars_to_width(text: &str, width: usize) -> Vec<char> {
+    let mut chars: Vec<char> = text.chars().collect();
+    chars.resize(width, ' ');
+    chars
+}
+
+/// The pointer's position local to `area` (section 1.4's own `cx`/`cy`),
+/// clamped so a caller's own hit-test rounding can never underflow.
+fn local_hover_coords(column: u16, row: u16, area: Rect) -> (u16, u16) {
+    (column.saturating_sub(area.x), row.saturating_sub(area.y))
+}
+
+/// Paints one status-bar text slot (the LEFT clock or the RIGHT pet's
+/// face row) through the uzor ASCII cell-shader engine rather than a
+/// plain `Paragraph` -- item 1 of slice B. `chars` must already be fit/
+/// padded to EXACTLY `area.width` (see [`pad_chars_to_width`]), index 0 =
+/// the slot's own leftmost cell. `hover_local`, when `Some`, is the
+/// pointer's position local to `area` (section 1.4's `cx`/`cy`) -- every
+/// ASCII-alphanumeric character whose cell falls inside the brush is
+/// re-rolled through `shimmer::apply_shimmer_char` before painting;
+/// `None` paints `chars` completely unchanged, so the effect reverts the
+/// instant the pointer leaves (section 1.2's own "immediately and
+/// completely", no settle phase).
+fn render_status_bar_slot(
+    mut chars: Vec<char>,
+    color: Color,
+    area: Rect,
+    buf: &mut TerminalBuffer,
+    hover_local: Option<(u16, u16)>,
+) {
+    if area.width == 0 {
+        return;
+    }
+    let now_millis = wall_clock_millis();
+    if let Some((cursor_column, cursor_row)) = hover_local {
+        let tick = shimmer::shimmer_tick_for_millis(now_millis);
+        let cursor_col = f64::from(cursor_column);
+        let cursor_row = f64::from(cursor_row);
+        for (index, ch) in chars.iter_mut().enumerate() {
+            *ch = shimmer::apply_shimmer_char(*ch, index, cursor_col, cursor_row, tick);
+        }
+    }
+    let shader = StatusBarEchoShader { chars, color: color_to_rgb(color) };
+    let mut grid = AsciiGrid::new(area.width as usize, 1);
+    grid.step(&shader, now_millis as f64 / 1000.0, 1.0);
+    blit_ascii_grid(buf, area, &grid);
+}
+
+/// The clock is painted across the WHOLE zone width -- slice A's own
+/// network-status dot is gone from this zone entirely (owner instruction,
+/// slice B item 5: the RIGHT zone's pet is now the app's only status-bar
+/// connection indicator, see `app::pet_connection_color_key`'s own doc
+/// comment); the full network word still lives one click away in this
+/// zone's own modal (`render_status_bar_left_modal`), unchanged. Routed
+/// through the engine (`render_status_bar_slot`) rather than a plain
+/// `Paragraph`, with the hover shimmer applied when `App::status_bar_hover`
+/// names this zone.
 fn render_status_bar_left(app: &App, area: Rect, buf: &mut TerminalBuffer, theme: Theme) {
     if area.width == 0 {
         return;
     }
-    let (label, color) = status_bar_network_label(app.network_summary(), theme);
-    Paragraph::new(truncate_cells(&format!(" {label}"), area.width as usize))
-        .style(Style::default().fg(color).bg(theme.panel))
-        .render(area, buf);
+    let width = area.width as usize;
+    let clock_text = format!(" {} ", app.clock_text());
+    let clock_rendered = truncate_cells(&clock_text, width);
+    let chars = pad_chars_to_width(&clock_rendered, width);
+    let hover_local = app
+        .status_bar_hover
+        .filter(|hover| hover.zone == StatusBarHoverZone::Left)
+        .map(|hover| local_hover_coords(hover.column, hover.row, area));
+    render_status_bar_slot(chars, theme.text, area, buf, hover_local);
 }
 
 /// The marquee: while `App::marquee_enabled` is false this stays blank
@@ -529,7 +718,8 @@ fn render_status_bar_left(app: &App, area: Rect, buf: &mut TerminalBuffer, theme
 /// click away); while it fits the zone at rest it is shown static with no
 /// scroll; otherwise it scrolls through `App::marquee_scroll_offset`'s own
 /// position, wrapping the joined log around rather than stopping dead at
-/// its own end.
+/// its own end. Not one of the two shimmer/engine slots (only the clock
+/// and the pet are, per slice B's own scope) -- unchanged from slice A.
 fn render_status_bar_center(app: &App, area: Rect, buf: &mut TerminalBuffer, theme: Theme) {
     if area.width == 0 || !app.marquee_enabled {
         return;
@@ -550,22 +740,94 @@ fn render_status_bar_center(app: &App, area: Rect, buf: &mut TerminalBuffer, the
         .render(area, buf);
 }
 
-// `_app`: kept for signature parity with the other two zone renderers
-// (every one of the three takes `&App` even though this one -- a minimal,
-// static placeholder occupant -- has nothing of the app's own state to
-// read yet).
-fn render_status_bar_right(_app: &App, area: Rect, buf: &mut TerminalBuffer, theme: Theme) {
-    if area.width == 0 {
+/// The RIGHT zone's own live ASCII pet -- see `docs/gate4agent/research/
+/// hover-shimmer-and-animated-pet-spec-2026-08-24.md` section 2. Disabled
+/// (`!App::pet_settings.enabled`) leaves the zone blank, the same
+/// convention `render_status_bar_center` already uses for a disabled
+/// marquee. The pet ALSO carries this app's connection state now (owner
+/// instruction, slice B item 5): its colour is `app::
+/// pet_connection_color_key(app.network_summary())`, and its face is
+/// pinned to its own resting frame (blink suspended) whenever the network
+/// summary is anything but `Connected` (`app::
+/// pet_blink_suspended_for_connection`) -- a disconnected/unsettled pet
+/// visibly stops "living," a connected one blinks normally. Hovering the
+/// pet's own slot overrides both the blink-suspend AND the ordinary blink
+/// cycle with the figure's own "looking at you" last frame (section 2.4),
+/// and, like the clock, is routed through the engine with the hover
+/// shimmer applied on top.
+fn render_status_bar_right(app: &App, area: Rect, buf: &mut TerminalBuffer, theme: Theme) {
+    if area.width == 0 || !app.pet_settings.enabled {
         return;
     }
-    // Plain themed text, never a sixel asset (nothing here is a clickable
-    // icon of its own; the whole zone is one `HitTarget::StatusBarRight`
-    // hit region), so it needs no `RailIcons` branch: the SAME glyphs
-    // render in both tiers already.
-    const PET: &str = "^,,^";
-    Paragraph::new(centered_label(PET, area.width as usize))
-        .style(Style::default().fg(theme.text).bg(theme.panel))
-        .render(area, buf);
+    let width = area.width as usize;
+    let network = app.network_summary();
+    let color = pet_theme_color(pet_connection_color_key(network), theme);
+    let figure = app.pet_settings.figure;
+    let face_width = figure.face_width();
+    let hovered = app
+        .status_bar_hover
+        .is_some_and(|hover| hover.zone == StatusBarHoverZone::Right);
+    let frame_index = if hovered {
+        figure.hover_frame_index()
+    } else if pet_blink_suspended_for_connection(network) {
+        0
+    } else {
+        figure.blink_frame_index(wall_clock_millis())
+    };
+    let face = centered_label(figure.frames()[frame_index], face_width);
+    let mut chars = vec![' '; width];
+    let room = width.saturating_sub(face_width);
+    let x = app.pet_motion.x.round().clamp(0.0, room as f64) as usize;
+    for (offset, ch) in face.chars().enumerate() {
+        if x + offset < width {
+            chars[x + offset] = ch;
+        }
+    }
+    let hover_local = app
+        .status_bar_hover
+        .filter(|hover| hover.zone == StatusBarHoverZone::Right)
+        .map(|hover| local_hover_coords(hover.column, hover.row, area));
+    render_status_bar_slot(chars, color, area, buf, hover_local);
+}
+
+fn pet_theme_color(key: PetConnectionColor, theme: Theme) -> Color {
+    match key {
+        PetConnectionColor::Muted => theme.muted,
+        PetConnectionColor::Green => theme.green,
+        PetConnectionColor::Yellow => theme.yellow,
+        PetConnectionColor::Red => theme.red,
+    }
+}
+
+/// Row layout inside `render_status_bar_left_modal`'s own `inner` rect --
+/// named so the height arithmetic and the row-by-row painting below can
+/// never drift apart. Slice A adds the five clock rows (0..=4) and a
+/// blank separator (5) ahead of the network content this modal already
+/// had (`summary` used to be row 0, the per-node list row 2 -- both moved
+/// down to make room, nothing about their OWN shape changed).
+const CLOCK_MODAL_FOLLOW_ROW: u16 = 0;
+const CLOCK_MODAL_SYSTEM_ROW: u16 = 1;
+const CLOCK_MODAL_OFFSET_ROW: u16 = 2;
+const CLOCK_MODAL_USE_24H_ROW: u16 = 3;
+const CLOCK_MODAL_UTC_PREFIX_ROW: u16 = 4;
+const CLOCK_MODAL_NETWORK_SUMMARY_ROW: u16 = 6;
+const CLOCK_MODAL_NODES_START_ROW: u16 = 8;
+/// Smallest this modal can ever need: the 8 rows through `CLOCK_MODAL_
+/// NODES_START_ROW` plus at least 1 node row (`app.nodes.is_empty()`
+/// still paints a "no nodes registered" line at that same row) plus 2
+/// border rows.
+const CLOCK_MODAL_MIN_HEIGHT: u16 = CLOCK_MODAL_NODES_START_ROW + 1 + 2;
+
+/// Safe replacement for a bare `.clamp(floor, available)`: `u16::clamp`
+/// panics if its own two bounds are inverted, which a pathologically
+/// short terminal (`available < floor`) would trigger. `desired` still
+/// shrinks to fit `available` exactly like a plain clamp would whenever
+/// `available >= floor` (the overwhelming common case); only when the
+/// terminal is shorter than `floor` itself does this diverge, returning
+/// `floor` (letting the dialog run slightly past the bottom edge) rather
+/// than panicking the whole render.
+fn clamp_modal_dimension(desired: u16, floor: u16, available: u16) -> u16 {
+    desired.min(available.max(floor)).max(floor)
 }
 
 fn render_status_bar_left_modal(
@@ -575,14 +837,16 @@ fn render_status_bar_left_modal(
     layout: &mut LayoutRects,
     theme: Theme,
 ) {
+    let node_rows = (app.nodes.len() as u16).max(1);
+    let desired_height = CLOCK_MODAL_NODES_START_ROW + node_rows + 2;
     let width = 48.min(area.width.saturating_sub(4));
-    let height = (4 + app.nodes.len() as u16).clamp(4, area.height.saturating_sub(2));
+    let height = clamp_modal_dimension(desired_height, CLOCK_MODAL_MIN_HEIGHT, area.height.saturating_sub(2));
     let dialog = positioned_modal(area, width, height, app.overlay_positions.get(&OverlayId::StatusBarLeft).copied());
     layout.status_bar_left_modal = dialog;
     layout.note_overlay(dialog);
     fill_rect(dialog, theme.modal, buf);
     Block::bordered()
-        .title(" network ")
+        .title(" clock & network ")
         .border_style(Style::default().fg(theme.accent))
         .style(Style::default().bg(theme.modal))
         .render(dialog, buf);
@@ -595,23 +859,112 @@ fn render_status_bar_left_modal(
         return;
     }
     let inner = Rect::new(dialog.x + 1, dialog.y + 1, dialog.width - 2, dialog.height - 2);
+
+    let settings = app.clock_settings;
+    let follow_label = if settings.follow_system {
+        "[x] follow system time"
+    } else {
+        "[ ] follow system time"
+    };
+    render_modal_line(
+        follow_label,
+        inner,
+        CLOCK_MODAL_FOLLOW_ROW,
+        Style::default().fg(theme.text).bg(theme.modal),
+        buf,
+    );
+    push_modal_hit(layout, modal_row(inner, CLOCK_MODAL_FOLLOW_ROW), HitTarget::StatusBarClockFollowSystem);
+
+    let system_label = match app.system_clock_offset_hours() {
+        Some(hours) => format!("system: {}", clock_offset_label(hours)),
+        None => "system: unknown".to_owned(),
+    };
+    render_modal_line(
+        system_label,
+        inner,
+        CLOCK_MODAL_SYSTEM_ROW,
+        Style::default().fg(theme.muted).bg(theme.modal),
+        buf,
+    );
+
+    let offset_row = modal_row(inner, CLOCK_MODAL_OFFSET_ROW);
+    if offset_row.height > 0 {
+        let mut x = render_toolbar_segment(
+            "[<]",
+            offset_row.x,
+            offset_row,
+            Style::default().fg(theme.teal).bg(theme.modal),
+            Some(HitTarget::StatusBarClockOffsetPrevious),
+            buf,
+            layout,
+        )
+        .saturating_add(1);
+        let label = format!(" {} ", clock_offset_label(settings.manual_offset_hours));
+        let label_width = (cell_width(&label) as u16).min(offset_row.right().saturating_sub(x));
+        if label_width > 0 {
+            Paragraph::new(truncate_cells(&label, label_width as usize))
+                .style(Style::default().fg(theme.text).bg(theme.modal))
+                .render(Rect::new(x, offset_row.y, label_width, 1), buf);
+        }
+        x = x.saturating_add(label_width);
+        render_toolbar_segment(
+            "[>]",
+            x,
+            offset_row,
+            Style::default().fg(theme.teal).bg(theme.modal),
+            Some(HitTarget::StatusBarClockOffsetNext),
+            buf,
+            layout,
+        );
+    }
+
+    let use_24h_label = if settings.use_24h { "[x] 24-hour clock" } else { "[ ] 24-hour clock" };
+    render_modal_line(
+        use_24h_label,
+        inner,
+        CLOCK_MODAL_USE_24H_ROW,
+        Style::default().fg(theme.text).bg(theme.modal),
+        buf,
+    );
+    push_modal_hit(layout, modal_row(inner, CLOCK_MODAL_USE_24H_ROW), HitTarget::StatusBarClockUse24h);
+
+    let utc_prefix_label = if settings.show_utc_prefix {
+        "[x] show UTC prefix"
+    } else {
+        "[ ] show UTC prefix"
+    };
+    render_modal_line(
+        utc_prefix_label,
+        inner,
+        CLOCK_MODAL_UTC_PREFIX_ROW,
+        Style::default().fg(theme.text).bg(theme.modal),
+        buf,
+    );
+    push_modal_hit(layout, modal_row(inner, CLOCK_MODAL_UTC_PREFIX_ROW), HitTarget::StatusBarClockShowUtcPrefix);
+
     let (label, color) = status_bar_network_label(app.network_summary(), theme);
     render_modal_line(
         format!("summary: {label}"),
         inner,
-        0,
+        CLOCK_MODAL_NETWORK_SUMMARY_ROW,
         Style::default().fg(color).bg(theme.modal).add_modifier(Modifier::BOLD),
         buf,
     );
     if app.nodes.is_empty() {
-        render_modal_line("no nodes registered", inner, 2, Style::default().fg(theme.muted).bg(theme.modal), buf);
+        render_modal_line(
+            "no nodes registered",
+            inner,
+            CLOCK_MODAL_NODES_START_ROW,
+            Style::default().fg(theme.muted).bg(theme.modal),
+            buf,
+        );
     } else {
         for (row, node) in app.nodes.iter().enumerate() {
             let (node_label, node_color) = status_bar_network_label(node_connection_summary(node), theme);
             render_modal_line(
                 format!("{} -- {node_label}", node.node_id),
                 inner,
-                2 + row as u16,
+                CLOCK_MODAL_NODES_START_ROW + row as u16,
                 Style::default().fg(node_color).bg(theme.modal),
                 buf,
             );
@@ -12328,6 +12681,45 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// The zone's own render pass is driven by the REAL wall clock
+    /// (`App::clock_text` reads `SystemTime::now()`), so this cannot pin
+    /// an exact digit string the way `app::tests::clock_display_text_*`
+    /// does -- what it CAN pin, regardless of what time it happens to run
+    /// at, is that the zone never truncates (no `…`) even in manual mode
+    /// with the widest prefix armed, proving the real render pipeline
+    /// (not just the pure arithmetic) actually fits inside `STATUS_BAR_
+    /// LEFT_WIDTH`.
+    #[test]
+    fn status_bar_left_zone_never_truncates_the_clock() {
+        let mut app = App::default();
+        app.clock_settings.follow_system = false;
+        app.clock_settings.manual_offset_hours = 12;
+        app.clock_settings.use_24h = false;
+        app.clock_settings.show_utc_prefix = true;
+        let mut buf = TerminalBuffer::new(80, 20);
+        let layout = render(&app, &mut buf);
+        let text = rect_text(&buf, layout.status_bar_left);
+        assert!(!text.contains('\u{2026}'), "clock zone truncated: {text:?}");
+    }
+
+    /// Owner instruction (slice B item 5): slice A's coloured network-
+    /// status dot is removed from the LEFT zone outright -- the RIGHT
+    /// zone's pet is now the app's only status-bar connection indicator
+    /// (`app::pet_connection_color_key`). `App::default()` (no nodes
+    /// registered) previously ALWAYS painted the muted `\u{b7}` dot here
+    /// regardless of node state, so proving it is gone for that case is
+    /// sufficient: every other `NetworkSummary` variant only ever swapped
+    /// which dot glyph/colour painted, never whether one painted at all.
+    #[test]
+    fn status_bar_left_zone_has_no_network_dot() {
+        let app = App::default();
+        let mut buf = TerminalBuffer::new(80, 20);
+        let layout = render(&app, &mut buf);
+        let text = rect_text(&buf, layout.status_bar_left);
+        assert!(!text.contains('\u{25cf}'), "left zone still paints the filled network dot: {text:?}");
+        assert!(!text.contains('\u{b7}'), "left zone still paints the muted network dot: {text:?}");
     }
 
     fn rich_harness_transfer(run: &RedactedRunV1) -> HarnessRunTransferSummaryV1 {

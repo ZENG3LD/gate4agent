@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use gate4agent_c2_protocol::C2RelayRoute;
 use gate4agent_node_protocol::{
@@ -2928,6 +2928,17 @@ pub enum HitTarget {
     /// The CENTRE zone modal's own marquee on/off row -- see `App::
     /// toggle_marquee`.
     StatusBarMarqueeToggle,
+    /// The LEFT zone modal's own clock settings rows -- see `App::
+    /// toggle_clock_follow_system`/`toggle_clock_use_24h`/`toggle_clock_
+    /// show_utc_prefix`/`step_clock_manual_offset`. `Previous`/`Next` are
+    /// the manual-offset stepper's own two ends, the same "one control,
+    /// both directions" shape `HarnessLaunchPanelPrevious`/`Next` already
+    /// use elsewhere in this file.
+    StatusBarClockFollowSystem,
+    StatusBarClockOffsetPrevious,
+    StatusBarClockOffsetNext,
+    StatusBarClockUse24h,
+    StatusBarClockShowUtcPrefix,
     /// The global search's own collapsed-or-expanding frame in the tab
     /// strip -- clicking it opens (`App::begin_global_search`) when
     /// collapsed, closes (`App::close_global_search`) when expanded. See
@@ -3190,14 +3201,513 @@ impl LayoutRects {
     }
 }
 
+/// Longest string `App::clock_text` can ever produce -- the number
+/// `STATUS_BAR_LEFT_WIDTH`'s own value is derived from below. MLC's own
+/// `format_clock_time` (mirrored verbatim by this crate's own `format_
+/// clock_time` below) never zero-pads the 12-hour hour digit, so the
+/// widest 12-hour production is `"12:59:59 AM"` (11 cells); the widest
+/// UTC-prefix production is `"[UTC+12] "`/`"[UTC-12] "` (9 cells, the
+/// 2-digit magnitude at either end of `ClockSettings`'s own `-12..=12`
+/// range). Combined: `"[UTC+12] 12:59:59 AM"` == 9 + 11 == 20. The 24-hour
+/// format (`"23:59:59"`, 8 cells) is always shorter and never the binding
+/// case.
+const CLOCK_MAX_WIDTH: u16 = 20;
+
 /// Status bar geometry shared between layout (`render::render_status_bar`)
 /// and the animation gate (`App::marquee_needs_scroll`, which has no
 /// render-time `Rect` to measure against and must approximate the CENTRE
 /// zone's own width the same way the renderer computes it) -- one source
 /// of truth so the two can never disagree about how much room the marquee
 /// actually has.
-pub(crate) const STATUS_BAR_LEFT_WIDTH: u16 = 14;
-pub(crate) const STATUS_BAR_RIGHT_WIDTH: u16 = 5;
+///
+/// Slice A of `docs/gate4agent/plans/gate4agent-tui-status-bar-clock-
+/// shimmer-and-pet-2026-08-24.md` re-budgets this from its original 14
+/// (network status alone, `" disconnected"` == 13 cells + 1 pad) so the
+/// zone can hold the clock plus a leading/trailing pad. Slice A itself
+/// briefly also drew a small network-status dot in this zone (reduced
+/// from the full English word, colour only) -- slice B's own owner
+/// instruction removes that dot outright: the RIGHT zone's pet is now the
+/// app's ONLY status-bar connection indicator (see `app::
+/// pet_connection_color_key`'s own doc comment), so this zone paints
+/// NOTHING but the clock. The width itself is left unchanged rather than
+/// shrunk back down -- the extra room the dot used to occupy is now just
+/// breathing space around the clock, and keeping the constant stable
+/// avoids re-deriving every width-dependent test below (`CLOCK_MAX_WIDTH`
+/// fits with room to spare regardless). Width arithmetic, cell by cell:
+///   1 (leading pad) + `CLOCK_MAX_WIDTH` (see that const's own doc
+///   comment) + 3 (trailing breathing room, the former separator+dot+pad
+///   budget) == 24.
+pub(crate) const STATUS_BAR_LEFT_WIDTH: u16 = CLOCK_MAX_WIDTH + 4;
+/// The pet's whole world. It has to be wider than the figure, because
+/// the travel room the pet actually patrols is this width MINUS the
+/// figure's own face width -- at the old value of 5 the widest figures
+/// left one or two cells of room, which reads as a twitch in place
+/// rather than as something walking. 18 leaves at least 13 cells of
+/// travel for every figure in the set, which at the middle speed is a
+/// crossing of several seconds: visibly alive without being a
+/// distraction in the corner of a working tool. The zone is taken from
+/// the flexible centre (the marquee), which is the only zone that can
+/// give width up.
+pub(crate) const STATUS_BAR_RIGHT_WIDTH: u16 = 18;
+
+/// Mirrors MLC's `TimeFormatSettings` shape (`docs/gate4agent/research/
+/// mlc-time-and-timezone-model-2026-08-24.md`'s own "smallest faithful
+/// mirror", `mylittlechart/crates/mlc-core/src/scale_settings.rs:42-56`)
+/// field for field -- `manual_offset_hours` (that doc's own `timezone_
+/// offset_hours`), `use_24h`, `show_utc_prefix` -- plus exactly ONE field
+/// MLC has no equivalent for at all: `follow_system`. MLC's own model has
+/// zero OS/locale detection (that doc's own §2 is an exhaustive grep
+/// proving it), so its manual picker IS the whole settings surface; this
+/// crate's own `platform::local_utc_offset_seconds` is new work layered on
+/// top, not something copied from MLC, and needs a mode switch MLC simply
+/// never needed. Deliberately NOT MLC's `date_format`/`show_day_of_week`
+/// (see that doc's own §5: both are x-axis/calendar-label settings with
+/// no equivalent here -- this is a time-of-day clock, never a date).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClockSettings {
+    /// Defaults to `true` -- the opposite of MLC's own default (a fixed
+    /// `UTC+0`, that doc's own §2 "Default offset is a hardcoded constant,
+    /// not a detection result"). MLC ships that way because it has nothing
+    /// else to fall back to; this crate has a real OS answer available, so
+    /// "use it automatically" is the only default that matches this
+    /// task's own brief ("automatic local-offset detection") rather than
+    /// silently reproducing MLC's own fixed-UTC starting point for a
+    /// reason that doesn't apply here.
+    pub follow_system: bool,
+    /// Clamped to `MIN_OFFSET_HOURS..=MAX_OFFSET_HOURS` at every write
+    /// (`clamped_offset_hours`) -- MLC's own field never clamps itself
+    /// (`TimeFormatSettings::cycle_timezone` just wraps instead, `scale_
+    /// settings.rs:82-88`), but this crate's picker is a stepper too (see
+    /// `App::step_clock_manual_offset`) and ALSO the field a hand-edited
+    /// preferences file writes straight into, so the clamp lives here
+    /// once rather than being re-derived at every write site.
+    pub manual_offset_hours: i32,
+    pub use_24h: bool,
+    pub show_utc_prefix: bool,
+}
+
+impl Default for ClockSettings {
+    fn default() -> Self {
+        Self {
+            follow_system: true,
+            manual_offset_hours: 0,
+            // 24-hour by default: this is a systems tool whose every
+            // other timestamp is already 24-hour, and the AM/PM form is
+            // also the wider one, so the default costs two columns it
+            // does not need. The 12-hour form stays available, and the
+            // width budget is sized for it either way.
+            use_24h: true,
+            show_utc_prefix: true,
+        }
+    }
+}
+
+impl ClockSettings {
+    pub const MIN_OFFSET_HOURS: i32 = -12;
+    pub const MAX_OFFSET_HOURS: i32 = 12;
+
+    pub fn clamped_offset_hours(offset_hours: i32) -> i32 {
+        offset_hours.clamp(Self::MIN_OFFSET_HOURS, Self::MAX_OFFSET_HOURS)
+    }
+
+    /// One representative city per UTC offset, `-12..=12` -- copied
+    /// wholesale (English labels only; this crate has no i18n, unlike
+    /// MLC's own 15-language table) from MLC's own `CityKey` table
+    /// (`mylittlechart/crates/mlc-core/src/i18n/tables.rs:1178-1204`),
+    /// index `offset + 12`. Out-of-range input is clamped first, so this
+    /// never indexes out of bounds.
+    pub fn city_for_offset(offset_hours: i32) -> &'static str {
+        const CITIES: [&str; 25] = [
+            "Baker Island", "Pago Pago", "Honolulu", "Alaska", "Los Angeles",
+            "Denver", "Chicago", "New York", "Halifax", "Buenos Aires",
+            "Mid-Atlantic", "Azores", "London", "Berlin", "Kyiv",
+            "Moscow", "Dubai", "Tashkent", "Almaty", "Bangkok",
+            "Singapore", "Tokyo", "Sydney", "Magadan", "Auckland",
+        ];
+        CITIES[(Self::clamped_offset_hours(offset_hours) + 12) as usize]
+    }
+}
+
+/// `"UTC+3 Moscow"` / `"UTC-5 New York"` -- mirrors MLC's own `timezone_
+/// label` (`scale_settings.rs:102-111`) minus the parentheses (this
+/// crate's modal rows already parenthesize nothing else).
+pub(crate) fn clock_offset_label(offset_hours: i32) -> String {
+    let city = ClockSettings::city_for_offset(offset_hours);
+    if offset_hours >= 0 {
+        format!("UTC+{offset_hours} {city}")
+    } else {
+        format!("UTC{offset_hours} {city}")
+    }
+}
+
+/// Resolves `ClockSettings` against a possibly-absent system reading into
+/// the ONE offset (in seconds) actually used to render this frame's clock.
+/// `follow_system` always wins over `manual_offset_hours` when it is set,
+/// regardless of whether a system reading actually exists -- falling back
+/// to plain UTC (`0`) rather than silently reusing the manual value, since
+/// "follow the system" that quietly degrades into "use the manual offset
+/// instead" the moment detection fails would be a worse surprise than
+/// just reading UTC. Manual mode never even looks at `system_offset_
+/// seconds`, so a system reading being available or not can never change
+/// what a manual-mode clock displays.
+fn effective_clock_offset_seconds(settings: ClockSettings, system_offset_seconds: Option<i32>) -> i32 {
+    if settings.follow_system {
+        system_offset_seconds.unwrap_or(0)
+    } else {
+        settings.manual_offset_hours.saturating_mul(3600)
+    }
+}
+
+/// Mirrors MLC's `TimeFormatSettings::format_clock_time` (`mylittlechart/
+/// crates/mlc-core/src/scale_settings.rs:114-137`) arithmetic byte for
+/// byte: `utc_seconds` stays plain UTC unix seconds, the offset is applied
+/// as seconds, and the double `% 86_400` (mod, then add a day and mod
+/// again) extracts a time-of-day even when `local_seconds` goes negative
+/// -- Rust's `%` keeps the sign of its LEFT operand, so a lone `% 86_400`
+/// on a negative value returns a negative remainder rather than wrapping
+/// into `0..86_400` the way MLC's own (identical) double-mod does. No
+/// calendar library, no date component -- exactly MLC's own scope (see
+/// this module's own `ClockSettings` doc comment on `date_format`).
+fn format_clock_time(utc_seconds: i64, offset_seconds: i64, use_24h: bool) -> String {
+    let local_seconds = utc_seconds + offset_seconds;
+    let seconds_in_day = ((local_seconds % 86_400) + 86_400) % 86_400;
+    let hours = seconds_in_day / 3600;
+    let minutes = (seconds_in_day % 3600) / 60;
+    let seconds = seconds_in_day % 60;
+    if use_24h {
+        format!("{hours:02}:{minutes:02}:{seconds:02}")
+    } else {
+        let (hour12, meridiem) = match hours {
+            0 => (12, "AM"),
+            1..=11 => (hours, "AM"),
+            12 => (12, "PM"),
+            _ => (hours - 12, "PM"),
+        };
+        format!("{hour12}:{minutes:02}:{seconds:02} {meridiem}")
+    }
+}
+
+/// The UTC-prefix wrapper MLC applies at its own call site rather than
+/// inside `format_clock_time` itself (`mylittlechart/crates/mlc-app/src/
+/// lib.rs:6852-6874`) -- kept separate here for the same reason: the bare
+/// time string is independently useful (and independently tested) without
+/// a prefix some callers may not want. `offset_hours` is truncated toward
+/// zero from whatever offset actually produced `time` -- MLC's own model
+/// has no fractional-hour representation at all (its picker is whole
+/// hours only), so a system reading that isn't an exact multiple of an
+/// hour (e.g. a real +5:30 zone) only ever shows its truncated hour here.
+/// This crate is not introducing a finer-grained offset type to fix that;
+/// it is a known, accepted approximation of `follow_system` mode only --
+/// manual mode is always an exact whole hour and never approximates
+/// anything.
+fn format_clock_with_prefix(time: &str, offset_hours: i32, show_prefix: bool) -> String {
+    if !show_prefix {
+        return time.to_owned();
+    }
+    if offset_hours >= 0 {
+        format!("[UTC+{offset_hours}] {time}")
+    } else {
+        format!("[UTC{offset_hours}] {time}")
+    }
+}
+
+/// The LEFT zone's full display string for one instant -- composes
+/// `effective_clock_offset_seconds`, `format_clock_time`, and `format_
+/// clock_with_prefix` in the one order `App::clock_text` (the only
+/// production caller) needs, kept as its own pure fn so a test can pin
+/// the whole pipeline against a fixed `utc_seconds` without touching the
+/// real wall clock or the real OS timezone call.
+fn clock_display_text(
+    settings: ClockSettings,
+    system_offset_seconds: Option<i32>,
+    utc_seconds: i64,
+) -> String {
+    let offset_seconds = effective_clock_offset_seconds(settings, system_offset_seconds);
+    let time = format_clock_time(utc_seconds, i64::from(offset_seconds), settings.use_24h);
+    format_clock_with_prefix(&time, offset_seconds / 3600, settings.show_utc_prefix)
+}
+
+/// The RIGHT status bar zone's own ASCII pet -- see `docs/gate4agent/
+/// research/hover-shimmer-and-animated-pet-spec-2026-08-24.md` section 2,
+/// the authority for every frame string, width, and cadence below. Eight
+/// literal figures, in the spec's own lettered order (A..H maps to `0..7`
+/// for `preferences::UiPreferences::pet_figure`'s stored integer).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PetFigure {
+    /// A -- small winged creature (4 frames).
+    WingedCreature,
+    /// B -- cat face (3 frames).
+    CatFace,
+    /// C -- fluttering moth (3 frames).
+    FlutteringMoth,
+    /// D -- sidled crab (3 frames).
+    SidledCrab,
+    /// E -- shelled crawler (3 frames).
+    ShelledCrawler,
+    /// F -- bent fastener (3 frames).
+    BentFastener,
+    /// G -- hovering wisp (3 frames).
+    HoveringWisp,
+    /// H -- grinning skull (3 frames).
+    GrinningSkull,
+}
+
+impl PetFigure {
+    pub const ALL: [PetFigure; 8] = [
+        PetFigure::WingedCreature,
+        PetFigure::CatFace,
+        PetFigure::FlutteringMoth,
+        PetFigure::SidledCrab,
+        PetFigure::ShelledCrawler,
+        PetFigure::BentFastener,
+        PetFigure::HoveringWisp,
+        PetFigure::GrinningSkull,
+    ];
+
+    /// The figure's own literal frames, in order -- section 2.2, verbatim.
+    pub fn frames(self) -> &'static [&'static str] {
+        match self {
+            PetFigure::WingedCreature => &["^v^", "^V^", "^\u{3c9}^", "\u{2248}v\u{2248}"],
+            PetFigure::CatFace => &["=^.^=", "=^o^=", "=^-^="],
+            PetFigure::FlutteringMoth => &["\u{259}o\u{259}", "-o-", "\u{259}O\u{259}"],
+            PetFigure::SidledCrab => &["V.v", "V-v", "V^v"],
+            PetFigure::ShelledCrawler => &["\u{b0}\u{1d25}\u{b0}", "\u{b0}-\u{b0}", "\u{b0}\u{1d25}~"],
+            PetFigure::BentFastener => &["[:]", "[.]", "[:~"],
+            PetFigure::HoveringWisp => &["\u{15a3}", "-o-", "\u{15a7}"],
+            PetFigure::GrinningSkull => &["x_x", "X_X", "*_*"],
+        }
+    }
+
+    /// Section 2.2's own note: "the renderer measures each figure's face
+    /// width as the maximum character count across its frames" -- so the
+    /// face never jitters horizontally as it blinks between frames of
+    /// different literal length (e.g. figure F's third frame).
+    pub fn face_width(self) -> usize {
+        self.frames()
+            .iter()
+            .map(|frame| frame.chars().count())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Section 2.4's own hover pose: "pinned to the figure's last frame
+    /// (the highest-index frame)".
+    pub fn hover_frame_index(self) -> usize {
+        self.frames().len().saturating_sub(1)
+    }
+
+    /// Section 2.4's own blink cadence: `phase = floor(now_ms / 520)`,
+    /// indexed through the fixed 8-entry cycle `[0, 0, 1, 0, 2, 0, 1, 0]`
+    /// (`phase mod 8`), then mapped into this figure's own frame count
+    /// (`mod frame_count`) -- so a 3-frame figure never reads an
+    /// out-of-range index 3 that only a 4-frame figure (A) actually has.
+    pub fn blink_frame_index(self, now_millis: u64) -> usize {
+        const BLINK_CYCLE: [usize; 8] = [0, 0, 1, 0, 2, 0, 1, 0];
+        let phase = (now_millis / PET_BLINK_CADENCE_MILLIS) as usize;
+        let frame_count = self.frames().len();
+        BLINK_CYCLE[phase % BLINK_CYCLE.len()] % frame_count
+    }
+
+    pub fn id(self) -> u8 {
+        Self::ALL
+            .iter()
+            .position(|figure| *figure == self)
+            .expect("PetFigure::ALL enumerates every variant") as u8
+    }
+
+    pub fn from_id(id: u8) -> Option<Self> {
+        Self::ALL.get(id as usize).copied()
+    }
+}
+
+/// Section 2.4's own blink cadence -- "the face index advances every
+/// 520 ms".
+const PET_BLINK_CADENCE_MILLIS: u64 = 520;
+
+/// Section 2.3's own three speed levels, in cells/second.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PetSpeed {
+    Slow,
+    Medium,
+    Fast,
+}
+
+impl PetSpeed {
+    /// Section 2.3's own literal values, plus the same "misconfigured
+    /// speed still creeps" floor (`PET_MIN_SPEED_CELLS_PER_SECOND`)
+    /// applied at the one call site that actually integrates position
+    /// (`PetMotionState::step`) -- kept there rather than clamped into
+    /// this accessor, so this function stays a direct, literal echo of
+    /// the spec's own three numbers.
+    pub fn cells_per_second(self) -> f64 {
+        match self {
+            PetSpeed::Slow => 0.7,
+            PetSpeed::Medium => 1.8,
+            PetSpeed::Fast => 3.6,
+        }
+    }
+
+    pub fn id(self) -> u8 {
+        match self {
+            PetSpeed::Slow => 0,
+            PetSpeed::Medium => 1,
+            PetSpeed::Fast => 2,
+        }
+    }
+
+    pub fn from_id(id: u8) -> Option<Self> {
+        match id {
+            0 => Some(PetSpeed::Slow),
+            1 => Some(PetSpeed::Medium),
+            2 => Some(PetSpeed::Fast),
+            _ => None,
+        }
+    }
+}
+
+/// Section 2.3's own floor: "a floor of 0.05 cells/s is applied so a
+/// misconfigured speed still creeps."
+const PET_MIN_SPEED_CELLS_PER_SECOND: f64 = 0.05;
+
+/// Section 2.3's own clamp: "clamped to a maximum of 0.05 s (so a stall or
+/// a slow frame cannot fling the figure across the slot in one jump)".
+const PET_MAX_STEP_SECONDS: f64 = 0.05;
+
+/// The RIGHT zone's own user preferences -- see [`PetFigure`]/[`PetSpeed`]
+/// for the two enumerated choices, plus a plain on/off switch. Persisted
+/// (`preferences::UiPreferences::pet_figure`/`pet_speed`/`pet_enabled`),
+/// same convention as `App::clock_settings` above.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PetSettings {
+    pub figure: PetFigure,
+    pub speed: PetSpeed,
+    pub enabled: bool,
+}
+
+impl Default for PetSettings {
+    fn default() -> Self {
+        Self {
+            figure: PetFigure::WingedCreature,
+            speed: PetSpeed::Medium,
+            enabled: true,
+        }
+    }
+}
+
+/// The pet's own LIVE motion state (section 2.7) -- deliberately NOT
+/// persisted (unlike [`PetSettings`] above): the spec's own "kept
+/// persistently across frames" only means "does not reset merely because
+/// the slot redraws," which holding this on `App` across the whole
+/// process already satisfies; there is no requirement (and no user-facing
+/// reason) to survive a process restart, the same "live, not durable"
+/// treatment `GlobalSearchState`'s own transient fields already get.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PetMotionState {
+    /// Floating-point position in cells, always kept inside `[0, room]` by
+    /// `step` below.
+    pub x: f64,
+    /// Direction sign, `+1.0` or `-1.0`.
+    pub dir: f64,
+    last_step_time: Option<Instant>,
+}
+
+impl Default for PetMotionState {
+    fn default() -> Self {
+        Self { x: 0.0, dir: 1.0, last_step_time: None }
+    }
+}
+
+impl PetMotionState {
+    /// Section 2.3's own elapsed-time integrator. `room` is `slot_w -
+    /// face_w` (section 2.3): `room <= 0` pins the figure at column 0 and
+    /// resets `last_step_time` to `None` (nothing to integrate, and if
+    /// `room` later grows again -- e.g. the owner switches to a narrower
+    /// figure -- the very next step correctly starts from `dt = 0` rather
+    /// than a stale, possibly huge elapsed gap). Otherwise: `dt = now -
+    /// last_step_time`, clamped to `PET_MAX_STEP_SECONDS`, `0` on the very
+    /// first call (`last_step_time` absent) -- exactly the spec's own
+    /// wording. The edge clamp/flip runs AFTER integrating position, so it
+    /// also recovers correctly if `room` shrank since the last call (e.g.
+    /// a terminal resize) and left `x` past the new edge.
+    pub(crate) fn step(&mut self, now: Instant, room: f64, speed_cells_per_second: f64) {
+        if room <= 0.0 {
+            self.x = 0.0;
+            self.last_step_time = None;
+            return;
+        }
+        let dt = match self.last_step_time {
+            Some(previous) => now
+                .saturating_duration_since(previous)
+                .as_secs_f64()
+                .min(PET_MAX_STEP_SECONDS),
+            None => 0.0,
+        };
+        self.last_step_time = Some(now);
+        let speed = speed_cells_per_second.max(PET_MIN_SPEED_CELLS_PER_SECOND);
+        self.x += self.dir * speed * dt;
+        if self.x <= 0.0 {
+            self.x = 0.0;
+            self.dir = 1.0;
+        } else if self.x >= room {
+            self.x = room;
+            self.dir = -1.0;
+        }
+    }
+}
+
+/// The pet's own connection-state colour key (owner instruction, `docs/
+/// gate4agent/plans/gate4agent-tui-status-bar-clock-shimmer-and-pet-2026-
+/// 08-24.md` slice B item 5): the RIGHT zone's pet is now the app's ONLY
+/// status-bar connection indicator -- slice A's coloured dot in the LEFT
+/// zone is removed outright, not left "just in case." Same four-way
+/// mapping `render::status_bar_network_label` already uses for the LEFT
+/// modal's own text, so the pet's colour never disagrees with what that
+/// modal spells out in full -- only the presentation (a small figure's
+/// colour, not a word) differs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PetConnectionColor {
+    Muted,
+    Green,
+    Yellow,
+    Red,
+}
+
+pub(crate) fn pet_connection_color_key(summary: NetworkSummary) -> PetConnectionColor {
+    match summary {
+        NetworkSummary::NoNodes => PetConnectionColor::Muted,
+        NetworkSummary::Connected => PetConnectionColor::Green,
+        NetworkSummary::Transitioning => PetConnectionColor::Yellow,
+        NetworkSummary::Disconnected => PetConnectionColor::Red,
+    }
+}
+
+/// The pet's own connection-state POSE (owner instruction's own "...and,
+/// where the spec's figure set allows it, which figure or pose is shown"):
+/// every one of the 8 figures already has a resting frame at index 0
+/// (section 2.2), so a disconnected/unsettled pet is pinned there --
+/// blink suspended, exactly the same "pinned to a fixed frame" mechanism
+/// section 2.4 already uses for the hover pose, just a different fixed
+/// index and a different trigger. Only a fully `Connected` summary lets
+/// the pet actually blink; every other state (no nodes yet, still
+/// connecting, disconnected) reads as visibly "not alive right now."
+pub(crate) fn pet_blink_suspended_for_connection(summary: NetworkSummary) -> bool {
+    !matches!(summary, NetworkSummary::Connected)
+}
+
+/// Which status bar zone (if any) the pointer currently sits over -- see
+/// `App::status_bar_hover`'s own doc comment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StatusBarHoverZone {
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StatusBarHover {
+    pub zone: StatusBarHoverZone,
+    pub column: u16,
+    pub row: u16,
+}
 
 /// Steps `App::advance_animation_frame` moves `GlobalSearchState::
 /// expand_step` toward its target by, one per call -- `client::run`'s own
@@ -3458,6 +3968,34 @@ pub struct App {
     /// working completely unchanged and still ends up on the marquee for
     /// free.
     pub marquee_log: VecDeque<String>,
+    /// The LEFT status bar zone's own clock settings -- see
+    /// [`ClockSettings`]'s own doc comment. Persisted (`preferences::
+    /// UiPreferences::clock_follow_system`/`clock_manual_offset_hours`/
+    /// `clock_use_24h`/`clock_show_utc_prefix`), same as `marquee_enabled`
+    /// above.
+    pub clock_settings: ClockSettings,
+    /// The RIGHT status bar zone's own pet preferences -- see
+    /// [`PetSettings`]'s own doc comment. Persisted (`preferences::
+    /// UiPreferences::pet_figure`/`pet_speed`/`pet_enabled`).
+    pub pet_settings: PetSettings,
+    /// The pet's own live motion state -- see [`PetMotionState`]'s own
+    /// doc comment for why this is NOT persisted. `pub(crate)` rather than
+    /// fully private: `render.rs` reads `.x`/`.dir` every frame to paint
+    /// the figure, `client.rs` calls `App::step_pet` (which owns writing
+    /// to it) once per redraw.
+    pub(crate) pet_motion: PetMotionState,
+    /// Which status bar zone (LEFT clock / RIGHT pet), if any, the
+    /// pointer currently sits over -- derived fresh every `App::hover`
+    /// call from `self.layout.status_bar_left`/`status_bar_right`'s own
+    /// hit regions (see `App::hover`'s own doc comment), the same
+    /// "recompute from the hit rects every frame, keep no per-character/
+    /// per-pixel state of its own" contract `context_usage_hover` already
+    /// established. Drives BOTH the hover shimmer (`render::
+    /// render_status_bar_left`/`right`) and the fast-cadence redraw claim
+    /// (`client::animation_wake_interval`) -- see `docs/gate4agent/
+    /// research/hover-shimmer-and-animated-pet-spec-2026-08-24.md`
+    /// sections 1.7 and 3.
+    pub status_bar_hover: Option<StatusBarHover>,
     /// The app-wide quick search living in the GLOBAL tab strip -- see
     /// [`GlobalSearchState`]'s own doc comment.
     pub global_search: GlobalSearchState,
@@ -3571,6 +4109,10 @@ impl Default for App {
             notice: None,
             marquee_enabled: true,
             marquee_log: VecDeque::new(),
+            clock_settings: ClockSettings::default(),
+            pet_settings: PetSettings::default(),
+            pet_motion: PetMotionState::default(),
+            status_bar_hover: None,
             global_search: GlobalSearchState::default(),
             terminal_rows: 24,
             terminal_cols: 80,
@@ -3763,6 +4305,41 @@ impl App {
         FRAMES[(usize::from(self.animation_tick) / 4) % FRAMES.len()]
     }
 
+    /// Advances the RIGHT zone's pet by one elapsed-time step -- called
+    /// once per redraw (`client::run`, immediately before `render::
+    /// render`), the same "step state, then render" ordering `client::run`
+    /// already uses for `advance_animation_frame`. A disabled pet is left
+    /// entirely untouched (no motion to integrate, and no stale `dt` to
+    /// accumulate for when it's turned back on). `room` is this zone's own
+    /// fixed width (`STATUS_BAR_RIGHT_WIDTH`) minus the selected figure's
+    /// own face width -- see `PetMotionState::step`'s own doc comment for
+    /// the integrator itself.
+    pub(crate) fn step_pet(&mut self, now: Instant) {
+        if !self.pet_settings.enabled {
+            return;
+        }
+        let room = f64::from(STATUS_BAR_RIGHT_WIDTH) - self.pet_settings.figure.face_width() as f64;
+        self.pet_motion.step(now, room, self.pet_settings.speed.cells_per_second());
+    }
+
+    /// One of the two NEW fast-cadence claims slice B adds (see `client::
+    /// animation_wake_interval`'s own doc comment) -- an enabled pet keeps
+    /// the whole UI redrawing at its own fast cadence continuously,
+    /// exactly per `docs/gate4agent/research/hover-shimmer-and-animated-
+    /// pet-spec-2026-08-24.md` section 3's own "enabling the pet keeps the
+    /// app at 60 Hz continuously."
+    pub(crate) fn pet_wants_fast_cadence(&self) -> bool {
+        self.pet_settings.enabled
+    }
+
+    /// The other NEW fast-cadence claim: a hovered shimmer slot (the LEFT
+    /// clock or the RIGHT pet) wants the 72ms re-roll cadence for as long
+    /// as the pointer sits over it, and no longer -- see `App::hover`'s
+    /// own doc comment for how `status_bar_hover` is derived.
+    pub(crate) fn status_bar_shimmer_hovered(&self) -> bool {
+        self.status_bar_hover.is_some()
+    }
+
     /// The status bar's own LEFT-zone summary -- worst-state-wins across
     /// every node this `App` currently holds. See [`NetworkSummary`]'s own
     /// doc comment.
@@ -3860,6 +4437,65 @@ impl App {
         self.marquee_enabled = !self.marquee_enabled;
     }
 
+    /// The LEFT zone's own display string this frame -- reads `SystemTime::
+    /// now()` and (only while `follow_system` is set) `platform::local_
+    /// utc_offset_seconds` fresh every call, the same "impure wall-clock
+    /// read straight inside an `App` method" shape `next_launch_
+    /// idempotency_key` above already uses, rather than caching either
+    /// behind some "last computed at" field: a live DST transition or a
+    /// tick of the second hand both need to show up without this `App`
+    /// carrying any extra timer state of its own to notice them. The
+    /// actual pure arithmetic (`clock_display_text` and what it calls) is
+    /// what the tests below pin -- this wrapper is deliberately thin.
+    pub(crate) fn clock_text(&self) -> String {
+        let utc_seconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(0);
+        let system_offset_seconds = self
+            .clock_settings
+            .follow_system
+            .then(|| crate::platform::local_utc_offset_seconds().ok())
+            .flatten();
+        clock_display_text(self.clock_settings, system_offset_seconds, utc_seconds)
+    }
+
+    /// A read-only echo of what `follow_system` resolves to RIGHT NOW,
+    /// truncated to whole hours for the modal's own informational row
+    /// (`render::render_status_bar_left_modal`) -- shown even while on
+    /// manual mode, so flipping `follow_system` back on has a visible,
+    /// honest preview instead of being a bet on an unlabeled toggle.
+    pub(crate) fn system_clock_offset_hours(&self) -> Option<i32> {
+        crate::platform::local_utc_offset_seconds()
+            .ok()
+            .map(|seconds| seconds / 3600)
+    }
+
+    /// The LEFT zone modal's own manual-offset stepper (`HitTarget::
+    /// StatusBarClockOffsetPrevious`/`Next`). MLC's own `cycle_timezone`
+    /// (`scale_settings.rs:82-88`) wraps at both ends rather than
+    /// stopping dead; this mirrors that, the same "one control, both
+    /// directions, no dead end" shape `HarnessLaunchPanelPrevious`/`Next`
+    /// already use elsewhere in this file for an unrelated pager.
+    fn step_clock_manual_offset(&mut self, delta: i32) {
+        const SPAN: i32 = ClockSettings::MAX_OFFSET_HOURS - ClockSettings::MIN_OFFSET_HOURS + 1;
+        let zeroed = self.clock_settings.manual_offset_hours - ClockSettings::MIN_OFFSET_HOURS;
+        let stepped = (zeroed + delta).rem_euclid(SPAN);
+        self.clock_settings.manual_offset_hours = stepped + ClockSettings::MIN_OFFSET_HOURS;
+    }
+
+    fn toggle_clock_follow_system(&mut self) {
+        self.clock_settings.follow_system = !self.clock_settings.follow_system;
+    }
+
+    fn toggle_clock_use_24h(&mut self) {
+        self.clock_settings.use_24h = !self.clock_settings.use_24h;
+    }
+
+    fn toggle_clock_show_utc_prefix(&mut self) {
+        self.clock_settings.show_utc_prefix = !self.clock_settings.show_utc_prefix;
+    }
+
     /// Opens whichever status bar zone modal `focus` names, remembering
     /// where to return to -- the click handler for all three zones
     /// (`HitTarget::StatusBarLeft`/`Center`/`Right`), reachable from any
@@ -3885,6 +4521,26 @@ impl App {
             Some(HitTarget::ModalClose) => self.close_status_bar_zone(),
             Some(HitTarget::StatusBarMarqueeToggle) if self.focus == Focus::StatusBarCenter => {
                 self.toggle_marquee();
+                AppAction::None
+            }
+            Some(HitTarget::StatusBarClockFollowSystem) if self.focus == Focus::StatusBarLeft => {
+                self.toggle_clock_follow_system();
+                AppAction::None
+            }
+            Some(HitTarget::StatusBarClockOffsetPrevious) if self.focus == Focus::StatusBarLeft => {
+                self.step_clock_manual_offset(-1);
+                AppAction::None
+            }
+            Some(HitTarget::StatusBarClockOffsetNext) if self.focus == Focus::StatusBarLeft => {
+                self.step_clock_manual_offset(1);
+                AppAction::None
+            }
+            Some(HitTarget::StatusBarClockUse24h) if self.focus == Focus::StatusBarLeft => {
+                self.toggle_clock_use_24h();
+                AppAction::None
+            }
+            Some(HitTarget::StatusBarClockShowUtcPrefix) if self.focus == Focus::StatusBarLeft => {
+                self.toggle_clock_show_utc_prefix();
                 AppAction::None
             }
             Some(HitTarget::StatusBarLeftDrag) => {
@@ -11819,6 +12475,13 @@ impl App {
                 // `click_status_bar_zone` guard -- never actually
                 // reachable here.
                 | HitTarget::StatusBarMarqueeToggle
+                // Same shape, for `Focus::StatusBarLeft`'s own `click_
+                // status_bar_zone` guard covering the clock settings rows.
+                | HitTarget::StatusBarClockFollowSystem
+                | HitTarget::StatusBarClockOffsetPrevious
+                | HitTarget::StatusBarClockOffsetNext
+                | HitTarget::StatusBarClockUse24h
+                | HitTarget::StatusBarClockShowUtcPrefix
                 // Same shape, for the other two zones' own drag rows --
                 // `click_status_bar_zone` handles all three regardless of
                 // which `Focus::StatusBar*` is active.
@@ -11887,22 +12550,44 @@ impl App {
         }
     }
 
+    /// Derives every per-frame hover projection from the SAME topmost hit
+    /// at `(column, row)` -- `context_usage_hover` (pre-existing) and
+    /// `status_bar_hover` (slice B, new) both read off one shared `.rev().
+    /// find(...)` lookup rather than two independent scans, so they can
+    /// never disagree about which hit is actually on top (e.g. a modal
+    /// opened over the status bar correctly yields `status_bar_hover =
+    /// None`, since the topmost hit at that point is the modal's own,
+    /// never `HitTarget::StatusBarLeft`/`Right` underneath it). See
+    /// `StatusBarHover`'s own doc comment for what it drives.
     pub fn hover(&mut self, column: u16, row: u16) -> AppAction {
         self.harness_kanban.hover_position = Some((column, row));
-        self.context_usage_hover = self
+        let topmost = self
             .layout
             .hits
             .iter()
             .rev()
-            .find(|hit| hit.rect.contains(column, row))
-            .and_then(|hit| match &hit.target {
-                HitTarget::ContextUsageSegment(segment) => Some(ContextUsageHover {
-                    column,
-                    row,
-                    hit: *segment,
-                }),
-                _ => None,
-            });
+            .find(|hit| hit.rect.contains(column, row));
+        self.context_usage_hover = topmost.and_then(|hit| match &hit.target {
+            HitTarget::ContextUsageSegment(segment) => Some(ContextUsageHover {
+                column,
+                row,
+                hit: *segment,
+            }),
+            _ => None,
+        });
+        self.status_bar_hover = topmost.and_then(|hit| match &hit.target {
+            HitTarget::StatusBarLeft => Some(StatusBarHover {
+                zone: StatusBarHoverZone::Left,
+                column,
+                row,
+            }),
+            HitTarget::StatusBarRight => Some(StatusBarHover {
+                zone: StatusBarHoverZone::Right,
+                column,
+                row,
+            }),
+            _ => None,
+        });
         AppAction::None
     }
 
@@ -21070,11 +21755,223 @@ fn validate_session_name(name: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use gate4agent_harness_client::{
         FeatureObservationStateV1, HarnessMonitoringVisibilityV1, MonitorFeatureStatesV1,
         ObservationEvidenceV1 as HarnessObservationEvidenceV1, ProjectionAvailabilityV1,
         ProjectionFreshnessV1, TimelineCategoryV1, TimelineStateV1,
     };
+
+    /// A positive offset rolling PAST midnight: `23:59:59 UTC` (one second
+    /// before a day boundary) plus `+3` lands the local time back at
+    /// `02:59:59` -- the double-mod in `format_clock_time` must wrap
+    /// forward across the boundary rather than reporting an hour >= 24.
+    #[test]
+    fn format_clock_time_rolls_forward_past_midnight_on_a_positive_offset() {
+        let one_second_before_midnight = 86_399;
+        assert_eq!(
+            format_clock_time(one_second_before_midnight, 3 * 3600, true),
+            "02:59:59",
+        );
+    }
+
+    /// A negative offset rolling BACK across midnight: `00:00:00 UTC`
+    /// minus `5` hours lands the local time at the PREVIOUS day's
+    /// `19:00:00` -- this is exactly the case the double-mod (`(local %
+    /// 86_400 + 86_400) % 86_400`) exists for for: Rust's own `%` alone
+    /// would return a negative remainder here, not the wrapped value.
+    #[test]
+    fn format_clock_time_rolls_backward_past_midnight_on_a_negative_offset() {
+        let midnight_utc = 0;
+        assert_eq!(
+            format_clock_time(midnight_utc, -5 * 3600, true),
+            "19:00:00",
+        );
+    }
+
+    /// 12-hour formatting's two edge hours: MLC's own `format_clock_time`
+    /// maps UTC hour-of-day `0` to `12:..:.. AM` (midnight) and `12` to
+    /// `12:..:.. PM` (noon) -- both are the ONLY two hours that produce a
+    /// 2-digit `"12"` in 12-hour mode (every other hour is 1 digit), which
+    /// is exactly why `CLOCK_MAX_WIDTH`'s own derivation singles them out.
+    #[test]
+    fn format_clock_time_12h_maps_midnight_and_noon_to_twelve() {
+        assert_eq!(format_clock_time(0, 0, false), "12:00:00 AM");
+        assert_eq!(format_clock_time(12 * 3600, 0, false), "12:00:00 PM");
+        // A non-edge hour stays single-digit, confirming the two edges
+        // above are genuinely the widest case, not an artifact of always
+        // zero-padding the hour.
+        assert_eq!(format_clock_time(15 * 3600, 0, false), "3:00:00 PM");
+    }
+
+    /// `ClockSettings::MIN_OFFSET_HOURS..=MAX_OFFSET_HOURS` is `-12..=12`;
+    /// anything outside it (from either direction) is clamped, never
+    /// carried through, whether it comes from the modal's own stepper or
+    /// (see `preferences.rs`'s own clamp test) a hand-edited config file.
+    #[test]
+    fn clamped_offset_hours_clamps_both_directions() {
+        assert_eq!(ClockSettings::clamped_offset_hours(47), 12);
+        assert_eq!(ClockSettings::clamped_offset_hours(-47), -12);
+        assert_eq!(ClockSettings::clamped_offset_hours(5), 5);
+    }
+
+    /// `follow_system` always wins over `manual_offset_hours` when a
+    /// system reading exists, and manual mode never even looks at the
+    /// system reading -- the two modes cannot blend, in either direction.
+    #[test]
+    fn effective_offset_follow_system_and_manual_never_blend() {
+        let following = ClockSettings {
+            follow_system: true,
+            manual_offset_hours: 5,
+            use_24h: true,
+            show_utc_prefix: true,
+        };
+        assert_eq!(
+            effective_clock_offset_seconds(following, Some(3 * 3600)),
+            3 * 3600,
+            "follow_system must ignore manual_offset_hours entirely",
+        );
+        assert_eq!(
+            effective_clock_offset_seconds(following, None),
+            0,
+            "a missing system reading falls back to UTC, never the manual value",
+        );
+
+        let manual = ClockSettings {
+            follow_system: false,
+            manual_offset_hours: 5,
+            use_24h: true,
+            show_utc_prefix: true,
+        };
+        assert_eq!(
+            effective_clock_offset_seconds(manual, Some(3 * 3600)),
+            5 * 3600,
+            "manual mode must ignore an available system reading entirely",
+        );
+        assert_eq!(effective_clock_offset_seconds(manual, None), 5 * 3600);
+    }
+
+    /// `CLOCK_MAX_WIDTH`'s own derivation, pinned end-to-end through
+    /// `clock_display_text` rather than trusted as a hand-worked comment:
+    /// 12-hour format, `show_utc_prefix` on, offset `+12` (`UTC+12`, the
+    /// widest magnitude), local hour landed exactly on noon (`12`, the
+    /// widest hour representation) by choosing `utc_seconds = 0` --
+    /// `0 + 12h == 12:00:00 PM` locally.
+    #[test]
+    fn clock_display_text_hits_exactly_clock_max_width_in_its_widest_configuration() {
+        let widest = ClockSettings {
+            follow_system: false,
+            manual_offset_hours: 12,
+            use_24h: false,
+            show_utc_prefix: true,
+        };
+        let text = clock_display_text(widest, None, 0);
+        assert_eq!(text, "[UTC+12] 12:00:00 PM");
+        assert_eq!(text.chars().count(), CLOCK_MAX_WIDTH as usize);
+
+        // The LEFT zone's own content (`" {clock} "`, slice B removed the
+        // trailing network dot -- see `app::pet_connection_color_key`'s
+        // own doc comment) must still fit `STATUS_BAR_LEFT_WIDTH` at this
+        // exact widest clock string.
+        let zone_content_len = 1 + text.chars().count() + 1;
+        assert!(
+            zone_content_len <= STATUS_BAR_LEFT_WIDTH as usize,
+            "widest clock ({zone_content_len} cells incl. pad) must fit STATUS_BAR_LEFT_WIDTH ({STATUS_BAR_LEFT_WIDTH})",
+        );
+    }
+
+    /// Section 2.3's own bounce: reaching either edge clamps `x` to it and
+    /// flips `dir` -- pinned at BOTH edges in one test, walking the figure
+    /// there and back with a speed/`dt` large enough to overshoot in a
+    /// single step (proving the clamp, not just a coincidental landing).
+    #[test]
+    fn pet_motion_bounces_and_flips_direction_at_both_edges() {
+        let mut motion = PetMotionState::default();
+        let room = 5.0;
+        let now = Instant::now();
+
+        // First step establishes `last_step_time` at `dt = 0` -- no motion
+        // yet, matching the spec's own "on the very first frame dt = 0".
+        motion.step(now, room, 1000.0);
+        assert_eq!(motion.x, 0.0);
+        assert_eq!(motion.dir, 1.0);
+
+        // A huge nominal speed, clamped to `PET_MAX_STEP_SECONDS` (0.05s)
+        // by the integrator itself, still overshoots `room` in one step --
+        // proves the clamp-to-edge, not merely "happened to land exactly
+        // on it."
+        motion.step(now + Duration::from_secs(1), room, 1000.0);
+        assert_eq!(motion.x, room, "must clamp to the right edge, never overshoot past it");
+        assert_eq!(motion.dir, -1.0, "must flip to leftward after hitting the right edge");
+
+        motion.step(now + Duration::from_secs(2), room, 1000.0);
+        assert_eq!(motion.x, 0.0, "must clamp to the left edge, never undershoot past it");
+        assert_eq!(motion.dir, 1.0, "must flip to rightward after hitting the left edge");
+    }
+
+    /// Section 2.3's own clamp: "clamped to a maximum of 0.05s (so a stall
+    /// or a slow frame cannot fling the figure across the slot in one
+    /// jump)". A ten-SECOND gap between steps must still only move the
+    /// figure as far as `speed * PET_MAX_STEP_SECONDS` would carry it, not
+    /// `speed * 10`.
+    #[test]
+    fn pet_motion_clamps_the_elapsed_delta_so_a_stall_never_flings_it_across_the_slot() {
+        let mut motion = PetMotionState::default();
+        let room = 100.0;
+        let speed = 10.0;
+        let now = Instant::now();
+
+        motion.step(now, room, speed); // dt = 0, establishes last_step_time
+        motion.step(now + Duration::from_secs(10), room, speed);
+
+        let max_possible_step = speed * PET_MAX_STEP_SECONDS;
+        assert!(
+            motion.x <= max_possible_step + f64::EPSILON,
+            "a 10s gap must not move the pet further than the {PET_MAX_STEP_SECONDS}s-clamped step \
+             ({max_possible_step} cells); moved to {}",
+            motion.x,
+        );
+        assert!(motion.x > 0.0, "the clamped step must still move it forward, not freeze it dead");
+    }
+
+    /// `room <= 0` (the figure's own face is wider than the slot) pins it
+    /// at column 0 and never moves it, regardless of speed or elapsed time.
+    #[test]
+    fn pet_motion_pins_at_zero_when_the_slot_has_no_room() {
+        let mut motion = PetMotionState::default();
+        let now = Instant::now();
+        motion.step(now, 0.0, 5.0);
+        motion.step(now + Duration::from_secs(1), -1.0, 5.0);
+        assert_eq!(motion.x, 0.0);
+    }
+
+    /// Owner instruction (slice B item 5): the pet's own colour carries
+    /// connected vs. disconnected -- `Connected` reads green, every other
+    /// summary reads a visibly different colour (yellow/red/muted), so a
+    /// screenshot of the pet alone already tells the two apart.
+    #[test]
+    fn pet_connection_color_distinguishes_connected_from_disconnected() {
+        assert_eq!(pet_connection_color_key(NetworkSummary::Connected), PetConnectionColor::Green);
+        assert_eq!(pet_connection_color_key(NetworkSummary::Disconnected), PetConnectionColor::Red);
+        assert_ne!(
+            pet_connection_color_key(NetworkSummary::Connected),
+            pet_connection_color_key(NetworkSummary::Disconnected),
+        );
+        assert_eq!(pet_connection_color_key(NetworkSummary::NoNodes), PetConnectionColor::Muted);
+        assert_eq!(pet_connection_color_key(NetworkSummary::Transitioning), PetConnectionColor::Yellow);
+    }
+
+    /// The pet's own POSE also carries connection state (owner
+    /// instruction's own "...and, where the spec's figure set allows it,
+    /// which figure or pose is shown"): only `Connected` lets the blink
+    /// cycle run; every other summary suspends it.
+    #[test]
+    fn pet_blink_is_suspended_for_every_summary_except_connected() {
+        assert!(!pet_blink_suspended_for_connection(NetworkSummary::Connected));
+        assert!(pet_blink_suspended_for_connection(NetworkSummary::Disconnected));
+        assert!(pet_blink_suspended_for_connection(NetworkSummary::Transitioning));
+        assert!(pet_blink_suspended_for_connection(NetworkSummary::NoNodes));
+    }
 
     fn harness_task(id_digit: char, state: HarnessTaskStateV1, revision: u64) -> RedactedTaskV1 {
         RedactedTaskV1 {

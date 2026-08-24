@@ -125,6 +125,21 @@ const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const DIRTY_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(80);
 const ANIMATION_TICKS_PER_FRAME: u8 = 4;
+/// The hovered-shimmer-slot fast cadence -- the SAME 72ms `shimmer::
+/// SHIMMER_TICK_MILLIS` the shimmer's own glyphs re-roll on (see that
+/// module's own doc comment), so a hovered clock/pet slot never redraws
+/// slower than its own flicker actually changes.
+const SHIMMER_ANIMATION_INTERVAL: Duration =
+    Duration::from_millis(crate::shimmer::SHIMMER_TICK_MILLIS);
+/// The enabled-pet fast cadence -- `docs/gate4agent/research/hover-
+/// shimmer-and-animated-pet-spec-2026-08-24.md` section 3's own "~16ms,
+/// ~60Hz" ("enabling the pet keeps the app at 60Hz continuously"). Its own
+/// named constant, kept separate from `DIRTY_FRAME_INTERVAL` even though
+/// both happen to be 16ms today -- the two express different concepts
+/// (one bounds a state-changed redraw's own coalescing window, the other
+/// is an animation source's own desired cadence) that could reasonably
+/// diverge later.
+const PET_ANIMATION_INTERVAL: Duration = Duration::from_millis(16);
 const MAX_TERMINAL_EVENT_BATCH: usize = 256;
 const HARNESS_SNAPSHOT_PAGE_SIZE: u16 = 64;
 const HARNESS_TASK_PAGE_BUDGET: usize = 16;
@@ -563,10 +578,31 @@ struct PendingRaw {
 /// Decouples terminal polling from full-screen rendering.  The event loop still
 /// polls often enough to keep Node/C2 updates and PTY input responsive, but a
 /// poll with no visible state change no longer writes the complete frame.
+///
+/// Slice B (`docs/gate4agent/plans/gate4agent-tui-status-bar-clock-shimmer-
+/// and-pet-2026-08-24.md`, "Per-source animation cadence") generalizes the
+/// animation side from a single fixed 80ms interval to a per-call
+/// `Option<Duration>` -- see `animation_wake_interval`'s own doc comment
+/// for how the caller computes it as the minimum over whichever animation
+/// sources are ACTUALLY active right now (spinner/marquee/search/loading
+/// tabs at 80ms, a hovered shimmer slot at 72ms, an enabled pet at its own
+/// fast cadence). `next_animation` itself still only ever tracks ONE
+/// deadline -- it simply reschedules at whatever interval the caller
+/// currently passes, instead of always `ANIMATION_FRAME_INTERVAL`.
 struct FrameScheduler {
     dirty: bool,
     next_dirty_frame: Instant,
     next_animation: Option<Instant>,
+    /// The spinner/marquee/search tick's OWN 80ms cadence, tracked
+    /// SEPARATELY from `next_animation` above -- without this, a faster
+    /// `next_animation` interval (demanded by a hovered shimmer slot or an
+    /// enabled pet) would also speed up `App::advance_animation_frame`
+    /// itself, since pre-slice-B that call was gated by the exact same
+    /// deadline `consume_redraw` reschedules. See [`Self::spinner_tick_
+    /// due`] and `client::run`'s own call site for how this stays pinned
+    /// to 80ms regardless of how often a redraw fires for some OTHER
+    /// reason.
+    next_spinner_tick: Option<Instant>,
 }
 
 impl FrameScheduler {
@@ -575,6 +611,7 @@ impl FrameScheduler {
             dirty: true,
             next_dirty_frame: now,
             next_animation: None,
+            next_spinner_tick: None,
         }
     }
 
@@ -582,39 +619,58 @@ impl FrameScheduler {
         self.dirty = true;
     }
 
-    fn redraw_due(&self, now: Instant, animation_active: bool) -> bool {
+    fn redraw_due(&self, now: Instant, animation_interval: Option<Duration>) -> bool {
         (self.dirty && now >= self.next_dirty_frame)
-            || (animation_active && self.next_animation.is_some_and(|deadline| now >= deadline))
+            || (animation_interval.is_some() && self.next_animation.is_some_and(|deadline| now >= deadline))
     }
 
-    fn consume_redraw(&mut self, now: Instant, animation_active: bool) -> bool {
-        let advance_animation = animation_active
+    fn consume_redraw(&mut self, now: Instant, animation_interval: Option<Duration>) {
+        let advance = animation_interval.is_some()
             && self.next_animation.is_some_and(|deadline| now >= deadline);
         self.dirty = false;
         self.next_dirty_frame = now + DIRTY_FRAME_INTERVAL;
-        self.next_animation = if animation_active {
-            Some(if advance_animation {
-                now + ANIMATION_FRAME_INTERVAL
+        self.next_animation = match animation_interval {
+            Some(interval) => Some(if advance {
+                now + interval
             } else {
-                self.next_animation.unwrap_or(now + ANIMATION_FRAME_INTERVAL)
-            })
-        } else {
-            None
+                self.next_animation.unwrap_or(now + interval)
+            }),
+            None => None,
         };
-        advance_animation
+    }
+
+    /// Whether `App::advance_animation_frame` should run THIS loop pass --
+    /// gated at its OWN fixed `ANIMATION_FRAME_INTERVAL`, independent of
+    /// whatever (possibly much faster) cadence `redraw_due`/`consume_
+    /// redraw` above are currently running the general redraw at. `active`
+    /// is `App::has_active_animation()`, unchanged -- exactly the same
+    /// predicate that gated this call before slice B. Resets its own
+    /// deadline to `None` the moment `active` goes false, so reactivating
+    /// later starts a fresh 80ms wait rather than inheriting a stale,
+    /// possibly-already-past deadline from before it went idle.
+    fn spinner_tick_due(&mut self, now: Instant, active: bool) -> bool {
+        if !active {
+            self.next_spinner_tick = None;
+            return false;
+        }
+        let due = self.next_spinner_tick.map_or(true, |deadline| now >= deadline);
+        if due {
+            self.next_spinner_tick = Some(now + ANIMATION_FRAME_INTERVAL);
+        }
+        due
     }
 
     fn poll_timeout(
         &self,
         now: Instant,
-        animation_active: bool,
+        animation_interval: Option<Duration>,
         deadlines: &[Option<Instant>],
     ) -> Duration {
         let mut timeout = EVENT_POLL_INTERVAL;
         if self.dirty {
             timeout = timeout.min(self.next_dirty_frame.saturating_duration_since(now));
         }
-        if animation_active {
+        if animation_interval.is_some() {
             if let Some(deadline) = self.next_animation {
                 timeout = timeout.min(deadline.saturating_duration_since(now));
             }
@@ -623,6 +679,64 @@ impl FrameScheduler {
             timeout.min(deadline.saturating_duration_since(now))
         })
     }
+}
+
+/// The union of every "does the UI need to keep redrawing on its own"
+/// source, and the TIGHTEST cadence any single currently-active one wants
+/// -- see `docs/gate4agent/research/hover-shimmer-and-animated-pet-spec-
+/// 2026-08-24.md` section 3. Before slice B this was one boolean
+/// (`App::has_active_animation`) driving one fixed `ANIMATION_FRAME_
+/// INTERVAL` for everything; slice B adds two more claims, each wanting a
+/// DIFFERENT period from the spinner/marquee/search's existing 80ms: a
+/// hovered shimmer slot (`SHIMMER_ANIMATION_INTERVAL`, 72ms) and an
+/// enabled pet (`PET_ANIMATION_INTERVAL`). Only sources that are ACTUALLY
+/// active right now contribute -- e.g. a disabled pet with nothing else
+/// animating contributes nothing at all (`None`), the exact same idle
+/// case slice A already had. `None` means "nothing wants periodic
+/// redraws"; `FrameScheduler::redraw_due`/`consume_redraw`/`poll_timeout`
+/// all already treat that identically to the old `false`.
+fn animation_wake_interval(app: &App) -> Option<Duration> {
+    let mut interval = app.has_active_animation().then_some(ANIMATION_FRAME_INTERVAL);
+    if app.status_bar_shimmer_hovered() {
+        interval = Some(
+            interval.map_or(SHIMMER_ANIMATION_INTERVAL, |current| current.min(SHIMMER_ANIMATION_INTERVAL)),
+        );
+    }
+    if app.pet_wants_fast_cadence() {
+        interval = Some(interval.map_or(PET_ANIMATION_INTERVAL, |current| current.min(PET_ANIMATION_INTERVAL)));
+    }
+    interval
+}
+
+/// The status bar clock's own redraw trigger -- the one piece MLC's own
+/// model has nothing to lend (see `docs/gate4agent/research/mlc-time-and-
+/// timezone-model-2026-08-24.md`'s own §4: MLC never needed one, since its
+/// whole chart already redraws continuously at ~60fps for unrelated
+/// reasons). This app is idle-cheap and only redraws on input, a deadline,
+/// or `App::has_active_animation` -- a per-second clock is none of those
+/// on its own, so it earns its own entry in `FrameScheduler::poll_
+/// timeout`'s existing deadline slice instead: computed as an `Instant`
+/// exactly `remaining` out from `now`, where `remaining` is how much of
+/// the CURRENT wall-clock second is still left (`1000 - subsec_millis()`,
+/// floored at 1ms so an exact-boundary read still waits a whole second
+/// rather than firing immediately). This is deliberately NOT routed
+/// through `has_active_animation`/`ANIMATION_FRAME_INTERVAL`: an active
+/// animation keeps the app rendering every 80ms regardless of whether
+/// anything is animating THIS second, which would burn CPU 12x more often
+/// than the clock's own digit actually changes.
+fn next_clock_second_boundary(now: Instant) -> Instant {
+    let millis_into_second = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.subsec_millis())
+        .unwrap_or(0);
+    // `1000 - millis_into_second` is already `0..=1000`; `.max(1)` only
+    // matters for the exact-boundary read (`millis_into_second == 0`,
+    // which this formula already maps to 1000, so the `.max` never
+    // actually changes anything -- kept as a documented invariant rather
+    // than a silent assumption, cheaper than deleting it and re-deriving
+    // "why can this never be zero" later).
+    let remaining_millis = 1000u32.saturating_sub(millis_into_second).max(1);
+    now + Duration::from_millis(u64::from(remaining_millis))
 }
 
 fn is_coalescible_drag(event: &TerminalEvent) -> bool {
@@ -931,13 +1045,25 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
             frames.mark_dirty();
         }
         let now = Instant::now();
-        let animation_active = app.has_active_animation();
-        if frames.redraw_due(now, animation_active) {
-            if frames.consume_redraw(now, animation_active) {
+        // See `animation_wake_interval`'s own doc comment: this is now the
+        // MINIMUM cadence any currently-active source wants, not always
+        // `ANIMATION_FRAME_INTERVAL` -- `spinner_tick_due` below is what
+        // keeps `App::advance_animation_frame` itself pinned to its own
+        // historical 80ms regardless of how much faster THIS redraw's own
+        // cadence is running (a hovered shimmer slot or an enabled pet).
+        let animation_interval = animation_wake_interval(&app);
+        if frames.redraw_due(now, animation_interval) {
+            frames.consume_redraw(now, animation_interval);
+            if frames.spinner_tick_due(now, app.has_active_animation()) {
                 for _ in 0..ANIMATION_TICKS_PER_FRAME {
                     app.advance_animation_frame();
                 }
             }
+            // The pet's own elapsed-time integrator (section 2.3) -- reads
+            // real wall-clock time directly, so it stays correct regardless
+            // of how sparsely or densely this block actually runs; see
+            // `App::step_pet`'s own doc comment.
+            app.step_pet(now);
             app.layout = render::render(&app, screen.buffer_mut());
             for action in changed_terminal_sizes(&app, &mut last_terminal_sizes) {
                 queue_action(&mut app, &commands, &inspection_commands, &mut pending_raw, action);
@@ -965,15 +1091,23 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
         let harness_terminal_deadline = harness_terminal_poll_address
             .is_some()
             .then_some(next_harness_terminal_poll);
+        // Only armed while the LEFT zone actually painted something this
+        // frame (`app.layout.status_bar_left` is zero-width on a terminal
+        // too small to show it, or before the very first render) -- see
+        // `next_clock_second_boundary`'s own doc comment for why this is a
+        // deadline rather than routed through `has_active_animation`.
+        let clock_deadline = (app.layout.status_bar_left.width > 0)
+            .then(|| next_clock_second_boundary(Instant::now()));
         let poll_timeout = frames.poll_timeout(
             Instant::now(),
-            app.has_active_animation(),
+            animation_interval,
             &[
                 notice_deadline,
                 preferences_deadline,
                 raw_deadline,
                 inspection_deadline,
                 harness_terminal_deadline,
+                clock_deadline,
             ],
         );
         if event::poll(poll_timeout)? {
@@ -6951,11 +7085,11 @@ mod tests {
         let now = Instant::now();
         let mut scheduler = FrameScheduler::new(now);
 
-        assert!(scheduler.redraw_due(now, false));
-        assert!(!scheduler.consume_redraw(now, false));
-        assert!(!scheduler.redraw_due(now + Duration::from_secs(1), false));
+        assert!(scheduler.redraw_due(now, None));
+        scheduler.consume_redraw(now, None);
+        assert!(!scheduler.redraw_due(now + Duration::from_secs(1), None));
         assert_eq!(
-            scheduler.poll_timeout(now + Duration::from_secs(1), false, &[]),
+            scheduler.poll_timeout(now + Duration::from_secs(1), None, &[]),
             EVENT_POLL_INTERVAL
         );
     }
@@ -6964,26 +7098,58 @@ mod tests {
     fn frame_scheduler_coalesces_dirty_frames_to_sixty_hz_and_keeps_animation_bounded() {
         let now = Instant::now();
         let mut scheduler = FrameScheduler::new(now);
-        let _ = scheduler.consume_redraw(now, false);
+        scheduler.consume_redraw(now, None);
         scheduler.mark_dirty();
 
-        assert!(!scheduler.redraw_due(now + Duration::from_millis(15), false));
-        assert!(scheduler.redraw_due(now + DIRTY_FRAME_INTERVAL, false));
-        assert!(!scheduler.consume_redraw(now + DIRTY_FRAME_INTERVAL, true));
+        assert!(!scheduler.redraw_due(now + Duration::from_millis(15), None));
+        assert!(scheduler.redraw_due(now + DIRTY_FRAME_INTERVAL, None));
+        scheduler.consume_redraw(now + DIRTY_FRAME_INTERVAL, Some(ANIMATION_FRAME_INTERVAL));
         assert!(!scheduler.redraw_due(
             now + DIRTY_FRAME_INTERVAL + ANIMATION_FRAME_INTERVAL - Duration::from_millis(1),
-            true,
+            Some(ANIMATION_FRAME_INTERVAL),
         ));
         assert!(scheduler.redraw_due(
             now + DIRTY_FRAME_INTERVAL + ANIMATION_FRAME_INTERVAL,
-            true,
+            Some(ANIMATION_FRAME_INTERVAL),
         ));
-        assert!(scheduler.consume_redraw(
+        scheduler.consume_redraw(
             now + DIRTY_FRAME_INTERVAL + ANIMATION_FRAME_INTERVAL,
+            Some(ANIMATION_FRAME_INTERVAL),
+        );
+        let after = now + DIRTY_FRAME_INTERVAL + ANIMATION_FRAME_INTERVAL;
+        assert!(!scheduler.redraw_due(after + Duration::from_secs(1), None));
+    }
+
+    /// Slice B's own decoupling: `App::advance_animation_frame` must keep
+    /// ticking at its historical 80ms even when the SURROUNDING redraw
+    /// cadence is running much faster (a hovered shimmer slot or an
+    /// enabled pet demanding e.g. a 16ms `animation_interval`) -- see
+    /// `FrameScheduler::next_spinner_tick`'s own doc comment.
+    #[test]
+    fn spinner_tick_is_gated_at_its_own_cadence_independent_of_a_faster_animation_interval() {
+        let now = Instant::now();
+        let mut scheduler = FrameScheduler::new(now);
+
+        assert!(scheduler.spinner_tick_due(now, true), "first check while active ticks immediately");
+        assert!(!scheduler.spinner_tick_due(now + Duration::from_millis(16), true));
+        assert!(!scheduler.spinner_tick_due(
+            now + ANIMATION_FRAME_INTERVAL - Duration::from_millis(1),
             true,
         ));
-        let after = now + DIRTY_FRAME_INTERVAL + ANIMATION_FRAME_INTERVAL;
-        assert!(!scheduler.redraw_due(after + Duration::from_secs(1), false));
+        assert!(scheduler.spinner_tick_due(now + ANIMATION_FRAME_INTERVAL, true));
+    }
+
+    /// Going inactive clears the pending deadline, so reactivating later
+    /// ticks right away instead of inheriting a stale (possibly already
+    /// past) deadline from before it went idle.
+    #[test]
+    fn spinner_tick_resets_on_deactivation_so_reactivation_ticks_immediately() {
+        let now = Instant::now();
+        let mut scheduler = FrameScheduler::new(now);
+
+        assert!(scheduler.spinner_tick_due(now, true));
+        assert!(!scheduler.spinner_tick_due(now + Duration::from_millis(10), false));
+        assert!(scheduler.spinner_tick_due(now + Duration::from_millis(20), true));
     }
 
     #[test]

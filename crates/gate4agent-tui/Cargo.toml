@@ -19,7 +19,8 @@ gate4agent-observation-service = { path = "../gate4agent-observation-service" }
 gate4agent-types = { path = "../gate4agent-types" }
 icy_sixel = "0.6"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
-uzor-tui = "1.5.1"
+uzor-text = "1.5.1"
+uzor-tui = { version = "1.5.1", features = ["ascii"] }
 vt100 = "0.16"
 
 [target.'cfg(windows)'.dependencies]
@@ -29,6 +30,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_DataExchange",
     "Win32_System_Memory",
     "Win32_System_Threading",
+    "Win32_System_Time",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }

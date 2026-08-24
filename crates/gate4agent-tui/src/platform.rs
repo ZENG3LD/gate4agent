@@ -91,6 +91,66 @@ fn normalize_ctrl_char_windows(ch: char) -> Option<char> {
     }
 }
 
+/// The status bar clock's own "follow system" reading -- the ONE piece of
+/// this feature MLC has nothing to mirror at all (see `docs/gate4agent/
+/// research/mlc-time-and-timezone-model-2026-08-24.md`'s own §2: MLC's
+/// "timezone" is a manual picker with zero OS/locale detection anywhere).
+/// Returns the local UTC offset in SECONDS (east of UTC is positive,
+/// matching `app::ClockSettings`'s own arithmetic), or an error string on
+/// any platform/call that cannot answer -- the exact same `Result<_,
+/// String>` shape `read_clipboard_text`/`write_clipboard_text` above
+/// already use for "this platform doesn't support the operation", so a
+/// non-Windows target has something concrete to fall back to instead of
+/// failing to compile. Queried fresh on every call (no caching): `App::
+/// clock_text` calls this once per render while `follow_system` is set,
+/// which is cheap (a single `GetTimeZoneInformation` syscall) and is what
+/// lets a live DST transition show up without the app needing its own
+/// "re-check the OS" timer.
+pub fn local_utc_offset_seconds() -> Result<i32, String> {
+    #[cfg(windows)]
+    {
+        local_utc_offset_seconds_windows()
+    }
+
+    #[cfg(not(windows))]
+    {
+        Err("local UTC offset detection is unsupported on this platform".to_owned())
+    }
+}
+
+/// `GetTimeZoneInformation` reports a `Bias` (minutes to ADD to local time
+/// to get UTC) plus a `StandardBias`/`DaylightBias`, and tells the caller
+/// via its own return value which of the two is currently in effect --
+/// `TIME_ZONE_ID_DAYLIGHT` (2) selects `DaylightBias`, anything else
+/// (`TIME_ZONE_ID_UNKNOWN` == 0, or `TIME_ZONE_ID_STANDARD` == 1) selects
+/// `StandardBias`, per MSDN. The UTC offset actually wanted here is the
+/// NEGATION of that total bias, in seconds: `Bias` is "minutes to add to
+/// local to reach UTC", so "local minus UTC" (east-positive, the sign
+/// convention this whole feature uses) is the negative of it.
+#[cfg(windows)]
+fn local_utc_offset_seconds_windows() -> Result<i32, String> {
+    use windows_sys::Win32::System::Time::{GetTimeZoneInformation, TIME_ZONE_INFORMATION, TIME_ZONE_ID_INVALID};
+
+    const TIME_ZONE_ID_DAYLIGHT: u32 = 2;
+
+    let mut info = TIME_ZONE_INFORMATION::default();
+    let result = unsafe { GetTimeZoneInformation(&mut info) };
+    if result == TIME_ZONE_ID_INVALID {
+        return Err(format!(
+            "failed to read the system time zone: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let active_bias = if result == TIME_ZONE_ID_DAYLIGHT {
+        info.Bias.checked_add(info.DaylightBias)
+    } else {
+        info.Bias.checked_add(info.StandardBias)
+    };
+    active_bias
+        .and_then(|bias| bias.checked_mul(-60))
+        .ok_or_else(|| "system time zone bias overflowed".to_owned())
+}
+
 pub fn read_clipboard_text() -> Result<String, String> {
     #[cfg(windows)]
     {
@@ -325,6 +385,28 @@ fn write_clipboard_text_windows(text: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `GetTimeZoneInformation` is safe to call in a test process (no GUI,
+    /// no clipboard-owner contention the way `read_clipboard_text` would
+    /// need) -- so unlike the clipboard functions above, this one gets a
+    /// real assertion on the live Windows result rather than being left
+    /// untested. `-12*3600..=14*3600` covers every zone that actually
+    /// exists (Kiribati's own UTC+14 is the extreme east edge) -- wider
+    /// than `ClockSettings`'s own `-12..=12` picker range on purpose, since
+    /// the OS answer is real and unclamped, unlike the manual picker.
+    #[test]
+    #[cfg(windows)]
+    fn local_utc_offset_seconds_reports_a_plausible_range_on_windows() {
+        let offset = local_utc_offset_seconds()
+            .expect("GetTimeZoneInformation must succeed on any real Windows host running this test");
+        assert!((-12 * 3600..=14 * 3600).contains(&offset));
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn local_utc_offset_seconds_is_unsupported_off_windows() {
+        assert!(local_utc_offset_seconds().is_err());
+    }
 
     #[test]
     fn ascii_ctrl_chars_are_normalized_without_a_layout_lookup() {

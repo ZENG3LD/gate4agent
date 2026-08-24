@@ -9,13 +9,14 @@ use gate4agent_node_protocol::{
 };
 
 use crate::app::{
-    App, ControlSection, IconFamily, LucideStrokeWidth, ManagedAgentPreference, MenuPlacement,
-    OverlayId, PtyColorMode, RailIcons, RosterMode, SidebarMode, SidebarPresentation,
-    MAX_LOCAL_AGENT_ALIAS_BYTES, MAX_MANAGED_AGENT_PREFERENCES, MAX_MANAGED_AGENT_RECORD_ID_BYTES,
+    App, ClockSettings, ControlSection, IconFamily, LucideStrokeWidth, ManagedAgentPreference,
+    MenuPlacement, OverlayId, PetFigure, PetSettings, PetSpeed, PtyColorMode, RailIcons,
+    RosterMode, SidebarMode, SidebarPresentation, MAX_LOCAL_AGENT_ALIAS_BYTES,
+    MAX_MANAGED_AGENT_PREFERENCES, MAX_MANAGED_AGENT_RECORD_ID_BYTES,
 };
 use crate::surface::LayoutPreset;
 
-const CONFIG_VERSION: u16 = 11;
+const CONFIG_VERSION: u16 = 13;
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const MAX_COLLAPSED_DIRECTORY_PREFERENCES: usize = 512;
 
@@ -44,10 +45,28 @@ pub struct UiPreferences {
     pub surface_layout: LayoutPreset,
     /// D? status bar (CONFIG_VERSION 10 -> 11): the CENTRE zone's own
     /// marquee on/off switch -- see `App::marquee_enabled`'s own doc
-    /// comment. The clock-vs-network LEFT-zone choice is NOT a preference:
-    /// this wave ships the LEFT zone as network state only (see `App::
-    /// network_summary`), so there is no second mode to persist.
+    /// comment.
     pub marquee_enabled: bool,
+    /// Slice A of `docs/gate4agent/plans/gate4agent-tui-status-bar-clock-
+    /// shimmer-and-pet-2026-08-24.md` (CONFIG_VERSION 11 -> 12): the LEFT
+    /// zone's own clock settings -- see `App::clock_settings`/`ClockSettings`'s
+    /// own doc comments. Stored flat (four fields, not a nested struct),
+    /// the same convention every other typed `App` field on this struct
+    /// already uses.
+    pub clock_follow_system: bool,
+    pub clock_manual_offset_hours: i32,
+    pub clock_use_24h: bool,
+    pub clock_show_utc_prefix: bool,
+    /// Slice B of `docs/gate4agent/plans/gate4agent-tui-status-bar-clock-
+    /// shimmer-and-pet-2026-08-24.md` (CONFIG_VERSION 12 -> 13): the RIGHT
+    /// zone's own pet preferences -- see `App::pet_settings`/`PetSettings`'s
+    /// own doc comments. `pet_figure`/`pet_speed` are stored as their own
+    /// `id()` integer (0..=7 / 0..=2), the same "flat, typed field, not a
+    /// nested struct" convention every other field on this struct already
+    /// uses.
+    pub pet_figure: PetFigure,
+    pub pet_speed: PetSpeed,
+    pub pet_enabled: bool,
     pub managed_agents: Vec<ManagedAgentPreference>,
     pub collapsed_directories: Vec<CollapsedDirectoryPreference>,
 }
@@ -85,6 +104,18 @@ impl Default for UiPreferences {
             control_modal_size: None,
             surface_layout: LayoutPreset::OneByOne,
             marquee_enabled: true,
+            // Matches `ClockSettings::default()` exactly -- see that
+            // impl's own doc comment for why `follow_system: true` is the
+            // one field where this crate's default deliberately diverges
+            // from MLC's own (a fixed `UTC+0`).
+            clock_follow_system: true,
+            clock_manual_offset_hours: 0,
+            clock_use_24h: true,
+            clock_show_utc_prefix: true,
+            // Matches `PetSettings::default()` exactly.
+            pet_figure: PetFigure::WingedCreature,
+            pet_speed: PetSpeed::Medium,
+            pet_enabled: true,
             managed_agents: Vec::new(),
             collapsed_directories: Vec::new(),
         }
@@ -116,6 +147,13 @@ impl UiPreferences {
             control_modal_size: app.control_modal_size.map(sanitize_modal_size),
             surface_layout: app.surface.preset.unwrap_or(LayoutPreset::OneByOne),
             marquee_enabled: app.marquee_enabled,
+            clock_follow_system: app.clock_settings.follow_system,
+            clock_manual_offset_hours: app.clock_settings.manual_offset_hours,
+            clock_use_24h: app.clock_settings.use_24h,
+            clock_show_utc_prefix: app.clock_settings.show_utc_prefix,
+            pet_figure: app.pet_settings.figure,
+            pet_speed: app.pet_settings.speed,
+            pet_enabled: app.pet_settings.enabled,
             managed_agents: app.managed_agent_preferences.values().cloned().collect(),
             collapsed_directories: app
                 .collapsed_directories
@@ -141,6 +179,17 @@ impl UiPreferences {
         // persisted. This check happens before any App field is mutated.
         let _ = self.encode()?;
         app.marquee_enabled = self.marquee_enabled;
+        app.clock_settings = ClockSettings {
+            follow_system: self.clock_follow_system,
+            manual_offset_hours: ClockSettings::clamped_offset_hours(self.clock_manual_offset_hours),
+            use_24h: self.clock_use_24h,
+            show_utc_prefix: self.clock_show_utc_prefix,
+        };
+        app.pet_settings = PetSettings {
+            figure: self.pet_figure,
+            speed: self.pet_speed,
+            enabled: self.pet_enabled,
+        };
         app.color_mode = self.color_mode;
         app.menu_placement = self.menu_placement;
         app.sidebar_presentation = self.sidebar_presentation;
@@ -246,7 +295,7 @@ impl UiPreferences {
         validate_managed_agents(&self.managed_agents)?;
         validate_collapsed_directories(&self.collapsed_directories)?;
         let mut encoded = format!(
-            "version={CONFIG_VERSION}\nstyle={}\nmenu={}\nsidebar_presentation={}\nsidebar_collapsed={}\nrail_icons={}\nicon_family={}\nlucide_stroke_width={}\ncontrol_section={}\nroster_mode={}\nsidebar_width={}\nsidebar_split_percent={}\ncontrol_modal_position={}\ncontrol_modal_size={}\nsurface_layout={}\nmarquee_enabled={}\n",
+            "version={CONFIG_VERSION}\nstyle={}\nmenu={}\nsidebar_presentation={}\nsidebar_collapsed={}\nrail_icons={}\nicon_family={}\nlucide_stroke_width={}\ncontrol_section={}\nroster_mode={}\nsidebar_width={}\nsidebar_split_percent={}\ncontrol_modal_position={}\ncontrol_modal_size={}\nsurface_layout={}\nmarquee_enabled={}\nclock_follow_system={}\nclock_manual_offset_hours={}\nclock_use_24h={}\nclock_show_utc_prefix={}\npet_figure={}\npet_speed={}\npet_enabled={}\n",
             self.color_mode.id(),
             self.menu_placement.id(),
             self.sidebar_presentation.id(),
@@ -265,6 +314,13 @@ impl UiPreferences {
             encode_pair(self.control_modal_size),
             self.surface_layout.id(),
             self.marquee_enabled,
+            self.clock_follow_system,
+            ClockSettings::clamped_offset_hours(self.clock_manual_offset_hours),
+            self.clock_use_24h,
+            self.clock_show_utc_prefix,
+            self.pet_figure.id(),
+            self.pet_speed.id(),
+            self.pet_enabled,
         );
         let mut managed_agents = self.managed_agents.clone();
         managed_agents.sort_by(|left, right| {
@@ -541,6 +597,53 @@ fn parse(contents: &str) -> io::Result<UiPreferences> {
                     _ => preferences.marquee_enabled,
                 }
             }
+            "clock_follow_system" => {
+                preferences.clock_follow_system = match value.trim() {
+                    "true" => true,
+                    "false" => false,
+                    _ => preferences.clock_follow_system,
+                }
+            }
+            "clock_manual_offset_hours" => {
+                if let Ok(offset) = value.trim().parse::<i32>() {
+                    preferences.clock_manual_offset_hours = ClockSettings::clamped_offset_hours(offset);
+                }
+            }
+            "clock_use_24h" => {
+                preferences.clock_use_24h = match value.trim() {
+                    "true" => true,
+                    "false" => false,
+                    _ => preferences.clock_use_24h,
+                }
+            }
+            "clock_show_utc_prefix" => {
+                preferences.clock_show_utc_prefix = match value.trim() {
+                    "true" => true,
+                    "false" => false,
+                    _ => preferences.clock_show_utc_prefix,
+                }
+            }
+            "pet_figure" => {
+                if let Ok(id) = value.trim().parse::<u8>() {
+                    if let Some(figure) = PetFigure::from_id(id) {
+                        preferences.pet_figure = figure;
+                    }
+                }
+            }
+            "pet_speed" => {
+                if let Ok(id) = value.trim().parse::<u8>() {
+                    if let Some(speed) = PetSpeed::from_id(id) {
+                        preferences.pet_speed = speed;
+                    }
+                }
+            }
+            "pet_enabled" => {
+                preferences.pet_enabled = match value.trim() {
+                    "true" => true,
+                    "false" => false,
+                    _ => preferences.pet_enabled,
+                }
+            }
             "managed_agent" => {
                 if managed_agents.len() >= MAX_MANAGED_AGENT_PREFERENCES {
                     return Err(invalid_data("too many managed agent preferences"));
@@ -625,7 +728,25 @@ fn parse(contents: &str) -> io::Result<UiPreferences> {
         // the exact same "new key just wasn't there yet" shape `icon_
         // family`'s own v9 -> v10 migration doc comment above already
         // uses.
-        Some(7) | Some(8) | Some(9) | Some(10) | Some(CONFIG_VERSION) => {
+        //
+        // Slice A of `docs/gate4agent/plans/gate4agent-tui-status-bar-
+        // clock-shimmer-and-pet-2026-08-24.md` (CONFIG_VERSION 11 -> 12):
+        // `clock_follow_system`/`clock_manual_offset_hours`/`clock_use_
+        // 24h`/`clock_show_utc_prefix` are four new keys, not migrated
+        // fields -- a v11 (or earlier) config has none of the four lines
+        // at all, so they keep `UiPreferences::default()`'s own values
+        // (`follow_system: true`, matching `ClockSettings::default()`'s
+        // own doc comment on why THIS field's default deliberately
+        // diverges from MLC's) -- the same "new key just wasn't there
+        // yet" shape every migration above already uses.
+        //
+        // Slice B of the same plan doc (CONFIG_VERSION 12 -> 13):
+        // `pet_figure`/`pet_speed`/`pet_enabled` are three more new keys --
+        // a v12 (or earlier) config has none of the three lines at all, so
+        // they keep `UiPreferences::default()`'s own values (matching
+        // `PetSettings::default()`) -- the same "new key just wasn't there
+        // yet" shape every migration above already uses.
+        Some(7) | Some(8) | Some(9) | Some(10) | Some(11) | Some(12) | Some(CONFIG_VERSION) => {
             finish_with_collections(preferences, managed_agents, collapsed_directory_values)
         }
         Some(other) => Err(invalid_data(format!("unsupported preferences version {other}"))),
@@ -854,6 +975,13 @@ mod tests {
             control_modal_size: Some((102, 37)),
             surface_layout: LayoutPreset::OneByFour,
             marquee_enabled: false,
+            clock_follow_system: false,
+            clock_manual_offset_hours: -5,
+            clock_use_24h: true,
+            clock_show_utc_prefix: false,
+            pet_figure: PetFigure::GrinningSkull,
+            pet_speed: PetSpeed::Fast,
+            pet_enabled: false,
             managed_agents: Vec::new(),
             collapsed_directories: Vec::new(),
         };
@@ -908,6 +1036,13 @@ mod tests {
             control_modal_size: Some((90, 28)),
             surface_layout: LayoutPreset::FourByOne,
             marquee_enabled: false,
+            clock_follow_system: false,
+            clock_manual_offset_hours: 9,
+            clock_use_24h: true,
+            clock_show_utc_prefix: false,
+            pet_figure: PetFigure::HoveringWisp,
+            pet_speed: PetSpeed::Slow,
+            pet_enabled: false,
             managed_agents: Vec::new(),
             collapsed_directories: Vec::new(),
         };
@@ -1067,6 +1202,123 @@ mod tests {
         let reencoded = loaded.encode().unwrap();
         assert!(reencoded.starts_with(&format!("version={CONFIG_VERSION}\n")));
         assert!(reencoded.contains("marquee_enabled=true\n"));
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Slice A of `docs/gate4agent/plans/gate4agent-tui-status-bar-clock-
+    /// shimmer-and-pet-2026-08-24.md` (CONFIG_VERSION 11 -> 12): a v11
+    /// config has none of the four `clock_*` lines at all (all four keys
+    /// are new at v12) -- same "new key, not a migrated field" shape as
+    /// `preferences_v10_config_with_no_marquee_enabled_key_lands_on_true`
+    /// above. `follow_system` lands on `true` -- `UiPreferences::
+    /// default()`'s own value, matching `ClockSettings::default()`.
+    #[test]
+    fn preferences_v11_config_with_no_clock_keys_lands_on_defaults() {
+        let path = temp_path("v11-lands-on-clock-defaults");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "version=11\nstyle=gate\nrail_icons=ascii\n").unwrap();
+
+        let loaded = UiPreferences::load(&path).unwrap();
+        assert!(loaded.clock_follow_system);
+        assert_eq!(loaded.clock_manual_offset_hours, 0);
+        assert!(loaded.clock_use_24h);
+        assert!(loaded.clock_show_utc_prefix);
+        let mut app = App::default();
+        app.clock_settings.follow_system = false;
+        loaded.apply_to(&mut app);
+        assert!(app.clock_settings.follow_system);
+
+        let reencoded = loaded.encode().unwrap();
+        assert!(reencoded.starts_with(&format!("version={CONFIG_VERSION}\n")));
+        assert!(reencoded.contains("clock_follow_system=true\n"));
+        assert!(reencoded.contains("clock_manual_offset_hours=0\n"));
+        assert!(reencoded.contains("clock_use_24h=true\n"));
+        assert!(reencoded.contains("clock_show_utc_prefix=true\n"));
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Slice B of the same plan doc (CONFIG_VERSION 12 -> 13): a v12
+    /// config has none of the three `pet_*` lines at all (all three keys
+    /// are new at v13) -- same "new key, not a migrated field" shape as
+    /// `preferences_v11_config_with_no_clock_keys_lands_on_defaults` above.
+    #[test]
+    fn preferences_v12_config_with_no_pet_keys_lands_on_defaults() {
+        let path = temp_path("v12-lands-on-pet-defaults");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "version=12\nstyle=gate\nrail_icons=ascii\n").unwrap();
+
+        let loaded = UiPreferences::load(&path).unwrap();
+        assert_eq!(loaded.pet_figure, PetFigure::WingedCreature);
+        assert_eq!(loaded.pet_speed, PetSpeed::Medium);
+        assert!(loaded.pet_enabled);
+        let mut app = App::default();
+        app.pet_settings.enabled = false;
+        loaded.apply_to(&mut app);
+        assert!(app.pet_settings.enabled);
+
+        let reencoded = loaded.encode().unwrap();
+        assert!(reencoded.starts_with(&format!("version={CONFIG_VERSION}\n")));
+        assert!(reencoded.contains(&format!("pet_figure={}\n", PetFigure::WingedCreature.id())));
+        assert!(reencoded.contains(&format!("pet_speed={}\n", PetSpeed::Medium.id())));
+        assert!(reencoded.contains("pet_enabled=true\n"));
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// An out-of-range stored `pet_figure`/`pet_speed` id (hand-edited or
+    /// corrupted) is simply IGNORED -- the per-line match only overwrites
+    /// the struct default when `PetFigure`/`PetSpeed::from_id` actually
+    /// returns `Some`, so an invalid id never panics and never leaves the
+    /// field in some other invalid state.
+    #[test]
+    fn preferences_out_of_range_pet_ids_are_ignored_not_rejected() {
+        let path = temp_path("pet-ids-out-of-range");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            &format!("version={CONFIG_VERSION}\npet_figure=99\npet_speed=99\n"),
+        )
+        .unwrap();
+        let loaded = UiPreferences::load(&path).unwrap();
+        assert_eq!(loaded.pet_figure, PetFigure::WingedCreature);
+        assert_eq!(loaded.pet_speed, PetSpeed::Medium);
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// `ClockSettings::MIN_OFFSET_HOURS..=MAX_OFFSET_HOURS` is `-12..=12` --
+    /// a hand-edited (or corrupted) config carrying an out-of-range value
+    /// on EITHER end is clamped on load, not rejected and not carried
+    /// through unclamped. `try_apply_to` clamps again on its own path (a
+    /// preferences file is not the only way an out-of-range value could
+    /// reach `App`), so both are pinned here.
+    #[test]
+    fn preferences_clock_manual_offset_hours_clamps_on_load_and_apply() {
+        let path = temp_path("clock-offset-clamped");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            &format!("version={CONFIG_VERSION}\nclock_manual_offset_hours=47\n"),
+        )
+        .unwrap();
+        let loaded = UiPreferences::load(&path).unwrap();
+        assert_eq!(loaded.clock_manual_offset_hours, 12);
+
+        fs::write(
+            &path,
+            &format!("version={CONFIG_VERSION}\nclock_manual_offset_hours=-99\n"),
+        )
+        .unwrap();
+        let loaded = UiPreferences::load(&path).unwrap();
+        assert_eq!(loaded.clock_manual_offset_hours, -12);
+
+        let mut preferences = UiPreferences::default();
+        preferences.clock_manual_offset_hours = 500;
+        let mut app = App::default();
+        preferences.try_apply_to(&mut app).unwrap();
+        assert_eq!(app.clock_settings.manual_offset_hours, 12);
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }

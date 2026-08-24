@@ -6,6 +6,7 @@ pub mod pty_palette;
 pub mod platform;
 pub mod preferences;
 pub mod render;
+pub(crate) mod shimmer;
 pub mod surface;
 pub mod terminal_bg;
 pub mod text_editor;

@@ -7484,7 +7484,7 @@ mod tests {
         send_operator_action(&mut app, &routes, action);
 
         assert_eq!(
-            app.notice(),
+            app.last_event_text(),
             Some("Session Monitor history refresh failed: command queue busy"),
         );
         assert!(matches!(
@@ -7736,10 +7736,12 @@ mod tests {
                 token: 1,
             },
         );
-        // No generic notice: the busy-lane rejection already routed the
+        // No corner popup: the busy-lane rejection already routed the
         // honest failure into the file tab's own error state (rendered
         // inline where the user tried to save), the same division of labor
-        // `reject_history_refresh_action` uses for history refresh.
+        // `reject_history_refresh_action` uses for history refresh. This is
+        // a claim about the corner (`notice`), not the feed -- the feed
+        // gets it regardless, checked separately below.
         assert_eq!(app.notice(), None);
         // But it MUST reach the central feed. Not flashing is a statement
         // about where the detail belongs, not permission to keep a real
@@ -7779,7 +7781,7 @@ mod tests {
         // surfaces a notice (the create dialog is a modal, not a background
         // save) — both channels carry the same honest, non-generic message.
         assert_eq!(
-            app.notice(),
+            app.last_event_text(),
             Some("busy: Harness detail/read command queue is full"),
         );
         let dialog = app.create_workspace_entry.as_ref().unwrap();
@@ -7956,7 +7958,7 @@ mod tests {
                 inspection: mismatched,
             },
         );
-        assert!(app.notice().unwrap_or_default().contains("workspace-b"));
+        assert!(app.last_event_text().unwrap_or_default().contains("workspace-b"));
         let still_valid = app.workspace_inspections
             .get(&("node-a".to_owned(), "workspace-a".to_owned()))
             .expect("the earlier valid inspection is not clobbered by a mismatched reply");
@@ -7993,7 +7995,7 @@ mod tests {
         assert!(app.harness_kanban.execution_mutation.is_none());
         assert_eq!(app.harness_kanban.pending_refresh, None);
         assert_eq!(
-            app.notice(),
+            app.last_event_text(),
             Some("Harness launch action failed: Harness operator unavailable: execution mutation queue is closed"),
         );
     }
@@ -8071,7 +8073,7 @@ mod tests {
         assert!(app.harness_kanban.execution_mutation.is_none());
         assert_eq!(app.harness_kanban.pending_refresh, None);
         assert_eq!(
-            app.notice(),
+            app.last_event_text(),
             Some("Harness launch action failed: Harness operator busy: execution mutation queue is full"),
         );
     }
@@ -8273,7 +8275,7 @@ mod tests {
         assert_eq!(composer.body, "Keep this body");
         assert_eq!(composer.field, HarnessTaskComposerField::Body);
         assert_eq!(
-            app.notice(),
+            app.last_event_text(),
             Some("Harness operator busy: command queue is full"),
         );
         assert!(matches!(harness_rx.try_recv(), Ok(AppAction::None)));
@@ -8295,7 +8297,7 @@ mod tests {
         );
         assert_eq!(app.harness_kanban.pending_refresh, None);
         assert_eq!(
-            app.notice(),
+            app.last_event_text(),
             Some("Harness operator unavailable: command queue is closed"),
         );
     }
@@ -8335,7 +8337,7 @@ mod tests {
         assert!(!app.harness_kanban.correlation_pending.contains(&run.run_id));
         assert!(app.harness_kanban.correlation_failures.contains_key(&run.run_id));
         assert_eq!(
-            app.notice(),
+            app.last_event_text(),
             Some("Harness operator busy: correlation command queue is full"),
         );
         assert!(matches!(detail_rx.try_recv(), Ok(AppAction::None)));

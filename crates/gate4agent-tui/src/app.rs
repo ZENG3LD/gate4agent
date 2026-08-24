@@ -5217,10 +5217,27 @@ impl App {
     /// a genuine backend failure that printed its line into the corner of
     /// a panel and never reached the feed at all. A caller should have to
     /// choose between "flash" and "report", not remember to do both.
+    /// It does NOT flash. An event that is on the strip must not also be
+    /// in the corner: the same sentence in two places at once is the noise
+    /// this feature exists to remove, and the strip is where errors were
+    /// asked to live. `flash` remains for what is NOT an event -- a guard
+    /// refusal, a keystroke acknowledgement, field validation.
+    /// The text of the most recent event, wherever it currently sits in
+    /// the feed's own three stages -- still queued, being played by the
+    /// strip, or already retired into the log. Tests that used to assert
+    /// on the corner popup assert on this instead: the event did not stop
+    /// happening when it stopped flashing, it moved.
+    #[cfg(test)]
+    pub(crate) fn last_event_text(&self) -> Option<&str> {
+        self.event_queue
+            .back()
+            .or(self.event_current.as_ref())
+            .or_else(|| self.event_log.back())
+            .map(|event| event.text.as_str())
+    }
+
     pub(crate) fn report_failure(&mut self, source: EventSource, text: impl Into<String>) {
-        let text = text.into();
-        self.emit_event(EventSeverity::Error, source, text.clone());
-        self.notice = Some(text);
+        self.emit_event(EventSeverity::Error, source, text);
     }
 
     /// Sets the local flash AND puts the same text on the central event
@@ -5235,30 +5252,15 @@ impl App {
     /// that "look at this" middle ground. A real failure with a reason
     /// belongs in `report_failure`, not here, so `Error` is deliberately
     /// not an option this method accepts.
-    /// Puts a real failure on the central feed WITHOUT the corner popup,
-    /// for the case where a local surface already shows it exactly where
-    /// the user acted -- a file tab's own inline error line, a git pane's
-    /// own failure row. Those surfaces are the better place for the
-    /// detail, and duplicating the same sentence into the corner as well
-    /// is the noise this whole feature exists to remove; what was missing
-    /// was never a second popup, it was the CENTRAL record, which this
-    /// supplies.
-    ///
-    /// This is the honest third case between `report_failure` (flash and
-    /// record) and `flash` (flash only): record only.
-    pub(crate) fn record_failure(&mut self, source: EventSource, text: impl Into<String>) {
-        self.emit_event(EventSeverity::Error, source, text);
-    }
-
     pub(crate) fn report_event(
         &mut self,
         severity: EventSeverity,
         source: EventSource,
         text: impl Into<String>,
     ) {
-        let text = text.into();
-        self.emit_event(severity, source, text.clone());
-        self.notice = Some(text);
+        // Strip only, never the corner -- same reasoning as
+        // `report_failure`'s own: one sentence, one place.
+        self.emit_event(severity, source, text);
     }
 
     /// Sets the transient corner-popup notice and nothing else -- for a
@@ -18151,7 +18153,7 @@ impl App {
         // failure ever showed up: never on the central feed, so a backend
         // failure here was invisible outside this one panel. Reported
         // additionally, keeping the local display exactly as it was.
-        self.record_failure(
+        self.report_failure(
             EventSource::Workspace,
             format!("{}: {message}", repository_path_display(&key.path)),
         );
@@ -22886,8 +22888,10 @@ mod tests {
         );
         assert!(app.harness_kanban.execution_mutation.is_none());
         assert!(app.harness_launch_view().unwrap().options.current_issued_spec.is_some());
+        // Was the corner popup; the launch-spec-saved notice is a real event
+        // now, so it lands on the feed instead.
         assert_eq!(
-            app.notice.as_deref(),
+            app.last_event_text(),
             Some("Launch spec saved (Applied); task not started"),
         );
         assert_eq!(app.harness_kanban.tasks[&task.task_id].state, HarnessTaskStateV1::Ready);
@@ -22961,7 +22965,9 @@ mod tests {
         assert!(app.harness_kanban.execution_mutation.is_none());
         assert_eq!(app.harness_kanban.last_start.as_ref().map(|value| &value.dispatch.run_id), Some(&run_id));
         let expected_notice = format!("Task started: run {run_id}");
-        assert_eq!(app.notice.as_deref(), Some(expected_notice.as_str()));
+        // Was the corner popup; a task-started confirmation is a real event
+        // now, so it lands on the feed instead.
+        assert_eq!(app.last_event_text(), Some(expected_notice.as_str()));
     }
 
     #[test]
@@ -25403,7 +25409,9 @@ mod tests {
         assert!(app.existing_session.as_ref().unwrap().rows.iter().all(|row| {
             row.route != route
         }));
-        assert_eq!(app.notice.as_deref(), Some("catalog refreshed; select session again"));
+        // Was the corner popup; the stale-catalog refresh notice is a real
+        // event now, so it lands on the feed instead.
+        assert_eq!(app.last_event_text(), Some("catalog refreshed; select session again"));
         assert_eq!(
             app.fail_native_session_page(
                 "node-a".to_owned(), route.clone(), NativeSessionCatalogWindow::Recent,
@@ -25468,7 +25476,9 @@ mod tests {
             ),
             AppAction::None,
         );
-        assert_eq!(app.notice.as_deref(), Some("page unavailable"));
+        // Was the corner popup; a non-stale page failure is a real event
+        // now, so it lands on the feed instead.
+        assert_eq!(app.last_event_text(), Some("page unavailable"));
         assert!(app.existing_session.as_ref().unwrap().route_pages.contains_key(&route));
     }
 
@@ -26707,8 +26717,10 @@ mod tests {
         app.upsert_node(restarted);
 
         assert!(app.surface.all_tabs().is_empty());
+        // Was the corner popup; a node restart detaching stale PTY targets
+        // is a real event now, so it lands on the feed instead.
         assert_eq!(
-            app.notice.as_deref(),
+            app.last_event_text(),
             Some("node-a restarted; stale PTY targets were detached"),
         );
     }
@@ -27271,8 +27283,10 @@ mod tests {
 
         assert!(app.spawn.is_none());
         assert_eq!(app.focus, Focus::Agents);
+        // Was the corner popup; a launch cancelled by a removed workspace
+        // is a real event now, so it lands on the feed instead.
         assert_eq!(
-            app.notice.as_deref(),
+            app.last_event_text(),
             Some("launch cancelled because its workspace was removed"),
         );
     }
@@ -27445,7 +27459,9 @@ mod tests {
 
         assert!(app.surface.all_tabs().is_empty());
         assert_eq!(app.focus, Focus::Agents);
-        assert!(app.notice.as_deref().unwrap().contains("input target cleared"));
+        // Was the corner popup; the active-PTY-disappeared notice is a real
+        // event now, so it lands on the feed instead.
+        assert!(app.last_event_text().unwrap().contains("input target cleared"));
     }
 
     #[test]
@@ -28421,13 +28437,17 @@ mod tests {
         assert_eq!(app.focus, Focus::Viewport);
         assert_eq!(app.surface.leaf_ids().len(), 1);
         assert_eq!(app.focused_address(), Some(&second));
-        assert!(app.notice.as_deref().unwrap().contains("nearest pane focused"));
+        // Was the corner popup; the nearest-pane-focused notice is a real
+        // event now, so it lands on the feed instead.
+        assert!(app.last_event_text().unwrap().contains("nearest pane focused"));
 
         replacement.workspaces[0].sessions.clear();
         app.upsert_node(replacement);
         assert!(app.surface.all_tabs().is_empty());
         assert_eq!(app.focus, Focus::Agents);
-        assert!(app.notice.as_deref().unwrap().contains("input target cleared"));
+        // Was the corner popup; the active-PTY-disappeared notice is a real
+        // event now, so it lands on the feed instead.
+        assert!(app.last_event_text().unwrap().contains("input target cleared"));
     }
 
     #[test]
@@ -29940,7 +29960,9 @@ mod tests {
         let error = tab.reconnect_error.as_deref().unwrap();
         assert!(error.contains("Reconnect failed: denied [31m retry"));
         assert!(!error.chars().any(char::is_control));
-        assert!(app.notice.as_deref().unwrap().contains("session reconnect failed"));
+        // Was the corner popup; a reconnect failure is a real event now, so
+        // it lands on the feed instead.
+        assert!(app.last_event_text().unwrap().contains("session reconnect failed"));
         assert!(app.preview_resume.is_none());
     }
 
@@ -30257,8 +30279,10 @@ mod tests {
     /// (confirmed by this very file compiling once the field lost its
     /// `pub(crate)`), but it CANNOT stop a fourth method added anywhere
     /// in `app.rs` itself from doing the same, because `App` and its
-    /// three sanctioned setters (`flash`/`report_failure`/`report_event`)
-    /// all live in this one module -- see `notice`'s own doc comment. A
+    /// sanctioned setters (`flash`, and `dismiss_notice` for clearing --
+    /// `report_failure`/`report_event` deliberately do NOT write `notice`
+    /// any more) all live in this one module -- see `notice`'s own doc
+    /// comment. A
     /// test that reads this crate's own source files is an unusual thing
     /// to write, but it is exactly the right tool for an invariant the
     /// type system cannot express: "no producer may print without
@@ -30278,8 +30302,8 @@ mod tests {
             let offenders = raw_notice_write_lines(source, &[]);
             assert!(
                 offenders.is_empty(),
-                "found a raw `.notice =` write in {file}, outside `App::flash`/\
-                 `report_failure`/`report_event`: {offenders:?}",
+                "found a raw `.notice =` write in {file} -- only `App::flash`/\
+                 `App::dismiss_notice` may ever touch `notice`: {offenders:?}",
             );
         }
         // `dismiss_notice` is the fourth allowed writer and deliberately
@@ -30287,13 +30311,22 @@ mod tests {
         // not printing -- there is no text to classify -- so forcing it
         // through one of the three would mean inventing a severity and a
         // source for the absence of a message.
-        let sanctioned = [
+        //
+        // `report_failure`/`report_event` used to be direct writers too
+        // (flash AND record, one call doing both), but an event on the
+        // strip must never also land in the corner, so their bodies no
+        // longer touch `notice` at all -- only `flash` and `dismiss_notice`
+        // still do. They stay in this crate's allow-list of names that
+        // exist (this is what keeps the list from going stale), but they
+        // are asserted CLEAN below rather than required to still write
+        // `notice`, and are left out of `allowed_spans` so a raw write
+        // reappearing inside either one is caught by the full-file scan
+        // just like anywhere else in this module.
+        let writers = [
             ("flash", function_body_span(app_source, "fn flash(")),
-            ("report_failure", function_body_span(app_source, "fn report_failure(")),
-            ("report_event", function_body_span(app_source, "fn report_event(")),
             ("dismiss_notice", function_body_span(app_source, "fn dismiss_notice(")),
         ];
-        for (name, span) in sanctioned {
+        for (name, span) in writers {
             let body = &app_source[span.0..span.1];
             assert!(
                 body.contains(".notice = "),
@@ -30301,14 +30334,27 @@ mod tests {
                  if it no longer does, this test's own allow-list is stale",
             );
         }
+        let non_writers = [
+            ("report_failure", function_body_span(app_source, "fn report_failure(")),
+            ("report_event", function_body_span(app_source, "fn report_event(")),
+        ];
+        for (name, span) in non_writers {
+            let body = &app_source[span.0..span.1];
+            assert!(
+                !body.contains(".notice = "),
+                "expected App::{name}'s own body to no longer assign `notice` directly -- \
+                 an event on the strip must never also flash in the corner",
+            );
+        }
         let allowed_spans: Vec<(usize, usize)> =
-            sanctioned.iter().map(|(_, span)| *span).collect();
+            writers.iter().map(|(_, span)| *span).collect();
         let offenders = raw_notice_write_lines(app_source, &allowed_spans);
         assert!(
             offenders.is_empty(),
             "found a raw `.notice =` write in app.rs outside `App::flash`/\
-             `report_failure`/`report_event` -- route it through one of those three \
-             instead of assigning `notice` directly: {offenders:?}",
+             `App::dismiss_notice` -- a real event belongs on the feed via \
+             `report_failure`/`report_event`, never a direct `notice` assignment: \
+             {offenders:?}",
         );
     }
 
@@ -31866,8 +31912,10 @@ mod tests {
             incarnation,
             "history unavailable".to_owned(),
         );
+        // Was the corner popup; a history refresh failure is a real event
+        // now, so it lands on the feed instead.
         assert_eq!(
-            app.notice.as_deref(),
+            app.last_event_text(),
             Some("Session Monitor history refresh failed: history unavailable"),
         );
         assert!(matches!(

@@ -2793,7 +2793,23 @@ fn harness_operator_worker(
                     let indexed = client.index_native_session(selection.clone(), display_name)
                         .map_err(|error| WorkerUpdate::ExistingSessionOperationFailed {
                             node_id: node_id.clone(), record_id: None, indexing: true, operation_token,
-                            message: error.to_string(), stale_catalog: false,
+                            message: error.to_string(),
+                            // This is the one arm here that actually reaches the
+                            // node, so it is the only one whose failure can BE a
+                            // stale catalog. It was hardcoded false, which meant
+                            // the self-heal that already exists for exactly this
+                            // -- drop the stale rows, re-fetch the catalog, retry
+                            // against a current revision -- was never armed for
+                            // indexing. The rejection surfaced as a bare error and
+                            // the row stayed unnamed, which is why naming a session
+                            // appeared to work only after clicking around until the
+                            // dialog happened to re-fetch. Derived exactly as
+                            // `HarnessNativeHistoryError::from_client` already
+                            // derives it for the history path.
+                            stale_catalog: matches!(
+                                error,
+                                HarnessOperatorClientError::Host(HarnessOperatorHostErrorV1::Conflict)
+                            ),
                         })?;
                     if indexed.selection != selection {
                         return Err(WorkerUpdate::ExistingSessionOperationFailed {

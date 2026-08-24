@@ -3304,10 +3304,17 @@ impl OperatorRequestLogIdentity {
             HarnessOperatorRequestV1::IndexProviderSession { node_id, workspace_id, .. } => {
                 (Some(node_id.clone()), Some(workspace_id.clone()), None)
             }
+            // This request has no session id by design -- creating the first
+            // durable identity for a session that has none yet is the whole
+            // point of it -- so the slot used to be left empty and every
+            // warning for this operation printed `session_id=""`, which reads
+            // as a lost id rather than as an absent one. The candidate being
+            // promoted is right here, so name it: the same slot the arm above
+            // fills with a record id.
             HarnessOperatorRequestV1::IndexNativeSession { selection, .. } => (
                 Some(selection.route.node_id.clone()),
                 selection.route.workspace_id.clone(),
-                None,
+                Some(selection.selection_id.clone()),
             ),
             HarnessOperatorRequestV1::BrowseHostDirectories { node_id, .. }
             | HarnessOperatorRequestV1::RemoveWorktree { node_id, .. } => {

@@ -282,6 +282,7 @@ pub fn render(app: &App, buf: &mut TerminalBuffer) -> LayoutRects {
         status_bar_center: Rect::default(),
         status_bar_right: Rect::default(),
         global_search_field: Rect::default(),
+        global_search_anchor: Rect::default(),
         global_search_dropdown: Rect::default(),
         surface_panes: Vec::new(),
         hits: Vec::new(),
@@ -357,6 +358,25 @@ pub fn render(app: &App, buf: &mut TerminalBuffer) -> LayoutRects {
     render_tabs(app, right[0], buf, &mut layout, theme);
     render_surface(app, right[1], buf, &mut layout, theme);
     render_status_bar(app, full_area, buf, &mut layout, theme);
+
+    // The global search's own results dropdown paints HERE, not from
+    // inside `render_tabs` above (where `render_global_search` computes
+    // its anchor) -- it must run AFTER `render_surface`, whose pane
+    // chrome (`render_surface_pane_tabs`/`render_surface_toolbar`, both
+    // called from `render_surface_pane`) `fill_rect`s its own header/
+    // actions rows in `right[1]` unconditionally, every frame, and those
+    // rows are exactly where this dropdown's own top border and first
+    // content row land when it opens (`right[1]`'s own top row sits
+    // directly under the tab strip the dropdown hangs from). Painting the
+    // dropdown from `render_tabs`, before the surface ever ran, meant the
+    // surface's very next pass silently erased it. Still runs BEFORE
+    // every modal dialog below, so an open modal keeps winning over it,
+    // exactly as before this fix -- see `LayoutRects::global_search_
+    // anchor`'s own doc comment for why a recorded rect, not a changed
+    // open condition, is what moved.
+    if !layout.global_search_anchor.is_empty() {
+        render_global_search_dropdown(app, layout.global_search_anchor, buf, &mut layout, theme);
+    }
 
     if app.focus == Focus::Spawn {
         render_spawn(app, area, buf, &mut layout, theme);
@@ -3547,6 +3567,13 @@ const SEARCH_MAX_EXPANDED_WIDTH: u16 = 34;
 /// strip's own ends (before the gear reservation) -- used only to compute
 /// where "centred" actually is; `controls_end` is the hard left boundary
 /// nothing here may cross (see this fn's own call site doc comment).
+///
+/// This fn only ever RECORDS that the dropdown should open, into
+/// `layout.global_search_anchor` -- it does not paint it. See `render::
+/// render`'s own top-level sequence (the call to `render_global_search_
+/// dropdown` right after `render_surface`) for where that actually
+/// happens now, and `LayoutRects::global_search_anchor`'s own doc comment
+/// for why painting moved out of here.
 fn render_global_search(
     app: &App,
     strip_left: u16,
@@ -3576,6 +3603,24 @@ fn render_global_search(
         .min(strip_right.saturating_sub(width));
     let block = Rect::new(left, row_y, width, 1);
     fill_rect(block, theme.active, buf);
+    // A real one-row frame, not just a filled background -- `SEARCH_
+    // COLLAPSED_WIDTH`'s own doc comment already calls this an "icon in a
+    // frame", but nothing here ever drew one. The tab strip itself is
+    // provably one row (`render_tabs`'s own call site), so a bordered
+    // `Block` (which needs three) is not an option here -- paint the
+    // frame as two edge cells on this same row instead, `▏` left and `▕`
+    // right. Both are cells nothing else in this fn ever touches: `width`
+    // is always >= `SEARCH_COLLAPSED_WIDTH` (the `available` guard above
+    // already returned otherwise), the icon starts one cell in at `icon_
+    // x` below, and the field span computed further down is deliberately
+    // shortened by one cell so its text can never grow into the right
+    // edge cell painted here.
+    let left_edge = buf.get_mut(block.x, block.y);
+    left_edge.symbol = "▏".into();
+    left_edge.style = Style::default().fg(theme.border).bg(theme.active);
+    let right_edge = buf.get_mut(block.right() - 1, block.y);
+    right_edge.symbol = "▕".into();
+    right_edge.style = Style::default().fg(theme.border).bg(theme.active);
     let icon_x = block.x + 1;
     let icon_width = icons::STRIP_SIXEL_ICON_CELLS_WIDE.min(block.width.saturating_sub(1));
     match app.rail_icons {
@@ -3600,10 +3645,14 @@ fn render_global_search(
         return;
     }
     let field_x = icon_x.saturating_add(icon_width).saturating_add(1);
-    if field_x >= block.right() {
+    // Stops one cell short of `block.right()` -- that last column is the
+    // `▕` frame edge painted above, and the query text must never grow
+    // into it.
+    let field_right = block.right().saturating_sub(1);
+    if field_x >= field_right {
         return;
     }
-    let field = Rect::new(field_x, block.y, block.right() - field_x, 1);
+    let field = Rect::new(field_x, block.y, field_right - field_x, 1);
     let (display, style) = if app.global_search.query.is_empty() {
         ("search...".to_owned(), Style::default().fg(theme.muted).bg(theme.active))
     } else {
@@ -3614,14 +3663,24 @@ fn render_global_search(
         .render(field, buf);
     layout.global_search_field = field;
     if app.focus == Focus::GlobalSearch && app.global_search.expand_step == crate::app::SEARCH_EXPAND_STEPS {
-        render_global_search_dropdown(app, block, buf, layout, theme);
+        // Recorded, not painted -- `render::render`'s own top-level
+        // sequence reads this back and paints the dropdown itself AFTER
+        // `render_surface` has already run this frame. See `LayoutRects::
+        // global_search_anchor`'s own doc comment for why.
+        layout.global_search_anchor = block;
     }
 }
 
 /// The global search's own results dropdown -- opens directly under the
 /// magnifier/field frame, left-aligned with it. An overlay like any other
 /// (`note_overlay`, opaque full-frame fill), so a sixel icon in the
-/// viewport underneath never bleeds through it.
+/// viewport underneath never bleeds through it. Called from `render::
+/// render`'s own top-level sequence, AFTER `render_surface` -- see that
+/// call site's own doc comment, and `LayoutRects::global_search_anchor`'s,
+/// for why: this used to be called from inside `render_global_search`
+/// itself (`render_tabs`'s own call chain), which ran BEFORE the surface,
+/// so the surface's own next pass silently painted over this dropdown's
+/// top rows every frame it was open.
 fn render_global_search_dropdown(
     app: &App,
     anchor: Rect,
@@ -3634,6 +3693,18 @@ fn render_global_search_dropdown(
     let rows = (results.len() as u16).clamp(1, MAX_VISIBLE_RESULTS);
     let width = anchor.width.max(28);
     let dropdown = Rect::new(anchor.x, anchor.bottom(), width, rows + 2);
+    // `width`/`rows + 2` alone assume the strip has that much room to the
+    // right and that many rows free below it -- true on a comfortably
+    // sized terminal, not guaranteed on a narrow or short one (the anchor
+    // can legitimately sit close enough to the right edge, or close
+    // enough to the bottom, that the raw rect above runs straight past
+    // `buf`'s own bounds). Clamp against the real buffer before painting
+    // a single cell -- same pattern `client::clear_rect` already uses for
+    // a remembered rect that can outlive a shrink. Without this, `fill_
+    // rect` below indexes straight past the buffer's own backing `Vec`
+    // and panics; the library's own `Block`/border renderer bounds-checks
+    // itself, but this crate's own `fill_rect` does not.
+    let dropdown = dropdown.intersect(buf.area());
     layout.note_overlay(dropdown);
     fill_rect(dropdown, theme.modal, buf);
     Block::bordered()
@@ -14767,6 +14838,79 @@ mod tests {
         let agent_layout = render(&app, &mut buf);
         assert!(agent_layout.hits.iter().any(|hit| hit.target == HitTarget::AddAgent));
         assert!(agent_layout.hits.iter().all(|hit| !matches!(hit.target, HitTarget::Viewport) || hit.rect == agent_layout.viewport));
+    }
+
+    /// Pins the actual defect this fixed: the global search dropdown used
+    /// to be painted from inside `render_tabs` (`render_global_search`'s
+    /// own call chain), which runs BEFORE `render_surface` -- and the
+    /// surface's own pane header (`render_surface_pane_tabs`'s
+    /// unconditional `fill_rect`) sits exactly on the dropdown's own top
+    /// border row, one row under the tab strip. Painted in the wrong
+    /// order, that border and its first content row got silently erased
+    /// every frame the dropdown was open. `render::render`'s own top-level
+    /// sequence now paints it AFTER the surface instead (see that call
+    /// site's own doc comment) -- so this dropdown's own top-left corner
+    /// must still show a real border glyph, not the header's plain space,
+    /// once both have painted the same frame.
+    #[test]
+    fn global_search_dropdown_paints_after_the_surface_so_its_border_survives() {
+        let mut app = fixture(PtyColorMode::GateOverride);
+        app.focus = Focus::GlobalSearch;
+        app.global_search.expand_target_open = true;
+        app.global_search.expand_step = crate::app::SEARCH_EXPAND_STEPS;
+        let mut buf = TerminalBuffer::new(100, 24);
+
+        let layout = render(&app, &mut buf);
+
+        assert_ne!(layout.global_search_dropdown, Rect::default(), "dropdown should be open and recorded this frame");
+        let dropdown = layout.global_search_dropdown;
+        // The dropdown's own top row sits directly under the tab strip
+        // (`render_global_search_dropdown`'s own `anchor.bottom()`), which
+        // is exactly the surface's own pane header row -- see this test's
+        // own doc comment. A plain space here would mean the header's
+        // `fill_rect` ran AFTER the dropdown and erased its border; the
+        // real corner glyph (`Block::bordered`'s default `BorderType::
+        // Plain` top-left) proves the opposite order actually happened.
+        let corner = buf.get(dropdown.x, dropdown.y);
+        assert_eq!(corner.symbol, "┌");
+    }
+
+    /// `render_global_search_dropdown`'s own `anchor.width.max(28)` /
+    /// `rows + 2` footprint assumes the strip has that much room to the
+    /// right and that many rows free below it -- nothing bounded it
+    /// against the actual buffer before this fix, so an anchor sitting
+    /// close enough to the right edge or the bottom (unreachable through
+    /// `render::render` itself, which refuses anything under 56x14, but
+    /// reachable by calling this helper directly, the same way the
+    /// pre-strip fallback tests above call `render_workspace_files`/
+    /// `render_workspace_git` directly) ran the raw rect straight past
+    /// `buf`'s own bounds. Picks an anchor/buffer pair that overflows both
+    /// the right edge AND the bottom at once, and pins the exact clamped
+    /// rect this fix now records -- not just "still inside", since a
+    /// clamp that silently produced the wrong size would pass a looser
+    /// check just as well.
+    #[test]
+    fn global_search_dropdown_clamps_to_a_narrow_short_buffer() {
+        let mut app = App::default();
+        // Four deterministic matches purely from `ControlSection::ALL`
+        // ("files", "agents", "workspaces", "settings" -- see that enum's
+        // own `id()`), independent of any fixture node/tab data, so `rows`
+        // is a known 4 regardless of what else this `App` does or doesn't
+        // hold.
+        app.global_search.query = "s".to_owned();
+        let mut buf = TerminalBuffer::new(16, 7);
+        let mut layout = LayoutRects::default();
+        let theme = Theme::for_mode(PtyColorMode::GateOverride);
+        let anchor = Rect::new(10, 2, 4, 1);
+
+        render_global_search_dropdown(&app, anchor, &mut buf, &mut layout, theme);
+
+        // Unclamped this would have been `Rect::new(10, 3, 28, 6)` --
+        // right edge 38, bottom 9 -- well past this 16x7 buffer on both
+        // axes.
+        assert_eq!(layout.global_search_dropdown, Rect::new(10, 3, 6, 4));
+        assert!(layout.global_search_dropdown.right() <= buf.width());
+        assert!(layout.global_search_dropdown.bottom() <= buf.height());
     }
 
     /// The tab strip's own AddTab/LayoutMenuToggle controls: the STRIP

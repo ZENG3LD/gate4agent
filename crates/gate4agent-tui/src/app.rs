@@ -3051,6 +3051,22 @@ pub struct LayoutRects {
     /// hit region, tracked in `hits` like every other click target, not
     /// here).
     pub global_search_field: Rect,
+    /// The global search's own frame (`render::render_global_search`'s own
+    /// `block`), recorded here instead of that fn painting the results
+    /// dropdown directly -- `render::render`'s own top-level sequence
+    /// reads this AFTER `render_surface` has already run and uses it to
+    /// paint `render::render_global_search_dropdown` from there instead,
+    /// so the dropdown's own cells land on top of the surface's rather
+    /// than under it (see that fn's own call site doc comment for the
+    /// full defect this fixed: the surface's pane header/toolbar `fill_
+    /// rect` their own rows in `right[1]` unconditionally, and those rows
+    /// are exactly the dropdown's own top border and first content row
+    /// when it opens). `Rect::default()` whenever the dropdown is not
+    /// open, same convention as `global_search_dropdown` below -- this is
+    /// set at the exact same point `render_global_search` used to call
+    /// the dropdown renderer directly, so "recorded" and "open" are still
+    /// the same one condition, never two that could drift apart.
+    pub global_search_anchor: Rect,
     /// The global search's own results dropdown -- `Rect::default()`
     /// whenever it is not open (see `render::render_global_search`'s own
     /// doc comment for exactly when that is).

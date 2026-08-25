@@ -800,6 +800,13 @@ fn request_budget(request: &NodeRequest, relay_deadline: Option<Instant>, now: I
         .unwrap_or_else(|| node_request_deadline(request))
 }
 
+/// Relay bound for a workspace inspection. The node's own inspection
+/// budget is 8s by default and 11s at most; this must clear that maximum
+/// plus the round trip, or the relay kills a request the node was still
+/// legitimately working on -- and killing it drops the node, not just the
+/// request. See `node_request_deadline`'s own `InspectWorkspace` arm.
+const WORKSPACE_INSPECTION_RELAY_DEADLINE: Duration = Duration::from_secs(15);
+
 fn node_request_deadline(request: &NodeRequest) -> Duration {
     match request {
         NodeRequest::Snapshot
@@ -810,7 +817,6 @@ fn node_request_deadline(request: &NodeRequest) -> Duration {
         | NodeRequest::PutHarnessMcpReplyChunk { .. }
         | NodeRequest::RejectHarnessMcpCall { .. }
         | NodeRequest::BrowseHostDirectories { .. }
-        | NodeRequest::InspectWorkspace { .. }
         | NodeRequest::ReadWorkspaceFile { .. }
         | NodeRequest::WriteWorkspaceFile { .. }
         | NodeRequest::ReadGitHistory { .. }
@@ -820,6 +826,24 @@ fn node_request_deadline(request: &NodeRequest) -> Duration {
         | NodeRequest::RenameSessionRecord { .. }
         | NodeRequest::SetSessionTask { .. }
         | NodeRequest::ForgetSessionRecord { .. } => Duration::from_secs(5),
+        // The node gives its own workspace inspection 8s by default and up
+        // to 11s, and says so when it uses them
+        // (`git_time_budget_exceeded`, elapsed over eight seconds on a
+        // real repository here). Bounding it from out here at five made
+        // that inner budget unreachable: any workspace big enough to spend
+        // its own allowance timed out at the relay every single time.
+        //
+        // And a relay timeout is not a slow answer, it is a dead node --
+        // the node is dropped from the relay, its controller lease is
+        // released, and every read behind it starts answering
+        // "unavailable" until it reattaches, which it then does, and the
+        // cycle repeats. One number two seconds too small took the whole
+        // stack down in a loop: no inventory, so a spawned session could
+        // never be shown, while its process ran perfectly well.
+        //
+        // The outer bound must therefore clear the node's own MAXIMUM, not
+        // its default, with room for the round trip on top.
+        NodeRequest::InspectWorkspace { .. } => WORKSPACE_INSPECTION_RELAY_DEADLINE,
         NodeRequest::CreateWorkspaceFile { .. }
         | NodeRequest::CreateWorkspaceDirectory { .. } => {
             WORKSPACE_ENTRY_CREATE_RELAY_DEADLINE
@@ -3882,5 +3906,32 @@ mod tests {
         assert!(inventory.managed_worktrees.is_empty());
         assert_eq!(inventory.managed_worktree_count, 0);
         assert!(!inventory.managed_worktrees_truncated);
+    }
+}
+
+#[cfg(test)]
+mod relay_deadline_tests {
+    use super::*;
+
+    /// The defect this pins, stated as an invariant rather than a number:
+    /// the relay's bound on a request must never sit below the budget the
+    /// node itself is allowed to spend answering it. It sat at five
+    /// seconds against the node's eight-to-eleven, so every inspection of
+    /// a workspace large enough to use its own allowance timed out at the
+    /// relay -- and a relay timeout drops the NODE, not the request, which
+    /// took every read behind it down in a loop.
+    #[test]
+    fn workspace_inspection_relay_bound_clears_the_nodes_own_maximum() {
+        // The node's own ceiling (`WORKSPACE_INSPECTION_TIME_BUDGET_MS_MAX`
+        // in the node crate) restated here rather than imported: these are
+        // separate crates by design, and the point of the test is that the
+        // two numbers must be compared by a human when either moves.
+        const NODE_INSPECTION_MAX: Duration = Duration::from_millis(11_000);
+        assert!(
+            WORKSPACE_INSPECTION_RELAY_DEADLINE > NODE_INSPECTION_MAX,
+            "relay bound {:?} must exceed the node's own inspection maximum {:?}",
+            WORKSPACE_INSPECTION_RELAY_DEADLINE,
+            NODE_INSPECTION_MAX,
+        );
     }
 }

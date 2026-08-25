@@ -10773,6 +10773,25 @@ impl App {
         if self.find_session(&address).is_some() {
             self.open_address(address);
         } else if !self.pending_open.contains(&address) {
+            // Queued because the inventory has not caught up yet. That is
+            // normal for a moment and fatal if it lasts: the queue is only
+            // ever drained by an inventory update, so a session whose node
+            // never arrives waits here forever while its process runs and
+            // the pane stays empty -- indistinguishable, from the outside,
+            // from a spawn that failed. It was silent, which is why three
+            // rounds of diagnosis could not tell those two apart. It says
+            // so now, and `reconcile_pending_open` says when it clears.
+            self.report_event(
+                EventSeverity::Warn,
+                EventSource::Session,
+                format!(
+                    "session {}/{} #{}.{} spawned but its node is not in view yet; waiting to open it",
+                    address.node_id,
+                    address.workspace_id,
+                    address.instance_id,
+                    address.generation,
+                ),
+            );
             self.pending_open.push(address);
         }
     }
@@ -11451,6 +11470,17 @@ impl App {
             .collect::<Vec<_>>();
         self.pending_open.retain(|address| !ready.contains(address));
         for address in ready {
+            // The other half of `request_open`'s own warning: this is the
+            // line that says the wait ended. Its absence, with the warning
+            // present, is the whole defect stated in two entries.
+            self.report_event(
+                EventSeverity::Info,
+                EventSource::Session,
+                format!(
+                    "opening session {}/{} #{}.{}",
+                    address.node_id, address.workspace_id, address.instance_id, address.generation,
+                ),
+            );
             self.open_address(address);
         }
     }

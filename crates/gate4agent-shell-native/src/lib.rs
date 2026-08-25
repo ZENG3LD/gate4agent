@@ -47,7 +47,7 @@ use gate4agent_types::{
     CONTROL_PROTOCOL_VERSION, WORKING_DIRECTORY_MAX_BYTES,
 };
 use std::collections::{BTreeMap, VecDeque};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -773,6 +773,29 @@ impl NativeEffectShell {
                     authoritative_provider_session.is_some(),
                     "codex",
                 );
+                // This is the last point before the OS-level PTY spawn where
+                // the program and its arguments are still plain, structured
+                // data (`spec.launch.program`/`fixed_args` are catalog
+                // constants; `launch_extra_args` is the dynamic, per-session
+                // portion). Provider secrets are environment-only by this
+                // repo's own convention (never argv, see `gate4agent/CLAUDE.md`),
+                // so `fixed_args` needs no redaction; `launch_extra_args`
+                // still gets a defensive per-token credential-shape check
+                // in case a provider CLI's own argv convention differs.
+                // The initial prompt itself is arbitrary-length user text,
+                // not an operational argument, so only its presence is
+                // logged, never its contents.
+                tracing::info!(
+                    agent_id = %agent_id,
+                    instance_id = ?key.instance_id,
+                    generation = ?key.generation,
+                    terminal_size = ?request.terminal_size,
+                    program = %spec.launch.program,
+                    fixed_args = ?spec.launch.fixed_args,
+                    extra_args = ?redact_provider_arguments(&launch_extra_args),
+                    has_initial_prompt = request.initial_prompt.is_some(),
+                    "spawning provider process over a PTY",
+                );
                 match PtySession::spawn_agent_with_size(
                     &spec,
                     LaunchRequest {
@@ -904,9 +927,19 @@ impl NativeEffectShell {
                     );
                     ControlObservation::Spawned { process_id }
                 }
-                    Err(error) => ControlObservation::SpawnFailed {
-                        message: error.to_string(),
-                    },
+                    Err(error) => {
+                        let message = error.to_string();
+                        tracing::warn!(
+                            agent_id = %agent_id,
+                            instance_id = ?key.instance_id,
+                            generation = ?key.generation,
+                            program = %spec.launch.program,
+                            fixed_args = ?spec.launch.fixed_args,
+                            cause = %message,
+                            "provider process failed to start",
+                        );
+                        ControlObservation::SpawnFailed { message }
+                    }
                 }
             }
             TransportKind::Pipe => {
@@ -1505,6 +1538,50 @@ fn validate_instance_launch_arguments(
         }
     }
     Ok(())
+}
+
+/// True if `value` has the shape of a bearer credential rather than an
+/// ordinary CLI flag, path, or session identifier.
+///
+/// Gate4Agent's own secrets are environment-only and never argv (see
+/// `gate4agent/CLAUDE.md`), so this should not fire for anything this repo
+/// itself constructs. It exists as defense-in-depth against a provider CLI
+/// whose own argv convention accepts a credential positionally. The check is
+/// deliberately keyword/prefix-based rather than an entropy heuristic: a
+/// generic "long hex/base64 string" rule would also catch legitimate,
+/// diagnostically valuable arguments such as a resume session UUID.
+fn argument_looks_like_credential(value: &str) -> bool {
+    const CREDENTIAL_PREFIXES: &[&str] = &[
+        "sk-", "sk_", "ghp_", "gho_", "ghs_", "xox", "g4aho_", "bearer ",
+    ];
+    const CREDENTIAL_MARKERS: &[&str] = &[
+        "apikey", "api_key", "api-key", "secret", "password", "passwd", "token=",
+    ];
+    let lower = value.to_ascii_lowercase();
+    CREDENTIAL_PREFIXES
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+        || CREDENTIAL_MARKERS
+            .iter()
+            .any(|marker| lower.contains(marker))
+}
+
+/// Renders one provider-CLI argument for a log line: verbatim unless it
+/// matches [`argument_looks_like_credential`], in which case it is replaced
+/// with a fixed placeholder rather than printed.
+fn redact_provider_argument(value: &OsStr) -> String {
+    let text = value.to_string_lossy();
+    if argument_looks_like_credential(&text) {
+        "[redacted-credential-shaped-argument]".to_owned()
+    } else {
+        text.into_owned()
+    }
+}
+
+/// Renders a full provider-CLI argument list for a log line, redacting any
+/// individual argument that looks like a credential.
+fn redact_provider_arguments(values: &[OsString]) -> Vec<String> {
+    values.iter().map(|value| redact_provider_argument(value)).collect()
 }
 
 fn require_runtime_capability(
@@ -3029,8 +3106,10 @@ fn elapsed_ms(started: Instant) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        drain_qwen_sidecar, finish_qwen_sidecar, prepare_fresh_pty_provider_session,
-        prompt_render_probe, prompt_rendered, reserve_provider_gap_sequence, NativeSessionKey,
+        argument_looks_like_credential, drain_qwen_sidecar, finish_qwen_sidecar,
+        prepare_fresh_pty_provider_session,
+        prompt_render_probe, prompt_rendered, redact_provider_argument, redact_provider_arguments,
+        reserve_provider_gap_sequence, NativeSessionKey,
         NativeEffectShell, OwnedQwenDualOutput, QwenDualOutputLaunch,
         QWEN_SIDECAR_READ_MAX_BYTES_PER_TICK,
         should_attach_pty_provider_stream, should_probe_pty_identity, startup_operator_gate,
@@ -3047,7 +3126,7 @@ mod tests {
         OperationId, ProviderEvent, ProviderRuntimePolicy, SessionGeneration, StartRequest,
         TerminalMouseProtocolEncoding, TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
     };
-    use std::ffi::OsString;
+    use std::ffi::{OsStr, OsString};
     use std::fs::{File, OpenOptions};
     use std::io::Write;
     use std::path::{Path, PathBuf};
@@ -3681,6 +3760,123 @@ mod tests {
             .await;
         assert!(matches!(failed.observation, ControlObservation::SpawnFailed { .. }));
         assert!(!directory.exists());
+    }
+
+    #[test]
+    fn credential_shaped_arguments_are_redacted_but_ordinary_ones_pass_through() {
+        assert!(argument_looks_like_credential("sk-ant-abcdef123456"));
+        assert!(argument_looks_like_credential("Bearer abcdef123456"));
+        assert!(argument_looks_like_credential("--api-key=abcdef123456"));
+        assert!(argument_looks_like_credential("token=abcdef123456"));
+        assert!(!argument_looks_like_credential("--resume"));
+        assert!(!argument_looks_like_credential(
+            "0f1e2d3c-4b5a-6978-8899-aabbccddeeff"
+        ));
+        assert!(!argument_looks_like_credential("--model"));
+        assert!(!argument_looks_like_credential("opus"));
+
+        assert_eq!(
+            redact_provider_argument(OsStr::new("sk-ant-abcdef123456")),
+            "[redacted-credential-shaped-argument]",
+        );
+        assert_eq!(
+            redact_provider_arguments(&[
+                OsString::from("--resume"),
+                OsString::from("g4aho_deadbeef"),
+            ]),
+            vec!["--resume".to_owned(), "[redacted-credential-shaped-argument]".to_owned()],
+        );
+    }
+
+    /// The logging itself is the contract here: a spawn failure must record
+    /// its actual OS-level cause, not a bare "failed". This is the exact gap
+    /// that left the live node silent while a real spawn attempt failed.
+    #[tokio::test]
+    async fn pty_spawn_failure_logs_the_os_error_cause() {
+        #[derive(Clone, Default)]
+        struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for CapturedLog {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+            type Writer = CapturedLog;
+
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .finish();
+        let _default_guard = tracing::subscriber::set_default(subscriber);
+
+        let mut spec = gate4agent_testkit::interactive_agent_spec();
+        let missing_launcher = std::env::temp_dir().join(format!(
+            "gate4agent-shell-native-missing-launcher-{}{}",
+            std::process::id(),
+            std::env::consts::EXE_SUFFIX,
+        ));
+        spec.launch.program = missing_launcher.to_string_lossy().into_owned();
+        let agent_id = spec.id.clone();
+        let mut shell =
+            NativeEffectShell::new(gate4agent_catalog::AgentRegistry::new([spec]).unwrap());
+
+        let failed = shell
+            .execute(EffectEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                operation_id: OperationId(1),
+                instance_id: AgentInstanceId(1),
+                generation: SessionGeneration(1),
+                effect: ControlEffect::Spawn {
+                    agent_id,
+                    transport: TransportKind::Pty,
+                    runtime_policy: ProviderRuntimePolicy::raw_pty(),
+                    request: StartRequest {
+                        working_directory: std::env::current_dir()
+                            .expect("test process has a current directory")
+                            .to_string_lossy()
+                            .into_owned(),
+                        terminal_size: TerminalSize { rows: 24, columns: 80 },
+                        initial_prompt: None,
+                        session_options: None,
+                    },
+                },
+            })
+            .await;
+        assert!(matches!(failed.observation, ControlObservation::SpawnFailed { .. }));
+
+        drop(_default_guard);
+        let log_text = String::from_utf8(
+            captured
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+        )
+        .expect("captured log output is valid UTF-8");
+        assert!(
+            log_text.contains("provider process failed to start"),
+            "expected the spawn-failure log line, got: {log_text}",
+        );
+        assert!(
+            log_text.contains("os error"),
+            "expected the log to name the OS spawn failure cause, got: {log_text}",
+        );
     }
 
     #[tokio::test]

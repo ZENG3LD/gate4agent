@@ -541,6 +541,13 @@ async fn node_relay_worker(
             Ok(Err(error)) => {
                 failures = failures.saturating_add(1);
                 let (error, hard) = sanitize_node_error(&error);
+                tracing::warn!(
+                    node_id = %node.node_id,
+                    cause = %error.message,
+                    category = ?error.category,
+                    hard,
+                    "node connection attempt failed",
+                );
                 ingress_attempt(&ingress, &node.node_id, AttemptResult::Failure { error, hard }).await?;
                 reject_disconnected_commands(&mut commands, previous);
                 acknowledge_disconnected_releases(&mut releases);
@@ -549,6 +556,11 @@ async fn node_relay_worker(
             }
             Err(_) => {
                 failures = failures.saturating_add(1);
+                tracing::warn!(
+                    node_id = %node.node_id,
+                    cause = "node connection deadline exceeded",
+                    "node connection attempt failed",
+                );
                 ingress_attempt(&ingress, &node.node_id, AttemptResult::Failure {
                     error: SanitizedError { category: C2ErrorCategory::Timeout, message: "node connection deadline exceeded".to_owned() },
                     hard: false,
@@ -567,6 +579,12 @@ async fn node_relay_worker(
             C2ObservationSupport::from_node_compatibility(hello.compatibility.as_ref());
         let incarnation_id = hello.incarnation_id;
         let connection_id = hello.connection_id;
+        tracing::info!(
+            node_id = %node.node_id,
+            connection_id,
+            incarnation_id = ?incarnation_id,
+            "node attached to relay",
+        );
         let mut controller_owned = hello.controller.as_ref().is_some_and(|controller| controller.connection_id == connection_id);
         let mut cursor = NodeCursor { incarnation_id, sequence: hello.event_sequence };
         let mut snapshot = hello.snapshot;
@@ -723,6 +741,14 @@ async fn node_relay_worker(
             }
         };
         let (error, hard) = sanitize_node_error(&disconnect_error);
+        tracing::warn!(
+            node_id = %node.node_id,
+            connection_id,
+            cause = %error.message,
+            category = ?error.category,
+            hard,
+            "node dropped from relay",
+        );
         ingress_attempt(&ingress, &node.node_id, AttemptResult::Failure { error, hard }).await?;
         reject_disconnected_commands(&mut commands, Some(cursor));
         failures = failures.saturating_add(1);

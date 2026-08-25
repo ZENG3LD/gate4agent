@@ -152,8 +152,18 @@ async fn serve_connection(
 ) -> Result<(), FrameError> {
     let hello = timeout(AUTH_DEADLINE, read_client_frame(&mut pipe, MAX_C2_AUTH_FRAME_BYTES))
         .await.map_err(|_| FrameError::PrefixTimedOut)??;
-    let C2ClientFrame::Hello(hello) = hello else { return Ok(()); };
-    if hello.protocol_version != C2_CONTROL_PROTOCOL_VERSION { return Ok(()); }
+    let C2ClientFrame::Hello(hello) = hello else {
+        tracing::warn!("control connection rejected: expected a hello frame first");
+        return Ok(());
+    };
+    if hello.protocol_version != C2_CONTROL_PROTOCOL_VERSION {
+        tracing::warn!(
+            protocol_version = hello.protocol_version,
+            expected_protocol_version = C2_CONTROL_PROTOCOL_VERSION,
+            "control connection rejected: unsupported protocol version",
+        );
+        return Ok(());
+    }
     let negotiated = c2_control_compatibility_support()?
         .negotiate(&hello)
         .map_err(|error| authentication_frame_error(error.to_string()))?;
@@ -184,7 +194,10 @@ async fn serve_connection(
     )).await.map_err(|_| FrameError::BodyTimedOut { length: 0 })??;
     let authentication = timeout(AUTH_DEADLINE, read_client_frame(&mut pipe, MAX_C2_AUTH_FRAME_BYTES))
         .await.map_err(|_| FrameError::PrefixTimedOut)??;
-    let C2ClientFrame::Authenticate(C2ClientAuthentication { client_proof }) = authentication else { return Ok(()); };
+    let C2ClientFrame::Authenticate(C2ClientAuthentication { client_proof }) = authentication else {
+        tracing::warn!("control connection rejected: expected an authenticate frame");
+        return Ok(());
+    };
     let expected = c2_proof(
         token,
         C2AuthDirection::Client,
@@ -193,12 +206,16 @@ async fn serve_connection(
         auth_compatibility,
     )
         .map_err(authentication_frame_error)?;
-    if !proofs_match(&client_proof, &expected) { return Ok(()); }
+    if !proofs_match(&client_proof, &expected) {
+        tracing::warn!("control connection rejected: authentication proof mismatch");
+        return Ok(());
+    }
     drop(preauth_permit);
 
     let operator_permit = match Arc::clone(&authenticated).try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
+            tracing::warn!("control connection rejected: another operator is already connected");
             timeout(AUTH_DEADLINE, write_json_frame_limited(
                 &mut pipe,
                 &C2ServerFrame::Rejected(relay_failure(
@@ -288,6 +305,7 @@ async fn serve_connection(
     ));
     let mut dispatches = JoinSet::new();
     let mut last_request_id = 0_u64;
+    tracing::info!(connection_id, "control connection opened");
 
     loop {
         tokio::select! {
@@ -299,6 +317,11 @@ async fn serve_connection(
                     break;
                 }
                 if request.request_id.0 == 0 || request.request_id.0 <= last_request_id {
+                    tracing::warn!(
+                        connection_id,
+                        request_id = request.request_id.0,
+                        "control request rejected: request ID must be nonzero and strictly increasing",
+                    );
                     let failure = relay_failure(C2RelayFailureCode::RequestIdReused, "C2 request IDs must be nonzero and strictly increasing", None);
                     if queue_reply(&outbound_tx, &budget, C2ReplyEnvelope { request_id: request.request_id, result: Err(failure) }).await.is_err() { break; }
                     continue;
@@ -308,6 +331,12 @@ async fn serve_connection(
                     &request.request.request,
                     path_capabilities,
                 ) {
+                    tracing::warn!(
+                        connection_id,
+                        request_id = request.request_id.0,
+                        cause = ?failure,
+                        "control request rejected: capability was not negotiated",
+                    );
                     if queue_reply(&outbound_tx, &budget, C2ReplyEnvelope {
                         request_id: request.request_id,
                         result: Err(failure),
@@ -317,6 +346,11 @@ async fn serve_connection(
                 if !path_capabilities.provider_ids_open
                     && request_targets_unavailable_provider(&request.request, status.borrow().as_ref())
                 {
+                    tracing::warn!(
+                        connection_id,
+                        request_id = request.request_id.0,
+                        "control request rejected: provider identity capability was not negotiated",
+                    );
                     let failure = relay_failure(
                         C2RelayFailureCode::RequestForbidden,
                         "provider identity capability was not negotiated with C2",
@@ -375,6 +409,7 @@ async fn serve_connection(
         while dispatches.try_join_next().is_some() {}
     }
 
+    tracing::info!(connection_id, "control connection closed");
     hub.detach(connection_id);
     dispatches.shutdown().await;
     release_all_controllers(&relays).await;

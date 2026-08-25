@@ -11,6 +11,17 @@ const C2_TOKEN_ENV: &str = "GATE4AGENT_C2_TOKEN";
 #[cfg(any(windows, unix))]
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    // Both c2 instances in a live stack had produced zero bytes of log output
+    // over fourteen hours -- not a filtered-out level, an absent subscriber.
+    // Without this, every `tracing::info!`/`warn!` call anywhere in this
+    // binary and its dependencies is a no-op. Mirrors gate4agent-node's own
+    // `main.rs` init exactly.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
     let mut api_listen = DEFAULT_C2_API_LISTEN.parse().expect("built-in C2 listen address is valid");
     let mut control_endpoint = default_c2_control_endpoint()
         .unwrap_or_else(|error| fail(&error.to_string()));

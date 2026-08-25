@@ -8860,6 +8860,98 @@ impl NodeShared {
                     && binding.generation == address.session.generation
             })
             .and_then(|binding| binding.record_id.clone());
+        // Every state change a session's process lifecycle can reach gets a
+        // line here: this is the single chokepoint every `ControlEventKind`
+        // passes through regardless of transport (PTY/pipe/ACP) or whether it
+        // came from a fresh spawn or a resume. Per-message provider chatter
+        // (`ProviderEvent`/`ProviderGap`/terminal frames) is deliberately not
+        // matched here -- that is exactly the per-frame noise this crate
+        // family's level discipline forbids at INFO.
+        match &event.event {
+            ControlEventKind::Running { process_id } => {
+                tracing::info!(
+                    node_id = %self.node_id,
+                    workspace_id = %address.workspace_id,
+                    session = ?address.session,
+                    pid = ?process_id,
+                    "session process is running",
+                );
+            }
+            ControlEventKind::Exited { exit_code, forced } => {
+                tracing::info!(
+                    node_id = %self.node_id,
+                    workspace_id = %address.workspace_id,
+                    session = ?address.session,
+                    exit_code = ?exit_code,
+                    forced = forced,
+                    "session process exited",
+                );
+            }
+            ControlEventKind::Failed { message } => {
+                tracing::warn!(
+                    node_id = %self.node_id,
+                    workspace_id = %address.workspace_id,
+                    session = ?address.session,
+                    cause = %message,
+                    "session failed",
+                );
+            }
+            ControlEventKind::CommandRejected { message } => {
+                tracing::warn!(
+                    node_id = %self.node_id,
+                    workspace_id = %address.workspace_id,
+                    session = ?address.session,
+                    cause = %message,
+                    "session command rejected",
+                );
+            }
+            ControlEventKind::Removed => {
+                tracing::info!(
+                    node_id = %self.node_id,
+                    workspace_id = %address.workspace_id,
+                    session = ?address.session,
+                    "session removed",
+                );
+            }
+            ControlEventKind::ResumeAuthorized { session: provider_session } => {
+                tracing::info!(
+                    node_id = %self.node_id,
+                    workspace_id = %address.workspace_id,
+                    session = ?address.session,
+                    provider_session = ?provider_session,
+                    "session resume authorized",
+                );
+            }
+            ControlEventKind::Resumed { session: provider_session, process_id } => {
+                tracing::info!(
+                    node_id = %self.node_id,
+                    workspace_id = %address.workspace_id,
+                    session = ?address.session,
+                    provider_session = ?provider_session,
+                    pid = ?process_id,
+                    "session resumed",
+                );
+            }
+            ControlEventKind::ResumeDenied { reason } => {
+                tracing::warn!(
+                    node_id = %self.node_id,
+                    workspace_id = %address.workspace_id,
+                    session = ?address.session,
+                    cause = %reason,
+                    "session resume denied",
+                );
+            }
+            ControlEventKind::ResumeFailed { message } => {
+                tracing::warn!(
+                    node_id = %self.node_id,
+                    workspace_id = %address.workspace_id,
+                    session = ?address.session,
+                    cause = %message,
+                    "session resume failed",
+                );
+            }
+            _ => {}
+        }
         let observations = provider_observations(&event);
         self.publish(NodeEvent::Control {
             address: address.clone(),
@@ -9507,6 +9599,7 @@ impl NodeShared {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut events = Vec::with_capacity(candidates.len());
         for (address, frame) in candidates {
+            let is_first_frame = !watermarks.contains_key(&address.session.instance_id);
             let advanced = watermarks
                 .get(&address.session.instance_id)
                 .map_or(true, |(current_address, sequence)| {
@@ -9514,6 +9607,32 @@ impl NodeShared {
                 });
             if !advanced {
                 continue;
+            }
+            if is_first_frame {
+                // This is the first PTY output this node has observed for
+                // this session -- a one-time event per spawn, not per-frame
+                // chatter (the watermark makes sure of that). A session that
+                // reaches this line with no controller attached anywhere on
+                // the node is running unobserved: exactly how processes from
+                // repeated spawn attempts went orphaned for hours without a
+                // single line about it.
+                if self.controller_state().is_none() {
+                    tracing::warn!(
+                        node_id = %self.node_id,
+                        workspace_id = %address.workspace_id,
+                        session = ?address.session,
+                        terminal_size = ?frame.size,
+                        "session producing output with no controller attached",
+                    );
+                } else {
+                    tracing::info!(
+                        node_id = %self.node_id,
+                        workspace_id = %address.workspace_id,
+                        session = ?address.session,
+                        terminal_size = ?frame.size,
+                        "session produced its first output",
+                    );
+                }
             }
             watermarks.insert(
                 address.session.instance_id,
@@ -9565,6 +9684,11 @@ impl NodeShared {
 
     fn acquire_controller(&self, connection_id: u64, role: ClientRole, lease_ms: u64) -> Result<ControllerState, NodeFailure> {
         if role != ClientRole::Operator {
+            tracing::warn!(
+                node_id = %self.node_id,
+                connection_id,
+                "controller lease rejected: observer connections cannot acquire control",
+            );
             return Err(failure(NodeFailureCode::ObserverReadOnly, "observer connections cannot acquire control"));
         }
         let lease_ms = if lease_ms == 0 {
@@ -9576,15 +9700,46 @@ impl NodeShared {
         let mut controller = self.controller.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(active) = controller.as_ref() {
             if active.connection_id != connection_id && active.expires_at > now {
+                tracing::warn!(
+                    node_id = %self.node_id,
+                    connection_id,
+                    holder_connection_id = active.connection_id,
+                    "controller lease rejected: another operator holds it",
+                );
                 return Err(failure(NodeFailureCode::ControllerBusy, "another operator holds the controller lease"));
             }
         }
+        // A reconnect (this connection already holds the lease, renewing
+        // before expiry) happens on a periodic cadence; logging it at INFO
+        // every renewal would be exactly the heartbeat chatter this crate
+        // family's level discipline forbids. A genuine attach -- the
+        // controller identity actually changing -- is a state change and
+        // gets INFO; a same-connection renewal gets DEBUG.
+        let is_new_attach = match controller.as_ref() {
+            Some(active) => active.connection_id != connection_id,
+            None => true,
+        };
         *controller = Some(ControllerLease {
             connection_id,
             expires_at: now + Duration::from_millis(lease_ms),
         });
         drop(controller);
         let state = ControllerState { connection_id, lease_remaining_ms: lease_ms };
+        if is_new_attach {
+            tracing::info!(
+                node_id = %self.node_id,
+                connection_id,
+                lease_ms,
+                "controller lease acquired",
+            );
+        } else {
+            tracing::debug!(
+                node_id = %self.node_id,
+                connection_id,
+                lease_ms,
+                "controller lease renewed",
+            );
+        }
         self.publish(NodeEvent::ControllerChanged { controller: Some(state.clone()) });
         Ok(state)
     }
@@ -9597,6 +9752,11 @@ impl NodeShared {
         }
         drop(controller);
         if released {
+            tracing::info!(
+                node_id = %self.node_id,
+                connection_id,
+                "controller lease released",
+            );
             self.publish(NodeEvent::ControllerChanged { controller: None });
         }
         released
@@ -10660,6 +10820,21 @@ impl NodeShared {
             workspace_id: workspace_id.clone(),
             session,
         };
+        // This is the request-accepted checkpoint: admission (managed
+        // worktree authority, runtime capability, dispatch deadline) already
+        // passed and a concrete session identity is minted. It is a distinct
+        // state from the process actually running (`ControlEventKind::Running`,
+        // logged in `publish_control`) or the terminal outcome (`Exited`/
+        // `Failed`, logged there too) -- this line exists so that gap is no
+        // longer silent.
+        tracing::info!(
+            node_id = %self.node_id,
+            workspace_id = %workspace_id,
+            provider = %provider,
+            environment_profile = ?environment_profile.as_ref().map(|receipt| &receipt.profile_id),
+            session = ?address.session,
+            "session spawn request accepted",
+        );
         let mut harness_mcp_overlay = if let Some(prepared) = harness_mcp {
             if mode != SessionMode::Pty || prepared.provider != provider {
                 return Err(failure(

@@ -1092,6 +1092,17 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
             for action in changed_terminal_sizes(&app, &mut last_terminal_sizes) {
                 queue_action(&mut app, &commands, &inspection_commands, &mut pending_raw, action);
             }
+            // Hidden for the whole paint, restored by `sync_cursor` at the
+            // end of it. Every write leaves the terminal's own cursor at
+            // the last cell it touched, and the sixel pass moves it again
+            // per icon -- so with the cursor visible throughout, it is
+            // seen at each of those positions in turn before being pulled
+            // back. That reads as a cursor flickering around the screen,
+            // and the two things that redraw on their own timers -- the
+            // clock every second, the pet far more often -- are exactly
+            // where it was seen. The cursor belongs in one place: wherever
+            // `sync_cursor` decides, once the frame is finished.
+            execute!(stdout(), Hide)?;
             screen.flush()?;
             flush_sixel_icon(&app, screen.current(), &mut sixel_emit_state)?;
             sync_cursor(&app)?;

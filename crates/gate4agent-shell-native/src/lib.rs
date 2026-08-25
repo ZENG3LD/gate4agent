@@ -2312,6 +2312,9 @@ fn terminal_frame(snapshot: PtyTerminalSnapshot) -> TerminalFrame {
             PtyMouseProtocolEncoding::Utf8 => TerminalMouseProtocolEncoding::Utf8,
             PtyMouseProtocolEncoding::Sgr => TerminalMouseProtocolEncoding::Sgr,
         },
+        // Carried through unchanged from the PTY snapshot -- this crate does
+        // not restamp it, see `TerminalFrame::produced_at_unix_ms`'s own doc.
+        produced_at_unix_ms: snapshot.produced_at_unix_ms,
     }
 }
 
@@ -3206,6 +3209,7 @@ mod tests {
             alternate_screen: false,
             mouse_protocol_enabled: false,
             mouse_protocol_encoding: PtyMouseProtocolEncoding::Default,
+            produced_at_unix_ms: 0,
         }
     }
 
@@ -3216,12 +3220,15 @@ mod tests {
         snapshot.alternate_screen = true;
         snapshot.mouse_protocol_enabled = true;
         snapshot.mouse_protocol_encoding = PtyMouseProtocolEncoding::Sgr;
+        snapshot.produced_at_unix_ms = 1_700_000_000_000;
 
         let frame = terminal_frame(snapshot);
         assert_eq!(frame.scrollback_formatted, vec![b"older".to_vec()]);
         assert!(frame.alternate_screen);
         assert!(frame.mouse_protocol_enabled);
         assert_eq!(frame.mouse_protocol_encoding, TerminalMouseProtocolEncoding::Sgr);
+        // `terminal_frame` must carry the stamp through, never recompute it.
+        assert_eq!(frame.produced_at_unix_ms, 1_700_000_000_000);
     }
 
     #[test]

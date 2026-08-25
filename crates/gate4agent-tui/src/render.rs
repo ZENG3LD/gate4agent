@@ -450,6 +450,9 @@ pub fn render(app: &App, buf: &mut TerminalBuffer) -> LayoutRects {
     if app.harness_kanban.reverse_attribution.is_some() {
         render_harness_reverse_attribution(app, area, buf, &mut layout, theme);
     }
+    if app.profiler_overlay_open {
+        render_profile_overlay(app, area, buf, &mut layout, theme);
+    }
     render_drag_preview(app, area, buf, &layout, theme);
     if let Some(notice) = app.notice() {
         render_notice(notice, right[1], buf, theme);
@@ -8226,6 +8229,88 @@ fn render_harness_monitor(
         if let Some(target) = target {
             layout.hits.push(HitRegion { rect: row, target });
         }
+    }
+}
+
+/// The owner-visible readout for `App::profiler` -- `Ctrl+P` toggles it
+/// open, the same key or `Escape` closes it (`App::reduce`'s own top-of-
+/// function guard), and a click anywhere outside its rect closes it too
+/// (`App::close_overlay_outside_click`). No `.title(...)` call and no
+/// `[x]`, deliberately, same contract `render_global_search_dropdown`'s
+/// own doc comment documents for that dropdown: a diagnostic readout is
+/// not a modal you configure, it is a window you glance at and dismiss the
+/// same way you opened it. Every number here comes from one `snapshot()`
+/// call -- the same one `TuiProfiler::maybe_write_log` formats into the
+/// log file, so the overlay and the log can never disagree about what
+/// "right now" means.
+fn render_profile_overlay(
+    app: &App,
+    area: Rect,
+    buf: &mut TerminalBuffer,
+    layout: &mut LayoutRects,
+    theme: Theme,
+) {
+    let snapshot = app.profiler.snapshot();
+    let width = 70.min(area.width);
+    let height = 16.min(area.height);
+    if width < 3 || height < 3 {
+        return;
+    }
+    let modal = centered(area, width, height);
+    layout.note_overlay(modal);
+    fill_rect(modal, theme.modal, buf);
+    Block::bordered()
+        .border_style(Style::default().fg(theme.accent))
+        .style(Style::default().bg(theme.modal))
+        .render(modal, buf);
+    let inner = Rect::new(
+        modal.x + 1,
+        modal.y + 1,
+        modal.width.saturating_sub(2),
+        modal.height.saturating_sub(2),
+    );
+    let dist_line = |name: &str, dist: crate::profile::Distribution| {
+        format!("{name:<11} p50={:<6} p95={:<6} max={:<6} n={}", dist.p50, dist.p95, dist.max, dist.count)
+    };
+    let empty_pct = if snapshot.terminal_polls_total == 0 {
+        0.0
+    } else {
+        100.0 * snapshot.terminal_polls_empty as f64 / snapshot.terminal_polls_total as f64
+    };
+    let lines = [
+        dist_line("render_us", snapshot.render_us),
+        dist_line("flush_us", snapshot.flush_us),
+        dist_line("sixel_us", snapshot.sixel_us),
+        dist_line("frame_us", snapshot.frame_us),
+        dist_line("wait_us", snapshot.wait_us),
+        format!(
+            "{:<11} p50={:<6} p95={:<6} max={:<6} n={} (ceiling {})",
+            "fps", snapshot.fps.p50, snapshot.fps.p95, snapshot.fps.max, snapshot.fps.count,
+            snapshot.fps_ceiling,
+        ),
+        dist_line("frame_age_ms", snapshot.frame_age_ms),
+        dist_line("term_rtt_us", snapshot.terminal_rtt_us),
+        dist_line("term_fps", snapshot.terminal_frames_per_sec),
+        dist_line("term_bps", snapshot.terminal_bytes_per_sec),
+        format!(
+            "term_polls  empty={} of total={} ({empty_pct:.0}% empty)",
+            snapshot.terminal_polls_empty, snapshot.terminal_polls_total,
+        ),
+        format!(
+            "term_total  frames={} bytes={}",
+            snapshot.terminal_frames_total, snapshot.terminal_bytes_total,
+        ),
+        String::new(),
+        "Ctrl+P or Esc closes".to_owned(),
+    ];
+    for (row, line) in lines.iter().enumerate() {
+        render_modal_line(
+            line,
+            inner,
+            row as u16,
+            Style::default().fg(theme.text).bg(theme.modal),
+            buf,
+        );
     }
 }
 

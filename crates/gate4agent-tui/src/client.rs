@@ -122,7 +122,7 @@ const INSPECTION_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const HARNESS_TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const PREFERENCES_SAVE_DEBOUNCE: Duration = Duration::from_millis(350);
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(20);
-const DIRTY_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+pub(crate) const DIRTY_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(80);
 const ANIMATION_TICKS_PER_FRAME: u8 = 4;
 /// The hovered-shimmer-slot fast cadence -- the SAME 72ms `shimmer::
@@ -945,6 +945,14 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
     let mut frames = FrameScheduler::new(Instant::now());
     let mut sixel_emit_state = SixelEmitState::default();
     while !app.should_quit {
+        // Rides this loop's own existing cadence -- no new thread, no new
+        // timer. `tick_second` is a cheap `Instant` comparison unless a
+        // full second actually elapsed (see its own doc comment for why
+        // it must run every iteration, not just on a redraw);
+        // `maybe_write_log` is the same shape at a several-second cadence.
+        let loop_tick = Instant::now();
+        app.profiler.tick_second(loop_tick);
+        app.profiler.maybe_write_log(loop_tick);
         let mut state_changed = false;
         while let Ok(update) = updates_rx.try_recv() {
             let action = apply_update(&mut app, &mut terminal_watermarks, update);
@@ -1016,6 +1024,10 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
                 .find(|node| node.node_id == address.node_id)
                 .and_then(|node| node.incarnation_id)
             {
+                // Starts `terminal_rtt_us`'s clock -- closed the moment
+                // the matching `WorkerUpdate::HarnessTerminalRead` gets
+                // applied (`apply_update`'s own arm below).
+                app.profiler.begin_terminal_poll(now);
                 let action = AppAction::HarnessOpenTerminal {
                     session: harness_terminal_session_address(&address, incarnation_id),
                     after_sequence: terminal_watermarks.terminal_watermark(&address),
@@ -1077,6 +1089,12 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
         // cadence is running (a hovered shimmer slot or an enabled pet).
         let animation_interval = animation_wake_interval(&app);
         if frames.redraw_due(now, animation_interval) {
+            // Wraps the whole redraw tick, start to finish, for `frame_us`
+            // -- see `TuiProfiler::record_frame`'s own doc comment for why
+            // this is also the one place a completed redraw is counted
+            // toward `fps`. Pure timing: nothing between here and `record_
+            // frame` below changes what this block already did.
+            let frame_start = Instant::now();
             frames.consume_redraw(now, animation_interval);
             if frames.spinner_tick_due(now, app.has_active_animation()) {
                 for _ in 0..ANIMATION_TICKS_PER_FRAME {
@@ -1088,7 +1106,9 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
             // of how sparsely or densely this block actually runs; see
             // `App::step_pet`'s own doc comment.
             app.step_pet(now);
+            let render_start = Instant::now();
             app.layout = render::render(&app, screen.buffer_mut());
+            app.profiler.record_render(render_start.elapsed());
             for action in changed_terminal_sizes(&app, &mut last_terminal_sizes) {
                 queue_action(&mut app, &commands, &inspection_commands, &mut pending_raw, action);
             }
@@ -1103,9 +1123,14 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
             // where it was seen. The cursor belongs in one place: wherever
             // `sync_cursor` decides, once the frame is finished.
             execute!(stdout(), Hide)?;
+            let flush_start = Instant::now();
             screen.flush()?;
+            app.profiler.record_flush(flush_start.elapsed());
+            let sixel_start = Instant::now();
             flush_sixel_icon(&app, screen.current(), &mut sixel_emit_state)?;
+            app.profiler.record_sixel(sixel_start.elapsed());
             sync_cursor(&app)?;
+            app.profiler.record_frame(frame_start.elapsed());
         }
 
         if pending_raw
@@ -1145,7 +1170,16 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
                 clock_deadline,
             ],
         );
-        if event::poll(poll_timeout)? {
+        // The spare time this iteration actually had: `event::poll` blocks
+        // up to `poll_timeout` (already the tightest deadline any pending
+        // redraw/animation/notice/preferences-save/harness-poll/clock
+        // source wants) or returns early the moment a terminal event
+        // arrives -- its own elapsed time IS "how long the loop slept
+        // between frames," with no separate timer needed to measure it.
+        let wait_start = Instant::now();
+        let has_terminal_event = event::poll(poll_timeout)?;
+        app.profiler.record_wait(wait_start.elapsed());
+        if has_terminal_event {
             let mut terminal_events = vec![event::read()?];
             while terminal_events.len() < MAX_TERMINAL_EVENT_BATCH
                 && event::poll(Duration::ZERO)?
@@ -5148,6 +5182,37 @@ fn apply_update(app: &mut App, terminal: &mut TerminalWatermarks, update: Worker
         }
         WorkerUpdate::HarnessTerminalRead(page) => {
             let HarnessRuntimeTerminalPageV1 { session, frames, .. } = page;
+            // Closes `terminal_rtt_us`'s clock and folds this poll's own
+            // frame/byte counts into `App::profiler` -- counted here,
+            // before the incarnation-id parse below, so this reflects
+            // every response this poll cadence actually got back
+            // (`frame_count == 0` is exactly "an empty poll," the direct
+            // cost `terminal_polls_empty`/`terminal_polls_total` name).
+            let terminal_poll_frame_count = frames.len();
+            let terminal_poll_byte_count = frames.iter()
+                .map(|frame| {
+                    frame.formatted.len()
+                        + frame.scrollback_formatted.iter().map(Vec::len).sum::<usize>()
+                })
+                .sum::<usize>();
+            app.profiler.record_terminal_poll(
+                Instant::now(),
+                terminal_poll_frame_count,
+                terminal_poll_byte_count,
+            );
+            // The provider-to-pixel measurement, closed here because this
+            // is where a frame first exists inside this process. Every hop
+            // before it carried `produced_at_unix_ms` untouched precisely
+            // so this subtraction covers the whole path: the node building
+            // the screen, the relay, and however long the harness's ring
+            // buffer held it waiting for this poll to come and ask.
+            let received_at_unix_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |since| since.as_millis().min(u128::from(u64::MAX)) as u64);
+            for frame in &frames {
+                app.profiler
+                    .record_frame_age(frame.produced_at_unix_ms, received_at_unix_ms);
+            }
             if let Ok(incarnation_id) =
                 session.incarnation_id.parse::<gate4agent_node_protocol::NodeIncarnationId>()
             {
@@ -5759,6 +5824,14 @@ fn terminal_frame_from_harness(frame: HarnessRuntimeTerminalFrameV1) -> Terminal
         contents: String::new(),
         formatted: frame.formatted,
         scrollback_formatted: frame.scrollback_formatted,
+        // Carried through untouched, like every hop before this one. The
+        // whole point of the stamp is that it says when the node built
+        // this screen, not when anyone since then handled it -- a frame
+        // that waited in the harness's ring buffer must still report its
+        // own age, because that wait is exactly what is being measured.
+        // A peer too old to send the field decodes it as 0, which reads
+        // as "age unknown" rather than "produced in 1970".
+        produced_at_unix_ms: frame.produced_at_unix_ms,
         alternate_screen: frame.alternate_screen,
         mouse_protocol_enabled: frame.mouse_protocol_enabled,
         mouse_protocol_encoding: match frame.mouse_protocol_encoding {
@@ -9118,6 +9191,9 @@ mod tests {
             cursor_column: bytes.len() as u16,
             formatted: bytes.to_vec(),
             scrollback_formatted: Vec::new(),
+            // 0 is the "age unknown" value, which is what a fixture that
+            // never went near a node should report.
+            produced_at_unix_ms: 0,
             alternate_screen: false,
             mouse_protocol_enabled: false,
             mouse_protocol_encoding: HarnessRuntimeMouseProtocolEncodingV1::Default,

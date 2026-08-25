@@ -165,5 +165,9 @@ pub fn terminal_frame_to_wire(frame: &TerminalFrame) -> HarnessRuntimeTerminalFr
             TerminalMouseProtocolEncoding::Utf8 => HarnessRuntimeMouseProtocolEncodingV1::Utf8,
             TerminalMouseProtocolEncoding::Sgr => HarnessRuntimeMouseProtocolEncodingV1::Sgr,
         },
+        // Carried through unchanged onto the operator wire -- see
+        // `TerminalFrame::produced_at_unix_ms`'s own doc for why no hop,
+        // including this one, may recompute it.
+        produced_at_unix_ms: frame.produced_at_unix_ms,
     }
 }

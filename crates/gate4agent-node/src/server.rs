@@ -19964,6 +19964,7 @@ mod tests {
             alternate_screen: false,
             mouse_protocol_enabled: false,
             mouse_protocol_encoding: Default::default(),
+            produced_at_unix_ms: 0,
         }
     }
 

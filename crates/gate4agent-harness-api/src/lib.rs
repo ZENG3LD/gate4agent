@@ -3964,6 +3964,16 @@ pub struct HarnessRuntimeTerminalFrameV1 {
     pub alternate_screen: bool,
     pub mouse_protocol_enabled: bool,
     pub mouse_protocol_encoding: HarnessRuntimeMouseProtocolEncodingV1,
+    /// Unix-epoch milliseconds when the source `TerminalFrame` was
+    /// materialized (`gate4agent_types::TerminalFrame::produced_at_unix_ms`,
+    /// stamped once at the PTY snapshot and carried unchanged through every
+    /// relay hop, including the harness's own terminal ring buffer). An
+    /// operator computing an age from this must account for clock skew
+    /// between the node host and its own, not just transit/queue delay.
+    /// `#[serde(default)]` so an operator client built before this field
+    /// existed still decodes the frame -- it just can't answer "how stale".
+    #[serde(default)]
+    pub produced_at_unix_ms: u64,
 }
 // NOTE: gate4agent_types::TerminalFrame::contents (plain-text render) is
 // deliberately dropped on the wire -- gate4agent-tui's apply_terminal_frame

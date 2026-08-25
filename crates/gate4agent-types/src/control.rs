@@ -200,6 +200,21 @@ pub struct TerminalFrame {
     pub mouse_protocol_enabled: bool,
     #[serde(default)]
     pub mouse_protocol_encoding: TerminalMouseProtocolEncoding,
+    /// Unix-epoch milliseconds when this frame's screen state was
+    /// materialized -- the one instant `PtyEventPublisher::snapshot` turns
+    /// live terminal state into a frame. Every hop after that (the shell's
+    /// `ObservationEnvelope`, the c2 relay, the harness's terminal ring
+    /// buffer, the operator wire) carries this value through unchanged; none
+    /// of them may recompute, refresh, or zero it, because the whole point
+    /// of the field is to let something 200ms downstream in a ring buffer
+    /// still answer "how stale am I". `#[serde(default)]` so a peer that
+    /// predates this field decodes it as 0 -- "age unknown" -- instead of a
+    /// fabricated timestamp. Diffing this value across two hosts also mixes
+    /// in their clock skew, not just transit time, so a consumer comparing
+    /// it against wall-clock time must say so rather than presenting the
+    /// gap as pure network/queue latency.
+    #[serde(default)]
+    pub produced_at_unix_ms: u64,
 }
 
 pub const FOREGROUND_PROCESS_NAME_MAX_BYTES: usize = 512;
@@ -1624,6 +1639,7 @@ mod tests {
         assert!(!frame.alternate_screen);
         assert!(!frame.mouse_protocol_enabled);
         assert_eq!(frame.mouse_protocol_encoding, TerminalMouseProtocolEncoding::Default);
+        assert_eq!(frame.produced_at_unix_ms, 0);
     }
 
     #[test]

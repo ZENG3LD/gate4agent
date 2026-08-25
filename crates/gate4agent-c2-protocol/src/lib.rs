@@ -3517,13 +3517,14 @@ mod tests {
                 mouse_protocol_enabled: false,
                 mouse_protocol_encoding:
                     gate4agent_types::TerminalMouseProtocolEncoding::Default,
+                produced_at_unix_ms: 0,
             },
         };
         let event = C2NodeEvent::from(&source);
         let json = serde_json::to_string(&event).unwrap();
         assert_eq!(
             json,
-            r#"{"kind":"terminal-frame","address":{"workspace_id":"primary","session":{"instance_id":7,"generation":3}},"frame":{"sequence":11,"size":{"rows":24,"columns":80},"cursor_row":2,"cursor_column":4,"contents":"ready","formatted":[114,101,97,100,121],"scrollback_formatted":[[112,114,101,118,105,111,117,115]],"alternate_screen":false,"mouse_protocol_enabled":false,"mouse_protocol_encoding":"default"}}"#,
+            r#"{"kind":"terminal-frame","address":{"workspace_id":"primary","session":{"instance_id":7,"generation":3}},"frame":{"sequence":11,"size":{"rows":24,"columns":80},"cursor_row":2,"cursor_column":4,"contents":"ready","formatted":[114,101,97,100,121],"scrollback_formatted":[[112,114,101,118,105,111,117,115]],"alternate_screen":false,"mouse_protocol_enabled":false,"mouse_protocol_encoding":"default","produced_at_unix_ms":0}}"#,
         );
         assert_eq!(serde_json::from_str::<C2NodeEvent>(&json).unwrap(), event);
     }

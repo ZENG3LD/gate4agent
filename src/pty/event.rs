@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -127,6 +128,29 @@ pub struct PtyTerminalSnapshot {
     pub mouse_protocol_enabled: bool,
     #[serde(default)]
     pub mouse_protocol_encoding: PtyMouseProtocolEncoding,
+    /// Unix-epoch milliseconds when this snapshot was taken -- stamped once,
+    /// here, by [`PtyEventPublisher::snapshot`], and carried unchanged by
+    /// every consumer that turns it into a `TerminalFrame` and relays it on.
+    /// Nothing downstream may recompute this: a frame that spent 200ms in a
+    /// relay queue or a ring buffer must still report the moment its screen
+    /// state was actually captured, since that lag is the thing being
+    /// measured. `#[serde(default)]` so a pre-existing serialized snapshot
+    /// decodes to 0 -- "age unknown" -- rather than a fabricated instant.
+    #[serde(default)]
+    pub produced_at_unix_ms: u64,
+}
+
+/// Current wall-clock time in Unix-epoch milliseconds, saturating instead of
+/// panicking. `SystemTime::now()` only fails to compare against
+/// `UNIX_EPOCH` when the system clock is set before 1970, which is not a
+/// case worth propagating an error for on the frame-stamping path -- 0 (the
+/// same "unknown" sentinel a missing/legacy field decodes to) is a safe
+/// fallback.
+pub(crate) fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Error)]
@@ -487,6 +511,9 @@ impl PtyEventPublisher {
                 vt100::MouseProtocolEncoding::Utf8 => PtyMouseProtocolEncoding::Utf8,
                 vt100::MouseProtocolEncoding::Sgr => PtyMouseProtocolEncoding::Sgr,
             },
+            // The one and only place this gets stamped -- see the field's
+            // own doc comment for why nothing downstream may touch it again.
+            produced_at_unix_ms: now_unix_ms(),
         })
     }
 }

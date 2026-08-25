@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::event::{
-    recent_scrollback_formatted, PtyEvent, PtyEventEnvelope, PtyGapReason,
+    now_unix_ms, recent_scrollback_formatted, PtyEvent, PtyEventEnvelope, PtyGapReason,
     PtyMouseProtocolEncoding, PtySize, PtyTerminalSnapshot, PTY_TERMINAL_SCROLLBACK_ROWS_MAX,
 };
 
@@ -176,6 +176,13 @@ impl PtyColdRestoreCheckpoint {
                 vt100::MouseProtocolEncoding::Utf8 => PtyMouseProtocolEncoding::Utf8,
                 vt100::MouseProtocolEncoding::Sgr => PtyMouseProtocolEncoding::Sgr,
             },
+            // This reconstructs screen state from a checkpoint plus a
+            // replayed tail, which is the cold-restore analogue of
+            // `PtyEventPublisher::snapshot` -- the checkpoint's own stamp
+            // describes the state as of the crash, not the state after the
+            // tail has been rolled forward onto it, so the restored result
+            // gets a fresh stamp the same way a live snapshot would.
+            produced_at_unix_ms: now_unix_ms(),
         })
     }
 
@@ -343,6 +350,7 @@ mod tests {
             alternate_screen: false,
             mouse_protocol_enabled: false,
             mouse_protocol_encoding: Default::default(),
+            produced_at_unix_ms: 0,
         })
         .expect("checkpoint")
     }

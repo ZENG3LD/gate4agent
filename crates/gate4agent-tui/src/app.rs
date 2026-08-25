@@ -4214,6 +4214,22 @@ pub struct App {
     pub terminal_rows: u16,
     pub terminal_cols: u16,
     pub layout: LayoutRects,
+    /// Whether the `Ctrl+P` frame-cadence/terminal-poll overlay is open --
+    /// see `render::render_profile_overlay` and this crate's own `profile`
+    /// module doc comment. A plain `bool`, not an `Option<T>` state like
+    /// the other popups: this overlay carries no state of its own to
+    /// remember between opens (every reading comes fresh from `profiler`
+    /// each frame), so there is nothing an `Option`'s `Some` payload would
+    /// hold. `pub(crate)`, same rationale as `pty_render_cache` right
+    /// above `profiler` below: this is a diagnostic detail, not part of
+    /// this crate's own public data model.
+    pub(crate) profiler_overlay_open: bool,
+    /// This session's own frame-cadence and terminal-poll measurements --
+    /// see the `profile` module's own doc comment for why it lives here
+    /// rather than as a `client::run` local. `client::run` is still the
+    /// only place any of these ticks actually happen; it just writes into
+    /// this field instead of a loop-local variable.
+    pub(crate) profiler: crate::profile::TuiProfiler,
     pub should_quit: bool,
     animation_tick: u16,
     last_idempotency_unix_ms: u64,
@@ -4335,6 +4351,8 @@ impl Default for App {
             terminal_rows: 24,
             terminal_cols: 80,
             layout: LayoutRects::default(),
+            profiler_overlay_open: false,
+            profiler: crate::profile::TuiProfiler::default(),
             should_quit: false,
             animation_tick: 0,
             last_idempotency_unix_ms: 0,
@@ -11827,6 +11845,20 @@ fn append_event_to_diagnostics_file(event: &AppEvent) {
             self.flash("unsupported key modifier; no input sent".to_owned());
             return AppAction::None;
         }
+        // The profiling overlay closes by the exact same key that opened
+        // it (`Ctrl+P`, the global arm further down) or by `Escape` --
+        // the same uniform overlay-close contract every other popup here
+        // follows (see `close_overlay_outside_click`'s own doc comment).
+        // Checked first, ahead of every focus-specific dispatch below
+        // (including `Focus::Viewport`'s raw-PTY passthrough), so this
+        // overlay is always reachable to close regardless of what had
+        // keyboard focus when it opened.
+        if self.profiler_overlay_open {
+            if matches!(key, UiKey::Ctrl('p') | UiKey::Escape | UiKey::OperatorEscape) {
+                self.profiler_overlay_open = false;
+            }
+            return AppAction::None;
+        }
         if self.harness_kanban.reverse_attribution.is_some() {
             if matches!(key, UiKey::Escape | UiKey::OperatorEscape) {
                 self.harness_kanban.reverse_attribution = None;
@@ -11913,6 +11945,22 @@ fn append_event_to_diagnostics_file(event: &AppEvent) {
             }
             UiKey::Ctrl('w') => {
                 self.close_selected_tab();
+                AppAction::None
+            }
+            // Opens the frame-cadence/terminal-poll overlay (`render::
+            // render_profile_overlay`) -- mnemonic "profile." Lives at
+            // this same priority tier as `Ctrl('q')`/`('n')`/`('t')`/
+            // `('w')` right above, which is exactly why it is
+            // deliberately unreachable while `Focus::Viewport` holds the
+            // keyboard (that arm returns above, before this match ever
+            // runs): `Ctrl+P` is `readline`'s "previous history" in a
+            // live shell and Vim's own autocomplete chord, so a raw PTY
+            // session must receive it unstolen, same as every other
+            // single-letter `Ctrl` chrome binding here. Closing it again
+            // is handled by the top-of-function guard above, not here --
+            // this arm is reachable only while the overlay is closed.
+            UiKey::Ctrl('p') => {
+                self.profiler_overlay_open = true;
                 AppAction::None
             }
             // `Ctrl+,` is the VS Code chord this shell is modelled on and
@@ -12024,6 +12072,14 @@ fn append_event_to_diagnostics_file(event: &AppEvent) {
         if self.layout.overlays.iter().any(|overlay| overlay.rect.contains(column, row)) {
             return None;
         }
+        // Topmost first: `render::render` paints the profiling overlay
+        // LAST (after every other overlay in this chain), so a click
+        // outside everything while it is open must close IT, not fall
+        // through to whatever might be open underneath.
+        if self.profiler_overlay_open {
+            self.profiler_overlay_open = false;
+            return Some(AppAction::None);
+        }
         if self.harness_kanban.reverse_attribution.is_some() {
             self.harness_kanban.reverse_attribution = None;
             return Some(AppAction::None);
@@ -12062,6 +12118,18 @@ fn append_event_to_diagnostics_file(event: &AppEvent) {
             .map(|hit| hit.target.clone());
         if let Some(action) = self.close_overlay_outside_click(column, row) {
             return action;
+        }
+        // Reaching this point with the overlay still open means the click
+        // landed INSIDE its rect (the guard above already closed it for
+        // any click outside): absorb it. The overlay has no interactive
+        // content of its own (a read-only readout, no rows to click), and
+        // without this the click would otherwise fall through to whatever
+        // `layout.hits` region happens to sit at these same coordinates
+        // underneath it -- exactly the click-through class of bug `close_
+        // overlay_outside_click`'s own doc comment describes fixing for
+        // every other overlay in this chain.
+        if self.profiler_overlay_open {
+            return AppAction::None;
         }
         // Both of these already close on ANY click their own match below
         // doesn't recognize (`_ => { self.agent_menu = None; }` and its

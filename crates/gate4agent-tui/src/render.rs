@@ -1290,30 +1290,41 @@ fn render_rail_button(
     layout.hits.push(HitRegion { rect: block, target: button.target.clone() });
 }
 
-/// Draws one inline, single-row icon (+ optional trailing text) button
-/// INSIDE `rect` -- `rect` is never resized or repositioned here, so
-/// every call site keeps registering the exact same [`HitRegion`] it
-/// always did; this only repaints what is visually inside it. Unlike the
-/// activity rail's own 4-cell x 2/3-row [`render_rail_button`], these
-/// buttons live in dense single-row panel lists (the Explorer/Git
-/// sidebar panels and their modals) where a rail-sized icon does not
-/// fit -- see `icons.rs`'s own "Compact tier" doc section for the baked
-/// asset size this draws (`icons::sixel_compact`, a distinct asset from
-/// the rail's own, not a runtime downscale).
+/// Draws one inline, single-row icon button INSIDE `rect` -- `rect` is
+/// never resized or repositioned here, so every call site keeps
+/// registering the exact same [`HitRegion`] it always did; this only
+/// repaints what is visually inside it. Unlike the activity rail's own
+/// 4-cell x 2/3-row [`render_rail_button`], these buttons live in dense
+/// single-row panel lists (the Explorer/Git sidebar panels and their
+/// modals) where a rail-sized icon does not fit -- see `icons.rs`'s own
+/// "Strip tier" doc section for the baked asset size this draws
+/// (`icons::sixel_strip`, the SAME asset [`render_control_strip_button`]
+/// already uses, not a runtime downscale).
 ///
-/// `text`, when `Some`, is the MEANING-carrying remainder of the
-/// button's original label (e.g. `"workspace"`, `"Use this folder"`),
-/// rendered right after the icon with a 1-column gap; `None` for buttons
-/// whose original label was pure decoration (e.g. the old `"[+.]"`),
-/// which the icon fully replaces with nothing kept. In `RailIcons::
-/// Ascii` mode this paints `ascii_label` UNCHANGED across the whole
-/// `rect` (ignoring `icon`/`text` entirely) -- the ascii tier keeps
-/// every button's original text exactly as it rendered before this
-/// wave.
+/// This used to draw the much smaller Compact-tier asset (exactly one
+/// assumed terminal cell) instead, and every caller used to pass a
+/// trailing text label to paint right after it -- a 1-cell icon read as
+/// an illegible speck on its own, so the word next to it was the only
+/// thing telling a reader the speck was a button at all. Moving to the
+/// Strip tier's 2-cell asset fixes the legibility problem directly, and
+/// the trailing-text parameter is gone WITH it, not kept alongside a
+/// bigger icon: once a glyph is actually big enough to read, a word
+/// beside it doesn't clarify the control, it visually splits ONE button
+/// into "a small picture" and "an unrelated bit of text" that a reader
+/// cannot tell is (or isn't) part of the same click target. Every caller
+/// that used to disambiguate two same-icon controls with a trailing word
+/// (e.g. "working diff"/"staged diff", "cancel task"/"retry task") was
+/// moved onto two DISTINCT `IconId`s instead (see e.g. [`icons::IconId::
+/// Diff`]/[`icons::IconId::DiffAdded`], [`icons::IconId::DebugStop`]/
+/// [`icons::IconId::DebugRestart`]) -- the icon alone always carries the
+/// control's own meaning now, never an icon plus a disambiguating word.
+///
+/// `RailIcons::Ascii` mode is UNCHANGED by any of this: it still paints
+/// `ascii_label` across the whole `rect`, ignoring `icon` entirely,
+/// exactly as it always has.
 fn render_compact_icon_button(
     rect: Rect,
     icon: icons::IconId,
-    text: Option<&str>,
     ascii_label: &str,
     style: Style,
     tier: RailIcons,
@@ -1337,89 +1348,65 @@ fn render_compact_icon_button(
             // `style.bg`-filled blank from the `fill_rect` above) and
             // records where `client::run`'s post-flush hook should
             // paint it -- see `SixelIconPlacement`'s own doc comment.
-            let icon_width = icons::COMPACT_SIXEL_ICON_CELLS_WIDE.min(rect.width);
+            let icon_width = icons::STRIP_SIXEL_ICON_CELLS_WIDE.min(rect.width);
             let icon_area = Rect::new(rect.x, rect.y, icon_width, 1);
-            // The compact tier is out of scope for cause 1's background-
-            // compositing fix (see `tools/bake_icons.py`'s own module
-            // doc): it is dense panel/modal content with 3+ distinct
-            // backgrounds in `PtyColorMode::GateOverride` alone (panel,
-            // accent, active), unlike the rail's 2 and the strip's 1, and
-            // touching it would mean changing already-shipped panel
-            // content pixels this task's own brief did not ask for -- it
-            // still ships as a real transparent asset, unchanged. `icons::
-            // sixel_compact` (unlike `sixel`/`sixel_strip`/`sixel_gallery`)
-            // takes no `SixelVariant` at all and never reads this field --
-            // `GateActive` is supplied purely because `SixelIconPlacement`
-            // carries one `variant` field across every tier for structural
-            // uniformity; any value here is equally inert for `Compact`.
+            // `GateActive` unconditionally, the same choice the old
+            // Compact-tier code made here (see `SixelIconSize::Compact`'s
+            // own doc comment for why that was inert there): unlike
+            // [`render_control_strip_button`]'s own single background
+            // (`theme.active`, never selected), these buttons paint over
+            // several different backgrounds across the Explorer/Git
+            // panels and their modals (panel/active/accent/surface/
+            // modal). Picking a variant that actually matches each
+            // caller's own background is real compositing work this
+            // task's own brief explicitly put out of scope ("do not
+            // re-open the sixel compositing work for the compact tier");
+            // `GateActive` is the closest match for the majority of this
+            // fn's own callers (theme.panel in `Inherited`, theme.active
+            // in `GateOverride`) and an accepted, known approximation
+            // everywhere else, same as it already was before this icon
+            // moved to a composited asset at all.
             layout.sixel_icons.push(SixelIconPlacement {
                 icon,
                 rect: icon_area,
                 variant: icons::SixelVariant::GateActive,
-                size: SixelIconSize::Compact,
+                size: SixelIconSize::Strip,
                 family,
             });
-            render_compact_trailing_text(rect, icon_width, text, style, buf);
         }
     }
-}
-
-/// Renders `text` (when present) immediately after a compact button's
-/// own icon footprint (`icon_width` cells, plus a 1-column gap),
-/// truncated to whatever room is left inside `rect` -- called by
-/// [`render_compact_icon_button`]'s own `RailIcons::Sixel` branch.
-fn render_compact_trailing_text(
-    rect: Rect,
-    icon_width: u16,
-    text: Option<&str>,
-    style: Style,
-    buf: &mut TerminalBuffer,
-) {
-    let Some(text) = text else { return };
-    let text_x = rect.x.saturating_add(icon_width).saturating_add(1);
-    if text_x >= rect.right() {
-        return;
-    }
-    let text_area = Rect::new(text_x, rect.y, rect.right() - text_x, 1);
-    Paragraph::new(truncate_cells(text, text_area.width as usize))
-        .style(style)
-        .render(text_area, buf);
 }
 
 /// Cell width a [`render_compact_icon_button`] call will actually occupy,
 /// mirroring that function's own paint logic exactly: the ASCII tier's
 /// own `cell_width(ascii_label)` (the whole point of that tier is
 /// painting the original bracketed label unchanged), or the Sixel
-/// tier's fixed `COMPACT_SIXEL_ICON_CELLS_WIDE` plus, when `text` is
-/// present, a 1-column gap and `text`'s own `cell_width`. Callers that
-/// used to size a `Rect` from a bracketed label's own literal width
-/// (e.g. `cell_width("[Harness links]")`) call this instead, so the
-/// button's hit rect shrinks to match its new, narrower icon body
-/// rather than keeping the old text's footprint.
-fn compact_icon_button_width(ascii_label: &str, text: Option<&str>, tier: RailIcons) -> u16 {
+/// tier's fixed `STRIP_SIXEL_ICON_CELLS_WIDE`, alone -- there is no
+/// trailing text to budget room for any more (see [`render_compact_icon_
+/// button`]'s own doc comment). Callers that used to size a `Rect` from
+/// a bracketed label's own literal width (e.g. `cell_width("[Harness
+/// links]")`) call this instead, so the button's hit rect shrinks to
+/// match its new, narrower icon body rather than keeping the old text's
+/// footprint.
+fn compact_icon_button_width(ascii_label: &str, tier: RailIcons) -> u16 {
     match tier {
         RailIcons::Ascii => cell_width(ascii_label) as u16,
-        RailIcons::Sixel => {
-            icons::COMPACT_SIXEL_ICON_CELLS_WIDE
-                .saturating_add(text.map_or(0, |text| 1 + cell_width(text) as u16))
-        }
+        RailIcons::Sixel => icons::STRIP_SIXEL_ICON_CELLS_WIDE,
     }
 }
 
 /// Icon-aware sibling of [`render_toolbar_segment`] for a Harness board/
 /// task-detail/monitor/surface-toolbar segment that should draw as a
-/// compact icon (+ optional trailing text) in `RailIcons::Sixel` mode
-/// while keeping the segment's original bracketed label, unchanged, in
-/// `RailIcons::Ascii` mode -- see [`render_compact_icon_button`]'s own
-/// doc comment for that split. `render_toolbar_segment` itself has no
-/// icon parameter or tier/family to switch on: most of its callers draw
-/// no icon at all, so this exists next to it rather than growing that
-/// one function's own signature for every caller. Same x-cursor contract
-/// as `render_toolbar_segment`: returns the position the caller's next
-/// segment should start from.
+/// compact icon in `RailIcons::Sixel` mode while keeping the segment's
+/// original bracketed label, unchanged, in `RailIcons::Ascii` mode -- see
+/// [`render_compact_icon_button`]'s own doc comment for that split.
+/// `render_toolbar_segment` itself has no icon parameter or tier/family
+/// to switch on: most of its callers draw no icon at all, so this exists
+/// next to it rather than growing that one function's own signature for
+/// every caller. Same x-cursor contract as `render_toolbar_segment`:
+/// returns the position the caller's next segment should start from.
 fn render_toolbar_icon_segment(
     icon: icons::IconId,
-    text: Option<&str>,
     ascii_label: &str,
     x: u16,
     area: Rect,
@@ -1433,13 +1420,13 @@ fn render_toolbar_icon_segment(
     if x >= area.right() {
         return x;
     }
-    let width = compact_icon_button_width(ascii_label, text, tier)
+    let width = compact_icon_button_width(ascii_label, tier)
         .min(area.right().saturating_sub(x));
     if width == 0 {
         return x;
     }
     let rect = Rect::new(x, area.y, width, 1);
-    render_compact_icon_button(rect, icon, text, ascii_label, style, tier, family, buf, layout);
+    render_compact_icon_button(rect, icon, ascii_label, style, tier, family, buf, layout);
     if let Some(target) = target {
         layout.hits.push(HitRegion { rect, target });
     }
@@ -1656,7 +1643,7 @@ fn pack_inline_button_left(
     }
     let x = *cursor_x - width;
     let rect = Rect::new(x, area.y, width, 1);
-    render_compact_icon_button(rect, icon, None, icons::ascii(icon), style, tier, family, buf, layout);
+    render_compact_icon_button(rect, icon, icons::ascii(icon), style, tier, family, buf, layout);
     layout.hits.push(HitRegion { rect, target });
     *cursor_x = x.saturating_sub(1);
 }
@@ -1972,12 +1959,16 @@ fn render_space_list(
     };
     if !use_strip {
         let add_label = " + workspace ";
-        let add_width = (cell_width(add_label) as u16).min(area.width);
+        // `compact_icon_button_width`, not `cell_width(add_label)` alone:
+        // that literal sized the OLD icon-plus-word Sixel footprint (and
+        // the ascii bracket text unconditionally); now that the control
+        // is icon-only in `Sixel` mode, the tier-aware width shrinks to
+        // match rather than reserving the old, wider text footprint.
+        let add_width = compact_icon_button_width(add_label, app.rail_icons).min(area.width);
         let add_rect = Rect::new(area.x, area.y, add_width, 1);
         render_compact_icon_button(
             add_rect,
             icons::IconId::Add,
-            Some("workspace"),
             add_label,
             Style::default().fg(theme.teal).bg(theme.panel).add_modifier(Modifier::BOLD),
             app.rail_icons, app.icon_family,
@@ -1996,7 +1987,6 @@ fn render_space_list(
             render_compact_icon_button(
                 remove_rect,
                 icons::IconId::Trash,
-                None,
                 remove_label,
                 Style::default().fg(theme.red).bg(theme.panel),
                 app.rail_icons, app.icon_family,
@@ -2086,13 +2076,12 @@ fn render_space_list(
                 &workspace.workspace_id,
             ) {
                 let ascii_label = "[Harness links]";
-                let width = compact_icon_button_width(ascii_label, Some("Harness links"), app.rail_icons)
+                let width = compact_icon_button_width(ascii_label, app.rail_icons)
                     .min(area.width);
                 let rect = Rect::new(area.right().saturating_sub(width), y + 1, width, 1);
                 render_compact_icon_button(
                     rect,
                     icons::IconId::Link,
-                    Some("Harness links"),
                     ascii_label,
                     Style::default().fg(theme.teal).bg(background),
                     app.rail_icons, app.icon_family,
@@ -2204,7 +2193,6 @@ fn render_workspace_files(
                 render_compact_icon_button(
                     directory,
                     icons::IconId::NewFolder,
-                    None,
                     directory_label,
                     Style::default().fg(theme.teal).bg(theme.panel).add_modifier(Modifier::BOLD),
                     app.rail_icons, app.icon_family,
@@ -2221,7 +2209,6 @@ fn render_workspace_files(
                     render_compact_icon_button(
                         file,
                         icons::IconId::NewFile,
-                        None,
                         file_label,
                         Style::default().fg(theme.teal).bg(theme.panel).add_modifier(Modifier::BOLD),
                         app.rail_icons, app.icon_family,
@@ -2522,7 +2509,6 @@ fn render_git_snapshot(
             render_compact_icon_button(
                 create_rect,
                 icons::IconId::RepoForked,
-                Some("worktree"),
                 create,
                 Style::default().fg(theme.active_tab_text).bg(theme.accent).add_modifier(Modifier::BOLD),
                 app.rail_icons, app.icon_family,
@@ -2570,7 +2556,6 @@ fn render_git_snapshot(
                 render_compact_icon_button(
                     remove_rect,
                     icons::IconId::Trash,
-                    None,
                     remove,
                     Style::default().fg(theme.red).bg(theme.panel),
                     app.rail_icons, app.icon_family,
@@ -3403,19 +3388,19 @@ fn render_native_session_list(
         let progress_ascii_label = if agent_expanded { "[details -]" } else { "[details +]" };
         let progress_icon = if agent_expanded { icons::IconId::ChevronDown } else { icons::IconId::ChevronRight };
         let progress_width = if agent_run_key.is_some() && !compact_agent_actions {
-            compact_icon_button_width(progress_ascii_label, None, app.rail_icons).min(area.width)
+            compact_icon_button_width(progress_ascii_label, app.rail_icons).min(area.width)
         } else {
             0
         };
         let agent_action_ascii_label = if area.width < 30 { "[act]" } else { "[actions]" };
         let agent_action_width = if compact_agent_actions {
-            compact_icon_button_width(agent_action_ascii_label, None, app.rail_icons).min(area.width)
+            compact_icon_button_width(agent_action_ascii_label, app.rail_icons).min(area.width)
         } else {
             0
         };
         let native_action_ascii_label = "[menu]";
         let native_action_width = if matches!(item, NativeSessionTreeItem::Session { .. }) {
-            compact_icon_button_width(native_action_ascii_label, None, app.rail_icons).min(area.width)
+            compact_icon_button_width(native_action_ascii_label, app.rail_icons).min(area.width)
         } else {
             0
         };
@@ -3456,7 +3441,6 @@ fn render_native_session_list(
             render_compact_icon_button(
                 actions,
                 icons::IconId::Ellipsis,
-                None,
                 native_action_ascii_label,
                 Style::default()
                     .fg(theme.teal)
@@ -3481,7 +3465,6 @@ fn render_native_session_list(
             render_compact_icon_button(
                 actions,
                 icons::IconId::Ellipsis,
-                None,
                 agent_action_ascii_label,
                 Style::default()
                     .fg(theme.teal)
@@ -3549,7 +3532,6 @@ fn render_native_session_list(
             render_compact_icon_button(
                 progress,
                 progress_icon,
-                None,
                 progress_ascii_label,
                 Style::default()
                     .fg(if agent_expanded { theme.active_tab_text } else { theme.teal })
@@ -3577,17 +3559,23 @@ fn render_native_session_list(
         }
         y = y.saturating_add(height);
     }
+    let open_ascii_label = "[Open transcript]";
+    // No trailing word to budget for any more (icon-only control, see
+    // `render_compact_icon_button`'s own doc comment) -- the old literal
+    // `19` was sized for the ascii label plus the sixel tier's own former
+    // icon-plus-word footprint; `compact_icon_button_width` mirrors
+    // whatever the actual paint needs per tier instead of a stale magic
+    // number. Nothing else on this row anchors off `open`'s own width.
     let open = Rect::new(
         area.x,
         area.bottom().saturating_sub(1),
-        area.width.min(19),
+        compact_icon_button_width(open_ascii_label, app.rail_icons).min(area.width),
         1,
     );
     render_compact_icon_button(
         open,
         icons::IconId::GoToFile,
-        Some("transcript"),
-        "[Open transcript]",
+        open_ascii_label,
         Style::default().fg(theme.teal).bg(theme.panel).add_modifier(Modifier::BOLD),
         app.rail_icons, app.icon_family,
         buf,
@@ -3599,7 +3587,7 @@ fn render_native_session_list(
     });
     if !use_strip {
         let add_ascii_label = "+ agent";
-        let add_width = compact_icon_button_width(add_ascii_label, None, app.rail_icons).min(area.width);
+        let add_width = compact_icon_button_width(add_ascii_label, app.rail_icons).min(area.width);
         let add = Rect::new(
             area.right().saturating_sub(add_width),
             area.bottom().saturating_sub(1),
@@ -3609,7 +3597,6 @@ fn render_native_session_list(
         render_compact_icon_button(
             add,
             icons::IconId::Add,
-            None,
             add_ascii_label,
             Style::default().fg(theme.teal).bg(theme.panel).add_modifier(Modifier::BOLD),
             app.rail_icons, app.icon_family,
@@ -4037,7 +4024,6 @@ fn render_tabs(
         render_compact_icon_button(
             gear,
             icons::IconId::SettingsGear,
-            None,
             icons::ascii(icons::IconId::SettingsGear),
             // Same "never shows as active" convention the rail's own
             // gear uses (`render_activity_rail`'s own `RailButton` for
@@ -5649,14 +5635,13 @@ fn render_harness_kanban(
         buf,
         layout,
     ).saturating_add(1);
-    for (icon, text, ascii_label, target) in [
-        (icons::IconId::Add, Some("New task"), "[New task]", HitTarget::HarnessTaskCreate),
-        (icons::IconId::Refresh, None, "[Refresh]", HitTarget::HarnessTaskRefresh),
-        (icons::IconId::Play, Some("next Ready"), "[Run next Ready]", HitTarget::HarnessScheduleNext),
+    for (icon, ascii_label, target) in [
+        (icons::IconId::Add, "[New task]", HitTarget::HarnessTaskCreate),
+        (icons::IconId::Refresh, "[Refresh]", HitTarget::HarnessTaskRefresh),
+        (icons::IconId::Play, "[Run next Ready]", HitTarget::HarnessScheduleNext),
     ] {
         action_x = render_toolbar_icon_segment(
             icon,
-            text,
             ascii_label,
             action_x,
             global_header,
@@ -5719,7 +5704,6 @@ fn render_harness_kanban(
         if !matches!(task.state, gate4agent_harness_client::HarnessTaskStateV1::Done | gate4agent_harness_client::HarnessTaskStateV1::Cancelled) {
             context_x = render_toolbar_icon_segment(
                 icons::IconId::DebugStop,
-                Some("task"),
                 "[Cancel task]",
                 context_x,
                 context_area,
@@ -5733,7 +5717,6 @@ fn render_harness_kanban(
         if matches!(task.state, gate4agent_harness_client::HarnessTaskStateV1::Failed | gate4agent_harness_client::HarnessTaskStateV1::Cancelled) {
             context_x = render_toolbar_icon_segment(
                 icons::IconId::DebugRestart,
-                Some("task"),
                 "[Retry task]",
                 context_x,
                 context_area,
@@ -5746,7 +5729,6 @@ fn render_harness_kanban(
         }
         let _ = render_toolbar_icon_segment(
             icons::IconId::GoToFile,
-            None,
             "[Open]",
             context_x,
             context_area,
@@ -5949,7 +5931,6 @@ fn render_harness_kanban(
         );
         let create_end = render_toolbar_icon_segment(
             icons::IconId::Add,
-            Some("Backlog"),
             "[Create in Backlog]",
             buttons.x,
             buttons,
@@ -5961,7 +5942,6 @@ fn render_harness_kanban(
         );
         let _ = render_toolbar_icon_segment(
             icons::IconId::Close,
-            None,
             "[Cancel]",
             create_end.saturating_add(1),
             buttons,
@@ -6256,7 +6236,6 @@ fn render_harness_task_card(
         render_compact_icon_button(
             open_rect,
             icons::IconId::GoToFile,
-            None,
             "[Open]",
             Style::default().fg(theme.teal).bg(background),
             app.rail_icons, app.icon_family,
@@ -6335,7 +6314,6 @@ fn render_agent_board_sidebar(
         render_compact_icon_button(
             header,
             icons::IconId::GoToFile,
-            Some("Open full board"),
             " [Open full board] ",
             Style::default().fg(theme.teal).bg(theme.panel).add_modifier(Modifier::BOLD),
             app.rail_icons, app.icon_family,
@@ -6715,7 +6693,6 @@ fn render_harness_launch_pager(
     let can_previous = offset > 0;
     let mut x = render_toolbar_icon_segment(
         icons::IconId::ArrowLeft,
-        None,
         "[<]",
         header.x,
         header,
@@ -6728,7 +6705,6 @@ fn render_harness_launch_pager(
     let can_next = offset.saturating_add(1) < count;
     x = render_toolbar_icon_segment(
         icons::IconId::ArrowRight,
-        None,
         "[>]",
         x,
         header,
@@ -6883,7 +6859,6 @@ fn render_harness_task_detail(
     let button_style = Style::default().fg(theme.teal).bg(theme.active);
     let back_end = render_toolbar_icon_segment(
         icons::IconId::ArrowLeft,
-        None,
         "[Back]",
         header.x,
         header,
@@ -7256,7 +7231,6 @@ fn render_harness_task_detail(
                         let actions = Rect::new(body.x, y, body.width, 1);
                         let _ = render_toolbar_icon_segment(
                             icons::IconId::Terminal,
-                            None,
                             "[Open terminal]",
                             actions.x,
                             actions,
@@ -7289,7 +7263,6 @@ fn render_harness_task_detail(
                         let actions = Rect::new(body.x, y, body.width, 1);
                         let files_end = render_toolbar_icon_segment(
                             icons::IconId::Folder,
-                            None,
                             "[Files]",
                             actions.x,
                             actions,
@@ -7301,7 +7274,6 @@ fn render_harness_task_detail(
                         );
                         let _ = render_toolbar_icon_segment(
                             icons::IconId::SourceControl,
-                            None,
                             "[Git]",
                             files_end.saturating_add(1),
                             actions,
@@ -7341,7 +7313,6 @@ fn render_harness_task_detail(
             let toolbar = Rect::new(body.x, body.y, body.width, 1);
             let mut x = render_toolbar_icon_segment(
                 icons::IconId::Refresh,
-                None,
                 "[Refresh]",
                 toolbar.x,
                 toolbar,
@@ -7354,7 +7325,6 @@ fn render_harness_task_detail(
             let can_previous = selected_index.is_some_and(|index| index > 0);
             x = render_toolbar_icon_segment(
                 icons::IconId::ArrowUp,
-                None,
                 "[Up]",
                 x,
                 toolbar,
@@ -7367,7 +7337,6 @@ fn render_harness_task_detail(
             let can_next = selected_index.is_some_and(|index| index + 1 < runs.len());
             let _ = render_toolbar_icon_segment(
                 icons::IconId::ArrowDown,
-                None,
                 "[Down]",
                 x,
                 toolbar,
@@ -7436,7 +7405,6 @@ fn render_harness_task_detail(
             let can_previous = selected_index.is_some_and(|index| index > 0);
             let x = render_toolbar_icon_segment(
                 icons::IconId::ArrowUp,
-                None,
                 "[Up]",
                 toolbar.x,
                 toolbar,
@@ -7449,7 +7417,6 @@ fn render_harness_task_detail(
             let can_next = selected_index.is_some_and(|index| index + 1 < runs.len());
             let _ = render_toolbar_icon_segment(
                 icons::IconId::ArrowDown,
-                None,
                 "[Down]",
                 x,
                 toolbar,
@@ -7651,7 +7618,6 @@ fn render_harness_task_detail(
                 let actions = Rect::new(body.x, body.y + 1, body.width, 1);
                 let mut x = render_toolbar_icon_segment(
                     icons::IconId::History,
-                    None,
                     "[History]",
                     actions.x,
                     actions,
@@ -7663,7 +7629,6 @@ fn render_harness_task_detail(
                 );
                 x = render_toolbar_icon_segment(
                     icons::IconId::Diff,
-                    Some("Working"),
                     "[Working diff]",
                     x.saturating_add(1),
                     actions,
@@ -7675,7 +7640,6 @@ fn render_harness_task_detail(
                 );
                 let _ = render_toolbar_icon_segment(
                     icons::IconId::DiffAdded,
-                    Some("Staged"),
                     "[Staged diff]",
                     x.saturating_add(1),
                     actions,
@@ -7736,7 +7700,6 @@ fn render_harness_task_detail(
             let can_refresh = pending.is_none();
             let mut action_x = render_toolbar_icon_segment(
                 icons::IconId::Refresh,
-                Some("options"),
                 "[Refresh options]",
                 actions.x,
                 actions,
@@ -7749,7 +7712,6 @@ fn render_harness_task_detail(
             let can_save = app.harness_launch_save_enabled();
             action_x = render_toolbar_icon_segment(
                 icons::IconId::Save,
-                Some("spec"),
                 "[Save spec]",
                 action_x,
                 actions,
@@ -7762,7 +7724,6 @@ fn render_harness_task_detail(
             let can_start = app.harness_launch_start_enabled();
             let _ = render_toolbar_icon_segment(
                 icons::IconId::Play,
-                Some("task"),
                 "[Start task]",
                 action_x,
                 actions,
@@ -8099,7 +8060,6 @@ fn render_harness_monitor(
         let actions = Rect::new(area.x, area.y + 2, area.width, 1);
         let mut x = render_toolbar_icon_segment(
             icons::IconId::ArrowLeft,
-            None,
             "[Back]",
             actions.x,
             actions,
@@ -8111,7 +8071,6 @@ fn render_harness_monitor(
         );
         x = render_toolbar_icon_segment(
             icons::IconId::Folder,
-            None,
             "[Files]",
             x.saturating_add(1),
             actions,
@@ -8123,7 +8082,6 @@ fn render_harness_monitor(
         );
         x = render_toolbar_icon_segment(
             icons::IconId::SourceControl,
-            None,
             "[Git]",
             x.saturating_add(1),
             actions,
@@ -8182,7 +8140,6 @@ fn render_harness_monitor(
         }
         x = render_toolbar_icon_segment(
             icons::IconId::ArrowUp,
-            None,
             "[Up]",
             x,
             sections,
@@ -8195,7 +8152,6 @@ fn render_harness_monitor(
         let more = lines.len().saturating_sub(end);
         x = render_toolbar_icon_segment(
             icons::IconId::ArrowDown,
-            None,
             "[Down]",
             x,
             sections,
@@ -8532,7 +8488,7 @@ fn render_agent_board_card(
         ));
     }
     let open_ascii_label = "[open]";
-    let open_width = compact_icon_button_width(open_ascii_label, Some("open"), app.rail_icons)
+    let open_width = compact_icon_button_width(open_ascii_label, app.rail_icons)
         .min(area.width);
     let open_rect = Rect::new(area.right().saturating_sub(open_width), area.y, open_width, 1);
     let pin = if app.agent_is_pinned(&card.key) { "P " } else { "" };
@@ -8549,7 +8505,6 @@ fn render_agent_board_card(
         render_compact_icon_button(
             open_rect,
             icons::IconId::GoToFile,
-            Some("open"),
             open_ascii_label,
             Style::default().fg(theme.teal).bg(background),
             app.rail_icons, app.icon_family,
@@ -8587,7 +8542,7 @@ fn render_agent_board_card(
         if app.harness_kanban.enabled {
             if let Some(subject) = app.harness_agent_links_subject(&card.key) {
                 let ascii_label = "[Harness links]";
-                let width = compact_icon_button_width(ascii_label, Some("Harness links"), app.rail_icons)
+                let width = compact_icon_button_width(ascii_label, app.rail_icons)
                     .min(area.width);
                 let rect = Rect::new(
                     area.right().saturating_sub(width),
@@ -8598,7 +8553,6 @@ fn render_agent_board_card(
                 render_compact_icon_button(
                     rect,
                     icons::IconId::Link,
-                    Some("Harness links"),
                     ascii_label,
                     Style::default().fg(theme.teal).bg(background),
                     app.rail_icons, app.icon_family,
@@ -8950,7 +8904,6 @@ fn render_surface_toolbar(
                 if let Some(history) = file.and_then(|file| file.inline_history.as_ref()) {
                     x = render_toolbar_icon_segment(
                         icons::IconId::File,
-                        None,
                         "[Source]",
                         x,
                         area,
@@ -8963,7 +8916,6 @@ fn render_surface_toolbar(
                     if history.mode == WorkspaceGitPaneMode::Detail {
                         x = render_toolbar_icon_segment(
                             icons::IconId::History,
-                            None,
                             "[Commits]",
                             x.saturating_add(1),
                             area,
@@ -8976,7 +8928,6 @@ fn render_surface_toolbar(
                         if history.selected > 0 {
                             x = render_toolbar_icon_segment(
                                 icons::IconId::ArrowLeft,
-                                None,
                                 "<",
                                 x.saturating_add(1),
                                 area,
@@ -8990,7 +8941,6 @@ fn render_surface_toolbar(
                         if history.selected.saturating_add(1) < history.commits.len() {
                             x = render_toolbar_icon_segment(
                                 icons::IconId::ArrowRight,
-                                None,
                                 ">",
                                 x.saturating_add(1),
                                 area,
@@ -9031,7 +8981,6 @@ fn render_surface_toolbar(
                 }
                 x = render_toolbar_icon_segment(
                     icons::IconId::History,
-                    None,
                     "[History]",
                     x,
                     area,
@@ -9043,7 +8992,6 @@ fn render_surface_toolbar(
                 );
                 x = render_toolbar_icon_segment(
                     icons::IconId::Diff,
-                    None,
                     "[Changes]",
                     x.saturating_add(1),
                     area,
@@ -9061,7 +9009,6 @@ fn render_surface_toolbar(
                 };
                 x = render_toolbar_icon_segment(
                     edit_icon,
-                    None,
                     edit_ascii_label,
                     x.saturating_add(1),
                     area,
@@ -9073,7 +9020,6 @@ fn render_surface_toolbar(
                 );
                 let _ = render_toolbar_icon_segment(
                     icons::IconId::Save,
-                    None,
                     "[Save]",
                     x.saturating_add(1),
                     area,
@@ -9111,7 +9057,6 @@ fn render_surface_toolbar(
             if ready {
                 x = render_toolbar_icon_segment(
                     icons::IconId::History,
-                    None,
                     "[History]",
                     x,
                     area,
@@ -9200,7 +9145,7 @@ fn render_harness_links_toolbar(
         return;
     };
     let ascii_label = "[Harness links]";
-    let width = compact_icon_button_width(ascii_label, Some("Harness links"), app.rail_icons)
+    let width = compact_icon_button_width(ascii_label, app.rail_icons)
         .min(area.width);
     if width == 0 {
         return;
@@ -9209,7 +9154,6 @@ fn render_harness_links_toolbar(
     render_compact_icon_button(
         rect,
         icons::IconId::Link,
-        Some("Harness links"),
         ascii_label,
         Style::default().fg(theme.teal).bg(theme.active),
         app.rail_icons, app.icon_family,
@@ -9997,18 +9941,16 @@ fn render_preview_tab(
     if action_height > 0 {
         // The ascii_label keeps choosing between the long/short bracketed
         // text exactly as before -- that is what `RailIcons::Ascii` still
-        // paints unchanged. `RailIcons::Sixel` draws one fixed icon +
-        // "session" trailing text regardless of which variant was
-        // chosen; `render_compact_icon_button`'s own truncation already
-        // drops the trailing text first when the row is too narrow, so no
-        // separate short-icon variant is needed the way the ascii text
-        // needed a shorter literal.
+        // paints unchanged. `RailIcons::Sixel` draws the icon alone (no
+        // trailing "session" word any more, see `render_compact_icon_
+        // button`'s own doc comment), so it needs no separate short-icon
+        // variant the way the ascii text needed a shorter literal.
         let ascii_label = if area.width as usize >= cell_width("[Resume session]") {
             "[Resume session]"
         } else {
             "[Resume]"
         };
-        let width = compact_icon_button_width(ascii_label, Some("session"), tier).min(area.width);
+        let width = compact_icon_button_width(ascii_label, tier).min(area.width);
         let footer = Rect::new(
             area.x,
             area.bottom().saturating_sub(1),
@@ -10034,7 +9976,6 @@ fn render_preview_tab(
         render_compact_icon_button(
             rect,
             icons::IconId::Play,
-            Some("session"),
             ascii_label,
             Style::default().fg(theme.teal).bg(theme.active).add_modifier(Modifier::BOLD),
             tier, family,
@@ -10825,7 +10766,6 @@ fn render_spawn(
     );
     render_inline_launch_icon_action(
         icons::IconId::Search,
-        Some("Browse\u{2026}"),
         "[Browse\u{2026}]",
         workspace_field_end,
         inner,
@@ -10855,7 +10795,6 @@ fn render_spawn(
     );
     render_inline_launch_icon_action(
         icons::IconId::RepoForked,
-        Some("Configure\u{2026}"),
         "[Configure\u{2026}]",
         target_field_end,
         inner,
@@ -11030,20 +10969,18 @@ fn render_launch_field(
 }
 
 /// Paints the Spawn dialog's own `[Browse…]`/`[Configure…]` action right
-/// after a launch field's own value, as a compact icon (+ optional
-/// trailing text) in `RailIcons::Sixel` mode or the original bracketed
-/// label unchanged in `RailIcons::Ascii` mode -- see
-/// [`render_compact_icon_button`]'s own doc comment for that split. Also
-/// SHRINKS the immediately-preceding field's own already-pushed
-/// `HitRegion` width so the two never overlap: it scans `layout.hits` in
-/// reverse for the most recent `SpawnField` hit on the same row that
-/// starts before this action does, and clamps that hit's width to end
-/// exactly where this action begins. That coupling reads this action's
-/// OWN drawn width, so it stays correct however narrow the icon body
-/// ends up relative to the label this replaced.
+/// after a launch field's own value, as a compact icon in `RailIcons::
+/// Sixel` mode or the original bracketed label unchanged in `RailIcons::
+/// Ascii` mode -- see [`render_compact_icon_button`]'s own doc comment
+/// for that split. Also SHRINKS the immediately-preceding field's own
+/// already-pushed `HitRegion` width so the two never overlap: it scans
+/// `layout.hits` in reverse for the most recent `SpawnField` hit on the
+/// same row that starts before this action does, and clamps that hit's
+/// width to end exactly where this action begins. That coupling reads
+/// this action's OWN drawn width, so it stays correct however narrow the
+/// icon body ends up relative to the label this replaced.
 fn render_inline_launch_icon_action(
     icon: icons::IconId,
-    text: Option<&str>,
     ascii_label: &str,
     field_end: u16,
     area: Rect,
@@ -11059,7 +10996,7 @@ fn render_inline_launch_icon_action(
     if row >= area.height || area.width == 0 {
         return;
     }
-    let width = compact_icon_button_width(ascii_label, text, tier).min(area.width);
+    let width = compact_icon_button_width(ascii_label, tier).min(area.width);
     let x = field_end
         .saturating_add(1)
         .min(area.right().saturating_sub(width));
@@ -11075,7 +11012,7 @@ fn render_inline_launch_icon_action(
         .fg(if enabled { theme.teal } else { theme.muted })
         .bg(theme.modal)
         .add_modifier(Modifier::BOLD);
-    render_compact_icon_button(action, icon, text, ascii_label, style, tier, family, buf, layout);
+    render_compact_icon_button(action, icon, ascii_label, style, tier, family, buf, layout);
     if enabled {
         push_modal_hit(layout, action, target);
     }
@@ -11503,12 +11440,22 @@ fn render_add_space(
         buf,
         layout,
     );
-    let browse = Rect::new(inner.right().saturating_sub(10), inner.y + 2, 10.min(inner.width), 1);
+    // Icon-only control now (no trailing "Browse…" word, see `render_
+    // compact_icon_button`'s own doc comment); nothing else in this
+    // modal anchors off `browse`'s own rect, so its width can shrink to
+    // match via `compact_icon_button_width` rather than keeping the old
+    // literal `10` sized for the icon-plus-word footprint.
+    let browse_ascii_label = "[Browse…]";
+    let browse = Rect::new(
+        inner.right().saturating_sub(compact_icon_button_width(browse_ascii_label, app.rail_icons).min(inner.width)),
+        inner.y + 2,
+        compact_icon_button_width(browse_ascii_label, app.rail_icons).min(inner.width),
+        1,
+    );
     render_compact_icon_button(
         browse,
         icons::IconId::Search,
-        Some("Browse…"),
-        "[Browse…]",
+        browse_ascii_label,
         Style::default().fg(theme.teal).bg(theme.modal).add_modifier(Modifier::BOLD),
         app.rail_icons, app.icon_family,
         buf,
@@ -11605,12 +11552,17 @@ fn render_folder_browser(
         Style::default().fg(theme.text).bg(theme.modal).add_modifier(Modifier::BOLD),
         buf,
     );
-    let parent = Rect::new(inner.x, inner.y + 1, 12.min(inner.width), 1);
+    // Icon-only control now (no trailing "Parent" word, see `render_
+    // compact_icon_button`'s own doc comment); nothing else in this
+    // modal anchors off `parent`'s own rect, so its width shrinks to
+    // match via `compact_icon_button_width` rather than the old literal
+    // `12` sized for the icon-plus-word footprint.
+    let parent_ascii_label = "[↑ Parent]";
+    let parent = Rect::new(inner.x, inner.y + 1, compact_icon_button_width(parent_ascii_label, app.rail_icons).min(inner.width), 1);
     render_compact_icon_button(
         parent,
         icons::IconId::ArrowUp,
-        Some("Parent"),
-        "[↑ Parent]",
+        parent_ascii_label,
         Style::default().fg(theme.teal).bg(theme.modal),
         app.rail_icons, app.icon_family,
         buf,
@@ -11674,12 +11626,17 @@ fn render_folder_browser(
     let can_load_more = browser.next_after.is_some()
         && browser.entries.len() < MAX_BROWSER_LOADED_ENTRIES
         && !browser.pending;
-    let load_more = Rect::new(inner.x, action_row, 13.min(inner.width), 1);
     let load_more_ascii_label = if can_load_more { "[Load more]" } else { " Load more " };
+    // Icon-only control now (no trailing "more" word, see `render_
+    // compact_icon_button`'s own doc comment); nothing else on this row
+    // anchors off `load_more`'s own rect (`use_folder`/`cancel` are
+    // right-anchored independently), so its width shrinks to match via
+    // `compact_icon_button_width` rather than the old literal `13` sized
+    // for the icon-plus-word footprint.
+    let load_more = Rect::new(inner.x, action_row, compact_icon_button_width(load_more_ascii_label, app.rail_icons).min(inner.width), 1);
     render_compact_icon_button(
         load_more,
         icons::IconId::CloudDownload,
-        Some("more"),
         load_more_ascii_label,
         Style::default().fg(if can_load_more { theme.teal } else { theme.muted }).bg(theme.modal),
         app.rail_icons, app.icon_family,
@@ -11689,11 +11646,19 @@ fn render_folder_browser(
     if can_load_more {
         push_modal_hit(layout, load_more, HitTarget::FolderBrowserLoadMore);
     }
+    // Icon-only control now (no trailing "Use this folder" word, see
+    // `render_compact_icon_button`'s own doc comment) -- but the rect's
+    // own geometry (the literal `17`, sized for the OLD icon-plus-word
+    // ascii label) is deliberately left untouched: `cancel`, below, is
+    // positioned via `use_folder.x.saturating_sub(9)`, a magic-number
+    // offset from this rect's own `x`, not from a returned cursor value
+    // -- shrinking `use_folder` here would silently drag `cancel` left
+    // with it. That chained pair is exactly the case this task's own
+    // brief says to leave untouched and report, not reach into.
     let use_folder = Rect::new(inner.right().saturating_sub(17), action_row, 17.min(inner.width), 1);
     render_compact_icon_button(
         use_folder,
         icons::IconId::Check,
-        Some("Use this folder"),
         "[Use this folder]",
         Style::default().fg(if browser.directory.is_some() { theme.active_tab_text } else { theme.muted }).bg(if browser.directory.is_some() { theme.accent } else { theme.modal }).add_modifier(Modifier::BOLD),
         app.rail_icons, app.icon_family,
@@ -11707,7 +11672,6 @@ fn render_folder_browser(
     render_compact_icon_button(
         cancel,
         icons::IconId::Close,
-        None,
         "[Cancel]",
         Style::default().fg(theme.text).bg(theme.active),
         app.rail_icons, app.icon_family,
@@ -15967,11 +15931,14 @@ mod tests {
     /// The workspaces roster's own pre-strip fallback (panel too short
     /// for `control_strip_fits`, see `space_list_control_strip_falls_
     /// back_to_inline_buttons_when_the_panel_is_too_short` for the exact
-    /// threshold): AddSpace keeps its "workspace" text next to
-    /// [`icons::IconId::Add`] (the label carries information the icon
-    /// alone cannot); RemoveSpace, a plain remove action mirroring
-    /// RemoveWorktree, becomes icon-only. Same 2-tier + stable-hit-rect
-    /// coverage as `workspace_files_create_buttons_render_in_the_
+    /// threshold): AddSpace and RemoveSpace are both icon-only controls in
+    /// `Sixel` mode -- AddSpace used to keep a "workspace" trailing word
+    /// next to [`icons::IconId::Add`], but a control is its icon alone,
+    /// never icon-plus-word (see [`render_compact_icon_button`]'s own doc
+    /// comment), so the word is gone and the (unique, unambiguous) glyph
+    /// carries the control by itself, same as RemoveSpace's plain remove
+    /// action mirroring RemoveWorktree already did. Same 2-tier + stable-
+    /// hit-rect coverage as `workspace_files_create_buttons_render_in_the_
     /// control_strip_per_tier`. Renders `render_space_list` directly
     /// (not the full `render()`) -- the Explorer panel's own control-
     /// plane strip now ALSO carries an `AddSpace`/`RemoveSpace` button
@@ -15982,7 +15949,7 @@ mod tests {
     /// OWN fallback button specifically, not whichever one a full
     /// render's hit list happens to list first.
     #[test]
-    fn space_list_add_and_remove_buttons_render_a_compact_icon_per_tier() {
+    fn space_list_add_and_remove_buttons_render_an_icon_only_control_per_tier() {
         let mut app = fixture(PtyColorMode::GateOverride);
         app.roster_mode = RosterMode::Workspaces;
         let area = Rect::new(0, 0, 40, 4);
@@ -16006,26 +15973,34 @@ mod tests {
         let remove_rect = hit_rect(&sixel_layout, HitTarget::RemoveSpace);
         assert!(sixel_layout.sixel_icons.iter().any(|placement| {
             placement.icon == icons::IconId::Add
-                && placement.size == crate::app::SixelIconSize::Compact
+                && placement.size == crate::app::SixelIconSize::Strip
                 && add_rect.contains(placement.rect.x, placement.rect.y)
         }));
         assert!(sixel_layout.sixel_icons.iter().any(|placement| {
             placement.icon == icons::IconId::Trash
-                && placement.size == crate::app::SixelIconSize::Compact
+                && placement.size == crate::app::SixelIconSize::Strip
                 && remove_rect.contains(placement.rect.x, placement.rect.y)
         }));
-        let sixel_text = rect_text(&sixel_buf, add_rect);
-        assert!(sixel_text.contains("workspace"), "{sixel_text:?}");
+        assert!(!rect_text(&sixel_buf, add_rect).contains("workspace"));
         assert!(!rect_text(&sixel_buf, remove_rect).contains("remove"));
 
         app.rail_icons = RailIcons::Ascii;
         let mut ascii_buf = TerminalBuffer::new(40, 4);
         let mut ascii_layout = LayoutRects::default();
         render_space_list(&app, area, &mut ascii_buf, &mut ascii_layout, theme);
-        assert_eq!(hit_rect(&ascii_layout, HitTarget::AddSpace), add_rect);
+        let ascii_add_rect = hit_rect(&ascii_layout, HitTarget::AddSpace);
+        // AddSpace is left-anchored (`Rect::new(area.x, area.y, add_width,
+        // 1)`) and `add_width` is now tier-aware (`compact_icon_button_
+        // width`): ascii keeps the full bracketed label's own width,
+        // sixel shrinks to the icon alone, so the two rects share their
+        // left edge but no longer their width -- unlike RemoveSpace,
+        // whose own width was never tier-aware (see `render_space_list`'s
+        // own body) and so keeps the SAME rect across both tiers.
+        assert_eq!(ascii_add_rect.x, add_rect.x);
+        assert!(ascii_add_rect.width > add_rect.width, "ascii={ascii_add_rect:?} sixel={add_rect:?}");
         assert_eq!(hit_rect(&ascii_layout, HitTarget::RemoveSpace), remove_rect);
         assert!(ascii_layout.sixel_icons.is_empty());
-        assert!(rect_text(&ascii_buf, add_rect).contains("+ workspace"));
+        assert!(rect_text(&ascii_buf, ascii_add_rect).contains("+ workspace"));
         assert!(rect_text(&ascii_buf, remove_rect).contains("- remove"));
     }
 
@@ -17525,11 +17500,14 @@ mod tests {
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
-    /// Wave-1 icon labelling: AddSpaceBrowse keeps its "Browse…" text
-    /// next to [`icons::IconId::Search`]. Same 2-tier + stable-hit-rect
-    /// coverage as the sidebar panels' own compact-icon tests.
+    /// AddSpaceBrowse is an icon-only control: [`icons::IconId::Search`]
+    /// alone, no trailing "Browse…" word (see [`render_compact_icon_
+    /// button`]'s own doc comment for why a control never pairs an icon
+    /// with a disambiguating word once the glyph itself is unique). Same
+    /// 2-tier + stable-hit-rect coverage as the sidebar panels' own
+    /// icon-only-control tests.
     #[test]
-    fn add_space_browse_button_renders_a_compact_icon_per_tier() {
+    fn add_space_browse_button_renders_an_icon_only_control_per_tier() {
         let mut app = fixture(PtyColorMode::GateOverride);
         app.focus = Focus::AddSpace;
         app.add_space = Some(crate::app::AddSpaceDialog {
@@ -17556,17 +17534,23 @@ mod tests {
         let browse_rect = hit_rect(&sixel_layout, HitTarget::AddSpaceBrowse);
         assert!(sixel_layout.sixel_icons.iter().any(|placement| {
             placement.icon == icons::IconId::Search
-                && placement.size == crate::app::SixelIconSize::Compact
+                && placement.size == crate::app::SixelIconSize::Strip
                 && browse_rect.contains(placement.rect.x, placement.rect.y)
         }));
-        assert!(rect_text(&sixel_buf, browse_rect).contains("Browse"));
+        assert!(!rect_text(&sixel_buf, browse_rect).contains("Browse"));
 
         app.rail_icons = RailIcons::Ascii;
         let mut ascii_buf = TerminalBuffer::new(100, 24);
         let ascii_layout = render(&app, &mut ascii_buf);
-        assert_eq!(hit_rect(&ascii_layout, HitTarget::AddSpaceBrowse), browse_rect);
+        let ascii_browse_rect = hit_rect(&ascii_layout, HitTarget::AddSpaceBrowse);
+        // `browse` is right-anchored and its width is now tier-aware
+        // (`compact_icon_button_width`): ascii keeps the full bracketed
+        // label's own width, sixel shrinks to the icon alone, so the two
+        // rects share their right edge but no longer their width.
+        assert_eq!(ascii_browse_rect.right(), browse_rect.right());
+        assert!(ascii_browse_rect.width > browse_rect.width, "ascii={ascii_browse_rect:?} sixel={browse_rect:?}");
         assert!(ascii_layout.sixel_icons.is_empty());
-        assert!(rect_text(&ascii_buf, browse_rect).contains("[Browse\u{2026}]"));
+        assert!(rect_text(&ascii_buf, ascii_browse_rect).contains("[Browse\u{2026}]"));
     }
 
     #[test]
@@ -20902,15 +20886,18 @@ mod tests {
         );
     }
 
-    /// Wave-1 icon labelling: FolderBrowserParent keeps "Parent" next to
-    /// [`icons::IconId::ArrowUp`], FolderBrowserUse keeps "Use this
-    /// folder" next to [`icons::IconId::Check`] (both explicit "keep the
-    /// text" examples in the task brief), and FolderBrowserCancel (a
-    /// universal X = cancel/close convention) becomes icon-only
-    /// [`icons::IconId::Close`]. Same 2-tier + stable-hit-rect coverage
-    /// as the other converted sites.
+    /// FolderBrowserParent ([`icons::IconId::ArrowUp`]), FolderBrowserUse
+    /// ([`icons::IconId::Check`]) and FolderBrowserCancel ([`icons::
+    /// IconId::Close`], a universal X = cancel/close convention) are all
+    /// icon-only controls: each of the three used to keep a trailing
+    /// word ("Parent"/"Use this folder") next to its own icon, but a
+    /// control is its icon alone, never icon-plus-word, once that icon's
+    /// own meaning is unambiguous (see [`render_compact_icon_button`]'s
+    /// own doc comment) -- none of these three share a glyph with a
+    /// sibling control that would need a word to tell them apart. Same
+    /// 2-tier + stable-hit-rect coverage as the other converted sites.
     #[test]
-    fn folder_browser_parent_use_and_cancel_buttons_render_a_compact_icon_per_tier() {
+    fn folder_browser_parent_use_and_cancel_buttons_render_an_icon_only_control_per_tier() {
         let mut app = fixture(PtyColorMode::GateOverride);
         app.focus = Focus::FolderBrowser;
         app.folder_browser = Some(FolderBrowserDialog {
@@ -20951,30 +20938,40 @@ mod tests {
         let cancel_rect = hit_rect(&sixel_layout, HitTarget::FolderBrowserCancel);
         assert!(sixel_layout.sixel_icons.iter().any(|placement| {
             placement.icon == icons::IconId::ArrowUp
-                && placement.size == crate::app::SixelIconSize::Compact
+                && placement.size == crate::app::SixelIconSize::Strip
                 && parent_rect.contains(placement.rect.x, placement.rect.y)
         }));
         assert!(sixel_layout.sixel_icons.iter().any(|placement| {
             placement.icon == icons::IconId::Check
-                && placement.size == crate::app::SixelIconSize::Compact
+                && placement.size == crate::app::SixelIconSize::Strip
                 && use_rect.contains(placement.rect.x, placement.rect.y)
         }));
         assert!(sixel_layout.sixel_icons.iter().any(|placement| {
             placement.icon == icons::IconId::Close
-                && placement.size == crate::app::SixelIconSize::Compact
+                && placement.size == crate::app::SixelIconSize::Strip
                 && cancel_rect.contains(placement.rect.x, placement.rect.y)
         }));
-        assert!(rect_text(&sixel_buf, parent_rect).contains("Parent"));
-        assert!(rect_text(&sixel_buf, use_rect).contains("Use this folder"));
+        assert!(!rect_text(&sixel_buf, parent_rect).contains("Parent"));
+        assert!(!rect_text(&sixel_buf, use_rect).contains("Use this folder"));
 
         app.rail_icons = RailIcons::Ascii;
         let mut ascii_buf = TerminalBuffer::new(110, 30);
         let ascii_layout = render(&app, &mut ascii_buf);
-        assert_eq!(hit_rect(&ascii_layout, HitTarget::FolderBrowserParent), parent_rect);
+        let ascii_parent_rect = hit_rect(&ascii_layout, HitTarget::FolderBrowserParent);
+        // `parent` is left-anchored and its width is now tier-aware
+        // (`compact_icon_button_width`): ascii keeps the full bracketed
+        // label's own width, sixel shrinks to the icon alone, so the two
+        // rects share their left edge but no longer their width. `use`/
+        // `cancel` keep their own literal, tier-independent widths (see
+        // `render_folder_browser`'s own doc comment on why `use_folder`'s
+        // geometry is deliberately left alone), so those two stay the
+        // SAME rect across both tiers, unchanged.
+        assert_eq!(ascii_parent_rect.x, parent_rect.x);
+        assert!(ascii_parent_rect.width > parent_rect.width, "ascii={ascii_parent_rect:?} sixel={parent_rect:?}");
         assert_eq!(hit_rect(&ascii_layout, HitTarget::FolderBrowserUse), use_rect);
         assert_eq!(hit_rect(&ascii_layout, HitTarget::FolderBrowserCancel), cancel_rect);
         assert!(ascii_layout.sixel_icons.is_empty());
-        assert!(rect_text(&ascii_buf, parent_rect).contains("[\u{2191} Parent]"));
+        assert!(rect_text(&ascii_buf, ascii_parent_rect).contains("[\u{2191} Parent]"));
         assert!(rect_text(&ascii_buf, use_rect).contains("[Use this folder]"));
         assert!(rect_text(&ascii_buf, cancel_rect).contains("[Cancel]"));
     }

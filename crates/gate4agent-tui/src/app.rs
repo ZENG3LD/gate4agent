@@ -2971,18 +2971,29 @@ pub struct HitRegion {
 /// Which baked raster [`SixelIconPlacement::icon`] resolves to -- `Rail`:
 /// the full `icons::sixel` asset (~4 cells wide x 2 rows, the activity
 /// rail's own button body); `Compact`: the much smaller `icons::
-/// sixel_compact` asset (exactly one assumed terminal cell), for dense
-/// single-row buttons in the Explorer/Git sidebar panels and their modals
-/// -- see `render::render_compact_icon_button`; `Strip`: the sidebar
-/// content panels' own control-plane strip asset (`icons::sixel_strip`,
-/// 2 cells wide x 1 row) -- see `render::render_control_strip_button`,
-/// plus `render::render_tabs`'s own AddTab/LayoutMenuToggle controls,
-/// the SAME asset size reused rather than a new tier; `Gallery`: the
-/// icon gallery dev surface's own dedicated (6 cells wide
-/// x 3 rows) comparison-column asset (`icons::sixel_gallery`) -- see
-/// `render::render_icon_gallery`. The gallery's OTHER two comparison
-/// columns (the strip/rail tiers' own pixel sizes) reuse `Strip`/`Rail`
-/// directly rather than
+/// sixel_compact` asset (exactly one assumed terminal cell), real-
+/// transparent rather than composited against a caller background (see
+/// `icons::sixel_compact_family`'s own doc comment) -- no production call
+/// site requests this tier any more: `render::render_compact_icon_button`
+/// used to (for the same dense single-row Explorer/Git sidebar panel and
+/// modal buttons `Strip` now covers below), but a 1-cell icon read as an
+/// illegible speck rather than a control, which is exactly why every
+/// caller of it used to paint a trailing text label alongside the icon
+/// just to make the button legible at all -- see that fn's own doc
+/// comment. `Compact` stays a real, dispatchable size (`client::flush_
+/// sixel_icon_into`'s own match arm, and its own baked asset/tests) for
+/// whatever future sub-2-cell, truly-transparent case still needs it;
+/// `Strip`: the sidebar content panels' own control-plane strip asset
+/// (`icons::sixel_strip`, 2 cells wide x 1 row) -- see `render::render_
+/// control_strip_button`, `render::render_tabs`'s own AddTab/
+/// LayoutMenuToggle controls, and (as of the icon-legibility fix above)
+/// `render::render_compact_icon_button`'s own single-row panel/modal
+/// buttons, all THREE reusing the SAME asset size rather than each
+/// getting its own tier; `Gallery`: the icon gallery dev surface's own
+/// dedicated (6 cells wide x 3 rows) comparison-column asset (`icons::
+/// sixel_gallery`) -- see `render::render_icon_gallery`. The gallery's
+/// OTHER two comparison columns (the strip/rail tiers' own pixel sizes)
+/// reuse `Strip`/`Rail` directly rather than
 /// getting their own variants: those are the EXACT SAME baked bytes the
 /// strip/rail already ship, not a new asset.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

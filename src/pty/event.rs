@@ -442,6 +442,25 @@ impl PtyEventPublisher {
         })
     }
 
+    /// The sequence a `snapshot` taken right now would carry, without
+    /// building one.
+    ///
+    /// `snapshot` is expensive out of proportion to its callers' usual
+    /// question. It renders the whole visible screen twice (plain and
+    /// formatted) and then CLONES the entire `vt100::Screen` to walk up to
+    /// `PTY_TERMINAL_SCROLLBACK_ROWS_MAX` rows of scrollback one
+    /// `set_scrollback` at a time. A caller polling "has anything changed
+    /// since I last looked?" pays all of that to read one integer off the
+    /// front of the result and, most of the time, throw the rest away.
+    /// This reads that integer under the same lock and nothing else.
+    pub(crate) fn terminal_sequence(&self) -> Result<u64, PtyAttachError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| PtyAttachError::JournalPoisoned)?;
+        Ok(state.sequence)
+    }
+
     pub(crate) fn snapshot(&self) -> Result<PtyTerminalSnapshot, PtyAttachError> {
         let state = self
             .state

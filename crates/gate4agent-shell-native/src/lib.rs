@@ -1413,9 +1413,26 @@ impl NativeEffectShell {
 
     /// Capture only changed terminal frames. Snapshot failures become an
     /// explicit stale observation once, until a later successful frame heals it.
+    ///
+    /// The sequence is checked BEFORE the capture, not after. This runs on
+    /// the per-session worker tick (20ms, so ~50 times a second per live
+    /// PTY session), and `terminal_state` is not a cheap read: it renders
+    /// the visible screen twice and clones the whole `vt100::Screen` to
+    /// walk its scrollback row by row. Asking it first and comparing
+    /// sequences afterwards meant every idle session rebuilt its entire
+    /// screen fifty times a second purely to discover nothing had changed,
+    /// and then dropped the result -- with a couple of dozen sessions open
+    /// that is the machine's time, all of it wasted. `terminal_sequence`
+    /// answers the same question by reading one integer.
     pub fn collect_terminal_frames(&mut self) -> Vec<ObservationEnvelope> {
         let mut observations = Vec::new();
         for (key, owned) in &mut self.pty_sessions {
+            if matches!(
+                owned.session.terminal_sequence(),
+                Ok(sequence) if sequence <= owned.last_terminal_sequence
+            ) {
+                continue;
+            }
             match owned.session.terminal_state() {
                 Ok(snapshot) if snapshot.sequence > owned.last_terminal_sequence => {
                     owned.last_terminal_sequence = snapshot.sequence;

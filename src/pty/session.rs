@@ -339,6 +339,14 @@ impl PtySession {
         self.events.snapshot()
     }
 
+    /// The sequence `terminal_state` would report, without paying for the
+    /// capture. A caller that only wants to know whether anything has
+    /// happened since it last looked must ask this first -- see
+    /// `PtyEventPublisher::terminal_sequence`.
+    pub fn terminal_sequence(&self) -> Result<u64, PtyAttachError> {
+        self.events.terminal_sequence()
+    }
+
     /// Take a fresh, bounded OS process-table observation for readiness.
     pub async fn observe_foreground(&self) -> Result<PtyForegroundObservation, AgentError> {
         let pty = self.pty.clone();

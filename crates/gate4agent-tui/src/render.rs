@@ -293,6 +293,7 @@ pub fn render(app: &App, buf: &mut TerminalBuffer) -> LayoutRects {
         status_bar_center_modal: Rect::default(),
         status_bar_right_modal: Rect::default(),
         harness_reverse_attribution_modal: Rect::default(),
+        status_bar_center_log_body: Rect::default(),
         status_bar_left: Rect::default(),
         status_bar_center: Rect::default(),
         status_bar_right: Rect::default(),
@@ -936,6 +937,12 @@ fn render_status_bar_center_modal(
     let height = 18.min(area.height.saturating_sub(2));
     let dialog = positioned_modal(area, width, height, app.overlay_positions.get(&OverlayId::StatusBarCenter).copied());
     layout.status_bar_center_modal = dialog;
+    // Cleared unconditionally up front, then overwritten with the real
+    // rect only once this function reaches the entries loop below --
+    // otherwise a terminal shrunk just past one of the size guards below
+    // this point would leave a STALE, previous-frame rect here, letting a
+    // click land inside a body that was not actually painted this frame.
+    layout.status_bar_center_log_body = Rect::default();
     layout.note_overlay(dialog);
     fill_rect(dialog, theme.modal, buf);
     Block::bordered()
@@ -968,6 +975,13 @@ fn render_status_bar_center_modal(
     let capacity = inner.height.saturating_sub(3) as usize;
     let offset = app.event_log_scroll.min(entries.len().saturating_sub(capacity.max(1)));
     let end = offset.saturating_add(capacity).min(entries.len());
+    // The log body's own rect -- see `LayoutRects::status_bar_center_log_
+    // body`'s own doc comment. Recorded even for an empty log (nothing
+    // paints there yet, but a press still lands somewhere sensible once
+    // the first event arrives) rather than only once `entries` is
+    // non-empty, so `App::click_status_bar_zone`'s guard sees the SAME
+    // rect this renderer just used to lay the rows out.
+    layout.status_bar_center_log_body = Rect::new(inner.x, inner.y + 2, inner.width, capacity as u16);
     let controls_row = Rect::new(inner.x, inner.y + 1, inner.width, 1);
     let mut x = controls_row.x;
     x = render_toolbar_segment(
@@ -1011,14 +1025,44 @@ fn render_status_bar_center_modal(
             buf,
         );
     }
+    // The same selection this row's line falls at, if any -- `App::
+    // event_log_selection`'s own doc comment explains why this is a frozen
+    // snapshot rather than something resynced every frame: the practical
+    // effect here is that its own line numbering (`offset + row`, matching
+    // how the snapshot text was built) can drift from what is CURRENTLY on
+    // screen if new events arrived since the interaction that produced it.
+    // That drift self-heals the next time a press or Ctrl+A rebuilds the
+    // snapshot; it is not a correctness bug this renderer needs to chase.
+    let selection = app.event_log_selection.as_ref();
+    let selection_range = selection.and_then(|editor| editor.selection_range());
     for (row, event) in entries[offset..end].iter().enumerate() {
-        render_modal_line(
-            app.event_log_line(event),
-            inner,
-            2 + row as u16,
-            Style::default().fg(event_severity_color(event.severity, theme)).bg(theme.modal),
-            buf,
-        );
+        let text = app.event_log_line(event);
+        let base_style = Style::default().fg(event_severity_color(event.severity, theme)).bg(theme.modal);
+        let line_start_byte = selection.and_then(|editor| editor.line_byte_start(offset + row));
+        let Some(line_start_byte) = line_start_byte.filter(|_| selection_range.is_some()) else {
+            render_modal_line(text, inner, 2 + row as u16, base_style, buf);
+            continue;
+        };
+        let truncated = truncate_cells(&text, inner.width as usize);
+        // Same per-character highlight recipe `render_workspace_file_tab_
+        // rich` already uses for the file editor's own selection (`theme.
+        // active_tab_text` on `theme.accent`) -- one look for "this text is
+        // selected" across the crate, not a second invention for the log.
+        let spans: Vec<Span> = truncated
+            .char_indices()
+            .map(|(byte_offset, character)| {
+                let absolute = line_start_byte + byte_offset;
+                let style = if file_byte_is_selected(selection_range.as_ref(), absolute) {
+                    Style::default().fg(theme.active_tab_text).bg(theme.accent)
+                } else {
+                    base_style
+                };
+                Span::styled(character.to_string(), style)
+            })
+            .collect();
+        Paragraph::new(Text::from_lines(vec![Line::from_spans(spans)]))
+            .style(Style::default().bg(theme.modal))
+            .render(Rect::new(inner.x, inner.y + 2 + row as u16, inner.width, 1), buf);
     }
     render_modal_line(
         "click, or m, toggles | Up/Down scrolls log | Esc close",

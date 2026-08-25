@@ -1509,6 +1509,14 @@ pub enum DragState {
         address: SessionAddress,
         viewport: Rect,
     },
+    /// Drag-selects a text range over the CENTRE zone's retained event log
+    /// (`App::event_log_selection`) -- the read-only-log sibling of
+    /// `FileSelection`/`HarnessFileSelection` above, minus their `key`:
+    /// there is exactly one log, not one per open tab, so nothing needs to
+    /// be looked up by key, only the body rect the drag is relative to.
+    EventLogSelection {
+        viewport: Rect,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3161,6 +3169,18 @@ pub struct LayoutRects {
     pub status_bar_center_modal: Rect,
     pub status_bar_right_modal: Rect,
     pub harness_reverse_attribution_modal: Rect,
+    /// The CENTRE zone modal's own retained-log ENTRY rows -- a sub-rect of
+    /// `status_bar_center_modal`, excluding its border, the marquee toggle
+    /// row, the `[Up]`/`[Down]`/`[Clear]` toolbar row, and the bottom help
+    /// line. `App::click_status_bar_zone`'s own empty-target fallback
+    /// tests a press against exactly this rect (not the whole dialog)
+    /// before starting a drag-selection (`App::begin_event_log_selection`)
+    /// -- the same "one rect per interactive body" shape `SurfacePaneLayout
+    /// ::viewport` already gives the file editor. Zero-area whenever the
+    /// modal itself did not paint this frame (`render_status_bar_center_
+    /// modal`'s own early returns for a too-small dialog), same convention
+    /// as every other conditional rect here.
+    pub status_bar_center_log_body: Rect,
     /// The bottom status bar's own three zones, in the frame's own last
     /// row -- see `render::render_status_bar`'s own doc comment for the
     /// geometry. Zero-area (`Rect::default()`) on a terminal too small to
@@ -4120,6 +4140,23 @@ pub struct App {
     /// convention `HarnessRunMonitorScrollUp`/`Down` already use for that
     /// panel's own scrollable section.
     pub(crate) event_log_scroll: usize,
+    /// A frozen, read-only snapshot of the ENTIRE retained log -- every
+    /// entry in `event_log`, in the SAME newest-first order and `App::
+    /// event_log_line` formatting `render_status_bar_center_modal` already
+    /// draws -- holding whatever selection a drag or Ctrl+A last produced.
+    /// See `App::snapshot_event_log_editor`'s own doc comment for why this
+    /// is a snapshot taken at each interaction's START rather than a
+    /// buffer kept permanently in sync with `event_log`: `push_event_log`
+    /// fires on essentially every user action, and `TextEditor::replace_
+    /// content` (the only way to change an existing editor's buffer)
+    /// unconditionally clears cursor/selection/scroll, so wiring a resync
+    /// into every push would erase whatever the owner had just selected
+    /// before Ctrl+C ever ran. `None` until the first interaction; never
+    /// cleared afterwards except by the next interaction replacing it --
+    /// the same "outlives the drag that made it, so Ctrl+C still works
+    /// after the mouse button is released" convention `terminal_selection`
+    /// already uses for the PTY output's own selection.
+    pub(crate) event_log_selection: Option<TextEditor>,
     /// The LEFT status bar zone's own clock settings -- see
     /// [`ClockSettings`]'s own doc comment. Persisted (`preferences::
     /// UiPreferences::clock_follow_system`/`clock_manual_offset_hours`/
@@ -4265,6 +4302,7 @@ impl Default for App {
             event_strip_started_tick: 0,
             event_log: VecDeque::new(),
             event_log_scroll: 0,
+            event_log_selection: None,
             clock_settings: ClockSettings::default(),
             pet_settings: PetSettings::default(),
             pet_motion: PetMotionState::default(),
@@ -4642,6 +4680,58 @@ impl App {
         self.event_log_scroll = 0;
     }
 
+    /// Builds a fresh `TextEditor` snapshot of the ENTIRE retained log --
+    /// every entry in `event_log`, in the SAME newest-first order and
+    /// `event_log_line` formatting `render_status_bar_center_modal` draws
+    /// -- with its scroll aligned to whatever window is CURRENTLY on
+    /// screen (mirroring the exact clamp `render_status_bar_center_modal`
+    /// applies to `event_log_scroll`) so a press this frame maps to the
+    /// row the owner is actually looking at. `None` for an empty log:
+    /// nothing to select. See `event_log_selection`'s own doc comment for
+    /// why this is built fresh at each interaction rather than kept
+    /// permanently in sync.
+    fn snapshot_event_log_editor(&self) -> Option<TextEditor> {
+        if self.event_log.is_empty() {
+            return None;
+        }
+        let text = self
+            .event_log
+            .iter()
+            .rev()
+            .map(|event| self.event_log_line(event))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut editor = TextEditor::from_text(text).ok()?;
+        let capacity = self.layout.status_bar_center_log_body.height.max(1) as usize;
+        let offset = self.event_log_scroll.min(self.event_log.len().saturating_sub(capacity));
+        editor.set_scroll(offset, 0);
+        Some(editor)
+    }
+
+    /// The CENTRE zone log body's own click handler (`App::click_status_
+    /// bar_zone`'s empty-target fallback, reached whenever a press lands
+    /// inside `LayoutRects::status_bar_center_log_body` and hits none of
+    /// the toolbar/toggle/drag targets above it) -- begins a drag-
+    /// selection instead of doing nothing, mirroring `begin_surface_body_
+    /// interaction`'s own file-editor arm. A fresh snapshot is taken here
+    /// (see `snapshot_event_log_editor`'s own doc comment) so the byte
+    /// offsets `TextEditor::start_drag_selection` computes line up with
+    /// what is on screen this frame; any prior selection is discarded --
+    /// the same "starting a new interaction replaces the old one" rule a
+    /// real text surface already follows.
+    fn begin_event_log_selection(&mut self, column: u16, row: u16) -> AppAction {
+        let viewport = self.layout.status_bar_center_log_body;
+        let Some(mut editor) = self.snapshot_event_log_editor() else {
+            return AppAction::None;
+        };
+        let viewport_row = row.saturating_sub(viewport.y) as usize;
+        let viewport_column = column.saturating_sub(viewport.x) as usize;
+        editor.start_drag_selection(viewport_row, viewport_column);
+        self.event_log_selection = Some(editor);
+        self.drag_state = Some(DragState::EventLogSelection { viewport });
+        AppAction::None
+    }
+
     /// Approximates the CENTRE zone's own on-screen width from `terminal_
     /// cols` alone -- `has_active_animation` has no render-time `Rect` to
     /// measure against (rendering hasn't happened yet for this frame), so
@@ -4863,6 +4953,20 @@ impl App {
                 );
                 AppAction::None
             }
+            // No `HitTarget` claims the log's own entry rows (only the
+            // toggle row, the `[Up]`/`[Down]`/`[Clear]` toolbar row, and
+            // the drag header above them do) -- this is what actually
+            // lets a plain press inside the body reach here as `target ==
+            // None` instead of some button's own click arm. Guarded by
+            // the log body's own rect (not just `Focus::StatusBarCenter`)
+            // so a click anywhere else inside the dialog that happens to
+            // hit no target either (there is none today, but nothing
+            // guarantees that forever) does not also start a selection.
+            None if self.focus == Focus::StatusBarCenter
+                && self.layout.status_bar_center_log_body.contains(column, row) =>
+            {
+                self.begin_event_log_selection(column, row)
+            }
             _ => AppAction::None,
         }
     }
@@ -4884,6 +4988,44 @@ impl App {
             }
             UiKey::Char('c') | UiKey::Char('C') if self.focus == Focus::StatusBarCenter => {
                 self.clear_event_log();
+                AppAction::None
+            }
+            // "Give me all of it" in one chord, the same select-all a real
+            // text surface offers -- matches `TextEditor::select_all`'s own
+            // semantics (`reduce_file_viewport`'s own `Ctrl('a')` arms):
+            // selects the WHOLE retained log, not merely the currently
+            // scrolled-into-view window, so a fragment scrolled off screen
+            // is still included once copied.
+            UiKey::Ctrl('a') if self.focus == Focus::StatusBarCenter => {
+                match self.snapshot_event_log_editor() {
+                    Some(mut editor) => {
+                        editor.select_all();
+                        self.event_log_selection = Some(editor);
+                        self.flash("selected all retained events".to_owned());
+                    }
+                    None => self.flash("no retained events to select".to_owned()),
+                }
+                AppAction::None
+            }
+            // A keystroke acknowledgement (`flash`, never `report_event`/
+            // `report_failure`) -- copying a selection is not itself a
+            // state change worth a permanent history entry, see `flash`'s
+            // own doc comment. Reads into an owned `String` before calling
+            // `flash` (a `&mut self` method) so the borrow of `self.
+            // event_log_selection` is not still alive when it runs.
+            UiKey::Ctrl('c') if self.focus == Focus::StatusBarCenter => {
+                let selected = self
+                    .event_log_selection
+                    .as_ref()
+                    .and_then(|editor| editor.selected_text())
+                    .map(str::to_owned);
+                match selected {
+                    Some(text) => match write_clipboard_text(&text) {
+                        Ok(()) => self.flash("selection copied".to_owned()),
+                        Err(error) => self.flash(format!("copy failed: {error}")),
+                    },
+                    None => self.flash("no selection to copy".to_owned()),
+                }
                 AppAction::None
             }
             _ => AppAction::None,
@@ -13616,6 +13758,13 @@ impl App {
             DragState::TerminalSelection { address, viewport } => {
                 self.update_terminal_selection(&address, viewport, column, row);
             }
+            DragState::EventLogSelection { viewport } => {
+                if let Some(editor) = self.event_log_selection.as_mut() {
+                    let viewport_row = row.saturating_sub(viewport.y) as usize;
+                    let viewport_column = column.saturating_sub(viewport.x) as usize;
+                    editor.update_drag_selection(viewport_row, viewport_column);
+                }
+            }
         }
         AppAction::None
     }
@@ -13626,7 +13775,9 @@ impl App {
         };
         match &drag {
             DragState::SurfaceDivider { .. } => return AppAction::None,
-            DragState::FileSelection { .. } | DragState::HarnessFileSelection { .. } => {
+            DragState::FileSelection { .. }
+            | DragState::HarnessFileSelection { .. }
+            | DragState::EventLogSelection { .. } => {
                 return AppAction::None;
             }
             DragState::FileScrollbar { key, viewport } => {
@@ -30414,6 +30565,193 @@ mod tests {
         assert_eq!(app.event_log.len(), EVENT_LOG_CAPACITY);
         assert_eq!(app.event_log.front().map(|event| event.text.as_str()), Some("event 1"));
         assert_eq!(app.event_log.back().map(|event| event.text.as_str()), Some(newest_expected.as_str()));
+    }
+
+    /// Drag-selecting across two log rows selects a text RANGE spanning
+    /// both rows, not whole rows -- the owner wants to quote a fragment.
+    /// Pins the exact substring against a deterministic `ClockSettings`/
+    /// `SystemTime` pair, the same approach `event_log_line_carries_
+    /// timestamp_severity_source_and_text` above uses, so this is not
+    /// sensitive to the live OS clock.
+    #[test]
+    fn event_log_drag_across_rows_selects_a_text_range() {
+        let mut app = App::default();
+        app.clock_settings = ClockSettings {
+            follow_system: false,
+            manual_offset_hours: 0,
+            use_24h: true,
+            show_utc_prefix: false,
+        };
+        let older = AppEvent {
+            at: UNIX_EPOCH,
+            severity: EventSeverity::Info,
+            source: EventSource::Session,
+            text: "alpha entry".to_owned(),
+        };
+        let newer = AppEvent {
+            at: UNIX_EPOCH + Duration::from_secs(5),
+            severity: EventSeverity::Info,
+            source: EventSource::Session,
+            text: "beta entry".to_owned(),
+        };
+        let newer_line = app.event_log_line(&newer);
+        let older_line = app.event_log_line(&older);
+        app.push_event_log(older);
+        app.push_event_log(newer);
+
+        let dialog = Rect::new(10, 2, 40, 12);
+        app.focus = Focus::StatusBarCenter;
+        app.layout.status_bar_center_modal = dialog;
+        app.layout.overlays = vec![OverlayRegion { rect: dialog, drawn_before: 0 }];
+        let body = Rect::new(dialog.x + 1, dialog.y + 3, dialog.width - 2, 5);
+        app.layout.status_bar_center_log_body = body;
+
+        // Row 0 (`body.y`) is the newest entry (`newer_line`); row 1 is the
+        // one just below it (`older_line`) -- `render_status_bar_center_
+        // modal` draws newest-first, and the snapshot's own line numbering
+        // matches it exactly (see `snapshot_event_log_editor`).
+        let start_col = body.x + 10;
+        let end_col = body.x + 4;
+        assert_eq!(app.click(start_col, body.y), AppAction::None);
+        assert!(matches!(app.drag_state, Some(DragState::EventLogSelection { .. })));
+        assert_eq!(app.drag(end_col, body.y + 1), AppAction::None);
+        assert_eq!(app.drop_at(end_col, body.y + 1), AppAction::None);
+
+        let expected = format!("{}\n{}", &newer_line[10..], &older_line[..4]);
+        assert_eq!(
+            app.event_log_selection.as_ref().and_then(|editor| editor.selected_text()),
+            Some(expected.as_str()),
+        );
+    }
+
+    /// A press with no drag afterward must select nothing (`TextEditor::
+    /// start_drag_selection` sets anchor == cursor, and `selection_range`
+    /// treats that as "no selection" -- text_editor.rs's own contract) and
+    /// -- the constraint that actually matters for item 4 of the brief --
+    /// must NOT close the modal the way an outside click would.
+    #[test]
+    fn event_log_click_without_drag_selects_nothing_and_keeps_modal_open() {
+        let mut app = App::default();
+        app.push_event_log(AppEvent {
+            at: UNIX_EPOCH,
+            severity: EventSeverity::Info,
+            source: EventSource::Session,
+            text: "only entry".to_owned(),
+        });
+
+        let dialog = Rect::new(10, 2, 40, 12);
+        app.focus = Focus::StatusBarCenter;
+        app.layout.status_bar_center_modal = dialog;
+        app.layout.overlays = vec![OverlayRegion { rect: dialog, drawn_before: 0 }];
+        let body = Rect::new(dialog.x + 1, dialog.y + 3, dialog.width - 2, 5);
+        app.layout.status_bar_center_log_body = body;
+
+        assert_eq!(app.click(body.x + 2, body.y), AppAction::None);
+        assert!(matches!(app.drag_state, Some(DragState::EventLogSelection { .. })));
+        assert_eq!(app.drop_at(body.x + 2, body.y), AppAction::None);
+
+        assert_eq!(
+            app.focus,
+            Focus::StatusBarCenter,
+            "a press inside the log body must not close the modal",
+        );
+        assert_eq!(
+            app.event_log_selection.as_ref().and_then(|editor| editor.selected_text()),
+            None,
+        );
+    }
+
+    /// "Give me all of it" -- Ctrl+A with no prior selection selects the
+    /// WHOLE retained log, including entries scrolled off the currently
+    /// visible window, not merely what is on screen.
+    #[test]
+    fn event_log_ctrl_a_selects_the_whole_retained_log() {
+        let mut app = App::default();
+        app.clock_settings = ClockSettings {
+            follow_system: false,
+            manual_offset_hours: 0,
+            use_24h: true,
+            show_utc_prefix: false,
+        };
+        let first = AppEvent {
+            at: UNIX_EPOCH,
+            severity: EventSeverity::Info,
+            source: EventSource::Session,
+            text: "first".to_owned(),
+        };
+        let second = AppEvent {
+            at: UNIX_EPOCH + Duration::from_secs(1),
+            severity: EventSeverity::Warn,
+            source: EventSource::Harness,
+            text: "second".to_owned(),
+        };
+        let expected = format!("{}\n{}", app.event_log_line(&second), app.event_log_line(&first));
+        app.push_event_log(first);
+        app.push_event_log(second);
+
+        app.focus = Focus::StatusBarCenter;
+        assert_eq!(app.reduce(UiKey::Ctrl('a')), AppAction::None);
+
+        assert_eq!(
+            app.event_log_selection.as_ref().and_then(|editor| editor.selected_text()),
+            Some(expected.as_str()),
+        );
+        assert_eq!(app.notice(), Some("selected all retained events"));
+    }
+
+    /// Ctrl+C with an active selection must reach `write_clipboard_text` --
+    /// pinned by the `flash` outcome it leaves behind rather than by
+    /// reading the system clipboard back (see `platform::write_clipboard_
+    /// text`'s own doc comment: it is a real OS call with no injectable
+    /// mock, and no existing test in this crate reads the clipboard back
+    /// either). Accepting either outcome string is deliberate: what this
+    /// test pins is that the call was REACHED, not that this CI host's
+    /// clipboard happens to be writable.
+    #[test]
+    fn event_log_ctrl_c_with_a_selection_reaches_the_clipboard_call() {
+        let mut app = App::default();
+        app.push_event_log(AppEvent {
+            at: UNIX_EPOCH,
+            severity: EventSeverity::Info,
+            source: EventSource::Session,
+            text: "copy me".to_owned(),
+        });
+        app.focus = Focus::StatusBarCenter;
+        assert_eq!(app.reduce(UiKey::Ctrl('a')), AppAction::None);
+        assert!(app.event_log_selection.as_ref().is_some_and(|editor| editor.has_selection()));
+
+        assert_eq!(app.reduce(UiKey::Ctrl('c')), AppAction::None);
+        let notice = app.notice().unwrap_or_default();
+        assert!(
+            notice == "selection copied" || notice.starts_with("copy failed"),
+            "Ctrl+C must reach write_clipboard_text and flash its outcome, got {notice:?}",
+        );
+    }
+
+    /// The modal's header row is still `HitTarget::StatusBarCenterDrag`,
+    /// unconditionally handled BEFORE the empty-target body arm in `App::
+    /// click_status_bar_zone`'s own match -- a press there must still move
+    /// the modal (`DragState::OverlayMove`), never start a log selection.
+    #[test]
+    fn event_log_header_press_starts_a_modal_drag_not_a_selection() {
+        let mut app = App::default();
+        let dialog = Rect::new(10, 2, 40, 12);
+        app.focus = Focus::StatusBarCenter;
+        app.layout.status_bar_center_modal = dialog;
+        app.layout.overlays = vec![OverlayRegion { rect: dialog, drawn_before: 0 }];
+        let body = Rect::new(dialog.x + 1, dialog.y + 3, dialog.width - 2, 5);
+        app.layout.status_bar_center_log_body = body;
+        app.layout.hits = vec![HitRegion {
+            rect: Rect::new(dialog.x, dialog.y, dialog.width, 1),
+            target: HitTarget::StatusBarCenterDrag,
+        }];
+
+        assert_eq!(app.click(dialog.x + 5, dialog.y), AppAction::None);
+
+        assert!(matches!(
+            app.drag_state,
+            Some(DragState::OverlayMove { id: OverlayId::StatusBarCenter, .. })
+        ));
     }
 
     /// The search field's own side of the same requirement: fully

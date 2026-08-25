@@ -6199,7 +6199,6 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                     // `RouteObservationRecovery::
                                     // awaiting_absent_sessions`.
                                     invalidate_runtime_inventory_for_route(
-                                        &mut runtime_inventory,
                                         &mut observation_recovery,
                                         &route,
                                     );
@@ -6219,7 +6218,6 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                     // (see `SessionRosterEffect::Changed`'s
                                     // doc comment).
                                     invalidate_runtime_inventory_for_route(
-                                        &mut runtime_inventory,
                                         &mut observation_recovery,
                                         &route,
                                     );
@@ -6246,7 +6244,6 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                         "session record mutation accepted; invalidating the node's runtime inventory route",
                                     );
                                     invalidate_runtime_inventory_for_route(
-                                        &mut runtime_inventory,
                                         &mut observation_recovery,
                                         &route,
                                     );
@@ -6305,7 +6302,6 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                             "resource mutation accepted; invalidating the node's runtime inventory route",
                                         );
                                         invalidate_runtime_inventory_for_route(
-                                            &mut runtime_inventory,
                                             &mut observation_recovery,
                                             &route,
                                         );
@@ -6486,7 +6482,6 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                     &mut observation,
                                     &mut support,
                                     &mut observation_recovery,
-                                    &mut runtime_inventory,
                                     &mut subscribers,
                                     event,
                                 )
@@ -7313,22 +7308,6 @@ impl HarnessRuntimeInventoryCache {
         self.managed_worktree_profiles
             .retain(|node_id, profiles| !departed(node_id, &profiles.node_incarnation));
         before.into_iter().filter(|node_id| !self.nodes.contains_key(node_id)).collect()
-    }
-
-    /// Drops this harness's own cached projection of `route`'s node so the
-    /// next resync rebuilds it. Returns nothing on purpose: whether a cache
-    /// entry happened to be present says nothing about whether the NODE is
-    /// present, and it used to be read as exactly that -- the one caller
-    /// turned a `true` here into a `RuntimeInventoryRemoved` push, which
-    /// subscribers cannot tell apart from a real departure. Node departure
-    /// is observed in `reconcile_topology`, and only there.
-    fn invalidate(&mut self, route: &NodeRoute) {
-        if self.nodes.get(&route.node_id).is_some_and(|inventory| {
-            inventory.incarnation_id == route.expected_incarnation_id.to_string()
-        }) {
-            self.nodes.remove(&route.node_id);
-            self.managed_worktree_profiles.remove(&route.node_id);
-        }
     }
 
     /// Every currently cached node, unpaginated -- the runtime-inventory
@@ -9252,7 +9231,6 @@ fn apply_or_buffer_host_live_event(
     observation: &mut ObservationService,
     support: &mut ObservationSupportRegistry,
     recovery: &mut ObservationRecoveryRegistry,
-    runtime_inventory: &mut HarnessRuntimeInventoryCache,
     subscribers: &mut SubscriberRegistry,
     routed: RoutedNodeEvent,
 ) -> Result<(), HarnessRuntimeError> {
@@ -9278,7 +9256,6 @@ fn apply_or_buffer_host_live_event(
         return Ok(());
     }
     let inventory_refresh_required = invalidate_runtime_inventory_for_event(
-        runtime_inventory,
         recovery,
         &route,
         &routed.event,
@@ -9339,7 +9316,6 @@ fn event_affects_runtime_inventory(event: &C2NodeEvent) -> bool {
 }
 
 fn invalidate_runtime_inventory_for_event(
-    runtime_inventory: &mut HarnessRuntimeInventoryCache,
     recovery: &mut ObservationRecoveryRegistry,
     route: &NodeRoute,
     event: &C2NodeEvent,
@@ -9347,7 +9323,7 @@ fn invalidate_runtime_inventory_for_event(
     if !event_affects_runtime_inventory(event) {
         return false;
     }
-    invalidate_runtime_inventory_for_route(runtime_inventory, recovery, route);
+    invalidate_runtime_inventory_for_route(recovery, route);
     true
 }
 
@@ -9373,6 +9349,19 @@ fn invalidate_runtime_inventory_for_event(
 /// emits per id returned by `HarnessRuntimeInventoryCache::
 /// reconcile_topology`; it is the only place that observes departure.
 ///
+/// **Touches no cached projection either, and takes no cache so that it
+/// cannot.** Scheduling a resync is the whole job. This used to also DELETE
+/// the node's cached entry, which made every reader of that cache --
+/// `all_nodes`, `page`, `node`, and so every `RuntimeInventoryList` poll an
+/// operator makes -- answer "no such node" for the window between a
+/// successful mutation and its resync landing. That window is exactly when
+/// a just-spawned session is trying to open, which is why the TUI logged
+/// `spawned but its node is not in view yet` on a node that had never gone
+/// anywhere. Stale is a legitimate answer and `observed_at_unix_ms` on the
+/// projection says how stale; absent is not a way to say it. The resync
+/// replaces the entry through `refresh`, whose `Eq` diff then decides
+/// whether anything actually changed and is worth an event.
+///
 /// Exists for callers that know a route needs a fresh resync from context
 /// alone, not from a live event that happened to carry the news: today,
 /// a successful `StopSession`, a resumed session, a session-record
@@ -9384,11 +9373,9 @@ fn invalidate_runtime_inventory_for_event(
 /// reliably publishes one, abrupt termination is not guaranteed to), so the
 /// reactive path alone cannot be relied on to notice.
 fn invalidate_runtime_inventory_for_route(
-    runtime_inventory: &mut HarnessRuntimeInventoryCache,
     recovery: &mut ObservationRecoveryRegistry,
     route: &NodeRoute,
 ) {
-    runtime_inventory.invalidate(route);
     let route_recovery = recovery.ensure_route(route.clone());
     if route_recovery.attempt.is_some() {
         route_recovery.refresh_after_completion = true;
@@ -12637,12 +12624,15 @@ mod tests {
             record: snapshot.session_records[0].clone(),
         };
         assert!(invalidate_runtime_inventory_for_event(
-            &mut cache,
             &mut recovery,
             &route,
             &event,
         ));
-        assert!(cache.page(None, 1).nodes.is_empty());
+        // The node stays readable across the whole invalidate-to-resync
+        // window: a scheduled resync is not evidence the node is gone, and
+        // an operator polling `RuntimeInventoryList` in that window used to
+        // be told it was.
+        assert_eq!(cache.page(None, 1).nodes.len(), 1);
         assert!(recovery.contains(&route));
 
         let refreshed = HarnessObservationResync::test_fixture(route, 6, snapshot);

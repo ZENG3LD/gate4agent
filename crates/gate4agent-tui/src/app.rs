@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -104,10 +105,22 @@ pub(crate) const MAX_MANAGED_AGENT_RECORD_ID_BYTES: usize = 256;
 
 pub type Provider = AgentId;
 
+/// How the app paints itself and its PTY cells.
+///
+/// `GateOverride` is the DEFAULT, and deliberately so. `Inherited` means
+/// "use whatever palette the host terminal has", and on a terminal left at
+/// its stock palette that resolves to plain foreground-on-background for
+/// the entire app -- every border, tab, status field and PTY cell renders
+/// in one colour. It reads as an app that lost its colours rather than as
+/// a chosen style, and it was the stored default long enough for exactly
+/// that report to come back from the field. `Inherited` remains available
+/// (`--style inherit`, Ctrl+T) for an operator who has a palette of their
+/// own and wants the app to sit inside it, but nobody should have to ask
+/// for colour.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum PtyColorMode {
-    #[default]
     Inherited,
+    #[default]
     GateOverride,
 }
 
@@ -3952,6 +3965,16 @@ pub struct App {
     pub workspaces_scroll: usize,
     pub terminal_scroll_offsets: BTreeMap<SessionAddress, usize>,
     pub terminal_selection: Option<TerminalSelection>,
+    /// Per-session VT100 projection cache for `render::render_terminal` --
+    /// see `pty_render_cache`'s own module doc comment. `RefCell`-wrapped
+    /// because `render::render` and everything under it take `&App` (this
+    /// crate's own test suite alone has well over a hundred call sites
+    /// that depend on that), so this is the interior-mutability seam that
+    /// lets a read-only render pass still update a perf cache. `pub(crate)`
+    /// rather than `pub` like its neighbours: nothing outside this crate
+    /// has any business reading a cache whose whole contract is "purely a
+    /// performance detail, never a source of truth".
+    pub(crate) pty_render_cache: RefCell<crate::pty_render_cache::PtyRenderCache>,
     pub collapsed_directories: BTreeSet<(String, String, RepositoryPath)>,
     pub collapsed_native_workspaces: BTreeSet<(String, NativeSessionGroupKey)>,
     pub collapsed_native_providers: BTreeSet<(String, NativeSessionGroupKey, Provider)>,
@@ -4246,6 +4269,7 @@ impl Default for App {
             workspaces_scroll: 0,
             terminal_scroll_offsets: BTreeMap::new(),
             terminal_selection: None,
+            pty_render_cache: RefCell::new(crate::pty_render_cache::PtyRenderCache::default()),
             collapsed_directories: BTreeSet::new(),
             collapsed_native_workspaces: BTreeSet::new(),
             collapsed_native_providers: BTreeSet::new(),
@@ -4293,7 +4317,7 @@ impl Default for App {
             last_managed_spawn_receipt: None,
             last_managed_worktree_lease: None,
             last_managed_worktree_removed: None,
-            color_mode: PtyColorMode::Inherited,
+            color_mode: PtyColorMode::default(),
             terminal_background: crate::terminal_bg::FALLBACK_BACKGROUND,
             notice: None,
             marquee_enabled: true,
@@ -10305,6 +10329,7 @@ fn append_event_to_diagnostics_file(event: &AppEvent) {
             .min(self.visible_workspace_entry_indices().len().saturating_sub(1));
         self.git_cursor = self.git_cursor.min(self.git_item_count().saturating_sub(1));
         self.reconcile_terminal_scroll_offsets(&previous_scrollback);
+        self.reconcile_pty_render_cache();
         self.reconcile_agent_menu();
         self.reconcile_native_session_menu();
         self.reconcile_session_drag();
@@ -10355,6 +10380,21 @@ fn append_event_to_diagnostics_file(event: &AppEvent) {
             }
         }
         true
+    }
+
+    /// Drops `pty_render_cache` entries for sessions that no longer exist
+    /// -- the same "prune on every node-update reconciliation" rhythm
+    /// `reconcile_terminal_scroll_offsets` already runs on. Unlike that
+    /// scroll-offset map, a render cache entry is never worth rebinding
+    /// across a generation change: it is a pure performance cache, so a
+    /// dropped entry just costs the next frame a cache miss rather than a
+    /// correctness gap, and `SessionAddress` includes `generation`, so a
+    /// rebound session gets a fresh key (and therefore a fresh cache
+    /// entry) on its own regardless.
+    fn reconcile_pty_render_cache(&self) {
+        self.pty_render_cache
+            .borrow_mut()
+            .retain_live(|address| self.find_session(address).is_some());
     }
 
     fn rebound_address(&self, address: &SessionAddress) -> Option<SessionAddress> {
@@ -27726,13 +27766,13 @@ mod tests {
     #[test]
     fn style_cycles_only_from_operator_focus() {
         let mut app = fixture();
-        assert_eq!(app.color_mode, PtyColorMode::Inherited);
+        assert_eq!(app.color_mode, PtyColorMode::GateOverride);
         app.focus = Focus::Tabs;
         app.reduce(UiKey::Ctrl('t'));
-        assert_eq!(app.color_mode, PtyColorMode::GateOverride);
+        assert_eq!(app.color_mode, PtyColorMode::Inherited);
         app.focus = Focus::Viewport;
         assert!(matches!(app.reduce(UiKey::Ctrl('t')), AppAction::TerminalControl { .. }));
-        assert_eq!(app.color_mode, PtyColorMode::GateOverride);
+        assert_eq!(app.color_mode, PtyColorMode::Inherited);
     }
 
     #[test]
@@ -27754,7 +27794,7 @@ mod tests {
         assert_eq!(app.focus, Focus::Settings);
         assert_eq!(app.control_section, ControlSection::Files);
         assert_eq!(app.reduce(UiKey::Char('s')), AppAction::None);
-        assert_eq!(app.color_mode, PtyColorMode::GateOverride);
+        assert_eq!(app.color_mode, PtyColorMode::Inherited);
         assert_eq!(app.reduce(UiKey::Char('m')), AppAction::None);
         assert_eq!(app.menu_placement, MenuPlacement::Modal);
         assert!(matches!(app.reduce(UiKey::Right), AppAction::InspectWorkspace { .. }));

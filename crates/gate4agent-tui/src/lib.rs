@@ -5,6 +5,7 @@ pub mod icons;
 pub mod pty_palette;
 pub mod platform;
 pub mod preferences;
+pub(crate) mod pty_render_cache;
 pub mod render;
 pub(crate) mod shimmer;
 pub mod surface;

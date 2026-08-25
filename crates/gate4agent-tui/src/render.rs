@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use uzor_tui::{
@@ -42,7 +43,8 @@ use crate::app::{
     MAX_BROWSER_LOADED_ENTRIES, RESTORE_VIA_SKILL_DISABLED_REASON,
 };
 use crate::icons;
-use crate::pty_palette::{apply_pty_palette, GATE_FG, TERM_BG};
+use crate::pty_palette::{GATE_FG, TERM_BG};
+use crate::pty_render_cache::PtyRenderCache;
 use crate::shimmer;
 use crate::surface::{
     LayoutPreset, PaneBranch, PaneId, PaneNode, PaneSplitPath, SplitAxis, SurfaceDropZone,
@@ -4414,6 +4416,8 @@ fn render_surface_pane(
                     app.terminal_selection.as_ref(),
                     theme,
                     buf,
+                    &app.pty_render_cache,
+                    focused,
                 );
             }
         }
@@ -10326,6 +10330,26 @@ fn draw_surface_divider(
     }
 }
 
+/// Cursor blink cadence expressed in shimmer ticks (`SHIMMER_TICK_MILLIS`
+/// = 72ms each): `8 * 72 = 576ms` per half-cycle, close to the ~530ms
+/// on/off period most terminals default a block cursor to. Deliberately
+/// rides the crate's ALREADY-existing free-running tick source
+/// (`wall_clock_millis` + `shimmer::shimmer_tick_for_millis` -- the same
+/// pair the status bar's shimmer effect and `PetFigure::blink_frame_index`
+/// both already read) instead of starting a second timer just for this.
+const CURSOR_BLINK_HALF_PERIOD_TICKS: u64 = 8;
+
+/// Renders one PTY panel: the live screen plus however much scrollback is
+/// scrolled into view, then the selection overlay, then (focused panel,
+/// not scrolled back) the blinking cursor block.
+///
+/// The live screen and every visible scrollback row are vt100 PROJECTIONS
+/// -- parsing ANSI bytes into a cell grid -- and that work is cached on
+/// `cache` (session-identity + geometry + input-bytes + color-mode keyed;
+/// see `pty_render_cache`'s own module doc comment for why reusing rather
+/// than reparsing is correct here). A frame where nothing changed for
+/// this session does no vt100 work at all, just copies already-projected
+/// cells into `buf`.
 fn render_terminal(
     session: &SessionView,
     area: Rect,
@@ -10334,6 +10358,8 @@ fn render_terminal(
     selection: Option<&crate::app::TerminalSelection>,
     theme: Theme,
     buf: &mut TerminalBuffer,
+    cache: &RefCell<PtyRenderCache>,
+    focused: bool,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -10341,38 +10367,55 @@ fn render_terminal(
     if session.terminal_formatted.is_empty() && session.terminal_scrollback.is_empty() {
         return;
     }
-    let mut parser = vt100::Parser::new(area.height.max(1), area.width.max(1), 0);
-    parser.process(&session.terminal_formatted);
-    let mut current = TerminalBuffer::new(area.width, area.height);
-    uzor_tui::vt100_to_buffer(parser.screen(), &mut current);
-    apply_pty_palette(&mut current, color_mode);
+    let mut cache = cache.borrow_mut();
+    // Owned copy: the loop below also needs `&mut cache` (for
+    // `project_row`), which could not coexist with a borrow of `current`
+    // still pointing into `cache`. This is the SAME one full-screen buffer
+    // the old per-frame code built from scratch every time, so it is not
+    // a new cost -- only the (expensive) vt100 parse behind it is now
+    // conditional.
+    let current = cache
+        .project_current(
+            &session.address,
+            &session.terminal_formatted,
+            area.width,
+            area.height,
+            color_mode,
+        )
+        .clone();
     let history_len = session.terminal_scrollback.len();
     let scroll_offset = scroll_offset.min(history_len);
     let first_logical_row = history_len.saturating_sub(scroll_offset);
     for row in 0..area.height {
         let logical_row = first_logical_row.saturating_add(row as usize);
-        let history_row = if logical_row < history_len {
-            let mut row_parser = vt100::Parser::new(1, area.width.max(1), 0);
-            row_parser.process(&session.terminal_scrollback[logical_row]);
-            let mut row_buffer = TerminalBuffer::new(area.width, 1);
-            uzor_tui::vt100_to_buffer(row_parser.screen(), &mut row_buffer);
-            apply_pty_palette(&mut row_buffer, color_mode);
-            Some(row_buffer)
-        } else {
-            None
-        };
         let current_row = logical_row.saturating_sub(history_len) as u16;
-        for column in 0..area.width {
-            let cell = if let Some(history_row) = &history_row {
-                history_row.get(column, 0).clone()
-            } else if current_row < area.height {
-                current.get(column, current_row).clone()
-            } else {
-                current.get(column, area.height.saturating_sub(1)).clone()
-            };
-            buf.set(area.x + column, area.y + row, cell);
+        if logical_row < history_len {
+            // Borrowed straight from `cache` and consumed cell-by-cell
+            // within this one iteration -- never cloned as a whole row,
+            // so a cached row costs this frame nothing but the same
+            // per-cell copy a live (uncached) row would already need.
+            let history_row = cache.project_row(
+                &session.address,
+                logical_row,
+                &session.terminal_scrollback[logical_row],
+                area.width,
+                color_mode,
+            );
+            for column in 0..area.width {
+                buf.set(area.x + column, area.y + row, history_row.get(column, 0).clone());
+            }
+        } else {
+            for column in 0..area.width {
+                let cell = if current_row < area.height {
+                    current.get(column, current_row).clone()
+                } else {
+                    current.get(column, area.height.saturating_sub(1)).clone()
+                };
+                buf.set(area.x + column, area.y + row, cell);
+            }
         }
     }
+    drop(cache);
     if let Some(selection) = selection.filter(|selection| selection.address == session.address) {
         let (start, end) = if (selection.start.1, selection.start.0)
             <= (selection.end.1, selection.end.0)
@@ -10395,6 +10438,36 @@ fn render_terminal(
                     .fg(theme.active_tab_text)
                     .bg(theme.accent)
                     .add_modifier(Modifier::BOLD);
+            }
+        }
+    }
+    // Cursor: only the focused panel's own session (a hidden pane's cursor
+    // would be a second, misleading blinking block elsewhere on screen),
+    // and only when not scrolled into history (a cursor drawn into
+    // scrollback would sit on text that no longer reflects where input
+    // actually lands). The wire carries no cursor-visibility flag
+    // (`gate4agent_types::control::TerminalFrame` has no such field, and
+    // neither does the harness's own frame type it is built from) -- a
+    // provider that hides its own cursor therefore cannot be honoured
+    // here; this always paints the reported position when the above two
+    // conditions hold and the blink phase is in its "on" half.
+    if focused && scroll_offset == 0 {
+        if let Some((cursor_row, cursor_column)) = session.terminal_cursor {
+            let blink_visible = (shimmer::shimmer_tick_for_millis(wall_clock_millis())
+                / CURSOR_BLINK_HALF_PERIOD_TICKS)
+                % 2
+                == 0;
+            if blink_visible {
+                let row = cursor_row.min(area.height.saturating_sub(1));
+                let column = cursor_column.min(area.width.saturating_sub(1));
+                let cell = buf.get_mut(area.x + column, area.y + row);
+                // Invert whatever is already there rather than replacing
+                // the symbol, so the character under the cursor stays
+                // readable. XOR (not OR): a cell the PTY already marked
+                // reverse-video must come back OUT of reverse for the
+                // cursor to still read as visually distinct from its
+                // surroundings.
+                cell.style.modifiers ^= Modifier::REVERSE;
             }
         }
     }

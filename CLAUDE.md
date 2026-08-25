@@ -90,8 +90,30 @@ Launch it in Windows Terminal exactly like this, exe path quoted:
 $tui = Join-Path $root "crates\gate4agent-tui\target\release\gate4agent-tui.exe"
 $q   = '"'
 Start-Process "$env:LOCALAPPDATA\Microsoft\WindowsApps\wt.exe" `
-  -ArgumentList "-w new --title G4A $q$tui$q --harness-operator 127.0.0.1:18330"
+  -ArgumentList "-w new --title G4A $q$tui$q --harness-operator 127.0.0.1:18330 --style gate"
 ```
+
+### A monochrome TUI is `--style inherit`, not a broken renderer
+
+`--style` picks the palette, and `inherit` means "paint with whatever
+palette the host terminal has". On a terminal left at its stock palette
+that resolves to one foreground on one background for the ENTIRE app —
+borders, tabs, status fields, icons and PTY cells alike. It looks exactly
+like an app that lost its colours, and it is stored in `tui.conf`
+(`style=inherit`), so it survives restarts and follows you into every new
+window until something rewrites it.
+
+`gate` is the app's own palette and is now the default. Launch with
+`--style gate`, or press Ctrl+T to cycle, if a session ever comes up
+colourless. Before hunting a colour bug anywhere else in the stack, read
+`%LOCALAPPDATA%\Gate4Agent\tui.conf` and check that line — a whole
+investigation into `TERM`, `COLORTERM`, `NO_COLOR`, the node's PTY
+environment and the vt100 bridge ended at that one setting.
+
+Separately, and genuinely: the node passes its own environment to every
+PTY child, so a `NO_COLOR=1` in whatever shell launched the node reaches
+the provider CLI and turns its output monochrome for real. Agent harnesses
+commonly set it. Clear it before starting the node.
 
 **Do not add flags to that line.** `--size` and `--pos` are window options
 accepted only BEFORE `-w`; placed after it, `wt` reads the tail as the
@@ -101,10 +123,31 @@ not options of `new-tab` at all. Want a bigger window — resize it by hand.
 `wt` exits 0 whether or not it started anything, and `MainWindowTitle` is a
 property of the PROCESS while a single `WindowsTerminal` process hosts every
 window — so an unrelated window's title gets read back and believed. Verify
-a launch by the thing you launched: `Get-Process gate4agent-tui`. To capture
-the window, force it foreground first (`AttachThreadInput` +
-`SetForegroundWindow`); `CopyFromScreen` over its rect otherwise captures
-whatever happens to be on top of it.
+a launch by the thing you launched: `Get-Process gate4agent-tui`.
+
+### Screenshotting and driving the window
+
+**Capture with `PrintWindow(hwnd, dc, PW_RENDERFULLCONTENT /* 2 */)`, never
+`CopyFromScreen`.** `PrintWindow` asks the window to render itself, so it
+works while the window is behind others or partly off-screen, and it never
+steals focus from the operator. `CopyFromScreen` reads the desktop at the
+window's rect and returns whatever is on top of it — that is how a capture
+comes back showing an unrelated application and gets believed.
+
+Driving it with synthetic input needs two details, and it silently does
+nothing without either:
+
+- **Keys need a scan code.** `keybd_event(vk, 0, ...)` is ignored by
+  Windows Terminal; pass `MapVirtualKey(vk, 0)` as the scan byte.
+- **Clicks need `MOUSEEVENTF_VIRTUALDESK`.** With
+  `MOVE|ABSOLUTE` (`0x8001`) alone the normalized coordinates are read
+  against the PRIMARY monitor, so every click lands on the wrong screen the
+  moment the window is on a second one. Use `0xC001` and normalize against
+  `SM_XVIRTUALSCREEN`/`SM_CXVIRTUALSCREEN`.
+
+Screen coordinates for a click come from `GetWindowRect` plus the offset
+measured in the `PrintWindow` bitmap — the bitmap is that rect, so the two
+line up directly.
 
 ## Build output
 

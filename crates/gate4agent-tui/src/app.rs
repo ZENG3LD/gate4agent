@@ -4888,6 +4888,30 @@ impl App {
     }
 
     fn click_status_bar_zone(&mut self, target: Option<HitTarget>, column: u16, row: u16) -> AppAction {
+        // The log body claims a press BEFORE the target is looked at, and
+        // that ordering is the whole fix: `hits` is one flat list shared by
+        // every surface painted this frame, resolved last-pushed-wins, and
+        // the log body registers no hit of its own. So a press there does
+        // NOT resolve to `None` -- it resolves to whatever was pushed
+        // earlier and still contains that cell, which in practice is the
+        // viewport underneath the dialog. Written as a `None` arm in the
+        // match below, the selection could therefore never start, which is
+        // exactly what shipped: selection and its highlight were both
+        // correct and simply unreachable. Geometry decides this one, not a
+        // hit target.
+        if self.focus == Focus::StatusBarCenter
+            && self.layout.status_bar_center_log_body.contains(column, row)
+            && !matches!(
+                target,
+                Some(HitTarget::ModalClose)
+                    | Some(HitTarget::StatusBarCenterLogScrollUp)
+                    | Some(HitTarget::StatusBarCenterLogScrollDown)
+                    | Some(HitTarget::StatusBarCenterLogClear)
+                    | Some(HitTarget::StatusBarMarqueeToggle)
+            )
+        {
+            return self.begin_event_log_selection(column, row);
+        }
         match target {
             Some(HitTarget::ModalClose) => self.close_status_bar_zone(),
             Some(HitTarget::StatusBarMarqueeToggle) if self.focus == Focus::StatusBarCenter => {
@@ -30621,6 +30645,46 @@ mod tests {
         assert_eq!(
             app.event_log_selection.as_ref().and_then(|editor| editor.selected_text()),
             Some(expected.as_str()),
+        );
+    }
+
+    /// The log body registers no hit of its own, and `hits` is ONE flat
+    /// list shared by every surface painted this frame. So a press in the
+    /// body does not resolve to `None` in the running app -- it resolves to
+    /// whatever was pushed earlier and still covers that cell, which is the
+    /// viewport underneath the dialog. Selection was first written as a
+    /// `None` arm and was therefore unreachable in the real app while its
+    /// own test, which drove `click` with an empty hit list, stayed green.
+    /// This drives it the way the app actually does: with a live region
+    /// underneath.
+    #[test]
+    fn event_log_selection_starts_even_though_a_lower_surface_claims_that_cell() {
+        let mut app = fixture();
+        app.push_event_log(AppEvent {
+            at: UNIX_EPOCH + Duration::from_secs(5),
+            severity: EventSeverity::Info,
+            source: EventSource::Session,
+            text: "alpha entry".to_owned(),
+        });
+
+        let dialog = Rect::new(10, 2, 40, 12);
+        app.focus = Focus::StatusBarCenter;
+        app.layout.status_bar_center_modal = dialog;
+        app.layout.overlays = vec![OverlayRegion { rect: dialog, drawn_before: 0 }];
+        let body = Rect::new(dialog.x + 1, dialog.y + 3, dialog.width - 2, 5);
+        app.layout.status_bar_center_log_body = body;
+        // The viewport underneath, exactly as `render_surface` registers it
+        // before any overlay paints -- the condition the shipped code could
+        // not survive.
+        app.layout.hits = vec![HitRegion {
+            rect: Rect::new(0, 0, 120, 40),
+            target: HitTarget::Viewport,
+        }];
+
+        assert_eq!(app.click(body.x + 2, body.y), AppAction::None);
+        assert!(
+            matches!(app.drag_state, Some(DragState::EventLogSelection { .. })),
+            "a press inside the log body must start a selection even when a lower surface owns that cell",
         );
     }
 

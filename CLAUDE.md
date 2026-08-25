@@ -51,6 +51,13 @@ An array is joined with spaces and nothing is re-quoted, so every path
 holding a space is split — node reports `workspace 'gate4agent' root
 'C:\Users\VA' is invalid: path is not a directory` and exits.
 
+**node, both c2, and the harness are spawned headless** — pass
+`-WindowStyle Hidden` and redirect both streams to a log in `$R`. They are
+background services with nothing to show; a console window per process
+clutters the desktop the operator is actually working in, and their output
+belongs in a file you can read afterwards anyway. The TUI is the only one
+of the five that gets a window, and it gets it from `wt`.
+
 - node — `--node-id opbox-windows-x86-64-1d67e837f8fa`, one
   `--workspace "<name>=<abs path>"` per repo, a matching
   `--worktree-mode <name>=manual`, one

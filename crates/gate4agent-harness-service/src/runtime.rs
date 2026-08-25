@@ -109,7 +109,7 @@ use gate4agent_node_protocol::{
     MAX_HARNESS_MCP_PENDING_CALLS_PER_NODE,
 };
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -6200,7 +6200,6 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                     // awaiting_absent_sessions`.
                                     invalidate_runtime_inventory_for_route(
                                         &mut runtime_inventory,
-                                        &mut subscribers,
                                         &mut observation_recovery,
                                         &route,
                                     );
@@ -6221,7 +6220,6 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                     // doc comment).
                                     invalidate_runtime_inventory_for_route(
                                         &mut runtime_inventory,
-                                        &mut subscribers,
                                         &mut observation_recovery,
                                         &route,
                                     );
@@ -6249,7 +6247,6 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                     );
                                     invalidate_runtime_inventory_for_route(
                                         &mut runtime_inventory,
-                                        &mut subscribers,
                                         &mut observation_recovery,
                                         &route,
                                     );
@@ -6309,7 +6306,6 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                         );
                                         invalidate_runtime_inventory_for_route(
                                             &mut runtime_inventory,
-                                            &mut subscribers,
                                             &mut observation_recovery,
                                             &route,
                                         );
@@ -6515,7 +6511,15 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                 .map(|observation_route| observation_route.route().clone())
                                 .collect::<Vec<_>>();
                             observation_recovery.reconcile_topology(&routes);
-                            for removed_node_id in runtime_inventory.reconcile_topology(&routes) {
+                            // Read back off the same watch the `changed()`
+                            // above just woke on -- `routes` is only the
+                            // online subset, and departure cannot be read
+                            // from that subset alone. See
+                            // `HarnessC2TopologyReceiver::known_node_ids`.
+                            let known_node_ids = topology.known_node_ids();
+                            for removed_node_id in
+                                runtime_inventory.reconcile_topology(&routes, &known_node_ids)
+                            {
                                 subscribers.emit(|sequence| {
                                     HarnessOperatorEventV1::RuntimeInventoryRemoved {
                                         sequence,
@@ -7269,41 +7273,61 @@ impl HarnessRuntimeInventoryCache {
         changed.then_some(node)
     }
 
-    /// Returns the ids of every node the topology change actually dropped
-    /// from the cache, so a caller can emit `RuntimeInventoryRemoved` per
-    /// dropped node rather than guessing from the `retain` predicate.
-    fn reconcile_topology(&mut self, routes: &[NodeRoute]) -> Vec<NodeId> {
+    /// Returns the ids of every node this topology change proves has
+    /// DEPARTED, so a caller can emit `RuntimeInventoryRemoved` per departed
+    /// node rather than guessing from the `retain` predicate. This is the
+    /// only place in the harness that observes a node departing, and so the
+    /// only source a `RuntimeInventoryRemoved` may come from.
+    ///
+    /// `routes` carries only the nodes that are `Online` this instant;
+    /// `known_node_ids` carries every node the C2 knows about at all. The
+    /// difference is the whole point. A node missing from `routes` but still
+    /// in `known_node_ids` has NOT departed -- its relay is reconnecting,
+    /// which happens on any request that overruns its bound, on backoff, on
+    /// a pipe hiccup, and lasts a blink while the node process and every PTY
+    /// under it keep running. Reading absence from `routes` alone published
+    /// a removal for that blink, and a removal tears the operator's live
+    /// tabs down. Such a node is kept, deliberately stale, until the resync
+    /// that follows its return replaces it.
+    ///
+    /// Departure is therefore exactly two things: the id is gone from the
+    /// C2's roster entirely, or the id is back online under a DIFFERENT
+    /// incarnation, which means the node process restarted and nothing
+    /// cached about the old one survives.
+    fn reconcile_topology(
+        &mut self,
+        routes: &[NodeRoute],
+        known_node_ids: &BTreeSet<NodeId>,
+    ) -> Vec<NodeId> {
+        let departed = |node_id: &NodeId, incarnation_id: &str| -> bool {
+            if !known_node_ids.contains(node_id) {
+                return true;
+            }
+            routes.iter().any(|route| {
+                &route.node_id == node_id
+                    && route.expected_incarnation_id.to_string() != incarnation_id
+            })
+        };
         let before = self.nodes.keys().cloned().collect::<Vec<_>>();
-        self.nodes.retain(|node_id, inventory| {
-            routes.iter().any(|route| {
-                &route.node_id == node_id
-                    && route.expected_incarnation_id.to_string() == inventory.incarnation_id
-            })
-        });
-        self.managed_worktree_profiles.retain(|node_id, profiles| {
-            routes.iter().any(|route| {
-                &route.node_id == node_id
-                    && profiles.node_incarnation == route.expected_incarnation_id.to_string()
-            })
-        });
+        self.nodes.retain(|node_id, inventory| !departed(node_id, &inventory.incarnation_id));
+        self.managed_worktree_profiles
+            .retain(|node_id, profiles| !departed(node_id, &profiles.node_incarnation));
         before.into_iter().filter(|node_id| !self.nodes.contains_key(node_id)).collect()
     }
 
-    /// Returns `true` when this call actually dropped a cached node -- the
-    /// caller uses that to decide whether a `RuntimeInventoryRemoved` event
-    /// is warranted (see `invalidate_runtime_inventory_for_event`). Matches
-    /// the poll-based read path's existing behavior exactly: a node
-    /// invalidated between two `RuntimeInventoryList` polls already read as
-    /// transiently absent there, well before this push feature existed.
-    fn invalidate(&mut self, route: &NodeRoute) -> bool {
+    /// Drops this harness's own cached projection of `route`'s node so the
+    /// next resync rebuilds it. Returns nothing on purpose: whether a cache
+    /// entry happened to be present says nothing about whether the NODE is
+    /// present, and it used to be read as exactly that -- the one caller
+    /// turned a `true` here into a `RuntimeInventoryRemoved` push, which
+    /// subscribers cannot tell apart from a real departure. Node departure
+    /// is observed in `reconcile_topology`, and only there.
+    fn invalidate(&mut self, route: &NodeRoute) {
         if self.nodes.get(&route.node_id).is_some_and(|inventory| {
             inventory.incarnation_id == route.expected_incarnation_id.to_string()
         }) {
             self.nodes.remove(&route.node_id);
             self.managed_worktree_profiles.remove(&route.node_id);
-            true
-        } else {
-            false
         }
     }
 
@@ -9255,7 +9279,6 @@ fn apply_or_buffer_host_live_event(
     }
     let inventory_refresh_required = invalidate_runtime_inventory_for_event(
         runtime_inventory,
-        subscribers,
         recovery,
         &route,
         &routed.event,
@@ -9317,7 +9340,6 @@ fn event_affects_runtime_inventory(event: &C2NodeEvent) -> bool {
 
 fn invalidate_runtime_inventory_for_event(
     runtime_inventory: &mut HarnessRuntimeInventoryCache,
-    subscribers: &mut SubscriberRegistry,
     recovery: &mut ObservationRecoveryRegistry,
     route: &NodeRoute,
     event: &C2NodeEvent,
@@ -9325,41 +9347,48 @@ fn invalidate_runtime_inventory_for_event(
     if !event_affects_runtime_inventory(event) {
         return false;
     }
-    invalidate_runtime_inventory_for_route(runtime_inventory, subscribers, recovery, route);
+    invalidate_runtime_inventory_for_route(runtime_inventory, recovery, route);
     true
 }
 
 /// Unconditional counterpart to `invalidate_runtime_inventory_for_event`,
-/// with no `C2NodeEvent` to gate on: drops the cached node (emitting
-/// `RuntimeInventoryRemoved` through the normal registry when it actually
-/// had one cached) and schedules a targeted resync for `route` the same way
-/// the reactive live-event path does, so `start_pending_observation_
-/// recoveries`'s very next pass picks it up and `finish_observation_
-/// recovery` emits `RuntimeInventoryChanged` through the same Eq-diffed
-/// `refresh` -- no direct event construction bypassing that diff.
+/// with no `C2NodeEvent` to gate on: drops this harness's own cached
+/// projection of the node and schedules a targeted resync for `route` the
+/// same way the reactive live-event path does, so `start_pending_
+/// observation_recoveries`'s very next pass picks it up and
+/// `finish_observation_recovery` emits `RuntimeInventoryChanged` through
+/// the same Eq-diffed `refresh` -- no direct event construction bypassing
+/// that diff.
+///
+/// **Emits nothing, and takes no `SubscriberRegistry` so that it cannot.**
+/// A cache is not a source of truth about whether the node exists: every
+/// caller here reaches this function on a mutation that SUCCEEDED against a
+/// live node, i.e. at the one moment the node is most certainly present.
+/// It used to push `RuntimeInventoryRemoved` whenever the drop actually hit
+/// a cached entry, and subscribers cannot tell that apart from the node
+/// genuinely leaving the topology -- so the TUI tore down every PTY,
+/// preview, file and git tab of a node in the same second a session was
+/// spawned on it (`index-native-session` is one of these mutations). Real
+/// departure has exactly one producer, the `topology.changed()` arm, which
+/// emits per id returned by `HarnessRuntimeInventoryCache::
+/// reconcile_topology`; it is the only place that observes departure.
 ///
 /// Exists for callers that know a route needs a fresh resync from context
 /// alone, not from a live event that happened to carry the news: today,
-/// exactly one -- a successful `StopSession`. A forced stop kills the node's
-/// PTY process directly and is not guaranteed to round-trip a
-/// `SessionRecordUpserted`/`SessionRecordRemoved`/`Control` event back
-/// through the live C2 stream the way every other inventory-affecting
-/// change does (the asymmetry: session creation reliably publishes one,
-/// abrupt termination is not guaranteed to), so the reactive path alone
-/// cannot be relied on to notice.
+/// a successful `StopSession`, a resumed session, a session-record
+/// mutation, and an inventory-affecting resource mutation. A forced stop
+/// kills the node's PTY process directly and is not guaranteed to
+/// round-trip a `SessionRecordUpserted`/`SessionRecordRemoved`/`Control`
+/// event back through the live C2 stream the way every other
+/// inventory-affecting change does (the asymmetry: session creation
+/// reliably publishes one, abrupt termination is not guaranteed to), so the
+/// reactive path alone cannot be relied on to notice.
 fn invalidate_runtime_inventory_for_route(
     runtime_inventory: &mut HarnessRuntimeInventoryCache,
-    subscribers: &mut SubscriberRegistry,
     recovery: &mut ObservationRecoveryRegistry,
     route: &NodeRoute,
 ) {
-    if runtime_inventory.invalidate(route) {
-        let node_id = route.node_id.as_str().to_owned();
-        subscribers.emit(|sequence| HarnessOperatorEventV1::RuntimeInventoryRemoved {
-            sequence,
-            node_id: node_id.clone(),
-        });
-    }
+    runtime_inventory.invalidate(route);
     let route_recovery = recovery.ensure_route(route.clone());
     if route_recovery.attempt.is_some() {
         route_recovery.refresh_after_completion = true;
@@ -12604,13 +12633,11 @@ mod tests {
         assert_eq!(cache.page(None, 1).nodes.len(), 1);
 
         let mut recovery = ObservationRecoveryRegistry::default();
-        let mut subscribers = SubscriberRegistry::default();
         let event = C2NodeEvent::SessionRecordUpserted {
             record: snapshot.session_records[0].clone(),
         };
         assert!(invalidate_runtime_inventory_for_event(
             &mut cache,
-            &mut subscribers,
             &mut recovery,
             &route,
             &event,

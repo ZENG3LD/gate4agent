@@ -76,7 +76,7 @@ use gate4agent_harness_protocol::{
 use gate4agent_node_wire::local_hmac_sha256;
 use gate4agent_types::{AgentId, AgentInstanceId, SessionGeneration, TerminalControl, TerminalSize};
 use thiserror::Error;
-use std::{sync::Arc, time::{Duration, Instant}};
+use std::{collections::BTreeSet, sync::Arc, time::{Duration, Instant}};
 
 const NATIVE_HISTORY_TIMEOUT_FLOOR: Duration = Duration::from_secs(34);
 const RUN_READ_TIMEOUT_FLOOR: Duration = Duration::from_secs(4);
@@ -121,6 +121,22 @@ pub struct HarnessC2TopologyReceiver {
 impl HarnessC2TopologyReceiver {
     pub fn current(&self) -> Vec<HarnessObservationRoute> {
         observation_topology(&self.inner.borrow())
+    }
+
+    /// Every node id this C2 knows about at all, INCLUDING the ones whose
+    /// transport is not `Online` right now.
+    ///
+    /// `current`/`changed` deliberately return only online routes, because
+    /// that is what an observation route has to be to be worth resyncing.
+    /// But "not online this instant" and "this node is gone" are different
+    /// facts, and a caller that reads absence from the route list alone
+    /// cannot tell them apart -- a relay reconnect (a request that ran past
+    /// its bound, a backoff, a pipe hiccup) empties the route list for the
+    /// blink it lasts while the node process, and every PTY under it, keeps
+    /// running untouched. Callers deciding whether a node has DEPARTED must
+    /// read this set, not the route list.
+    pub fn known_node_ids(&self) -> BTreeSet<NodeId> {
+        self.inner.borrow().nodes.iter().map(|node| node.node_id.clone()).collect()
     }
 
     pub async fn changed(&mut self) -> Result<Vec<HarnessObservationRoute>, HarnessC2Error> {

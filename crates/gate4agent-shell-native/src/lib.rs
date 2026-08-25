@@ -748,6 +748,11 @@ impl NativeEffectShell {
                 }
             }
             TransportKind::Pty => {
+                // Only the interactive PTY path renders anything to color;
+                // the Pipe/OneShotText arm below spawns a plain pipe with
+                // no terminal device behind it, so `pty_env` is left as the
+                // caller passed it there.
+                let pty_env = with_pty_terminal_capability_defaults(pty_env);
                 if let Some(sidecar) = &qwen_sidecar {
                     sidecar.append_launch_arguments(&mut launch_extra_args);
                 }
@@ -1443,6 +1448,42 @@ impl NativeEffectShell {
         }
         observations
     }
+}
+
+/// ConPTY does not populate `TERM`/`COLORTERM` in the environment it hands
+/// to a spawned child; a provider CLI reads exactly those two variables to
+/// decide whether the terminal in front of it renders color, so a
+/// Windows-hosted PTY session comes up monochrome unless something else
+/// supplies them. These are the values truecolor-capable terminals
+/// (xterm.js, WezTerm, ...) advertise about themselves.
+const PTY_TERM_DEFAULT_KEY: &str = "TERM";
+const PTY_TERM_DEFAULT_VALUE: &str = "xterm-256color";
+const PTY_COLORTERM_DEFAULT_KEY: &str = "COLORTERM";
+const PTY_COLORTERM_DEFAULT_VALUE: &str = "truecolor";
+
+/// Fill in the PTY terminal-capability defaults above for whichever of the
+/// two keys the caller has not already mutated. A caller-supplied
+/// `EnvMutation` for `TERM`/`COLORTERM` -- whether it sets or removes the
+/// variable -- always wins: this only appends a default into a gap, it
+/// never overwrites or reorders an existing entry.
+fn with_pty_terminal_capability_defaults(mut pty_env: Vec<EnvMutation>) -> Vec<EnvMutation> {
+    let already_mutated = |env: &[EnvMutation], key: &str| {
+        env.iter()
+            .any(|mutation| mutation.key.as_os_str() == OsStr::new(key))
+    };
+    if !already_mutated(&pty_env, PTY_TERM_DEFAULT_KEY) {
+        pty_env.push(EnvMutation {
+            key: OsString::from(PTY_TERM_DEFAULT_KEY),
+            value: Some(OsString::from(PTY_TERM_DEFAULT_VALUE)),
+        });
+    }
+    if !already_mutated(&pty_env, PTY_COLORTERM_DEFAULT_KEY) {
+        pty_env.push(EnvMutation {
+            key: OsString::from(PTY_COLORTERM_DEFAULT_KEY),
+            value: Some(OsString::from(PTY_COLORTERM_DEFAULT_VALUE)),
+        });
+    }
+    pty_env
 }
 
 fn missing_session_message(key: NativeSessionKey) -> String {
@@ -3109,7 +3150,7 @@ mod tests {
         argument_looks_like_credential, drain_qwen_sidecar, finish_qwen_sidecar,
         prepare_fresh_pty_provider_session,
         prompt_render_probe, prompt_rendered, redact_provider_argument, redact_provider_arguments,
-        reserve_provider_gap_sequence, NativeSessionKey,
+        reserve_provider_gap_sequence, with_pty_terminal_capability_defaults, NativeSessionKey,
         NativeEffectShell, OwnedQwenDualOutput, QwenDualOutputLaunch,
         QWEN_SIDECAR_READ_MAX_BYTES_PER_TICK,
         should_attach_pty_provider_stream, should_probe_pty_identity, startup_operator_gate,
@@ -3117,6 +3158,7 @@ mod tests {
         ReadinessDiagnostics, Utf8ChunkDecoder,
     };
     use gate4agent_adapters::builtin_adapter_registry;
+    use gate4agent_catalog::EnvMutation;
     use gate4agent::core::types::{
         AgentEvent, ContextWindowUsage as AgentContextWindowUsage,
     };
@@ -3211,6 +3253,28 @@ mod tests {
             })
         );
         assert!(super::provider_event(AgentEvent::PtyRaw { data: b"105/100".to_vec() }).is_none());
+    }
+
+    #[test]
+    fn pty_terminal_capability_defaults_never_override_a_caller_supplied_term() {
+        let caller_supplied = vec![EnvMutation {
+            key: OsString::from("TERM"),
+            value: Some(OsString::from("dumb")),
+        }];
+        let filled = with_pty_terminal_capability_defaults(caller_supplied);
+
+        let term_values: Vec<_> = filled
+            .iter()
+            .filter(|mutation| mutation.key.as_os_str() == OsStr::new("TERM"))
+            .collect();
+        assert_eq!(term_values.len(), 1, "TERM must not be duplicated");
+        assert_eq!(term_values[0].value.as_deref(), Some(OsStr::new("dumb")));
+
+        let colorterm = filled
+            .iter()
+            .find(|mutation| mutation.key.as_os_str() == OsStr::new("COLORTERM"))
+            .expect("COLORTERM default is filled in when the caller left it unset");
+        assert_eq!(colorterm.value.as_deref(), Some(OsStr::new("truecolor")));
     }
 
     #[test]

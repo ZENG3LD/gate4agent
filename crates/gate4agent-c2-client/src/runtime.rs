@@ -62,7 +62,7 @@ const NATIVE_SESSION_RELAY_DEADLINE: Duration = Duration::from_secs(35);
 const COMMAND_CAPACITY: usize = 64;
 const INBOUND_CAPACITY: usize = 2;
 const WRITER_CAPACITY: usize = 64;
-const EVENT_CAPACITY: usize = 2;
+pub(crate) const EVENT_CAPACITY: usize = 2;
 const HARNESS_MCP_EVENT_CAPACITY: usize = 128;
 const REGULAR_EVENT_DELIVERY_DEADLINE: Duration = Duration::from_millis(250);
 const OPAQUE_UNIX_PATH_NOT_NEGOTIATED: &str =
@@ -488,7 +488,7 @@ pub async fn connect_local(
     }))
 }
 
-fn client_compatibility_offer() -> Result<ClientCompatibilityOffer, C2ControlError> {
+pub(crate) fn client_compatibility_offer() -> Result<ClientCompatibilityOffer, C2ControlError> {
     Ok(ClientCompatibilityOffer {
         protocol_versions: ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION)
             .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
@@ -2649,7 +2649,7 @@ async fn control_owner<E>(
     }
 }
 
-fn c2_proof(
+pub(crate) fn c2_proof(
     token: &str,
     direction: C2AuthDirection,
     client_nonce: &[u8; C2_AUTH_NONCE_BYTES],
@@ -3492,6 +3492,7 @@ mod tests {
                 CapabilityId::new(C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_HISTORY_CONTEXT_PACK_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_SESSION_RECORD_CONTEXT_EXPORT_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_NATIVE_SESSION_CATALOG_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_NATIVE_SESSION_CATALOG_PAGING_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_NATIVE_SESSION_INDEX_CAPABILITY).unwrap(),

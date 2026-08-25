@@ -1386,6 +1386,66 @@ fn render_compact_trailing_text(
         .render(text_area, buf);
 }
 
+/// Cell width a [`render_compact_icon_button`] call will actually occupy,
+/// mirroring that function's own paint logic exactly: the ASCII tier's
+/// own `cell_width(ascii_label)` (the whole point of that tier is
+/// painting the original bracketed label unchanged), or the Sixel
+/// tier's fixed `COMPACT_SIXEL_ICON_CELLS_WIDE` plus, when `text` is
+/// present, a 1-column gap and `text`'s own `cell_width`. Callers that
+/// used to size a `Rect` from a bracketed label's own literal width
+/// (e.g. `cell_width("[Harness links]")`) call this instead, so the
+/// button's hit rect shrinks to match its new, narrower icon body
+/// rather than keeping the old text's footprint.
+fn compact_icon_button_width(ascii_label: &str, text: Option<&str>, tier: RailIcons) -> u16 {
+    match tier {
+        RailIcons::Ascii => cell_width(ascii_label) as u16,
+        RailIcons::Sixel => {
+            icons::COMPACT_SIXEL_ICON_CELLS_WIDE
+                .saturating_add(text.map_or(0, |text| 1 + cell_width(text) as u16))
+        }
+    }
+}
+
+/// Icon-aware sibling of [`render_toolbar_segment`] for a Harness board/
+/// task-detail/monitor/surface-toolbar segment that should draw as a
+/// compact icon (+ optional trailing text) in `RailIcons::Sixel` mode
+/// while keeping the segment's original bracketed label, unchanged, in
+/// `RailIcons::Ascii` mode -- see [`render_compact_icon_button`]'s own
+/// doc comment for that split. `render_toolbar_segment` itself has no
+/// icon parameter or tier/family to switch on: most of its callers draw
+/// no icon at all, so this exists next to it rather than growing that
+/// one function's own signature for every caller. Same x-cursor contract
+/// as `render_toolbar_segment`: returns the position the caller's next
+/// segment should start from.
+fn render_toolbar_icon_segment(
+    icon: icons::IconId,
+    text: Option<&str>,
+    ascii_label: &str,
+    x: u16,
+    area: Rect,
+    style: Style,
+    target: Option<HitTarget>,
+    tier: RailIcons,
+    family: IconFamily,
+    buf: &mut TerminalBuffer,
+    layout: &mut LayoutRects,
+) -> u16 {
+    if x >= area.right() {
+        return x;
+    }
+    let width = compact_icon_button_width(ascii_label, text, tier)
+        .min(area.right().saturating_sub(x));
+    if width == 0 {
+        return x;
+    }
+    let rect = Rect::new(x, area.y, width, 1);
+    render_compact_icon_button(rect, icon, text, ascii_label, style, tier, family, buf, layout);
+    if let Some(target) = target {
+        layout.hits.push(HitRegion { rect, target });
+    }
+    x.saturating_add(width)
+}
+
 /// Height, in cell rows, of one sidebar content panel's own dedicated
 /// control-plane strip (see [`render_control_strip`]): a single row of
 /// real buttons, each hosting the STRIP tier's own dedicated sixel asset
@@ -2025,12 +2085,20 @@ fn render_space_list(
                 &node.node_id,
                 &workspace.workspace_id,
             ) {
-                let label = "[Harness links]";
-                let width = (cell_width(label) as u16).min(area.width);
+                let ascii_label = "[Harness links]";
+                let width = compact_icon_button_width(ascii_label, Some("Harness links"), app.rail_icons)
+                    .min(area.width);
                 let rect = Rect::new(area.right().saturating_sub(width), y + 1, width, 1);
-                Paragraph::new(label)
-                    .style(Style::default().fg(theme.teal).bg(background))
-                    .render(rect, buf);
+                render_compact_icon_button(
+                    rect,
+                    icons::IconId::Link,
+                    Some("Harness links"),
+                    ascii_label,
+                    Style::default().fg(theme.teal).bg(background),
+                    app.rail_icons, app.icon_family,
+                    buf,
+                    layout,
+                );
                 layout.hits.push(HitRegion {
                     rect,
                     target: HitTarget::HarnessLinks(subject),
@@ -3332,21 +3400,22 @@ fn render_native_session_list(
         let compact_agent_actions = agent_run_key.is_some() && area.width < 25;
         let agent_expanded = agent_run_key.as_ref()
             .is_some_and(|key| app.agent_progress_expanded(key));
-        let progress_label = if agent_expanded { "[details -]" } else { "[details +]" };
+        let progress_ascii_label = if agent_expanded { "[details -]" } else { "[details +]" };
+        let progress_icon = if agent_expanded { icons::IconId::ChevronDown } else { icons::IconId::ChevronRight };
         let progress_width = if agent_run_key.is_some() && !compact_agent_actions {
-            (cell_width(progress_label) as u16).min(area.width)
+            compact_icon_button_width(progress_ascii_label, None, app.rail_icons).min(area.width)
         } else {
             0
         };
-        let agent_action_label = if area.width < 30 { "[act]" } else { "[actions]" };
+        let agent_action_ascii_label = if area.width < 30 { "[act]" } else { "[actions]" };
         let agent_action_width = if compact_agent_actions {
-            (cell_width(agent_action_label) as u16).min(area.width)
+            compact_icon_button_width(agent_action_ascii_label, None, app.rail_icons).min(area.width)
         } else {
             0
         };
-        let native_action_label = "[menu]";
+        let native_action_ascii_label = "[menu]";
         let native_action_width = if matches!(item, NativeSessionTreeItem::Session { .. }) {
-            (cell_width(native_action_label) as u16).min(area.width)
+            compact_icon_button_width(native_action_ascii_label, None, app.rail_icons).min(area.width)
         } else {
             0
         };
@@ -3384,14 +3453,19 @@ fn render_native_session_list(
                 native_action_width,
                 1,
             );
-            Paragraph::new(native_action_label)
-                .style(
-                    Style::default()
-                        .fg(theme.teal)
-                        .bg(if selected { theme.accent } else { theme.panel })
-                        .add_modifier(Modifier::BOLD),
-                )
-                .render(actions, buf);
+            render_compact_icon_button(
+                actions,
+                icons::IconId::Ellipsis,
+                None,
+                native_action_ascii_label,
+                Style::default()
+                    .fg(theme.teal)
+                    .bg(if selected { theme.accent } else { theme.panel })
+                    .add_modifier(Modifier::BOLD),
+                app.rail_icons, app.icon_family,
+                buf,
+                layout,
+            );
             layout.hits.push(HitRegion {
                 rect: actions,
                 target: HitTarget::NativeSessionMore(*row_index),
@@ -3404,14 +3478,19 @@ fn render_native_session_list(
                 agent_action_width,
                 1,
             );
-            Paragraph::new(agent_action_label)
-                .style(
-                    Style::default()
-                        .fg(theme.teal)
-                        .bg(if selected { theme.accent } else { theme.panel })
-                        .add_modifier(Modifier::BOLD),
-                )
-                .render(actions, buf);
+            render_compact_icon_button(
+                actions,
+                icons::IconId::Ellipsis,
+                None,
+                agent_action_ascii_label,
+                Style::default()
+                    .fg(theme.teal)
+                    .bg(if selected { theme.accent } else { theme.panel })
+                    .add_modifier(Modifier::BOLD),
+                app.rail_icons, app.icon_family,
+                buf,
+                layout,
+            );
             layout.hits.push(HitRegion {
                 rect: actions,
                 target: HitTarget::AgentMore(agent_index),
@@ -3467,14 +3546,19 @@ fn render_native_session_list(
                 progress_width,
                 1,
             );
-            Paragraph::new(progress_label)
-                .style(
-                    Style::default()
-                        .fg(if agent_expanded { theme.active_tab_text } else { theme.teal })
-                        .bg(if agent_expanded { theme.accent } else if selected { theme.accent } else { theme.panel })
-                        .add_modifier(Modifier::BOLD),
-                )
-                .render(progress, buf);
+            render_compact_icon_button(
+                progress,
+                progress_icon,
+                None,
+                progress_ascii_label,
+                Style::default()
+                    .fg(if agent_expanded { theme.active_tab_text } else { theme.teal })
+                    .bg(if agent_expanded { theme.accent } else if selected { theme.accent } else { theme.panel })
+                    .add_modifier(Modifier::BOLD),
+                app.rail_icons, app.icon_family,
+                buf,
+                layout,
+            );
             layout.hits.push(HitRegion {
                 rect: progress,
                 target: HitTarget::AgentProgressToggle(key.clone()),
@@ -3499,25 +3583,39 @@ fn render_native_session_list(
         area.width.min(19),
         1,
     );
-    Paragraph::new("[Open transcript]")
-        .style(Style::default().fg(theme.teal).bg(theme.panel).add_modifier(Modifier::BOLD))
-        .render(open, buf);
+    render_compact_icon_button(
+        open,
+        icons::IconId::GoToFile,
+        Some("transcript"),
+        "[Open transcript]",
+        Style::default().fg(theme.teal).bg(theme.panel).add_modifier(Modifier::BOLD),
+        app.rail_icons, app.icon_family,
+        buf,
+        layout,
+    );
     layout.hits.push(HitRegion {
         rect: open,
         target: HitTarget::NativeSessionsOpen,
     });
     if !use_strip {
-        let add_label = "+ agent";
-        let add_width = (cell_width(add_label) as u16).min(area.width);
+        let add_ascii_label = "+ agent";
+        let add_width = compact_icon_button_width(add_ascii_label, None, app.rail_icons).min(area.width);
         let add = Rect::new(
             area.right().saturating_sub(add_width),
             area.bottom().saturating_sub(1),
             add_width,
             1,
         );
-        Paragraph::new(add_label)
-            .style(Style::default().fg(theme.teal).bg(theme.panel).add_modifier(Modifier::BOLD))
-            .render(add, buf);
+        render_compact_icon_button(
+            add,
+            icons::IconId::Add,
+            None,
+            add_ascii_label,
+            Style::default().fg(theme.teal).bg(theme.panel).add_modifier(Modifier::BOLD),
+            app.rail_icons, app.icon_family,
+            buf,
+            layout,
+        );
         layout.hits.push(HitRegion {
             rect: add,
             target: HitTarget::AddAgent,
@@ -4299,6 +4397,7 @@ fn render_surface_pane(
                     layout,
                     theme,
                     app.activity_spinner(),
+                    app.rail_icons, app.icon_family,
                 );
             }
         }
@@ -5550,17 +5649,20 @@ fn render_harness_kanban(
         buf,
         layout,
     ).saturating_add(1);
-    for (label, target) in [
-        ("[New task]", HitTarget::HarnessTaskCreate),
-        ("[Refresh]", HitTarget::HarnessTaskRefresh),
-        ("[Run next Ready]", HitTarget::HarnessScheduleNext),
+    for (icon, text, ascii_label, target) in [
+        (icons::IconId::Add, Some("New task"), "[New task]", HitTarget::HarnessTaskCreate),
+        (icons::IconId::Refresh, None, "[Refresh]", HitTarget::HarnessTaskRefresh),
+        (icons::IconId::Play, Some("next Ready"), "[Run next Ready]", HitTarget::HarnessScheduleNext),
     ] {
-        action_x = render_toolbar_segment(
-            label,
+        action_x = render_toolbar_icon_segment(
+            icon,
+            text,
+            ascii_label,
             action_x,
             global_header,
             button_style,
             Some(target),
+            app.rail_icons, app.icon_family,
             buf,
             layout,
         ).saturating_add(1);
@@ -5615,33 +5717,42 @@ fn render_harness_kanban(
             ).saturating_add(1);
         }
         if !matches!(task.state, gate4agent_harness_client::HarnessTaskStateV1::Done | gate4agent_harness_client::HarnessTaskStateV1::Cancelled) {
-            context_x = render_toolbar_segment(
+            context_x = render_toolbar_icon_segment(
+                icons::IconId::DebugStop,
+                Some("task"),
                 "[Cancel task]",
                 context_x,
                 context_area,
                 button_style,
                 Some(HitTarget::HarnessTaskCancel),
+                app.rail_icons, app.icon_family,
                 buf,
                 layout,
             ).saturating_add(1);
         }
         if matches!(task.state, gate4agent_harness_client::HarnessTaskStateV1::Failed | gate4agent_harness_client::HarnessTaskStateV1::Cancelled) {
-            context_x = render_toolbar_segment(
+            context_x = render_toolbar_icon_segment(
+                icons::IconId::DebugRestart,
+                Some("task"),
                 "[Retry task]",
                 context_x,
                 context_area,
                 button_style,
                 Some(HitTarget::HarnessTaskRetry),
+                app.rail_icons, app.icon_family,
                 buf,
                 layout,
             ).saturating_add(1);
         }
-        let _ = render_toolbar_segment(
+        let _ = render_toolbar_icon_segment(
+            icons::IconId::GoToFile,
+            None,
             "[Open]",
             context_x,
             context_area,
             button_style,
             Some(HitTarget::HarnessTaskOpen(task.task_id.clone())),
+            app.rail_icons, app.icon_family,
             buf,
             layout,
         );
@@ -5836,21 +5947,27 @@ fn render_harness_kanban(
             modal.width.saturating_sub(2),
             1,
         );
-        let create_end = render_toolbar_segment(
+        let create_end = render_toolbar_icon_segment(
+            icons::IconId::Add,
+            Some("Backlog"),
             "[Create in Backlog]",
             buttons.x,
             buttons,
             Style::default().fg(theme.teal).bg(theme.panel),
             Some(HitTarget::HarnessComposerCreate),
+            app.rail_icons, app.icon_family,
             buf,
             layout,
         );
-        let _ = render_toolbar_segment(
+        let _ = render_toolbar_icon_segment(
+            icons::IconId::Close,
+            None,
             "[Cancel]",
             create_end.saturating_add(1),
             buttons,
             Style::default().fg(theme.yellow).bg(theme.panel),
             Some(HitTarget::HarnessComposerCancel),
+            app.rail_icons, app.icon_family,
             buf,
             layout,
         );
@@ -6136,9 +6253,16 @@ fn render_harness_task_card(
     if area.height > 4 {
         let open_width = area.width.min(6);
         let open_rect = Rect::new(area.x, area.y + 4, open_width, 1);
-        Paragraph::new("[Open]")
-            .style(Style::default().fg(theme.teal).bg(background))
-            .render(open_rect, buf);
+        render_compact_icon_button(
+            open_rect,
+            icons::IconId::GoToFile,
+            None,
+            "[Open]",
+            Style::default().fg(theme.teal).bg(background),
+            app.rail_icons, app.icon_family,
+            buf,
+            layout,
+        );
         layout.hits.push(HitRegion {
             rect: open_rect,
             target: HitTarget::HarnessTaskOpen(task.task_id.clone()),
@@ -6208,10 +6332,16 @@ fn render_agent_board_sidebar(
         // fits`'s own doc comment) -- a cramped sidebar still keeps a
         // real, clickable way to reach the full board.
         let header = Rect::new(area.x, area.y, area.width, area.height.min(1));
-        let label = " [Open full board] ";
-        Paragraph::new(truncate_cells(label, header.width as usize))
-            .style(Style::default().fg(theme.teal).bg(theme.panel).add_modifier(Modifier::BOLD))
-            .render(header, buf);
+        render_compact_icon_button(
+            header,
+            icons::IconId::GoToFile,
+            Some("Open full board"),
+            " [Open full board] ",
+            Style::default().fg(theme.teal).bg(theme.panel).add_modifier(Modifier::BOLD),
+            app.rail_icons, app.icon_family,
+            buf,
+            layout,
+        );
         layout.hits.push(HitRegion { rect: header, target: HitTarget::AgentBoardOpen });
         Rect::new(area.x, area.y.saturating_add(1), area.width, area.height.saturating_sub(1))
     };
@@ -6572,6 +6702,8 @@ fn render_harness_launch_pager(
     panel: crate::app::HarnessLaunchOptionPanel,
     offset: usize,
     count: usize,
+    tier: RailIcons,
+    family: IconFamily,
     buf: &mut TerminalBuffer,
     layout: &mut LayoutRects,
     theme: Theme,
@@ -6581,22 +6713,28 @@ fn render_harness_launch_pager(
     }
     let header = Rect::new(inner.x, inner.y, inner.width, 1);
     let can_previous = offset > 0;
-    let mut x = render_toolbar_segment(
+    let mut x = render_toolbar_icon_segment(
+        icons::IconId::ArrowLeft,
+        None,
         "[<]",
         header.x,
         header,
         Style::default().fg(if can_previous { theme.teal } else { theme.muted }).bg(theme.surface),
         can_previous.then_some(HitTarget::HarnessLaunchPanelPrevious(panel)),
+        tier, family,
         buf,
         layout,
     ).saturating_add(1);
     let can_next = offset.saturating_add(1) < count;
-    x = render_toolbar_segment(
+    x = render_toolbar_icon_segment(
+        icons::IconId::ArrowRight,
+        None,
         "[>]",
         x,
         header,
         Style::default().fg(if can_next { theme.teal } else { theme.muted }).bg(theme.surface),
         can_next.then_some(HitTarget::HarnessLaunchPanelNext(panel)),
+        tier, family,
         buf,
         layout,
     ).saturating_add(1);
@@ -6743,12 +6881,15 @@ fn render_harness_task_detail(
     let header = Rect::new(inner.x, inner.y, inner.width, inner.height.min(1));
     fill_rect(header, theme.active, buf);
     let button_style = Style::default().fg(theme.teal).bg(theme.active);
-    let back_end = render_toolbar_segment(
+    let back_end = render_toolbar_icon_segment(
+        icons::IconId::ArrowLeft,
+        None,
         "[Back]",
         header.x,
         header,
         button_style,
         Some(HitTarget::HarnessTaskDetailBack),
+        app.rail_icons, app.icon_family,
         buf,
         layout,
     );
@@ -7113,12 +7254,15 @@ fn render_harness_task_detail(
                 if y < body.bottom() {
                     if app.harness_run_terminal_address(&run.run_id).is_some() {
                         let actions = Rect::new(body.x, y, body.width, 1);
-                        let _ = render_toolbar_segment(
+                        let _ = render_toolbar_icon_segment(
+                            icons::IconId::Terminal,
+                            None,
                             "[Open terminal]",
                             actions.x,
                             actions,
                             Style::default().fg(theme.teal).bg(theme.surface),
                             Some(HitTarget::HarnessTaskDetailRunTerminal(run.run_id.clone())),
+                            app.rail_icons, app.icon_family,
                             buf,
                             layout,
                         );
@@ -7143,21 +7287,27 @@ fn render_harness_task_detail(
                         app.harness_workspace_for_run(run_ref).is_some()
                     }) {
                         let actions = Rect::new(body.x, y, body.width, 1);
-                        let files_end = render_toolbar_segment(
+                        let files_end = render_toolbar_icon_segment(
+                            icons::IconId::Folder,
+                            None,
                             "[Files]",
                             actions.x,
                             actions,
                             Style::default().fg(theme.teal).bg(theme.surface),
                             Some(HitTarget::HarnessTaskDetailRunFiles(run.run_id.clone())),
+                            app.rail_icons, app.icon_family,
                             buf,
                             layout,
                         );
-                        let _ = render_toolbar_segment(
+                        let _ = render_toolbar_icon_segment(
+                            icons::IconId::SourceControl,
+                            None,
                             "[Git]",
                             files_end.saturating_add(1),
                             actions,
                             Style::default().fg(theme.teal).bg(theme.surface),
                             Some(HitTarget::HarnessTaskDetailRunGit(run.run_id.clone())),
+                            app.rail_icons, app.icon_family,
                             buf,
                             layout,
                         );
@@ -7189,32 +7339,41 @@ fn render_harness_task_detail(
                 runs.iter().position(|candidate| candidate.run_id == run.run_id)
             });
             let toolbar = Rect::new(body.x, body.y, body.width, 1);
-            let mut x = render_toolbar_segment(
+            let mut x = render_toolbar_icon_segment(
+                icons::IconId::Refresh,
+                None,
                 "[Refresh]",
                 toolbar.x,
                 toolbar,
                 Style::default().fg(if selected.is_some() { theme.teal } else { theme.muted }).bg(theme.surface),
                 selected.is_some().then_some(HitTarget::HarnessTransferRefresh),
+                app.rail_icons, app.icon_family,
                 buf,
                 layout,
             ).saturating_add(1);
             let can_previous = selected_index.is_some_and(|index| index > 0);
-            x = render_toolbar_segment(
+            x = render_toolbar_icon_segment(
+                icons::IconId::ArrowUp,
+                None,
                 "[Up]",
                 x,
                 toolbar,
                 Style::default().fg(if can_previous { theme.teal } else { theme.muted }).bg(theme.surface),
                 can_previous.then_some(HitTarget::HarnessTransferPreviousRun),
+                app.rail_icons, app.icon_family,
                 buf,
                 layout,
             ).saturating_add(1);
             let can_next = selected_index.is_some_and(|index| index + 1 < runs.len());
-            let _ = render_toolbar_segment(
+            let _ = render_toolbar_icon_segment(
+                icons::IconId::ArrowDown,
+                None,
                 "[Down]",
                 x,
                 toolbar,
                 Style::default().fg(if can_next { theme.teal } else { theme.muted }).bg(theme.surface),
                 can_next.then_some(HitTarget::HarnessTransferNextRun),
+                app.rail_icons, app.icon_family,
                 buf,
                 layout,
             );
@@ -7275,22 +7434,28 @@ fn render_harness_task_detail(
             });
             let toolbar = Rect::new(body.x, body.y, body.width, 1);
             let can_previous = selected_index.is_some_and(|index| index > 0);
-            let x = render_toolbar_segment(
+            let x = render_toolbar_icon_segment(
+                icons::IconId::ArrowUp,
+                None,
                 "[Up]",
                 toolbar.x,
                 toolbar,
                 Style::default().fg(if can_previous { theme.teal } else { theme.muted }).bg(theme.surface),
                 can_previous.then_some(HitTarget::HarnessResultPreviousRun),
+                app.rail_icons, app.icon_family,
                 buf,
                 layout,
             ).saturating_add(1);
             let can_next = selected_index.is_some_and(|index| index + 1 < runs.len());
-            let _ = render_toolbar_segment(
+            let _ = render_toolbar_icon_segment(
+                icons::IconId::ArrowDown,
+                None,
                 "[Down]",
                 x,
                 toolbar,
                 Style::default().fg(if can_next { theme.teal } else { theme.muted }).bg(theme.surface),
                 can_next.then_some(HitTarget::HarnessResultNextRun),
+                app.rail_icons, app.icon_family,
                 buf,
                 layout,
             );
@@ -7484,30 +7649,39 @@ fn render_harness_task_detail(
             }
             if body.height > 1 {
                 let actions = Rect::new(body.x, body.y + 1, body.width, 1);
-                let mut x = render_toolbar_segment(
+                let mut x = render_toolbar_icon_segment(
+                    icons::IconId::History,
+                    None,
                     "[History]",
                     actions.x,
                     actions,
                     button_style,
                     Some(HitTarget::HarnessWorkspaceGitHistory(origin.clone())),
+                    app.rail_icons, app.icon_family,
                     buf,
                     layout,
                 );
-                x = render_toolbar_segment(
+                x = render_toolbar_icon_segment(
+                    icons::IconId::Diff,
+                    Some("Working"),
                     "[Working diff]",
                     x.saturating_add(1),
                     actions,
                     button_style,
                     Some(HitTarget::HarnessWorkspaceGitWorking(origin.clone())),
+                    app.rail_icons, app.icon_family,
                     buf,
                     layout,
                 );
-                let _ = render_toolbar_segment(
+                let _ = render_toolbar_icon_segment(
+                    icons::IconId::DiffAdded,
+                    Some("Staged"),
                     "[Staged diff]",
                     x.saturating_add(1),
                     actions,
                     button_style,
                     Some(HitTarget::HarnessWorkspaceGitStaged(origin.clone())),
+                    app.rail_icons, app.icon_family,
                     buf,
                     layout,
                 );
@@ -7560,32 +7734,41 @@ fn render_harness_task_detail(
             }
             let actions = Rect::new(body.x, body.y.saturating_add(1), body.width, body.height.saturating_sub(1).min(1));
             let can_refresh = pending.is_none();
-            let mut action_x = render_toolbar_segment(
+            let mut action_x = render_toolbar_icon_segment(
+                icons::IconId::Refresh,
+                Some("options"),
                 "[Refresh options]",
                 actions.x,
                 actions,
                 Style::default().fg(if can_refresh { theme.teal } else { theme.muted }).bg(theme.surface),
                 can_refresh.then_some(HitTarget::HarnessLaunchRefresh),
+                app.rail_icons, app.icon_family,
                 buf,
                 layout,
             ).saturating_add(1);
             let can_save = app.harness_launch_save_enabled();
-            action_x = render_toolbar_segment(
+            action_x = render_toolbar_icon_segment(
+                icons::IconId::Save,
+                Some("spec"),
                 "[Save spec]",
                 action_x,
                 actions,
                 Style::default().fg(if can_save { theme.teal } else { theme.muted }).bg(theme.surface),
                 can_save.then_some(HitTarget::HarnessLaunchSave),
+                app.rail_icons, app.icon_family,
                 buf,
                 layout,
             ).saturating_add(1);
             let can_start = app.harness_launch_start_enabled();
-            let _ = render_toolbar_segment(
+            let _ = render_toolbar_icon_segment(
+                icons::IconId::Play,
+                Some("task"),
                 "[Start task]",
                 action_x,
                 actions,
                 Style::default().fg(if can_start { theme.teal } else { theme.muted }).bg(theme.surface),
                 can_start.then_some(HitTarget::HarnessLaunchStart),
+                app.rail_icons, app.icon_family,
                 buf,
                 layout,
             );
@@ -7648,6 +7831,7 @@ fn render_harness_task_detail(
                 crate::app::HarnessLaunchOptionPanel::Plan,
                 view.plan_offset,
                 view.options.plans.len(),
+                app.rail_icons, app.icon_family,
                 buf,
                 layout,
                 theme,
@@ -7698,6 +7882,7 @@ fn render_harness_task_detail(
                 crate::app::HarnessLaunchOptionPanel::Worktree,
                 view.worktree_offset,
                 worktree_count,
+                app.rail_icons, app.icon_family,
                 buf,
                 layout,
                 theme,
@@ -7745,6 +7930,7 @@ fn render_harness_task_detail(
                 crate::app::HarnessLaunchOptionPanel::Context,
                 view.context_offset,
                 context_count,
+                app.rail_icons, app.icon_family,
                 buf,
                 layout,
                 theme,
@@ -7809,6 +7995,7 @@ fn render_harness_task_detail(
                 crate::app::HarnessLaunchOptionPanel::Delivery,
                 view.delivery_offset,
                 delivery_count,
+                app.rail_icons, app.icon_family,
                 buf,
                 layout,
                 theme,
@@ -7910,30 +8097,39 @@ fn render_harness_monitor(
     }
     if area.height > 2 {
         let actions = Rect::new(area.x, area.y + 2, area.width, 1);
-        let mut x = render_toolbar_segment(
+        let mut x = render_toolbar_icon_segment(
+            icons::IconId::ArrowLeft,
+            None,
             "[Back]",
             actions.x,
             actions,
             Style::default().fg(theme.teal).bg(theme.surface),
             Some(HitTarget::HarnessRunMonitorBack),
+            app.rail_icons, app.icon_family,
             buf,
             layout,
         );
-        x = render_toolbar_segment(
+        x = render_toolbar_icon_segment(
+            icons::IconId::Folder,
+            None,
             "[Files]",
             x.saturating_add(1),
             actions,
             Style::default().fg(theme.teal).bg(theme.surface),
             Some(HitTarget::HarnessTaskDetailRunFiles(view.run.run_id.clone())),
+            app.rail_icons, app.icon_family,
             buf,
             layout,
         );
-        x = render_toolbar_segment(
+        x = render_toolbar_icon_segment(
+            icons::IconId::SourceControl,
+            None,
             "[Git]",
             x.saturating_add(1),
             actions,
             Style::default().fg(theme.teal).bg(theme.surface),
             Some(HitTarget::HarnessTaskDetailRunGit(view.run.run_id.clone())),
+            app.rail_icons, app.icon_family,
             buf,
             layout,
         );
@@ -7984,22 +8180,28 @@ fn render_harness_monitor(
                 layout,
             ).saturating_add(1);
         }
-        x = render_toolbar_segment(
+        x = render_toolbar_icon_segment(
+            icons::IconId::ArrowUp,
+            None,
             "[Up]",
             x,
             sections,
             Style::default().fg(if offset > 0 { theme.teal } else { theme.muted }).bg(theme.surface),
             (offset > 0).then_some(HitTarget::HarnessRunMonitorScrollUp),
+            app.rail_icons, app.icon_family,
             buf,
             layout,
         ).saturating_add(1);
         let more = lines.len().saturating_sub(end);
-        x = render_toolbar_segment(
+        x = render_toolbar_icon_segment(
+            icons::IconId::ArrowDown,
+            None,
             "[Down]",
             x,
             sections,
             Style::default().fg(if more > 0 { theme.teal } else { theme.muted }).bg(theme.surface),
             (more > 0).then_some(HitTarget::HarnessRunMonitorScrollDown),
+            app.rail_icons, app.icon_family,
             buf,
             layout,
         ).saturating_add(1);
@@ -8329,8 +8531,9 @@ fn render_agent_board_card(
             &run[..run.len().min(10)],
         ));
     }
-    let open_label = "[open]";
-    let open_width = (cell_width(open_label) as u16).min(area.width);
+    let open_ascii_label = "[open]";
+    let open_width = compact_icon_button_width(open_ascii_label, Some("open"), app.rail_icons)
+        .min(area.width);
     let open_rect = Rect::new(area.right().saturating_sub(open_width), area.y, open_width, 1);
     let pin = if app.agent_is_pinned(&card.key) { "P " } else { "" };
     let title_width = area.width.saturating_sub(open_width).saturating_sub(1);
@@ -8343,9 +8546,16 @@ fn render_agent_board_card(
         )
         .render(Rect::new(area.x, area.y, title_width, 1), buf);
     if open_width > 0 {
-        Paragraph::new(open_label)
-            .style(Style::default().fg(theme.teal).bg(background))
-            .render(open_rect, buf);
+        render_compact_icon_button(
+            open_rect,
+            icons::IconId::GoToFile,
+            Some("open"),
+            open_ascii_label,
+            Style::default().fg(theme.teal).bg(background),
+            app.rail_icons, app.icon_family,
+            buf,
+            layout,
+        );
         layout.hits.push(HitRegion {
             rect: open_rect,
             target: HitTarget::AgentBoardCardOpen(card.key.clone()),
@@ -8376,17 +8586,25 @@ fn render_agent_board_card(
             .render(Rect::new(area.x, area.y + 3, area.width, 1), buf);
         if app.harness_kanban.enabled {
             if let Some(subject) = app.harness_agent_links_subject(&card.key) {
-                let label = "[Harness links]";
-                let width = (cell_width(label) as u16).min(area.width);
+                let ascii_label = "[Harness links]";
+                let width = compact_icon_button_width(ascii_label, Some("Harness links"), app.rail_icons)
+                    .min(area.width);
                 let rect = Rect::new(
                     area.right().saturating_sub(width),
                     area.y + 3,
                     width,
                     1,
                 );
-                Paragraph::new(label)
-                    .style(Style::default().fg(theme.teal).bg(background))
-                    .render(rect, buf);
+                render_compact_icon_button(
+                    rect,
+                    icons::IconId::Link,
+                    Some("Harness links"),
+                    ascii_label,
+                    Style::default().fg(theme.teal).bg(background),
+                    app.rail_icons, app.icon_family,
+                    buf,
+                    layout,
+                );
                 layout.hits.push(HitRegion {
                     rect,
                     target: HitTarget::HarnessLinks(subject),
@@ -8730,43 +8948,55 @@ fn render_surface_toolbar(
             let ready = file.is_some_and(|file| file.state == WorkspaceFileState::Ready);
             if ready {
                 if let Some(history) = file.and_then(|file| file.inline_history.as_ref()) {
-                    x = render_toolbar_segment(
+                    x = render_toolbar_icon_segment(
+                        icons::IconId::File,
+                        None,
                         "[Source]",
                         x,
                         area,
                         button_style,
                         Some(HitTarget::FileSource(pane_id)),
+                        app.rail_icons, app.icon_family,
                         buf,
                         layout,
                     );
                     if history.mode == WorkspaceGitPaneMode::Detail {
-                        x = render_toolbar_segment(
+                        x = render_toolbar_icon_segment(
+                            icons::IconId::History,
+                            None,
                             "[Commits]",
                             x.saturating_add(1),
                             area,
                             button_style,
                             Some(HitTarget::FileHistoryBack(pane_id)),
+                            app.rail_icons, app.icon_family,
                             buf,
                             layout,
                         );
                         if history.selected > 0 {
-                            x = render_toolbar_segment(
+                            x = render_toolbar_icon_segment(
+                                icons::IconId::ArrowLeft,
+                                None,
                                 "<",
                                 x.saturating_add(1),
                                 area,
                                 button_style,
                                 Some(HitTarget::FileHistoryPrevious(pane_id)),
+                                app.rail_icons, app.icon_family,
                                 buf,
                                 layout,
                             );
                         }
                         if history.selected.saturating_add(1) < history.commits.len() {
-                            x = render_toolbar_segment(
+                            x = render_toolbar_icon_segment(
+                                icons::IconId::ArrowRight,
+                                None,
                                 ">",
                                 x.saturating_add(1),
                                 area,
                                 button_style,
                                 Some(HitTarget::FileHistoryNext(pane_id)),
+                                app.rail_icons, app.icon_family,
                                 buf,
                                 layout,
                             );
@@ -8799,44 +9029,57 @@ fn render_surface_toolbar(
                     render_harness_links_toolbar(app, tab, area, buf, layout, theme);
                     return;
                 }
-                x = render_toolbar_segment(
+                x = render_toolbar_icon_segment(
+                    icons::IconId::History,
+                    None,
                     "[History]",
                     x,
                     area,
                     button_style,
                     Some(HitTarget::FileHistory(pane_id)),
+                    app.rail_icons, app.icon_family,
                     buf,
                     layout,
                 );
-                x = render_toolbar_segment(
+                x = render_toolbar_icon_segment(
+                    icons::IconId::Diff,
+                    None,
                     "[Changes]",
                     x.saturating_add(1),
                     area,
                     button_style,
                     Some(HitTarget::FileChanges(pane_id)),
+                    app.rail_icons, app.icon_family,
                     buf,
                     layout,
                 );
-                let edit_label = if app.file_tabs.get(key).is_some_and(|file| file.edit_mode) {
-                    "[View]"
+                let editing = app.file_tabs.get(key).is_some_and(|file| file.edit_mode);
+                let (edit_icon, edit_ascii_label) = if editing {
+                    (icons::IconId::Eye, "[View]")
                 } else {
-                    "[Edit]"
+                    (icons::IconId::Edit, "[Edit]")
                 };
-                x = render_toolbar_segment(
-                    edit_label,
+                x = render_toolbar_icon_segment(
+                    edit_icon,
+                    None,
+                    edit_ascii_label,
                     x.saturating_add(1),
                     area,
                     button_style,
                     Some(HitTarget::FileEdit(pane_id)),
+                    app.rail_icons, app.icon_family,
                     buf,
                     layout,
                 );
-                let _ = render_toolbar_segment(
+                let _ = render_toolbar_icon_segment(
+                    icons::IconId::Save,
+                    None,
                     "[Save]",
                     x.saturating_add(1),
                     area,
                     button_style,
                     Some(HitTarget::FileSave(pane_id)),
+                    app.rail_icons, app.icon_family,
                     buf,
                     layout,
                 );
@@ -8866,12 +9109,15 @@ fn render_surface_toolbar(
             let ready = app.harness_file_tabs.get(key)
                 .is_some_and(|file| file.state == WorkspaceFileState::Ready);
             if ready {
-                x = render_toolbar_segment(
+                x = render_toolbar_icon_segment(
+                    icons::IconId::History,
+                    None,
                     "[History]",
                     x,
                     area,
                     button_style,
                     Some(HitTarget::HarnessFileHistory(pane_id)),
+                    app.rail_icons, app.icon_family,
                     buf,
                     layout,
                 );
@@ -8953,15 +9199,23 @@ fn render_harness_links_toolbar(
     let Some(subject) = tab.and_then(|tab| app.harness_surface_links_subject(tab)) else {
         return;
     };
-    let label = "[Harness links]";
-    let width = (cell_width(label) as u16).min(area.width);
+    let ascii_label = "[Harness links]";
+    let width = compact_icon_button_width(ascii_label, Some("Harness links"), app.rail_icons)
+        .min(area.width);
     if width == 0 {
         return;
     }
     let rect = Rect::new(area.right().saturating_sub(width), area.y, width, 1);
-    Paragraph::new(label)
-        .style(Style::default().fg(theme.teal).bg(theme.active))
-        .render(rect, buf);
+    render_compact_icon_button(
+        rect,
+        icons::IconId::Link,
+        Some("Harness links"),
+        ascii_label,
+        Style::default().fg(theme.teal).bg(theme.active),
+        app.rail_icons, app.icon_family,
+        buf,
+        layout,
+    );
     layout.hits.push(HitRegion {
         rect,
         target: HitTarget::HarnessLinks(subject),
@@ -9667,6 +9921,8 @@ fn render_preview_tab(
     layout: &mut LayoutRects,
     theme: Theme,
     activity_spinner: char,
+    tier: RailIcons,
+    family: IconFamily,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -9739,12 +9995,20 @@ fn render_preview_tab(
         .render(rect, buf);
     }
     if action_height > 0 {
-        let label = if area.width as usize >= cell_width("[Resume session]") {
+        // The ascii_label keeps choosing between the long/short bracketed
+        // text exactly as before -- that is what `RailIcons::Ascii` still
+        // paints unchanged. `RailIcons::Sixel` draws one fixed icon +
+        // "session" trailing text regardless of which variant was
+        // chosen; `render_compact_icon_button`'s own truncation already
+        // drops the trailing text first when the row is too narrow, so no
+        // separate short-icon variant is needed the way the ascii text
+        // needed a shorter literal.
+        let ascii_label = if area.width as usize >= cell_width("[Resume session]") {
             "[Resume session]"
         } else {
             "[Resume]"
         };
-        let width = (cell_width(label) as u16).min(area.width);
+        let width = compact_icon_button_width(ascii_label, Some("session"), tier).min(area.width);
         let footer = Rect::new(
             area.x,
             area.bottom().saturating_sub(1),
@@ -9767,9 +10031,16 @@ fn render_preview_tab(
             width,
             1,
         );
-        Paragraph::new(label)
-            .style(Style::default().fg(theme.teal).bg(theme.active).add_modifier(Modifier::BOLD))
-            .render(rect, buf);
+        render_compact_icon_button(
+            rect,
+            icons::IconId::Play,
+            Some("session"),
+            ascii_label,
+            Style::default().fg(theme.teal).bg(theme.active).add_modifier(Modifier::BOLD),
+            tier, family,
+            buf,
+            layout,
+        );
         layout.hits.push(HitRegion {
             rect,
             target: HitTarget::PreviewResume(pane_id),
@@ -10552,13 +10823,16 @@ fn render_spawn(
         buf,
         layout,
     );
-    render_inline_launch_action(
+    render_inline_launch_icon_action(
+        icons::IconId::Search,
+        Some("Browse\u{2026}"),
         "[Browse\u{2026}]",
         workspace_field_end,
         inner,
         1,
         true,
         HitTarget::SpawnRegisterWorkspace,
+        app.rail_icons, app.icon_family,
         theme,
         buf,
         layout,
@@ -10579,13 +10853,16 @@ fn render_spawn(
         buf,
         layout,
     );
-    render_inline_launch_action(
+    render_inline_launch_icon_action(
+        icons::IconId::RepoForked,
+        Some("Configure\u{2026}"),
         "[Configure\u{2026}]",
         target_field_end,
         inner,
         2,
         spawn.target != LaunchTarget::ExistingWorkspace,
         HitTarget::SpawnConfigureGitLocation,
+        app.rail_icons, app.icon_family,
         theme,
         buf,
         layout,
@@ -10752,13 +11029,29 @@ fn render_launch_field(
     area.x.saturating_add(line_width)
 }
 
-fn render_inline_launch_action(
-    label: &str,
+/// Paints the Spawn dialog's own `[Browse…]`/`[Configure…]` action right
+/// after a launch field's own value, as a compact icon (+ optional
+/// trailing text) in `RailIcons::Sixel` mode or the original bracketed
+/// label unchanged in `RailIcons::Ascii` mode -- see
+/// [`render_compact_icon_button`]'s own doc comment for that split. Also
+/// SHRINKS the immediately-preceding field's own already-pushed
+/// `HitRegion` width so the two never overlap: it scans `layout.hits` in
+/// reverse for the most recent `SpawnField` hit on the same row that
+/// starts before this action does, and clamps that hit's width to end
+/// exactly where this action begins. That coupling reads this action's
+/// OWN drawn width, so it stays correct however narrow the icon body
+/// ends up relative to the label this replaced.
+fn render_inline_launch_icon_action(
+    icon: icons::IconId,
+    text: Option<&str>,
+    ascii_label: &str,
     field_end: u16,
     area: Rect,
     row: u16,
     enabled: bool,
     target: HitTarget,
+    tier: RailIcons,
+    family: IconFamily,
     theme: Theme,
     buf: &mut TerminalBuffer,
     layout: &mut LayoutRects,
@@ -10766,7 +11059,7 @@ fn render_inline_launch_action(
     if row >= area.height || area.width == 0 {
         return;
     }
-    let width = (cell_width(label) as u16).min(area.width);
+    let width = compact_icon_button_width(ascii_label, text, tier).min(area.width);
     let x = field_end
         .saturating_add(1)
         .min(area.right().saturating_sub(width));
@@ -10778,14 +11071,11 @@ fn render_inline_launch_action(
     }) {
         field_hit.rect.width = action.x.saturating_sub(field_hit.rect.x);
     }
-    Paragraph::new(truncate_cells(label, width as usize))
-        .style(
-            Style::default()
-                .fg(if enabled { theme.teal } else { theme.muted })
-                .bg(theme.modal)
-                .add_modifier(Modifier::BOLD),
-        )
-        .render(action, buf);
+    let style = Style::default()
+        .fg(if enabled { theme.teal } else { theme.muted })
+        .bg(theme.modal)
+        .add_modifier(Modifier::BOLD);
+    render_compact_icon_button(action, icon, text, ascii_label, style, tier, family, buf, layout);
     if enabled {
         push_modal_hit(layout, action, target);
     }
@@ -11385,9 +11675,17 @@ fn render_folder_browser(
         && browser.entries.len() < MAX_BROWSER_LOADED_ENTRIES
         && !browser.pending;
     let load_more = Rect::new(inner.x, action_row, 13.min(inner.width), 1);
-    Paragraph::new(if can_load_more { "[Load more]" } else { " Load more " })
-        .style(Style::default().fg(if can_load_more { theme.teal } else { theme.muted }).bg(theme.modal))
-        .render(load_more, buf);
+    let load_more_ascii_label = if can_load_more { "[Load more]" } else { " Load more " };
+    render_compact_icon_button(
+        load_more,
+        icons::IconId::CloudDownload,
+        Some("more"),
+        load_more_ascii_label,
+        Style::default().fg(if can_load_more { theme.teal } else { theme.muted }).bg(theme.modal),
+        app.rail_icons, app.icon_family,
+        buf,
+        layout,
+    );
     if can_load_more {
         push_modal_hit(layout, load_more, HitTarget::FolderBrowserLoadMore);
     }
@@ -12885,6 +13183,11 @@ mod tests {
     #[test]
     fn harness_kanban_renders_exact_state_columns_and_stale_snapshot_banner() {
         let mut app = fixture(PtyColorMode::Inherited);
+        // Ascii tier: several of the mouse-first labels asserted below
+        // (New task/Refresh/Run next Ready/Open) now draw as compact
+        // icons under the default `RailIcons::Sixel` -- only Ascii still
+        // paints their original bracketed text.
+        app.rail_icons = RailIcons::Ascii;
         app.harness_kanban.enabled = true;
         app.agent_board_mode = crate::app::AgentBoardMode::HarnessKanban;
         app.surface.open_in_focused(SurfaceTab::AgentBoard);
@@ -12999,6 +13302,9 @@ mod tests {
     #[test]
     fn harness_task_detail_renders_internal_sections_without_new_surface_tab() {
         let mut app = fixture(PtyColorMode::Inherited);
+        // Ascii tier: the "[Back]" check below asserts the header
+        // button's own literal bracket text.
+        app.rail_icons = RailIcons::Ascii;
         app.harness_kanban.enabled = true;
         app.agent_board_mode = crate::app::AgentBoardMode::HarnessKanban;
         app.surface.open_in_focused(SurfaceTab::AgentBoard);
@@ -13244,6 +13550,9 @@ mod tests {
     #[test]
     fn harness_task_detail_transfers_render_explicit_states_and_mouse_controls() {
         let mut app = fixture(PtyColorMode::Inherited);
+        // Ascii tier: the "[Refresh] [Up] [Down]" check below asserts
+        // the toolbar's own literal bracket text.
+        app.rail_icons = RailIcons::Ascii;
         app.harness_kanban.enabled = true;
         app.agent_board_mode = crate::app::AgentBoardMode::HarnessKanban;
         app.surface.open_in_focused(SurfaceTab::AgentBoard);
@@ -13709,6 +14018,9 @@ mod tests {
     #[test]
     fn harness_task_detail_launch_is_bordered_mouse_first_and_private() {
         let mut app = fixture(PtyColorMode::Inherited);
+        // Ascii tier: the "[Refresh options]"/"[Save spec]"/"[Start
+        // task]" checks below assert their own literal bracket text.
+        app.rail_icons = RailIcons::Ascii;
         app.harness_kanban.enabled = true;
         app.agent_board_mode = crate::app::AgentBoardMode::HarnessKanban;
         app.surface.open_in_focused(SurfaceTab::AgentBoard);
@@ -14036,6 +14348,9 @@ mod tests {
     #[test]
     fn harness_kanban_empty_loading_and_error_keep_columns_and_mouse_actions_visible() {
         let mut app = fixture(PtyColorMode::Inherited);
+        // Ascii tier: the "[New task]"/"[Refresh]"/"[Run next Ready]"
+        // checks below assert the toolbar's own literal bracket text.
+        app.rail_icons = RailIcons::Ascii;
         app.harness_kanban.enabled = true;
         app.agent_board_mode = crate::app::AgentBoardMode::HarnessKanban;
 
@@ -14219,6 +14534,9 @@ mod tests {
     #[test]
     fn harness_composer_modal_has_unicode_frame_and_contained_mouse_targets() {
         let mut app = fixture(PtyColorMode::Inherited);
+        // Ascii tier: the "[Create in Backlog]"/"[Cancel]" checks below
+        // assert their own literal bracket text.
+        app.rail_icons = RailIcons::Ascii;
         app.harness_kanban.enabled = true;
         app.agent_board_mode = crate::app::AgentBoardMode::HarnessKanban;
         app.harness_kanban.composer = Some(crate::app::HarnessTaskComposer::default());
@@ -15092,6 +15410,13 @@ mod tests {
     #[test]
     fn agent_progress_card_collapses_expands_and_clips_on_both_agent_surfaces() {
         let mut app = fixture(PtyColorMode::Inherited);
+        // Ascii tier: the "unified" (native session list) check below
+        // asserts the progress toggle's own literal bracket text, which
+        // only `RailIcons::Ascii` still paints -- `RailIcons::Sixel`
+        // (the default) now draws a Chevron icon there instead. The
+        // legacy roster's own "[d+]"/"[d-]" checks are unaffected either
+        // way -- that render path was not converted.
+        app.rail_icons = RailIcons::Ascii;
         let address = active_pty_address(&app);
         app.nodes[0].workspaces[0].sessions[0].progress = Some(test_agent_progress());
         let key = AgentRowKey::Legacy(address.clone());
@@ -16025,6 +16350,11 @@ mod tests {
     #[test]
     fn preview_surface_renders_loading_empty_unavailable_and_error_states() {
         let mut app = fixture(PtyColorMode::Inherited);
+        // Ascii tier: the Resume-button checks below assert its own
+        // literal bracket text, which only `RailIcons::Ascii` still
+        // paints -- `RailIcons::Sixel` (the default) draws a Play icon
+        // there instead.
+        app.rail_icons = RailIcons::Ascii;
         let key = crate::app::PreviewTabKey::ManagedRecord {
             node_id: "node-a".to_owned(),
             record_id: "record-history".to_owned(),
@@ -16195,6 +16525,10 @@ mod tests {
                 &mut layout,
                 Theme::for_mode(PtyColorMode::Inherited),
                 '⠙',
+                // Ascii tier: the "[Resume session]" check below asserts
+                // the button's own literal bracket text.
+                RailIcons::Ascii,
+                IconFamily::Codicons,
             );
             let text = buffer_text(&buffer);
             assert!(text.contains(assistant), "{provider_id}: {text}");
@@ -16322,6 +16656,8 @@ mod tests {
                 &mut layout,
                 Theme::for_mode(PtyColorMode::Inherited),
                 '⠙',
+                RailIcons::Sixel,
+                IconFamily::Codicons,
             );
             let text = buffer_text(&buffer);
             assert!(text.contains(&format!("total tokens {expected}")), "{text}");
@@ -16376,6 +16712,8 @@ mod tests {
             &mut layout,
             Theme::for_mode(PtyColorMode::Inherited),
             '⠙',
+            RailIcons::Sixel,
+            IconFamily::Codicons,
         );
 
         let hits = layout.hits.iter().filter(|hit| {
@@ -16508,6 +16846,9 @@ mod tests {
     #[test]
     fn hydrated_preview_resume_chip_dispatches_exact_correlated_resume() {
         let mut app = fixture(PtyColorMode::Inherited);
+        // Ascii tier: the "[Resume session]" check below asserts the
+        // chip's own literal bracket text.
+        app.rail_icons = RailIcons::Ascii;
         app.nodes[0].session_records.push(crate::app::ManagedSessionView {
             node_id: "node-a".to_owned(),
             record_id: "record-chip".to_owned(),
@@ -16588,6 +16929,9 @@ mod tests {
     #[test]
     fn reconnect_failure_remains_visible_below_long_hydrated_transcript() {
         let mut app = fixture(PtyColorMode::Inherited);
+        // Ascii tier: the "[Resume session]" check below asserts the
+        // chip's own literal bracket text.
+        app.rail_icons = RailIcons::Ascii;
         let key = crate::app::PreviewTabKey::ManagedRecord {
             node_id: "node-a".to_owned(),
             record_id: "record-error".to_owned(),
@@ -18458,6 +18802,11 @@ mod tests {
     #[test]
     fn launch_product_ux_rows_and_hits_hide_internal_fields_and_do_not_overlap() {
         let mut app = fixture(PtyColorMode::GateOverride);
+        // Ascii tier: the "[Browse…]"/"[Configure…]" checks below assert
+        // their own literal bracket text, which only `RailIcons::Ascii`
+        // still paints -- `RailIcons::Sixel` (the default) draws a
+        // Search/RepoForked icon there instead.
+        app.rail_icons = RailIcons::Ascii;
         app.focus = Focus::Spawn;
         app.overlay_positions.insert(OverlayId::Spawn, (6, 3));
         app.spawn = Some(SpawnDialog {
@@ -18658,6 +19007,9 @@ mod tests {
     #[test]
     fn managed_and_off_git_policy_are_visible_only_inside_configuration_modal() {
         let mut app = fixture(PtyColorMode::GateOverride);
+        // Ascii tier: the "[Configure…]" check below asserts its own
+        // literal bracket text.
+        app.rail_icons = RailIcons::Ascii;
         app.focus = Focus::Spawn;
         app.nodes[0].workspaces[0].worktree_service_mode =
             Some(gate4agent_node_protocol::WorktreeServiceMode::Managed);
@@ -20379,11 +20731,19 @@ mod tests {
             "spawn modal {:?} must cover at least one gallery placement: {:?}",
             covered.spawn_modal, baseline.sixel_icons,
         );
+        // Only BASELINE (background gallery) placements are required to
+        // have been occluded here -- the spawn dialog now paints its own
+        // Browse/Configure actions as compact icons (see `render_spawn`),
+        // and those legitimately live INSIDE `covered.spawn_modal`, on
+        // top of it, same as any other modal content. Filtering to
+        // placements the gallery baseline already had keeps this
+        // assertion about occlusion of the covered BASE layer, not a
+        // blanket "nothing may ever paint inside this modal" claim.
         assert!(
-            covered.sixel_icons.iter().all(|placement| {
-                placement.rect.intersect(covered.spawn_modal).is_empty()
-            }),
-            "no surviving placement may intersect the spawn modal: {:?} vs {:?}",
+            covered.sixel_icons.iter()
+                .filter(|placement| baseline.sixel_icons.contains(placement))
+                .all(|placement| placement.rect.intersect(covered.spawn_modal).is_empty()),
+            "no surviving BASE placement may intersect the spawn modal: {:?} vs {:?}",
             covered.sixel_icons, covered.spawn_modal,
         );
 
@@ -20857,10 +21217,24 @@ mod tests {
         assert!(!top.contains(" file "), "{top:?}");
         assert!(header_text.contains(" lib.rs "), "{header_text:?}");
         assert!(!header_text.contains(" file "), "{header_text:?}");
-        assert!(actions_text.contains("[History]"), "{actions_text:?}");
-        assert!(actions_text.contains("[Changes]"), "{actions_text:?}");
-        assert!(actions_text.contains("[Edit]"), "{actions_text:?}");
-        assert!(actions_text.contains("[Save]"), "{actions_text:?}");
+        // `RailIcons::Sixel` (the default here) draws these four actions
+        // as compact icons, not the old bracketed text -- check the icon
+        // placements landing on the actions row instead of `actions_text`
+        // (see `folder_browser_parent_use_and_cancel_buttons_render_a_
+        // compact_icon_per_tier` for the same per-tier assertion shape;
+        // the ASCII-mode fallback keeping the original bracket text is
+        // covered separately by `tab_strip_ascii_tier_keeps_its_old_text_
+        // and_both_controls_keep_their_hit_targets`'s own sibling
+        // coverage for this row).
+        let actions_row_has_icon = |icon: icons::IconId| {
+            layout.sixel_icons.iter().any(|placement| {
+                placement.icon == icon && placement.rect.y == header.y + 1
+            })
+        };
+        assert!(actions_row_has_icon(icons::IconId::History), "{actions_text:?}");
+        assert!(actions_row_has_icon(icons::IconId::Diff), "{actions_text:?}");
+        assert!(actions_row_has_icon(icons::IconId::Edit), "{actions_text:?}");
+        assert!(actions_row_has_icon(icons::IconId::Save), "{actions_text:?}");
         for target in [
             HitTarget::FileHistory(pane_id),
             HitTarget::FileChanges(pane_id),
@@ -20929,7 +21303,15 @@ mod tests {
             .collect::<String>();
         assert!(history_header_text.contains(" lib.rs "), "{history_header_text:?}");
         assert!(!history_header_text.contains("commits"), "{history_header_text:?}");
-        assert!(history_actions_text.contains("[Source]"), "{history_actions_text:?}");
+        // `RailIcons::Sixel` draws `[Source]` as a compact `File` icon,
+        // not the old bracket text -- see this test's own earlier
+        // `actions_row_has_icon` assertion for the same per-tier shape.
+        assert!(
+            history_layout.sixel_icons.iter().any(|placement| {
+                placement.icon == icons::IconId::File && placement.rect.y == history_header.y + 1
+            }),
+            "{history_actions_text:?}",
+        );
         assert!(history_actions_text.contains("commits | Up/Down"), "{history_actions_text:?}");
         assert!(buffer_text(&buffer).contains("loading file history"));
         assert!(app.git_tabs.is_empty());
@@ -20978,6 +21360,11 @@ mod tests {
     #[test]
     fn file_and_commit_panes_keep_independent_headers_and_ascii_chrome() {
         let mut app = App::default();
+        // Ascii tier: the "[History]" check below asserts the file
+        // pane's own literal bracket text, which only `RailIcons::Ascii`
+        // still paints -- `RailIcons::Sixel` (the default) draws a
+        // History icon there instead.
+        app.rail_icons = RailIcons::Ascii;
         app.menu_placement = MenuPlacement::Modal;
         let file_key = crate::app::WorkspaceFileTabKey {
             node_id: "node-a".to_owned(),
@@ -21285,6 +21672,9 @@ mod tests {
     #[test]
     fn inline_file_commit_detail_uses_toolbar_navigation_and_colored_diff_rows() {
         let mut app = App::default();
+        // Ascii tier: the "[Source] [Commits] < >" check below asserts
+        // the inline-history toolbar's own literal bracket text.
+        app.rail_icons = RailIcons::Ascii;
         app.menu_placement = MenuPlacement::Modal;
         let key = crate::app::WorkspaceFileTabKey {
             node_id: "node-a".to_owned(),

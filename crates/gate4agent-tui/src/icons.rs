@@ -25,16 +25,25 @@
 //!
 //! ## Wiring status
 //!
-//! Only the activity rail's original 7 icons (`Files`, `SourceControl`,
-//! `Person`, `Project`, `SettingsGear`, `ChevronLeft`, `ChevronRight`)
-//! are drawn anywhere today, via `render::render_activity_rail`'s own
-//! `RailButton::icon: icons::IconId` field -- unchanged from before this
-//! catalog generalized beyond the rail, just re-pointed at the wider
-//! [`IconId`] enum so there is exactly one icon source in this crate
-//! (there used to be a rail-only `RailIconId`; it no longer exists).
-//! Every other [`IconId`] variant is baked and unit-tested (see this
-//! module's own `tests`) but not yet drawn at any UI site -- a
-//! deliberate, scoped-out next slice, not an oversight.
+//! The activity rail itself wires only `Files`, `SourceControl`,
+//! `Person`, `Project`, `SettingsGear`, and `Layout` (its own icon-gallery
+//! button), via `render::render_activity_rail`'s own `RailButton::icon:
+//! icons::IconId` field -- re-pointed at the wider [`IconId`] enum so
+//! there is exactly one icon source in this crate (there used to be a
+//! rail-only `RailIconId`; it no longer exists). `ChevronLeft`/
+//! `ChevronRight` are NOT part of that set: the rail has no separate
+//! collapse button any more (see `render_activity_rail`'s own "There is
+//! no separate collapse button here any more" doc comment), so those two
+//! variants are currently unused. Beyond the rail, the strip tier
+//! (`render::render_control_strip_button`) and the compact tier
+//! (`render::render_compact_icon_button`) wire a growing set of their
+//! own -- `NewFile`/`NewFolder`/`Add`/`Trash`/`Refresh`/`RepoForked` on
+//! the Explorer/Git/Agents control strips, `Search`/`ArrowUp`/`Check`/
+//! `Close`/`GoToFile`/and others across the sidebar panels and modals --
+//! see each call site rather than this doc keeping its own duplicate
+//! tally, since that list grows independently of the rail's own. Every
+//! [`IconId`] variant is baked and unit-tested (see this module's own
+//! `tests`) regardless of whether a UI site draws it yet.
 //!
 //! ## Source, licence, regeneration
 //!

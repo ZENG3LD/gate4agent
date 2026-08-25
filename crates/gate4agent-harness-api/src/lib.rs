@@ -2951,6 +2951,25 @@ pub enum HarnessOperatorEventV1 {
     /// task/run/node it is holding as stale rather than trying to patch
     /// around the gap.
     Lagged { sequence: u64 },
+    /// Server-side keep-alive, unconditional and periodic (see
+    /// `gate4agent-harness-service::runtime`'s own
+    /// `HOST_SUBSCRIBER_KEEPALIVE_INTERVAL`): the registry's only way to
+    /// discover a dead subscriber is a write to it actually failing, so
+    /// without something to push on an otherwise-idle connection an
+    /// abandoned subscriber can sit occupying its slot indefinitely (see
+    /// `SubscriberRegistry`'s own doc comment). Deliberately its own
+    /// variant rather than reusing an existing one: `Lagged` carries a
+    /// promise (a `SnapshotBaseline` follows) that a bare keep-alive would
+    /// break, and every other variant carries real task/run/node state a
+    /// client applies -- faking either risks a client acting on a change
+    /// that never happened. `Ping` carries nothing to act on, so it cannot
+    /// be mistaken for either; every current reader
+    /// (`gate4agent-harness-client`'s generic `next_event` decode,
+    /// `gate4agent-tui`'s `project_harness_operator_event`) drops it on the
+    /// floor by construction. `sequence` is kept only for schema symmetry
+    /// with every other variant -- there is no gap to detect against a
+    /// keep-alive that carries no state of its own.
+    Ping { sequence: u64 },
 }
 
 impl HarnessOperatorEventV1 {
@@ -2981,6 +3000,7 @@ impl HarnessOperatorEventV1 {
                 Ok(())
             }
             Self::Lagged { .. } => Ok(()),
+            Self::Ping { .. } => Ok(()),
         }
     }
 }

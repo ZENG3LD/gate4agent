@@ -191,7 +191,8 @@ fn event_sequence(event: &HarnessOperatorEventV1) -> u64 {
         | HarnessOperatorEventV1::RunChanged { sequence, .. }
         | HarnessOperatorEventV1::RuntimeInventoryChanged { sequence, .. }
         | HarnessOperatorEventV1::RuntimeInventoryRemoved { sequence, .. }
-        | HarnessOperatorEventV1::Lagged { sequence } => *sequence,
+        | HarnessOperatorEventV1::Lagged { sequence }
+        | HarnessOperatorEventV1::Ping { sequence } => *sequence,
     }
 }
 

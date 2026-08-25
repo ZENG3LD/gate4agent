@@ -338,6 +338,20 @@ enum WorkerUpdate {
     /// what actually resynchronizes state -- kept as its own variant purely
     /// so a future diagnostic surface has something to hook.
     HarnessEventLagged,
+    /// `harness_event_subscription_worker` could not keep its subscription
+    /// alive -- either `subscribe_events()` itself failed, or the live
+    /// `next_event()` loop returned an error and the worker had to
+    /// reconnect. Before this variant existed the error was discarded
+    /// (`Err(_) => break`), which was exactly the gap that made the
+    /// operator-subscriber slot leak's own root cause undiagnosable from
+    /// the log alone (see `docs/gate4agent/research/gate4agent-operator-
+    /// subscriber-slot-leak-2026-08-25.md` item 1/3): the worker
+    /// resubscribes on its own cadence regardless, so silently swallowing
+    /// *why* meant nobody could tell a client-side misfire apart from a
+    /// genuine server-side cutoff. `message` is the error's own `Display`
+    /// text -- every `HarnessOperatorClientError` variant renders distinct
+    /// wording, so this is enough to name exactly which one fired.
+    HarnessEventSubscriptionFailed { message: String },
     HarnessMonitor {
         run: RedactedRunV1,
         monitor: HarnessSessionMonitorV1,
@@ -4850,6 +4864,9 @@ fn apply_update(app: &mut App, terminal: &mut TerminalWatermarks, update: Worker
             app.remove_topology_node(&node_id);
         }
         WorkerUpdate::HarnessEventLagged => {}
+        WorkerUpdate::HarnessEventSubscriptionFailed { message } => {
+            app.report_failure(EventSource::Connectivity, message);
+        }
         WorkerUpdate::HarnessMonitor { run, monitor, timeline } => {
             app.apply_harness_monitor(run, monitor, timeline);
         }
@@ -5519,7 +5536,11 @@ fn project_harness_inventory_node(entry: HarnessRuntimeNodeInventoryV1) -> Resul
 /// subscription goes live -- gating the run loop's
 /// `HARNESS_SNAPSHOT_REFRESH_INTERVAL` poll into a fallback, see its call
 /// site -- and false the moment the subscription ends, so the poll resumes
-/// as a fallback during any reconnect gap.
+/// as a fallback during any reconnect gap. Every error that ends a
+/// subscription (or prevents one from opening) is reported via
+/// `report_harness_event_subscription_error` before the retry -- see
+/// `WorkerUpdate::HarnessEventSubscriptionFailed`'s own doc comment for why
+/// that variant exists at all.
 fn harness_event_subscription_worker(
     client: HarnessOperatorClient,
     updates: mpsc::Sender<WorkerUpdate>,
@@ -5529,7 +5550,8 @@ fn harness_event_subscription_worker(
     loop {
         let mut subscription = match client.subscribe_events() {
             Ok(subscription) => subscription,
-            Err(_) => {
+            Err(error) => {
+                report_harness_event_subscription_error(&updates, &error);
                 thread::sleep(backoff);
                 backoff = (backoff * 2).min(HARNESS_SUBSCRIPTION_BACKOFF_MAX);
                 continue;
@@ -5540,7 +5562,10 @@ fn harness_event_subscription_worker(
         loop {
             let event = match subscription.next_event() {
                 Ok(event) => event,
-                Err(_) => break,
+                Err(error) => {
+                    report_harness_event_subscription_error(&updates, &error);
+                    break;
+                }
             };
             let Some(update) = project_harness_operator_event(event) else { continue; };
             if updates.blocking_send(update).is_err() {
@@ -5552,6 +5577,27 @@ fn harness_event_subscription_worker(
         thread::sleep(backoff);
         backoff = (backoff * 2).min(HARNESS_SUBSCRIPTION_BACKOFF_MAX);
     }
+}
+
+/// The one place `harness_event_subscription_worker` turns a
+/// `HarnessOperatorClientError` it would otherwise discard into something
+/// visible: pushes `WorkerUpdate::HarnessEventSubscriptionFailed` so the
+/// exact variant that ended a subscription (or failed to open one) reaches
+/// the central event feed instead of vanishing at a silent `Err(_) =>
+/// break`. Uses the error's own `Display` text (`error.to_string()`), the
+/// same conversion this file's other worker-thread failure sites
+/// (`publish_harness_failure`'s own callers) already use to turn a typed
+/// error into a `WorkerUpdate` message. Best-effort send, matching every
+/// other worker -> app channel write in this file: if the app's own update
+/// channel is already gone, the worker is shutting down anyway and there is
+/// nothing left to report to.
+fn report_harness_event_subscription_error(
+    updates: &mpsc::Sender<WorkerUpdate>,
+    error: &HarnessOperatorClientError,
+) {
+    let _ = updates.blocking_send(WorkerUpdate::HarnessEventSubscriptionFailed {
+        message: error.to_string(),
+    });
 }
 
 /// Projects one pushed `HarnessOperatorEventV1` into its `WorkerUpdate`,
@@ -5585,6 +5631,11 @@ fn project_harness_operator_event(event: HarnessOperatorEventV1) -> Option<Worke
             Some(WorkerUpdate::HarnessRuntimeInventoryNodeRemoved { node_id })
         }
         HarnessOperatorEventV1::Lagged { .. } => Some(WorkerUpdate::HarnessEventLagged),
+        // Server-side keep-alive (see `HarnessOperatorEventV1::Ping`'s own
+        // doc comment): carries no state, so there is nothing to apply --
+        // its only job is to be a write attempt the host's registry can
+        // succeed or fail on.
+        HarnessOperatorEventV1::Ping { .. } => None,
     }
 }
 
@@ -7902,6 +7953,44 @@ mod tests {
             Err(mpsc::error::TryRecvError::Empty),
         ));
         assert_eq!(app.notice(), None);
+    }
+
+    /// The operator-subscriber slot leak's own diagnostic fix, pinned
+    /// directly: `report_harness_event_subscription_error` must not
+    /// silently drop the error the way the old `Err(_) => break` did --
+    /// it has to reach the worker's update channel as a named variant.
+    #[test]
+    fn subscription_error_helper_sends_a_named_variant_not_a_silent_drop() {
+        let (updates, mut receiver) = mpsc::channel(1);
+        report_harness_event_subscription_error(&updates, &HarnessOperatorClientError::Transport);
+        let update = receiver.try_recv().expect("the helper must not silently drop the error");
+        let WorkerUpdate::HarnessEventSubscriptionFailed { message } = update else {
+            panic!("expected HarnessEventSubscriptionFailed");
+        };
+        assert_eq!(message, HarnessOperatorClientError::Transport.to_string());
+    }
+
+    /// Sibling of the above, one layer up: `apply_update` must route a
+    /// recorded subscription error onto the central event feed as an
+    /// `Error`/`Connectivity` entry -- the feed's own combination the brief
+    /// calls out as "a subscription dying is exactly a connectivity event" --
+    /// not silently discard it the way the pre-fix worker did.
+    #[test]
+    fn harness_event_subscription_failed_reaches_the_event_feed_as_a_connectivity_error() {
+        let mut app = App::default();
+        let mut terminal = TerminalWatermarks::default();
+        let message = HarnessOperatorClientError::ConnectionClosed.to_string();
+        let follow_up = apply_update(
+            &mut app,
+            &mut terminal,
+            WorkerUpdate::HarnessEventSubscriptionFailed { message: message.clone() },
+        );
+        assert_eq!(follow_up, AppAction::None);
+        let recorded = app.event_queue.back()
+            .expect("a recorded subscription error must reach the event feed");
+        assert_eq!(recorded.severity, EventSeverity::Error);
+        assert_eq!(recorded.source, EventSource::Connectivity);
+        assert_eq!(recorded.text, message);
     }
 
     #[test]

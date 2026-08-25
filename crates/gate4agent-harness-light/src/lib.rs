@@ -52,7 +52,7 @@ use gate4agent_harness_service::runtime::{
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, watch, Semaphore};
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::time::{interval_at, timeout, Instant, MissedTickBehavior};
 
 pub use error::HarnessLightError;
 
@@ -94,6 +94,16 @@ const LIGHT_SUBSCRIBER_LIMIT: usize = 8;
 /// `HOST_SUBSCRIBER_QUEUE_CAPACITY` -- same rationale as
 /// `LIGHT_SUBSCRIBER_LIMIT` above.
 const LIGHT_SUBSCRIBER_QUEUE_CAPACITY: usize = 256;
+
+/// Mirrors `gate4agent-harness-service::runtime`'s own
+/// `HOST_SUBSCRIBER_KEEPALIVE_INTERVAL` -- see that constant's own doc
+/// comment for the full reasoning (this crate reuses `SubscriberRegistry`
+/// verbatim, so it inherits the exact same "only reaps on a failed write"
+/// property and the exact same leak). Same duplication rationale as
+/// `LIGHT_SUBSCRIBER_LIMIT` above: a plain literal here, not shared, since
+/// this crate has no dependency on the full harness's own kernel-bound
+/// constants.
+const LIGHT_SUBSCRIBER_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Shared, cloneable state every accepted connection dispatches against:
 /// the live C2 control handle (session-verb relay, route resolution), the
@@ -285,6 +295,15 @@ async fn run_light_host(
     mut commands: mpsc::Receiver<LightCommand>,
 ) {
     let mut subscribers = SubscriberRegistry::default();
+    // See `LIGHT_SUBSCRIBER_KEEPALIVE_INTERVAL`'s own doc comment: this
+    // registry only ever discovers a dead subscriber on a failed write, so a
+    // periodic tick is what makes that discovery happen even when nothing
+    // real ever changes.
+    let mut subscriber_keepalive = interval_at(
+        Instant::now() + LIGHT_SUBSCRIBER_KEEPALIVE_INTERVAL,
+        LIGHT_SUBSCRIBER_KEEPALIVE_INTERVAL,
+    );
+    subscriber_keepalive.set_missed_tick_behavior(MissedTickBehavior::Skip);
     // Both `events.recv()` and `topology.changed()` resolve immediately,
     // forever, once their sender side has closed (a dead C2 connection) --
     // without these guards `select!` would busy-poll that branch on every
@@ -392,6 +411,14 @@ async fn run_light_host(
                     topology_open = false;
                     tracing::warn!("harness-light: c2 topology watch closed");
                 }
+            }
+            _ = subscriber_keepalive.tick(), if !subscribers.is_empty() => {
+                // Same `Ping` shape and the same reasoning as
+                // `gate4agent-harness-service::runtime`'s own
+                // `emit_subscriber_keepalive`: `emit`'s existing `Closed`
+                // handling reaps a dead peer and logs it; this call site
+                // adds no logging of its own.
+                subscribers.emit(|sequence| HarnessOperatorEventV1::Ping { sequence });
             }
         }
         // Runs once per select-loop pass, exactly mirroring

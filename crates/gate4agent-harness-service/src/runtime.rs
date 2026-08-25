@@ -131,6 +131,30 @@ const HOST_CONNECTION_LIMIT: usize = 32;
 // or hung subscriber would otherwise permanently shrink the ordinary
 // concurrent-request headroom. Its own, much smaller cap lives here instead.
 const HOST_SUBSCRIBER_LIMIT: usize = 8;
+// `SubscriberRegistry` only ever discovers a dead subscriber when a write to
+// it fails (see that struct's own doc comment) -- there is no read/EOF
+// detection on the subscription's `TcpStream` and no subscription lifetime.
+// A subscriber that abandons its own connection while the harness has
+// nothing new to push therefore sits occupying its registry entry and its
+// `HOST_SUBSCRIBER_LIMIT` permit indefinitely: confirmed in practice, an
+// ordinary, continuously-running `gate4agent-tui` self-abandons and
+// re-subscribes roughly every 120s on its own, with zero dependency on any
+// real task/run/inventory event ever happening (docs/gate4agent/research/
+// gate4agent-operator-subscriber-slot-leak-2026-08-25.md). At
+// `HOST_SUBSCRIBER_LIMIT` = 8 and that ~120s cadence, 8 such abandonments
+// exhaust the whole pool in about 16 minutes from an otherwise-healthy
+// client doing nothing wrong by the wire's own rules. This interval drives
+// the periodic keep-alive tick (`emit_subscriber_keepalive`) that makes a
+// write attempt happen regardless of real activity, so `emit`'s existing
+// `Closed` handling reaps an abandoned subscriber promptly instead of
+// waiting on the next real event. It must stay well under the ~120s/8-slot
+// budget above to guarantee the pool cannot exhaust from idle abandonment
+// alone; 30s clears that bar with several ticks of margin (four per ~120s
+// window, not one) while staying far below being a cost of its own -- one
+// `try_send` per live subscriber, twice a minute, is not a meaningfully
+// different load than the `emit` calls a single ordinary task/run change
+// already causes.
+const HOST_SUBSCRIBER_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 // Bounded per-subscriber outbound queue: `SubscriberRegistry::emit` uses
 // `try_send`, never blocking the single-writer select loop on a slow
 // reader. A subscriber whose queue fills up is marked `needs_baseline`
@@ -792,6 +816,23 @@ fn notify_touched(subscribers: &mut SubscriberRegistry, harness: &HarnessService
     if subscribers.is_empty() { return; }
     for task_id in &touch.task_ids { notify_task_changed(subscribers, harness, task_id); }
     for run_id in &touch.run_ids { notify_run_changed(subscribers, harness, run_id); }
+}
+
+/// Called once per `HOST_SUBSCRIBER_KEEPALIVE_INTERVAL` tick (see that
+/// constant's own doc comment for why this exists at all): pushes a `Ping`
+/// to every live subscriber through the registry's ordinary `emit` path, so
+/// a subscriber whose peer went away without any real event ever needing to
+/// reach it gets reaped exactly the way a real event's failed write would
+/// reap it -- `emit`'s existing `Closed` handling
+/// (`SubscriberRegistry::remove_at`) already does the right thing here, and
+/// already logs it; this function adds no logging of its own; a tick that
+/// narrated itself on every fire would be worse than the leak it exists to
+/// close. A healthy, idle subscriber simply receives one more frame it
+/// drops on the floor (`Ping` carries no state to act on) -- `emit`'s
+/// `Sent`/`Full` outcomes are unchanged, so this never disturbs a live
+/// connection.
+fn emit_subscriber_keepalive(subscribers: &mut SubscriberRegistry) {
+    subscribers.emit(|sequence| HarnessOperatorEventV1::Ping { sequence });
 }
 
 /// Best-effort task/run change notification for a `HostCommand::*Finished`
@@ -4407,6 +4448,11 @@ pub async fn start_harness_host_with_operator_and_catalogs(
             RUN_CONTEXT_SOURCE_POLL_INTERVAL,
         );
         run_context_source_poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut subscriber_keepalive = interval_at(
+            Instant::now() + HOST_SUBSCRIBER_KEEPALIVE_INTERVAL,
+            HOST_SUBSCRIBER_KEEPALIVE_INTERVAL,
+        );
+        subscriber_keepalive.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut observation_recovery = ObservationRecoveryRegistry::default();
         loop {
             tokio::select! {
@@ -6548,6 +6594,9 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                         &mut run_git_facts_workers,
                         &commands,
                     );
+                }
+                _ = subscriber_keepalive.tick(), if !subscribers.is_empty() => {
+                    emit_subscriber_keepalive(&mut subscribers);
                 }
                 accepted = listener.accept() => {
                     let (stream, peer) = accepted.map_err(|_| HarnessRuntimeError::AcceptFailed)?;
@@ -8865,6 +8914,7 @@ fn event_kind_label(event: &HarnessOperatorEventV1) -> &'static str {
         HarnessOperatorEventV1::RuntimeInventoryChanged { .. } => "runtime-inventory-changed",
         HarnessOperatorEventV1::RuntimeInventoryRemoved { .. } => "runtime-inventory-removed",
         HarnessOperatorEventV1::Lagged { .. } => "lagged",
+        HarnessOperatorEventV1::Ping { .. } => "ping",
     }
 }
 
@@ -13756,5 +13806,56 @@ mod tests {
         drop(receiver);
         subscribers.emit(|sequence| HarnessOperatorEventV1::Lagged { sequence });
         assert!(subscribers.subscribers.is_empty());
+    }
+
+    /// The operator-subscriber slot leak's own fix, pinned directly: a
+    /// subscriber whose peer already went away (receiver dropped, exactly
+    /// what an abandoned `HarnessEventSubscription` looks like server-side)
+    /// is reaped by `emit_subscriber_keepalive` the same way a real event's
+    /// failed write would reap it -- no dependency on any task/run/inventory
+    /// change ever happening.
+    #[test]
+    fn keepalive_tick_reaps_a_subscriber_whose_write_fails() {
+        let identity = OperatorRequestLogIdentity::describe(
+            &HarnessOperatorRequestV1::SubscribeEvents {},
+        );
+        let mut subscribers = SubscriberRegistry::default();
+        let (sender, receiver) = mpsc::channel::<HarnessOperatorEventV1>(HOST_SUBSCRIBER_QUEUE_CAPACITY);
+        subscribers.insert(sender, identity);
+        assert_eq!(subscribers.subscribers.len(), 1);
+
+        // Abandon the connection exactly as a dropped `HarnessEventSubscription`
+        // does: only the receiver goes away, nothing else touches the registry.
+        drop(receiver);
+
+        emit_subscriber_keepalive(&mut subscribers);
+        assert!(
+            subscribers.subscribers.is_empty(),
+            "a keep-alive write to a subscriber whose receiver is gone must reap it",
+        );
+    }
+
+    /// Sibling of the above: the same tick must be a complete no-op for a
+    /// subscriber that is still alive -- it neither drops it nor marks it
+    /// `needs_baseline`, and the frame that lands is the `Ping` the tick
+    /// actually sent.
+    #[test]
+    fn keepalive_tick_does_not_disturb_a_live_subscriber() {
+        let identity = OperatorRequestLogIdentity::describe(
+            &HarnessOperatorRequestV1::SubscribeEvents {},
+        );
+        let mut subscribers = SubscriberRegistry::default();
+        let (sender, mut receiver) = mpsc::channel::<HarnessOperatorEventV1>(HOST_SUBSCRIBER_QUEUE_CAPACITY);
+        subscribers.insert(sender, identity);
+
+        emit_subscriber_keepalive(&mut subscribers);
+
+        assert_eq!(subscribers.subscribers.len(), 1, "a live subscriber must survive the tick");
+        assert!(!subscribers.subscribers[0].needs_baseline);
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            HarnessOperatorEventV1::Ping { sequence: 0 },
+        ));
+        assert!(receiver.try_recv().is_err(), "exactly one keep-alive frame per tick");
     }
 }

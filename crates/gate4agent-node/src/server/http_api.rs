@@ -1,5 +1,6 @@
 use super::{clear_snapshot_context_packs, project_snapshot_history_for_wire, NodeShared};
 use crate::protocol::{MAX_NODE_FRAME_BYTES, NODE_PROTOCOL_VERSION};
+use gate4agent_runtime_native::tick_profile::Distribution;
 use serde_json::{json, Value};
 use std::io;
 use std::net::SocketAddr;
@@ -101,6 +102,7 @@ fn route(request: Request, shared: &NodeShared) -> Response {
     match path {
         "/health" => Response::json(200, health_body(shared)),
         "/ready" => Response::json(200, ready_body(shared)),
+        "/metrics" => Response::json(200, metrics_body(shared)),
         "/status" => {
             if !authorized(request.authorization.as_deref(), &shared.access_token) {
                 return Response::plain(401, "Unauthorized")
@@ -151,6 +153,86 @@ fn ready_body(shared: &NodeShared) -> Value {
         },
         "shutdown": shutting_down,
         "persistence_error": persistence_error.map(|_| PUBLIC_PERSISTENCE_ERROR),
+    })
+}
+
+/// One windowed distribution as `{p50, p95, max, count}` -- `unit_suffix`
+/// picks between microsecond-labelled fields (the phase timings) and
+/// bare fields (the iteration-rate series, whose samples are a per-second
+/// count, not a duration).
+fn distribution_body(distribution: Distribution, unit_suffix: &str) -> Value {
+    json!({
+        format!("p50{unit_suffix}"): distribution.p50,
+        format!("p95{unit_suffix}"): distribution.p95,
+        format!("max{unit_suffix}"): distribution.max,
+        "count": distribution.count,
+    })
+}
+
+/// Read-only tick-cadence diagnostics, unauthenticated under the same rule
+/// as `/health`: it reports timings and counts, never session content
+/// (prompts, output, environment, credentials) -- see this module's own
+/// `authorized` gate for the boundary that keeps `/status` (which DOES
+/// carry session content) behind a bearer token while this stays open.
+///
+/// Answers "where does an idle drive-loop iteration's own CPU go," split
+/// into the loop's own three phases plus whatever remains before the
+/// trailing sleep, `NativeRuntime::tick`'s own six internal phases, the
+/// loop's actual (not merely configured) iteration rate, and the two
+/// session counts that can legitimately disagree -- see
+/// `native_pty_sessions`'s own field comment for why.
+fn metrics_body(shared: &NodeShared) -> Value {
+    let drive_loop = shared
+        .drive_loop_profile
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .snapshot();
+    let runtime_tick = *shared
+        .runtime_tick_profile
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let native_pty_sessions = shared.native_session_gauge.load(Ordering::Relaxed);
+    // The control plane's own session bookkeeping: every session the
+    // kernel's backend snapshot still carries, live or already exited but
+    // not yet reaped. A count here with no matching `native_pty_sessions`
+    // is exactly the gap worth reading `step_control_plane_us` against --
+    // `step_control_plane` rebuilds this same snapshot, unconditionally,
+    // every tick.
+    let control_plane_sessions = shared.handle.snapshot().sessions.len();
+    json!({
+        "service": SERVICE_NAME,
+        "iterations_per_sec": distribution_body(drive_loop.iterations_per_sec, ""),
+        "drive_loop_phases_us": {
+            "runtime_tick": distribution_body(drive_loop.runtime_tick_us, "_us"),
+            "event_drain": distribution_body(drive_loop.event_drain_us, "_us"),
+            "publish_terminal_frames":
+                distribution_body(drive_loop.publish_terminal_frames_us, "_us"),
+            "remainder": distribution_body(drive_loop.remainder_us, "_us"),
+        },
+        "runtime_tick_phases_us": {
+            "drain_observations":
+                distribution_body(runtime_tick.drain_observations_us, "_us"),
+            "drain_ingress": distribution_body(runtime_tick.drain_ingress_us, "_us"),
+            "step_control_plane":
+                distribution_body(runtime_tick.step_control_plane_us, "_us"),
+            "dispatch_effects": distribution_body(runtime_tick.dispatch_effects_us, "_us"),
+            "publish_step": distribution_body(runtime_tick.publish_step_us, "_us"),
+            "provider_supervisors":
+                distribution_body(runtime_tick.provider_supervisors_us, "_us"),
+        },
+        "sessions": {
+            "native_pty": native_pty_sessions,
+            "control_plane": control_plane_sessions,
+        },
+        // Lifetime totals across every connection served. Read them twice
+        // and divide by the interval for a rate. `iterations` far
+        // outrunning `events_sent` means the serve loop is spinning rather
+        // than sleeping -- which is where an idle node's CPU goes, since
+        // it burns it only while a c2 is attached.
+        "connections": {
+            "loop_iterations": shared.connection_loop_iterations.load(Ordering::Relaxed),
+            "events_sent": shared.connection_events_sent.load(Ordering::Relaxed),
+        },
     })
 }
 
@@ -465,6 +547,48 @@ mod tests {
         assert!(!authorized.contains("provider secret"));
         assert!(!authorized.contains(r"C:\private"));
         assert!(!authorized.contains("test-token"));
+
+        server.shutdown_handle().request_shutdown().await.unwrap();
+        timeout(Duration::from_secs(1), task).await.unwrap().unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn metrics_is_unauthenticated_and_reports_every_phase_and_session_count() {
+        let server = node_server();
+        let shared = Arc::clone(&server.shared);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(serve_listener(listener, Arc::clone(&shared)));
+
+        // No Authorization header at all -- same rule as `/health`: timings
+        // and counts, never session content, so no credential is required.
+        let metrics = request(address, "GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
+        assert!(metrics.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(metrics.contains("\"service\":\"gate4agent-node\""));
+        assert!(metrics.contains("\"iterations_per_sec\""));
+        for phase in [
+            "runtime_tick", "event_drain", "publish_terminal_frames", "remainder",
+        ] {
+            assert!(
+                metrics.contains(&format!("\"{phase}\"")),
+                "missing drive_loop_phases_us.{phase} in {metrics}",
+            );
+        }
+        for phase in [
+            "drain_observations", "drain_ingress", "step_control_plane",
+            "dispatch_effects", "publish_step", "provider_supervisors",
+        ] {
+            assert!(
+                metrics.contains(&format!("\"{phase}\"")),
+                "missing runtime_tick_phases_us.{phase} in {metrics}",
+            );
+        }
+        assert!(metrics.contains("\"native_pty\":0"));
+        assert!(metrics.contains("\"control_plane\":0"));
+        assert!(!metrics.contains("test-token"));
+
+        let posted = request(address, "POST /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
+        assert!(posted.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"));
 
         server.shutdown_handle().request_shutdown().await.unwrap();
         timeout(Duration::from_secs(1), task).await.unwrap().unwrap().unwrap();

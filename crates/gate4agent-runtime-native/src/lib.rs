@@ -1,6 +1,7 @@
 //! Tick-driven native runtime for embedding gate4agent in an owning app core.
 
 mod launch_profiles;
+pub mod tick_profile;
 mod vendor_contract;
 
 pub use launch_profiles::{
@@ -1275,6 +1276,10 @@ pub struct NativeRuntime {
     provider_fault_cursor: Option<ToolProviderId>,
     effects: NativeEffectDispatcher,
     hook_ingress: Option<HookIngressServer>,
+    /// Per-phase timing distributions for [`Self::tick`] -- see
+    /// `tick_profile`'s own doc comment for why this is a fixed-window
+    /// ring, not an average, and why it stays on unconditionally.
+    tick_profile: tick_profile::TickPhaseProfiler,
 }
 
 impl NativeRuntime {
@@ -1353,6 +1358,7 @@ impl NativeRuntime {
             provider_fault_cursor: None,
             effects: NativeEffectDispatcher::new(catalog, config, history),
             hook_ingress: None,
+            tick_profile: tick_profile::TickPhaseProfiler::default(),
         };
         (handle, runtime)
     }
@@ -1519,25 +1525,47 @@ impl NativeRuntime {
     /// Run one non-blocking host tick. Effects are dispatched in session order
     /// to per-instance workers; their observations enter later ticks.
     pub async fn tick(&mut self) -> NativeRuntimeTick {
+        let drain_observations_start = Instant::now();
         let (observations, terminal_frames_collected) = self
             .effects
             .drain_observations(self.config.max_observations_per_tick.max(1));
         let observations_applied = observations.len();
+        self.tick_profile
+            .record_drain_observations(drain_observations_start.elapsed());
+
+        let drain_ingress_start = Instant::now();
         let ingress = self
             .port
             .drain_ingress(self.config.max_commands_per_tick.max(1));
+        self.tick_profile
+            .record_drain_ingress(drain_ingress_start.elapsed());
+
+        let step_control_plane_start = Instant::now();
         let step = self.kernel.step_control_plane(ingress, observations);
         let effects_dispatched = step.effects.len();
+        self.tick_profile
+            .record_step_control_plane(step_control_plane_start.elapsed());
+
+        let dispatch_effects_start = Instant::now();
         for effect in step.effects.iter().cloned() {
             self.effects.dispatch(effect);
         }
+        self.tick_profile
+            .record_dispatch_effects(dispatch_effects_start.elapsed());
 
         let snapshot_revision = step.snapshot.revision;
+        let publish_step_start = Instant::now();
         let publish_report = self.port.publish_step(&step).control_events;
+        self.tick_profile
+            .record_publish_step(publish_step_start.elapsed());
+
+        let provider_supervisors_start = Instant::now();
         for supervisor in self.provider_supervisors.values_mut() {
             supervisor.tick();
         }
         self.collect_provider_supervisor_events();
+        self.tick_profile
+            .record_provider_supervisors(provider_supervisors_start.elapsed());
 
         NativeRuntimeTick {
             command_outcomes: step.command_outcomes,
@@ -1547,6 +1575,14 @@ impl NativeRuntime {
             snapshot_revision,
             publish_report,
         }
+    }
+
+    /// Snapshot of the last [`tick_profile::SAMPLE_WINDOW`] ticks' own
+    /// per-phase timing distributions -- the number `/metrics` reads to
+    /// name which piece of an otherwise-idle [`Self::tick`] is spending the
+    /// CPU.
+    pub fn tick_profile_snapshot(&self) -> tick_profile::TickProfileSnapshot {
+        self.tick_profile.snapshot()
     }
 
     fn collect_provider_supervisor_events(&mut self) {
@@ -3668,6 +3704,46 @@ mod tests {
         assert_eq!(no_hook_runtime.active_hook_routes(), 0);
 
         no_hook_runtime.stop_hook_ingress().await;
+    }
+
+    /// Repro for the standing observation that `gate4agent-node` burns CPU
+    /// with zero live PTY sessions: drives `tick()` repeatedly on a runtime
+    /// with no spawned sessions and no installed native providers -- the
+    /// same "idle" shape as the live stand -- and prints which phase the
+    /// time actually landed in. Run with `--nocapture` to read the numbers;
+    /// the assertions only check that every phase got a full window of
+    /// samples, since the absolute timings are hardware-dependent and the
+    /// point of this test is the printed breakdown, not a threshold.
+    #[tokio::test]
+    async fn tick_profile_snapshot_records_every_phase_on_an_idle_runtime() {
+        let catalog = builtin_registry().clone();
+        let (_, mut runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
+        const IDLE_TICKS: usize = 64;
+        for _ in 0..IDLE_TICKS {
+            runtime.tick().await;
+        }
+        let snapshot = runtime.tick_profile_snapshot();
+        println!(
+            "idle tick phases (us, p50/p95/max/n over {IDLE_TICKS} ticks): \
+             drain_observations={:?} drain_ingress={:?} step_control_plane={:?} \
+             dispatch_effects={:?} publish_step={:?} provider_supervisors={:?}",
+            snapshot.drain_observations_us,
+            snapshot.drain_ingress_us,
+            snapshot.step_control_plane_us,
+            snapshot.dispatch_effects_us,
+            snapshot.publish_step_us,
+            snapshot.provider_supervisors_us,
+        );
+        for distribution in [
+            snapshot.drain_observations_us,
+            snapshot.drain_ingress_us,
+            snapshot.step_control_plane_us,
+            snapshot.dispatch_effects_us,
+            snapshot.publish_step_us,
+            snapshot.provider_supervisors_us,
+        ] {
+            assert_eq!(distribution.count, IDLE_TICKS);
+        }
     }
 
     #[test]

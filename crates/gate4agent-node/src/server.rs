@@ -161,6 +161,8 @@ use gate4agent_runtime_native::{
     NativeSessionCatalogAuthority, NativeSessionCatalogError, NativeSessionPreviewError,
     ScopedNativeSessionCatalogEntry,
 };
+use gate4agent_runtime_native::tick_profile::TickProfileSnapshot;
+use drive_loop_profile::DriveLoopProfiler;
 #[cfg(test)]
 use gate4agent_runtime_native::{HistorySourceLayout, NativeHistoryRoot};
 use gate4agent_node_wire::{
@@ -186,7 +188,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -195,6 +197,8 @@ use tokio::task::{AbortHandle, JoinSet};
 use tokio::time::{sleep, timeout};
 
 mod http_api;
+
+mod drive_loop_profile;
 
 #[path = "bundle_delivery.rs"]
 mod bundle_delivery;
@@ -2435,7 +2439,17 @@ async fn drive_runtime_until_shutdown(
 ) -> Result<(), NodeServerError> {
     let mut shutdown_started = None;
     loop {
+        // Every phase below is timed unconditionally -- see
+        // `drive_loop_profile`'s own doc comment for why an always-on,
+        // allocation-free ring is cheap enough to never need a feature
+        // flag. This is the only place these numbers can be taken: the
+        // phases are calls made directly from this loop, not something a
+        // callee could time on our behalf.
+        let runtime_tick_start = Instant::now();
         runtime.tick().await;
+        let runtime_tick_elapsed = runtime_tick_start.elapsed();
+
+        let event_drain_start = Instant::now();
         while let Ok(event) = events.try_recv() {
             let clean_exit = matches!(
                 event.event,
@@ -2468,7 +2482,26 @@ async fn drive_runtime_until_shutdown(
             }
             shared.publish_control(event);
         }
+        let event_drain_elapsed = event_drain_start.elapsed();
+
+        let publish_terminal_frames_start = Instant::now();
         shared.publish_terminal_frames();
+        let publish_terminal_frames_elapsed = publish_terminal_frames_start.elapsed();
+
+        // Physical PTY count and the runtime's own per-phase tick timings
+        // both live inside `NativeRuntime`, which `GET /metrics` (reading
+        // only `NodeShared`) cannot reach directly -- this loop is the one
+        // place holding `&mut NativeRuntime`, so it is the only place that
+        // can copy either out.
+        shared
+            .native_session_gauge
+            .store(runtime.active_native_sessions(), Ordering::Relaxed);
+        *shared
+            .runtime_tick_profile
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = runtime.tick_profile_snapshot();
+
+        let remainder_start = Instant::now();
         if shared.shutdown.load(Ordering::Acquire) {
             let started = *shutdown_started.get_or_insert_with(Instant::now);
             let snapshot = shared.handle.snapshot();
@@ -2489,6 +2522,20 @@ async fn drive_runtime_until_shutdown(
                 });
             }
         }
+        let remainder_elapsed = remainder_start.elapsed();
+
+        {
+            let mut profile = shared
+                .drive_loop_profile
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            profile.record_runtime_tick(runtime_tick_elapsed);
+            profile.record_event_drain(event_drain_elapsed);
+            profile.record_publish_terminal_frames(publish_terminal_frames_elapsed);
+            profile.record_remainder(remainder_elapsed);
+            profile.note_iteration(Instant::now());
+        }
+
         sleep(Duration::from_millis(10)).await;
     }
 }
@@ -2818,6 +2865,35 @@ struct NodeShared {
     persistence_error: RwLock<Option<String>>,
     state_transaction: Mutex<()>,
     input_settle_timeout_ms: u64,
+    /// Drive-loop phase/rate timings -- see `drive_loop_profile`'s own doc
+    /// comment. Written once per iteration by
+    /// `drive_runtime_until_shutdown`, read by `GET /metrics`.
+    drive_loop_profile: Mutex<DriveLoopProfiler>,
+    /// Latest copy of `NativeRuntime::tick_profile_snapshot()` -- `Copy`,
+    /// so an overwrite each iteration is cheap. The runtime itself is not
+    /// reachable from here (it is owned locally by
+    /// `drive_runtime_until_shutdown`), so this is how its own per-phase
+    /// tick timings reach `GET /metrics`.
+    runtime_tick_profile: Mutex<TickProfileSnapshot>,
+    /// Physical PTY sessions the native runtime currently owns
+    /// (`NativeRuntime::active_native_sessions`), refreshed once per drive
+    /// loop iteration -- deliberately a separate count from
+    /// `handle.snapshot().sessions.len()` (the control-plane kernel's own
+    /// session bookkeeping), since the two can disagree and the gap is
+    /// itself a diagnostic signal `GET /metrics` exposes.
+    native_session_gauge: AtomicUsize,
+    /// Lifetime totals for the per-connection serve loop, summed across
+    /// every live connection.
+    ///
+    /// The drive loop's own phase timings account for about ten
+    /// microseconds an iteration on an idle node, yet the process burns a
+    /// quarter of a core — and burns it ONLY while a c2 is attached (0.5%
+    /// with none, 23% with two, measured). That gap is somewhere in
+    /// serving a connection, and there was no way to see it: iterations
+    /// says whether the loop is spinning rather than sleeping, and events
+    /// says whether it is spinning over real work or over nothing.
+    connection_loop_iterations: AtomicU64,
+    connection_events_sent: AtomicU64,
     #[cfg(feature = "fixture")]
     fixture_semantic_hook_policy: bool,
     #[cfg(feature = "fixture")]
@@ -3141,6 +3217,11 @@ impl NodeShared {
             ),
             state_transaction: Mutex::new(()),
             input_settle_timeout_ms,
+            drive_loop_profile: Mutex::new(DriveLoopProfiler::default()),
+            runtime_tick_profile: Mutex::new(TickProfileSnapshot::default()),
+            native_session_gauge: AtomicUsize::new(0),
+            connection_loop_iterations: AtomicU64::new(0),
+            connection_events_sent: AtomicU64::new(0),
             #[cfg(feature = "fixture")]
             fixture_semantic_hook_policy: false,
             #[cfg(feature = "fixture")]
@@ -11494,6 +11575,11 @@ async fn serve_connection(
     let mut resync_required = false;
     let mut discard_events_through = 0_u64;
     loop {
+        // One tick of the serve loop, whether or not it had anything to do.
+        // Against `connection_events_sent` this separates "busy" from
+        // "spinning": a loop turning over thousands of times a second while
+        // sending nothing is not serving, it is burning a core.
+        shared.connection_loop_iterations.fetch_add(1, Ordering::Relaxed);
         let durable_drain_budget = NODE_CONNECTION_EVENT_BURST_MAX
             .saturating_sub(pending_events.len().min(NODE_CONNECTION_EVENT_BURST_MAX));
         for _ in 0..durable_drain_budget {
@@ -11539,6 +11625,9 @@ async fn serve_connection(
         if !pending_events.is_empty() {
             pending_events.sort_unstable_by_key(|event| event.sequence);
             let burst_len = connection_event_burst_len(pending_events.len());
+            shared
+                .connection_events_sent
+                .fetch_add(burst_len as u64, Ordering::Relaxed);
             for event in pending_events.drain(..burst_len) {
                 let event = if include_managed_worktrees {
                     Some(event)

@@ -4839,13 +4839,35 @@ fn apply_update(app: &mut App, terminal: &mut TerminalWatermarks, update: Worker
             app.request_open(address);
         }
         WorkerUpdate::HarnessSnapshot { token, tasks, runs, nodes } => {
-            let retained = nodes.iter().map(|node| node.node_id.clone()).collect::<BTreeSet<_>>();
-            let removed = app.nodes.iter()
-                .filter(|node| !retained.contains(&node.node_id))
-                .map(|node| node.node_id.clone())
-                .collect::<Vec<_>>();
-            for node_id in removed {
-                app.remove_topology_node(&node_id);
+            // An EMPTY inventory is not evidence that every node vanished.
+            // It is what a momentary read failure looks like from here --
+            // and this arm used to treat the two as the same thing, so one
+            // empty answer tore down every known node, taking the open PTY
+            // target with it: a session that had just been spawned and
+            // shown was removed from the view two seconds later while its
+            // process ran on. Observed exactly that way in the field.
+            //
+            // A snapshot that lists SOME nodes is still authoritative
+            // about the ones it omits -- that is a real topology change
+            // and is honoured below. Emptiness alone is not, and a genuine
+            // removal has its own event anyway
+            // (`HarnessRuntimeInventoryNodeRemoved`), which is the
+            // authoritative way a node goes away.
+            if nodes.is_empty() && !app.nodes.is_empty() {
+                app.report_failure(
+                    EventSource::Connectivity,
+                    "runtime inventory came back empty; keeping the known nodes rather than \
+                     tearing them down",
+                );
+            } else {
+                let retained = nodes.iter().map(|node| node.node_id.clone()).collect::<BTreeSet<_>>();
+                let removed = app.nodes.iter()
+                    .filter(|node| !retained.contains(&node.node_id))
+                    .map(|node| node.node_id.clone())
+                    .collect::<Vec<_>>();
+                for node_id in removed {
+                    app.remove_topology_node(&node_id);
+                }
             }
             for mut node in nodes {
                 app.preserve_known_session_terminal_state(&mut node);

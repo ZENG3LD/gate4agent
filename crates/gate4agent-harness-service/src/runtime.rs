@@ -3474,8 +3474,29 @@ impl OperatorRequestLogIdentity {
     }
 }
 
+/// Establishing a subscription is not a cheap verb. Its reply carries a
+/// baseline -- every task, every run, and the whole runtime inventory --
+/// which walks the same node reads the inventory verbs do, and those are
+/// bounded in seconds each on their own.
+///
+/// It used to fall through to the generic three-second default, and so it
+/// could not finish: the harness answered `deadline` and closed, every
+/// single time, measured at three seconds flat against a live stack. The
+/// consequence was not "the subscription drops sometimes" -- it was that a
+/// subscription NEVER established, so the app never learned about anything
+/// it had not polled for, and a session spawned right beside it stayed
+/// invisible. The two-minute rhythm this looked like from the outside was
+/// the client's own retry, not a subscription's lifetime.
+///
+/// Sized like the other heavy classes above and kept under
+/// `HOST_CONNECTION_DEADLINE`, so the connection bound still has the last
+/// word.
+const HOST_SUBSCRIBE_RESPONSE_DEADLINE: Duration = Duration::from_secs(40);
+
 fn operator_response_deadline(request: &HarnessOperatorRequestV1) -> Duration {
-    if is_native_history_request(request) {
+    if matches!(request, HarnessOperatorRequestV1::SubscribeEvents { .. }) {
+        HOST_SUBSCRIBE_RESPONSE_DEADLINE
+    } else if is_native_history_request(request) {
         HOST_NATIVE_HISTORY_RESPONSE_DEADLINE
     } else if is_run_context_source_request(request) {
         HOST_RUN_CONTEXT_SOURCE_RESPONSE_DEADLINE

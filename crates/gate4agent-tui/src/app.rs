@@ -4639,6 +4639,47 @@ impl App {
     /// inventory's own classification -- that is what stops them reaching
     /// the retained log. Empty text is dropped, the same "nothing to show"
     /// guard the old `push_marquee_line` used.
+/// Appends one event to a plain text file alongside the other services'
+/// logs, in addition to the in-app feed.
+///
+/// The feed alone was a dead end in both directions at once: the owner
+/// could not copy a line out of it to report, and whoever is diagnosing
+/// could not read it at all, because it lives only in this process's
+/// memory. Three rounds of diagnosis stalled on exactly that. Every other
+/// process in this stack writes a log; the one surface that knows what the
+/// app itself decided did not.
+///
+/// Best-effort by design: a diagnostics file that can fail the app it is
+/// diagnosing is worse than no file. Every error here is swallowed, and the
+/// path is resolved per call rather than cached, so no state has to be
+/// threaded through `App` for it.
+fn append_event_to_diagnostics_file(event: &AppEvent) {
+    let Some(path) = crate::preferences::default_path()
+        .and_then(|config| config.parent().map(|dir| dir.join("tui-events.log")))
+    else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let stamp = event
+        .at
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default();
+    let line = format!(
+        "{stamp} {severity:?} {source:?} {text}
+",
+        severity = event.severity,
+        source = event.source,
+        text = event.text,
+    );
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        use std::io::Write;
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
     pub(crate) fn emit_event(
         &mut self,
         severity: EventSeverity,
@@ -4649,12 +4690,14 @@ impl App {
         if text.is_empty() {
             return;
         }
-        self.event_queue.push_back(AppEvent {
+        let event = AppEvent {
             at: SystemTime::now(),
             severity,
             source,
             text,
-        });
+        };
+        Self::append_event_to_diagnostics_file(&event);
+        self.event_queue.push_back(event);
     }
 
     /// Moves `event` into the retained log, evicting the oldest entry once

@@ -327,6 +327,18 @@ enum WorkerUpdate {
         tasks: Vec<RedactedTaskV1>,
         runs: Vec<RedactedRunV1>,
         nodes: Vec<NodeView>,
+        /// Nodes this build could not project, named with their reason.
+        /// Empty on every healthy frame; non-empty means the app is about
+        /// to act on a view that is missing a node, which is the one
+        /// condition under which a live session can never be opened.
+        dropped: Vec<String>,
+    },
+    /// A runtime inventory node arrived and could not be projected. It
+    /// used to be discarded silently; see
+    /// `project_harness_operator_event`'s own arms for why that silence
+    /// was worse than a partial view.
+    HarnessInventoryNodeDropped {
+        detail: String,
     },
     HarnessTaskChanged(RedactedTaskV1),
     HarnessRunChanged(RedactedRunV1),
@@ -4834,7 +4846,22 @@ fn apply_update(app: &mut App, terminal: &mut TerminalWatermarks, update: Worker
         WorkerUpdate::HarnessRefreshFailed { token, message } => {
             app.fail_harness_refresh(token, message);
         }
-        WorkerUpdate::HarnessEventSnapshotBaseline { tasks, runs, nodes } => {
+        WorkerUpdate::HarnessInventoryNodeDropped { detail } => {
+            app.report_failure(
+                EventSource::Connectivity,
+                format!("runtime inventory node dropped, sessions on it cannot open: {detail}"),
+            );
+        }
+        WorkerUpdate::HarnessEventSnapshotBaseline { tasks, runs, nodes, dropped } => {
+            if !dropped.is_empty() {
+                app.report_failure(
+                    EventSource::Connectivity,
+                    format!(
+                        "runtime inventory nodes dropped, sessions on them cannot open: {}",
+                        dropped.join("; "),
+                    ),
+                );
+            }
             let retained = nodes.iter().map(|node| node.node_id.clone()).collect::<BTreeSet<_>>();
             let removed = app.nodes.iter()
                 .filter(|node| !retained.contains(&node.node_id))
@@ -5612,10 +5639,30 @@ fn report_harness_event_subscription_error(
 fn project_harness_operator_event(event: HarnessOperatorEventV1) -> Option<WorkerUpdate> {
     match event {
         HarnessOperatorEventV1::SnapshotBaseline { tasks, runs, nodes, .. } => {
-            let nodes = nodes.into_iter()
-                .filter_map(|node| project_harness_inventory_node(node).ok())
-                .collect();
-            Some(WorkerUpdate::HarnessEventSnapshotBaseline { tasks, runs, nodes })
+            // A node this build cannot project used to be dropped in
+            // silence. That silence is expensive out of all proportion to
+            // the line it saved: without its node in `App::nodes`,
+            // `find_session` can never match, so a freshly spawned session
+            // stays in `pending_open` forever and no viewport ever opens --
+            // the session is live, the record is bound, and the app simply
+            // shows nothing, with no way to tell that from "the spawn
+            // failed". Tolerating a partial view is still right; hiding
+            // WHICH node was dropped, and why, is not.
+            let mut nodes_out = Vec::with_capacity(nodes.len());
+            let mut dropped = Vec::new();
+            for node in nodes {
+                let node_id = node.node_id.clone();
+                match project_harness_inventory_node(node) {
+                    Ok(view) => nodes_out.push(view),
+                    Err(reason) => dropped.push(format!("{node_id}: {reason}")),
+                }
+            }
+            Some(WorkerUpdate::HarnessEventSnapshotBaseline {
+                tasks,
+                runs,
+                nodes: nodes_out,
+                dropped,
+            })
         }
         HarnessOperatorEventV1::TaskChanged { task, .. } => {
             Some(WorkerUpdate::HarnessTaskChanged(task))
@@ -5624,8 +5671,16 @@ fn project_harness_operator_event(event: HarnessOperatorEventV1) -> Option<Worke
             Some(WorkerUpdate::HarnessRunChanged(run))
         }
         HarnessOperatorEventV1::RuntimeInventoryChanged { node, .. } => {
-            project_harness_inventory_node(node).ok()
-                .map(WorkerUpdate::HarnessRuntimeInventoryNodeChanged)
+            // Same silence, same cost, same fix as the baseline arm above:
+            // the node carrying a just-spawned session is exactly the one
+            // whose loss is invisible and fatal to opening it.
+            let node_id = node.node_id.clone();
+            match project_harness_inventory_node(node) {
+                Ok(view) => Some(WorkerUpdate::HarnessRuntimeInventoryNodeChanged(view)),
+                Err(reason) => Some(WorkerUpdate::HarnessInventoryNodeDropped {
+                    detail: format!("{node_id}: {reason}"),
+                }),
+            }
         }
         HarnessOperatorEventV1::RuntimeInventoryRemoved { node_id, .. } => {
             Some(WorkerUpdate::HarnessRuntimeInventoryNodeRemoved { node_id })

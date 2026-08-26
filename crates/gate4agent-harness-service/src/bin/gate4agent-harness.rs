@@ -65,10 +65,9 @@ async fn run(arguments: Vec<String>) -> Result<(), String> {
         .map_err(|error| format!("--harness-db failed to open: {error}"))?;
     let observation = ObservationService::open(&config.observation_db)
         .map_err(|error| format!("--observation-db failed to open: {error}"))?;
-    let (adapter, events) = HarnessC2Adapter::connect(&config.c2_endpoint, &c2_token)
+    let (adapter, events) = HarnessC2Adapter::connect(config.c2_endpoint, c2_token)
         .await
         .map_err(|error| format!("--c2-endpoint connect failed: {error}"))?;
-    drop(c2_token);
     let (host, task) = start_harness_host_with_operator_and_catalogs(
         harness,
         observation,

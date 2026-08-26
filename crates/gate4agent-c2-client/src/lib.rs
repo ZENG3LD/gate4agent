@@ -12,10 +12,16 @@ use tokio::time::timeout;
 
 #[cfg(any(windows, unix))]
 mod runtime;
+#[cfg(any(windows, unix))]
+mod reconnect;
 
 #[cfg(any(windows, unix))]
 pub use runtime::{
     connect_local, C2ControlError, C2ControlHandle, C2EventReceiver, C2PendingRequest,
+};
+#[cfg(any(windows, unix))]
+pub use reconnect::{
+    connect_local_reconnecting, C2LinkState, C2ReconnectingEventReceiver, C2ReconnectingHandle,
 };
 
 const MAX_RESPONSE_HEADERS: usize = 16 * 1024;

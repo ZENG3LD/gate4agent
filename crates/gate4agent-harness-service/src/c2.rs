@@ -1,5 +1,6 @@
 use gate4agent_c2_client::{
-    connect_local, C2ControlError, C2ControlHandle, C2EventReceiver, C2PendingRequest,
+    connect_local_reconnecting, C2ControlError, C2LinkState, C2PendingRequest,
+    C2ReconnectingEventReceiver, C2ReconnectingHandle,
 };
 use gate4agent_c2_protocol::{
     C2GitWorktreeSnapshot, C2ManagedSessionRecord, C2NodeEventEnvelope, C2NodeResponse,
@@ -100,20 +101,31 @@ const RUN_CONTEXT_SOURCE_MESSAGE_LIMIT: u16 = 1;
 // `HarnessC2Adapter::dispatch_session_spawn`.
 const SESSION_SPAWN_DEADLINE_MS: u64 = 20_000;
 
+/// Holds one `C2ReconnectingHandle`, not a raw `C2ControlHandle`: the
+/// underlying physical connection to the harness's own dedicated c2 can
+/// die and be re-established any number of times over this adapter's
+/// lifetime without ever handing out a new value here -- a background
+/// supervisor keeps the handle's `watch` cells pointed at whichever
+/// connection is live, so a relay restart never permanently breaks it.
 #[derive(Clone)]
 pub struct HarnessC2Adapter {
-    control: C2ControlHandle,
+    control: C2ReconnectingHandle,
 }
 
 /// The sole authenticated C2 event stream owned by the harness connection.
 ///
 /// It is returned to the caller instead of being internally drained so the
 /// observation service can consume every routed event without a black hole.
+/// Backed by `C2ReconnectingEventReceiver`, so it never closes on a mere
+/// reconnect -- only when the adapter itself is torn down.
 pub struct HarnessC2EventReceiver {
-    inner: C2EventReceiver,
+    inner: C2ReconnectingEventReceiver,
 }
 
-/// Sealed topology watch for observation route health.
+/// Sealed topology watch for observation route health. Sourced from the
+/// reconnecting adapter's own bridge topology channel, so a relay restart
+/// is invisible to it: it keeps observing changes from whichever physical
+/// connection is live underneath, never closing.
 pub struct HarnessC2TopologyReceiver {
     inner: tokio::sync::watch::Receiver<Arc<C2Topology>>,
 }
@@ -163,6 +175,34 @@ impl HarnessC2EventReceiver {
     }
 }
 
+/// Pure decision function behind `HarnessC2Adapter::exact_route`, factored
+/// out so the reconnect-vs-genuinely-unknown distinction is testable
+/// without any live C2 connection.
+fn resolve_exact_route(
+    link_state: C2LinkState,
+    topology: &C2Topology,
+    node_id: &NodeId,
+) -> Result<NodeRoute, HarnessC2Error> {
+    if link_state == C2LinkState::Reconnecting {
+        return Err(HarnessC2Error::RelayReconnecting);
+    }
+    let node = topology
+        .nodes
+        .iter()
+        .find(|node| &node.node_id == node_id)
+        .ok_or_else(|| HarnessC2Error::UnknownNode(node_id.clone()))?;
+    if node.transport != NodeTransportState::Online {
+        return Err(HarnessC2Error::NodeOffline(node_id.clone()));
+    }
+    let expected_incarnation_id = node
+        .current_incarnation_id
+        .ok_or_else(|| HarnessC2Error::MissingIncarnation(node_id.clone()))?;
+    Ok(NodeRoute {
+        node_id: node_id.clone(),
+        expected_incarnation_id,
+    })
+}
+
 impl HarnessC2Adapter {
     /// Connects the harness as the authenticated C2 operator.
     ///
@@ -171,32 +211,24 @@ impl HarnessC2Adapter {
     /// export, and SpawnSpec dispatch.
     /// Candidate inventory is deliberately not a reconciliation authority.
     pub async fn connect(
-        endpoint: &str,
-        token: &str,
+        endpoint: impl Into<String>,
+        token: impl Into<String>,
     ) -> Result<(Self, HarnessC2EventReceiver), HarnessC2Error> {
-        let (control, events) = connect_local(endpoint, token)
+        let (control, events) = connect_local_reconnecting(endpoint, token)
             .await
             .map_err(HarnessC2Error::Connect)?;
         Ok((Self { control }, HarnessC2EventReceiver { inner: events }))
     }
 
+    /// Resolves `node_id` to its exact, currently-online route. While the
+    /// harness's own c2 link is reconnecting, the cached topology this
+    /// reads from is stale-but-non-empty (the last value seen before the
+    /// link died), so a plain cache miss/offline read here would wrongly
+    /// claim the node itself is unknown or offline. Gating on
+    /// `link_state()` first turns that into the accurate
+    /// `RelayReconnecting`, without touching the resolution logic itself.
     pub fn exact_route(&self, node_id: &NodeId) -> Result<NodeRoute, HarnessC2Error> {
-        let topology = self.control.current_topology();
-        let node = topology
-            .nodes
-            .iter()
-            .find(|node| &node.node_id == node_id)
-            .ok_or_else(|| HarnessC2Error::UnknownNode(node_id.clone()))?;
-        if node.transport != NodeTransportState::Online {
-            return Err(HarnessC2Error::NodeOffline(node_id.clone()));
-        }
-        let expected_incarnation_id = node
-            .current_incarnation_id
-            .ok_or_else(|| HarnessC2Error::MissingIncarnation(node_id.clone()))?;
-        Ok(NodeRoute {
-            node_id: node_id.clone(),
-            expected_incarnation_id,
-        })
+        resolve_exact_route(self.control.link_state(), &self.control.current_topology(), node_id)
     }
 
     pub(crate) fn validate_current_staged_delivery_proof(
@@ -5793,6 +5825,8 @@ fn unknown_reason(error: &C2ControlError) -> SpawnOutcomeUnknownReason {
 pub enum HarnessC2Error {
     #[error("C2 connection failed: {0}")]
     Connect(C2ControlError),
+    #[error("C2 relay is reconnecting")]
+    RelayReconnecting,
     #[error("C2 inventory transport failed: {0}")]
     InventoryTransport(C2ControlError),
     #[error("C2 delivery outcome is unknown after transport, protocol, or relay failure: {0}")]
@@ -8296,6 +8330,33 @@ mod tests {
         assert_eq!(routes[1].route().node_id.as_str(), "node-b");
         assert_eq!(routes[1].route().expected_incarnation_id, incarnation_b);
         assert_eq!(routes[1].support(), Some(support_b));
+    }
+
+    /// Proves the actual defect fix: while the harness's own c2 link is
+    /// reconnecting, a stale-but-non-empty cached topology must never be
+    /// read as "this node does not exist" -- the link gates first,
+    /// regardless of what the (stale) topology says.
+    #[test]
+    fn exact_route_reports_relay_reconnecting_not_unknown_node_while_down() {
+        let topology = C2Topology { nodes: Vec::new() };
+        let node_id = NodeId::new("node-a").unwrap();
+        assert!(matches!(
+            resolve_exact_route(C2LinkState::Reconnecting, &topology, &node_id),
+            Err(HarnessC2Error::RelayReconnecting)
+        ));
+    }
+
+    /// The companion proof: the fix does not blanket-suppress the genuine
+    /// "no such node" case -- with the link up, an absent node is still
+    /// exactly `UnknownNode`, not `RelayReconnecting`.
+    #[test]
+    fn exact_route_still_reports_unknown_node_when_connected() {
+        let topology = C2Topology { nodes: Vec::new() };
+        let node_id = NodeId::new("node-a").unwrap();
+        assert!(matches!(
+            resolve_exact_route(C2LinkState::Connected, &topology, &node_id),
+            Err(HarnessC2Error::UnknownNode(ref unknown)) if unknown == &node_id
+        ));
     }
 
     /// `PreparedResourceMutation` has no adapter-free constructor for the

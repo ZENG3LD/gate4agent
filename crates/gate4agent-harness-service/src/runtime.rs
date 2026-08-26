@@ -2661,7 +2661,8 @@ fn map_run_context_source_error(error: HarnessC2Error) -> HarnessOperatorHostErr
         | HarnessC2Error::RunContextSourceTransport(_)
         | HarnessC2Error::UnknownNode(_)
         | HarnessC2Error::NodeOffline(_)
-        | HarnessC2Error::MissingIncarnation(_) => HarnessOperatorHostErrorV1::Unavailable,
+        | HarnessC2Error::MissingIncarnation(_)
+        | HarnessC2Error::RelayReconnecting => HarnessOperatorHostErrorV1::Unavailable,
         HarnessC2Error::IncarnationChanged { .. }
         | HarnessC2Error::RunContextSourceRouteMismatch => {
             HarnessOperatorHostErrorV1::Conflict
@@ -2704,7 +2705,8 @@ fn map_run_read_error(error: HarnessC2Error) -> HarnessOperatorHostErrorV1 {
         | HarnessC2Error::RunReadTransport(_)
         | HarnessC2Error::UnknownNode(_)
         | HarnessC2Error::NodeOffline(_)
-        | HarnessC2Error::MissingIncarnation(_) => HarnessOperatorHostErrorV1::Unavailable,
+        | HarnessC2Error::MissingIncarnation(_)
+        | HarnessC2Error::RelayReconnecting => HarnessOperatorHostErrorV1::Unavailable,
         HarnessC2Error::IncarnationChanged { .. }
         | HarnessC2Error::RunReadRouteMismatch => HarnessOperatorHostErrorV1::Conflict,
         HarnessC2Error::RunReadDeadline => HarnessOperatorHostErrorV1::Deadline,
@@ -2767,7 +2769,8 @@ fn map_node_workspace_read_error(error: HarnessC2Error) -> HarnessOperatorHostEr
         | HarnessC2Error::NodeWorkspaceReadTransport(_)
         | HarnessC2Error::UnknownNode(_)
         | HarnessC2Error::NodeOffline(_)
-        | HarnessC2Error::MissingIncarnation(_) => HarnessOperatorHostErrorV1::Unavailable,
+        | HarnessC2Error::MissingIncarnation(_)
+        | HarnessC2Error::RelayReconnecting => HarnessOperatorHostErrorV1::Unavailable,
         HarnessC2Error::IncarnationChanged { .. }
         | HarnessC2Error::NodeWorkspaceReadRouteMismatch => HarnessOperatorHostErrorV1::Conflict,
         HarnessC2Error::NodeWorkspaceReadDeadline
@@ -2834,7 +2837,8 @@ fn map_node_workspace_write_error(error: HarnessC2Error) -> HarnessOperatorHostE
         | HarnessC2Error::NodeWorkspaceWriteTransport(_)
         | HarnessC2Error::UnknownNode(_)
         | HarnessC2Error::NodeOffline(_)
-        | HarnessC2Error::MissingIncarnation(_) => HarnessOperatorHostErrorV1::Unavailable,
+        | HarnessC2Error::MissingIncarnation(_)
+        | HarnessC2Error::RelayReconnecting => HarnessOperatorHostErrorV1::Unavailable,
         HarnessC2Error::IncarnationChanged { .. }
         | HarnessC2Error::NodeWorkspaceWriteRouteMismatch => HarnessOperatorHostErrorV1::Conflict,
         HarnessC2Error::NodeWorkspaceWriteDeadline
@@ -2884,7 +2888,8 @@ fn map_session_spawn_error(error: HarnessC2Error) -> HarnessOperatorHostErrorV1 
         HarnessC2Error::InvalidSessionSpawnRequest => HarnessOperatorHostErrorV1::InvalidRequest,
         HarnessC2Error::UnknownNode(_)
         | HarnessC2Error::NodeOffline(_)
-        | HarnessC2Error::MissingIncarnation(_) => HarnessOperatorHostErrorV1::Unavailable,
+        | HarnessC2Error::MissingIncarnation(_)
+        | HarnessC2Error::RelayReconnecting => HarnessOperatorHostErrorV1::Unavailable,
         HarnessC2Error::IncarnationChanged { .. } => HarnessOperatorHostErrorV1::Conflict,
         HarnessC2Error::SpawnProfileUnavailable(_) => HarnessOperatorHostErrorV1::NotFound,
         HarnessC2Error::SpawnEnqueue(gate4agent_c2_client::C2ControlError::QueueFull) => {
@@ -2934,7 +2939,8 @@ fn map_session_control_error(error: HarnessC2Error) -> HarnessOperatorHostErrorV
         | HarnessC2Error::SessionControlTransport(_)
         | HarnessC2Error::UnknownNode(_)
         | HarnessC2Error::NodeOffline(_)
-        | HarnessC2Error::MissingIncarnation(_) => HarnessOperatorHostErrorV1::Unavailable,
+        | HarnessC2Error::MissingIncarnation(_)
+        | HarnessC2Error::RelayReconnecting => HarnessOperatorHostErrorV1::Unavailable,
         HarnessC2Error::IncarnationChanged { .. }
         | HarnessC2Error::SessionControlRouteMismatch => HarnessOperatorHostErrorV1::Conflict,
         HarnessC2Error::SessionControlCancelled => HarnessOperatorHostErrorV1::Deadline,
@@ -2968,7 +2974,8 @@ fn map_session_record_mutation_error(error: HarnessC2Error) -> HarnessOperatorHo
         | HarnessC2Error::SessionRecordMutationTransport(_)
         | HarnessC2Error::UnknownNode(_)
         | HarnessC2Error::NodeOffline(_)
-        | HarnessC2Error::MissingIncarnation(_) => HarnessOperatorHostErrorV1::Unavailable,
+        | HarnessC2Error::MissingIncarnation(_)
+        | HarnessC2Error::RelayReconnecting => HarnessOperatorHostErrorV1::Unavailable,
         HarnessC2Error::IncarnationChanged { .. }
         | HarnessC2Error::SessionRecordMutationRouteMismatch
         | HarnessC2Error::SessionRecordMutationCorrelationMismatch => {
@@ -3015,7 +3022,8 @@ fn map_host_directory_browse_error(error: HarnessC2Error) -> HarnessOperatorHost
         | HarnessC2Error::HostDirectoryBrowseTransport(_)
         | HarnessC2Error::UnknownNode(_)
         | HarnessC2Error::NodeOffline(_)
-        | HarnessC2Error::MissingIncarnation(_) => HarnessOperatorHostErrorV1::Unavailable,
+        | HarnessC2Error::MissingIncarnation(_)
+        | HarnessC2Error::RelayReconnecting => HarnessOperatorHostErrorV1::Unavailable,
         HarnessC2Error::IncarnationChanged { .. }
         | HarnessC2Error::HostDirectoryBrowseRouteMismatch
         | HarnessC2Error::HostDirectoryBrowseCorrelationMismatch => {
@@ -3065,7 +3073,8 @@ fn map_resource_mutation_error(error: HarnessC2Error) -> HarnessOperatorHostErro
         | HarnessC2Error::ResourceMutationTransport(_)
         | HarnessC2Error::UnknownNode(_)
         | HarnessC2Error::NodeOffline(_)
-        | HarnessC2Error::MissingIncarnation(_) => HarnessOperatorHostErrorV1::Unavailable,
+        | HarnessC2Error::MissingIncarnation(_)
+        | HarnessC2Error::RelayReconnecting => HarnessOperatorHostErrorV1::Unavailable,
         HarnessC2Error::IncarnationChanged { .. }
         | HarnessC2Error::ResourceMutationRouteMismatch
         | HarnessC2Error::ResourceMutationCorrelationMismatch => HarnessOperatorHostErrorV1::Conflict,
@@ -3121,7 +3130,8 @@ fn map_native_history_error(error: HarnessC2Error) -> HarnessOperatorHostErrorV1
         | HarnessC2Error::NativeHistoryTransport(_)
         | HarnessC2Error::UnknownNode(_)
         | HarnessC2Error::NodeOffline(_)
-        | HarnessC2Error::MissingIncarnation(_) => HarnessOperatorHostErrorV1::Unavailable,
+        | HarnessC2Error::MissingIncarnation(_)
+        | HarnessC2Error::RelayReconnecting => HarnessOperatorHostErrorV1::Unavailable,
         HarnessC2Error::IncarnationChanged { .. }
         | HarnessC2Error::NativeHistoryRouteMismatch => {
             HarnessOperatorHostErrorV1::Conflict

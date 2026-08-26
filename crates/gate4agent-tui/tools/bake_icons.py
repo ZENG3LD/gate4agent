@@ -730,6 +730,35 @@ def die(message: str) -> "None":
     sys.exit(1)
 
 
+# The straight-alpha (non-premultiplied) output assumption that
+# `icons.rs::composite_over_background` and every colour in this pipeline
+# rests on was established ONCE, by hand, against this exact resvg build
+# (see `icons.rs`'s "cause 1" note). A resvg that emits premultiplied
+# alpha, or rounds `-w`/`-h` differently, would silently corrupt every
+# baked colour with no signal at all -- so the version is checked here
+# rather than only asserted in prose, matching this tool's own
+# fetch/patch contract: FAIL LOUDLY, never proceed on a guess.
+REQUIRED_RESVG_VERSION = "0.47.0"
+
+
+def require_resvg_version() -> None:
+    try:
+        result = subprocess.run(["resvg", "--version"], capture_output=True, text=True)
+    except OSError as error:
+        die(f"resvg is not on PATH: {error}")
+    if result.returncode != 0:
+        die(f"`resvg --version` failed: {result.stderr.strip()}")
+    found = result.stdout.strip()
+    if found != REQUIRED_RESVG_VERSION:
+        die(
+            f"resvg {found} is on PATH, but every baked asset in this crate was "
+            f"produced with resvg {REQUIRED_RESVG_VERSION}, and the straight-alpha "
+            "output assumption the whole compositing path depends on was verified "
+            "against that build only. Install the pinned version, or re-verify the "
+            "alpha assumption and update REQUIRED_RESVG_VERSION deliberately."
+        )
+
+
 def run_tool(cmd: list[str]) -> None:
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -1546,6 +1575,7 @@ def check_lucide_coverage() -> None:
 
 
 def main(argv: list[str]) -> int:
+    require_resvg_version()
     check_lucide_coverage()
     args = parse_args(argv)
     only = set(s.strip() for s in args.only.split(",")) if args.only else None

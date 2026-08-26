@@ -64,6 +64,12 @@ pub(crate) enum LightRelayError {
     NodeOffline,
     #[error("node has no current incarnation")]
     MissingIncarnation,
+    /// The physical connection to this process's own dedicated c2 is being
+    /// re-established after a loss -- see `crate::c2::resolve_exact_route`'s
+    /// doc comment for why this must be checked before, not derived from,
+    /// the (possibly stale-but-populated) cached topology.
+    #[error("c2 relay is reconnecting")]
+    RelayReconnecting,
     #[error("no advertised spawn profile matches the requested provider profile")]
     SpawnProfileUnavailable,
     #[error("credential/nonce cryptography failed: {0}")]
@@ -101,7 +107,7 @@ impl LightRelayError {
             Self::UnknownNode | Self::SpawnProfileUnavailable => {
                 HarnessOperatorHostErrorV1::NotFound
             }
-            Self::NodeOffline | Self::MissingIncarnation => {
+            Self::NodeOffline | Self::MissingIncarnation | Self::RelayReconnecting => {
                 HarnessOperatorHostErrorV1::Unavailable
             }
             Self::IncarnationChanged => HarnessOperatorHostErrorV1::Conflict,

@@ -38,7 +38,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use gate4agent_c2_client::{C2ControlHandle, C2EventReceiver};
+use gate4agent_c2_client::{C2ReconnectingEventReceiver, C2ReconnectingHandle};
 use gate4agent_c2_protocol::C2Topology;
 use gate4agent_harness_api::{
     HarnessOperatorCredential, HarnessOperatorEnvelopeV1, HarnessOperatorEventV1,
@@ -109,8 +109,17 @@ const LIGHT_SUBSCRIBER_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 /// the live C2 control handle (session-verb relay, route resolution), the
 /// maintained runtime-inventory roster, and the one credential this process
 /// minted at start.
+///
+/// `control` is a `C2ReconnectingHandle`, not a raw `C2ControlHandle`: the
+/// physical connection to `c2_endpoint` can die and be re-established any
+/// number of times over this process's lifetime without ever handing out a
+/// new value here -- a background supervisor keeps the handle's `watch`
+/// cells pointed at whichever connection is live, so a c2 relay restart
+/// never permanently breaks this crate the way the bare `connect_local` it
+/// replaced would have (see `crate::c2::resolve_exact_route`'s doc comment
+/// for the specific failure this fixes).
 pub(crate) struct LightState {
-    control: C2ControlHandle,
+    control: C2ReconnectingHandle,
     inventory: inventory::SharedInventory,
     /// The maintained ring of live terminal frames, kept in lockstep with
     /// `inventory` on every C2 event/topology change -- see `crate::terminal`'s
@@ -234,7 +243,7 @@ pub async fn start_harness_light(
     c2_token: &str,
 ) -> Result<HarnessLightRunning, HarnessLightError> {
     let (control, events) =
-        gate4agent_c2_client::connect_local(c2_endpoint, c2_token).await
+        gate4agent_c2_client::connect_local_reconnecting(c2_endpoint, c2_token).await
             .map_err(HarnessLightError::C2Connect)?;
     let topology = control.subscribe_topology();
 
@@ -290,7 +299,7 @@ pub async fn start_harness_light(
 async fn run_light_host(
     listener: TcpListener,
     state: Arc<LightState>,
-    mut events: C2EventReceiver,
+    mut events: C2ReconnectingEventReceiver,
     mut topology: watch::Receiver<Arc<C2Topology>>,
     mut commands: mpsc::Receiver<LightCommand>,
 ) {

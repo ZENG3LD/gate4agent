@@ -26,7 +26,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use gate4agent_c2_client::C2ControlHandle;
+use gate4agent_c2_client::C2ReconnectingHandle;
 use gate4agent_c2_protocol::{
     C2NodeEvent, C2Topology, NodeRoute, RoutedNodeEvent, SlimNodeInventory, NodeTransportState,
 };
@@ -65,7 +65,7 @@ pub(crate) fn new_shared() -> SharedInventory {
 /// Concurrency note: multiple callers can each have their own in-flight
 /// `NodeRequest::Snapshot` against the same route at once -- an eager post-
 /// mutation refresh (`crate::relay`) racing the background event loop's own
-/// refresh for the same node, for instance. `C2ControlHandle::request`
+/// refresh for the same node, for instance. `C2ReconnectingHandle::request`
 /// gives no guarantee that responses complete in dispatch order, so without
 /// the freshness guard a snapshot issued *before* a mutation could still
 /// land *after* one issued after it, overwriting fresher data with stale
@@ -85,7 +85,7 @@ pub(crate) fn new_shared() -> SharedInventory {
 /// all; see `LIGHT_COMMAND_CAPACITY`'s doc comment for why that is safe
 /// regardless).
 pub(crate) async fn refresh_route(
-    control: &C2ControlHandle,
+    control: &C2ReconnectingHandle,
     snapshot_gate: &Mutex<()>,
     inventory: &SharedInventory,
     commands: &mpsc::Sender<LightCommand>,

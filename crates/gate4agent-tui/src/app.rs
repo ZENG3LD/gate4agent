@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
+use std::rc::Rc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use gate4agent_c2_protocol::C2RelayRoute;
@@ -80,6 +81,9 @@ use gate4agent_harness_client::{
     HarnessRunWorktreeViewV1, HarnessWorktreeIntentV1, RedactedRunIntentV1,
     RedactedWorktreeIntentV1, TaskCreatorCategoryV1,
 };
+use gate4agent_arcade_pet_bastion::pet::Evolution;
+use gate4agent_arcade_pet_bastion::rune::Rune;
+use gate4agent_arcade_pet_bastion::tower::{TowerKind, UpgradeBranch};
 use uzor_tui::Rect;
 
 use crate::icons::{IconId, SixelVariant};
@@ -1370,6 +1374,41 @@ impl MenuPlacement {
     }
 }
 
+/// Which sub-cell technique the Pet Bastion arcade board (`render::
+/// render_pet_arcade`) currently paints with -- the SAME "owner-visible,
+/// manually toggled, no runtime capability probing" discipline `RailIcons`
+/// already established (see that type's own doc comment) rather than a
+/// second mechanism. Owned by `App` (`App::pet_arcade_visual_tier`), not
+/// persisted through `preferences::UiPreferences` the way `RailIcons`/
+/// `IconFamily` are: this toggle is scoped to one in-game overlay and
+/// reached through that overlay's own `v` key/HUD button, matching every
+/// OTHER piece of Pet Arcade UI state (`selected_tile`, `selected_tower_
+/// kind`, ...), none of which survives a restart either -- a global
+/// Settings-page toggle would be the wrong home for a knob that only means
+/// anything while this one modal is open.
+///
+/// `Pixel` composites the whole board as one continuous URX-rendered raster
+/// per frame (`gate4agent_arcade_engine::{compose_frame, encode_frame}`,
+/// `render::render_pet_arcade`'s own doc comment) and is the default -- the
+/// point of this whole pass. `Glyph` is the pre-existing, always-available
+/// floor tier (`GlyphBackend`) this crate shipped before the pixel tier
+/// existed, kept as the explicit, visible fallback: automatic per-frame
+/// degradation (the board too narrow for a full-width pixel frame, or
+/// `render::drop_pet_arcade_pixel_frame_if_covered` dropping an occluded
+/// placement) NEVER silently mutates this field -- it only decides,
+/// per-frame, whether `Pixel`'s own preference can actually be honoured
+/// right now (see `render::render_pet_arcade`'s own `pixel_tier_fits`
+/// local). The owner's preference stays exactly what they last chose,
+/// visible via the board header's own `[V]` button/label
+/// (`render::pet_arcade_tier_label`) so a frame that reads differently from
+/// usual is always explained, never a silent, unexplained downgrade.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PetArcadeVisualTier {
+    #[default]
+    Pixel,
+    Glyph,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ControlSection {
     #[default]
@@ -1450,6 +1489,11 @@ pub enum OverlayId {
     StatusBarCenter,
     StatusBarRight,
     HarnessReverseAttribution,
+    /// The Pet Bastion arcade overlay -- see `pet_arcade`'s own module doc
+    /// comment for why it was NOT draggable before (`render::render_pet_
+    /// arcade`'s own doc comment): the sixel-plane concern that ruled
+    /// dragging out no longer applies on this crate's glyph-tier board.
+    PetArcade,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1529,6 +1573,24 @@ pub enum DragState {
     /// be looked up by key, only the body rect the drag is relative to.
     EventLogSelection {
         viewport: Rect,
+    },
+    /// Dragging a tower out of the Pet Bastion arcade's own palette
+    /// (`HitTarget::PetArcadeTowerKind`) onto a board tile -- the pointer's
+    /// own counterpart to that same click's "place on the already-selected
+    /// pad" shortcut, which still fires unconditionally on the initial
+    /// press (`App::click_pet_arcade`) exactly as before. Same shape as
+    /// `SessionChip` above: `current_column`/`current_row` track the live
+    /// cursor for the ghost `render::render_drag_preview` paints, `moved`
+    /// distinguishes an actual drag from a plain click so `App::drop_at`
+    /// never double-places a tower for a click that already placed one on
+    /// mouse-down.
+    PetArcadeTowerPlacement {
+        kind: TowerKind,
+        start_column: u16,
+        start_row: u16,
+        current_column: u16,
+        current_row: u16,
+        moved: bool,
     },
 }
 
@@ -2931,6 +2993,74 @@ pub enum HitTarget {
     /// Every existing per-modal Escape/Cancel path is unchanged; this is
     /// strictly an addition.
     ModalClose,
+    /// The RIGHT zone's own small "pet" modal's own launch row -- opens
+    /// the Pet Bastion arcade overlay (`App::open_pet_arcade`). See
+    /// `pet_arcade`'s own module doc comment for the overlay this leads
+    /// to; the small modal itself stays exactly what it always was.
+    PetArcadeLaunch,
+    /// The Pet Bastion arcade overlay's own header-row drag target -- see
+    /// `RemoveWorktreeDrag`'s own doc comment for the shared convention.
+    /// `OverlayId::PetArcade`.
+    PetArcadeDrag,
+    /// One board tile, carrying its logical `(x, y)` board coordinate --
+    /// resolved against the current run's own snapshot at click time
+    /// (`PetArcade::click_tile`), never against a stored identity, so a
+    /// tile whose occupant changed between render and click (an enemy that
+    /// moved on) simply resolves against whatever is there NOW. Pushed
+    /// once per visible board tile by `render::render_pet_arcade`, using
+    /// the exact same `footprint`/`dest` arithmetic that positions that
+    /// tile's own glyph -- never a second, independently-derived mapping.
+    PetArcadeTile(u8, u8),
+    /// One row of the arcade's own tower palette -- selects that
+    /// `TowerKind` and, if a free tile is already selected, places it
+    /// there immediately (`PetArcade::click_tower_kind`).
+    PetArcadeTowerKind(TowerKind),
+    /// The selected tower's own upgrade/sell action rows -- mirrors the
+    /// `u`/`p`/`o`/`x` keyboard bindings (`PetArcade::handle_run_key`) for
+    /// the mouse, dispatched against the exact same `PetArcade::selected_
+    /// tower_view` this crate's own keyboard path already reads.
+    PetArcadeUpgradeL2,
+    PetArcadeUpgradeL3Power,
+    PetArcadeUpgradeL3Utility,
+    PetArcadeSell,
+    /// The arcade's own header row (wave/phase line) -- opens the wave
+    /// inspector card (`PetArcade::inspect_wave`).
+    PetArcadeWaveInspect,
+    /// The Living Circuit's own three ability buttons -- mirrors the
+    /// `g`/`b`/`f` keyboard bindings (`PetArcade::click_pet_pulse`/
+    /// `click_blink`/`click_full_circuit`). Owner report: these were
+    /// keyboard-only.
+    PetArcadePetPulse,
+    PetArcadeBlink,
+    PetArcadeFullCircuit,
+    /// The explicit "move the pet to whichever anchor is selected" button
+    /// -- mirrors the `m` key AND the anchor-tile click that already both
+    /// selects and moves in one gesture (`PetArcade::click_move_pet`).
+    /// Owner report: repositioning the pet had no button of its own, only
+    /// the anchor tile itself.
+    PetArcadeMovePet,
+    /// Ends the Build phase early -- mirrors the `Space` key
+    /// (`PetArcade::click_start_wave`). Owner report: no mouse way to
+    /// launch a wave early.
+    PetArcadeStartWave,
+    /// One of the rune-draft card's own `F1`-`F3` options -- mirrors that
+    /// same keyboard binding (`PetArcade::click_draft_rune`). Owner
+    /// report: none of these were clickable at all, which stalls a run
+    /// outright for a mouse-only player (the draft blocks everything else
+    /// until resolved).
+    PetArcadeDraftRune(Rune),
+    /// One of the evolution-choice card's own `F1`-`F3` options -- see
+    /// `PetArcadeDraftRune`'s own doc comment for the matching rationale.
+    PetArcadeChooseEvolution(Evolution),
+    /// The Results screen's own `[R] Play Again` button -- mirrors the `r`
+    /// key (`PetArcade::click_restart`). Owner report: restarting after a
+    /// win/loss was keyboard-only.
+    PetArcadeRestart,
+    /// The board header row's own `[V]` render-tier button -- mirrors the
+    /// `v` key (`App::toggle_pet_arcade_visual_tier`). See
+    /// [`PetArcadeVisualTier`]'s own doc comment for why this is a manual,
+    /// visible switch rather than automatic capability probing.
+    PetArcadeToggleTier,
     /// The bottom status bar's own three zones -- clicking any of them
     /// opens that zone's own modal (`App::begin_status_bar_zone`). See
     /// `Focus::StatusBarLeft`'s own doc comment.
@@ -3067,6 +3197,45 @@ pub struct SixelIconPlacement {
     pub family: IconFamily,
 }
 
+/// The Pet Bastion arcade board's own whole-board pixel-tier frame for
+/// THIS render pass -- `render::render_pet_arcade`'s counterpart to
+/// [`SixelIconPlacement`] above, but deliberately NOT one: a baked rail/
+/// strip/gallery icon resolves its own bytes from a small, fixed catalog
+/// keyed by `(IconId, tier, family, background)` (see `icons.rs`'s own
+/// `SIXEL_CACHE`); this frame is a genuinely NEW raster built fresh every
+/// single frame it paints at all (`gate4agent_arcade_engine::{compose_
+/// frame, encode_frame}`, driven by interpolated, continuously-moving sim
+/// state) -- there is no fixed catalog entry this could ever be a cache
+/// key into. `client::flush_pet_arcade_pixel_frame_into` is the ONE place
+/// that actually writes `encoded` to the terminal -- see that fn's own doc
+/// comment for why it does not reuse `SixelEmitState`'s own
+/// signature/fingerprint survivor-gating (this placement is never a
+/// "survivor": it is recomposed every frame by design).
+///
+/// `rect` is the board's own destination screen-cell rect (the SAME `dest`
+/// `GlyphBackend::project` painted the glyph tier's board into) -- the
+/// pixel raster is always placed exactly where the glyph board's own cells
+/// already sit, never a second, independently-computed position.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PetArcadePixelPlacement {
+    pub rect: Rect,
+    /// Already sixel-encoded bytes (`gate4agent_arcade_engine::PixelFrame::
+    /// encoded`), ready to write straight to the terminal -- this crate
+    /// never re-encodes or otherwise touches these bytes, only relocates
+    /// the cursor and writes them (see `client::flush_pet_arcade_pixel_
+    /// frame_into`).
+    pub encoded: Vec<u8>,
+    /// `layout.overlays.len()` at the exact moment this placement was
+    /// pushed -- `render::drop_pet_arcade_pixel_frame_if_covered`'s own
+    /// index-cutoff, mirroring [`OverlayRegion::drawn_before`]'s own
+    /// reasoning but from this single placement's own side: any overlay
+    /// registered AT OR AFTER this index painted on top of this frame and
+    /// so must occlude it; any overlay registered BEFORE it (including
+    /// this board's own modal, `note_overlay`d before this placement is
+    /// ever pushed) must not.
+    pub overlays_before: usize,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SurfacePaneLayout {
     pub pane_id: PaneId,
@@ -3116,6 +3285,17 @@ pub struct LayoutRects {
     /// nothing downstream ever sees a placement a modal or popup is
     /// sitting on top of.
     pub sixel_icons: Vec<SixelIconPlacement>,
+    /// The Pet Bastion arcade board's own whole-board pixel-tier frame this
+    /// render pass, if `app.pet_arcade_visual_tier` is `Pixel` AND the
+    /// board's own negotiated width/height actually fit the pixel tier's
+    /// own fixed-scale board this frame (`render::render_pet_arcade`'s own
+    /// `pixel_tier_fits` local) -- `None` whenever the arcade overlay is
+    /// closed, on the glyph tier, or too small this frame; see
+    /// [`PetArcadePixelPlacement`]'s own doc comment for why this is a
+    /// separate field rather than another `sixel_icons` entry. Like
+    /// `sixel_icons`, already filtered against `overlays` by the time
+    /// `render::render` returns (`drop_pet_arcade_pixel_frame_if_covered`).
+    pub pet_arcade_pixel_frame: Option<PetArcadePixelPlacement>,
     /// Every overlay's own outer paint frame this frame -- registered by
     /// `render_spawn`/`render_existing_session`/`render_settings`/every
     /// other renderer in `render::render`'s own overlay chain (modals,
@@ -3182,6 +3362,9 @@ pub struct LayoutRects {
     pub status_bar_center_modal: Rect,
     pub status_bar_right_modal: Rect,
     pub harness_reverse_attribution_modal: Rect,
+    /// The Pet Bastion arcade overlay's own painted rect -- see
+    /// `OverlayId::PetArcade`'s own doc comment.
+    pub pet_arcade_modal: Rect,
     /// The CENTRE zone modal's own retained-log ENTRY rows -- a sub-rect of
     /// `status_bar_center_modal`, excluding its border, the marquee toggle
     /// row, the `[Up]`/`[Down]`/`[Clear]` toolbar row, and the bottom help
@@ -4224,6 +4407,25 @@ pub struct App {
     /// above `profiler` below: this is a diagnostic detail, not part of
     /// this crate's own public data model.
     pub(crate) profiler_overlay_open: bool,
+    /// Whether the Pet Bastion arcade overlay (`render::render_pet_arcade`)
+    /// is currently open -- a top-priority, `Focus`-independent gate over
+    /// `App::reduce`/`App::click`, the exact same shape `profiler_overlay_
+    /// open` above already established (see that field's own doc comment
+    /// and `App::reduce_pet_arcade`'s own call site). A live run keeps
+    /// ticking while this is `true` and freezes the instant it goes
+    /// `false` (`PetArcade::suspend`) -- see `pet_arcade`'s own module doc
+    /// comment.
+    pub(crate) pet_arcade_open: bool,
+    /// The arcade session itself -- see `pet_arcade`'s own module doc
+    /// comment for why this is `Rc<RefCell<_>>` rather than a plain field
+    /// (`App` derives `Clone, Debug`; the engine's own `Runner`/`GameScreen`/
+    /// `ArcadeShell` implement neither).
+    pub(crate) pet_arcade: Rc<RefCell<crate::pet_arcade::PetArcade>>,
+    /// See [`PetArcadeVisualTier`]'s own doc comment -- the owner's current
+    /// preference for the arcade board's own render tier, toggled by the
+    /// board's own `v` key/HUD button (`App::toggle_pet_arcade_visual_
+    /// tier`), read by `render::render_pet_arcade` every frame.
+    pub(crate) pet_arcade_visual_tier: PetArcadeVisualTier,
     /// This session's own frame-cadence and terminal-poll measurements --
     /// see the `profile` module's own doc comment for why it lives here
     /// rather than as a `client::run` local. `client::run` is still the
@@ -4352,6 +4554,9 @@ impl Default for App {
             terminal_cols: 80,
             layout: LayoutRects::default(),
             profiler_overlay_open: false,
+            pet_arcade_open: false,
+            pet_arcade_visual_tier: PetArcadeVisualTier::Pixel,
+            pet_arcade: crate::pet_arcade::PetArcade::new(),
             profiler: crate::profile::TuiProfiler::default(),
             should_quit: false,
             animation_tick: 0,
@@ -4631,6 +4836,168 @@ impl App {
     /// app at 60 Hz continuously."
     pub(crate) fn pet_wants_fast_cadence(&self) -> bool {
         self.pet_settings.enabled
+    }
+
+    /// Opens the Pet Bastion arcade overlay -- see `pet_arcade`'s own
+    /// module doc comment. Closes the small "pet" status-bar modal it was
+    /// launched from (the two are never shown stacked -- `App::close_
+    /// status_bar_zone` restores whatever focus held the keyboard before
+    /// that modal opened) and un-suspends whatever run the session already
+    /// holds, starting a fresh one if this is the very first launch.
+    pub(crate) fn open_pet_arcade(&mut self) -> AppAction {
+        self.pet_arcade.borrow_mut().resume();
+        self.pet_arcade_open = true;
+        self.close_status_bar_zone()
+    }
+
+    /// Closes the arcade overlay -- `Escape`, its own `[x]`, or a click
+    /// outside its rect (`App::close_overlay_outside_click`) all reach
+    /// this. Freezes the run in place rather than dropping it (`PetArcade::
+    /// suspend`), so reopening the modal resumes the same build/wave.
+    pub(crate) fn close_pet_arcade(&mut self) {
+        self.pet_arcade.borrow_mut().suspend();
+        self.pet_arcade_open = false;
+    }
+
+    /// The arcade overlay's own exclusive key dispatch -- reached from the
+    /// very top of `App::reduce`, ahead of every other check including
+    /// `profiler_overlay_open`, the same "this top-priority overlay owns
+    /// every key while open" contract that field's own call site already
+    /// established: a live run is never interrupted by anything else this
+    /// crate might otherwise do with a keystroke.
+    fn reduce_pet_arcade(&mut self, key: UiKey) -> AppAction {
+        if matches!(key, UiKey::Escape | UiKey::OperatorEscape) {
+            self.close_pet_arcade();
+            return AppAction::None;
+        }
+        // Intercepted HERE, ahead of `PetArcade::handle_key`, the same way
+        // `Escape` above is: the render-tier toggle is `App`'s own
+        // preference (`pet_arcade_visual_tier`), not sim/session state
+        // `PetArcade` owns, so it never reaches that type's own keymap at
+        // all -- see `HitTarget::PetArcadeToggleTier`'s own doc comment for
+        // the mouse counterpart.
+        if matches!(key, UiKey::Char('v') | UiKey::Char('V')) {
+            self.toggle_pet_arcade_visual_tier();
+            return AppAction::None;
+        }
+        self.pet_arcade.borrow_mut().handle_key(key);
+        AppAction::None
+    }
+
+    /// Flips [`PetArcadeVisualTier`] between `Pixel` and `Glyph` -- the `v`
+    /// key (`reduce_pet_arcade`) and the board header's own `[V]` button
+    /// (`HitTarget::PetArcadeToggleTier`) both reach this, exactly the
+    /// `toggle_rail_icons` shape this crate already uses for its other
+    /// manual render-tier switch.
+    pub(crate) fn toggle_pet_arcade_visual_tier(&mut self) {
+        self.pet_arcade_visual_tier = match self.pet_arcade_visual_tier {
+            PetArcadeVisualTier::Pixel => PetArcadeVisualTier::Glyph,
+            PetArcadeVisualTier::Glyph => PetArcadeVisualTier::Pixel,
+        };
+    }
+
+    /// The arcade overlay's own click dispatch -- the pointer counterpart
+    /// to `reduce_pet_arcade` above. Reached from `App::click` only once
+    /// `close_overlay_outside_click` has already confirmed the press
+    /// landed INSIDE the overlay's own rect (a click outside it already
+    /// closed the overlay before this ever runs). Every target this
+    /// overlay recognizes is dispatched straight to `PetArcade`'s own
+    /// mutators -- this fn holds no game logic of its own, matching
+    /// `pet_arcade`'s own "sim/input state lives there, never in `App`"
+    /// convention.
+    fn click_pet_arcade(&mut self, target: Option<HitTarget>, column: u16, row: u16) -> AppAction {
+        match target {
+            Some(HitTarget::ModalClose) => self.close_pet_arcade(),
+            Some(HitTarget::PetArcadeDrag) => {
+                self.begin_overlay_drag(OverlayId::PetArcade, self.layout.pet_arcade_modal, column, row);
+            }
+            Some(HitTarget::PetArcadeTile(x, y)) => self.pet_arcade.borrow_mut().click_tile(x, y),
+            Some(HitTarget::PetArcadeTowerKind(kind)) => {
+                self.pet_arcade.borrow_mut().click_tower_kind(kind);
+                // The existing click-to-place-on-selected-tile shortcut
+                // above already fired unconditionally -- this ADDITIONALLY
+                // starts a drag so a player who keeps holding the button
+                // and moves the pointer gets the ghost/highlight (`render::
+                // render_drag_preview`, `render_pet_arcade`'s own
+                // `buildable_tiles` highlight) and can drop onto a
+                // DIFFERENT tile. `App::drop_at`'s own `moved` check is what
+                // keeps a plain click (no drag ever observed) from placing
+                // a second tower on top of the first.
+                self.drag_state = Some(DragState::PetArcadeTowerPlacement {
+                    kind,
+                    start_column: column,
+                    start_row: row,
+                    current_column: column,
+                    current_row: row,
+                    moved: false,
+                });
+            }
+            Some(HitTarget::PetArcadeUpgradeL2) => self.pet_arcade.borrow_mut().click_upgrade_l2(),
+            Some(HitTarget::PetArcadeUpgradeL3Power) => {
+                self.pet_arcade.borrow_mut().click_upgrade_l3(UpgradeBranch::Power)
+            }
+            Some(HitTarget::PetArcadeUpgradeL3Utility) => {
+                self.pet_arcade.borrow_mut().click_upgrade_l3(UpgradeBranch::Utility)
+            }
+            Some(HitTarget::PetArcadeSell) => self.pet_arcade.borrow_mut().click_sell(),
+            Some(HitTarget::PetArcadeWaveInspect) => self.pet_arcade.borrow_mut().inspect_wave(),
+            Some(HitTarget::PetArcadePetPulse) => self.pet_arcade.borrow_mut().click_pet_pulse(),
+            Some(HitTarget::PetArcadeBlink) => self.pet_arcade.borrow_mut().click_blink(),
+            Some(HitTarget::PetArcadeFullCircuit) => self.pet_arcade.borrow_mut().click_full_circuit(),
+            Some(HitTarget::PetArcadeMovePet) => self.pet_arcade.borrow_mut().click_move_pet(),
+            Some(HitTarget::PetArcadeStartWave) => self.pet_arcade.borrow_mut().click_start_wave(),
+            Some(HitTarget::PetArcadeDraftRune(rune)) => {
+                self.pet_arcade.borrow_mut().click_draft_rune(rune)
+            }
+            Some(HitTarget::PetArcadeChooseEvolution(evolution)) => {
+                self.pet_arcade.borrow_mut().click_choose_evolution(evolution)
+            }
+            Some(HitTarget::PetArcadeRestart) => self.pet_arcade.borrow_mut().click_restart(),
+            Some(HitTarget::PetArcadeToggleTier) => self.toggle_pet_arcade_visual_tier(),
+            _ => {}
+        }
+        AppAction::None
+    }
+
+    /// The arcade's own elapsed-time integrator -- called once per redraw
+    /// (`client::run`, alongside `App::step_pet`), reads real wall-clock
+    /// time directly so it stays correct regardless of how sparsely this
+    /// runs. A no-op while the overlay is closed: `PetArcade::suspend`
+    /// already froze the hosted `Runner`'s own accumulator, so there is
+    /// nothing to integrate.
+    pub(crate) fn step_pet_arcade(&mut self, now: Instant) {
+        if !self.pet_arcade_open {
+            return;
+        }
+        self.pet_arcade.borrow_mut().advance(now);
+    }
+
+    /// One more fast-cadence claim `client::animation_wake_interval` folds
+    /// in, the same shape `pet_wants_fast_cadence` above already uses: an
+    /// open, in-run arcade session wants a redraw at least as often as
+    /// whichever tier its own board is actually asking to render at. The
+    /// glyph tier has nothing new to show between sim ticks (it paints one
+    /// snapshot verbatim, no interpolation), so it keeps the pre-existing
+    /// `pet_arcade::TICK_INTERVAL` (50ms/20Hz) cadence -- redrawing it
+    /// faster would just repaint pixel-identical frames. The pixel tier
+    /// interpolates continuous motion BETWEEN ticks (`render::render_pet_
+    /// arcade`'s own `interpolated_dynamic_sprites` call), so it earns its
+    /// own faster `pet_arcade::PIXEL_TIER_FRAME_INTERVAL` (~60Hz) cadence --
+    /// see that constant's own doc comment. Keyed off the owner's own
+    /// `pet_arcade_visual_tier` PREFERENCE, not this frame's actually-
+    /// resolved tier (which `render::render_pet_arcade` alone decides,
+    /// after this cadence has already been picked) -- a terminal briefly
+    /// too narrow for the pixel tier polling a little faster than it
+    /// strictly needs to is a harmless inefficiency, not a correctness bug.
+    pub(crate) fn pet_arcade_wake_interval(&self) -> Option<std::time::Duration> {
+        if self.pet_arcade_open && self.pet_arcade.borrow().is_running() {
+            Some(match self.pet_arcade_visual_tier {
+                PetArcadeVisualTier::Pixel => crate::pet_arcade::PIXEL_TIER_FRAME_INTERVAL,
+                PetArcadeVisualTier::Glyph => crate::pet_arcade::TICK_INTERVAL,
+            })
+        } else {
+            None
+        }
     }
 
     /// The other NEW fast-cadence claim: a hovered shimmer slot (the LEFT
@@ -4999,6 +5366,9 @@ fn append_event_to_diagnostics_file(event: &AppEvent) {
         }
         match target {
             Some(HitTarget::ModalClose) => self.close_status_bar_zone(),
+            Some(HitTarget::PetArcadeLaunch) if self.focus == Focus::StatusBarRight => {
+                self.open_pet_arcade()
+            }
             Some(HitTarget::StatusBarMarqueeToggle) if self.focus == Focus::StatusBarCenter => {
                 self.toggle_marquee();
                 AppAction::None
@@ -5083,6 +5453,7 @@ fn append_event_to_diagnostics_file(event: &AppEvent) {
     fn reduce_status_bar_zone(&mut self, key: UiKey) -> AppAction {
         match key {
             UiKey::Escape => self.close_status_bar_zone(),
+            UiKey::Enter if self.focus == Focus::StatusBarRight => self.open_pet_arcade(),
             UiKey::Char('m') | UiKey::Char('M') if self.focus == Focus::StatusBarCenter => {
                 self.toggle_marquee();
                 AppAction::None
@@ -11845,6 +12216,16 @@ fn append_event_to_diagnostics_file(event: &AppEvent) {
             self.flash("unsupported key modifier; no input sent".to_owned());
             return AppAction::None;
         }
+        // The arcade overlay is checked BEFORE the profiling overlay below
+        // -- see `App::reduce_pet_arcade`'s own doc comment: a live run
+        // must never be interrupted by anything else this fn might
+        // otherwise do with a keystroke. The two are mutually exclusive in
+        // practice (this very guard is what makes `Ctrl+P` unreachable
+        // while the arcade holds the keyboard), so the relative order
+        // between them never actually matters at runtime.
+        if self.pet_arcade_open {
+            return self.reduce_pet_arcade(key);
+        }
         // The profiling overlay closes by the exact same key that opened
         // it (`Ctrl+P`, the global arm further down) or by `Escape` --
         // the same uniform overlay-close contract every other popup here
@@ -12072,8 +12453,16 @@ fn append_event_to_diagnostics_file(event: &AppEvent) {
         if self.layout.overlays.iter().any(|overlay| overlay.rect.contains(column, row)) {
             return None;
         }
-        // Topmost first: `render::render` paints the profiling overlay
-        // LAST (after every other overlay in this chain), so a click
+        // Topmost first: `render::render` paints the arcade overlay LAST
+        // of all (after the profiling overlay itself), so a click outside
+        // everything while a run is open must close IT before anything
+        // else gets a turn.
+        if self.pet_arcade_open {
+            self.close_pet_arcade();
+            return Some(AppAction::None);
+        }
+        // `render::render` paints the profiling overlay LAST of everything
+        // else (after every other overlay in this chain), so a click
         // outside everything while it is open must close IT, not fall
         // through to whatever might be open underneath.
         if self.profiler_overlay_open {
@@ -12118,6 +12507,12 @@ fn append_event_to_diagnostics_file(event: &AppEvent) {
             .map(|hit| hit.target.clone());
         if let Some(action) = self.close_overlay_outside_click(column, row) {
             return action;
+        }
+        // Reaching this point with the arcade still open means the click
+        // landed INSIDE its rect (the guard above already closed it for
+        // any click outside) -- dispatch to its own click handler.
+        if self.pet_arcade_open {
+            return self.click_pet_arcade(target, column, row);
         }
         // Reaching this point with the overlay still open means the click
         // landed INSIDE its rect (the guard above already closed it for
@@ -13322,6 +13717,30 @@ fn append_event_to_diagnostics_file(event: &AppEvent) {
                 | HitTarget::StatusBarLeftDrag
                 | HitTarget::StatusBarCenterDrag
                 | HitTarget::StatusBarRightDrag
+                // Same shape, for the RIGHT zone's own "pet" modal launch
+                // row -- also handled by `click_status_bar_zone`, only
+                // ever drawn while `Focus::StatusBarRight` holds focus.
+                | HitTarget::PetArcadeLaunch
+                // Only ever drawn while `pet_arcade_open`, which returns
+                // earlier in this fn via `click_pet_arcade` -- same shape
+                // as every other overlay's own drag/action rows above.
+                | HitTarget::PetArcadeDrag
+                | HitTarget::PetArcadeTile(_, _)
+                | HitTarget::PetArcadeTowerKind(_)
+                | HitTarget::PetArcadeUpgradeL2
+                | HitTarget::PetArcadeUpgradeL3Power
+                | HitTarget::PetArcadeUpgradeL3Utility
+                | HitTarget::PetArcadeSell
+                | HitTarget::PetArcadeWaveInspect
+                | HitTarget::PetArcadePetPulse
+                | HitTarget::PetArcadeBlink
+                | HitTarget::PetArcadeFullCircuit
+                | HitTarget::PetArcadeMovePet
+                | HitTarget::PetArcadeStartWave
+                | HitTarget::PetArcadeDraftRune(_)
+                | HitTarget::PetArcadeChooseEvolution(_)
+                | HitTarget::PetArcadeRestart
+                | HitTarget::PetArcadeToggleTier
                 // Same shape, for `Focus::GlobalSearch`'s own `click_
                 // global_search` guard.
                 | HitTarget::GlobalSearchResult(_)
@@ -13426,6 +13845,11 @@ fn append_event_to_diagnostics_file(event: &AppEvent) {
     }
 
     pub fn right_click(&mut self, column: u16, row: u16) -> AppAction {
+        // Same exclusive-input contract as `App::click`/`App::reduce` --
+        // no context menu may pop up over an in-progress arcade run.
+        if self.pet_arcade_open {
+            return AppAction::None;
+        }
         let target = self
             .layout
             .hits
@@ -13970,6 +14394,25 @@ fn append_event_to_diagnostics_file(event: &AppEvent) {
                     editor.update_drag_selection(viewport_row, viewport_column);
                 }
             }
+            DragState::PetArcadeTowerPlacement {
+                start_column,
+                start_row,
+                ..
+            } => {
+                if let Some(DragState::PetArcadeTowerPlacement {
+                    current_column,
+                    current_row,
+                    moved,
+                    ..
+                }) = self.drag_state.as_mut()
+                {
+                    *current_column = column;
+                    *current_row = row;
+                    if column != start_column || row != start_row {
+                        *moved = true;
+                    }
+                }
+            }
         }
         AppAction::None
     }
@@ -14017,6 +14460,37 @@ fn append_event_to_diagnostics_file(event: &AppEvent) {
                 });
                 if let Some(target) = target {
                     self.reorder_managed_agents(key, &target);
+                }
+                return AppAction::None;
+            }
+            // The palette click that started this drag already placed a
+            // tower on the then-selected tile, unconditionally, on
+            // mouse-down (`click_pet_arcade`'s own `PetArcadeTowerKind`
+            // arm) -- if the pointer never actually moved this was a plain
+            // click and that placement is the whole story, so there is
+            // nothing left to do here (never a second, duplicate `Place`
+            // for the exact same press). A real drag resolves against
+            // whatever `HitTarget::PetArcadeTile` is under the drop point
+            // THIS frame -- a tile that cannot host a tower at all, or one
+            // that is occupied/unaffordable, is a silent no-op inside
+            // `PetArcade::drop_tower` itself, the same "sim gates it"
+            // contract every other arcade action button already follows.
+            DragState::PetArcadeTowerPlacement { kind, moved, .. } => {
+                if !moved {
+                    return AppAction::None;
+                }
+                let kind = *kind;
+                let target_tile = self.layout.hits.iter().rev().find_map(|hit| {
+                    if !hit.rect.contains(column, row) {
+                        return None;
+                    }
+                    match &hit.target {
+                        HitTarget::PetArcadeTile(x, y) => Some((*x, *y)),
+                        _ => None,
+                    }
+                });
+                if let Some((x, y)) = target_tile {
+                    self.pet_arcade.borrow_mut().drop_tower(kind, x, y);
                 }
                 return AppAction::None;
             }
@@ -14123,6 +14597,7 @@ fn append_event_to_diagnostics_file(event: &AppEvent) {
             OverlayId::StatusBarCenter => self.layout.status_bar_center_modal,
             OverlayId::StatusBarRight => self.layout.status_bar_right_modal,
             OverlayId::HarnessReverseAttribution => self.layout.harness_reverse_attribution_modal,
+            OverlayId::PetArcade => self.layout.pet_arcade_modal,
         }
     }
 

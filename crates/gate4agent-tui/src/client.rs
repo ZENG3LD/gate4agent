@@ -731,6 +731,9 @@ fn animation_wake_interval(app: &App) -> Option<Duration> {
     if app.pet_wants_fast_cadence() {
         interval = Some(interval.map_or(PET_ANIMATION_INTERVAL, |current| current.min(PET_ANIMATION_INTERVAL)));
     }
+    if let Some(pet_arcade_interval) = app.pet_arcade_wake_interval() {
+        interval = Some(interval.map_or(pet_arcade_interval, |current| current.min(pet_arcade_interval)));
+    }
     interval
 }
 
@@ -944,6 +947,7 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
     let mut preferences_deadline = None;
     let mut frames = FrameScheduler::new(Instant::now());
     let mut sixel_emit_state = SixelEmitState::default();
+    let mut pet_arcade_pixel_emit_state = PetArcadePixelEmitState::default();
     while !app.should_quit {
         // Rides this loop's own existing cadence -- no new thread, no new
         // timer. `tick_second` is a cheap `Instant` comparison unless a
@@ -1106,6 +1110,7 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
             // of how sparsely or densely this block actually runs; see
             // `App::step_pet`'s own doc comment.
             app.step_pet(now);
+            app.step_pet_arcade(now);
             let render_start = Instant::now();
             app.layout = render::render(&app, screen.buffer_mut());
             app.profiler.record_render(render_start.elapsed());
@@ -1128,6 +1133,21 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
             app.profiler.record_flush(flush_start.elapsed());
             let sixel_start = Instant::now();
             flush_sixel_icon(&app, screen.current(), &mut sixel_emit_state)?;
+            // Painted AFTER the rail/strip/gallery icons above, on the SAME
+            // measured span (`app.profiler.record_sixel` below covers
+            // both): the arcade board is a MODAL, drawn on top of
+            // everything else in the ordinary cell buffer's own z-order
+            // (`render::render_pet_arcade` runs late in that sequence), so
+            // its own raster must win visually wherever it happens to
+            // overlap a rail/strip/gallery icon too (e.g. the modal
+            // dragged over the activity rail) -- see `flush_pet_arcade_
+            // pixel_frame_into`'s own doc comment for why this never
+            // fights `flush_sixel_icon`'s own occlusion handling: any rail
+            // icon under the modal was already dropped from `app.layout.
+            // sixel_icons` by `render::render`'s own end-of-frame occlusion
+            // pass, so `flush_sixel_icon` above already repainted that
+            // area's real (modal) content before this call ever runs.
+            flush_pet_arcade_pixel_frame(&app, screen.current(), &mut pet_arcade_pixel_emit_state)?;
             app.profiler.record_sixel(sixel_start.elapsed());
             sync_cursor(&app)?;
             app.profiler.record_frame(frame_start.elapsed());
@@ -2336,6 +2356,110 @@ fn cell_rect_fingerprint(screen_buffer: &TerminalBuffer, rect: Rect) -> u64 {
         }
     }
     hasher.finish()
+}
+
+/// Remembers the Pet Bastion arcade board's own pixel-tier placement rect
+/// across frames -- the ONLY state [`flush_pet_arcade_pixel_frame_into`]
+/// needs, unlike [`SixelEmitState`]'s own much larger bookkeeping. That
+/// bigger machinery exists to answer "did anything change since last
+/// time, and if not can this frame skip writing anything at all" for
+/// placements that mostly DON'T change frame to frame (a rail icon). This
+/// placement is the opposite: it is recomposed from scratch and re-encoded
+/// every single frame it exists at all (interpolated 20Hz-sim-into-60Hz-
+/// render motion, see `render::render_pet_arcade`'s own doc comment), so
+/// "was this frame's content identical to last frame's" is not a case
+/// worth detecting -- there is no persistent-identity `Vec` to diff
+/// against, no fingerprint, no `force_next`. The one thing this state DOES
+/// still need to answer is "did the placement's own RECT move or
+/// disappear since last time," which -- exactly like a vacated rail-icon
+/// rect -- needs an explicit [`clear_rect`] read from the current,
+/// already-correct `screen_buffer` content.
+#[derive(Default)]
+struct PetArcadePixelEmitState {
+    last_rect: Option<Rect>,
+}
+
+fn flush_pet_arcade_pixel_frame(app: &App, screen_buffer: &TerminalBuffer, state: &mut PetArcadePixelEmitState) -> io::Result<()> {
+    flush_pet_arcade_pixel_frame_into(&mut stdout(), app, screen_buffer, state)
+}
+
+/// The pixel tier's own counterpart to [`flush_sixel_icon_into`] -- same
+/// underlying discipline (a sixel raster is painted OUTSIDE `uzor_tui`'s
+/// own cell buffer/diff, so a moved or vacated placement needs an explicit
+/// [`clear_rect`] read from `screen_buffer`, and a placement whose bottom
+/// row would land on the terminal's own last row is dropped rather than
+/// risking the unsolicited-scroll defect that fn's own doc comment
+/// describes), but WITHOUT that fn's own signature/fingerprint survivor-
+/// gating -- see [`PetArcadePixelEmitState`]'s own doc comment for why: this
+/// function simply re-emits `app.layout.pet_arcade_pixel_frame`'s own
+/// bytes every call it is `Some`, and only pays [`clear_rect`]'s own extra
+/// cost when the placement's own RECT changed (a drag, a resize-driven
+/// renegotiation, the tier just switching on) or disappeared (the tier
+/// switched off, the modal closed, the frame became too small this frame,
+/// or `render::render`'s own end-of-frame occlusion pass dropped it -- see
+/// `render::drop_pet_arcade_pixel_frame_if_covered`'s own doc comment).
+/// The steady-state case (same rect as last call) skips `clear_rect`
+/// entirely and just re-prints straight over the previous raster: a
+/// terminal holds a sixel image as one object anchored at its own cursor
+/// cell and replaces it WHOLE on a fresh emission at the same position
+/// (measured, not assumed -- the same fact `icons.rs`'s own sixel-icon
+/// path already relies on for its own steady-state placements), so there
+/// is nothing stale left behind by skipping a redundant clear-then-repaint
+/// there.
+///
+/// No `SixelEmitState::force_next`-equivalent flag is needed here at all:
+/// a genuine terminal resize already forces a NEW negotiated board size
+/// next frame (`ArcadeShell::negotiate_size`, re-run from `render::render_
+/// pet_arcade` every call), which is a RECT change this function's own
+/// `state.last_rect != Some(placement.rect)` branch already reacts to by
+/// clearing first -- and even in the (currently unreachable in practice --
+/// `render::render_pet_arcade`'s own `pixel_tier_fits` doc comment)
+/// pathological case where a resize left the rect byte-identical, this
+/// function re-emits on EVERY surviving-rect frame regardless, so there is
+/// no "signature says unchanged, skip" case a resize could ever need to
+/// override in the first place.
+fn flush_pet_arcade_pixel_frame_into<W: io::Write>(
+    writer: &mut W,
+    app: &App,
+    screen_buffer: &TerminalBuffer,
+    state: &mut PetArcadePixelEmitState,
+) -> io::Result<()> {
+    let last_row = screen_buffer.height().saturating_sub(1);
+    let placement = app.layout.pet_arcade_pixel_frame.as_ref().filter(|placement| {
+        placement.rect.width > 0 && placement.rect.height > 0 && placement.rect.bottom().saturating_sub(1) < last_row
+    });
+
+    let Some(placement) = placement else {
+        if let Some(old_rect) = state.last_rect.take() {
+            clear_rect(writer, old_rect, screen_buffer)?;
+        }
+        return Ok(());
+    };
+
+    if state.last_rect != Some(placement.rect) {
+        if let Some(old_rect) = state.last_rect {
+            clear_rect(writer, old_rect, screen_buffer)?;
+        }
+        // Defensively clears the NEW rect too, even though it is about to
+        // be fully overwritten by an opaque-everywhere board raster in
+        // practice (the board's own always-present `Ground` layer paints
+        // every tile, see `gate4agent-arcade`'s own `paint_terrain`): a
+        // stale, still-opaque placement from something ELSE (e.g. a rail
+        // icon the modal just moved on top of) sitting under a
+        // `BackgroundMode::Transparent` encode could otherwise bleed
+        // through any genuinely transparent pixel this scene ever does
+        // produce (a fading combat effect at the very edge of its own
+        // life), the same "New placement bleed-through" concern `flush_
+        // sixel_icon_into`'s own doc comment already documents for rail
+        // icons.
+        clear_rect(writer, placement.rect, screen_buffer)?;
+    }
+
+    execute!(writer, SavePosition, MoveTo(placement.rect.x, placement.rect.y))?;
+    writer.write_all(&placement.encoded)?;
+    execute!(writer, RestorePosition)?;
+    state.last_rect = Some(placement.rect);
+    Ok(())
 }
 
 fn sync_cursor(app: &App) -> io::Result<()> {

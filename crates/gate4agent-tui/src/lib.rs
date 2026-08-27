@@ -4,6 +4,7 @@ pub mod diagnostics;
 pub mod icons;
 pub mod pty_palette;
 pub mod platform;
+pub(crate) mod pet_arcade;
 pub mod preferences;
 pub(crate) mod profile;
 pub(crate) mod pty_render_cache;

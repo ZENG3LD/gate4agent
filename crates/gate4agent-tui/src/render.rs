@@ -1,10 +1,28 @@
 use std::cell::RefCell;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use uzor_tui::{
     split, Block, Color, Constraint, Direction, Line, Modifier, Paragraph, Rect, Span, Style,
     TerminalBuffer, Text, Widget,
 };
+use gate4agent_arcade_engine::{
+    build_background, compose_frame, encode_frame, BoardBackground, CellArea, DirtyHint, DynamicStroke, GlyphBackend,
+    PixelFrameOutput, RenderBackend, Rgb as ArcadeRgb, Surface, TileFootprint,
+};
+use gate4agent_arcade_pet_bastion::board::{AnchorId, Board};
+use gate4agent_arcade_pet_bastion::boss::BossKind;
+use gate4agent_arcade_pet_bastion::constants::{
+    BLINK_COST, BOARD_HEIGHT, BOARD_WIDTH, FIXED_SCALE, FULL_CIRCUIT_COST, PET_PULSE_COST, SPARK_CAP,
+    WAVE_COUNT,
+};
+use gate4agent_arcade_pet_bastion::enemy::EnemyKind;
+use gate4agent_arcade_pet_bastion::pet::Evolution;
+use gate4agent_arcade_pet_bastion::rune::Rune;
+use gate4agent_arcade_pet_bastion::snapshot::{RunPhaseView, SimulationSnapshot};
+use gate4agent_arcade_pet_bastion::tower::{effective_stats, DamageFamily, TowerKind, TowerStats, UpgradeBranch, UpgradeLevel};
+use gate4agent_arcade_pet_bastion::RunOutcome as PetBastionRunOutcome;
+use gate4agent_arcade_pet_bastion_render::interp::interpolated_dynamic_sprites;
+use gate4agent_arcade_pet_bastion_render::{snapshot_to_surface, terrain_surface};
 use gate4agent_c2_protocol::C2RelayRoute;
 use gate4agent_harness_protocol::HarnessRunGitFactsOutcomeV1;
 use gate4agent_node_protocol::{
@@ -30,7 +48,7 @@ use crate::app::{
     ContextUsageHover, ContextUsageSegment, ContextUsageSegmentHit,
     ExistingSessionMode, ExistingSessionOperation, Focus, FolderBrowserField,
     AgentRunGitScopeView, GitLocationDialogKind, HitRegion, HitTarget, LaunchContextMode, LaunchField, LaunchTarget,
-    IconFamily, LayoutRects, MenuPlacement, NativeSessionGroupKey, NativeSessionTreeItem, NetworkSummary, NodeView, OverlayId, PreviewTabPhase, PreviewTabView, PtyColorMode, RailIcons, RosterMode, SessionView,
+    IconFamily, LayoutRects, MenuPlacement, NativeSessionGroupKey, NativeSessionTreeItem, NetworkSummary, NodeView, OverlayId, PetArcadePixelPlacement, PetArcadeVisualTier, PreviewTabPhase, PreviewTabView, PtyColorMode, RailIcons, RosterMode, SessionView,
     SixelIconPlacement, SixelIconSize,
     pet_blink_suspended_for_connection, pet_connection_color_key, PetConnectionColor,
     StatusBarHoverZone,
@@ -43,6 +61,7 @@ use crate::app::{
     MAX_BROWSER_LOADED_ENTRIES, RESTORE_VIA_SKILL_DISABLED_REASON,
 };
 use crate::icons;
+use crate::pet_arcade::{Inspect, PetArcade};
 use crate::pty_palette::{GATE_FG, TERM_BG};
 use crate::pty_render_cache::PtyRenderCache;
 use crate::shimmer;
@@ -272,6 +291,7 @@ pub fn render(app: &App, buf: &mut TerminalBuffer) -> LayoutRects {
     let mut layout = LayoutRects {
         activity_rail,
         sixel_icons: Vec::new(),
+        pet_arcade_pixel_frame: None,
         overlays: Vec::new(),
         spaces,
         agents,
@@ -295,6 +315,7 @@ pub fn render(app: &App, buf: &mut TerminalBuffer) -> LayoutRects {
         status_bar_center_modal: Rect::default(),
         status_bar_right_modal: Rect::default(),
         harness_reverse_attribution_modal: Rect::default(),
+        pet_arcade_modal: Rect::default(),
         status_bar_center_log_body: Rect::default(),
         status_bar_left: Rect::default(),
         status_bar_center: Rect::default(),
@@ -453,12 +474,16 @@ pub fn render(app: &App, buf: &mut TerminalBuffer) -> LayoutRects {
     if app.profiler_overlay_open {
         render_profile_overlay(app, area, buf, &mut layout, theme);
     }
+    if app.pet_arcade_open {
+        render_pet_arcade(app, area, buf, &mut layout, theme);
+    }
     render_drag_preview(app, area, buf, &layout, theme);
     if let Some(notice) = app.notice() {
         render_notice(notice, right[1], buf, theme);
     }
     render_context_usage_tooltip(app.context_usage_hover, area, buf, &layout, theme);
     drop_sixel_icons_covered_by_overlays(&mut layout);
+    drop_pet_arcade_pixel_frame_if_covered(&mut layout);
     layout
 }
 
@@ -1105,7 +1130,1000 @@ fn render_status_bar_right_modal(
         return;
     }
     let inner = Rect::new(dialog.x + 1, dialog.y + 1, dialog.width - 2, dialog.height - 2);
-    render_modal_line("nothing here yet", inner, 0, Style::default().fg(theme.muted).bg(theme.modal), buf);
+    render_modal_line(
+        "Pet Bastion: Night Garden",
+        inner,
+        0,
+        Style::default().fg(theme.text).bg(theme.modal),
+        buf,
+    );
+    render_modal_line(
+        "[Enter] play",
+        inner,
+        1,
+        Style::default().fg(theme.accent).bg(theme.modal),
+        buf,
+    );
+    push_modal_hit(layout, modal_row(inner, 1), HitTarget::PetArcadeLaunch);
+}
+
+/// The Pet Bastion arcade overlay itself -- opened from the small "pet"
+/// status-bar modal's own `[Enter] play` row (`App::open_pet_arcade`),
+/// closed by `Escape`, its own `[x]`, or a click outside its rect
+/// (`App::close_pet_arcade`, reached through `App::reduce`/`App::click`'s
+/// own top-priority gate ahead of every `Focus`-driven dispatch -- see
+/// `App::reduce_pet_arcade`'s own doc comment).
+///
+/// Built through `positioned_modal`/`DragState::OverlayMove`
+/// (`OverlayId::PetArcade`) like every other draggable modal in this
+/// crate now -- this overlay used to be centered fresh every frame with no
+/// drag of its own, over a sixel-re-emission concern that does not apply
+/// to this crate's glyph-tier board (see `pet_arcade`'s own module doc
+/// comment): dragging a glyph-tier board costs nothing beyond the ordinary
+/// per-cell diff every other draggable modal already pays.
+///
+/// Size comes entirely from the engine's own sizing contract
+/// (`PetArcade::negotiate_size`, backed by `GameEntry::min_modal_size`/
+/// `preferred_modal_size`), never hardcoded here. Those two sizes describe
+/// the game's own CONTENT area (board + HUD panel + header/hint rows --
+/// see `gate4agent_arcade_pet_bastion::sim`'s own `GameEntry` impl doc for
+/// the exact accounting), not this overlay's outer bordered rect, so the
+/// border this fn draws is budgeted OUTSIDE what gets negotiated (`content_
+/// budget` below reserves 2 cells on each axis before ever asking), and
+/// `inner` below is exactly the negotiated size, never smaller. A terminal
+/// with no room for even the minimum gets an honest "needs more room"
+/// message instead of a clipped board.
+///
+/// # Screen cell <-> board tile
+///
+/// The board is painted by projecting a `BOARD_WIDTH x BOARD_HEIGHT`
+/// `Surface` onto `dest` at `footprint` cells per tile (`GlyphBackend::
+/// project`, from `gate4agent-arcade-engine`) -- tile `(tx, ty)`'s own
+/// glyph lands at screen cell `(dest.x + tx * footprint.cells_w, dest.y +
+/// ty * footprint.cells_h)`. Below, once that same `dest`/`footprint` pair
+/// is computed, this fn walks every tile that arithmetic actually painted
+/// and pushes ONE `HitTarget::PetArcadeTile(tx, ty)` hit region per tile,
+/// covering exactly the `footprint.cells_w x 1` screen cells that tile's
+/// own glyph occupies -- the SAME multiplication, not a second, inverted
+/// copy of it. `App::click`/`PetArcade::click_tile` never need to convert
+/// a screen coordinate back into a tile coordinate at all: `layout.hits`'s
+/// own rect-contains-point scan (`App::click`) already did that lookup by
+/// construction, the same way every other per-cell click target in this
+/// crate (e.g. `HitTarget::FolderBrowserEntry`) already works.
+///
+/// # The pixel tier's own cached board background
+///
+/// [`PET_ARCADE_PIXEL_BACKGROUND`] is `gate4agent_arcade_engine::
+/// build_background`'s own expensive one-time raster (ground/decor/
+/// routes/pool/anchors/Heartseed), built exactly once, process-wide, from
+/// `gate4agent_arcade_pet_bastion_render::terrain_surface()` -- NOT from
+/// this fn's own live, per-snapshot `surface` (see that function's own doc
+/// comment for why a live surface is the wrong input: a placed tower
+/// replaces a decor tile's own `art`, which would otherwise make the
+/// cached seed drift and force a rebuild on every placement). A
+/// `LazyLock`, not a `background_seed`-checked cache kept in `PetArcade`,
+/// because Pet Bastion's own board LAYOUT is a fixed constant
+/// (`terrain_surface`'s own doc comment: "calling this twice... always
+/// produces byte-identical output") -- there is no seed that could ever
+/// actually change to invalidate against.
+static PET_ARCADE_PIXEL_BACKGROUND: std::sync::LazyLock<BoardBackground> =
+    std::sync::LazyLock::new(|| build_background(&terrain_surface()));
+
+fn render_pet_arcade(
+    app: &App,
+    area: Rect,
+    buf: &mut TerminalBuffer,
+    layout: &mut LayoutRects,
+    theme: Theme,
+) {
+    let arcade = app.pet_arcade.borrow();
+    let content_budget = CellArea {
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    let Some(negotiated) = arcade.negotiate_size(content_budget) else {
+        render_pet_arcade_too_small(area, buf, layout, theme, crate::pet_arcade::min_modal_size());
+        return;
+    };
+    let modal = positioned_modal(
+        area,
+        negotiated.width + 2,
+        negotiated.height + 2,
+        app.overlay_positions.get(&OverlayId::PetArcade).copied(),
+    );
+    layout.pet_arcade_modal = modal;
+    layout.note_overlay(modal);
+    fill_rect(modal, theme.modal, buf);
+    Block::bordered()
+        .title(" Pet Bastion: Night Garden ")
+        .border_style(Style::default().fg(theme.accent))
+        .style(Style::default().bg(theme.modal))
+        .render(modal, buf);
+    layout.hits.push(HitRegion {
+        rect: Rect::new(modal.x, modal.y, modal.width, 1),
+        target: HitTarget::PetArcadeDrag,
+    });
+    render_modal_close(modal, buf, layout, theme);
+    if modal.width < 3 || modal.height < 3 {
+        return;
+    }
+    let inner = Rect::new(modal.x + 1, modal.y + 1, negotiated.width, negotiated.height);
+
+    if let Some((outcome, _final_hash)) = arcade.results() {
+        render_pet_arcade_results(outcome, inner, buf, layout, theme);
+        return;
+    }
+    let Some(snapshot) = arcade.snapshot() else {
+        render_modal_line(
+            "starting...",
+            inner,
+            0,
+            Style::default().fg(theme.muted).bg(theme.modal),
+            buf,
+        );
+        return;
+    };
+
+    let preferred = crate::pet_arcade::preferred_modal_size();
+    let footprint_w: u16 = if negotiated.width >= preferred.width { 2 } else { 1 };
+    let footprint = TileFootprint { cells_w: footprint_w, cells_h: 1 };
+    let board_w = (BOARD_WIDTH as u16 * footprint_w).min(inner.width);
+    let board_h = (BOARD_HEIGHT as u16).min(inner.height);
+    // Whether THIS frame's own negotiated size actually fits the pixel
+    // tier's own fixed-scale board (`backend_pixel::PX_PER_CELL_W`/`_H`
+    // assume a `28 * 2 = 56`-cell-wide, `14`-cell-tall board -- exactly
+    // `footprint_w == 2`'s own full, unclamped `board_w`/`board_h`, see
+    // `gate4agent-arcade`'s own `backend_pixel.rs` module doc comment for
+    // the `20px`/cell-tile derivation this depends on). `footprint_w == 1`
+    // (a narrow terminal/modal) is the one real, common reason to fall
+    // back -- the structurally impossible "landed on the terminal's own
+    // true last row" case `client::flush_pet_arcade_pixel_frame_into` also
+    // guards is not repeated here: `area` (this fn's own outer bound) is
+    // already one row short of the real terminal height (`render::render`'s
+    // own status-bar reservation), so this modal can never reach it at all.
+    let pixel_tier_fits = footprint_w == 2 && board_h == BOARD_HEIGHT as u16;
+
+    // `inner.height` is guaranteed `>= BOARD_HEIGHT + 1` (the min-size
+    // contract's own one hint row) -- `extra_rows` is therefore always at
+    // least 1. A header row only appears once there is enough extra room
+    // for BOTH it and at least one hint row (the preferred-size contract's
+    // own header(1) + hint(2) = 3); anything narrower than that keeps the
+    // header off and gives every spare row straight to the hint text.
+    let extra_rows = inner.height.saturating_sub(board_h);
+    let header_h: u16 = if extra_rows >= 3 { 1 } else { 0 };
+    let board_y = inner.y + header_h;
+
+    if header_h > 0 {
+        render_modal_line(
+            &pet_arcade_header_line(&snapshot),
+            inner,
+            0,
+            Style::default().fg(theme.text).bg(theme.modal),
+            buf,
+        );
+        push_modal_hit(layout, modal_row(inner, 0), HitTarget::PetArcadeWaveInspect);
+        // Pushed AFTER `PetArcadeWaveInspect` above, onto the SAME row --
+        // `App::click`'s own hit scan is last-pushed-wins
+        // (`.iter().rev().find(...)`), so a click on this button's own
+        // few columns resolves here, and a click anywhere else on the
+        // header row still falls through to the wave inspector, exactly
+        // like every other "small button pushed after a full-row hit"
+        // pattern in this crate (`render_modal_close`'s own doc comment).
+        let tier_label = pet_arcade_tier_label(app.pet_arcade_visual_tier, pixel_tier_fits);
+        let tier_label_w = cell_width(&tier_label) as u16;
+        let tier_rect = Rect::new(
+            inner.right().saturating_sub(tier_label_w).max(inner.x),
+            inner.y,
+            tier_label_w.min(inner.width),
+            1,
+        );
+        render_modal_line(&tier_label, tier_rect, 0, Style::default().fg(theme.accent).bg(theme.modal), buf);
+        push_modal_hit(layout, tier_rect, HitTarget::PetArcadeToggleTier);
+    }
+
+    let mut surface = snapshot_to_surface(&snapshot);
+    pet_arcade_highlight_cursor(&mut surface, arcade.selected_tile(), arcade.selected_anchor());
+    if let Some(DragState::PetArcadeTowerPlacement { kind, .. }) = &app.drag_state {
+        pet_arcade_highlight_buildable_tiles(&mut surface, &snapshot, *kind);
+    }
+    let dest = Rect::new(inner.x, board_y, board_w, board_h);
+    GlyphBackend.project(&surface, footprint, dest, buf, false, DirtyHint::Full);
+    // The glyph backend paints every tile's own `bg`, including `None`
+    // (blank board tiles -- void cells with no terrain/unit, the majority
+    // of a 28x14 board whose real features are a thin route plus ten pads,
+    // four anchors and the Heartseed) as `Color::Reset`
+    // (`backend_glyph::paint_tile`'s own fallback). `Color::Reset` reaches
+    // the real terminal as ITS OWN default background (typically plain
+    // black), unconditionally overwriting the `theme.modal` fill this fn
+    // already laid down under the whole modal a few lines up -- that reads
+    // as a stark black rectangle where the board sits, with a visible seam
+    // right where it meets the HUD panel's own `theme.modal` background,
+    // and the board's own sparsely-populated bottom rows read as "empty"
+    // for the exact same reason. Backfilling every still-`Reset` cell
+    // inside `dest` with `theme.modal` here (host-side, AFTER the engine's
+    // own paint pass) is the only fix available without editing
+    // `gate4agent-arcade`'s own render crate: it never touches a cell that
+    // carries a real terrain/unit `bg`, only the ones the backend left as
+    // a literal "no colour of my own" marker.
+    for row in dest.y..dest.bottom() {
+        for col in dest.x..dest.right() {
+            let cell = buf.get_mut(col, row);
+            if cell.style.bg == Color::Reset {
+                cell.style.bg = theme.modal;
+            }
+        }
+    }
+    for ty in 0..board_h {
+        for tx in 0..BOARD_WIDTH as u16 {
+            let cell_x = inner.x + tx * footprint_w;
+            if cell_x + footprint_w > inner.x + board_w {
+                break;
+            }
+            push_modal_hit(
+                layout,
+                Rect::new(cell_x, board_y + ty, footprint_w, 1),
+                HitTarget::PetArcadeTile(tx as u8, ty as u8),
+            );
+        }
+    }
+
+    // The pixel tier: composes and sixel-encodes the SAME board, on top of
+    // (never instead of) the glyph-tier paint above -- see `render::render`'s
+    // own end-of-frame occlusion pass and `client::flush_pet_arcade_pixel_
+    // frame_into`'s own doc comment for why the glyph board underneath is
+    // the correct, always-visible fallback content whenever this placement
+    // ends up dropped for a reason only known later (occluded by an
+    // overlay opened afterward) or at flush time (the terminal's own last
+    // row -- structurally unreachable here, see `pixel_tier_fits`'s own
+    // doc comment, but still guarded defensively at the one place that
+    // actually writes to the real terminal).
+    if app.pet_arcade_visual_tier == PetArcadeVisualTier::Pixel && pixel_tier_fits {
+        let drag_kind = match &app.drag_state {
+            Some(DragState::PetArcadeTowerPlacement { kind, .. }) => Some(*kind),
+            _ => None,
+        };
+        // `prev`/`curr` -- `arcade.presenter().previous()` is the last
+        // TICK-BOUNDARY snapshot before `snapshot` (already fetched above
+        // for the glyph tier); the two are exactly the pair `interp::
+        // interpolated_dynamic_sprites` needs to lerp between (see
+        // `pet_arcade::PetArcade::presenter`'s own doc comment for why
+        // `snapshot` itself IS `presenter`'s own `curr`, so there is no
+        // second live-runner query here). `alpha` is real wall-clock
+        // progress since that last tick fired
+        // (`pet_arcade::PetArcade::tick_alpha`), which is what actually
+        // lets this redraw at up to 60Hz look smoother than the sim's own
+        // unchanged 20Hz tick.
+        let prev = arcade.presenter().previous();
+        let alpha = arcade.tick_alpha(Instant::now());
+        let dynamic = interpolated_dynamic_sprites(prev, &snapshot, alpha);
+        let strokes = pet_arcade_pixel_highlight_strokes(&snapshot, arcade.selected_tile(), arcade.selected_anchor(), drag_kind);
+        let canvas = compose_frame(&PET_ARCADE_PIXEL_BACKGROUND, &surface, &dynamic, &strokes, drag_kind.is_some());
+        if let PixelFrameOutput::Frame(frame) = encode_frame(&canvas, dest) {
+            layout.pet_arcade_pixel_frame = Some(PetArcadePixelPlacement {
+                rect: frame.rect,
+                encoded: frame.encoded,
+                overlays_before: layout.overlays.len(),
+            });
+        }
+    }
+
+    let hud_x = inner.x + board_w;
+    let hud_w = inner.width.saturating_sub(board_w);
+    if hud_w > 0 {
+        let hud = Rect::new(hud_x, board_y, hud_w, board_h);
+        render_pet_arcade_hud(&snapshot, &arcade, hud, buf, layout, theme);
+    }
+
+    let hint_y = board_y + board_h;
+    if hint_y < inner.bottom() {
+        let hint_area = Rect::new(inner.x, hint_y, inner.width, inner.bottom() - hint_y);
+        render_pet_arcade_hints(hint_area, buf, theme);
+    }
+}
+
+fn render_pet_arcade_too_small(
+    area: Rect,
+    buf: &mut TerminalBuffer,
+    layout: &mut LayoutRects,
+    theme: Theme,
+    min: CellArea,
+) {
+    let message = format!(
+        "Pet Bastion needs at least {}x{} -- resize the terminal (Esc closes)",
+        min.width, min.height
+    );
+    let width = (message.chars().count() as u16 + 4).min(area.width);
+    let height = 3.min(area.height);
+    if width < 3 || height < 3 {
+        return;
+    }
+    let modal = centered(area, width, height);
+    layout.note_overlay(modal);
+    fill_rect(modal, theme.modal, buf);
+    Block::bordered()
+        .border_style(Style::default().fg(theme.yellow))
+        .style(Style::default().bg(theme.modal))
+        .render(modal, buf);
+    let inner = Rect::new(
+        modal.x + 1,
+        modal.y + 1,
+        modal.width.saturating_sub(2),
+        modal.height.saturating_sub(2),
+    );
+    render_modal_line(&message, inner, 0, Style::default().fg(theme.yellow).bg(theme.modal), buf);
+}
+
+/// Owner report: restarting after a win/loss was keyboard-only (`r`).
+/// `[R] Play Again` is now its own clickable button (`HitTarget::
+/// PetArcadeRestart`, sized to its own label rather than the full-width
+/// `modal_row` every other single-button row here uses -- there is a
+/// second, unrelated hint line sharing this same card, and a full-width
+/// hit on THIS row would swallow clicks meant for empty space next to the
+/// button). Closing still works two ways without any new code: the
+/// title bar's own `[x]` (`render_modal_close`, drawn once for every
+/// screen this overlay can be in, Results included) and `Esc`.
+fn render_pet_arcade_results(
+    outcome: PetBastionRunOutcome,
+    inner: Rect,
+    buf: &mut TerminalBuffer,
+    layout: &mut LayoutRects,
+    theme: Theme,
+) {
+    let (headline, color) = match outcome {
+        PetBastionRunOutcome::Won => ("VICTORY -- the Heartseed holds.", theme.green),
+        PetBastionRunOutcome::Lost => ("DEFEAT -- the Heartseed broke.", theme.red),
+    };
+    render_modal_line(headline, inner, 0, Style::default().fg(color).bg(theme.modal), buf);
+
+    let restart_label = "[R] Play Again";
+    let restart_width = (cell_width(restart_label) as u16).min(inner.width);
+    if restart_width > 0 && inner.height > 2 {
+        let rect = Rect::new(inner.x, inner.y + 2, restart_width, 1);
+        Paragraph::new(restart_label)
+            .style(Style::default().fg(theme.active_tab_text).bg(theme.accent).add_modifier(Modifier::BOLD))
+            .render(rect, buf);
+        push_modal_hit(layout, rect, HitTarget::PetArcadeRestart);
+    }
+    render_modal_line(
+        "[x] top-right or Esc closes",
+        inner,
+        3,
+        Style::default().fg(theme.muted).bg(theme.modal),
+        buf,
+    );
+}
+
+/// Ticks-remaining is converted to whole seconds rounded UP (never floats
+/// -- this is presentation code, but it still follows the sim's own "no
+/// floats" convention for consistency): `TICKS_PER_SECOND` is 20 (50ms
+/// ticks), so `(ticks + 19) / 20` is the standard integer round-up.
+fn pet_arcade_phase_label(phase: &RunPhaseView) -> String {
+    match phase {
+        RunPhaseView::Build { ticks_remaining } => format!("Build ({}s)", (ticks_remaining + 19) / 20),
+        RunPhaseView::Combat => "Combat".to_owned(),
+        RunPhaseView::RuneDraft => "Rune draft".to_owned(),
+        RunPhaseView::EvolutionChoice => "Evolution choice".to_owned(),
+        RunPhaseView::Victory => "Victory".to_owned(),
+        RunPhaseView::Defeat => "Defeat".to_owned(),
+    }
+}
+
+/// The board header row -- also a click target (`HitTarget::
+/// PetArcadeWaveInspect`, pushed by the caller) that opens the wave
+/// inspector card (`render_pet_arcade_inspect_card`'s own `Inspect::Wave`
+/// arm).
+fn pet_arcade_header_line(snapshot: &SimulationSnapshot) -> String {
+    format!("Wave {}/{}  {}", snapshot.wave, WAVE_COUNT, pet_arcade_phase_label(&snapshot.phase))
+}
+
+/// Tints the currently selected build tile and pet anchor's own background
+/// so the cursor (`PetArcade::selected_tile`/`selected_anchor` -- driven by
+/// either `Tab`/`[`/`]` or a click, see `pet_arcade`'s own module doc
+/// comment) is visible on the board -- never touches `glyph`/`fg`, so the
+/// real terrain/unit glyph underneath always stays legible, the same
+/// "tint, never replace" discipline `gate4agent-arcade-pet-bastion-render`
+/// already uses for its own status-effect tiles.
+fn pet_arcade_highlight_cursor(surface: &mut Surface, selected_tile: (u8, u8), selected_anchor: u8) {
+    let (px, py) = (u16::from(selected_tile.0), u16::from(selected_tile.1));
+    let mut tile_cell = surface.get(px, py);
+    tile_cell.bg = Some(ArcadeRgb(90, 70, 20));
+    surface.set(px, py, tile_cell);
+
+    let anchor_tile = Board::anchor_tile(AnchorId(selected_anchor));
+    let (ax, ay) = (anchor_tile.x as u16, anchor_tile.y as u16);
+    let mut anchor_cell = surface.get(ax, ay);
+    anchor_cell.bg = Some(ArcadeRgb(20, 60, 90));
+    surface.set(ax, ay, anchor_cell);
+}
+
+/// Tints every build-radius cell a tower drag (`DragState::PetArcade
+/// TowerPlacement`) currently makes worth showing -- green for a cell the
+/// drop would actually place `kind` on right now, dim yellow for one that
+/// is otherwise eligible but unaffordable, dim red for one another tower
+/// already occupies (`pet_arcade::BuildDragState`'s own three states). The
+/// drag still runs even when nothing is affordable, so the player gets
+/// this exact visual refusal instead of a silently-failing gesture -- but
+/// nothing ever gets charged for a drop that lands on anything but a green
+/// cell; see `PetArcade::drop_tower`'s own doc comment. Reads `pet_arcade::
+/// buildable_tiles` rather than walking any board table itself, so this
+/// stays correct the moment that fn's own notion of "buildable" changes
+/// (see that fn's own doc comment).
+fn pet_arcade_highlight_buildable_tiles(surface: &mut Surface, snapshot: &SimulationSnapshot, kind: TowerKind) {
+    for (tile, state) in crate::pet_arcade::buildable_tiles(snapshot, kind) {
+        let (x, y) = (tile.x as u16, tile.y as u16);
+        let mut cell = surface.get(x, y);
+        cell.bg = Some(match state {
+            crate::pet_arcade::BuildDragState::Buildable => ArcadeRgb(30, 110, 40),
+            crate::pet_arcade::BuildDragState::Unaffordable => ArcadeRgb(90, 80, 20),
+            crate::pet_arcade::BuildDragState::Occupied => ArcadeRgb(110, 30, 30),
+        });
+        surface.set(x, y, cell);
+    }
+}
+
+/// The board header's own `[V]` render-tier button label (see `HitTarget::
+/// PetArcadeToggleTier`'s own doc comment) -- names the owner's current
+/// `PetArcadeVisualTier` PREFERENCE, plus an honest `(small)` suffix
+/// whenever `Pixel` is preferred but this exact frame could not actually
+/// honour it (`pixel_tier_fits`, `render_pet_arcade`'s own local): the
+/// board falls back to the glyph tier that frame, and this label is what
+/// tells the player why they are looking at a different picture than
+/// usual, per this whole pass's own "переключение должно быть... видимым"
+/// requirement -- never a silent downgrade.
+fn pet_arcade_tier_label(tier: PetArcadeVisualTier, pixel_tier_fits: bool) -> String {
+    match tier {
+        PetArcadeVisualTier::Pixel if pixel_tier_fits => "[V] Pixel".to_string(),
+        PetArcadeVisualTier::Pixel => "[V] Pixel (small)".to_string(),
+        PetArcadeVisualTier::Glyph => "[V] Glyph".to_string(),
+    }
+}
+
+/// Pixel-tier equivalent of [`pet_arcade_highlight_cursor`]/[`pet_arcade_
+/// highlight_buildable_tiles`] above: those two mutate a `Surface` cell's
+/// own `bg`, which `gate4agent-arcade`'s own pixel-tier painters only ever
+/// read for a handful of `TileId`s (towers/enemies/bosses/the pet -- see
+/// `backend_pixel::paint_overlay_layer` -> `sprites::paint_tile`'s own
+/// match arms). Plain terrain (`Ground`/`Path`/`PetAnchor`/`Rock`/`Plant`/
+/// `Firefly`/`WaterPool`/`Heartseed`) is not even reachable through that
+/// path any more at all -- it is painted once into the cached
+/// `background::BoardBackground` this crate's own `PET_ARCADE_PIXEL_
+/// BACKGROUND` holds, from a terrain-only `Surface` with no cursor/drag
+/// tint ever applied to it (see that static's own doc comment) -- so a
+/// `bg`-only tint on an otherwise-bare tile (the common case: a cursor or
+/// build-radius highlight usually lands on open ground) is silently
+/// invisible in the pixel tier either way. `gate4agent-arcade` is out of
+/// scope for this pass (a sibling agent owns it concurrently) -- the fix
+/// on THIS side of that boundary is to draw the SAME information as a
+/// bright inset outline via the engine's own public `DynamicStroke`
+/// contract (`compose_frame`'s own `strokes` parameter), which paints
+/// identically regardless of which `TileId` (or no `TileId` at all, per
+/// the background split above) sits underneath.
+fn pet_arcade_pixel_highlight_strokes(
+    snapshot: &SimulationSnapshot,
+    selected_tile: (u8, u8),
+    selected_anchor: u8,
+    drag_kind: Option<TowerKind>,
+) -> Vec<DynamicStroke> {
+    let mut strokes = Vec::new();
+    push_tile_outline_stroke(&mut strokes, selected_tile.0 as f64, selected_tile.1 as f64, ArcadeRgb(220, 180, 60), 2.0);
+    let anchor_tile = Board::anchor_tile(AnchorId(selected_anchor));
+    push_tile_outline_stroke(&mut strokes, anchor_tile.x as f64, anchor_tile.y as f64, ArcadeRgb(70, 160, 220), 2.0);
+    if let Some(kind) = drag_kind {
+        for (tile, state) in crate::pet_arcade::buildable_tiles(snapshot, kind) {
+            let color = match state {
+                crate::pet_arcade::BuildDragState::Buildable => ArcadeRgb(60, 200, 80),
+                crate::pet_arcade::BuildDragState::Unaffordable => ArcadeRgb(210, 180, 60),
+                crate::pet_arcade::BuildDragState::Occupied => ArcadeRgb(210, 70, 70),
+            };
+            push_tile_outline_stroke(&mut strokes, tile.x as f64, tile.y as f64, color, 1.6);
+        }
+    }
+    strokes
+}
+
+/// Four straight [`DynamicStroke`]s forming one tile's own inset rectangle
+/// outline, `(tile_x, tile_y)` being that tile's own top-left corner in
+/// board-tile units -- see [`pet_arcade_pixel_highlight_strokes`]'s own doc
+/// comment for why an outline, not a filled wash. Inset by a fixed
+/// fraction of the tile so the outline reads as a distinct ring around the
+/// tile's own content rather than touching (and visually fusing with) the
+/// neighbouring tile's edge.
+fn push_tile_outline_stroke(strokes: &mut Vec<DynamicStroke>, tile_x: f64, tile_y: f64, color: ArcadeRgb, width_px: f32) {
+    const INSET: f64 = 0.1;
+    let (x0, y0) = (tile_x + INSET, tile_y + INSET);
+    let (x1, y1) = (tile_x + 1.0 - INSET, tile_y + 1.0 - INSET);
+    let corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)];
+    for i in 0..4 {
+        let (fx, fy) = corners[i];
+        let (tx, ty) = corners[(i + 1) % 4];
+        strokes.push(DynamicStroke { from_tile: (fx, fy), to_tile: (tx, ty), color, width_px, bulge: 0.0, alpha: 0.95 });
+    }
+}
+
+fn rune_label(rune: Rune) -> &'static str {
+    match rune {
+        Rune::Echo => "Echo",
+        Rune::Anchor => "Anchor",
+        Rune::Overgrowth => "Overgrowth",
+        Rune::Phase => "Phase",
+        Rune::Symbiosis => "Symbiosis",
+    }
+}
+
+/// The arcade's own right-hand panel: two resource rows, two packed
+/// ability-button rows, a Start Wave row, a five-row context block
+/// (whatever `render_pet_arcade_context` decides -- the selected tile/
+/// tower, or the inspector card), a label, and a three-row, two-column
+/// tower palette (`render::render_pet_arcade_hud`'s own "Towers:" rows) --
+/// exactly `board_h` rows end to end (`2 info + 2 ability + 1 wave + 5
+/// context + 1 label + 3 palette = 14`, matching `BOARD_HEIGHT`, which is
+/// this column's own fixed height every time it paints at all -- see
+/// `render_pet_arcade`'s own call site). Every row here is either resource
+/// text or a clickable target (`HitTarget::PetArcadePetPulse`/`Blink`/
+/// `FullCircuit`/`MovePet`/`StartWave`/`PetArcadeTowerKind`/`PetArcade
+/// UpgradeL2`/`PetArcadeUpgradeL3Power`/`PetArcadeUpgradeL3Utility`/
+/// `PetArcadeSell`), so this is the one place both readouts live now --
+/// the old draft/evolution rune list (`F1`-`F3`) moved into `render_pet_
+/// arcade_context` since it is exactly as context-sensitive as the tile/
+/// tower card it now shares a slot with.
+fn render_pet_arcade_hud(
+    snapshot: &SimulationSnapshot,
+    arcade: &crate::pet_arcade::PetArcade,
+    area: Rect,
+    buf: &mut TerminalBuffer,
+    layout: &mut LayoutRects,
+    theme: Theme,
+) {
+    let text_style = Style::default().fg(theme.text).bg(theme.modal);
+    let muted_style = Style::default().fg(theme.muted).bg(theme.modal);
+
+    render_modal_line(&format!("Sap {}   Wave {}/{}", snapshot.sap, snapshot.wave, WAVE_COUNT), area, 0, text_style, buf);
+    render_modal_line(
+        &format!("Spark {}/{}   HP {}", snapshot.pet.spark, SPARK_CAP, snapshot.integrity),
+        area,
+        1,
+        text_style,
+        buf,
+    );
+
+    render_pet_arcade_button_row(
+        &[
+            (format!("[G] Pulse -{PET_PULSE_COST}"), PetArcade::can_pet_pulse(snapshot), HitTarget::PetArcadePetPulse),
+            (format!("[B] Blink -{BLINK_COST}"), PetArcade::can_blink(snapshot), HitTarget::PetArcadeBlink),
+        ],
+        area,
+        2,
+        buf,
+        layout,
+        theme,
+    );
+    render_pet_arcade_button_row(
+        &[
+            (format!("[F] Circuit -{FULL_CIRCUIT_COST}"), PetArcade::can_full_circuit(snapshot), HitTarget::PetArcadeFullCircuit),
+            (format!("[M] Move->#{}", arcade.selected_anchor()), true, HitTarget::PetArcadeMovePet),
+        ],
+        area,
+        3,
+        buf,
+        layout,
+        theme,
+    );
+    render_pet_arcade_button_row(
+        &[("[Space] Start Wave".to_owned(), PetArcade::can_start_wave(snapshot), HitTarget::PetArcadeStartWave)],
+        area,
+        4,
+        buf,
+        layout,
+        theme,
+    );
+
+    let context_area = Rect::new(area.x, area.y + 5, area.width, 5.min(area.height.saturating_sub(5)));
+    render_pet_arcade_context(snapshot, arcade, context_area, buf, layout, theme);
+
+    render_modal_line("Towers:", area, 10, muted_style, buf);
+    let selected_kind = arcade.selected_tower_kind();
+    let col_width = area.width / 2;
+    for (index, kind) in TowerKind::ALL.iter().enumerate() {
+        let index = index as u16;
+        let Some(row) = 11u16.checked_add(index / 2) else { break };
+        if row >= area.height {
+            break;
+        }
+        let col = index % 2;
+        let x = area.x + col * col_width;
+        let width = if col == 0 { col_width } else { area.width - col_width };
+        if width == 0 {
+            continue;
+        }
+        let cost = kind.base_stats().cost;
+        let affordable = cost <= snapshot.sap;
+        let marker = if *kind == selected_kind { '>' } else { ' ' };
+        let line = format!("{marker}{} {} {}", index + 1, tower_kind_label(*kind), cost);
+        let style = if !affordable {
+            Style::default().fg(theme.dim).bg(theme.modal)
+        } else if *kind == selected_kind {
+            Style::default().fg(theme.accent).bg(theme.modal)
+        } else {
+            text_style
+        };
+        let rect = Rect::new(x, area.y + row, width, 1);
+        Paragraph::new(truncate_cells(&line, width as usize)).style(style).render(rect, buf);
+        push_modal_hit(layout, rect, HitTarget::PetArcadeTowerKind(*kind));
+    }
+}
+
+/// Paints a row of 1-2 short action buttons packed left-to-right with a
+/// two-column gap, each getting its OWN hit region sized to its own
+/// label -- never one shared full-row hit the way `push_modal_hit`/
+/// `modal_row` give every other single-button row in this HUD, since two
+/// buttons sharing a row would otherwise fight over the same click.
+/// `enabled` only changes the button's own colour (accent vs dim) -- every
+/// arcade action button's own click handler (`PetArcade::click_pet_pulse`,
+/// `click_blink`, ...) already queues its command unconditionally and lets
+/// the sim itself no-op an unaffordable one, so a dim button here still
+/// carries a live hit region rather than silently swallowing the click:
+/// the owner's own ask was "visibly unavailable", not "unclickable".
+fn render_pet_arcade_button_row(
+    buttons: &[(String, bool, HitTarget)],
+    area: Rect,
+    row: u16,
+    buf: &mut TerminalBuffer,
+    layout: &mut LayoutRects,
+    theme: Theme,
+) {
+    if row >= area.height {
+        return;
+    }
+    let y = area.y + row;
+    let right = area.x + area.width;
+    let mut x = area.x;
+    for (label, enabled, target) in buttons {
+        if x >= right {
+            break;
+        }
+        let width = (cell_width(label) as u16).min(right - x);
+        if width == 0 {
+            break;
+        }
+        let style = if *enabled {
+            Style::default().fg(theme.accent).bg(theme.modal)
+        } else {
+            Style::default().fg(theme.dim).bg(theme.modal)
+        };
+        let rect = Rect::new(x, y, width, 1);
+        Paragraph::new(truncate_cells(label, width as usize)).style(style).render(rect, buf);
+        push_modal_hit(layout, rect, target.clone());
+        x += width + 2;
+    }
+}
+
+/// The HUD's own context-sensitive block, right under the resource rows --
+/// the inspector card (`Inspect`, if a click set one -- takes priority,
+/// since inspecting an entity is a deliberate, explicit action) or
+/// otherwise whatever `selected_tile` currently holds: a placed tower's own
+/// action rows, or an empty tile's own placement preview for whichever
+/// kind the palette currently has selected. Exactly `area.height` rows,
+/// always -- every branch below pads its own unused rows with nothing
+/// rather than leaving stale content from a previous frame's different
+/// branch (each row is drawn fresh every frame, never carried over).
+fn render_pet_arcade_context(
+    snapshot: &SimulationSnapshot,
+    arcade: &crate::pet_arcade::PetArcade,
+    area: Rect,
+    buf: &mut TerminalBuffer,
+    layout: &mut LayoutRects,
+    theme: Theme,
+) {
+    if let Some(inspect) = arcade.inspect() {
+        render_pet_arcade_inspect_card(snapshot, inspect, area, buf, theme);
+        return;
+    }
+    match &snapshot.phase {
+        // Owner report: neither of these two cards had a single clickable
+        // option -- `F1`-`F3` were the ONLY way to resolve either, which
+        // stalls a mouse-only run outright (both phases block every other
+        // action until resolved). Each option row below is now also a
+        // `HitTarget::PetArcadeDraftRune`/`PetArcadeChooseEvolution` hit,
+        // dispatched to `PetArcade::click_draft_rune`/`click_choose_
+        // evolution` -- the exact same commands the `F1`-`F3` keys queue.
+        RunPhaseView::RuneDraft => {
+            render_modal_line("Draft a rune (click below closed):", area, 0, Style::default().fg(theme.text).bg(theme.modal), buf);
+            for (index, rune) in snapshot.rune_options.iter().enumerate() {
+                let Ok(row) = u16::try_from(1 + index) else { break };
+                render_modal_line(&format!("F{} {}", index + 1, rune_label(*rune)), area, row, Style::default().fg(theme.accent).bg(theme.modal), buf);
+                push_modal_hit(layout, modal_row(area, row), HitTarget::PetArcadeDraftRune(*rune));
+            }
+            return;
+        }
+        RunPhaseView::EvolutionChoice => {
+            render_modal_line("Choose an evolution:", area, 0, Style::default().fg(theme.text).bg(theme.modal), buf);
+            for (row, (line, evolution)) in [
+                ("F1 Moth", Evolution::Moth),
+                ("F2 Crab", Evolution::Crab),
+                ("F3 Wisp", Evolution::Wisp),
+            ]
+            .iter()
+            .enumerate()
+            {
+                let Ok(row) = u16::try_from(1 + row) else { break };
+                render_modal_line(line, area, row, Style::default().fg(theme.accent).bg(theme.modal), buf);
+                push_modal_hit(layout, modal_row(area, row), HitTarget::PetArcadeChooseEvolution(*evolution));
+            }
+            return;
+        }
+        _ => {}
+    }
+
+    let text_style = Style::default().fg(theme.text).bg(theme.modal);
+    let muted_style = Style::default().fg(theme.muted).bg(theme.modal);
+    let action_style = Style::default().fg(theme.accent).bg(theme.modal);
+
+    let (selected_x, selected_y) = arcade.selected_tile();
+    match arcade.selected_tower_view(snapshot) {
+        Some(tower) => {
+            render_modal_line(
+                &format!(
+                    "{} L{} @{},{}",
+                    tower_kind_label(tower.kind),
+                    upgrade_level_label(tower.level),
+                    selected_x,
+                    selected_y
+                ),
+                area,
+                0,
+                text_style,
+                buf,
+            );
+            render_modal_line(&tower_stats_line(&tower.stats), area, 1, muted_style, buf);
+            match tower.level {
+                UpgradeLevel::Base => {
+                    let cost = tower.next_upgrade_cost.unwrap_or(0);
+                    render_modal_line(&format!("[U] Upgrade L2  -{cost}"), area, 2, action_style, buf);
+                    push_modal_hit(layout, modal_row(area, 2), HitTarget::PetArcadeUpgradeL2);
+                }
+                UpgradeLevel::L2 => {
+                    let cost = tower.next_upgrade_cost.unwrap_or(0);
+                    render_modal_line(&format!("[P] L3 Power  -{cost}"), area, 2, action_style, buf);
+                    push_modal_hit(layout, modal_row(area, 2), HitTarget::PetArcadeUpgradeL3Power);
+                    render_modal_line(&format!("[O] L3 Utility  -{cost}"), area, 3, action_style, buf);
+                    push_modal_hit(layout, modal_row(area, 3), HitTarget::PetArcadeUpgradeL3Utility);
+                }
+                UpgradeLevel::L3(_) => {
+                    render_modal_line("max level", area, 2, muted_style, buf);
+                }
+            }
+            render_modal_line(&format!("[X] Sell  +{}", tower.sell_price), area, 4, Style::default().fg(theme.red).bg(theme.modal), buf);
+            push_modal_hit(layout, modal_row(area, 4), HitTarget::PetArcadeSell);
+        }
+        None => {
+            render_modal_line(&format!("Tile {selected_x},{selected_y} (empty)"), area, 0, text_style, buf);
+            let kind = arcade.selected_tower_kind();
+            render_modal_line(&format!("place: {} -{}", tower_kind_label(kind), kind.base_stats().cost), area, 1, muted_style, buf);
+            let preview = effective_stats(kind, UpgradeLevel::Base);
+            render_modal_line(&tower_stats_line(&preview), area, 2, muted_style, buf);
+            if let Some(extras) = tower_stats_extras_line(&preview) {
+                render_modal_line(&extras, area, 3, muted_style, buf);
+            }
+        }
+    }
+}
+
+/// The tower context card's own single-line combat summary -- damage,
+/// damage family, range and attack interval. Shared by a placed tower's
+/// own real `TowerView::stats` and the empty-tile preview's `tower::
+/// effective_stats(kind, UpgradeLevel::Base)`: identical `TowerStats`
+/// shape either way, so one formatter serves both call sites.
+/// `range_fp`/`FIXED_SCALE` is truncated to whole tiles (never a float --
+/// this crate's own "no floats in presentation code either" convention,
+/// matching `pet_arcade_header_line`'s own tick-to-seconds rounding).
+fn tower_stats_line(stats: &TowerStats) -> String {
+    let range_tiles = stats.range_fp / FIXED_SCALE;
+    match stats.family {
+        Some(family) => format!(
+            "{} dmg {}  rng{} int{}t",
+            stats.damage,
+            damage_family_label(family),
+            range_tiles,
+            stats.interval_ticks
+        ),
+        None => "support tower (no attack)".to_owned(),
+    }
+}
+
+/// The tower context card's own second line: whichever of pierce/splash/
+/// chain/slow/dead-zone this tower's current stats actually carry, `None`
+/// if none apply (Prism at Base with no chain bonus yet is a real example
+/// -- `chain_jumps` starts at its own base value, which can be `0` before
+/// any Utility upgrade for a kind whose base is already non-zero elsewhere
+/// -- this fn never pads with a placeholder row, it just omits itself).
+fn tower_stats_extras_line(stats: &TowerStats) -> Option<String> {
+    let mut extras = Vec::new();
+    if stats.pierce > 0 {
+        extras.push(format!("pierce {}", stats.pierce));
+    }
+    if let Some(splash) = stats.splash_radius_fp {
+        extras.push(format!("splash {}", splash / FIXED_SCALE));
+    }
+    if stats.chain_jumps > 0 {
+        extras.push(format!("chain {}", stats.chain_jumps));
+    }
+    if let Some(slow) = stats.slow_permille {
+        extras.push(format!("slow {}%", slow / 10));
+    }
+    if let Some(min_range) = stats.min_range_fp {
+        extras.push(format!("deadzone {}", min_range / FIXED_SCALE));
+    }
+    if extras.is_empty() {
+        None
+    } else {
+        Some(extras.join(", "))
+    }
+}
+
+fn upgrade_level_label(level: UpgradeLevel) -> &'static str {
+    match level {
+        UpgradeLevel::Base => "1",
+        UpgradeLevel::L2 => "2",
+        UpgradeLevel::L3(UpgradeBranch::Power) => "3-Power",
+        UpgradeLevel::L3(UpgradeBranch::Utility) => "3-Utility",
+    }
+}
+
+fn damage_family_label(family: DamageFamily) -> &'static str {
+    match family {
+        DamageFamily::Physical => "Physical",
+        DamageFamily::Impact => "Impact",
+        DamageFamily::Arcane => "Arcane",
+        DamageFamily::Fire => "Fire",
+        DamageFamily::Nature => "Nature",
+    }
+}
+
+fn enemy_kind_label(kind: EnemyKind) -> &'static str {
+    match kind {
+        EnemyKind::Mite => "Mite",
+        EnemyKind::Skitter => "Skitter",
+        EnemyKind::Shellback => "Shellback",
+        EnemyKind::Splitter => "Splitter",
+        EnemyKind::Husher => "Husher",
+        EnemyKind::Mirror => "Mirror",
+    }
+}
+
+fn boss_kind_label(kind: BossKind) -> &'static str {
+    match kind {
+        BossKind::Bellkeeper => "Bellkeeper",
+        BossKind::NightMaw => "Night Maw",
+    }
+}
+
+/// The entity inspector's own card -- see [`Inspect`]'s own doc comment
+/// for what each variant carries and why. Every field this fn reads comes
+/// straight off `SimulationSnapshot` (or, for an enemy's fixed armour, the
+/// per-kind `EnemyKind::base_stats` lookup the snapshot's own doc comment
+/// explicitly says NOT to duplicate per-instance) -- nothing here computes
+/// a derived combat quantity (effective damage against this target,
+/// time-to-kill, ...) that is not already one of those fields.
+fn render_pet_arcade_inspect_card(
+    snapshot: &SimulationSnapshot,
+    inspect: Inspect,
+    area: Rect,
+    buf: &mut TerminalBuffer,
+    theme: Theme,
+) {
+    let text_style = Style::default().fg(theme.text).bg(theme.modal);
+    let muted_style = Style::default().fg(theme.muted).bg(theme.modal);
+    match inspect {
+        Inspect::Enemy(id) => {
+            let Some(enemy) = snapshot.enemies.iter().find(|enemy| enemy.id == id) else {
+                render_modal_line("enemy defeated", area, 0, muted_style, buf);
+                return;
+            };
+            let armour = enemy.kind.base_stats().armour;
+            render_modal_line(enemy_kind_label(enemy.kind), area, 0, text_style, buf);
+            render_modal_line(&format!("HP {}/{}  Armour {}", enemy.hp.max(0), enemy.max_hp, armour), area, 1, text_style, buf);
+            let slow_pct = enemy.slow_permille / 10;
+            let stunned = if enemy.stunned { "stunned" } else { "not stunned" };
+            render_modal_line(&format!("Slow {slow_pct}%  {stunned}"), area, 2, muted_style, buf);
+            let last_hit = enemy.last_hit_family.map(damage_family_label).unwrap_or("none");
+            render_modal_line(&format!("Last hit: {last_hit}"), area, 3, muted_style, buf);
+            let resist = match enemy.resist {
+                Some(resist) => format!(
+                    "Resist {} ({}t left)",
+                    damage_family_label(resist.family),
+                    resist.ticks_remaining
+                ),
+                None => "Resist: none".to_owned(),
+            };
+            render_modal_line(&resist, area, 4, muted_style, buf);
+        }
+        Inspect::Boss => {
+            let Some(boss) = &snapshot.boss else {
+                render_modal_line("boss defeated", area, 0, muted_style, buf);
+                return;
+            };
+            render_modal_line(&format!("{} (BOSS)", boss_kind_label(boss.kind)), area, 0, text_style, buf);
+            render_modal_line(
+                &format!("HP {}/{}  ({}%)", boss.hp.max(0), boss.max_hp, boss.hp_permille / 10),
+                area,
+                1,
+                text_style,
+                buf,
+            );
+            render_modal_line(if boss.final_phase { "Phase: final" } else { "Phase: normal" }, area, 2, muted_style, buf);
+            let progress = if boss.kind == BossKind::NightMaw {
+                format!("Split: {}", if boss.split_triggered { "yes" } else { "no" })
+            } else {
+                let triggered = boss.escort_triggered.iter().filter(|&&t| t).count();
+                format!("Escort: {triggered}/{} triggered", boss.escort_triggered.len())
+            };
+            render_modal_line(&progress, area, 3, muted_style, buf);
+            render_modal_line(&format!("Bodies {}", boss.bodies.len()), area, 4, muted_style, buf);
+        }
+        Inspect::Wave => {
+            render_modal_line(&format!("Wave {}/{}", snapshot.wave, WAVE_COUNT), area, 0, text_style, buf);
+            render_modal_line(&pet_arcade_phase_label(&snapshot.phase), area, 1, muted_style, buf);
+            match &snapshot.wave_plan {
+                Some(plan) => {
+                    let composition: String = EnemyKind::ALL
+                        .iter()
+                        .filter_map(|kind| {
+                            let count = plan.spawns.iter().filter(|spawn| spawn.kind == *kind).count();
+                            (count > 0).then(|| format!("{} x{count}", enemy_kind_label(*kind)))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("  ");
+                    render_modal_line(&composition, area, 2, muted_style, buf);
+                    if let Some(boss) = plan.boss {
+                        render_modal_line(&format!("Boss: {}", boss_kind_label(boss)), area, 3, muted_style, buf);
+                    }
+                }
+                None => {
+                    render_modal_line("no plan (Build phase)", area, 2, muted_style, buf);
+                }
+            }
+        }
+    }
+}
+
+fn tower_kind_label(kind: TowerKind) -> &'static str {
+    match kind {
+        TowerKind::Needle => "Needle",
+        TowerKind::Bell => "Bell",
+        TowerKind::Prism => "Prism",
+        TowerKind::EmberNest => "EmberNest",
+        TowerKind::Moonwell => "Moonwell",
+        TowerKind::Relay => "Relay",
+    }
+}
+
+/// The single-letter glyph a tower-placement drag's own carried ghost
+/// (`render_drag_preview`) shows -- a host-side duplicate of `gate4agent-
+/// arcade-pet-bastion-render`'s own PRIVATE `tower_glyph` (not reusable
+/// from here, same reason `tower_kind_label` above already duplicates that
+/// crate's own kind names instead of importing them): both happen to be
+/// each kind's own first letter today, so this is purely cosmetic and
+/// never drifts out of sync with what a PLACED tower actually paints as.
+fn tower_kind_glyph(kind: TowerKind) -> char {
+    match kind {
+        TowerKind::Needle => 'N',
+        TowerKind::Bell => 'B',
+        TowerKind::Prism => 'P',
+        TowerKind::EmberNest => 'E',
+        TowerKind::Moonwell => 'M',
+        TowerKind::Relay => 'R',
+    }
+}
+
+fn render_pet_arcade_hints(area: Rect, buf: &mut TerminalBuffer, theme: Theme) {
+    let lines = [
+        "Click: tile select, palette places/drags, anchor moves pet, board inspects",
+        "Tab tile [ ] anchor 1-6 place u/p/o upgrade x sell m/b/g/f pet space wave Esc close",
+    ];
+    for (row, line) in lines.iter().enumerate() {
+        let Ok(row) = u16::try_from(row) else { break };
+        render_modal_line(line, area, row, Style::default().fg(theme.muted).bg(theme.modal), buf);
+    }
 }
 
 /// A sixel image is raster painted directly over the terminal and obeys
@@ -1165,6 +2183,33 @@ fn drop_sixel_icons_covered_by_overlays(layout: &mut LayoutRects) {
         .map(|(_, placement)| placement)
         .collect();
     layout.overlays = overlays;
+}
+
+/// The pixel tier's own single-placement analogue of [`drop_sixel_icons_
+/// covered_by_overlays`] above -- same index-cutoff reasoning (an overlay
+/// registered AT OR AFTER this placement's own [`PetArcadePixelPlacement::
+/// overlays_before`] marker painted on top of it and so must occlude it
+/// whole; partial intersection counts as fully covered, same as that fn's
+/// own doc comment explains -- there is no way to clip a sixel image to a
+/// sub-rect), just keyed off `layout.overlays`'s own length at push time
+/// rather than `sixel_icons`'s, since this placement is never itself a
+/// member of that list (see [`PetArcadePixelPlacement`]'s own doc comment
+/// for why). Must run AFTER `drop_sixel_icons_covered_by_overlays` at the
+/// end of `render::render` -- that fn takes `layout.overlays` out
+/// (`std::mem::take`) and puts it back before returning, so this only sees
+/// a complete `overlays` list once that call has already finished.
+fn drop_pet_arcade_pixel_frame_if_covered(layout: &mut LayoutRects) {
+    let Some(placement) = &layout.pet_arcade_pixel_frame else {
+        return;
+    };
+    let covered = layout
+        .overlays
+        .iter()
+        .skip(placement.overlays_before)
+        .any(|overlay| !placement.rect.intersect(overlay.rect).is_empty());
+    if covered {
+        layout.pet_arcade_pixel_frame = None;
+    }
 }
 
 /// One rail button on the activity rail: a view-select action plus the
@@ -12627,37 +13672,63 @@ fn render_drag_preview(
     layout: &LayoutRects,
     theme: Theme,
 ) {
-    let Some(DragState::SessionChip {
-        tab,
-        current_column,
-        current_row,
-        moved: true,
-        ..
-    }) = &app.drag_state
-    else {
-        return;
-    };
-    if let Some(target) = layout
-        .surface_panes
-        .iter()
-        .find(|pane| pane.frame.contains(*current_column, *current_row))
-    {
-        let zone = surface_drop_zone(target.frame, *current_column, *current_row);
-        draw_surface_compass(target.frame, zone, buf, theme);
-    }
+    match &app.drag_state {
+        Some(DragState::SessionChip {
+            tab,
+            current_column,
+            current_row,
+            moved: true,
+            ..
+        }) => {
+            if let Some(target) = layout
+                .surface_panes
+                .iter()
+                .find(|pane| pane.frame.contains(*current_column, *current_row))
+            {
+                let zone = surface_drop_zone(target.frame, *current_column, *current_row);
+                draw_surface_compass(target.frame, zone, buf, theme);
+            }
 
-    let title = app.surface_tab_title(tab);
-    let label = format!(" {title} ");
-    let width = (cell_width(&label) as u16).min(area.width);
+            let title = app.surface_tab_title(tab);
+            let label = format!(" {title} ");
+            render_drag_ghost_label(&label, *current_column, *current_row, area, buf, theme);
+        }
+        // Owner report: dragging a tower out of the palette had no visible
+        // carried image at all -- the player had to trust an invisible
+        // gesture. This paints the same accent-on-bold chip `SessionChip`
+        // above already uses for its own carried tab, just labelled with
+        // this tower's own kind -- see `render_pet_arcade`'s own call to
+        // `pet_arcade_highlight_buildable_tiles` for the OTHER half of
+        // this drag's feedback (which board cells would actually accept
+        // it right now).
+        Some(DragState::PetArcadeTowerPlacement { kind, current_column, current_row, .. }) => {
+            let label = format!(" {} {} ", tower_kind_glyph(*kind), tower_kind_label(*kind));
+            render_drag_ghost_label(&label, *current_column, *current_row, area, buf, theme);
+        }
+        _ => {}
+    }
+}
+
+/// Shared by every drag that carries a small floating text chip under the
+/// cursor (`SessionChip`'s own carried tab title, `PetArcadeTowerPlacement`
+/// 's carried tower kind): centres `label` horizontally on `(column, row)`,
+/// clamped so it never paints outside `area`.
+fn render_drag_ghost_label(
+    label: &str,
+    column: u16,
+    row: u16,
+    area: Rect,
+    buf: &mut TerminalBuffer,
+    theme: Theme,
+) {
+    let width = (cell_width(label) as u16).min(area.width);
     if width == 0 || area.height == 0 {
         return;
     }
     let maximum_x = area.right().saturating_sub(width);
-    let x = current_column
-        .saturating_sub(width / 2)
-        .clamp(area.x, maximum_x);
-    let y = (*current_row).clamp(area.y, area.bottom().saturating_sub(1));
-    Paragraph::new(truncate_cells(&label, width as usize))
+    let x = column.saturating_sub(width / 2).clamp(area.x, maximum_x);
+    let y = row.clamp(area.y, area.bottom().saturating_sub(1));
+    Paragraph::new(truncate_cells(label, width as usize))
         .style(
             Style::default()
                 .fg(theme.active_tab_text)
@@ -22903,5 +23974,584 @@ mod tests {
         assert!(!combined.contains('Р'), "{combined}");
         assert!(!combined.contains("В·"), "{combined}");
         assert!(!combined.contains('�'), "{combined}");
+    }
+
+    // -----------------------------------------------------------------
+    // Pet Bastion arcade: mouse control.
+    //
+    // Every one of these drives `App::click`/`App::drag` against
+    // `layout.hits` a REAL `render::render` pass just produced -- never a
+    // hand-built `HitRegion`/reducer call. This crate's own history has a
+    // documented trap here: a drag/click test that calls the reducer
+    // directly with an empty (or hand-rolled) `layout.hits` can stay green
+    // even when a live click would land on nothing at all, because it
+    // never exercises the geometry a real frame actually painted. Each
+    // test below finds ITS OWN target rect by scanning the real `layout`
+    // this same render pass returned, exactly the way `App::click` itself
+    // does, so a real regression in the tile/palette/drag geometry fails
+    // these, not just a change to a hand-picked coordinate.
+    // -----------------------------------------------------------------
+
+    fn open_pet_arcade_app(cols: u16, rows: u16) -> App {
+        let mut app = App::default();
+        app.terminal_cols = cols;
+        app.terminal_rows = rows;
+        let _ = app.open_pet_arcade();
+        app
+    }
+
+    fn render_pet_arcade_app(app: &mut App) -> TerminalBuffer {
+        let mut buf = TerminalBuffer::new(app.terminal_cols, app.terminal_rows);
+        app.layout = render(app, &mut buf);
+        buf
+    }
+
+    fn find_hit(app: &App, target: HitTarget) -> HitRegion {
+        app.layout
+            .hits
+            .iter()
+            .find(|hit| hit.target == target)
+            .cloned()
+            .unwrap_or_else(|| panic!("no live hit region for {target:?}: {:?}", app.layout.hits))
+    }
+
+    /// Forces one queued arcade command batch to actually apply. `*now`
+    /// is advanced by a full tick EVERY call (never re-reads the real
+    /// wall clock) -- `PetArcade::advance` sets its own `last_advance` to
+    /// whatever `now` it was just given, so a second call seeded fresh
+    /// from `Instant::now()` can land BEFORE that stored value (the two
+    /// calls are typically microseconds apart in a tight test, nowhere
+    /// near the `TICK_INTERVAL` gap the first call already advanced past)
+    /// and silently apply nothing -- exactly the trap that cost the first
+    /// draft of the upgrade/sell test its second and third ticks. A
+    /// caller-owned, monotonically-advancing `now` sidesteps that
+    /// entirely.
+    fn tick_pet_arcade(app: &App, now: &mut std::time::Instant) {
+        *now += crate::pet_arcade::TICK_INTERVAL;
+        app.pet_arcade.borrow_mut().advance(*now);
+    }
+
+    /// Owner report: the arcade overlay could not be dragged by its own
+    /// header at all. Proves the drag through the exact `App::click`/
+    /// `App::drag` path a real mouse takes, then proves the NEW position
+    /// through a SECOND real render pass (not just the stored `(x, y)`
+    /// pair) -- see this section's own doc comment for why that second
+    /// pass matters.
+    #[test]
+    fn pet_arcade_overlay_drags_by_its_header_row_through_a_real_render_and_click_pass() {
+        let mut app = open_pet_arcade_app(140, 40);
+        render_pet_arcade_app(&mut app);
+
+        let drag_hit = find_hit(&app, HitTarget::PetArcadeDrag);
+        let origin = (app.layout.pet_arcade_modal.x, app.layout.pet_arcade_modal.y);
+        let grab = (drag_hit.rect.x + 1, drag_hit.rect.y);
+
+        let _ = app.click(grab.0, grab.1);
+        assert!(
+            matches!(app.drag_state, Some(DragState::OverlayMove { id: OverlayId::PetArcade, .. })),
+            "clicking the header row must start an OverlayMove drag for OverlayId::PetArcade, got {:?}",
+            app.drag_state,
+        );
+
+        let _ = app.drag(grab.0 + 6, grab.1 + 4);
+        let moved = app
+            .overlay_positions
+            .get(&OverlayId::PetArcade)
+            .copied()
+            .expect("dragging must record the overlay's new position");
+        assert_ne!(moved, origin, "the overlay must actually have moved");
+
+        render_pet_arcade_app(&mut app);
+        assert_eq!(
+            (app.layout.pet_arcade_modal.x, app.layout.pet_arcade_modal.y),
+            moved,
+            "the modal must repaint at the new dragged position"
+        );
+    }
+
+    /// Every build-radius cell the run currently reports as genuinely
+    /// buildable (`BuildCellView::reason == None`) -- the free-placement
+    /// generalization of what used to be "any of the ten fixed pads".
+    /// Panics if the map ever has none, which would mean the map itself is
+    /// unplayable, not a test-setup mistake.
+    fn buildable_tiles(app: &App) -> Vec<(u8, u8)> {
+        let snapshot = app.pet_arcade.borrow().snapshot().expect("run must be in progress");
+        snapshot
+            .build_cells
+            .iter()
+            .filter(|cell| cell.reason.is_none())
+            .map(|cell| (cell.tile.0 as u8, cell.tile.1 as u8))
+            .collect()
+    }
+
+    /// Owner report: no mouse way to select a build tile, pick a tower
+    /// kind, or place it. Clicks the map's own first buildable tile
+    /// (proving the screen-cell -> tile arithmetic `render_pet_arcade`
+    /// pushes really lands on the right tile), then the palette's own
+    /// Needle row, then forces one sim tick so the queued `Command::Place`
+    /// actually applies.
+    #[test]
+    fn pet_arcade_click_selects_a_pad_then_the_palette_places_a_tower() {
+        let mut app = open_pet_arcade_app(140, 40);
+        render_pet_arcade_app(&mut app);
+
+        let (tile_x, tile_y) = buildable_tiles(&app)[0];
+        let pad_hit = find_hit(&app, HitTarget::PetArcadeTile(tile_x, tile_y));
+        let _ = app.click(pad_hit.rect.x, pad_hit.rect.y);
+        assert_eq!(
+            app.pet_arcade.borrow().selected_tile(),
+            (tile_x, tile_y),
+            "clicking the tile must select it"
+        );
+
+        render_pet_arcade_app(&mut app);
+        let needle_hit = find_hit(&app, HitTarget::PetArcadeTowerKind(TowerKind::Needle));
+        let _ = app.click(needle_hit.rect.x, needle_hit.rect.y);
+
+        let mut now = std::time::Instant::now();
+        tick_pet_arcade(&app, &mut now);
+        let snapshot = app.pet_arcade.borrow().snapshot().expect("run must still be in progress");
+        assert_eq!(snapshot.towers.len(), 1, "the palette click must have placed exactly one tower");
+        assert_eq!(snapshot.towers[0].kind, TowerKind::Needle);
+        assert_eq!(snapshot.towers[0].position, (i32::from(tile_x), i32::from(tile_y)));
+    }
+
+    /// Owner report: a placed tower's own upgrade/sell actions were
+    /// keyboard-only. Places a Needle on the map's own first buildable
+    /// tile (same path as the test above), then drives `[U] Upgrade L2`
+    /// and `[X] Sell` purely by clicking the context card's own rows a
+    /// real render pass painted.
+    #[test]
+    fn pet_arcade_click_upgrades_then_sells_the_selected_tower() {
+        let mut app = open_pet_arcade_app(140, 40);
+        render_pet_arcade_app(&mut app);
+        let (tile_x, tile_y) = buildable_tiles(&app)[0];
+        let pad_hit = find_hit(&app, HitTarget::PetArcadeTile(tile_x, tile_y));
+        let _ = app.click(pad_hit.rect.x, pad_hit.rect.y);
+        render_pet_arcade_app(&mut app);
+        let needle_hit = find_hit(&app, HitTarget::PetArcadeTowerKind(TowerKind::Needle));
+        let _ = app.click(needle_hit.rect.x, needle_hit.rect.y);
+        let mut now = std::time::Instant::now();
+        tick_pet_arcade(&app, &mut now);
+        let sap_after_place = app.pet_arcade.borrow().snapshot().unwrap().sap;
+
+        render_pet_arcade_app(&mut app);
+        let upgrade_hit = find_hit(&app, HitTarget::PetArcadeUpgradeL2);
+        let _ = app.click(upgrade_hit.rect.x, upgrade_hit.rect.y);
+        tick_pet_arcade(&app, &mut now);
+        let after_upgrade = app.pet_arcade.borrow().snapshot().unwrap();
+        assert_eq!(after_upgrade.towers[0].level, UpgradeLevel::L2, "the click on [U] must have upgraded the tower to L2");
+        assert!(after_upgrade.sap < sap_after_place, "the upgrade must have spent Sap");
+
+        render_pet_arcade_app(&mut app);
+        let sell_hit = find_hit(&app, HitTarget::PetArcadeSell);
+        let _ = app.click(sell_hit.rect.x, sell_hit.rect.y);
+        tick_pet_arcade(&app, &mut now);
+        let after_sell = app.pet_arcade.borrow().snapshot().unwrap();
+        assert!(after_sell.towers.is_empty(), "the click on [X] Sell must have removed the tower");
+        assert!(after_sell.sap > after_upgrade.sap, "selling must have refunded Sap");
+    }
+
+    /// Owner report: the pet could only be repositioned by keyboard. One
+    /// click on an anchor's own board tile both selects it AND queues the
+    /// move -- no separate confirm step, unlike tower placement.
+    #[test]
+    fn pet_arcade_click_on_an_anchor_moves_the_pet_there() {
+        let mut app = open_pet_arcade_app(140, 40);
+        render_pet_arcade_app(&mut app);
+
+        let anchor_tile = Board::anchor_tile(AnchorId(2));
+        let anchor_hit = find_hit(&app, HitTarget::PetArcadeTile(anchor_tile.x as u8, anchor_tile.y as u8));
+        let _ = app.click(anchor_hit.rect.x, anchor_hit.rect.y);
+        assert_eq!(app.pet_arcade.borrow().selected_anchor(), 2, "clicking anchor 2's tile must select it");
+
+        let mut now = std::time::Instant::now();
+        tick_pet_arcade(&app, &mut now);
+        let snapshot = app.pet_arcade.borrow().snapshot().unwrap();
+        let reached_or_moving_to_2 = match snapshot.pet.state {
+            gate4agent_arcade_pet_bastion::pet::PetState::AtAnchor(anchor) => anchor == AnchorId(2),
+            gate4agent_arcade_pet_bastion::pet::PetState::Moving { to, .. } => to == AnchorId(2),
+        };
+        assert!(reached_or_moving_to_2, "the click must have queued a MovePet to anchor 2: {:?}", snapshot.pet.state);
+    }
+
+    /// Owner report: no way to inspect an entity by clicking it. The
+    /// header's own wave/phase line is the one inspector target that is
+    /// fully deterministic in the Build phase (no live enemy/boss exists
+    /// yet, and `wave_plan` is only populated once combat starts) -- it
+    /// opens the wave card, and that card honestly says no plan exists
+    /// yet rather than fabricating a composition (see `Inspect::Wave` and
+    /// `SimulationSnapshot::wave_plan`'s own doc comments).
+    #[test]
+    fn pet_arcade_click_on_the_header_opens_the_wave_inspector_card() {
+        let mut app = open_pet_arcade_app(140, 40);
+        render_pet_arcade_app(&mut app);
+
+        let header_hit = find_hit(&app, HitTarget::PetArcadeWaveInspect);
+        let _ = app.click(header_hit.rect.x, header_hit.rect.y);
+        assert_eq!(app.pet_arcade.borrow().inspect(), Some(Inspect::Wave));
+
+        let buf = render_pet_arcade_app(&mut app);
+        let text = rect_text(&buf, app.layout.pet_arcade_modal);
+        assert!(
+            text.contains("Wave 1") && text.contains("no plan (Build phase)"),
+            "wave card must show the wave number and an honest no-composition-yet line: {text:?}"
+        );
+    }
+
+    /// Owner report: the key legend used to cut off mid-word ("5=Moonw…")
+    /// at the overlay's own preferred size, because the old single hint
+    /// line crammed a full per-kind tower legend (now the palette's own
+    /// job) alongside every other binding. Proves neither of the two
+    /// rewritten hint lines truncates at that same preferred size.
+    #[test]
+    fn pet_arcade_hint_legend_never_truncates_at_preferred_size() {
+        let mut app = open_pet_arcade_app(140, 40);
+        let buf = render_pet_arcade_app(&mut app);
+        let text = rect_text(&buf, app.layout.pet_arcade_modal);
+        assert!(!text.contains('\u{2026}'), "arcade overlay truncated something at preferred size: {text:?}");
+    }
+
+    /// Owner report: every Living Circuit ability (pulse/blink/full
+    /// circuit) and the explicit "move pet" button were keyboard-only
+    /// (`g`/`b`/`f`/`m`). A fresh run starts at 0 Spark (`pet.rs`'s own
+    /// `spark` field), and the only way to ever earn any is a linked
+    /// kill in live combat -- so none of these can actually AFFORD to
+    /// fire without a full, real playthrough this unit test cannot drive
+    /// deterministically. What every button CAN prove without that: the
+    /// exact real hit region a real render pass paints reaches its own
+    /// handler and queues the right `Command` -- `PetArcade::queue` only
+    /// gates on the run actually being in progress, never on
+    /// affordability (the sim itself is what silently no-ops an
+    /// unaffordable one, exactly like the tower palette's own "(locked)"
+    /// rows already do). Also proves the 0-Spark Pulse button actually
+    /// PAINTS disabled rather than being silently indistinguishable from
+    /// an enabled one.
+    #[test]
+    fn pet_arcade_pulse_blink_circuit_and_move_buttons_queue_their_commands() {
+        use gate4agent_arcade_pet_bastion::Command;
+
+        let mut app = open_pet_arcade_app(140, 40);
+        let buf = render_pet_arcade_app(&mut app);
+
+        let pulse_hit = find_hit(&app, HitTarget::PetArcadePetPulse);
+        let theme = Theme::for_mode(app.color_mode);
+        assert_eq!(
+            buf.get(pulse_hit.rect.x, pulse_hit.rect.y).style.fg,
+            theme.dim,
+            "0 Spark must paint the [G] Pulse button dim, not indistinguishable from enabled"
+        );
+        let _ = app.click(pulse_hit.rect.x, pulse_hit.rect.y);
+        assert!(
+            matches!(app.pet_arcade.borrow().pending_commands_for_test(), [Command::PetPulse]),
+            "the [G] Pulse button must queue Command::PetPulse"
+        );
+        let mut now = std::time::Instant::now();
+        tick_pet_arcade(&app, &mut now);
+
+        render_pet_arcade_app(&mut app);
+        let blink_hit = find_hit(&app, HitTarget::PetArcadeBlink);
+        let _ = app.click(blink_hit.rect.x, blink_hit.rect.y);
+        assert!(
+            matches!(app.pet_arcade.borrow().pending_commands_for_test(), [Command::Blink { .. }]),
+            "the [B] Blink button must queue Command::Blink"
+        );
+        tick_pet_arcade(&app, &mut now);
+
+        render_pet_arcade_app(&mut app);
+        let circuit_hit = find_hit(&app, HitTarget::PetArcadeFullCircuit);
+        let _ = app.click(circuit_hit.rect.x, circuit_hit.rect.y);
+        assert!(
+            matches!(app.pet_arcade.borrow().pending_commands_for_test(), [Command::FullCircuit]),
+            "the [F] Circuit button must queue Command::FullCircuit"
+        );
+        tick_pet_arcade(&app, &mut now);
+
+        render_pet_arcade_app(&mut app);
+        let move_hit = find_hit(&app, HitTarget::PetArcadeMovePet);
+        let _ = app.click(move_hit.rect.x, move_hit.rect.y);
+        assert!(
+            matches!(app.pet_arcade.borrow().pending_commands_for_test(), [Command::MovePet { .. }]),
+            "the explicit [M] Move button must queue Command::MovePet"
+        );
+    }
+
+    /// Owner report: no mouse way to launch a wave early (`Space` only).
+    #[test]
+    fn pet_arcade_start_wave_button_ends_the_build_phase_early() {
+        let mut app = open_pet_arcade_app(140, 40);
+        render_pet_arcade_app(&mut app);
+        assert!(
+            matches!(app.pet_arcade.borrow().snapshot().unwrap().phase, RunPhaseView::Build { .. }),
+            "setup: a fresh run must start in the Build phase"
+        );
+
+        let wave_hit = find_hit(&app, HitTarget::PetArcadeStartWave);
+        let _ = app.click(wave_hit.rect.x, wave_hit.rect.y);
+        let mut now = std::time::Instant::now();
+        tick_pet_arcade(&app, &mut now);
+        assert_eq!(
+            app.pet_arcade.borrow().snapshot().unwrap().phase,
+            RunPhaseView::Combat,
+            "the [Space] Start Wave button must end the Build phase immediately"
+        );
+    }
+
+    /// Owner report: the owner specifically doubted the two L3 branch
+    /// buttons actually work. Reaching L3 for real needs Sap this crate's
+    /// own test fixtures cannot legitimately earn without live combat
+    /// kills (Needle's own placement + L2 + L3 costs sum past the run's
+    /// starting Sap) -- see `pet_arcade_pulse_blink_circuit_and_move_
+    /// buttons_queue_their_commands`'s own doc comment for the same
+    /// constraint. What IS provable without that: both buttons resolve to
+    /// a real hit region once the tower is genuinely at L2 (`render_pet_
+    /// arcade_context`'s own `UpgradeLevel::L2` arm, reached for real
+    /// here), and each one queues its own distinct `Command::
+    /// UpgradeToL3` branch.
+    #[test]
+    fn pet_arcade_click_upgrades_to_l3_both_branches_are_clickable() {
+        use gate4agent_arcade_pet_bastion::Command;
+
+        let mut app = open_pet_arcade_app(140, 40);
+        render_pet_arcade_app(&mut app);
+        let (tile_x, tile_y) = buildable_tiles(&app)[0];
+        let pad_hit = find_hit(&app, HitTarget::PetArcadeTile(tile_x, tile_y));
+        let _ = app.click(pad_hit.rect.x, pad_hit.rect.y);
+        render_pet_arcade_app(&mut app);
+        let needle_hit = find_hit(&app, HitTarget::PetArcadeTowerKind(TowerKind::Needle));
+        let _ = app.click(needle_hit.rect.x, needle_hit.rect.y);
+        let mut now = std::time::Instant::now();
+        tick_pet_arcade(&app, &mut now);
+
+        render_pet_arcade_app(&mut app);
+        let upgrade_hit = find_hit(&app, HitTarget::PetArcadeUpgradeL2);
+        let _ = app.click(upgrade_hit.rect.x, upgrade_hit.rect.y);
+        tick_pet_arcade(&app, &mut now);
+        assert_eq!(
+            app.pet_arcade.borrow().snapshot().unwrap().towers[0].level,
+            UpgradeLevel::L2,
+            "setup: the tower must actually be at L2 before either L3 branch button appears"
+        );
+
+        render_pet_arcade_app(&mut app);
+        let power_hit = find_hit(&app, HitTarget::PetArcadeUpgradeL3Power);
+        let _ = app.click(power_hit.rect.x, power_hit.rect.y);
+        assert!(
+            matches!(
+                app.pet_arcade.borrow().pending_commands_for_test(),
+                [Command::UpgradeToL3 { branch: UpgradeBranch::Power, .. }]
+            ),
+            "the [P] L3 Power button must queue Command::UpgradeToL3 {{ branch: Power }}"
+        );
+        tick_pet_arcade(&app, &mut now);
+
+        render_pet_arcade_app(&mut app);
+        let utility_hit = find_hit(&app, HitTarget::PetArcadeUpgradeL3Utility);
+        let _ = app.click(utility_hit.rect.x, utility_hit.rect.y);
+        assert!(
+            matches!(
+                app.pet_arcade.borrow().pending_commands_for_test(),
+                [Command::UpgradeToL3 { branch: UpgradeBranch::Utility, .. }]
+            ),
+            "the [O] L3 Utility button must queue Command::UpgradeToL3 {{ branch: Utility }}"
+        );
+    }
+
+    /// Owner report: neither the rune-draft nor the evolution-choice card
+    /// had a single clickable option (`F1`-`F3` only) -- and since either
+    /// phase BLOCKS every other action until resolved, a mouse-only
+    /// player got stuck outright. Reaching either phase for real needs a
+    /// full wave of live combat (`rune.rs`'s own "offered after waves 2
+    /// and 6"), well beyond what a unit test can drive deterministically
+    /// -- so this proves the wiring the same way the rest of this file
+    /// already proves anything engine-encapsulated it cannot fully drive:
+    /// run the REAL renderer (`render_pet_arcade_context`, the exact
+    /// function `render_pet_arcade` itself calls) against a hand-built
+    /// `SimulationSnapshot` fixture in that phase, feeding its OWN real
+    /// output hit regions into the SAME real `App::click` dispatch a live
+    /// run would use. What this does NOT fabricate: the hit rects, or the
+    /// dispatch path from a click at those coordinates through to
+    /// `PetArcade::click_draft_rune`/`click_choose_evolution`.
+    #[test]
+    fn pet_arcade_rune_draft_and_evolution_choice_options_are_clickable() {
+        use gate4agent_arcade_pet_bastion::pet::PetState;
+        use gate4agent_arcade_pet_bastion::snapshot::PetView;
+        use gate4agent_arcade_pet_bastion::wave::Difficulty;
+        use gate4agent_arcade_pet_bastion::Command;
+
+        let mut app = open_pet_arcade_app(140, 40);
+        render_pet_arcade_app(&mut app);
+        // Anywhere inside the modal `render_pet_arcade` already registered
+        // via `layout.note_overlay` -- a fixture rect outside it would get
+        // treated as a click OUTSIDE every open overlay by `App::click`'s
+        // own `close_overlay_outside_click` guard, closing the overlay
+        // before the click ever reaches `click_pet_arcade` at all.
+        let modal = app.layout.pet_arcade_modal;
+        let context_area = Rect::new(modal.x + 2, modal.y + 2, 30, 5);
+
+        let rune_snapshot = SimulationSnapshot {
+            tick_index: 0,
+            difficulty: Difficulty::Standard,
+            wave: 3,
+            phase: RunPhaseView::RuneDraft,
+            sap: 0,
+            integrity: 100,
+            crab_shield: 0,
+            towers: Vec::new(),
+            enemies: Vec::new(),
+            boss: None,
+            pet: PetView {
+                state: PetState::AtAnchor(AnchorId(0)),
+                spark: 0,
+                evolution: None,
+                linked_towers: Vec::new(),
+            },
+            rune_options: vec![Rune::Echo, Rune::Anchor, Rune::Phase],
+            runes_picked: Vec::new(),
+            build_cells: Vec::new(),
+            wave_plan: None,
+        };
+        {
+            let mut buf = TerminalBuffer::new(140, 40);
+            let arcade = app.pet_arcade.borrow();
+            let theme = Theme::for_mode(app.color_mode);
+            render_pet_arcade_context(&rune_snapshot, &arcade, context_area, &mut buf, &mut app.layout, theme);
+        }
+        let rune_hit = find_hit(&app, HitTarget::PetArcadeDraftRune(Rune::Anchor));
+        let _ = app.click(rune_hit.rect.x, rune_hit.rect.y);
+        assert!(
+            matches!(app.pet_arcade.borrow().pending_commands_for_test(), [Command::DraftRune(Rune::Anchor)]),
+            "clicking the Anchor rune option must queue Command::DraftRune(Rune::Anchor)"
+        );
+
+        let evolution_snapshot = SimulationSnapshot {
+            phase: RunPhaseView::EvolutionChoice,
+            ..rune_snapshot
+        };
+        {
+            let mut buf = TerminalBuffer::new(140, 40);
+            let arcade = app.pet_arcade.borrow();
+            let theme = Theme::for_mode(app.color_mode);
+            render_pet_arcade_context(&evolution_snapshot, &arcade, context_area, &mut buf, &mut app.layout, theme);
+        }
+        let crab_hit = find_hit(&app, HitTarget::PetArcadeChooseEvolution(Evolution::Crab));
+        let _ = app.click(crab_hit.rect.x, crab_hit.rect.y);
+        assert!(
+            matches!(
+                app.pet_arcade.borrow().pending_commands_for_test(),
+                [Command::DraftRune(Rune::Anchor), Command::ChooseEvolution(Evolution::Crab)]
+            ),
+            "clicking the Crab evolution option must queue Command::ChooseEvolution(Evolution::Crab)"
+        );
+    }
+
+    /// Owner report: restarting after a win/loss was keyboard-only (`r`).
+    #[test]
+    fn pet_arcade_restart_button_starts_a_fresh_run_after_a_result() {
+        let mut app = open_pet_arcade_app(140, 40);
+        render_pet_arcade_app(&mut app);
+        app.pet_arcade.borrow_mut().force_results_for_test(PetBastionRunOutcome::Lost);
+        assert!(app.pet_arcade.borrow().snapshot().is_none(), "setup: the Results screen has no live board snapshot");
+
+        let buf = render_pet_arcade_app(&mut app);
+        let restart_hit = find_hit(&app, HitTarget::PetArcadeRestart);
+        let text = rect_text(&buf, restart_hit.rect);
+        assert!(text.contains("Play Again"), "the restart button must be labelled: {text:?}");
+
+        let _ = app.click(restart_hit.rect.x, restart_hit.rect.y);
+        assert!(app.pet_arcade.borrow().is_running(), "clicking [R] Play Again must start a fresh run");
+    }
+
+    /// Owner report: closing had not been verified through the mouse path
+    /// at all -- the overlay's own `[x]` (`render_modal_close`, drawn for
+    /// every screen this overlay can be in) is the same close every other
+    /// modal in this crate already carries.
+    #[test]
+    fn pet_arcade_close_cross_closes_the_overlay() {
+        let mut app = open_pet_arcade_app(140, 40);
+        render_pet_arcade_app(&mut app);
+        assert!(app.pet_arcade_open, "setup: the overlay must be open");
+
+        let close_hit = find_hit(&app, HitTarget::ModalClose);
+        let _ = app.click(close_hit.rect.x, close_hit.rect.y);
+        assert!(!app.pet_arcade_open, "the [x] button must close the arcade overlay");
+    }
+
+    /// Owner report: placing a tower was click-only -- there was no real
+    /// drag (pick it up, carry it with the cursor, drop it on a chosen
+    /// slot). Presses the Bell palette row (which ALSO fires the existing
+    /// "place on whatever tile is already selected" shortcut on that same
+    /// press, unconditionally -- `App::click_pet_arcade`'s own doc
+    /// comment), then drags onto a DIFFERENT buildable tile and drops --
+    /// proving the SAME real `render()` + `App::click`/`App::drag`/
+    /// `App::drop_at` chain every other test in this file already uses
+    /// places a SECOND tower exactly where the cursor released, not only
+    /// where it was picked up.
+    #[test]
+    fn pet_arcade_drag_a_tower_from_the_palette_onto_a_different_tile_places_it_there() {
+        let mut app = open_pet_arcade_app(140, 40);
+        render_pet_arcade_app(&mut app);
+
+        let tiles = buildable_tiles(&app);
+        let (target_x, target_y) = tiles[1];
+        let bell_hit = find_hit(&app, HitTarget::PetArcadeTowerKind(TowerKind::Bell));
+        let _ = app.click(bell_hit.rect.x, bell_hit.rect.y);
+        assert!(
+            matches!(app.drag_state, Some(DragState::PetArcadeTowerPlacement { kind: TowerKind::Bell, .. })),
+            "pressing the Bell row must start a tower-placement drag: {:?}",
+            app.drag_state
+        );
+
+        render_pet_arcade_app(&mut app);
+        let target_hit = find_hit(&app, HitTarget::PetArcadeTile(target_x, target_y));
+        let _ = app.drag(target_hit.rect.x, target_hit.rect.y);
+        let _ = app.drop_at(target_hit.rect.x, target_hit.rect.y);
+        assert!(app.drag_state.is_none(), "dropping must end the drag");
+
+        let mut now = std::time::Instant::now();
+        tick_pet_arcade(&app, &mut now);
+        let snapshot = app.pet_arcade.borrow().snapshot().unwrap();
+        assert!(
+            snapshot.towers.iter().any(|tower| {
+                tower.kind == TowerKind::Bell && tower.position == (i32::from(target_x), i32::from(target_y))
+            }),
+            "dragging Bell onto the target tile and dropping must place it exactly there: {:?}",
+            snapshot.towers
+        );
+    }
+
+    /// Owner report: dropping on a slot that cannot take a tower must
+    /// cancel without spending anything, not silently fail after already
+    /// charging Sap. `(0, 0)` sits roughly three tiles from the nearest
+    /// route leg -- outside `BUILD_RADIUS_FP` (2.0 tiles), so it never
+    /// even appears in `build_cells` at all, the clearest possible
+    /// "nothing can ever be built here" tile on this map.
+    #[test]
+    fn pet_arcade_dragging_a_tower_onto_an_invalid_tile_places_nothing_and_charges_nothing() {
+        let mut app = open_pet_arcade_app(140, 40);
+        render_pet_arcade_app(&mut app);
+
+        let bell_hit = find_hit(&app, HitTarget::PetArcadeTowerKind(TowerKind::Bell));
+        let _ = app.click(bell_hit.rect.x, bell_hit.rect.y);
+        // The press itself may already have placed a Bell on whatever
+        // tile was selected (the existing click-to-place shortcut) --
+        // settle that queued command first, so only the DRAG's own drop
+        // is under test below.
+        let mut now = std::time::Instant::now();
+        tick_pet_arcade(&app, &mut now);
+        let sap_after_press = app.pet_arcade.borrow().snapshot().unwrap().sap;
+
+        render_pet_arcade_app(&mut app);
+        let invalid_hit = find_hit(&app, HitTarget::PetArcadeTile(0, 0));
+        let _ = app.drag(invalid_hit.rect.x, invalid_hit.rect.y);
+        let _ = app.drop_at(invalid_hit.rect.x, invalid_hit.rect.y);
+        tick_pet_arcade(&app, &mut now);
+
+        let snapshot = app.pet_arcade.borrow().snapshot().unwrap();
+        assert_eq!(snapshot.sap, sap_after_press, "dropping on an out-of-zone tile must not spend any Sap");
+        assert!(
+            !snapshot.towers.iter().any(|tower| tower.position == (0, 0)),
+            "dropping on an out-of-zone tile must not place a tower there"
+        );
     }
 }

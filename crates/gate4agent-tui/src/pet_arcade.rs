@@ -63,7 +63,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gate4agent_arcade_engine::{
     AdmissionCredit, AdmissionError, AdmissionSource, ArcadeOccupant, ArcadeShell, CellArea,
-    GameCatalogEntry, GameEntry, GameScreen, MiniGame, Runner,
+    DynamicSprite, DynamicStroke, GameCatalogEntry, GameEntry, GameScreen, MiniGame, Runner,
 };
 use gate4agent_arcade_pet_bastion::board::{AnchorId, BuildIneligibleReason, ANCHOR_COUNT, ANCHORS};
 use gate4agent_arcade_pet_bastion::constants::{
@@ -77,7 +77,8 @@ use gate4agent_arcade_pet_bastion::snapshot::{RunPhaseView, SimulationSnapshot, 
 use gate4agent_arcade_pet_bastion::tower::{TowerKind, UpgradeBranch};
 use gate4agent_arcade_pet_bastion::wave::Difficulty;
 use gate4agent_arcade_pet_bastion::{Command, PetBastionParams, RunOutcome, Simulation};
-use gate4agent_arcade_pet_bastion_render::interp::FramePresenter;
+use gate4agent_arcade_pet_bastion_render::effects::EffectsLayer;
+use gate4agent_arcade_pet_bastion_render::interp::{sim_time, FramePresenter};
 
 use crate::app::UiKey;
 
@@ -226,6 +227,26 @@ pub(crate) struct PetArcade {
     /// tier never has to special-case "no `curr` yet" for the ~50ms window
     /// before the first real tick fires.
     presenter: FramePresenter,
+    /// Time-aged combat visual effects (projectile trails, impact
+    /// flashes, death bursts, Prism chain arcs, splash rings, Link Burst
+    /// pulses) -- ingested from the hosted `Runner`'s own recorded ticks
+    /// ([`Self::advance`], `Runner::drain_recorded`) and read back by the
+    /// pixel-tier renderer (`render::render_pet_arcade`). A `RefCell`,
+    /// not a plain field: that renderer holds an OUTER immutable
+    /// `Ref<PetArcade>` (`app.pet_arcade.borrow()`) for its entire body,
+    /// so ageing this layer at render time cannot go through a second
+    /// `borrow_mut()` on `App`'s own `Rc<RefCell<PetArcade>>` (that
+    /// would panic -- an active `Ref` and a `RefMut` on the SAME
+    /// `RefCell` can never coexist). Nesting the interior mutability one
+    /// level down, inside a field of the struct the outer `Ref` already
+    /// points at, sidesteps that entirely: `self.effects.borrow_mut()`
+    /// borrows a DIFFERENT `RefCell` than `app.pet_arcade`'s own, so
+    /// [`Self::age_and_effect_sprites`] can take `&self` and still age
+    /// the layer, callable straight from inside `render_pet_arcade`'s own
+    /// already-borrowed `arcade`. Reset alongside `presenter` in
+    /// `start_run` -- a fresh run has no earlier tick's effects still
+    /// worth showing.
+    effects: RefCell<EffectsLayer>,
     /// The wall-clock instant the LAST tick that actually fired ran at --
     /// distinct from `last_advance` above, which updates on every
     /// [`Self::advance`] call regardless of whether a tick ran. [`Self::
@@ -268,6 +289,7 @@ impl PetArcade {
             inspect: None,
             difficulty: Difficulty::Standard,
             presenter: FramePresenter::new(),
+            effects: RefCell::new(EffectsLayer::new()),
             last_tick_at: Instant::now(),
         }))
     }
@@ -276,7 +298,16 @@ impl PetArcade {
         let mut source = UnlimitedAdmission;
         let params = PetBastionParams::new(self.difficulty);
         self.presenter = FramePresenter::new();
-        if let Ok(runner) = Runner::start(&mut source, AdmissionCredit(1), fresh_seed(), params) {
+        self.effects = RefCell::new(EffectsLayer::new());
+        if let Ok(mut runner) = Runner::start(&mut source, AdmissionCredit(1), fresh_seed(), params) {
+            // Off by default on every `Runner` (see `Runner::set_
+            // recording`'s own doc comment) -- this is the ONE place that
+            // turns it on, matching the engine's own "energy gates
+            // admission, ... this being the only door" pattern for
+            // `Runner::start` one level up: a TUI-hosted run always wants
+            // its own combat presented, so recording is unconditional
+            // here, never a per-frame decision.
+            runner.set_recording(true);
             // Seed the cursor on a real build TARGET from the very first
             // frame rather than an arbitrary `(0, 0)` -- `build_cells`'s
             // own first entry is not good enough on its own: it is
@@ -355,6 +386,21 @@ impl PetArcade {
         }
         self.pending.clear();
         self.last_tick_at = now;
+        // Every tick this call actually ran, oldest first (`Runner::
+        // drain_recorded`'s own ordering guarantee) -- ingested one at a
+        // time, each against its OWN pre-tick snapshot, so a catch-up
+        // burst of several ticks in this one call never collapses into a
+        // single `ingest` call spanning more than one tick's worth of
+        // events (see `EffectsLayer::ingest`'s own doc comment for why
+        // that would be wrong: `snapshot_before` must be THAT tick's
+        // pre-tick state). `born_at = sim_time(tick_index_before, 0.0)`
+        // matches `PROJECTILE_FLIGHT_MS`'s own doc comment: a shot's own
+        // trail lands exactly as the tick that resolved it becomes the
+        // new `curr`.
+        for tick in runner.drain_recorded() {
+            let born_at = sim_time(tick.tick_index_before, 0.0);
+            self.effects.get_mut().ingest(&tick.events, &tick.snapshot_before, born_at);
+        }
         let snapshot = runner.snapshot();
         let outcome = match snapshot.phase {
             RunPhaseView::Victory => Some(RunOutcome::Won),
@@ -392,6 +438,20 @@ impl PetArcade {
     /// clamping.
     pub(crate) fn tick_alpha(&self, now: Instant) -> f64 {
         gate4agent_arcade_engine::tick_alpha(now.saturating_duration_since(self.last_tick_at), TICK_INTERVAL)
+    }
+
+    /// Ages `effects` to `now` (a simulated instant -- `interp::sim_time`,
+    /// never a real `Instant`, see that fn's own doc comment) and returns
+    /// what is still alive as of that same `now`, ready to feed straight
+    /// into `compose_frame`'s own `dynamic`/`strokes` slices. Takes `&self`
+    /// -- see the `effects` field's own doc comment for exactly why this
+    /// can mutate through a shared reference (an inner `RefCell`) and
+    /// why that is the fix, not a workaround, for `render_pet_arcade`
+    /// already holding an outer `Ref<PetArcade>` for its whole body.
+    pub(crate) fn age_and_effect_sprites(&self, now: Duration) -> (Vec<DynamicSprite>, Vec<DynamicStroke>) {
+        let mut effects = self.effects.borrow_mut();
+        effects.age(now);
+        effects.sprites(now)
     }
 
     fn queue(&mut self, command: Command) {

@@ -21,7 +21,7 @@ use gate4agent_arcade_pet_bastion::rune::Rune;
 use gate4agent_arcade_pet_bastion::snapshot::{RunPhaseView, SimulationSnapshot};
 use gate4agent_arcade_pet_bastion::tower::{effective_stats, DamageFamily, TowerKind, TowerStats, UpgradeBranch, UpgradeLevel};
 use gate4agent_arcade_pet_bastion::RunOutcome as PetBastionRunOutcome;
-use gate4agent_arcade_pet_bastion_render::interp::interpolated_dynamic_sprites;
+use gate4agent_arcade_pet_bastion_render::interp::{interpolated_dynamic_sprites, render_sim_time};
 use gate4agent_arcade_pet_bastion_render::{snapshot_to_surface, terrain_surface};
 use gate4agent_c2_protocol::C2RelayRoute;
 use gate4agent_harness_protocol::HarnessRunGitFactsOutcomeV1;
@@ -1395,8 +1395,25 @@ fn render_pet_arcade(
         // unchanged 20Hz tick.
         let prev = arcade.presenter().previous();
         let alpha = arcade.tick_alpha(Instant::now());
-        let dynamic = interpolated_dynamic_sprites(prev, &snapshot, alpha);
-        let strokes = pet_arcade_pixel_highlight_strokes(&snapshot, arcade.selected_tile(), arcade.selected_anchor(), drag_kind);
+        let mut dynamic = interpolated_dynamic_sprites(prev, &snapshot, alpha);
+        // Combat visuals (projectiles, impact flashes, death bursts, Prism
+        // chain arcs, splash rings, Link Burst pulses) -- `EffectsLayer`
+        // ages against SIMULATED time, never a real wall-clock read, and
+        // the index that simulated time counts from is `prev`'s, NOT
+        // `snapshot`'s: `snapshot` here is `presenter`'s own `curr`, one
+        // tick AHEAD of the interval this frame is actually drawing
+        // (`prev -> snapshot` at `alpha`), and that interval is the tick
+        // whose events were ingested with `born_at = sim_time(tick_index_
+        // before, 0.0)` in `PetArcade::advance`. `interp::render_sim_time`
+        // owns that rule for both this call site and `gate4agent-arcade-
+        // preview`'s own sequence loop -- see its doc comment for what
+        // aging by `curr`'s index instead actually costs (every trail
+        // invisible, every flash and burst missing its own first tick).
+        let now = render_sim_time(prev, &snapshot, alpha);
+        let (effect_sprites, effect_strokes) = arcade.age_and_effect_sprites(now);
+        dynamic.extend(effect_sprites);
+        let mut strokes = pet_arcade_pixel_highlight_strokes(&snapshot, arcade.selected_tile(), arcade.selected_anchor(), drag_kind);
+        strokes.extend(effect_strokes);
         let canvas = compose_frame(&PET_ARCADE_PIXEL_BACKGROUND, &surface, &dynamic, &strokes, drag_kind.is_some());
         if let PixelFrameOutput::Frame(frame) = encode_frame(&canvas, dest) {
             layout.pet_arcade_pixel_frame = Some(PetArcadePixelPlacement {

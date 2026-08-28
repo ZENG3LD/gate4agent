@@ -10124,7 +10124,6 @@ mod tests {
         assert_eq!(buf.get(pane.viewport.x, pane.viewport.y).symbol, "Z");
     }
 
-    #[test]
     /// A push-covered session must not hold the loop's wake deadline.
     ///
     /// Its due-map entry is never advanced (only a real poll advances one),
@@ -10170,6 +10169,7 @@ mod tests {
         assert!(deadline < now, "a dropped subscription makes its session due at once");
     }
 
+    #[test]
     fn harness_terminal_sessions_due_for_poll_resumes_covering_a_dropped_subscription() {
         // Requirement 2, made checkable without a socket: the poll must be
         // the FALLBACK for a session the push worker is not (or is no

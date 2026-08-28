@@ -1498,14 +1498,59 @@ mod tests {
             reply: reply_tx,
         };
         let action = apply(&mut app, &TerminalWatermarks::default(), command);
-        // The refusal never produced ANY `AppAction` to queue -- unlike a
-        // real keystroke through `InjectKey`, which would have produced
-        // `AppAction::Input` and then silently dropped it two steps later.
+        // The refusal never produced ANY `AppAction` to queue. A real
+        // keystroke does produce `AppAction::Input` and still routes to
+        // `None` two steps later -- but it no longer does so silently;
+        // see `a_keystroke_that_cannot_be_routed_says_so_instead_of_
+        // vanishing` for the popup that names the same cause.
         assert_eq!(action, AppAction::None);
         let ControlReplyV1::Error { error } = reply_rx.try_recv().unwrap() else {
             panic!("expected an Error reply naming why the write was refused");
         };
         assert!(matches!(error, ControlErrorV1::NodeIncarnationUnknown));
+    }
+
+    /// The product defect the control plane exposed but did not fix: a
+    /// REAL keystroke into a pane whose node has no known incarnation
+    /// used to route to `AppAction::None` and stop there -- no request,
+    /// no error, no popup, no feed entry. The keyboard looked dead and
+    /// the injection path looked broken; the drop site was three layers
+    /// away. It still routes to `None` (there is no address to send to),
+    /// but it now names the refusal and its cause.
+    ///
+    /// Both causes are covered here, because they are different waits:
+    /// a node absent from the inventory is a stale pane, a node without
+    /// an incarnation is a node that just restarted.
+    #[test]
+    fn a_keystroke_that_cannot_be_routed_says_so_instead_of_vanishing() {
+        for (clear_nodes, expected_cause) in
+            [(false, "has not reported an incarnation"), (true, "not in the harness runtime inventory")]
+        {
+            let mut app = app_with_one_pty_pane();
+            let raw_action = app.reduce(UiKey::Char('x'));
+            assert!(
+                matches!(raw_action, AppAction::Input { .. }),
+                "the keystroke must reach the routing step as an Input, got {raw_action:?}",
+            );
+            if clear_nodes {
+                app.nodes.clear();
+            }
+            app.dismiss_notice();
+
+            let routed = app.route_harness_session_verb(raw_action);
+            assert_eq!(routed, AppAction::None, "an unroutable write must not be sent");
+            let notice = app
+                .notice()
+                .expect("a dropped keystroke must name its refusal in the corner popup");
+            assert!(
+                notice.contains("input not delivered"),
+                "the popup must say the verb did not arrive, got {notice:?}",
+            );
+            assert!(
+                notice.contains(expected_cause),
+                "the popup must name the cause {expected_cause:?}, got {notice:?}",
+            );
+        }
     }
 
     #[test]

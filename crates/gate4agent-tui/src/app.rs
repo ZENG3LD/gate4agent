@@ -9376,15 +9376,15 @@ fn append_event_to_diagnostics_file(event: &AppEvent) {
                     cols,
                 }
             }
-            AppAction::Input { address, text } => match self.harness_session_address(&address) {
+            AppAction::Input { address, text } => match self.harness_session_address(&address, "input") {
                 Some(session) => AppAction::HarnessWriteSessionInput { session, text },
                 None => AppAction::None,
             },
-            AppAction::Resize { address, rows, cols } => match self.harness_session_address(&address) {
+            AppAction::Resize { address, rows, cols } => match self.harness_session_address(&address, "resize") {
                 Some(session) => AppAction::HarnessResizeSession { session, rows, cols },
                 None => AppAction::None,
             },
-            AppAction::Stop { address, force } => match self.harness_session_address(&address) {
+            AppAction::Stop { address, force } => match self.harness_session_address(&address, "stop") {
                 Some(session) => {
                     let token = self.begin_harness_mutation_refresh();
                     AppAction::HarnessStopSession { token, session, force }
@@ -9392,7 +9392,7 @@ fn append_event_to_diagnostics_file(event: &AppEvent) {
                 None => AppAction::None,
             },
             AppAction::TerminalControl { address, control } => {
-                match self.harness_session_address(&address) {
+                match self.harness_session_address(&address, "control") {
                     Some(session) => AppAction::HarnessControlSession {
                         session,
                         control: harness_terminal_control(control),
@@ -9401,30 +9401,30 @@ fn append_event_to_diagnostics_file(event: &AppEvent) {
                 }
             }
             AppAction::TerminalBytes { address, bytes } => {
-                match self.harness_session_address(&address) {
+                match self.harness_session_address(&address, "bytes") {
                     Some(session) => AppAction::HarnessWriteSessionBytes { session, bytes },
                     None => AppAction::None,
                 }
             }
-            AppAction::Paste { address, text } => match self.harness_session_address(&address) {
+            AppAction::Paste { address, text } => match self.harness_session_address(&address, "paste") {
                 Some(session) => AppAction::HarnessPasteSession { session, text },
                 None => AppAction::None,
             },
-            AppAction::Remove { address } => match self.harness_session_address(&address) {
+            AppAction::Remove { address } => match self.harness_session_address(&address, "remove") {
                 Some(session) => {
                     let token = self.begin_harness_mutation_refresh();
                     AppAction::HarnessRemoveSession { token, session }
                 }
                 None => AppAction::None,
             },
-            AppAction::Resume { address, rows, cols } => match self.harness_session_address(&address) {
+            AppAction::Resume { address, rows, cols } => match self.harness_session_address(&address, "resume") {
                 Some(session) => {
                     let token = self.begin_harness_mutation_refresh();
                     AppAction::HarnessResumeSession { token, session, rows, cols }
                 }
                 None => AppAction::None,
             },
-            AppAction::ExportContextPack { address } => match self.harness_session_address(&address) {
+            AppAction::ExportContextPack { address } => match self.harness_session_address(&address, "context-pack export") {
                 Some(session) => AppAction::HarnessExportContextPack { session },
                 None => AppAction::None,
             },
@@ -9436,17 +9436,55 @@ fn append_event_to_diagnostics_file(event: &AppEvent) {
     /// address's `incarnation_id`, which the direct-mode `SessionAddress`
     /// this crate uses does not carry) from `self.nodes` -- the same lookup
     /// `HarnessOpenTerminal`'s own construction uses in `client.rs`'s poll
-    /// loop. `None` if the node isn't (yet) in the harness runtime
-    /// inventory, which drops the action via `route_harness_session_verb`'s
-    /// `None` arms rather than sending a request the host cannot route.
+    /// loop.
+    ///
+    /// The routing lookup EVERY drop arm of `route_harness_session_verb`
+    /// goes through, and the reason it is `&mut self`: a failure here used
+    /// to return a bare `None` that the caller turned into
+    /// `AppAction::None`, so a keystroke, a resize or a stop simply
+    /// evaporated -- no request, no error, no popup, no feed entry. From
+    /// the operator's chair that is a dead keyboard with no explanation,
+    /// and it cost an hour of hunting the injection path before the drop
+    /// site was found. Now the refusal names itself and its cause.
+    ///
+    /// `flash`, not `report_failure`: this is a precondition refusal
+    /// ("the action cannot be routed right now"), it recurs once per
+    /// keystroke while the inventory is cold, and nothing happened that a
+    /// permanent history entry should keep -- exactly the split `flash`'s
+    /// own doc comment draws. Re-flashing the same sentence is free: the
+    /// popup's dismiss timer in `client::run` re-arms only when the TEXT
+    /// changes, so a burst of dropped keys shows one popup, not a stutter.
     fn harness_session_address(
+        &mut self,
+        address: &SessionAddress,
+        verb: &str,
+    ) -> Option<HarnessRuntimeSessionAddressV1> {
+        match self.harness_session_route(address) {
+            Ok(session) => Some(session),
+            Err(drop) => {
+                self.flash(format!(
+                    "{verb} not delivered: {}",
+                    drop.describe(&address.node_id),
+                ));
+                None
+            }
+        }
+    }
+
+    /// The address translation itself, with the two ways it can fail kept
+    /// apart. Borrow-only, so callers that must not flash (and the tests
+    /// that assert on the cause rather than on its wording) can use it
+    /// directly.
+    fn harness_session_route(
         &self,
         address: &SessionAddress,
-    ) -> Option<HarnessRuntimeSessionAddressV1> {
-        let incarnation_id = self.nodes.iter()
+    ) -> Result<HarnessRuntimeSessionAddressV1, HarnessRouteDrop> {
+        let node = self.nodes.iter()
             .find(|node| node.node_id == address.node_id)
-            .and_then(|node| node.incarnation_id)?;
-        Some(HarnessRuntimeSessionAddressV1 {
+            .ok_or(HarnessRouteDrop::NodeAbsent)?;
+        let incarnation_id = node.incarnation_id
+            .ok_or(HarnessRouteDrop::IncarnationUnknown)?;
+        Ok(HarnessRuntimeSessionAddressV1 {
             node_id: address.node_id.clone(),
             incarnation_id: incarnation_id.to_string(),
             workspace_id: address.workspace_id.clone(),
@@ -23490,6 +23528,35 @@ fn control_for_ctrl(ch: char) -> Option<TerminalControl> {
         'y' => Some(TerminalControl::ControlY),
         'z' => Some(TerminalControl::ControlZ),
         _ => None,
+    }
+}
+
+/// Why `App::harness_session_route` could not build a harness wire
+/// address for a session the operator is acting on.
+///
+/// Both arms end the same way -- the verb is not sent -- but they are
+/// different states of the node inventory and different waits, so the
+/// popup says which one it is. `NodeAbsent` means the harness runtime
+/// inventory has no node under that id at all (a stale pane, or a
+/// snapshot that has not arrived yet); `IncarnationUnknown` means the
+/// node is listed but has not reported the incarnation the wire address
+/// requires, which is the transient state right after a node restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HarnessRouteDrop {
+    NodeAbsent,
+    IncarnationUnknown,
+}
+
+impl HarnessRouteDrop {
+    fn describe(self, node_id: &str) -> String {
+        match self {
+            Self::NodeAbsent => {
+                format!("node {node_id} is not in the harness runtime inventory")
+            }
+            Self::IncarnationUnknown => {
+                format!("node {node_id} has not reported an incarnation yet")
+            }
+        }
     }
 }
 

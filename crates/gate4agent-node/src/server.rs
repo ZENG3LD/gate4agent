@@ -220,6 +220,11 @@ const AUTH_FRAME_TIMEOUT_MS: u64 = 5_000;
 const FRAME_BODY_TIMEOUT_MS: u64 = 5_000;
 const CONNECTION_SHUTDOWN_GRACE_MS: u64 = 250;
 const SPAWN_DISPATCH_TIMEOUT_MS: u64 = 2_000;
+/// How long `wait_until_removed` waits between two `Remove` re-dispatches
+/// for the same session. The presence poll runs far faster (2ms); this
+/// only paces the sending, so an accepted `Remove` still in flight is not
+/// piled on by a dozen more that land on an already-dropped instance.
+const REMOVE_REDISPATCH_INTERVAL_MS: u64 = 100;
 const SPAWN_IDEMPOTENCY_MAX_ENTRIES: usize = 256;
 const SPAWN_IDEMPOTENCY_TTL_MS: u64 = 15 * 60 * 1_000;
 const PROVIDER_RUNTIME_ADMISSION_TIMEOUT_MS: u64 = 2_500;
@@ -11282,12 +11287,31 @@ impl NodeShared {
     /// the gate costs nothing extra. It races -- the status can move
     /// between the read and the dispatch -- and that is fine: a rare lost
     /// race is one rejection, and the next tick retries.
+    ///
+    /// Re-dispatch is separately rate-limited to
+    /// [`REMOVE_REDISPATCH_INTERVAL_MS`], because the status gate alone
+    /// leaves a second burst behind it. Once the session settles, every
+    /// 2ms tick sent another `Remove` while the accepted one was still in
+    /// flight, and each of those landed on an instance the engine had
+    /// already dropped -- `agent instance … is not registered`, observed
+    /// live as a tail of rejections immediately after the `session
+    /// removed` line. The presence poll stays at 2ms so the wait still
+    /// exits promptly; only the sending slows down.
+    ///
+    /// Rate-limited rather than once-only on purpose: the status gate
+    /// covers the status precondition, but `Gate4AgentEngine::remove` has
+    /// others (a pending operation, an in-flight capability probe or
+    /// history request) that clear on their own. A single shot would turn
+    /// those into a guaranteed `BackendBusy` timeout; at 10Hz they still
+    /// get their retries, just twenty of them across the deadline instead
+    /// of a thousand.
     async fn wait_until_removed(
         &self,
         address: &SessionAddress,
         commit_timeout: Duration,
     ) -> Result<(), NodeFailure> {
         let deadline = Instant::now() + commit_timeout;
+        let mut next_dispatch = Instant::now();
         loop {
             let snapshot = self.handle.snapshot();
             let status = snapshot
@@ -11298,16 +11322,18 @@ impl NodeShared {
             let Some(status) = status else {
                 return Ok(());
             };
-            if Instant::now() >= deadline {
+            let now = Instant::now();
+            if now >= deadline {
                 return Err(failure(
                     NodeFailureCode::BackendBusy,
                     "remove did not commit before the bounded deadline; session binding was retained",
                 ));
             }
-            if status.allows_remove() {
+            if status.allows_remove() && now >= next_dispatch {
                 let _ = self.dispatch(ControlCommand::Remove {
                     instance_id: address.session.instance_id,
                 });
+                next_dispatch = now + Duration::from_millis(REMOVE_REDISPATCH_INTERVAL_MS);
             }
             sleep(Duration::from_millis(2)).await;
         }

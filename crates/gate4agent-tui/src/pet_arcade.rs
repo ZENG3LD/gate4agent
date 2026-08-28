@@ -258,7 +258,54 @@ pub(crate) struct PetArcade {
     /// completed tick is render time right now" definition
     /// (`gate4agent_arcade_engine::tick_alpha`'s own doc comment).
     last_tick_at: Instant,
+    /// Every run this session has FINISHED (won or lost), newest last --
+    /// see [`PetArcadeScoreEntry`]'s own doc comment for what a row holds
+    /// and why this is in-session only, not written to `preferences.rs`.
+    /// Read by `render::render_pet_arcade_menu`'s own `PetArcadeMenuState::
+    /// ScoreList` arm; written exactly once per finished run, at the
+    /// moment [`Self::advance`] transitions `screen` to `GameScreen::
+    /// Results`.
+    scores: Vec<PetArcadeScoreEntry>,
 }
+
+/// One row of the run menu's own score list -- everything a row needs
+/// already exists on a finished run's own last `SimulationSnapshot`
+/// (`difficulty`, `wave`) plus the `RunOutcome` [`PetArcade::advance`]
+/// already computes to decide the transition into `GameScreen::Results`
+/// in the first place, so this is a plain copy of three fields already in
+/// hand, never a second source of truth. Owner: "может какой-то скор-лист
+/// там будет еще что-то".
+///
+/// # Persistence
+///
+/// In-session only (`PetArcade::scores`, a plain `Vec` -- cleared the
+/// moment the TUI process restarts), NOT written to `preferences.rs`.
+/// Checked, not assumed: every existing repeated-line preference in that
+/// file (`managed_agent=...`, `collapsed_directory=...`) needs a
+/// `CONFIG_VERSION` bump with its own migration note, a capacity constant,
+/// an `App`-side collection field, `UiPreferences::from_app`/`try_apply_to`
+/// plumbing, an `encode` line, a two-pass `parse` (raw accumulation +
+/// a `finish_with_collections`-style resolver), a dedicated `validated_*`/
+/// `parse_*_preference` pair, AND round-trip/malformed-rejection tests
+/// (`preferences_v7_managed_agents_round_trip_deterministically`,
+/// `preferences_v5_rejects_malformed_duplicate_and_oversize_managed_agents`).
+/// That is a real, multi-part feature, not "a repeated keyed line" --
+/// wiring it in as an afterthought here would half-build it. Left for a
+/// pass that can give it that.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PetArcadeScoreEntry {
+    pub(crate) difficulty: Difficulty,
+    pub(crate) wave_reached: u32,
+    pub(crate) outcome: RunOutcome,
+}
+
+/// How many finished runs [`PetArcade::scores`] keeps -- oldest evicted
+/// first once a NEW one would exceed this, so an all-day session cannot
+/// grow this `Vec` without bound. Comfortably more than a menu popup
+/// would ever show without its own scrolling, matching this crate's
+/// existing `MAX_MANAGED_AGENT_PREFERENCES`-style "cap the collection,
+/// not just the render" convention.
+const MAX_SCORE_ENTRIES: usize = 20;
 
 impl fmt::Debug for PetArcade {
     /// Deliberately does not inspect `screen`/`shell` -- neither
@@ -294,6 +341,7 @@ impl PetArcade {
             presenter: FramePresenter::new(),
             effects: RefCell::new(EffectsLayer::new()),
             last_tick_at: Instant::now(),
+            scores: Vec::new(),
         }))
     }
 
@@ -365,6 +413,13 @@ impl PetArcade {
         self.screen.set_suspended(true);
     }
 
+    /// `true` while there is a live run a restart would throw away --
+    /// `App::activate_pet_arcade_restart`'s own confirm-prompt gate, and
+    /// `App::step_pet_arcade`'s own "the run menu has nothing left to
+    /// anchor to" close, both key off this. Note this stays `true` while
+    /// merely SUSPENDED (`Self::suspend`, the whole arcade overlay
+    /// closed) -- a suspended run is still a real run with real progress
+    /// to lose, not a finished one.
     pub(crate) fn is_running(&self) -> bool {
         matches!(self.screen, GameScreen::InRun(_))
     }
@@ -410,6 +465,12 @@ impl PetArcade {
             RunPhaseView::Defeat => Some(RunOutcome::Lost),
             _ => None,
         };
+        // Captured here (plain `Copy` reads, not moves) rather than after
+        // `presenter.push_tick` hands `snapshot` away below -- a score
+        // row needs exactly these two fields off THIS tick's own
+        // snapshot, the one that just decided `outcome`.
+        let difficulty = snapshot.difficulty;
+        let wave_reached = snapshot.wave;
         // Pushed AFTER `outcome` is already decided from `snapshot.phase`
         // (a plain `Copy` read, not a move) so this can hand `presenter`
         // ownership of `snapshot` outright rather than cloning it -- the
@@ -418,7 +479,27 @@ impl PetArcade {
         if let Some(outcome) = outcome {
             let final_hash = runner.stable_hash();
             self.screen = GameScreen::Results { outcome, final_hash };
+            // One row per finished run -- see `PetArcadeScoreEntry`'s own
+            // doc comment for why this crate never revisits a run that
+            // already ended (there is no "update the last row" path,
+            // `advance` only ever reaches THIS arm once per run: `screen`
+            // is already `Results` on every subsequent call, so `Runner
+            // ::advance` above never runs again until `start_run` resets
+            // it).
+            self.scores.push(PetArcadeScoreEntry { difficulty, wave_reached, outcome });
+            if self.scores.len() > MAX_SCORE_ENTRIES {
+                self.scores.remove(0);
+            }
         }
+    }
+
+    /// Every finished run this session, newest last -- see
+    /// [`PetArcadeScoreEntry`]'s own doc comment. `render::render_pet_
+    /// arcade_menu`'s own `ScoreList` arm reads this and reverses it
+    /// (newest first is the more useful reading order for a popup that
+    /// only ever shows a handful of rows at a time).
+    pub(crate) fn scores(&self) -> &[PetArcadeScoreEntry] {
+        &self.scores
     }
 
     /// The pixel tier's own interpolation input -- see `presenter`'s own
@@ -761,17 +842,23 @@ impl PetArcade {
         self.queue(Command::ChooseEvolution(evolution));
     }
 
-    /// The Results screen's own `[R] Play Again` button -- mouse
-    /// counterpart to the `r` key (see [`Self::handle_key`]'s own
-    /// `Results` arm). Guarded the same way that arm is: a click reaching
-    /// this while the screen is NOT `Results` (should never happen --
-    /// `HitTarget::PetArcadeRestart` is only ever pushed by `render_pet_
-    /// arcade_results`) is a silent no-op rather than restarting an
-    /// in-progress run out from under the player.
+    /// Actually restarts -- the Results screen's own `[R] Play Again`
+    /// button, the `r` key (see [`Self::handle_key`]'s own `Results` arm),
+    /// and the run menu's own Restart row (`App::activate_pet_arcade_
+    /// restart`) all funnel through this ONE fn regardless of which
+    /// screen the run is currently on, never a second path. Restarting
+    /// throws an in-progress run away -- that consequence is now made
+    /// visible BEFORE it happens by the caller (`App::activate_pet_arcade_
+    /// restart`'s own confirm-prompt gate, shown once whenever [`Self::
+    /// is_running`] is true), not by this fn refusing to run: by the time
+    /// this actually fires, either that confirmation already happened, or
+    /// there was nothing to confirm (`Results`/`Home` have nothing
+    /// running to lose, exactly as before this menu existed). Unconditional
+    /// on purpose -- re-deriving "is this safe" a second time here would
+    /// be a second source of truth for the same one decision the caller
+    /// already made.
     pub(crate) fn click_restart(&mut self) {
-        if matches!(self.screen, GameScreen::Results { .. }) {
-            self.start_run();
-        }
+        self.start_run();
     }
 
     /// A drag-and-drop tower placement landing on board tile `(x, y)` --
@@ -879,6 +966,16 @@ impl PetArcade {
     #[cfg(test)]
     pub(crate) fn force_results_for_test(&mut self, outcome: RunOutcome) {
         self.screen = GameScreen::Results { outcome, final_hash: 0 };
+    }
+
+    /// Test-only seam for [`PetArcadeScoreEntry`] -- a real one only ever
+    /// gets appended by [`Self::advance`], mid-tick, off a `Runner`
+    /// snapshot a unit test cannot legitimately fabricate any more easily
+    /// than `force_results_for_test`'s own doc comment already explains
+    /// for `Results` itself. Never compiled into a real build.
+    #[cfg(test)]
+    pub(crate) fn push_score_for_test(&mut self, entry: PetArcadeScoreEntry) {
+        self.scores.push(entry);
     }
 }
 

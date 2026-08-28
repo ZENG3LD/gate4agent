@@ -23,6 +23,7 @@ use gate4agent_arcade_pet_bastion::pet::Evolution;
 use gate4agent_arcade_pet_bastion::rune::Rune;
 use gate4agent_arcade_pet_bastion::snapshot::{RunPhaseView, SimulationSnapshot};
 use gate4agent_arcade_pet_bastion::tower::{effective_stats, DamageFamily, TowerKind, TowerStats, UpgradeBranch, UpgradeLevel};
+use gate4agent_arcade_pet_bastion::wave::Difficulty;
 use gate4agent_arcade_pet_bastion::RunOutcome as PetBastionRunOutcome;
 use gate4agent_arcade_pet_bastion_render::interp::{interpolated_dynamic_sprites, render_sim_time};
 use gate4agent_arcade_pet_bastion_render::{snapshot_to_surface, terrain_surface};
@@ -51,7 +52,8 @@ use crate::app::{
     ContextUsageHover, ContextUsageSegment, ContextUsageSegmentHit,
     ExistingSessionMode, ExistingSessionOperation, Focus, FolderBrowserField,
     AgentRunGitScopeView, GitLocationDialogKind, HitRegion, HitTarget, LaunchContextMode, LaunchField, LaunchTarget,
-    IconFamily, LayoutRects, MenuPlacement, NativeSessionGroupKey, NativeSessionTreeItem, NetworkSummary, NodeView, OverlayId, PetArcadePixelPlacement, PetArcadeVisualTier, PreviewTabPhase, PreviewTabView, PtyColorMode, RailIcons, RosterMode, SessionView,
+    IconFamily, LayoutRects, MenuPlacement, NativeSessionGroupKey, NativeSessionTreeItem, NetworkSummary, NodeView, OverlayId, PetArcadeMenuAction, PetArcadeMenuState, PetArcadePixelPlacement, PetArcadeVisualTier, PreviewTabPhase, PreviewTabView, PtyColorMode, RailIcons, RosterMode, SessionView,
+    PET_ARCADE_INFO_VISIBLE_ROWS,
     SixelIconPlacement, SixelIconSize,
     pet_blink_suspended_for_connection, pet_connection_color_key, PetConnectionColor,
     StatusBarHoverZone,
@@ -320,6 +322,7 @@ pub fn render(app: &App, buf: &mut TerminalBuffer) -> LayoutRects {
         harness_reverse_attribution_modal: Rect::default(),
         pet_arcade_modal: Rect::default(),
         pet_arcade_info_modal: Rect::default(),
+        pet_arcade_menu: Rect::default(),
         status_bar_center_log_body: Rect::default(),
         status_bar_left: Rect::default(),
         status_bar_center: Rect::default(),
@@ -487,7 +490,15 @@ pub fn render(app: &App, buf: &mut TerminalBuffer) -> LayoutRects {
         // overlay_outside_click`'s own doc comment for why this check runs
         // ahead of everything else that could close the arcade underneath.
         if app.pet_arcade_info_open {
-            render_pet_arcade_info(area, buf, &mut layout, theme);
+            render_pet_arcade_info(app, area, buf, &mut layout, theme);
+        }
+        // Same shape as the mechanics modal just above -- the run menu
+        // popup is the OTHER thing stacked on top of the arcade modal,
+        // and the two are mutually exclusive (`App::toggle_pet_arcade_
+        // menu`/`click_pet_arcade`'s own `PetArcadeInfo` arm each close
+        // the other).
+        if app.pet_arcade_menu.is_some() {
+            render_pet_arcade_menu(app, area, buf, &mut layout, theme);
         }
     }
     render_drag_preview(app, area, buf, &layout, theme);
@@ -1359,6 +1370,23 @@ fn render_pet_arcade(
         let info_rect = Rect::new(info_x, inner.y, info_width, 1);
         render_modal_line(INFO_LABEL, info_rect, 0, Style::default().fg(theme.accent).bg(theme.modal), buf);
         push_modal_hit(layout, info_rect, HitTarget::PetArcadeInfo);
+        // The run menu's own launch control (`HitTarget::PetArcadeMenuToggle`
+        // -> `render_pet_arcade_menu`) -- owner report: "не хватает
+        // какого-то меню там, где можно рестарт сделать" -- the only
+        // existing way to restart was the Results screen's own button,
+        // unreachable while a run was still in progress. Sits directly
+        // left of `[?] Info` on this SAME header row, same reasoning as
+        // that button's own doc comment for why here and not the HUD
+        // panel; reachable by mouse here and by the `n` key (`App::
+        // reduce_pet_arcade`).
+        const MENU_LABEL: &str = "[N] Menu";
+        let menu_label_w = cell_width(MENU_LABEL) as u16;
+        let menu_right = info_x.saturating_sub(1);
+        let menu_x = menu_right.saturating_sub(menu_label_w).max(inner.x);
+        let menu_width = menu_right.saturating_sub(menu_x).min(menu_label_w);
+        let menu_rect = Rect::new(menu_x, inner.y, menu_width, 1);
+        render_modal_line(MENU_LABEL, menu_rect, 0, Style::default().fg(theme.accent).bg(theme.modal), buf);
+        push_modal_hit(layout, menu_rect, HitTarget::PetArcadeMenuToggle);
     }
 
     let dest = Rect::new(inner.x, board_y, board_w, board_h);
@@ -1533,10 +1561,28 @@ fn one_decimal(numerator: i64, denominator: i64) -> String {
     format!("{whole}.{tenths}")
 }
 
+/// Whether [`render_pet_arcade_info`]'s own content needs a scrollbar at
+/// all THIS frame, and the scroll offset actually usable once the raw,
+/// unclamped `App::pet_arcade_info_scroll` request is clamped against
+/// `total_lines`/`visible_rows`. Pulled out as its own pure fn so the
+/// "a bar shows only once content genuinely overflows" boundary is
+/// directly unit-testable against synthetic `(total_lines, visible_rows)`
+/// pairs, without needing a real, artificially-shortened content list --
+/// the REAL content (`pet_arcade_info_lines`) is 22 lines against a fixed
+/// 14-row budget ([`PET_ARCADE_INFO_VISIBLE_ROWS`]) and so always
+/// overflows today, which proves the bar SHOWS but not that it would stay
+/// hidden if it did not.
+fn pet_arcade_info_scroll_state(total_lines: u16, visible_rows: u16, requested_scroll: u16) -> (bool, u16) {
+    let needs_scrollbar = total_lines > visible_rows;
+    let max_scroll = total_lines.saturating_sub(visible_rows);
+    (needs_scrollbar, requested_scroll.min(max_scroll))
+}
+
 /// The arcade's own mechanics reference -- everything the header's own
 /// `[?] Info` button (`HitTarget::PetArcadeInfo`, `render_pet_arcade`'s own
 /// header block) and the `?` key (`App::reduce_pet_arcade`) open;
-/// `Escape`/`?`/its own `[x]`/a click outside it all close it (`App::
+/// `Escape`/`?`/its own `<-` (`render_modal_back`, not `[x]` -- see that
+/// fn's own doc comment)/a click outside it all close it (`App::
 /// close_overlay_outside_click`'s own `pet_arcade_info_open` branch, which
 /// runs AHEAD of the arcade's own outside-click guard so this always
 /// closes first, never the arcade underneath it). Owner report: "мне не
@@ -1566,59 +1612,40 @@ fn one_decimal(numerator: i64, denominator: i64) -> String {
 /// this one frame -- the glyph-tier board underneath (always painted
 /// first regardless of visual tier, `render_pet_arcade`'s own doc comment)
 /// is what actually shows through behind this card.
-fn render_pet_arcade_info(area: Rect, buf: &mut TerminalBuffer, layout: &mut LayoutRects, theme: Theme) {
-    enum Line {
-        Label(&'static str),
-        Body(String),
-    }
-
-    let wisp_free_blink_s = WISP_FREE_BLINK_INTERVAL_TICKS / TICKS_PER_SECOND as u64;
-    let anchor_linger_s = ANCHOR_RUNE_LINGER_TICKS / TICKS_PER_SECOND as u64;
-    let move_s = one_decimal(PET_MOVE_TICKS as i64, TICKS_PER_SECOND);
-    let symbiosis_tiles = one_decimal(SYMBIOSIS_ADJACENCY_FP, FIXED_SCALE);
-    let symbiosis_pct = SYMBIOSIS_DAMAGE_BONUS_PERMILLE / 10;
-    let linked_attack_speed_pct = (LINKED_ATTACK_SPEED_PERMILLE - 1000) / 10;
-
-    let lines = [
-        Line::Label("SPARK"),
-        Line::Body("Only a KILL by a tower currently linked to the pet earns it (see PET below).".to_owned()),
-        Line::Body(format!(
-            "{SPARK_PER_KILLS} linked kills = +1 Spark, capped at {SPARK_CAP}. Doubled during Night Maw's final phase."
-        )),
-        Line::Body(format!(
-            "Spends: Pulse -{PET_PULSE_COST}  Blink -{BLINK_COST} (free every {wisp_free_blink_s}s on a Wisp)  Circuit -{FULL_CIRCUIT_COST}"
-        )),
-        Line::Label("RUNES"),
-        Line::Body(format!(
-            "Drafted after wave {} and wave {} -- pick 1 of {RUNE_DRAFT_OPTIONS}, blocking the build phase.",
-            RUNE_DRAFT_AFTER_WAVES[0], RUNE_DRAFT_AFTER_WAVES[1],
-        )),
-        Line::Body(format!("Echo: every {ECHO_EVERY_NTH_ATTACK}th attack, a same-kind tower fires again for free.")),
-        Line::Body(format!("Anchor: linked buffs linger {anchor_linger_s}s after the pet leaves that anchor.")),
-        Line::Body("Overgrowth: a kill's overkill damage carries into the next chain/splash hit.".to_owned()),
-        Line::Body(format!("Phase: every {PHASE_EVERY_NTH_HIT}rd hit ignores armour.")),
-        Line::Body(format!(
-            "Symbiosis: towers within {symbiosis_tiles} tiles of a different kind deal +{symbiosis_pct}% damage."
-        )),
-        Line::Label("PET"),
-        Line::Body("The glowing firefly is the pet -- it lives on a blue-highlighted anchor tile.".to_owned()),
-        Line::Body(format!(
-            "Linked to its {CIRCUIT_BASE_SLOTS} nearest attacking towers (+1 per placed Relay), +{linked_attack_speed_pct}% attack speed."
-        )),
-        Line::Body(format!("An evolution, drafted after wave {EVOLUTION_AFTER_WAVE}, can change that slot count.")),
-        Line::Body(format!("Click any anchor tile to move the pet there (or press M) -- {move_s}s on foot.")),
-        Line::Body(format!("[B] Blink -{BLINK_COST} arrives instantly instead, spending Spark.")),
-        Line::Label("WAVES"),
-        Line::Body("A unit that reaches the Heartseed is NOT killed and does not end the run.".to_owned()),
-        Line::Body("It loops back to its own route start at full health and keeps walking.".to_owned()),
-        Line::Body(format!(
-            "Each lap costs Integrity instead: -{LEAK_INTEGRITY_DAMAGE} for a minion, -{BOSS_LAP_INTEGRITY_DAMAGE} for a boss."
-        )),
-        Line::Body("A wave ends only once every enemy on it is dead, not on Heartseed arrival.".to_owned()),
-    ];
+///
+/// # Scrolling
+///
+/// Owner report: "если в механике инфа не влазит сделай скролбар, окно
+/// скроллбары мы умеем делать внутри модалок" -- fixed at [`PET_ARCADE_
+/// INFO_VISIBLE_ROWS`] tall (14) rather than growing to fit every line
+/// (this content's own predecessor, back when it was 17 lines and just
+/// barely fit; it is 22 now and will grow again), so this modal ALWAYS has
+/// to scroll in practice today, exercising the mechanism every frame it
+/// is open rather than only once the text happens to overflow some
+/// terminal-dependent budget. Reuses `render_file_scrollbar`'s own track-
+/// plus-thumb visual contract (`|` track, `#` thumb, the identical
+/// proportional-sizing formula) rather than a second scrollbar mechanism
+/// -- see [`render_pet_arcade_info_scrollbar`]'s own doc comment for why
+/// that is a sibling fn, not a literal call to the file-specific one.
+/// `app.pet_arcade_info_scroll` is the raw, UNCLAMPED offset `App::scroll`/
+/// `reduce_pet_arcade` nudge -- clamped against this frame's own real
+/// `total_lines`/`visible_rows` right here, the same "nudge there, clamp
+/// here" split `board_sidebar_scroll`'s own doc comment already
+/// establishes, so a content change (a rune added, a WAVES section landing)
+/// can never leave a stale scroll position pointing past the end. The
+/// scrollbar's own track claims exactly one column, taken from the text
+/// body's own width, ONLY while `total_lines > visible_rows` -- content
+/// that fits needs no bar and loses no width to one; content that
+/// scrolls still gets the full, un-truncated text width `pet_arcade_info_
+/// modal_never_truncates` already tests, just one column narrower.
+fn render_pet_arcade_info(app: &App, area: Rect, buf: &mut TerminalBuffer, layout: &mut LayoutRects, theme: Theme) {
+    let lines = pet_arcade_info_lines();
+    let total_lines = lines.len() as u16;
+    let visible_rows = PET_ARCADE_INFO_VISIBLE_ROWS.min(total_lines).max(1);
+    let (needs_scrollbar, scroll) = pet_arcade_info_scroll_state(total_lines, visible_rows, app.pet_arcade_info_scroll);
 
     const WIDTH: u16 = 88;
-    let height = lines.len() as u16 + 2;
+    let height = visible_rows + 2;
     let modal = positioned_modal(area, WIDTH, height, None);
     layout.pet_arcade_info_modal = modal;
     layout.note_overlay(modal);
@@ -1628,20 +1655,157 @@ fn render_pet_arcade_info(area: Rect, buf: &mut TerminalBuffer, layout: &mut Lay
         .border_style(Style::default().fg(theme.accent))
         .style(Style::default().bg(theme.modal))
         .render(modal, buf);
-    render_modal_close(modal, buf, layout, theme);
+    // Owner report: "ты сделал возврат из механики через Х, лучше сделай
+    // через стрелочку <-, иначе не очевидно" -- see `render_modal_back`'s
+    // own doc comment for why this paints `<-` in `render_modal_close`'s
+    // exact corner spot rather than that fn's own `[x]`.
+    render_modal_back(modal, buf, layout, theme);
     if modal.width < 3 || modal.height < 3 {
         return;
     }
-    let inner = Rect::new(modal.x + 1, modal.y + 1, modal.width - 2, modal.height - 2);
-    for (row, line) in lines.iter().enumerate() {
-        let Ok(row) = u16::try_from(row) else { break };
+    let full_inner = Rect::new(modal.x + 1, modal.y + 1, modal.width - 2, modal.height - 2);
+    let text_width = if needs_scrollbar { full_inner.width.saturating_sub(1) } else { full_inner.width };
+    let text_area = Rect::new(full_inner.x, full_inner.y, text_width, full_inner.height);
+    for (index, line) in lines.iter().enumerate().skip(scroll as usize).take(visible_rows as usize) {
+        let Ok(row) = u16::try_from(index - scroll as usize) else { break };
         match line {
-            Line::Label(text) => {
-                render_modal_line(*text, inner, row, Style::default().fg(theme.accent).bg(theme.modal), buf)
+            PetArcadeInfoLine::Label(text) => {
+                render_modal_line(*text, text_area, row, Style::default().fg(theme.accent).bg(theme.modal), buf)
             }
-            Line::Body(text) => render_modal_line(text, inner, row, Style::default().fg(theme.text).bg(theme.modal), buf),
+            PetArcadeInfoLine::Body(text) => {
+                render_modal_line(text, text_area, row, Style::default().fg(theme.text).bg(theme.modal), buf)
+            }
         }
     }
+    if needs_scrollbar {
+        render_pet_arcade_info_scrollbar(full_inner, total_lines, visible_rows, scroll, buf, layout, theme);
+    }
+}
+
+/// One line of [`render_pet_arcade_info`]'s own content -- `pub(crate)`
+/// (not a function-local type) because `App::update_pet_arcade_info_
+/// scrollbar`'s own click-to-jump math needs `pet_arcade_info_lines().len()`
+/// to agree with what this fn actually painted, never a second,
+/// independently-maintained line count.
+pub(crate) enum PetArcadeInfoLine {
+    Label(&'static str),
+    Body(String),
+}
+
+/// The mechanics modal's own content -- a plain data list, split out of
+/// [`render_pet_arcade_info`] so `App::update_pet_arcade_info_scrollbar`
+/// can read its length without duplicating the formatting above (see that
+/// fn's own doc comment). EVERY number below is read from `gate4agent_
+/// arcade_pet_bastion::constants` (this module's own import list at the
+/// top of the file) AT CALL TIME, never copied into a string literal here
+/// -- a number that can drift out of sync with the sim it describes is
+/// worse than showing no number at all. The two genuinely non-integer
+/// ones (Symbiosis' own 1.5-tile radius, the pet's own 1.2s move) go
+/// through [`one_decimal`] rather than truncating to a wrong whole number.
+///
+/// Owner report: "мне не ясна механика траты спарков ... рун и какого-то
+/// светлячка которая куда-то встает" -- Spark, runes and the pet's own
+/// anchor mechanic were nowhere in the interface at all, and clicking a
+/// pet anchor silently issuing `Command::MovePet` was not something the
+/// owner knew he was doing. The WAVES section covers a follow-up the
+/// rules crate changed out from under the UI: an enemy reaching the
+/// Heartseed is no longer killed (it loops back to its own route start at
+/// full health and keeps walking, costing Integrity per lap instead) and
+/// a wave no longer ends on the first Heartseed arrival (only once every
+/// enemy on it is dead) -- both are silent rule changes the owner has no
+/// other way to learn.
+pub(crate) fn pet_arcade_info_lines() -> Vec<PetArcadeInfoLine> {
+    let wisp_free_blink_s = WISP_FREE_BLINK_INTERVAL_TICKS / TICKS_PER_SECOND as u64;
+    let anchor_linger_s = ANCHOR_RUNE_LINGER_TICKS / TICKS_PER_SECOND as u64;
+    let move_s = one_decimal(PET_MOVE_TICKS as i64, TICKS_PER_SECOND);
+    let symbiosis_tiles = one_decimal(SYMBIOSIS_ADJACENCY_FP, FIXED_SCALE);
+    let symbiosis_pct = SYMBIOSIS_DAMAGE_BONUS_PERMILLE / 10;
+    let linked_attack_speed_pct = (LINKED_ATTACK_SPEED_PERMILLE - 1000) / 10;
+
+    vec![
+        PetArcadeInfoLine::Label("SPARK"),
+        PetArcadeInfoLine::Body("Only a KILL by a tower currently linked to the pet earns it (see PET below).".to_owned()),
+        PetArcadeInfoLine::Body(format!(
+            "{SPARK_PER_KILLS} linked kills = +1 Spark, capped at {SPARK_CAP}. Doubled during Night Maw's final phase."
+        )),
+        PetArcadeInfoLine::Body(format!(
+            "Spends: Pulse -{PET_PULSE_COST}  Blink -{BLINK_COST} (free every {wisp_free_blink_s}s on a Wisp)  Circuit -{FULL_CIRCUIT_COST}"
+        )),
+        PetArcadeInfoLine::Label("RUNES"),
+        PetArcadeInfoLine::Body(format!(
+            "Drafted after wave {} and wave {} -- pick 1 of {RUNE_DRAFT_OPTIONS}, blocking the build phase.",
+            RUNE_DRAFT_AFTER_WAVES[0], RUNE_DRAFT_AFTER_WAVES[1],
+        )),
+        PetArcadeInfoLine::Body(format!("Echo: every {ECHO_EVERY_NTH_ATTACK}th attack, a same-kind tower fires again for free.")),
+        PetArcadeInfoLine::Body(format!("Anchor: linked buffs linger {anchor_linger_s}s after the pet leaves that anchor.")),
+        PetArcadeInfoLine::Body("Overgrowth: a kill's overkill damage carries into the next chain/splash hit.".to_owned()),
+        PetArcadeInfoLine::Body(format!("Phase: every {PHASE_EVERY_NTH_HIT}rd hit ignores armour.")),
+        PetArcadeInfoLine::Body(format!(
+            "Symbiosis: towers within {symbiosis_tiles} tiles of a different kind deal +{symbiosis_pct}% damage."
+        )),
+        PetArcadeInfoLine::Label("PET"),
+        PetArcadeInfoLine::Body("The glowing firefly is the pet -- it lives on a blue-highlighted anchor tile.".to_owned()),
+        PetArcadeInfoLine::Body(format!(
+            "Linked to its {CIRCUIT_BASE_SLOTS} nearest attacking towers (+1 per placed Relay), +{linked_attack_speed_pct}% attack speed."
+        )),
+        PetArcadeInfoLine::Body(format!("An evolution, drafted after wave {EVOLUTION_AFTER_WAVE}, can change that slot count.")),
+        PetArcadeInfoLine::Body(format!("Click any anchor tile to move the pet there (or press M) -- {move_s}s on foot.")),
+        PetArcadeInfoLine::Body(format!("[B] Blink -{BLINK_COST} arrives instantly instead, spending Spark.")),
+        PetArcadeInfoLine::Label("WAVES"),
+        PetArcadeInfoLine::Body("A unit that reaches the Heartseed is NOT killed and does not end the run.".to_owned()),
+        PetArcadeInfoLine::Body("It loops back to its own route start at full health and keeps walking.".to_owned()),
+        PetArcadeInfoLine::Body(format!(
+            "Each lap costs Integrity instead: -{LEAK_INTEGRITY_DAMAGE} for a minion, -{BOSS_LAP_INTEGRITY_DAMAGE} for a boss."
+        )),
+        PetArcadeInfoLine::Body("A wave ends only once every enemy on it is dead, not on Heartseed arrival.".to_owned()),
+    ]
+}
+
+/// [`render_file_scrollbar`]'s own track-plus-thumb visual contract,
+/// generalized off plain `(total, visible, scroll)` integers instead of a
+/// `WorkspaceFileTabView` -- that fn cannot be called directly here (it
+/// is hard-wired to a file tab's own `editor.line_count()`/`scroll_line()`
+/// and a `PaneId`), but the ALGORITHM it establishes (a `|` track the
+/// full visible height, a `#` thumb sized `visible/total` of that height
+/// and positioned `scroll/(total-1)` along it) is exactly what a scrolled
+/// modal needs too, so this reuses that math verbatim rather than
+/// inventing a second scrollbar look. `area` is the modal's own full
+/// content rect (border-excluded) -- the track claims its own rightmost
+/// column.
+fn render_pet_arcade_info_scrollbar(
+    area: Rect,
+    total: u16,
+    visible: u16,
+    scroll: u16,
+    buf: &mut TerminalBuffer,
+    layout: &mut LayoutRects,
+    theme: Theme,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let track = Rect::new(area.right().saturating_sub(1), area.y, 1, area.height);
+    for y in track.y..track.bottom() {
+        let cell = buf.get_mut(track.x, y);
+        cell.symbol = "|".into();
+        cell.style = Style::default().fg(theme.border).bg(theme.modal);
+    }
+    let thumb_height = ((u32::from(visible) * u32::from(visible) + u32::from(total) - 1) / u32::from(total))
+        .max(1)
+        .min(u32::from(visible)) as u16;
+    let travel = area.height.saturating_sub(thumb_height);
+    let last_line = total.saturating_sub(1);
+    let thumb_offset = if last_line == 0 {
+        0
+    } else {
+        (u32::from(scroll.min(last_line)) * u32::from(travel) / u32::from(last_line)) as u16
+    };
+    for y in track.y.saturating_add(thumb_offset)..track.y.saturating_add(thumb_offset).saturating_add(thumb_height) {
+        let cell = buf.get_mut(track.x, y);
+        cell.symbol = "#".into();
+        cell.style = Style::default().fg(theme.accent).bg(theme.modal);
+    }
+    layout.hits.push(HitRegion { rect: track, target: HitTarget::PetArcadeInfoScrollbar });
 }
 
 fn render_pet_arcade_too_small(
@@ -1714,6 +1878,161 @@ fn render_pet_arcade_results(
         Style::default().fg(theme.muted).bg(theme.modal),
         buf,
     );
+}
+
+fn difficulty_label(difficulty: Difficulty) -> &'static str {
+    match difficulty {
+        Difficulty::Cozy => "Cozy",
+        Difficulty::Standard => "Standard",
+        Difficulty::Wild => "Wild",
+    }
+}
+
+/// One [`PetArcadeMenuState::ScoreList`] row -- everything on it comes
+/// straight off the `PetArcadeScoreEntry` it was built from (`pet_arcade
+/// ::PetArcadeScoreEntry`'s own doc comment covers where those three
+/// fields came from), never a derived/re-computed quantity.
+fn pet_arcade_score_line(entry: crate::pet_arcade::PetArcadeScoreEntry) -> String {
+    let outcome = match entry.outcome {
+        PetBastionRunOutcome::Won => "Won",
+        PetBastionRunOutcome::Lost => "Lost",
+    };
+    format!(
+        "{}  wave {}/{WAVE_COUNT}  {outcome}",
+        difficulty_label(entry.difficulty),
+        entry.wave_reached
+    )
+}
+
+/// The run menu popup (`App::pet_arcade_menu`) -- see [`PetArcadeMenuState`]'s
+/// own doc comment for the three things it can show. Owner report: "не
+/// хватает какого-то меню там, где можно рестарт сделать, может какой-то
+/// скор-лист там будет еще что-то" -- Restart is always the fixed first
+/// row of `Open`, everything after it is [`PetArcadeMenuAction::ALL`], so
+/// a future entry (a score list was named explicitly; more may follow)
+/// costs one match arm and one more `ALL` element, never a rearrangement
+/// of what is already here.
+///
+/// Same "it is a popup, not a modal" shape `render_agent_menu`'s own doc
+/// comment already establishes for this crate's other context menu: no
+/// `[x]`/back glyph in the popup's own corner -- `Open`'s own row list
+/// closes via outside-click/Escape/re-click on the header's own trigger
+/// button (`App::close_overlay_outside_click`'s own `pet_arcade_menu`
+/// branch). `ConfirmRestart`/`ScoreList` each carry an explicit `<- Back`
+/// ROW instead, one level further in than `render_modal_back`'s own
+/// corner arrow reaches, but the SAME "arrow means step back one level,
+/// never `[x]`" reasoning the owner asked applied here too.
+fn render_pet_arcade_menu(app: &App, area: Rect, buf: &mut TerminalBuffer, layout: &mut LayoutRects, theme: Theme) {
+    let Some(state) = app.pet_arcade_menu else { return };
+
+    enum Row {
+        /// A clickable, keyboard-selectable row -- `selected_index` (from
+        /// `PetArcadeMenuState::Open`) highlights it if it matches.
+        Action { label: String, target: HitTarget },
+        /// Read-only text -- the confirm prompt's own warning line, and
+        /// every score-list row.
+        Plain(String),
+    }
+
+    let selected_index = match state {
+        PetArcadeMenuState::Open { selected } => Some(selected),
+        PetArcadeMenuState::ConfirmRestart | PetArcadeMenuState::ScoreList => None,
+    };
+    let rows: Vec<Row> = match state {
+        PetArcadeMenuState::Open { .. } => {
+            let mut rows = vec![Row::Action { label: "[R] Restart run".to_owned(), target: HitTarget::PetArcadeRestart }];
+            for action in PetArcadeMenuAction::ALL {
+                rows.push(Row::Action {
+                    label: format!("[S] {}", action.label()),
+                    target: HitTarget::PetArcadeMenuAction(action),
+                });
+            }
+            rows
+        }
+        PetArcadeMenuState::ConfirmRestart => {
+            // Owner: "make that consequence visible before it happens" --
+            // named against the wave actually in progress when available
+            // (`is_running` is required for this state to even be
+            // reachable, `App::activate_pet_arcade_restart`'s own doc
+            // comment), a generic warning otherwise rather than a panic
+            // or a fabricated wave number.
+            let warning = match app.pet_arcade.borrow().snapshot() {
+                Some(snapshot) => format!("Restart wave {}? The run in progress will be thrown away.", snapshot.wave),
+                None => "Restart? The run in progress will be thrown away.".to_owned(),
+            };
+            vec![
+                Row::Plain(warning),
+                Row::Action { label: "<- Back".to_owned(), target: HitTarget::PetArcadeMenuBack },
+                Row::Action { label: "Yes, restart".to_owned(), target: HitTarget::PetArcadeRestart },
+            ]
+        }
+        PetArcadeMenuState::ScoreList => {
+            let mut rows = vec![Row::Action { label: "<- Back".to_owned(), target: HitTarget::PetArcadeMenuBack }];
+            let arcade = app.pet_arcade.borrow();
+            let scores = arcade.scores();
+            if scores.is_empty() {
+                rows.push(Row::Plain("No finished runs yet this session.".to_owned()));
+            } else {
+                for entry in scores.iter().rev() {
+                    rows.push(Row::Plain(pet_arcade_score_line(*entry)));
+                }
+            }
+            rows
+        }
+    };
+
+    let width = 44u16.min(area.width);
+    let height = (rows.len() as u16 + 2).min(area.height.saturating_sub(1));
+    if width < 3 || height < 3 {
+        return;
+    }
+    // Anchored under the header's own `[N] Menu` button (`render_pet_
+    // arcade`'s own header block, `layout.pet_arcade_modal` -- ALREADY
+    // painted this same frame, ahead of this fn's own call site in
+    // `render::render`, so this is never a stale, one-frame-lagged
+    // position) rather than a captured anchor column/row: the header's
+    // own position never scrolls or moves independently of the modal
+    // itself, so there is nothing here `agent_menu`'s own `anchor_column`/
+    // `anchor_row` capture would ever need to account for.
+    let arcade_modal = layout.pet_arcade_modal;
+    let x = arcade_modal.right().saturating_sub(width).max(area.x);
+    let y = arcade_modal.y.saturating_add(1).min(area.bottom().saturating_sub(height));
+    let menu_area = Rect::new(x, y, width, height);
+    layout.pet_arcade_menu = menu_area;
+    layout.note_overlay(menu_area);
+    fill_rect(menu_area, theme.modal, buf);
+    Block::bordered()
+        .title(" run menu ")
+        .border_style(Style::default().fg(theme.accent))
+        .style(Style::default().bg(theme.modal))
+        .render(menu_area, buf);
+    let inner = Rect::new(
+        menu_area.x.saturating_add(1),
+        menu_area.y.saturating_add(1),
+        menu_area.width.saturating_sub(2),
+        menu_area.height.saturating_sub(2),
+    );
+    for (index, row) in rows.iter().enumerate().take(inner.height as usize) {
+        let Ok(row_y) = u16::try_from(index) else { break };
+        let rect = Rect::new(inner.x, inner.y + row_y, inner.width, 1);
+        match row {
+            Row::Action { label, target } => {
+                let selected = selected_index == Some(index);
+                let style = if selected {
+                    Style::default().fg(theme.active_tab_text).bg(theme.accent).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.accent).bg(theme.modal)
+                };
+                Paragraph::new(truncate_cells(label, inner.width as usize)).style(style).render(rect, buf);
+                push_modal_hit(layout, rect, target.clone());
+            }
+            Row::Plain(text) => {
+                Paragraph::new(truncate_cells(text, inner.width as usize))
+                    .style(Style::default().fg(theme.text).bg(theme.modal))
+                    .render(rect, buf);
+            }
+        }
+    }
 }
 
 /// Ticks-remaining is converted to whole seconds rounded UP (never floats
@@ -12964,6 +13283,37 @@ fn render_modal_close(modal: Rect, buf: &mut TerminalBuffer, layout: &mut Layout
         1,
     );
     Paragraph::new(CLOSE)
+        .style(Style::default().fg(theme.teal).bg(theme.modal))
+        .render(rect, buf);
+    layout.hits.push(HitRegion { rect, target: HitTarget::ModalClose });
+}
+
+/// [`render_modal_close`]'s own sibling for a modal that RETURNS the
+/// player somewhere rather than closing the whole overlay it belongs to
+/// -- today, only `render_pet_arcade_info`. Owner report: "ты сделал
+/// возврат из механики через Х, лучше сделай через стрелочку <-, иначе не
+/// очевидно" -- `[x]` reads as "close everything", which returning from
+/// the mechanics modal to the board is not (the arcade run underneath
+/// keeps going untouched, see `App::click_pet_arcade_info`'s own doc
+/// comment). Identical geometry to `render_modal_close` (same corner, same
+/// width, same `HitTarget::ModalClose` -- the ACTION is unchanged, only
+/// the glyph is), kept as a separate fn rather than a parameter on that
+/// one so every one of its many OTHER callers (`render_spawn`, `render_
+/// existing_session`, ...) -- which genuinely DO mean "close everything" --
+/// never has to pass a flag to say so.
+fn render_modal_back(modal: Rect, buf: &mut TerminalBuffer, layout: &mut LayoutRects, theme: Theme) {
+    const BACK: &str = "<-";
+    let width = BACK.len() as u16;
+    if modal.width < width.saturating_add(2) || modal.height == 0 {
+        return;
+    }
+    let rect = Rect::new(
+        modal.right().saturating_sub(1).saturating_sub(width),
+        modal.y,
+        width,
+        1,
+    );
+    Paragraph::new(BACK)
         .style(Style::default().fg(theme.teal).bg(theme.modal))
         .render(rect, buf);
     layout.hits.push(HitRegion { rect, target: HitTarget::ModalClose });
@@ -25057,11 +25407,20 @@ mod tests {
             "{text:?}"
         );
         assert!(text.contains(&format!("pick 1 of {RUNE_DRAFT_OPTIONS}")), "{text:?}");
+
         // Owner report (free-placement follow-up): the rules crate stopped
         // killing a unit at the Heartseed and stopped ending a wave on its
         // first arrival there -- both silent rule changes the modal must
         // now explain, with the real per-lap Integrity cost read straight
-        // off the same constants `sim.rs` charges against.
+        // off the same constants `sim.rs` charges against. The WAVES
+        // section is content #17-21 of 22 (`pet_arcade_info_lines`), below
+        // the fold at the modal's own fixed `PET_ARCADE_INFO_VISIBLE_ROWS`
+        // (14) -- `PageDown` (the real key, `App::reduce_pet_arcade`, not
+        // a hand-set scroll field) is what a real reader would press to
+        // reach it.
+        app.reduce(crate::UiKey::PageDown);
+        let buf = render_pet_arcade_app(&mut app);
+        let text = rect_text(&buf, app.layout.pet_arcade_info_modal);
         assert!(text.contains("NOT killed"), "{text:?}");
         assert!(text.contains("loops back to its own route start"), "{text:?}");
         assert!(
@@ -25206,5 +25565,268 @@ mod tests {
             baseline.len() + 4,
             "the drag highlight must add exactly ONE tile's own outline for the hovered tile, never one per legal candidate"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Pet Bastion arcade: the run menu, the mechanics modal's own
+    // scrollbar, and the X-vs-arrow distinction. See each test's own doc
+    // comment for which owner report it proves.
+    // -----------------------------------------------------------------
+
+    /// Owner report: "не хватает какого-то меню там, где можно рестарт
+    /// сделать, может какой-то скор-лист там будет еще что-то". Proves
+    /// `[N] Menu` is a real, clickable hit region on the header row a
+    /// real render pass painted (reachable WHILE a run is in progress,
+    /// unlike the Results screen's own restart button), that clicking it
+    /// opens `PetArcadeMenuState::Open`, and that Restart is genuinely the
+    /// FIRST row -- above `Score list`, `PetArcadeMenuAction::ALL`'s own
+    /// one member today.
+    #[test]
+    fn pet_arcade_menu_button_opens_a_run_menu_holding_restart_first() {
+        let mut app = open_pet_arcade_app(140, 40);
+        render_pet_arcade_app(&mut app);
+        assert!(app.pet_arcade.borrow().is_running(), "setup: a fresh run must be in progress");
+
+        let menu_hit = find_hit(&app, HitTarget::PetArcadeMenuToggle);
+        let _ = app.click(menu_hit.rect.x, menu_hit.rect.y);
+        assert_eq!(app.pet_arcade_menu, Some(PetArcadeMenuState::Open { selected: 0 }), "clicking [N] Menu must open it");
+
+        let buf = render_pet_arcade_app(&mut app);
+        let restart_hit = find_hit(&app, HitTarget::PetArcadeRestart);
+        let score_hit = find_hit(&app, HitTarget::PetArcadeMenuAction(PetArcadeMenuAction::ScoreList));
+        assert!(restart_hit.rect.y < score_hit.rect.y, "Restart must be the menu's own FIRST row, above Score list");
+        let text = rect_text(&buf, app.layout.pet_arcade_menu);
+        assert!(text.contains("Restart"), "{text:?}");
+        assert!(text.contains("Score list"), "{text:?}");
+    }
+
+    /// Owner: "Restarting a run in progress throws that run away, so make
+    /// that consequence visible before it happens rather than after."
+    /// Proves the menu's own Restart row does NOT restart immediately
+    /// while a run is live -- it shows `ConfirmRestart` first (the tower
+    /// placed below is still there after that first click) -- and that a
+    /// SECOND click on the confirm's own "Yes, restart" row (the SAME
+    /// `HitTarget::PetArcadeRestart`, never a second path -- see `App::
+    /// activate_pet_arcade_restart`'s own doc comment) is what actually
+    /// restarts (the tower is gone afterward, a fresh run).
+    #[test]
+    fn pet_arcade_menu_restart_shows_a_confirm_before_throwing_the_run_away() {
+        let mut app = open_pet_arcade_app(140, 40);
+        render_pet_arcade_app(&mut app);
+        let (tile_x, tile_y) = buildable_tiles(&app)[0];
+        let pad_hit = find_hit(&app, HitTarget::PetArcadeTile(tile_x, tile_y));
+        let _ = app.click(pad_hit.rect.x, pad_hit.rect.y);
+        render_pet_arcade_app(&mut app);
+        let needle_hit = find_hit(&app, HitTarget::PetArcadeTowerKind(TowerKind::Needle));
+        let _ = app.click(needle_hit.rect.x, needle_hit.rect.y);
+        let mut now = std::time::Instant::now();
+        tick_pet_arcade(&app, &mut now);
+        assert_eq!(app.pet_arcade.borrow().snapshot().unwrap().towers.len(), 1, "setup: the Needle must be placed");
+
+        let menu_hit = find_hit(&app, HitTarget::PetArcadeMenuToggle);
+        let _ = app.click(menu_hit.rect.x, menu_hit.rect.y);
+        render_pet_arcade_app(&mut app);
+        let restart_row = find_hit(&app, HitTarget::PetArcadeRestart);
+        let _ = app.click(restart_row.rect.x, restart_row.rect.y);
+        assert_eq!(
+            app.pet_arcade_menu,
+            Some(PetArcadeMenuState::ConfirmRestart),
+            "the first click on Restart while a run is live must show a confirm, not restart immediately"
+        );
+        assert_eq!(
+            app.pet_arcade.borrow().snapshot().unwrap().towers.len(),
+            1,
+            "the confirm prompt itself must not have restarted anything yet"
+        );
+
+        render_pet_arcade_app(&mut app);
+        let confirm_yes = find_hit(&app, HitTarget::PetArcadeRestart);
+        let _ = app.click(confirm_yes.rect.x, confirm_yes.rect.y);
+        assert_eq!(app.pet_arcade_menu, None, "confirming must close the menu");
+        assert!(
+            app.pet_arcade.borrow().snapshot().unwrap().towers.is_empty(),
+            "confirming must actually restart -- the fresh run has no towers"
+        );
+    }
+
+    /// The `<- Back` half of the confirm prompt -- owner: "апply the same
+    /// [arrow, not X] reasoning to the new menu". Proves it returns to the
+    /// row list WITHOUT restarting (the placed tower survives), through
+    /// `HitTarget::PetArcadeMenuBack`, never `HitTarget::PetArcadeRestart`.
+    #[test]
+    fn pet_arcade_menu_back_arrow_cancels_without_restarting() {
+        let mut app = open_pet_arcade_app(140, 40);
+        render_pet_arcade_app(&mut app);
+        let (tile_x, tile_y) = buildable_tiles(&app)[0];
+        let pad_hit = find_hit(&app, HitTarget::PetArcadeTile(tile_x, tile_y));
+        let _ = app.click(pad_hit.rect.x, pad_hit.rect.y);
+        render_pet_arcade_app(&mut app);
+        let needle_hit = find_hit(&app, HitTarget::PetArcadeTowerKind(TowerKind::Needle));
+        let _ = app.click(needle_hit.rect.x, needle_hit.rect.y);
+        let mut now = std::time::Instant::now();
+        tick_pet_arcade(&app, &mut now);
+
+        let menu_hit = find_hit(&app, HitTarget::PetArcadeMenuToggle);
+        let _ = app.click(menu_hit.rect.x, menu_hit.rect.y);
+        render_pet_arcade_app(&mut app);
+        let restart_row = find_hit(&app, HitTarget::PetArcadeRestart);
+        let _ = app.click(restart_row.rect.x, restart_row.rect.y);
+        assert_eq!(app.pet_arcade_menu, Some(PetArcadeMenuState::ConfirmRestart), "setup: confirm must be showing");
+
+        render_pet_arcade_app(&mut app);
+        let back_hit = find_hit(&app, HitTarget::PetArcadeMenuBack);
+        let _ = app.click(back_hit.rect.x, back_hit.rect.y);
+        assert_eq!(
+            app.pet_arcade_menu,
+            Some(PetArcadeMenuState::Open { selected: 0 }),
+            "<- Back must return to the row list, not close the whole menu"
+        );
+        assert_eq!(
+            app.pet_arcade.borrow().snapshot().unwrap().towers.len(),
+            1,
+            "cancelling must not have restarted anything -- the placed tower must survive"
+        );
+    }
+
+    /// Owner: "может какой-то скор-лист там будет еще что-то". Proves the
+    /// score list reads real `PetArcade::scores()` entries (pushed via the
+    /// same test-only seam `force_results_for_test`'s own doc comment
+    /// already establishes the precedent for -- a real entry is only ever
+    /// appended mid-tick by `PetArcade::advance`, off a `Runner` snapshot
+    /// a unit test cannot fabricate) and shows an honest empty state
+    /// rather than a blank list before any run has finished.
+    #[test]
+    fn pet_arcade_menu_score_list_shows_empty_state_then_real_entries() {
+        use gate4agent_arcade_pet_bastion::wave::Difficulty;
+
+        let mut app = open_pet_arcade_app(140, 40);
+        render_pet_arcade_app(&mut app);
+
+        let menu_hit = find_hit(&app, HitTarget::PetArcadeMenuToggle);
+        let _ = app.click(menu_hit.rect.x, menu_hit.rect.y);
+        render_pet_arcade_app(&mut app);
+        let score_row = find_hit(&app, HitTarget::PetArcadeMenuAction(PetArcadeMenuAction::ScoreList));
+        let _ = app.click(score_row.rect.x, score_row.rect.y);
+        assert_eq!(app.pet_arcade_menu, Some(PetArcadeMenuState::ScoreList));
+
+        let buf = render_pet_arcade_app(&mut app);
+        let text = rect_text(&buf, app.layout.pet_arcade_menu);
+        assert!(text.contains("No finished runs yet"), "{text:?}");
+
+        app.pet_arcade.borrow_mut().push_score_for_test(crate::pet_arcade::PetArcadeScoreEntry {
+            difficulty: Difficulty::Wild,
+            wave_reached: 6,
+            outcome: PetBastionRunOutcome::Lost,
+        });
+        let buf = render_pet_arcade_app(&mut app);
+        let text = rect_text(&buf, app.layout.pet_arcade_menu);
+        assert!(text.contains("Wild"), "{text:?}");
+        assert!(text.contains("wave 6"), "{text:?}");
+        assert!(text.contains("Lost"), "{text:?}");
+
+        // `<- Back` must still work from the score list too.
+        let back_hit = find_hit(&app, HitTarget::PetArcadeMenuBack);
+        let _ = app.click(back_hit.rect.x, back_hit.rect.y);
+        assert_eq!(app.pet_arcade_menu, Some(PetArcadeMenuState::Open { selected: 0 }));
+    }
+
+    /// Owner: "Give the arcade a menu reachable... by a key". Proves `n`
+    /// opens it, `Down` moves the keyboard selection off Restart onto
+    /// Score list, and `Escape` closes the whole menu from its own top
+    /// layer (never just backing out of a state it was never in).
+    #[test]
+    fn pet_arcade_menu_is_reachable_and_navigable_by_keyboard() {
+        let mut app = open_pet_arcade_app(140, 40);
+        render_pet_arcade_app(&mut app);
+
+        app.reduce(crate::UiKey::Char('n'));
+        assert_eq!(app.pet_arcade_menu, Some(PetArcadeMenuState::Open { selected: 0 }), "the n key must open the menu");
+
+        app.reduce(crate::UiKey::Down);
+        assert_eq!(app.pet_arcade_menu, Some(PetArcadeMenuState::Open { selected: 1 }), "Down must move off Restart");
+
+        app.reduce(crate::UiKey::Escape);
+        assert_eq!(app.pet_arcade_menu, None, "Escape at the row list must close the menu outright");
+        assert!(app.pet_arcade_open, "closing the menu must not also close the arcade underneath");
+    }
+
+    /// Owner: "ты сделал возврат из механики через Х, лучше сделай через
+    /// стрелочку <-, иначе не очевидно". Proves the corner control now
+    /// paints `<-`, not `[x]`, while still doing exactly what it did
+    /// before (return to the board, arcade run untouched).
+    #[test]
+    fn pet_arcade_info_back_arrow_returns_to_the_board_not_closing_the_arcade() {
+        let mut app = open_pet_arcade_app(140, 40);
+        render_pet_arcade_app(&mut app);
+        let info_hit = find_hit(&app, HitTarget::PetArcadeInfo);
+        let _ = app.click(info_hit.rect.x, info_hit.rect.y);
+        let buf = render_pet_arcade_app(&mut app);
+
+        let text = rect_text(&buf, app.layout.pet_arcade_info_modal);
+        assert!(text.contains("<-"), "the corner control must read as a back arrow: {text:?}");
+        assert!(!text.contains("[x]"), "the corner control must NOT read as a close-everything X: {text:?}");
+
+        let back_hit = app
+            .layout
+            .hits
+            .iter()
+            .rev()
+            .find(|hit| hit.target == HitTarget::ModalClose)
+            .expect("the info modal must paint its own back control")
+            .rect;
+        let _ = app.click(back_hit.x, back_hit.y);
+        assert!(!app.pet_arcade_info_open, "the back arrow must return to the board");
+        assert!(app.pet_arcade_open, "the back arrow must NOT close the arcade run underneath");
+    }
+
+    /// Owner: "если в механике инфа не влазит сделай скролбар... окно
+    /// скроллбары мы умеем делать внутри модалок" -- proves the wheel
+    /// (`App::scroll`) and the keyboard (`PageDown`, `App::reduce_pet_
+    /// arcade`) both move `pet_arcade_info_scroll`, and that content below
+    /// the fold (the WAVES section, invisible at `scroll == 0`) actually
+    /// becomes visible once scrolled -- not just that a counter changes.
+    #[test]
+    fn pet_arcade_info_modal_scrolls_with_the_wheel_and_with_keys() {
+        let mut app = open_pet_arcade_app(140, 40);
+        render_pet_arcade_app(&mut app);
+        let info_hit = find_hit(&app, HitTarget::PetArcadeInfo);
+        let _ = app.click(info_hit.rect.x, info_hit.rect.y);
+        let buf = render_pet_arcade_app(&mut app);
+        let text = rect_text(&buf, app.layout.pet_arcade_info_modal);
+        assert!(!text.contains("NOT killed"), "setup: the WAVES section must start below the fold, unscrolled");
+
+        let _ = app.scroll(app.layout.pet_arcade_info_modal.x, app.layout.pet_arcade_info_modal.y, false);
+        assert_eq!(app.pet_arcade_info_scroll, 3, "the wheel must move the scroll offset by WHEEL_SCROLL_LINES");
+
+        app.reduce(crate::UiKey::PageDown);
+        let buf = render_pet_arcade_app(&mut app);
+        let text = rect_text(&buf, app.layout.pet_arcade_info_modal);
+        assert!(text.contains("NOT killed"), "PageDown must reveal content that was below the fold: {text:?}");
+
+        app.reduce(crate::UiKey::Up);
+        assert!(app.pet_arcade_info_scroll > 0, "Up must move the offset by one line, not reset it");
+    }
+
+    /// Owner: "мы умеем делать [скроллбары]" -- reuse, per the coordinator,
+    /// not a second mechanism. Proves the "show a bar only once content
+    /// overflows" boundary directly: `total_lines <= visible_rows` must
+    /// report no scrollbar needed, `total_lines > visible_rows` must.
+    /// Exercised against synthetic sizes (`pet_arcade_info_scroll_state`'s
+    /// own doc comment explains why: the REAL content always overflows
+    /// today's fixed 14-row budget, which alone only proves the bar CAN
+    /// show, not that it stays hidden when unnecessary).
+    #[test]
+    fn pet_arcade_info_scrollbar_shows_only_when_content_overflows() {
+        let (needs_bar, scroll) = pet_arcade_info_scroll_state(10, 14, 5);
+        assert!(!needs_bar, "content shorter than the visible budget must not need a scrollbar");
+        assert_eq!(scroll, 0, "a request past the (nonexistent) end must clamp to 0 when everything already fits");
+
+        let (needs_bar, scroll) = pet_arcade_info_scroll_state(14, 14, 5);
+        assert!(!needs_bar, "content exactly as tall as the visible budget must not need a scrollbar either");
+        assert_eq!(scroll, 0);
+
+        let (needs_bar, scroll) = pet_arcade_info_scroll_state(22, 14, 100);
+        assert!(needs_bar, "content taller than the visible budget must need a scrollbar");
+        assert_eq!(scroll, 8, "an over-large request must clamp to max_scroll = total - visible");
     }
 }

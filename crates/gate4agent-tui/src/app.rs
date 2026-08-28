@@ -94,6 +94,15 @@ use crate::text_editor::TextEditor;
 use crate::platform::{read_clipboard_text, write_clipboard_text};
 
 const WHEEL_SCROLL_LINES: usize = 3;
+/// The mechanics modal's own visible content-row budget -- shared between
+/// `App::reduce_pet_arcade`'s own `PageUp`/`PageDown` step size and
+/// `render::render_pet_arcade_info`'s own scroll clamp/scrollbar sizing,
+/// so the two can never silently disagree about how tall the modal's own
+/// body actually is. Deliberately shorter than the mechanics text ALWAYS
+/// needs (today: 22 lines) rather than sized to fit everything -- see
+/// that render fn's own doc comment for why a modal that always grew to
+/// fit was the wrong fix once the WAVES section landed.
+pub(crate) const PET_ARCADE_INFO_VISIBLE_ROWS: u16 = 14;
 /// Dragging the sidebar's width divider left of this many content columns
 /// collapses the sidebar outright (the rail stays, and is how it reopens)
 /// instead of parking at the 18-column minimum.
@@ -1407,6 +1416,58 @@ pub enum PetArcadeVisualTier {
     #[default]
     Pixel,
     Glyph,
+}
+
+/// One EXTENSIBLE row of the run menu's own action list, below the fixed
+/// Restart row -- see [`HitTarget::PetArcadeMenuAction`]'s own doc
+/// comment for why Restart itself is not a member of this enum (it
+/// already has its own `HitTarget`/handler; this enum is only for
+/// everything else). Owner named a score list as the next thing that
+/// belongs here ("может какой-то скор-лист там будет еще что-то") --
+/// [`Self::ScoreList`] is that, and the shape (`ALL` + `label`) is the
+/// same one [`AgentMenuAction`] already establishes for exactly this
+/// "menu grows without rearranging" requirement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PetArcadeMenuAction {
+    ScoreList,
+}
+
+impl PetArcadeMenuAction {
+    pub const ALL: [Self; 1] = [Self::ScoreList];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ScoreList => "Score list",
+        }
+    }
+}
+
+/// What the run menu popup (`App::pet_arcade_menu`, `render::render_pet_
+/// arcade_menu`) is currently showing -- `None` on `App` itself means the
+/// popup is closed outright. Three flat states, not a stack, because the
+/// popup is never more than one layer deep from its own row list: `Open`
+/// is that list, `ConfirmRestart`/`ScoreList` are each one step INTO it,
+/// and stepping back (`HitTarget::PetArcadeMenuBack`, the `Escape`/`Left`
+/// keys) always returns straight to `Open { selected: 0 }`, never to a
+/// third state further back.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PetArcadeMenuState {
+    /// The row list itself -- Restart first, then [`PetArcadeMenuAction::
+    /// ALL`]. `selected` drives `Up`/`Down` keyboard navigation
+    /// (`App::reduce_pet_arcade_menu`), the same shape `AgentMenuState::
+    /// selected` already uses for its own popup.
+    Open { selected: usize },
+    /// Restarting throws an in-progress run away -- shown in front of the
+    /// actual restart exactly once, the first time `HitTarget::
+    /// PetArcadeRestart` fires while `PetArcade::is_running()` (see
+    /// `App::activate_pet_arcade_restart`'s own doc comment). Never
+    /// reached from the Results screen's own `[R] Play Again` button --
+    /// nothing is running there, so there is nothing to confirm.
+    ConfirmRestart,
+    /// Every completed run this session, newest first (`PetArcade::
+    /// scores`). Persistence: see that field's own doc comment for why
+    /// this is in-session only for now, not written to `preferences.rs`.
+    ScoreList,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -3067,6 +3128,42 @@ pub enum HitTarget {
     /// reduce_pet_arcade`). Owner report: Spark/rune/pet-anchor mechanics
     /// were nowhere in the interface at all, keyboard or mouse.
     PetArcadeInfo,
+    /// The board header row's own `[N] Menu` button -- opens the run
+    /// menu (`App::pet_arcade_menu`, `render::render_pet_arcade_menu`).
+    /// Mirrored by the `n` key (`App::reduce_pet_arcade`). Owner report:
+    /// "не хватает какого-то меню там, где можно рестарт сделать" -- the
+    /// ONLY existing way to reach `HitTarget::PetArcadeRestart` was
+    /// `render_pet_arcade_results`, reachable only after a run had already
+    /// ended.
+    PetArcadeMenuToggle,
+    /// One row of the run menu's own EXTENSIBLE action list, below the
+    /// fixed Restart row (`PetArcadeRestart`, reused verbatim -- see
+    /// `App::activate_pet_arcade_restart`'s own doc comment for why this
+    /// is not a second path to it). `PetArcadeMenuAction::ALL` is the
+    /// whole list; today that is just `ScoreList`, and a future entry is
+    /// exactly one more match arm plus one more `ALL` element, never a
+    /// rearrangement of what is already here.
+    PetArcadeMenuAction(PetArcadeMenuAction),
+    /// The run menu's own "go back one level" control -- the confirm
+    /// prompt's own `<- Back` (returns to the menu's row list without
+    /// restarting) and the score list's own `<- Back` (returns to the row
+    /// list too) both reach this. Owner report: "лучше сделай через
+    /// стрелочку <-, иначе не очевидно" -- a control that returns you one
+    /// level reads as an arrow, never as `[x]` (that reads as "close
+    /// everything", which this is not -- see `PetArcadeMenuToggle`'s own
+    /// doc comment for the control that actually does mean that).
+    PetArcadeMenuBack,
+    /// The mechanics modal's own scrollbar track (`render::render_pet_
+    /// arcade_info`'s own scrollable body, `render_file_scrollbar`'s
+    /// established track-plus-thumb contract, reused rather than a second
+    /// scrollbar mechanism -- see that fn's own doc comment). A click
+    /// jumps the scroll position proportionally to where the track was
+    /// clicked, the same "jump to here" contract `HitTarget::
+    /// FileScrollbar` already has (`App::update_pet_arcade_info_scrollbar`).
+    /// Only ever pushed while the info modal's own content actually
+    /// overflows its visible rows -- see that render fn's own doc comment
+    /// for why the bar itself is conditional.
+    PetArcadeInfoScrollbar,
     /// The bottom status bar's own three zones -- clicking any of them
     /// opens that zone's own modal (`App::begin_status_bar_zone`). See
     /// `Focus::StatusBarLeft`'s own doc comment.
@@ -3379,6 +3476,12 @@ pub struct LayoutRects {
     /// rect, ahead of the arcade's own outside-click guard, so this modal
     /// always closes first while it is stacked on top.
     pub pet_arcade_info_modal: Rect,
+    /// The run menu popup's own painted rect (`render::render_pet_arcade_
+    /// menu`, `App::pet_arcade_menu`) -- `Rect::default()` while closed,
+    /// same convention as `pet_arcade_info_modal` just above, which this
+    /// mirrors: `App::close_overlay_outside_click`'s own `pet_arcade_menu`
+    /// branch tests a press against exactly this rect.
+    pub pet_arcade_menu: Rect,
     /// The CENTRE zone modal's own retained-log ENTRY rows -- a sub-rect of
     /// `status_bar_center_modal`, excluding its border, the marquee toggle
     /// row, the `[Up]`/`[Down]`/`[Clear]` toolbar row, and the bottom help
@@ -4440,6 +4543,23 @@ pub struct App {
     /// tier toggle. Owner report: Spark/rune/pet-anchor mechanics were
     /// nowhere in the interface at all.
     pub(crate) pet_arcade_info_open: bool,
+    /// The mechanics modal's own scroll offset, in LINES -- `render::
+    /// render_pet_arcade_info` clamps this against its own real content-
+    /// vs-visible row counts every frame, the same "nudge the raw offset
+    /// here, render clamps it" convention `board_sidebar_scroll`'s own
+    /// field doc comment already establishes, so a resize or a content
+    /// change (the WAVES section landing after this field already existed)
+    /// can never leave it pointing past the end. Nudged by the mouse
+    /// wheel (`App::scroll`) and by `Up`/`Down`/`PageUp`/`PageDown`
+    /// (`App::reduce_pet_arcade`) while the modal is open; reset to `0`
+    /// whenever it closes so reopening it always starts at the top.
+    pub(crate) pet_arcade_info_scroll: u16,
+    /// The run menu popup -- `None` while closed. See [`PetArcadeMenuState`]'s
+    /// own doc comment for what each variant shows. Owner report: "не
+    /// хватает какого-то меню там, где можно рестарт сделать" -- the only
+    /// existing way to reach a restart was the Results screen's own
+    /// button, unreachable while a run was still in progress.
+    pub(crate) pet_arcade_menu: Option<PetArcadeMenuState>,
     /// The arcade session itself -- see `pet_arcade`'s own module doc
     /// comment for why this is `Rc<RefCell<_>>` rather than a plain field
     /// (`App` derives `Clone, Debug`; the engine's own `Runner`/`GameScreen`/
@@ -4580,6 +4700,8 @@ impl Default for App {
             profiler_overlay_open: false,
             pet_arcade_open: false,
             pet_arcade_info_open: false,
+            pet_arcade_info_scroll: 0,
+            pet_arcade_menu: None,
             pet_arcade_visual_tier: PetArcadeVisualTier::Pixel,
             pet_arcade: crate::pet_arcade::PetArcade::new(),
             profiler: crate::profile::TuiProfiler::default(),
@@ -4882,6 +5004,14 @@ impl App {
     pub(crate) fn close_pet_arcade(&mut self) {
         self.pet_arcade.borrow_mut().suspend();
         self.pet_arcade_open = false;
+        // Both are transient UI state scoped to the overlay being open at
+        // all -- reopening later must never resurrect a stale confirm
+        // prompt or a mid-scroll position from a previous session, the
+        // same "closing resets, reopening starts fresh" contract `PetArcade
+        // ::suspend`'s own doc comment already gives the run itself (just
+        // for chrome instead of sim state).
+        self.pet_arcade_menu = None;
+        self.pet_arcade_info_scroll = 0;
     }
 
     /// The arcade overlay's own exclusive key dispatch -- reached from the
@@ -4889,7 +5019,11 @@ impl App {
     /// `profiler_overlay_open`, the same "this top-priority overlay owns
     /// every key while open" contract that field's own call site already
     /// established: a live run is never interrupted by anything else this
-    /// crate might otherwise do with a keystroke.
+    /// crate might otherwise do with a keystroke. Priority among the
+    /// arcade's own stacked layers, topmost first: the mechanics modal,
+    /// then the run menu, then the board/HUD itself -- the same order
+    /// `App::close_overlay_outside_click`'s own doc comment gives the
+    /// mouse.
     fn reduce_pet_arcade(&mut self, key: UiKey) -> AppAction {
         // Checked FIRST, ahead of even `Escape`'s own arcade-closing arm
         // below: while the mechanics-reference modal is open it owns every
@@ -4903,8 +5037,31 @@ impl App {
         if self.pet_arcade_info_open {
             if matches!(key, UiKey::Escape | UiKey::OperatorEscape | UiKey::Char('?')) {
                 self.pet_arcade_info_open = false;
+                self.pet_arcade_info_scroll = 0;
+                return AppAction::None;
+            }
+            // Owner report: "если в механике инфа не влазит сделай
+            // скролбар" -- `PageUp`/`PageDown` move a full visible page
+            // (`render_pet_arcade_info`'s own clamp turns this into
+            // whatever that page height actually is this frame), `Up`/
+            // `Down` move one line, matching the raw-nudge-here/clamp-at-
+            // render split `App::scroll`'s own info-modal branch already
+            // uses for the wheel.
+            match key {
+                UiKey::Up => self.pet_arcade_info_scroll = self.pet_arcade_info_scroll.saturating_sub(1),
+                UiKey::Down => self.pet_arcade_info_scroll = self.pet_arcade_info_scroll.saturating_add(1),
+                UiKey::PageUp => {
+                    self.pet_arcade_info_scroll = self.pet_arcade_info_scroll.saturating_sub(PET_ARCADE_INFO_VISIBLE_ROWS)
+                }
+                UiKey::PageDown => {
+                    self.pet_arcade_info_scroll = self.pet_arcade_info_scroll.saturating_add(PET_ARCADE_INFO_VISIBLE_ROWS)
+                }
+                _ => {}
             }
             return AppAction::None;
+        }
+        if let Some(state) = self.pet_arcade_menu {
+            return self.reduce_pet_arcade_menu(key, state);
         }
         if matches!(key, UiKey::Escape | UiKey::OperatorEscape) {
             self.close_pet_arcade();
@@ -4928,8 +5085,117 @@ impl App {
             self.pet_arcade_info_open = true;
             return AppAction::None;
         }
+        // Same shape again -- `pet_arcade_menu` is `App`'s own UI state
+        // too. Only reachable at all while `PetArcade::handle_key`'s own
+        // board/HUD keymap could otherwise see this key, which is exactly
+        // when the run menu's own trigger button is even painted
+        // (`render_pet_arcade`'s own header block only exists while a run
+        // is in progress) -- see `HitTarget::PetArcadeMenuToggle`'s own
+        // doc comment for the mouse counterpart.
+        if matches!(key, UiKey::Char('n') | UiKey::Char('N')) {
+            self.toggle_pet_arcade_menu();
+            return AppAction::None;
+        }
         self.pet_arcade.borrow_mut().handle_key(key);
         AppAction::None
+    }
+
+    /// The run menu's own exclusive key dispatch, split out of `reduce_
+    /// pet_arcade` for the same reason that fn's own info-modal branch
+    /// stays inline (short) while this one does not (three sub-states,
+    /// each with its own bindings). `Escape` and `Left` are deliberately
+    /// the SAME action at every sub-state below (back one layer, or close
+    /// outright from the top layer) -- see [`PetArcadeMenuState`]'s own
+    /// doc comment for why there is only ever one layer to back OUT of.
+    fn reduce_pet_arcade_menu(&mut self, key: UiKey, state: PetArcadeMenuState) -> AppAction {
+        let back_or_close = matches!(key, UiKey::Escape | UiKey::OperatorEscape | UiKey::Left)
+            || matches!(key, UiKey::Char('n') | UiKey::Char('N'));
+        match state {
+            PetArcadeMenuState::Open { selected } => {
+                let total = 1 + PetArcadeMenuAction::ALL.len();
+                match key {
+                    UiKey::Up => {
+                        self.pet_arcade_menu =
+                            Some(PetArcadeMenuState::Open { selected: moved_index(selected, total, true) });
+                    }
+                    UiKey::Down => {
+                        self.pet_arcade_menu =
+                            Some(PetArcadeMenuState::Open { selected: moved_index(selected, total, false) });
+                    }
+                    UiKey::Enter => self.activate_pet_arcade_menu_row(selected),
+                    UiKey::Char('r') | UiKey::Char('R') => self.activate_pet_arcade_restart(),
+                    UiKey::Char('s') | UiKey::Char('S') => {
+                        self.pet_arcade_menu = Some(PetArcadeMenuState::ScoreList);
+                    }
+                    _ if back_or_close => self.pet_arcade_menu = None,
+                    _ => {}
+                }
+            }
+            PetArcadeMenuState::ConfirmRestart => match key {
+                UiKey::Enter | UiKey::Char('y') | UiKey::Char('Y') => self.activate_pet_arcade_restart(),
+                _ if back_or_close => self.pet_arcade_menu = Some(PetArcadeMenuState::Open { selected: 0 }),
+                _ => {}
+            },
+            PetArcadeMenuState::ScoreList => {
+                if back_or_close {
+                    self.pet_arcade_menu = Some(PetArcadeMenuState::Open { selected: 0 });
+                }
+            }
+        }
+        AppAction::None
+    }
+
+    /// `Enter` on the run menu's own row list -- `selected == 0` is always
+    /// Restart (the fixed first row, [`PetArcadeMenuState::Open`]'s own
+    /// doc comment), anything past that indexes [`PetArcadeMenuAction::
+    /// ALL`].
+    fn activate_pet_arcade_menu_row(&mut self, selected: usize) {
+        if selected == 0 {
+            self.activate_pet_arcade_restart();
+            return;
+        }
+        match PetArcadeMenuAction::ALL.get(selected - 1) {
+            Some(PetArcadeMenuAction::ScoreList) => {
+                self.pet_arcade_menu = Some(PetArcadeMenuState::ScoreList);
+            }
+            None => {}
+        }
+    }
+
+    /// Opens the run menu (from closed) or closes it outright (from ANY
+    /// open sub-state, including mid-confirm) -- the header's own `[N]
+    /// Menu` button reaches this too (`HitTarget::PetArcadeMenuToggle`).
+    /// Also closes the mechanics modal if that happened to be open, so
+    /// the two popups this overlay can show never end up stacked on top
+    /// of each other.
+    pub(crate) fn toggle_pet_arcade_menu(&mut self) {
+        self.pet_arcade_info_open = false;
+        self.pet_arcade_menu = match self.pet_arcade_menu {
+            None => Some(PetArcadeMenuState::Open { selected: 0 }),
+            Some(_) => None,
+        };
+    }
+
+    /// The run menu's own Restart row, its own confirm prompt's own "Yes,
+    /// restart" row, AND the Results screen's own pre-existing `[R] Play
+    /// Again` button all reach `PetArcade::click_restart` through this ONE
+    /// fn and the ONE `HitTarget::PetArcadeRestart` every one of them is
+    /// pushed with -- never a second path to that handler. Restarting
+    /// throws an in-progress run away, so this interposes [`PetArcadeMenuState
+    /// ::ConfirmRestart`] in front of the actual restart exactly once, the
+    /// FIRST time it fires while `PetArcade::is_running()` -- a second hit
+    /// while that confirm state is already showing means the owner just
+    /// confirmed it, so this one is the real restart. `Results`/`Home`
+    /// have nothing running to lose, so they skip the confirm entirely,
+    /// unchanged from before this menu existed.
+    fn activate_pet_arcade_restart(&mut self) {
+        let already_confirming = matches!(self.pet_arcade_menu, Some(PetArcadeMenuState::ConfirmRestart));
+        if self.pet_arcade.borrow().is_running() && !already_confirming {
+            self.pet_arcade_menu = Some(PetArcadeMenuState::ConfirmRestart);
+            return;
+        }
+        self.pet_arcade.borrow_mut().click_restart();
+        self.pet_arcade_menu = None;
     }
 
     /// Flips [`PetArcadeVisualTier`] between `Pixel` and `Glyph` -- the `v`
@@ -5000,9 +5266,37 @@ impl App {
             Some(HitTarget::PetArcadeChooseEvolution(evolution)) => {
                 self.pet_arcade.borrow_mut().click_choose_evolution(evolution)
             }
-            Some(HitTarget::PetArcadeRestart) => self.pet_arcade.borrow_mut().click_restart(),
+            Some(HitTarget::PetArcadeRestart) => self.activate_pet_arcade_restart(),
             Some(HitTarget::PetArcadeToggleTier) => self.toggle_pet_arcade_visual_tier(),
-            Some(HitTarget::PetArcadeInfo) => self.pet_arcade_info_open = true,
+            Some(HitTarget::PetArcadeInfo) => {
+                self.pet_arcade_menu = None;
+                self.pet_arcade_info_open = true;
+            }
+            Some(HitTarget::PetArcadeMenuToggle) => self.toggle_pet_arcade_menu(),
+            _ => {}
+        }
+        AppAction::None
+    }
+
+    /// The run menu popup's own click dispatch -- the pointer counterpart
+    /// to `reduce_pet_arcade_menu`. Reached from `App::click` only once
+    /// `close_overlay_outside_click` has already confirmed the press
+    /// landed INSIDE the popup's own rect (a click outside it already
+    /// closed the popup before this ever runs). `HitTarget::PetArcadeRestart`
+    /// is deliberately handled here too (not just in `click_pet_arcade`):
+    /// the SAME target/handler serves the confirm prompt's own "Yes,
+    /// restart" row, reached while this popup, not the board, owns the
+    /// click.
+    fn click_pet_arcade_menu(&mut self, target: Option<HitTarget>) -> AppAction {
+        match target {
+            Some(HitTarget::PetArcadeRestart) => self.activate_pet_arcade_restart(),
+            Some(HitTarget::PetArcadeMenuAction(PetArcadeMenuAction::ScoreList)) => {
+                self.pet_arcade_menu = Some(PetArcadeMenuState::ScoreList);
+            }
+            Some(HitTarget::PetArcadeMenuBack) => {
+                self.pet_arcade_menu = Some(PetArcadeMenuState::Open { selected: 0 });
+            }
+            Some(HitTarget::PetArcadeMenuToggle) => self.pet_arcade_menu = None,
             _ => {}
         }
         AppAction::None
@@ -5013,16 +5307,51 @@ impl App {
     /// branch. Reached from `App::click` only once `close_overlay_outside_
     /// click` has already confirmed the press landed INSIDE this modal's
     /// own rect (a click outside it already closed the modal before this
-    /// ever runs, see that fn's own doc comment) -- so the only target this
-    /// ever needs to recognize is its own `[x]` (`render::render_modal_
-    /// close`, reused verbatim here rather than a bespoke close control).
-    /// Every other click inside the card's own body is a no-op: it is a
-    /// read-only reference, nothing on it besides `[x]` DOES anything.
-    fn click_pet_arcade_info(&mut self, target: Option<HitTarget>) -> AppAction {
-        if matches!(target, Some(HitTarget::ModalClose)) {
-            self.pet_arcade_info_open = false;
+    /// ever runs, see that fn's own doc comment). Owner report: "ты сделал
+    /// возврат из механики через Х, лучше сделай через стрелочку" -- the
+    /// corner control still pushes `HitTarget::ModalClose` (`render::
+    /// render_modal_back`, painting `<-` instead of `render_modal_close`'s
+    /// own `[x]`; the ACTION is identical, only the glyph changed, so the
+    /// dispatch here is unchanged too) -- returning to the board is a
+    /// "go back one level" gesture, never "close the arcade", the same
+    /// reasoning `HitTarget::PetArcadeMenuBack`'s own doc comment applies
+    /// to the run menu.
+    fn click_pet_arcade_info(&mut self, target: Option<HitTarget>, row: u16) -> AppAction {
+        match target {
+            Some(HitTarget::ModalClose) => {
+                self.pet_arcade_info_open = false;
+                self.pet_arcade_info_scroll = 0;
+            }
+            Some(HitTarget::PetArcadeInfoScrollbar) => self.update_pet_arcade_info_scrollbar(row),
+            _ => {}
         }
         AppAction::None
+    }
+
+    /// The mechanics modal's own scrollbar track -- a click jumps the
+    /// scroll position proportionally to where the track was clicked, the
+    /// exact same "jump to here" math `App::update_file_scrollbar` already
+    /// uses for its own track (`render_file_scrollbar`'s established
+    /// contract, reused rather than a second scrollbar mechanism -- see
+    /// that fn's own doc comment). `crate::render::pet_arcade_info_lines`
+    /// is the SAME content list `render_pet_arcade_info` paints from, so
+    /// this can never disagree with that fn's own idea of how many lines
+    /// there are to scroll through.
+    fn update_pet_arcade_info_scrollbar(&mut self, row: u16) {
+        let track_height = PET_ARCADE_INFO_VISIBLE_ROWS;
+        if track_height == 0 {
+            return;
+        }
+        let track_y = self.layout.pet_arcade_info_modal.y.saturating_add(1);
+        let last_line = (crate::render::pet_arcade_info_lines().len() as u16).saturating_sub(1);
+        let relative = row
+            .clamp(track_y, track_y.saturating_add(track_height).saturating_sub(1))
+            .saturating_sub(track_y);
+        self.pet_arcade_info_scroll = if track_height <= 1 {
+            0
+        } else {
+            (u32::from(relative) * u32::from(last_line) / u32::from(track_height - 1)) as u16
+        };
     }
 
     /// The arcade's own elapsed-time integrator -- called once per redraw
@@ -5036,6 +5365,18 @@ impl App {
             return;
         }
         self.pet_arcade.borrow_mut().advance(now);
+        // The run menu's own trigger button only ever paints while a run
+        // is in progress (`render_pet_arcade`'s own header block, gated on
+        // `PetArcade::snapshot` -- `is_running`'s own doc comment). A run
+        // can end (win, lose, or the wave rules' own natural completion)
+        // while the menu is still open on top of it -- there is nothing
+        // left underneath for it to anchor to at that point, so it closes
+        // itself here rather than surviving as a stale popup that would
+        // otherwise flash back up over a FRESH run started moments later
+        // from the Results screen's own `[R] Play Again`.
+        if self.pet_arcade_menu.is_some() && !self.pet_arcade.borrow().is_running() {
+            self.pet_arcade_menu = None;
+        }
     }
 
     /// One more fast-cadence claim `client::animation_wake_interval` folds
@@ -12533,6 +12874,23 @@ fn append_event_to_diagnostics_file(event: &AppEvent) {
             }
             return None;
         }
+        // Same shape as the mechanics modal just above -- the run menu
+        // popup is the OTHER thing this overlay can stack on top of
+        // itself, and it too nests inside the arcade's own bigger
+        // registered rect. A click outside it closes the WHOLE popup
+        // regardless of which of its three sub-states was showing
+        // (`PetArcadeMenuState`'s own doc comment) -- only `Escape`/`Left`/
+        // the menu's own back rows step back one layer at a time; an
+        // outside click abandons the gesture outright, the same
+        // "re-click/outside-click both close fully" contract `render_
+        // agent_menu`'s own doc comment already establishes for a popup.
+        if self.pet_arcade_menu.is_some() {
+            if !self.layout.pet_arcade_menu.contains(column, row) {
+                self.pet_arcade_menu = None;
+                return Some(AppAction::None);
+            }
+            return None;
+        }
         if self.layout.overlays.is_empty() {
             return None;
         }
@@ -12601,7 +12959,12 @@ fn append_event_to_diagnostics_file(event: &AppEvent) {
         // absorb the click, never let it fall through to whatever board
         // tile/button happens to sit underneath.
         if self.pet_arcade_info_open {
-            return self.click_pet_arcade_info(target);
+            return self.click_pet_arcade_info(target, row);
+        }
+        // Same shape -- the run menu popup absorbs its own click, ahead of
+        // the plain arcade check right below.
+        if self.pet_arcade_menu.is_some() {
+            return self.click_pet_arcade_menu(target);
         }
         // Reaching this point with the arcade still open means the click
         // landed INSIDE its rect (the guard above already closed it for
@@ -13837,6 +14200,10 @@ fn append_event_to_diagnostics_file(event: &AppEvent) {
                 | HitTarget::PetArcadeRestart
                 | HitTarget::PetArcadeToggleTier
                 | HitTarget::PetArcadeInfo
+                | HitTarget::PetArcadeInfoScrollbar
+                | HitTarget::PetArcadeMenuToggle
+                | HitTarget::PetArcadeMenuAction(_)
+                | HitTarget::PetArcadeMenuBack
                 // Same shape, for `Focus::GlobalSearch`'s own `click_
                 // global_search` guard.
                 | HitTarget::GlobalSearchResult(_)
@@ -14182,6 +14549,25 @@ fn append_event_to_diagnostics_file(event: &AppEvent) {
     }
 
     pub fn scroll(&mut self, column: u16, row: u16, up: bool) -> AppAction {
+        // Checked FIRST, ahead of every other overlay below -- the arcade
+        // (and its own mechanics modal specifically) is the crate's own
+        // top-priority overlay while open, the same "owns every key/click
+        // that reaches it" contract `App::reduce_pet_arcade`'s own doc
+        // comment already establishes for the keyboard. Owner report:
+        // "если в механике инфа не влазит сделай скролбар" -- the wheel is
+        // one of the two ways that scrollbar has to actually move
+        // (`App::reduce_pet_arcade`'s own `Up`/`Down`/`PageUp`/`PageDown`
+        // arm is the other), so this fires regardless of where over the
+        // modal `column`/`row` land, matching `WHEEL_SCROLL_LINES`'s own
+        // step size every other wheel-scrolled list in this crate uses.
+        if self.pet_arcade_info_open {
+            self.pet_arcade_info_scroll = if up {
+                self.pet_arcade_info_scroll.saturating_sub(WHEEL_SCROLL_LINES as u16)
+            } else {
+                self.pet_arcade_info_scroll.saturating_add(WHEEL_SCROLL_LINES as u16)
+            };
+            return AppAction::None;
+        }
         if self.native_session_menu.is_some() {
             self.move_native_session_menu_selection(!up);
             return AppAction::None;

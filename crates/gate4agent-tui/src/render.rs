@@ -25713,11 +25713,11 @@ mod tests {
         let text = rect_text(&buf, app.layout.pet_arcade_menu);
         assert!(text.contains("No finished runs yet"), "{text:?}");
 
-        app.pet_arcade.borrow_mut().push_score_for_test(crate::pet_arcade::PetArcadeScoreEntry {
+        app.pet_arcade.borrow_mut().set_scores(vec![crate::pet_arcade::PetArcadeScoreEntry {
             difficulty: Difficulty::Wild,
             wave_reached: 6,
             outcome: PetBastionRunOutcome::Lost,
-        });
+        }]);
         let buf = render_pet_arcade_app(&mut app);
         let text = rect_text(&buf, app.layout.pet_arcade_menu);
         assert!(text.contains("Wild"), "{text:?}");

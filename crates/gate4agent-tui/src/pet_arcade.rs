@@ -258,13 +258,15 @@ pub(crate) struct PetArcade {
     /// completed tick is render time right now" definition
     /// (`gate4agent_arcade_engine::tick_alpha`'s own doc comment).
     last_tick_at: Instant,
-    /// Every run this session has FINISHED (won or lost), newest last --
-    /// see [`PetArcadeScoreEntry`]'s own doc comment for what a row holds
-    /// and why this is in-session only, not written to `preferences.rs`.
-    /// Read by `render::render_pet_arcade_menu`'s own `PetArcadeMenuState::
-    /// ScoreList` arm; written exactly once per finished run, at the
-    /// moment [`Self::advance`] transitions `screen` to `GameScreen::
-    /// Results`.
+    /// Every run that has FINISHED (won or lost), newest last -- see
+    /// [`PetArcadeScoreEntry`]'s own doc comment for what a row holds and
+    /// where it persists. Read by `render::render_pet_arcade_menu`'s own
+    /// `PetArcadeMenuState::ScoreList` arm. Two writers: [`Self::advance`]
+    /// appends exactly once per finished run, at the moment `screen`
+    /// transitions to `GameScreen::Results`; [`Self::set_scores`] REPLACES
+    /// the whole `Vec` outright, the one time at startup `preferences::
+    /// UiPreferences::try_apply_to` seeds it from what was persisted last
+    /// session.
     scores: Vec<PetArcadeScoreEntry>,
 }
 
@@ -274,29 +276,34 @@ pub(crate) struct PetArcade {
 /// already computes to decide the transition into `GameScreen::Results`
 /// in the first place, so this is a plain copy of three fields already in
 /// hand, never a second source of truth. Owner: "может какой-то скор-лист
-/// там будет еще что-то".
+/// там будет еще что-то". Deliberately no timestamp: nothing in this
+/// crate hands a render/persistence call site a deterministic clock
+/// (`ClockSettings` is a DISPLAY preference for the status-bar clock, not
+/// a time source), and a `SystemTime::now()`-stamped row would make
+/// `preferences.rs`'s own round-trip tests non-deterministic against a
+/// fixed expected string -- so this stores only what the sim genuinely
+/// carries, nothing invented to look complete.
 ///
 /// # Persistence
 ///
-/// In-session only (`PetArcade::scores`, a plain `Vec` -- cleared the
-/// moment the TUI process restarts), NOT written to `preferences.rs`.
-/// Checked, not assumed: every existing repeated-line preference in that
-/// file (`managed_agent=...`, `collapsed_directory=...`) needs a
-/// `CONFIG_VERSION` bump with its own migration note, a capacity constant,
-/// an `App`-side collection field, `UiPreferences::from_app`/`try_apply_to`
-/// plumbing, an `encode` line, a two-pass `parse` (raw accumulation +
-/// a `finish_with_collections`-style resolver), a dedicated `validated_*`/
-/// `parse_*_preference` pair, AND round-trip/malformed-rejection tests
-/// (`preferences_v7_managed_agents_round_trip_deterministically`,
-/// `preferences_v5_rejects_malformed_duplicate_and_oversize_managed_agents`).
-/// That is a real, multi-part feature, not "a repeated keyed line" --
-/// wiring it in as an afterthought here would half-build it. Left for a
-/// pass that can give it that.
+/// Written to `preferences.rs` (`UiPreferences::arcade_scores`, a
+/// `arcade_score=<difficulty>,<wave_reached>,<outcome>` repeated line,
+/// `CONFIG_VERSION` 13 -> 14) -- restarting the TUI is routine while
+/// working on it, and a score list that empties every restart reads as a
+/// broken widget, not a feature. Malformed/truncated `arcade_score=` rows
+/// are DROPPED silently at parse time rather than failing the whole file
+/// the way a bad `managed_agent=`/`collapsed_directory=` row does today
+/// (`parse_managed_agent_preference`'s own `?` in the per-line loop,
+/// `collapsed_directory`'s own hard `collect::<io::Result<_>>()?` in
+/// `finish_with_collections`) -- this is the least important field in
+/// that file, and one corrupt row in it must never cost the owner every
+/// OTHER preference too. `preferences.rs`'s own module doc/`finish_with_
+/// collections` doc comment has the full reasoning.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct PetArcadeScoreEntry {
-    pub(crate) difficulty: Difficulty,
-    pub(crate) wave_reached: u32,
-    pub(crate) outcome: RunOutcome,
+pub struct PetArcadeScoreEntry {
+    pub difficulty: Difficulty,
+    pub wave_reached: u32,
+    pub outcome: RunOutcome,
 }
 
 /// How many finished runs [`PetArcade::scores`] keeps -- oldest evicted
@@ -304,8 +311,10 @@ pub(crate) struct PetArcadeScoreEntry {
 /// grow this `Vec` without bound. Comfortably more than a menu popup
 /// would ever show without its own scrolling, matching this crate's
 /// existing `MAX_MANAGED_AGENT_PREFERENCES`-style "cap the collection,
-/// not just the render" convention.
-const MAX_SCORE_ENTRIES: usize = 20;
+/// not just the render" convention. `pub(crate)`: `preferences.rs`'s own
+/// encode-time/parse-time caps reuse this SAME constant rather than a
+/// second one that could drift out of sync with it.
+pub(crate) const MAX_SCORE_ENTRIES: usize = 20;
 
 impl fmt::Debug for PetArcade {
     /// Deliberately does not inspect `screen`/`shell` -- neither
@@ -493,13 +502,29 @@ impl PetArcade {
         }
     }
 
-    /// Every finished run this session, newest last -- see
-    /// [`PetArcadeScoreEntry`]'s own doc comment. `render::render_pet_
-    /// arcade_menu`'s own `ScoreList` arm reads this and reverses it
-    /// (newest first is the more useful reading order for a popup that
-    /// only ever shows a handful of rows at a time).
+    /// Every finished run, newest last -- see [`PetArcadeScoreEntry`]'s
+    /// own doc comment. `render::render_pet_arcade_menu`'s own
+    /// `ScoreList` arm reads this and reverses it (newest first is the
+    /// more useful reading order for a popup that only ever shows a
+    /// handful of rows at a time); `preferences::UiPreferences::from_app`
+    /// reads it (in THIS same oldest-first order) to persist.
     pub(crate) fn scores(&self) -> &[PetArcadeScoreEntry] {
         &self.scores
+    }
+
+    /// Replaces the whole score list outright -- the ONE real (non-test)
+    /// caller is `preferences::UiPreferences::try_apply_to`, seeding
+    /// whatever was persisted last session back in at startup, before any
+    /// run this session has finished. A REPLACE, never an append/merge:
+    /// this only ever runs once, before [`Self::advance`] has had a
+    /// chance to append anything of its own, so there is nothing yet to
+    /// merge with. `entries` is trusted already-validated input (`try_
+    /// apply_to`'s own `validate_arcade_scores` call, ahead of this) --
+    /// this fn does not re-check `MAX_SCORE_ENTRIES` itself, the same
+    /// "validate once, at the boundary" contract that fn's own doc
+    /// comment already states for every other field it applies.
+    pub(crate) fn set_scores(&mut self, entries: Vec<PetArcadeScoreEntry>) {
+        self.scores = entries;
     }
 
     /// The pixel tier's own interpolation input -- see `presenter`'s own
@@ -968,15 +993,6 @@ impl PetArcade {
         self.screen = GameScreen::Results { outcome, final_hash: 0 };
     }
 
-    /// Test-only seam for [`PetArcadeScoreEntry`] -- a real one only ever
-    /// gets appended by [`Self::advance`], mid-tick, off a `Runner`
-    /// snapshot a unit test cannot legitimately fabricate any more easily
-    /// than `force_results_for_test`'s own doc comment already explains
-    /// for `Results` itself. Never compiled into a real build.
-    #[cfg(test)]
-    pub(crate) fn push_score_for_test(&mut self, entry: PetArcadeScoreEntry) {
-        self.scores.push(entry);
-    }
 }
 
 /// Whether a `BuildCellView::reason` still marks its tile as a genuine

@@ -4,6 +4,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
+use gate4agent_arcade_pet_bastion::wave::Difficulty;
+use gate4agent_arcade_pet_bastion::RunOutcome;
 use gate4agent_node_protocol::{
     NodeId, RepositoryPath, WorkspaceId, MAX_REPOSITORY_PATH_BYTES,
 };
@@ -14,9 +16,24 @@ use crate::app::{
     RosterMode, SidebarMode, SidebarPresentation, MAX_LOCAL_AGENT_ALIAS_BYTES,
     MAX_MANAGED_AGENT_PREFERENCES, MAX_MANAGED_AGENT_RECORD_ID_BYTES,
 };
+use crate::pet_arcade::{PetArcadeScoreEntry, MAX_SCORE_ENTRIES};
 use crate::surface::LayoutPreset;
 
-const CONFIG_VERSION: u16 = 13;
+/// CONFIG_VERSION 13 -> 14: `arcade_score=<difficulty>,<wave_reached>,
+/// <outcome>` is a new repeated key -- `PetArcadeScoreEntry`'s own doc
+/// comment has the full reasoning (owner: a score list that empties every
+/// TUI restart reads as broken, not in-session-by-design). A pre-14
+/// config simply has zero `arcade_score=` lines, so `UiPreferences::
+/// arcade_scores` keeps `Default`'s own `Vec::new()` -- the same "new key
+/// just wasn't there yet" shape every scalar addition above already uses
+/// (`pet_figure`'s own CONFIG_VERSION 12 -> 13 migration note) -- except
+/// this key is a REPEATED one like `managed_agent`/`collapsed_directory`,
+/// so `parse`'s own per-version match still clears it explicitly for
+/// every version below 14, the same defensive "this version doesn't have
+/// this field, ignore anything that looks like it" contract those two
+/// already established at their own introduction (`Some(5)`/`Some(6)`'s
+/// own arms).
+const CONFIG_VERSION: u16 = 14;
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const MAX_COLLAPSED_DIRECTORY_PREFERENCES: usize = 512;
 
@@ -69,6 +86,11 @@ pub struct UiPreferences {
     pub pet_enabled: bool,
     pub managed_agents: Vec<ManagedAgentPreference>,
     pub collapsed_directories: Vec<CollapsedDirectoryPreference>,
+    /// CONFIG_VERSION 13 -> 14 -- see `PetArcadeScoreEntry`'s own doc
+    /// comment for what a row holds and `parse`'s own migration note above
+    /// `CONFIG_VERSION` for why a pre-14 config loads this as empty rather
+    /// than failing.
+    pub arcade_scores: Vec<PetArcadeScoreEntry>,
 }
 
 impl Default for UiPreferences {
@@ -118,6 +140,7 @@ impl Default for UiPreferences {
             pet_enabled: true,
             managed_agents: Vec::new(),
             collapsed_directories: Vec::new(),
+            arcade_scores: Vec::new(),
         }
     }
 }
@@ -164,6 +187,11 @@ impl UiPreferences {
                     path: path.clone(),
                 })
                 .collect(),
+            // Oldest-first, exactly `PetArcade::scores`'s own storage
+            // order (never re-sorted) -- see `encode`'s own doc comment
+            // on why this field alone skips the `sort_by` every OTHER
+            // repeated field here uses.
+            arcade_scores: app.pet_arcade.borrow().scores().to_vec(),
         }
     }
 
@@ -175,6 +203,7 @@ impl UiPreferences {
         let managed_agent_preferences = validated_managed_agent_map(&self.managed_agents)?;
         let collapsed_directories =
             validated_collapsed_directory_set(&self.collapsed_directories)?;
+        validate_arcade_scores(&self.arcade_scores)?;
         // Applying preferences must accept exactly the same bounded state that can be
         // persisted. This check happens before any App field is mutated.
         let _ = self.encode()?;
@@ -227,6 +256,12 @@ impl UiPreferences {
         let _ = app.surface.apply_layout_preset(self.surface_layout);
         app.managed_agent_preferences = managed_agent_preferences;
         app.collapsed_directories = collapsed_directories;
+        // Seeds whatever was persisted last session -- see `PetArcade::
+        // set_scores`'s own doc comment for why this is a REPLACE, safe
+        // to call unconditionally: this only ever runs once, at startup,
+        // before any run this session has had a chance to finish and
+        // append one of its own.
+        app.pet_arcade.borrow_mut().set_scores(self.arcade_scores.clone());
         Ok(())
     }
 
@@ -294,6 +329,7 @@ impl UiPreferences {
     fn encode(&self) -> io::Result<String> {
         validate_managed_agents(&self.managed_agents)?;
         validate_collapsed_directories(&self.collapsed_directories)?;
+        validate_arcade_scores(&self.arcade_scores)?;
         let mut encoded = format!(
             "version={CONFIG_VERSION}\nstyle={}\nmenu={}\nsidebar_presentation={}\nsidebar_collapsed={}\nrail_icons={}\nicon_family={}\nlucide_stroke_width={}\ncontrol_section={}\nroster_mode={}\nsidebar_width={}\nsidebar_split_percent={}\ncontrol_modal_position={}\ncontrol_modal_size={}\nsurface_layout={}\nmarquee_enabled={}\nclock_follow_system={}\nclock_manual_offset_hours={}\nclock_use_24h={}\nclock_show_utc_prefix={}\npet_figure={}\npet_speed={}\npet_enabled={}\n",
             self.color_mode.id(),
@@ -354,6 +390,26 @@ impl UiPreferences {
             encoded.push_str(&preference.workspace_id);
             encoded.push(',');
             encoded.push_str(&encode_hex(preference.path.as_bytes()));
+            encoded.push('\n');
+            if encoded.len() as u64 > MAX_CONFIG_BYTES {
+                return Err(invalid_data("encoded preferences exceed the size limit"));
+            }
+        }
+        // Deliberately NOT sorted, unlike `managed_agents`/`collapsed_
+        // directories` just above -- those two live in an `App`-side
+        // `BTreeMap`/tuple set with no inherent order of their own, so
+        // sorting is what makes their own encoded byte output
+        // deterministic. `self.arcade_scores` already has a real order
+        // (`PetArcade::scores`'s own "newest last" doc comment, play
+        // order) that a sort would destroy -- encoding it as-is is both
+        // the deterministic choice AND the only one that keeps meaning.
+        for entry in &self.arcade_scores {
+            encoded.push_str("arcade_score=");
+            encoded.push_str(encode_difficulty(entry.difficulty));
+            encoded.push(',');
+            encoded.push_str(&entry.wave_reached.to_string());
+            encoded.push(',');
+            encoded.push_str(encode_run_outcome(entry.outcome));
             encoded.push('\n');
             if encoded.len() as u64 > MAX_CONFIG_BYTES {
                 return Err(invalid_data("encoded preferences exceed the size limit"));
@@ -452,6 +508,78 @@ fn validated_collapsed_directory_set(
         .collect())
 }
 
+/// `encode`/`try_apply_to`'s own strict, whole-collection check -- unlike
+/// a single malformed row at PARSE time (`finish_with_collections`'s own
+/// doc comment on why THAT is lenient), the data this validates always
+/// came from typed `App`/`PetArcade` state, never raw file bytes, so it
+/// is either already within bounds by construction (`PetArcade::MAX_
+/// SCORE_ENTRIES` already caps `PetArcade::scores` before `UiPreferences::
+/// from_app` ever reads it) or genuinely a bug worth failing loudly on --
+/// the same "defense in depth, should never actually reject anything in
+/// practice" role `validate_managed_agents`/`validate_collapsed_
+/// directories` already play for their own two collections.
+fn validate_arcade_scores(arcade_scores: &[PetArcadeScoreEntry]) -> io::Result<()> {
+    if arcade_scores.len() > MAX_SCORE_ENTRIES {
+        return Err(invalid_data("too many arcade score preferences"));
+    }
+    Ok(())
+}
+
+fn encode_difficulty(difficulty: Difficulty) -> &'static str {
+    match difficulty {
+        Difficulty::Cozy => "cozy",
+        Difficulty::Standard => "standard",
+        Difficulty::Wild => "wild",
+    }
+}
+
+fn decode_difficulty(value: &str) -> Option<Difficulty> {
+    match value {
+        "cozy" => Some(Difficulty::Cozy),
+        "standard" => Some(Difficulty::Standard),
+        "wild" => Some(Difficulty::Wild),
+        _ => None,
+    }
+}
+
+fn encode_run_outcome(outcome: RunOutcome) -> &'static str {
+    match outcome {
+        RunOutcome::Won => "won",
+        RunOutcome::Lost => "lost",
+    }
+}
+
+fn decode_run_outcome(value: &str) -> Option<RunOutcome> {
+    match value {
+        "won" => Some(RunOutcome::Won),
+        "lost" => Some(RunOutcome::Lost),
+        _ => None,
+    }
+}
+
+/// A single `arcade_score=` row -- three plain tokens, none of them
+/// arbitrary/attacker-shaped text (`Difficulty`/`RunOutcome` are both
+/// closed three/two-variant enums, `wave_reached` a plain integer), so
+/// unlike `managed_agent`/`collapsed_directory` this needs no hex
+/// escaping at all. Field-count and token-shape errors both return `Err`
+/// -- the caller (`finish_with_collections`) is what turns that into a
+/// silently-dropped row rather than a failed file; this fn itself stays
+/// a normal, honest parser that never swallows its own errors.
+fn parse_arcade_score_preference(value: &str) -> io::Result<PetArcadeScoreEntry> {
+    let fields = value.split(',').collect::<Vec<_>>();
+    if fields.len() != 3 {
+        return Err(invalid_data("arcade score preference field count is invalid"));
+    }
+    let difficulty = decode_difficulty(fields[0])
+        .ok_or_else(|| invalid_data("arcade score difficulty is invalid"))?;
+    let wave_reached = fields[1]
+        .parse::<u32>()
+        .map_err(|_| invalid_data("arcade score wave is invalid"))?;
+    let outcome =
+        decode_run_outcome(fields[2]).ok_or_else(|| invalid_data("arcade score outcome is invalid"))?;
+    Ok(PetArcadeScoreEntry { difficulty, wave_reached, outcome })
+}
+
 pub fn default_path() -> Option<PathBuf> {
     if cfg!(windows) {
         return nonempty_env("LOCALAPPDATA")
@@ -478,6 +606,7 @@ fn parse(contents: &str) -> io::Result<UiPreferences> {
     let mut managed_agents = Vec::new();
     let mut managed_agent_keys = std::collections::BTreeSet::new();
     let mut collapsed_directory_values = Vec::new();
+    let mut arcade_score_values = Vec::new();
     for line in contents.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -658,6 +787,14 @@ fn parse(contents: &str) -> io::Result<UiPreferences> {
             "collapsed_directory" => {
                 collapsed_directory_values.push(value.trim().to_owned());
             }
+            // Deferred, same shape as `collapsed_directory` just above --
+            // raw accumulation here, real parsing (and the LENIENT
+            // "drop it, don't fail the file" resolution -- `finish_with_
+            // collections`'s own doc comment) happens once the whole
+            // file has been read.
+            "arcade_score" => {
+                arcade_score_values.push(value.trim().to_owned());
+            }
             "grid_preset" => {
                 preferences.surface_layout = match value.trim() {
                     "2x2" | "quad" => LayoutPreset::TwoByTwo,
@@ -673,11 +810,13 @@ fn parse(contents: &str) -> io::Result<UiPreferences> {
         Some(1) | Some(2) | Some(3) | Some(4) => {
             preferences.managed_agents.clear();
             preferences.collapsed_directories.clear();
+            preferences.arcade_scores.clear();
             Ok(preferences)
         }
         Some(5) => {
             preferences.managed_agents = managed_agents;
             preferences.collapsed_directories.clear();
+            preferences.arcade_scores.clear();
             Ok(preferences)
         }
         Some(6) => {
@@ -689,7 +828,7 @@ fn parse(contents: &str) -> io::Result<UiPreferences> {
             // `rail_icons` has no v6 representation and keeps the struct
             // default (Sixel) set before this loop ran.
             preferences.sidebar_presentation = SidebarPresentation::Activity;
-            finish_with_collections(preferences, managed_agents, collapsed_directory_values)
+            finish_with_collections(preferences, managed_agents, collapsed_directory_values, Vec::new())
         }
         // D? (CONFIG_VERSION 7 -> 8): the rail-icons toggle grows a third
         // state (Sixel/Braille/Ascii, replacing Glyph/Ascii). The stored
@@ -746,21 +885,56 @@ fn parse(contents: &str) -> io::Result<UiPreferences> {
         // they keep `UiPreferences::default()`'s own values (matching
         // `PetSettings::default()`) -- the same "new key just wasn't there
         // yet" shape every migration above already uses.
-        Some(7) | Some(8) | Some(9) | Some(10) | Some(11) | Some(12) | Some(CONFIG_VERSION) => {
-            finish_with_collections(preferences, managed_agents, collapsed_directory_values)
+        //
+        // v7-v13 all share this exact tail -- none of them has `arcade_
+        // score=` (`CONFIG_VERSION` 13 -> 14's own doc comment above the
+        // constant), so `Vec::new()` here is what makes that explicit:
+        // even if a line that LOOKS like `arcade_score=...` somehow
+        // appeared in one of these files, this version simply does not
+        // support the key, the exact same "ignore anything that looks
+        // like it" contract `Some(1..=4)`'s own `.clear()` calls already
+        // establish for `managed_agent`/`collapsed_directory` at THEIR
+        // own pre-introduction versions.
+        Some(7) | Some(8) | Some(9) | Some(10) | Some(11) | Some(12) | Some(13) => {
+            finish_with_collections(preferences, managed_agents, collapsed_directory_values, Vec::new())
+        }
+        // CONFIG_VERSION 13 -> 14 (see the constant's own doc comment):
+        // `arcade_score=` is a new repeated key -- THIS is the one arm
+        // that actually resolves `arcade_score_values` into real rows.
+        Some(CONFIG_VERSION) => {
+            finish_with_collections(preferences, managed_agents, collapsed_directory_values, arcade_score_values)
         }
         Some(other) => Err(invalid_data(format!("unsupported preferences version {other}"))),
         None => Err(invalid_data("preferences version is missing")),
     }
 }
 
-/// The v6/v7/v8 tail shared by all three versions' `parse()` arms: attach
-/// the managed-agent rows already parsed by the per-line loop, then parse
-/// and validate the collapsed-directory rows.
+/// The tail shared by every `parse()` arm from v6 onward: attach the
+/// managed-agent rows already parsed by the per-line loop, then parse and
+/// validate the collapsed-directory rows, then resolve the arcade-score
+/// rows.
+///
+/// The first two collections are STRICT -- a single malformed `managed_
+/// agent=`/`collapsed_directory=` row fails this fn, and so the whole
+/// file (`parse_managed_agent_preference`'s own `?` reaching all the way
+/// back through the per-line loop into `parse` itself for the former;
+/// the `collect::<io::Result<Vec<_>>>()?` two lines below for the
+/// latter -- checked directly, not assumed, exactly as asked). Arcade
+/// scores are the opposite, deliberately: owner report, relayed by the
+/// coordinator -- "a corrupt score row is the least important thing in
+/// that file and must not take a real preference down with it". A
+/// malformed OR truncated `arcade_score=` row (wrong field count, an
+/// unknown difficulty/outcome token, an unparseable wave number) is
+/// silently DROPPED via `filter_map(...).ok())` rather than propagated,
+/// and every other row/field in the file still loads. `take(MAX_SCORE_
+/// ENTRIES)` bounds the result the same way `validate_arcade_scores`
+/// bounds an encode -- a file with more rows than that (tampered, or
+/// hand-edited) still loads, just truncated, never rejected outright.
 fn finish_with_collections(
     mut preferences: UiPreferences,
     managed_agents: Vec<ManagedAgentPreference>,
     collapsed_directory_values: Vec<String>,
+    arcade_score_values: Vec<String>,
 ) -> io::Result<UiPreferences> {
     preferences.managed_agents = managed_agents;
     if collapsed_directory_values.len() > MAX_COLLAPSED_DIRECTORY_PREFERENCES {
@@ -771,6 +945,11 @@ fn finish_with_collections(
         .map(|value| parse_collapsed_directory_preference(value))
         .collect::<io::Result<Vec<_>>>()?;
     validate_collapsed_directories(&preferences.collapsed_directories)?;
+    preferences.arcade_scores = arcade_score_values
+        .iter()
+        .filter_map(|value| parse_arcade_score_preference(value).ok())
+        .take(MAX_SCORE_ENTRIES)
+        .collect();
     Ok(preferences)
 }
 
@@ -984,6 +1163,7 @@ mod tests {
             pet_enabled: false,
             managed_agents: Vec::new(),
             collapsed_directories: Vec::new(),
+            arcade_scores: Vec::new(),
         };
 
         UiPreferences::default().save(&path).unwrap();
@@ -1045,6 +1225,7 @@ mod tests {
             pet_enabled: false,
             managed_agents: Vec::new(),
             collapsed_directories: Vec::new(),
+            arcade_scores: Vec::new(),
         };
         let mut app = App::default();
 
@@ -1366,6 +1547,38 @@ mod tests {
         assert_eq!(UiPreferences::from_app(&app), decoded);
     }
 
+    /// Owner (relayed by the coordinator): a score list that empties every
+    /// TUI restart reads as broken, not in-session-by-design -- so it must
+    /// round-trip through the SAME `encode`/`parse`/`apply_to`/`from_app`
+    /// path `managed_agents` already proves above, following that test's
+    /// own shape exactly (a third repeated field should not invent a
+    /// fourth one).
+    #[test]
+    fn preferences_v14_arcade_scores_round_trip_deterministically() {
+        let mut preferences = UiPreferences::default();
+        preferences.arcade_scores = vec![
+            PetArcadeScoreEntry { difficulty: Difficulty::Standard, wave_reached: 4, outcome: RunOutcome::Lost },
+            PetArcadeScoreEntry { difficulty: Difficulty::Wild, wave_reached: 8, outcome: RunOutcome::Won },
+        ];
+        let encoded = preferences.encode().unwrap();
+        assert!(encoded.starts_with(&format!("version={CONFIG_VERSION}\n")));
+        let decoded = parse(&encoded).unwrap();
+        assert_eq!(decoded.encode().unwrap(), encoded);
+        assert_eq!(decoded.arcade_scores, preferences.arcade_scores);
+        // Play order survives -- unlike `managed_agents`/`collapsed_
+        // directories` (sorted at encode time, `encode`'s own doc comment
+        // on why THIS field alone is not), the standard-then-wild
+        // insertion order above must still be standard-then-wild here.
+        assert!(
+            encoded.find("arcade_score=standard,4,lost").unwrap()
+                < encoded.find("arcade_score=wild,8,won").unwrap()
+        );
+
+        let mut app = App::default();
+        decoded.apply_to(&mut app);
+        assert_eq!(UiPreferences::from_app(&app), decoded);
+    }
+
     #[test]
     fn preferences_v7_collapsed_directories_round_trip_non_utf8_deterministically() {
         let utf8 = collapsed_directory(
@@ -1638,6 +1851,72 @@ mod tests {
                 alias: Some("a".repeat(MAX_LOCAL_AGENT_ALIAS_BYTES)),
                 order: Some(index as u16),
             })
+            .collect();
+        assert!(too_large.encode().is_err());
+        assert!(too_large.save(&path).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "sentinel");
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Checked, not assumed, per the coordinator's own instruction: the
+    /// test right above proves a bad `managed_agent=` row fails `parse`
+    /// OUTRIGHT (the whole file, every other field included). Owner: "a
+    /// corrupt score row is the least important thing in that file and
+    /// must not take a real preference down with it" -- this proves the
+    /// DELIBERATE opposite for `arcade_score=` specifically: the row is
+    /// dropped, everything else on the same load survives.
+    #[test]
+    fn preferences_v14_malformed_arcade_score_rows_are_dropped_not_fatal() {
+        let valid_agent = "managed_agent=6e6f6465,7265636f7264,1,0,-\n";
+        for malformed in [
+            "arcade_score=notadifficulty,4,lost\n",
+            "arcade_score=standard,notanumber,lost\n",
+            "arcade_score=standard,4,notanoutcome\n",
+            "arcade_score=standard,4\n",
+            "arcade_score=standard,4,lost,extra\n",
+            "arcade_score=\n",
+        ] {
+            let contents = format!("version={CONFIG_VERSION}\nstyle=gate\n{valid_agent}{malformed}");
+            let loaded = parse(&contents)
+                .unwrap_or_else(|error| panic!("{malformed:?} must not fail the whole file: {error}"));
+            assert!(loaded.arcade_scores.is_empty(), "{malformed:?} must be dropped, not kept malformed");
+            assert_eq!(loaded.managed_agents.len(), 1, "{malformed:?} must not cost the managed_agent row too");
+            assert_eq!(
+                loaded.color_mode,
+                PtyColorMode::GateOverride,
+                "{malformed:?} must not cost an unrelated scalar field either"
+            );
+        }
+
+        // A good row survives alongside a bad one on the very same load.
+        let mixed = format!("version={CONFIG_VERSION}\narcade_score=cozy,2,won\narcade_score=not-a-row\n");
+        let loaded = parse(&mixed).unwrap();
+        assert_eq!(
+            loaded.arcade_scores,
+            vec![PetArcadeScoreEntry { difficulty: Difficulty::Cozy, wave_reached: 2, outcome: RunOutcome::Won }]
+        );
+
+        // Too many rows truncate at parse time rather than reject the
+        // whole file -- the same leniency, applied to "too many" as well
+        // as "malformed" (both are the least-important field misbehaving,
+        // never a reason to lose everything else).
+        let too_many: String = (0..MAX_SCORE_ENTRIES + 5).map(|_| "arcade_score=wild,1,lost\n".to_owned()).collect();
+        let loaded = parse(&format!("version={CONFIG_VERSION}\n{too_many}")).unwrap();
+        assert_eq!(
+            loaded.arcade_scores.len(),
+            MAX_SCORE_ENTRIES,
+            "an oversized file must truncate the scores, not fail to load"
+        );
+
+        // `encode`/`save` stay STRICT, unlike `parse` -- that data always
+        // comes from typed `App`/`PetArcade` state, never raw file bytes
+        // (`validate_arcade_scores`'s own doc comment).
+        let path = temp_path("arcade-score-encode-stays-strict");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "sentinel").unwrap();
+        let mut too_large = UiPreferences::default();
+        too_large.arcade_scores = (0..=MAX_SCORE_ENTRIES)
+            .map(|_| PetArcadeScoreEntry { difficulty: Difficulty::Wild, wave_reached: 1, outcome: RunOutcome::Lost })
             .collect();
         assert!(too_large.encode().is_err());
         assert!(too_large.save(&path).is_err());

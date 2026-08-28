@@ -15,7 +15,7 @@ use crossterm::{
         EnableMouseCapture, Event as TerminalEvent, KeyCode, KeyEvent, KeyEventKind,
         KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
-    execute,
+    execute, queue,
     style::Print,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -1325,9 +1325,19 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
             // clock every second, the pet far more often -- are exactly
             // where it was seen. The cursor belongs in one place: wherever
             // `sync_cursor` decides, once the frame is finished.
+            // QUEUED, not executed: `execute!` is `queue!` plus an
+            // immediate flush, and that flush is a console write of its
+            // own for six bytes. Measured, it cost 123us at p50 -- four
+            // times what `screen.flush()` charges to write a whole
+            // frame's diff -- and there is nothing to buy with it, because
+            // `screen.flush()` runs on the very next line. `Screen`'s own
+            // backend was built with `CrosstermBackend::new(stdout())`, so
+            // it holds a handle to the SAME process-global buffered
+            // stdout these bytes land in: they go out ahead of the frame,
+            // in order, on the frame's own flush.
             let hide_start = Instant::now();
-            execute!(stdout(), Hide)?;
-            phases.cursor = hide_start.elapsed();
+            queue!(stdout(), Hide)?;
+            phases.cursor_hide = hide_start.elapsed();
             let flush_start = Instant::now();
             screen.flush()?;
             phases.flush = flush_start.elapsed();
@@ -1351,13 +1361,9 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
             flush_pet_arcade_pixel_frame(&app, screen.current(), &mut pet_arcade_pixel_emit_state)?;
             phases.sixel = sixel_start.elapsed();
             app.profiler.record_sixel(phases.sixel);
-            // Both cursor syscalls land in one phase: `Hide` above opens
-            // the paint, `sync_cursor` closes it, and neither is
-            // interesting alone -- what is worth seeing is what the
-            // terminal charges for the pair.
             let sync_start = Instant::now();
             sync_cursor(&app)?;
-            phases.cursor += sync_start.elapsed();
+            phases.cursor_sync = sync_start.elapsed();
             app.profiler.record_frame(frame_start.elapsed(), phases);
         }
 
@@ -2679,12 +2685,24 @@ fn flush_pet_arcade_pixel_frame_into<W: io::Write>(
     Ok(())
 }
 
+/// Puts the terminal's own cursor where this frame decided it belongs,
+/// and closes the frame's output.
+///
+/// This one DOES flush, unlike the `Hide` that opens the paint: it is the
+/// last write of the redraw tick, so the bytes queued here -- and any the
+/// sixel pass left buffered ahead of them -- have nothing after them to
+/// carry them out. One console write per frame is the floor; the point of
+/// queueing everywhere else is that this is the only one.
 fn sync_cursor(app: &App) -> io::Result<()> {
+    use io::Write as _;
+
+    let mut out = stdout();
     if let Some((column, row)) = visible_cursor_position(app) {
-        execute!(stdout(), MoveTo(column, row), Show)
+        queue!(out, MoveTo(column, row), Show)?;
     } else {
-        execute!(stdout(), Hide)
+        queue!(out, Hide)?;
     }
+    out.flush()
 }
 
 fn visible_cursor_position(app: &App) -> Option<(u16, u16)> {

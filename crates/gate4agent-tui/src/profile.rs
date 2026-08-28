@@ -125,15 +125,30 @@ pub struct FramePhases {
     /// The sixel icon pass plus the arcade's pixel frame. Also reported on
     /// its own as `sixel_us`.
     pub sixel: Duration,
-    /// The two cursor syscalls bracketing the paint: `Hide` before it,
-    /// `sync_cursor` after.
-    pub cursor: Duration,
+    /// `execute!(Hide)`, the first write of the frame. Split from its
+    /// sibling below because the two look identical on paper -- a few
+    /// escape bytes each -- and measured 226us together at p50 against a
+    /// `screen.flush()` that writes a whole frame's diff for 34us. Two
+    /// tiny writes cannot cost seven times a large one, so one of these
+    /// is not paying for its bytes: either `sync_cursor`'s own
+    /// `visible_cursor_position` walk, or this one absorbing the
+    /// terminal's back-pressure by being first through the door.
+    pub cursor_hide: Duration,
+    /// `sync_cursor`: `visible_cursor_position` plus the `MoveTo`/`Show`
+    /// (or `Hide`) that follows from it, the last write of the frame.
+    pub cursor_sync: Duration,
 }
 
 impl FramePhases {
     /// Everything this breakdown accounts for, for the remainder subtraction.
     fn total(self) -> Duration {
-        self.animate + self.render + self.queue + self.flush + self.sixel + self.cursor
+        self.animate
+            + self.render
+            + self.queue
+            + self.flush
+            + self.sixel
+            + self.cursor_hide
+            + self.cursor_sync
     }
 }
 
@@ -155,7 +170,8 @@ pub struct ProfileSnapshot {
     pub flush_us: Distribution,
     pub sixel_us: Distribution,
     pub queue_us: Distribution,
-    pub cursor_us: Distribution,
+    pub cursor_hide_us: Distribution,
+    pub cursor_sync_us: Distribution,
     pub frame_us: Distribution,
     /// `frame_us` minus every named phase above. Near zero means the
     /// breakdown accounts for the whole tick; a growing remainder means a
@@ -215,7 +231,8 @@ pub struct TuiProfiler {
     flush_us: RingStats<SAMPLE_WINDOW>,
     sixel_us: RingStats<SAMPLE_WINDOW>,
     queue_us: RingStats<SAMPLE_WINDOW>,
-    cursor_us: RingStats<SAMPLE_WINDOW>,
+    cursor_hide_us: RingStats<SAMPLE_WINDOW>,
+    cursor_sync_us: RingStats<SAMPLE_WINDOW>,
     frame_us: RingStats<SAMPLE_WINDOW>,
     frame_remainder_us: RingStats<SAMPLE_WINDOW>,
     wait_us: RingStats<SAMPLE_WINDOW>,
@@ -257,7 +274,8 @@ impl Default for TuiProfiler {
             flush_us: RingStats::default(),
             sixel_us: RingStats::default(),
             queue_us: RingStats::default(),
-            cursor_us: RingStats::default(),
+            cursor_hide_us: RingStats::default(),
+            cursor_sync_us: RingStats::default(),
             frame_us: RingStats::default(),
             frame_remainder_us: RingStats::default(),
             wait_us: RingStats::default(),
@@ -322,7 +340,8 @@ impl TuiProfiler {
         self.frame_us.push(duration_micros(elapsed));
         self.animate_us.push(duration_micros(phases.animate));
         self.queue_us.push(duration_micros(phases.queue));
-        self.cursor_us.push(duration_micros(phases.cursor));
+        self.cursor_hide_us.push(duration_micros(phases.cursor_hide));
+        self.cursor_sync_us.push(duration_micros(phases.cursor_sync));
         self.frame_remainder_us
             .push(duration_micros(elapsed.saturating_sub(phases.total())));
         self.frames_this_second = self.frames_this_second.saturating_add(1);
@@ -474,7 +493,8 @@ impl TuiProfiler {
             flush_us: self.flush_us.stats(),
             sixel_us: self.sixel_us.stats(),
             queue_us: self.queue_us.stats(),
-            cursor_us: self.cursor_us.stats(),
+            cursor_hide_us: self.cursor_hide_us.stats(),
+            cursor_sync_us: self.cursor_sync_us.stats(),
             frame_us: self.frame_us.stats(),
             frame_remainder_us: self.frame_remainder_us.stats(),
             wait_us: self.wait_us.stats(),
@@ -530,7 +550,8 @@ impl TuiProfiler {
             log_field("flush_us", snapshot.flush_us),
             log_field("sixel_us", snapshot.sixel_us),
             log_field("queue_us", snapshot.queue_us),
-            log_field("cursor_us", snapshot.cursor_us),
+            log_field("cursor_hide_us", snapshot.cursor_hide_us),
+            log_field("cursor_sync_us", snapshot.cursor_sync_us),
             log_field("frame_us", snapshot.frame_us),
             log_field("frame_remainder_us", snapshot.frame_remainder_us),
             log_field("wait_us", snapshot.wait_us),
@@ -611,14 +632,16 @@ mod tests {
             queue: Duration::from_micros(10),
             flush: Duration::from_micros(40),
             sixel: Duration::from_micros(8),
-            cursor: Duration::from_micros(12),
+            cursor_hide: Duration::from_micros(5),
+            cursor_sync: Duration::from_micros(7),
         };
         profiler.record_frame(Duration::from_micros(1_070), accounted);
         let snapshot = profiler.snapshot();
         assert_eq!(snapshot.frame_remainder_us.max, 0, "a fully accounted tick leaves nothing over");
         assert_eq!(snapshot.animate_us.max, 100);
         assert_eq!(snapshot.queue_us.max, 10);
-        assert_eq!(snapshot.cursor_us.max, 12);
+        assert_eq!(snapshot.cursor_hide_us.max, 5);
+        assert_eq!(snapshot.cursor_sync_us.max, 7);
 
         // The same phases inside a tick that took 5ms longer: every one of
         // those microseconds is unattributed, and the remainder says so.

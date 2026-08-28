@@ -25,6 +25,8 @@
 //!   fires), never once per frame.
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use serde::Serialize;
+
 /// Ring capacity shared by every windowed series below -- "the last 256
 /// samples," never more, never an average across the process lifetime.
 /// 256 loop iterations at the ~16ms dirty-frame cadence is a little over
@@ -43,7 +45,7 @@ const LOG_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 /// every caller must print alongside the three numbers, since `count` below
 /// `SAMPLE_WINDOW` means "the process hasn't produced a full window yet,"
 /// not "the window is smaller than advertised."
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct Distribution {
     pub p50: u32,
     pub p95: u32,
@@ -96,7 +98,11 @@ impl<const N: usize> RingStats<N> {
 /// snapshot so the two can never disagree about "right now": both format
 /// this same struct, never re-derive their own numbers from the live
 /// counters.
-#[derive(Clone, Debug)]
+// `Serialize`: `control_plane`'s `QueryState` verb reports this struct
+// verbatim over the wire (see that module's own `ControlStateV1::profile`)
+// -- one canonical shape rather than a hand-duplicated mirror struct kept
+// in sync by hand.
+#[derive(Clone, Debug, Serialize)]
 pub struct ProfileSnapshot {
     pub render_us: Distribution,
     pub flush_us: Distribution,
@@ -128,6 +134,13 @@ pub struct ProfileSnapshot {
     pub terminal_polls_empty: u64,
     pub terminal_frames_total: u64,
     pub terminal_bytes_total: u64,
+    /// Cumulative since process start: frames the harness coalesced away
+    /// (replaced before ever being sent) on a terminal-push subscription --
+    /// see `TuiProfiler::record_terminal_coalesced`'s own doc comment for
+    /// why this stays 0 for an idle-to-moderate session and only ever
+    /// climbs when one is producing output faster than this connection
+    /// drains it.
+    pub terminal_coalesced_total: u64,
 }
 
 /// Owns every frame-cadence and terminal-poll measurement for one running
@@ -159,6 +172,7 @@ pub struct TuiProfiler {
     terminal_polls_empty: u64,
     terminal_frames_total: u64,
     terminal_bytes_total: u64,
+    terminal_coalesced_total: u64,
 
     /// The current one-second bucket's own accumulators, rolled into the
     /// three `*_per_sec` rings above by [`Self::tick_second`] the moment a
@@ -195,6 +209,7 @@ impl Default for TuiProfiler {
             terminal_polls_empty: 0,
             terminal_frames_total: 0,
             terminal_bytes_total: 0,
+            terminal_coalesced_total: 0,
             second_start: now,
             frames_this_second: 0,
             terminal_frames_this_second: 0,
@@ -334,6 +349,40 @@ impl TuiProfiler {
             .saturating_add(byte_count.min(u32::MAX as usize) as u32);
     }
 
+    /// Folds a PUSHED frame's count/bytes into the SAME throughput series
+    /// `record_terminal_poll` feeds (`terminal_frames_total`/`terminal_
+    /// bytes_total`, and the two `*_this_second` accumulators those same
+    /// fields roll into every `tick_second`) -- total frame/byte throughput
+    /// is transport-agnostic, so both paths belong in one series. What it
+    /// deliberately does NOT touch is `terminal_rtt_us`/`terminal_polls_
+    /// total`/`terminal_polls_empty`: those three must stay poll-only,
+    /// because they are exactly the numbers this backlog item is judged
+    /// against falling toward zero (see this crate's own terminal-push-
+    /// channel plan, "how the result is measured") -- folding a pushed
+    /// frame into them would corrupt the very measurement the feature
+    /// exists to move.
+    pub fn record_terminal_pushed(&mut self, frame_count: usize, byte_count: usize) {
+        self.terminal_frames_total = self.terminal_frames_total.saturating_add(frame_count as u64);
+        self.terminal_bytes_total = self.terminal_bytes_total.saturating_add(byte_count as u64);
+        self.terminal_frames_this_second = self.terminal_frames_this_second
+            .saturating_add(frame_count.min(u32::MAX as usize) as u32);
+        self.terminal_bytes_this_second = self.terminal_bytes_this_second
+            .saturating_add(byte_count.min(u32::MAX as usize) as u32);
+    }
+
+    /// A running count of frames the harness coalesced away (replaced
+    /// before ever being sent -- see `TerminalSubscriberRegistry`'s own
+    /// doc comment, `gate4agent-harness-service::terminal`) before they
+    /// ever reached this client. 0 unless a session is producing output
+    /// faster than this connection can drain it, in which case it is
+    /// exactly the "how much did the push path drop" number the
+    /// coalescing design needs to stay honest about -- a number this
+    /// client had no way to see before this series existed, not a
+    /// regression check against one it already had.
+    pub fn record_terminal_coalesced(&mut self, count: u32) {
+        self.terminal_coalesced_total = self.terminal_coalesced_total.saturating_add(u64::from(count));
+    }
+
     pub fn snapshot(&self) -> ProfileSnapshot {
         // `1000 / DIRTY_FRAME_INTERVAL` -- the actual redraw-coalescing
         // constant `client::run` schedules against, not a duplicated
@@ -357,6 +406,7 @@ impl TuiProfiler {
             terminal_polls_empty: self.terminal_polls_empty,
             terminal_frames_total: self.terminal_frames_total,
             terminal_bytes_total: self.terminal_bytes_total,
+            terminal_coalesced_total: self.terminal_coalesced_total,
         }
     }
 
@@ -410,6 +460,7 @@ impl TuiProfiler {
             ),
             format!("terminal_frames_total={}", snapshot.terminal_frames_total),
             format!("terminal_bytes_total={}", snapshot.terminal_bytes_total),
+            format!("terminal_coalesced_total={}", snapshot.terminal_coalesced_total),
         ];
         let line = format!("{stamp} {}\n", fields.join(" "));
         if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
@@ -501,6 +552,39 @@ mod tests {
         assert_eq!(snapshot.terminal_polls_empty, 0);
         assert_eq!(snapshot.terminal_frames_total, 3);
         assert_eq!(snapshot.terminal_bytes_total, 900);
+    }
+
+    #[test]
+    fn terminal_pushed_frames_fold_into_throughput_but_never_poll_counters() {
+        // The whole point of `record_terminal_pushed`: it must move
+        // `terminal_frames_total`/`terminal_bytes_total` (throughput is
+        // transport-agnostic) while leaving `terminal_rtt_us`/`terminal_
+        // polls_total`/`terminal_polls_empty` at zero -- those three are
+        // exactly the numbers this backlog item needs to fall toward zero,
+        // and a pushed frame folding into them would be the bug this test
+        // exists to catch.
+        let mut profiler = TuiProfiler::default();
+        profiler.record_terminal_pushed(2, 128);
+        profiler.record_terminal_pushed(1, 32);
+        let snapshot = profiler.snapshot();
+        assert_eq!(snapshot.terminal_frames_total, 3);
+        assert_eq!(snapshot.terminal_bytes_total, 160);
+        assert_eq!(snapshot.terminal_rtt_us.count, 0);
+        assert_eq!(snapshot.terminal_polls_total, 0);
+        assert_eq!(snapshot.terminal_polls_empty, 0);
+    }
+
+    #[test]
+    fn terminal_coalesced_accumulates_independently_of_every_other_counter() {
+        let mut profiler = TuiProfiler::default();
+        profiler.record_terminal_pushed(1, 10);
+        profiler.record_terminal_coalesced(3);
+        profiler.record_terminal_coalesced(2);
+        let snapshot = profiler.snapshot();
+        assert_eq!(snapshot.terminal_coalesced_total, 5);
+        // Still transport-agnostic-throughput-only, unaffected by the
+        // coalesce count landing alongside it.
+        assert_eq!(snapshot.terminal_frames_total, 1);
     }
 
     #[test]

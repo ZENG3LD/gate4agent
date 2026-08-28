@@ -110,6 +110,10 @@ async fn main() {
         // board is the default view -- matching light's pre-cutover UX.
         kanban_default: false,
         color_mode_override: startup.color_mode_override,
+        // Light has no `--control-plane` flag of its own yet -- this stays
+        // `None` unconditionally, so `client::run` never binds a socket
+        // for this binary. See `control_plane`'s own module doc comment.
+        control_plane: None,
     };
     let run_result = gate4agent_tui::run(options).await;
     if let Err(error) = running.shutdown().await {

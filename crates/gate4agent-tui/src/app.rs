@@ -23018,7 +23018,12 @@ fn terminal_selected_text(
     selected.join("\n").trim_end_matches('\n').to_owned()
 }
 
-fn terminal_visible_rows(
+/// `pub(crate)`: `control_plane::read_pty` projects a session's CURRENT
+/// screen (`scroll_offset: 0`) through this SAME row-by-row vt100 parse
+/// `terminal_selected_text` (the real Ctrl+C/Ctrl+X copy path) already
+/// runs, rather than a second reimplementation of "what does this session's
+/// buffer actually say" that could drift from it.
+pub(crate) fn terminal_visible_rows(
     session: &SessionView,
     width: u16,
     height: u16,

@@ -1,5 +1,6 @@
 pub mod app;
 pub mod client;
+pub mod control_plane;
 pub mod diagnostics;
 pub mod icons;
 pub mod pty_palette;

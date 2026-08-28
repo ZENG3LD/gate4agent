@@ -20,11 +20,23 @@ gate4agent-harness-client = { path = "../gate4agent-harness-client" }
 gate4agent-harness-light = { path = "../gate4agent-harness-light" }
 gate4agent-harness-protocol = { path = "../gate4agent-harness-protocol" }
 gate4agent-node-protocol = { path = "../gate4agent-node-protocol" }
+# `local_hmac_sha256`/`proofs_match`: the same constant-time credential-
+# digest primitives `gate4agent-harness-service`'s own operator-credential
+# authority uses (`HarnessOperatorCredentialAuthority`) -- `control_plane`
+# follows that exact precedent instead of hand-rolling a second comparison
+# scheme. In-tree sibling crate, no new external dependency.
+gate4agent-node-wire = { path = "../gate4agent-node-wire" }
 gate4agent-observation-api = { path = "../gate4agent-observation-api" }
 gate4agent-observation-engine = { path = "../gate4agent-observation-engine" }
 gate4agent-observation-service = { path = "../gate4agent-observation-service" }
 gate4agent-types = { path = "../gate4agent-types" }
 icy_sixel = "0.6"
+# `control_plane`'s wire frame: line-delimited JSON, the same idiom
+# `gate4agent-harness-api`/`gate4agent-harness-client` already use for the
+# harness operator wire (see that crate's own `Cargo.toml` for the matching
+# version pins this mirrors).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 uzor-text = "1.5.1"
 uzor-tui = { version = "1.5.1", features = ["ascii"] }

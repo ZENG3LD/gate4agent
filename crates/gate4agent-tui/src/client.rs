@@ -1,10 +1,10 @@
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::hash::{Hash, Hasher};
 use std::io::{self, stdout};
-use std::net::SocketAddr;
+use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -45,7 +45,7 @@ use gate4agent_harness_client::{
     HarnessNativeSessionPreviewV1, HarnessNativeSessionRouteV1,
     HarnessNativeSessionSelectionV1,
     HarnessOperatorActionV1, HarnessOperatorClient,
-    HarnessOperatorCredential, HarnessOperatorEventV1,
+    HarnessOperatorCredential, HarnessOperatorEventV1, HarnessOperatorTerminalEventV1,
     HarnessOperatorIntentV1, HarnessOperatorMutationOutcomeV1, HarnessOperatorRequestRefV1,
     HarnessOperatorResponseV1, HarnessTaskLaunchOptionsV1,
     HarnessRunContextSourceObservationV1,
@@ -87,7 +87,7 @@ use uzor_tui::{Backend, CrosstermBackend, Rect, Screen, TerminalBuffer};
 use crate::app::{
     App, AppAction, ConnectionState, EventSeverity, EventSource, NodeView, Provider, ProviderInventory, PtyColorMode,
     ManagedSessionView, NativeSessionCatalogRoute, NativeSessionCatalogRowView, NativeSessionPreviewMessageView,
-    NativeSessionPreviewView, SessionAddress, SessionView, UiKey, GitCommitView,
+    NativeSessionPreviewView, SessionAddress, SessionView, SurfaceTab, UiKey, GitCommitView,
     HarnessReadFailure, HarnessRunOrigin, HarnessRunRef, HarnessWorkspaceFileTabKey,
     HarnessWorkspaceGitRequestDestination, SixelIconPlacement, SixelIconSize, WorkspaceFileTabKey, WorkspaceGitDiffTarget, WorkspaceGitDiffView,
     WorkspaceGitRequestDestination, WorkspaceView,
@@ -99,10 +99,17 @@ use crate::render;
 use crate::terminal_bg;
 
 #[cfg(test)]
-use crate::app::{SurfaceTab, WorkspaceGitTabKey};
+use crate::app::WorkspaceGitTabKey;
 
 const COMMAND_QUEUE: usize = 64;
 const UPDATE_QUEUE: usize = 256;
+/// `control_plane`'s own command channel -- small on purpose. Every
+/// command on it blocks its own TCP connection thread until this loop
+/// drains and answers it (see `control_plane::ControlCommand`'s own doc
+/// comment), so a caller driving the app one request at a time never needs
+/// more than a couple in flight; a deep queue here would just let a stuck
+/// caller pile up requests behind a main loop that is not the bottleneck.
+const CONTROL_COMMAND_QUEUE: usize = 8;
 const HARNESS_COMMAND_ROUTE: &str = "\0harness";
 const HARNESS_HISTORY_COMMAND_ROUTE: &str = "\0harness-history";
 const HARNESS_DETAIL_COMMAND_ROUTE: &str = "\0harness-detail";
@@ -173,6 +180,12 @@ pub struct RunOptions {
     /// empty by canon anyway, see `gate4agent-harness-light`'s crate doc).
     pub kanban_default: bool,
     pub color_mode_override: Option<PtyColorMode>,
+    /// Loopback control endpoint for programmatic input injection/state
+    /// inspection -- see `control_plane`'s own module doc comment. `None`
+    /// is the default for both binaries: `run()` below never binds a
+    /// socket, never spawns the accept thread, and behaves byte-identically
+    /// to before this field existed.
+    pub control_plane: Option<crate::control_plane::ControlPlaneEndpoint>,
 }
 
 enum WorkerUpdate {
@@ -561,6 +574,37 @@ enum WorkerUpdate {
         message: String,
     },
     HarnessTerminalRead(HarnessRuntimeTerminalPageV1),
+    /// Pushed by `harness_terminal_subscription_worker` for a
+    /// `HarnessOperatorTerminalEventV1::TerminalFrame` -- the terminal-push
+    /// counterpart to `HarnessTerminalRead` above, and now the PRIMARY way
+    /// a terminal frame reaches this app (see that worker's own doc
+    /// comment): `HarnessTerminalRead` survives only as the fallback for a
+    /// session whose subscription is down. Carries the same wire shapes the
+    /// poll path does (`HarnessRuntimeSessionAddressV1`/
+    /// `HarnessRuntimeTerminalFrameV1`) rather than a pre-projected
+    /// `TerminalFrame`, so `apply_update`'s new arm can reuse the exact
+    /// same `TerminalWatermarks` gate and `terminal_frame_from_harness`
+    /// projection the poll arm already has -- one reconciliation rule for
+    /// both transports, not two that could disagree.
+    HarnessTerminalPushed {
+        session: HarnessRuntimeSessionAddressV1,
+        frame: HarnessRuntimeTerminalFrameV1,
+        /// See `HarnessOperatorTerminalEventV1::TerminalFrame`'s own field
+        /// of the same name: diagnostic-only, folded into `TuiProfiler::
+        /// record_terminal_coalesced` when nonzero.
+        coalesced_since_last: u32,
+    },
+    /// `harness_terminal_subscription_worker` could not keep its
+    /// subscription alive -- the terminal-push sibling of this type's own
+    /// `HarnessEventSubscriptionFailed` (the task/run/node subscription's
+    /// equivalent), same rationale: silently discarding the error would
+    /// make a client-side misfire indistinguishable from a
+    /// genuine server-side cutoff (or, per this feature's own backwards-
+    /// compatibility note, an old harness that does not understand
+    /// `SubscribeTerminal` yet) in anything the owner can actually read.
+    /// The per-session fallback poll covers every open pane regardless, so
+    /// this is a visibility improvement, not a correctness dependency.
+    HarnessTerminalSubscriptionFailed { message: String },
     Notice(String),
 }
 
@@ -574,8 +618,17 @@ enum WorkspaceSnapshotUpdate {
 /// periodic `HarnessOpenTerminal` poll) shares this exact per-session
 /// high-watermark tracking, so it gets its own small, focused home instead of
 /// dying with the rest of that struct.
+///
+/// `pub(crate)`: `control_plane::apply`'s own `WaitForOutput` arm reads
+/// [`terminal_watermark`](Self::terminal_watermark) too -- this is THE
+/// per-session sequence number every real terminal frame this app ever
+/// displays (push or poll, `apply_update`'s `HarnessTerminalPolled`/
+/// `HarnessTerminalPushed` arms below) already advances, so a caller
+/// blocking on "did this session's output move" is watching the exact same
+/// number the app's own screen is driven by, not a second one invented for
+/// the control plane.
 #[derive(Default)]
-struct TerminalWatermarks {
+pub(crate) struct TerminalWatermarks {
     watermarks: BTreeMap<SessionAddress, u64>,
 }
 
@@ -586,11 +639,15 @@ impl TerminalWatermarks {
             .is_none_or(|current| sequence > *current)
     }
 
-    fn record_terminal_frame(&mut self, address: SessionAddress, sequence: u64) {
+    /// `pub(crate)`: `control_plane`'s own test module drives this the
+    /// same way `apply_update`'s two real arms below do, to prove `apply`'s
+    /// `WaitForOutput` arm reacts to a genuine watermark advance rather
+    /// than a control-plane-only stand-in for one.
+    pub(crate) fn record_terminal_frame(&mut self, address: SessionAddress, sequence: u64) {
         self.watermarks.insert(address, sequence);
     }
 
-    fn terminal_watermark(&self, address: &SessionAddress) -> Option<u64> {
+    pub(crate) fn terminal_watermark(&self, address: &SessionAddress) -> Option<u64> {
         self.watermarks.get(address).copied()
     }
 }
@@ -825,7 +882,7 @@ impl Drop for TerminalGuard {
 }
 
 pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
-    let RunOptions { operator, kanban_default, color_mode_override } = options;
+    let RunOptions { operator, kanban_default, color_mode_override, control_plane } = options;
     // MUST run before `TerminalGuard::enter()` below (raw mode + the
     // alternate screen + mouse capture + bracketed paste) ever touches
     // the console -- see `terminal_bg`'s own module doc comment for why
@@ -898,6 +955,7 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
     let history_client = client.clone();
     let detail_client = client.clone();
     let subscription_client = client.clone();
+    let terminal_subscription_client = client.clone();
     tokio::task::spawn_blocking(move || {
         harness_operator_worker(client, command_rx, harness_updates, operator_inventory)
     });
@@ -923,6 +981,38 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
             subscription_active,
         )
     });
+    // The whole open-session set this connection is asked to cover, and the
+    // subset it currently has live -- both shared with the run loop below,
+    // which owns writing `harness_terminal_desired` (see `harness_desired_
+    // terminal_sessions`'s own call site) and reads `harness_terminal_active`
+    // to decide which open pane still needs the fallback poll. `Condvar`,
+    // not a channel: the worker only ever needs the LATEST desired set, the
+    // same "replace, don't queue" idiom `TerminalSubscriberRegistry` uses
+    // for the frames themselves on the wire side of this same feature.
+    let harness_terminal_active: Arc<Mutex<HashSet<SessionAddress>>> =
+        Arc::new(Mutex::new(HashSet::new()));
+    let harness_terminal_desired: Arc<(Mutex<Vec<HarnessRuntimeSessionAddressV1>>, Condvar)> =
+        Arc::new((Mutex::new(Vec::new()), Condvar::new()));
+    // The live connection's own read-half clone, set by the worker the
+    // instant a subscription goes live -- the run loop below takes and
+    // shuts this down the moment the desired set changes, which is what
+    // interrupts the worker's blocking `next_event()` read without waiting
+    // for a real network error. See `HarnessTerminalSubscription::
+    // try_clone_canceler`'s own doc comment.
+    let harness_terminal_canceler: Arc<Mutex<Option<TcpStream>>> = Arc::new(Mutex::new(None));
+    let terminal_subscription_updates = updates_tx.clone();
+    let terminal_subscription_active_handle = harness_terminal_active.clone();
+    let terminal_subscription_desired_handle = harness_terminal_desired.clone();
+    let terminal_subscription_canceler_handle = harness_terminal_canceler.clone();
+    tokio::task::spawn_blocking(move || {
+        harness_terminal_subscription_worker(
+            terminal_subscription_client,
+            terminal_subscription_updates,
+            terminal_subscription_active_handle,
+            terminal_subscription_desired_handle,
+            terminal_subscription_canceler_handle,
+        )
+    });
     if kanban_default {
         let action = app.enable_harness_kanban();
         if command_tx.try_send(action).is_err() {
@@ -931,14 +1021,36 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
     }
     drop(updates_tx);
 
+    // `control_plane` is `None` on both binaries' own default path (no CLI
+    // flag / no env var read) -- this whole block is then skipped
+    // entirely, so nothing here changes the default build's behaviour. See
+    // `control_plane`'s own module doc comment for what the endpoint it
+    // spawns actually does; `control_rx` below is drained the same way
+    // `updates_rx` already is, one loop iteration at a time.
+    let mut control_rx = None;
+    if let Some(endpoint) = control_plane {
+        let (control_tx, receiver) = mpsc::channel(CONTROL_COMMAND_QUEUE);
+        let bound = crate::control_plane::spawn(endpoint, control_tx)?;
+        eprintln!("gate4agent-tui: control plane listening on {bound}");
+        control_rx = Some(receiver);
+    }
+
     let mut pending_raw: Option<PendingRaw> = None;
     let mut last_terminal_sizes = BTreeMap::new();
     let mut last_notice = None;
     let mut notice_deadline = None;
     let mut auto_inspected_route = None;
     let mut next_auto_inspection = Instant::now();
-    let mut harness_terminal_poll_address: Option<SessionAddress> = None;
-    let mut next_harness_terminal_poll = Instant::now();
+    // Per-session fallback poll due-times -- requirement 2 generalized from
+    // "the one connection" (the old single `Option<SessionAddress>`/
+    // `Instant` pair) to "the one session whose push happens to be down":
+    // see `reconcile_harness_terminal_poll_due`'s own doc comment.
+    let mut harness_terminal_poll_due: BTreeMap<SessionAddress, Instant> = BTreeMap::new();
+    // The addresses `harness_terminal_desired` was last told to cover --
+    // compared against the current open set every tick so a reconnect only
+    // fires on an actual change, never every loop pass. See
+    // `reconcile_harness_terminal_desired`'s own doc comment.
+    let mut last_desired_terminal_sessions: HashSet<SessionAddress> = HashSet::new();
     let mut next_harness_snapshot_refresh = Instant::now();
     let mut preferred_color_mode = initial_preferences.color_mode;
     let mut observed_app_color_mode = app.color_mode;
@@ -968,6 +1080,30 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
                 action,
             );
             state_changed = true;
+        }
+        // Same shape as the `updates_rx` drain just above: `control_plane::
+        // apply` is the ONE place a `ControlCommand` ever touches `app`
+        // (this loop, this thread -- see that fn's own doc comment), and
+        // whatever `AppAction` it produces (a real `app.reduce`/`map_mouse`
+        // result for an injection verb, `AppAction::None` for a read-only
+        // one) is queued exactly like every other action this loop handles.
+        // `&terminal_watermarks` rides along read-only: `apply`'s own
+        // `WaitForOutput` arm answers "has this session's frame sequence
+        // moved" from it, never mutating it -- only the two `apply_update`
+        // arms below (`HarnessTerminalPolled`/`HarnessTerminalPushed`) ever
+        // write to it, exactly as before this parameter existed.
+        if let Some(receiver) = control_rx.as_mut() {
+            while let Ok(command) = receiver.try_recv() {
+                let action = crate::control_plane::apply(&mut app, &terminal_watermarks, command);
+                queue_action(
+                    &mut app,
+                    &commands,
+                    &inspection_commands,
+                    &mut pending_raw,
+                    action,
+                );
+                state_changed = true;
+            }
         }
         let selected_route = app.selected_workspace_route();
         if selected_route != auto_inspected_route {
@@ -1017,26 +1153,83 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
             }
             next_harness_snapshot_refresh = now + HARNESS_SNAPSHOT_REFRESH_INTERVAL;
         }
-        let focused_harness_terminal = app.focused_address().cloned();
-        if focused_harness_terminal != harness_terminal_poll_address {
-            harness_terminal_poll_address = focused_harness_terminal.clone();
-            next_harness_terminal_poll = now;
-        }
-        if let Some(address) = focused_harness_terminal.filter(|_| now >= next_harness_terminal_poll) {
-            next_harness_terminal_poll = now + HARNESS_TERMINAL_POLL_INTERVAL;
-            if let Some(incarnation_id) = app.nodes.iter()
-                .find(|node| node.node_id == address.node_id)
-                .and_then(|node| node.incarnation_id)
+        // The whole open-session set, not just the focused pane's address
+        // (`App::focused_address`) -- the direct fix for backlog item 6:
+        // both the push subscription below and the fallback poll after it
+        // key off THIS, so an unfocused pane's session is covered by
+        // whichever of the two is actually live for it, exactly like the
+        // focused one.
+        let open_harness_terminal_sessions = harness_desired_terminal_sessions(&app);
+        if let Some((resolved, sessions)) = reconcile_harness_terminal_desired(
+            &app,
+            &open_harness_terminal_sessions,
+            &last_desired_terminal_sessions,
+        ) {
             {
-                // Starts `terminal_rtt_us`'s clock -- closed the moment
-                // the matching `WorkerUpdate::HarnessTerminalRead` gets
-                // applied (`apply_update`'s own arm below).
-                app.profiler.begin_terminal_poll(now);
-                let action = AppAction::HarnessOpenTerminal {
-                    session: harness_terminal_session_address(&address, incarnation_id),
-                    after_sequence: terminal_watermarks.terminal_watermark(&address),
-                };
-                queue_action(&mut app, &commands, &inspection_commands, &mut pending_raw, action);
+                let (lock, condvar) = &*harness_terminal_desired;
+                *lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = sessions;
+                condvar.notify_all();
+            }
+            // Interrupts the worker's blocking `next_event()` read on a now-
+            // stale connection instead of waiting for a real network error
+            // to notice the desired set moved on -- see `HarnessTerminal
+            // Subscription::try_clone_canceler`'s own doc comment. Any frame
+            // already in flight on that connection is simply lost: every
+            // terminal frame is a full, self-contained screen (see
+            // `HarnessOperatorTerminalEventV1::TerminalFrame`'s own doc
+            // comment), and the reconnect's own seed frame recovers whatever
+            // session is still wanted in full, so there is nothing to
+            // buffer or replay across the cut.
+            if let Some(stream) = harness_terminal_canceler
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+            {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+            last_desired_terminal_sessions = resolved;
+        }
+        reconcile_harness_terminal_poll_due(&mut harness_terminal_poll_due, &open_harness_terminal_sessions, now);
+        {
+            // A session the push worker currently has live is skipped here
+            // -- polling it too would just be a second, redundant read of
+            // the same ring the push already drains promptly. Everything
+            // else (never subscribed yet, mid-reconnect, or an old harness
+            // that will never accept `SubscribeTerminal`) still gets the
+            // 250ms poll, same cadence and same `begin_terminal_poll`/
+            // `AppAction::HarnessOpenTerminal` call shape as before this
+            // feature existed -- just looped over every open, not-yet-
+            // pushed address instead of the one focused one. See
+            // `harness_terminal_sessions_due_for_poll`'s own doc comment
+            // for why a session that just DROPPED out of `active` (a
+            // subscription that ended) needs no separate "resume polling"
+            // trigger: the next tick this same call already includes it.
+            let harness_terminal_active_snapshot = harness_terminal_active
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            let due_now = harness_terminal_sessions_due_for_poll(
+                &open_harness_terminal_sessions,
+                &harness_terminal_poll_due,
+                &harness_terminal_active_snapshot,
+                now,
+            );
+            for address in &due_now {
+                harness_terminal_poll_due.insert(address.clone(), now + HARNESS_TERMINAL_POLL_INTERVAL);
+                if let Some(incarnation_id) = app.nodes.iter()
+                    .find(|node| node.node_id == address.node_id)
+                    .and_then(|node| node.incarnation_id)
+                {
+                    // Starts `terminal_rtt_us`'s clock -- closed the moment
+                    // the matching `WorkerUpdate::HarnessTerminalRead` gets
+                    // applied (`apply_update`'s own arm below).
+                    app.profiler.begin_terminal_poll(now);
+                    let action = AppAction::HarnessOpenTerminal {
+                        session: harness_terminal_session_address(address, incarnation_id),
+                        after_sequence: terminal_watermarks.terminal_watermark(address),
+                    };
+                    queue_action(&mut app, &commands, &inspection_commands, &mut pending_raw, action);
+                }
             }
         }
         if app.notice() != last_notice.as_deref() {
@@ -1168,9 +1361,11 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
         // above (`next_auto_inspection`), not a separate poll cadence -- the
         // direct-C2 poll cadence this used to gate died with the C2 dialect.
         let inspection_deadline: Option<Instant> = None;
-        let harness_terminal_deadline = harness_terminal_poll_address
-            .is_some()
-            .then_some(next_harness_terminal_poll);
+        // The earliest still-armed fallback-poll due-time across every open
+        // session -- `None` once the map is empty (no PTY tab open at all),
+        // same "no PTY tab, no deadline" behavior the single-address poll
+        // had before this generalized to one per open session.
+        let harness_terminal_deadline = harness_terminal_poll_due.values().min().copied();
         // Only armed while the LEFT zone actually painted something this
         // frame (`app.layout.status_bar_left` is zero-width on a terminal
         // too small to show it, or before the very first render) -- see
@@ -2541,7 +2736,12 @@ fn diff_terminal_sizes(
     actions
 }
 
-fn map_key(key: KeyEvent) -> Option<UiKey> {
+/// `pub(crate)`: `control_plane`'s own test suite calls this directly to
+/// prove its `ControlKeyV1::into_ui_key` decode matches what a real
+/// terminal keypress decodes into -- see that module's own doc comment.
+/// Production code there never calls this (it only needs the already-
+/// decoded `UiKey`), only the proof test does.
+pub(crate) fn map_key(key: KeyEvent) -> Option<UiKey> {
     if key.modifiers.intersects(
         KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META,
     ) {
@@ -2622,7 +2822,14 @@ fn map_key(key: KeyEvent) -> Option<UiKey> {
     }
 }
 
-fn map_mouse(app: &mut App, mouse: MouseEvent) -> AppAction {
+/// `pub(crate)`, not private: `control_plane::apply`'s `InjectMouse` arm
+/// calls this SAME function a real crossterm `TerminalEvent::Mouse` reaches
+/// (see this file's own event loop, the `TerminalEvent::Mouse(mouse) =>
+/// map_mouse(&mut app, mouse)` arm) -- the whole point of routing injected
+/// mouse input through here rather than a control-plane-local copy is that
+/// there is only ever one mapping from a mouse event to an `AppAction` for
+/// either caller to drift out of sync with.
+pub(crate) fn map_mouse(app: &mut App, mouse: MouseEvent) -> AppAction {
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => app.click(mouse.column, mouse.row),
         MouseEventKind::Down(MouseButton::Right) => {
@@ -5357,6 +5564,53 @@ fn apply_update(app: &mut App, terminal: &mut TerminalWatermarks, update: Worker
                 }
             }
         }
+        WorkerUpdate::HarnessTerminalPushed { session, frame, coalesced_since_last } => {
+            // Folds this pushed frame's own count/bytes into the SAME
+            // throughput series the poll arm above feeds -- see
+            // `TuiProfiler::record_terminal_pushed`'s own doc comment for
+            // why it deliberately never touches `terminal_rtt_us`/
+            // `terminal_polls_total`/`terminal_polls_empty`, which must
+            // stay poll-only: those are exactly the numbers this backlog
+            // item needs to fall toward zero as more sessions land here
+            // instead of in the poll arm.
+            let byte_count = frame.formatted.len()
+                + frame.scrollback_formatted.iter().map(Vec::len).sum::<usize>();
+            app.profiler.record_terminal_pushed(1, byte_count);
+            if coalesced_since_last > 0 {
+                app.profiler.record_terminal_coalesced(coalesced_since_last);
+            }
+            // Same provider-to-pixel measurement the poll arm above closes,
+            // now on the transport this backlog item exists to make the
+            // normal path -- see this feature's own "how the result is
+            // measured" section for why this number collapsing toward the
+            // transport floor is the actual proof this change worked.
+            let received_at_unix_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |since| since.as_millis().min(u128::from(u64::MAX)) as u64);
+            app.profiler.record_frame_age(frame.produced_at_unix_ms, received_at_unix_ms);
+            if let Ok(incarnation_id) =
+                session.incarnation_id.parse::<gate4agent_node_protocol::NodeIncarnationId>()
+            {
+                let address = session_address_from_harness(&session);
+                let frame_sequence = frame.sequence;
+                let frame = terminal_frame_from_harness(frame);
+                // The exact same monotonic-sequence gate the poll arm above
+                // uses, and nothing new besides it -- requirement 4 in full:
+                // a pushed frame and a polled frame for the same session are
+                // reconciled because both ultimately read the same
+                // `TerminalBufferRegistry` ring and the same `sequence`
+                // numbering, so whichever arrives with the higher sequence
+                // wins here regardless of which transport it rode in on.
+                if terminal.terminal_frame_is_new(&address, frame_sequence)
+                    && app.apply_terminal_frame(&address, incarnation_id, frame)
+                {
+                    terminal.record_terminal_frame(address, frame_sequence);
+                }
+            }
+        }
+        WorkerUpdate::HarnessTerminalSubscriptionFailed { message } => {
+            app.report_failure(EventSource::Connectivity, message);
+        }
         // The single choke point every background-worker-thread notice
         // (21 construction sites across this file, all "X failed: {error}"
         // or a connectivity-adjacent confirmation) already funnels through
@@ -5966,6 +6220,264 @@ fn terminal_frame_from_harness(frame: HarnessRuntimeTerminalFrameV1) -> Terminal
     }
 }
 
+/// Drops `incarnation_id` from a wire `HarnessRuntimeSessionAddressV1` --
+/// the app-level `SessionAddress` never carries it (a node's own current
+/// incarnation is looked up fresh via `App::nodes` wherever one is needed,
+/// e.g. `harness_terminal_session_address` immediately above going the
+/// other direction). The same conversion `apply_update`'s own
+/// `HarnessTerminalRead`/`HarnessTerminalPushed` arms perform inline for a
+/// wire frame's `session`; factored out here because `harness_terminal_
+/// subscription_worker` needs it too, to know which app-level addresses it
+/// is currently covering by push.
+fn session_address_from_harness(session: &HarnessRuntimeSessionAddressV1) -> SessionAddress {
+    SessionAddress {
+        node_id: session.node_id.clone(),
+        workspace_id: session.workspace_id.clone(),
+        instance_id: session.instance_id,
+        generation: session.generation,
+    }
+}
+
+/// The whole open-session set from every pane's own tabs, not just the
+/// globally focused pane's (`App::focused_address`, the old poll's sole
+/// input at `client.rs:1016` pre-dating this feature) -- the direct fix
+/// for backlog item 6. Both `reconcile_harness_terminal_desired` (the push
+/// subscription) and `reconcile_harness_terminal_poll_due` (the fallback
+/// poll) key off this same set, so an unfocused pane's session is covered
+/// by whichever of the two is actually live for it, exactly like the
+/// focused one -- there is no separate "also cover the unfocused panes"
+/// mechanism to build, because neither of those two ever singled out the
+/// focused pane in the first place once this feeds them.
+fn harness_desired_terminal_sessions(app: &App) -> HashSet<SessionAddress> {
+    app.surface.all_tabs().into_iter()
+        .filter_map(SurfaceTab::pty_address)
+        .cloned()
+        .collect()
+}
+
+/// Resolves `open` against `app.nodes` -- an address whose node incarnation
+/// isn't known yet is skipped, same tolerance the fallback poll already
+/// has at its own call site, and is retried automatically the next time
+/// this runs: a still-unresolved address never joins `last`, so it keeps
+/// tripping the inequality below on every subsequent tick until it
+/// resolves -- and, only when the resolved set actually differs from what
+/// the subscription worker was last told to cover, returns that set (for
+/// the caller to remember as the new `last`) plus its wire-ready `Vec` to
+/// hand to `harness_terminal_desired`. `None` is the signal to leave the
+/// live subscription alone this tick -- most ticks, since a human opening
+/// or closing a pane is what actually changes this, not the render loop's
+/// own ~60Hz cadence.
+fn reconcile_harness_terminal_desired(
+    app: &App,
+    open: &HashSet<SessionAddress>,
+    last: &HashSet<SessionAddress>,
+) -> Option<(HashSet<SessionAddress>, Vec<HarnessRuntimeSessionAddressV1>)> {
+    let resolved: Vec<(SessionAddress, HarnessRuntimeSessionAddressV1)> = open.iter()
+        .filter_map(|address| {
+            app.nodes.iter()
+                .find(|node| node.node_id == address.node_id)
+                .and_then(|node| node.incarnation_id)
+                .map(|incarnation_id| {
+                    (address.clone(), harness_terminal_session_address(address, incarnation_id))
+                })
+        })
+        .collect();
+    let resolved_addresses: HashSet<SessionAddress> =
+        resolved.iter().map(|(address, _)| address.clone()).collect();
+    if &resolved_addresses == last {
+        return None;
+    }
+    Some((resolved_addresses, resolved.into_iter().map(|(_, wire)| wire).collect()))
+}
+
+/// Reconciles the per-session fallback-poll due map against `open`: a
+/// newly-opened session is armed to poll immediately (`now`, so it does
+/// not sit idle for a full `HARNESS_TERMINAL_POLL_INTERVAL` before its
+/// first read), and a closed one is dropped so this map does not grow
+/// without bound over a long session. This is requirement 2 ("the poll
+/// survives as a fallback") generalized from "the one connection" to "the
+/// one session whose push happens to be down" -- see this function's own
+/// call site in `run` for why a session the push worker already has live
+/// is still tracked HERE (armed, but skipped when due) rather than removed
+/// from this map entirely: a subscription that drops must fall straight
+/// back to a due poll on its very next due-check, not wait for this
+/// reconciliation to notice the session is "new" again.
+fn reconcile_harness_terminal_poll_due(
+    due: &mut BTreeMap<SessionAddress, Instant>,
+    open: &HashSet<SessionAddress>,
+    now: Instant,
+) {
+    due.retain(|address, _| open.contains(address));
+    for address in open {
+        due.entry(address.clone()).or_insert(now);
+    }
+}
+
+/// Which open sessions are due for the fallback poll right now: every
+/// address in `open` that the push worker does NOT currently list in
+/// `active`, and whose own `due` time has arrived. This is requirement 2
+/// ("the poll survives as a fallback, not the primary path") made
+/// checkable in isolation: a session that just dropped out of `active` (its
+/// subscription ended, for any reason -- a real disconnect or the run loop
+/// forcing a reconnect) needs no separate "resume polling" signal, because
+/// the very next call to this function already includes it the moment its
+/// `due` time (armed by `reconcile_harness_terminal_poll_due` the instant
+/// the session first opened, and re-armed every time this function's own
+/// caller actually issues a poll for it) has passed.
+fn harness_terminal_sessions_due_for_poll(
+    open: &HashSet<SessionAddress>,
+    due: &BTreeMap<SessionAddress, Instant>,
+    active: &HashSet<SessionAddress>,
+    now: Instant,
+) -> Vec<SessionAddress> {
+    open.iter()
+        .filter(|address| !active.contains(*address))
+        .filter(|address| due.get(*address).copied().unwrap_or(now) <= now)
+        .cloned()
+        .collect()
+}
+
+/// Terminal-push counterpart to `harness_event_subscription_worker` above:
+/// opens `SubscribeTerminal` instead of `SubscribeEvents`, on its own
+/// connection, carrying whatever `desired` currently holds -- the run
+/// loop's own whole open-session set (`harness_desired_terminal_sessions`),
+/// re-sent as a fresh subscription every time that set changes (this wire
+/// has no representable "patch an existing subscription" message; see
+/// `SubscribeTerminal`'s own doc comment, `gate4agent-harness-api`).
+/// Reuses `harness_event_subscription_worker`'s exact reconnect-with-
+/// backoff loop for BOTH reasons a subscription needs to restart: a real
+/// network failure, and "the desired session set changed" -- the run loop
+/// signals the latter by shutting down `canceler`, which makes the
+/// blocked `next_event()` read below fail exactly like a real disconnect
+/// would, so there is no second code path to maintain for the two.
+///
+/// `active` is the set this worker is CURRENTLY covering by push, updated
+/// the moment a subscription goes live and cleared the moment it ends --
+/// read by the run loop's own fallback-poll gate
+/// (`reconcile_harness_terminal_poll_due`'s call site) so a session mid-
+/// reconnect falls back to being polled instead of going silent, exactly
+/// the way `harness_subscription_active` already gates the task/run/node
+/// snapshot poll one level up.
+///
+/// `desired` is a condvar-guarded cell, not a channel: this worker only
+/// ever cares about the LATEST wanted set, never a queue of past ones --
+/// the same "replace, don't queue" idiom `TerminalSubscriberRegistry`
+/// applies to the frames themselves on the wire side of this same feature
+/// (see that type's own doc comment, `gate4agent-harness-service::
+/// terminal`) applies here too, one hop further out, to the desired-set
+/// itself.
+fn harness_terminal_subscription_worker(
+    client: HarnessOperatorClient,
+    updates: mpsc::Sender<WorkerUpdate>,
+    active: Arc<Mutex<HashSet<SessionAddress>>>,
+    desired: Arc<(Mutex<Vec<HarnessRuntimeSessionAddressV1>>, Condvar)>,
+    canceler: Arc<Mutex<Option<TcpStream>>>,
+) {
+    let mut backoff = HARNESS_SUBSCRIPTION_BACKOFF_INITIAL;
+    loop {
+        let sessions = {
+            let (lock, condvar) = &*desired;
+            let mut guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if guard.is_empty() {
+                let (woken, _timed_out) = condvar
+                    .wait_timeout(guard, HARNESS_SUBSCRIPTION_BACKOFF_MAX)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                guard = woken;
+            }
+            guard.clone()
+        };
+        if sessions.is_empty() {
+            // Woke on the timeout rather than a real update (or every open
+            // pane closed again in the moment between the wake and this
+            // read) -- nothing to subscribe to yet. Loop back and wait
+            // again rather than sending a request `SubscribeTerminal::
+            // validate()` would reject outright for an empty list.
+            continue;
+        }
+        let session_addresses: HashSet<SessionAddress> =
+            sessions.iter().map(session_address_from_harness).collect();
+        let mut subscription = match client.subscribe_terminal(sessions) {
+            Ok(subscription) => subscription,
+            Err(error) => {
+                report_harness_terminal_subscription_error(&updates, &error);
+                thread::sleep(backoff);
+                backoff = (backoff * 2).min(HARNESS_SUBSCRIPTION_BACKOFF_MAX);
+                continue;
+            }
+        };
+        if let Ok(clone) = subscription.try_clone_canceler() {
+            *canceler.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(clone);
+        }
+        {
+            let mut active_guard = active.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            active_guard.extend(session_addresses.iter().cloned());
+        }
+        backoff = HARNESS_SUBSCRIPTION_BACKOFF_INITIAL;
+        loop {
+            let event = match subscription.next_event() {
+                Ok(event) => event,
+                Err(error) => {
+                    report_harness_terminal_subscription_error(&updates, &error);
+                    break;
+                }
+            };
+            let update = match event {
+                HarnessOperatorTerminalEventV1::TerminalFrame {
+                    session, frame, coalesced_since_last, ..
+                } => WorkerUpdate::HarnessTerminalPushed { session, frame, coalesced_since_last },
+                // Server-side keep-alive, same rationale as
+                // `HarnessOperatorEventV1::Ping` (`project_harness_operator_
+                // event`'s own arm above): carries no state to apply.
+                HarnessOperatorTerminalEventV1::Ping { .. } => continue,
+            };
+            if updates.blocking_send(update).is_err() {
+                clear_harness_terminal_active(&active, &session_addresses);
+                *canceler.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                return;
+            }
+        }
+        clear_harness_terminal_active(&active, &session_addresses);
+        *canceler.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        thread::sleep(backoff);
+        backoff = (backoff * 2).min(HARNESS_SUBSCRIPTION_BACKOFF_MAX);
+    }
+}
+
+/// Removes exactly the sessions this connection was covering from `active`
+/// -- called both when the connection ends (a real failure, or the run
+/// loop forcing a reconnect via `canceler`) and when the update channel
+/// itself is gone (`updates.blocking_send` failing, meaning the app is
+/// shutting down). A subscriber-scoped subtraction, not a blanket clear:
+/// a session another still-live connection also happens to cover (possible
+/// for one brief overlap while a reconnect is mid-flight) must not be
+/// marked inactive out from under it.
+fn clear_harness_terminal_active(
+    active: &Arc<Mutex<HashSet<SessionAddress>>>,
+    sessions: &HashSet<SessionAddress>,
+) {
+    let mut guard = active.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    for address in sessions {
+        guard.remove(address);
+    }
+}
+
+/// The one place `harness_terminal_subscription_worker` turns a
+/// `HarnessOperatorClientError` it would otherwise discard into something
+/// visible -- the terminal-push sibling of `report_harness_event_
+/// subscription_error` immediately above this file's other worker error
+/// reporter, same rationale: an old harness that does not understand
+/// `SubscribeTerminal` yet (see this feature's own backwards-compatibility
+/// note) fails every attempt the same way a real network outage would, and
+/// the two must not be indistinguishable in anything the owner can read.
+fn report_harness_terminal_subscription_error(
+    updates: &mpsc::Sender<WorkerUpdate>,
+    error: &HarnessOperatorClientError,
+) {
+    let _ = updates.blocking_send(WorkerUpdate::HarnessTerminalSubscriptionFailed {
+        message: error.to_string(),
+    });
+}
+
 fn project_harness_inventory_session(
     node_id: &str,
     workspace_id: &str,
@@ -6311,7 +6823,7 @@ mod tests {
         HarnessTaskComposerField, HarnessTaskRef, LaunchTarget, OverlayId, PtyColorMode, SidebarPresentation, SpawnDialog,
         SurfacePaneLayout,
     };
-    use crate::surface::PaneId;
+    use crate::surface::{LayoutPreset, PaneId};
 
     fn host_path(value: impl Into<String>) -> OpaqueHostPath {
         OpaqueHostPath::utf8(value.into()).unwrap()
@@ -9007,6 +9519,7 @@ mod tests {
             },
             kanban_default: false,
             color_mode_override: Some(PtyColorMode::Inherited),
+            control_plane: None,
         };
         assert_eq!(options.color_mode_override, Some(PtyColorMode::Inherited));
     }
@@ -9022,6 +9535,7 @@ mod tests {
             },
             kanban_default: false,
             color_mode_override: None,
+            control_plane: None,
         };
         let preferences = preferences_for_save(&App::default(), PtyColorMode::Inherited);
         let path = std::env::temp_dir().join(format!(
@@ -9346,5 +9860,306 @@ mod tests {
         apply_update(&mut app, &mut terminal, page(vec![harness_frame(2, b"second")]));
         assert_eq!(app.find_session(&address).unwrap().terminal_formatted, b"second");
         assert_eq!(terminal.terminal_watermark(&address), Some(2));
+    }
+
+    /// Two PTY sessions on the same node, neither opened as a surface tab
+    /// yet -- the shared setup every terminal-push-channel test below
+    /// builds on, so each test only has to state the surface arrangement
+    /// (which tabs, which panes, which focus) it actually cares about.
+    fn two_session_node_fixture() -> (App, SessionAddress, SessionAddress) {
+        let incarnation_id = incarnation(0x22);
+        let address_a = SessionAddress {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            instance_id: 1,
+            generation: 1,
+        };
+        let address_b = SessionAddress {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            instance_id: 2,
+            generation: 1,
+        };
+        let session = |address: SessionAddress| SessionView {
+            address,
+            provider: provider("codex"),
+            status: "running".to_owned(),
+            running: true,
+            stoppable: true,
+            removable: false,
+            restartable: false,
+            attention: false,
+            has_provider_session_identity: true,
+            progress: None,
+            terminal_formatted: Vec::new(),
+            terminal_scrollback: Vec::new(),
+            terminal_alternate_screen: false,
+            terminal_mouse_protocol_enabled: false,
+            terminal_mouse_protocol_encoding: TerminalMouseProtocolEncoding::Default,
+            terminal_cursor: None,
+        };
+        let mut app = App::default();
+        app.nodes.push(NodeView {
+            node_id: "node-a".to_owned(),
+            incarnation_id: Some(incarnation_id),
+            endpoint: "harness://runtime-inventory/node-a@1".to_owned(),
+            relay_route: C2RelayRoute::Unknown,
+            connection: ConnectionState::Connected,
+            controller_owned: false,
+            event_sequence: 1,
+            session_records: Vec::new(),
+            launch_inventory: None,
+            providers: Vec::new(),
+            workspaces: vec![WorkspaceView {
+                workspace_id: "workspace-a".to_owned(),
+                label: "workspace-a".to_owned(),
+                canonical_root: host_path(r"C:\work\workspace-a"),
+                providers: Vec::new(),
+                sessions: vec![session(address_a.clone()), session(address_b.clone())],
+                worktree_service_mode: None,
+                managed_worktree_profiles: None,
+            }],
+        });
+        (app, address_a, address_b)
+    }
+
+    /// Opens both fixture addresses as PTY tabs, one per pane -- exactly
+    /// the "2x1 layout, unfocus one" scenario this feature's own
+    /// backwards-compatibility/measurement sections name as backlog item
+    /// 6's own acceptance case. Returns which of the two ended up NOT
+    /// focused, since `SurfaceState::apply_layout_preset` (not this
+    /// helper) is what actually decides that.
+    fn split_two_sessions_into_two_panes(
+        app: &mut App,
+        address_a: &SessionAddress,
+        address_b: &SessionAddress,
+    ) -> SessionAddress {
+        app.surface.open_in_focused(SurfaceTab::Pty(address_a.clone()));
+        app.surface.open_in_focused(SurfaceTab::Pty(address_b.clone()));
+        app.surface.apply_layout_preset(LayoutPreset::TwoByOne).unwrap();
+        assert_eq!(app.surface.leaf_ids().len(), 2, "fixture must actually produce two panes");
+        if app.focused_address() == Some(address_a) {
+            address_b.clone()
+        } else {
+            assert_eq!(app.focused_address(), Some(address_b));
+            address_a.clone()
+        }
+    }
+
+    #[test]
+    fn harness_desired_terminal_sessions_covers_every_open_pane_not_just_the_focused_one() {
+        // The direct, code-level proof of backlog item 6's own fix: before
+        // this feature, `client.rs`'s only input to "which session gets
+        // polled" was `App::focused_address` -- an unfocused pane's address
+        // never reached it at all. `harness_desired_terminal_sessions` is
+        // what both the push subscription and the fallback poll now key
+        // off instead, so this asserts it returns BOTH addresses, using a
+        // real `App`/`SurfaceState` (`SurfaceState::apply_layout_preset`),
+        // not a hand-built fixture that assumes the answer.
+        let (mut app, address_a, address_b) = two_session_node_fixture();
+        let unfocused = split_two_sessions_into_two_panes(&mut app, &address_a, &address_b);
+        let focused = app.focused_address().cloned().expect("one pane must be focused");
+        assert_ne!(unfocused, focused, "the two addresses must land in different panes");
+
+        let open = harness_desired_terminal_sessions(&app);
+        assert_eq!(open, HashSet::from([address_a, address_b]));
+        assert!(open.contains(&unfocused), "the UNFOCUSED pane's own session must still be covered");
+    }
+
+    #[test]
+    fn reconcile_harness_terminal_desired_only_fires_on_an_actual_change_and_retries_unresolved() {
+        let (mut app, address_a, address_b) = two_session_node_fixture();
+        let open: HashSet<SessionAddress> = HashSet::from([address_a.clone(), address_b.clone()]);
+
+        // First call from an empty `last`: both sessions resolve (their
+        // node's incarnation is already known), so this must return
+        // something to send.
+        let (resolved, sessions) = reconcile_harness_terminal_desired(&app, &open, &HashSet::new())
+            .expect("first call from an empty `last` must always have something to send");
+        assert_eq!(resolved, open);
+        assert_eq!(sessions.len(), 2);
+
+        // Same `open`, `last` now equal to what was just resolved -- must
+        // NOT fire again. This is the reconnect-only-on-change guarantee:
+        // the render loop calls this every ~16ms, and a reconnect on every
+        // unchanged tick would defeat the whole point of a long-lived
+        // subscription.
+        assert!(
+            reconcile_harness_terminal_desired(&app, &open, &resolved).is_none(),
+            "an unchanged desired set must not trigger a reconnect",
+        );
+
+        // A third address on a node this build has never heard of is
+        // skipped from the resolved set (same tolerance the fallback poll
+        // already has for an address it cannot yet resolve), not an error.
+        let unknown_node_address = SessionAddress {
+            node_id: "node-b".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            instance_id: 9,
+            generation: 1,
+        };
+        let open_with_unresolved: HashSet<SessionAddress> =
+            HashSet::from([address_a.clone(), unknown_node_address.clone()]);
+        let (resolved_partial, sessions_partial) =
+            reconcile_harness_terminal_desired(&app, &open_with_unresolved, &HashSet::new())
+                .expect("a changed set must fire even when part of it cannot resolve yet");
+        assert_eq!(resolved_partial, HashSet::from([address_a.clone()]));
+        assert_eq!(sessions_partial.len(), 1);
+
+        // The node for the previously-unresolvable address becomes known --
+        // `open` itself never changed, only `app.nodes` did, and the next
+        // call still picks it up: the retry this backlog item's own
+        // fallback-poll tolerance already guaranteed is preserved here too.
+        app.nodes.push(NodeView {
+            node_id: "node-b".to_owned(),
+            incarnation_id: Some(incarnation(0x33)),
+            endpoint: "harness://runtime-inventory/node-b@1".to_owned(),
+            relay_route: C2RelayRoute::Unknown,
+            connection: ConnectionState::Connected,
+            controller_owned: false,
+            event_sequence: 1,
+            session_records: Vec::new(),
+            launch_inventory: None,
+            providers: Vec::new(),
+            workspaces: Vec::new(),
+        });
+        let (resolved_full, sessions_full) = reconcile_harness_terminal_desired(
+            &app,
+            &open_with_unresolved,
+            &resolved_partial,
+        ).expect("resolving the previously-unknown node must trigger a reconnect on its own");
+        assert_eq!(resolved_full, open_with_unresolved);
+        assert_eq!(sessions_full.len(), 2);
+    }
+
+    #[test]
+    fn harness_terminal_pushed_updates_an_unfocused_pane_without_touching_poll_counters() {
+        // Proves three things the task names explicitly: (1) a pushed
+        // frame reaches the pane without a poll -- `terminal_polls_total`
+        // stays 0 while `terminal_frames_total` (the transport-agnostic
+        // series) moves; (2) it reaches an UNFOCUSED pane, the concrete
+        // fix for backlog item 6, all the way through to a real rendered
+        // `TerminalBuffer` cell, not just `App` state; (3) the FOCUSED
+        // pane's own session is untouched by a push aimed at the other one.
+        let (mut app, address_a, address_b) = two_session_node_fixture();
+        let unfocused = split_two_sessions_into_two_panes(&mut app, &address_a, &address_b);
+        let focused = app.focused_address().cloned().expect("one pane must be focused");
+        let incarnation_id = incarnation(0x22);
+        let mut terminal = TerminalWatermarks::default();
+
+        let pushed = WorkerUpdate::HarnessTerminalPushed {
+            session: harness_terminal_session_address(&unfocused, incarnation_id),
+            frame: HarnessRuntimeTerminalFrameV1 {
+                sequence: 1,
+                size: HarnessRuntimeTerminalSizeV1 { rows: 24, columns: 80 },
+                cursor_row: 0,
+                cursor_column: 1,
+                formatted: b"Z".to_vec(),
+                scrollback_formatted: Vec::new(),
+                produced_at_unix_ms: 0,
+                alternate_screen: false,
+                mouse_protocol_enabled: false,
+                mouse_protocol_encoding: HarnessRuntimeMouseProtocolEncodingV1::Default,
+            },
+            coalesced_since_last: 0,
+        };
+        apply_update(&mut app, &mut terminal, pushed);
+
+        assert_eq!(app.find_session(&unfocused).unwrap().terminal_formatted, b"Z");
+        assert_eq!(terminal.terminal_watermark(&unfocused), Some(1));
+        // The FOCUSED pane's own session must be untouched: this push named
+        // the unfocused address only.
+        assert!(app.find_session(&focused).unwrap().terminal_formatted.is_empty());
+
+        let snapshot = app.profiler.snapshot();
+        assert_eq!(snapshot.terminal_polls_total, 0, "a pushed frame must never count as a poll");
+        assert_eq!(snapshot.terminal_polls_empty, 0);
+        assert_eq!(snapshot.terminal_frames_total, 1, "but it must still count toward total throughput");
+        assert_eq!(snapshot.terminal_bytes_total, 1);
+
+        // The real rendered artifact, not a proxy: the unfocused pane's own
+        // viewport must show the pushed byte, reached the normal way
+        // (`render::render` -> `render_terminal`), with no poll involved.
+        let mut buf = uzor_tui::TerminalBuffer::new(app.terminal_cols, app.terminal_rows);
+        let layout = render::render(&app, &mut buf);
+        let (pane_id, _) = app.surface.tab_location(&SurfaceTab::Pty(unfocused))
+            .expect("the pushed-to address must still be an open tab");
+        let pane = layout.surface_panes.iter()
+            .find(|pane| pane.pane_id == pane_id)
+            .expect("the unfocused pane must still have painted its own viewport");
+        assert_eq!(buf.get(pane.viewport.x, pane.viewport.y).symbol, "Z");
+    }
+
+    #[test]
+    fn harness_terminal_sessions_due_for_poll_resumes_covering_a_dropped_subscription() {
+        // Requirement 2, made checkable without a socket: the poll must be
+        // the FALLBACK for a session the push worker is not (or is no
+        // longer) covering, never the primary path for one it is.
+        let address = SessionAddress {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            instance_id: 1,
+            generation: 1,
+        };
+        let open = HashSet::from([address.clone()]);
+        let now = Instant::now();
+        let due = BTreeMap::from([(address.clone(), now)]);
+
+        // While the push worker has this session `active`, the poll must
+        // stay silent for it -- polling on top of a live push would just
+        // be a second, redundant read of the same ring.
+        let active = HashSet::from([address.clone()]);
+        assert!(harness_terminal_sessions_due_for_poll(&open, &due, &active, now).is_empty());
+
+        // The subscription drops (a real network failure, or the run loop
+        // forcing a reconnect) -- `harness_terminal_subscription_worker`
+        // removes the session from `active` the moment that happens (see
+        // `clear_harness_terminal_active`). With no OTHER change (no new
+        // `AppAction::HarnessOpenTerminal` was ever queued, so `due` is
+        // unchanged), this session must become due again immediately, with
+        // no separate "resume polling" trigger needed.
+        let active_after_drop = HashSet::new();
+        let due_now = harness_terminal_sessions_due_for_poll(&open, &due, &active_after_drop, now);
+        assert_eq!(due_now, vec![address.clone()]);
+
+        // Not due YET (its own next poll is still in the future) -- still
+        // excluded even though nothing covers it by push.
+        let due_later = BTreeMap::from([(address.clone(), now + Duration::from_millis(200))]);
+        assert!(harness_terminal_sessions_due_for_poll(&open, &due_later, &active_after_drop, now).is_empty());
+    }
+
+    #[test]
+    fn reconcile_harness_terminal_poll_due_arms_new_sessions_and_drops_closed_ones() {
+        let address_a = SessionAddress {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            instance_id: 1,
+            generation: 1,
+        };
+        let address_b = SessionAddress {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            instance_id: 2,
+            generation: 1,
+        };
+        let mut due: BTreeMap<SessionAddress, Instant> = BTreeMap::new();
+        let now = Instant::now();
+
+        reconcile_harness_terminal_poll_due(&mut due, &HashSet::from([address_a.clone()]), now);
+        assert_eq!(due.get(&address_a), Some(&now));
+
+        // A session already tracked keeps its own due time on a later tick
+        // that still finds it open -- re-arming it here would mean it can
+        // never actually come due.
+        let later = now + Duration::from_millis(50);
+        reconcile_harness_terminal_poll_due(&mut due, &HashSet::from([address_a.clone()]), later);
+        assert_eq!(due.get(&address_a), Some(&now));
+
+        // `address_a` closes and `address_b` opens in the same tick: the
+        // closed one is dropped (it must not accumulate forever), the
+        // newly-open one is armed to poll immediately.
+        reconcile_harness_terminal_poll_due(&mut due, &HashSet::from([address_b.clone()]), later);
+        assert!(!due.contains_key(&address_a));
+        assert_eq!(due.get(&address_b), Some(&later));
     }
 }

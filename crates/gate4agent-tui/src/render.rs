@@ -10746,7 +10746,13 @@ fn render_profile_overlay(
 ) {
     let snapshot = app.profiler.snapshot();
     let width = 70.min(area.width);
-    let height = 16.min(area.height);
+    // 17, not 16: one more row than before this feature's own `term_
+    // coalesced` line (below) joined `lines` -- see `render_modal_line`'s
+    // own bounds check for why silently reusing the old height would just
+    // as silently have dropped this line (and, before it, the "Ctrl+P or
+    // Esc closes" hint) off the bottom of the modal on any terminal tall
+    // enough to show the full overlay uncropped.
+    let height = 17.min(area.height);
     if width < 3 || height < 3 {
         return;
     }
@@ -10793,6 +10799,15 @@ fn render_profile_overlay(
         format!(
             "term_total  frames={} bytes={}",
             snapshot.terminal_frames_total, snapshot.terminal_bytes_total,
+        ),
+        // 0 in steady state on a session the push path can keep up with --
+        // see `TuiProfiler::record_terminal_coalesced`'s own doc comment
+        // for why a nonzero reading here means the harness is dropping
+        // intermediate frames for a session producing output faster than
+        // this connection drains it, not a bug.
+        format!(
+            "term_coalesced total={}",
+            snapshot.terminal_coalesced_total,
         ),
         String::new(),
         "Ctrl+P or Esc closes".to_owned(),

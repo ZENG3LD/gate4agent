@@ -9,18 +9,21 @@
 //! on-screen tile grid -- see `render::render_pet_arcade`'s own doc
 //! comment for how a screen cell resolves to a board tile).
 //!
-//! # Free build placement, not fixed pads
+//! # Free build placement, not fixed pads, not a route-proximity radius
 //!
 //! `gate4agent-arcade-pet-bastion`'s own board (`board.rs`) used to expose
-//! ten fixed build pads (`PadId`/`PADS`). It now exposes every board cell
-//! within its own build radius of a route (`Board::near_route_cells`,
-//! surfaced per-run as `SimulationSnapshot::build_cells`), and `Command::
-//! Place` addresses a `Tile` directly. This module tracks a `selected_tile:
-//! Tile` cursor rather than a pad index, and every "which cells can I build
-//! on right now" query (`Tab`/`BackTab` cycling, a tower drag's own board
-//! highlight -- [`buildable_tiles`]) reads `SimulationSnapshot::build_cells`
-//! -- never a hand-maintained pad table -- so this module never needs a
-//! second update the next time that list's own eligibility rules change.
+//! ten fixed build pads (`PadId`/`PADS`), then a build radius around each
+//! route. Both are gone -- it now exposes every board cell that is not
+//! itself a route/choke tile, a pet anchor, or already occupied
+//! (`Board::build_zone_cells`, surfaced per-run as `SimulationSnapshot::
+//! build_cells`; owner's own ask, "я хочу ставить куда хочу"), and
+//! `Command::Place` addresses a `Tile` directly. This module tracks a
+//! `selected_tile: Tile` cursor rather than a pad index, and every "which
+//! cell can I build on right now" query (`Tab`/`BackTab` cycling, a tower
+//! drag's own board highlight -- [`build_drag_state_at`]) reads
+//! `SimulationSnapshot::build_cells` -- never a hand-maintained pad table
+//! -- so this module never needs a second update the next time that
+//! list's own eligibility rules change.
 //!
 //! Drawing lives in `render.rs` (`render_pet_arcade`), matching this
 //! crate's own "every `render_*` fn lives in `render.rs`" convention --
@@ -175,10 +178,10 @@ pub(crate) enum Inspect {
     Wave,
 }
 
-/// Whether a build-radius cell (`SimulationSnapshot::build_cells`) a tower
-/// drag is currently hovering would accept a drop RIGHT NOW -- what
-/// [`buildable_tiles`] reports for every cell it returns, and what `render::
-/// render_pet_arcade`'s own drag highlight paints each of them as.
+/// Whether the ONE board cell (`SimulationSnapshot::build_cells`) a tower
+/// drag's own cursor is currently hovering would accept a drop RIGHT NOW --
+/// what [`build_drag_state_at`] reports for that single tile, and what
+/// `render::render_pet_arcade`'s own drag highlight paints it as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BuildDragState {
     /// Empty and affordable -- dropping here places the tower.
@@ -881,44 +884,46 @@ impl PetArcade {
 
 /// Whether a `BuildCellView::reason` still marks its tile as a genuine
 /// build TARGET -- empty and eligible (`None`) or already holding another
-/// tower (`Some(Occupied)`), as opposed to a cell that merely sits inside
-/// the build radius for an unrelated reason (on a route, on a pet anchor,
-/// or -- `static_build_reason`'s own `OutOfZone` arm -- not really in the
-/// zone at all). Shared by [`PetArcade::click_tile`] (which of the many
-/// `build_cells` entries a click may select) and [`buildable_tiles`]
-/// (which of them a tower drag still shows at all).
+/// tower (`Some(Occupied)`), as opposed to a route/anchor/out-of-bounds
+/// cell (`static_build_reason`'s other three `BuildIneligibleReason`
+/// variants -- free placement dropped the old build-radius concept
+/// entirely, so those three are the ONLY remaining ways a tile refuses a
+/// tower, see `board.rs`'s own module doc). Shared by [`PetArcade::
+/// click_tile`] (which of the many `build_cells` entries a click may
+/// select) and [`build_drag_state_at`] (whether a hovered tile is even a
+/// candidate worth reporting a state for at all).
 fn is_build_target(reason: Option<BuildIneligibleReason>) -> bool {
     matches!(reason, None | Some(BuildIneligibleReason::Occupied))
 }
 
-/// Every build-radius cell (`SimulationSnapshot::build_cells`) worth
-/// showing to a tower-placement drag right now, paired with whether
-/// dropping `kind` THERE would actually place it -- the one place both the
-/// drag's own board-cell highlight (`render::render_pet_arcade`) and its
-/// ghost read "where can this go" today. Reads `snapshot.build_cells`
-/// directly rather than any host-side pad table, so this stays correct
-/// automatically the next time that field's own eligibility rules change --
-/// nothing here hardcodes a tile count or a fixed candidate set. Cells
-/// [`is_build_target`] excludes (route, anchor, out of the build radius
-/// entirely) are left out here too: they are not genuine "almost worked"
-/// candidates, and are already visually obvious as routes/anchors on the
-/// board itself.
-pub(crate) fn buildable_tiles(snapshot: &SimulationSnapshot, kind: TowerKind) -> Vec<(Tile, BuildDragState)> {
+/// What dropping `kind` on `tile` would do RIGHT NOW -- `None` if `tile`
+/// is not even a candidate (a route/anchor/out-of-bounds cell,
+/// [`is_build_target`]'s own exclusion; these are already visually
+/// obvious as routes/anchors/off-board on the board itself, so they get no
+/// highlight of their own either). This is a SINGLE-tile query, not a bulk
+/// one, on purpose: free placement means 333 of the board's 392 tiles pass
+/// `is_build_target` at once (`board.rs`'s own "я хочу ставить куда хочу"),
+/// so affordability is no longer spatial information at all -- it is one
+/// flat Sap-vs-cost boolean true (or false) for the ENTIRE board
+/// simultaneously. Painting that boolean onto ~330 individual tiles every
+/// drag frame used to be this fn's own predecessor (`buildable_tiles`,
+/// removed) and was pure noise, not signal -- what a drag genuinely needs
+/// to answer, tile by tile, is only ever "what happens if I let go HERE,
+/// right now", which is exactly this one query against whichever tile the
+/// cursor currently sits over. `render::render_pet_arcade`'s own drag
+/// highlight (glyph tint, pixel-tier outline stroke, and the ghost sprite)
+/// all call this against the SAME hovered tile now, never a bulk list.
+pub(crate) fn build_drag_state_at(snapshot: &SimulationSnapshot, kind: TowerKind, tile: (i32, i32)) -> Option<BuildDragState> {
+    let cell = snapshot.build_cells.iter().find(|cell| cell.tile == tile)?;
+    if !is_build_target(cell.reason) {
+        return None;
+    }
     let cost = kind.base_stats().cost;
-    snapshot
-        .build_cells
-        .iter()
-        .filter(|cell| is_build_target(cell.reason))
-        .map(|cell| {
-            let tile = Tile::new(cell.tile.0, cell.tile.1);
-            let state = match cell.reason {
-                None if cost <= snapshot.sap => BuildDragState::Buildable,
-                None => BuildDragState::Unaffordable,
-                Some(_) => BuildDragState::Occupied,
-            };
-            (tile, state)
-        })
-        .collect()
+    Some(match cell.reason {
+        None if cost <= snapshot.sap => BuildDragState::Buildable,
+        None => BuildDragState::Unaffordable,
+        Some(_) => BuildDragState::Occupied,
+    })
 }
 
 /// Rounds a continuous fixed-point board position to its nearest tile,

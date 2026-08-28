@@ -3061,6 +3061,12 @@ pub enum HitTarget {
     /// [`PetArcadeVisualTier`]'s own doc comment for why this is a manual,
     /// visible switch rather than automatic capability probing.
     PetArcadeToggleTier,
+    /// The board header row's own `[?] Info` button -- opens the arcade's
+    /// own mechanics-reference modal (`App::pet_arcade_info_open`,
+    /// `render::render_pet_arcade_info`). Mirrored by the `?` key (`App::
+    /// reduce_pet_arcade`). Owner report: Spark/rune/pet-anchor mechanics
+    /// were nowhere in the interface at all, keyboard or mouse.
+    PetArcadeInfo,
     /// The bottom status bar's own three zones -- clicking any of them
     /// opens that zone's own modal (`App::begin_status_bar_zone`). See
     /// `Focus::StatusBarLeft`'s own doc comment.
@@ -3365,6 +3371,14 @@ pub struct LayoutRects {
     /// The Pet Bastion arcade overlay's own painted rect -- see
     /// `OverlayId::PetArcade`'s own doc comment.
     pub pet_arcade_modal: Rect,
+    /// The arcade's own mechanics-reference modal (`render::render_pet_
+    /// arcade_info`, `App::pet_arcade_info_open`) -- `Rect::default()`
+    /// whenever it is not open, same convention as every other conditional
+    /// rect on this struct. `App::close_overlay_outside_click`'s own
+    /// `pet_arcade_info_open` branch tests a press against exactly this
+    /// rect, ahead of the arcade's own outside-click guard, so this modal
+    /// always closes first while it is stacked on top.
+    pub pet_arcade_info_modal: Rect,
     /// The CENTRE zone modal's own retained-log ENTRY rows -- a sub-rect of
     /// `status_bar_center_modal`, excluding its border, the marquee toggle
     /// row, the `[Up]`/`[Down]`/`[Clear]` toolbar row, and the bottom help
@@ -4416,6 +4430,16 @@ pub struct App {
     /// `false` (`PetArcade::suspend`) -- see `pet_arcade`'s own module doc
     /// comment.
     pub(crate) pet_arcade_open: bool,
+    /// Whether the arcade's own mechanics-reference modal (`render::render_
+    /// pet_arcade_info`, `HitTarget::PetArcadeInfo`, the `?` key) is
+    /// currently open, stacked on top of the arcade overlay itself -- see
+    /// `App::reduce_pet_arcade`'s own doc comment for why it is intercepted
+    /// ahead of `PetArcade::handle_key`, the same "this is `App`'s own UI
+    /// preference, not sim/session state `PetArcade` owns" shape [`PetArcade
+    /// VisualTier`]'s own doc comment already established for the render-
+    /// tier toggle. Owner report: Spark/rune/pet-anchor mechanics were
+    /// nowhere in the interface at all.
+    pub(crate) pet_arcade_info_open: bool,
     /// The arcade session itself -- see `pet_arcade`'s own module doc
     /// comment for why this is `Rc<RefCell<_>>` rather than a plain field
     /// (`App` derives `Clone, Debug`; the engine's own `Runner`/`GameScreen`/
@@ -4555,6 +4579,7 @@ impl Default for App {
             layout: LayoutRects::default(),
             profiler_overlay_open: false,
             pet_arcade_open: false,
+            pet_arcade_info_open: false,
             pet_arcade_visual_tier: PetArcadeVisualTier::Pixel,
             pet_arcade: crate::pet_arcade::PetArcade::new(),
             profiler: crate::profile::TuiProfiler::default(),
@@ -4866,6 +4891,21 @@ impl App {
     /// established: a live run is never interrupted by anything else this
     /// crate might otherwise do with a keystroke.
     fn reduce_pet_arcade(&mut self, key: UiKey) -> AppAction {
+        // Checked FIRST, ahead of even `Escape`'s own arcade-closing arm
+        // below: while the mechanics-reference modal is open it owns every
+        // key, the same "topmost overlay first" contract `App::close_
+        // overlay_outside_click`'s own doc comment already establishes for
+        // the mouse -- `Escape` (or the same `?` that opened it) closes
+        // ONLY this modal, never the arcade run underneath it, matching
+        // `close_pet_arcade`'s own "freeze in place, never drop" contract:
+        // a modal stacked on top closing is not the same event as the run
+        // itself closing.
+        if self.pet_arcade_info_open {
+            if matches!(key, UiKey::Escape | UiKey::OperatorEscape | UiKey::Char('?')) {
+                self.pet_arcade_info_open = false;
+            }
+            return AppAction::None;
+        }
         if matches!(key, UiKey::Escape | UiKey::OperatorEscape) {
             self.close_pet_arcade();
             return AppAction::None;
@@ -4878,6 +4918,14 @@ impl App {
         // the mouse counterpart.
         if matches!(key, UiKey::Char('v') | UiKey::Char('V')) {
             self.toggle_pet_arcade_visual_tier();
+            return AppAction::None;
+        }
+        // Same shape as `v` above -- `pet_arcade_info_open` is `App`'s own
+        // UI state, never sim/session state `PetArcade` owns, so it never
+        // reaches that type's own keymap either. See `HitTarget::
+        // PetArcadeInfo`'s own doc comment for the mouse counterpart.
+        if matches!(key, UiKey::Char('?')) {
+            self.pet_arcade_info_open = true;
             return AppAction::None;
         }
         self.pet_arcade.borrow_mut().handle_key(key);
@@ -4954,7 +5002,25 @@ impl App {
             }
             Some(HitTarget::PetArcadeRestart) => self.pet_arcade.borrow_mut().click_restart(),
             Some(HitTarget::PetArcadeToggleTier) => self.toggle_pet_arcade_visual_tier(),
+            Some(HitTarget::PetArcadeInfo) => self.pet_arcade_info_open = true,
             _ => {}
+        }
+        AppAction::None
+    }
+
+    /// The mechanics-reference modal's own click dispatch -- the pointer
+    /// counterpart to `reduce_pet_arcade`'s own `pet_arcade_info_open`
+    /// branch. Reached from `App::click` only once `close_overlay_outside_
+    /// click` has already confirmed the press landed INSIDE this modal's
+    /// own rect (a click outside it already closed the modal before this
+    /// ever runs, see that fn's own doc comment) -- so the only target this
+    /// ever needs to recognize is its own `[x]` (`render::render_modal_
+    /// close`, reused verbatim here rather than a bespoke close control).
+    /// Every other click inside the card's own body is a no-op: it is a
+    /// read-only reference, nothing on it besides `[x]` DOES anything.
+    fn click_pet_arcade_info(&mut self, target: Option<HitTarget>) -> AppAction {
+        if matches!(target, Some(HitTarget::ModalClose)) {
+            self.pet_arcade_info_open = false;
         }
         AppAction::None
     }
@@ -12447,6 +12513,26 @@ fn append_event_to_diagnostics_file(event: &AppEvent) {
     /// `open_agent_menu` without changing focus) -- the order below is
     /// what picks the one actually on top.
     fn close_overlay_outside_click(&mut self, column: u16, row: u16) -> Option<AppAction> {
+        // Topmost of the topmost: the arcade's own mechanics modal, when
+        // open, paints stacked ON TOP OF the arcade modal itself (`render::
+        // render`'s own call site, right after `render_pet_arcade`), inside
+        // that larger rect -- so the generic `layout.overlays` "any overlay
+        // contains this click" guard right below would still see the
+        // arcade's own (bigger) rect and treat a click OUTSIDE this smaller
+        // modal but INSIDE the arcade as "inside some overlay, do nothing",
+        // never closing it. Checked here, ahead of that guard, for exactly
+        // that reason -- a click inside `pet_arcade_info_modal` falls
+        // through (`None`) to `App::click`'s own `click_pet_arcade_info`
+        // dispatch; anything else closes this modal only, never the arcade
+        // underneath (`reduce_pet_arcade`'s own doc comment covers the
+        // keyboard side of the same rule).
+        if self.pet_arcade_info_open {
+            if !self.layout.pet_arcade_info_modal.contains(column, row) {
+                self.pet_arcade_info_open = false;
+                return Some(AppAction::None);
+            }
+            return None;
+        }
         if self.layout.overlays.is_empty() {
             return None;
         }
@@ -12507,6 +12593,15 @@ fn append_event_to_diagnostics_file(event: &AppEvent) {
             .map(|hit| hit.target.clone());
         if let Some(action) = self.close_overlay_outside_click(column, row) {
             return action;
+        }
+        // Reaching this point with the mechanics modal still open means the
+        // click landed INSIDE its own rect (the guard above already closed
+        // it for any click outside) -- dispatch to its own handler, ahead
+        // of the arcade check right below: it is stacked on top and must
+        // absorb the click, never let it fall through to whatever board
+        // tile/button happens to sit underneath.
+        if self.pet_arcade_info_open {
+            return self.click_pet_arcade_info(target);
         }
         // Reaching this point with the arcade still open means the click
         // landed INSIDE its rect (the guard above already closed it for
@@ -13741,6 +13836,7 @@ fn append_event_to_diagnostics_file(event: &AppEvent) {
                 | HitTarget::PetArcadeChooseEvolution(_)
                 | HitTarget::PetArcadeRestart
                 | HitTarget::PetArcadeToggleTier
+                | HitTarget::PetArcadeInfo
                 // Same shape, for `Focus::GlobalSearch`'s own `click_
                 // global_search` guard.
                 | HitTarget::GlobalSearchResult(_)

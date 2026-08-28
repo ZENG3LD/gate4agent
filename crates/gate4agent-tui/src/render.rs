@@ -6,14 +6,17 @@ use uzor_tui::{
     TerminalBuffer, Text, Widget,
 };
 use gate4agent_arcade_engine::{
-    build_background, compose_frame, encode_frame, BoardBackground, CellArea, DirtyHint, DynamicStroke, GlyphBackend,
-    PixelFrameOutput, RenderBackend, Rgb as ArcadeRgb, Surface, TileFootprint,
+    build_background, compose_frame, encode_frame, BoardBackground, CellArea, DirtyHint, DynamicSprite, DynamicStroke,
+    GlyphBackend, PixelFrameOutput, RenderBackend, Rgb as ArcadeRgb, Surface, TileFootprint, TileId,
 };
 use gate4agent_arcade_pet_bastion::board::{AnchorId, Board};
 use gate4agent_arcade_pet_bastion::boss::BossKind;
 use gate4agent_arcade_pet_bastion::constants::{
-    BLINK_COST, BOARD_HEIGHT, BOARD_WIDTH, FIXED_SCALE, FULL_CIRCUIT_COST, PET_PULSE_COST, SPARK_CAP,
-    WAVE_COUNT,
+    ANCHOR_RUNE_LINGER_TICKS, BLINK_COST, BOARD_HEIGHT, BOARD_WIDTH, BOSS_LAP_INTEGRITY_DAMAGE, CIRCUIT_BASE_SLOTS,
+    ECHO_EVERY_NTH_ATTACK, EVOLUTION_AFTER_WAVE, FIXED_SCALE, FULL_CIRCUIT_COST, LEAK_INTEGRITY_DAMAGE,
+    LINKED_ATTACK_SPEED_PERMILLE, PET_MOVE_TICKS, PET_PULSE_COST, PHASE_EVERY_NTH_HIT, RUNE_DRAFT_AFTER_WAVES,
+    RUNE_DRAFT_OPTIONS, SPARK_CAP, SPARK_PER_KILLS, SYMBIOSIS_ADJACENCY_FP, SYMBIOSIS_DAMAGE_BONUS_PERMILLE,
+    TICKS_PER_SECOND, WAVE_COUNT, WISP_FREE_BLINK_INTERVAL_TICKS,
 };
 use gate4agent_arcade_pet_bastion::enemy::EnemyKind;
 use gate4agent_arcade_pet_bastion::pet::Evolution;
@@ -316,6 +319,7 @@ pub fn render(app: &App, buf: &mut TerminalBuffer) -> LayoutRects {
         status_bar_right_modal: Rect::default(),
         harness_reverse_attribution_modal: Rect::default(),
         pet_arcade_modal: Rect::default(),
+        pet_arcade_info_modal: Rect::default(),
         status_bar_center_log_body: Rect::default(),
         status_bar_left: Rect::default(),
         status_bar_center: Rect::default(),
@@ -476,6 +480,15 @@ pub fn render(app: &App, buf: &mut TerminalBuffer) -> LayoutRects {
     }
     if app.pet_arcade_open {
         render_pet_arcade(app, area, buf, &mut layout, theme);
+        // Stacked ON TOP of the arcade modal itself, painted (and hit-
+        // tested, and registered as an overlay -- `render_pet_arcade_info`'s
+        // own doc comment) only while the owner has actually opened it
+        // (`HitTarget::PetArcadeInfo`, the `?` key) -- see `App::close_
+        // overlay_outside_click`'s own doc comment for why this check runs
+        // ahead of everything else that could close the arcade underneath.
+        if app.pet_arcade_info_open {
+            render_pet_arcade_info(area, buf, &mut layout, theme);
+        }
     }
     render_drag_preview(app, area, buf, &layout, theme);
     if let Some(notice) = app.notice() {
@@ -1284,13 +1297,24 @@ fn render_pet_arcade(
     let pixel_tier_fits = footprint_w == 2 && board_h == BOARD_HEIGHT as u16;
 
     // `inner.height` is guaranteed `>= BOARD_HEIGHT + 1` (the min-size
-    // contract's own one hint row) -- `extra_rows` is therefore always at
-    // least 1. A header row only appears once there is enough extra room
-    // for BOTH it and at least one hint row (the preferred-size contract's
-    // own header(1) + hint(2) = 3); anything narrower than that keeps the
-    // header off and gives every spare row straight to the hint text.
+    // contract's own one reserved row -- `gate4agent-arcade-pet-bastion`'s
+    // own `sim.rs::MIN_HINT_ROWS`/`PREFERRED_HINT_ROWS`, which this crate
+    // cannot edit: that game crate is off-limits for this pass) --
+    // `extra_rows` is therefore always at least 1. Owner report: the two
+    // legend lines that row used to hold ("Click: tile select..." / "Tab
+    // tile [ ] anchor...") were dead screen space nobody read -- deleted
+    // outright (`render_pet_arcade_hints` is gone; the keyboard bindings it
+    // described still work exactly as before, unlisted). The threshold this
+    // row's own header used to need (`extra_rows >= 3`, so it never fought
+    // the legend for room) drops to `>= 1` now that there is no legend left
+    // to fight: `negotiate_size` never returns more than 3 extra rows
+    // (`preferred_modal_size`'s own `BOARD_HEIGHT + PREFERRED_HEADER_ROWS +
+    // PREFERRED_HINT_ROWS` ceiling), so this reclaims the freed row for the
+    // header -- the board's OWN wave/phase/tier/info chrome -- every frame
+    // the board renders at all, not just at the one exact size that used to
+    // clear the old `>= 3` bar.
     let extra_rows = inner.height.saturating_sub(board_h);
-    let header_h: u16 = if extra_rows >= 3 { 1 } else { 0 };
+    let header_h: u16 = if extra_rows >= 1 { 1 } else { 0 };
     let board_y = inner.y + header_h;
 
     if header_h > 0 {
@@ -1319,14 +1343,31 @@ fn render_pet_arcade(
         );
         render_modal_line(&tier_label, tier_rect, 0, Style::default().fg(theme.accent).bg(theme.modal), buf);
         push_modal_hit(layout, tier_rect, HitTarget::PetArcadeToggleTier);
+        // The mechanics explainer's own launch control (`HitTarget::
+        // PetArcadeInfo` -> `render_pet_arcade_info`) -- owner report:
+        // Spark/rune/pet-anchor mechanics were nowhere in the interface at
+        // all, keyboard or mouse. Sits directly left of the tier toggle on
+        // this SAME header row rather than costing the HUD panel a row of
+        // its own (that panel's own budget is already fully spoken for --
+        // see `render_pet_arcade_hud`'s own doc comment), reachable by
+        // mouse here and by the `?` key (`App::reduce_pet_arcade`).
+        const INFO_LABEL: &str = "[?] Info";
+        let info_label_w = cell_width(INFO_LABEL) as u16;
+        let info_right = tier_rect.x.saturating_sub(1);
+        let info_x = info_right.saturating_sub(info_label_w).max(inner.x);
+        let info_width = info_right.saturating_sub(info_x).min(info_label_w);
+        let info_rect = Rect::new(info_x, inner.y, info_width, 1);
+        render_modal_line(INFO_LABEL, info_rect, 0, Style::default().fg(theme.accent).bg(theme.modal), buf);
+        push_modal_hit(layout, info_rect, HitTarget::PetArcadeInfo);
     }
 
+    let dest = Rect::new(inner.x, board_y, board_w, board_h);
     let mut surface = snapshot_to_surface(&snapshot);
     pet_arcade_highlight_cursor(&mut surface, arcade.selected_tile(), arcade.selected_anchor());
-    if let Some(DragState::PetArcadeTowerPlacement { kind, .. }) = &app.drag_state {
-        pet_arcade_highlight_buildable_tiles(&mut surface, &snapshot, *kind);
+    if let Some(DragState::PetArcadeTowerPlacement { kind, current_column, current_row, .. }) = &app.drag_state {
+        let hovered = pet_arcade_drag_hovered_tile(*current_column, *current_row, dest, footprint_w);
+        pet_arcade_highlight_buildable_tiles(&mut surface, &snapshot, *kind, hovered);
     }
-    let dest = Rect::new(inner.x, board_y, board_w, board_h);
     GlyphBackend.project(&surface, footprint, dest, buf, false, DirtyHint::Full);
     // The glyph backend paints every tile's own `bg`, including `None`
     // (blank board tiles -- void cells with no terrain/unit, the majority
@@ -1378,10 +1419,20 @@ fn render_pet_arcade(
     // doc comment, but still guarded defensively at the one place that
     // actually writes to the real terminal).
     if app.pet_arcade_visual_tier == PetArcadeVisualTier::Pixel && pixel_tier_fits {
-        let drag_kind = match &app.drag_state {
-            Some(DragState::PetArcadeTowerPlacement { kind, .. }) => Some(*kind),
-            _ => None,
+        let (drag_kind, drag_cursor) = match &app.drag_state {
+            Some(DragState::PetArcadeTowerPlacement { kind, current_column, current_row, .. }) => {
+                (Some(*kind), Some((*current_column, *current_row)))
+            }
+            _ => (None, None),
         };
+        // The SINGLE hovered tile every drag-time visual on this frame
+        // agrees on -- the ghost sprite below, and the highlight stroke
+        // `pet_arcade_pixel_highlight_strokes` draws for it -- so neither
+        // can independently drift onto a different tile than the other
+        // (see `pet_arcade::build_drag_state_at`'s own doc comment for why
+        // there is exactly one tile worth asking about at all now).
+        let hovered_tile = drag_cursor
+            .and_then(|(column, row)| pet_arcade_drag_hovered_tile(column, row, dest, footprint_w));
         // `prev`/`curr` -- `arcade.presenter().previous()` is the last
         // TICK-BOUNDARY snapshot before `snapshot` (already fetched above
         // for the glyph tier); the two are exactly the pair `interp::
@@ -1412,7 +1463,30 @@ fn render_pet_arcade(
         let now = render_sim_time(prev, &snapshot, alpha);
         let (effect_sprites, effect_strokes) = arcade.age_and_effect_sprites(now);
         dynamic.extend(effect_sprites);
-        let mut strokes = pet_arcade_pixel_highlight_strokes(&snapshot, arcade.selected_tile(), arcade.selected_anchor(), drag_kind);
+        // Owner report: dragging a tower out of the palette carried a text
+        // label at the cursor, never the tower itself ("пусть сюда
+        // рисуется башня, а не тянется надпись"). `dynamic` is pushed into
+        // `compose_frame` AFTER `strokes` below (`build_scene`'s own
+        // paint order: strokes first, then every `dynamic` sprite on top --
+        // see `gate4agent-arcade`'s own `backend_pixel::build_scene`), so a
+        // ghost pushed here always paints OVER the buildable-tile outlines
+        // `pet_arcade_pixel_highlight_strokes` draws for this exact same
+        // drag, matching "over the lit legal cells that already highlight
+        // today". `render_drag_preview`'s own `PetArcadeTowerPlacement` arm
+        // keeps painting the glyph-tier text chip unchanged -- that tier has
+        // no sprite engine to borrow a real tower image from, so it stays
+        // exactly what it was.
+        if let (Some(kind), Some((column, row))) = (drag_kind, drag_cursor) {
+            if let Some(ghost) = pet_arcade_drag_ghost_sprite(kind, column, row, dest, footprint_w) {
+                dynamic.push(ghost);
+            }
+        }
+        let mut strokes = pet_arcade_pixel_highlight_strokes(
+            &snapshot,
+            arcade.selected_tile(),
+            arcade.selected_anchor(),
+            drag_kind.zip(hovered_tile),
+        );
         strokes.extend(effect_strokes);
         let canvas = compose_frame(&PET_ARCADE_PIXEL_BACKGROUND, &surface, &dynamic, &strokes, drag_kind.is_some());
         if let PixelFrameOutput::Frame(frame) = encode_frame(&canvas, dest) {
@@ -1431,10 +1505,142 @@ fn render_pet_arcade(
         render_pet_arcade_hud(&snapshot, &arcade, hud, buf, layout, theme);
     }
 
-    let hint_y = board_y + board_h;
-    if hint_y < inner.bottom() {
-        let hint_area = Rect::new(inner.x, hint_y, inner.width, inner.bottom() - hint_y);
-        render_pet_arcade_hints(hint_area, buf, theme);
+    // Owner report: the two legend lines that used to paint below the board
+    // ("Click: tile select..." / "Tab tile [ ] anchor...") were dead screen
+    // space nobody read -- deleted outright, along with `render_pet_arcade_
+    // hints` itself. Every binding it once listed still works exactly as
+    // before; a genuinely undiscoverable one now lives on the button that
+    // does the same thing instead (`render_pet_arcade_hud`'s own doc
+    // comment, the header's own `[?] Info` button just above). Whatever
+    // rows this freed (`header_h`'s own doc comment above covers the one
+    // this fn can actually reclaim) are simply left as the modal's own
+    // plain background now, never a re-purposed legend.
+}
+
+/// Formats `numerator/denominator` as `whole.tenths` (one decimal digit,
+/// rounded toward zero) using pure integer arithmetic -- this crate's own
+/// "no floats in presentation code either" convention (`tower_stats_line`'s
+/// own doc comment), taken one digit further than that fn's own whole-tile
+/// truncation because [`render_pet_arcade_info`]'s own numbers (a 1.5-tile
+/// Symbiosis radius, a 1.2s pet move) would otherwise round down to a
+/// genuinely WRONG whole number, not merely a less precise one.
+fn one_decimal(numerator: i64, denominator: i64) -> String {
+    if denominator == 0 {
+        return "0".to_owned();
+    }
+    let whole = numerator / denominator;
+    let tenths = ((numerator % denominator) * 10) / denominator;
+    format!("{whole}.{tenths}")
+}
+
+/// The arcade's own mechanics reference -- everything the header's own
+/// `[?] Info` button (`HitTarget::PetArcadeInfo`, `render_pet_arcade`'s own
+/// header block) and the `?` key (`App::reduce_pet_arcade`) open;
+/// `Escape`/`?`/its own `[x]`/a click outside it all close it (`App::
+/// close_overlay_outside_click`'s own `pet_arcade_info_open` branch, which
+/// runs AHEAD of the arcade's own outside-click guard so this always
+/// closes first, never the arcade underneath it). Owner report: "мне не
+/// ясна механика траты спарков ... рун и какого-то светлячка которая
+/// куда-то встает" -- Spark, runes and the pet's own anchor mechanic were
+/// nowhere in the interface at all, and clicking a pet anchor silently
+/// issuing `Command::MovePet` was not something the owner knew he was
+/// doing. A WAVES section covers a follow-up the rules crate changed out
+/// from under the UI: an enemy reaching the Heartseed is no longer killed
+/// (it loops back to its own route start at full health and keeps
+/// walking, costing Integrity per lap instead) and a wave no longer ends
+/// on the first Heartseed arrival (only once every enemy on it is dead) --
+/// both are silent rule changes the owner has no other way to learn.
+///
+/// EVERY number below is read from `gate4agent_arcade_pet_bastion::
+/// constants` (this module's own import list at the top of the file) AT
+/// RENDER TIME, never copied into a string literal here -- a number that
+/// can drift out of sync with the sim it describes is worse than showing
+/// no number at all. The two genuinely non-integer ones (Symbiosis' own
+/// 1.5-tile radius, the pet's own 1.2s move) go through [`one_decimal`]
+/// rather than truncating to a wrong whole number.
+///
+/// Stacked on top of the arcade modal (`render::render`'s own call site,
+/// right after `render_pet_arcade`) and registered as its own overlay
+/// (`layout.note_overlay`) so `render::drop_pet_arcade_pixel_frame_if_
+/// covered` correctly drops that frame's own occluded pixel-tier board for
+/// this one frame -- the glyph-tier board underneath (always painted
+/// first regardless of visual tier, `render_pet_arcade`'s own doc comment)
+/// is what actually shows through behind this card.
+fn render_pet_arcade_info(area: Rect, buf: &mut TerminalBuffer, layout: &mut LayoutRects, theme: Theme) {
+    enum Line {
+        Label(&'static str),
+        Body(String),
+    }
+
+    let wisp_free_blink_s = WISP_FREE_BLINK_INTERVAL_TICKS / TICKS_PER_SECOND as u64;
+    let anchor_linger_s = ANCHOR_RUNE_LINGER_TICKS / TICKS_PER_SECOND as u64;
+    let move_s = one_decimal(PET_MOVE_TICKS as i64, TICKS_PER_SECOND);
+    let symbiosis_tiles = one_decimal(SYMBIOSIS_ADJACENCY_FP, FIXED_SCALE);
+    let symbiosis_pct = SYMBIOSIS_DAMAGE_BONUS_PERMILLE / 10;
+    let linked_attack_speed_pct = (LINKED_ATTACK_SPEED_PERMILLE - 1000) / 10;
+
+    let lines = [
+        Line::Label("SPARK"),
+        Line::Body("Only a KILL by a tower currently linked to the pet earns it (see PET below).".to_owned()),
+        Line::Body(format!(
+            "{SPARK_PER_KILLS} linked kills = +1 Spark, capped at {SPARK_CAP}. Doubled during Night Maw's final phase."
+        )),
+        Line::Body(format!(
+            "Spends: Pulse -{PET_PULSE_COST}  Blink -{BLINK_COST} (free every {wisp_free_blink_s}s on a Wisp)  Circuit -{FULL_CIRCUIT_COST}"
+        )),
+        Line::Label("RUNES"),
+        Line::Body(format!(
+            "Drafted after wave {} and wave {} -- pick 1 of {RUNE_DRAFT_OPTIONS}, blocking the build phase.",
+            RUNE_DRAFT_AFTER_WAVES[0], RUNE_DRAFT_AFTER_WAVES[1],
+        )),
+        Line::Body(format!("Echo: every {ECHO_EVERY_NTH_ATTACK}th attack, a same-kind tower fires again for free.")),
+        Line::Body(format!("Anchor: linked buffs linger {anchor_linger_s}s after the pet leaves that anchor.")),
+        Line::Body("Overgrowth: a kill's overkill damage carries into the next chain/splash hit.".to_owned()),
+        Line::Body(format!("Phase: every {PHASE_EVERY_NTH_HIT}rd hit ignores armour.")),
+        Line::Body(format!(
+            "Symbiosis: towers within {symbiosis_tiles} tiles of a different kind deal +{symbiosis_pct}% damage."
+        )),
+        Line::Label("PET"),
+        Line::Body("The glowing firefly is the pet -- it lives on a blue-highlighted anchor tile.".to_owned()),
+        Line::Body(format!(
+            "Linked to its {CIRCUIT_BASE_SLOTS} nearest attacking towers (+1 per placed Relay), +{linked_attack_speed_pct}% attack speed."
+        )),
+        Line::Body(format!("An evolution, drafted after wave {EVOLUTION_AFTER_WAVE}, can change that slot count.")),
+        Line::Body(format!("Click any anchor tile to move the pet there (or press M) -- {move_s}s on foot.")),
+        Line::Body(format!("[B] Blink -{BLINK_COST} arrives instantly instead, spending Spark.")),
+        Line::Label("WAVES"),
+        Line::Body("A unit that reaches the Heartseed is NOT killed and does not end the run.".to_owned()),
+        Line::Body("It loops back to its own route start at full health and keeps walking.".to_owned()),
+        Line::Body(format!(
+            "Each lap costs Integrity instead: -{LEAK_INTEGRITY_DAMAGE} for a minion, -{BOSS_LAP_INTEGRITY_DAMAGE} for a boss."
+        )),
+        Line::Body("A wave ends only once every enemy on it is dead, not on Heartseed arrival.".to_owned()),
+    ];
+
+    const WIDTH: u16 = 88;
+    let height = lines.len() as u16 + 2;
+    let modal = positioned_modal(area, WIDTH, height, None);
+    layout.pet_arcade_info_modal = modal;
+    layout.note_overlay(modal);
+    fill_rect(modal, theme.modal, buf);
+    Block::bordered()
+        .title(" Mechanics ")
+        .border_style(Style::default().fg(theme.accent))
+        .style(Style::default().bg(theme.modal))
+        .render(modal, buf);
+    render_modal_close(modal, buf, layout, theme);
+    if modal.width < 3 || modal.height < 3 {
+        return;
+    }
+    let inner = Rect::new(modal.x + 1, modal.y + 1, modal.width - 2, modal.height - 2);
+    for (row, line) in lines.iter().enumerate() {
+        let Ok(row) = u16::try_from(row) else { break };
+        match line {
+            Line::Label(text) => {
+                render_modal_line(*text, inner, row, Style::default().fg(theme.accent).bg(theme.modal), buf)
+            }
+            Line::Body(text) => render_modal_line(text, inner, row, Style::default().fg(theme.text).bg(theme.modal), buf),
+        }
     }
 }
 
@@ -1553,29 +1759,58 @@ fn pet_arcade_highlight_cursor(surface: &mut Surface, selected_tile: (u8, u8), s
     surface.set(ax, ay, anchor_cell);
 }
 
-/// Tints every build-radius cell a tower drag (`DragState::PetArcade
-/// TowerPlacement`) currently makes worth showing -- green for a cell the
-/// drop would actually place `kind` on right now, dim yellow for one that
-/// is otherwise eligible but unaffordable, dim red for one another tower
-/// already occupies (`pet_arcade::BuildDragState`'s own three states). The
-/// drag still runs even when nothing is affordable, so the player gets
-/// this exact visual refusal instead of a silently-failing gesture -- but
-/// nothing ever gets charged for a drop that lands on anything but a green
-/// cell; see `PetArcade::drop_tower`'s own doc comment. Reads `pet_arcade::
-/// buildable_tiles` rather than walking any board table itself, so this
-/// stays correct the moment that fn's own notion of "buildable" changes
-/// (see that fn's own doc comment).
-fn pet_arcade_highlight_buildable_tiles(surface: &mut Surface, snapshot: &SimulationSnapshot, kind: TowerKind) {
-    for (tile, state) in crate::pet_arcade::buildable_tiles(snapshot, kind) {
-        let (x, y) = (tile.x as u16, tile.y as u16);
-        let mut cell = surface.get(x, y);
-        cell.bg = Some(match state {
-            crate::pet_arcade::BuildDragState::Buildable => ArcadeRgb(30, 110, 40),
-            crate::pet_arcade::BuildDragState::Unaffordable => ArcadeRgb(90, 80, 20),
-            crate::pet_arcade::BuildDragState::Occupied => ArcadeRgb(110, 30, 30),
-        });
-        surface.set(x, y, cell);
+/// The single discrete board tile a tower-placement drag's own cursor
+/// (`current_column`/`current_row` off `DragState::PetArcadeTowerPlacement`)
+/// is currently over -- the SAME snapping `HitTarget::PetArcadeTile`'s own
+/// hit-region grid uses, so this always names whichever tile a drop THIS
+/// frame would actually resolve against, never an independently-drifting
+/// approximation. Shared by every drag-time visual that needs to know
+/// "which ONE tile does this gesture concern right now": [`pet_arcade_
+/// highlight_buildable_tiles`]/[`pet_arcade_pixel_highlight_strokes`]'s own
+/// hover tint, and [`pet_arcade_drag_ghost_sprite`]'s own carried-tower
+/// position. `None` while the cursor sits outside `dest` (still over the
+/// palette, or off the board entirely) or `footprint_w` is degenerate.
+fn pet_arcade_drag_hovered_tile(column: u16, row: u16, dest: Rect, footprint_w: u16) -> Option<(u8, u8)> {
+    if footprint_w == 0 || !dest.contains(column, row) {
+        return None;
     }
+    let tx = (column - dest.x) / footprint_w;
+    let ty = row - dest.y;
+    Some((tx as u8, ty as u8))
+}
+
+/// Tints the ONE board tile a tower drag's own cursor (`hovered`,
+/// [`pet_arcade_drag_hovered_tile`]) is currently over -- green if the
+/// drop would actually place `kind` there right now, dim yellow if it is
+/// otherwise eligible but unaffordable, dim red if another tower already
+/// occupies it (`pet_arcade::BuildDragState`'s own three states). No-op
+/// (nothing painted at all) once `hovered` is `None`, or once it names a
+/// route/anchor/out-of-bounds tile (`pet_arcade::build_drag_state_at`'s
+/// own `None`) -- those already read unambiguously as "not buildable"
+/// from their own terrain/off-board rendering.
+///
+/// Free placement (owner's own "я хочу ставить куда хочу") dropped the old
+/// build-radius concept entirely -- 333 of the board's 392 tiles are legal
+/// now, and Sap-vs-cost affordability is one flat boolean true (or false)
+/// for the WHOLE board at once, never spatial. Tinting every one of those
+/// ~330 candidate tiles every drag frame (this fn's own predecessor) lit up
+/// almost the entire board -- noise, not information. What a drag actually
+/// needs, tile by tile, is only ever "what happens if I let go HERE" --
+/// this now answers exactly that, for exactly the one tile the question is
+/// actually about.
+fn pet_arcade_highlight_buildable_tiles(surface: &mut Surface, snapshot: &SimulationSnapshot, kind: TowerKind, hovered: Option<(u8, u8)>) {
+    let Some((tx, ty)) = hovered else { return };
+    let Some(state) = crate::pet_arcade::build_drag_state_at(snapshot, kind, (i32::from(tx), i32::from(ty))) else {
+        return;
+    };
+    let (x, y) = (u16::from(tx), u16::from(ty));
+    let mut cell = surface.get(x, y);
+    cell.bg = Some(match state {
+        crate::pet_arcade::BuildDragState::Buildable => ArcadeRgb(30, 110, 40),
+        crate::pet_arcade::BuildDragState::Unaffordable => ArcadeRgb(90, 80, 20),
+        crate::pet_arcade::BuildDragState::Occupied => ArcadeRgb(110, 30, 30),
+    });
+    surface.set(x, y, cell);
 }
 
 /// The board header's own `[V]` render-tier button label (see `HitTarget::
@@ -1607,32 +1842,36 @@ fn pet_arcade_tier_label(tier: PetArcadeVisualTier, pixel_tier_fits: bool) -> St
 /// BACKGROUND` holds, from a terrain-only `Surface` with no cursor/drag
 /// tint ever applied to it (see that static's own doc comment) -- so a
 /// `bg`-only tint on an otherwise-bare tile (the common case: a cursor or
-/// build-radius highlight usually lands on open ground) is silently
+/// drag hover highlight usually lands on open ground) is silently
 /// invisible in the pixel tier either way. `gate4agent-arcade` is out of
 /// scope for this pass (a sibling agent owns it concurrently) -- the fix
 /// on THIS side of that boundary is to draw the SAME information as a
 /// bright inset outline via the engine's own public `DynamicStroke`
 /// contract (`compose_frame`'s own `strokes` parameter), which paints
 /// identically regardless of which `TileId` (or no `TileId` at all, per
-/// the background split above) sits underneath.
+/// the background split above) sits underneath. `drag` is `Some((kind,
+/// hovered))` only while a tower drag is BOTH live and hovering the board
+/// (`Option::zip` of the two, its own call site) -- see [`pet_arcade_
+/// highlight_buildable_tiles`]'s own doc comment for why this is a single
+/// tile now, never the whole legal set.
 fn pet_arcade_pixel_highlight_strokes(
     snapshot: &SimulationSnapshot,
     selected_tile: (u8, u8),
     selected_anchor: u8,
-    drag_kind: Option<TowerKind>,
+    drag: Option<(TowerKind, (u8, u8))>,
 ) -> Vec<DynamicStroke> {
     let mut strokes = Vec::new();
     push_tile_outline_stroke(&mut strokes, selected_tile.0 as f64, selected_tile.1 as f64, ArcadeRgb(220, 180, 60), 2.0);
     let anchor_tile = Board::anchor_tile(AnchorId(selected_anchor));
     push_tile_outline_stroke(&mut strokes, anchor_tile.x as f64, anchor_tile.y as f64, ArcadeRgb(70, 160, 220), 2.0);
-    if let Some(kind) = drag_kind {
-        for (tile, state) in crate::pet_arcade::buildable_tiles(snapshot, kind) {
+    if let Some((kind, (tx, ty))) = drag {
+        if let Some(state) = crate::pet_arcade::build_drag_state_at(snapshot, kind, (i32::from(tx), i32::from(ty))) {
             let color = match state {
                 crate::pet_arcade::BuildDragState::Buildable => ArcadeRgb(60, 200, 80),
                 crate::pet_arcade::BuildDragState::Unaffordable => ArcadeRgb(210, 180, 60),
                 crate::pet_arcade::BuildDragState::Occupied => ArcadeRgb(210, 70, 70),
             };
-            push_tile_outline_stroke(&mut strokes, tile.x as f64, tile.y as f64, color, 1.6);
+            push_tile_outline_stroke(&mut strokes, tx as f64, ty as f64, color, 1.6);
         }
     }
     strokes
@@ -1667,22 +1906,39 @@ fn rune_label(rune: Rune) -> &'static str {
     }
 }
 
-/// The arcade's own right-hand panel: two resource rows, two packed
-/// ability-button rows, a Start Wave row, a five-row context block
-/// (whatever `render_pet_arcade_context` decides -- the selected tile/
-/// tower, or the inspector card), a label, and a three-row, two-column
-/// tower palette (`render::render_pet_arcade_hud`'s own "Towers:" rows) --
-/// exactly `board_h` rows end to end (`2 info + 2 ability + 1 wave + 5
-/// context + 1 label + 3 palette = 14`, matching `BOARD_HEIGHT`, which is
-/// this column's own fixed height every time it paints at all -- see
-/// `render_pet_arcade`'s own call site). Every row here is either resource
-/// text or a clickable target (`HitTarget::PetArcadePetPulse`/`Blink`/
-/// `FullCircuit`/`MovePet`/`StartWave`/`PetArcadeTowerKind`/`PetArcade
-/// UpgradeL2`/`PetArcadeUpgradeL3Power`/`PetArcadeUpgradeL3Utility`/
-/// `PetArcadeSell`), so this is the one place both readouts live now --
-/// the old draft/evolution rune list (`F1`-`F3`) moved into `render_pet_
-/// arcade_context` since it is exactly as context-sensitive as the tile/
-/// tower card it now shares a slot with.
+/// The arcade's own right-hand panel -- a real control plane now, not a
+/// readout: every action the player can take is a labelled, clickable
+/// control here, its hotkey printed on it, its cost printed where it has
+/// one, and a visibly dim (never invisibly-unclickable, see `render_pet_
+/// arcade_button_row`'s own doc comment) state whenever it is currently
+/// unaffordable or illegal. Owner report (twice): "справа сделать более
+/// понятную контролплейн" / "кнопки должны быть под нажатие мышкой ну
+/// максимум хоткей на них" -- every one of these rows already had a real
+/// `HitTarget` and handler before this pass; what was missing was
+/// PRESENTING them as a panel a mouse-only player could actually read.
+///
+/// Reads top to bottom in exactly the order asked for -- what I can build,
+/// what the selected thing can do, what the pet can do, what the wave is
+/// doing:
+///
+/// - one packed resource row (Sap/Spark/HP);
+/// - a `Build:` label plus the three-row, two-column tower palette
+///   (`HitTarget::PetArcadeTowerKind`);
+/// - the five-row context block (`render_pet_arcade_context` -- the
+///   selected tile/tower's own upgrade/sell actions, the inspector card,
+///   or the rune-draft/evolution-choice cards, whichever currently applies
+///   -- unchanged, already exactly this shape);
+/// - a `Pet:` label plus the two packed Living Circuit ability rows
+///   (Pulse/Blink, Full Circuit/Move);
+/// - the Start Wave row.
+///
+/// `1 resource + 1 label + 3 palette + 5 context + 1 label + 2 ability + 1
+/// wave = 14`, exactly `board_h`/`BOARD_HEIGHT` -- this column's own fixed
+/// height every time it paints at all (`render_pet_arcade`'s own call
+/// site). The panel's own width/row budget is unchanged by this
+/// reordering; it does not, and structurally cannot, grow at the board's
+/// expense -- `render_pet_arcade` hands this fn a fixed `area` it never
+/// negotiates for itself.
 fn render_pet_arcade_hud(
     snapshot: &SimulationSnapshot,
     arcade: &crate::pet_arcade::PetArcade,
@@ -1694,55 +1950,20 @@ fn render_pet_arcade_hud(
     let text_style = Style::default().fg(theme.text).bg(theme.modal);
     let muted_style = Style::default().fg(theme.muted).bg(theme.modal);
 
-    render_modal_line(&format!("Sap {}   Wave {}/{}", snapshot.sap, snapshot.wave, WAVE_COUNT), area, 0, text_style, buf);
     render_modal_line(
-        &format!("Spark {}/{}   HP {}", snapshot.pet.spark, SPARK_CAP, snapshot.integrity),
+        &format!("Sap {}  Spark {}/{}  HP {}", snapshot.sap, snapshot.pet.spark, SPARK_CAP, snapshot.integrity),
         area,
-        1,
+        0,
         text_style,
         buf,
     );
 
-    render_pet_arcade_button_row(
-        &[
-            (format!("[G] Pulse -{PET_PULSE_COST}"), PetArcade::can_pet_pulse(snapshot), HitTarget::PetArcadePetPulse),
-            (format!("[B] Blink -{BLINK_COST}"), PetArcade::can_blink(snapshot), HitTarget::PetArcadeBlink),
-        ],
-        area,
-        2,
-        buf,
-        layout,
-        theme,
-    );
-    render_pet_arcade_button_row(
-        &[
-            (format!("[F] Circuit -{FULL_CIRCUIT_COST}"), PetArcade::can_full_circuit(snapshot), HitTarget::PetArcadeFullCircuit),
-            (format!("[M] Move->#{}", arcade.selected_anchor()), true, HitTarget::PetArcadeMovePet),
-        ],
-        area,
-        3,
-        buf,
-        layout,
-        theme,
-    );
-    render_pet_arcade_button_row(
-        &[("[Space] Start Wave".to_owned(), PetArcade::can_start_wave(snapshot), HitTarget::PetArcadeStartWave)],
-        area,
-        4,
-        buf,
-        layout,
-        theme,
-    );
-
-    let context_area = Rect::new(area.x, area.y + 5, area.width, 5.min(area.height.saturating_sub(5)));
-    render_pet_arcade_context(snapshot, arcade, context_area, buf, layout, theme);
-
-    render_modal_line("Towers:", area, 10, muted_style, buf);
+    render_modal_line("Build:", area, 1, muted_style, buf);
     let selected_kind = arcade.selected_tower_kind();
     let col_width = area.width / 2;
     for (index, kind) in TowerKind::ALL.iter().enumerate() {
         let index = index as u16;
-        let Some(row) = 11u16.checked_add(index / 2) else { break };
+        let Some(row) = 2u16.checked_add(index / 2) else { break };
         if row >= area.height {
             break;
         }
@@ -1767,6 +1988,41 @@ fn render_pet_arcade_hud(
         Paragraph::new(truncate_cells(&line, width as usize)).style(style).render(rect, buf);
         push_modal_hit(layout, rect, HitTarget::PetArcadeTowerKind(*kind));
     }
+
+    let context_area = Rect::new(area.x, area.y + 5, area.width, 5.min(area.height.saturating_sub(5)));
+    render_pet_arcade_context(snapshot, arcade, context_area, buf, layout, theme);
+
+    render_modal_line("Pet:", area, 10, muted_style, buf);
+    render_pet_arcade_button_row(
+        &[
+            (format!("[G] Pulse -{PET_PULSE_COST}"), PetArcade::can_pet_pulse(snapshot), HitTarget::PetArcadePetPulse),
+            (format!("[B] Blink -{BLINK_COST}"), PetArcade::can_blink(snapshot), HitTarget::PetArcadeBlink),
+        ],
+        area,
+        11,
+        buf,
+        layout,
+        theme,
+    );
+    render_pet_arcade_button_row(
+        &[
+            (format!("[F] Circuit -{FULL_CIRCUIT_COST}"), PetArcade::can_full_circuit(snapshot), HitTarget::PetArcadeFullCircuit),
+            (format!("[M] Move->#{}", arcade.selected_anchor()), true, HitTarget::PetArcadeMovePet),
+        ],
+        area,
+        12,
+        buf,
+        layout,
+        theme,
+    );
+    render_pet_arcade_button_row(
+        &[("[Space] Start Wave".to_owned(), PetArcade::can_start_wave(snapshot), HitTarget::PetArcadeStartWave)],
+        area,
+        13,
+        buf,
+        layout,
+        theme,
+    );
 }
 
 /// Paints a row of 1-2 short action buttons packed left-to-right with a
@@ -1892,17 +2148,30 @@ fn render_pet_arcade_context(
                 buf,
             );
             render_modal_line(&tower_stats_line(&tower.stats), area, 1, muted_style, buf);
+            // Owner report: an unaffordable Upgrade/L3 button used to paint
+            // exactly like an affordable one and just silently no-op on
+            // click (`apply_command`'s own `Command::UpgradeToL2`/`ToL3`
+            // guard) -- indistinguishable from a real click swallowed by a
+            // bug. Dimmed here the same way `render_pet_arcade_button_row`
+            // already dims Pulse/Blink/Circuit/Start Wave: the HIT REGION
+            // still gets pushed unconditionally either way (the sim gates
+            // it, this fn only greys it), so a genuinely borderline click
+            // (Sap earned mid-frame from a kill) is never dropped on the
+            // floor by the render side second-guessing the sim's own gate.
+            let dim_action_style = Style::default().fg(theme.dim).bg(theme.modal);
             match tower.level {
                 UpgradeLevel::Base => {
                     let cost = tower.next_upgrade_cost.unwrap_or(0);
-                    render_modal_line(&format!("[U] Upgrade L2  -{cost}"), area, 2, action_style, buf);
+                    let style = if cost <= snapshot.sap { action_style } else { dim_action_style };
+                    render_modal_line(&format!("[U] Upgrade L2  -{cost}"), area, 2, style, buf);
                     push_modal_hit(layout, modal_row(area, 2), HitTarget::PetArcadeUpgradeL2);
                 }
                 UpgradeLevel::L2 => {
                     let cost = tower.next_upgrade_cost.unwrap_or(0);
-                    render_modal_line(&format!("[P] L3 Power  -{cost}"), area, 2, action_style, buf);
+                    let style = if cost <= snapshot.sap { action_style } else { dim_action_style };
+                    render_modal_line(&format!("[P] L3 Power  -{cost}"), area, 2, style, buf);
                     push_modal_hit(layout, modal_row(area, 2), HitTarget::PetArcadeUpgradeL3Power);
-                    render_modal_line(&format!("[O] L3 Utility  -{cost}"), area, 3, action_style, buf);
+                    render_modal_line(&format!("[O] L3 Utility  -{cost}"), area, 3, style, buf);
                     push_modal_hit(layout, modal_row(area, 3), HitTarget::PetArcadeUpgradeL3Utility);
                 }
                 UpgradeLevel::L3(_) => {
@@ -2132,15 +2401,70 @@ fn tower_kind_glyph(kind: TowerKind) -> char {
     }
 }
 
-fn render_pet_arcade_hints(area: Rect, buf: &mut TerminalBuffer, theme: Theme) {
-    let lines = [
-        "Click: tile select, palette places/drags, anchor moves pet, board inspects",
-        "Tab tile [ ] anchor 1-6 place u/p/o upgrade x sell m/b/g/f pet space wave Esc close",
-    ];
-    for (row, line) in lines.iter().enumerate() {
-        let Ok(row) = u16::try_from(row) else { break };
-        render_modal_line(line, area, row, Style::default().fg(theme.muted).bg(theme.modal), buf);
+/// A host-side duplicate of `gate4agent-arcade-pet-bastion-render`'s own
+/// PRIVATE `tower_tile_id` table (`lib.rs`) -- same reason `tower_kind_
+/// glyph`/`tower_kind_label` above already duplicate that crate's own
+/// per-kind tables instead of importing them (that crate is off-limits to
+/// edit for this pass, and its own tables are `pub(crate)`, not exported).
+/// Feeds [`pet_arcade_drag_ghost_sprite`]'s own `DynamicSprite::tile`, so
+/// the drag ghost paints as the exact same `TileId` a placed tower of this
+/// kind uses (`gate4agent-arcade-pet-bastion-render`'s own `snapshot_to_
+/// surface` adapter picks the identical variant for a REAL placement).
+fn tower_kind_tile_id(kind: TowerKind) -> TileId {
+    match kind {
+        TowerKind::Needle => TileId::TowerNeedle,
+        TowerKind::Bell => TileId::TowerBell,
+        TowerKind::Prism => TileId::TowerPrism,
+        TowerKind::EmberNest => TileId::TowerEmberNest,
+        TowerKind::Moonwell => TileId::TowerMoonwell,
+        TowerKind::Relay => TileId::TowerRelay,
     }
+}
+
+/// [`tower_kind_tile_id`]'s own colour counterpart -- a host-side duplicate
+/// of `gate4agent-arcade-pet-bastion-render`'s own PRIVATE `tower_base_
+/// color` table, for the exact same reason.
+fn tower_kind_base_color(kind: TowerKind) -> ArcadeRgb {
+    match kind {
+        TowerKind::Needle => ArcadeRgb(200, 200, 200),
+        TowerKind::Bell => ArcadeRgb(150, 120, 255),
+        TowerKind::Prism => ArcadeRgb(255, 140, 255),
+        TowerKind::EmberNest => ArcadeRgb(255, 110, 40),
+        TowerKind::Moonwell => ArcadeRgb(110, 200, 255),
+        TowerKind::Relay => ArcadeRgb(180, 180, 80),
+    }
+}
+
+/// The pixel tier's own carried-tower drag ghost -- see this fn's own call
+/// site (`render_pet_arcade`'s pixel-tier branch) for why it is pushed into
+/// `dynamic`, never `strokes`. Snapped to whichever board tile is currently
+/// under `(column, row)` (the SAME discrete tile `HitTarget::PetArcadeTile`
+/// would resolve a drop at this point to, and the same tile `pet_arcade_
+/// pixel_highlight_strokes` outlines for legality) rather than following
+/// the pointer at sub-tile precision -- so the ghost always lands centred
+/// exactly on one of the legality-tinted outlines it is being dragged
+/// over, never straddling two. `None` while the cursor sits outside `dest`
+/// (still over the palette, or off the board entirely -- nothing to snap
+/// to yet) or `footprint_w` is degenerate (the narrow-terminal glyph
+/// footprint this fn's own caller already excludes via `pixel_tier_fits`,
+/// guarded here too since this is cheap and this fn has no other caller to
+/// rely on that upstream guard).
+fn pet_arcade_drag_ghost_sprite(kind: TowerKind, column: u16, row: u16, dest: Rect, footprint_w: u16) -> Option<DynamicSprite> {
+    let (tile_x, tile_y) = pet_arcade_drag_hovered_tile(column, row, dest, footprint_w)?;
+    Some(DynamicSprite {
+        tile: tower_kind_tile_id(kind),
+        variant: 0,
+        fg: tower_kind_base_color(kind),
+        bg: None,
+        tile_x: tile_x as f64 + 0.5,
+        tile_y: tile_y as f64 + 0.5,
+        scale: 1.0,
+        // Semi-transparent -- "пусть сюда рисуется башня, а не тянется
+        // надпись", but still visibly a PREVIEW, not a placed tower (a
+        // real placed tower always paints at `alpha: 1.0`, see `paint_
+        // overlay_layer`'s own call into `paint_tile`).
+        alpha: 0.6,
+    })
 }
 
 /// A sixel image is raster painted directly over the terminal and obeys
@@ -24216,11 +24540,15 @@ mod tests {
         );
     }
 
-    /// Owner report: the key legend used to cut off mid-word ("5=Moonw…")
-    /// at the overlay's own preferred size, because the old single hint
-    /// line crammed a full per-kind tower legend (now the palette's own
-    /// job) alongside every other binding. Proves neither of the two
-    /// rewritten hint lines truncates at that same preferred size.
+    /// Owner report (historical): the key legend used to cut off mid-word
+    /// ("5=Moonw…") at the overlay's own preferred size, because the old
+    /// single hint line crammed a full per-kind tower legend (now the
+    /// palette's own job) alongside every other binding. The legend itself
+    /// is gone now (`render_pet_arcade_hints` was deleted outright, owner
+    /// report: dead screen space nobody read) -- this test survives as the
+    /// general "nothing in the arcade modal truncates at its own preferred
+    /// size" guard, now covering the new HUD panel's own build/pet/wave
+    /// labels and button rows instead.
     #[test]
     fn pet_arcade_hint_legend_never_truncates_at_preferred_size() {
         let mut app = open_pet_arcade_app(140, 40);
@@ -24539,12 +24867,22 @@ mod tests {
 
     /// Owner report: dropping on a slot that cannot take a tower must
     /// cancel without spending anything, not silently fail after already
-    /// charging Sap. `(0, 0)` sits roughly three tiles from the nearest
-    /// route leg -- outside `BUILD_RADIUS_FP` (2.0 tiles), so it never
-    /// even appears in `build_cells` at all, the clearest possible
-    /// "nothing can ever be built here" tile on this map.
+    /// charging Sap. Free placement (`gate4agent-arcade-pet-bastion`'s own
+    /// `board.rs` module doc: "я хочу ставить куда хочу", `BuildIneligible
+    /// Reason::{Route,Anchor,Occupied,OutOfBounds}` the only four refusal
+    /// reasons left) means there is no build-radius edge to walk off any
+    /// more -- 333 of the board's 392 tiles are legal. The Heartseed
+    /// (`board::HEARTSEED`) is the one tile guaranteed invalid regardless
+    /// of that: it is the shared last waypoint of BOTH routes (`board.rs`'s
+    /// own doc comment, and its own `the_heartseed_tile_is_never_a_build_
+    /// candidate` test), so `static_build_reason` always reports `Route`
+    /// for it -- the clearest possible "nothing can ever be built here"
+    /// tile left on this map now that a route/anchor/occupied cell is the
+    /// entire remaining refusal list.
     #[test]
     fn pet_arcade_dragging_a_tower_onto_an_invalid_tile_places_nothing_and_charges_nothing() {
+        use gate4agent_arcade_pet_bastion::board::HEARTSEED;
+
         let mut app = open_pet_arcade_app(140, 40);
         render_pet_arcade_app(&mut app);
 
@@ -24559,16 +24897,314 @@ mod tests {
         let sap_after_press = app.pet_arcade.borrow().snapshot().unwrap().sap;
 
         render_pet_arcade_app(&mut app);
-        let invalid_hit = find_hit(&app, HitTarget::PetArcadeTile(0, 0));
+        let (heartseed_x, heartseed_y) = (HEARTSEED.x as u8, HEARTSEED.y as u8);
+        let invalid_hit = find_hit(&app, HitTarget::PetArcadeTile(heartseed_x, heartseed_y));
         let _ = app.drag(invalid_hit.rect.x, invalid_hit.rect.y);
         let _ = app.drop_at(invalid_hit.rect.x, invalid_hit.rect.y);
         tick_pet_arcade(&app, &mut now);
 
         let snapshot = app.pet_arcade.borrow().snapshot().unwrap();
-        assert_eq!(snapshot.sap, sap_after_press, "dropping on an out-of-zone tile must not spend any Sap");
+        assert_eq!(snapshot.sap, sap_after_press, "dropping on the Heartseed's own route tile must not spend any Sap");
         assert!(
-            !snapshot.towers.iter().any(|tower| tower.position == (0, 0)),
-            "dropping on an out-of-zone tile must not place a tower there"
+            !snapshot.towers.iter().any(|tower| tower.position == (i32::from(heartseed_x), i32::from(heartseed_y))),
+            "dropping on the Heartseed's own route tile must not place a tower there"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Pet Bastion arcade: the owner's four UI complaints (hint legend
+    // removal, the HUD-as-control-plane reorder, the mechanics info modal,
+    // the drag ghost). See each test's own doc comment for which one.
+    // -----------------------------------------------------------------
+
+    /// Owner report: "я просил убрать снизу подписи ... какая-то эта
+    /// параша бессмысленная которая просто пространство экрана забирает".
+    /// `render_pet_arcade_hints` is gone outright -- proves neither of its
+    /// two old legend strings paints anywhere in the arcade modal any
+    /// more, at a size roomy enough that the old code would definitely
+    /// have shown them.
+    #[test]
+    fn pet_arcade_no_longer_paints_the_old_keybind_legend_text() {
+        let mut app = open_pet_arcade_app(140, 40);
+        let buf = render_pet_arcade_app(&mut app);
+        let text = rect_text(&buf, app.layout.pet_arcade_modal);
+        assert!(!text.contains("Click: tile select"), "old legend line 1 must be gone: {text:?}");
+        assert!(!text.contains("Tab tile"), "old legend line 2 must be gone: {text:?}");
+    }
+
+    /// Owner report (twice): "справа сделать более понятную контролплейн".
+    /// Proves the new HUD panel actually reads top to bottom in the order
+    /// asked for -- build, then the selected thing, then the pet, then the
+    /// wave -- through the real hit regions a real render pass painted,
+    /// never a hand-picked row number.
+    #[test]
+    fn pet_arcade_hud_panel_reads_build_then_pet_then_wave_top_to_bottom() {
+        let mut app = open_pet_arcade_app(140, 40);
+        render_pet_arcade_app(&mut app);
+
+        let build_hit = find_hit(&app, HitTarget::PetArcadeTowerKind(TowerKind::Needle));
+        let pulse_hit = find_hit(&app, HitTarget::PetArcadePetPulse);
+        let move_hit = find_hit(&app, HitTarget::PetArcadeMovePet);
+        let wave_hit = find_hit(&app, HitTarget::PetArcadeStartWave);
+
+        assert!(
+            build_hit.rect.y < pulse_hit.rect.y,
+            "the tower palette (\"what I can build\") must sit above the pet ability buttons"
+        );
+        assert!(
+            pulse_hit.rect.y < wave_hit.rect.y && move_hit.rect.y < wave_hit.rect.y,
+            "the pet ability buttons (\"what the pet can do\") must sit above Start Wave (\"what the wave is doing\")"
+        );
+    }
+
+    /// Owner report: an unaffordable upgrade button used to paint exactly
+    /// like an affordable one and just silently no-op on click -- the same
+    /// "visibly unavailable, not unclickable" gap the pulse/blink/circuit
+    /// buttons already closed. Drives `render_pet_arcade_context` directly
+    /// against a hand-built fixture (the same shape `pet_arcade_rune_
+    /// draft_and_evolution_choice_options_are_clickable` already uses)
+    /// since legitimately earning Sap scarce enough to make a fresh
+    /// Needle's own L2 upgrade unaffordable needs live combat this unit
+    /// test cannot drive deterministically.
+    #[test]
+    fn pet_arcade_upgrade_button_dims_when_unaffordable() {
+        use gate4agent_arcade_pet_bastion::ids::EntityId;
+        use gate4agent_arcade_pet_bastion::pet::PetState;
+        use gate4agent_arcade_pet_bastion::snapshot::{PetView, TowerView};
+        use gate4agent_arcade_pet_bastion::wave::Difficulty;
+
+        let mut app = open_pet_arcade_app(140, 40);
+        render_pet_arcade_app(&mut app);
+        let (selected_x, selected_y) = app.pet_arcade.borrow().selected_tile();
+
+        let tower = TowerView {
+            id: EntityId(1),
+            kind: TowerKind::Needle,
+            level: UpgradeLevel::Base,
+            position: (i32::from(selected_x), i32::from(selected_y)),
+            linked: false,
+            cooldown_ticks: 0,
+            stats: effective_stats(TowerKind::Needle, UpgradeLevel::Base),
+            next_upgrade_cost: Some(999),
+            sell_price: 5,
+        };
+        let snapshot = SimulationSnapshot {
+            tick_index: 0,
+            difficulty: Difficulty::Standard,
+            wave: 1,
+            phase: RunPhaseView::Build { ticks_remaining: 100 },
+            sap: 0,
+            integrity: 100,
+            crab_shield: 0,
+            towers: vec![tower],
+            enemies: Vec::new(),
+            boss: None,
+            pet: PetView {
+                state: PetState::AtAnchor(AnchorId(0)),
+                spark: 0,
+                evolution: None,
+                linked_towers: Vec::new(),
+            },
+            rune_options: Vec::new(),
+            runes_picked: Vec::new(),
+            build_cells: Vec::new(),
+            wave_plan: None,
+        };
+
+        let context_area = Rect::new(10, 10, 30, 5);
+        let mut buf = TerminalBuffer::new(140, 40);
+        let theme = Theme::for_mode(app.color_mode);
+        {
+            let arcade = app.pet_arcade.borrow();
+            render_pet_arcade_context(&snapshot, &arcade, context_area, &mut buf, &mut app.layout, theme);
+        }
+        assert_eq!(
+            buf.get(context_area.x, context_area.y + 2).style.fg,
+            theme.dim,
+            "0 Sap against a 999-cost upgrade must paint [U] Upgrade L2 dim, not indistinguishable from affordable"
+        );
+    }
+
+    /// Owner report (twice): Spark/rune/pet-anchor mechanics were nowhere
+    /// in the interface at all. Proves `[?] Info` is a real, clickable hit
+    /// region on the header row a real render pass painted, that clicking
+    /// it opens the mechanics modal, and that the modal's own text is
+    /// built from the SIM's real constants -- these assertions are the
+    /// actual numeric substrings those constants resolve to today, read
+    /// straight off `gate4agent_arcade_pet_bastion::constants` here too,
+    /// never a copied literal, so this test breaks the moment the modal's
+    /// own numbers would silently drift from the rules they describe.
+    #[test]
+    fn pet_arcade_info_button_opens_a_mechanics_card_built_from_real_constants() {
+        use gate4agent_arcade_pet_bastion::constants::{
+            BOSS_LAP_INTEGRITY_DAMAGE, LEAK_INTEGRITY_DAMAGE, RUNE_DRAFT_AFTER_WAVES, RUNE_DRAFT_OPTIONS, SPARK_CAP,
+            SPARK_PER_KILLS,
+        };
+
+        let mut app = open_pet_arcade_app(140, 40);
+        render_pet_arcade_app(&mut app);
+
+        let info_hit = find_hit(&app, HitTarget::PetArcadeInfo);
+        let _ = app.click(info_hit.rect.x, info_hit.rect.y);
+        assert!(app.pet_arcade_info_open, "clicking [?] Info must open the mechanics modal");
+
+        let buf = render_pet_arcade_app(&mut app);
+        let text = rect_text(&buf, app.layout.pet_arcade_info_modal);
+        assert!(text.contains(&format!("{SPARK_PER_KILLS} linked kills")), "{text:?}");
+        assert!(text.contains(&format!("capped at {SPARK_CAP}")), "{text:?}");
+        assert!(
+            text.contains(&format!("wave {} and wave {}", RUNE_DRAFT_AFTER_WAVES[0], RUNE_DRAFT_AFTER_WAVES[1])),
+            "{text:?}"
+        );
+        assert!(text.contains(&format!("pick 1 of {RUNE_DRAFT_OPTIONS}")), "{text:?}");
+        // Owner report (free-placement follow-up): the rules crate stopped
+        // killing a unit at the Heartseed and stopped ending a wave on its
+        // first arrival there -- both silent rule changes the modal must
+        // now explain, with the real per-lap Integrity cost read straight
+        // off the same constants `sim.rs` charges against.
+        assert!(text.contains("NOT killed"), "{text:?}");
+        assert!(text.contains("loops back to its own route start"), "{text:?}");
+        assert!(
+            text.contains(&format!("-{LEAK_INTEGRITY_DAMAGE} for a minion, -{BOSS_LAP_INTEGRITY_DAMAGE} for a boss")),
+            "{text:?}"
+        );
+        assert!(text.contains("only once every enemy on it is dead"), "{text:?}");
+
+        // `Escape` closes ONLY the info modal -- the arcade run underneath
+        // must stay open (`App::close_pet_arcade`'s own "freeze in place,
+        // never drop" contract; `App::reduce_pet_arcade`'s own doc comment
+        // covers the same rule for its own `pet_arcade_info_open` branch).
+        app.reduce(crate::UiKey::Escape);
+        assert!(!app.pet_arcade_info_open, "Escape must close the info modal");
+        assert!(app.pet_arcade_open, "Escape must NOT also close the arcade run underneath");
+    }
+
+    /// The general "nothing in the arcade modal truncates" guard (`pet_
+    /// arcade_hint_legend_never_truncates_at_preferred_size`) only ever
+    /// scans `pet_arcade_modal` -- it never covered the mechanics card at
+    /// all, which is how a line long enough to truncate (`Content width <
+    /// line length`) could land in `render_pet_arcade_info` unnoticed.
+    /// Proves the info modal's own text never truncates either.
+    #[test]
+    fn pet_arcade_info_modal_never_truncates() {
+        let mut app = open_pet_arcade_app(140, 40);
+        render_pet_arcade_app(&mut app);
+        let info_hit = find_hit(&app, HitTarget::PetArcadeInfo);
+        let _ = app.click(info_hit.rect.x, info_hit.rect.y);
+        let buf = render_pet_arcade_app(&mut app);
+        let text = rect_text(&buf, app.layout.pet_arcade_info_modal);
+        assert!(!text.contains('\u{2026}'), "the mechanics modal truncated a line: {text:?}");
+    }
+
+    /// The mouse counterpart to the Escape half of the test above -- a
+    /// click OUTSIDE the centred info modal must close only that modal
+    /// (`App::close_overlay_outside_click`'s own `pet_arcade_info_open`
+    /// branch, checked ahead of every other overlay check and returning
+    /// unconditionally while that modal is open, so it never falls through
+    /// to whatever the arcade itself would have done with the same click --
+    /// the arcade's own outside-click branch is provably unreachable while
+    /// this one is `true`, not merely untested for this particular point).
+    /// The terminal's own top-left corner is used as "outside" rather than
+    /// a point derived from `pet_arcade_modal`'s own rect: the info modal
+    /// is a full mechanics reference in its own right, not guaranteed to
+    /// nest strictly inside the (much shorter) arcade panel behind it, so
+    /// a relative-geometry assumption between the two would be fragile.
+    #[test]
+    fn pet_arcade_info_modal_closes_on_a_click_outside_it_without_closing_the_arcade() {
+        let mut app = open_pet_arcade_app(140, 40);
+        render_pet_arcade_app(&mut app);
+        let info_hit = find_hit(&app, HitTarget::PetArcadeInfo);
+        let _ = app.click(info_hit.rect.x, info_hit.rect.y);
+        render_pet_arcade_app(&mut app);
+        assert!(app.pet_arcade_info_open, "setup: info modal must be open");
+
+        let info = app.layout.pet_arcade_info_modal;
+        assert!(!info.is_empty(), "setup: the info modal must have painted a real rect");
+        assert!(!info.contains(0, 0), "setup: the terminal's own corner must sit outside the centred info modal");
+
+        let _ = app.click(0, 0);
+        assert!(!app.pet_arcade_info_open, "a click outside the info modal must close it");
+        assert!(app.pet_arcade_open, "closing the info modal must not also close the arcade underneath");
+    }
+
+    /// The info modal's own `[x]` (`render::render_modal_close`, reused
+    /// verbatim) must close only this modal, not the arcade's OWN `[x]`
+    /// underneath it -- both push the identical `HitTarget::ModalClose`,
+    /// so this resolves the click the exact way a real mouse would
+    /// (`App::click`'s own last-pushed-wins scan, `.iter().rev().find`),
+    /// which is guaranteed to land on the info modal's own cross since it
+    /// paints (and so is hit-tested) after the arcade's.
+    #[test]
+    fn pet_arcade_info_modal_close_button_closes_only_the_info_modal() {
+        let mut app = open_pet_arcade_app(140, 40);
+        render_pet_arcade_app(&mut app);
+        let info_hit = find_hit(&app, HitTarget::PetArcadeInfo);
+        let _ = app.click(info_hit.rect.x, info_hit.rect.y);
+        render_pet_arcade_app(&mut app);
+        assert!(app.pet_arcade_info_open, "setup: info modal must be open");
+
+        let close_rect = app
+            .layout
+            .hits
+            .iter()
+            .rev()
+            .find(|hit| hit.target == HitTarget::ModalClose)
+            .expect("the info modal must paint its own [x]")
+            .rect;
+        let _ = app.click(close_rect.x, close_rect.y);
+        assert!(!app.pet_arcade_info_open, "[x] must close the info modal");
+        assert!(app.pet_arcade_open, "[x] must not also close the arcade underneath");
+    }
+
+    /// Owner report: "когда тянем башню ... чтобы заплейсить её на точку,
+    /// ну пусть сюда рисуется башня, а не тянется надпись". Proves [`pet_
+    /// arcade_drag_ghost_sprite`] paints the tower's OWN `TileId` (the same
+    /// one a real placement uses, `tower_kind_tile_id`), snapped to
+    /// whichever discrete board tile sits under the cursor, semi-
+    /// transparent -- and that a cursor outside the board (`dest`)
+    /// produces no ghost at all rather than a bogus one.
+    #[test]
+    fn pet_arcade_drag_ghost_sprite_snaps_to_the_hovered_tile_and_stays_semi_transparent() {
+        let dest = Rect::new(5, 3, 56, 14);
+        let ghost = pet_arcade_drag_ghost_sprite(TowerKind::Bell, 5 + 2 * 3 + 1, 3 + 4, dest, 2)
+            .expect("a cursor inside dest must produce a ghost");
+        assert_eq!(ghost.tile, TileId::TowerBell, "the ghost must use the SAME TileId a real placement uses");
+        assert_eq!((ghost.tile_x, ghost.tile_y), (3.5, 4.5), "the ghost must be centred on the hovered tile");
+        assert!(ghost.alpha < 1.0, "the ghost must be semi-transparent -- 1.0 is a REAL placed tower's own opacity");
+
+        assert!(
+            pet_arcade_drag_ghost_sprite(TowerKind::Bell, dest.x - 1, dest.y, dest, 2).is_none(),
+            "a cursor outside the board must produce no ghost at all"
+        );
+        assert!(
+            pet_arcade_drag_ghost_sprite(TowerKind::Bell, dest.x, dest.y, dest, 0).is_none(),
+            "a degenerate footprint_w must not divide by zero"
+        );
+    }
+
+    /// Free placement follow-up (owner report via coordinator): with the
+    /// build radius gone, 333 of the board's 392 tiles are legal at once,
+    /// so the OLD "tint every legal candidate" drag highlight lit up
+    /// nearly the whole board -- noise, not information (`pet_arcade_
+    /// highlight_buildable_tiles`'s own doc comment has the full
+    /// reasoning). Proves the redesign emits exactly ONE tile's own
+    /// outline (4 `DynamicStroke`s, `push_tile_outline_stroke`'s own doc
+    /// comment) for a hovered, genuinely-buildable tile, never one per
+    /// legal candidate -- this test would have failed outright against the
+    /// predecessor, which multiplied per-legal-tile instead.
+    #[test]
+    fn pet_arcade_drag_highlight_lights_up_only_the_hovered_tile_not_the_whole_legal_set() {
+        let mut app = open_pet_arcade_app(140, 40);
+        render_pet_arcade_app(&mut app);
+        let (tx, ty) = buildable_tiles(&app)[0];
+
+        let snapshot = app.pet_arcade.borrow().snapshot().unwrap();
+        let baseline = pet_arcade_pixel_highlight_strokes(&snapshot, (0, 0), 0, None);
+        let with_drag = pet_arcade_pixel_highlight_strokes(&snapshot, (0, 0), 0, Some((TowerKind::Needle, (tx, ty))));
+        assert_eq!(
+            with_drag.len(),
+            baseline.len() + 4,
+            "the drag highlight must add exactly ONE tile's own outline for the hovered tile, never one per legal candidate"
         );
     }
 }

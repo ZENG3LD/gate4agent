@@ -8094,12 +8094,35 @@ fn append_event_to_diagnostics_file(event: &AppEvent) {
                     .map(AgentRowKey::Legacy),
             )
             .collect::<Vec<_>>();
-        rows.sort_by(|left, right| {
-            self.agent_row_customization_sort_key(left)
-                .cmp(&self.agent_row_customization_sort_key(right))
-                .then_with(|| self.agent_row_sort_key(left).cmp(&self.agent_row_sort_key(right)))
-        });
-        rows
+        // Decorate-sort-undecorate, and not for tidiness: both key
+        // functions are expensive. `agent_row_sort_key` resolves its row
+        // through `find_managed_session`, a linear scan of every node's
+        // every record, and then allocates three `String`s (one of them a
+        // fresh `to_ascii_lowercase`); `agent_row_customization_sort_key`
+        // walks the manual-order and pin lists the same way.
+        //
+        // Computed inside the comparator, they ran once per COMPARISON --
+        // O(n log n) key builds rather than O(n) -- and `agent_rows` is
+        // rebuilt from scratch on every frame the roster is on screen. At
+        // 50 records that measured `render_us` p50 11880us, sustained, at
+        // 61fps: twelve milliseconds of a sixteen-millisecond frame spent
+        // re-deriving an order that had not changed. Each row's key is now
+        // built once.
+        //
+        // The pair compares lexicographically, which is exactly what the
+        // `cmp(...).then_with(...)` chain it replaces did.
+        let mut decorated = rows
+            .into_iter()
+            .map(|row| {
+                let order = (
+                    self.agent_row_customization_sort_key(&row),
+                    self.agent_row_sort_key(&row),
+                );
+                (order, row)
+            })
+            .collect::<Vec<_>>();
+        decorated.sort_by(|(left, _), (right, _)| left.cmp(right));
+        decorated.into_iter().map(|(_, row)| row).collect()
     }
 
     fn agent_board_node<'a>(&'a self, key: &AgentRowKey) -> Option<&'a NodeView> {

@@ -3112,6 +3112,16 @@ pub enum HitTarget {
     PetArcadeUpgradeL3Power,
     PetArcadeUpgradeL3Utility,
     PetArcadeSell,
+    /// The HUD's own top resource row ("Sap X  Spark Y/Z  HP W",
+    /// `render::render_pet_arcade_hud`'s own row 0) -- owner report: "что
+    /// дают руны мне не очевидно ... тултип с инфой" extended to the
+    /// resource readouts themselves, not just the runes: what each of the
+    /// three numbers actually means and how it moves (Spark's own per-kill
+    /// earn rate and cap, Integrity's own per-leak cost), read fresh off
+    /// the live `SimulationSnapshot` at hover time (`render::pet_arcade_
+    /// tooltip_text`'s own `PetArcadeResources` arm), never a hand-
+    /// described summary.
+    PetArcadeResources,
     /// The arcade's own header row (wave/phase line) -- opens the wave
     /// inspector card (`PetArcade::inspect_wave`).
     PetArcadeWaveInspect,
@@ -14260,6 +14270,7 @@ fn append_event_to_diagnostics_file(event: &AppEvent) {
                 | HitTarget::PetArcadeUpgradeL3Power
                 | HitTarget::PetArcadeUpgradeL3Utility
                 | HitTarget::PetArcadeSell
+                | HitTarget::PetArcadeResources
                 | HitTarget::PetArcadeWaveInspect
                 | HitTarget::PetArcadePetPulse
                 | HitTarget::PetArcadeBlink

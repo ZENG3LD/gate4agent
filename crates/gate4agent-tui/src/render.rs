@@ -25,7 +25,7 @@ use gate4agent_arcade_pet_bastion::constants::{
 use gate4agent_arcade_pet_bastion::enemy::EnemyKind;
 use gate4agent_arcade_pet_bastion::pet::{Evolution, PetCharge};
 use gate4agent_arcade_pet_bastion::rune::Rune;
-use gate4agent_arcade_pet_bastion::snapshot::{FieldZoneView, RunPhaseView, SimulationSnapshot};
+use gate4agent_arcade_pet_bastion::snapshot::{FieldZoneView, RunPhaseView, SimulationSnapshot, TowerView};
 use gate4agent_arcade_pet_bastion::tower::{effective_stats, DamageFamily, TowerKind, TowerStats, UpgradeBranch, UpgradeLevel};
 use gate4agent_arcade_pet_bastion::wave::Difficulty;
 use gate4agent_arcade_pet_bastion::zone::{ZoneKind, ZonePolarity};
@@ -511,7 +511,7 @@ pub fn render(app: &App, buf: &mut TerminalBuffer) -> LayoutRects {
         // mutually exclusive already (`App::hover`'s own doc comment:
         // hovering either of THEIR hit regions is never tooltip-eligible,
         // so `pet_arcade_hover` is already `None` whenever one is open).
-        render_pet_arcade_tooltip(app, area, buf, &layout, theme);
+        render_pet_arcade_tooltip(app, area, buf, &mut layout, theme);
     }
     render_drag_preview(app, area, buf, &layout, theme);
     if let Some(notice) = app.notice() {
@@ -1588,24 +1588,31 @@ fn one_decimal(numerator: i64, denominator: i64) -> String {
 /// calls this again, once the hold has actually elapsed, for the text to
 /// paint) -- never two independently-maintained lists.
 ///
-/// Covers, at minimum (owner's own ask): the rune draft options, the
-/// tower palette entries, the pet's own ability buttons (Pulse/Blink/
-/// Full Circuit/Move), and the evolution choices. EVERY number below is
-/// read from `gate4agent_arcade_pet_bastion::constants` (or, for towers,
-/// `TowerKind::base_stats`/`effective_stats`, the SAME calls `render_pet_
-/// arcade_hud`/`render_pet_arcade_context` already make) at call time,
-/// never copied into a string literal -- the same discipline `render_pet_
-/// arcade_info`'s own doc comment already states for the mechanics modal.
+/// Covers, at minimum (owner's own ask, "давай сделаем такие же тултипы с
+/// инфой на все"): the rune draft options, the tower palette entries, the
+/// pet's own ability buttons (Pulse/Blink/Full Circuit/Move), the Pet
+/// Charge draft options, the evolution choices, a placed tower (hovering
+/// the board tile it stands on), a board tile's own field zone, the
+/// [Space] Start Wave control, and the HUD's own top resource row. EVERY
+/// number below is read from `gate4agent_arcade_pet_bastion::constants`
+/// (or, for towers, `TowerKind::base_stats`/`effective_stats`, the SAME
+/// calls `render_pet_arcade_hud`/`render_pet_arcade_context` already make)
+/// at call time, never copied into a string literal -- the same
+/// discipline `render_pet_arcade_info`'s own doc comment already states
+/// for the mechanics modal.
 ///
 /// `snapshot` is `None` for every control whose tooltip is a pure function
 /// of the target alone (a rune, a tower kind, an ability button, an
 /// evolution, a Pet Charge) -- the same fixture-free shape this fn already
-/// had. The one exception is `HitTarget::PetArcadeTile`: a board tile's own
-/// tooltip (which field zone, if any, it sits inside) is genuinely per-run
-/// state (`snapshot.field_zones`, redrawn every wave), so that one arm
-/// needs a live snapshot to answer at all and returns `None` without one --
-/// exactly `App::hover`'s own `PetArcade::snapshot()` read, and `Home`/
-/// `Results` (no live run) correctly have no zone tooltip either.
+/// had. `HitTarget::PetArcadeTile`, `PetArcadeResources` and
+/// `PetArcadeStartWave` all need a LIVE snapshot to answer at all (a placed
+/// tower's own level, a field zone, or the current Sap/Spark/Integrity/
+/// wave number are all genuinely per-run state) and return `None` without
+/// one -- exactly `App::hover`'s own `PetArcade::snapshot()` read, and
+/// `Home`/`Results` (no live run) correctly have no tooltip for any of the
+/// three either, matching the render side: none of the controls they cover
+/// ever paints outside a live run in the first place (`render_pet_arcade`
+/// returns before `render_pet_arcade_hud` ever runs without one).
 pub(crate) fn pet_arcade_tooltip_text(target: &HitTarget, snapshot: Option<&SimulationSnapshot>) -> Option<String> {
     match target {
         HitTarget::PetArcadeDraftRune(rune) => Some(pet_arcade_rune_tooltip(*rune)),
@@ -1631,9 +1638,23 @@ pub(crate) fn pet_arcade_tooltip_text(target: &HitTarget, snapshot: Option<&Simu
         )),
         HitTarget::PetArcadeChooseEvolution(evolution) => Some(pet_arcade_evolution_tooltip(*evolution)),
         HitTarget::PetArcadeTile(x, y) => {
-            let zone = field_zone_at(snapshot?, *x, *y)?;
-            Some(pet_arcade_field_zone_tooltip(zone))
+            let snapshot = snapshot?;
+            let position = (i32::from(*x), i32::from(*y));
+            let zone_text = field_zone_at(snapshot, *x, *y).map(pet_arcade_field_zone_tooltip);
+            match snapshot.towers.iter().find(|tower| tower.position == position) {
+                Some(tower) => {
+                    let mut text = pet_arcade_placed_tower_tooltip(tower);
+                    if let Some(zone_text) = zone_text {
+                        text.push(' ');
+                        text.push_str(&zone_text);
+                    }
+                    Some(text)
+                }
+                None => zone_text,
+            }
         }
+        HitTarget::PetArcadeResources => Some(pet_arcade_resources_tooltip(snapshot?)),
+        HitTarget::PetArcadeStartWave => Some(pet_arcade_start_wave_tooltip(snapshot?)),
         _ => None,
     }
 }
@@ -1769,6 +1790,94 @@ fn pet_arcade_tower_tooltip(kind: TowerKind) -> String {
         text.push(')');
     }
     text
+}
+
+/// A PLACED tower's own tooltip (`HitTarget::PetArcadeTile`, hovered over
+/// whichever board tile this tower actually stands on) -- its real current
+/// level and combat summary (the SAME `tower_stats_line`/`tower_stats_
+/// extras_line` the HUD's own selected-tower context card already shows on
+/// CLICK, `render_pet_arcade_context`'s own `Some(tower)` arm), plus what
+/// its own NEXT upgrade step would actually buy: real `tower::effective_
+/// stats` at the resulting level, read the exact same way `tower.stats`
+/// itself already is (`TowerView::stats`'s own doc comment: `tower::
+/// effective_stats(kind, level)`), never a hand-described "gets stronger".
+/// Owner report: "для башни в поле это должно отражать её реальный
+/// уровень и что купит апгрейд".
+///
+/// `UpgradeLevel::L2`'s own next step is genuinely two branches
+/// (`UpgradeBranch::Power`/`Utility`, `render_pet_arcade_context`'s own
+/// `[P]`/`[O]` rows), at the SAME Sap cost either way (`tower::
+/// next_upgrade_cost`'s own doc comment) -- both previews are shown side by
+/// side rather than picking one arbitrarily, so hovering never hides which
+/// branch this tower would actually gain.
+fn pet_arcade_placed_tower_tooltip(tower: &TowerView) -> String {
+    let mut text = format!(
+        "{} L{} @{},{}: {}",
+        tower_kind_label(tower.kind),
+        upgrade_level_label(tower.level),
+        tower.position.0,
+        tower.position.1,
+        tower_stats_line(&tower.stats),
+    );
+    if let Some(extras) = tower_stats_extras_line(&tower.stats) {
+        text.push_str(" (");
+        text.push_str(&extras);
+        text.push(')');
+    }
+    match (tower.level, tower.next_upgrade_cost) {
+        (_, None) => text.push_str(". Already at max level."),
+        (UpgradeLevel::L2, Some(cost)) => {
+            let power = effective_stats(tower.kind, UpgradeLevel::L3(UpgradeBranch::Power));
+            let utility = effective_stats(tower.kind, UpgradeLevel::L3(UpgradeBranch::Utility));
+            text.push_str(&format!(
+                ". Next upgrade -{cost}: Power {} vs Utility {}",
+                tower_stats_line(&power),
+                tower_stats_line(&utility),
+            ));
+        }
+        (_, Some(cost)) => {
+            let preview = effective_stats(tower.kind, UpgradeLevel::L2);
+            text.push_str(&format!(". Next upgrade -{cost}: {}", tower_stats_line(&preview)));
+            if let Some(extras) = tower_stats_extras_line(&preview) {
+                text.push_str(" (");
+                text.push_str(&extras);
+                text.push(')');
+            }
+        }
+    }
+    text
+}
+
+/// The HUD's own top resource row (`HitTarget::PetArcadeResources`,
+/// `render_pet_arcade_hud`'s own row 0) -- the current live Sap/Spark/
+/// Integrity readouts, plus what each one actually means and how it
+/// moves: Spark's own per-kill earn rate and cap (`SPARK_PER_KILLS`,
+/// `SPARK_CAP`, the SAME numbers the mechanics modal's own SPARK section
+/// states), and Integrity's own per-leak cost (`LEAK_INTEGRITY_DAMAGE`,
+/// `BOSS_LAP_INTEGRITY_DAMAGE`, the SAME numbers its own WAVES section
+/// states). Owner report: the resource readouts were three bare numbers
+/// with no explanation of what earns or spends any of them.
+fn pet_arcade_resources_tooltip(snapshot: &SimulationSnapshot) -> String {
+    format!(
+        "Sap {}: spent placing and upgrading towers. Spark {}/{SPARK_CAP}: only a KILL by a tower currently linked to the pet earns it -- {SPARK_PER_KILLS} linked kills = +1 Spark, doubled during Night Maw's final phase. Integrity {}: the run ends in Defeat at 0 -- a leaked minion costs -{LEAK_INTEGRITY_DAMAGE}, a leaked boss lap costs -{BOSS_LAP_INTEGRITY_DAMAGE}.",
+        snapshot.sap, snapshot.pet.spark, snapshot.integrity,
+    )
+}
+
+/// The `[Space] Start Wave` control's own tooltip (`HitTarget::
+/// PetArcadeStartWave`) -- what pressing it actually does (ends the Build
+/// phase early, `PetArcade::can_start_wave`'s own doc comment) and the
+/// wave-loop rule the mechanics modal's own WAVES section already states
+/// in full (`pet_arcade_info_lines`' own doc comment): a unit reaching the
+/// Heartseed is NOT killed, it loops back to its own route start and costs
+/// Integrity per lap instead, and the wave only ends once every enemy on
+/// it is genuinely dead -- worth restating right on the button that starts
+/// that wave, not only in the mechanics reference a player may never open.
+fn pet_arcade_start_wave_tooltip(snapshot: &SimulationSnapshot) -> String {
+    format!(
+        "Start Wave: ends the Build phase now and begins Wave {}/{WAVE_COUNT} combat immediately. A unit reaching the Heartseed is NOT killed -- it loops back to its own route start at full health and keeps walking, costing Integrity per lap instead: -{LEAK_INTEGRITY_DAMAGE} for a minion, -{BOSS_LAP_INTEGRITY_DAMAGE} for a boss. The wave only ends once every enemy on it is dead.",
+        snapshot.wave,
+    )
 }
 
 /// An evolution choice's own tooltip -- the trade-off it makes, in the
@@ -2300,6 +2409,169 @@ fn render_pet_arcade_menu(app: &App, area: Rect, buf: &mut TerminalBuffer, layou
     }
 }
 
+/// The tooltip panel's own preferred width -- narrow and TALL on purpose
+/// (owner report: "тултип крутой но слишком растянут вбок поэтому сцена
+/// его перекрывает ... пусть более вертикально открывается"), replacing
+/// the old flat 52-column `MAX_WIDTH` that was wide enough to reach across
+/// the board almost wherever it opened. Still only a CAP, never a fixed
+/// size: [`pet_arcade_tooltip_rect`]'s own candidates each shrink it to
+/// whatever room their own side of `area` genuinely has, down to
+/// [`PET_ARCADE_TOOLTIP_MIN_WIDTH`], and reject that side outright rather
+/// than squeezing narrower than that floor.
+const PET_ARCADE_TOOLTIP_WIDTH: u16 = 32;
+
+/// The narrowest a tooltip panel may open at before a candidate side is
+/// rejected as "not really room" -- below this a wrapped line holds only a
+/// handful of characters, which reads as broken, not narrow.
+const PET_ARCADE_TOOLTIP_MIN_WIDTH: u16 = 20;
+
+/// The shortest a tooltip panel may open at -- one border row each side
+/// plus at least one content row.
+const PET_ARCADE_TOOLTIP_MIN_HEIGHT: u16 = 3;
+
+/// The inner, wrapped-TEXT width for a tooltip panel of outer `width`
+/// columns -- the panel's own bordered `Block` claims one column on each
+/// side, so wrapping to the full outer `width` would let a maximally-wide
+/// line collide with the border this fn's own caller draws around it.
+fn pet_arcade_tooltip_content_width(width: u16) -> usize {
+    width.saturating_sub(2) as usize
+}
+
+/// The x-clamp/flip every non-scene-constrained candidate below shares --
+/// opens flush with the pointer's own column, but never lets the panel's
+/// own right edge run past `area`'s.
+fn clamp_tooltip_x(area: Rect, hover_col: u16, width: u16) -> u16 {
+    hover_col.min(area.right().saturating_sub(width)).max(area.x)
+}
+
+/// The y-clamp/flip every non-scene-constrained candidate below shares --
+/// opens one row BELOW the pointer if that fits inside `area`, otherwise
+/// flips to open ABOVE it instead of running off the bottom edge. This is
+/// the "flipping ... near an edge rather than being clipped" half of the
+/// owner's own ask; [`clamp_tooltip_x`] is the other half.
+fn clamp_tooltip_y(area: Rect, hover_row: u16, height: u16) -> u16 {
+    let preferred = hover_row.saturating_add(1);
+    if preferred.saturating_add(height) <= area.bottom() {
+        preferred
+    } else {
+        hover_row.saturating_sub(height).max(area.y)
+    }
+}
+
+/// One "beside the scene" candidate -- `prefer_right` picks the scene's
+/// own right edge (the common case: the HUD panel already lives there) or
+/// its left edge. `None` if that side does not have at least
+/// [`PET_ARCADE_TOOLTIP_MIN_WIDTH`] genuine columns of room in `area` --
+/// rejected outright rather than squeezed narrower, so [`pet_arcade_
+/// tooltip_rect`] moves on to its next candidate instead of painting an
+/// illegible sliver. `y` is unconstrained by `scene` here (this candidate's
+/// own `x` range already never overlaps it, whatever `y` ends up being),
+/// so it just follows the pointer like every non-scene tooltip already
+/// does ([`clamp_tooltip_y`]).
+fn pet_arcade_tooltip_beside(area: Rect, scene: Rect, hover_row: u16, text: &str, prefer_right: bool) -> Option<Rect> {
+    let available_w = if prefer_right {
+        area.right().saturating_sub(scene.right())
+    } else {
+        scene.x.saturating_sub(area.x)
+    };
+    if available_w < PET_ARCADE_TOOLTIP_MIN_WIDTH {
+        return None;
+    }
+    let width = PET_ARCADE_TOOLTIP_WIDTH.min(available_w);
+    let lines = wrap_preview_text(text, pet_arcade_tooltip_content_width(width));
+    let height = (lines.len() as u16).saturating_add(2).min(area.height);
+    if height < PET_ARCADE_TOOLTIP_MIN_HEIGHT {
+        return None;
+    }
+    let x = if prefer_right { scene.right() } else { scene.x.saturating_sub(width) };
+    let y = clamp_tooltip_y(area, hover_row, height);
+    Some(Rect::new(x, y, width, height))
+}
+
+/// One "around the scene" candidate -- `below` picks the scene's own
+/// bottom edge or its top edge, tried only once neither [`pet_arcade_
+/// tooltip_beside`] candidate had room (e.g. a hover whose own column
+/// sits ON the board, in a window too narrow for the HUD strip itself to
+/// clear [`PET_ARCADE_TOOLTIP_MIN_WIDTH`]). `x` still follows the pointer
+/// within `area` ([`clamp_tooltip_x`]) -- nothing about `scene` constrains
+/// it horizontally here, only `y` is pinned to the scene's own edge.
+fn pet_arcade_tooltip_around(area: Rect, scene: Rect, hover_col: u16, text: &str, below: bool) -> Option<Rect> {
+    let available_h = if below {
+        area.bottom().saturating_sub(scene.bottom())
+    } else {
+        scene.y.saturating_sub(area.y)
+    };
+    if available_h < PET_ARCADE_TOOLTIP_MIN_HEIGHT {
+        return None;
+    }
+    let width = PET_ARCADE_TOOLTIP_WIDTH.min(area.width.saturating_sub(2)).max(6);
+    let lines = wrap_preview_text(text, pet_arcade_tooltip_content_width(width));
+    let height = (lines.len() as u16).saturating_add(2).min(available_h);
+    let x = clamp_tooltip_x(area, hover_col, width);
+    let y = if below { scene.bottom() } else { scene.y.saturating_sub(height) };
+    Some(Rect::new(x, y, width, height))
+}
+
+/// The last-resort candidate -- pointer-anchored exactly like every
+/// tooltip in this crate already opens (`render_context_usage_tooltip`'s
+/// own established shape), used verbatim whenever `scene` is `None` (the
+/// glyph tier, or a frame with no pixel-tier board painted at all -- a
+/// plain terminal cell obeys normal paint-order z-ordering, so there is
+/// nothing to avoid) and as the genuine fallback when every scene-aware
+/// candidate above rejected its own side.
+fn pet_arcade_tooltip_anchored(area: Rect, hover_col: u16, hover_row: u16, text: &str) -> Rect {
+    let width = PET_ARCADE_TOOLTIP_WIDTH.min(area.width.saturating_sub(2)).max(6);
+    let lines = wrap_preview_text(text, pet_arcade_tooltip_content_width(width));
+    let height = (lines.len() as u16).saturating_add(2).min(area.height);
+    let x = clamp_tooltip_x(area, hover_col, width);
+    let y = clamp_tooltip_y(area, hover_row, height);
+    Rect::new(x, y, width, height)
+}
+
+/// Chooses this frame's own tooltip panel rect. Owner report: "тултип
+/// крутой но слишком растянут вбок поэтому сцена его перекрывает, она
+/// оверрайдит все, пусть уважает сцену и более вертикально открывается с
+/// учётом размеров окна и положения модалки" -- `scene` is the pixel
+/// tier's own whole-board raster THIS frame (`layout.pet_arcade_pixel_
+/// frame`'s own rect, a sixel image painted directly to the terminal that
+/// "obeys no z-order of its own", `drop_pet_arcade_pixel_frame_if_
+/// covered`'s own doc comment), or `None` on the glyph tier / whenever no
+/// pixel frame painted at all this frame.
+///
+/// Tried in this order, the FIRST candidate with genuine room wins:
+/// 1. beside the scene ([`pet_arcade_tooltip_beside`], right of it then
+///    left of it) -- a narrow panel almost always fits in the HUD strip
+///    beside the board, or the window's own margin outside the modal,
+///    without touching the scene at all;
+/// 2. around the scene ([`pet_arcade_tooltip_around`], below it then
+///    above it) -- covers a hover whose own column sits ON the board (a
+///    tile's own tooltip) for whichever window shape leaves no room
+///    beside it;
+/// 3. pointer-anchored ([`pet_arcade_tooltip_anchored`]) -- the true last
+///    resort, reached only when `area` genuinely had no non-overlapping
+///    room anywhere for this frame's own text. The caller (`render_pet_
+///    arcade_tooltip`) is what actually registers this as an overlay when
+///    that happens, so the end-of-frame occlusion pass drops the pixel
+///    frame for this one redraw -- this fn only ever picks geometry, it
+///    never touches `layout` itself.
+fn pet_arcade_tooltip_rect(area: Rect, scene: Option<Rect>, hover_col: u16, hover_row: u16, text: &str) -> Rect {
+    if let Some(scene) = scene {
+        if let Some(rect) = pet_arcade_tooltip_beside(area, scene, hover_row, text, true) {
+            return rect;
+        }
+        if let Some(rect) = pet_arcade_tooltip_beside(area, scene, hover_row, text, false) {
+            return rect;
+        }
+        if let Some(rect) = pet_arcade_tooltip_around(area, scene, hover_col, text, true) {
+            return rect;
+        }
+        if let Some(rect) = pet_arcade_tooltip_around(area, scene, hover_col, text, false) {
+            return rect;
+        }
+    }
+    pet_arcade_tooltip_anchored(area, hover_col, hover_row, text)
+}
+
 /// The hover-and-hold tooltip itself -- owner: "что дают руны мне не
 /// очевидно ... было бы неплохо делать тултип с инфой, если наводим на
 /// вариант и держим на нем допустим 2 секунды". Paints [`pet_arcade_
@@ -2317,7 +2589,7 @@ fn render_pet_arcade_menu(app: &App, area: Rect, buf: &mut TerminalBuffer, layou
 /// hover` blindly: a click can change the board/HUD layout under an
 /// unmoved pointer (upgrading a tower reflows the context card, say)
 /// between one `App::hover` update and the next redraw.
-fn render_pet_arcade_tooltip(app: &App, area: Rect, buf: &mut TerminalBuffer, layout: &LayoutRects, theme: Theme) {
+fn render_pet_arcade_tooltip(app: &App, area: Rect, buf: &mut TerminalBuffer, layout: &mut LayoutRects, theme: Theme) {
     let Some(hover) = app.pet_arcade_hover.as_ref() else { return };
     if hover.since.elapsed() < PET_ARCADE_TOOLTIP_HOLD_DELAY {
         return;
@@ -2338,28 +2610,28 @@ fn render_pet_arcade_tooltip(app: &App, area: Rect, buf: &mut TerminalBuffer, la
     if area.width < 6 || area.height < 3 {
         return;
     }
-    const MAX_WIDTH: u16 = 52;
-    let width = MAX_WIDTH.min(area.width.saturating_sub(2)).max(6);
-    // `width - 2`: the wrapped TEXT width is the panel's own inner width,
-    // border excluded -- wrapping to the full outer `width` would let a
-    // maximally-wide line collide with the border columns this fn is
-    // about to draw around it.
-    let lines = wrap_preview_text(&text, width.saturating_sub(2) as usize);
-    let outer_height = (lines.len() as u16).saturating_add(2).min(area.height);
-    if outer_height < 3 {
+    let scene = layout.pet_arcade_pixel_frame.as_ref().map(|placement| placement.rect);
+    let rect = pet_arcade_tooltip_rect(area, scene, hover.column, hover.row, &text);
+    if rect.height < PET_ARCADE_TOOLTIP_MIN_HEIGHT {
         return;
     }
-    let x = hover
-        .column
-        .min(area.right().saturating_sub(width))
-        .max(area.x);
-    let preferred_y = hover.row.saturating_add(1);
-    let y = if preferred_y.saturating_add(outer_height) <= area.bottom() {
-        preferred_y
-    } else {
-        hover.row.saturating_sub(outer_height).max(area.y)
-    };
-    let rect = Rect::new(x, y, width, outer_height);
+    // Every non-overlapping placement `pet_arcade_tooltip_rect` could try
+    // already failed this frame if we reach here still intersecting
+    // `scene` -- the ONLY way left to keep this tooltip legible is to drop
+    // the board's own sixel raster back to the always-present glyph tier
+    // underneath for this one redraw (`render_pet_arcade`'s own doc
+    // comment: the glyph board paints first, unconditionally, regardless
+    // of visual tier). Registering as an overlay is what `drop_pet_arcade_
+    // pixel_frame_if_covered` (`render::render`'s own end-of-frame
+    // occlusion pass) keys off to actually do that -- a real cost (the
+    // pixel-tier board vanishes for this redraw), so this only ever runs
+    // as the fallback, never the default.
+    if let Some(scene) = scene {
+        if !rect.intersect(scene).is_empty() {
+            layout.note_overlay(rect);
+        }
+    }
+    let lines = wrap_preview_text(&text, pet_arcade_tooltip_content_width(rect.width));
     fill_rect(rect, theme.modal, buf);
     Block::bordered()
         .border_style(Style::default().fg(theme.accent))
@@ -2762,6 +3034,7 @@ fn render_pet_arcade_hud(
         text_style,
         buf,
     );
+    push_modal_hit(layout, modal_row(area, 0), HitTarget::PetArcadeResources);
 
     render_modal_line("Build:", area, 1, muted_style, buf);
     let selected_kind = arcade.selected_tower_kind();
@@ -26917,6 +27190,366 @@ mod tests {
         assert!(
             !rect_text(&buf, screen).contains(&tooltip_marker),
             "the tooltip must be gone the instant the pointer moves off"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Pet Bastion arcade: the tooltip's own vertical, scene-respecting
+    // placement. Owner: "тултип крутой но слишком растянут вбок поэтому
+    // сцена его перекрывает ... пусть уважает сцену и более вертикально
+    // открывается с учётом размеров окна и положения модалки".
+    // -----------------------------------------------------------------
+
+    /// A roomy right side (the common case: the HUD panel already lives
+    /// there) must win outright -- never overlapping the scene, and never
+    /// widening past [`PET_ARCADE_TOOLTIP_WIDTH`] just because the room
+    /// exists (that would be the old flat-52-column panel again).
+    #[test]
+    fn pet_arcade_tooltip_rect_prefers_beside_the_scene_over_overlapping_it() {
+        let area = Rect::new(0, 0, 120, 40);
+        let scene = Rect::new(10, 10, 50, 20);
+        let rect = pet_arcade_tooltip_rect(area, Some(scene), 30, 15, "short text");
+        assert!(rect.intersect(scene).is_empty(), "a roomy right side must never overlap the scene: {rect:?}");
+        assert_eq!(rect.x, scene.right(), "the beside-right candidate must open flush against the scene's own right edge");
+        assert!(rect.width <= PET_ARCADE_TOOLTIP_WIDTH, "must stay narrow, never the old 52-column panel: {rect:?}");
+    }
+
+    /// The full priority order: right of the scene, then left of it, then
+    /// below it, then above it -- each one only reached once every prior
+    /// candidate genuinely lacked room, proven by constructing `area`/
+    /// `scene` pairs where exactly one candidate can possibly work.
+    #[test]
+    fn pet_arcade_tooltip_rect_flips_side_then_direction_when_each_prior_candidate_lacks_room() {
+        // Right of the scene has only 5 columns (below the
+        // `PET_ARCADE_TOOLTIP_MIN_WIDTH` floor); left of it has exactly
+        // the floor's own 20.
+        let area = Rect::new(0, 0, 80, 40);
+        let scene = Rect::new(20, 10, 55, 20);
+        let rect = pet_arcade_tooltip_rect(area, Some(scene), 40, 15, "short text");
+        assert!(rect.intersect(scene).is_empty(), "must fall back to the left side rather than overlap: {rect:?}");
+        assert_eq!(rect.x + rect.width, scene.x, "the beside-left candidate must open flush against the scene's own left edge");
+
+        // Neither side has ANY room -- the scene spans the area's full
+        // width, so only above/below are left to try.
+        let area2 = Rect::new(0, 0, 40, 40);
+        let scene2 = Rect::new(0, 5, 40, 20);
+        let rect2 = pet_arcade_tooltip_rect(area2, Some(scene2), 20, 15, "short text");
+        assert!(rect2.intersect(scene2).is_empty(), "must fall back to below the scene: {rect2:?}");
+        assert_eq!(rect2.y, scene2.bottom(), "the around-below candidate must open flush against the scene's own bottom edge");
+
+        // Below is also out of room now -- the scene reaches the area's
+        // own bottom edge, only above still has room.
+        let area3 = Rect::new(0, 0, 40, 30);
+        let scene3 = Rect::new(0, 5, 40, 24);
+        let rect3 = pet_arcade_tooltip_rect(area3, Some(scene3), 20, 15, "short text");
+        assert!(rect3.intersect(scene3).is_empty(), "must fall back to above the scene: {rect3:?}");
+        assert_eq!(rect3.y + rect3.height, scene3.y, "the around-above candidate must open flush against the scene's own top edge");
+    }
+
+    /// Only when `area` genuinely has no non-overlapping room anywhere
+    /// (the scene fills the whole window) may the tooltip actually
+    /// intersect it -- and even then the fallback rect must still stay
+    /// fully inside `area`, never clipped by it.
+    #[test]
+    fn pet_arcade_tooltip_rect_only_overlaps_the_scene_when_no_side_has_room_anywhere() {
+        let area = Rect::new(0, 0, 20, 10);
+        let scene = area;
+        let rect = pet_arcade_tooltip_rect(area, Some(scene), 5, 5, "short text");
+        assert!(
+            !rect.intersect(scene).is_empty(),
+            "with no room anywhere the fallback must still return a usable rect, even though it overlaps: {rect:?}"
+        );
+        assert!(
+            rect.x >= area.x && rect.y >= area.y && rect.right() <= area.right() && rect.bottom() <= area.bottom(),
+            "the fallback rect must still stay inside the window: {rect:?}"
+        );
+    }
+
+    /// The width is picked from what `area` (and, with a scene, whichever
+    /// side won) actually has room for -- never the old flat 52-column
+    /// constant, and never wider than the window genuinely allows.
+    #[test]
+    fn pet_arcade_tooltip_rect_width_adapts_to_available_room_never_the_old_fixed_width() {
+        let roomy = Rect::new(0, 0, 200, 60);
+        let rect = pet_arcade_tooltip_rect(roomy, None, 50, 20, "short text");
+        assert_eq!(rect.width, PET_ARCADE_TOOLTIP_WIDTH, "a roomy window opens at the preferred narrow width: {rect:?}");
+        assert!(rect.width < 52, "must never reach the old fixed 52-column panel: {rect:?}");
+
+        let narrow = Rect::new(0, 0, 25, 20);
+        let rect2 = pet_arcade_tooltip_rect(narrow, None, 10, 10, "short text");
+        assert!(rect2.width <= narrow.width, "must never claim more width than the window actually has: {rect2:?}");
+    }
+
+    /// Every candidate -- scene-aware or not -- must stay fully inside
+    /// `area` regardless of where the pointer sits, flipping side/
+    /// direction near an edge rather than running off it.
+    #[test]
+    fn pet_arcade_tooltip_rect_stays_inside_the_window_near_every_edge() {
+        let area = Rect::new(0, 0, 100, 40);
+        let text = "a somewhat longer line of tooltip text to force real wrapping across a few rows";
+        for &(col, row) in &[(0, 0), (99, 0), (0, 39), (99, 39), (50, 20)] {
+            let rect = pet_arcade_tooltip_rect(area, None, col, row, text);
+            assert!(
+                rect.x >= area.x && rect.y >= area.y && rect.right() <= area.right() && rect.bottom() <= area.bottom(),
+                "hover at ({col},{row}) with no scene must stay fully inside the window: {rect:?}"
+            );
+        }
+        let scene = Rect::new(30, 10, 40, 20);
+        for &(col, row) in &[(0, 0), (99, 0), (0, 39), (99, 39), (50, 20)] {
+            let rect = pet_arcade_tooltip_rect(area, Some(scene), col, row, text);
+            assert!(
+                rect.x >= area.x && rect.y >= area.y && rect.right() <= area.right() && rect.bottom() <= area.bottom(),
+                "hover at ({col},{row}) with a scene present must stay fully inside the window: {rect:?}"
+            );
+        }
+    }
+
+    /// The real, end-to-end proof of the owner's own bug report: at the
+    /// TIGHTEST real geometry the pixel tier ever negotiates (88x18 --
+    /// `preferred_modal_size` (86x15) plus the 2-column/2-row border plus
+    /// the 1-row status bar reservation, the modal fills `area` with ZERO
+    /// margin on every side), a real hover on a HUD control still resolves
+    /// to a panel that never overlaps the board's own sixel raster, the
+    /// tooltip actually paints, and the pixel frame survives the frame's
+    /// own end-of-frame occlusion pass untouched.
+    #[test]
+    fn pet_arcade_tooltip_never_overlaps_the_pixel_board_at_the_tightest_real_geometry() {
+        let mut app = open_pet_arcade_app(88, 18);
+        render_pet_arcade_app(&mut app);
+        let scene = app
+            .layout
+            .pet_arcade_pixel_frame
+            .as_ref()
+            .expect("this exact size must still negotiate the pixel tier")
+            .rect;
+
+        let needle_hit = find_hit(&app, HitTarget::PetArcadeTowerKind(TowerKind::Needle));
+        let _ = app.hover(needle_hit.rect.x, needle_hit.rect.y);
+        if let Some(hover) = app.pet_arcade_hover.as_mut() {
+            hover.since = std::time::Instant::now()
+                .checked_sub(PET_ARCADE_TOOLTIP_HOLD_DELAY + std::time::Duration::from_millis(1))
+                .unwrap();
+        }
+        let area = Rect::new(0, 0, app.terminal_cols, app.terminal_rows.saturating_sub(1));
+        let expected_text = pet_arcade_tower_tooltip(TowerKind::Needle);
+        let expected = pet_arcade_tooltip_rect(area, Some(scene), needle_hit.rect.x, needle_hit.rect.y, &expected_text);
+        assert!(
+            expected.intersect(scene).is_empty(),
+            "the HUD strip beside a full-size board must always have room for a narrow panel: {expected:?} vs {scene:?}"
+        );
+
+        let buf = render_pet_arcade_app(&mut app);
+        let screen = Rect::new(0, 0, app.terminal_cols, app.terminal_rows);
+        let tooltip_marker = format!("{} -{}:", tower_kind_label(TowerKind::Needle), TowerKind::Needle.base_stats().cost);
+        assert!(rect_text(&buf, screen).contains(&tooltip_marker), "the tooltip must actually paint at this size");
+        assert!(
+            app.layout.pet_arcade_pixel_frame.is_some(),
+            "the pixel board must survive this redraw -- the tooltip never had to overlap it"
+        );
+    }
+
+    /// The fallback mechanism itself, proven directly: whenever [`pet_
+    /// arcade_tooltip_rect`] genuinely cannot avoid the scene, `render_pet_
+    /// arcade_tooltip` must register the panel as an overlay, and the
+    /// existing end-of-frame occlusion pass (`drop_pet_arcade_pixel_frame_
+    /// if_covered`) must then drop the pixel frame for that redraw. The
+    /// real `PetArcade` engine's own HUD panel is always at least 31
+    /// columns wide whenever the pixel tier paints at all (`pet_arcade_
+    /// tooltip_rect`'s own doc comment), so this exact fallback is not
+    /// reachable through today's real game geometry at any window size or
+    /// modal position -- proven here instead with a synthetic scene that
+    /// deliberately fills the whole window, exercising the WIRING
+    /// (`note_overlay` plus the occlusion pass) rather than a real layout.
+    #[test]
+    fn pet_arcade_tooltip_registers_as_an_overlay_and_drops_the_pixel_frame_when_it_must_overlap_the_scene() {
+        use crate::app::PetArcadeHoverState;
+
+        let mut app = open_pet_arcade_app(140, 40);
+        render_pet_arcade_app(&mut app);
+        let area = Rect::new(0, 0, app.terminal_cols, app.terminal_rows.saturating_sub(1));
+
+        let mut layout = LayoutRects::default();
+        layout.pet_arcade_pixel_frame = Some(PetArcadePixelPlacement { rect: area, encoded: Vec::new(), overlays_before: 0 });
+        let target = HitTarget::PetArcadeTowerKind(TowerKind::Needle);
+        let hit_rect = Rect::new(10, 10, 6, 1);
+        layout.hits.push(HitRegion { rect: hit_rect, target: target.clone() });
+        app.pet_arcade_hover = Some(PetArcadeHoverState {
+            target,
+            column: hit_rect.x,
+            row: hit_rect.y,
+            since: std::time::Instant::now()
+                .checked_sub(PET_ARCADE_TOOLTIP_HOLD_DELAY + std::time::Duration::from_millis(1))
+                .unwrap(),
+        });
+
+        let mut buf = TerminalBuffer::new(app.terminal_cols, app.terminal_rows);
+        let theme = Theme::for_mode(app.color_mode);
+        render_pet_arcade_tooltip(&app, area, &mut buf, &mut layout, theme);
+        assert!(!layout.overlays.is_empty(), "a tooltip that must overlap the scene has to register itself as an overlay");
+
+        drop_pet_arcade_pixel_frame_if_covered(&mut layout);
+        assert!(
+            layout.pet_arcade_pixel_frame.is_none(),
+            "the end-of-frame occlusion pass must drop the pixel frame once the tooltip's own overlay covers it"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Pet Bastion arcade: concrete content everywhere. Owner: "чтобы
+    // конкретное инфо по конкретной штуке было там" -- placed towers, the
+    // resource readouts, and the wave control.
+    // -----------------------------------------------------------------
+
+    /// A placed tower's own tile tooltip: its real current level and, for
+    /// a Base-level tower, the real next-upgrade (L2) preview; for an L2
+    /// tower, BOTH real L3 branch previews side by side; an L3 tower
+    /// honestly says it has nothing left to buy. Every number traces back
+    /// to `tower::effective_stats`/`next_upgrade_cost`, never a hand-
+    /// described "gets stronger".
+    #[test]
+    fn pet_arcade_placed_tower_tooltip_previews_the_real_next_upgrade_stats() {
+        use gate4agent_arcade_pet_bastion::ids::EntityId;
+        use gate4agent_arcade_pet_bastion::tower::next_upgrade_cost;
+
+        let base_cost = TowerKind::Needle.base_stats().cost;
+        let base = TowerView {
+            id: EntityId(1),
+            kind: TowerKind::Needle,
+            level: UpgradeLevel::Base,
+            position: (5, 5),
+            linked: false,
+            cooldown_ticks: 0,
+            stats: effective_stats(TowerKind::Needle, UpgradeLevel::Base),
+            next_upgrade_cost: next_upgrade_cost(UpgradeLevel::Base, base_cost),
+            sell_price: 30,
+        };
+        let text = pet_arcade_placed_tower_tooltip(&base);
+        assert!(text.contains("Needle L1 @5,5"), "{text:?}");
+        let l2_preview = effective_stats(TowerKind::Needle, UpgradeLevel::L2);
+        assert!(
+            text.contains(&format!("Next upgrade -{}: {}", next_upgrade_cost(UpgradeLevel::Base, base_cost).unwrap(), tower_stats_line(&l2_preview))),
+            "{text:?}"
+        );
+
+        let l2 = TowerView {
+            level: UpgradeLevel::L2,
+            stats: effective_stats(TowerKind::Needle, UpgradeLevel::L2),
+            next_upgrade_cost: next_upgrade_cost(UpgradeLevel::L2, base_cost),
+            ..base
+        };
+        let text2 = pet_arcade_placed_tower_tooltip(&l2);
+        let power = effective_stats(TowerKind::Needle, UpgradeLevel::L3(UpgradeBranch::Power));
+        let utility = effective_stats(TowerKind::Needle, UpgradeLevel::L3(UpgradeBranch::Utility));
+        assert!(text2.contains(&format!("Power {}", tower_stats_line(&power))), "{text2:?}");
+        assert!(text2.contains(&format!("Utility {}", tower_stats_line(&utility))), "{text2:?}");
+
+        let l3 = TowerView { level: UpgradeLevel::L3(UpgradeBranch::Power), next_upgrade_cost: None, ..l2 };
+        let text3 = pet_arcade_placed_tower_tooltip(&l3);
+        assert!(text3.contains("Already at max level."), "{text3:?}");
+    }
+
+    /// A board tile carrying BOTH a placed tower and a field zone must
+    /// state both -- the tower's own combat summary first, then the
+    /// zone's, never silently dropping either just because the other one
+    /// applies too.
+    #[test]
+    fn pet_arcade_tile_tooltip_combines_a_placed_tower_with_its_own_field_zone() {
+        use gate4agent_arcade_pet_bastion::ids::EntityId;
+
+        let tower = TowerView {
+            id: EntityId(1),
+            kind: TowerKind::Bell,
+            level: UpgradeLevel::L3(UpgradeBranch::Power),
+            position: (3, 3),
+            linked: false,
+            cooldown_ticks: 0,
+            stats: effective_stats(TowerKind::Bell, UpgradeLevel::L3(UpgradeBranch::Power)),
+            next_upgrade_cost: None,
+            sell_price: 10,
+        };
+        let mut snapshot = pet_arcade_fixture_snapshot(
+            RunPhaseView::Combat,
+            Vec::new(),
+            Vec::new(),
+            vec![FieldZoneView { kind: ZoneKind::TowerDamage, polarity: ZonePolarity::Buff, tile_bounds: (0, 0, 7, 7) }],
+        );
+        snapshot.towers = vec![tower];
+
+        let text = pet_arcade_tooltip_text(&HitTarget::PetArcadeTile(3, 3), Some(&snapshot)).unwrap();
+        assert!(text.contains("Bell L3-Power"), "{text:?}");
+        assert!(text.contains("Already at max level."), "{text:?}");
+        assert!(text.contains("Tower damage zone (buff)"), "{text:?}");
+    }
+
+    /// A real click-to-place flow, end to end: hovering the tile a real
+    /// placement just landed on resolves through the exact same `App::
+    /// hover` -> `pet_arcade_tooltip_text` path a real mouse takes, never
+    /// a hand-built fixture standing in for it.
+    #[test]
+    fn pet_arcade_tile_tooltip_reflects_a_really_placed_towers_level_and_position() {
+        let mut app = open_pet_arcade_app(140, 40);
+        render_pet_arcade_app(&mut app);
+        let (tile_x, tile_y) = buildable_tiles(&app)[0];
+        let pad_hit = find_hit(&app, HitTarget::PetArcadeTile(tile_x, tile_y));
+        let _ = app.click(pad_hit.rect.x, pad_hit.rect.y);
+        render_pet_arcade_app(&mut app);
+        let needle_hit = find_hit(&app, HitTarget::PetArcadeTowerKind(TowerKind::Needle));
+        let _ = app.click(needle_hit.rect.x, needle_hit.rect.y);
+        let _ = app.drop_at(needle_hit.rect.x, needle_hit.rect.y);
+        let mut now = std::time::Instant::now();
+        tick_pet_arcade(&app, &mut now);
+
+        let snapshot = app.pet_arcade.borrow().snapshot().unwrap();
+        let cost = TowerKind::Needle.base_stats().cost;
+        let l2_cost = UpgradeLevel::L2.step_cost(cost);
+        let text = pet_arcade_tooltip_text(&HitTarget::PetArcadeTile(tile_x, tile_y), Some(&snapshot))
+            .expect("a placed tower's own tile must have a tooltip");
+        assert!(text.contains("Needle L1"), "{text:?}");
+        assert!(text.contains(&format!("@{tile_x},{tile_y}")), "{text:?}");
+        assert!(text.contains(&format!("Next upgrade -{l2_cost}")), "{text:?}");
+    }
+
+    /// The HUD's own top resource row: live Sap/Spark/Integrity numbers
+    /// off the real snapshot, plus the real Spark earn-rate/cap and
+    /// Integrity leak-cost constants -- and honestly `None` without a live
+    /// run, matching that the row itself never paints without one either.
+    #[test]
+    fn pet_arcade_resources_tooltip_shows_live_numbers_and_the_real_spark_and_leak_constants() {
+        let mut app = open_pet_arcade_app(140, 40);
+        render_pet_arcade_app(&mut app);
+        let snapshot = app.pet_arcade.borrow().snapshot().unwrap();
+        let resources_hit = find_hit(&app, HitTarget::PetArcadeResources);
+        let text = pet_arcade_tooltip_text(&resources_hit.target, Some(&snapshot)).unwrap();
+        assert!(text.contains(&format!("Sap {}", snapshot.sap)), "{text:?}");
+        assert!(text.contains(&format!("Spark {}/{SPARK_CAP}", snapshot.pet.spark)), "{text:?}");
+        assert!(text.contains(&format!("Integrity {}", snapshot.integrity)), "{text:?}");
+        assert!(text.contains(&format!("{SPARK_PER_KILLS} linked kills")), "{text:?}");
+        assert!(text.contains(&format!("-{LEAK_INTEGRITY_DAMAGE}")), "{text:?}");
+        assert!(text.contains(&format!("-{BOSS_LAP_INTEGRITY_DAMAGE}")), "{text:?}");
+        assert!(
+            pet_arcade_tooltip_text(&HitTarget::PetArcadeResources, None).is_none(),
+            "no live snapshot means nothing genuine to show, matching the row's own render gate"
+        );
+    }
+
+    /// The `[Space] Start Wave` control: the real current/next wave number
+    /// against the real `WAVE_COUNT`, and the Heartseed loop rule restated
+    /// with the real per-lap Integrity constants -- and honestly `None`
+    /// without a live run.
+    #[test]
+    fn pet_arcade_start_wave_tooltip_states_the_real_wave_number_and_the_heartseed_loop_rule() {
+        let mut app = open_pet_arcade_app(140, 40);
+        render_pet_arcade_app(&mut app);
+        let snapshot = app.pet_arcade.borrow().snapshot().unwrap();
+        let start_wave_hit = find_hit(&app, HitTarget::PetArcadeStartWave);
+        let text = pet_arcade_tooltip_text(&start_wave_hit.target, Some(&snapshot)).unwrap();
+        assert!(text.contains(&format!("Wave {}/{WAVE_COUNT}", snapshot.wave)), "{text:?}");
+        assert!(text.contains("NOT killed"), "{text:?}");
+        assert!(text.contains(&format!("-{LEAK_INTEGRITY_DAMAGE} for a minion")), "{text:?}");
+        assert!(text.contains(&format!("-{BOSS_LAP_INTEGRITY_DAMAGE} for a boss")), "{text:?}");
+        assert!(
+            pet_arcade_tooltip_text(&HitTarget::PetArcadeStartWave, None).is_none(),
+            "no live snapshot means nothing genuine to show, matching the button's own render gate"
         );
     }
 }

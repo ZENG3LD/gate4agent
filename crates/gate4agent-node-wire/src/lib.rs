@@ -1,6 +1,7 @@
 //! Reusable local wire client and authentication primitives for Gate4Agent nodes.
 
 mod auth;
+mod call_home;
 mod client;
 #[cfg(windows)]
 mod windows_secure_pipe;
@@ -11,8 +12,10 @@ pub use auth::{
     auth_proof, local_hmac_sha256, negotiated_auth_proof, proofs_match, random_incarnation_id,
     random_nonce, AuthDirection,
 };
+pub use call_home::{read_call_home_announce, write_call_home_announce, CallHomeAnnounceError};
 pub use client::{
     LocalNodeClient, LocalSessionHarnessMcpClient, LocalSessionHarnessMcpError, NodeClientError,
+    NodeClientStream,
 };
 #[cfg(windows)]
 pub type NamedPipeNodeClient = LocalNodeClient;

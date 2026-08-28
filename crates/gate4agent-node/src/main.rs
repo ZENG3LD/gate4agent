@@ -30,6 +30,7 @@ async fn main() {
     let mut api_listen = "127.0.0.1:18310"
         .parse()
         .expect("the built-in node API listen address must be valid");
+    let mut call_home: Option<std::net::SocketAddr> = None;
     let mut node_id = None;
     let mut workspaces = Vec::new();
     let mut worktree_modes = BTreeMap::new();
@@ -45,6 +46,15 @@ async fn main() {
                 api_listen = value
                     .parse()
                     .unwrap_or_else(|error| fail(&format!("--api-listen is invalid: {error}")));
+            }
+            // Dial the relay instead of only waiting to be dialled -- for
+            // a node the relay has no way to reach. The node stays the
+            // wire's server either way; only who places the call changes.
+            "--c2-dial" => {
+                let value = required_value("--c2-dial", args.next());
+                call_home = Some(value.parse().unwrap_or_else(|error| {
+                    fail(&format!("--c2-dial is invalid: {error}"))
+                }));
             }
             "--node-id" => {
                 let value = required_value("--node-id", args.next());
@@ -157,6 +167,10 @@ async fn main() {
     let config = NodeServerConfig::new(endpoint, token, node_id, workspaces)
         .and_then(|config| config.with_state_path(state_path))
         .and_then(|config| config.with_api_listen(api_listen))
+        .and_then(|config| match call_home {
+            Some(relay) => config.with_call_home(relay),
+            None => Ok(config),
+        })
         .unwrap_or_else(|error| fail(&error.to_string()));
     let config = if let Some(history) = explicit_history_config(history_roots)
         .unwrap_or_else(|error| fail(&error))

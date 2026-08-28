@@ -6716,6 +6716,43 @@ impl NodeEvent {
     }
 }
 
+/// The first frame on a CALL-HOME connection, and the only frame this
+/// protocol adds for it: the node announcing which node it is.
+///
+/// Every other connection on this wire is dialled by the operator, which
+/// therefore already knows which node it reached and which per-node access
+/// token to prove against. A call-home connection inverts who opens the
+/// socket -- a node with no reachable address connects out to the relay
+/// instead of waiting to be connected to -- and the relay, holding a fresh
+/// accepted socket, has no idea whose it is. It cannot even verify the
+/// server proof, because that proof is computed from the token belonging
+/// to a specific node.
+///
+/// So the node says its name first. Note what this frame is NOT: it is not
+/// authentication and it grants nothing. It only SELECTS which configured
+/// node's token the relay will use for the handshake that follows, and
+/// that handshake is the same mutual challenge-response every dialled
+/// connection runs (`ServerChallenge`/`ClientAuthentication`, both sides
+/// proving over both nonces). A caller announcing a node id it does not
+/// hold the token for fails at the very next frame, exactly as an
+/// impostor on a dialled connection would.
+///
+/// Deliberately not a variant of [`ClientFrame`]: it travels before the
+/// wire's own handshake begins, in one direction only, and adding it to
+/// the frame enum would make it look like something a client may send at
+/// any point in a session. It is a preface, not a frame of the protocol.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NodeCallHomeAnnounce {
+    pub protocol_version: u16,
+    pub node_id: String,
+}
+
+impl NodeCallHomeAnnounce {
+    pub fn new(node_id: impl Into<String>) -> Self {
+        Self { protocol_version: NODE_PROTOCOL_VERSION, node_id: node_id.into() }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", content = "payload", rename_all = "kebab-case")]
 pub enum ClientFrame {

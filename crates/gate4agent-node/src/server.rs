@@ -167,7 +167,7 @@ use drive_loop_profile::DriveLoopProfiler;
 use gate4agent_runtime_native::{HistorySourceLayout, NativeHistoryRoot};
 use gate4agent_node_wire::{
     auth_proof, negotiated_auth_proof, proofs_match, random_incarnation_id, random_nonce,
-    AuthDirection, LocalServerStream, OwnerOnlyLocalListener,
+    AuthDirection, OwnerOnlyLocalListener,
 };
 use gate4agent_types::{
     AdapterBinding, AdapterFamily, AgentId, AgentInstanceId, AgentSpec, CommandEnvelope, CommandId,
@@ -1112,6 +1112,9 @@ impl WorkspaceConfig {
 pub struct NodeServerConfig {
     pub endpoint: String,
     api_listen: Option<std::net::SocketAddr>,
+    /// A relay to CALL, rather than wait to be called by. `None` keeps the
+    /// node purely a listener, which is what it has always been.
+    call_home: Option<std::net::SocketAddr>,
     pub node_id: NodeId,
     pub workspaces: Vec<WorkspaceConfig>,
     access_token: String,
@@ -1190,6 +1193,7 @@ impl NodeServerConfig {
         Ok(Self {
             endpoint,
             api_listen: None,
+            call_home: None,
             node_id,
             workspaces,
             access_token,
@@ -1212,6 +1216,37 @@ impl NodeServerConfig {
             return Err(NodeServerError::InvalidApiListen(api_listen));
         }
         self.api_listen = Some(api_listen);
+        Ok(self)
+    }
+
+    /// Also dial `relay` and serve this wire over the connection, in
+    /// addition to accepting on the local endpoint.
+    ///
+    /// Who opens the socket and who is the protocol's server are separate
+    /// questions, and this is the node's half of separating them. The node
+    /// stays the server either way -- it answers `NodeRequest`s and emits
+    /// `NodeEvent`s exactly as it does for a relay that dialled it. All
+    /// that changes is that a node with no address anyone can reach makes
+    /// the connection itself, and names itself once it arrives (see
+    /// `gate4agent_node_wire::write_call_home_announce`).
+    ///
+    /// Loopback only, and that is not an oversight to be flagged and
+    /// worked around. This wire carries terminal contents, keystrokes and
+    /// file bytes as plaintext JSON; its mutual challenge-response
+    /// authenticates both ends and encrypts nothing. Every listener in
+    /// this stack is loopback-guarded for that reason, and a dialler must
+    /// hold the same line -- a node calling a public relay would put the
+    /// whole control plane on the wire in the clear. Reaching a relay on
+    /// another host is a transport question, and it stays unanswered here
+    /// on purpose: this change is about direction, not distance.
+    pub fn with_call_home(
+        mut self,
+        relay: std::net::SocketAddr,
+    ) -> Result<Self, NodeServerError> {
+        if !relay.ip().is_loopback() || relay.port() == 0 {
+            return Err(NodeServerError::InvalidCallHome(relay));
+        }
+        self.call_home = Some(relay);
         Ok(self)
     }
 
@@ -2370,6 +2405,7 @@ try { $contextHash = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadA
             .await
             .map_err(|error| NodeServerError::HookIngressStartup(error.to_string()))?;
         let endpoint = config.endpoint.clone();
+        let call_home = config.call_home;
         let api_listen = config.api_listen;
         let accept_shared = Arc::clone(&shared);
         let api_shared = Arc::clone(&shared);
@@ -2384,7 +2420,7 @@ try { $contextHash = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadA
                 Arc::clone(&shared),
                 shutdown_timeout,
             );
-            let accept_loop = accept_connections(&endpoint, accept_shared);
+            let accept_loop = accept_connections(&endpoint, call_home, accept_shared);
             let api_loop = http_api::run(api_listen, api_shared);
             tokio::pin!(runtime_loop);
             tokio::pin!(accept_loop);
@@ -11359,9 +11395,39 @@ impl NodeShared {
     }
 }
 
-async fn accept_connections(endpoint: &str, shared: Arc<NodeShared>) -> Result<(), NodeServerError> {
+/// Serves this wire on the local endpoint, and -- when `call_home` names a
+/// relay -- over an outbound connection to it as well.
+///
+/// The two live in one future rather than a fourth arm of `run`'s own
+/// `select!` because they are one concern: this is where the node's wire
+/// is served, and the direction a given connection was opened in does not
+/// change what happens on it. It also means the existing graceful drain
+/// below covers both without being duplicated.
+///
+/// Either side finishing ends the pair, which is correct: the listener
+/// only returns on shutdown or a bind failure, and `call_home_loop` only
+/// returns on shutdown -- a failed relay connection is retried inside it,
+/// never propagated out.
+async fn accept_connections(
+    endpoint: &str,
+    call_home: Option<std::net::SocketAddr>,
+    shared: Arc<NodeShared>,
+) -> Result<(), NodeServerError> {
     let mut connections = JoinSet::new();
-    let result = accept_connections_inner(endpoint, shared, &mut connections).await;
+    let result = match call_home {
+        None => accept_connections_inner(endpoint, shared, &mut connections).await,
+        Some(relay) => {
+            let listener =
+                accept_connections_inner(endpoint, Arc::clone(&shared), &mut connections);
+            let dialler = call_home_loop(relay, Arc::clone(&shared));
+            tokio::pin!(listener);
+            tokio::pin!(dialler);
+            tokio::select! {
+                result = &mut listener => result,
+                result = &mut dialler => result,
+            }
+        }
+    };
     let graceful_deadline = Instant::now() + Duration::from_millis(CONNECTION_SHUTDOWN_GRACE_MS);
     while !connections.is_empty() {
         let remaining = graceful_deadline.saturating_duration_since(Instant::now());
@@ -11374,6 +11440,87 @@ async fn accept_connections(endpoint: &str, shared: Arc<NodeShared>) -> Result<(
     connections.abort_all();
     while connections.join_next().await.is_some() {}
     result
+}
+
+/// Backoff ladder for a relay that will not answer, capped rather than
+/// unbounded: a node whose relay is down is not broken and should keep
+/// trying forever, but it should not spend a core doing it.
+const CALL_HOME_BACKOFFS_MS: [u64; 5] = [500, 1_000, 2_000, 4_000, 8_000];
+
+/// Dials the relay, serves this wire over the connection, and does it
+/// again when the connection ends.
+///
+/// The node is the SERVER on the socket it just opened. That inversion is
+/// the whole point: `serve_connection` is the same function the local
+/// listener feeds, and it neither knows nor cares which end placed the
+/// call. The one thing this direction adds is the preface -- the relay
+/// accepted a socket and cannot know whose it is, so the node says its
+/// name before the handshake it would otherwise begin with.
+///
+/// Never returns an error. A relay that is down, refusing, or speaking a
+/// different protocol is a condition to retry, not a reason to take the
+/// node's local endpoint down with it; the only way out is shutdown.
+async fn call_home_loop(
+    relay: std::net::SocketAddr,
+    shared: Arc<NodeShared>,
+) -> Result<(), NodeServerError> {
+    let mut failures = 0_usize;
+    loop {
+        if shared.shutdown.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let permit = tokio::select! {
+            permit = Arc::clone(&shared.preauth_slots).acquire_owned() => {
+                permit.map_err(|_| NodeServerError::PreauthClosed)?
+            }
+            _ = shared.shutdown_notify.notified() => return Ok(()),
+        };
+        match dial_relay_and_serve(relay, Arc::clone(&shared), permit).await {
+            Ok(()) => {
+                // A clean end is the relay hanging up, which it does on
+                // its own restart. Reconnect immediately rather than
+                // serving the backoff a peer that is plainly there.
+                failures = 0;
+                tracing::info!(node_id = %shared.node_id, %relay, "call-home connection closed");
+            }
+            Err(error) => {
+                failures = failures.saturating_add(1);
+                tracing::warn!(
+                    node_id = %shared.node_id,
+                    %relay,
+                    cause = %error,
+                    attempt = failures,
+                    "call-home connection failed",
+                );
+                let backoff = CALL_HOME_BACKOFFS_MS
+                    [failures.saturating_sub(1).min(CALL_HOME_BACKOFFS_MS.len() - 1)];
+                tokio::select! {
+                    _ = sleep(Duration::from_millis(backoff)) => {}
+                    _ = shared.shutdown_notify.notified() => return Ok(()),
+                }
+            }
+        }
+    }
+}
+
+/// One call-home attempt: connect, name this node, then serve.
+async fn dial_relay_and_serve(
+    relay: std::net::SocketAddr,
+    shared: Arc<NodeShared>,
+    preauth_permit: OwnedSemaphorePermit,
+) -> Result<(), NodeServerError> {
+    let mut stream = tokio::net::TcpStream::connect(relay)
+        .await
+        .map_err(NodeServerError::CallHomeTransport)?;
+    // Nagle off for the same reason the rest of this wire wants it off:
+    // the traffic is small request/response frames, and coalescing them
+    // adds latency to every one.
+    let _ = stream.set_nodelay(true);
+    gate4agent_node_wire::write_call_home_announce(&mut stream, &shared.node_id)
+        .await
+        .map_err(|error| NodeServerError::Handshake(error.to_string()))?;
+    tracing::info!(node_id = %shared.node_id, %relay, "announced this node to the relay");
+    serve_connection(stream, shared, preauth_permit).await
 }
 
 async fn accept_connections_inner(
@@ -11407,11 +11554,21 @@ async fn accept_connections_inner(
     }
 }
 
-async fn serve_connection(
-    mut pipe: LocalServerStream,
+/// Serves one connection, whichever end opened it.
+///
+/// Generic over the stream rather than typed to `LocalServerStream`
+/// because a call-home connection arrives on a `TcpStream` the node itself
+/// dialled. Nothing in the body ever depended on the concrete type -- it
+/// reads and writes framed JSON and then `tokio::io::split`s -- so this is
+/// the whole of what welding "who dials" to "who serves" was costing.
+async fn serve_connection<S>(
+    mut pipe: S,
     shared: Arc<NodeShared>,
     preauth_permit: OwnedSemaphorePermit,
-) -> Result<(), NodeServerError> {
+) -> Result<(), NodeServerError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let hello_frame = timeout(
         Duration::from_millis(AUTH_FRAME_TIMEOUT_MS),
         read_json_frame_limited_body_timeout(
@@ -15575,6 +15732,10 @@ pub enum NodeServerError {
     InvalidAccessToken,
     #[error("node HTTP observer must listen on a loopback address: {0}")]
     InvalidApiListen(std::net::SocketAddr),
+    #[error("node call-home relay must be a loopback address with a nonzero port: {0}")]
+    InvalidCallHome(std::net::SocketAddr),
+    #[error("node could not reach its call-home relay: {0}")]
+    CallHomeTransport(#[source] std::io::Error),
     #[error("node durable state path must be an absolute file path: {0}")]
     InvalidStatePath(String),
     #[error("harness MCP helper must be an exact reviewed absolute regular file")]

@@ -25,6 +25,7 @@ async fn main() {
     let mut api_listen = DEFAULT_C2_API_LISTEN.parse().expect("built-in C2 listen address is valid");
     let mut control_endpoint = default_c2_control_endpoint()
         .unwrap_or_else(|error| fail(&error.to_string()));
+    let mut node_listen: Option<std::net::SocketAddr> = None;
     let mut node_args = Vec::new();
     let mut seen = BTreeSet::new();
     let mut args = std::env::args().skip(1);
@@ -35,6 +36,12 @@ async fn main() {
                     .unwrap_or_else(|error| fail(&format!("--api-listen is invalid: {error}")));
             }
             "--control-endpoint" => control_endpoint = required_value("--control-endpoint", args.next()),
+            // Where nodes that cannot be dialled call in. Required by, and
+            // only by, a `--node ID=accept` assignment.
+            "--node-listen" => {
+                node_listen = Some(required_value("--node-listen", args.next()).parse()
+                    .unwrap_or_else(|error| fail(&format!("--node-listen is invalid: {error}"))));
+            }
             "--node" => {
                 if node_args.len() == MAX_C2_NODES { fail("at most 64 --node values are allowed"); }
                 let value = required_value("--node", args.next());
@@ -66,6 +73,11 @@ async fn main() {
     std::env::remove_var(C2_TOKEN_ENV);
     let config = C2Config::new(api_listen, api_token, nodes)
         .and_then(|config| config.with_control_endpoint(control_endpoint))
+        .and_then(|config| match node_listen {
+            Some(listen) => config.with_node_listen(listen),
+            None => Ok(config),
+        })
+        .and_then(|config| config.validate_call_home().map(|()| config))
         .unwrap_or_else(|error| fail(&error.to_string()));
     let running = C2Running::start(config).await.unwrap_or_else(|error| fail(&error.to_string()));
     let shutdown = running.shutdown_handle();
@@ -128,10 +140,10 @@ fn fail(message: &str) -> ! {
 }
 
 #[cfg(windows)]
-fn node_assignment_error() -> &'static str { "--node requires NODE_ID=NAMED_PIPE_OR_TCP_LOOPBACK" }
+fn node_assignment_error() -> &'static str { "--node requires NODE_ID=NAMED_PIPE_OR_TCP_LOOPBACK_OR_ACCEPT" }
 
 #[cfg(unix)]
-fn node_assignment_error() -> &'static str { "--node requires NODE_ID=LOCAL_ENDPOINT_OR_TCP_LOOPBACK" }
+fn node_assignment_error() -> &'static str { "--node requires NODE_ID=LOCAL_ENDPOINT_OR_TCP_LOOPBACK_OR_ACCEPT" }
 
 #[cfg(windows)]
 fn print_help() {
@@ -140,7 +152,7 @@ fn print_help() {
 
 #[cfg(unix)]
 fn print_help() {
-    println!("gate4agent-c2 --node NODE_ID=LOCAL_ENDPOINT|tcp://127.0.0.1:PORT|tcp://[::1]:PORT [--node ...] [--api-listen 127.0.0.1:PORT] [--control-endpoint LOCAL_ENDPOINT]");
+    println!("gate4agent-c2 --node NODE_ID=LOCAL_ENDPOINT|tcp://127.0.0.1:PORT|tcp://[::1]:PORT|accept [--node ...] [--api-listen 127.0.0.1:PORT] [--node-listen 127.0.0.1:PORT] [--control-endpoint LOCAL_ENDPOINT]");
 }
 
 #[cfg(not(any(windows, unix)))]

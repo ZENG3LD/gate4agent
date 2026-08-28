@@ -14,7 +14,7 @@ use gate4agent_node_protocol::{
     ClientRole, FrameError, NegotiatedNodeCompatibility, NodeEvent, NodeEventEnvelope, NodeFailureCode,
     NodeResponse, NodeSnapshot, ServerFrame,
 };
-use gate4agent_node_wire::{LocalNodeClient, NodeClientError};
+use gate4agent_node_wire::{read_call_home_announce, LocalNodeClient, NodeClientError};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::net::SocketAddr;
@@ -93,6 +93,16 @@ pub struct C2NodeConfig {
 enum C2NodeRoute {
     Local,
     SshForwardedLoopback(SocketAddr),
+    /// This relay does not dial the node; the node dials the relay.
+    ///
+    /// For a node the relay has no way to reach -- behind NAT, in a
+    /// container with no published port, on a machine with no listener the
+    /// relay is allowed to open. The protocol roles are unchanged: the
+    /// node is still the server, this relay is still the client asking it
+    /// for things. Only the direction of the TCP connection moves, which
+    /// is why the whole of this variant's implementation is "wait for a
+    /// socket instead of opening one" and then the identical handshake.
+    CallHome,
 }
 
 impl C2NodeConfig {
@@ -109,6 +119,7 @@ impl C2NodeConfig {
         match self.route {
             C2NodeRoute::Local => local_transport_label(),
             C2NodeRoute::SshForwardedLoopback(_) => "ssh-forwarded-loopback",
+            C2NodeRoute::CallHome => "call-home",
         }
     }
 }
@@ -145,6 +156,9 @@ pub struct C2Config {
     pub control_endpoint: String,
     api_token: String,
     pub nodes: Vec<C2NodeConfig>,
+    /// Where nodes that cannot be dialled come to announce themselves.
+    /// `None` unless at least one node is configured `accept`.
+    pub node_listen: Option<SocketAddr>,
     pub timings: C2Timings,
 }
 
@@ -157,12 +171,63 @@ impl C2Config {
         let mut ids = BTreeSet::new();
         let mut endpoints = BTreeSet::new();
         if nodes.iter().any(|node| !ids.insert(node.node_id.clone())) { return Err(C2ConfigError::DuplicateNode); }
-        if nodes.iter().any(|node| !endpoints.insert(endpoint_key(&node.endpoint))) { return Err(C2ConfigError::DuplicateEndpoint); }
+        // Call-home nodes are exempt: they name no endpoint, so every one
+        // of them carries the same `accept` and the uniqueness this check
+        // enforces is `node_id`'s job for them (already done above). The
+        // check exists to stop two dialled nodes pointing at one socket,
+        // which cannot happen to a node that is never dialled.
+        if nodes
+            .iter()
+            .filter(|node| node.route != C2NodeRoute::CallHome)
+            .any(|node| !endpoints.insert(endpoint_key(&node.endpoint)))
+        {
+            return Err(C2ConfigError::DuplicateEndpoint);
+        }
         let control_endpoint = default_c2_control_endpoint()?;
         if nodes.iter().any(|node| endpoints_equal(&node.endpoint, &control_endpoint)) {
             return Err(C2ConfigError::ControlEndpointConflict);
         }
-        Ok(Self { api_listen, control_endpoint, api_token, nodes, timings: C2Timings::default() })
+        Ok(Self {
+            api_listen,
+            control_endpoint,
+            api_token,
+            nodes,
+            node_listen: None,
+            timings: C2Timings::default(),
+        })
+    }
+
+    /// Binds the address nodes call in on.
+    ///
+    /// Loopback only, deliberately, and for the same reason every other
+    /// listener in this stack is: the node wire authenticates both ends
+    /// with a mutual challenge-response but encrypts nothing, so its
+    /// frames -- terminal contents, keystrokes, file bytes -- are
+    /// plaintext JSON. Accepting node connections from off-box would put
+    /// all of that on the network. Direction and distance are separate
+    /// problems and this change only solves direction.
+    pub fn with_node_listen(mut self, node_listen: SocketAddr) -> Result<Self, C2ConfigError> {
+        if !node_listen.ip().is_loopback() || node_listen.port() == 0 {
+            return Err(C2ConfigError::NonLoopbackNodeListen(node_listen));
+        }
+        if node_listen == self.api_listen {
+            return Err(C2ConfigError::NodeListenConflict);
+        }
+        self.node_listen = Some(node_listen);
+        Ok(self)
+    }
+
+    /// Every node that waits to be called needs somewhere to call, so a
+    /// config that asks for one without the other is refused rather than
+    /// started into a relay that can never reach that node. Checked at
+    /// startup, not at connect time, because the failure is total and
+    /// permanent -- there is nothing to retry.
+    pub fn validate_call_home(&self) -> Result<(), C2ConfigError> {
+        let waiting = self.nodes.iter().find(|node| node.route == C2NodeRoute::CallHome);
+        match (waiting, self.node_listen) {
+            (Some(node), None) => Err(C2ConfigError::CallHomeWithoutListener(node.node_id.clone())),
+            _ => Ok(()),
+        }
     }
 
     pub fn with_timings(mut self, timings: C2Timings) -> Self {
@@ -189,6 +254,14 @@ fn validate_control_endpoint(endpoint: &str) -> Result<(), C2ConfigError> {
 }
 
 fn parse_node_endpoint(endpoint: &str) -> Option<(String, C2NodeRoute)> {
+    // The one assignment that names no address, because there is nothing
+    // to address: this node will arrive on the call-home listener under
+    // its own name. Spelled as a word rather than an empty value so a
+    // config reader can tell "waits to be called" from "somebody forgot to
+    // fill this in".
+    if endpoint == "accept" {
+        return Some((endpoint.to_owned(), C2NodeRoute::CallHome));
+    }
     if let Some(authority) = endpoint.strip_prefix("tcp://") {
         let address = authority.parse::<SocketAddr>().ok()?;
         let is_exact_loopback = match address.ip() {
@@ -267,6 +340,12 @@ pub enum C2ConfigError {
     InvalidControlEndpoint,
     #[error("C2 control endpoint must not equal a configured node endpoint")]
     ControlEndpointConflict,
+    #[error("C2 node call-home listen address must be loopback with a nonzero port: {0}")]
+    NonLoopbackNodeListen(SocketAddr),
+    #[error("C2 node call-home listen address must not equal the API listen address")]
+    NodeListenConflict,
+    #[error("node '{0}' waits to be called but no --node-listen address was configured")]
+    CallHomeWithoutListener(NodeId),
     #[cfg(unix)]
     #[error("C2 default runtime endpoint is unavailable: {0}")]
     RuntimeEndpoint(String),
@@ -417,6 +496,12 @@ async fn run_bound(config: C2Config, listener: TcpListener, mut shutdown: watch:
     let hub = OperatorHub::new();
     let mut relay_senders = BTreeMap::new();
     let mut relay_receivers = Vec::new();
+    // Where the call-home listener hands a freshly announced socket. One
+    // slot per waiting node and no more: a node has one live connection to
+    // this relay, so a second socket arriving while the first is still
+    // being served means the node reconnected and the relay has not
+    // noticed yet -- queueing more of those would only serve them stale.
+    let mut call_home_routes: BTreeMap<NodeId, mpsc::Sender<TcpStream>> = BTreeMap::new();
     for node in config.nodes.clone() {
         let (commands_tx, commands_rx) = mpsc::channel(8);
         let (releases_tx, releases_rx) = mpsc::channel(1);
@@ -426,12 +511,22 @@ async fn run_bound(config: C2Config, listener: TcpListener, mut shutdown: watch:
             releases: releases_tx,
             force_disconnect: force_tx,
         });
-        relay_receivers.push((node, commands_rx, releases_rx, force_rx));
+        let call_home_rx = if node.route == C2NodeRoute::CallHome {
+            let (call_home_tx, call_home_rx) = mpsc::channel(1);
+            call_home_routes.insert(node.node_id.clone(), call_home_tx);
+            Some(call_home_rx)
+        } else {
+            None
+        };
+        relay_receivers.push((node, commands_rx, releases_rx, force_rx, call_home_rx));
     }
     let relay_senders = Arc::new(relay_senders);
+    if let Some(node_listen) = config.node_listen {
+        tasks.spawn(accept_call_home(node_listen, call_home_routes, shutdown.clone()));
+    }
     tasks.spawn(inventory_owner(config.nodes.len(), config.timings.fresh_for, ingress_rx, status_tx, shutdown.clone()));
-    for (node, commands, releases, force_disconnect) in relay_receivers {
-        tasks.spawn(node_relay_worker(node, config.timings, commands, releases, force_disconnect, ingress_tx.clone(), status_rx.clone(), hub.clone(), shutdown.clone()));
+    for (node, commands, releases, force_disconnect, call_home) in relay_receivers {
+        tasks.spawn(node_relay_worker(node, config.timings, commands, releases, force_disconnect, call_home, ingress_tx.clone(), status_rx.clone(), hub.clone(), shutdown.clone()));
     }
     drop(ingress_tx);
     tasks.spawn(http_server(listener, config.api_token.clone(), config.timings.http_io_deadline, status_rx.clone(), shutdown.clone()));
@@ -520,12 +615,114 @@ enum AttemptResult {
 
 struct Attempt { node_id: NodeId, at_unix_ms: u64, result: AttemptResult }
 
+/// Accepts node connections and hands each one to the relay worker for
+/// whichever node it says it is.
+///
+/// This is the only place in the relay that learns a node's identity from
+/// the wire rather than from configuration, and it is careful about what
+/// that means: the announced name SELECTS a worker and nothing more. The
+/// worker then runs the same mutual challenge-response it runs on a
+/// dialled connection, against the token configured for that node, so a
+/// caller that announced a name it cannot prove gets no further than the
+/// next frame.
+///
+/// A socket for an unknown node, an unreadable preface, or a node whose
+/// slot is already full is dropped with a line saying which -- never
+/// silently, because "the node is calling but nothing happens" is exactly
+/// the failure that is impossible to diagnose from the node's end.
+async fn accept_call_home(
+    listen: SocketAddr,
+    routes: BTreeMap<NodeId, mpsc::Sender<TcpStream>>,
+    mut shutdown: watch::Receiver<bool>,
+) -> io::Result<()> {
+    let listener = TcpListener::bind(listen).await?;
+    tracing::info!(%listen, waiting_nodes = routes.len(), "call-home listener bound");
+    loop {
+        if *shutdown.borrow() {
+            return Ok(());
+        }
+        let (stream, peer) = tokio::select! {
+            accepted = listener.accept() => accepted?,
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() { return Ok(()); }
+                continue;
+            }
+        };
+        let routes = routes.clone();
+        // Off the accept loop: the preface has its own deadline, and one
+        // peer that connects and then says nothing must not stop every
+        // other node from being accepted meanwhile.
+        tokio::spawn(async move {
+            let mut stream = stream;
+            let _ = stream.set_nodelay(true);
+            let node_id = match read_call_home_announce(&mut stream).await {
+                Ok(node_id) => node_id,
+                Err(error) => {
+                    tracing::warn!(%peer, cause = %error, "call-home connection rejected");
+                    return;
+                }
+            };
+            let Some(sender) = routes.get(&node_id) else {
+                tracing::warn!(
+                    %peer,
+                    %node_id,
+                    "call-home connection named a node this relay does not wait for",
+                );
+                return;
+            };
+            match sender.try_send(stream) {
+                Ok(()) => tracing::info!(%peer, %node_id, "node called home"),
+                Err(mpsc::error::TrySendError::Full(_)) => tracing::warn!(
+                    %peer,
+                    %node_id,
+                    "node called home while its previous connection is still being taken up",
+                ),
+                Err(mpsc::error::TrySendError::Closed(_)) => tracing::warn!(
+                    %peer,
+                    %node_id,
+                    "node called home but its relay worker is gone",
+                ),
+            }
+        });
+    }
+}
+
+/// Blocks until this node calls in, or shutdown -- with no deadline of its
+/// own on purpose.
+///
+/// A dialled connection either answers within `attempt_deadline` or has
+/// failed, and treating a slow answer as a failure is right there. Waiting
+/// for a node to call is the opposite: a node that has not called yet has
+/// not failed at anything, and it may be minutes from starting. Putting
+/// that wait under the attempt deadline would turn an idle relay into a
+/// stream of "connection deadline exceeded" warnings about nodes that are
+/// merely not running. The handshake that FOLLOWS is deadlined normally --
+/// a peer that connects and then stalls is a real failure.
+async fn await_call_home(
+    receiver: Option<&mut mpsc::Receiver<TcpStream>>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Option<TcpStream> {
+    let receiver = receiver?;
+    loop {
+        if *shutdown.borrow() {
+            return None;
+        }
+        tokio::select! {
+            stream = receiver.recv() => return stream,
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() { return None; }
+            }
+        }
+    }
+}
+
 async fn node_relay_worker(
     node: C2NodeConfig,
     timings: C2Timings,
     mut commands: mpsc::Receiver<RelayCommand>,
     mut releases: mpsc::Receiver<oneshot::Sender<()>>,
     mut force_disconnect: watch::Receiver<u64>,
+    mut call_home: Option<mpsc::Receiver<TcpStream>>,
     ingress: mpsc::Sender<Attempt>,
     status: watch::Receiver<Arc<StatusResponse>>,
     hub: OperatorHub,
@@ -535,7 +732,19 @@ async fn node_relay_worker(
     loop {
         if *shutdown.borrow() { return Ok(()); }
         let previous = status.borrow().nodes.get(&node.node_id).and_then(|item| item.cursor);
-        let connected = timeout(timings.attempt_deadline, connect_operator(&node)).await;
+        // A waiting node's socket is collected BEFORE the deadline starts,
+        // because waiting for a node to call is not an attempt that can
+        // time out -- see `await_call_home`. Once it is here, the
+        // handshake over it is deadlined exactly like a dialled one.
+        let adopted = if node.route == C2NodeRoute::CallHome {
+            match await_call_home(call_home.as_mut(), &mut shutdown).await {
+                Some(stream) => Some(stream),
+                None => return Ok(()),
+            }
+        } else {
+            None
+        };
+        let connected = timeout(timings.attempt_deadline, connect_operator(&node, adopted)).await;
         let mut client = match connected {
             Ok(Ok(client)) => client,
             Ok(Err(error)) => {
@@ -756,13 +965,39 @@ async fn node_relay_worker(
     }
 }
 
-async fn connect_operator(node: &C2NodeConfig) -> Result<LocalNodeClient, NodeClientError> {
+/// Produces an authenticated operator client for `node`, whichever end
+/// opened the socket.
+///
+/// All three arms end in the same handshake. The first two open a
+/// connection and hand it straight to it; the third is handed one that a
+/// node opened and the listener already matched to this node's name. That
+/// symmetry is the point of the change: `LocalNodeClient::adopt` is what
+/// `connect`/`connect_loopback` both do after their own `connect` call, so
+/// a call-home node is authenticated by exactly the same code, against
+/// exactly the same per-node token, as one this relay dialled.
+async fn connect_operator(
+    node: &C2NodeConfig,
+    adopted: Option<TcpStream>,
+) -> Result<LocalNodeClient, NodeClientError> {
     match node.route {
         C2NodeRoute::Local => {
             LocalNodeClient::connect(&node.endpoint, &node.node_id, ClientRole::Operator, &node.token).await
         }
         C2NodeRoute::SshForwardedLoopback(endpoint) => {
             LocalNodeClient::connect_loopback(endpoint, &node.node_id, ClientRole::Operator, &node.token).await
+        }
+        C2NodeRoute::CallHome => {
+            // `node_relay_worker` collects the socket before calling this
+            // and returns rather than calling without one, so `None` here
+            // is a caller bug, not a runtime condition -- reported instead
+            // of panicking because a relay worker is not worth aborting a
+            // whole C2 over.
+            let stream = adopted.ok_or_else(|| {
+                NodeClientError::Protocol(
+                    "call-home node reached the connect step with no adopted stream".to_owned(),
+                )
+            })?;
+            LocalNodeClient::adopt(stream, &node.node_id, ClientRole::Operator, &node.token).await
         }
     }
 }
@@ -2272,6 +2507,77 @@ mod endpoint_tests {
                 C2RelayRoute::SshForwardedLoopback,
             );
         }
+    }
+
+    /// `accept` is the assignment that names no address, and the config
+    /// has to treat it as a different KIND of route rather than as a
+    /// malformed endpoint: it is how a node that cannot be dialled is
+    /// declared.
+    #[test]
+    fn a_node_that_waits_to_be_called_is_declared_by_name_not_by_address() {
+        let waiting = node("accept").unwrap();
+        assert_eq!(waiting.route, C2NodeRoute::CallHome);
+        assert_eq!(waiting.transport_label(), "call-home");
+
+        // Every waiting node carries the same `accept`, so the
+        // duplicate-endpoint check must not see them as two nodes fighting
+        // over one socket. Their uniqueness is `node_id`'s job, and that
+        // check still applies.
+        let second = C2NodeConfig::new(
+            NodeId::new("second-waiting-node").unwrap(),
+            "accept",
+            "safe-token",
+        )
+        .unwrap();
+        let config = C2Config::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "safe-token",
+            vec![waiting.clone(), second],
+        )
+        .expect("two waiting nodes are not a duplicate endpoint");
+        assert_eq!(config.nodes.len(), 2);
+    }
+
+    /// A node that waits for a call the relay never listens for is a
+    /// deployment that can never work, so it is refused at startup instead
+    /// of becoming a node that is silently offline forever.
+    #[test]
+    fn waiting_for_a_call_requires_somewhere_to_be_called() {
+        let waiting = node("accept").unwrap();
+        let config =
+            C2Config::new("127.0.0.1:0".parse().unwrap(), "safe-token", vec![waiting]).unwrap();
+        assert!(matches!(
+            config.validate_call_home(),
+            Err(C2ConfigError::CallHomeWithoutListener(_)),
+        ));
+        let config = config.with_node_listen("127.0.0.1:48200".parse().unwrap()).unwrap();
+        assert!(config.validate_call_home().is_ok());
+    }
+
+    /// The call-home listener holds the same line every other listener in
+    /// this stack holds. The wire authenticates both ends and encrypts
+    /// nothing, so accepting node connections from off-box would put
+    /// terminal contents and keystrokes on the network in the clear.
+    #[test]
+    fn the_call_home_listener_refuses_to_leave_loopback() {
+        let waiting = node("accept").unwrap();
+        let config =
+            C2Config::new("127.0.0.1:9000".parse().unwrap(), "safe-token", vec![waiting]).unwrap();
+        for refused in ["0.0.0.0:48200", "192.168.1.10:48200", "127.0.0.1:0"] {
+            assert!(
+                matches!(
+                    config.clone().with_node_listen(refused.parse().unwrap()),
+                    Err(C2ConfigError::NonLoopbackNodeListen(_)),
+                ),
+                "accepted {refused}",
+            );
+        }
+        // Sharing the API's own address would mean HTTP and node frames
+        // arriving on one socket; neither parser would survive the other.
+        assert!(matches!(
+            config.with_node_listen("127.0.0.1:9000".parse().unwrap()),
+            Err(C2ConfigError::NodeListenConflict),
+        ));
     }
 
     #[test]

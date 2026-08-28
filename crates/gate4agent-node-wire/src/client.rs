@@ -174,7 +174,16 @@ pub enum LocalSessionHarnessMcpError {
     Host(HarnessReadHostErrorV1),
 }
 
-trait NodeClientStream: AsyncRead + AsyncWrite + Unpin + Send {}
+/// Any byte stream this wire's CLIENT side can run on.
+///
+/// Public so a caller can hand in a stream it established itself. The
+/// handshake never cared what carried it -- it reads and writes framed
+/// JSON -- but until [`LocalNodeClient::adopt`] existed the only way in
+/// was through a constructor that also opened the connection, which welded
+/// "who dials" to "who is the protocol client". Those are separate
+/// questions: a node behind NAT must dial out, and must still be the
+/// protocol's server when it gets there.
+pub trait NodeClientStream: AsyncRead + AsyncWrite + Unpin + Send {}
 
 impl<T> NodeClientStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
@@ -309,6 +318,30 @@ impl LocalNodeClient {
             )));
         }
         let stream = TcpStream::connect(endpoint).await?;
+        Self::connect_stream(Box::new(stream), expected_node_id, role, access_token).await
+    }
+
+    /// Runs the client handshake over a stream the caller already opened
+    /// -- or, on a call-home relay, one it ACCEPTED.
+    ///
+    /// Identical to what [`Self::connect`] and [`Self::connect_loopback`]
+    /// do after their own `connect` call: same hello, same mutual
+    /// challenge-response over both nonces, same compatibility
+    /// negotiation. The direction the socket was opened in is not an input
+    /// to any of it, and this constructor is the proof of that -- it is
+    /// the same code path, entered one step later.
+    ///
+    /// `expected_node_id` still has to be known up front, because the
+    /// server proof is computed from that node's own access token. On a
+    /// call-home connection the relay learns it from the node's
+    /// `NodeCallHomeAnnounce` preface, which selects a token and nothing
+    /// else -- see that type's own doc comment.
+    pub async fn adopt(
+        stream: impl NodeClientStream + 'static,
+        expected_node_id: &NodeId,
+        role: ClientRole,
+        access_token: &str,
+    ) -> Result<Self, NodeClientError> {
         Self::connect_stream(Box::new(stream), expected_node_id, role, access_token).await
     }
 

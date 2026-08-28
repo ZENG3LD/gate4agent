@@ -1365,7 +1365,14 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
         // session -- `None` once the map is empty (no PTY tab open at all),
         // same "no PTY tab, no deadline" behavior the single-address poll
         // had before this generalized to one per open session.
-        let harness_terminal_deadline = harness_terminal_poll_due.values().min().copied();
+        // Over the sessions the fallback poll ACTUALLY runs on, never the
+        // whole due map -- see `harness_terminal_next_poll_deadline`.
+        let harness_terminal_deadline = harness_terminal_next_poll_deadline(
+            &harness_terminal_poll_due,
+            &harness_terminal_active
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
         // Only armed while the LEFT zone actually painted something this
         // frame (`app.layout.status_bar_left` is zero-width on a terminal
         // too small to show it, or before the very first render) -- see
@@ -6324,6 +6331,33 @@ fn reconcile_harness_terminal_poll_due(
 /// `due` time (armed by `reconcile_harness_terminal_poll_due` the instant
 /// the session first opened, and re-armed every time this function's own
 /// caller actually issues a poll for it) has passed.
+/// The soonest fallback-poll deadline the main loop must wake for, taken
+/// over the sessions that are actually polled rather than over every entry
+/// in the due map.
+///
+/// A session covered by the terminal push subscription is filtered out by
+/// [`harness_terminal_sessions_due_for_poll`], so it is never polled, so
+/// its own due-map entry is never advanced -- only an actual poll advances
+/// it, at that function's own call site. Left in the minimum, that entry
+/// sits permanently in the past, `FrameScheduler::poll_timeout` collapses
+/// to zero every iteration, and the loop stops sleeping altogether.
+///
+/// Measured, on a fully idle pane with push covering it: `wait_us` p50
+/// 42us, against 15025us on the same build before the push channel
+/// existed. The efficiency backlog's own description of this loop is that
+/// it "sleeps 97% of every tick" and that nothing in this stack is
+/// compute-bound; a stale deadline here turns it into a spin that renders
+/// the same unchanged frame forever.
+fn harness_terminal_next_poll_deadline(
+    due: &BTreeMap<SessionAddress, Instant>,
+    active: &HashSet<SessionAddress>,
+) -> Option<Instant> {
+    due.iter()
+        .filter(|(address, _)| !active.contains(*address))
+        .map(|(_, deadline)| *deadline)
+        .min()
+}
+
 fn harness_terminal_sessions_due_for_poll(
     open: &HashSet<SessionAddress>,
     due: &BTreeMap<SessionAddress, Instant>,
@@ -10091,6 +10125,51 @@ mod tests {
     }
 
     #[test]
+    /// A push-covered session must not hold the loop's wake deadline.
+    ///
+    /// Its due-map entry is never advanced (only a real poll advances one),
+    /// so leaving it in the minimum pins `poll_timeout` at zero and the
+    /// main loop spins instead of sleeping -- observed live as `wait_us`
+    /// p50 42us on an idle pane against 15025us before the push channel.
+    /// See `harness_terminal_next_poll_deadline`'s own doc comment.
+    #[test]
+    fn a_push_covered_session_does_not_hold_the_loop_awake() {
+        let now = Instant::now();
+        let pushed = SessionAddress {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            instance_id: 1,
+            generation: 1,
+        };
+        let polled = SessionAddress {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            instance_id: 2,
+            generation: 1,
+        };
+        let mut due = BTreeMap::new();
+        // The pushed session's deadline is stale by construction: nothing
+        // ever advances it while push covers the session.
+        due.insert(pushed.clone(), now - Duration::from_secs(30));
+        due.insert(polled.clone(), now + Duration::from_millis(250));
+        let mut active = HashSet::new();
+        active.insert(pushed.clone());
+
+        let deadline = harness_terminal_next_poll_deadline(&due, &active)
+            .expect("the still-polled session keeps a deadline");
+        assert!(
+            deadline > now,
+            "a stale deadline belonging to a pushed session must not be what the loop wakes for",
+        );
+
+        // With push gone, that same session is due immediately again --
+        // the fallback resumes with no separate trigger.
+        active.remove(&pushed);
+        let deadline = harness_terminal_next_poll_deadline(&due, &active)
+            .expect("both sessions are candidates once push drops");
+        assert!(deadline < now, "a dropped subscription makes its session due at once");
+    }
+
     fn harness_terminal_sessions_due_for_poll_resumes_covering_a_dropped_subscription() {
         // Requirement 2, made checkable without a socket: the poll must be
         // the FALLBACK for a session the push worker is not (or is no

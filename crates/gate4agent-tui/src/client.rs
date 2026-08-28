@@ -1292,6 +1292,7 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
             // toward `fps`. Pure timing: nothing between here and `record_
             // frame` below changes what this block already did.
             let frame_start = Instant::now();
+            let mut phases = crate::profile::FramePhases::default();
             frames.consume_redraw(now, animation_interval);
             if frames.spinner_tick_due(now, app.has_active_animation()) {
                 for _ in 0..ANIMATION_TICKS_PER_FRAME {
@@ -1304,12 +1305,16 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
             // `App::step_pet`'s own doc comment.
             app.step_pet(now);
             app.step_pet_arcade(now);
+            phases.animate = frame_start.elapsed();
             let render_start = Instant::now();
             app.layout = render::render(&app, screen.buffer_mut());
-            app.profiler.record_render(render_start.elapsed());
+            phases.render = render_start.elapsed();
+            app.profiler.record_render(phases.render);
+            let queue_start = Instant::now();
             for action in changed_terminal_sizes(&app, &mut last_terminal_sizes) {
                 queue_action(&mut app, &commands, &inspection_commands, &mut pending_raw, action);
             }
+            phases.queue = queue_start.elapsed();
             // Hidden for the whole paint, restored by `sync_cursor` at the
             // end of it. Every write leaves the terminal's own cursor at
             // the last cell it touched, and the sixel pass moves it again
@@ -1320,10 +1325,13 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
             // clock every second, the pet far more often -- are exactly
             // where it was seen. The cursor belongs in one place: wherever
             // `sync_cursor` decides, once the frame is finished.
+            let hide_start = Instant::now();
             execute!(stdout(), Hide)?;
+            phases.cursor = hide_start.elapsed();
             let flush_start = Instant::now();
             screen.flush()?;
-            app.profiler.record_flush(flush_start.elapsed());
+            phases.flush = flush_start.elapsed();
+            app.profiler.record_flush(phases.flush);
             let sixel_start = Instant::now();
             flush_sixel_icon(&app, screen.current(), &mut sixel_emit_state)?;
             // Painted AFTER the rail/strip/gallery icons above, on the SAME
@@ -1341,9 +1349,16 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
             // pass, so `flush_sixel_icon` above already repainted that
             // area's real (modal) content before this call ever runs.
             flush_pet_arcade_pixel_frame(&app, screen.current(), &mut pet_arcade_pixel_emit_state)?;
-            app.profiler.record_sixel(sixel_start.elapsed());
+            phases.sixel = sixel_start.elapsed();
+            app.profiler.record_sixel(phases.sixel);
+            // Both cursor syscalls land in one phase: `Hide` above opens
+            // the paint, `sync_cursor` closes it, and neither is
+            // interesting alone -- what is worth seeing is what the
+            // terminal charges for the pair.
+            let sync_start = Instant::now();
             sync_cursor(&app)?;
-            app.profiler.record_frame(frame_start.elapsed());
+            phases.cursor += sync_start.elapsed();
+            app.profiler.record_frame(frame_start.elapsed(), phases);
         }
 
         if pending_raw

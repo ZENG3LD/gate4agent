@@ -94,6 +94,49 @@ impl<const N: usize> RingStats<N> {
     }
 }
 
+/// One redraw tick's own phase breakdown, handed to
+/// [`TuiProfiler::record_frame`] so the remainder is always subtracted
+/// from the same six numbers the named series report.
+///
+/// `frame_us` measured the whole tick and three of its pieces
+/// (`render_us`/`flush_us`/`sixel_us`), which left the difference
+/// unattributed: p50 1387us of frame against 1096us of measured pieces,
+/// and a 21ms maximum with no way to say which step produced it. The
+/// three phases added here -- the animation/pet integrators, the
+/// terminal-resize action queueing, the two cursor syscalls -- close that
+/// gap, and `frame_remainder_us` is what is left over after all six.
+///
+/// A remainder that stays near zero means the breakdown is complete; one
+/// that grows means a step was added to the tick without being measured.
+/// Same shape the node's own `drive_loop_phases_us` already uses.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FramePhases {
+    /// `consume_redraw` + the spinner ticks + `step_pet` +
+    /// `step_pet_arcade` -- everything before the paint begins.
+    pub animate: Duration,
+    /// `render::render` into the back buffer. Also reported on its own as
+    /// `render_us`.
+    pub render: Duration,
+    /// `changed_terminal_sizes` and the `queue_action` calls it feeds --
+    /// unmeasured before, and it can enqueue real work.
+    pub queue: Duration,
+    /// `Screen::flush`. Also reported on its own as `flush_us`.
+    pub flush: Duration,
+    /// The sixel icon pass plus the arcade's pixel frame. Also reported on
+    /// its own as `sixel_us`.
+    pub sixel: Duration,
+    /// The two cursor syscalls bracketing the paint: `Hide` before it,
+    /// `sync_cursor` after.
+    pub cursor: Duration,
+}
+
+impl FramePhases {
+    /// Everything this breakdown accounts for, for the remainder subtraction.
+    fn total(self) -> Duration {
+        self.animate + self.render + self.queue + self.flush + self.sixel + self.cursor
+    }
+}
+
 /// Everything both sinks (the overlay, the log line) read -- a single
 /// snapshot so the two can never disagree about "right now": both format
 /// this same struct, never re-derive their own numbers from the live
@@ -104,10 +147,20 @@ impl<const N: usize> RingStats<N> {
 // in sync by hand.
 #[derive(Clone, Debug, Serialize)]
 pub struct ProfileSnapshot {
+    /// The redraw tick's own phases, in the order the tick runs them.
+    /// `render_us`/`flush_us`/`sixel_us` are three of the six; the other
+    /// three and the leftover are described on [`FramePhases`].
+    pub animate_us: Distribution,
     pub render_us: Distribution,
     pub flush_us: Distribution,
     pub sixel_us: Distribution,
+    pub queue_us: Distribution,
+    pub cursor_us: Distribution,
     pub frame_us: Distribution,
+    /// `frame_us` minus every named phase above. Near zero means the
+    /// breakdown accounts for the whole tick; a growing remainder means a
+    /// step joined the tick without being measured.
+    pub frame_remainder_us: Distribution,
     pub wait_us: Distribution,
     pub terminal_rtt_us: Distribution,
     /// Age of a terminal frame at the moment this client received it:
@@ -157,10 +210,14 @@ pub struct ProfileSnapshot {
 /// redraw.
 #[derive(Clone, Debug)]
 pub struct TuiProfiler {
+    animate_us: RingStats<SAMPLE_WINDOW>,
     render_us: RingStats<SAMPLE_WINDOW>,
     flush_us: RingStats<SAMPLE_WINDOW>,
     sixel_us: RingStats<SAMPLE_WINDOW>,
+    queue_us: RingStats<SAMPLE_WINDOW>,
+    cursor_us: RingStats<SAMPLE_WINDOW>,
     frame_us: RingStats<SAMPLE_WINDOW>,
+    frame_remainder_us: RingStats<SAMPLE_WINDOW>,
     wait_us: RingStats<SAMPLE_WINDOW>,
     terminal_rtt_us: RingStats<SAMPLE_WINDOW>,
     frame_age_ms: RingStats<SAMPLE_WINDOW>,
@@ -195,10 +252,14 @@ impl Default for TuiProfiler {
     fn default() -> Self {
         let now = Instant::now();
         Self {
+            animate_us: RingStats::default(),
             render_us: RingStats::default(),
             flush_us: RingStats::default(),
             sixel_us: RingStats::default(),
+            queue_us: RingStats::default(),
+            cursor_us: RingStats::default(),
             frame_us: RingStats::default(),
+            frame_remainder_us: RingStats::default(),
             wait_us: RingStats::default(),
             terminal_rtt_us: RingStats::default(),
             frame_age_ms: RingStats::default(),
@@ -241,12 +302,29 @@ impl TuiProfiler {
         self.sixel_us.push(duration_micros(elapsed));
     }
 
-    /// The whole redraw tick, start to finish -- also the ONE place a
-    /// completed redraw is counted toward `fps` (see `tick_second`'s own
-    /// doc comment): a "frame" is exactly what this measures the duration
-    /// of, so both belong at the same call site.
-    pub fn record_frame(&mut self, elapsed: Duration) {
+    /// The whole redraw tick, start to finish, plus the breakdown of what
+    /// it spent that time on -- also the ONE place a completed redraw is
+    /// counted toward `fps` (see `tick_second`'s own doc comment): a
+    /// "frame" is exactly what this measures the duration of, so both
+    /// belong at the same call site.
+    ///
+    /// `phases` carries all six spans, including the three that are also
+    /// recorded on their own (`record_render`/`record_flush`/
+    /// `record_sixel`), so the remainder is subtracted from exactly the
+    /// numbers the named series report rather than from a second reading
+    /// of the same clock.
+    ///
+    /// The subtraction saturates: the phases are measured one at a time
+    /// and their total is a sum of independently rounded spans, so it can
+    /// exceed `elapsed` by a microsecond. A remainder pinned at 0 says the
+    /// breakdown is complete, which is exactly what it means.
+    pub fn record_frame(&mut self, elapsed: Duration, phases: FramePhases) {
         self.frame_us.push(duration_micros(elapsed));
+        self.animate_us.push(duration_micros(phases.animate));
+        self.queue_us.push(duration_micros(phases.queue));
+        self.cursor_us.push(duration_micros(phases.cursor));
+        self.frame_remainder_us
+            .push(duration_micros(elapsed.saturating_sub(phases.total())));
         self.frames_this_second = self.frames_this_second.saturating_add(1);
     }
 
@@ -391,10 +469,14 @@ impl TuiProfiler {
         let interval_ms = crate::client::DIRTY_FRAME_INTERVAL.as_millis().max(1);
         let fps_ceiling = (1000u128 / interval_ms).min(u128::from(u32::MAX)) as u32;
         ProfileSnapshot {
+            animate_us: self.animate_us.stats(),
             render_us: self.render_us.stats(),
             flush_us: self.flush_us.stats(),
             sixel_us: self.sixel_us.stats(),
+            queue_us: self.queue_us.stats(),
+            cursor_us: self.cursor_us.stats(),
             frame_us: self.frame_us.stats(),
+            frame_remainder_us: self.frame_remainder_us.stats(),
             wait_us: self.wait_us.stats(),
             terminal_rtt_us: self.terminal_rtt_us.stats(),
             frame_age_ms: self.frame_age_ms.stats(),
@@ -443,10 +525,14 @@ impl TuiProfiler {
         // total`) -- see `log_field`'s own doc comment for the per-field
         // shape a reading script parses.
         let fields = [
+            log_field("animate_us", snapshot.animate_us),
             log_field("render_us", snapshot.render_us),
             log_field("flush_us", snapshot.flush_us),
             log_field("sixel_us", snapshot.sixel_us),
+            log_field("queue_us", snapshot.queue_us),
+            log_field("cursor_us", snapshot.cursor_us),
             log_field("frame_us", snapshot.frame_us),
+            log_field("frame_remainder_us", snapshot.frame_remainder_us),
             log_field("wait_us", snapshot.wait_us),
             log_field("fps", snapshot.fps),
             format!("fps_ceiling={}", snapshot.fps_ceiling),
@@ -512,13 +598,54 @@ mod tests {
         assert_eq!(ring.stats(), Distribution::default());
     }
 
+    /// The remainder is the whole point of the breakdown: it is what the
+    /// named phases did NOT account for. A tick whose phases sum to its
+    /// own duration leaves zero; a tick with an unmeasured step leaves
+    /// exactly that step.
+    #[test]
+    fn the_frame_remainder_is_whatever_the_named_phases_did_not_account_for() {
+        let mut profiler = TuiProfiler::default();
+        let accounted = FramePhases {
+            animate: Duration::from_micros(100),
+            render: Duration::from_micros(900),
+            queue: Duration::from_micros(10),
+            flush: Duration::from_micros(40),
+            sixel: Duration::from_micros(8),
+            cursor: Duration::from_micros(12),
+        };
+        profiler.record_frame(Duration::from_micros(1_070), accounted);
+        let snapshot = profiler.snapshot();
+        assert_eq!(snapshot.frame_remainder_us.max, 0, "a fully accounted tick leaves nothing over");
+        assert_eq!(snapshot.animate_us.max, 100);
+        assert_eq!(snapshot.queue_us.max, 10);
+        assert_eq!(snapshot.cursor_us.max, 12);
+
+        // The same phases inside a tick that took 5ms longer: every one of
+        // those microseconds is unattributed, and the remainder says so.
+        profiler.record_frame(Duration::from_micros(6_070), accounted);
+        assert_eq!(profiler.snapshot().frame_remainder_us.max, 5_000);
+    }
+
+    /// The subtraction must not wrap when the phase sum edges past the
+    /// tick's own reading -- six independently rounded spans can total a
+    /// microsecond more than the single span measured around them.
+    #[test]
+    fn a_phase_sum_past_the_tick_reads_as_zero_left_over() {
+        let mut profiler = TuiProfiler::default();
+        profiler.record_frame(
+            Duration::from_micros(100),
+            FramePhases { render: Duration::from_micros(101), ..FramePhases::default() },
+        );
+        assert_eq!(profiler.snapshot().frame_remainder_us.max, 0);
+    }
+
     #[test]
     fn tick_second_rolls_exactly_once_per_elapsed_second() {
         let start = Instant::now();
         let mut profiler = TuiProfiler::default();
         profiler.second_start = start;
-        profiler.record_frame(Duration::from_micros(500));
-        profiler.record_frame(Duration::from_micros(500));
+        profiler.record_frame(Duration::from_micros(500), FramePhases::default());
+        profiler.record_frame(Duration::from_micros(500), FramePhases::default());
         profiler.tick_second(start + Duration::from_millis(1_001));
         let snapshot = profiler.snapshot();
         assert_eq!(snapshot.fps.count, 1);

@@ -10778,10 +10778,18 @@ fn render_profile_overlay(
         100.0 * snapshot.terminal_polls_empty as f64 / snapshot.terminal_polls_total as f64
     };
     let lines = [
+        // The redraw tick's own phases, in the order the tick runs them,
+        // then the whole tick and what none of the phases accounted for.
+        // A `frame_rest_us` that is not near zero means a step joined the
+        // tick without being measured -- see `profile::FramePhases`.
+        dist_line("animate_us", snapshot.animate_us),
         dist_line("render_us", snapshot.render_us),
+        dist_line("queue_us", snapshot.queue_us),
+        dist_line("cursor_us", snapshot.cursor_us),
         dist_line("flush_us", snapshot.flush_us),
         dist_line("sixel_us", snapshot.sixel_us),
         dist_line("frame_us", snapshot.frame_us),
+        dist_line("frame_rest_us", snapshot.frame_remainder_us),
         dist_line("wait_us", snapshot.wait_us),
         format!(
             "{:<11} p50={:<6} p95={:<6} max={:<6} n={} (ceiling {})",

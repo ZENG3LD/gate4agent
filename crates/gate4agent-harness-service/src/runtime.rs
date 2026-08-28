@@ -2962,6 +2962,18 @@ fn map_session_control_error(error: HarnessC2Error) -> HarnessOperatorHostErrorV
         HarnessC2Error::SessionControlCancelled => HarnessOperatorHostErrorV1::Deadline,
         HarnessC2Error::SessionControlRejected { code } => match code {
             NodeFailureCode::InvalidRequest => HarnessOperatorHostErrorV1::InvalidRequest,
+            // The unknown-target bucket every other mapper on this wire
+            // already has (`map_resource_mutation_error` buckets these two
+            // exactly this way). Without it both fell through to
+            // `Internal`, so all eight session-control verbs answered
+            // "the host broke" for a session that is simply not there any
+            // more -- observed live: a `RemoveSession` for a session the
+            // node had already reaped during its own `Stop` came back
+            // `internal`, and reading it as a failure of the remove cost
+            // an investigation that ended at this arm.
+            NodeFailureCode::UnknownSession | NodeFailureCode::UnknownWorkspace => {
+                HarnessOperatorHostErrorV1::NotFound
+            }
             NodeFailureCode::BindingMismatch | NodeFailureCode::StaleGeneration => {
                 HarnessOperatorHostErrorV1::Conflict
             }
@@ -13467,6 +13479,19 @@ mod tests {
             }),
             HarnessOperatorHostErrorV1::Busy,
         );
+        // A session that is not there is NotFound, not Internal. The node
+        // reaps a session during its own `Stop`, so an operator's follow-up
+        // `RemoveSession` legitimately arrives after the session is gone --
+        // and used to be answered as a host fault.
+        for absent in [NodeFailureCode::UnknownSession, NodeFailureCode::UnknownWorkspace] {
+            assert_eq!(
+                map_session_control_error(HarnessC2Error::SessionControlRejected {
+                    code: absent.clone(),
+                }),
+                HarnessOperatorHostErrorV1::NotFound,
+                "{absent:?} names a missing target, not a broken host",
+            );
+        }
 
         let input_identity = OperatorRequestLogIdentity::describe(
             &HarnessOperatorRequestV1::WriteSessionInput {

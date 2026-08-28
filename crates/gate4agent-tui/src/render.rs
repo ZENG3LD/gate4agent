@@ -13,17 +13,22 @@ use gate4agent_arcade_pet_bastion::board::{AnchorId, Board};
 use gate4agent_arcade_pet_bastion::boss::BossKind;
 use gate4agent_arcade_pet_bastion::constants::{
     ANCHOR_RUNE_LINGER_TICKS, BLINK_COST, BOARD_HEIGHT, BOARD_WIDTH, BOSS_LAP_INTEGRITY_DAMAGE, CIRCUIT_BASE_SLOTS,
-    ECHO_EVERY_NTH_ATTACK, EVOLUTION_AFTER_WAVE, FIXED_SCALE, FULL_CIRCUIT_COST, LEAK_INTEGRITY_DAMAGE,
-    LINKED_ATTACK_SPEED_PERMILLE, PET_MOVE_TICKS, PET_PULSE_COST, PHASE_EVERY_NTH_HIT, RUNE_DRAFT_AFTER_WAVES,
-    RUNE_DRAFT_OPTIONS, SPARK_CAP, SPARK_PER_KILLS, SYMBIOSIS_ADJACENCY_FP, SYMBIOSIS_DAMAGE_BONUS_PERMILLE,
-    TICKS_PER_SECOND, WAVE_COUNT, WISP_FREE_BLINK_INTERVAL_TICKS,
+    CIRCUIT_MOTH_SLOTS, CIRCUIT_WISP_SLOTS, CRAB_PET_PULSE_DAMAGE_PERMILLE, CRAB_SHIELD_CAP, CRAB_SHIELD_ON_ARRIVAL,
+    ECHO_EVERY_NTH_ATTACK, EVOLUTION_AFTER_WAVE, FIXED_SCALE, FULL_CIRCUIT_COST, FULL_CIRCUIT_TICKS,
+    LEAK_INTEGRITY_DAMAGE, LINKED_ATTACK_SPEED_PERMILLE, PET_CHARGE_BLOOM_RADIUS_PERMILLE, PET_CHARGE_DRAFT_AFTER_WAVES,
+    PET_CHARGE_DRAFT_OPTIONS, PET_CHARGE_FANG_DAMAGE_PERMILLE, PET_CHARGE_SURGE_EXTRA_SPEED_PERMILLE, PET_MOVE_TICKS,
+    PET_MOVE_TICKS_MOTH, PET_PULSE_COST, PET_PULSE_DAMAGE, PET_PULSE_RADIUS_FP, PHASE_EVERY_NTH_HIT,
+    RUNE_DRAFT_AFTER_WAVES, RUNE_DRAFT_OPTIONS, SPARK_CAP, SPARK_PER_KILLS, SYMBIOSIS_ADJACENCY_FP,
+    SYMBIOSIS_DAMAGE_BONUS_PERMILLE, TICKS_PER_SECOND, WAVE_COUNT, WISP_FREE_BLINK_INTERVAL_TICKS,
+    ZONE_ENEMY_SPEED_PERMILLE, ZONE_TOWER_DAMAGE_PERMILLE,
 };
 use gate4agent_arcade_pet_bastion::enemy::EnemyKind;
-use gate4agent_arcade_pet_bastion::pet::Evolution;
+use gate4agent_arcade_pet_bastion::pet::{Evolution, PetCharge};
 use gate4agent_arcade_pet_bastion::rune::Rune;
-use gate4agent_arcade_pet_bastion::snapshot::{RunPhaseView, SimulationSnapshot};
+use gate4agent_arcade_pet_bastion::snapshot::{FieldZoneView, RunPhaseView, SimulationSnapshot};
 use gate4agent_arcade_pet_bastion::tower::{effective_stats, DamageFamily, TowerKind, TowerStats, UpgradeBranch, UpgradeLevel};
 use gate4agent_arcade_pet_bastion::wave::Difficulty;
+use gate4agent_arcade_pet_bastion::zone::{ZoneKind, ZonePolarity};
 use gate4agent_arcade_pet_bastion::RunOutcome as PetBastionRunOutcome;
 use gate4agent_arcade_pet_bastion_render::interp::{interpolated_dynamic_sprites, render_sim_time};
 use gate4agent_arcade_pet_bastion_render::{snapshot_to_surface, terrain_surface};
@@ -53,7 +58,7 @@ use crate::app::{
     ExistingSessionMode, ExistingSessionOperation, Focus, FolderBrowserField,
     AgentRunGitScopeView, GitLocationDialogKind, HitRegion, HitTarget, LaunchContextMode, LaunchField, LaunchTarget,
     IconFamily, LayoutRects, MenuPlacement, NativeSessionGroupKey, NativeSessionTreeItem, NetworkSummary, NodeView, OverlayId, PetArcadeMenuAction, PetArcadeMenuState, PetArcadePixelPlacement, PetArcadeVisualTier, PreviewTabPhase, PreviewTabView, PtyColorMode, RailIcons, RosterMode, SessionView,
-    PET_ARCADE_INFO_VISIBLE_ROWS,
+    PET_ARCADE_INFO_VISIBLE_ROWS, PET_ARCADE_TOOLTIP_HOLD_DELAY,
     SixelIconPlacement, SixelIconSize,
     pet_blink_suspended_for_connection, pet_connection_color_key, PetConnectionColor,
     StatusBarHoverZone,
@@ -500,6 +505,13 @@ pub fn render(app: &App, buf: &mut TerminalBuffer) -> LayoutRects {
         if app.pet_arcade_menu.is_some() {
             render_pet_arcade_menu(app, area, buf, &mut layout, theme);
         }
+        // Owner: "если наводим на вариант и держим на нем допустим 2
+        // секунды" -- painted last of the three so it always reads on
+        // top, though in practice it and the two overlays just above are
+        // mutually exclusive already (`App::hover`'s own doc comment:
+        // hovering either of THEIR hit regions is never tooltip-eligible,
+        // so `pet_arcade_hover` is already `None` whenever one is open).
+        render_pet_arcade_tooltip(app, area, buf, &layout, theme);
     }
     render_drag_preview(app, area, buf, &layout, theme);
     if let Some(notice) = app.notice() {
@@ -1391,6 +1403,11 @@ fn render_pet_arcade(
 
     let dest = Rect::new(inner.x, board_y, board_w, board_h);
     let mut surface = snapshot_to_surface(&snapshot);
+    // Painted BEFORE the cursor/anchor highlight just below, so the more
+    // specific, actionable cursor state always wins visually on whichever
+    // tile the two happen to overlap (`pet_arcade_highlight_cursor`
+    // unconditionally overwrites `bg`, last write wins).
+    pet_arcade_highlight_field_zones(&mut surface, &snapshot);
     pet_arcade_highlight_cursor(&mut surface, arcade.selected_tile(), arcade.selected_anchor());
     if let Some(DragState::PetArcadeTowerPlacement { kind, current_column, current_row, .. }) = &app.drag_state {
         let hovered = pet_arcade_drag_hovered_tile(*current_column, *current_row, dest, footprint_w);
@@ -1561,6 +1578,223 @@ fn one_decimal(numerator: i64, denominator: i64) -> String {
     format!("{whole}.{tenths}")
 }
 
+/// The hover-and-hold tooltip's own text for `target`, or `None` if
+/// `target` is not one of the controls this covers. Owner report: "что
+/// дают руны мне не очевидно ... было бы неплохо делать тултип с инфой,
+/// если наводим на вариант и держим на нем допустим 2 секунды". This is
+/// the ONE place that decides both "is this eligible at all" (`App::
+/// hover`'s own doc comment calls this to decide whether to start/keep
+/// the hold timer) and "what does it say" (`render_pet_arcade_tooltip`
+/// calls this again, once the hold has actually elapsed, for the text to
+/// paint) -- never two independently-maintained lists.
+///
+/// Covers, at minimum (owner's own ask): the rune draft options, the
+/// tower palette entries, the pet's own ability buttons (Pulse/Blink/
+/// Full Circuit/Move), and the evolution choices. EVERY number below is
+/// read from `gate4agent_arcade_pet_bastion::constants` (or, for towers,
+/// `TowerKind::base_stats`/`effective_stats`, the SAME calls `render_pet_
+/// arcade_hud`/`render_pet_arcade_context` already make) at call time,
+/// never copied into a string literal -- the same discipline `render_pet_
+/// arcade_info`'s own doc comment already states for the mechanics modal.
+///
+/// `snapshot` is `None` for every control whose tooltip is a pure function
+/// of the target alone (a rune, a tower kind, an ability button, an
+/// evolution, a Pet Charge) -- the same fixture-free shape this fn already
+/// had. The one exception is `HitTarget::PetArcadeTile`: a board tile's own
+/// tooltip (which field zone, if any, it sits inside) is genuinely per-run
+/// state (`snapshot.field_zones`, redrawn every wave), so that one arm
+/// needs a live snapshot to answer at all and returns `None` without one --
+/// exactly `App::hover`'s own `PetArcade::snapshot()` read, and `Home`/
+/// `Results` (no live run) correctly have no zone tooltip either.
+pub(crate) fn pet_arcade_tooltip_text(target: &HitTarget, snapshot: Option<&SimulationSnapshot>) -> Option<String> {
+    match target {
+        HitTarget::PetArcadeDraftRune(rune) => Some(pet_arcade_rune_tooltip(*rune)),
+        HitTarget::PetArcadeDraftPetCharge(charge) => Some(pet_arcade_pet_charge_tooltip(*charge)),
+        HitTarget::PetArcadeTowerKind(kind) => Some(pet_arcade_tower_tooltip(*kind)),
+        HitTarget::PetArcadePetPulse => Some(format!(
+            "Pet Pulse -{PET_PULSE_COST} Spark: an AoE burst centred on the pet's own anchor, {} tiles, {PET_PULSE_DAMAGE} damage (+{}% as a Crab) and a knockback. Requires the pet be standing at an anchor.",
+            one_decimal(PET_PULSE_RADIUS_FP, FIXED_SCALE),
+            (CRAB_PET_PULSE_DAMAGE_PERMILLE - 1000) / 10,
+        )),
+        HitTarget::PetArcadeBlink => Some(format!(
+            "Blink -{BLINK_COST} Spark: teleports the pet to the selected anchor instantly. Free every {}s as a Wisp.",
+            WISP_FREE_BLINK_INTERVAL_TICKS / TICKS_PER_SECOND as u64,
+        )),
+        HitTarget::PetArcadeFullCircuit => Some(format!(
+            "Full Circuit -{FULL_CIRCUIT_COST} Spark: for {}s, links EVERY attacking tower on the board, ignoring the normal anchor slot limit.",
+            FULL_CIRCUIT_TICKS / TICKS_PER_SECOND as u64,
+        )),
+        HitTarget::PetArcadeMovePet => Some(format!(
+            "Move Pet: walks the pet to the selected anchor, {}s on foot ({}s as a Moth). Free -- Blink is the instant, Spark-costing alternative.",
+            one_decimal(PET_MOVE_TICKS as i64, TICKS_PER_SECOND),
+            one_decimal(PET_MOVE_TICKS_MOTH as i64, TICKS_PER_SECOND),
+        )),
+        HitTarget::PetArcadeChooseEvolution(evolution) => Some(pet_arcade_evolution_tooltip(*evolution)),
+        HitTarget::PetArcadeTile(x, y) => {
+            let zone = field_zone_at(snapshot?, *x, *y)?;
+            Some(pet_arcade_field_zone_tooltip(zone))
+        }
+        _ => None,
+    }
+}
+
+/// The [`FieldZoneView`] (if any) whose own `tile_bounds` covers board tile
+/// `(x, y)` -- `snapshot.field_zones` is always 0 or 2 entries
+/// (`SimulationSnapshot::field_zones`'s own doc comment), never more, so a
+/// linear scan of it is exactly as cheap as an indexed lookup would be.
+fn field_zone_at(snapshot: &SimulationSnapshot, x: u8, y: u8) -> Option<&FieldZoneView> {
+    let (x, y) = (i32::from(x), i32::from(y));
+    snapshot.field_zones.iter().find(|zone| {
+        let (x0, y0, x1, y1) = zone.tile_bounds;
+        x >= x0 && x < x1 && y >= y0 && y < y1
+    })
+}
+
+/// A Pet Charge draft option's own tooltip -- same "attaches to:" spirit
+/// the rune tooltips already use (`pet_arcade_rune_tooltip`'s own doc
+/// comment), except every one of these four attaches to exactly the same
+/// thing: whichever tower(s) the Living Circuit currently LINKS, never the
+/// pet itself and never every tower on the board (`pet.rs`'s own
+/// `PetCharge` doc comment; `sim.rs`'s own `fire_tower`/`adjusted_interval`
+/// gate every one of the four behind `linked &&`). Moving the pet off an
+/// anchor that used to link a tower a charge was buffing genuinely turns
+/// that buff off for that tower -- "where do I put the pet" stays a live
+/// decision even after a pick, which is worth stating plainly rather than
+/// leaving the player to infer it.
+fn pet_arcade_pet_charge_tooltip(charge: PetCharge) -> String {
+    const ATTACHES: &str = "attaches to: every tower currently LINKED to the pet's own Circuit.";
+    match charge {
+        PetCharge::Surge => format!(
+            "Surge -- {ATTACHES} An extra +{}% attack speed on top of the Circuit's own link bonus.",
+            (PET_CHARGE_SURGE_EXTRA_SPEED_PERMILLE - 1000) / 10,
+        ),
+        PetCharge::Fang => format!("Fang -- {ATTACHES} +{}% damage.", PET_CHARGE_FANG_DAMAGE_PERMILLE / 10),
+        PetCharge::Bloom => format!(
+            "Bloom -- {ATTACHES} +{}% splash/chain reach, plus one extra target slot.",
+            PET_CHARGE_BLOOM_RADIUS_PERMILLE / 10,
+        ),
+        PetCharge::Attune => format!(
+            "Attune -- {ATTACHES} Its outgoing damage family rotates through every family instead of staying fixed -- the real answer to Mirror's own resistance."
+        ),
+    }
+}
+
+/// A field zone's own tooltip -- read straight off `zone.rs`'s own
+/// `tower_damage_bonus_permille`/`enemy_speed_permille` sign rules: a
+/// tower-damage Buff/Debuff is a flat +/-`ZONE_TOWER_DAMAGE_PERMILLE`, an
+/// enemy-speed Buff makes an enemy/boss SLOWER (`1000 - ZONE_ENEMY_SPEED_
+/// PERMILLE`, good for the player) and a Debuff makes it FASTER (`1000 +
+/// ...`, bad) -- stated in plain SLOWER/FASTER words rather than a signed
+/// permille a player would have to mentally invert.
+fn pet_arcade_field_zone_tooltip(zone: &FieldZoneView) -> String {
+    let tower_pct = ZONE_TOWER_DAMAGE_PERMILLE / 10;
+    let speed_pct = one_decimal(ZONE_ENEMY_SPEED_PERMILLE, 10);
+    match (zone.kind, zone.polarity) {
+        (ZoneKind::TowerDamage, ZonePolarity::Buff) => {
+            format!("Tower damage zone (buff): an attacking tower built inside this sector deals +{tower_pct}% damage.")
+        }
+        (ZoneKind::TowerDamage, ZonePolarity::Debuff) => {
+            format!("Tower damage zone (debuff): an attacking tower built inside this sector deals -{tower_pct}% damage.")
+        }
+        (ZoneKind::EnemySpeed, ZonePolarity::Buff) => {
+            format!("Enemy speed zone (buff): an enemy or boss inside this sector moves {speed_pct}% SLOWER.")
+        }
+        (ZoneKind::EnemySpeed, ZonePolarity::Debuff) => {
+            format!("Enemy speed zone (debuff): an enemy or boss inside this sector moves {speed_pct}% FASTER.")
+        }
+    }
+}
+
+/// A rune's own tooltip -- answers the owner's own two questions in plain
+/// words: what the rune does, and what it attaches to (the pet, one
+/// tower, or every tower). Read straight off `sim.rs`'s own per-rune
+/// checks (`fire_tower`'s own `world.runes.has(Rune::X)` gates, `pet.rs`'s
+/// own `start_move`) -- see this fn's own per-arm comment for exactly
+/// which lines of `sim.rs` each one traces to.
+fn pet_arcade_rune_tooltip(rune: Rune) -> String {
+    match rune {
+        // `fire_tower`'s own `!is_echo_bonus && world.runes.has(Rune::Echo)
+        // && world.towers[idx].attack_count % ECHO_EVERY_NTH_ATTACK == 0`
+        // -- a GLOBAL check against whichever tower is firing, not scoped
+        // to one placed tower: every tower on the board is eligible.
+        Rune::Echo => format!(
+            "Echo -- attaches to: every tower. Every {ECHO_EVERY_NTH_ATTACK}th attack from a tower, a same-kind tower on the board fires again for free."
+        ),
+        // `pet.rs`'s own `start_move`: when the pet leaves an anchor with
+        // this rune, `self.lingering = Some((linked_before_move, ...))` --
+        // `sim.rs`'s own `linked_towers_now` then keeps treating exactly
+        // those towers (the ones linked at THAT anchor, not "every
+        // tower") as linked for a few more seconds, on top of whatever is
+        // linked at the new anchor. Genuinely a hybrid -- a pet-side
+        // trigger, a tower-side effect on a moving subset -- so it is
+        // described in its own terms rather than forced into "one" or
+        // "every".
+        Rune::Anchor => format!(
+            "Anchor -- attaches to: the pet's own Circuit link. When the pet leaves an anchor, whichever towers were linked to it keep that link's attack-speed buff for {}s longer.",
+            ANCHOR_RUNE_LINGER_TICKS / TICKS_PER_SECOND as u64,
+        ),
+        // `fire_tower`'s own `world.runes.has(Rune::Overgrowth)` gate on
+        // the overkill carried from one chain/splash jump into the next --
+        // global, any tower's own kill can trigger it.
+        Rune::Overgrowth => "Overgrowth -- attaches to: every tower. A kill's own overkill damage carries into the next chain/splash target instead of being wasted."
+            .to_owned(),
+        // `fire_tower`'s own `world.runes.has(Rune::Phase) && world.towers
+        // [idx].hit_count % PHASE_EVERY_NTH_HIT == 0` -- global, keyed off
+        // each tower's own accumulating hit count, but the rule itself
+        // applies uniformly to every tower.
+        Rune::Phase => format!(
+            "Phase -- attaches to: every tower. Every {PHASE_EVERY_NTH_HIT}rd hit from a tower ignores the target's armour."
+        ),
+        // `symbiosis_bonus_permille` -- global, checked for whichever
+        // tower is currently firing, against every OTHER placed tower's
+        // own position.
+        Rune::Symbiosis => format!(
+            "Symbiosis -- attaches to: every tower. A tower within {} tiles of a DIFFERENT kind deals +{}% damage.",
+            one_decimal(SYMBIOSIS_ADJACENCY_FP, FIXED_SCALE),
+            SYMBIOSIS_DAMAGE_BONUS_PERMILLE / 10,
+        ),
+    }
+}
+
+/// A tower palette entry's own tooltip -- kind, cost, and the SAME combat
+/// summary the empty-tile context card already shows for it
+/// (`render_pet_arcade_context`'s own `None` arm), reusing `tower_stats_
+/// line`/`tower_stats_extras_line` rather than a second formatter.
+fn pet_arcade_tower_tooltip(kind: TowerKind) -> String {
+    let stats = effective_stats(kind, UpgradeLevel::Base);
+    let mut text = format!("{} -{}: {}", tower_kind_label(kind), kind.base_stats().cost, tower_stats_line(&stats));
+    if let Some(extras) = tower_stats_extras_line(&stats) {
+        text.push_str(" (");
+        text.push_str(&extras);
+        text.push(')');
+    }
+    text
+}
+
+/// An evolution choice's own tooltip -- the trade-off it makes, in the
+/// same "attaches to" spirit the runes use, since an evolution is a
+/// permanent choice about how the pet's own Circuit link and movement
+/// behave for the rest of the run. `Pet::base_slots`/`move_duration_
+/// ticks`/`pet_pulse_damage`/`on_arrival_shield` (`pet.rs`) are this fn's
+/// own source for every number.
+fn pet_arcade_evolution_tooltip(evolution: Evolution) -> String {
+    match evolution {
+        Evolution::Moth => format!(
+            "Moth: links {CIRCUIT_MOTH_SLOTS} towers instead of {CIRCUIT_BASE_SLOTS}, but moves {}s per hop instead of {}s.",
+            one_decimal(PET_MOVE_TICKS_MOTH as i64, TICKS_PER_SECOND),
+            one_decimal(PET_MOVE_TICKS as i64, TICKS_PER_SECOND),
+        ),
+        Evolution::Crab => format!(
+            "Crab: gains a shield (+{CRAB_SHIELD_ON_ARRIVAL}, capped at {CRAB_SHIELD_CAP}) on arriving at an anchor, absorbing Integrity loss before it reaches Integrity itself. Pet Pulse deals +{}% damage.",
+            (CRAB_PET_PULSE_DAMAGE_PERMILLE - 1000) / 10,
+        ),
+        Evolution::Wisp => format!(
+            "Wisp: links only {CIRCUIT_WISP_SLOTS} towers, but Blink is free once every {}s.",
+            WISP_FREE_BLINK_INTERVAL_TICKS / TICKS_PER_SECOND as u64,
+        ),
+    }
+}
+
 /// Whether [`render_pet_arcade_info`]'s own content needs a scrollbar at
 /// all THIS frame, and the scroll offset actually usable once the raw,
 /// unclamped `App::pet_arcade_info_scroll` request is clamped against
@@ -1568,7 +1802,7 @@ fn one_decimal(numerator: i64, denominator: i64) -> String {
 /// "a bar shows only once content genuinely overflows" boundary is
 /// directly unit-testable against synthetic `(total_lines, visible_rows)`
 /// pairs, without needing a real, artificially-shortened content list --
-/// the REAL content (`pet_arcade_info_lines`) is 22 lines against a fixed
+/// the REAL content (`pet_arcade_info_lines`) is 35 lines against a fixed
 /// 14-row budget ([`PET_ARCADE_INFO_VISIBLE_ROWS`]) and so always
 /// overflows today, which proves the bar SHOWS but not that it would stay
 /// hidden if it did not.
@@ -1721,6 +1955,11 @@ pub(crate) fn pet_arcade_info_lines() -> Vec<PetArcadeInfoLine> {
     let symbiosis_tiles = one_decimal(SYMBIOSIS_ADJACENCY_FP, FIXED_SCALE);
     let symbiosis_pct = SYMBIOSIS_DAMAGE_BONUS_PERMILLE / 10;
     let linked_attack_speed_pct = (LINKED_ATTACK_SPEED_PERMILLE - 1000) / 10;
+    let surge_pct = (PET_CHARGE_SURGE_EXTRA_SPEED_PERMILLE - 1000) / 10;
+    let fang_pct = PET_CHARGE_FANG_DAMAGE_PERMILLE / 10;
+    let bloom_pct = PET_CHARGE_BLOOM_RADIUS_PERMILLE / 10;
+    let zone_tower_pct = ZONE_TOWER_DAMAGE_PERMILLE / 10;
+    let zone_speed_pct = one_decimal(ZONE_ENEMY_SPEED_PERMILLE, 10);
 
     vec![
         PetArcadeInfoLine::Label("SPARK"),
@@ -1758,6 +1997,32 @@ pub(crate) fn pet_arcade_info_lines() -> Vec<PetArcadeInfoLine> {
             "Each lap costs Integrity instead: -{LEAK_INTEGRITY_DAMAGE} for a minion, -{BOSS_LAP_INTEGRITY_DAMAGE} for a boss."
         )),
         PetArcadeInfoLine::Body("A wave ends only once every enemy on it is dead, not on Heartseed arrival.".to_owned()),
+        // `gate4agent-arcade`'s own concurrent rules addition -- the Living
+        // Circuit's own build draft and the per-wave field zones, neither
+        // of which had a single word of documentation anywhere in the
+        // interface before this pass, the exact "мне не ясна механика"
+        // owner report this whole modal already exists to answer.
+        PetArcadeInfoLine::Label("PET CHARGES"),
+        PetArcadeInfoLine::Body(format!(
+            "Drafted after waves {}, {}, {} and {} -- pick 1 of {PET_CHARGE_DRAFT_OPTIONS}, blocking the build phase.",
+            PET_CHARGE_DRAFT_AFTER_WAVES[0], PET_CHARGE_DRAFT_AFTER_WAVES[1], PET_CHARGE_DRAFT_AFTER_WAVES[2], PET_CHARGE_DRAFT_AFTER_WAVES[3],
+        )),
+        PetArcadeInfoLine::Body("Every charge applies ONLY to a tower currently LINKED to the pet's own Circuit.".to_owned()),
+        PetArcadeInfoLine::Body(format!("Surge: +{surge_pct}% attack speed on top of the Circuit's own link bonus.")),
+        PetArcadeInfoLine::Body(format!("Fang: +{fang_pct}% damage.")),
+        PetArcadeInfoLine::Body(format!("Bloom: +{bloom_pct}% splash/chain reach, plus one extra target slot.")),
+        PetArcadeInfoLine::Body("Attune: a linked tower's damage family rotates every hit instead of staying fixed --".to_owned()),
+        PetArcadeInfoLine::Body("the real answer to Mirror's own resistance.".to_owned()),
+        PetArcadeInfoLine::Body("Picking an already-held charge is a harmless no-op -- picks are idempotent.".to_owned()),
+        PetArcadeInfoLine::Label("FIELD ZONES"),
+        PetArcadeInfoLine::Body("Every wave draws two board sectors: one alters tower damage, one alters speed.".to_owned()),
+        PetArcadeInfoLine::Body(format!(
+            "Tower damage sector: +{zone_tower_pct}% (buff) or -{zone_tower_pct}% (debuff) for a tower built inside it."
+        )),
+        PetArcadeInfoLine::Body(format!(
+            "Enemy speed sector: {zone_speed_pct}% slower (buff) or {zone_speed_pct}% faster (debuff) while inside it."
+        )),
+        PetArcadeInfoLine::Body("Redrawn every wave, always on two DIFFERENT sectors -- never the same one twice.".to_owned()),
     ]
 }
 
@@ -2035,6 +2300,83 @@ fn render_pet_arcade_menu(app: &App, area: Rect, buf: &mut TerminalBuffer, layou
     }
 }
 
+/// The hover-and-hold tooltip itself -- owner: "что дают руны мне не
+/// очевидно ... было бы неплохо делать тултип с инфой, если наводим на
+/// вариант и держим на нем допустим 2 секунды". Paints [`pet_arcade_
+/// tooltip_text`]'s own text for whatever `app.pet_arcade_hover` is
+/// currently tracking, but ONLY once the pointer has held it for at
+/// least [`PET_ARCADE_TOOLTIP_HOLD_DELAY`] -- before that this paints
+/// nothing at all, which is the entire "hold" half of "hover-and-hold"
+/// (`App::hover`'s own doc comment covers the other half: dismissed the
+/// instant the pointer moves off, by clearing `pet_arcade_hover`
+/// outright rather than this fn hiding a stale one).
+///
+/// Re-verifies the hovered hit is STILL under the tracked column/row
+/// THIS frame -- `render_context_usage_tooltip`'s own established
+/// "still_hovered" check, reused here rather than trusting `pet_arcade_
+/// hover` blindly: a click can change the board/HUD layout under an
+/// unmoved pointer (upgrading a tower reflows the context card, say)
+/// between one `App::hover` update and the next redraw.
+fn render_pet_arcade_tooltip(app: &App, area: Rect, buf: &mut TerminalBuffer, layout: &LayoutRects, theme: Theme) {
+    let Some(hover) = app.pet_arcade_hover.as_ref() else { return };
+    if hover.since.elapsed() < PET_ARCADE_TOOLTIP_HOLD_DELAY {
+        return;
+    }
+    let still_hovered = layout
+        .hits
+        .iter()
+        .rev()
+        .find(|hit| hit.rect.contains(hover.column, hover.row))
+        .is_some_and(|hit| hit.target == hover.target);
+    if !still_hovered {
+        return;
+    }
+    let snapshot = app.pet_arcade.borrow().snapshot();
+    let Some(text) = pet_arcade_tooltip_text(&hover.target, snapshot.as_ref()) else {
+        return;
+    };
+    if area.width < 6 || area.height < 3 {
+        return;
+    }
+    const MAX_WIDTH: u16 = 52;
+    let width = MAX_WIDTH.min(area.width.saturating_sub(2)).max(6);
+    // `width - 2`: the wrapped TEXT width is the panel's own inner width,
+    // border excluded -- wrapping to the full outer `width` would let a
+    // maximally-wide line collide with the border columns this fn is
+    // about to draw around it.
+    let lines = wrap_preview_text(&text, width.saturating_sub(2) as usize);
+    let outer_height = (lines.len() as u16).saturating_add(2).min(area.height);
+    if outer_height < 3 {
+        return;
+    }
+    let x = hover
+        .column
+        .min(area.right().saturating_sub(width))
+        .max(area.x);
+    let preferred_y = hover.row.saturating_add(1);
+    let y = if preferred_y.saturating_add(outer_height) <= area.bottom() {
+        preferred_y
+    } else {
+        hover.row.saturating_sub(outer_height).max(area.y)
+    };
+    let rect = Rect::new(x, y, width, outer_height);
+    fill_rect(rect, theme.modal, buf);
+    Block::bordered()
+        .border_style(Style::default().fg(theme.accent))
+        .style(Style::default().bg(theme.modal))
+        .render(rect, buf);
+    let inner = Rect::new(
+        rect.x.saturating_add(1),
+        rect.y.saturating_add(1),
+        rect.width.saturating_sub(2),
+        rect.height.saturating_sub(2),
+    );
+    for (row, line) in lines.iter().enumerate().take(inner.height as usize) {
+        let Ok(row) = u16::try_from(row) else { break };
+        render_modal_line(line, inner, row, Style::default().fg(theme.text).bg(theme.modal), buf);
+    }
+}
+
 /// Ticks-remaining is converted to whole seconds rounded UP (never floats
 /// -- this is presentation code, but it still follows the sim's own "no
 /// floats" convention for consistency): `TICKS_PER_SECOND` is 20 (50ms
@@ -2045,6 +2387,12 @@ fn pet_arcade_phase_label(phase: &RunPhaseView) -> String {
         RunPhaseView::Combat => "Combat".to_owned(),
         RunPhaseView::RuneDraft => "Rune draft".to_owned(),
         RunPhaseView::EvolutionChoice => "Evolution choice".to_owned(),
+        // The Living Circuit's own build draft (`pet.rs`'s own
+        // `PetCharge`) -- the same structural shape as `RuneDraft` just
+        // above, drafted after waves 1/3/5/7 instead of 2/6
+        // (`PET_CHARGE_DRAFT_AFTER_WAVES`). `render_pet_arcade_context`'s
+        // own `PetChargeDraft` arm is what actually answers it.
+        RunPhaseView::PetChargeDraft => "Pet Charge draft".to_owned(),
         RunPhaseView::Victory => "Victory".to_owned(),
         RunPhaseView::Defeat => "Defeat".to_owned(),
     }
@@ -2056,6 +2404,65 @@ fn pet_arcade_phase_label(phase: &RunPhaseView) -> String {
 /// arm).
 fn pet_arcade_header_line(snapshot: &SimulationSnapshot) -> String {
     format!("Wave {}/{}  {}", snapshot.wave, WAVE_COUNT, pet_arcade_phase_label(&snapshot.phase))
+}
+
+/// Tints every board tile inside this wave's two field zones
+/// (`snapshot.field_zones`) with a muted, kind/polarity-specific
+/// background -- the glyph tier's own counterpart to the pixel tier's
+/// [`push_zone_outline_stroke`] (which draws an outline via `DynamicStroke`
+/// instead, since a `Surface` cell's own `bg` is invisible on plain terrain
+/// at that tier -- see [`pet_arcade_pixel_highlight_strokes`]'s own doc
+/// comment). This is the natural, already-established mechanism at THIS
+/// tier: `pet_arcade_highlight_cursor`/`pet_arcade_highlight_buildable_
+/// tiles` already tint a `Surface` cell's own `bg` for exactly this reason
+/// (a `SurfaceCell`'s `glyph`/`fg` are never touched, so the real terrain/
+/// unit character underneath always stays legible on top of the tint --
+/// the same "tint, never replace" discipline this module's own doc
+/// comments already establish).
+///
+/// Skips any cell that ALREADY carries its own `bg` (a stunned/slowed
+/// enemy's status tint, a boss's own kind colour, the pet's own evolution
+/// glow -- `gate4agent-arcade-pet-bastion-render`'s own `paint_enemy`/
+/// `paint_boss`/`paint_pet`, the only three painters that ever set `bg` at
+/// all) rather than overwriting it: that state is more specific and more
+/// urgent than an ambient field zone, and overwriting it here would be
+/// exactly the "drown the units standing on it" failure this mechanic must
+/// avoid.
+fn pet_arcade_highlight_field_zones(surface: &mut Surface, snapshot: &SimulationSnapshot) {
+    for zone in &snapshot.field_zones {
+        let tint = pet_arcade_field_zone_glyph_tint(zone.kind, zone.polarity);
+        let (x0, y0, x1, y1) = zone.tile_bounds;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let (ux, uy) = (x as u16, y as u16);
+                let mut cell = surface.get(ux, uy);
+                if cell.bg.is_some() {
+                    continue;
+                }
+                cell.bg = Some(tint);
+                surface.set(ux, uy, cell);
+            }
+        }
+    }
+}
+
+/// The glyph tier's own muted tint for one field-zone kind/polarity --
+/// deliberately far dimmer than [`pet_arcade_field_zone_color`]'s own
+/// pixel-tier hues: this paints a FULL solid background across every one
+/// of a sector's own ~49 cells (`ZONE_SECTOR_COLS x ZONE_SECTOR_ROWS`
+/// tiles), not a thin translucent outline, so a saturated colour here
+/// would read as a stark plate rather than an ambient tint -- the same
+/// "must not drown the units on it" constraint [`push_zone_outline_stroke`]'s
+/// own doc comment states for the pixel tier, answered differently at
+/// this one (low saturation instead of low alpha, since a glyph-tier cell
+/// has no alpha channel of its own to turn down).
+fn pet_arcade_field_zone_glyph_tint(kind: ZoneKind, polarity: ZonePolarity) -> ArcadeRgb {
+    match (kind, polarity) {
+        (ZoneKind::TowerDamage, ZonePolarity::Buff) => ArcadeRgb(55, 45, 15),
+        (ZoneKind::TowerDamage, ZonePolarity::Debuff) => ArcadeRgb(45, 22, 15),
+        (ZoneKind::EnemySpeed, ZonePolarity::Buff) => ArcadeRgb(15, 42, 46),
+        (ZoneKind::EnemySpeed, ZonePolarity::Debuff) => ArcadeRgb(45, 20, 38),
+    }
 }
 
 /// Tints the currently selected build tile and pet anchor's own background
@@ -2180,6 +2587,15 @@ fn pet_arcade_pixel_highlight_strokes(
     drag: Option<(TowerKind, (u8, u8))>,
 ) -> Vec<DynamicStroke> {
     let mut strokes = Vec::new();
+    // Painted FIRST (bottom-most) -- the cursor/anchor/drag outlines below
+    // are more specific, momentary state and must stay legible on top of
+    // an ambient zone outline whenever the two land on the same tile, the
+    // same priority `render_pet_arcade`'s own glyph-tier call order gives
+    // `pet_arcade_highlight_field_zones` versus `pet_arcade_highlight_
+    // cursor`.
+    for zone in &snapshot.field_zones {
+        push_zone_outline_stroke(&mut strokes, zone.tile_bounds, pet_arcade_field_zone_color(zone.kind, zone.polarity));
+    }
     push_tile_outline_stroke(&mut strokes, selected_tile.0 as f64, selected_tile.1 as f64, ArcadeRgb(220, 180, 60), 2.0);
     let anchor_tile = Board::anchor_tile(AnchorId(selected_anchor));
     push_tile_outline_stroke(&mut strokes, anchor_tile.x as f64, anchor_tile.y as f64, ArcadeRgb(70, 160, 220), 2.0);
@@ -2215,6 +2631,67 @@ fn push_tile_outline_stroke(strokes: &mut Vec<DynamicStroke>, tile_x: f64, tile_
     }
 }
 
+/// This wave's field-zone colour -- distinct hues for the two `ZoneKind`s
+/// (gold/amber for tower damage, cyan for enemy speed) and a distinct
+/// saturation/brightness for the two `ZonePolarity`s within each, so all
+/// four combinations read apart at a glance without needing the tooltip
+/// (`pet_arcade_field_zone_tooltip`) open at the same time.
+fn pet_arcade_field_zone_color(kind: ZoneKind, polarity: ZonePolarity) -> ArcadeRgb {
+    match (kind, polarity) {
+        (ZoneKind::TowerDamage, ZonePolarity::Buff) => ArcadeRgb(255, 205, 70),
+        (ZoneKind::TowerDamage, ZonePolarity::Debuff) => ArcadeRgb(170, 70, 40),
+        (ZoneKind::EnemySpeed, ZonePolarity::Buff) => ArcadeRgb(90, 210, 230),
+        (ZoneKind::EnemySpeed, ZonePolarity::Debuff) => ArcadeRgb(210, 80, 170),
+    }
+}
+
+/// One field zone's own sector-wide outline -- the SAME `DynamicStroke`
+/// contract [`push_tile_outline_stroke`] draws a single tile's inset ring
+/// with, scaled up to a whole `ZONE_SECTOR_COLS x ZONE_SECTOR_ROWS` sector
+/// (`bounds`, `SimulationSnapshot::field_zones`'s own pre-resolved tile
+/// rectangle) instead of one tile. Two constraints this crate already
+/// enforces elsewhere for terrain (`gate4agent-arcade`'s own `background.
+/// rs` module doc: "No hard edge anywhere in this layer, by construction")
+/// apply here too, on this side of that boundary:
+///
+/// - **No cell-aligned hard edge.** A flat, opaque fill sized to the
+///   sector's own raw tile grid would read as exactly the checkerboard
+///   that module's doc warns against. This draws an OUTLINE only, well
+///   INSET from the sector's own raw tile boundary (`INSET`, comfortably
+///   larger than a single tile's own `push_tile_outline_stroke` inset --
+///   a sector is 7 tiles wide, so there is room to spare) so the border
+///   never runs flush along the underlying tile grid, plus a second,
+///   wider, much fainter pass underneath the crisp one for a soft glow
+///   rather than a razor edge -- the same "fade to transparent, never a
+///   flat-filled rectangle" shape that module's own doc describes,
+///   available here via [`DynamicStroke::alpha`] rather than a real
+///   gradient (this crate cannot add a raster gradient primitive of its
+///   own; `gate4agent-arcade` -- where one lives -- is out of scope for
+///   this pass).
+/// - **Must not drown the units on it.** An outline covers a tiny fraction
+///   of the sector's own interior compared to a fill, and every alpha here
+///   stays translucent (`0.16`/`0.55`, never `1.0`) so a tower/enemy/the
+///   pet standing near the border stays fully legible through it.
+fn push_zone_outline_stroke(strokes: &mut Vec<DynamicStroke>, bounds: (i32, i32, i32, i32), color: ArcadeRgb) {
+    const INSET: f64 = 0.4;
+    let (x0, y0, x1, y1) = bounds;
+    let corners = [
+        (x0 as f64 + INSET, y0 as f64 + INSET),
+        (x1 as f64 - INSET, y0 as f64 + INSET),
+        (x1 as f64 - INSET, y1 as f64 - INSET),
+        (x0 as f64 + INSET, y1 as f64 - INSET),
+    ];
+    for i in 0..4 {
+        let (fx, fy) = corners[i];
+        let (tx, ty) = corners[(i + 1) % 4];
+        // Wide, faint glow pass first (painted underneath).
+        strokes.push(DynamicStroke { from_tile: (fx, fy), to_tile: (tx, ty), color, width_px: 7.0, bulge: 0.0, alpha: 0.16 });
+        // Crisp pass on top -- still translucent, per this fn's own "must
+        // not drown the units on it" doc section above.
+        strokes.push(DynamicStroke { from_tile: (fx, fy), to_tile: (tx, ty), color, width_px: 2.0, bulge: 0.0, alpha: 0.55 });
+    }
+}
+
 fn rune_label(rune: Rune) -> &'static str {
     match rune {
         Rune::Echo => "Echo",
@@ -2222,6 +2699,15 @@ fn rune_label(rune: Rune) -> &'static str {
         Rune::Overgrowth => "Overgrowth",
         Rune::Phase => "Phase",
         Rune::Symbiosis => "Symbiosis",
+    }
+}
+
+fn pet_charge_label(charge: PetCharge) -> &'static str {
+    match charge {
+        PetCharge::Surge => "Surge",
+        PetCharge::Fang => "Fang",
+        PetCharge::Bloom => "Bloom",
+        PetCharge::Attune => "Attune",
     }
 }
 
@@ -2440,6 +2926,36 @@ fn render_pet_arcade_context(
                 let Ok(row) = u16::try_from(1 + row) else { break };
                 render_modal_line(line, area, row, Style::default().fg(theme.accent).bg(theme.modal), buf);
                 push_modal_hit(layout, modal_row(area, row), HitTarget::PetArcadeChooseEvolution(*evolution));
+            }
+            return;
+        }
+        // The Living Circuit's own build draft -- structurally the SAME
+        // decision point as `RuneDraft` just above (mirrored deliberately
+        // rather than inventing a second kind of draft), reached after
+        // waves 1/3/5/7 instead of 2/6. Owner report (`gate4agent-arcade`'s
+        // own concurrent rules pass): this phase used to reach this crate
+        // only as a header label string -- no overlay, no options drawn,
+        // `Command::DraftPetCharge` never issued -- so a run stalled here
+        // forever with no way to answer it, by mouse OR keyboard, the same
+        // "blocks every other action until resolved" trap the rune/
+        // evolution cards' own doc comment describes. A charge already
+        // held (`snapshot.pet_charges_picked`) is marked `(held)` rather
+        // than presented identically to a fresh pick -- `pet.rs`'s own
+        // `PetChargeLoadout::add` is idempotent membership, not a stacking
+        // counter, and re-drafting an already-held charge is a deliberate,
+        // harmless no-op the interface must not disguise as progress.
+        RunPhaseView::PetChargeDraft => {
+            render_modal_line("Draft a Pet Charge (click or F1-F3):", area, 0, Style::default().fg(theme.text).bg(theme.modal), buf);
+            for (index, charge) in snapshot.pet_charge_options.iter().enumerate() {
+                let Ok(row) = u16::try_from(1 + index) else { break };
+                let held = snapshot.pet_charges_picked.contains(charge);
+                let line = if held {
+                    format!("F{} {} (held)", index + 1, pet_charge_label(*charge))
+                } else {
+                    format!("F{} {}", index + 1, pet_charge_label(*charge))
+                };
+                render_modal_line(&line, area, row, Style::default().fg(theme.accent).bg(theme.modal), buf);
+                push_modal_hit(layout, modal_row(area, row), HitTarget::PetArcadeDraftPetCharge(*charge));
             }
             return;
         }
@@ -24722,6 +25238,52 @@ mod tests {
         app.pet_arcade.borrow_mut().advance(*now);
     }
 
+    /// A hand-built `SimulationSnapshot` fixture -- the same shape `pet_
+    /// arcade_rune_draft_and_evolution_choice_options_are_clickable`'s own
+    /// `rune_snapshot` hand-builds inline, generalized so the Pet Charge
+    /// draft/field-zone tests below (which need to vary `phase`/`pet_
+    /// charge_options`/`pet_charges_picked`/`field_zones` independently)
+    /// do not each repeat its ~20 field boilerplate. Every OTHER field
+    /// stays the same harmless default `rune_snapshot` already used: no
+    /// towers/enemies/boss, the pet idle at anchor 0, no runes offered or
+    /// picked.
+    fn pet_arcade_fixture_snapshot(
+        phase: RunPhaseView,
+        pet_charge_options: Vec<PetCharge>,
+        pet_charges_picked: Vec<PetCharge>,
+        field_zones: Vec<FieldZoneView>,
+    ) -> SimulationSnapshot {
+        use gate4agent_arcade_pet_bastion::pet::PetState;
+        use gate4agent_arcade_pet_bastion::snapshot::PetView;
+        use gate4agent_arcade_pet_bastion::wave::Difficulty;
+
+        SimulationSnapshot {
+            tick_index: 0,
+            difficulty: Difficulty::Standard,
+            wave: 1,
+            phase,
+            sap: 0,
+            integrity: 100,
+            crab_shield: 0,
+            towers: Vec::new(),
+            enemies: Vec::new(),
+            boss: None,
+            pet: PetView {
+                state: PetState::AtAnchor(AnchorId(0)),
+                spark: 0,
+                evolution: None,
+                linked_towers: Vec::new(),
+            },
+            rune_options: Vec::new(),
+            runes_picked: Vec::new(),
+            pet_charge_options,
+            pet_charges_picked,
+            field_zones,
+            build_cells: Vec::new(),
+            wave_plan: None,
+        }
+    }
+
     /// Owner report: the arcade overlay could not be dragged by its own
     /// header at all. Proves the drag through the exact `App::click`/
     /// `App::drag` path a real mouse takes, then proves the NEW position
@@ -24780,7 +25342,15 @@ mod tests {
     /// (proving the screen-cell -> tile arithmetic `render_pet_arcade`
     /// pushes really lands on the right tile), then the palette's own
     /// Needle row, then forces one sim tick so the queued `Command::Place`
-    /// actually applies.
+    /// actually applies. Also pins the owner's own double-charge report
+    /// ("вначале мне дают 120 сап, а когда я ставлю тавер получается
+    /// поставить только один за 60") for THIS flow specifically: a plain
+    /// click is press-then-release at the same spot, and must spend
+    /// exactly one tower's cost -- `PetArcade::click_tower_kind`'s own doc
+    /// comment traces where a second, unseen charge used to come from for
+    /// the drag flow (a sibling test, `pet_arcade_drag_a_tower_from_the_
+    /// palette_onto_a_different_tile_spends_exactly_one_towers_cost`,
+    /// pins that one).
     #[test]
     fn pet_arcade_click_selects_a_pad_then_the_palette_places_a_tower() {
         let mut app = open_pet_arcade_app(140, 40);
@@ -24794,10 +25364,17 @@ mod tests {
             (tile_x, tile_y),
             "clicking the tile must select it"
         );
+        let sap_before = app.pet_arcade.borrow().snapshot().unwrap().sap;
+        let cost = TowerKind::Needle.base_stats().cost;
 
         render_pet_arcade_app(&mut app);
         let needle_hit = find_hit(&app, HitTarget::PetArcadeTowerKind(TowerKind::Needle));
         let _ = app.click(needle_hit.rect.x, needle_hit.rect.y);
+        // A plain click is press-THEN-release at the SAME spot -- the
+        // click-to-place shortcut only resolves on release (`App::drop_at`'s
+        // own `DragState::PetArcadeTowerPlacement` arm), never on the press
+        // alone.
+        let _ = app.drop_at(needle_hit.rect.x, needle_hit.rect.y);
 
         let mut now = std::time::Instant::now();
         tick_pet_arcade(&app, &mut now);
@@ -24805,6 +25382,7 @@ mod tests {
         assert_eq!(snapshot.towers.len(), 1, "the palette click must have placed exactly one tower");
         assert_eq!(snapshot.towers[0].kind, TowerKind::Needle);
         assert_eq!(snapshot.towers[0].position, (i32::from(tile_x), i32::from(tile_y)));
+        assert_eq!(sap_before - snapshot.sap, cost, "a plain palette click must spend exactly one tower's cost, never two");
     }
 
     /// Owner report: a placed tower's own upgrade/sell actions were
@@ -24822,6 +25400,10 @@ mod tests {
         render_pet_arcade_app(&mut app);
         let needle_hit = find_hit(&app, HitTarget::PetArcadeTowerKind(TowerKind::Needle));
         let _ = app.click(needle_hit.rect.x, needle_hit.rect.y);
+        // A plain click is press-THEN-release at the SAME spot --
+        // placement only resolves on release now (`App::drop_at`'s own
+        // `DragState::PetArcadeTowerPlacement` arm).
+        let _ = app.drop_at(needle_hit.rect.x, needle_hit.rect.y);
         let mut now = std::time::Instant::now();
         tick_pet_arcade(&app, &mut now);
         let sap_after_place = app.pet_arcade.borrow().snapshot().unwrap().sap;
@@ -25015,6 +25597,10 @@ mod tests {
         render_pet_arcade_app(&mut app);
         let needle_hit = find_hit(&app, HitTarget::PetArcadeTowerKind(TowerKind::Needle));
         let _ = app.click(needle_hit.rect.x, needle_hit.rect.y);
+        // A plain click is press-THEN-release at the SAME spot --
+        // placement only resolves on release now (`App::drop_at`'s own
+        // `DragState::PetArcadeTowerPlacement` arm).
+        let _ = app.drop_at(needle_hit.rect.x, needle_hit.rect.y);
         let mut now = std::time::Instant::now();
         tick_pet_arcade(&app, &mut now);
 
@@ -25103,6 +25689,12 @@ mod tests {
             },
             rune_options: vec![Rune::Echo, Rune::Anchor, Rune::Phase],
             runes_picked: Vec::new(),
+            // gate4agent-arcade's own concurrent addition -- see
+            // pet_arcade_phase_label's own PetChargeDraft arm doc
+            // comment; empty here since neither fixture exercises it.
+            pet_charge_options: Vec::new(),
+            pet_charges_picked: Vec::new(),
+            field_zones: Vec::new(),
             build_cells: Vec::new(),
             wave_plan: None,
         };
@@ -25140,6 +25732,67 @@ mod tests {
         );
     }
 
+    /// The Pet Charge draft: `gate4agent-arcade`'s own concurrent rules
+    /// pass added this decision point (drafted after waves 1/3/5/7,
+    /// `PET_CHARGE_DRAFT_AFTER_WAVES`), and it used to reach this crate
+    /// only as a phase LABEL string -- no overlay, no options drawn, no
+    /// `Command::DraftPetCharge` ever issued, so a run stalled here
+    /// forever with no way to answer it AT ALL, by mouse or keyboard.
+    /// Reaching this phase for real needs a full wave of live combat, the
+    /// same problem `pet_arcade_rune_draft_and_evolution_choice_options_
+    /// are_clickable`'s own doc comment describes -- this proves both
+    /// halves the same two ways that test already proves the mouse half:
+    /// the CLICK half runs the real renderer (`render_pet_arcade_context`)
+    /// against a hand-built fixture and dispatches through the real
+    /// `App::click`; the KEY half has no render-side equivalent to piggy-
+    /// back on (a key never touches `layout.hits`), so it goes through
+    /// [`PetArcade::handle_run_key_for_test`] instead -- the exact real
+    /// `F1`-`F3` binding `PetArcade::handle_run_key` itself dispatches
+    /// from, against the SAME fixture. Each half is checked to queue
+    /// EXACTLY one `Command::DraftPetCharge`, never more.
+    #[test]
+    fn pet_arcade_pet_charge_draft_is_answerable_by_click_and_key() {
+        use gate4agent_arcade_pet_bastion::Command;
+
+        let mut app = open_pet_arcade_app(140, 40);
+        render_pet_arcade_app(&mut app);
+        let modal = app.layout.pet_arcade_modal;
+        let context_area = Rect::new(modal.x + 2, modal.y + 2, 30, 5);
+
+        let snapshot = pet_arcade_fixture_snapshot(
+            RunPhaseView::PetChargeDraft,
+            vec![PetCharge::Surge, PetCharge::Fang, PetCharge::Bloom],
+            Vec::new(),
+            Vec::new(),
+        );
+        {
+            let mut buf = TerminalBuffer::new(140, 40);
+            let arcade = app.pet_arcade.borrow();
+            let theme = Theme::for_mode(app.color_mode);
+            render_pet_arcade_context(&snapshot, &arcade, context_area, &mut buf, &mut app.layout, theme);
+        }
+        let fang_hit = find_hit(&app, HitTarget::PetArcadeDraftPetCharge(PetCharge::Fang));
+        let _ = app.click(fang_hit.rect.x, fang_hit.rect.y);
+        assert!(
+            matches!(app.pet_arcade.borrow().pending_commands_for_test(), [Command::DraftPetCharge(PetCharge::Fang)]),
+            "clicking the Fang option must queue exactly one Command::DraftPetCharge(Fang)"
+        );
+
+        // The key half: F2 selects index 1 of the fixture's own three
+        // options (`Surge`, `Fang`, `Bloom`) -- `Fang` again, on purpose,
+        // so both halves' own resulting command is directly comparable.
+        app.pet_arcade
+            .borrow_mut()
+            .handle_run_key_for_test(crate::UiKey::Function(2), &snapshot);
+        assert!(
+            matches!(
+                app.pet_arcade.borrow().pending_commands_for_test(),
+                [Command::DraftPetCharge(PetCharge::Fang), Command::DraftPetCharge(PetCharge::Fang)]
+            ),
+            "F2 must queue exactly ONE more Command::DraftPetCharge, on top of the click's own"
+        );
+    }
+
     /// Owner report: restarting after a win/loss was keyboard-only (`r`).
     #[test]
     fn pet_arcade_restart_button_starts_a_fresh_run_after_a_result() {
@@ -25174,21 +25827,36 @@ mod tests {
 
     /// Owner report: placing a tower was click-only -- there was no real
     /// drag (pick it up, carry it with the cursor, drop it on a chosen
-    /// slot). Presses the Bell palette row (which ALSO fires the existing
-    /// "place on whatever tile is already selected" shortcut on that same
-    /// press, unconditionally -- `App::click_pet_arcade`'s own doc
-    /// comment), then drags onto a DIFFERENT buildable tile and drops --
-    /// proving the SAME real `render()` + `App::click`/`App::drag`/
+    /// slot). Presses the Bell palette row -- which selects Bell and
+    /// starts a drag, placing NOTHING (`PetArcade::click_tower_kind`'s own
+    /// doc comment) -- then drags onto a DIFFERENT buildable tile and
+    /// drops, proving the SAME real `render()` + `App::click`/`App::drag`/
     /// `App::drop_at` chain every other test in this file already uses
-    /// places a SECOND tower exactly where the cursor released, not only
-    /// where it was picked up.
+    /// places exactly ONE tower, at the tile the cursor released on.
+    ///
+    /// Owner report (a second, separate bug the coordinator traced):
+    /// "вначале мне дают 120 сап, а когда я ставлю тавер получается
+    /// поставить только один за 60" -- the press used to ALSO queue a
+    /// placement at whatever tile was selected BEFORE the press (here,
+    /// `tiles[0]`, seeded by `PetArcade::start_run` -- different from
+    /// `tiles[1]`, the drop target below, by construction), so a real
+    /// drag placed TWO towers and spent Sap twice. Asserting only that a
+    /// tower exists AT THE TARGET tile (this test's own predecessor) would
+    /// still have passed against that bug -- the phantom second tower
+    /// lands on a DIFFERENT tile, so a `.any()` existence check at the
+    /// target alone never sees it. This asserts the Sap actually spent AND
+    /// the total tower count, which the old bug would have failed on both
+    /// counts.
     #[test]
-    fn pet_arcade_drag_a_tower_from_the_palette_onto_a_different_tile_places_it_there() {
+    fn pet_arcade_drag_a_tower_from_the_palette_onto_a_different_tile_spends_exactly_one_towers_cost() {
         let mut app = open_pet_arcade_app(140, 40);
         render_pet_arcade_app(&mut app);
 
         let tiles = buildable_tiles(&app);
         let (target_x, target_y) = tiles[1];
+        let sap_before = app.pet_arcade.borrow().snapshot().unwrap().sap;
+        let cost = TowerKind::Bell.base_stats().cost;
+
         let bell_hit = find_hit(&app, HitTarget::PetArcadeTowerKind(TowerKind::Bell));
         let _ = app.click(bell_hit.rect.x, bell_hit.rect.y);
         assert!(
@@ -25206,12 +25874,43 @@ mod tests {
         let mut now = std::time::Instant::now();
         tick_pet_arcade(&app, &mut now);
         let snapshot = app.pet_arcade.borrow().snapshot().unwrap();
+        assert_eq!(snapshot.towers.len(), 1, "a full press-move-release drag must place exactly ONE tower: {:?}", snapshot.towers);
+        assert_eq!(
+            snapshot.towers[0].position,
+            (i32::from(target_x), i32::from(target_y)),
+            "the one tower placed must be at the DROPPED tile, never the tile that was selected before the press"
+        );
+        assert_eq!(
+            sap_before - snapshot.sap,
+            cost,
+            "a full press-move-release drag must spend exactly one tower's cost, never two"
+        );
+    }
+
+    /// Coordinator's own follow-up check on the double-charge report:
+    /// the keyboard `1`-`6` placement path (`PetArcade::handle_run_key`)
+    /// has none of the click path's own press/drag coupling -- it is a
+    /// single, synchronous key EVENT with no `DragState` of its own,
+    /// reached through exactly one call chain (`App::reduce` -> `App::
+    /// reduce_pet_arcade` -- a single, unconditional `return` once
+    /// `pet_arcade_open`, never a fallthrough -- -> `PetArcade::handle_key`
+    /// -> `handle_run_key`, each with exactly one call site, traced, not
+    /// assumed). Proves one `1` keypress queues exactly one
+    /// `Command::Place`.
+    #[test]
+    fn pet_arcade_keyboard_place_queues_exactly_one_command_per_press() {
+        use gate4agent_arcade_pet_bastion::Command;
+
+        let mut app = open_pet_arcade_app(140, 40);
+        render_pet_arcade_app(&mut app);
+        app.reduce(crate::UiKey::Char('1'));
         assert!(
-            snapshot.towers.iter().any(|tower| {
-                tower.kind == TowerKind::Bell && tower.position == (i32::from(target_x), i32::from(target_y))
-            }),
-            "dragging Bell onto the target tile and dropping must place it exactly there: {:?}",
-            snapshot.towers
+            matches!(
+                app.pet_arcade.borrow().pending_commands_for_test(),
+                [Command::Place { kind: TowerKind::Needle, .. }]
+            ),
+            "one press of `1` must queue exactly one Command::Place, never two: {:?}",
+            app.pet_arcade.borrow().pending_commands_for_test()
         );
     }
 
@@ -25357,6 +26056,12 @@ mod tests {
             },
             rune_options: Vec::new(),
             runes_picked: Vec::new(),
+            // gate4agent-arcade's own concurrent addition -- see
+            // pet_arcade_phase_label's own PetChargeDraft arm doc
+            // comment; empty here since neither fixture exercises it.
+            pet_charge_options: Vec::new(),
+            pet_charges_picked: Vec::new(),
+            field_zones: Vec::new(),
             build_cells: Vec::new(),
             wave_plan: None,
         };
@@ -25413,7 +26118,9 @@ mod tests {
         // first arrival there -- both silent rule changes the modal must
         // now explain, with the real per-lap Integrity cost read straight
         // off the same constants `sim.rs` charges against. The WAVES
-        // section is content #17-21 of 22 (`pet_arcade_info_lines`), below
+        // section is content #17-21 of 35 (`pet_arcade_info_lines`; two
+        // more sections -- PET CHARGES, FIELD ZONES -- now follow it),
+        // below
         // the fold at the modal's own fixed `PET_ARCADE_INFO_VISIBLE_ROWS`
         // (14) -- `PageDown` (the real key, `App::reduce_pet_arcade`, not
         // a hand-set scroll field) is what a real reader would press to
@@ -25443,16 +26150,26 @@ mod tests {
     /// scans `pet_arcade_modal` -- it never covered the mechanics card at
     /// all, which is how a line long enough to truncate (`Content width <
     /// line length`) could land in `render_pet_arcade_info` unnoticed.
-    /// Proves the info modal's own text never truncates either.
+    /// Proves the info modal's own text never truncates either -- EVERY
+    /// page, not just the first: this content is taller than `PET_ARCADE_
+    /// INFO_VISIBLE_ROWS` (`render_pet_arcade_info`'s own doc comment:
+    /// "this modal ALWAYS has to scroll in practice"), and a line long
+    /// enough to truncate could land anywhere in it. `PageDown` past the
+    /// end is a harmless no-op (`pet_arcade_info_scroll_state`'s own
+    /// clamp), so a fixed, generous loop count covers the whole content
+    /// without this test needing to know its exact line count.
     #[test]
     fn pet_arcade_info_modal_never_truncates() {
         let mut app = open_pet_arcade_app(140, 40);
         render_pet_arcade_app(&mut app);
         let info_hit = find_hit(&app, HitTarget::PetArcadeInfo);
         let _ = app.click(info_hit.rect.x, info_hit.rect.y);
-        let buf = render_pet_arcade_app(&mut app);
-        let text = rect_text(&buf, app.layout.pet_arcade_info_modal);
-        assert!(!text.contains('\u{2026}'), "the mechanics modal truncated a line: {text:?}");
+        for _ in 0..6 {
+            let buf = render_pet_arcade_app(&mut app);
+            let text = rect_text(&buf, app.layout.pet_arcade_info_modal);
+            assert!(!text.contains('\u{2026}'), "the mechanics modal truncated a line: {text:?}");
+            app.reduce(crate::UiKey::PageDown);
+        }
     }
 
     /// The mouse counterpart to the Escape half of the test above -- a
@@ -25568,6 +26285,171 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // Pet Bastion arcade: per-wave field zones. Owner ask (via the rules
+    // pass): "еще какую-то рандомную механику на раунд, где случайные
+    // области получают какой-то баф-дебаф" -- `snapshot.field_zones` used
+    // to be invisible in this crate entirely (`Vec::new()` in every test
+    // fixture, nothing ever drew it).
+    // -----------------------------------------------------------------
+
+    /// The glyph tier's own zone tint (`pet_arcade_highlight_field_zones`):
+    /// every tile strictly inside a zone's own half-open `tile_bounds`
+    /// carries that zone's tint, the tile just past either bound does not,
+    /// and a SECOND, disjoint zone reads with its own, different tint --
+    /// pure-function, deterministic proof of "a zone is drawn where the
+    /// snapshot says it is", independent of whatever a live, randomly-
+    /// seeded run's own RNG happened to draw this run.
+    #[test]
+    fn pet_arcade_field_zone_highlight_tints_exactly_the_zone_bounds_and_nothing_else() {
+        use gate4agent_arcade_engine::SurfaceCell;
+
+        let mut surface = Surface::new(BOARD_WIDTH as u16, BOARD_HEIGHT as u16, SurfaceCell::BLANK);
+        let snapshot = pet_arcade_fixture_snapshot(
+            RunPhaseView::Combat,
+            Vec::new(),
+            Vec::new(),
+            vec![
+                FieldZoneView { kind: ZoneKind::TowerDamage, polarity: ZonePolarity::Buff, tile_bounds: (0, 0, 7, 7) },
+                FieldZoneView { kind: ZoneKind::EnemySpeed, polarity: ZonePolarity::Debuff, tile_bounds: (21, 7, 28, 14) },
+            ],
+        );
+        pet_arcade_highlight_field_zones(&mut surface, &snapshot);
+
+        let tower_tint = pet_arcade_field_zone_glyph_tint(ZoneKind::TowerDamage, ZonePolarity::Buff);
+        let speed_tint = pet_arcade_field_zone_glyph_tint(ZoneKind::EnemySpeed, ZonePolarity::Debuff);
+
+        for y in 0..7u16 {
+            for x in 0..7u16 {
+                assert_eq!(surface.get(x, y).bg, Some(tower_tint), "({x}, {y}) is inside the tower-damage zone's own [0,7)x[0,7) bound");
+            }
+        }
+        assert_eq!(surface.get(7, 0).bg, None, "(7, 0) is one tile past the zone's own x1 bound and must stay untinted");
+        assert_eq!(surface.get(0, 7).bg, None, "(0, 7) is one tile past the zone's own y1 bound and must stay untinted");
+
+        assert_eq!(surface.get(21, 7).bg, Some(speed_tint), "the second zone's own top-left corner must carry ITS tint");
+        assert_eq!(surface.get(27, 13).bg, Some(speed_tint), "the second zone's own last in-bounds corner must carry it too");
+        assert_eq!(surface.get(14, 3).bg, None, "a tile in neither sector must stay untouched");
+    }
+
+    /// "the zone must not drown the units standing on it" -- a cell that
+    /// already carries its OWN `bg` (a stunned/slowed enemy, a boss, the
+    /// pet's own evolution glow) must survive the ambient zone tint
+    /// entirely untouched, glyph included.
+    #[test]
+    fn pet_arcade_field_zone_highlight_never_overwrites_a_cell_that_already_carries_its_own_bg() {
+        use gate4agent_arcade_engine::SurfaceCell;
+
+        let mut surface = Surface::new(BOARD_WIDTH as u16, BOARD_HEIGHT as u16, SurfaceCell::BLANK);
+        let existing_bg = ArcadeRgb(9, 9, 9);
+        surface.set(3, 3, SurfaceCell { glyph: '@', fg: ArcadeRgb(1, 2, 3), bg: Some(existing_bg), art: None });
+
+        let snapshot = pet_arcade_fixture_snapshot(
+            RunPhaseView::Combat,
+            Vec::new(),
+            Vec::new(),
+            vec![FieldZoneView { kind: ZoneKind::TowerDamage, polarity: ZonePolarity::Buff, tile_bounds: (0, 0, 7, 7) }],
+        );
+        pet_arcade_highlight_field_zones(&mut surface, &snapshot);
+
+        let cell = surface.get(3, 3);
+        assert_eq!(cell.bg, Some(existing_bg), "a unit's own bg tint must survive the ambient zone tint underneath it");
+        assert_eq!(cell.glyph, '@', "the unit's own glyph must stay untouched too");
+    }
+
+    /// The pixel tier's own zone outline (`push_zone_outline_stroke`):
+    /// exactly 4 edges x (1 soft glow pass + 1 crisp pass) = 8 translucent
+    /// `DynamicStroke`s per zone, and NOT ONE of them lands on a whole-
+    /// number board-tile coordinate -- the "no cell-aligned hard edge"
+    /// constraint this crate's own terrain layer already enforces
+    /// (`gate4agent-arcade`'s own `background.rs` module doc), checked
+    /// here on this side of that boundary since this crate draws its own
+    /// zone overlay rather than reusing that module.
+    #[test]
+    fn pet_arcade_field_zone_strokes_stay_translucent_and_off_the_raw_tile_grid() {
+        let mut strokes = Vec::new();
+        push_zone_outline_stroke(&mut strokes, (0, 0, 7, 7), ArcadeRgb(1, 2, 3));
+        assert_eq!(strokes.len(), 8, "4 edges x 2 passes (glow + crisp) = 8 strokes for one zone");
+        for stroke in &strokes {
+            assert!(stroke.alpha < 1.0, "a zone outline must stay translucent so it never drowns a unit near it: {stroke:?}");
+            for value in [stroke.from_tile.0, stroke.from_tile.1, stroke.to_tile.0, stroke.to_tile.1] {
+                assert!(
+                    (value - value.round()).abs() > 0.01,
+                    "a zone outline must sit INSET from the sector's own raw tile grid, never on a whole-tile coordinate: {value}"
+                );
+            }
+        }
+    }
+
+    /// Every `(ZoneKind, ZonePolarity)` combination reads as a visually
+    /// distinct pixel-tier colour, so a player can tell all four apart at
+    /// a glance without the tooltip open.
+    #[test]
+    fn pet_arcade_field_zone_color_is_distinct_per_kind_and_polarity() {
+        let colors = [
+            pet_arcade_field_zone_color(ZoneKind::TowerDamage, ZonePolarity::Buff),
+            pet_arcade_field_zone_color(ZoneKind::TowerDamage, ZonePolarity::Debuff),
+            pet_arcade_field_zone_color(ZoneKind::EnemySpeed, ZonePolarity::Buff),
+            pet_arcade_field_zone_color(ZoneKind::EnemySpeed, ZonePolarity::Debuff),
+        ];
+        for i in 0..colors.len() {
+            for j in (i + 1)..colors.len() {
+                assert_ne!(colors[i], colors[j], "every kind/polarity combination must read as a visually distinct colour");
+            }
+        }
+    }
+
+    /// The end-to-end wiring proof: a REAL run, REAL combat start (queued
+    /// through the real `[Space] Start Wave` button, not a hand-built
+    /// fixture), so `snapshot.field_zones` holds whatever this run's OWN
+    /// (randomly seeded) RNG actually drew this time -- then a REAL render
+    /// pass, reading the tint back off the REAL `TerminalBuffer` at the
+    /// REAL on-screen rect `HitTarget::PetArcadeTile` already registered
+    /// for each board tile (never a hand-picked coordinate independent of
+    /// the snapshot). Tolerant of a live unit (the pet, a spawned enemy)
+    /// legitimately occupying and thus NOT showing the tint on any one
+    /// individual cell (`pet_arcade_field_zone_highlight_never_overwrites_
+    /// a_cell_that_already_carries_its_own_bg` above already pins that
+    /// exact behaviour precisely) -- this only asserts that at least one
+    /// tile inside each zone's own bounds shows it, which a 7x7 = 49-tile
+    /// sector with at most a small handful of live units on it always has.
+    #[test]
+    fn pet_arcade_field_zones_from_a_real_run_are_drawn_where_the_snapshot_says() {
+        let mut app = open_pet_arcade_app(140, 40);
+        render_pet_arcade_app(&mut app);
+        let start_hit = find_hit(&app, HitTarget::PetArcadeStartWave);
+        let _ = app.click(start_hit.rect.x, start_hit.rect.y);
+        let mut now = std::time::Instant::now();
+        tick_pet_arcade(&app, &mut now);
+
+        let snapshot = app.pet_arcade.borrow().snapshot().expect("a run must still be in progress after Start Wave");
+        assert_eq!(snapshot.field_zones.len(), 2, "combat beginning must have drawn this wave's own two field zones");
+
+        let buf = render_pet_arcade_app(&mut app);
+        for zone in &snapshot.field_zones {
+            let (x0, y0, x1, y1) = zone.tile_bounds;
+            let expected = pet_arcade_field_zone_glyph_tint(zone.kind, zone.polarity);
+            let expected_color = Color::Rgb(expected.0, expected.1, expected.2);
+            let mut tinted = false;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let Some(hit) = app
+                        .layout
+                        .hits
+                        .iter()
+                        .find(|hit| hit.target == HitTarget::PetArcadeTile(x as u8, y as u8))
+                    else {
+                        continue;
+                    };
+                    if buf.get(hit.rect.x, hit.rect.y).style.bg == expected_color {
+                        tinted = true;
+                    }
+                }
+            }
+            assert!(tinted, "no tile inside {:?}'s own bounds {:?} carried its expected tint", zone.kind, zone.tile_bounds);
+        }
+    }
+
+    // -----------------------------------------------------------------
     // Pet Bastion arcade: the run menu, the mechanics modal's own
     // scrollbar, and the X-vs-arrow distinction. See each test's own doc
     // comment for which owner report it proves.
@@ -25619,6 +26501,10 @@ mod tests {
         render_pet_arcade_app(&mut app);
         let needle_hit = find_hit(&app, HitTarget::PetArcadeTowerKind(TowerKind::Needle));
         let _ = app.click(needle_hit.rect.x, needle_hit.rect.y);
+        // A plain click is press-THEN-release at the SAME spot --
+        // placement only resolves on release now (`App::drop_at`'s own
+        // `DragState::PetArcadeTowerPlacement` arm).
+        let _ = app.drop_at(needle_hit.rect.x, needle_hit.rect.y);
         let mut now = std::time::Instant::now();
         tick_pet_arcade(&app, &mut now);
         assert_eq!(app.pet_arcade.borrow().snapshot().unwrap().towers.len(), 1, "setup: the Needle must be placed");
@@ -25663,6 +26549,10 @@ mod tests {
         render_pet_arcade_app(&mut app);
         let needle_hit = find_hit(&app, HitTarget::PetArcadeTowerKind(TowerKind::Needle));
         let _ = app.click(needle_hit.rect.x, needle_hit.rect.y);
+        // A plain click is press-THEN-release at the SAME spot --
+        // placement only resolves on release now (`App::drop_at`'s own
+        // `DragState::PetArcadeTowerPlacement` arm).
+        let _ = app.drop_at(needle_hit.rect.x, needle_hit.rect.y);
         let mut now = std::time::Instant::now();
         tick_pet_arcade(&app, &mut now);
 
@@ -25828,5 +26718,205 @@ mod tests {
         let (needs_bar, scroll) = pet_arcade_info_scroll_state(22, 14, 100);
         assert!(needs_bar, "content taller than the visible budget must need a scrollbar");
         assert_eq!(scroll, 8, "an over-large request must clamp to max_scroll = total - visible");
+    }
+
+    // -----------------------------------------------------------------
+    // Pet Bastion arcade: hover-and-hold tooltips. Owner: "что дают руны
+    // мне не очевидно ... тултип с инфой ... держим на нем допустим 2
+    // секунды".
+    // -----------------------------------------------------------------
+
+    /// Proves [`pet_arcade_tooltip_text`] -- the ONE eligibility-and-text
+    /// source both `App::hover` and `render_pet_arcade_tooltip` read --
+    /// covers every group the owner asked for at minimum (rune draft
+    /// options, tower palette entries, pet ability buttons, evolution
+    /// choices, Pet Charge draft options), and that a board tile
+    /// (`HitTarget::PetArcadeTile`) is `None` WITHOUT a live snapshot to
+    /// answer against (`Home`/`Results`, `App::hover`'s own `None` read) --
+    /// but `Some` once a real snapshot says that tile sits inside a field
+    /// zone (see the dedicated field-zone test below for the full mapping).
+    #[test]
+    fn pet_arcade_tooltip_text_covers_the_required_control_groups() {
+        assert!(pet_arcade_tooltip_text(&HitTarget::PetArcadeDraftRune(Rune::Echo), None).is_some());
+        assert!(pet_arcade_tooltip_text(&HitTarget::PetArcadeDraftPetCharge(PetCharge::Fang), None).is_some());
+        assert!(pet_arcade_tooltip_text(&HitTarget::PetArcadeTowerKind(TowerKind::Needle), None).is_some());
+        assert!(pet_arcade_tooltip_text(&HitTarget::PetArcadePetPulse, None).is_some());
+        assert!(pet_arcade_tooltip_text(&HitTarget::PetArcadeBlink, None).is_some());
+        assert!(pet_arcade_tooltip_text(&HitTarget::PetArcadeFullCircuit, None).is_some());
+        assert!(pet_arcade_tooltip_text(&HitTarget::PetArcadeMovePet, None).is_some());
+        assert!(pet_arcade_tooltip_text(&HitTarget::PetArcadeChooseEvolution(Evolution::Crab), None).is_some());
+        assert!(
+            pet_arcade_tooltip_text(&HitTarget::PetArcadeTile(0, 0), None).is_none(),
+            "a board tile with no live snapshot to check against must not fabricate a tooltip"
+        );
+    }
+
+    /// Owner's own two questions, per rune: what it does, and what it
+    /// attaches to (the pet, one tower, or every tower) -- every rune's
+    /// own tooltip must answer "attaches to:" explicitly, and the number
+    /// it states must be the REAL constant `sim.rs` actually enforces,
+    /// read here the same way `pet_arcade_tooltip_text` itself does, never
+    /// a copied literal on either side of the assertion.
+    #[test]
+    fn pet_arcade_rune_tooltips_state_what_they_do_and_what_they_attach_to() {
+        use gate4agent_arcade_pet_bastion::constants::{
+            ANCHOR_RUNE_LINGER_TICKS, ECHO_EVERY_NTH_ATTACK, PHASE_EVERY_NTH_HIT, SYMBIOSIS_DAMAGE_BONUS_PERMILLE,
+        };
+
+        let echo = pet_arcade_tooltip_text(&HitTarget::PetArcadeDraftRune(Rune::Echo), None).unwrap();
+        assert!(echo.contains("attaches to: every tower"), "{echo:?}");
+        assert!(echo.contains(&format!("{ECHO_EVERY_NTH_ATTACK}th attack")), "{echo:?}");
+
+        let anchor = pet_arcade_tooltip_text(&HitTarget::PetArcadeDraftRune(Rune::Anchor), None).unwrap();
+        assert!(anchor.contains("attaches to: the pet's own Circuit link"), "{anchor:?}");
+        assert!(anchor.contains(&format!("{}s longer", ANCHOR_RUNE_LINGER_TICKS / TICKS_PER_SECOND as u64)), "{anchor:?}");
+
+        let overgrowth = pet_arcade_tooltip_text(&HitTarget::PetArcadeDraftRune(Rune::Overgrowth), None).unwrap();
+        assert!(overgrowth.contains("attaches to: every tower"), "{overgrowth:?}");
+
+        let phase = pet_arcade_tooltip_text(&HitTarget::PetArcadeDraftRune(Rune::Phase), None).unwrap();
+        assert!(phase.contains("attaches to: every tower"), "{phase:?}");
+        assert!(phase.contains(&format!("{PHASE_EVERY_NTH_HIT}rd hit")), "{phase:?}");
+
+        let symbiosis = pet_arcade_tooltip_text(&HitTarget::PetArcadeDraftRune(Rune::Symbiosis), None).unwrap();
+        assert!(symbiosis.contains("attaches to: every tower"), "{symbiosis:?}");
+        assert!(symbiosis.contains(&format!("+{}% damage", SYMBIOSIS_DAMAGE_BONUS_PERMILLE / 10)), "{symbiosis:?}");
+    }
+
+    /// Same two questions as the rune tooltips just above, for a Pet
+    /// Charge draft option -- except every one of the four attaches to the
+    /// SAME thing (a linked tower, `pet.rs`'s own `PetCharge` doc comment),
+    /// so this asserts that shared "attaches to:" line once per charge
+    /// alongside each charge's own real permille constant, read here the
+    /// same way `pet_arcade_pet_charge_tooltip` itself does.
+    #[test]
+    fn pet_arcade_pet_charge_tooltips_state_what_they_do_and_what_they_attach_to() {
+        use gate4agent_arcade_pet_bastion::constants::{
+            PET_CHARGE_BLOOM_RADIUS_PERMILLE, PET_CHARGE_FANG_DAMAGE_PERMILLE, PET_CHARGE_SURGE_EXTRA_SPEED_PERMILLE,
+        };
+
+        const ATTACHES: &str = "attaches to: every tower currently LINKED to the pet's own Circuit.";
+
+        let surge = pet_arcade_tooltip_text(&HitTarget::PetArcadeDraftPetCharge(PetCharge::Surge), None).unwrap();
+        assert!(surge.contains(ATTACHES), "{surge:?}");
+        assert!(
+            surge.contains(&format!("+{}%", (PET_CHARGE_SURGE_EXTRA_SPEED_PERMILLE - 1000) / 10)),
+            "{surge:?}"
+        );
+
+        let fang = pet_arcade_tooltip_text(&HitTarget::PetArcadeDraftPetCharge(PetCharge::Fang), None).unwrap();
+        assert!(fang.contains(ATTACHES), "{fang:?}");
+        assert!(fang.contains(&format!("+{}% damage", PET_CHARGE_FANG_DAMAGE_PERMILLE / 10)), "{fang:?}");
+
+        let bloom = pet_arcade_tooltip_text(&HitTarget::PetArcadeDraftPetCharge(PetCharge::Bloom), None).unwrap();
+        assert!(bloom.contains(ATTACHES), "{bloom:?}");
+        assert!(
+            bloom.contains(&format!("+{}% splash/chain reach", PET_CHARGE_BLOOM_RADIUS_PERMILLE / 10)),
+            "{bloom:?}"
+        );
+
+        let attune = pet_arcade_tooltip_text(&HitTarget::PetArcadeDraftPetCharge(PetCharge::Attune), None).unwrap();
+        assert!(attune.contains(ATTACHES), "{attune:?}");
+        assert!(attune.contains("Mirror's own resistance"), "{attune:?}");
+    }
+
+    /// The field-zone tooltip: a board tile with a live snapshot whose
+    /// `field_zones` covers it must resolve to that zone's own text
+    /// (`ZONE_TOWER_DAMAGE_PERMILLE`/`ZONE_ENEMY_SPEED_PERMILLE`, the exact
+    /// same constants `zone.rs` enforces), a tile just outside the same
+    /// bounds must resolve to `None`, and the sign/direction wording
+    /// (+/- damage, SLOWER/FASTER) must match `zone.rs`'s own `tower_
+    /// damage_bonus_permille`/`enemy_speed_permille` polarity rules.
+    #[test]
+    fn pet_arcade_field_zone_tooltip_matches_the_snapshot_and_the_real_constants() {
+        use gate4agent_arcade_pet_bastion::constants::{ZONE_ENEMY_SPEED_PERMILLE, ZONE_TOWER_DAMAGE_PERMILLE};
+
+        let snapshot = pet_arcade_fixture_snapshot(
+            RunPhaseView::Combat,
+            Vec::new(),
+            Vec::new(),
+            vec![
+                FieldZoneView { kind: ZoneKind::TowerDamage, polarity: ZonePolarity::Buff, tile_bounds: (0, 0, 7, 7) },
+                FieldZoneView { kind: ZoneKind::EnemySpeed, polarity: ZonePolarity::Debuff, tile_bounds: (7, 7, 14, 14) },
+            ],
+        );
+
+        let tower_buff = pet_arcade_tooltip_text(&HitTarget::PetArcadeTile(3, 3), Some(&snapshot)).unwrap();
+        assert!(tower_buff.contains("Tower damage zone (buff)"), "{tower_buff:?}");
+        assert!(tower_buff.contains(&format!("+{}% damage", ZONE_TOWER_DAMAGE_PERMILLE / 10)), "{tower_buff:?}");
+
+        let enemy_debuff = pet_arcade_tooltip_text(&HitTarget::PetArcadeTile(10, 10), Some(&snapshot)).unwrap();
+        assert!(enemy_debuff.contains("Enemy speed zone (debuff)"), "{enemy_debuff:?}");
+        assert!(
+            enemy_debuff.contains(&format!("{}% FASTER", one_decimal(ZONE_ENEMY_SPEED_PERMILLE, 10))),
+            "{enemy_debuff:?}"
+        );
+
+        assert!(
+            pet_arcade_tooltip_text(&HitTarget::PetArcadeTile(6, 6), Some(&snapshot)).is_some(),
+            "(6, 6) is still inside the tower-damage zone's own half-open [0, 7) bound"
+        );
+        assert!(
+            pet_arcade_tooltip_text(&HitTarget::PetArcadeTile(7, 6), Some(&snapshot)).is_none(),
+            "(7, 6) is just outside both zones and must not fabricate a tooltip"
+        );
+    }
+
+    /// The end-to-end mechanism: a real `App::hover` (the same fn a real
+    /// mouse-move event reaches, `client.rs`'s own `MouseEventKind::Moved`)
+    /// starts tracking an eligible control; a render pass BEFORE the hold
+    /// delay elapses paints nothing; ageing `since` past the delay (no
+    /// real 2-second sleep -- the SAME "advance a caller-owned clock"
+    /// discipline `tick_pet_arcade`'s own doc comment already uses,
+    /// applied to a wall-clock `Instant` instead of the sim's own tick
+    /// clock) makes the SAME render pass paint the tooltip; hovering
+    /// somewhere else afterward clears it immediately, proving "dismissed
+    /// as soon as the pointer moves off" is not just an assumption.
+    #[test]
+    fn pet_arcade_tooltip_appears_only_after_the_hold_delay_and_disappears_on_move_off() {
+        let mut app = open_pet_arcade_app(140, 40);
+        render_pet_arcade_app(&mut app);
+        let screen = Rect::new(0, 0, app.terminal_cols, app.terminal_rows);
+
+        let needle_hit = find_hit(&app, HitTarget::PetArcadeTowerKind(TowerKind::Needle));
+        let _ = app.hover(needle_hit.rect.x, needle_hit.rect.y);
+        assert_eq!(
+            app.pet_arcade_hover.as_ref().map(|hover| hover.target.clone()),
+            Some(HitTarget::PetArcadeTowerKind(TowerKind::Needle)),
+            "hovering an eligible control must start tracking it"
+        );
+
+        // The palette row (`render_pet_arcade_hud`'s own `"{marker}
+        // {index} {name} {cost}"`) already paints "Needle", AND the
+        // context card's own empty-tile preview (`render_pet_arcade_
+        // context`'s own `"place: {name} -{cost}"` line) already paints
+        // "Needle -{cost}" for the DEFAULT-selected kind, neither of
+        // which is the tooltip. `pet_arcade_tower_tooltip`'s own text is
+        // `"{name} -{cost}: {stats}"` -- the trailing COLON right after
+        // the cost is the one thing neither of those two produces, so
+        // that is what these assertions key off.
+        let tooltip_marker = format!("{} -{}:", tower_kind_label(TowerKind::Needle), TowerKind::Needle.base_stats().cost);
+        let buf = render_pet_arcade_app(&mut app);
+        assert!(
+            !rect_text(&buf, screen).contains(&tooltip_marker),
+            "no tooltip may paint before the hold delay elapses"
+        );
+
+        if let Some(hover) = app.pet_arcade_hover.as_mut() {
+            hover.since = std::time::Instant::now()
+                .checked_sub(PET_ARCADE_TOOLTIP_HOLD_DELAY + std::time::Duration::from_millis(1))
+                .unwrap();
+        }
+        let buf = render_pet_arcade_app(&mut app);
+        let text = rect_text(&buf, screen);
+        assert!(text.contains(&tooltip_marker), "the tooltip must paint once the hold delay elapses: {text:?}");
+
+        let _ = app.hover(0, 0);
+        assert!(app.pet_arcade_hover.is_none(), "moving off an eligible control must clear the hover state immediately");
+        let buf = render_pet_arcade_app(&mut app);
+        assert!(
+            !rect_text(&buf, screen).contains(&tooltip_marker),
+            "the tooltip must be gone the instant the pointer moves off"
+        );
     }
 }

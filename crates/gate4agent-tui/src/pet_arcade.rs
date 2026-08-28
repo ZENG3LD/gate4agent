@@ -74,7 +74,7 @@ use gate4agent_arcade_pet_bastion::constants::{
 };
 use gate4agent_arcade_pet_bastion::geometry::{FixedPos, Tile};
 use gate4agent_arcade_pet_bastion::ids::EntityId;
-use gate4agent_arcade_pet_bastion::pet::{Evolution, PetState};
+use gate4agent_arcade_pet_bastion::pet::{Evolution, PetCharge, PetState};
 use gate4agent_arcade_pet_bastion::rune::Rune;
 use gate4agent_arcade_pet_bastion::snapshot::{RunPhaseView, SimulationSnapshot, TowerView};
 use gate4agent_arcade_pet_bastion::tower::{TowerKind, UpgradeBranch};
@@ -214,10 +214,12 @@ pub(crate) struct PetArcade {
     selected_anchor: u8,
     /// The tower palette's own current selection (`render::render_pet_
     /// arcade_hud`'s "Towers:" rows) -- set by `click_tower_kind`, read by
-    /// both that same fn (to place on the already-selected tile) and the
-    /// renderer (to highlight the chosen row). The keyboard's own `1`-`6`
-    /// placement bindings never touch this field: they carry their own
-    /// kind directly in the keystroke, exactly like before this existed.
+    /// `App::drop_at`'s own `DragState::PetArcadeTowerPlacement` arm (to
+    /// place on whichever tile the resulting drag/click actually resolves
+    /// to, `click_tower_kind`'s own doc comment) and the renderer (to
+    /// highlight the chosen row). The keyboard's own `1`-`6` placement
+    /// bindings never touch this field: they carry their own kind
+    /// directly in the keystroke, exactly like before this existed.
     selected_tower_kind: TowerKind,
     /// See [`Inspect`]'s own doc comment.
     inspect: Option<Inspect>,
@@ -643,6 +645,15 @@ impl PetArcade {
             UiKey::Char(']') => {
                 self.selected_anchor = (self.selected_anchor + 1) % ANCHOR_COUNT as u8;
             }
+            // Checked against the same double-charge report the click
+            // path had (`Self::click_tower_kind`'s own doc comment): this
+            // arm is NOT the click path -- it is a single, synchronous key
+            // EVENT with no `DragState` of its own, reached through
+            // exactly one call chain (`Self::handle_key` -> `Self::
+            // handle_run_key`, each with exactly one call site in this
+            // file; `App::reduce_pet_arcade` above THAT returns
+            // unconditionally, never falls through to a second dispatch).
+            // One `1`-`6` press queues exactly one `Command::Place`.
             UiKey::Char(digit @ '1'..='6') => {
                 let index = digit as usize - '1' as usize;
                 self.queue(Command::Place { tile: self.selected_tile, kind: TowerKind::ALL[index] });
@@ -696,6 +707,15 @@ impl PetArcade {
                     };
                     self.queue(Command::ChooseEvolution(evolution));
                 }
+                // Same shape as `RuneDraft` just above -- `pet_charge_
+                // options` is this phase's own equivalent of `rune_
+                // options`, drafted after waves 1/3/5/7
+                // (`PET_CHARGE_DRAFT_AFTER_WAVES`) rather than 2/6.
+                RunPhaseView::PetChargeDraft => {
+                    if let Some(charge) = snapshot.pet_charge_options.get(usize::from(number - 1)).copied() {
+                        self.queue(Command::DraftPetCharge(charge));
+                    }
+                }
                 _ => {}
             },
             _ => {}
@@ -708,8 +728,9 @@ impl PetArcade {
     /// (`snapshot.build_cells`, filtered by [`is_build_target`] -- empty
     /// and eligible, or already holding another tower, but never a route/
     /// anchor/out-of-zone cell that merely happens to sit inside the build
-    /// radius) always selects (never places -- placement is a second
-    /// click, on a palette row: [`Self::click_tower_kind`]), an anchor
+    /// radius) always selects (never places -- placement is a SEPARATE
+    /// gesture, starting on a palette row: [`Self::click_tower_kind`]'s
+    /// own doc comment has the two ways it resolves), an anchor
     /// selects AND immediately repositions the pet there (one click, not
     /// two -- there is no "confirm" step for a move the way there is for a
     /// placement), and anything else is checked against the current
@@ -752,20 +773,24 @@ impl PetArcade {
         }
     }
 
-    /// One click on the tower palette (`render::render_pet_arcade_hud`'s
-    /// own "Towers:" rows): always selects `kind` (so the palette's own
-    /// highlight follows the click even when nothing gets placed), and
-    /// places it on `selected_tile` in the SAME click when that tile is
-    /// currently free -- the sim's own `place_tower` already no-ops for an
-    /// occupied/ineligible tile or insufficient Sap (see that fn's own doc
-    /// comment in `sim.rs`), so this never needs to duplicate either check
-    /// to decide whether to queue the command.
+    /// A PRESS on the tower palette (`render::render_pet_arcade_hud`'s own
+    /// "Towers:" rows): selects `kind` (so the palette's own highlight
+    /// follows the press) and nothing else -- it queues no `Command`.
+    /// Owner report: this used to ALSO place on `selected_tile` right
+    /// here, unconditionally, on the same press that `App::click_pet_
+    /// arcade`'s own `PetArcadeTowerKind` arm starts a drag from -- so a
+    /// press-drag-release placed twice (once here, once more from `App::
+    /// drop_at`'s own `DragState::PetArcadeTowerPlacement` arm), the
+    /// second charge landing on whatever tile happened to be selected
+    /// before the press, nowhere near where the player actually dropped.
+    /// Placement now happens exactly once, entirely on RELEASE
+    /// (`App::drop_at`'s own doc comment has the two release shapes:
+    /// dropped-without-moving reuses [`Self::drop_tower`] against
+    /// `selected_tile` -- the click-to-place shortcut, now paid for once
+    /// -- dropped-after-moving reuses it against wherever the pointer
+    /// actually landed).
     pub(crate) fn click_tower_kind(&mut self, kind: TowerKind) {
         self.selected_tower_kind = kind;
-        let Some(snapshot) = self.snapshot() else { return };
-        if self.selected_tower_view(&snapshot).is_none() {
-            self.queue(Command::Place { tile: self.selected_tile, kind });
-        }
     }
 
     /// The context card's own `[U] Upgrade L2` row -- mouse counterpart to
@@ -805,7 +830,7 @@ impl PetArcade {
     /// The HUD's own `[G] Pulse` button -- mouse counterpart to the `g`
     /// key. Queued unconditionally, exactly like every other action button
     /// in this crate (`click_upgrade_l2`, the tower palette's own
-    /// `click_tower_kind`, ...): the sim already no-ops a `PetPulse` it
+    /// `drop_tower`, ...): the sim already no-ops a `PetPulse` it
     /// cannot afford (`sim.rs`'s own `use_pet_pulse`, which checks Spark
     /// and requires the pet be standing at an anchor before it spends
     /// any), so there is no second affordability check to duplicate here --
@@ -867,6 +892,16 @@ impl PetArcade {
         self.queue(Command::ChooseEvolution(evolution));
     }
 
+    /// One of the Pet Charge draft card's own `F1`-`F3` options, clicked --
+    /// see [`Self::click_draft_rune`]'s own doc comment for the matching
+    /// rationale. `gate4agent-arcade`'s own concurrent addition
+    /// (`RunPhaseView::PetChargeDraft`) used to reach this crate only as a
+    /// phase label -- no overlay, no options drawn, no way to answer it at
+    /// all, which stalled a run outright after wave 1.
+    pub(crate) fn click_draft_pet_charge(&mut self, charge: PetCharge) {
+        self.queue(Command::DraftPetCharge(charge));
+    }
+
     /// Actually restarts -- the Results screen's own `[R] Play Again`
     /// button, the `r` key (see [`Self::handle_key`]'s own `Results` arm),
     /// and the run menu's own Restart row (`App::activate_pet_arcade_
@@ -886,14 +921,17 @@ impl PetArcade {
         self.start_run();
     }
 
-    /// A drag-and-drop tower placement landing on board tile `(x, y)` --
-    /// the pointer's own counterpart to the palette click's "place on the
-    /// already-selected tile" shortcut (`click_tower_kind`), except this
-    /// one places wherever the player actually dropped it. Queued
-    /// unconditionally, same as every other action here: `place_tower`'s
-    /// own eligibility/occupied/cost checks already cover a drop on
-    /// anything else (open route, another tower's own tile, out of Sap),
-    /// so this never charges Sap for a cancelled drop.
+    /// The ONE place a tower placement actually gets queued from --
+    /// `App::drop_at`'s own `DragState::PetArcadeTowerPlacement` arm calls
+    /// this for BOTH release shapes: dropped-without-moving passes
+    /// `selected_tile`'s own coordinates (the palette press's own "place
+    /// on the already-selected tile" shortcut, `click_tower_kind`'s own
+    /// doc comment), dropped-after-moving passes wherever the pointer
+    /// actually landed. Queued unconditionally, same as every other
+    /// action here: `place_tower`'s own eligibility/occupied/cost checks
+    /// already cover a drop on anything else (open route, another
+    /// tower's own tile, out of Sap), so this never charges Sap for a
+    /// cancelled drop.
     pub(crate) fn drop_tower(&mut self, kind: TowerKind, x: u8, y: u8) {
         let tile = Tile::new(i32::from(x), i32::from(y));
         self.queue(Command::Place { tile, kind });
@@ -993,6 +1031,25 @@ impl PetArcade {
         self.screen = GameScreen::Results { outcome, final_hash: 0 };
     }
 
+    /// Test-only seam onto [`Self::handle_run_key`] -- the same problem
+    /// [`Self::force_results_for_test`]'s own doc comment describes for
+    /// `Results`: reaching a real `RunPhaseView::PetChargeDraft` (or
+    /// `RuneDraft`/`EvolutionChoice`) through actual live combat is well
+    /// beyond what a unit test can drive deterministically (a full wave of
+    /// combat against a real, seeded `Runner`). [`Self::handle_key`]'s own
+    /// public path always reads its snapshot off the LIVE `screen`
+    /// (`GameScreen::InRun(runner) => runner.snapshot()`), so there is no
+    /// way to exercise the `F1`-`F3` draft bindings against a hand-built
+    /// fixture snapshot without this seam -- the render-side click path has
+    /// exactly this same test problem, solved the exact same way: `render::
+    /// render_pet_arcade_context` is called directly against a hand-built
+    /// `SimulationSnapshot` (`render.rs`'s own `pet_arcade_rune_draft_and_
+    /// evolution_choice_options_are_clickable` test). Never compiled into a
+    /// real build.
+    #[cfg(test)]
+    pub(crate) fn handle_run_key_for_test(&mut self, key: UiKey, snapshot: &SimulationSnapshot) {
+        self.handle_run_key(key, snapshot);
+    }
 }
 
 /// Whether a `BuildCellView::reason` still marks its tile as a genuine

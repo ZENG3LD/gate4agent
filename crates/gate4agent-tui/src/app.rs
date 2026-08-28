@@ -81,7 +81,7 @@ use gate4agent_harness_client::{
     HarnessRunWorktreeViewV1, HarnessWorktreeIntentV1, RedactedRunIntentV1,
     RedactedWorktreeIntentV1, TaskCreatorCategoryV1,
 };
-use gate4agent_arcade_pet_bastion::pet::Evolution;
+use gate4agent_arcade_pet_bastion::pet::{Evolution, PetCharge};
 use gate4agent_arcade_pet_bastion::rune::Rune;
 use gate4agent_arcade_pet_bastion::tower::{TowerKind, UpgradeBranch};
 use uzor_tui::Rect;
@@ -103,6 +103,11 @@ const WHEEL_SCROLL_LINES: usize = 3;
 /// that render fn's own doc comment for why a modal that always grew to
 /// fit was the wrong fix once the WAVES section landed.
 pub(crate) const PET_ARCADE_INFO_VISIBLE_ROWS: u16 = 14;
+/// How long the pointer must rest on one tooltip-eligible arcade
+/// control before `render::render_pet_arcade_tooltip` shows it -- owner:
+/// "держим на нем допустим 2 секунды". `App::pet_arcade_hover`'s own
+/// doc comment has the full hold-and-show mechanism.
+pub(crate) const PET_ARCADE_TOOLTIP_HOLD_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 /// Dragging the sidebar's width divider left of this many content columns
 /// collapses the sidebar outright (the rail stays, and is how it reopens)
 /// instead of parking at the 18-column minimum.
@@ -1470,6 +1475,24 @@ pub enum PetArcadeMenuState {
     ScoreList,
 }
 
+/// A hover-and-hold tooltip candidate -- `App::pet_arcade_hover`'s own
+/// doc comment has the full mechanism. `target` is whatever `HitTarget`
+/// the pointer is CURRENTLY resting on; `since` is the `Instant` that
+/// became true (reset to `Instant::now()` only when `target` itself
+/// CHANGES, `App::hover`'s own doc comment) -- `render::render_pet_
+/// arcade_tooltip` reads `since.elapsed()` at paint time and shows
+/// nothing until it clears [`crate::app::PET_ARCADE_TOOLTIP_HOLD_DELAY`].
+/// `column`/`row` are the last observed cursor position, purely for
+/// placing the tooltip panel near it -- the same two fields `ContextUsageHover`
+/// already carries for its own (immediate, non-delayed) tooltip.
+#[derive(Clone, Debug)]
+pub struct PetArcadeHoverState {
+    pub target: HitTarget,
+    pub column: u16,
+    pub row: u16,
+    pub since: Instant,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ControlSection {
     #[default]
@@ -1636,15 +1659,17 @@ pub enum DragState {
         viewport: Rect,
     },
     /// Dragging a tower out of the Pet Bastion arcade's own palette
-    /// (`HitTarget::PetArcadeTowerKind`) onto a board tile -- the pointer's
-    /// own counterpart to that same click's "place on the already-selected
-    /// pad" shortcut, which still fires unconditionally on the initial
-    /// press (`App::click_pet_arcade`) exactly as before. Same shape as
+    /// (`HitTarget::PetArcadeTowerKind`) onto a board tile -- started
+    /// unconditionally on the initial press (`App::click_pet_arcade`),
+    /// which selects the kind and queues NO placement of its own
+    /// (`PetArcade::click_tower_kind`'s own doc comment). Same shape as
     /// `SessionChip` above: `current_column`/`current_row` track the live
     /// cursor for the ghost `render::render_drag_preview` paints, `moved`
-    /// distinguishes an actual drag from a plain click so `App::drop_at`
-    /// never double-places a tower for a click that already placed one on
-    /// mouse-down.
+    /// is what `App::drop_at`'s own arm for this variant reads to decide
+    /// which of its own two release shapes applies -- the click-to-place
+    /// shortcut against `selected_tile` (never moved) or the dropped-on
+    /// tile (moved) -- exactly ONE of which ever queues a placement, on
+    /// release, never on this press.
     PetArcadeTowerPlacement {
         kind: TowerKind,
         start_column: u16,
@@ -3072,9 +3097,12 @@ pub enum HitTarget {
     /// the exact same `footprint`/`dest` arithmetic that positions that
     /// tile's own glyph -- never a second, independently-derived mapping.
     PetArcadeTile(u8, u8),
-    /// One row of the arcade's own tower palette -- selects that
-    /// `TowerKind` and, if a free tile is already selected, places it
-    /// there immediately (`PetArcade::click_tower_kind`).
+    /// One row of the arcade's own tower palette -- PRESSING it selects
+    /// that `TowerKind` (`PetArcade::click_tower_kind`) and starts a drag
+    /// (`DragState::PetArcadeTowerPlacement`); placement itself only ever
+    /// happens on release, either on `selected_tile` (a plain click, the
+    /// shortcut) or wherever the pointer was dropped (a real drag) -- see
+    /// that `DragState` variant's own doc comment for the full split.
     PetArcadeTowerKind(TowerKind),
     /// The selected tower's own upgrade/sell action rows -- mirrors the
     /// `u`/`p`/`o`/`x` keyboard bindings (`PetArcade::handle_run_key`) for
@@ -3113,6 +3141,14 @@ pub enum HitTarget {
     /// One of the evolution-choice card's own `F1`-`F3` options -- see
     /// `PetArcadeDraftRune`'s own doc comment for the matching rationale.
     PetArcadeChooseEvolution(Evolution),
+    /// One of the Pet Charge draft card's own `F1`-`F3` options -- see
+    /// `PetArcadeDraftRune`'s own doc comment for the matching rationale.
+    /// `gate4agent-arcade`'s own concurrent addition (`RunPhaseView::
+    /// PetChargeDraft`, drafted after waves 1/3/5/7): this used to reach
+    /// this crate only as a phase label string, with no overlay, no
+    /// options drawn, and no `Command::DraftPetCharge` ever issued -- a run
+    /// stalled here forever, unreachable by either mouse or keyboard.
+    PetArcadeDraftPetCharge(PetCharge),
     /// The Results screen's own `[R] Play Again` button -- mirrors the `r`
     /// key (`PetArcade::click_restart`). Owner report: restarting after a
     /// win/loss was keyboard-only.
@@ -4560,6 +4596,31 @@ pub struct App {
     /// existing way to reach a restart was the Results screen's own
     /// button, unreachable while a run was still in progress.
     pub(crate) pet_arcade_menu: Option<PetArcadeMenuState>,
+    /// A hover-and-hold tooltip candidate -- `None` whenever the pointer
+    /// is not resting on a tooltip-eligible arcade control (`render::
+    /// pet_arcade_tooltip_text`'s own doc comment has the current list:
+    /// rune draft options, tower palette entries, the pet's own ability
+    /// buttons, evolution choices). Owner report: "что дают руны мне не
+    /// очевидно ... было бы неплохо делать тултип с инфой, если наводим
+    /// на вариант и держим на нем допустим 2 секунды". Written by
+    /// `App::hover` (real mouse-move events already reach it -- `client.rs`'s
+    /// own `MouseEventKind::Moved => app.hover(...)`, `App::hover`'s own
+    /// doc comment traces the rest), read by `render::render_pet_arcade_
+    /// tooltip` at paint time -- this crate's own established split
+    /// between "input handlers mutate `App` state" and "render fns turn
+    /// it into pixels/cells" everywhere else, not a new one invented for
+    /// this. The 2-second HOLD itself needs no new clock or polling
+    /// mechanism: `PetArcade::advance`'s own `pet_arcade_wake_interval`
+    /// already forces a redraw at least every 50ms (glyph tier) or ~16ms
+    /// (pixel tier) for the ENTIRE duration a run is in progress -- which
+    /// is exactly when every tooltip-eligible control this covers is even
+    /// on screen -- so `Instant::now().duration_since(hover.since)`,
+    /// re-checked every one of those already-scheduled redraws, crosses
+    /// [`PET_ARCADE_TOOLTIP_HOLD_DELAY`] on schedule with zero new wake
+    /// sources, the same "read a real `Instant` at render/decision time,
+    /// no invented ticking" discipline `PetArcade::tick_alpha`/`step_pet_
+    /// arcade` already use.
+    pub(crate) pet_arcade_hover: Option<PetArcadeHoverState>,
     /// The arcade session itself -- see `pet_arcade`'s own module doc
     /// comment for why this is `Rc<RefCell<_>>` rather than a plain field
     /// (`App` derives `Clone, Debug`; the engine's own `Runner`/`GameScreen`/
@@ -4702,6 +4763,7 @@ impl Default for App {
             pet_arcade_info_open: false,
             pet_arcade_info_scroll: 0,
             pet_arcade_menu: None,
+            pet_arcade_hover: None,
             pet_arcade_visual_tier: PetArcadeVisualTier::Pixel,
             pet_arcade: crate::pet_arcade::PetArcade::new(),
             profiler: crate::profile::TuiProfiler::default(),
@@ -5227,16 +5289,22 @@ impl App {
             }
             Some(HitTarget::PetArcadeTile(x, y)) => self.pet_arcade.borrow_mut().click_tile(x, y),
             Some(HitTarget::PetArcadeTowerKind(kind)) => {
+                // Owner report: "вначале мне дают 120 сап, а когда я
+                // ставлю тавер получается поставить только один за 60" --
+                // this used to ALSO queue a placement right here, at
+                // whatever tile was selected BEFORE this press
+                // (`PetArcade::click_tower_kind`'s own doc comment has the
+                // full trace), so a press-drag-release placed twice: once
+                // there, unseen, once more below on release. `click_
+                // tower_kind` now only selects -- this press queues NO
+                // placement at all. It still starts the drag unconditionally
+                // (never gated on whether the player goes on to actually
+                // move the pointer) so a plain click and a real drag both
+                // reach `App::drop_at`'s own `DragState::PetArcadeTower
+                // Placement` arm, which is now the ONLY place a placement
+                // is ever queued from -- exactly once, on release, at
+                // whichever tile that arm's own `moved` check resolves to.
                 self.pet_arcade.borrow_mut().click_tower_kind(kind);
-                // The existing click-to-place-on-selected-tile shortcut
-                // above already fired unconditionally -- this ADDITIONALLY
-                // starts a drag so a player who keeps holding the button
-                // and moves the pointer gets the ghost/highlight (`render::
-                // render_drag_preview`, `render_pet_arcade`'s own
-                // `buildable_tiles` highlight) and can drop onto a
-                // DIFFERENT tile. `App::drop_at`'s own `moved` check is what
-                // keeps a plain click (no drag ever observed) from placing
-                // a second tower on top of the first.
                 self.drag_state = Some(DragState::PetArcadeTowerPlacement {
                     kind,
                     start_column: column,
@@ -5265,6 +5333,9 @@ impl App {
             }
             Some(HitTarget::PetArcadeChooseEvolution(evolution)) => {
                 self.pet_arcade.borrow_mut().click_choose_evolution(evolution)
+            }
+            Some(HitTarget::PetArcadeDraftPetCharge(charge)) => {
+                self.pet_arcade.borrow_mut().click_draft_pet_charge(charge)
             }
             Some(HitTarget::PetArcadeRestart) => self.activate_pet_arcade_restart(),
             Some(HitTarget::PetArcadeToggleTier) => self.toggle_pet_arcade_visual_tier(),
@@ -14197,6 +14268,7 @@ fn append_event_to_diagnostics_file(event: &AppEvent) {
                 | HitTarget::PetArcadeStartWave
                 | HitTarget::PetArcadeDraftRune(_)
                 | HitTarget::PetArcadeChooseEvolution(_)
+                | HitTarget::PetArcadeDraftPetCharge(_)
                 | HitTarget::PetArcadeRestart
                 | HitTarget::PetArcadeToggleTier
                 | HitTarget::PetArcadeInfo
@@ -14267,14 +14339,17 @@ fn append_event_to_diagnostics_file(event: &AppEvent) {
     }
 
     /// Derives every per-frame hover projection from the SAME topmost hit
-    /// at `(column, row)` -- `context_usage_hover` (pre-existing) and
-    /// `status_bar_hover` (slice B, new) both read off one shared `.rev().
-    /// find(...)` lookup rather than two independent scans, so they can
-    /// never disagree about which hit is actually on top (e.g. a modal
-    /// opened over the status bar correctly yields `status_bar_hover =
-    /// None`, since the topmost hit at that point is the modal's own,
-    /// never `HitTarget::StatusBarLeft`/`Right` underneath it). See
-    /// `StatusBarHover`'s own doc comment for what it drives.
+    /// at `(column, row)` -- `context_usage_hover` (pre-existing),
+    /// `status_bar_hover` (slice B), and `pet_arcade_hover` (owner: "если
+    /// наводим на вариант и держим на нем допустим 2 секунды") all read
+    /// off one shared `.rev().find(...)` lookup rather than independent
+    /// scans, so they can never disagree about which hit is actually on
+    /// top (e.g. a modal opened over the status bar correctly yields
+    /// `status_bar_hover = None`, since the topmost hit at that point is
+    /// the modal's own, never `HitTarget::StatusBarLeft`/`Right`
+    /// underneath it -- the mechanics modal covering the board behind it
+    /// clears `pet_arcade_hover` the exact same way). See `StatusBarHover`'s
+    /// own doc comment for what it drives.
     pub fn hover(&mut self, column: u16, row: u16) -> AppAction {
         self.harness_kanban.hover_position = Some((column, row));
         let topmost = self
@@ -14304,6 +14379,48 @@ fn append_event_to_diagnostics_file(event: &AppEvent) {
             }),
             _ => None,
         });
+        // The hold timer: `since` only resets when the topmost TARGET
+        // actually changes (moving off-and-back-on restarts the hold,
+        // the expected "OS tooltip" feel) -- re-hovering the exact same
+        // control frame after frame with no real movement, which is the
+        // common case while the pointer just sits there, must never keep
+        // pushing `since` forward, or the 2-second delay would never be
+        // reached. Eligibility itself is decided by `render::pet_arcade_
+        // tooltip_text` -- the SAME fn `render_pet_arcade_tooltip` calls
+        // for the text it actually paints, so there is exactly one place
+        // that knows "which controls get a tooltip at all", not a second,
+        // independently-maintained list here.
+        if self.pet_arcade_open {
+            // A field-zone tooltip (`HitTarget::PetArcadeTile`) needs the
+            // live run's own `field_zones` to know which sector (if any) a
+            // hovered tile falls in -- everything else `pet_arcade_
+            // tooltip_text` covers is a pure function of the target alone
+            // and ignores this. `PetArcade::snapshot` is `None` outside a
+            // live run (`Home`/`Results`), which is also exactly when
+            // `pet_arcade_tooltip_text` has nothing eligible to find.
+            let snapshot = self.pet_arcade.borrow().snapshot();
+            let eligible = topmost.and_then(|hit| {
+                crate::render::pet_arcade_tooltip_text(&hit.target, snapshot.as_ref()).map(|_| hit.target.clone())
+            });
+            match eligible {
+                Some(target) => {
+                    let already_this_target =
+                        self.pet_arcade_hover.as_ref().is_some_and(|hover| hover.target == target);
+                    if already_this_target {
+                        if let Some(hover) = self.pet_arcade_hover.as_mut() {
+                            hover.column = column;
+                            hover.row = row;
+                        }
+                    } else {
+                        self.pet_arcade_hover =
+                            Some(PetArcadeHoverState { target, column, row, since: Instant::now() });
+                    }
+                }
+                None => self.pet_arcade_hover = None,
+            }
+        } else if self.pet_arcade_hover.is_some() {
+            self.pet_arcade_hover = None;
+        }
         AppAction::None
     }
 
@@ -14945,32 +15062,41 @@ fn append_event_to_diagnostics_file(event: &AppEvent) {
                 }
                 return AppAction::None;
             }
-            // The palette click that started this drag already placed a
-            // tower on the then-selected tile, unconditionally, on
-            // mouse-down (`click_pet_arcade`'s own `PetArcadeTowerKind`
-            // arm) -- if the pointer never actually moved this was a plain
-            // click and that placement is the whole story, so there is
-            // nothing left to do here (never a second, duplicate `Place`
-            // for the exact same press). A real drag resolves against
-            // whatever `HitTarget::PetArcadeTile` is under the drop point
-            // THIS frame -- a tile that cannot host a tower at all, or one
-            // that is occupied/unaffordable, is a silent no-op inside
-            // `PetArcade::drop_tower` itself, the same "sim gates it"
-            // contract every other arcade action button already follows.
+            // The palette press that started this drag placed NOTHING
+            // (`click_pet_arcade`'s own `PetArcadeTowerKind` arm, `PetArcade
+            // ::click_tower_kind`'s own doc comment traces the owner's own
+            // "places twice" report back to this arm once ALSO placing on
+            // press) -- this is the ONLY place a tower placement is
+            // actually queued from, exactly once per release, whichever of
+            // the two shapes it turns out to be. Never moved: the
+            // click-to-place shortcut, resolved against `selected_tile`
+            // (the same tile the palette press's own board cursor was
+            // already sitting on) -- a plain click and a press-release-in-
+            // place both take this branch, since `moved` only ever flips
+            // once `App::drag` observes the pointer at a DIFFERENT column/
+            // row than the press (`DragState::PetArcadeTowerPlacement`'s
+            // own doc comment). Moved: resolves against whatever
+            // `HitTarget::PetArcadeTile` is under the drop point THIS
+            // frame instead. Either way, a tile that cannot host a tower
+            // at all, or one that is occupied/unaffordable, is a silent
+            // no-op inside `PetArcade::drop_tower` itself, the same "sim
+            // gates it" contract every other arcade action button already
+            // follows.
             DragState::PetArcadeTowerPlacement { kind, moved, .. } => {
-                if !moved {
-                    return AppAction::None;
-                }
                 let kind = *kind;
-                let target_tile = self.layout.hits.iter().rev().find_map(|hit| {
-                    if !hit.rect.contains(column, row) {
-                        return None;
-                    }
-                    match &hit.target {
-                        HitTarget::PetArcadeTile(x, y) => Some((*x, *y)),
-                        _ => None,
-                    }
-                });
+                let target_tile = if *moved {
+                    self.layout.hits.iter().rev().find_map(|hit| {
+                        if !hit.rect.contains(column, row) {
+                            return None;
+                        }
+                        match &hit.target {
+                            HitTarget::PetArcadeTile(x, y) => Some((*x, *y)),
+                            _ => None,
+                        }
+                    })
+                } else {
+                    Some(self.pet_arcade.borrow().selected_tile())
+                };
                 if let Some((x, y)) = target_tile {
                     self.pet_arcade.borrow_mut().drop_tower(kind, x, y);
                 }

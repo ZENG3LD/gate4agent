@@ -381,6 +381,62 @@ pub fn sixel_compact_family(id: IconId, family: IconFamily) -> Option<&'static s
     }
 }
 
+// ---- Raw RGBA accessors (control-plane native frame capture) -----------
+//
+// `sixel_family`/`sixel_strip_family`/`sixel_gallery_family`/
+// `sixel_compact_family` above all end in an already sixel-ENCODED string
+// -- exactly what `client::flush_sixel_icon_into` needs to `Print` at the
+// terminal, and exactly NOT what `frame_capture::blit_sixel_icon` needs:
+// a PNG pixel canvas wants the RGBA bytes themselves, composited but
+// never run through `icy_sixel`'s own lossy palette/threshold encoder
+// (`icons.rs`'s own "Sixel background variants" doc section documents
+// exactly what that encoder throws away). These four functions are the
+// tier-dispatch half of `sixel_family`'s own family (`Codicons` vs
+// `Lucide`, `None` on the same two documented Lucide gaps) WITHOUT the
+// compositing/caching/encoding steps -- `frame_capture` composites (via
+// [`composite_over_background`], called directly, no cache: a frame
+// capture happens at most once per operator request, never per real
+// terminal repaint, so [`SIXEL_CACHE`]'s whole reason to exist does not
+// apply here) and PNG-encodes on its own.
+
+/// Rail-tier raw source bytes -- see this section's own doc comment.
+pub(crate) fn rail_source_rgba(id: IconId, family: IconFamily) -> Option<&'static [u8]> {
+    match family {
+        IconFamily::Codicons => Some(catalog::sixel_source_rgba(id)),
+        IconFamily::Lucide => catalog::lucide_sixel_source_rgba(id),
+    }
+}
+
+/// Strip-tier raw source bytes -- see this section's own doc comment.
+pub(crate) fn strip_source_rgba(id: IconId, family: IconFamily) -> Option<&'static [u8]> {
+    match family {
+        IconFamily::Codicons => Some(catalog::sixel_strip_source_rgba(id)),
+        IconFamily::Lucide => catalog::lucide_sixel_strip_source_rgba(id),
+    }
+}
+
+/// Gallery-tier raw source bytes -- see this section's own doc comment.
+pub(crate) fn gallery_source_rgba(id: IconId, family: IconFamily) -> Option<&'static [u8]> {
+    match family {
+        IconFamily::Codicons => Some(catalog::sixel_gallery_source_rgba(id)),
+        IconFamily::Lucide => catalog::lucide_sixel_gallery_source_rgba(id),
+    }
+}
+
+/// Compact-tier raw source bytes -- see this section's own doc comment.
+/// Unlike [`sixel_compact_family`] (real sixel transparency, no
+/// background parameter at all), `frame_capture` still composites this
+/// tier's own bytes against a concrete colour -- the ONE covered
+/// terminal cell's own resolved background -- because a PNG canvas has no
+/// "let the terminal show through" concept; see `frame_capture::
+/// blit_sixel_icon`'s own doc comment for exactly which colour that is.
+pub(crate) fn compact_source_rgba(id: IconId, family: IconFamily) -> Option<&'static [u8]> {
+    match family {
+        IconFamily::Codicons => Some(catalog::sixel_compact_source_rgba(id)),
+        IconFamily::Lucide => catalog::lucide_sixel_compact_source_rgba(id),
+    }
+}
+
 /// Which of an icon-bearing button's own two contextual states a given
 /// sixel-tier placement is in -- see this module's own "Sixel background
 /// variants" doc section above for how each one resolves to a concrete

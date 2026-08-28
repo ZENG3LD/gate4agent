@@ -494,10 +494,14 @@ pub fn ascii(id: IconId) -> &'static str {
     }
 }
 
-// Compact tier's own raw source, test-only (byte-length assertions) --
-// production code only ever reaches for the pre-encoded `sixel_compact`
-// above; this tier never composites against a background at runtime.
-#[cfg(test)]
+// Compact tier's own raw source. `sixel_compact` above (pre-encoded, real
+// transparency) is still the ONLY thing `client::flush_sixel_icon_into`
+// ever reaches for -- this tier still never composites against a
+// background for a REAL terminal. `../../frame_capture.rs`'s own
+// `blit_sixel_icon` is a second, legitimate caller: a PNG canvas has no
+// "let the terminal show through" concept, so it composites this tier's
+// own raw bytes against the one covered cell's own resolved background
+// (see that function's own doc comment) -- no longer test-only.
 pub(crate) fn sixel_compact_source_rgba(id: IconId) -> &'static [u8] {
     match id {
         IconId::Files => FILES_COMPACT_RGBA,
@@ -1340,9 +1344,9 @@ pub fn lucide_slug(id: IconId) -> Option<&'static str> {
     }
 }
 
-// Compact tier's own raw Lucide source, test-only -- same precedent as
-// the codicon `sixel_compact_source_rgba` above.
-#[cfg(test)]
+// Compact tier's own raw Lucide source -- same precedent (and same
+// no-longer-test-only reasoning) as the codicon `sixel_compact_source_
+// rgba` above.
 pub(crate) fn lucide_sixel_compact_source_rgba(id: IconId) -> Option<&'static [u8]> {
     match id {
         IconId::Files => Some(LUCIDE_FILES_COMPACT_RGBA),

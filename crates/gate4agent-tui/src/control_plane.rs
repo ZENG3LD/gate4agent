@@ -256,6 +256,14 @@ enum ControlRequestV1 {
     /// RIGHT NOW", never sleeps, and is therefore safe to also reach
     /// directly from a unit test without spinning up a socket.
     WaitForOutput { session: ControlSessionAddressV1, after_frame: u64, timeout_ms: u64 },
+    /// Native pixel render of the app's CURRENT frame, written to disk as
+    /// a PNG -- see [`capture_frame`]'s own doc comment for exactly what
+    /// this covers that [`DumpFrame`](ControlRequestV1::DumpFrame)'s
+    /// plain-text projection cannot (colour, background, text attributes,
+    /// baked sixel icon placements) and what it deliberately still does
+    /// not (the Pet Bastion arcade board's own pixel-tier overlay; real
+    /// glyph shapes).
+    CaptureFrame,
 }
 
 /// The two shapes `App::reduce_viewport`'s own `UiKey::Char`/`UiKey::
@@ -438,6 +446,12 @@ enum ControlErrorV1 {
     /// `WriteSession`'s `Text` payload exceeded [`TERMINAL_INPUT_MAX_BYTES`]
     /// -- the same bound the real Ctrl+V paste path enforces.
     WriteTooLarge,
+    /// `CaptureFrame` rendered its PNG bytes successfully but writing them
+    /// to disk (`std::fs::write` in [`capture_frame`]) failed -- a full
+    /// temp directory, a permissions problem, or similar. Distinct from
+    /// every other error above: the ONLY one whose cause is outside this
+    /// process's own state (`app`, the request) entirely.
+    FrameWriteFailed,
 }
 
 #[derive(Serialize)]
@@ -462,6 +476,7 @@ enum ControlResponseV1 {
     Written,
     SessionContent(ControlSessionContentV1),
     WaitedForOutput(ControlWaitResultV1),
+    CapturedFrame(ControlCapturedFrameV1),
 }
 
 #[derive(Serialize)]
@@ -562,6 +577,27 @@ struct ControlFrameV1 {
     /// never changes buffer cell content, so skipping it here is exactly
     /// "plain cell text, no bitmap," not an approximation of it).
     text: String,
+}
+
+/// [`ControlRequestV1::CaptureFrame`]'s own reply -- see [`capture_frame`]'s
+/// own doc comment for why this carries a filesystem PATH rather than the
+/// PNG bytes themselves.
+#[derive(Serialize)]
+struct ControlCapturedFrameV1 {
+    /// Absolute path to the just-written PNG on THIS machine's own local
+    /// disk -- meaningful only to a caller running on the same host as
+    /// this process (true of every existing verb on this loopback-only
+    /// wire, see this module's own top doc comment). The file is not
+    /// deleted by this process; a caller driving repeated captures across
+    /// a long session is responsible for its own cleanup (`std::env::
+    /// temp_dir()` -- see [`capture_frame`]'s own doc comment -- so the
+    /// OS's own temp-directory housekeeping is the eventual backstop
+    /// either way).
+    path: String,
+    cols: u16,
+    rows: u16,
+    width_px: u32,
+    height_px: u32,
 }
 
 /// Binds `endpoint.bind`, spawns the accept-loop thread, and returns the
@@ -826,6 +862,9 @@ pub(crate) fn apply(app: &mut App, terminal: &TerminalWatermarks, command: Contr
                 waited_ms: 0,
             })))
         }
+        ControlRequestV1::CaptureFrame => {
+            capture_frame(app).map(|frame| (AppAction::None, ControlResponseV1::CapturedFrame(frame)))
+        }
     };
     match outcome {
         Ok((action, response)) => {
@@ -1018,6 +1057,48 @@ fn dump_frame(app: &App) -> ControlFrameV1 {
     ControlFrameV1 { cols, rows, text }
 }
 
+/// [`ControlRequestV1::CaptureFrame`]'s own handler: renders `app`'s
+/// CURRENT frame to PNG bytes via [`crate::frame_capture::render_frame_
+/// png`] -- see that function's own doc comment for exactly what pixel
+/// content this does and does not contain -- and writes them to a fresh
+/// file under [`std::env::temp_dir`]. The wire reply carries that file's
+/// own PATH, never the bytes: a full-terminal capture at [`icons::
+/// ASSUMED_CELL_WIDTH_PX`]x[`icons::ASSUMED_CELL_HEIGHT_PX`] per cell,
+/// PNG-encoded with NO real compression (`crate::png_encode`'s own doc
+/// comment), lands close to its raw pixel size -- several megabytes the
+/// moment a caller opens more than a couple of panes, past [`CONTROL_
+/// RESPONSE_MAX_BYTES`] the moment [`write_reply`] would have to encode
+/// it inline. A path costs a few dozen bytes regardless of frame size,
+/// exactly like every other verb on this wire that returns something
+/// bounded instead of something proportional to screen content.
+///
+/// Filename pattern (`gate4agent-tui-frame-<pid>-<nanos>.png`) matches
+/// `client::tests`'s own existing `std::env::temp_dir()` convention for
+/// this crate's other disposable per-process artifacts -- unique per
+/// call (process id plus a nanosecond timestamp), so concurrent captures
+/// -- across processes or across two requests on the same one -- never
+/// collide on one path and never require this handler to invent its own
+/// cleanup/locking scheme.
+fn capture_frame(app: &App) -> Result<ControlCapturedFrameV1, ControlErrorV1> {
+    let frame = crate::frame_capture::render_frame_png(app);
+    let path = std::env::temp_dir().join(format!(
+        "gate4agent-tui-frame-{}-{}.png",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default(),
+    ));
+    std::fs::write(&path, &frame.png).map_err(|_| ControlErrorV1::FrameWriteFailed)?;
+    Ok(ControlCapturedFrameV1 {
+        path: path.display().to_string(),
+        cols: frame.cols,
+        rows: frame.rows,
+        width_px: frame.width_px,
+        height_px: frame.height_px,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1088,6 +1169,29 @@ mod tests {
         let bound = spawn(endpoint, tx).unwrap();
         assert!(bound.ip().is_loopback());
         assert_ne!(bound.port(), 0);
+    }
+
+    /// `CaptureFrame` -- like every other verb on this wire -- is refused
+    /// by ABSENCE, not by a per-request check: this module's own top doc
+    /// comment states the contract plainly ("`client::run` then never
+    /// calls [`spawn`]... byte-identical to before this module existed"
+    /// when `--control-plane` is not given). There is no live accept loop
+    /// to send a `CaptureFrame` envelope to at all when the control plane
+    /// is disabled, so this proves refusal the same way [`spawn_refuses_
+    /// a_non_loopback_bind_address`] proves it for a bad bind address:
+    /// bind a real ephemeral port with a plain listener, read back its
+    /// concrete port number, then drop that listener WITHOUT ever calling
+    /// [`spawn`] on it -- nothing is listening on that port afterward, so
+    /// connecting to it (the same first step [`round_trip`] takes for
+    /// every other verb's own tests) fails outright.
+    #[test]
+    fn capture_frame_is_unreachable_when_the_control_plane_was_never_spawned() {
+        let reserved = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = reserved.local_addr().unwrap();
+        drop(reserved);
+
+        let outcome = TcpStream::connect_timeout(&addr, Duration::from_millis(500));
+        assert!(outcome.is_err(), "a CaptureFrame request must have nothing listening to reach when the control plane is disabled");
     }
 
     /// Sends one full envelope over a real loopback socket and reads the
@@ -1340,6 +1444,37 @@ mod tests {
         assert_eq!(frame.cols, 20);
         assert_eq!(frame.rows, 5);
         assert_eq!(frame.text.split('\n').count(), 5);
+    }
+
+    /// End to end through [`apply`]/[`capture_frame`]: a real PNG lands on
+    /// disk at the reported `path`, sized exactly `cols`/`rows` times
+    /// [`icons::ASSUMED_CELL_WIDTH_PX`]/[`icons::ASSUMED_CELL_HEIGHT_PX`],
+    /// and its bytes actually decode as a PNG of that size -- not just a
+    /// struct reporting numbers with no real file behind them. Removes
+    /// its own written file afterward so repeated test runs never leave
+    /// artifacts behind in `std::env::temp_dir()`.
+    #[test]
+    fn apply_capture_frame_writes_a_real_png_at_the_reported_path() {
+        let mut app = App::default();
+        app.terminal_cols = 20;
+        app.terminal_rows = 5;
+        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+        let command = ControlCommand { request: ControlRequestV1::CaptureFrame, reply: reply_tx };
+        let action = apply(&mut app, &TerminalWatermarks::default(), command);
+        assert_eq!(action, AppAction::None);
+        let ControlReplyV1::Ok { response: ControlResponseV1::CapturedFrame(frame) } = reply_rx.try_recv().unwrap() else {
+            panic!("expected a CapturedFrame response");
+        };
+        assert_eq!(frame.cols, 20);
+        assert_eq!(frame.rows, 5);
+        assert_eq!(frame.width_px, 20 * crate::icons::ASSUMED_CELL_WIDTH_PX);
+        assert_eq!(frame.height_px, 5 * crate::icons::ASSUMED_CELL_HEIGHT_PX);
+
+        let bytes = std::fs::read(&frame.path).expect("capture_frame must have written a real file at its own reported path");
+        std::fs::remove_file(&frame.path).expect("test cleanup must be able to remove its own written file");
+        let (decoded_width, decoded_height, _decoded_rgba) = crate::png_encode::decode_for_test(&bytes);
+        assert_eq!(decoded_width, frame.width_px);
+        assert_eq!(decoded_height, frame.height_px);
     }
 
     /// THE pin: reproduces exactly the precondition this module's own doc

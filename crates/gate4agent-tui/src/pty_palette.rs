@@ -4,8 +4,22 @@ use crate::app::PtyColorMode;
 
 pub const GATE_FG: Color = Color::Rgb(205, 214, 244);
 pub const TERM_BG: Color = Color::Rgb(17, 17, 27);
+/// [`GATE_FG`] as a plain tuple -- `frame_capture`'s own pixel canvas
+/// works in `(u8, u8, u8)` throughout (it never constructs a `Color`
+/// value at all), so this spares that module a `let Color::Rgb(r, g, b) =
+/// GATE_FG else { unreachable!() }` just to read three bytes back out of
+/// a `Color` it already knows the shape of. Kept hand-in-sync with
+/// `GATE_FG` (both are compile-time constants, so a mismatch would be a
+/// copy-paste error, not a drift risk from either changing independently
+/// at runtime).
+pub(crate) const GATE_FG_RGB: (u8, u8, u8) = (205, 214, 244);
 
-const ANSI: [Color; 16] = [
+/// `pub(crate)`, not `pub`: read directly by `frame_capture`'s own named-
+/// colour resolver ([`indexed_rgb`]'s doc comment below has the full
+/// reasoning for why THAT resolver, not [`gate_foreground`], is the one a
+/// native pixel render must use). Values unchanged from when this array
+/// was private to this module.
+pub(crate) const ANSI: [Color; 16] = [
     Color::Rgb(69, 71, 90),
     Color::Rgb(243, 139, 168),
     Color::Rgb(166, 227, 161),
@@ -68,7 +82,17 @@ fn gate_foreground(color: Color) -> Color {
     }
 }
 
-fn indexed_rgb(index: u8) -> (u8, u8, u8) {
+/// `pub(crate)`: `frame_capture`'s own colour resolver calls this for
+/// EVERY named/indexed colour a styled cell can carry (including the 16
+/// values `index < 16` resolves here), never [`gate_foreground`] --
+/// `gate_foreground` snaps every `Indexed`/`Rgb` colour to the NEAREST of
+/// these same 16 swatches ([`nearest_swatch`]), a deliberate `GateOverride`
+/// PTY-palette aesthetic choice that a native capture of the app's own
+/// real cell colours must NOT inherit (`frame_capture::resolve_color`'s
+/// own doc comment). This function alone -- the xterm 216-colour cube /
+/// greyscale-ramp arithmetic below, `index < 16` aside -- is exact, not a
+/// re-quantization, which is exactly what a faithful pixel render needs.
+pub(crate) fn indexed_rgb(index: u8) -> (u8, u8, u8) {
     if index < 16 {
         return rgb(ANSI[index as usize]);
     }

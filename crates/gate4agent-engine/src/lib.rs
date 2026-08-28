@@ -2390,10 +2390,7 @@ impl Gate4AgentEngine {
             .sessions
             .get(&instance_id)
             .ok_or(ControlError::UnknownInstance { instance_id })?;
-        if matches!(
-            state.snapshot.status,
-            SessionStatus::Starting | SessionStatus::Running | SessionStatus::Stopping
-        ) {
+        if !state.snapshot.status.allows_remove() {
             return Err(ControlError::InvalidTransition {
                 instance_id,
                 action: "remove".to_owned(),

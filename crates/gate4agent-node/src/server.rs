@@ -11260,15 +11260,28 @@ impl NodeShared {
     ///
     /// A `Remove` sent while the session is not yet in a terminal status
     /// (e.g. still `Stopping`, mid-effect right after a `Stop`) is rejected
-    /// once by the engine (`Gate4AgentEngine::remove` requires `Registered`/
-    /// `Exited`/`Failed`) and then discarded -- nothing re-issues it on its
-    /// own, so the removal that would satisfy this wait never arrives and
-    /// the caller was guaranteed to time out even though the session settles
-    /// microseconds later. Re-dispatch `Remove` on every poll tick so a
-    /// session that settles mid-wait -- the common case right after a
-    /// `Stop` -- still gets removed inside the same bounded deadline instead
-    /// of a guaranteed timeout. A rejected re-dispatch is a harmless no-op
-    /// here: the only outcome this loop observes is the session's presence.
+    /// once by the engine (`SessionStatus::allows_remove`) and
+    /// then discarded -- nothing re-issues it on its own, so the removal
+    /// that would satisfy this wait never arrives and the caller was
+    /// guaranteed to time out even though the session settles microseconds
+    /// later. So this re-dispatches on every poll tick: a session that
+    /// settles mid-wait -- the common case right after a `Stop` -- still
+    /// gets removed inside the same bounded deadline.
+    ///
+    /// It re-dispatches only once the status will ACCEPT the command. A
+    /// rejected re-dispatch is not the harmless no-op this loop first
+    /// assumed: every rejection publishes a `ControlEventKind::Command
+    /// Rejected` to every subscriber and writes a WARN line. Ungated, one
+    /// ordinary teardown produced 241 of them in 1.6 seconds -- the whole
+    /// `Stopping` window at one known-doomed dispatch per 2ms tick, fanned
+    /// out to the harness and every attached client. Gated, the same
+    /// teardown sends exactly one `Remove`, at the first tick the engine
+    /// can act on it.
+    ///
+    /// The status is read from the snapshot this loop already takes, so
+    /// the gate costs nothing extra. It races -- the status can move
+    /// between the read and the dispatch -- and that is fine: a rare lost
+    /// race is one rejection, and the next tick retries.
     async fn wait_until_removed(
         &self,
         address: &SessionAddress,
@@ -11276,24 +11289,26 @@ impl NodeShared {
     ) -> Result<(), NodeFailure> {
         let deadline = Instant::now() + commit_timeout;
         loop {
-            let still_present = self
-                .handle
-                .snapshot()
+            let snapshot = self.handle.snapshot();
+            let status = snapshot
                 .sessions
                 .iter()
-                .any(|session| session.instance_id == address.session.instance_id);
-            if !still_present {
+                .find(|session| session.instance_id == address.session.instance_id)
+                .map(|session| session.status.clone());
+            let Some(status) = status else {
                 return Ok(());
-            }
+            };
             if Instant::now() >= deadline {
                 return Err(failure(
                     NodeFailureCode::BackendBusy,
                     "remove did not commit before the bounded deadline; session binding was retained",
                 ));
             }
-            let _ = self.dispatch(ControlCommand::Remove {
-                instance_id: address.session.instance_id,
-            });
+            if status.allows_remove() {
+                let _ = self.dispatch(ControlCommand::Remove {
+                    instance_id: address.session.instance_id,
+                });
+            }
             sleep(Duration::from_millis(2)).await;
         }
     }

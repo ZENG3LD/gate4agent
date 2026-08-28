@@ -568,6 +568,29 @@ pub enum SessionStatus {
     Failed { message: String },
 }
 
+impl SessionStatus {
+    /// Whether a `Remove` command for a session in this status will be
+    /// accepted rather than rejected as an invalid transition.
+    ///
+    /// It lives here, on the status itself, because two crates need the
+    /// same answer and neither may depend on the other: `gate4agent-engine`
+    /// enforces it in `Gate4AgentEngine::remove`, and `gate4agent-node`
+    /// consults it in `wait_until_removed` BEFORE re-dispatching, because a
+    /// rejected command is not free -- it publishes a `ControlEventKind::
+    /// CommandRejected` to every subscriber and writes a WARN line. Ungated,
+    /// one ordinary teardown produced 241 rejections in 1.6 seconds: the
+    /// entire `Stopping` window at one known-doomed dispatch per 2ms tick.
+    ///
+    /// Exhaustive on purpose -- a status added to this enum without a
+    /// decision here fails to compile rather than silently joining one set.
+    pub fn allows_remove(&self) -> bool {
+        match self {
+            Self::Starting | Self::Running | Self::Stopping => false,
+            Self::Registered | Self::Exited { .. } | Self::Failed { .. } => true,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SessionSnapshot {
     pub instance_id: AgentInstanceId,
@@ -1506,6 +1529,44 @@ impl Default for ControlSnapshot {
 
 #[cfg(test)]
 mod tests {
+
+    /// The split `SessionStatus::allows_remove` draws, stated once so the
+    /// two crates that consult it (`gate4agent-engine`'s own `remove`
+    /// guard, `gate4agent-node`'s `wait_until_removed` re-dispatch gate)
+    /// are pinned to the same answer.
+    ///
+    /// The three live statuses refuse: a session that is starting, running
+    /// or stopping still owns a process. The three settled ones allow. The
+    /// node's retry loop reads this BEFORE dispatching, because a rejected
+    /// `Remove` fans a `CommandRejected` out to every subscriber -- 241 of
+    /// them in 1.6 seconds when the loop dispatched blind.
+    #[test]
+    fn only_a_settled_session_admits_a_remove() {
+        use crate::SessionStatus;
+
+        for live in [
+            SessionStatus::Starting,
+            SessionStatus::Running,
+            SessionStatus::Stopping,
+        ] {
+            assert!(
+                !live.allows_remove(),
+                "{live:?} still owns a process; a Remove for it is rejected",
+            );
+        }
+        for settled in [
+            SessionStatus::Registered,
+            SessionStatus::Exited { exit_code: Some(0) },
+            SessionStatus::Exited { exit_code: None },
+            SessionStatus::Failed { message: "boom".to_owned() },
+        ] {
+            assert!(
+                settled.allows_remove(),
+                "{settled:?} is settled; a Remove for it must be accepted",
+            );
+        }
+    }
+
     use crate::AgentId;
     use super::{
         ContextWindowUsage, ForegroundProcess, ForegroundProcessKind, ProviderEvent,

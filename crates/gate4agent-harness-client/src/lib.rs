@@ -1242,6 +1242,49 @@ impl HarnessOperatorClient {
         Ok(HarnessEventSubscription { reader: BufReader::new(stream) })
     }
 
+    /// Terminal-push counterpart to `subscribe_events` immediately above --
+    /// same "opens a long-lived, server-push subscription, dropping it is
+    /// the only unsubscribe" framing, on its own connection, carrying
+    /// `HarnessOperatorTerminalEventV1` instead: see that type's own doc
+    /// comment for why terminal frames do not ride `subscribe_events`'s
+    /// queue. `sessions` is declared once, at subscribe time -- opening or
+    /// closing a pane means calling this again with the updated list, not
+    /// patching an existing subscription (see `SubscribeTerminal`'s own doc
+    /// comment, `gate4agent-harness-api`).
+    pub fn subscribe_terminal(
+        &self,
+        sessions: Vec<HarnessRuntimeSessionAddressV1>,
+    ) -> Result<HarnessTerminalSubscription, HarnessOperatorClientError> {
+        let request = HarnessOperatorRequestV1::SubscribeTerminal { sessions };
+        request.validate()?;
+        let version = request.minimum_wire_version();
+        let envelope = HarnessOperatorEnvelopeV1 {
+            version,
+            credential: self.credential.clone(),
+            request,
+        };
+        envelope.validate()?;
+        let mut encoded = serde_json::to_vec(&envelope)
+            .map_err(|_| HarnessOperatorClientError::Encoding)?;
+        if encoded.len() >= HARNESS_OPERATOR_REQUEST_MAX_BYTES {
+            return Err(HarnessOperatorClientError::RequestTooLarge);
+        }
+        encoded.push(b'\n');
+
+        let mut stream = TcpStream::connect_timeout(&self.endpoint, self.deadline)
+            .map_err(map_operator_connect_error)?;
+        stream.set_write_timeout(Some(self.deadline))
+            .map_err(|_| HarnessOperatorClientError::Transport)?;
+        stream.write_all(&encoded).map_err(map_operator_io_error)?;
+        stream.shutdown(Shutdown::Write)
+            .map_err(|_| HarnessOperatorClientError::Transport)?;
+
+        // Deliberately no read timeout, same reasoning as `subscribe_events`
+        // above: `HarnessTerminalSubscription::next_event` blocks until the
+        // host pushes a frame or the connection ends.
+        Ok(HarnessTerminalSubscription { reader: BufReader::new(stream) })
+    }
+
     fn send_mutation(
         &self,
         request: HarnessOperatorRequestV1,
@@ -1401,6 +1444,54 @@ impl HarnessEventSubscription {
             .map_err(|_| HarnessOperatorClientError::InvalidResponse)?;
         event.validate()?;
         Ok(event)
+    }
+}
+
+/// A live `SubscribeTerminal` connection: see
+/// `HarnessOperatorClient::subscribe_terminal`. `HarnessEventSubscription`'s
+/// exact sibling over `HarnessOperatorTerminalEventV1` instead. Dropping this
+/// value closes the socket, which is the wire's only representable
+/// unsubscribe.
+pub struct HarnessTerminalSubscription {
+    reader: BufReader<TcpStream>,
+}
+
+impl HarnessTerminalSubscription {
+    /// Blocks until the next pushed frame arrives, or returns an error once
+    /// the connection ends -- `HarnessEventSubscription::next_event`'s own
+    /// doc comment applies verbatim here, including the "sniff for an
+    /// ordinary reply first" reasoning (an auth failure or an over-limit
+    /// subscribe both still reply with the usual single-frame
+    /// `HarnessOperatorReplyV1::Error` before closing).
+    pub fn next_event(&mut self) -> Result<HarnessOperatorTerminalEventV1, HarnessOperatorClientError> {
+        let line = read_operator_bounded_line(&mut self.reader, HARNESS_OPERATOR_RESPONSE_MAX_BYTES)?;
+        let value: serde_json::Value = serde_json::from_slice(&line)
+            .map_err(|_| HarnessOperatorClientError::InvalidResponse)?;
+        if value.get("status").is_some() {
+            let reply: HarnessOperatorReplyV1 = serde_json::from_value(value)
+                .map_err(|_| HarnessOperatorClientError::InvalidResponse)?;
+            reply.validate()?;
+            return match reply {
+                HarnessOperatorReplyV1::Error { error } => Err(HarnessOperatorClientError::Host(error)),
+                HarnessOperatorReplyV1::Ok { .. } => Err(HarnessOperatorClientError::UnexpectedResponse),
+            };
+        }
+        let event: HarnessOperatorTerminalEventV1 = serde_json::from_value(value)
+            .map_err(|_| HarnessOperatorClientError::InvalidResponse)?;
+        event.validate()?;
+        Ok(event)
+    }
+
+    /// Lets the caller force this blocking connection to unblock and die
+    /// (its `next_event`'s `read` returns an error) from another thread,
+    /// without adding a second wire message -- the client-side subscription
+    /// worker (`gate4agent-tui`) needs this because the desired-session-set
+    /// can change while a `next_event` call is blocked on a socket read with
+    /// no data pending: shutting down this cloned handle's read half is the
+    /// only way to interrupt that blocking read from outside the thread that
+    /// owns it.
+    pub fn try_clone_canceler(&self) -> std::io::Result<TcpStream> {
+        self.reader.get_ref().try_clone()
     }
 }
 
@@ -2979,4 +3070,141 @@ mod tests {
         );
     }
 
+    fn sample_session_address() -> HarnessRuntimeSessionAddressV1 {
+        HarnessRuntimeSessionAddressV1 {
+            node_id: "node-a".to_owned(),
+            incarnation_id: "07".repeat(16),
+            workspace_id: "workspace-a".to_owned(),
+            instance_id: 1,
+            generation: 1,
+        }
+    }
+
+    fn sample_terminal_frame(sequence: u64) -> HarnessRuntimeTerminalFrameV1 {
+        HarnessRuntimeTerminalFrameV1 {
+            sequence,
+            size: HarnessRuntimeTerminalSizeV1 { rows: 24, columns: 80 },
+            cursor_row: 0,
+            cursor_column: 0,
+            formatted: format!("frame-{sequence}").into_bytes(),
+            scrollback_formatted: Vec::new(),
+            alternate_screen: false,
+            mouse_protocol_enabled: false,
+            mouse_protocol_encoding: HarnessRuntimeMouseProtocolEncodingV1::Default,
+            produced_at_unix_ms: 1_000,
+        }
+    }
+
+    /// The wire-framing proof step 5's own integration test builds on: the
+    /// request envelope carries the v12 `subscribe-terminal` kind with the
+    /// exact requested sessions, and `next_event` decodes a pushed
+    /// `TerminalFrame` followed by a `Ping` off the SAME connection, in
+    /// order -- the connect-once, read-repeatedly shape `subscribe_events`'
+    /// own doc comment describes, exercised here for its terminal sibling.
+    #[test]
+    fn operator_client_subscribe_terminal_sends_v12_envelope_and_streams_pushed_frames() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let endpoint = listener.local_addr().expect("address");
+        let session = sample_session_address();
+        let expected_session = session.clone();
+        let host = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = String::new();
+            stream.read_to_string(&mut request).expect("request");
+            let envelope: HarnessOperatorEnvelopeV1 =
+                serde_json::from_str(request.trim_end()).expect("envelope");
+            assert_eq!(envelope.version, HARNESS_OPERATOR_WIRE_VERSION_V12);
+            assert!(matches!(
+                &envelope.request,
+                HarnessOperatorRequestV1::SubscribeTerminal { sessions }
+                    if sessions == &vec![expected_session.clone()],
+            ));
+            let frame_event = HarnessOperatorTerminalEventV1::TerminalFrame {
+                sequence: 0,
+                session: expected_session,
+                frame: sample_terminal_frame(1),
+                coalesced_since_last: 0,
+            };
+            let mut encoded = serde_json::to_vec(&frame_event).expect("frame event");
+            encoded.push(b'\n');
+            stream.write_all(&encoded).expect("write frame event");
+            let ping_event = HarnessOperatorTerminalEventV1::Ping { sequence: 1 };
+            let mut encoded = serde_json::to_vec(&ping_event).expect("ping event");
+            encoded.push(b'\n');
+            stream.write_all(&encoded).expect("write ping event");
+        });
+        let client = HarnessOperatorClient::new(endpoint, operator_credential())
+            .expect("operator client");
+        let mut subscription = client.subscribe_terminal(vec![session])
+            .expect("subscribe terminal");
+        assert!(matches!(
+            subscription.next_event().expect("first pushed event"),
+            HarnessOperatorTerminalEventV1::TerminalFrame { sequence: 0, .. },
+        ));
+        assert!(matches!(
+            subscription.next_event().expect("second pushed event"),
+            HarnessOperatorTerminalEventV1::Ping { sequence: 1 },
+        ));
+        host.join().expect("host");
+    }
+
+    /// The auth-failure/over-limit sniff `next_event`'s own doc comment
+    /// promises: a host that never admits the subscription still replies
+    /// with the ordinary single-frame `HarnessOperatorReplyV1::Error` shape,
+    /// and `next_event` must surface it as a typed host error rather than
+    /// failing to decode it as a push event.
+    #[test]
+    fn terminal_subscription_next_event_surfaces_an_error_reply_before_any_push_frame() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let endpoint = listener.local_addr().expect("address");
+        let host = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = String::new();
+            stream.read_to_string(&mut request).expect("request");
+            let reply = HarnessOperatorReplyV1::Error { error: HarnessOperatorHostErrorV1::Busy };
+            let mut encoded = serde_json::to_vec(&reply).expect("reply");
+            encoded.push(b'\n');
+            stream.write_all(&encoded).expect("write reply");
+        });
+        let client = HarnessOperatorClient::new(endpoint, operator_credential())
+            .expect("operator client");
+        let mut subscription = client.subscribe_terminal(vec![sample_session_address()])
+            .expect("subscribe terminal");
+        assert!(matches!(
+            subscription.next_event(),
+            Err(HarnessOperatorClientError::Host(HarnessOperatorHostErrorV1::Busy)),
+        ));
+        host.join().expect("host");
+    }
+
+    /// `try_clone_canceler` operates on the shared underlying socket, not on
+    /// a specific in-flight call: shutting the cloned handle down makes the
+    /// ORIGINAL subscription's next `next_event` read fail, exactly the
+    /// property `gate4agent-tui`'s subscription worker depends on to force a
+    /// blocked `next_event` call to unblock from another thread when the
+    /// desired session set changes. Calling shutdown before `next_event` even
+    /// starts proves the same underlying property deterministically, without
+    /// needing to race a concurrently blocked read.
+    #[test]
+    fn terminal_subscription_try_clone_canceler_unblocks_the_original_reader() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let endpoint = listener.local_addr().expect("address");
+        let host = thread::spawn(move || {
+            // Accepted and held open, never dropped early and never written
+            // to -- the only thing that ends this connection must be the
+            // canceler shutdown below, not a peer disconnect or a real push
+            // frame.
+            let (stream, _) = listener.accept().expect("accept");
+            stream
+        });
+        let client = HarnessOperatorClient::new(endpoint, operator_credential())
+            .expect("operator client");
+        let mut subscription = client.subscribe_terminal(vec![sample_session_address()])
+            .expect("subscribe terminal");
+        let canceler = subscription.try_clone_canceler().expect("canceler");
+        canceler.shutdown(Shutdown::Both).expect("shutdown canceler");
+
+        assert!(subscription.next_event().is_err());
+        drop(host.join().expect("host"));
+    }
 }

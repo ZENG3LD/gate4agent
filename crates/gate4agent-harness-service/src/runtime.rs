@@ -36,7 +36,10 @@ use crate::dispatch::{
     HarnessLaunchCatalog, HarnessLifecycleEventKindV1, HarnessLifecycleProjectionV1,
     HARNESS_LAUNCH_CATALOG_MAX,
 };
-use crate::terminal::{terminal_frame_to_wire, TerminalBufferRegistry};
+use crate::terminal::{
+    terminal_frame_to_wire, TerminalBufferRegistry, TerminalSubscriberRegistry,
+    HOST_TERMINAL_SUBSCRIBER_LIMIT, HOST_TERMINAL_SUBSCRIBER_QUEUE_CAPACITY,
+};
 use gate4agent_harness_delivery::DeliveryCatalogV2;
 use gate4agent_c2_protocol::{
     C2ManagedSessionRecord, C2NodeEvent, C2ObservationSupport, C2SessionStatus,
@@ -53,7 +56,7 @@ use gate4agent_harness_api::{
     HarnessLaunchPlanPageV1, HarnessLaunchPlanSummaryV1,
     HarnessNodeIncarnationV1,
     HarnessOperatorCredential, HarnessOperatorEnvelopeV1, HarnessOperatorEventV1,
-    HarnessOperatorHostErrorV1,
+    HarnessOperatorHostErrorV1, HarnessOperatorTerminalEventV1,
     HarnessOperatorIntentV1,
     HarnessOperatorMutationOutcomeV1, HarnessOperatorReplyV1, HarnessOperatorRequestV1,
     HarnessOperatorResponseV1, HarnessReadCredential, HarnessReadEnvelopeV1,
@@ -109,7 +112,7 @@ use gate4agent_node_protocol::{
     MAX_HARNESS_MCP_PENDING_CALLS_PER_NODE,
 };
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -517,6 +520,19 @@ enum HostCommand {
     /// `handle_connection`'s `SubscribeEvents` branch for the sender side.
     Subscribe {
         sender: mpsc::Sender<HarnessOperatorEventV1>,
+        identity: OperatorRequestLogIdentity,
+    },
+    /// Registers a new terminal-push subscriber -- the sibling of `Subscribe`
+    /// above for `TerminalSubscriberRegistry` rather than `SubscriberRegistry`.
+    /// Also fire-and-forget for the same reason: the connection task already
+    /// holds the paired `mpsc::Receiver`, and this arm's own per-session seed
+    /// (via `TerminalSubscriberRegistry::send_to`, using whatever
+    /// `TerminalBufferRegistry::latest` already holds for each requested
+    /// session) is the observable proof of successful registration. See
+    /// `handle_connection`'s `SubscribeTerminal` branch for the sender side.
+    SubscribeTerminal {
+        sender: mpsc::Sender<HarnessOperatorTerminalEventV1>,
+        sessions: HashSet<RuntimeSessionKey>,
         identity: OperatorRequestLogIdentity,
     },
     Shutdown {
@@ -3306,7 +3322,11 @@ fn is_session_control_request(request: &HarnessOperatorRequestV1) -> bool {
 /// mapping either harness wants, with zero kernel entanglement.
 #[derive(Clone, Debug)]
 pub struct OperatorRequestLogIdentity {
-    operation: String,
+    // `pub(crate)`, not private: `terminal::TerminalSubscriberRegistry::
+    // remove_at` (a different module in this crate) logs a closed
+    // subscriber the same way `SubscriberRegistry::remove_at` below does,
+    // and needs this field directly for the same `tracing::info!` shape.
+    pub(crate) operation: String,
     node_id: Option<String>,
     workspace_id: Option<String>,
     run_id: Option<String>,
@@ -3451,11 +3471,13 @@ impl OperatorRequestLogIdentity {
         }
     }
 
-    fn node_id(&self) -> &str {
+    // `pub(crate)`, same reason as the `operation` field above: `terminal::
+    // TerminalSubscriberRegistry::remove_at` reads both accessors.
+    pub(crate) fn node_id(&self) -> &str {
         self.node_id.as_deref().unwrap_or("")
     }
 
-    fn workspace_id(&self) -> &str {
+    pub(crate) fn workspace_id(&self) -> &str {
         self.workspace_id.as_deref().unwrap_or("")
     }
 
@@ -4400,9 +4422,11 @@ pub async fn start_harness_host_with_operator_and_catalogs(
     let handle = HarnessHostHandle { endpoint, commands: commands.clone() };
     let connections = Arc::new(Semaphore::new(HOST_CONNECTION_LIMIT));
     let subscriber_connections = Arc::new(Semaphore::new(HOST_SUBSCRIBER_LIMIT));
+    let terminal_subscriber_connections = Arc::new(Semaphore::new(HOST_TERMINAL_SUBSCRIBER_LIMIT));
     let task = tokio::spawn(async move {
         let mut active_dispatch = None;
         let mut subscribers = SubscriberRegistry::default();
+        let mut terminal_subscribers = TerminalSubscriberRegistry::default();
         let mut harness_mcp_workers = HarnessMcpWorkerRegistry::default();
         let mut native_history_workers = NativeHistoryWorkerRegistry::default();
         let mut run_read_workers = RunReadWorkerRegistry::default();
@@ -6430,6 +6454,18 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                 HarnessOperatorEventV1::SnapshotBaseline { sequence, tasks, runs, nodes }
                             });
                         }
+                        Some(HostCommand::SubscribeTerminal { sender, sessions, identity }) => {
+                            tracing::info!(
+                                operation = %identity.operation,
+                                "harness terminal event subscriber registered",
+                            );
+                            let id = terminal_subscribers.insert(sender, sessions.clone(), identity);
+                            for key in &sessions {
+                                if let Some(frame) = terminal_buffers.latest(key) {
+                                    terminal_subscribers.send_to(id, key, frame.clone());
+                                }
+                            }
+                        }
                         Some(HostCommand::Shutdown { reply }) => {
                             let result = harness.flush().map_err(HarnessRuntimeError::Harness)
                                 .and_then(|_| observation.flush().map_err(HarnessRuntimeError::Observation));
@@ -6446,16 +6482,15 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                         Some(event) => {
                             match &event.event {
                                 C2NodeEvent::TerminalFrame { address, frame } => {
-                                    terminal_buffers.ingest(
-                                        RuntimeSessionKey {
-                                            node_id: event.node_id.clone(),
-                                            incarnation_id: event.cursor.incarnation_id,
-                                            workspace_id: address.workspace_id.clone(),
-                                            instance_id: address.session.instance_id,
-                                            generation: address.session.generation,
-                                        },
-                                        frame.clone(),
-                                    );
+                                    let key = RuntimeSessionKey {
+                                        node_id: event.node_id.clone(),
+                                        incarnation_id: event.cursor.incarnation_id,
+                                        workspace_id: address.workspace_id.clone(),
+                                        instance_id: address.session.instance_id,
+                                        generation: address.session.generation,
+                                    };
+                                    terminal_buffers.ingest(key.clone(), frame.clone());
+                                    terminal_subscribers.publish(&key, frame);
                                 }
                                 C2NodeEvent::ResyncRequired { .. } => {
                                     terminal_buffers.invalidate(&NodeRoute {
@@ -6625,8 +6660,9 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                         &commands,
                     );
                 }
-                _ = subscriber_keepalive.tick(), if !subscribers.is_empty() => {
+                _ = subscriber_keepalive.tick(), if !subscribers.is_empty() || !terminal_subscribers.is_empty() => {
                     emit_subscriber_keepalive(&mut subscribers);
+                    terminal_subscribers.keepalive();
                 }
                 accepted = listener.accept() => {
                     let (stream, peer) = accepted.map_err(|_| HarnessRuntimeError::AcceptFailed)?;
@@ -6635,6 +6671,8 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                     let request_commands = commands.clone();
                     let request_operator_authority = operator_authority.clone();
                     let request_subscriber_connections = subscriber_connections.clone();
+                    let request_terminal_subscriber_connections =
+                        terminal_subscriber_connections.clone();
                     tokio::spawn(async move {
                         let _ = handle_connection(
                             stream,
@@ -6642,11 +6680,13 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                             request_operator_authority,
                             permit,
                             request_subscriber_connections,
+                            request_terminal_subscriber_connections,
                         ).await;
                     });
                 }
             }
             subscribers.recover_lagged(&harness, &runtime_inventory);
+            terminal_subscribers.flush_pending();
             start_pending_observation_recoveries(
                 &adapter,
                 &commands,
@@ -8427,6 +8467,14 @@ fn execute_operator_request(
         HarnessOperatorRequestV1::SubscribeEvents {} => {
             return Err(HarnessOperatorHostErrorV1::Internal);
         }
+        // Same reasoning as `SubscribeEvents` immediately above:
+        // `handle_connection` intercepts `SubscribeTerminal` before it is
+        // ever wrapped into `HostCommand::Operator` (it registers via
+        // `HostCommand::SubscribeTerminal` instead). This arm exists only so
+        // this match stays exhaustive.
+        HarnessOperatorRequestV1::SubscribeTerminal { .. } => {
+            return Err(HarnessOperatorHostErrorV1::Internal);
+        }
     };
     response.validate().map_err(|_| HarnessOperatorHostErrorV1::Internal)?;
     Ok(response)
@@ -8663,6 +8711,7 @@ async fn handle_connection(
     operator_authority: Option<HarnessOperatorCredentialAuthority>,
     connection_permit: tokio::sync::OwnedSemaphorePermit,
     subscriber_connections: Arc<Semaphore>,
+    terminal_subscriber_connections: Arc<Semaphore>,
 ) -> Result<(), HarnessRuntimeError> {
     let mut operator_frame = false;
     // Populated only by the `SubscribeEvents` branch below. Read after the
@@ -8672,6 +8721,17 @@ async fn handle_connection(
     // it -- see the branch's own doc comment.
     let mut subscription: Option<(
         mpsc::Receiver<HarnessOperatorEventV1>,
+        tokio::sync::OwnedSemaphorePermit,
+    )> = None;
+    // Sibling to `subscription` above, populated only by the
+    // `SubscribeTerminal` branch below -- kept as its own local (not folded
+    // into an enum with `subscription`) because the two are never both
+    // `Some` for the same connection (a connection is classified as one
+    // subscription kind or the other, or neither) and keeping them
+    // physically separate mirrors `TerminalSubscriberRegistry`'s own
+    // physical separation from `SubscriberRegistry`.
+    let mut terminal_subscription: Option<(
+        mpsc::Receiver<HarnessOperatorTerminalEventV1>,
         tokio::sync::OwnedSemaphorePermit,
     )> = None;
     let outcome = timeout(HOST_CONNECTION_DEADLINE, async {
@@ -8780,6 +8840,55 @@ async fn handle_connection(
                 subscription = Some((receiver, subscriber_permit));
                 return Ok(());
             }
+            // Same "opens a long-lived, server-push subscription" shape as
+            // `SubscribeEvents` immediately above, its own connection pool
+            // (`terminal_subscriber_connections`), its own registration
+            // command (`HostCommand::SubscribeTerminal`), and its own
+            // outbound-channel size (`HOST_TERMINAL_SUBSCRIBER_QUEUE_CAPACITY`
+            // -- deliberately not `HOST_SUBSCRIBER_QUEUE_CAPACITY`, see that
+            // constant's own doc comment in `terminal.rs`). Each requested
+            // session address is parsed with the same `terminal_session_key`
+            // helper `TerminalRead` already uses; the first one that fails
+            // local shape validation fails the whole subscribe with
+            // `InvalidRequest`, mirroring how a single malformed field fails
+            // any other operator request wholesale rather than admitting a
+            // partial subscription.
+            if let HarnessOperatorRequestV1::SubscribeTerminal { sessions } = &request {
+                let Ok(terminal_subscriber_permit) =
+                    terminal_subscriber_connections.clone().try_acquire_owned()
+                else {
+                    tracing::info!(
+                        limit = HOST_TERMINAL_SUBSCRIBER_LIMIT,
+                        "harness terminal event subscribe rejected: subscriber limit reached",
+                    );
+                    write_operator_reply(
+                        &mut stream,
+                        HarnessOperatorReplyV1::Error { error: HarnessOperatorHostErrorV1::Busy },
+                    ).await?;
+                    return Ok(());
+                };
+                let mut keys = HashSet::with_capacity(sessions.len());
+                for session in sessions {
+                    let Ok(key) = terminal_session_key(session) else {
+                        write_operator_reply(
+                            &mut stream,
+                            HarnessOperatorReplyV1::Error {
+                                error: HarnessOperatorHostErrorV1::InvalidRequest,
+                            },
+                        ).await?;
+                        return Ok(());
+                    };
+                    keys.insert(key);
+                }
+                let (sender, receiver) = mpsc::channel(HOST_TERMINAL_SUBSCRIBER_QUEUE_CAPACITY);
+                commands.send(HostCommand::SubscribeTerminal {
+                    sender,
+                    sessions: keys,
+                    identity,
+                }).await.map_err(|_| HarnessRuntimeError::HostStopped)?;
+                terminal_subscription = Some((receiver, terminal_subscriber_permit));
+                return Ok(());
+            }
             // A node-workspace-read, node-workspace-write, session-spawn,
             // session-control, session-record-mutation, host-directory-
             // browse, or resource-mutation request gets a cancel signal:
@@ -8874,8 +8983,13 @@ async fn handle_connection(
         }
     }).await;
     match outcome {
-        Ok(Ok(())) => match subscription {
-            Some((receiver, subscriber_permit)) => {
+        // `subscription`/`terminal_subscription` are mutually exclusive --
+        // exactly one of the two classify branches above can have set either
+        // one, never both -- so matching the pair together stays exhaustive
+        // without a reachable-but-impossible third combination to reason
+        // about.
+        Ok(Ok(())) => match (subscription, terminal_subscription) {
+            (Some((receiver, subscriber_permit)), _) => {
                 // The main connection permit is released here, not held for
                 // the subscription's whole (unbounded) lifetime: see
                 // `HOST_SUBSCRIBER_LIMIT`'s doc comment. `subscriber_permit`
@@ -8884,7 +8998,14 @@ async fn handle_connection(
                 drop(connection_permit);
                 run_operator_event_subscription(stream, receiver, subscriber_permit).await
             }
-            None => Ok(()),
+            (None, Some((receiver, terminal_subscriber_permit))) => {
+                // Same reasoning as the task/run/node branch above, against
+                // `HOST_TERMINAL_SUBSCRIBER_LIMIT` instead.
+                drop(connection_permit);
+                run_operator_terminal_subscription(stream, receiver, terminal_subscriber_permit)
+                    .await
+            }
+            (None, None) => Ok(()),
         },
         Ok(Err(error)) => Err(error),
         Err(_) => {
@@ -8970,6 +9091,68 @@ pub async fn write_operator_event(
             error = ?error,
             kind = event_kind_label(&event),
             "operator event failed validation before write; closing the subscription",
+        );
+        HarnessRuntimeError::InvalidReply
+    })?;
+    let mut encoded = serde_json::to_vec(&event).map_err(|_| HarnessRuntimeError::InvalidReply)?;
+    if encoded.len().saturating_add(1) > HARNESS_OPERATOR_RESPONSE_MAX_BYTES {
+        return Err(HarnessRuntimeError::ResponseTooLarge);
+    }
+    encoded.push(b'\n');
+    stream.write_all(&encoded).await.map_err(|_| HarnessRuntimeError::WriteFailed)?;
+    stream.flush().await.map_err(|_| HarnessRuntimeError::WriteFailed)
+}
+
+/// Forwarding loop for a connection that just subscribed via
+/// `SubscribeTerminal` (`handle_connection`'s own branch above) --
+/// `run_operator_event_subscription`'s exact sibling, over
+/// `HarnessOperatorTerminalEventV1`/`terminal_subscriber_permit` instead:
+/// same "outside `HOST_CONNECTION_DEADLINE`, ends on the first write failure
+/// or channel close" lifetime, same reasoning for why there is no
+/// unsubscribe frame to read for (see that function's own doc comment,
+/// which applies verbatim here).
+pub async fn run_operator_terminal_subscription(
+    mut stream: TcpStream,
+    mut events: mpsc::Receiver<HarnessOperatorTerminalEventV1>,
+    _subscriber_permit: tokio::sync::OwnedSemaphorePermit,
+) -> Result<(), HarnessRuntimeError> {
+    tracing::info!("terminal event subscription forwarding started");
+    while let Some(event) = events.recv().await {
+        tracing::debug!(
+            kind = terminal_event_kind_label(&event),
+            "forwarding terminal event",
+        );
+        write_operator_terminal_event(&mut stream, event).await?;
+    }
+    tracing::info!("terminal event subscription channel drained; closing");
+    Ok(())
+}
+
+fn terminal_event_kind_label(event: &HarnessOperatorTerminalEventV1) -> &'static str {
+    match event {
+        HarnessOperatorTerminalEventV1::TerminalFrame { .. } => "terminal-frame",
+        HarnessOperatorTerminalEventV1::Ping { .. } => "ping",
+    }
+}
+
+/// Push-frame counterpart to `write_operator_reply` for a `SubscribeTerminal`
+/// connection -- `write_operator_event`'s exact sibling over
+/// `HarnessOperatorTerminalEventV1` instead (same validate-before-write,
+/// same size ceiling, same "never shuts the connection down afterward"
+/// contract).
+pub async fn write_operator_terminal_event(
+    stream: &mut TcpStream,
+    event: HarnessOperatorTerminalEventV1,
+) -> Result<(), HarnessRuntimeError> {
+    event.validate().map_err(|error| {
+        // Same reasoning as `write_operator_event`'s own validate-before-write
+        // check: a push frame failing its own validation is a server-side
+        // bug, so the stream dies here rather than the cause dying silently
+        // with it.
+        tracing::warn!(
+            error = ?error,
+            kind = terminal_event_kind_label(&event),
+            "terminal event failed validation before write; closing the subscription",
         );
         HarnessRuntimeError::InvalidReply
     })?;
@@ -12335,10 +12518,19 @@ mod tests {
         let (commands, _receiver) = mpsc::channel(HOST_COMMAND_CAPACITY);
         let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
         let subscriber_connections = Arc::new(Semaphore::new(HOST_SUBSCRIBER_LIMIT));
+        let terminal_subscriber_connections =
+            Arc::new(Semaphore::new(HOST_TERMINAL_SUBSCRIBER_LIMIT));
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             assert!(matches!(
-                handle_connection(stream, commands, None, permit, subscriber_connections).await,
+                handle_connection(
+                    stream,
+                    commands,
+                    None,
+                    permit,
+                    subscriber_connections,
+                    terminal_subscriber_connections,
+                ).await,
                 Err(HarnessRuntimeError::Deadline),
             ));
         });
@@ -12368,6 +12560,8 @@ mod tests {
         let authority = HarnessOperatorCredentialAuthority::new(credential.clone()).unwrap();
         let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
         let subscriber_connections = Arc::new(Semaphore::new(HOST_SUBSCRIBER_LIMIT));
+        let terminal_subscriber_connections =
+            Arc::new(Semaphore::new(HOST_TERMINAL_SUBSCRIBER_LIMIT));
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             assert!(matches!(
@@ -12377,6 +12571,7 @@ mod tests {
                     Some(authority),
                     permit,
                     subscriber_connections,
+                    terminal_subscriber_connections,
                 ).await,
                 Err(HarnessRuntimeError::Deadline),
             ));

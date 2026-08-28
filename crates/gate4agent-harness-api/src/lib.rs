@@ -69,6 +69,13 @@ pub const HARNESS_OPERATOR_WIRE_VERSION_V8: u16 = 8;
 pub const HARNESS_OPERATOR_WIRE_VERSION_V9: u16 = 9;
 pub const HARNESS_OPERATOR_WIRE_VERSION_V10: u16 = 10;
 pub const HARNESS_OPERATOR_WIRE_VERSION_V11: u16 = 11;
+pub const HARNESS_OPERATOR_WIRE_VERSION_V12: u16 = 12;
+// Realistic multi-pane ceiling with headroom; bounds the harness-side
+// per-subscriber HashSet<RuntimeSessionKey> and the connect-time seed burst
+// `SubscribeTerminal`'s handler sends immediately after registering (see
+// `gate4agent-harness-service::runtime`'s `HostCommand::SubscribeTerminal`
+// arm).
+pub const HARNESS_TERMINAL_SUBSCRIPTION_SESSIONS_MAX: usize = 32;
 pub const HARNESS_OPERATOR_REQUEST_MAX_BYTES: usize = 64 * 1024;
 pub const HARNESS_OPERATOR_RESPONSE_MAX_BYTES: usize = 1024 * 1024;
 pub const HARNESS_OPERATOR_CREDENTIAL_MAX_BYTES: usize = 256;
@@ -231,6 +238,7 @@ impl HarnessOperatorEnvelopeV1 {
                 | HARNESS_OPERATOR_WIRE_VERSION_V9
                 | HARNESS_OPERATOR_WIRE_VERSION_V10
                 | HARNESS_OPERATOR_WIRE_VERSION_V11
+                | HARNESS_OPERATOR_WIRE_VERSION_V12
         ) || self.version < self.request.minimum_wire_version()
         {
             return Err(HarnessOperatorApiError::UnsupportedVersion);
@@ -2408,6 +2416,15 @@ pub enum HarnessOperatorRequestV1 {
     // one-shot request/reply: see the framing note on `HarnessOperatorEventV1`
     // for the wire shape this switches the connection into.
     SubscribeEvents {},
+    // Same "opens a long-lived, server-push subscription" framing as
+    // SubscribeEvents immediately above, on its own connection: see
+    // `HarnessOperatorTerminalEventV1`'s doc comment for why terminal
+    // frames do not ride SubscribeEvents's own queue. `sessions` is
+    // declared once, at subscribe time -- this wire has no representable
+    // second client-to-host message (see the module doc), so a client
+    // that opens or closes a pane reconnects with the updated list rather
+    // than patching an existing subscription.
+    SubscribeTerminal { sessions: Vec<HarnessRuntimeSessionAddressV1> },
 }
 
 impl HarnessOperatorRequestV1 {
@@ -2775,6 +2792,19 @@ impl HarnessOperatorRequestV1 {
                 context_id.validate().map_err(HarnessOperatorApiError::Protocol)
             }
             Self::SubscribeEvents {} => Ok(()),
+            Self::SubscribeTerminal { sessions } => {
+                if sessions.is_empty()
+                    || sessions.len() > HARNESS_TERMINAL_SUBSCRIPTION_SESSIONS_MAX
+                {
+                    return Err(HarnessOperatorApiError::InvalidTerminalPage);
+                }
+                for session in sessions { session.validate()?; }
+                let mut seen = std::collections::HashSet::with_capacity(sessions.len());
+                if !sessions.iter().all(|session| seen.insert(session)) {
+                    return Err(HarnessOperatorApiError::InvalidTerminalPage);
+                }
+                Ok(())
+            }
         }
     }
 
@@ -2875,8 +2905,14 @@ impl HarnessOperatorRequestV1 {
         )
     }
 
+    pub fn requires_v12(&self) -> bool {
+        matches!(self, Self::SubscribeTerminal { .. })
+    }
+
     pub fn minimum_wire_version(&self) -> u16 {
-        if self.requires_v11() {
+        if self.requires_v12() {
+            HARNESS_OPERATOR_WIRE_VERSION_V12
+        } else if self.requires_v11() {
             HARNESS_OPERATOR_WIRE_VERSION_V11
         } else if self.requires_v10() {
             HARNESS_OPERATOR_WIRE_VERSION_V10
@@ -3000,6 +3036,53 @@ impl HarnessOperatorEventV1 {
                 Ok(())
             }
             Self::Lagged { .. } => Ok(()),
+            Self::Ping { .. } => Ok(()),
+        }
+    }
+}
+
+/// Long-lived, server-push counterpart to a `SubscribeTerminal` connection --
+/// see `HarnessOperatorEventV1`'s own doc comment for the shared framing this
+/// also uses. Deliberately its own type, not a variant of
+/// `HarnessOperatorEventV1`: that type's `Lagged`/`SnapshotBaseline` pair
+/// promises a full task/run/node resync on overflow, which is both wrong for
+/// a terminal frame (there is no "task/run/node" to resync, only a screen
+/// that is already self-contained) and unaffordable at terminal-frame volume
+/// (see `TerminalSubscriberRegistry`'s own doc comment for the coalescing
+/// discipline this type's `coalesced_since_last` field reports on).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum HarnessOperatorTerminalEventV1 {
+    /// Sent once per session immediately after a successful subscribe (the
+    /// tail of whatever `TerminalBufferRegistry` already holds, or nothing
+    /// if the ring is empty for that session -- a legitimate state for a
+    /// pane with no output yet), and again every time that session's ring
+    /// gains a strictly newer frame. Always a full screen, never a delta
+    /// (see backlog item 4) -- a client that missed intermediate frames is
+    /// already caught up the moment this one arrives.
+    TerminalFrame {
+        sequence: u64,
+        session: HarnessRuntimeSessionAddressV1,
+        frame: HarnessRuntimeTerminalFrameV1,
+        /// How many frames for THIS session were coalesced away (replaced
+        /// before ever being sent) since the last frame actually delivered
+        /// on this subscription. 0 on every frame delivered without
+        /// contention, including the very first. Diagnostic only.
+        coalesced_since_last: u32,
+    },
+    /// Same keep-alive rationale as `HarnessOperatorEventV1::Ping`: this is
+    /// a physically separate connection with its own dead-peer-detection
+    /// problem, independent of the task/run/node subscription's.
+    Ping { sequence: u64 },
+}
+
+impl HarnessOperatorTerminalEventV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        match self {
+            Self::TerminalFrame { session, frame, .. } => {
+                session.validate()?;
+                frame.validate()
+            }
             Self::Ping { .. } => Ok(()),
         }
     }
@@ -8083,6 +8166,21 @@ mod tests {
         }
     }
 
+    fn sample_terminal_frame(sequence: u64) -> HarnessRuntimeTerminalFrameV1 {
+        HarnessRuntimeTerminalFrameV1 {
+            sequence,
+            size: HarnessRuntimeTerminalSizeV1 { rows: 24, columns: 80 },
+            cursor_row: 0,
+            cursor_column: 0,
+            formatted: format!("frame-{sequence}").into_bytes(),
+            scrollback_formatted: Vec::new(),
+            alternate_screen: false,
+            mouse_protocol_enabled: false,
+            mouse_protocol_encoding: HarnessRuntimeMouseProtocolEncodingV1::Default,
+            produced_at_unix_ms: 1_000,
+        }
+    }
+
     #[test]
     fn operator_v10_session_verbs_are_exact_round_trips_and_fail_closed_on_v9() {
         let session = session_address(41, 3);
@@ -9015,6 +9113,64 @@ mod tests {
     }
 
     #[test]
+    fn operator_v12_subscribe_terminal_is_exact_round_trip_and_fails_closed_on_v11() {
+        let request = HarnessOperatorRequestV1::SubscribeTerminal {
+            sessions: vec![session_address(1, 1), session_address(2, 1)],
+        };
+        request.validate().expect("valid v12 subscribe-terminal request");
+        assert_eq!(request.minimum_wire_version(), HARNESS_OPERATOR_WIRE_VERSION_V12);
+        let encoded = serde_json::to_string(&request).unwrap();
+        let decoded: HarnessOperatorRequestV1 = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, request);
+
+        let credential = HarnessOperatorCredential::parse(format!(
+            "g4aho_{}",
+            "a".repeat(64),
+        )).unwrap();
+        assert!(matches!(
+            HarnessOperatorEnvelopeV1 {
+                version: HARNESS_OPERATOR_WIRE_VERSION_V11,
+                credential: credential.clone(),
+                request: request.clone(),
+            }.validate(),
+            Err(HarnessOperatorApiError::UnsupportedVersion),
+        ));
+        HarnessOperatorEnvelopeV1 {
+            version: HARNESS_OPERATOR_WIRE_VERSION_V12,
+            credential,
+            request,
+        }.validate().unwrap();
+    }
+
+    #[test]
+    fn subscribe_terminal_rejects_empty_oversized_and_duplicate_session_lists() {
+        assert!(matches!(
+            HarnessOperatorRequestV1::SubscribeTerminal { sessions: Vec::new() }.validate(),
+            Err(HarnessOperatorApiError::InvalidTerminalPage),
+        ));
+
+        let oversized = (0..=HARNESS_TERMINAL_SUBSCRIPTION_SESSIONS_MAX as u64)
+            .map(|instance_id| session_address(instance_id + 1, 1))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            HarnessOperatorRequestV1::SubscribeTerminal { sessions: oversized }.validate(),
+            Err(HarnessOperatorApiError::InvalidTerminalPage),
+        ));
+
+        let duplicated = vec![session_address(1, 1), session_address(1, 1)];
+        assert!(matches!(
+            HarnessOperatorRequestV1::SubscribeTerminal { sessions: duplicated }.validate(),
+            Err(HarnessOperatorApiError::InvalidTerminalPage),
+        ));
+
+        let mut malformed = session_address(1, 1);
+        malformed.node_id = String::new();
+        assert!(HarnessOperatorRequestV1::SubscribeTerminal { sessions: vec![malformed] }
+            .validate()
+            .is_err());
+    }
+
+    #[test]
     fn operator_event_variants_are_exact_round_trips() {
         let task = sample_redacted_task('a');
         let run = sample_redacted_run('b');
@@ -9041,6 +9197,60 @@ mod tests {
             let decoded: HarnessOperatorEventV1 = serde_json::from_str(&encoded).unwrap();
             assert_eq!(decoded, event);
         }
+    }
+
+    #[test]
+    fn operator_terminal_event_variants_are_exact_round_trips() {
+        let events = vec![
+            HarnessOperatorTerminalEventV1::TerminalFrame {
+                sequence: 0,
+                session: session_address(1, 1),
+                frame: sample_terminal_frame(1),
+                coalesced_since_last: 0,
+            },
+            HarnessOperatorTerminalEventV1::TerminalFrame {
+                sequence: 1,
+                session: session_address(1, 1),
+                frame: sample_terminal_frame(2),
+                coalesced_since_last: 3,
+            },
+            HarnessOperatorTerminalEventV1::Ping { sequence: 2 },
+        ];
+        for event in events {
+            event.validate().expect("valid operator terminal event");
+            let encoded = serde_json::to_string(&event).unwrap();
+            let decoded: HarnessOperatorTerminalEventV1 = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, event);
+        }
+    }
+
+    #[test]
+    fn operator_terminal_event_validate_rejects_a_malformed_frame_or_session() {
+        let mut bad_session = session_address(1, 1);
+        bad_session.node_id = String::new();
+        let bad_session_event = HarnessOperatorTerminalEventV1::TerminalFrame {
+            sequence: 0,
+            session: bad_session,
+            frame: sample_terminal_frame(1),
+            coalesced_since_last: 0,
+        };
+        assert!(matches!(
+            bad_session_event.validate(),
+            Err(HarnessOperatorApiError::InvalidTerminalPage),
+        ));
+
+        let mut zero_size_frame = sample_terminal_frame(1);
+        zero_size_frame.size.rows = 0;
+        let bad_frame_event = HarnessOperatorTerminalEventV1::TerminalFrame {
+            sequence: 0,
+            session: session_address(1, 1),
+            frame: zero_size_frame,
+            coalesced_since_last: 0,
+        };
+        assert!(matches!(
+            bad_frame_event.validate(),
+            Err(HarnessOperatorApiError::InvalidTerminalPage),
+        ));
     }
 
     #[test]

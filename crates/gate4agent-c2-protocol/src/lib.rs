@@ -3583,6 +3583,7 @@ mod tests {
                     gate4agent_types::TerminalMouseProtocolEncoding::Default,
                 produced_at_unix_ms: 0,
                 screen_state: gate4agent_types::PtyScreenState::default(),
+                bracketed_paste: None,
             },
         };
         let event = C2NodeEvent::from(&source);

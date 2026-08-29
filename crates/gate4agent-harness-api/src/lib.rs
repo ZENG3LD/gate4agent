@@ -4145,6 +4145,18 @@ pub struct HarnessRuntimeTerminalFrameV1 {
     /// classified yet"); a consumer must not conflate the two.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub screen_state: Option<PtyScreenStateV1>,
+    /// Mirrors `gate4agent_types::TerminalFrame::bracketed_paste` onto the
+    /// operator wire, carried through unconditionally (unlike
+    /// `screen_state`, this is not gated on the requesting peer's declared
+    /// wire version -- `None` already means "no value", so there is no
+    /// separate "this peer didn't ask" state to distinguish it from).
+    /// `skip_serializing_if` is load-bearing the same way it is on
+    /// `screen_state`: the key must be ABSENT from the JSON, not `null`, or
+    /// a pre-existing `deny_unknown_fields` decoder rejects the whole
+    /// message. `#[serde(default)]` so an operator client built before this
+    /// field existed still decodes the frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bracketed_paste: Option<bool>,
 }
 // NOTE: gate4agent_types::TerminalFrame::contents (plain-text render) is
 // deliberately dropped on the wire -- gate4agent-tui's apply_terminal_frame
@@ -8270,6 +8282,7 @@ mod tests {
             mouse_protocol_encoding: HarnessRuntimeMouseProtocolEncodingV1::Default,
             produced_at_unix_ms: 1_000,
             screen_state: None,
+            bracketed_paste: None,
         }
     }
 

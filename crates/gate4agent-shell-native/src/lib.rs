@@ -2536,6 +2536,11 @@ fn terminal_frame(snapshot: PtyTerminalSnapshot, screen_state: PtyScreenState) -
         // not restamp it, see `TerminalFrame::produced_at_unix_ms`'s own doc.
         produced_at_unix_ms: snapshot.produced_at_unix_ms,
         screen_state,
+        // Known at capture time: `PtyTerminalSnapshot::bracketed_paste` is
+        // read off the same `vt100::Screen` as `contents`/`formatted`, so
+        // `Some` here always means "sampled", never "unknown" -- see
+        // `TerminalFrame::bracketed_paste`'s own doc for what `None` means.
+        bracketed_paste: Some(snapshot.bracketed_paste),
     }
 }
 
@@ -3286,6 +3291,23 @@ fn startup_operator_gate(contents: &str) -> Option<&'static str> {
     {
         return Some("workspace trust");
     }
+    // A CLI's own hook-trust prompt at startup (seen from Codex): a set of
+    // shell hooks it discovered need to be reviewed/trusted before they are
+    // allowed to run, distinct from `"workspace trust"` above -- that gate
+    // is about trusting the PROJECT DIRECTORY, this one is about trusting
+    // SHELL HOOKS the CLI found inside it, and an operator reading
+    // `OperatorGate::gate` should be able to tell which question is being
+    // asked. Required to co-occur with the screen's own "decline" option
+    // rather than matching on "hooks need review" alone, so an agent's
+    // ordinary narration that merely uses the word "hooks" (explaining a
+    // git hook, a React hook, a build hook) never matches: real narration
+    // essentially never also contains the literal refusal phrasing
+    // "continue without trusting" this same prompt renders. The number of
+    // hooks reported (which varies run to run) plays no part in the match.
+    if normalized.contains("hooks need review") && normalized.contains("continue without trusting")
+    {
+        return Some("hook trust review");
+    }
     if [
         "select authentication method",
         "choose how to authenticate",
@@ -3961,6 +3983,43 @@ mod tests {
                  Update ran successfully! Please restart Codex."
             ),
             Some("vendor update")
+        );
+        // Regression test for the live-stand incident this branch fixes:
+        // Codex's startup hook-trust prompt was classified `Ready` because
+        // no marker recognized it, so a prompt injected into the PTY landed
+        // in this blocking select-list instead of the agent. Verbatim
+        // transcript from `terminal-read`, 40x120.
+        assert_eq!(
+            startup_operator_gate(
+                "  Hooks need review\n\
+                   6 hooks are new or changed.\n\
+                   Hooks can run outside the sandbox after you trust them.\u{203a} 1. Review hooks\n\
+                   2. Trust all and continue\n\
+                   3. Continue without trusting (hooks won't run)  Press enter to confirm or esc to go back"
+            ),
+            Some("hook trust review")
+        );
+        // Same screen, different hook count -- the match must not depend on
+        // the number.
+        assert_eq!(
+            startup_operator_gate(
+                "  Hooks need review\n\
+                   42 hooks are new or changed.\n\
+                   Hooks can run outside the sandbox after you trust them.\u{203a} 1. Review hooks\n\
+                   2. Trust all and continue\n\
+                   3. Continue without trusting (hooks won't run)  Press enter to confirm or esc to go back"
+            ),
+            Some("hook trust review")
+        );
+        // Ordinary agent narration that happens to mention hooks and trust
+        // must NOT be classified as this gate -- it lacks the screen's own
+        // "continue without trusting" refusal phrasing.
+        assert_eq!(
+            startup_operator_gate(
+                "I reviewed the pre-commit hooks in this repo and they look safe to trust; \
+                 I'll leave the hooks config as-is and continue with the refactor."
+            ),
+            None
         );
     }
 

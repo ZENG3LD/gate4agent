@@ -3164,6 +3164,7 @@ mod tests {
             mouse_protocol_encoding: HarnessRuntimeMouseProtocolEncodingV1::Default,
             produced_at_unix_ms: 1_000,
             screen_state: None,
+            bracketed_paste: None,
         }
     }
 

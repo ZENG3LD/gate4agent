@@ -262,6 +262,22 @@ pub struct TerminalFrame {
     /// `Unknown` and not `Ready` is the entire point of that default.
     #[serde(default)]
     pub screen_state: PtyScreenState,
+    /// Whether bracketed-paste mode was enabled on the PTY at the instant
+    /// THIS frame's screen was materialized, read straight off the same
+    /// `vt100::Screen` snapshot that produced `contents`/`formatted` --
+    /// `Some(true)` means the terminal application has turned the mode on
+    /// (a paste is delivered to it as one bracketed block instead of
+    /// keystrokes), `Some(false)` means it explicitly has not, and `None`
+    /// means this frame predates the field or the value was never sampled.
+    /// `None` is not a claim that the mode is off; a caller that needs to
+    /// know must treat `None` the same as `PtyScreenState::Unknown` --
+    /// absence of information, not a fabricated default.
+    /// `skip_serializing_if` is load-bearing the same way it is on
+    /// `HarnessRuntimeTerminalFrameV1::screen_state`: the key must be
+    /// ABSENT from the JSON, not `null`, so a peer that predates this field
+    /// decodes it as `None` rather than a fabricated `Some(false)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bracketed_paste: Option<bool>,
 }
 
 pub const FOREGROUND_PROCESS_NAME_MAX_BYTES: usize = 512;

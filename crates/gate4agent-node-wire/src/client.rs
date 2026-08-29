@@ -3795,6 +3795,7 @@ mod tests {
                     mouse_protocol_encoding: Default::default(),
                     produced_at_unix_ms: 0,
                     screen_state: PtyScreenState::default(),
+                    bracketed_paste: None,
                 },
             },
         });
@@ -3883,6 +3884,7 @@ mod tests {
                         mouse_protocol_encoding: Default::default(),
                         produced_at_unix_ms: 0,
                         screen_state: PtyScreenState::default(),
+                        bracketed_paste: None,
                     },
                 },
             }

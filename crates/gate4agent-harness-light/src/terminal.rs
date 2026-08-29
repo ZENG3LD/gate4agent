@@ -183,6 +183,7 @@ mod tests {
             mouse_protocol_encoding: TerminalMouseProtocolEncoding::Default,
             produced_at_unix_ms: 0,
             screen_state: PtyScreenState::default(),
+            bracketed_paste: None,
         }
     }
 

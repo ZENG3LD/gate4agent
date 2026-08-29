@@ -6259,6 +6259,7 @@ fn terminal_frame_from_harness(frame: HarnessRuntimeTerminalFrameV1) -> Terminal
             HarnessRuntimeMouseProtocolEncodingV1::Sgr => TerminalMouseProtocolEncoding::Sgr,
         },
         screen_state: project_pty_screen_state(frame.screen_state),
+        bracketed_paste: frame.bracketed_paste,
     }
 }
 
@@ -10005,6 +10006,7 @@ mod tests {
             // that into `PtyScreenState::Unknown`, not a fabricated
             // `Ready`.
             screen_state: None,
+            bracketed_paste: None,
         };
         let page = |frames: Vec<HarnessRuntimeTerminalFrameV1>| WorkerUpdate::HarnessTerminalRead(
             HarnessRuntimeTerminalPageV1 {
@@ -10232,6 +10234,7 @@ mod tests {
                 mouse_protocol_enabled: false,
                 mouse_protocol_encoding: HarnessRuntimeMouseProtocolEncodingV1::Default,
                 screen_state: None,
+                bracketed_paste: None,
             },
             coalesced_since_last: 0,
         };

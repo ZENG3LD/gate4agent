@@ -5847,6 +5847,7 @@ mod tests {
             mouse_protocol_encoding: Default::default(),
             produced_at_unix_ms: 0,
             screen_state: PtyScreenState::default(),
+            bracketed_paste: None,
         };
         engine.apply_observation(ObservationEnvelope {
             protocol_version: CONTROL_PROTOCOL_VERSION,
@@ -5882,6 +5883,7 @@ mod tests {
                     mouse_protocol_encoding: Default::default(),
                     produced_at_unix_ms: 0,
                     screen_state: PtyScreenState::default(),
+                    bracketed_paste: None,
                 },
             },
         });

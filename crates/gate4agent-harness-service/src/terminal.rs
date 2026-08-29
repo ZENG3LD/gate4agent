@@ -201,6 +201,10 @@ pub fn terminal_frame_to_wire(
         produced_at_unix_ms: frame.produced_at_unix_ms,
         screen_state: (wire_version >= HARNESS_OPERATOR_WIRE_VERSION_V13)
             .then(|| map_screen_state(&frame.screen_state)),
+        // Unlike `screen_state`, not gated on `wire_version` -- see
+        // `HarnessRuntimeTerminalFrameV1::bracketed_paste`'s own doc for why
+        // there is no separate "peer didn't ask" state to distinguish.
+        bracketed_paste: frame.bracketed_paste,
     }
 }
 
@@ -557,6 +561,7 @@ mod tests {
             mouse_protocol_encoding: TerminalMouseProtocolEncoding::Default,
             produced_at_unix_ms: 0,
             screen_state: PtyScreenState::default(),
+            bracketed_paste: None,
         }
     }
 

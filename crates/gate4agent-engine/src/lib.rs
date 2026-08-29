@@ -394,7 +394,8 @@ impl Gate4AgentEngine {
                 | (
                     SessionStatus::Running | SessionStatus::Stopping,
                     ControlObservation::TerminalFrame { .. }
-                        | ControlObservation::TerminalStale { .. },
+                        | ControlObservation::TerminalStale { .. }
+                        | ControlObservation::ScreenState { .. },
                 )
                 | (
                     SessionStatus::Starting | SessionStatus::Running | SessionStatus::Stopping,
@@ -621,6 +622,10 @@ impl Gate4AgentEngine {
                         session.session_options = None;
                         session.history = HistorySnapshot::default();
                         session.foreground = ForegroundSnapshot::default();
+                        // A new generation must not inherit the old one's
+                        // screen classification -- nothing has observed
+                        // this generation's PTY yet.
+                        session.screen_state = PtyScreenState::default();
                         session.provider = ProviderSnapshot::default();
                         session.resume.pending = Some(PendingResumeOperation {
                             phase: ResumePhase::Spawning,
@@ -853,6 +858,20 @@ impl Gate4AgentEngine {
                     message: message.clone(),
                 },
             );
+            return;
+        }
+        if let ControlObservation::ScreenState { state: screen_state } = &envelope.observation {
+            // The observation is the authority for `SessionSnapshot::screen_state`;
+            // `TerminalFrame::screen_state` is only a per-frame stamp for terminal
+            // subscribers reading a single frame in isolation. Both are read off
+            // the same value computed at the node, but only this observation sets
+            // the snapshot field a caller consults without subscribing to frames.
+            let state = self
+                .sessions
+                .get_mut(&instance_id)
+                .expect("validated session");
+            state.snapshot.screen_state = screen_state.clone();
+            self.bump_revision();
             return;
         }
         if let ControlObservation::ProviderEvent {
@@ -1242,6 +1261,7 @@ impl Gate4AgentEngine {
             }
             ControlObservation::TerminalFrame { .. }
             | ControlObservation::TerminalStale { .. }
+            | ControlObservation::ScreenState { .. }
             | ControlObservation::ProviderEvent { .. }
             | ControlObservation::ProviderGap { .. }
             | ControlObservation::CapabilitiesProbed { .. }
@@ -1432,6 +1452,10 @@ impl Gate4AgentEngine {
             session.terminal_stale = None;
             session.session_options = request.session_options.clone();
             session.foreground = ForegroundSnapshot::default();
+            // A new generation must not inherit the old one's screen
+            // classification -- nothing has observed this generation's
+            // PTY yet.
+            session.screen_state = PtyScreenState::default();
             session.provider = ProviderSnapshot::default();
             (session.agent_id.clone(), session.transport)
         };

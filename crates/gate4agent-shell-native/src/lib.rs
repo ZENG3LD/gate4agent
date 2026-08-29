@@ -15,7 +15,7 @@ pub use provider_supervisor::{
     MAX_PROVIDER_SUPERVISOR_WORK_PER_TICK,
 };
 
-use gate4agent::agent::ReadinessStatus;
+use gate4agent::agent::{is_agent_foreground_wrapper, is_expected_agent_process, ReadinessStatus};
 use gate4agent::pty::cli::codex::strip_ansi_codes;
 use gate4agent::pty::cli::{create_pipeline, ClassificationPipeline, MessageClass, ParsedMessage};
 use gate4agent::pty::event::PtyMouseProtocolEncoding;
@@ -100,6 +100,26 @@ struct OwnedPtySession {
     runtime_policy: ProviderRuntimePolicy,
     provider: Option<OwnedPtyProvider>,
     qwen_sidecar: Option<OwnedQwenDualOutput>,
+    /// Set once at the spawn site and never mutated -- this is what lets
+    /// `reclassify_foreground` resolve the session's `AgentSpec` from
+    /// `NativeEffectShell::catalog` without holding a borrow of `session`
+    /// across the same loop iteration it awaits `observe_foreground` on.
+    agent_id: AgentId,
+    last_screen_gate: Option<&'static str>,
+    last_screen_failure: Option<&'static str>,
+    last_foreground_verdict: Option<ForegroundVerdict>,
+    last_screen_state: PtyScreenState,
+    /// Whether this generation's merged state has ever been `Ready`. Text
+    /// crash/missing-command markers are only trustworthy before this
+    /// flips -- see the gate in `collect_terminal_frames`. Never reset in
+    /// place; a new generation gets a fresh `OwnedPtySession`, so `false`
+    /// is simply this field's initial value at the spawn site.
+    ever_reached_ready: bool,
+    /// `None` means disarmed -- the session reached `Ready` and stays
+    /// unprobed until its text disagrees again. See
+    /// `NativeEffectShell::reclassify_foreground` for the cadence this
+    /// drives.
+    next_foreground_probe: Option<Instant>,
 }
 
 pub struct QwenDualOutputLaunch {
@@ -928,6 +948,17 @@ impl NativeEffectShell {
                             runtime_policy,
                             provider,
                             qwen_sidecar: qwen_sidecar.map(OwnedQwenDualOutput::from),
+                            agent_id,
+                            last_screen_gate: None,
+                            last_screen_failure: None,
+                            last_foreground_verdict: None,
+                            last_screen_state: PtyScreenState::default(),
+                            ever_reached_ready: false,
+                            // Armed immediately -- the first
+                            // `reclassify_foreground` tick after spawn
+                            // probes this session right away rather than
+                            // waiting a full `FOREGROUND_RECLASSIFY_INTERVAL`.
+                            next_foreground_probe: Some(Instant::now()),
                         },
                     );
                     ControlObservation::Spawned { process_id }
@@ -1264,7 +1295,10 @@ impl NativeEffectShell {
                 Ok(outcome) => ControlObservation::StopCompleted {
                     forced: force || outcome.termination.is_some(),
                     exit_code: outcome.exit_code,
-                    final_terminal: Some(terminal_frame(outcome.terminal)),
+                    // The last classification this session ever computed --
+                    // stamped through unchanged, same as every other frame;
+                    // nothing observes this session again after this point.
+                    final_terminal: Some(terminal_frame(outcome.terminal, owned.last_screen_state.clone())),
                 },
                 Err(error) => {
                     eprintln!(
@@ -1362,8 +1396,12 @@ impl NativeEffectShell {
                 .pty_sessions
                 .remove(&key)
                 .expect("completed key came from the owned session map");
+            let last_screen_state = owned.last_screen_state.clone();
             let (exit_code, final_terminal) = match owned.session.shutdown().await {
-                Ok(outcome) => (outcome.exit_code, Some(terminal_frame(outcome.terminal))),
+                Ok(outcome) => (
+                    outcome.exit_code,
+                    Some(terminal_frame(outcome.terminal, last_screen_state)),
+                ),
                 Err(_) => (None, None),
             };
             if let Some(sidecar) = &mut owned.qwen_sidecar {
@@ -1437,13 +1475,54 @@ impl NativeEffectShell {
                 Ok(snapshot) if snapshot.sequence > owned.last_terminal_sequence => {
                     owned.last_terminal_sequence = snapshot.sequence;
                     owned.terminal_stale_published = false;
+
+                    // `snapshot.contents` is already in memory for the
+                    // `TerminalFrame` below, so both text matchers run for
+                    // free here -- no extra syscall, no extra capture.
+                    owned.last_screen_gate = startup_operator_gate(&snapshot.contents);
+                    // `screen_failure`'s markers are crash SHAPES, and as
+                    // raw bytes those are indistinguishable from an agent
+                    // choosing to render the same text while explaining or
+                    // running someone else's failure. Before this
+                    // generation has ever rendered its own UI, nothing else
+                    // could have put a crash banner on the screen, so the
+                    // marker genuinely means the CLI failed to come up;
+                    // once it has been `Ready`, the identical bytes are
+                    // ordinary content, not state, so the matcher is not
+                    // even run.
+                    owned.last_screen_failure =
+                        screen_failure_for_generation(&snapshot.contents, owned.ever_reached_ready);
+                    let merged = classify_pty_screen_state(
+                        owned.last_foreground_verdict.as_ref(),
+                        owned.last_screen_gate,
+                        owned.last_screen_failure,
+                    );
+                    if merged == PtyScreenState::Ready {
+                        owned.ever_reached_ready = true;
+                    }
+                    if merged != owned.last_screen_state {
+                        if foreground_probe_rearms_immediately(&owned.last_screen_state, &merged) {
+                            owned.next_foreground_probe = Some(Instant::now());
+                        }
+                        owned.last_screen_state = merged.clone();
+                        observations.push(ObservationEnvelope {
+                            protocol_version: CONTROL_PROTOCOL_VERSION,
+                            operation_id: None,
+                            instance_id: key.instance_id,
+                            generation: key.generation,
+                            observation: ControlObservation::ScreenState {
+                                state: merged.clone(),
+                            },
+                        });
+                    }
+
                     observations.push(ObservationEnvelope {
                         protocol_version: CONTROL_PROTOCOL_VERSION,
                         operation_id: None,
                         instance_id: key.instance_id,
                         generation: key.generation,
                         observation: ControlObservation::TerminalFrame {
-                            frame: terminal_frame(snapshot),
+                            frame: terminal_frame(snapshot, merged),
                         },
                     });
                 }
@@ -1461,6 +1540,99 @@ impl NativeEffectShell {
                     });
                 }
                 Err(_) => {}
+            }
+        }
+        observations
+    }
+
+    /// Refresh the foreground half of `PtyScreenState` for whichever
+    /// sessions are due, per `next_foreground_probe`.
+    ///
+    /// Deliberately not folded into `collect_terminal_frames`: that method
+    /// is synchronous and only pays for a real capture when the terminal
+    /// sequence says the screen changed, but `PtySession::observe_foreground`
+    /// is async and walks the live OS process tree
+    /// (`CreateToolhelp32Snapshot` on Windows) unconditionally every time
+    /// it is called. Running that walk once per changed frame would scale
+    /// a syscall with output rate -- exactly the cost
+    /// `collect_terminal_frames`'s own sequence gate exists to avoid. The
+    /// cost here is bounded by the count of sessions NOT currently
+    /// `Ready`, never by output rate and never by total session count: a
+    /// session that reaches `Ready` disarms itself (see
+    /// `foreground_probe_schedule`) and is never probed again until its
+    /// text disagrees.
+    pub async fn reclassify_foreground(&mut self) -> Vec<ObservationEnvelope> {
+        let catalog = &self.catalog;
+        let now = Instant::now();
+        let due: Vec<NativeSessionKey> = self
+            .pty_sessions
+            .iter()
+            .filter(|(_, owned)| owned.next_foreground_probe.is_some_and(|at| now >= at))
+            .map(|(key, _)| *key)
+            .collect();
+
+        let mut observations = Vec::new();
+        for key in due {
+            let Some(owned) = self.pty_sessions.get_mut(&key) else {
+                continue;
+            };
+            match owned.session.observe_foreground().await {
+                Ok(observation) => {
+                    let verdict = match catalog.get(&owned.agent_id) {
+                        Some(spec) => resolve_foreground_verdict(
+                            spec,
+                            &observation,
+                            RuntimePlatform::current(),
+                        ),
+                        // The catalog is loaded once at startup and does not
+                        // shrink at runtime; this branch exists only so a
+                        // hypothetical gap fails toward the conservative
+                        // "not confirmed as the agent" reading rather than
+                        // panicking or silently keeping a stale verdict.
+                        None => ForegroundVerdict::Foreign {
+                            process: observation.observed_process.clone(),
+                        },
+                    };
+                    owned.last_foreground_verdict = Some(verdict);
+                    let merged = classify_pty_screen_state(
+                        owned.last_foreground_verdict.as_ref(),
+                        owned.last_screen_gate,
+                        owned.last_screen_failure,
+                    );
+                    // A foreground-only transition into `Ready` (text was
+                    // already clean; only the process signal was missing)
+                    // must ALSO close the `screen_failure` window for
+                    // future text passes -- see `collect_terminal_frames`.
+                    if merged == PtyScreenState::Ready {
+                        owned.ever_reached_ready = true;
+                    }
+                    if merged != owned.last_screen_state {
+                        owned.last_screen_state = merged.clone();
+                        observations.push(ObservationEnvelope {
+                            protocol_version: CONTROL_PROTOCOL_VERSION,
+                            operation_id: None,
+                            instance_id: key.instance_id,
+                            generation: key.generation,
+                            observation: ControlObservation::ScreenState { state: merged },
+                        });
+                    }
+                    owned.next_foreground_probe =
+                        match foreground_probe_schedule(&owned.last_screen_state) {
+                            ForegroundProbeSchedule::Disarmed => None,
+                            ForegroundProbeSchedule::Armed => {
+                                Some(now + FOREGROUND_RECLASSIFY_INTERVAL)
+                            }
+                        };
+                }
+                Err(_) => {
+                    // A failed OS process-tree walk is `Unknown`'s territory
+                    // -- it says nothing was confirmed, not that the
+                    // process is wrong. Leave whatever verdict/state is
+                    // already recorded alone and simply try again next
+                    // cadence rather than fabricating a `NotAgent` verdict
+                    // or a `Ready` one.
+                    owned.next_foreground_probe = Some(now + FOREGROUND_RECLASSIFY_INTERVAL);
+                }
             }
         }
         observations
@@ -2293,7 +2465,7 @@ fn builtin_legacy_adapter_runtimes() -> AdapterRuntimeRegistry<CliTool> {
     runtimes
 }
 
-fn terminal_frame(snapshot: PtyTerminalSnapshot) -> TerminalFrame {
+fn terminal_frame(snapshot: PtyTerminalSnapshot, screen_state: PtyScreenState) -> TerminalFrame {
     TerminalFrame {
         sequence: snapshot.sequence,
         size: TerminalSize {
@@ -2315,9 +2487,7 @@ fn terminal_frame(snapshot: PtyTerminalSnapshot) -> TerminalFrame {
         // Carried through unchanged from the PTY snapshot -- this crate does
         // not restamp it, see `TerminalFrame::produced_at_unix_ms`'s own doc.
         produced_at_unix_ms: snapshot.produced_at_unix_ms,
-        // No classifier is wired in yet -- the process/text match that
-        // produces a real `PtyScreenState` lands in a later slice.
-        screen_state: PtyScreenState::Unknown,
+        screen_state,
     }
 }
 
@@ -2534,6 +2704,20 @@ fn seed_readiness_from_terminal(
 
 const STARTUP_GATE_SETTLE_MS: u64 = 350;
 const STARTUP_GATE_POLL_MS: u64 = 25;
+/// Steady-state cadence for `NativeEffectShell::reclassify_foreground`.
+///
+/// `wait_for_readiness` already polls the foreground far tighter than this
+/// during startup (`spec.readiness.poll_interval_ms`, 150ms by default),
+/// because a session takes at most a few seconds to come up and getting
+/// that window right matters. This constant is not that -- it governs the
+/// STEADY STATE: a session that has been sitting non-`Ready` for a long
+/// time, which is exactly the incident this module fixes (an update
+/// screen with nobody watching it). A session that reaches `Ready` stops
+/// being probed at all (see `foreground_probe_schedule`), so the cost of
+/// this interval is bounded by the count of sessions that are NOT
+/// `Ready`, never by output rate and never by total session count. One
+/// process-tree walk a second for a handful of stuck sessions is ample.
+const FOREGROUND_RECLASSIFY_INTERVAL: Duration = Duration::from_secs(1);
 // Codex rust-v0.144.0 keeps Enter in newline mode for 120 ms after
 // Windows paste-burst activity. Wait beyond that window only after the TUI
 // visibly incorporates the deferred initial prompt.
@@ -2929,6 +3113,25 @@ async fn wait_for_startup_operator_gate(
     }
 }
 
+/// Refuses a prompt submission while a known operator gate is on screen.
+///
+/// Deliberately checks gates ONLY, never `screen_failure`. A crash banner
+/// means "the CLI fell over" solely before the agent has rendered its own
+/// UI; afterwards the identical bytes mean "the agent is showing you a
+/// crash" -- a test it ran, a traceback it was asked to explain. What
+/// separates the two is not the text but WHEN it appeared, and this
+/// function has no way to date its evidence: it holds a screen snapshot
+/// and a spec, and is called from seven sites spanning both the startup
+/// window and long-running follow-up delivery. A check that cannot tell
+/// those apart would refuse work from a perfectly healthy session every
+/// time its pane happened to show a failing subprocess.
+///
+/// The `Failing` classification is not lost by this -- it is computed
+/// where the window IS known (`collect_terminal_frames`, gated on
+/// `OwnedPtySession::ever_reached_ready`), published upstream, and enforced
+/// by the callers that gate dispatch on `PtyScreenState`. Gates are
+/// different in kind and stay here: a trust or update prompt is legitimate
+/// at any point in a session's life, so it needs no window to be believed.
 fn ensure_no_startup_operator_gate(session: &PtySession, spec: &AgentSpec) -> Result<(), String> {
     let snapshot = session.terminal_state().map_err(|error| error.to_string())?;
     match startup_operator_gate(&snapshot.contents) {
@@ -2954,12 +3157,49 @@ fn ensure_no_readiness_operator_gate(
     }
 }
 
-fn startup_operator_gate(contents: &str) -> Option<&'static str> {
-    let normalized = contents
+/// Whitespace-collapse and lowercase raw PTY screen text before pattern
+/// matching. Shared by `startup_operator_gate` and `screen_failure` so the
+/// two agree on what "the same phrase" means -- if they normalized
+/// independently, a line-wrap difference or a run of extra spaces could
+/// make one matcher see a phrase the other misses for no reason connected
+/// to the actual screen content.
+fn normalize_screen_text(contents: &str) -> String {
+    contents
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
-        .to_ascii_lowercase();
+        .to_ascii_lowercase()
+}
+
+/// Phrases showing a package manager actively installing or updating a
+/// package. Generic across npm/pip/yarn/pnpm rather than any one vendor's
+/// package name, so a wrapper script fronting any provider CLI is
+/// recognized the same way -- see the `PACKAGE_MANAGER_UPDATE_COMPLETION_MARKERS`
+/// doc below for why a bare occurrence of one of these alone is not enough.
+const PACKAGE_MANAGER_INSTALL_MARKERS: &[&str] = &[
+    "npm install -g",
+    "npm i -g",
+    "npm update -g",
+    "pip install --upgrade",
+    "pip install -u",
+    "yarn global add",
+    "pnpm add -g",
+];
+
+/// Phrases showing the install/update above reached a terminal state and
+/// wants the CLI relaunched. Required to co-occur with a marker from
+/// `PACKAGE_MANAGER_INSTALL_MARKERS` so a screen that merely MENTIONS a
+/// package-manager command (an agent explaining how to install something,
+/// for instance) never matches on the install phrase alone.
+const PACKAGE_MANAGER_UPDATE_COMPLETION_MARKERS: &[&str] = &[
+    "update ran successfully",
+    "please restart",
+    "update complete",
+    "updated successfully",
+];
+
+fn startup_operator_gate(contents: &str) -> Option<&'static str> {
+    let normalized = normalize_screen_text(contents);
     if [
         "trust this folder",
         "trust the files in this folder",
@@ -2999,6 +3239,26 @@ fn startup_operator_gate(contents: &str) -> Option<&'static str> {
     {
         return Some("vendor update");
     }
+    // A wrapper script self-updating via a package manager before the real
+    // CLI ever launches -- the case that produced the incident this module
+    // fixes: an npm-driven wrapper ran an update to completion and printed
+    // nothing that looked like the agent, while every consumer still saw a
+    // live, `status: running` PTY. This shares the "vendor update" label
+    // with the Kimi in-app case just above on purpose, not by omission:
+    // both are "the CLI is updating itself", the only difference is WHICH
+    // process drives it (the agent's own composer vs. a wrapper script's
+    // package-manager install), and an operator reading `OperatorGate::gate`
+    // should see one meaning for that fact regardless of which vendor's
+    // update mechanism produced it.
+    if PACKAGE_MANAGER_INSTALL_MARKERS
+        .iter()
+        .any(|marker| normalized.contains(marker))
+        && PACKAGE_MANAGER_UPDATE_COMPLETION_MARKERS
+            .iter()
+            .any(|marker| normalized.contains(marker))
+    {
+        return Some("vendor update");
+    }
     if normalized.contains("choose the text style that looks best with your terminal") {
         return Some("terminal appearance setup");
     }
@@ -3017,6 +3277,214 @@ fn startup_operator_gate(contents: &str) -> Option<&'static str> {
             && normalized.contains("enter confirm")
             && normalized.contains("esc")
     })
+}
+
+/// True if `line` ends in a bare shell-prompt character -- used only to
+/// raise confidence on the one `screen_failure` marker
+/// (`"no such file or directory"`) that is otherwise too generic to trust
+/// alone; see that bucket's own comment.
+fn looks_like_shell_prompt_line(line: &str) -> bool {
+    matches!(line.trim_end().chars().last(), Some('$' | '%' | '#' | '>'))
+}
+
+/// Screens where the foreground process already matches the agent (this is
+/// NOT the `NotAgent` process-mismatch case) but the screen itself shows
+/// the process came up wrong or fell over. Nothing typed into THIS screen
+/// fixes it, which is the line that separates `Failing` from
+/// `OperatorGate`: a gate is resolved by typing an answer into the pane, a
+/// failure is not.
+///
+/// Every marker here is a crash SHAPE -- a stack-trace banner, a shell's
+/// own "command not found" line -- and as raw bytes a crash shape is
+/// indistinguishable from an agent CHOOSING to render that same text while
+/// explaining, or running, someone else's failure (`cargo test` hitting a
+/// failing assertion, a script the agent ran that threw, a bug report it
+/// was asked to read). Text alone cannot tell "the CLI crashed" from "the
+/// CLI is showing you a crash" -- both put identical bytes on screen. The
+/// one window where these markers ARE trustworthy is before this
+/// generation's session has ever reached `Ready`: with no prior render of
+/// the agent's own UI, there is nothing else on the screen that could have
+/// produced a crash banner, so it genuinely means the launch failed. That
+/// is why this function's caller in `collect_terminal_frames` stops
+/// calling it at all once `Ready`, rather than trying to make the matching
+/// itself tell healthy narration apart from a real crash -- no marker set
+/// can do that from bytes alone.
+fn screen_failure(contents: &str) -> Option<&'static str> {
+    let normalized = normalize_screen_text(contents);
+
+    // A language runtime's own uncaught-exception banner -- fixed strings
+    // a runtime prints verbatim at the head of a crash dump, not phrasing
+    // a chat transcript would casually reproduce in this exact shape.
+    // `"fatal error:"` is deliberately NOT included: it is also what a
+    // C/C++ compiler prints for an ordinary missing-header build error, and
+    // a wrapper script's build step can emit that while the real CLI still
+    // comes up fine afterwards -- untrustworthy even in the startup window
+    // without a second signal this function does not have.
+    if ["panicked at", "unhandled exception", "traceback (most recent call last)"]
+        .iter()
+        .any(|marker| normalized.contains(marker))
+    {
+        return Some("crash");
+    }
+
+    // A shell reporting that the launch command itself does not exist.
+    // The first two are OS/shell-owned sentence shapes on their own. The
+    // third, `"no such file or directory"`, is common enough in ordinary
+    // ENOENT discussion that it needs a companion signal -- a line that
+    // itself ends in a bare shell prompt -- before it counts.
+    if normalized.contains("command not found")
+        || normalized.contains("is not recognized as an internal or external command")
+        || (normalized.contains("no such file or directory")
+            && contents.lines().any(looks_like_shell_prompt_line))
+    {
+        return Some("missing command");
+    }
+
+    None
+}
+
+/// The window gate on `screen_failure`, factored into its own pure
+/// function so the "stop trusting crash markers once this generation has
+/// ever been `Ready`" rule is unit-testable without constructing a live
+/// `OwnedPtySession` (which owns a real PTY and cannot be built in a unit
+/// test). `collect_terminal_frames` calls this, not `screen_failure`
+/// directly.
+fn screen_failure_for_generation(contents: &str, ever_reached_ready: bool) -> Option<&'static str> {
+    if ever_reached_ready {
+        None
+    } else {
+        screen_failure(contents)
+    }
+}
+
+/// The foreground half of the classification, resolved by the caller so
+/// the merge itself stays a pure function.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ForegroundVerdict {
+    /// Foreground is the agent's own binary, or a tolerated wrapper.
+    Agent,
+    /// Foreground is something else. Carries what was actually seen.
+    Foreign { process: String },
+}
+
+/// Merge the foreground and text signals into one screen classification.
+///
+/// The ORDER below, not the branches, is the part worth reading closely:
+///
+/// 1. A foreign foreground wins outright, even over a matching gate or
+///    failure text pattern, because the process signal is structurally
+///    exhaustive in the one way that matters -- it never needs to
+///    recognize an updater's specific wording to say "this is not the
+///    agent". A vendor wrapper whose text this module's matchers do not
+///    yet know about still gets caught here.
+/// 2. With no foreign foreground, `Failing` outranks `OperatorGate`: a
+///    crashed screen can still have a leftover gate prompt sitting in
+///    view above the crash dump, and "broken" is the more urgent of the
+///    two truths for an operator to hear -- reporting "waiting for input"
+///    about a session that has actually fallen over sends someone to type
+///    into a pane that cannot use it.
+/// 3. `OperatorGate` next, for the "resolvable by typing" reason
+///    documented on `PtyScreenState` itself.
+/// 4. With no foreground observation at all, the answer is `Unknown`, not
+///    `Ready` -- a clean text read is NEVER, by itself, proof the screen
+///    is the agent's. `Ready` requires the foreground to have been
+///    checked AND to have matched, per the asymmetry documented on
+///    `PtyScreenState::Ready`.
+/// 5. Only once foreground is confirmed AND no gate/failure text matched
+///    does the merge land on `Ready`.
+fn classify_pty_screen_state(
+    foreground: Option<&ForegroundVerdict>,
+    gate: Option<&'static str>,
+    failure: Option<&'static str>,
+) -> PtyScreenState {
+    if let Some(ForegroundVerdict::Foreign { process }) = foreground {
+        return PtyScreenState::NotAgent {
+            observed_process: process.clone(),
+        };
+    }
+    if let Some(reason) = failure {
+        return PtyScreenState::Failing {
+            reason: reason.to_owned(),
+        };
+    }
+    if let Some(gate) = gate {
+        return PtyScreenState::OperatorGate {
+            gate: gate.to_owned(),
+        };
+    }
+    if foreground.is_some() {
+        PtyScreenState::Ready
+    } else {
+        PtyScreenState::Unknown
+    }
+}
+
+/// Resolve what an OS process-tree observation means for classification,
+/// reusing the exact matchers `ReadinessTracker::observe_foreground` trusts
+/// at startup so this module's tolerance for a spawning wrapper
+/// (`node`/`python`/`python3`) never drifts from readiness's own -- a false
+/// `NotAgent` on a legitimate wrapper would be a regression on what
+/// readiness already tolerates.
+///
+/// Deliberately looser than `ReadinessTracker::observe_foreground` in one
+/// respect: it does not gate the wrapper tolerance behind
+/// `has_child_processes`/a poll-count threshold. Those exist there to
+/// decide "confident enough to flip session status to Running" from a
+/// process signal ALONE. Here the text signal still has to independently
+/// agree before the merge can reach `Ready` (see `classify_pty_screen_state`),
+/// so being more permissive about which process counts as plausible never
+/// lets a bad screen through on the process signal by itself.
+fn resolve_foreground_verdict(
+    spec: &AgentSpec,
+    observation: &PtyForegroundObservation,
+    platform: RuntimePlatform,
+) -> ForegroundVerdict {
+    let process_name = observation
+        .readiness
+        .process_name
+        .as_deref()
+        .unwrap_or(observation.observed_process.as_str());
+    if is_expected_agent_process(spec, process_name, platform)
+        || is_agent_foreground_wrapper(process_name, platform)
+    {
+        ForegroundVerdict::Agent
+    } else {
+        ForegroundVerdict::Foreign {
+            process: observation.observed_process.clone(),
+        }
+    }
+}
+
+/// Whether `NativeEffectShell::reclassify_foreground` should schedule
+/// another probe after a fresh classification, factored out as a small
+/// pure function so the decision is testable without constructing a live
+/// `OwnedPtySession` (which owns a real PTY and cannot be built in a unit
+/// test).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ForegroundProbeSchedule {
+    /// The session reached `Ready` -- stop probing until text disagrees.
+    Disarmed,
+    /// Still unresolved, or freshly non-ready -- probe again after the interval.
+    Armed,
+}
+
+fn foreground_probe_schedule(state: &PtyScreenState) -> ForegroundProbeSchedule {
+    if matches!(state, PtyScreenState::Ready) {
+        ForegroundProbeSchedule::Disarmed
+    } else {
+        ForegroundProbeSchedule::Armed
+    }
+}
+
+/// Whether a text-only reclassification that just changed the merged state
+/// (inside `collect_terminal_frames`) should force the foreground probe due
+/// immediately, rather than waiting for its normal cadence. Factored out
+/// for the same testability reason as `foreground_probe_schedule`: a
+/// session that was `Ready` and whose text just started matching a gate or
+/// failure pattern needs its foreground re-checked promptly, since the
+/// last thing anyone probed was clean and the screen no longer agrees.
+fn foreground_probe_rearms_immediately(previous: &PtyScreenState, next: &PtyScreenState) -> bool {
+    matches!(previous, PtyScreenState::Ready) && !matches!(next, PtyScreenState::Ready)
 }
 
 fn observe_readiness_event(
@@ -3170,26 +3638,31 @@ fn elapsed_ms(started: Instant) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        argument_looks_like_credential, drain_qwen_sidecar, finish_qwen_sidecar,
+        argument_looks_like_credential, classify_pty_screen_state, drain_qwen_sidecar,
+        finish_qwen_sidecar, foreground_probe_rearms_immediately, foreground_probe_schedule,
         prepare_fresh_pty_provider_session,
         prompt_render_probe, prompt_rendered, redact_provider_argument, redact_provider_arguments,
-        reserve_provider_gap_sequence, with_pty_terminal_capability_defaults, NativeSessionKey,
-        NativeEffectShell, OwnedQwenDualOutput, QwenDualOutputLaunch,
-        QWEN_SIDECAR_READ_MAX_BYTES_PER_TICK,
+        reserve_provider_gap_sequence, resolve_foreground_verdict, screen_failure,
+        screen_failure_for_generation, with_pty_terminal_capability_defaults, NativeSessionKey,
+        NativeEffectShell,
+        OwnedQwenDualOutput, QwenDualOutputLaunch, QWEN_SIDECAR_READ_MAX_BYTES_PER_TICK,
         should_attach_pty_provider_stream, should_probe_pty_identity, startup_operator_gate,
         terminal_frame, validate_instance_launch_arguments, validate_spawn_runtime_policy,
-        ReadinessDiagnostics, Utf8ChunkDecoder,
+        ForegroundProbeSchedule, ForegroundVerdict, ReadinessDiagnostics, Utf8ChunkDecoder,
     };
     use gate4agent_adapters::builtin_adapter_registry;
     use gate4agent_catalog::EnvMutation;
+    use gate4agent::agent::ForegroundObservation;
     use gate4agent::core::types::{
         AgentEvent, ContextWindowUsage as AgentContextWindowUsage,
     };
     use gate4agent::pty::event::PtyMouseProtocolEncoding;
+    use gate4agent::pty::{PtyForegroundObservation, PtyForegroundSource};
     use gate4agent_types::{
         AdapterFamily, AgentId, AgentInstanceId, ControlEffect, ControlObservation, EffectEnvelope,
-        OperationId, ProviderEvent, ProviderRuntimePolicy, SessionGeneration, StartRequest,
-        TerminalMouseProtocolEncoding, TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
+        OperationId, ProviderEvent, ProviderRuntimePolicy, PtyScreenState, RuntimePlatform,
+        SessionGeneration, StartRequest, TerminalMouseProtocolEncoding, TerminalSize,
+        TransportKind, CONTROL_PROTOCOL_VERSION,
     };
     use std::ffi::{OsStr, OsString};
     use std::fs::{File, OpenOptions};
@@ -3225,7 +3698,7 @@ mod tests {
         snapshot.mouse_protocol_encoding = PtyMouseProtocolEncoding::Sgr;
         snapshot.produced_at_unix_ms = 1_700_000_000_000;
 
-        let frame = terminal_frame(snapshot);
+        let frame = terminal_frame(snapshot, PtyScreenState::default());
         assert_eq!(frame.scrollback_formatted, vec![b"older".to_vec()]);
         assert!(frame.alternate_screen);
         assert!(frame.mouse_protocol_enabled);
@@ -3383,6 +3856,274 @@ mod tests {
             Some("workspace trust")
         );
         assert_eq!(startup_operator_gate("ready for a prompt"), None);
+        // Regression test for the incident this module fixes: a provider
+        // CLI's wrapper self-updated via npm before the real agent ever
+        // launched, and every consumer saw `status: running` on a live PTY
+        // that was actually showing this text. Verbatim transcript.
+        assert_eq!(
+            startup_operator_gate(
+                "Updating Codex via `npm install -g @openai/codex`...\n\
+                 npm warn cleanup Failed to remove some directories\n\
+                 Update ran successfully! Please restart Codex."
+            ),
+            Some("vendor update")
+        );
+    }
+
+    #[test]
+    fn screen_failure_recognizes_crash_and_missing_command_banners() {
+        assert_eq!(
+            screen_failure("thread 'main' panicked at 'index out of bounds', src/main.rs:12:5"),
+            Some("crash")
+        );
+        assert_eq!(
+            screen_failure("Traceback (most recent call last):\n  File \"a.py\", line 1"),
+            Some("crash")
+        );
+        assert_eq!(
+            screen_failure("bash: fooagent: command not found"),
+            Some("missing command")
+        );
+        assert_eq!(
+            screen_failure("C:\\workspace> fooagent\n'fooagent' is not recognized as an internal or external command"),
+            Some("missing command")
+        );
+        assert_eq!(
+            screen_failure(
+                "workspace/project $ fooagent: no such file or directory\nworkspace/project $"
+            ),
+            Some("missing command")
+        );
+        // Bare ENOENT prose with no trailing shell-prompt line is exactly
+        // the generic case this bucket must NOT fire on alone.
+        assert_eq!(
+            screen_failure("The build log mentions no such file or directory near line 40."),
+            None
+        );
+        // `"fatal error:"` was deliberately dropped: a build step inside a
+        // wrapper script can print this while the real CLI still comes up
+        // fine, so it is not a crash SHAPE this function trusts at all.
+        assert_eq!(
+            screen_failure("fooagent-installer: fatal error: missing header <stdio.h>"),
+            None
+        );
+    }
+
+    #[test]
+    fn screen_failure_no_longer_has_an_authentication_expired_bucket() {
+        // Two common words matched anywhere on one 80x24 screen is not a
+        // signal -- an agent's own prose explaining an auth bug ("the
+        // token has expired") used to flip a healthy session to `Failing`.
+        // The bucket is gone entirely, not narrowed.
+        assert_eq!(
+            screen_failure("Your session token has expired. Please re-authenticate."),
+            None
+        );
+        assert_eq!(
+            screen_failure("The stored credential was revoked by the workspace admin."),
+            None
+        );
+    }
+
+    #[test]
+    fn screen_failure_does_not_false_positive_on_an_agent_narrating_an_error() {
+        // The false-positive direction matters more than coverage here: an
+        // agent CLI renders arbitrary text back at a human, including logs
+        // and error messages it was asked to explain. None of the phrases
+        // below are in the exact failure SHAPE this module matches on.
+        let narration = "I looked at the traceback you pasted -- it's a Python \
+             exception, a plain ValueError from a retry loop, not a real crash. \
+             Our harness logs the word fatal in its own banner for visibility, \
+             but nothing actually panicked. The command definitely exists; it \
+             just needed different flags, and your token is still valid.";
+        assert_eq!(screen_failure(narration), None);
+    }
+
+    #[test]
+    fn screen_failure_for_generation_ignores_every_marker_once_the_session_was_ever_ready() {
+        // Each of these is a screen from a HEALTHY, already-`Ready` session
+        // whose own routine work happens to render a crash-shaped string.
+        // This is the regression this whole gate exists to close: before
+        // it, every one of these flipped a working session to `Failing`.
+        let shell_command_not_found = "$ frobnicate --help\nbash: frobnicate: command not found\n$";
+        assert_eq!(
+            screen_failure_for_generation(shell_command_not_found, true),
+            None
+        );
+
+        let python_traceback_from_a_ran_script = "$ python broken.py\n\
+             Traceback (most recent call last):\n  File \"broken.py\", line 3, in <module>\n\
+             ValueError: bad input\n$";
+        assert_eq!(
+            screen_failure_for_generation(python_traceback_from_a_ran_script, true),
+            None
+        );
+
+        let cargo_test_panic = "running 1 test\n\
+             error[E0308]: mismatched types\n\
+             thread 'tests::it_fails' panicked at 'assertion failed', src/lib.rs:9:5\n\
+             test result: FAILED. 0 passed; 1 failed";
+        assert_eq!(screen_failure_for_generation(cargo_test_panic, true), None);
+
+        let agent_narrating_an_expired_token = "The API token has expired; \
+             I revoked the old credential and issued a new one for you.";
+        assert_eq!(
+            screen_failure_for_generation(agent_narrating_an_expired_token, true),
+            None
+        );
+
+        // Pin the narrowing from the other side too: the exact same
+        // screens are still real evidence of a broken LAUNCH inside the
+        // startup window, before this generation has ever rendered its
+        // own UI.
+        assert_eq!(
+            screen_failure_for_generation(shell_command_not_found, false),
+            Some("missing command")
+        );
+        assert_eq!(
+            screen_failure_for_generation(python_traceback_from_a_ran_script, false),
+            Some("crash")
+        );
+        assert_eq!(screen_failure_for_generation(cargo_test_panic, false), Some("crash"));
+    }
+
+    #[test]
+    fn classify_pty_screen_state_lets_a_foreign_process_win_over_a_matching_gate_text() {
+        // The process signal outranks the text signal outright: it does not
+        // need to recognize an updater's specific wording to know the
+        // screen is not the agent's, so it wins even when the text ALSO
+        // happens to match a known gate pattern.
+        let foreign = ForegroundVerdict::Foreign {
+            process: "npm".to_owned(),
+        };
+        assert_eq!(
+            classify_pty_screen_state(Some(&foreign), None, None),
+            PtyScreenState::NotAgent {
+                observed_process: "npm".to_owned()
+            }
+        );
+        assert_eq!(
+            classify_pty_screen_state(Some(&foreign), Some("vendor update"), None),
+            PtyScreenState::NotAgent {
+                observed_process: "npm".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn classify_pty_screen_state_reports_a_gate_only_when_foreground_matches() {
+        assert_eq!(
+            classify_pty_screen_state(Some(&ForegroundVerdict::Agent), Some("authentication"), None),
+            PtyScreenState::OperatorGate {
+                gate: "authentication".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn classify_pty_screen_state_reports_failing_for_a_matched_foreground() {
+        assert_eq!(
+            classify_pty_screen_state(Some(&ForegroundVerdict::Agent), None, Some("crash")),
+            PtyScreenState::Failing {
+                reason: "crash".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn classify_pty_screen_state_prefers_failing_over_a_co_occurring_gate() {
+        // Pins the precedence: a crashed screen can still carry a leftover
+        // gate prompt above the crash dump, and `Failing` is the more
+        // urgent of the two truths.
+        assert_eq!(
+            classify_pty_screen_state(
+                Some(&ForegroundVerdict::Agent),
+                Some("authentication"),
+                Some("crash")
+            ),
+            PtyScreenState::Failing {
+                reason: "crash".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn classify_pty_screen_state_reaches_ready_only_with_matched_foreground_and_clean_text() {
+        assert_eq!(
+            classify_pty_screen_state(Some(&ForegroundVerdict::Agent), None, None),
+            PtyScreenState::Ready
+        );
+    }
+
+    #[test]
+    fn classify_pty_screen_state_never_reaches_ready_without_a_foreground_observation() {
+        // The one case that must never regress: a clean text read alone is
+        // never proof of `Ready`.
+        assert_eq!(classify_pty_screen_state(None, None, None), PtyScreenState::Unknown);
+    }
+
+    #[test]
+    fn resolve_foreground_verdict_tolerates_a_spawning_wrapper_like_readiness_does() {
+        // The fixture spec's `expected_processes` does not name "node", so
+        // this only passes if the wrapper-tolerance branch (mirroring
+        // `ReadinessTracker::observe_foreground`'s own `node`/`python`/
+        // `python3` tolerance) is actually what resolves it -- proving the
+        // existing wrapper tolerance is not regressed. Fed into
+        // `classify_pty_screen_state` with clean text, this is what reaches
+        // `Ready` rather than `NotAgent` for a legitimate spawning wrapper.
+        let spec = gate4agent_testkit::interactive_agent_spec();
+        let observation = PtyForegroundObservation {
+            root_pid: 1,
+            observed_pid: 2,
+            observed_process: "node".to_owned(),
+            readiness: ForegroundObservation {
+                process_name: Some("node".to_owned()),
+                has_child_processes: true,
+                is_shell: false,
+            },
+            source: PtyForegroundSource::ProcessTree,
+        };
+        let verdict = resolve_foreground_verdict(&spec, &observation, RuntimePlatform::current());
+        assert_eq!(verdict, ForegroundVerdict::Agent);
+        assert_eq!(
+            classify_pty_screen_state(Some(&verdict), None, None),
+            PtyScreenState::Ready
+        );
+    }
+
+    #[test]
+    fn foreground_probe_disarms_only_once_ready_and_rearms_on_a_fresh_gate() {
+        assert_eq!(
+            foreground_probe_schedule(&PtyScreenState::Ready),
+            ForegroundProbeSchedule::Disarmed
+        );
+        assert_eq!(
+            foreground_probe_schedule(&PtyScreenState::Unknown),
+            ForegroundProbeSchedule::Armed
+        );
+        assert_eq!(
+            foreground_probe_schedule(&PtyScreenState::OperatorGate {
+                gate: "vendor update".to_owned()
+            }),
+            ForegroundProbeSchedule::Armed
+        );
+    }
+
+    #[test]
+    fn text_only_gate_transition_rearms_the_probe_only_when_leaving_ready() {
+        let gate = PtyScreenState::OperatorGate {
+            gate: "vendor update".to_owned(),
+        };
+        assert!(foreground_probe_rearms_immediately(
+            &PtyScreenState::Ready,
+            &gate
+        ));
+        // Was never `Ready` in the first place -- nothing to rearm early
+        // for, the session's normal cadence already has it covered.
+        assert!(!foreground_probe_rearms_immediately(
+            &PtyScreenState::Unknown,
+            &gate
+        ));
     }
 
     #[test]

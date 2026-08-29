@@ -629,6 +629,17 @@ pub enum ControlObservation {
     TerminalStale {
         message: String,
     },
+    /// The node's merged `PtyScreenState` classification changed. Emitted
+    /// only on an actual change, never per frame and never per foreground
+    /// probe -- the node compares against its own last-published value
+    /// before sending this, so a subscriber never has to de-duplicate.
+    /// This is node-internal (shell -> engine), the same lane as
+    /// `TerminalFrame`/`TerminalStale`, not a wire type: neither the node
+    /// nor the c2 protocol carries `ControlObservation` across a process
+    /// boundary, so this variant needs no version gate.
+    ScreenState {
+        state: PtyScreenState,
+    },
     ProviderEvent {
         source: ProviderSource,
         sequence: u64,
@@ -648,6 +659,7 @@ impl ControlObservation {
             Self::ProcessExited { .. }
                 | Self::TerminalFrame { .. }
                 | Self::TerminalStale { .. }
+                | Self::ScreenState { .. }
                 | Self::ProviderEvent { .. }
                 | Self::ProviderGap { .. }
         )

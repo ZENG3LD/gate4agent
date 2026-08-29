@@ -2717,6 +2717,19 @@ async fn publish_shell_observations(
         }
     }
 
+    // Foreground reclassification runs after the text pass above so a
+    // session `collect_terminal_frames` just re-armed (text went from
+    // `Ready` to a gate/failure) is picked up in this same tick instead of
+    // waiting a full `FOREGROUND_RECLASSIFY_INTERVAL`. Kept out of the text
+    // loop itself: this performs a real OS process-tree walk per due
+    // session, which the text pass's own sequence gate exists specifically
+    // to avoid paying on every changed frame.
+    for observation in shell.reclassify_foreground().await {
+        if context.control_tx.send(observation).await.is_err() {
+            return false;
+        }
+    }
+
     let before = shell.active_session_count();
     for observation in shell.collect_exits().await {
         remove_hook_route_for_observation(&context.hook_ingress, &observation);

@@ -899,13 +899,20 @@ pub(crate) fn apply(app: &mut App, terminal: &TerminalWatermarks, command: Contr
 /// state (its `admits_blind_write()` guard runs first), so this arm never
 /// actually executes there, but the fn stays total rather than panicking
 /// on a state a future caller might legitimately pass it.
+///
+/// `OperatorGate`'s label is `gate.describe()`, not the bare `kind` label:
+/// this response is the one place a caller driving the pane by request/
+/// reply (rather than watching the roster) learns what is on screen, so it
+/// carries whatever options `startup_operator_gate` managed to parse (with
+/// the currently-selected one marked) on top of the gate's kind, same as
+/// `OperatorGateState::describe`'s own doc comment.
 fn screen_state_label(state: &PtyScreenState) -> (&'static str, Option<String>) {
     match state {
         PtyScreenState::Unknown => ("unknown", None),
         PtyScreenState::NotAgent { observed_process } => {
             ("not-agent", Some(observed_process.clone()))
         }
-        PtyScreenState::OperatorGate { gate } => ("operator-gate", Some(gate.clone())),
+        PtyScreenState::OperatorGate { gate } => ("operator-gate", Some(gate.describe())),
         PtyScreenState::Failing { reason } => ("failing", Some(reason.clone())),
         PtyScreenState::Ready => ("ready", None),
     }
@@ -1148,7 +1155,9 @@ mod tests {
     use std::io::BufRead;
 
     use gate4agent_node_protocol::{NodeIncarnationId, OpaqueHostPath};
-    use gate4agent_types::{PtyScreenState, TerminalMouseProtocolEncoding};
+    use gate4agent_types::{
+        OperatorGateKind, OperatorGateState, PtyScreenState, TerminalMouseProtocolEncoding,
+    };
 
     use crate::app::{ConnectionState, NodeView, Provider, SessionView, WorkspaceView};
 
@@ -1694,7 +1703,9 @@ mod tests {
         let mut app = pty_pane_app_with_screen_state(
             true,
             Some(NodeIncarnationId::from_bytes([9; 16])),
-            PtyScreenState::OperatorGate { gate: "workspace-trust".to_owned() },
+            PtyScreenState::OperatorGate {
+                gate: OperatorGateState::new(OperatorGateKind::WorkspaceTrust),
+            },
         );
         let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
         let command = ControlCommand {
@@ -1713,7 +1724,7 @@ mod tests {
             panic!("expected ScreenNotReady");
         };
         assert_eq!(state_kind, "operator-gate");
-        assert_eq!(label.as_deref(), Some("workspace-trust"));
+        assert_eq!(label.as_deref(), Some("workspace trust"));
     }
 
     /// `Failing` half of the `ScreenNotReady` refusal: kept distinct from

@@ -4931,7 +4931,9 @@ mod tests {
     #[test]
     fn slim_inventory_projection_carries_a_non_default_screen_state_from_the_session_snapshot() {
         let mut session = fixture_session();
-        session.screen_state = PtyScreenState::OperatorGate { gate: "workspace-trust".to_owned() };
+        session.screen_state = PtyScreenState::OperatorGate {
+            gate: gate4agent_types::OperatorGateState::new(gate4agent_types::OperatorGateKind::WorkspaceTrust),
+        };
         let snapshot = NodeSnapshot {
             node_id: NodeId::new("node-a").unwrap(),
             enabled_providers: vec![provider("codex")],

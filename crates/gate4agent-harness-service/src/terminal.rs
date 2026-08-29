@@ -17,10 +17,15 @@ use gate4agent_c2_protocol::NodeRoute;
 use gate4agent_harness_api::{
     HarnessOperatorTerminalEventV1, HarnessRuntimeMouseProtocolEncodingV1,
     HarnessRuntimeSessionAddressV1, HarnessRuntimeTerminalFrameV1, HarnessRuntimeTerminalSizeV1,
-    PtyScreenStateV1,
+    OperatorGateInputV1, OperatorGateKindV1, OperatorGateOptionSemanticsV1, OperatorGateOptionV1,
+    OperatorGateStateV1, OperatorGateSubjectV1, PtyScreenStateV1,
 };
 use gate4agent_observation_api::RuntimeSessionKey;
-use gate4agent_types::{PtyScreenState, TerminalFrame, TerminalMouseProtocolEncoding};
+use gate4agent_types::{
+    OperatorGateInput, OperatorGateKind, OperatorGateOption, OperatorGateOptionSemantics,
+    OperatorGateState, OperatorGateSubject, PtyScreenState, TerminalFrame,
+    TerminalMouseProtocolEncoding,
+};
 use std::collections::{HashMap, HashSet, VecDeque};
 use tokio::sync::mpsc;
 
@@ -199,12 +204,81 @@ pub fn map_screen_state(state: &PtyScreenState) -> PtyScreenStateV1 {
             PtyScreenStateV1::NotAgent { observed_process: observed_process.clone() }
         }
         PtyScreenState::OperatorGate { gate } => {
-            PtyScreenStateV1::OperatorGate { gate: gate.clone() }
+            PtyScreenStateV1::OperatorGate { gate: map_operator_gate(gate) }
         }
         PtyScreenState::Failing { reason } => {
             PtyScreenStateV1::Failing { reason: reason.clone() }
         }
         PtyScreenState::Ready => PtyScreenStateV1::Ready,
+    }
+}
+
+/// Maps the node's structured gate classification onto its hand-mirrored
+/// wire shape -- the `OperatorGate` half of `map_screen_state`, factored out
+/// on its own since `OperatorGateState` nests its own kind/subject/input/
+/// option types that each need the same field-for-field translation.
+fn map_operator_gate(gate: &OperatorGateState) -> OperatorGateStateV1 {
+    OperatorGateStateV1 {
+        kind: map_operator_gate_kind(gate.kind),
+        subject: map_operator_gate_subject(&gate.subject),
+        input: map_operator_gate_input(gate.input),
+        options: gate.options.iter().map(map_operator_gate_option).collect(),
+    }
+}
+
+fn map_operator_gate_kind(kind: OperatorGateKind) -> OperatorGateKindV1 {
+    match kind {
+        OperatorGateKind::WorkspaceTrust => OperatorGateKindV1::WorkspaceTrust,
+        OperatorGateKind::HookTrust => OperatorGateKindV1::HookTrust,
+        OperatorGateKind::Authentication => OperatorGateKindV1::Authentication,
+        OperatorGateKind::VendorUpdate => OperatorGateKindV1::VendorUpdate,
+        OperatorGateKind::Onboarding => OperatorGateKindV1::Onboarding,
+        OperatorGateKind::TerminalAppearance => OperatorGateKindV1::TerminalAppearance,
+        OperatorGateKind::ConfigurationMigration => OperatorGateKindV1::ConfigurationMigration,
+    }
+}
+
+fn map_operator_gate_subject(subject: &OperatorGateSubject) -> OperatorGateSubjectV1 {
+    match subject {
+        OperatorGateSubject::Directory { path } => {
+            OperatorGateSubjectV1::Directory { path: path.clone() }
+        }
+        OperatorGateSubject::Hooks { count } => OperatorGateSubjectV1::Hooks { count: *count },
+        OperatorGateSubject::McpServers => OperatorGateSubjectV1::McpServers,
+        OperatorGateSubject::Account => OperatorGateSubjectV1::Account,
+        OperatorGateSubject::ApiKey => OperatorGateSubjectV1::ApiKey,
+        OperatorGateSubject::Appearance => OperatorGateSubjectV1::Appearance,
+        OperatorGateSubject::Unknown => OperatorGateSubjectV1::Unknown,
+    }
+}
+
+fn map_operator_gate_input(input: OperatorGateInput) -> OperatorGateInputV1 {
+    match input {
+        OperatorGateInput::NumberedList => OperatorGateInputV1::NumberedList,
+        OperatorGateInput::ArrowList => OperatorGateInputV1::ArrowList,
+        OperatorGateInput::PressEnter => OperatorGateInputV1::PressEnter,
+        OperatorGateInput::TextEntry => OperatorGateInputV1::TextEntry,
+        OperatorGateInput::Unknown => OperatorGateInputV1::Unknown,
+    }
+}
+
+fn map_operator_gate_option(option: &OperatorGateOption) -> OperatorGateOptionV1 {
+    OperatorGateOptionV1 {
+        text: option.text.clone(),
+        semantics: map_operator_gate_option_semantics(option.semantics),
+        selected: option.selected,
+    }
+}
+
+fn map_operator_gate_option_semantics(
+    semantics: OperatorGateOptionSemantics,
+) -> OperatorGateOptionSemanticsV1 {
+    match semantics {
+        OperatorGateOptionSemantics::Accept => OperatorGateOptionSemanticsV1::Accept,
+        OperatorGateOptionSemantics::Decline => OperatorGateOptionSemanticsV1::Decline,
+        OperatorGateOptionSemantics::Inspect => OperatorGateOptionSemanticsV1::Inspect,
+        OperatorGateOptionSemantics::Exit => OperatorGateOptionSemanticsV1::Exit,
+        OperatorGateOptionSemantics::Unknown => OperatorGateOptionSemanticsV1::Unknown,
     }
 }
 
@@ -527,7 +601,9 @@ mod tests {
     #[test]
     fn terminal_frame_to_wire_always_carries_screen_state() {
         let mut frame = sample_frame(1);
-        frame.screen_state = PtyScreenState::OperatorGate { gate: "workspace-trust".to_owned() };
+        frame.screen_state = PtyScreenState::OperatorGate {
+            gate: OperatorGateState::new(OperatorGateKind::WorkspaceTrust),
+        };
 
         let wire = terminal_frame_to_wire(&frame);
         assert_eq!(wire.screen_state, Some(map_screen_state(&frame.screen_state)));

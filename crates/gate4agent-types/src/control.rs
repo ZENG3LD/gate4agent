@@ -282,6 +282,277 @@ pub struct TerminalFrame {
 
 pub const FOREGROUND_PROCESS_NAME_MAX_BYTES: usize = 512;
 pub const PTY_SCREEN_GATE_NAME_MAX_BYTES: usize = 128;
+/// Bound on `OperatorGateState::options` -- large enough for any list a real
+/// prompt has ever been observed to render (2-4 choices), small enough that
+/// a garbled or hostile screen capture cannot inflate the wire payload.
+pub const OPERATOR_GATE_OPTIONS_MAX: usize = 8;
+/// Per-`OperatorGateOption::text` byte bound, same scale as
+/// `PTY_SCREEN_GATE_NAME_MAX_BYTES` -- an option label is a single short
+/// line off the screen, never a paragraph.
+pub const OPERATOR_GATE_OPTION_TEXT_MAX_BYTES: usize = 128;
+/// Bound on `OperatorGateSubject::Directory`'s `path`, matching the scale of
+/// other path-shaped fields carried on this wire (see `WORKING_DIRECTORY_MAX_BYTES`
+/// for the same order of magnitude on a full working-directory string).
+pub const OPERATOR_GATE_PATH_MAX_BYTES: usize = 32_768;
+
+/// What TYPE of blocking question `OperatorGateState` is showing, classified
+/// from the screen's own top-level phrasing (see `startup_operator_gate` in
+/// `gate4agent-shell-native`, the only producer). Distinct kinds exist so a
+/// consumer can react differently to "an update is running" versus "type an
+/// answer" without parsing `OperatorGateSubject`/`options` first.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OperatorGateKind {
+    /// Trust the current project directory before the CLI will read or run
+    /// anything in it.
+    WorkspaceTrust,
+    /// Trust a specific set of shell hooks the CLI discovered inside an
+    /// already-trusted directory. Kept distinct from `WorkspaceTrust`: that
+    /// gate is about the directory as a whole, this one is about hooks the
+    /// CLI found inside it -- an operator reading `kind` should be able to
+    /// tell which question is being asked.
+    HookTrust,
+    /// Sign in, or choose how to sign in / which credential to use.
+    Authentication,
+    /// The CLI (or a wrapper script fronting it) is installing or updating
+    /// itself and wants a relaunch, regardless of which mechanism drives the
+    /// update -- an in-app updater or an external package manager.
+    VendorUpdate,
+    /// A first-run welcome/setup screen unrelated to trust or auth (IDE
+    /// integration notice, "press enter to continue" splash, and similar).
+    Onboarding,
+    /// Choosing a terminal color/text style during first-run setup.
+    TerminalAppearance,
+    /// A stored configuration format needs to be migrated/confirmed before
+    /// the CLI continues.
+    ConfigurationMigration,
+}
+
+impl OperatorGateKind {
+    /// Short operator-facing label, one per variant, stable in wording with
+    /// what this module classified as a bare string before `OperatorGateState`
+    /// existed -- existing log lines and error messages that quote this text
+    /// keep reading the same.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::WorkspaceTrust => "workspace trust",
+            Self::HookTrust => "hook trust review",
+            Self::Authentication => "authentication",
+            Self::VendorUpdate => "vendor update",
+            Self::Onboarding => "onboarding",
+            Self::TerminalAppearance => "terminal appearance setup",
+            Self::ConfigurationMigration => "configuration migration",
+        }
+    }
+}
+
+/// WHAT entity `OperatorGateState` is gating access to -- narrower than
+/// `kind` (which says what TYPE of question this is): two `WorkspaceTrust`
+/// gates always share `subject: Directory`, but the `path` detail (when a
+/// matcher can read one off the screen) distinguishes which directory.
+/// `Unknown` is the honest reading for a `kind` whose screen text does not
+/// name a concrete subject from this list (a vendor updater or onboarding
+/// splash is not "about" a directory, a hook set, or an account) -- it is
+/// never upgraded into a guess.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum OperatorGateSubject {
+    /// A project/workspace directory. `path` is the directory the screen
+    /// names, when a matcher can read one off the text; `None` means the
+    /// screen's phrasing did not carry one, not that there is no directory.
+    Directory { path: Option<String> },
+    /// A set of shell hooks discovered inside an already-trusted directory.
+    /// `count` is the number reported on screen, when readable; `None` means
+    /// unreadable, never zero.
+    Hooks { count: Option<u32> },
+    /// MCP servers configured for the project.
+    McpServers,
+    /// The signed-in account/identity.
+    Account,
+    /// An API key/credential value.
+    ApiKey,
+    /// Terminal color/text-style appearance.
+    Appearance,
+    /// No concrete subject from this list applies to the matched `kind`.
+    Unknown,
+}
+
+/// HOW `OperatorGateState` is controlled -- what a caller resolving it
+/// (typically a human, occasionally a scripted answer) needs to send.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OperatorGateInput {
+    /// Choices are numbered (`1.`, `2.`, ...); confirmed with Enter after
+    /// selecting a number.
+    NumberedList,
+    /// Choices are an unnumbered list navigated with arrow keys and a
+    /// cursor glyph; confirmed with Enter.
+    ArrowList,
+    /// A single acknowledgement -- nothing to choose between, just Enter.
+    PressEnter,
+    /// Free text (a pasted code, a typed value) rather than a choice from a
+    /// list.
+    TextEntry,
+    /// The screen's input mechanism was not recognized.
+    Unknown,
+}
+
+/// What choosing a given `OperatorGateOption` does, inferred from the verb
+/// in its own on-screen text (see `classify_operator_gate_option_semantics`
+/// in `gate4agent-shell-native`) -- never from its position or number, since
+/// neither is stable across CLIs or screen wraps.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OperatorGateOptionSemantics {
+    /// Grants what the gate is asking for (trust, continue, proceed).
+    Accept,
+    /// Refuses what the gate is asking for (don't trust, continue without
+    /// trusting) while still moving past the prompt.
+    Decline,
+    /// Opens a closer look before deciding (review the hooks/diff) rather
+    /// than accepting or declining outright.
+    Inspect,
+    /// Leaves the CLI entirely rather than answering the prompt.
+    Exit,
+    /// The option's own text used none of the recognized verbs.
+    Unknown,
+}
+
+/// One choice as rendered on screen inside an `OperatorGateState`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OperatorGateOption {
+    /// The option's label exactly as it appears on screen (list-marker and
+    /// leading whitespace stripped, nothing else altered) -- never
+    /// paraphrased, so an operator reading it sees the same words the CLI
+    /// rendered.
+    pub text: String,
+    pub semantics: OperatorGateOptionSemantics,
+    /// Whether the screen's own cursor/highlight currently sits on this
+    /// option. `false` means either it is not selected or selection is not
+    /// visible on this screen shape -- there is no third state, because a
+    /// consumer deciding "which option is highlighted right now" only ever
+    /// needs to know if THIS one is.
+    pub selected: bool,
+}
+
+impl OperatorGateOption {
+    fn is_valid(&self) -> bool {
+        !self.text.trim().is_empty()
+            && self.text.len() <= OPERATOR_GATE_OPTION_TEXT_MAX_BYTES
+            && !self.text.chars().any(char::is_control)
+    }
+}
+
+/// The full classification of a screen recognized as an `OperatorGate`,
+/// replacing what used to be a bare label string. `kind` is always known (a
+/// matcher only returns this type once it has matched a specific gate
+/// phrase); `subject`, `input`, and `options` degrade independently to
+/// `Unknown`/empty when the screen's specific shape was not recognized --
+/// never invented from `kind` alone.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OperatorGateState {
+    pub kind: OperatorGateKind,
+    pub subject: OperatorGateSubject,
+    pub input: OperatorGateInput,
+    /// Recognized on-screen choices, in on-screen order. Empty means no
+    /// option list was recognized -- NOT that the screen has no choices;
+    /// see `OperatorGateInput::Unknown` for the paired "input mechanism
+    /// unrecognized either" case.
+    pub options: Vec<OperatorGateOption>,
+}
+
+impl OperatorGateState {
+    /// The gate with nothing known past `kind` -- `subject: Unknown`,
+    /// `input: Unknown`, no options. This is the honest shape for a matched
+    /// `kind` whose screen a parser has not (yet) learned to read past the
+    /// phrase that identified it; never upgrade an unread screen into a
+    /// guessed subject or option list.
+    pub fn new(kind: OperatorGateKind) -> Self {
+        Self {
+            kind,
+            subject: OperatorGateSubject::Unknown,
+            input: OperatorGateInput::Unknown,
+            options: Vec::new(),
+        }
+    }
+
+    /// Builder-style: attach a recognized subject.
+    pub fn with_subject(mut self, subject: OperatorGateSubject) -> Self {
+        self.subject = subject;
+        self
+    }
+
+    /// Builder-style: attach a recognized input mechanism and its options
+    /// together, since one is meaningless without the other (an `Unknown`
+    /// input never carries options, and options never accompany an
+    /// unrecognized input mechanism).
+    pub fn with_options(mut self, input: OperatorGateInput, options: Vec<OperatorGateOption>) -> Self {
+        self.input = input;
+        self.options = options;
+        self
+    }
+
+    /// Bounds check matching `PtyScreenState::is_valid`'s own rationale --
+    /// every string this type carries travels over the wire into an
+    /// operator UI and must be non-empty (where required), control-character
+    /// free, and within its per-field byte cap before anything downstream
+    /// trusts it.
+    pub fn is_valid(&self) -> bool {
+        let subject_valid = match &self.subject {
+            OperatorGateSubject::Directory { path: Some(path) } => {
+                !path.trim().is_empty()
+                    && path.len() <= OPERATOR_GATE_PATH_MAX_BYTES
+                    && !path.chars().any(char::is_control)
+            }
+            OperatorGateSubject::Directory { path: None }
+            | OperatorGateSubject::Hooks { .. }
+            | OperatorGateSubject::McpServers
+            | OperatorGateSubject::Account
+            | OperatorGateSubject::ApiKey
+            | OperatorGateSubject::Appearance
+            | OperatorGateSubject::Unknown => true,
+        };
+        subject_valid
+            && self.options.len() <= OPERATOR_GATE_OPTIONS_MAX
+            && self.options.iter().all(OperatorGateOption::is_valid)
+    }
+}
+
+impl std::fmt::Display for OperatorGateState {
+    /// Renders as `kind.label()` alone -- the same text this whole type
+    /// replaced used to carry as its only payload -- so an existing
+    /// `format!("...{gate}...")` call site keeps reading the same message
+    /// after this type lands under it.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.kind.label())
+    }
+}
+
+impl OperatorGateState {
+    /// Longer operator-facing rendering than `Display`: the kind label,
+    /// plus a compact list of recognized options (currently-selected one
+    /// prefixed `*`) when `options` is non-empty. `Display` stays kind-only
+    /// on purpose (see its own doc comment) -- this is for a surface that
+    /// can afford, and wants, the fuller picture once one was parsed.
+    pub fn describe(&self) -> String {
+        if self.options.is_empty() {
+            return self.kind.label().to_owned();
+        }
+        let options = self
+            .options
+            .iter()
+            .map(|option| {
+                if option.selected {
+                    format!("*{}", option.text)
+                } else {
+                    option.text.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{} [{options}]", self.kind.label())
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
@@ -355,8 +626,13 @@ pub enum PtyScreenState {
     /// recognized blocking pattern -- workspace trust, authentication,
     /// a vendor update, first-run onboarding. This is the state that wants a
     /// human specifically, because resolving it means typing into the pane
-    /// rather than dispatching another agent turn.
-    OperatorGate { gate: String },
+    /// rather than dispatching another agent turn. `gate` is a structured
+    /// `OperatorGateState`, not a bare label -- what TYPE of gate
+    /// (`kind`), what it is gating (`subject`), how it is answered
+    /// (`input`), and which choices were read off the screen (`options`),
+    /// so a consumer can close the gate or ask an operator a real question
+    /// instead of only ever surfacing a tag.
+    OperatorGate { gate: OperatorGateState },
     /// The foreground process matches, but the screen shows the agent came
     /// up wrong or fell over -- a crash/stack trace, an expired or rejected
     /// login, a fatal startup error. Kept distinct from `OperatorGate` on
@@ -366,8 +642,9 @@ pub enum PtyScreenState {
     /// versus "broken". For write-gating it behaves like every other
     /// non-`Ready` state (refused); the split buys a correct label, not
     /// different gating. `reason` is a short classifier label, the same
-    /// shape as `OperatorGate::gate`, never raw terminal text -- nothing in
-    /// this enum carries screen contents. Where a provider has a
+    /// shape `OperatorGate::gate` used to carry before it became a
+    /// structured type, never raw terminal text -- nothing in this enum
+    /// carries screen contents. Where a provider has a
     /// `pty_sidecar` adapter bound, structured signals (rate limits arriving
     /// as a `ProviderEvent`) remain the authority for those specific
     /// conditions; this variant is the text-derived fallback, and the only
@@ -406,10 +683,11 @@ impl PtyScreenState {
                     && observed_process.len() <= FOREGROUND_PROCESS_NAME_MAX_BYTES
                     && !observed_process.chars().any(char::is_control)
             }
-            Self::OperatorGate { gate } | Self::Failing { reason: gate } => {
-                !gate.trim().is_empty()
-                    && gate.len() <= PTY_SCREEN_GATE_NAME_MAX_BYTES
-                    && !gate.chars().any(char::is_control)
+            Self::OperatorGate { gate } => gate.is_valid(),
+            Self::Failing { reason } => {
+                !reason.trim().is_empty()
+                    && reason.len() <= PTY_SCREEN_GATE_NAME_MAX_BYTES
+                    && !reason.chars().any(char::is_control)
             }
         }
     }
@@ -1740,7 +2018,9 @@ mod tests {
     use crate::AgentId;
     use super::{
         AgentInstanceId, CapabilitySnapshot, ContextWindowUsage, ForegroundProcess,
-        ForegroundProcessKind, ForegroundSnapshot, HistorySnapshot, ProviderEvent,
+        ForegroundProcessKind, ForegroundSnapshot, HistorySnapshot, OperatorGateInput,
+        OperatorGateKind, OperatorGateOption, OperatorGateOptionSemantics, OperatorGateState,
+        OperatorGateSubject, ProviderEvent,
         ProviderEventValidationError,
         ProviderInteractionKind, ProviderInteractionOutcome, ProviderInteractionResponse,
         ProviderInteractionResponseError, ProviderRuntimeCapability, ProviderRuntimePolicy,
@@ -1748,9 +2028,37 @@ mod tests {
         ProviderSessionIdentity, ProviderSessionKey, ProviderSnapshot, PtyScreenState,
         ResumeSnapshot, SessionGeneration, SessionSnapshot, SessionStatus, TerminalFrame,
         TerminalMouseProtocolEncoding, TransportKind,
-        FOREGROUND_PROCESS_NAME_MAX_BYTES, PROVIDER_INTERACTION_RESPONSE_MAX_BYTES,
+        FOREGROUND_PROCESS_NAME_MAX_BYTES, OPERATOR_GATE_OPTIONS_MAX,
+        OPERATOR_GATE_OPTION_TEXT_MAX_BYTES, OPERATOR_GATE_PATH_MAX_BYTES,
+        PROVIDER_INTERACTION_RESPONSE_MAX_BYTES,
         PTY_SCREEN_GATE_NAME_MAX_BYTES,
     };
+
+    /// Shared fixture: a fully-known gate (every field populated), used by
+    /// every test below that needs "some real `OperatorGateState`" without
+    /// re-deriving one -- one option accepted, one declined, matching the
+    /// shape `parse_operator_gate_options` actually produces for a numbered
+    /// list (see `gate4agent-shell-native`'s own tests for the parser
+    /// itself; this crate only owns the data shape and its bounds).
+    fn sample_gate() -> OperatorGateState {
+        OperatorGateState::new(OperatorGateKind::HookTrust)
+            .with_subject(OperatorGateSubject::Hooks { count: Some(6) })
+            .with_options(
+                OperatorGateInput::NumberedList,
+                vec![
+                    OperatorGateOption {
+                        text: "Trust all and continue".to_owned(),
+                        semantics: OperatorGateOptionSemantics::Accept,
+                        selected: false,
+                    },
+                    OperatorGateOption {
+                        text: "Continue without trusting".to_owned(),
+                        semantics: OperatorGateOptionSemantics::Decline,
+                        selected: true,
+                    },
+                ],
+            )
+    }
 
     #[test]
     fn context_window_usage_ingress_requires_exact_bounded_segments() {
@@ -1952,9 +2260,7 @@ mod tests {
             PtyScreenState::NotAgent {
                 observed_process: "npm".to_owned(),
             },
-            PtyScreenState::OperatorGate {
-                gate: "workspace-trust".to_owned(),
-            },
+            PtyScreenState::OperatorGate { gate: sample_gate() },
             PtyScreenState::Failing {
                 reason: "startup-crash".to_owned(),
             },
@@ -1976,10 +2282,7 @@ mod tests {
             observed_process: "npm".to_owned(),
         }
         .admits_blind_write());
-        assert!(!PtyScreenState::OperatorGate {
-            gate: "workspace-trust".to_owned(),
-        }
-        .admits_blind_write());
+        assert!(!PtyScreenState::OperatorGate { gate: sample_gate() }.admits_blind_write());
         assert!(!PtyScreenState::Failing {
             reason: "startup-crash".to_owned(),
         }
@@ -2006,20 +2309,69 @@ mod tests {
         }
         .is_valid());
 
-        assert!(PtyScreenState::OperatorGate {
-            gate: "workspace-trust".to_owned(),
+        assert!(PtyScreenState::OperatorGate { gate: sample_gate() }.is_valid());
+        assert!(!PtyScreenState::OperatorGate {
+            gate: sample_gate().with_subject(OperatorGateSubject::Directory {
+                path: Some("x".repeat(OPERATOR_GATE_PATH_MAX_BYTES + 1)),
+            }),
         }
         .is_valid());
         assert!(!PtyScreenState::OperatorGate {
-            gate: "x".repeat(PTY_SCREEN_GATE_NAME_MAX_BYTES + 1),
+            gate: sample_gate().with_subject(OperatorGateSubject::Directory {
+                path: Some(String::new()),
+            }),
         }
         .is_valid());
         assert!(!PtyScreenState::OperatorGate {
-            gate: String::new(),
+            gate: sample_gate().with_subject(OperatorGateSubject::Directory {
+                path: Some("bad\u{0000}path".to_owned()),
+            }),
         }
         .is_valid());
         assert!(!PtyScreenState::OperatorGate {
-            gate: "bad\u{0000}gate".to_owned(),
+            gate: sample_gate().with_options(
+                OperatorGateInput::NumberedList,
+                vec![OperatorGateOption {
+                    text: "x".repeat(OPERATOR_GATE_OPTION_TEXT_MAX_BYTES + 1),
+                    semantics: OperatorGateOptionSemantics::Accept,
+                    selected: false,
+                }],
+            ),
+        }
+        .is_valid());
+        assert!(!PtyScreenState::OperatorGate {
+            gate: sample_gate().with_options(
+                OperatorGateInput::NumberedList,
+                vec![OperatorGateOption {
+                    text: String::new(),
+                    semantics: OperatorGateOptionSemantics::Accept,
+                    selected: false,
+                }],
+            ),
+        }
+        .is_valid());
+        assert!(!PtyScreenState::OperatorGate {
+            gate: sample_gate().with_options(
+                OperatorGateInput::NumberedList,
+                vec![OperatorGateOption {
+                    text: "bad\u{0000}option".to_owned(),
+                    semantics: OperatorGateOptionSemantics::Accept,
+                    selected: false,
+                }],
+            ),
+        }
+        .is_valid());
+        assert!(!PtyScreenState::OperatorGate {
+            gate: sample_gate().with_options(
+                OperatorGateInput::NumberedList,
+                (0..=OPERATOR_GATE_OPTIONS_MAX)
+                    .map(|index| OperatorGateOption {
+                        text: format!("option {index}"),
+                        semantics: OperatorGateOptionSemantics::Unknown,
+                        selected: false,
+                    })
+                    .collect(),
+            ),
         }
         .is_valid());
 

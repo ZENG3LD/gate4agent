@@ -520,7 +520,8 @@ mod tests {
     use gate4agent_c2_protocol::C2WorkspaceSnapshot;
     use gate4agent_node_protocol::{NodeIncarnationId, SessionAddress, SessionKey};
     use gate4agent_types::{
-        AgentId, AgentInstanceId, ProviderActivity, PtyScreenState, SessionGeneration,
+        AgentId, AgentInstanceId, OperatorGateKind, OperatorGateState, ProviderActivity,
+        PtyScreenState, SessionGeneration,
         TerminalMouseProtocolEncoding, TransportKind,
     };
 
@@ -829,14 +830,14 @@ mod tests {
         let workspace_id = WorkspaceId::new("primary").unwrap();
         let mut seeded = [seeded_session(agent("codex"), &workspace_id, 20)];
         let mut session = fixture_session(agent("codex"), 20);
-        session.screen_state = PtyScreenState::OperatorGate { gate: "vendor update".to_owned() };
+        session.screen_state = PtyScreenState::OperatorGate { gate: OperatorGateState::new(OperatorGateKind::VendorUpdate) };
         let snapshot = fixture_snapshot(&workspace_id, session);
         assert!(!evaluate_readiness(&snapshot, &workspace_id, &mut seeded).unwrap());
         assert!(seeded[0].evidence.observed_running_pid);
         assert!(seeded[0].evidence.pty_output);
         assert_eq!(
             seeded[0].evidence.screen_state,
-            PtyScreenState::OperatorGate { gate: "vendor update".to_owned() },
+            PtyScreenState::OperatorGate { gate: OperatorGateState::new(OperatorGateKind::VendorUpdate) },
         );
     }
 
@@ -889,7 +890,7 @@ mod tests {
         seeded[0].evidence.observed_running_pid = true;
         seeded[0].evidence.pty_output = true;
         seeded[0].evidence.screen_state =
-            PtyScreenState::OperatorGate { gate: "vendor update".to_owned() };
+            PtyScreenState::OperatorGate { gate: OperatorGateState::new(OperatorGateKind::VendorUpdate) };
         seeded[0].evidence.final_status = Some(C2SessionStatus::Running);
 
         assert_eq!(

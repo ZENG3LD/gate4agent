@@ -3863,8 +3863,128 @@ pub struct HarnessRuntimeTerminalSizeV1 {
 /// hand-duplicated below.
 pub const HARNESS_SCREEN_STATE_PROCESS_MAX_BYTES: usize = 512;
 /// Mirrors `gate4agent_types::PTY_SCREEN_GATE_NAME_MAX_BYTES`, the bound on
-/// both `PtyScreenStateV1::OperatorGate`'s `gate` and `Failing`'s `reason`.
+/// `Failing`'s `reason`.
 pub const HARNESS_SCREEN_STATE_GATE_MAX_BYTES: usize = 128;
+/// Mirrors `gate4agent_types::OPERATOR_GATE_OPTIONS_MAX`.
+pub const HARNESS_GATE_OPTIONS_MAX: usize = 8;
+/// Mirrors `gate4agent_types::OPERATOR_GATE_OPTION_TEXT_MAX_BYTES`.
+pub const HARNESS_GATE_OPTION_TEXT_MAX_BYTES: usize = 128;
+/// Mirrors `gate4agent_types::OPERATOR_GATE_PATH_MAX_BYTES`.
+pub const HARNESS_GATE_PATH_MAX_BYTES: usize = 32_768;
+
+/// Exact mirror of `gate4agent_types::OperatorGateKind`.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OperatorGateKindV1 {
+    WorkspaceTrust,
+    HookTrust,
+    Authentication,
+    VendorUpdate,
+    Onboarding,
+    TerminalAppearance,
+    ConfigurationMigration,
+}
+
+impl OperatorGateKindV1 {
+    /// Mirrors `gate4agent_types::OperatorGateKind::label`.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::WorkspaceTrust => "workspace trust",
+            Self::HookTrust => "hook trust review",
+            Self::Authentication => "authentication",
+            Self::VendorUpdate => "vendor update",
+            Self::Onboarding => "onboarding",
+            Self::TerminalAppearance => "terminal appearance setup",
+            Self::ConfigurationMigration => "configuration migration",
+        }
+    }
+}
+
+/// Exact mirror of `gate4agent_types::OperatorGateSubject`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum OperatorGateSubjectV1 {
+    Directory { path: Option<String> },
+    Hooks { count: Option<u32> },
+    McpServers,
+    Account,
+    ApiKey,
+    Appearance,
+    Unknown,
+}
+
+/// Exact mirror of `gate4agent_types::OperatorGateInput`.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OperatorGateInputV1 {
+    NumberedList,
+    ArrowList,
+    PressEnter,
+    TextEntry,
+    Unknown,
+}
+
+/// Exact mirror of `gate4agent_types::OperatorGateOptionSemantics`.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OperatorGateOptionSemanticsV1 {
+    Accept,
+    Decline,
+    Inspect,
+    Exit,
+    Unknown,
+}
+
+/// Exact mirror of `gate4agent_types::OperatorGateOption`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorGateOptionV1 {
+    pub text: String,
+    pub semantics: OperatorGateOptionSemanticsV1,
+    pub selected: bool,
+}
+
+impl OperatorGateOptionV1 {
+    fn is_valid(&self) -> bool {
+        valid_native_single_line(&self.text, HARNESS_GATE_OPTION_TEXT_MAX_BYTES, true)
+    }
+}
+
+/// Exact mirror of `gate4agent_types::OperatorGateState`: this crate has no
+/// dependency on `gate4agent-types` (see the doc comment on
+/// `HarnessTerminalControlV1`), so the node's gate classification is
+/// duplicated here as its own closed wire shape rather than imported.
+/// `gate4agent-harness-service` is the single place that maps one into the
+/// other (`map_operator_gate`), so a field added to one side without the
+/// other fails to compile there.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorGateStateV1 {
+    pub kind: OperatorGateKindV1,
+    pub subject: OperatorGateSubjectV1,
+    pub input: OperatorGateInputV1,
+    pub options: Vec<OperatorGateOptionV1>,
+}
+
+impl OperatorGateStateV1 {
+    fn is_valid(&self) -> bool {
+        let subject_valid = match &self.subject {
+            OperatorGateSubjectV1::Directory { path: Some(path) } => {
+                valid_native_single_line(path, HARNESS_GATE_PATH_MAX_BYTES, true)
+            }
+            OperatorGateSubjectV1::Directory { path: None }
+            | OperatorGateSubjectV1::Hooks { .. }
+            | OperatorGateSubjectV1::McpServers
+            | OperatorGateSubjectV1::Account
+            | OperatorGateSubjectV1::ApiKey
+            | OperatorGateSubjectV1::Appearance
+            | OperatorGateSubjectV1::Unknown => true,
+        };
+        subject_valid
+            && self.options.len() <= HARNESS_GATE_OPTIONS_MAX
+            && self.options.iter().all(OperatorGateOptionV1::is_valid)
+    }
+}
 
 /// Exact mirror of `gate4agent_types::PtyScreenState`: this crate has no
 /// dependency on `gate4agent-types` (see the doc comment on
@@ -3879,7 +3999,7 @@ pub enum PtyScreenStateV1 {
     #[default]
     Unknown,
     NotAgent { observed_process: String },
-    OperatorGate { gate: String },
+    OperatorGate { gate: OperatorGateStateV1 },
     Failing { reason: String },
     Ready,
 }
@@ -3899,9 +4019,7 @@ impl PtyScreenStateV1 {
             Self::NotAgent { observed_process } => {
                 valid_native_single_line(observed_process, HARNESS_SCREEN_STATE_PROCESS_MAX_BYTES, true)
             }
-            Self::OperatorGate { gate } => {
-                valid_native_single_line(gate, HARNESS_SCREEN_STATE_GATE_MAX_BYTES, true)
-            }
+            Self::OperatorGate { gate } => gate.is_valid(),
             Self::Failing { reason } => {
                 valid_native_single_line(reason, HARNESS_SCREEN_STATE_GATE_MAX_BYTES, true)
             }
@@ -8020,6 +8138,30 @@ mod tests {
         }
     }
 
+    /// A fully-populated `OperatorGateStateV1` -- one accepted option, one
+    /// declined, matching the shape `gate4agent-shell-native`'s numbered-list
+    /// parser actually produces (see that crate's own tests for the parser
+    /// itself; this crate only owns the wire mirror and its bounds).
+    fn sample_operator_gate_state() -> OperatorGateStateV1 {
+        OperatorGateStateV1 {
+            kind: OperatorGateKindV1::HookTrust,
+            subject: OperatorGateSubjectV1::Hooks { count: Some(6) },
+            input: OperatorGateInputV1::NumberedList,
+            options: vec![
+                OperatorGateOptionV1 {
+                    text: "Trust all and continue".to_owned(),
+                    semantics: OperatorGateOptionSemanticsV1::Accept,
+                    selected: false,
+                },
+                OperatorGateOptionV1 {
+                    text: "Continue without trusting".to_owned(),
+                    semantics: OperatorGateOptionSemanticsV1::Decline,
+                    selected: true,
+                },
+            ],
+        }
+    }
+
     /// Every `PtyScreenStateV1` variant, for the round-trip and validation
     /// sweeps below -- kept as one list so a variant added to the enum
     /// without a matching addition here is caught by a stale sweep rather
@@ -8028,7 +8170,7 @@ mod tests {
         vec![
             PtyScreenStateV1::Unknown,
             PtyScreenStateV1::NotAgent { observed_process: "installer.exe".to_owned() },
-            PtyScreenStateV1::OperatorGate { gate: "workspace-trust".to_owned() },
+            PtyScreenStateV1::OperatorGate { gate: sample_operator_gate_state() },
             PtyScreenStateV1::Failing { reason: "crash-loop".to_owned() },
             PtyScreenStateV1::Ready,
         ]
@@ -8093,8 +8235,50 @@ mod tests {
         let oversized_gate = "x".repeat(HARNESS_SCREEN_STATE_GATE_MAX_BYTES + 1);
         let cases = [
             PtyScreenStateV1::NotAgent { observed_process: oversized_process },
-            PtyScreenStateV1::OperatorGate { gate: oversized_gate.clone() },
             PtyScreenStateV1::Failing { reason: oversized_gate },
+        ];
+        for case in cases {
+            let mut frame = sample_terminal_frame(1);
+            frame.screen_state = Some(case.clone());
+            assert!(
+                matches!(frame.validate(), Err(HarnessOperatorApiError::InvalidRuntimeInventory)),
+                "expected frame validate() to reject {case:?}",
+            );
+
+            let mut session = sample_runtime_session(1, 1);
+            session.screen_state = Some(case.clone());
+            assert!(
+                matches!(session.validate(), Err(HarnessOperatorApiError::InvalidRuntimeInventory)),
+                "expected session validate() to reject {case:?}",
+            );
+        }
+    }
+
+    /// Sibling of the sweep above for `OperatorGateStateV1`'s own nested
+    /// bounds -- an oversized `Directory` path and an oversized option
+    /// label are each, on their own, enough to fail `validate()`, on both
+    /// carriers.
+    #[test]
+    fn validate_rejects_an_oversized_field_nested_inside_an_operator_gate() {
+        let oversized_path = "x".repeat(HARNESS_GATE_PATH_MAX_BYTES + 1);
+        let oversized_option_text = "x".repeat(HARNESS_GATE_OPTION_TEXT_MAX_BYTES + 1);
+        let cases = [
+            PtyScreenStateV1::OperatorGate {
+                gate: OperatorGateStateV1 {
+                    subject: OperatorGateSubjectV1::Directory { path: Some(oversized_path) },
+                    ..sample_operator_gate_state()
+                },
+            },
+            PtyScreenStateV1::OperatorGate {
+                gate: OperatorGateStateV1 {
+                    options: vec![OperatorGateOptionV1 {
+                        text: oversized_option_text,
+                        semantics: OperatorGateOptionSemanticsV1::Accept,
+                        selected: false,
+                    }],
+                    ..sample_operator_gate_state()
+                },
+            },
         ];
         for case in cases {
             let mut frame = sample_terminal_frame(1);

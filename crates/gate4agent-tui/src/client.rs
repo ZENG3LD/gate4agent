@@ -62,7 +62,8 @@ use gate4agent_harness_client::{
     HarnessRuntimeManagedStateV1, HarnessRuntimeNodeInventoryV1,
     HarnessRuntimeMouseProtocolEncodingV1, HarnessRuntimeSessionAddressV1,
     HarnessRuntimeSessionStatusV1, HarnessRuntimeSessionV1, HarnessRuntimeTerminalFrameV1,
-    PtyScreenStateV1,
+    OperatorGateInputV1, OperatorGateKindV1, OperatorGateOptionSemanticsV1, OperatorGateOptionV1,
+    OperatorGateStateV1, OperatorGateSubjectV1, PtyScreenStateV1,
     HarnessRuntimeTerminalPageV1, HarnessRuntimeTerminalSizeV1, HarnessRuntimeTransportV1,
     HarnessRuntimeLaunchInventoryV1,
     HarnessNodeWorkspaceFileV1, HarnessNodeWorkspaceInspectionV1, HarnessNodeWorkspaceDirectoryV1,
@@ -78,7 +79,9 @@ use gate4agent_harness_protocol::HarnessSelectorV1;
 use gate4agent_types::{
     AgentId, AgentInstanceId, ProviderActivity, ProviderSessionIdentity,
     HistoryMessageRole, NativeSessionExternalGroup, NativeSessionExternalGroupKind,
-    NativeSessionPreviewMessage, PtyScreenState, SessionGeneration,
+    NativeSessionPreviewMessage, OperatorGateInput, OperatorGateKind, OperatorGateOption,
+    OperatorGateOptionSemantics, OperatorGateState, OperatorGateSubject, PtyScreenState,
+    SessionGeneration,
     TerminalFrame, TerminalSize,
     TerminalMouseProtocolEncoding, TransportKind,
 };
@@ -6573,9 +6576,79 @@ fn project_pty_screen_state(state: Option<PtyScreenStateV1>) -> PtyScreenState {
         Some(PtyScreenStateV1::NotAgent { observed_process }) => {
             PtyScreenState::NotAgent { observed_process }
         }
-        Some(PtyScreenStateV1::OperatorGate { gate }) => PtyScreenState::OperatorGate { gate },
+        Some(PtyScreenStateV1::OperatorGate { gate }) => {
+            PtyScreenState::OperatorGate { gate: project_operator_gate(gate) }
+        }
         Some(PtyScreenStateV1::Failing { reason }) => PtyScreenState::Failing { reason },
         Some(PtyScreenStateV1::Ready) => PtyScreenState::Ready,
+    }
+}
+
+/// Projects the wire's `OperatorGateStateV1` onto the app's own
+/// `OperatorGateState` -- the `OperatorGate` half of
+/// `project_pty_screen_state`, factored out on its own since the gate nests
+/// its own kind/subject/input/option shapes that each need the same
+/// field-for-field projection.
+fn project_operator_gate(gate: OperatorGateStateV1) -> OperatorGateState {
+    OperatorGateState {
+        kind: project_operator_gate_kind(gate.kind),
+        subject: project_operator_gate_subject(gate.subject),
+        input: project_operator_gate_input(gate.input),
+        options: gate.options.into_iter().map(project_operator_gate_option).collect(),
+    }
+}
+
+fn project_operator_gate_kind(kind: OperatorGateKindV1) -> OperatorGateKind {
+    match kind {
+        OperatorGateKindV1::WorkspaceTrust => OperatorGateKind::WorkspaceTrust,
+        OperatorGateKindV1::HookTrust => OperatorGateKind::HookTrust,
+        OperatorGateKindV1::Authentication => OperatorGateKind::Authentication,
+        OperatorGateKindV1::VendorUpdate => OperatorGateKind::VendorUpdate,
+        OperatorGateKindV1::Onboarding => OperatorGateKind::Onboarding,
+        OperatorGateKindV1::TerminalAppearance => OperatorGateKind::TerminalAppearance,
+        OperatorGateKindV1::ConfigurationMigration => OperatorGateKind::ConfigurationMigration,
+    }
+}
+
+fn project_operator_gate_subject(subject: OperatorGateSubjectV1) -> OperatorGateSubject {
+    match subject {
+        OperatorGateSubjectV1::Directory { path } => OperatorGateSubject::Directory { path },
+        OperatorGateSubjectV1::Hooks { count } => OperatorGateSubject::Hooks { count },
+        OperatorGateSubjectV1::McpServers => OperatorGateSubject::McpServers,
+        OperatorGateSubjectV1::Account => OperatorGateSubject::Account,
+        OperatorGateSubjectV1::ApiKey => OperatorGateSubject::ApiKey,
+        OperatorGateSubjectV1::Appearance => OperatorGateSubject::Appearance,
+        OperatorGateSubjectV1::Unknown => OperatorGateSubject::Unknown,
+    }
+}
+
+fn project_operator_gate_input(input: OperatorGateInputV1) -> OperatorGateInput {
+    match input {
+        OperatorGateInputV1::NumberedList => OperatorGateInput::NumberedList,
+        OperatorGateInputV1::ArrowList => OperatorGateInput::ArrowList,
+        OperatorGateInputV1::PressEnter => OperatorGateInput::PressEnter,
+        OperatorGateInputV1::TextEntry => OperatorGateInput::TextEntry,
+        OperatorGateInputV1::Unknown => OperatorGateInput::Unknown,
+    }
+}
+
+fn project_operator_gate_option(option: OperatorGateOptionV1) -> OperatorGateOption {
+    OperatorGateOption {
+        text: option.text,
+        semantics: project_operator_gate_option_semantics(option.semantics),
+        selected: option.selected,
+    }
+}
+
+fn project_operator_gate_option_semantics(
+    semantics: OperatorGateOptionSemanticsV1,
+) -> OperatorGateOptionSemantics {
+    match semantics {
+        OperatorGateOptionSemanticsV1::Accept => OperatorGateOptionSemantics::Accept,
+        OperatorGateOptionSemanticsV1::Decline => OperatorGateOptionSemantics::Decline,
+        OperatorGateOptionSemanticsV1::Inspect => OperatorGateOptionSemantics::Inspect,
+        OperatorGateOptionSemanticsV1::Exit => OperatorGateOptionSemantics::Exit,
+        OperatorGateOptionSemanticsV1::Unknown => OperatorGateOptionSemantics::Unknown,
     }
 }
 
@@ -7846,6 +7919,26 @@ mod tests {
     /// state` is caught here rather than silently falling through.
     #[test]
     fn harness_session_wire_screen_state_projects_through_unchanged_for_every_variant() {
+        let wire_gate = OperatorGateStateV1 {
+            kind: OperatorGateKindV1::WorkspaceTrust,
+            subject: OperatorGateSubjectV1::Directory { path: None },
+            input: OperatorGateInputV1::ArrowList,
+            options: vec![OperatorGateOptionV1 {
+                text: "Trust this folder".to_owned(),
+                semantics: OperatorGateOptionSemanticsV1::Accept,
+                selected: false,
+            }],
+        };
+        let expected_gate = OperatorGateState {
+            kind: OperatorGateKind::WorkspaceTrust,
+            subject: OperatorGateSubject::Directory { path: None },
+            input: OperatorGateInput::ArrowList,
+            options: vec![OperatorGateOption {
+                text: "Trust this folder".to_owned(),
+                semantics: OperatorGateOptionSemantics::Accept,
+                selected: false,
+            }],
+        };
         let cases = [
             (PtyScreenStateV1::Unknown, PtyScreenState::Unknown),
             (
@@ -7853,8 +7946,8 @@ mod tests {
                 PtyScreenState::NotAgent { observed_process: "npm".to_owned() },
             ),
             (
-                PtyScreenStateV1::OperatorGate { gate: "workspace-trust".to_owned() },
-                PtyScreenState::OperatorGate { gate: "workspace-trust".to_owned() },
+                PtyScreenStateV1::OperatorGate { gate: wire_gate },
+                PtyScreenState::OperatorGate { gate: expected_gate },
             ),
             (
                 PtyScreenStateV1::Failing { reason: "crash-loop".to_owned() },

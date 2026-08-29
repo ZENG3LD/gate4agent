@@ -46,12 +46,14 @@ use gate4agent_types::{
     AdapterFamily, AgentCommand, AgentId, AgentInstanceId, CapabilityProbeFailure,
     ContextWindowUsage as ProviderContextWindowUsage, ControlEffect,
     ControlObservation, EffectEnvelope, ForegroundProcess, ForegroundProcessKind,
-    ForegroundRequirement, InputAction, ObservationEnvelope, OperationId, PipeProtocol,
+    ForegroundRequirement, InputAction, ObservationEnvelope, OperationId, OperatorGateInput,
+    OperatorGateKind, OperatorGateOption, OperatorGateOptionSemantics, OperatorGateState,
+    OperatorGateSubject, PipeProtocol,
     PreparedInputKind, PromptPayload, ProviderEvent, ProviderInteractionKind,
     ProviderRuntimeCapability, ProviderRuntimePolicy, ProviderSessionIdentity, ProviderSessionKey,
     ProviderSource, PtyScreenState, ResumeLaunchRequest, SessionGeneration, StartRequest,
     TerminalFrame, TerminalMouseProtocolEncoding, TerminalSize, TokenUsage, TransportKind,
-    CONTROL_PROTOCOL_VERSION, WORKING_DIRECTORY_MAX_BYTES,
+    CONTROL_PROTOCOL_VERSION, OPERATOR_GATE_OPTIONS_MAX, WORKING_DIRECTORY_MAX_BYTES,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{OsStr, OsString};
@@ -112,7 +114,7 @@ struct OwnedPtySession {
     /// `NativeEffectShell::catalog` without holding a borrow of `session`
     /// across the same loop iteration it awaits `observe_foreground` on.
     agent_id: AgentId,
-    last_screen_gate: Option<&'static str>,
+    last_screen_gate: Option<OperatorGateState>,
     last_screen_failure: Option<&'static str>,
     last_foreground_verdict: Option<ForegroundVerdict>,
     last_screen_state: PtyScreenState,
@@ -1527,7 +1529,7 @@ impl NativeEffectShell {
                         screen_failure_for_generation(&snapshot.contents, owned.ever_reached_ready);
                     let merged = classify_pty_screen_state(
                         owned.last_foreground_verdict.as_ref(),
-                        owned.last_screen_gate,
+                        owned.last_screen_gate.as_ref(),
                         owned.last_screen_failure,
                     );
                     if merged == PtyScreenState::Ready {
@@ -1644,7 +1646,7 @@ impl NativeEffectShell {
                     owned.last_foreground_verdict = Some(verdict);
                     let merged = classify_pty_screen_state(
                         owned.last_foreground_verdict.as_ref(),
-                        owned.last_screen_gate,
+                        owned.last_screen_gate.as_ref(),
                         owned.last_screen_failure,
                     );
                     // A foreground-only transition into `Ready` (text was
@@ -2977,7 +2979,7 @@ async fn wait_for_prompt_render(
     loop {
         let snapshot = session.terminal_state().map_err(|error| error.to_string())?;
         if let Some(gate) = startup_operator_gate(&snapshot.contents) {
-            return Err(startup_operator_error(spec, gate));
+            return Err(startup_operator_error(spec, &gate));
         }
         if prompt_rendered(&snapshot, baseline, &probe) {
             return Ok(());
@@ -3209,12 +3211,12 @@ async fn wait_for_startup_operator_gate(
 fn ensure_no_startup_operator_gate(session: &PtySession, spec: &AgentSpec) -> Result<(), String> {
     let snapshot = session.terminal_state().map_err(|error| error.to_string())?;
     match startup_operator_gate(&snapshot.contents) {
-        Some(gate) => Err(startup_operator_error(spec, gate)),
+        Some(gate) => Err(startup_operator_error(spec, &gate)),
         None => Ok(()),
     }
 }
 
-fn startup_operator_error(spec: &AgentSpec, gate: &str) -> String {
+fn startup_operator_error(spec: &AgentSpec, gate: &OperatorGateState) -> String {
     format!(
         "agent '{}' requires operator action at startup ({gate}); initial prompt was not submitted",
         spec.id
@@ -3225,7 +3227,7 @@ fn ensure_no_readiness_operator_gate(
     diagnostics: &ReadinessDiagnostics,
     spec: &AgentSpec,
 ) -> Result<(), String> {
-    match diagnostics.operator_gate {
+    match &diagnostics.operator_gate {
         Some(gate) => Err(startup_operator_error(spec, gate)),
         None => Ok(()),
     }
@@ -3272,7 +3274,24 @@ const PACKAGE_MANAGER_UPDATE_COMPLETION_MARKERS: &[&str] = &[
     "updated successfully",
 ];
 
-fn startup_operator_gate(contents: &str) -> Option<&'static str> {
+/// Builds the classified `OperatorGateState` for a matched `kind`/`subject`
+/// pair, filling `input`/`options` from whatever `parse_operator_gate_options`
+/// can read off the RAW (un-normalized, multi-line) screen text. Every
+/// `startup_operator_gate` match arm goes through this one function so
+/// option-list recognition is uniform across every gate kind rather than
+/// hand-wired per branch -- a kind this module has not yet seen an option
+/// layout for simply gets `OperatorGateInput::Unknown` and no options,
+/// exactly like a kind whose options this parser fails to recognize on a
+/// given screen; there is no special-casing between "not implemented yet"
+/// and "not recognized this time".
+fn operator_gate(kind: OperatorGateKind, subject: OperatorGateSubject, contents: &str) -> OperatorGateState {
+    let (input, options) = parse_operator_gate_options(contents);
+    OperatorGateState::new(kind)
+        .with_subject(subject)
+        .with_options(input, options)
+}
+
+fn startup_operator_gate(contents: &str) -> Option<OperatorGateState> {
     let normalized = normalize_screen_text(contents);
     if [
         "trust this folder",
@@ -3283,30 +3302,43 @@ fn startup_operator_gate(contents: &str) -> Option<&'static str> {
     .iter()
     .any(|marker| normalized.contains(marker))
     {
-        return Some("workspace trust");
+        return Some(operator_gate(
+            OperatorGateKind::WorkspaceTrust,
+            OperatorGateSubject::Directory { path: None },
+            contents,
+        ));
     }
     if normalized.contains("quick safety check")
         && (normalized.contains("yes, i trust this folder")
             || normalized.contains("continue without these permissions"))
     {
-        return Some("workspace trust");
+        return Some(operator_gate(
+            OperatorGateKind::WorkspaceTrust,
+            OperatorGateSubject::Directory { path: None },
+            contents,
+        ));
     }
     // A CLI's own hook-trust prompt at startup (seen from Codex): a set of
     // shell hooks it discovered need to be reviewed/trusted before they are
-    // allowed to run, distinct from `"workspace trust"` above -- that gate
-    // is about trusting the PROJECT DIRECTORY, this one is about trusting
-    // SHELL HOOKS the CLI found inside it, and an operator reading
-    // `OperatorGate::gate` should be able to tell which question is being
-    // asked. Required to co-occur with the screen's own "decline" option
-    // rather than matching on "hooks need review" alone, so an agent's
-    // ordinary narration that merely uses the word "hooks" (explaining a
-    // git hook, a React hook, a build hook) never matches: real narration
-    // essentially never also contains the literal refusal phrasing
-    // "continue without trusting" this same prompt renders. The number of
-    // hooks reported (which varies run to run) plays no part in the match.
+    // allowed to run, distinct from `WorkspaceTrust` above -- that gate is
+    // about trusting the PROJECT DIRECTORY, this one is about trusting
+    // SHELL HOOKS the CLI found inside it, and an operator reading `kind`
+    // should be able to tell which question is being asked. Required to
+    // co-occur with the screen's own "decline" option rather than matching
+    // on "hooks need review" alone, so an agent's ordinary narration that
+    // merely uses the word "hooks" (explaining a git hook, a React hook, a
+    // build hook) never matches: real narration essentially never also
+    // contains the literal refusal phrasing "continue without trusting"
+    // this same prompt renders. The number of hooks reported (which varies
+    // run to run, and is not read into `subject`'s `count` -- no matcher
+    // here parses it off the screen) plays no part in the match.
     if normalized.contains("hooks need review") && normalized.contains("continue without trusting")
     {
-        return Some("hook trust review");
+        return Some(operator_gate(
+            OperatorGateKind::HookTrust,
+            OperatorGateSubject::Hooks { count: None },
+            contents,
+        ));
     }
     if [
         "select authentication method",
@@ -3316,31 +3348,42 @@ fn startup_operator_gate(contents: &str) -> Option<&'static str> {
     .iter()
     .any(|marker| normalized.contains(marker))
     {
-        return Some("authentication");
+        return Some(operator_gate(
+            OperatorGateKind::Authentication,
+            OperatorGateSubject::Account,
+            contents,
+        ));
     }
     if normalized.contains("sign in")
         && (normalized.contains("openai")
             || normalized.contains("chatgpt")
             || normalized.contains("codex"))
     {
-        return Some("authentication");
+        return Some(operator_gate(
+            OperatorGateKind::Authentication,
+            OperatorGateSubject::Account,
+            contents,
+        ));
     }
     if normalized.contains("kimi code update available")
         && normalized.contains("install update now")
     {
-        return Some("vendor update");
+        return Some(operator_gate(
+            OperatorGateKind::VendorUpdate,
+            OperatorGateSubject::Unknown,
+            contents,
+        ));
     }
     // A wrapper script self-updating via a package manager before the real
     // CLI ever launches -- the case that produced the incident this module
     // fixes: an npm-driven wrapper ran an update to completion and printed
     // nothing that looked like the agent, while every consumer still saw a
-    // live, `status: running` PTY. This shares the "vendor update" label
-    // with the Kimi in-app case just above on purpose, not by omission:
-    // both are "the CLI is updating itself", the only difference is WHICH
-    // process drives it (the agent's own composer vs. a wrapper script's
-    // package-manager install), and an operator reading `OperatorGate::gate`
-    // should see one meaning for that fact regardless of which vendor's
-    // update mechanism produced it.
+    // live, `status: running` PTY. This shares `VendorUpdate` with the Kimi
+    // in-app case just above on purpose, not by omission: both are "the CLI
+    // is updating itself", the only difference is WHICH process drives it
+    // (the agent's own composer vs. a wrapper script's package-manager
+    // install), and an operator reading `kind` should see one meaning for
+    // that fact regardless of which vendor's update mechanism produced it.
     if PACKAGE_MANAGER_INSTALL_MARKERS
         .iter()
         .any(|marker| normalized.contains(marker))
@@ -3348,26 +3391,196 @@ fn startup_operator_gate(contents: &str) -> Option<&'static str> {
             .iter()
             .any(|marker| normalized.contains(marker))
     {
-        return Some("vendor update");
+        return Some(operator_gate(
+            OperatorGateKind::VendorUpdate,
+            OperatorGateSubject::Unknown,
+            contents,
+        ));
     }
     if normalized.contains("choose the text style that looks best with your terminal") {
-        return Some("terminal appearance setup");
+        return Some(operator_gate(
+            OperatorGateKind::TerminalAppearance,
+            OperatorGateSubject::Appearance,
+            contents,
+        ));
     }
     if normalized.contains("welcome to claude code for")
         && (normalized.contains("open files") || normalized.contains("selected lines"))
     {
-        return Some("IDE onboarding");
+        return Some(operator_gate(
+            OperatorGateKind::Onboarding,
+            OperatorGateSubject::Unknown,
+            contents,
+        ));
     }
     if normalized.contains("welcome to claude code")
         && (normalized.contains("press enter") || normalized.contains("enter to continue"))
     {
-        return Some("Claude onboarding");
+        return Some(operator_gate(
+            OperatorGateKind::Onboarding,
+            OperatorGateSubject::Unknown,
+            contents,
+        ));
     }
-    Some("configuration migration").filter(|_| {
-        normalized.contains("migration")
-            && normalized.contains("enter confirm")
-            && normalized.contains("esc")
+    if normalized.contains("migration") && normalized.contains("enter confirm") && normalized.contains("esc")
+    {
+        return Some(operator_gate(
+            OperatorGateKind::ConfigurationMigration,
+            OperatorGateSubject::Unknown,
+            contents,
+        ));
+    }
+    None
+}
+
+/// Reads the recognized on-screen choice list, if any, off the RAW
+/// (multi-line, un-normalized) screen text -- called uniformly by every
+/// `startup_operator_gate` match arm through `operator_gate`. Recognizes
+/// exactly two rendered shapes, both observed verbatim on a live stand:
+///
+/// - a NUMBERED list (Codex's hook-trust prompt): each option line starts,
+///   after an optional leading cursor glyph (`›`) and whitespace, with
+///   `N.`; `Some` lines from `parse_numbered_gate_option_line` win outright
+///   over the arrow shape below, so a screen that happens to also contain an
+///   arrow glyph elsewhere (a Codex composer prompt sharing the pane, say)
+///   is still read as the numbered list it actually is.
+/// - an ARROW list (Kimi's workspace-trust prompt): the currently selected
+///   option carries a leading `❯`; the other options carry no glyph at all,
+///   so they are told apart from the description line rendered under each
+///   one (`"Enable project MCP servers. Remembered for this folder."` under
+///   `"Trust this folder"`, for instance) by `parse_arrow_gate_option_line`'s
+///   own filter -- see that function's doc comment for the exact rule.
+///
+/// Neither line is stable across CLIs, and this parser recognizes nothing
+/// else: a screen matching neither shape returns `(Unknown, vec![])`, never
+/// a guess built from partial matches.
+fn parse_operator_gate_options(contents: &str) -> (OperatorGateInput, Vec<OperatorGateOption>) {
+    let numbered: Vec<OperatorGateOption> = contents
+        .lines()
+        .filter_map(parse_numbered_gate_option_line)
+        .take(OPERATOR_GATE_OPTIONS_MAX)
+        .collect();
+    if !numbered.is_empty() {
+        return (OperatorGateInput::NumberedList, numbered);
+    }
+    let arrow: Vec<OperatorGateOption> = contents
+        .lines()
+        .filter_map(parse_arrow_gate_option_line)
+        .take(OPERATOR_GATE_OPTIONS_MAX)
+        .collect();
+    if !arrow.is_empty() {
+        return (OperatorGateInput::ArrowList, arrow);
+    }
+    (OperatorGateInput::Unknown, Vec::new())
+}
+
+/// Parses one line of a numbered option list -- `"› 1. Review hooks"`,
+/// `"  2. Trust all and continue"` -- into `(selected, text)`. `selected` is
+/// true only when the line carries the leading `›` cursor glyph Codex draws
+/// on the highlighted row; every other line in the same list has none.
+/// Returns `None` for any line that, once a leading glyph is stripped, does
+/// not start with `<digits>.` -- an instruction line like `"Press enter to
+/// confirm or esc to go back"` is exactly this shape and is meant to fall
+/// through untouched.
+fn parse_numbered_gate_option_line(line: &str) -> Option<OperatorGateOption> {
+    let trimmed = line.trim_start();
+    let (selected, rest) = match trimmed.strip_prefix('\u{203a}') {
+        Some(stripped) => (true, stripped.trim_start()),
+        None => (false, trimmed),
+    };
+    let digits_end = rest.find(|character: char| !character.is_ascii_digit()).unwrap_or(0);
+    if digits_end == 0 {
+        return None;
+    }
+    let text = rest[digits_end..].strip_prefix('.')?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(OperatorGateOption {
+        semantics: classify_operator_gate_option_semantics(text),
+        text: text.to_owned(),
+        selected,
     })
+}
+
+/// Parses one line of an arrow-navigated option list -- `"❯ Don't trust"`,
+/// `"  Trust this folder"` -- into `(selected, text)`. `selected` is true
+/// only when the line carries the leading `❯` cursor glyph.
+///
+/// Distinguishing an option TITLE from the description/header/instruction
+/// prose around it (`"Enable project MCP servers. Remembered for this
+/// folder."` under `"Trust this folder"`; `"Do you trust the files in this
+/// folder?"` above it; `"Press enter to confirm or esc to go back"` below a
+/// DIFFERENT screen's numbered list entirely) cannot rely on the glyph
+/// alone, since only the currently-selected title ever carries one. A
+/// candidate line is accepted as an option only if EITHER it carries the
+/// `❯` marker (the screen's own cursor is unambiguous proof this is a real,
+/// currently-selected option, whatever its wording), OR it both looks like
+/// a short menu label rather than a sentence (no `.`, `?`, `!`, or `:`
+/// anywhere in it -- a description or instruction is a full sentence
+/// carrying one of these; an option label like `"Trust this folder"` or
+/// `"Don't trust"` never does) AND its own text uses one of the recognized
+/// option verbs (`classify_operator_gate_option_semantics` returns
+/// something other than `Unknown`) -- an unmarked line whose wording this
+/// module does not recognize as a choice-verb is left as prose rather than
+/// guessed into an option with `semantics: Unknown`. The arrow-key legend
+/// itself (`"↑↓ navigate · Enter select · Esc exit"`) is excluded
+/// explicitly rather than relying on either rule catching it.
+fn parse_arrow_gate_option_line(line: &str) -> Option<OperatorGateOption> {
+    let trimmed = line.trim();
+    if trimmed.is_empty()
+        || trimmed
+            .chars()
+            .any(|character| matches!(character, '.' | '?' | '!' | ':'))
+    {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains('\u{2191}') || lower.contains('\u{2193}') || lower.contains("navigate") {
+        return None;
+    }
+    let (selected, rest) = match trimmed.strip_prefix('\u{276f}') {
+        Some(stripped) => (true, stripped.trim()),
+        None => (false, trimmed),
+    };
+    if rest.is_empty() || !rest.chars().any(|character| character.is_alphabetic()) {
+        return None;
+    }
+    let semantics = classify_operator_gate_option_semantics(rest);
+    if !selected && semantics == OperatorGateOptionSemantics::Unknown {
+        return None;
+    }
+    Some(OperatorGateOption {
+        semantics,
+        text: rest.to_owned(),
+        selected,
+    })
+}
+
+/// Infers what choosing a given on-screen option does from the verb in its
+/// OWN text -- never from its position or number, since neither is stable
+/// across CLIs or screen wraps. Decline phrasing is checked before accept
+/// phrasing so `"Continue without trusting"` (contains both "continue" and
+/// "without trusting") reads as `Decline`, matching what the option
+/// actually does; an option whose text uses none of these verbs classifies
+/// `Unknown` rather than a guessed default.
+fn classify_operator_gate_option_semantics(text: &str) -> OperatorGateOptionSemantics {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("review") {
+        OperatorGateOptionSemantics::Inspect
+    } else if lower.contains("don't trust")
+        || lower.contains("do not trust")
+        || lower.contains("without trusting")
+        || lower.contains("decline")
+    {
+        OperatorGateOptionSemantics::Decline
+    } else if lower.contains("trust") || lower.contains("continue") || lower.contains("proceed") {
+        OperatorGateOptionSemantics::Accept
+    } else if lower.contains("exit") || lower.contains("quit") || lower.contains("cancel") {
+        OperatorGateOptionSemantics::Exit
+    } else {
+        OperatorGateOptionSemantics::Unknown
+    }
 }
 
 /// True if `line` ends in a bare shell-prompt character -- used only to
@@ -3485,7 +3698,7 @@ enum ForegroundVerdict {
 ///    does the merge land on `Ready`.
 fn classify_pty_screen_state(
     foreground: Option<&ForegroundVerdict>,
-    gate: Option<&'static str>,
+    gate: Option<&OperatorGateState>,
     failure: Option<&'static str>,
 ) -> PtyScreenState {
     if let Some(ForegroundVerdict::Foreign { process }) = foreground {
@@ -3499,9 +3712,7 @@ fn classify_pty_screen_state(
         };
     }
     if let Some(gate) = gate {
-        return PtyScreenState::OperatorGate {
-            gate: gate.to_owned(),
-        };
+        return PtyScreenState::OperatorGate { gate: gate.clone() };
     }
     if foreground.is_some() {
         PtyScreenState::Ready
@@ -3621,7 +3832,7 @@ struct ReadinessDiagnostics {
     saw_claude_composer: bool,
     saw_codex_composer: bool,
     saw_named_foreground: bool,
-    operator_gate: Option<&'static str>,
+    operator_gate: Option<OperatorGateState>,
 }
 
 impl ReadinessDiagnostics {
@@ -3642,6 +3853,7 @@ impl ReadinessDiagnostics {
         let text = String::from_utf8_lossy(&combined);
         self.operator_gate = self
             .operator_gate
+            .take()
             .or_else(|| startup_operator_gate(&strip_ansi_codes(&text)));
         self.tail = combined[combined.len().saturating_sub(SIGNAL_TAIL_BYTES)..].to_vec();
     }
@@ -3729,9 +3941,10 @@ fn elapsed_ms(started: Instant) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        argument_looks_like_credential, classify_pty_screen_state, drain_qwen_sidecar,
+        argument_looks_like_credential, classify_operator_gate_option_semantics,
+        classify_pty_screen_state, drain_qwen_sidecar,
         finish_qwen_sidecar, foreground_probe_rearms_immediately, foreground_probe_schedule,
-        prepare_fresh_pty_provider_session,
+        parse_operator_gate_options, prepare_fresh_pty_provider_session,
         prompt_render_probe, prompt_rendered, redact_provider_argument, redact_provider_arguments,
         reserve_provider_gap_sequence, resolve_foreground_verdict, screen_failure,
         screen_failure_for_generation, with_pty_terminal_capability_defaults, NativeSessionKey,
@@ -3752,7 +3965,9 @@ mod tests {
     use gate4agent::pty::{PtyForegroundObservation, PtyForegroundSource};
     use gate4agent_types::{
         AdapterFamily, AgentId, AgentInstanceId, ControlEffect, ControlObservation, EffectEnvelope,
-        OperationId, ProviderEvent, ProviderRuntimePolicy, PtyScreenState, RuntimePlatform,
+        OperationId, OperatorGateInput, OperatorGateKind, OperatorGateOptionSemantics,
+        OperatorGateState, ProviderEvent, ProviderRuntimePolicy,
+        PtyScreenState, RuntimePlatform,
         SessionGeneration, StartRequest, TerminalMouseProtocolEncoding, TerminalSize,
         TransportKind, CONTROL_PROTOCOL_VERSION,
     };
@@ -3925,101 +4140,239 @@ mod tests {
         .is_ok());
     }
 
+    /// Classifies `contents` and returns just the `kind` -- the same check
+    /// every case below cares about, without repeating `.map(|gate|
+    /// gate.kind)` at every call site.
+    fn kind_of(contents: &str) -> Option<OperatorGateKind> {
+        startup_operator_gate(contents).map(|gate| gate.kind)
+    }
+
     #[test]
     fn startup_operator_gates_are_classified_without_returning_terminal_text() {
+        assert_eq!(kind_of(" Trust this\nfolder? "), Some(OperatorGateKind::WorkspaceTrust));
         assert_eq!(
-            startup_operator_gate(" Trust this\nfolder? "),
-            Some("workspace trust")
+            kind_of("No auth type is selected"),
+            Some(OperatorGateKind::Authentication)
         );
         assert_eq!(
-            startup_operator_gate("No auth type is selected"),
-            Some("authentication")
+            kind_of("Sign in with OpenAI to use Codex"),
+            Some(OperatorGateKind::Authentication)
         );
         assert_eq!(
-            startup_operator_gate("Sign in with OpenAI to use Codex"),
-            Some("authentication")
+            kind_of("Kimi Code Update Available\nInstall update now (0.32.0)\nEnter confirm"),
+            Some(OperatorGateKind::VendorUpdate)
         );
         assert_eq!(
-            startup_operator_gate(
-                "Kimi Code Update Available\nInstall update now (0.32.0)\nEnter confirm"
-            ),
-            Some("vendor update")
-        );
-        assert_eq!(
-            startup_operator_gate(
+            kind_of(
                 "Welcome to Claude Code\nChoose the text style that looks best with your terminal"
             ),
-            Some("terminal appearance setup")
+            Some(OperatorGateKind::TerminalAppearance)
         );
         assert_eq!(
-            startup_operator_gate(
+            kind_of(
                 "Welcome to Claude Code for VS Code\nClaude has context of open files and selected lines"
             ),
-            Some("IDE onboarding")
+            Some(OperatorGateKind::Onboarding)
         );
         assert_eq!(
-            startup_operator_gate("Welcome to Claude Code\n❯ Press Enter to continue"),
-            Some("Claude onboarding")
+            kind_of("Welcome to Claude Code\n❯ Press Enter to continue"),
+            Some(OperatorGateKind::Onboarding)
         );
+        assert_eq!(kind_of("Welcome to Claude Code\n❯ ready\nEnter to send"), None);
         assert_eq!(
-            startup_operator_gate("Welcome to Claude Code\n❯ ready\nEnter to send"),
-            None
-        );
-        assert_eq!(
-            startup_operator_gate(
+            kind_of(
                 "Quick safety check: Is this a project you trust?\nYes, I trust this folder\nNo, continue without these permissions"
             ),
-            Some("workspace trust")
+            Some(OperatorGateKind::WorkspaceTrust)
         );
-        assert_eq!(startup_operator_gate("ready for a prompt"), None);
+        assert_eq!(kind_of("ready for a prompt"), None);
         // Regression test for the incident this module fixes: a provider
         // CLI's wrapper self-updated via npm before the real agent ever
         // launched, and every consumer saw `status: running` on a live PTY
         // that was actually showing this text. Verbatim transcript.
         assert_eq!(
-            startup_operator_gate(
+            kind_of(
                 "Updating Codex via `npm install -g @openai/codex`...\n\
                  npm warn cleanup Failed to remove some directories\n\
                  Update ran successfully! Please restart Codex."
             ),
-            Some("vendor update")
+            Some(OperatorGateKind::VendorUpdate)
         );
         // Regression test for the live-stand incident this branch fixes:
         // Codex's startup hook-trust prompt was classified `Ready` because
         // no marker recognized it, so a prompt injected into the PTY landed
         // in this blocking select-list instead of the agent. Verbatim
-        // transcript from `terminal-read`, 40x120.
+        // transcript from `terminal-read`, 40x120 -- note this capture wraps
+        // the `› 1. Review hooks` marker onto the end of the preceding
+        // sentence, so it is deliberately NOT the clean list shape the
+        // dedicated option-parsing tests below assert on; this test only
+        // pins the `kind`, same as it always has.
         assert_eq!(
-            startup_operator_gate(
+            kind_of(
                 "  Hooks need review\n\
                    6 hooks are new or changed.\n\
                    Hooks can run outside the sandbox after you trust them.\u{203a} 1. Review hooks\n\
                    2. Trust all and continue\n\
                    3. Continue without trusting (hooks won't run)  Press enter to confirm or esc to go back"
             ),
-            Some("hook trust review")
+            Some(OperatorGateKind::HookTrust)
         );
         // Same screen, different hook count -- the match must not depend on
         // the number.
         assert_eq!(
-            startup_operator_gate(
+            kind_of(
                 "  Hooks need review\n\
                    42 hooks are new or changed.\n\
                    Hooks can run outside the sandbox after you trust them.\u{203a} 1. Review hooks\n\
                    2. Trust all and continue\n\
                    3. Continue without trusting (hooks won't run)  Press enter to confirm or esc to go back"
             ),
-            Some("hook trust review")
+            Some(OperatorGateKind::HookTrust)
         );
         // Ordinary agent narration that happens to mention hooks and trust
         // must NOT be classified as this gate -- it lacks the screen's own
         // "continue without trusting" refusal phrasing.
         assert_eq!(
-            startup_operator_gate(
+            kind_of(
                 "I reviewed the pre-commit hooks in this repo and they look safe to trust; \
                  I'll leave the hooks config as-is and continue with the refactor."
             ),
             None
+        );
+    }
+
+    /// Codex's hook-trust prompt rendered as a clean numbered list (the
+    /// shape actually described by the task this parser was written for,
+    /// as opposed to the line-wrapped capture pinned by `kind` alone
+    /// above): `parse_operator_gate_options` reads all three choices, marks
+    /// the `›`-prefixed one selected, and infers accept/inspect/decline
+    /// from each option's own verb -- never from its number or position.
+    #[test]
+    fn startup_operator_gate_parses_a_numbered_hook_trust_option_list() {
+        let contents = "Hooks need review\n\
+             \u{203a} 1. Review hooks\n  \
+             2. Trust all and continue\n  \
+             3. Continue without trusting (hooks won't run)\n\
+             Press enter to confirm or esc to go back";
+        let gate = startup_operator_gate(contents).expect("hook trust must classify");
+        assert_eq!(gate.kind, OperatorGateKind::HookTrust);
+        assert_eq!(gate.input, OperatorGateInput::NumberedList);
+        assert_eq!(
+            gate.options,
+            vec![
+                gate4agent_types::OperatorGateOption {
+                    text: "Review hooks".to_owned(),
+                    semantics: OperatorGateOptionSemantics::Inspect,
+                    selected: true,
+                },
+                gate4agent_types::OperatorGateOption {
+                    text: "Trust all and continue".to_owned(),
+                    semantics: OperatorGateOptionSemantics::Accept,
+                    selected: false,
+                },
+                gate4agent_types::OperatorGateOption {
+                    text: "Continue without trusting (hooks won't run)".to_owned(),
+                    semantics: OperatorGateOptionSemantics::Decline,
+                    selected: false,
+                },
+            ],
+        );
+    }
+
+    /// Kimi's workspace-trust prompt rendered as an arrow-navigated list
+    /// with a description line under each title: `parse_operator_gate_options`
+    /// reads the two TITLES ("Trust this folder", "Don't trust") as options,
+    /// marks the `❯`-prefixed one selected, and does NOT mistake either
+    /// description line (both full sentences, ending in `.`) for a third
+    /// and fourth option.
+    #[test]
+    fn startup_operator_gate_parses_an_arrow_workspace_trust_option_list() {
+        let contents = "Do you trust the files in this folder?\n  \
+             Trust this folder\n  \
+             Enable project MCP servers. Remembered for this folder.\n\u{276f} \
+             Don't trust\n  \
+             Exit Kimi Code. Asked again next launch.\n  \
+             \u{2191}\u{2193} navigate \u{b7} Enter select \u{b7} Esc exit";
+        let gate = startup_operator_gate(contents).expect("workspace trust must classify");
+        assert_eq!(gate.kind, OperatorGateKind::WorkspaceTrust);
+        assert_eq!(gate.input, OperatorGateInput::ArrowList);
+        assert_eq!(
+            gate.options,
+            vec![
+                gate4agent_types::OperatorGateOption {
+                    text: "Trust this folder".to_owned(),
+                    semantics: OperatorGateOptionSemantics::Accept,
+                    selected: false,
+                },
+                gate4agent_types::OperatorGateOption {
+                    text: "Don't trust".to_owned(),
+                    semantics: OperatorGateOptionSemantics::Decline,
+                    selected: true,
+                },
+            ],
+        );
+    }
+
+    /// A matched gate whose screen carries no recognized option list (every
+    /// other `kind` this module classifies today) must NOT invent one --
+    /// `input` stays `Unknown` and `options` stays empty, never a guess.
+    #[test]
+    fn startup_operator_gate_without_a_recognized_option_list_reports_unknown_input() {
+        let gate = startup_operator_gate("No auth type is selected")
+            .expect("authentication must classify");
+        assert_eq!(gate.kind, OperatorGateKind::Authentication);
+        assert_eq!(gate.input, OperatorGateInput::Unknown);
+        assert!(gate.options.is_empty());
+    }
+
+    /// `parse_operator_gate_options` is the parser both dedicated tests
+    /// above exercise indirectly through `startup_operator_gate`; this pins
+    /// it directly against the same two shapes so a regression in the
+    /// standalone parser is caught even if some future `kind` branch stops
+    /// calling it through `operator_gate`.
+    #[test]
+    fn parse_operator_gate_options_recognizes_numbered_and_arrow_shapes_and_nothing_else() {
+        assert_eq!(
+            parse_operator_gate_options("Press enter to confirm or esc to go back"),
+            (OperatorGateInput::Unknown, Vec::new()),
+        );
+        let (input, options) = parse_operator_gate_options(
+            "\u{203a} 1. Review hooks\n  2. Trust all and continue",
+        );
+        assert_eq!(input, OperatorGateInput::NumberedList);
+        assert_eq!(options.len(), 2);
+        let (input, options) = parse_operator_gate_options(
+            "  Trust this folder\n  Enable project MCP servers. Remembered for this folder.\n\u{276f} Don't trust",
+        );
+        assert_eq!(input, OperatorGateInput::ArrowList);
+        assert_eq!(options.len(), 2);
+    }
+
+    #[test]
+    fn classify_operator_gate_option_semantics_reads_the_verb_not_the_position() {
+        assert_eq!(
+            classify_operator_gate_option_semantics("Review hooks"),
+            OperatorGateOptionSemantics::Inspect,
+        );
+        assert_eq!(
+            classify_operator_gate_option_semantics("Trust all and continue"),
+            OperatorGateOptionSemantics::Accept,
+        );
+        assert_eq!(
+            classify_operator_gate_option_semantics("Continue without trusting (hooks won't run)"),
+            OperatorGateOptionSemantics::Decline,
+        );
+        assert_eq!(
+            classify_operator_gate_option_semantics("Don't trust"),
+            OperatorGateOptionSemantics::Decline,
+        );
+        assert_eq!(
+            classify_operator_gate_option_semantics("Exit Kimi Code"),
+            OperatorGateOptionSemantics::Exit,
+        );
+        assert_eq!(
+            classify_operator_gate_option_semantics("Something unrecognized"),
+            OperatorGateOptionSemantics::Unknown,
         );
     }
 
@@ -4155,8 +4508,9 @@ mod tests {
                 observed_process: "npm".to_owned()
             }
         );
+        let vendor_update_gate = OperatorGateState::new(OperatorGateKind::VendorUpdate);
         assert_eq!(
-            classify_pty_screen_state(Some(&foreign), Some("vendor update"), None),
+            classify_pty_screen_state(Some(&foreign), Some(&vendor_update_gate), None),
             PtyScreenState::NotAgent {
                 observed_process: "npm".to_owned()
             }
@@ -4165,10 +4519,11 @@ mod tests {
 
     #[test]
     fn classify_pty_screen_state_reports_a_gate_only_when_foreground_matches() {
+        let authentication_gate = OperatorGateState::new(OperatorGateKind::Authentication);
         assert_eq!(
-            classify_pty_screen_state(Some(&ForegroundVerdict::Agent), Some("authentication"), None),
+            classify_pty_screen_state(Some(&ForegroundVerdict::Agent), Some(&authentication_gate), None),
             PtyScreenState::OperatorGate {
-                gate: "authentication".to_owned()
+                gate: authentication_gate.clone()
             }
         );
     }
@@ -4188,10 +4543,11 @@ mod tests {
         // Pins the precedence: a crashed screen can still carry a leftover
         // gate prompt above the crash dump, and `Failing` is the more
         // urgent of the two truths.
+        let authentication_gate = OperatorGateState::new(OperatorGateKind::Authentication);
         assert_eq!(
             classify_pty_screen_state(
                 Some(&ForegroundVerdict::Agent),
-                Some("authentication"),
+                Some(&authentication_gate),
                 Some("crash")
             ),
             PtyScreenState::Failing {
@@ -4256,7 +4612,7 @@ mod tests {
         );
         assert_eq!(
             foreground_probe_schedule(&PtyScreenState::OperatorGate {
-                gate: "vendor update".to_owned()
+                gate: OperatorGateState::new(OperatorGateKind::VendorUpdate)
             }),
             ForegroundProbeSchedule::Armed
         );
@@ -4265,7 +4621,7 @@ mod tests {
     #[test]
     fn text_only_gate_transition_rearms_the_probe_only_when_leaving_ready() {
         let gate = PtyScreenState::OperatorGate {
-            gate: "vendor update".to_owned(),
+            gate: OperatorGateState::new(OperatorGateKind::VendorUpdate),
         };
         assert!(foreground_probe_rearms_immediately(
             &PtyScreenState::Ready,
@@ -4284,7 +4640,10 @@ mod tests {
         let mut diagnostics = ReadinessDiagnostics::default();
         diagnostics.observe_output(b"\x1b[31mNo auth ");
         diagnostics.observe_output(b"\x1b[0mtype is selected");
-        assert_eq!(diagnostics.operator_gate, Some("authentication"));
+        assert_eq!(
+            diagnostics.operator_gate.as_ref().map(|gate| gate.kind),
+            Some(OperatorGateKind::Authentication)
+        );
         assert!(!diagnostics.summary().contains("No auth"));
     }
 

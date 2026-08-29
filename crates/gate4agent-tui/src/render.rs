@@ -15468,13 +15468,22 @@ fn workspace_state(node: &NodeView, workspace: &WorkspaceView, theme: Theme) -> 
 /// (`PtyScreenState::OperatorGate`'s own doc comment), the same "needs a
 /// look, not necessarily broken" register `stoppable`'s yellow already
 /// uses a few lines below in `session_state`.
+///
+/// `OperatorGate`'s label here is `gate.kind.label()` -- just the KIND, not
+/// `OperatorGateState::describe`'s fuller `kind [options]` rendering
+/// `control_plane::screen_state_label` uses -- because this is a single
+/// roster-row glyph label shared with every other branch's one-word text
+/// (`"blocked"`, `"working"`, the bare observed-process/crash-reason
+/// string); `kind.label()` is a `&'static str` so it costs nothing extra to
+/// return here, and this floor keeps the existing render exactly as
+/// compact as it was before `OperatorGate` carried anything past a label.
 fn screen_state_alert(state: &PtyScreenState, theme: Theme) -> Option<(Color, &str)> {
     match state {
         PtyScreenState::Unknown | PtyScreenState::Ready => None,
         PtyScreenState::NotAgent { observed_process } => {
             Some((theme.red, observed_process.as_str()))
         }
-        PtyScreenState::OperatorGate { gate } => Some((theme.yellow, gate.as_str())),
+        PtyScreenState::OperatorGate { gate } => Some((theme.yellow, gate.kind.label())),
         PtyScreenState::Failing { reason } => Some((theme.red, reason.as_str())),
     }
 }
@@ -15720,7 +15729,8 @@ mod tests {
         NODE_INCARNATION_ID_BYTES,
     };
     use gate4agent_types::{
-        AgentId, AgentInstanceId, ProviderActivity, SessionGeneration,
+        AgentId, AgentInstanceId, OperatorGateKind, OperatorGateState, ProviderActivity,
+        SessionGeneration,
         TerminalMouseProtocolEncoding, TerminalSize,
     };
     use crate::app::{
@@ -15787,7 +15797,9 @@ mod tests {
         let address = test_session_view_address();
 
         let mut gated = base_session_view(address.clone());
-        gated.screen_state = PtyScreenState::OperatorGate { gate: "workspace-trust".to_owned() };
+        gated.screen_state = PtyScreenState::OperatorGate {
+            gate: OperatorGateState::new(OperatorGateKind::WorkspaceTrust),
+        };
         let (_, _, gated_label) = session_state(&gated, theme);
 
         let mut failing = base_session_view(address.clone());
@@ -15798,7 +15810,7 @@ mod tests {
         attention.attention = true;
         let (_, _, attention_label) = session_state(&attention, theme);
 
-        assert_eq!(gated_label, "workspace-trust");
+        assert_eq!(gated_label, "workspace trust");
         assert_eq!(failing_label, "crash-loop");
         assert_eq!(attention_label, "blocked");
         assert_ne!(gated_label, failing_label);

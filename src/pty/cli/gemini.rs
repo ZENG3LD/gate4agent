@@ -1289,15 +1289,26 @@ impl GeminiOutputParser {
     }
 
     /// Parse tool approval request.
+    ///
+    /// Case-insensitive on purpose, in both the gate and the pattern. It was
+    /// neither, and the two disagreed with each other: the gate admitted
+    /// `"Allow"` with a capital A while the pattern only matched lower-case
+    /// `allow`, so `"Allow run_shell_command"` passed the gate and then
+    /// matched nothing, and `"Approve ..."` never passed the gate at all.
+    /// What survived was literally lower-case `"approve x"`, which is not
+    /// how a CLI addresses a human. A pane blocked on someone approving a
+    /// tool call is the least ambiguous "this is not the composer" evidence
+    /// this parser can produce, and it was being thrown away over letter
+    /// case.
     fn parse_tool_approval(text: &str) -> Option<GeminiResponse> {
-        // Check for tool approval patterns
-        if !text.contains("approve") && !text.contains("Allow") {
+        let normalized = text.to_ascii_lowercase();
+        if !normalized.contains("approve") && !normalized.contains("allow") {
             return None;
         }
 
         static TOOL_RE: OnceLock<Regex> = OnceLock::new();
         let tool_re = TOOL_RE.get_or_init(|| {
-            Regex::new(r"(?:approve|allow)\s+(\w+)").unwrap()
+            Regex::new(r"(?i)(?:approve|allow)\s+(\w+)").unwrap()
         });
 
         tool_re.captures(text).map(|cap| {
@@ -1648,23 +1659,49 @@ impl OutputParser for GeminiOutputParser {
         let mut messages = Vec::new();
 
         for resp in responses {
-            let content = match &resp {
-                GeminiResponse::Raw(s) => s.clone(),
-                GeminiResponse::Working { message } => message.clone(),
-                GeminiResponse::RateLimitHit { message, .. } => message.clone(),
-                GeminiResponse::WelcomeScreen { model, version } => {
-                    format!("Gemini CLI (v{}) Model: {}", version, model)
+            // A variant this parser already recognized structurally carries
+            // its own class. Only `Raw` -- text nothing matched -- has to be
+            // guessed at by `classify`.
+            //
+            // This used to format every variant into a display string and
+            // re-derive the class from THAT, which lost the parser's own
+            // answer and then failed to recover it: `ToolApprovalRequest`
+            // renders as "Approve {tool}" while `classify` tests
+            // `contains("approve")` in lower case, so a screen definitively
+            // blocked on a human approving a tool call was classified as
+            // something else every single time. Laundering a known type
+            // through prose and matching the prose back cannot be made
+            // reliable; not doing it can.
+            let (content, known_class) = match &resp {
+                GeminiResponse::Raw(s) => (s.clone(), None),
+                GeminiResponse::Working { message } => {
+                    (message.clone(), Some(MessageClass::ThinkingIndicator))
                 }
-                GeminiResponse::ApprovalModeChanged { mode } => {
-                    format!("Approval mode: {}", mode)
+                GeminiResponse::RateLimitHit { message, .. } => {
+                    (message.clone(), Some(MessageClass::Error))
                 }
-                GeminiResponse::ToolApprovalRequest { tool_name, .. } => {
-                    format!("Approve {}", tool_name)
-                }
-                other => format!("{:?}", other),
+                GeminiResponse::WelcomeScreen { model, version } => (
+                    format!("Gemini CLI (v{}) Model: {}", version, model),
+                    Some(MessageClass::InfoMessage),
+                ),
+                GeminiResponse::ApprovalModeChanged { mode } => (
+                    format!("Approval mode: {}", mode),
+                    Some(MessageClass::InfoMessage),
+                ),
+                GeminiResponse::ToolApprovalRequest { tool_name, .. } => (
+                    format!("Approve {}", tool_name),
+                    Some(MessageClass::ToolApproval),
+                ),
+                other => (format!("{:?}", other), None),
+            };
+            // The tool this approval is about, so a consumer is not handed
+            // the literal string "unknown" for a name the parser had.
+            let approval_tool_name = match &resp {
+                GeminiResponse::ToolApprovalRequest { tool_name, .. } => Some(tool_name.clone()),
+                _ => None,
             };
 
-            let class = self.classify(&content);
+            let class = known_class.unwrap_or_else(|| self.classify(&content));
 
             match class {
                 MessageClass::AiResponse => {
@@ -1710,6 +1747,10 @@ impl OutputParser for GeminiOutputParser {
                         content,
                         metadata: MessageMetadata {
                             tool: CliTool::Gemini,
+                            // `None` for every class but an approval, whose
+                            // subject the parser knows and a consumer would
+                            // otherwise receive as the literal "unknown".
+                            tool_name: approval_tool_name,
                             ..Default::default()
                         },
                     });
@@ -1825,8 +1866,10 @@ impl OutputParser for GeminiOutputParser {
             return MessageClass::ThinkingIndicator;
         }
 
-        // ToolApproval
-        if text.contains("approve") || text.contains("Allow") {
+        // ToolApproval -- case-insensitive for the same reason
+        // `parse_tool_approval` is; see its doc comment.
+        let lowered = text.to_ascii_lowercase();
+        if lowered.contains("approve") || lowered.contains("allow") {
             return MessageClass::ToolApproval;
         }
 
@@ -2081,6 +2124,36 @@ mod tests {
             }
             _ => panic!("Expected RateLimitHit"),
         }
+    }
+
+    /// A tool-approval screen is the clearest "this pane is blocked on a
+    /// human" evidence Gemini produces, and it was being lost.
+    ///
+    /// The parser recognized the request structurally, rendered it as
+    /// "Approve {tool}", then re-derived the class from that rendering with
+    /// a lower-case `contains("approve")` test that a capital A never
+    /// satisfies. So the one screen that must not read as ordinary output
+    /// read as ordinary output, every time. The class now comes from the
+    /// variant the parser already matched, and the tool name rides along
+    /// instead of reaching a consumer as the literal "unknown".
+    #[test]
+    fn a_recognized_tool_approval_keeps_its_class_and_names_its_tool() {
+        let mut parser = GeminiOutputParser::new();
+        // Disambiguated: the inherent `parse` yields `GeminiResponse`s, the
+        // trait's yields the classified `ParsedMessage`s this is about.
+        OutputParser::feed(&mut parser, "Approve run_shell_command");
+        let approval = OutputParser::parse(&mut parser)
+            .into_iter()
+            .find(|message| message.class == MessageClass::ToolApproval)
+            .expect("a recognized approval request stays an approval");
+
+        assert_eq!(
+            approval.metadata.tool_name.as_deref(),
+            Some("run_shell_command"),
+        );
+        // The old path's own failure mode, pinned: the rendered text alone
+        // does not satisfy the matcher that used to decide this.
+        assert!(!approval.content.contains("approve"));
     }
 
     #[test]

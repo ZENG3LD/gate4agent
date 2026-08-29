@@ -145,14 +145,31 @@ fn node_assignment_error() -> &'static str { "--node requires NODE_ID=NAMED_PIPE
 #[cfg(unix)]
 fn node_assignment_error() -> &'static str { "--node requires NODE_ID=LOCAL_ENDPOINT_OR_TCP_LOOPBACK_OR_ACCEPT" }
 
+/// How a local endpoint is spelled on this platform. The one part of the
+/// usage line that legitimately differs per platform -- see `print_help`.
 #[cfg(windows)]
-fn print_help() {
-    println!("gate4agent-c2 --node NODE_ID=\\\\.\\pipe\\ENDPOINT|tcp://127.0.0.1:PORT|tcp://[::1]:PORT [--node ...] [--api-listen 127.0.0.1:PORT] [--control-endpoint \\\\.\\pipe\\ENDPOINT]");
-}
+const LOCAL_ENDPOINT_SPELLING: &str = "\\\\.\\pipe\\ENDPOINT";
 
 #[cfg(unix)]
+const LOCAL_ENDPOINT_SPELLING: &str = "LOCAL_ENDPOINT";
+
+/// One body, not one per platform.
+///
+/// This was two `#[cfg]`-gated functions carrying two copies of the whole
+/// flag list, and they drifted exactly the way that arrangement invites:
+/// `accept` and `--node-listen` were added to the unix copy and not the
+/// windows one, so on Windows -- where this is actually developed --
+/// `--help` described a binary without the call-home support it had
+/// shipped with. Only the endpoint spelling is platform-specific, so now
+/// only the endpoint spelling is.
 fn print_help() {
-    println!("gate4agent-c2 --node NODE_ID=LOCAL_ENDPOINT|tcp://127.0.0.1:PORT|tcp://[::1]:PORT|accept [--node ...] [--api-listen 127.0.0.1:PORT] [--node-listen 127.0.0.1:PORT] [--control-endpoint LOCAL_ENDPOINT]");
+    println!(
+        "gate4agent-c2 --node NODE_ID={endpoint}|tcp://127.0.0.1:PORT|tcp://[::1]:PORT|accept \
+[--node ...] [--api-listen 127.0.0.1:PORT] [--node-listen 127.0.0.1:PORT] \
+[--control-endpoint {endpoint}]",
+        endpoint = LOCAL_ENDPOINT_SPELLING,
+    );
+    println!("  accept: this node dials in instead of being dialled; requires --node-listen");
 }
 
 #[cfg(not(any(windows, unix)))]

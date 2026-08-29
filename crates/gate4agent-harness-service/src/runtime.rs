@@ -55,6 +55,7 @@ use gate4agent_harness_api::{
     HarnessInlineRunSessionV1, HarnessManagedRunSessionV1,
     HarnessLaunchPlanPageV1, HarnessLaunchPlanSummaryV1,
     HarnessNodeIncarnationV1,
+    HarnessOperatorApiError,
     HarnessOperatorCredential, HarnessOperatorEnvelopeV1, HarnessOperatorEventV1,
     HarnessOperatorHostErrorV1, HarnessOperatorTerminalEventV1,
     HarnessOperatorIntentV1,
@@ -85,7 +86,7 @@ use gate4agent_harness_api::{
     RedactedRunIntentV1, RedactedRunV1, RedactedTaskV1, RedactedWorktreeIntentV1,
     RunPageV1, TaskCreatorCategoryV1, TaskPageV1,
     HARNESS_OPERATOR_RESPONSE_MAX_BYTES, HARNESS_READ_REQUEST_MAX_BYTES,
-    HARNESS_READ_RESPONSE_MAX_BYTES, HARNESS_OPERATOR_WIRE_VERSION_V13,
+    HARNESS_READ_RESPONSE_MAX_BYTES,
 };
 use gate4agent_harness_protocol::{
     HarnessActorV1, HarnessDispatchIntentV1, HarnessExecutionModeV1,
@@ -381,13 +382,6 @@ enum HostCommand {
         /// exactly as before this field existed" — no cancellation
         /// available, not an error.
         cancel: Option<oneshot::Receiver<()>>,
-        /// This connection's own declared `HarnessOperatorEnvelopeV1::version`
-        /// -- captured by `handle_connection` at the point it already
-        /// validates the envelope, and threaded through to
-        /// `execute_operator_request` so a version-gated reply field (e.g.
-        /// `HarnessRuntimeTerminalFrameV1::screen_state`) reflects what THIS
-        /// request actually declared, never a default or a constant.
-        wire_version: u16,
     },
     ApplyHarnessMutation {
         mutation: HarnessMutationV1,
@@ -541,13 +535,6 @@ enum HostCommand {
         sender: mpsc::Sender<HarnessOperatorTerminalEventV1>,
         sessions: HashSet<RuntimeSessionKey>,
         identity: OperatorRequestLogIdentity,
-        /// This connection's own declared `HarnessOperatorEnvelopeV1::version`
-        /// -- set once here from the value `handle_connection` already
-        /// validated, and carried unchanged into `TerminalSubscriberRegistry
-        /// ::insert` (`TerminalSubscriber::wire_version`) for the lifetime of
-        /// the subscription, the same way `terminal_frame_to_wire`'s poll-path
-        /// callers read it fresh per request.
-        wire_version: u16,
     },
     Shutdown {
         reply: oneshot::Sender<Result<(), HarnessRuntimeError>>,
@@ -4592,7 +4579,7 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                             };
                             let _ = reply.send(reply_value);
                         }
-                        Some(HostCommand::Operator { request, reply, cancel, wire_version }) => {
+                        Some(HostCommand::Operator { request, reply, cancel }) => {
                             if is_run_context_source_request(&request) {
                                 let prepared = run_context_source_run_id(&request)
                                     .ok_or(HarnessOperatorHostErrorV1::InvalidRequest)
@@ -5163,7 +5150,6 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                 &runtime_inventory,
                                 &terminal_buffers,
                                 request,
-                                wire_version,
                             );
                             let scheduled_dispatch = response.as_ref().ok()
                                 .and_then(scheduled_dispatch_from_operator_response);
@@ -6481,7 +6467,7 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                 HarnessOperatorEventV1::SnapshotBaseline { sequence, tasks, runs, nodes }
                             });
                         }
-                        Some(HostCommand::SubscribeTerminal { sender, sessions, identity, wire_version }) => {
+                        Some(HostCommand::SubscribeTerminal { sender, sessions, identity }) => {
                             tracing::info!(
                                 operation = %identity.operation,
                                 "harness terminal event subscriber registered",
@@ -6490,7 +6476,6 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                 sender,
                                 sessions.clone(),
                                 identity,
-                                wire_version,
                             );
                             for key in &sessions {
                                 if let Some(frame) = terminal_buffers.latest(key) {
@@ -7799,16 +7784,10 @@ fn project_run_correlation(
 /// construction, with no duplicated field-mapping logic to drift.
 ///
 /// Always populates `screen_state: Some(..)` from the source `SlimSession`,
-/// unconditionally -- this function builds the cache's canonical, richest
-/// projection and is not the place that decides what any given peer is
-/// allowed to see. Both of its callers (`HarnessRuntimeInventoryCache::
-/// refresh` here, `gate4agent-harness-light::inventory::refresh_route`)
-/// build a value that is cached once and then fanned out to every currently
-/// polling/subscribed peer, which may straddle several different declared
-/// wire versions at once; see `downgrade_runtime_inventory`'s own doc
-/// comment (and `map_screen_state`'s, `terminal.rs`) for where the
-/// per-recipient version gate actually lives instead, and why it cannot
-/// live here.
+/// unconditionally -- this wire has exactly one accepted version (see
+/// `HARNESS_OPERATOR_WIRE_VERSION`), so every peer sees the same
+/// projection, cached once and fanned out to every currently
+/// polling/subscribed peer with no per-recipient variation.
 pub fn redact_runtime_inventory(
     inventory: gate4agent_c2_protocol::SlimNodeInventory,
 ) -> HarnessRuntimeInventoryV1 {
@@ -8257,12 +8236,6 @@ fn execute_operator_request(
     runtime_inventory: &HarnessRuntimeInventoryCache,
     terminal_buffers: &TerminalBufferRegistry,
     request: HarnessOperatorRequestV1,
-    // This connection's own declared `HarnessOperatorEnvelopeV1::version`,
-    // read by `handle_connection` and threaded through `HostCommand::
-    // Operator::wire_version` -- never a default or a constant. Consumed by
-    // the `TerminalRead` arm below to gate `HarnessRuntimeTerminalFrameV1::
-    // screen_state` (see `terminal_frame_to_wire`).
-    wire_version: u16,
 ) -> Result<HarnessOperatorResponseV1, HarnessOperatorHostErrorV1> {
     request.validate().map_err(|_| HarnessOperatorHostErrorV1::InvalidRequest)?;
     let request = match request {
@@ -8402,16 +8375,7 @@ fn execute_operator_request(
             )?)
         }
         HarnessOperatorRequestV1::RuntimeInventoryList { after_node_id, limit } => {
-            // The poll counterpart to `write_operator_event`'s push-side
-            // downgrade: `page` already `.clone()`s every node it returns
-            // (`HarnessRuntimeInventoryCache::page`), so this mutates that
-            // fresh, this-request-only copy for the version THIS request
-            // declared -- never the cache's own canonical (always-`Some`)
-            // value. See `downgrade_runtime_inventory`'s own doc comment.
-            let mut page = runtime_inventory.page(after_node_id.as_deref(), limit);
-            for node in &mut page.nodes {
-                downgrade_runtime_inventory(node, wire_version);
-            }
+            let page = runtime_inventory.page(after_node_id.as_deref(), limit);
             HarnessOperatorResponseV1::RuntimeInventory(page)
         }
         HarnessOperatorRequestV1::TerminalRead { session, after_sequence, limit } => {
@@ -8421,7 +8385,7 @@ fn execute_operator_request(
             HarnessOperatorResponseV1::TerminalRead(HarnessRuntimeTerminalPageV1 {
                 session,
                 frames: page.frames.into_iter()
-                    .map(|frame| terminal_frame_to_wire(frame, wire_version))
+                    .map(terminal_frame_to_wire)
                     .collect(),
                 dropped: page.dropped,
                 transport_incomplete: page.transport_incomplete,
@@ -8844,7 +8808,6 @@ async fn handle_connection(
     let mut subscription: Option<(
         mpsc::Receiver<HarnessOperatorEventV1>,
         tokio::sync::OwnedSemaphorePermit,
-        u16,
     )> = None;
     // Sibling to `subscription` above, populated only by the
     // `SubscribeTerminal` branch below -- kept as its own local (not folded
@@ -8900,20 +8863,26 @@ async fn handle_connection(
                     return Err(HarnessRuntimeError::InvalidFrame);
                 }
             };
-            if envelope.validate().is_err() {
+            if let Err(error) = envelope.validate() {
+                let host_error = match error {
+                    HarnessOperatorApiError::WireVersionMismatch { expected, received } => {
+                        tracing::warn!(
+                            expected,
+                            received,
+                            "harness operator wire version mismatch: rebuild and restart \
+                             the out-of-date side",
+                        );
+                        HarnessOperatorHostErrorV1::WireVersionMismatch { expected, received }
+                    }
+                    _ => HarnessOperatorHostErrorV1::InvalidRequest,
+                };
                 write_operator_reply(
                     &mut stream,
-                    HarnessOperatorReplyV1::Error {
-                        error: HarnessOperatorHostErrorV1::InvalidRequest,
-                    },
+                    HarnessOperatorReplyV1::Error { error: host_error },
                 ).await?;
                 return Err(HarnessRuntimeError::InvalidFrame);
             }
-            let HarnessOperatorEnvelopeV1 {
-                version: wire_version,
-                credential,
-                request,
-            } = envelope;
+            let HarnessOperatorEnvelopeV1 { credential, request, .. } = envelope;
             let response_deadline = operator_response_deadline(&request);
             let identity = OperatorRequestLogIdentity::describe(&request);
             let authorized = match operator_authority.as_ref() {
@@ -8960,7 +8929,7 @@ async fn handle_connection(
                 let (sender, receiver) = mpsc::channel(HOST_SUBSCRIBER_QUEUE_CAPACITY);
                 commands.send(HostCommand::Subscribe { sender, identity }).await
                     .map_err(|_| HarnessRuntimeError::HostStopped)?;
-                subscription = Some((receiver, subscriber_permit, wire_version));
+                subscription = Some((receiver, subscriber_permit));
                 return Ok(());
             }
             // Same "opens a long-lived, server-push subscription" shape as
@@ -9008,7 +8977,6 @@ async fn handle_connection(
                     sender,
                     sessions: keys,
                     identity,
-                    wire_version,
                 }).await.map_err(|_| HarnessRuntimeError::HostStopped)?;
                 terminal_subscription = Some((receiver, terminal_subscriber_permit));
                 return Ok(());
@@ -9046,7 +9014,6 @@ async fn handle_connection(
                 request,
                 reply,
                 cancel: cancel_rx,
-                wire_version,
             }).await.map_err(|_| HarnessRuntimeError::HostStopped)?;
             let reply = match timeout(response_deadline, receive).await {
                 Ok(Ok(reply)) => reply,
@@ -9114,14 +9081,14 @@ async fn handle_connection(
         // without a reachable-but-impossible third combination to reason
         // about.
         Ok(Ok(())) => match (subscription, terminal_subscription) {
-            (Some((receiver, subscriber_permit, wire_version)), _) => {
+            (Some((receiver, subscriber_permit)), _) => {
                 // The main connection permit is released here, not held for
                 // the subscription's whole (unbounded) lifetime: see
                 // `HOST_SUBSCRIBER_LIMIT`'s doc comment. `subscriber_permit`
                 // takes over as the thing keeping this connection counted
                 // against a limit for as long as it stays open.
                 drop(connection_permit);
-                run_operator_event_subscription(stream, receiver, subscriber_permit, wire_version)
+                run_operator_event_subscription(stream, receiver, subscriber_permit)
                     .await
             }
             (None, Some((receiver, terminal_subscriber_permit))) => {
@@ -9177,19 +9144,11 @@ pub async fn run_operator_event_subscription(
     mut stream: TcpStream,
     mut events: mpsc::Receiver<HarnessOperatorEventV1>,
     _subscriber_permit: tokio::sync::OwnedSemaphorePermit,
-    // This connection's own declared `HarnessOperatorEnvelopeV1::version`,
-    // read by `handle_connection` (both here and in `gate4agent-harness-
-    // light::lib::handle_connection`) at the point it already validates the
-    // envelope, and carried into `subscription`'s tuple across the
-    // `SubscribeEvents` classify branch specifically so it survives to this
-    // call unchanged -- never a default. See `write_operator_event`'s own
-    // doc comment for what it does with it.
-    wire_version: u16,
 ) -> Result<(), HarnessRuntimeError> {
     tracing::info!("operator event subscription forwarding started");
     while let Some(event) = events.recv().await {
         tracing::debug!(kind = event_kind_label(&event), "forwarding operator event");
-        write_operator_event(&mut stream, event, wire_version).await?;
+        write_operator_event(&mut stream, event).await?;
     }
     tracing::info!("operator event subscription channel drained; closing");
     Ok(())
@@ -9207,92 +9166,17 @@ fn event_kind_label(event: &HarnessOperatorEventV1) -> &'static str {
     }
 }
 
-/// Strips fields a peer's declared wire version cannot decode, mutating a
-/// node inventory that was already `.clone()`d for this one connection
-/// (`redact_runtime_inventory`'s own doc comment explains why the value
-/// arrives here already carrying every field -- this is the first point
-/// downstream of the shared cache where it stops being shared and becomes
-/// one connection's own copy, which is exactly why the version gate lives
-/// here and not there; `map_screen_state`'s own doc comment, `terminal.rs`,
-/// is the mirror-image case where a value is NEVER shared and the gate
-/// sits at construction instead).
-///
-/// `HarnessRuntimeSessionV1` carries `deny_unknown_fields`, so a
-/// `screen_state` key reaching a pre-V13 decoder does not degrade
-/// gracefully -- it rejects the WHOLE message, decoder and all, which is
-/// why this exists rather than leaving the field for an older client to
-/// ignore.
-///
-/// For `wire_version >= HARNESS_OPERATOR_WIRE_VERSION_V13` this is a no-op
-/// and returns before touching a single workspace or session -- the common
-/// path once `gate4agent-tui`/`gate4agent-tui-light` declare V13, which
-/// must cost nothing. Below V13 it walks every session in every workspace
-/// clearing `screen_state` back to `None`; that walk is bounded exactly the
-/// way the cache itself already is (`SlimNodeInventory::from_c2_snapshot`'s
-/// own per-node workspace/session truncation caps, upstream of this
-/// function entirely), and every call site (`page` below,
-/// `downgrade_operator_event`, and `gate4agent-harness-light::inventory::
-/// list`'s own `RuntimeInventoryList` poll path) was already `.clone()`-ing
-/// this exact value regardless -- this mutates that fresh copy in place,
-/// not a second pass over anything shared.
-///
-/// `pub` for the same reason `redact_runtime_inventory` is: harness-light
-/// serves `RuntimeInventoryList` from its own, separately maintained
-/// `SharedInventory` rather than through `execute_operator_request`, so it
-/// needs this same per-connection gate at its own poll edge rather than
-/// inheriting it for free.
-pub fn downgrade_runtime_inventory(node: &mut HarnessRuntimeNodeInventoryV1, wire_version: u16) {
-    if wire_version >= HARNESS_OPERATOR_WIRE_VERSION_V13 {
-        return;
-    }
-    for workspace in node.inventory.workspaces.values_mut() {
-        for session in &mut workspace.sessions {
-            session.screen_state = None;
-        }
-    }
-}
-
-/// Applies `downgrade_runtime_inventory` to whichever event variants carry a
-/// runtime inventory -- `SnapshotBaseline`'s `nodes` and
-/// `RuntimeInventoryChanged`'s `node` -- and leaves every other variant
-/// untouched. The one place `write_operator_event` needs to know about the
-/// two carrier shapes, so a third one added later needs a match arm here
-/// and nowhere else.
-fn downgrade_operator_event(event: &mut HarnessOperatorEventV1, wire_version: u16) {
-    match event {
-        HarnessOperatorEventV1::SnapshotBaseline { nodes, .. } => {
-            for node in nodes { downgrade_runtime_inventory(node, wire_version); }
-        }
-        HarnessOperatorEventV1::RuntimeInventoryChanged { node, .. } => {
-            downgrade_runtime_inventory(node, wire_version);
-        }
-        HarnessOperatorEventV1::TaskChanged { .. }
-        | HarnessOperatorEventV1::RunChanged { .. }
-        | HarnessOperatorEventV1::RuntimeInventoryRemoved { .. }
-        | HarnessOperatorEventV1::Lagged { .. }
-        | HarnessOperatorEventV1::Ping { .. } => {}
-    }
-}
-
 /// Push-frame counterpart to `write_operator_reply`: writes one
 /// newline-terminated `HarnessOperatorEventV1` and flushes, but -- unlike
 /// `write_operator_reply` -- never shuts the connection down afterward, so
 /// the socket stays open for the next event.
 ///
-/// The single serialization point for every event a subscribed connection
-/// will ever receive, which is why the per-connection wire-version
-/// downgrade (`downgrade_operator_event`) runs here, immediately before
-/// `validate`/encode, rather than in the forwarding loop that calls this or
-/// anywhere upstream of it.
-///
 /// Promoted `pub` for `gate4agent-harness-light` (A3), same reasoning as
 /// `run_operator_event_subscription` (its one caller) above.
 pub async fn write_operator_event(
     stream: &mut TcpStream,
-    mut event: HarnessOperatorEventV1,
-    wire_version: u16,
+    event: HarnessOperatorEventV1,
 ) -> Result<(), HarnessRuntimeError> {
-    downgrade_operator_event(&mut event, wire_version);
     event.validate().map_err(|error| {
         // A push frame failing its own validation is a server-side bug; the
         // stream dies here, so the cause must not die silently with it.
@@ -10875,7 +10759,6 @@ pub enum HarnessRuntimeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gate4agent_harness_api::HARNESS_OPERATOR_WIRE_VERSION_V12;
     use gate4agent_c2_protocol::{
         C2ControlEvent, C2ControlEventKind, C2ManagedSessionRecord,
         C2NodeEventEnvelope, C2NodeSnapshot, C2ObservationSupport,
@@ -11792,56 +11675,22 @@ mod tests {
         );
     }
 
-    /// `redact_runtime_inventory` always populates `screen_state: Some(..)`
-    /// -- it builds the cache's one canonical, richest projection and does
-    /// not decide what a peer sees. `downgrade_runtime_inventory` is the
-    /// per-connection edge that decides that, and this proves it does so
-    /// correctly from a SINGLE shared cached value: a V12 peer's copy has
-    /// `screen_state: None` on every session, a V13 peer's copy carries the
-    /// real classification through, and both copies are downgraded from the
-    /// exact same `HarnessRuntimeNodeInventoryV1` -- proving the two peers
-    /// genuinely see different projections of one shared value, not two
-    /// independently-built ones that merely happen to differ.
+    /// `redact_runtime_inventory` always populates `screen_state: Some(..)`,
+    /// and nothing downstream strips it back out: this wire has exactly one
+    /// accepted version (see `HARNESS_OPERATOR_WIRE_VERSION`), so a
+    /// `RuntimeInventoryChanged` event carries the real classification key
+    /// on every serialized session unconditionally.
     #[test]
-    fn downgrade_runtime_inventory_projects_one_shared_cached_node_differently_per_peer_version() {
-        let cached = sample_runtime_node_inventory(PtyScreenState::Ready);
-        let expected_v13_state = map_screen_state(&PtyScreenState::Ready);
-
-        let mut for_v12_peer = cached.clone();
-        downgrade_runtime_inventory(&mut for_v12_peer, HARNESS_OPERATOR_WIRE_VERSION_V12);
-        let v12_session = &for_v12_peer.inventory.workspaces["workspace-a"].sessions[0];
-        assert_eq!(v12_session.screen_state, None);
-
-        let mut for_v13_peer = cached.clone();
-        downgrade_runtime_inventory(&mut for_v13_peer, HARNESS_OPERATOR_WIRE_VERSION_V13);
-        let v13_session = &for_v13_peer.inventory.workspaces["workspace-a"].sessions[0];
-        assert_eq!(v13_session.screen_state, Some(expected_v13_state));
-
-        // The cached source itself is untouched by either downgrade --
-        // `for_v12_peer`/`for_v13_peer` are each their own independent
-        // clone, never a shared mutation of `cached`.
-        assert_eq!(
-            cached.inventory.workspaces["workspace-a"].sessions[0].screen_state,
-            Some(map_screen_state(&PtyScreenState::Ready)),
-        );
-    }
-
-    /// The literal proof the `deny_unknown_fields` hazard is closed end to
-    /// end for the PUSH path, not just at the type level (mirrors test 3's
-    /// technique in `gate4agent-harness-api`): a `RuntimeInventoryChanged`
-    /// event downgraded for a V12 peer serializes with no `screen_state` key
-    /// at all on its sessions, not a `null`.
-    #[test]
-    fn a_runtime_inventory_changed_event_downgraded_for_v12_omits_the_screen_state_key_entirely() {
+    fn a_runtime_inventory_changed_event_always_carries_the_screen_state_key() {
         let node = sample_runtime_node_inventory(PtyScreenState::Ready);
-        let mut event = HarnessOperatorEventV1::RuntimeInventoryChanged { sequence: 3, node };
-        downgrade_operator_event(&mut event, HARNESS_OPERATOR_WIRE_VERSION_V12);
+        let event = HarnessOperatorEventV1::RuntimeInventoryChanged { sequence: 3, node };
 
         let value = serde_json::to_value(&event).unwrap();
         let session = &value["node"]["inventory"]["workspaces"]["workspace-a"]["sessions"][0];
-        assert!(
-            session.as_object().unwrap().get("screen_state").is_none(),
-            "expected no screen_state key in {session}",
+        assert_eq!(
+            session["screen_state"],
+            serde_json::to_value(map_screen_state(&PtyScreenState::Ready)).unwrap(),
+            "expected the real screen_state key in {session}",
         );
     }
 
@@ -12098,7 +11947,6 @@ mod tests {
             HarnessOperatorRequestV1::RunCorrelationGet {
                 run_id: run_id.clone(),
             },
-            HARNESS_OPERATOR_WIRE_VERSION_V13,
         ).unwrap();
         let HarnessOperatorResponseV1::RunCorrelation(correlation) = response else {
             panic!("run correlation response expected");
@@ -12212,7 +12060,6 @@ mod tests {
             HarnessOperatorRequestV1::RunTransferGet {
                 run_id: run_id.clone(),
             },
-            HARNESS_OPERATOR_WIRE_VERSION_V13,
         ).unwrap();
         let HarnessOperatorResponseV1::RunTransfer(transfer) = response else {
             panic!("run transfer response expected");
@@ -12234,7 +12081,6 @@ mod tests {
             HarnessOperatorRequestV1::RunTransferGet {
                 run_id: HarnessRunId::new(format!("hrun_{}", "f".repeat(24))).unwrap(),
             },
-            HARNESS_OPERATOR_WIRE_VERSION_V13,
         );
         assert_eq!(missing, Err(HarnessOperatorHostErrorV1::NotFound));
         observation.close().unwrap();
@@ -13020,7 +12866,6 @@ mod tests {
             &runtime_inventory,
             &terminal_buffers,
             HarnessOperatorRequestV1::CreateTask { request: request.clone() },
-            HARNESS_OPERATOR_WIRE_VERSION_V13,
         ).unwrap();
         let replay = execute_operator_request(
             &mut harness,
@@ -13031,7 +12876,6 @@ mod tests {
             &runtime_inventory,
             &terminal_buffers,
             HarnessOperatorRequestV1::CreateTask { request: request.clone() },
-            HARNESS_OPERATOR_WIRE_VERSION_V13,
         ).unwrap();
         assert_eq!(
             first,
@@ -13053,7 +12897,6 @@ mod tests {
                 &runtime_inventory,
                 &terminal_buffers,
                 HarnessOperatorRequestV1::CreateTask { request: changed },
-                HARNESS_OPERATOR_WIRE_VERSION_V13,
             ),
             Err(HarnessOperatorHostErrorV1::Conflict),
         );
@@ -13116,7 +12959,6 @@ mod tests {
                 &runtime_inventory,
                 &terminal_buffers,
                 HarnessOperatorRequestV1::SubmitIntent { intent: intent.clone() },
-                HARNESS_OPERATOR_WIRE_VERSION_V13,
             ).unwrap(),
             HarnessOperatorResponseV1::Mutation(HarnessOperatorMutationOutcomeV1::Applied),
         );
@@ -13134,7 +12976,6 @@ mod tests {
                 &runtime_inventory,
                 &terminal_buffers,
                 HarnessOperatorRequestV1::SubmitIntent { intent: intent.clone() },
-                HARNESS_OPERATOR_WIRE_VERSION_V13,
             ).unwrap(),
             HarnessOperatorResponseV1::Mutation(HarnessOperatorMutationOutcomeV1::Replayed),
         );
@@ -13156,7 +12997,6 @@ mod tests {
                 &runtime_inventory,
                 &terminal_buffers,
                 HarnessOperatorRequestV1::SubmitIntent { intent: changed_payload },
-                HARNESS_OPERATOR_WIRE_VERSION_V13,
             ),
             Err(HarnessOperatorHostErrorV1::Conflict),
         );
@@ -13172,7 +13012,6 @@ mod tests {
                 &runtime_inventory,
                 &terminal_buffers,
                 HarnessOperatorRequestV1::SubmitIntent { intent: changed_time },
-                HARNESS_OPERATOR_WIRE_VERSION_V13,
             ),
             Err(HarnessOperatorHostErrorV1::Conflict),
         );
@@ -14017,7 +13856,6 @@ mod tests {
             },
             reply,
             cancel: None,
-            wire_version: HARNESS_OPERATOR_WIRE_VERSION_V13,
         }).await.unwrap();
         assert!(matches!(
             timeout(Duration::from_millis(50), command_rx.recv()).await.unwrap(),
@@ -14223,7 +14061,6 @@ mod tests {
             },
             reply,
             cancel: None,
-            wire_version: HARNESS_OPERATOR_WIRE_VERSION_V13,
         }).await.unwrap();
         assert!(matches!(
             timeout(Duration::from_millis(50), receive.recv()).await.unwrap(),

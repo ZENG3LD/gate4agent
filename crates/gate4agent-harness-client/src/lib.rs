@@ -182,46 +182,6 @@ impl HarnessReadClient {
     }
 }
 
-/// The wire version this client actually DECLARES in the envelope for a
-/// given request -- distinct from `HarnessOperatorRequestV1::minimum_wire_
-/// version()`, which is only ever a FLOOR (`HarnessOperatorEnvelopeV1::
-/// validate` rejects a version below it, never one above). See
-/// `HARNESS_OPERATOR_WIRE_VERSION_V13`'s and `_V14`'s own doc comments in
-/// `gate4agent-harness-api` for why `requires_v13()`/`requires_v14()` are
-/// deliberately absent from that floor computation: both gate RESPONSE
-/// fields (`PtyScreenStateV1` on `HarnessRuntimeSessionV1`/
-/// `HarnessRuntimeTerminalFrameV1` at V13, `HarnessRuntimeTerminalFrameV1::
-/// bracketed_paste` at V14), not any request shape, so every request kind
-/// remains servable at any accepted version regardless of whether the
-/// host's reply happens to carry either field.
-///
-/// The four request kinds whose reply CAN carry those fields --
-/// `RuntimeInventoryList` and its push counterpart `SubscribeEvents` (whose
-/// `SnapshotBaseline`/`RuntimeInventoryChanged` events carry the same
-/// runtime inventory, and so only ever carry `screen_state` -- runtime
-/// inventory sessions have no `bracketed_paste`), and the two terminal-frame
-/// paths `TerminalRead` (poll) and `SubscribeTerminal` (push), which can
-/// carry both -- therefore always declare at least
-/// `HARNESS_OPERATOR_WIRE_VERSION_V14` here, never merely their own floor;
-/// declaring above the floor has always been legal, this is simply this
-/// client choosing to. Every other request kind is untouched and keeps
-/// declaring exactly its own floor, so no other request's envelope version
-/// changes.
-fn declared_wire_version(request: &HarnessOperatorRequestV1) -> u16 {
-    let floor = request.minimum_wire_version();
-    if matches!(
-        request,
-        HarnessOperatorRequestV1::RuntimeInventoryList { .. }
-            | HarnessOperatorRequestV1::TerminalRead { .. }
-            | HarnessOperatorRequestV1::SubscribeTerminal { .. }
-            | HarnessOperatorRequestV1::SubscribeEvents {}
-    ) {
-        floor.max(HARNESS_OPERATOR_WIRE_VERSION_V14)
-    } else {
-        floor
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct HarnessOperatorClient {
     endpoint: SocketAddr,
@@ -1254,9 +1214,8 @@ impl HarnessOperatorClient {
     pub fn subscribe_events(&self) -> Result<HarnessEventSubscription, HarnessOperatorClientError> {
         let request = HarnessOperatorRequestV1::SubscribeEvents {};
         request.validate()?;
-        let version = declared_wire_version(&request);
         let envelope = HarnessOperatorEnvelopeV1 {
-            version,
+            version: HARNESS_OPERATOR_WIRE_VERSION,
             credential: self.credential.clone(),
             request,
         };
@@ -1297,9 +1256,8 @@ impl HarnessOperatorClient {
     ) -> Result<HarnessTerminalSubscription, HarnessOperatorClientError> {
         let request = HarnessOperatorRequestV1::SubscribeTerminal { sessions };
         request.validate()?;
-        let version = declared_wire_version(&request);
         let envelope = HarnessOperatorEnvelopeV1 {
-            version,
+            version: HARNESS_OPERATOR_WIRE_VERSION,
             credential: self.credential.clone(),
             request,
         };
@@ -1403,9 +1361,8 @@ impl HarnessOperatorClient {
             self.deadline
         };
         request.validate()?;
-        let version = declared_wire_version(&request);
         let envelope = HarnessOperatorEnvelopeV1 {
-            version,
+            version: HARNESS_OPERATOR_WIRE_VERSION,
             credential: self.credential.clone(),
             request,
         };
@@ -1433,7 +1390,7 @@ impl HarnessOperatorClient {
             HARNESS_OPERATOR_RESPONSE_MAX_BYTES,
         )?;
         let reply: HarnessOperatorReplyV1 = serde_json::from_slice(&response)
-            .map_err(|_| HarnessOperatorClientError::InvalidResponse)?;
+            .map_err(HarnessOperatorClientError::MalformedResponse)?;
         reply.validate()?;
         match reply {
             HarnessOperatorReplyV1::Ok { response } => Ok(response),
@@ -1470,10 +1427,10 @@ impl HarnessEventSubscription {
     pub fn next_event(&mut self) -> Result<HarnessOperatorEventV1, HarnessOperatorClientError> {
         let line = read_operator_bounded_line(&mut self.reader, HARNESS_OPERATOR_RESPONSE_MAX_BYTES)?;
         let value: serde_json::Value = serde_json::from_slice(&line)
-            .map_err(|_| HarnessOperatorClientError::InvalidResponse)?;
+            .map_err(HarnessOperatorClientError::MalformedResponse)?;
         if value.get("status").is_some() {
             let reply: HarnessOperatorReplyV1 = serde_json::from_value(value)
-                .map_err(|_| HarnessOperatorClientError::InvalidResponse)?;
+                .map_err(HarnessOperatorClientError::MalformedResponse)?;
             reply.validate()?;
             return match reply {
                 HarnessOperatorReplyV1::Error { error } => Err(HarnessOperatorClientError::Host(error)),
@@ -1481,7 +1438,7 @@ impl HarnessEventSubscription {
             };
         }
         let event: HarnessOperatorEventV1 = serde_json::from_value(value)
-            .map_err(|_| HarnessOperatorClientError::InvalidResponse)?;
+            .map_err(HarnessOperatorClientError::MalformedResponse)?;
         event.validate()?;
         Ok(event)
     }
@@ -1506,10 +1463,10 @@ impl HarnessTerminalSubscription {
     pub fn next_event(&mut self) -> Result<HarnessOperatorTerminalEventV1, HarnessOperatorClientError> {
         let line = read_operator_bounded_line(&mut self.reader, HARNESS_OPERATOR_RESPONSE_MAX_BYTES)?;
         let value: serde_json::Value = serde_json::from_slice(&line)
-            .map_err(|_| HarnessOperatorClientError::InvalidResponse)?;
+            .map_err(HarnessOperatorClientError::MalformedResponse)?;
         if value.get("status").is_some() {
             let reply: HarnessOperatorReplyV1 = serde_json::from_value(value)
-                .map_err(|_| HarnessOperatorClientError::InvalidResponse)?;
+                .map_err(HarnessOperatorClientError::MalformedResponse)?;
             reply.validate()?;
             return match reply {
                 HarnessOperatorReplyV1::Error { error } => Err(HarnessOperatorClientError::Host(error)),
@@ -1517,7 +1474,7 @@ impl HarnessTerminalSubscription {
             };
         }
         let event: HarnessOperatorTerminalEventV1 = serde_json::from_value(value)
-            .map_err(|_| HarnessOperatorClientError::InvalidResponse)?;
+            .map_err(HarnessOperatorClientError::MalformedResponse)?;
         event.validate()?;
         Ok(event)
     }
@@ -1586,7 +1543,7 @@ fn map_operator_io_error(error: std::io::Error) -> HarnessOperatorClientError {
 pub enum HarnessOperatorClientError {
     #[error("harness operator endpoint must be a concrete loopback address")]
     NonLoopbackEndpoint,
-    #[error("harness operator request is invalid")]
+    #[error("harness operator request is invalid: {0}")]
     Api(#[from] HarnessOperatorApiError),
     #[error("harness operator request encoding failed")]
     Encoding,
@@ -1596,8 +1553,18 @@ pub enum HarnessOperatorClientError {
     ResponseTooLarge,
     #[error("harness operator response is incomplete")]
     IncompleteResponse,
-    #[error("harness operator response is invalid")]
+    #[error("harness operator response is empty")]
     InvalidResponse,
+    // A reply that read as a complete, non-empty frame but did not decode
+    // into the expected shape. Under the single-version doctrine (see
+    // `HARNESS_OPERATOR_WIRE_VERSION`'s doc comment) the two sides of this
+    // loopback wire always share one schema, so this can only mean the peer
+    // was built from a different tree state than this binary -- carries the
+    // serde error verbatim (field name / expected-vs-found) rather than the
+    // old bare "response is invalid", which named neither the field nor
+    // which side was stale.
+    #[error("harness operator response failed to parse: {0}")]
+    MalformedResponse(#[source] serde_json::Error),
     #[error("harness operator response type is unexpected")]
     UnexpectedResponse,
     #[error("harness operator host closed the connection")]
@@ -1877,7 +1844,7 @@ mod tests {
             assert!(!request.contains("\"task_id\":"));
             let envelope: HarnessOperatorEnvelopeV1 =
                 serde_json::from_str(request.trim_end()).expect("operator envelope");
-            assert_eq!(envelope.version, HARNESS_OPERATOR_WIRE_VERSION_V3);
+            assert_eq!(envelope.version, HARNESS_OPERATOR_WIRE_VERSION);
             assert!(matches!(
                 envelope.request,
                 HarnessOperatorRequestV1::SubmitIntent {
@@ -1940,7 +1907,7 @@ mod tests {
             }
             let envelope: HarnessOperatorEnvelopeV1 =
                 serde_json::from_str(request.trim_end()).expect("operator envelope");
-            assert_eq!(envelope.version, HARNESS_OPERATOR_WIRE_VERSION_V3);
+            assert_eq!(envelope.version, HARNESS_OPERATOR_WIRE_VERSION);
             assert!(matches!(
                 envelope.request,
                 HarnessOperatorRequestV1::CatalogNativeSessions {
@@ -2005,7 +1972,7 @@ mod tests {
             stream.read_to_string(&mut request).expect("request");
             let envelope: HarnessOperatorEnvelopeV1 =
                 serde_json::from_str(request.trim_end()).expect("operator envelope");
-            assert_eq!(envelope.version, HARNESS_OPERATOR_WIRE_VERSION_V4);
+            assert_eq!(envelope.version, HARNESS_OPERATOR_WIRE_VERSION);
             assert!(matches!(
                 envelope.request,
                 HarnessOperatorRequestV1::RunCorrelationGet { run_id }
@@ -2038,7 +2005,7 @@ mod tests {
             stream.read_to_string(&mut request).expect("request");
             let envelope: HarnessOperatorEnvelopeV1 =
                 serde_json::from_str(request.trim_end()).expect("operator envelope");
-            assert_eq!(envelope.version, HARNESS_OPERATOR_WIRE_VERSION_V5);
+            assert_eq!(envelope.version, HARNESS_OPERATOR_WIRE_VERSION);
             assert!(matches!(
                 envelope.request,
                 HarnessOperatorRequestV1::RunTransferGet { run_id }
@@ -2175,7 +2142,7 @@ mod tests {
                 }
                 let envelope: HarnessOperatorEnvelopeV1 =
                     serde_json::from_str(request.trim_end()).expect("operator envelope");
-                assert_eq!(envelope.version, HARNESS_OPERATOR_WIRE_VERSION_V6);
+                assert_eq!(envelope.version, HARNESS_OPERATOR_WIRE_VERSION);
                 let response = match (index, envelope.request) {
                     (0, HarnessOperatorRequestV1::TaskLaunchOptionsGet { task_id }) => {
                         assert_eq!(task_id, expected_task_id);
@@ -2410,7 +2377,7 @@ mod tests {
                 }
                 let envelope: HarnessOperatorEnvelopeV1 =
                     serde_json::from_str(request.trim_end()).expect("operator envelope");
-                assert_eq!(envelope.version, HARNESS_OPERATOR_WIRE_VERSION_V4);
+                assert_eq!(envelope.version, HARNESS_OPERATOR_WIRE_VERSION);
                 let response = match (index, envelope.request) {
                     (0, HarnessOperatorRequestV1::LaunchPlansList { limit: 16, .. }) => {
                         HarnessOperatorResponseV1::LaunchPlans(expected_page.clone())
@@ -2552,7 +2519,7 @@ mod tests {
                 }
                 let envelope: HarnessOperatorEnvelopeV1 =
                     serde_json::from_str(request.trim_end()).expect("operator envelope");
-                assert_eq!(envelope.version, HARNESS_OPERATOR_WIRE_VERSION_V4);
+                assert_eq!(envelope.version, HARNESS_OPERATOR_WIRE_VERSION);
                 let response = match (index, envelope.request) {
                     (0, HarnessOperatorRequestV1::InspectRunWorkspace { .. }) => {
                         HarnessOperatorResponseV1::RunWorkspaceInspected(inspection.clone())
@@ -2676,7 +2643,7 @@ mod tests {
                 }
                 let envelope: HarnessOperatorEnvelopeV1 =
                     serde_json::from_str(request.trim_end()).expect("operator envelope");
-                assert_eq!(envelope.version, HARNESS_OPERATOR_WIRE_VERSION_V9);
+                assert_eq!(envelope.version, HARNESS_OPERATOR_WIRE_VERSION);
                 let response = match (index, envelope.request) {
                     (0, HarnessOperatorRequestV1::InspectNodeWorkspace { .. }) => {
                         HarnessOperatorResponseV1::NodeWorkspaceInspected(inspection.clone())
@@ -2791,7 +2758,7 @@ mod tests {
                 }
                 let envelope: HarnessOperatorEnvelopeV1 =
                     serde_json::from_str(request.trim_end()).expect("operator envelope");
-                assert_eq!(envelope.version, HARNESS_OPERATOR_WIRE_VERSION_V11);
+                assert_eq!(envelope.version, HARNESS_OPERATOR_WIRE_VERSION);
                 let response = match (index, envelope.request) {
                     (0, HarnessOperatorRequestV1::WriteNodeWorkspaceFile { path, content, .. })
                         if path == expected_path && content == "fn main() {}\n" =>
@@ -2942,7 +2909,7 @@ mod tests {
             }
             let envelope: HarnessOperatorEnvelopeV1 =
                 serde_json::from_str(request.trim_end()).expect("operator envelope");
-            assert_eq!(envelope.version, HARNESS_OPERATOR_WIRE_VERSION_V7);
+            assert_eq!(envelope.version, HARNESS_OPERATOR_WIRE_VERSION);
             match envelope.request {
                 HarnessOperatorRequestV1::ReverseAttributionGet { subject } => {
                     assert_eq!(subject, expected_subject);
@@ -3044,7 +3011,7 @@ mod tests {
             }
             let envelope: HarnessOperatorEnvelopeV1 =
                 serde_json::from_str(request.trim_end()).expect("operator envelope");
-            assert_eq!(envelope.version, HARNESS_OPERATOR_WIRE_VERSION_V8);
+            assert_eq!(envelope.version, HARNESS_OPERATOR_WIRE_VERSION);
             assert!(matches!(
                 envelope.request,
                 HarnessOperatorRequestV1::ObserveRunContextSource { run_id }
@@ -3110,40 +3077,6 @@ mod tests {
         );
     }
 
-    /// Pins `declared_wire_version`'s own contract directly, without a
-    /// socket: the four request kinds whose reply can carry `screen_state`
-    /// and/or `bracketed_paste` (`RuntimeInventoryList`, `TerminalRead`,
-    /// `SubscribeTerminal`, `SubscribeEvents`) declare
-    /// `HARNESS_OPERATOR_WIRE_VERSION_V14` regardless of their own, lower
-    /// `minimum_wire_version()` floor, and an unrelated request kind
-    /// (`StopSession`, floor V10) keeps declaring exactly its own floor --
-    /// this change must not silently raise every request's wire version.
-    #[test]
-    fn declared_wire_version_bumps_only_the_four_request_kinds_whose_reply_can_carry_screen_state() {
-        let session = sample_session_address();
-
-        let inventory_list =
-            HarnessOperatorRequestV1::RuntimeInventoryList { after_node_id: None, limit: 16 };
-        assert_eq!(declared_wire_version(&inventory_list), HARNESS_OPERATOR_WIRE_VERSION_V14);
-
-        let terminal_read = HarnessOperatorRequestV1::TerminalRead {
-            session: session.clone(),
-            after_sequence: None,
-            limit: 16,
-        };
-        assert_eq!(declared_wire_version(&terminal_read), HARNESS_OPERATOR_WIRE_VERSION_V14);
-
-        let subscribe_terminal =
-            HarnessOperatorRequestV1::SubscribeTerminal { sessions: vec![session.clone()] };
-        assert_eq!(declared_wire_version(&subscribe_terminal), HARNESS_OPERATOR_WIRE_VERSION_V14);
-
-        let subscribe_events = HarnessOperatorRequestV1::SubscribeEvents {};
-        assert_eq!(declared_wire_version(&subscribe_events), HARNESS_OPERATOR_WIRE_VERSION_V14);
-
-        let stop_session = HarnessOperatorRequestV1::StopSession { session, force: false };
-        assert_eq!(declared_wire_version(&stop_session), HARNESS_OPERATOR_WIRE_VERSION_V10);
-    }
-
     fn sample_session_address() -> HarnessRuntimeSessionAddressV1 {
         HarnessRuntimeSessionAddressV1 {
             node_id: "node-a".to_owned(),
@@ -3172,17 +3105,14 @@ mod tests {
     }
 
     /// The wire-framing proof step 5's own integration test builds on: the
-    /// request envelope carries the `subscribe-terminal` kind at
-    /// `HARNESS_OPERATOR_WIRE_VERSION_V14` (`declared_wire_version` bumps
-    /// this request kind above its bare `requires_v12()` floor so the
-    /// host's pushed frames actually carry `screen_state` and
-    /// `bracketed_paste`) with the exact requested sessions, and
-    /// `next_event` decodes a pushed `TerminalFrame` followed by a `Ping`
-    /// off the SAME connection, in order -- the connect-once,
+    /// request envelope declares `HARNESS_OPERATOR_WIRE_VERSION` -- the one
+    /// version this wire ever accepts -- with the exact requested sessions,
+    /// and `next_event` decodes a pushed `TerminalFrame` followed by a
+    /// `Ping` off the SAME connection, in order -- the connect-once,
     /// read-repeatedly shape `subscribe_events`' own doc comment describes,
     /// exercised here for its terminal sibling.
     #[test]
-    fn operator_client_subscribe_terminal_declares_v14_so_pushed_frames_can_carry_screen_state() {
+    fn operator_client_subscribe_terminal_declares_the_one_accepted_wire_version() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
         let endpoint = listener.local_addr().expect("address");
         let session = sample_session_address();
@@ -3193,7 +3123,7 @@ mod tests {
             stream.read_to_string(&mut request).expect("request");
             let envelope: HarnessOperatorEnvelopeV1 =
                 serde_json::from_str(request.trim_end()).expect("envelope");
-            assert_eq!(envelope.version, HARNESS_OPERATOR_WIRE_VERSION_V14);
+            assert_eq!(envelope.version, HARNESS_OPERATOR_WIRE_VERSION);
             assert!(matches!(
                 &envelope.request,
                 HarnessOperatorRequestV1::SubscribeTerminal { sessions }

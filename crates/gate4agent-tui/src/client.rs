@@ -4316,6 +4316,13 @@ fn project_harness_read_failure(error: HarnessOperatorClientError) -> HarnessRea
             // the full harness this TUI's harness mode talks to never
             // returns it, but the match must stay exhaustive.
             HarnessOperatorHostErrorV1::Unsupported => "unsupported",
+            // The host decoded the envelope but rejected its declared
+            // version -- a build/version skew between this TUI and the
+            // harness it just connected to. Its own category, distinct from
+            // `invalid-response`/`validation` below: those mean a frame this
+            // client could not parse or a request it built wrong, not a
+            // version mismatch the host detected and named for us.
+            HarnessOperatorHostErrorV1::WireVersionMismatch { .. } => "wire-version-mismatch",
         },
         HarnessOperatorClientError::Api(_) => "validation",
         HarnessOperatorClientError::Deadline => "deadline",
@@ -4324,6 +4331,7 @@ fn project_harness_read_failure(error: HarnessOperatorClientError) -> HarnessRea
         HarnessOperatorClientError::RequestTooLarge
         | HarnessOperatorClientError::ResponseTooLarge => "too-large",
         HarnessOperatorClientError::InvalidResponse
+        | HarnessOperatorClientError::MalformedResponse(_)
         | HarnessOperatorClientError::IncompleteResponse
         | HarnessOperatorClientError::UnexpectedResponse
         | HarnessOperatorClientError::Encoding => "invalid-response",

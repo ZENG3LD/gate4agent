@@ -41,9 +41,9 @@ use std::time::Duration;
 use gate4agent_c2_client::{C2ReconnectingEventReceiver, C2ReconnectingHandle};
 use gate4agent_c2_protocol::C2Topology;
 use gate4agent_harness_api::{
-    HarnessOperatorCredential, HarnessOperatorEnvelopeV1, HarnessOperatorEventV1,
-    HarnessOperatorHostErrorV1, HarnessOperatorReplyV1, HarnessOperatorRequestV1,
-    HarnessRuntimeNodeInventoryV1,
+    HarnessOperatorApiError, HarnessOperatorCredential, HarnessOperatorEnvelopeV1,
+    HarnessOperatorEventV1, HarnessOperatorHostErrorV1, HarnessOperatorReplyV1,
+    HarnessOperatorRequestV1, HarnessRuntimeNodeInventoryV1,
 };
 use gate4agent_harness_service::runtime::{
     read_single_frame_detecting_operator, run_operator_event_subscription, write_operator_reply,
@@ -469,7 +469,23 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<LightState>) {
         let frame = read_single_frame_detecting_operator(&mut stream, &mut operator_frame).await?;
         let envelope: HarnessOperatorEnvelopeV1 = serde_json::from_slice(&frame)
             .map_err(|_| HarnessRuntimeError::InvalidFrame)?;
-        envelope.validate().map_err(|_| HarnessRuntimeError::InvalidFrame)?;
+        if let Err(error) = envelope.validate() {
+            if let HarnessOperatorApiError::WireVersionMismatch { expected, received } = error {
+                tracing::warn!(
+                    expected,
+                    received,
+                    "harness-light: operator wire version mismatch: rebuild and restart \
+                     the out-of-date side",
+                );
+                write_operator_reply(
+                    &mut stream,
+                    HarnessOperatorReplyV1::Error {
+                        error: HarnessOperatorHostErrorV1::WireVersionMismatch { expected, received },
+                    },
+                ).await?;
+            }
+            return Err(HarnessRuntimeError::InvalidFrame);
+        }
 
         if !state.credential_authority.verify(&envelope.credential) {
             tracing::warn!("harness-light: operator request rejected: unauthorized");
@@ -495,11 +511,11 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<LightState>) {
             let (sender, receiver) = mpsc::channel(LIGHT_SUBSCRIBER_QUEUE_CAPACITY);
             state.commands.send(LightCommand::Subscribe { sender, identity }).await
                 .map_err(|_| HarnessRuntimeError::HostStopped)?;
-            subscription = Some((receiver, subscriber_permit, envelope.version));
+            subscription = Some((receiver, subscriber_permit));
             return Ok(());
         }
 
-        let reply = dispatch::handle_request(&state, envelope.request, envelope.version).await;
+        let reply = dispatch::handle_request(&state, envelope.request).await;
         match write_operator_reply(&mut stream, reply).await {
             Err(HarnessRuntimeError::ResponseTooLarge) => write_operator_reply(
                 &mut stream,
@@ -511,10 +527,8 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<LightState>) {
 
     match outcome {
         Ok(Ok(())) => {
-            if let Some((receiver, subscriber_permit, wire_version)) = subscription {
-                let _ = run_operator_event_subscription(
-                    stream, receiver, subscriber_permit, wire_version,
-                ).await;
+            if let Some((receiver, subscriber_permit)) = subscription {
+                let _ = run_operator_event_subscription(stream, receiver, subscriber_permit).await;
             }
         }
         Ok(Err(error)) => {

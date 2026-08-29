@@ -17,7 +17,7 @@ use gate4agent_c2_protocol::NodeRoute;
 use gate4agent_harness_api::{
     HarnessOperatorTerminalEventV1, HarnessRuntimeMouseProtocolEncodingV1,
     HarnessRuntimeSessionAddressV1, HarnessRuntimeTerminalFrameV1, HarnessRuntimeTerminalSizeV1,
-    PtyScreenStateV1, HARNESS_OPERATOR_WIRE_VERSION_V13, HARNESS_OPERATOR_WIRE_VERSION_V14,
+    PtyScreenStateV1,
 };
 use gate4agent_observation_api::RuntimeSessionKey;
 use gate4agent_types::{PtyScreenState, TerminalFrame, TerminalMouseProtocolEncoding};
@@ -157,27 +157,7 @@ fn frame_byte_footprint(frame: &TerminalFrame) -> usize {
 // this crate, so the orphan rule forbids implementing the foreign `From`
 // trait for a foreign type here. This crate is the only one that depends on
 // both sides, so the translation lives here as a plain function instead.
-///
-/// `wire_version` is the REQUESTING PEER's own declared
-/// `HarnessOperatorEnvelopeV1::version` -- never a default or a constant --
-/// because `screen_state` is only ever present in the JSON for a peer that
-/// declared `>= HARNESS_OPERATOR_WIRE_VERSION_V13`, and `bracketed_paste`
-/// only for one that declared `>= HARNESS_OPERATOR_WIRE_VERSION_V14`; a
-/// decoder below either threshold has `deny_unknown_fields` and would
-/// reject the whole frame if the corresponding key were sent regardless.
-/// Both call paths of this function -- the poll
-/// (`TerminalRead`) and push (`SubscribeTerminal`) sides -- know their own
-/// connection's declared version at the point they call this, unlike
-/// `redact_runtime_inventory`'s cache-refresh call sites, which are
-/// asynchronous background refreshers shared by many concurrently
-/// connected peers and so have no single "the connection" to read a
-/// version from; that is why this function threads a real per-call version
-/// and `redact_runtime_inventory` does not (see this crate's own report on
-/// that gap).
-pub fn terminal_frame_to_wire(
-    frame: &TerminalFrame,
-    wire_version: u16,
-) -> HarnessRuntimeTerminalFrameV1 {
+pub fn terminal_frame_to_wire(frame: &TerminalFrame) -> HarnessRuntimeTerminalFrameV1 {
     HarnessRuntimeTerminalFrameV1 {
         sequence: frame.sequence,
         size: HarnessRuntimeTerminalSizeV1 {
@@ -201,41 +181,17 @@ pub fn terminal_frame_to_wire(
         // `TerminalFrame::produced_at_unix_ms`'s own doc for why no hop,
         // including this one, may recompute it.
         produced_at_unix_ms: frame.produced_at_unix_ms,
-        screen_state: (wire_version >= HARNESS_OPERATOR_WIRE_VERSION_V13)
-            .then(|| map_screen_state(&frame.screen_state)),
-        // Gated on `wire_version` the same way `screen_state` is, one
-        // version later -- see `HarnessRuntimeTerminalFrameV1::
-        // bracketed_paste`'s own doc for why an ungated field here would put
-        // the key on every frame regardless of the recipient's declared
-        // version (the node reports `Some` in practice, so
-        // `skip_serializing_if` alone never actually omits it).
-        bracketed_paste: (wire_version >= HARNESS_OPERATOR_WIRE_VERSION_V14)
-            .then(|| frame.bracketed_paste)
-            .flatten(),
+        // Unconditional: this wire has exactly one accepted version (see
+        // `HARNESS_OPERATOR_WIRE_VERSION`), so there is no older peer shape
+        // to withhold either field from.
+        screen_state: Some(map_screen_state(&frame.screen_state)),
+        bracketed_paste: frame.bracketed_paste,
     }
 }
 
 /// Maps the node's screen classification onto its hand-mirrored wire shape.
-/// Whether the field is even carried on the wire (`Option`-wrapping) is the
-/// CALLER's decision -- it depends on the requesting peer's declared wire
-/// version -- but the variant mapping itself never does, so it is factored
-/// out once here rather than duplicated at every call site that carries a
-/// `PtyScreenState` onto the operator wire.
-///
-/// The version gate belongs wherever the value stops being shared. A
-/// `TerminalFrame` is converted fresh for exactly one recipient every time
-/// (`terminal_frame_to_wire`, above), so its gate sits right here, at
-/// construction. `HarnessRuntimeNodeInventoryV1` is the opposite: it is
-/// built once by `redact_runtime_inventory` (`runtime.rs`) and cached,
-/// shared by every currently polling/subscribed peer regardless of that
-/// peer's own declared version, so gating it here would either leak the
-/// field to a pre-V13 peer or hide it from a V13 one -- see that
-/// function's own doc comment. Its gate instead lives at
-/// `downgrade_runtime_inventory` (`runtime.rs`), applied at each of the
-/// per-connection edges where the shared cached value actually becomes one
-/// connection's own copy (`write_operator_event`, the `RuntimeInventoryList`
-/// poll handlers in both harnesses). The asymmetry between the two is
-/// deliberate, not an oversight one side forgot to apply to the other.
+/// Factored out once here rather than duplicated at every call site that
+/// carries a `PtyScreenState` onto the operator wire.
 pub fn map_screen_state(state: &PtyScreenState) -> PtyScreenStateV1 {
     match state {
         PtyScreenState::Unknown => PtyScreenStateV1::Unknown,
@@ -307,13 +263,6 @@ struct TerminalSubscriber {
     /// this registry has no such pair at all.
     next_sequence: u64,
     identity: OperatorRequestLogIdentity,
-    /// This connection's own declared `HarnessOperatorEnvelopeV1::version`,
-    /// set once at `insert` from the value `handle_connection` already
-    /// validated for it and never revisited afterward (a push subscription
-    /// lives for the whole connection, so there is no later point to read a
-    /// fresher one from). Gates `screen_state` on every `TerminalFrame`
-    /// event this subscriber receives -- see `terminal_frame_to_wire`.
-    wire_version: u16,
 }
 
 impl TerminalSubscriber {
@@ -335,7 +284,7 @@ impl TerminalSubscriber {
         let event = HarnessOperatorTerminalEventV1::TerminalFrame {
             sequence,
             session: session_key_to_address(key),
-            frame: terminal_frame_to_wire(&frame, self.wire_version),
+            frame: terminal_frame_to_wire(&frame),
             coalesced_since_last,
         };
         match self.sender.try_send(event) {
@@ -391,7 +340,6 @@ impl TerminalSubscriberRegistry {
         sender: mpsc::Sender<HarnessOperatorTerminalEventV1>,
         sessions: HashSet<RuntimeSessionKey>,
         identity: OperatorRequestLogIdentity,
-        wire_version: u16,
     ) -> u64 {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
@@ -403,7 +351,6 @@ impl TerminalSubscriberRegistry {
             coalesced: HashMap::new(),
             next_sequence: 0,
             identity,
-            wire_version,
         });
         id
     }
@@ -538,7 +485,7 @@ impl TerminalSubscriberRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gate4agent_harness_api::{HarnessOperatorRequestV1, HARNESS_OPERATOR_WIRE_VERSION_V12};
+    use gate4agent_harness_api::HarnessOperatorRequestV1;
     use gate4agent_observation_api::{
         AgentInstanceId, NodeId, NodeIncarnationId, SessionGeneration, WorkspaceId,
     };
@@ -572,39 +519,35 @@ mod tests {
         }
     }
 
-    /// The version gate at the one place `screen_state` actually crosses
-    /// onto the operator wire: the same input frame produces `None` for a
-    /// pre-V13 peer and `Some` reflecting its real classification for a V13
-    /// peer, asserted side by side so neither path can silently forget the
-    /// other's expectation.
+    /// `screen_state` is unconditional: every frame carries the caller's
+    /// real classification, never `None` for a version reason (see
+    /// `HARNESS_OPERATOR_WIRE_VERSION`'s doc comment -- there is exactly one
+    /// accepted version on this wire, so there is no older shape to
+    /// withhold the field from).
     #[test]
-    fn terminal_frame_to_wire_gates_screen_state_on_the_callers_declared_wire_version() {
+    fn terminal_frame_to_wire_always_carries_screen_state() {
         let mut frame = sample_frame(1);
         frame.screen_state = PtyScreenState::OperatorGate { gate: "workspace-trust".to_owned() };
 
-        let pre_v13 = terminal_frame_to_wire(&frame, HARNESS_OPERATOR_WIRE_VERSION_V12);
-        assert!(pre_v13.screen_state.is_none());
-
-        let v13 = terminal_frame_to_wire(&frame, HARNESS_OPERATOR_WIRE_VERSION_V13);
-        assert_eq!(v13.screen_state, Some(map_screen_state(&frame.screen_state)));
+        let wire = terminal_frame_to_wire(&frame);
+        assert_eq!(wire.screen_state, Some(map_screen_state(&frame.screen_state)));
+        let encoded = serde_json::to_string(&wire).unwrap();
+        assert!(encoded.contains("\"screen_state\""));
     }
 
-    /// Sibling to `terminal_frame_to_wire_gates_screen_state_on_the_callers_
-    /// declared_wire_version`, one version later: the same input frame
-    /// produces `None` for a peer declared below V14 (including a V13 peer,
-    /// which already sees `screen_state` but must not yet see
-    /// `bracketed_paste`) and `Some` reflecting the real captured value for
-    /// a V14 peer.
+    /// Sibling to `terminal_frame_to_wire_always_carries_screen_state`:
+    /// `bracketed_paste` passes the source frame's own value straight
+    /// through -- unconditionally present on the wire whenever the node
+    /// actually captured one, never withheld for a version reason.
     #[test]
-    fn terminal_frame_to_wire_gates_bracketed_paste_on_the_callers_declared_wire_version() {
+    fn terminal_frame_to_wire_always_carries_a_captured_bracketed_paste() {
         let mut frame = sample_frame(1);
         frame.bracketed_paste = Some(true);
 
-        let pre_v14 = terminal_frame_to_wire(&frame, HARNESS_OPERATOR_WIRE_VERSION_V13);
-        assert!(pre_v14.bracketed_paste.is_none());
-
-        let v14 = terminal_frame_to_wire(&frame, HARNESS_OPERATOR_WIRE_VERSION_V14);
-        assert_eq!(v14.bracketed_paste, Some(true));
+        let wire = terminal_frame_to_wire(&frame);
+        assert_eq!(wire.bracketed_paste, Some(true));
+        let encoded = serde_json::to_string(&wire).unwrap();
+        assert!(encoded.contains("\"bracketed_paste\":true"));
     }
 
     // `sessions: Vec::new()` is structurally invalid for `SubscribeTerminal`
@@ -640,7 +583,7 @@ mod tests {
         let (sender, mut receiver) = mpsc::channel(HOST_TERMINAL_SUBSCRIBER_QUEUE_CAPACITY);
         let mut sessions = HashSet::new();
         sessions.insert(key.clone());
-        registry.insert(sender, sessions, subscribe_terminal_identity(), HARNESS_OPERATOR_WIRE_VERSION_V13);
+        registry.insert(sender, sessions, subscribe_terminal_identity());
 
         registry.publish(&key, &sample_frame(1));
 
@@ -662,7 +605,7 @@ mod tests {
         let (sender, mut receiver) = mpsc::channel(HOST_TERMINAL_SUBSCRIBER_QUEUE_CAPACITY);
         let mut sessions = HashSet::new();
         sessions.insert(other_key);
-        registry.insert(sender, sessions, subscribe_terminal_identity(), HARNESS_OPERATOR_WIRE_VERSION_V13);
+        registry.insert(sender, sessions, subscribe_terminal_identity());
 
         registry.publish(&key, &sample_frame(1));
 
@@ -681,7 +624,7 @@ mod tests {
         let (sender, receiver) = mpsc::channel(1);
         let mut sessions = HashSet::new();
         sessions.insert(key.clone());
-        registry.insert(sender, sessions, subscribe_terminal_identity(), HARNESS_OPERATOR_WIRE_VERSION_V13);
+        registry.insert(sender, sessions, subscribe_terminal_identity());
 
         // First publish is sent directly: the capacity-1 channel starts
         // empty, nothing is stashed.
@@ -714,7 +657,7 @@ mod tests {
         let (sender, mut receiver) = mpsc::channel(1);
         let mut sessions = HashSet::new();
         sessions.insert(key.clone());
-        registry.insert(sender, sessions, subscribe_terminal_identity(), HARNESS_OPERATOR_WIRE_VERSION_V13);
+        registry.insert(sender, sessions, subscribe_terminal_identity());
 
         registry.publish(&key, &sample_frame(1)); // sent directly, fills the channel
         registry.publish(&key, &sample_frame(2)); // stashed
@@ -757,7 +700,7 @@ mod tests {
         let mut sessions = HashSet::new();
         sessions.insert(key.clone());
         sessions.insert(empty_key.clone());
-        let id = registry.insert(sender, sessions, subscribe_terminal_identity(), HARNESS_OPERATOR_WIRE_VERSION_V13);
+        let id = registry.insert(sender, sessions, subscribe_terminal_identity());
 
         for seed_key in [&key, &empty_key] {
             if let Some(frame) = buffers.latest(seed_key) {
@@ -783,7 +726,7 @@ mod tests {
         let (sender, receiver) = mpsc::channel(HOST_TERMINAL_SUBSCRIBER_QUEUE_CAPACITY);
         let mut sessions = HashSet::new();
         sessions.insert(key.clone());
-        registry.insert(sender, sessions, subscribe_terminal_identity(), HARNESS_OPERATOR_WIRE_VERSION_V13);
+        registry.insert(sender, sessions, subscribe_terminal_identity());
         assert_eq!(registry.subscribers.len(), 1);
 
         drop(receiver);
@@ -801,7 +744,7 @@ mod tests {
         let (sender, receiver) = mpsc::channel::<HarnessOperatorTerminalEventV1>(
             HOST_TERMINAL_SUBSCRIBER_QUEUE_CAPACITY,
         );
-        registry.insert(sender, HashSet::new(), subscribe_terminal_identity(), HARNESS_OPERATOR_WIRE_VERSION_V13);
+        registry.insert(sender, HashSet::new(), subscribe_terminal_identity());
         drop(receiver);
 
         registry.keepalive();
@@ -817,7 +760,7 @@ mod tests {
         let (sender, mut receiver) = mpsc::channel::<HarnessOperatorTerminalEventV1>(
             HOST_TERMINAL_SUBSCRIBER_QUEUE_CAPACITY,
         );
-        registry.insert(sender, HashSet::new(), subscribe_terminal_identity(), HARNESS_OPERATOR_WIRE_VERSION_V13);
+        registry.insert(sender, HashSet::new(), subscribe_terminal_identity());
 
         registry.keepalive();
 

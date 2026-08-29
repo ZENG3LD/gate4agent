@@ -58,43 +58,21 @@ pub const HARNESS_OBSERVATION_TODO_TEXT_MAX_BYTES: usize = 256;
 pub const HARNESS_OBSERVATION_PATH_MAX_BYTES: usize = 1_024;
 pub const HARNESS_READ_CREDENTIAL_MAX_BYTES: usize = 8 * 1024;
 pub const HARNESS_MCP_AUDIENCE: &str = "gate4agent-harness-mcp-read-v1";
-pub const HARNESS_OPERATOR_WIRE_VERSION_V1: u16 = 1;
-pub const HARNESS_OPERATOR_WIRE_VERSION_V2: u16 = 2;
-pub const HARNESS_OPERATOR_WIRE_VERSION_V3: u16 = 3;
-pub const HARNESS_OPERATOR_WIRE_VERSION_V4: u16 = 4;
-pub const HARNESS_OPERATOR_WIRE_VERSION_V5: u16 = 5;
-pub const HARNESS_OPERATOR_WIRE_VERSION_V6: u16 = 6;
-pub const HARNESS_OPERATOR_WIRE_VERSION_V7: u16 = 7;
-pub const HARNESS_OPERATOR_WIRE_VERSION_V8: u16 = 8;
-pub const HARNESS_OPERATOR_WIRE_VERSION_V9: u16 = 9;
-pub const HARNESS_OPERATOR_WIRE_VERSION_V10: u16 = 10;
-pub const HARNESS_OPERATOR_WIRE_VERSION_V11: u16 = 11;
-pub const HARNESS_OPERATOR_WIRE_VERSION_V12: u16 = 12;
-/// V13 gates the two `screen_state` fields on `HarnessRuntimeTerminalFrameV1`
-/// and `HarnessRuntimeSessionV1` (see `PtyScreenStateV1`). Deliberately NOT
-/// wired into `requires_v13()`/`minimum_wire_version()`: those exist to
-/// reject an OLDER peer's request for something newer than it declared
-/// (e.g. an action added at V6 sent by a V4 caller). V13 gates the opposite
-/// direction -- what a RESPONSE field contains for a peer that already
-/// asked at any accepted version -- and every request is servable at any
-/// accepted version regardless of whether its reply happens to carry
-/// `screen_state`. Do not add `requires_v13()` by analogy with V4..V12;
-/// there is no request this version makes newly valid.
-pub const HARNESS_OPERATOR_WIRE_VERSION_V13: u16 = 13;
-/// V14 gates `bracketed_paste` on `HarnessRuntimeTerminalFrameV1`, the same
-/// way V13 gates that struct's (and `HarnessRuntimeSessionV1`'s) two
-/// `screen_state` fields: present in the JSON only for a peer that declared
-/// `>= HARNESS_OPERATOR_WIRE_VERSION_V14`, absent (never `null`) below it,
-/// because the struct carries `#[serde(deny_unknown_fields)]` and a pre-V14
-/// decoder would reject the whole frame if the key reached it regardless of
-/// its value. Deliberately NOT wired into `requires_v14()`/
-/// `minimum_wire_version()` for the identical reason `HARNESS_OPERATOR_WIRE_
-/// VERSION_V13`'s own doc comment gives: this gates a RESPONSE field, not
-/// any request shape, so every request kind stays servable at any accepted
-/// version regardless of whether its reply happens to carry
-/// `bracketed_paste`. Do not add `requires_v14()` by analogy with V4..V12;
-/// there is no request this version makes newly valid.
-pub const HARNESS_OPERATOR_WIRE_VERSION_V14: u16 = 14;
+/// The harness operator wire is a loopback protocol between processes built
+/// from the same tree and rolled together (`gate4agent-harness` and its two
+/// clients, `gate4agent-tui` / `gate4agent-tui-light`, via
+/// `gate4agent-harness-client`). There is exactly one peer shape at a time --
+/// no peer that cannot be rebuilt exists -- so there is exactly one accepted
+/// version, not a negotiated range.
+///
+/// Value `15` deliberately continues the counter past the last real version
+/// this protocol carried (`14`, retired together with V1..V13 in the same
+/// change that introduced this single constant) rather than resetting to
+/// `1`. A stray old log line or captured frame that says `"version":1` meant
+/// something structurally different under the old multi-version scheme; a
+/// frame that says `"version":15` can only ever be this protocol, never
+/// misread as an artifact from before the collapse.
+pub const HARNESS_OPERATOR_WIRE_VERSION: u16 = 15;
 // Realistic multi-pane ceiling with headroom; bounds the harness-side
 // per-subscriber HashSet<RuntimeSessionKey> and the connect-time seed burst
 // `SubscribeTerminal`'s handler sends immediately after registering (see
@@ -251,24 +229,11 @@ pub struct HarnessOperatorEnvelopeV1 {
 
 impl HarnessOperatorEnvelopeV1 {
     pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
-        if !matches!(
-            self.version,
-            HARNESS_OPERATOR_WIRE_VERSION_V2
-                | HARNESS_OPERATOR_WIRE_VERSION_V3
-                | HARNESS_OPERATOR_WIRE_VERSION_V4
-                | HARNESS_OPERATOR_WIRE_VERSION_V5
-                | HARNESS_OPERATOR_WIRE_VERSION_V6
-                | HARNESS_OPERATOR_WIRE_VERSION_V7
-                | HARNESS_OPERATOR_WIRE_VERSION_V8
-                | HARNESS_OPERATOR_WIRE_VERSION_V9
-                | HARNESS_OPERATOR_WIRE_VERSION_V10
-                | HARNESS_OPERATOR_WIRE_VERSION_V11
-                | HARNESS_OPERATOR_WIRE_VERSION_V12
-                | HARNESS_OPERATOR_WIRE_VERSION_V13
-                | HARNESS_OPERATOR_WIRE_VERSION_V14
-        ) || self.version < self.request.minimum_wire_version()
-        {
-            return Err(HarnessOperatorApiError::UnsupportedVersion);
+        if self.version != HARNESS_OPERATOR_WIRE_VERSION {
+            return Err(HarnessOperatorApiError::WireVersionMismatch {
+                expected: HARNESS_OPERATOR_WIRE_VERSION,
+                received: self.version,
+            });
         }
         validate_operator_credential(self.credential.expose())?;
         self.request.validate()
@@ -531,19 +496,6 @@ impl HarnessOperatorActionV1 {
         }
     }
 
-    pub fn requires_v4(&self) -> bool {
-        matches!(
-            self,
-            Self::ReplaceTaskExecutionSpec { .. } | Self::StartTask { .. }
-        )
-    }
-
-    pub fn requires_v6(&self) -> bool {
-        matches!(
-            self,
-            Self::ReplaceTaskExecutionSpecV2 { .. } | Self::StartTaskV2 { .. }
-        )
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2835,132 +2787,6 @@ impl HarnessOperatorRequestV1 {
         }
     }
 
-    pub fn requires_v3(&self) -> bool {
-        matches!(
-            self,
-            Self::RuntimeInventoryList { .. }
-                | Self::CatalogNativeSessions { .. }
-                | Self::PageNativeSessions { .. }
-                | Self::PreviewNativeSession { .. }
-                | Self::SubmitIntent { .. }
-        )
-    }
-
-    pub fn requires_v4(&self) -> bool {
-        matches!(
-            self,
-            Self::RunCorrelationGet { .. }
-                | Self::InspectRunWorkspace { .. }
-                | Self::ReadRunWorkspaceFile { .. }
-                | Self::ReadRunGitHistory { .. }
-                | Self::ReadRunGitDiff { .. }
-                | Self::LaunchPlansList { .. }
-                | Self::TaskExecutionSpecGet { .. }
-                | Self::ReplaceTaskExecutionSpec { .. }
-                | Self::StartTask { .. }
-        ) || matches!(self, Self::SubmitIntent { intent } if intent.action.requires_v4())
-    }
-
-    pub fn requires_v5(&self) -> bool {
-        matches!(self, Self::RunTransferGet { .. })
-    }
-
-    pub fn requires_v6(&self) -> bool {
-        matches!(
-            self,
-            Self::TaskLaunchOptionsGet { .. }
-                | Self::ReplaceTaskExecutionSpecV2 { .. }
-                | Self::StartTaskV2 { .. }
-        ) || matches!(self, Self::SubmitIntent { intent } if intent.action.requires_v6())
-    }
-
-    pub fn requires_v7(&self) -> bool {
-        matches!(self, Self::ReverseAttributionGet { .. })
-    }
-
-    pub fn requires_v8(&self) -> bool {
-        matches!(self, Self::ObserveRunContextSource { .. })
-    }
-
-    pub fn requires_v9(&self) -> bool {
-        matches!(
-            self,
-            Self::InspectNodeWorkspace { .. }
-                | Self::ReadNodeWorkspaceFile { .. }
-                | Self::ReadNodeGitHistory { .. }
-                | Self::ReadNodeGitDiff { .. }
-        )
-    }
-
-    pub fn requires_v10(&self) -> bool {
-        matches!(
-            self,
-            Self::SpawnSession { .. }
-                | Self::WriteSessionInput { .. }
-                | Self::ResizeSession { .. }
-                | Self::StopSession { .. }
-        )
-    }
-
-    pub fn requires_v11(&self) -> bool {
-        matches!(
-            self,
-            Self::SubscribeEvents {}
-                | Self::ControlSession { .. }
-                | Self::WriteSessionBytes { .. }
-                | Self::PasteSession { .. }
-                | Self::RemoveSession { .. }
-                | Self::ResumeSession { .. }
-                | Self::WriteNodeWorkspaceFile { .. }
-                | Self::CreateNodeWorkspaceFile { .. }
-                | Self::CreateNodeWorkspaceDirectory { .. }
-                | Self::PreviewSessionRecord { .. }
-                | Self::ResumeSessionRecord { .. }
-                | Self::RenameSessionRecord { .. }
-                | Self::SetSessionTask { .. }
-                | Self::ForgetSessionRecord { .. }
-                | Self::IndexProviderSession { .. }
-                | Self::IndexNativeSession { .. }
-                | Self::BrowseHostDirectories { .. }
-                | Self::RegisterWorkspace { .. }
-                | Self::UnregisterWorkspace { .. }
-                | Self::CreateStandaloneWorkspace { .. }
-                | Self::CreateWorktree { .. }
-                | Self::RemoveWorktree { .. }
-                | Self::ExportContextPack { .. }
-                | Self::ForgetContextPack { .. }
-        )
-    }
-
-    pub fn requires_v12(&self) -> bool {
-        matches!(self, Self::SubscribeTerminal { .. })
-    }
-
-    pub fn minimum_wire_version(&self) -> u16 {
-        if self.requires_v12() {
-            HARNESS_OPERATOR_WIRE_VERSION_V12
-        } else if self.requires_v11() {
-            HARNESS_OPERATOR_WIRE_VERSION_V11
-        } else if self.requires_v10() {
-            HARNESS_OPERATOR_WIRE_VERSION_V10
-        } else if self.requires_v9() {
-            HARNESS_OPERATOR_WIRE_VERSION_V9
-        } else if self.requires_v8() {
-            HARNESS_OPERATOR_WIRE_VERSION_V8
-        } else if self.requires_v7() {
-            HARNESS_OPERATOR_WIRE_VERSION_V7
-        } else if self.requires_v6() {
-            HARNESS_OPERATOR_WIRE_VERSION_V6
-        } else if self.requires_v5() {
-            HARNESS_OPERATOR_WIRE_VERSION_V5
-        } else if self.requires_v4() {
-            HARNESS_OPERATOR_WIRE_VERSION_V4
-        } else if self.requires_v3() {
-            HARNESS_OPERATOR_WIRE_VERSION_V3
-        } else {
-            HARNESS_OPERATOR_WIRE_VERSION_V2
-        }
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -4096,14 +3922,11 @@ pub struct HarnessRuntimeSessionV1 {
     pub terminal_size: Option<HarnessRuntimeTerminalSizeV1>,
     pub operation_pending: bool,
     pub input_pending: bool,
-    /// The node's current screen classification, present only when the
-    /// requesting peer declared `>= HARNESS_OPERATOR_WIRE_VERSION_V13`.
-    /// `skip_serializing_if` is load-bearing: the key must be ABSENT from
-    /// the JSON, not `null`, or a pre-V13 `deny_unknown_fields` decoder
-    /// rejects the whole message. `None` means "this peer did not ask for a
-    /// version that carries it" -- it is NOT the same as `Some(Unknown)`
-    /// ("asked, and nothing is classified yet"); a consumer must not
-    /// conflate the two.
+    /// The node's current screen classification. Always populated by every
+    /// server on this wire -- `Unknown` is a real classification, not an
+    /// absence marker -- so `Some` is the only value ever actually sent;
+    /// `Option`-wrapped only so a decoder never has to special-case a
+    /// missing key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub screen_state: Option<PtyScreenStateV1>,
 }
@@ -4151,30 +3974,16 @@ pub struct HarnessRuntimeTerminalFrameV1 {
     #[serde(default)]
     pub produced_at_unix_ms: u64,
     /// The screen classification stamped at the instant this frame's screen
-    /// was materialized, present only when the requesting peer declared
-    /// `>= HARNESS_OPERATOR_WIRE_VERSION_V13`. `skip_serializing_if` is
-    /// load-bearing: the key must be ABSENT from the JSON, not `null`, or a
-    /// pre-V13 `deny_unknown_fields` decoder rejects the whole message.
-    /// `None` means "this peer did not ask for a version that carries it"
-    /// -- it is NOT the same as `Some(Unknown)` ("asked, and nothing is
-    /// classified yet"); a consumer must not conflate the two.
+    /// was materialized. Always populated -- `Unknown` is a real
+    /// classification, not an absence marker -- so `Some` is the only value
+    /// ever actually sent; `Option`-wrapped only so a decoder never has to
+    /// special-case a missing key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub screen_state: Option<PtyScreenStateV1>,
     /// Mirrors `gate4agent_types::TerminalFrame::bracketed_paste` onto the
-    /// operator wire, present only when the requesting peer declared
-    /// `>= HARNESS_OPERATOR_WIRE_VERSION_V14`. `skip_serializing_if` is
-    /// load-bearing the same way it is on `screen_state`: the key must be
-    /// ABSENT from the JSON, not `null`, or a pre-V14 `deny_unknown_fields`
-    /// decoder rejects the whole message. The node always reports `Some`
-    /// here in practice, so an ungated field would be present on every
-    /// frame regardless of the recipient's declared version -- exactly the
-    /// shape of bug this gate exists to prevent. `None` means either "this
-    /// peer did not ask for a version that carries it" or "the node hasn't
-    /// captured a value yet"; unlike `screen_state`'s `Unknown` variant,
-    /// `bracketed_paste` has no separate "asked, nothing captured yet" state
-    /// to distinguish the two, so callers must not read anything into which
-    /// one occurred. `#[serde(default)]` so an operator client built before
-    /// this field existed still decodes the frame.
+    /// operator wire unconditionally. `None` here means only "the node
+    /// hasn't captured a value yet" -- the source field's own genuine
+    /// absence -- never a wire-version gate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bracketed_paste: Option<bool>,
 }
@@ -4729,6 +4538,15 @@ pub enum HarnessOperatorHostErrorV1 {
     // skew risk in practice: `gate4agent-harness-light` pairs this crate
     // in-process (same build, same binary), never across a version boundary.
     Unsupported,
+    // The host decoded the envelope but its declared `version` was not
+    // `HARNESS_OPERATOR_WIRE_VERSION` (see `HarnessOperatorApiError::
+    // WireVersionMismatch`, which this carries verbatim onto the wire so the
+    // caller sees both numbers instead of the generic `InvalidRequest` every
+    // other malformed-envelope shape collapses to). Reaching this variant
+    // itself proves a build/version skew between the two loopback sides --
+    // this protocol has exactly one accepted version, so a well-formed peer
+    // never triggers it against a matching one.
+    WireVersionMismatch { expected: u16, received: u16 },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -5612,8 +5430,13 @@ pub enum HarnessReadApiError {
 
 #[derive(Debug, Error)]
 pub enum HarnessOperatorApiError {
-    #[error("unsupported harness operator wire version")]
-    UnsupportedVersion,
+    #[error(
+        "harness operator wire version mismatch: this side speaks version {expected}, the \
+         peer sent version {received} -- rebuild and restart the out-of-date side \
+         (gate4agent-harness and its gate4agent-tui / gate4agent-tui-light client are built \
+         from the same tree and must be rolled together)"
+    )]
+    WireVersionMismatch { expected: u16, received: u16 },
     #[error("harness operator credential is malformed")]
     MalformedCredential,
     #[error("harness operator limit is outside the supported range")]
@@ -6235,30 +6058,13 @@ mod tests {
     }
 
     #[test]
-    fn operator_v2_rejects_v1_wire_and_legacy_raw_schedule_variant() {
-        let credential = HarnessOperatorCredential::parse(format!(
-            "g4aho_{}",
-            "a".repeat(64),
-        )).unwrap();
-        let envelope = HarnessOperatorEnvelopeV1 {
-            version: HARNESS_OPERATOR_WIRE_VERSION_V1,
-            credential,
-            request: HarnessOperatorRequestV1::TasksList {
-                after_task_id: None,
-                state: None,
-                limit: 1,
-            },
-        };
-        assert!(matches!(
-            envelope.validate(),
-            Err(HarnessOperatorApiError::UnsupportedVersion),
-        ));
+    fn legacy_raw_schedule_variant_json_is_rejected() {
         let legacy = r#"{"kind":"schedule-ready-task","request":{}}"#;
         assert!(serde_json::from_str::<HarnessOperatorRequestV1>(legacy).is_err());
     }
 
     #[test]
-    fn operator_v3_intent_is_authority_free_and_fails_closed_on_v2() {
+    fn operator_intent_is_authority_free() {
         let credential = HarnessOperatorCredential::parse(format!(
             "g4aho_{}",
             "a".repeat(64),
@@ -6284,29 +6090,20 @@ mod tests {
         assert!(!encoded_request.contains("operation_id"));
         assert!(!encoded_request.contains("idempotency_ref"));
         assert!(!encoded_request.contains("\"task_id\":"));
-        let v2 = HarnessOperatorEnvelopeV1 {
-            version: HARNESS_OPERATOR_WIRE_VERSION_V2,
-            credential: credential.clone(),
-            request: request.clone(),
-        };
-        assert!(matches!(
-            v2.validate(),
-            Err(HarnessOperatorApiError::UnsupportedVersion),
-        ));
-        let v3 = HarnessOperatorEnvelopeV1 {
-            version: HARNESS_OPERATOR_WIRE_VERSION_V3,
+        let envelope = HarnessOperatorEnvelopeV1 {
+            version: HARNESS_OPERATOR_WIRE_VERSION,
             credential,
             request,
         };
-        assert!(v3.validate().is_ok());
+        assert!(envelope.validate().is_ok());
         let decoded: HarnessOperatorEnvelopeV1 = serde_json::from_slice(
-            &serde_json::to_vec(&v3).unwrap(),
+            &serde_json::to_vec(&envelope).unwrap(),
         ).unwrap();
-        assert_eq!(decoded, v3);
+        assert_eq!(decoded, envelope);
     }
 
     #[test]
-    fn operator_v4_run_correlation_is_exact_and_fails_closed_on_v3() {
+    fn operator_run_correlation_is_exact() {
         let credential = HarnessOperatorCredential::parse(format!(
             "g4aho_{}",
             "a".repeat(64),
@@ -6314,19 +6111,8 @@ mod tests {
         let request = HarnessOperatorRequestV1::RunCorrelationGet {
             run_id: HarnessRunId::new(format!("hrun_{}", "c".repeat(24))).unwrap(),
         };
-        assert_eq!(request.minimum_wire_version(), HARNESS_OPERATOR_WIRE_VERSION_V4);
-        assert!(request.requires_v4());
-        assert!(!request.requires_v3());
-        assert!(matches!(
-            HarnessOperatorEnvelopeV1 {
-                version: HARNESS_OPERATOR_WIRE_VERSION_V3,
-                credential: credential.clone(),
-                request: request.clone(),
-            }.validate(),
-            Err(HarnessOperatorApiError::UnsupportedVersion),
-        ));
         let envelope = HarnessOperatorEnvelopeV1 {
-            version: HARNESS_OPERATOR_WIRE_VERSION_V4,
+            version: HARNESS_OPERATOR_WIRE_VERSION,
             credential,
             request,
         };
@@ -6338,7 +6124,7 @@ mod tests {
     }
 
     #[test]
-    fn operator_v5_run_transfer_is_exact_private_and_fails_closed_on_v4() {
+    fn operator_run_transfer_is_exact_private() {
         let credential = HarnessOperatorCredential::parse(format!(
             "g4aho_{}",
             "a".repeat(64),
@@ -6348,19 +6134,8 @@ mod tests {
         let request = HarnessOperatorRequestV1::RunTransferGet {
             run_id: summary.run_id.clone(),
         };
-        assert_eq!(request.minimum_wire_version(), HARNESS_OPERATOR_WIRE_VERSION_V5);
-        assert!(request.requires_v5());
-        assert!(!request.requires_v4());
-        assert!(matches!(
-            HarnessOperatorEnvelopeV1 {
-                version: HARNESS_OPERATOR_WIRE_VERSION_V4,
-                credential: credential.clone(),
-                request: request.clone(),
-            }.validate(),
-            Err(HarnessOperatorApiError::UnsupportedVersion),
-        ));
         HarnessOperatorEnvelopeV1 {
-            version: HARNESS_OPERATOR_WIRE_VERSION_V5,
+            version: HARNESS_OPERATOR_WIRE_VERSION,
             credential,
             request,
         }.validate().unwrap();
@@ -6521,7 +6296,7 @@ mod tests {
     }
 
     #[test]
-    fn operator_v6_task_launch_contract_is_exact_private_and_fails_closed_on_v5() {
+    fn operator_task_launch_contract_is_exact_and_private() {
         let credential = HarnessOperatorCredential::parse(format!(
             "g4aho_{}",
             "a".repeat(64),
@@ -6572,19 +6347,10 @@ mod tests {
             replace.clone(),
             start.clone(),
         ] {
-            assert_eq!(request.minimum_wire_version(), HARNESS_OPERATOR_WIRE_VERSION_V6);
             request.validate().unwrap();
-            assert!(matches!(
-                HarnessOperatorEnvelopeV1 {
-                    version: HARNESS_OPERATOR_WIRE_VERSION_V5,
-                    credential: credential.clone(),
-                    request,
-                }.validate(),
-                Err(HarnessOperatorApiError::UnsupportedVersion),
-            ));
         }
         HarnessOperatorEnvelopeV1 {
-            version: HARNESS_OPERATOR_WIRE_VERSION_V6,
+            version: HARNESS_OPERATOR_WIRE_VERSION,
             credential,
             request: replace.clone(),
         }.validate().unwrap();
@@ -6621,10 +6387,6 @@ mod tests {
         };
         let intent_json = serde_json::to_string(&intent).unwrap();
         assert!(!intent_json.contains("authority"));
-        assert_eq!(
-            HarnessOperatorRequestV1::SubmitIntent { intent }.minimum_wire_version(),
-            HARNESS_OPERATOR_WIRE_VERSION_V6,
-        );
         let start_intent = HarnessOperatorIntentV1 {
             request_ref: HarnessOperatorRequestRefV1::new(format!(
                 "hireq_{}",
@@ -6641,11 +6403,6 @@ mod tests {
         };
         let start_intent_json = serde_json::to_string(&start_intent).unwrap();
         assert!(!start_intent_json.contains("authority"));
-        assert_eq!(
-            HarnessOperatorRequestV1::SubmitIntent { intent: start_intent }
-                .minimum_wire_version(),
-            HARNESS_OPERATOR_WIRE_VERSION_V6,
-        );
     }
 
     #[test]
@@ -6691,7 +6448,7 @@ mod tests {
     }
 
     #[test]
-    fn operator_v4_execution_requests_are_exact_and_fail_closed_on_v3() {
+    fn operator_execution_requests_are_exact() {
         let credential = HarnessOperatorCredential::parse(format!(
             "g4aho_{}",
             "a".repeat(64),
@@ -6740,16 +6497,12 @@ mod tests {
             },
         ];
         for request in requests {
-            assert_eq!(request.minimum_wire_version(), HARNESS_OPERATOR_WIRE_VERSION_V4);
             assert!(request.validate().is_ok());
-            assert!(matches!(
-                HarnessOperatorEnvelopeV1 {
-                    version: HARNESS_OPERATOR_WIRE_VERSION_V3,
-                    credential: credential.clone(),
-                    request,
-                }.validate(),
-                Err(HarnessOperatorApiError::UnsupportedVersion),
-            ));
+            assert!(HarnessOperatorEnvelopeV1 {
+                version: HARNESS_OPERATOR_WIRE_VERSION,
+                credential: credential.clone(),
+                request,
+            }.validate().is_ok());
         }
 
         assert!(matches!(
@@ -6795,7 +6548,7 @@ mod tests {
     }
 
     #[test]
-    fn execution_spec_and_start_intents_are_authority_free_v4() {
+    fn execution_spec_and_start_intents_are_authority_free() {
         let intent = HarnessOperatorIntentV1 {
             request_ref: HarnessOperatorRequestRefV1::new(format!(
                 "hireq_{}",
@@ -6813,7 +6566,6 @@ mod tests {
         };
         intent.validate().unwrap();
         let request = HarnessOperatorRequestV1::SubmitIntent { intent };
-        assert_eq!(request.minimum_wire_version(), HARNESS_OPERATOR_WIRE_VERSION_V4);
         let encoded = serde_json::to_string(&request).unwrap();
         assert!(!encoded.contains("authority"));
         assert!(!encoded.contains("operation_id"));
@@ -6842,7 +6594,6 @@ mod tests {
             },
         };
         replace.validate().unwrap();
-        assert_eq!(replace.minimum_wire_version(), HARNESS_OPERATOR_WIRE_VERSION_V4);
     }
 
     #[test]
@@ -6919,7 +6670,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_inventory_request_requires_v3() {
+    fn runtime_inventory_request_validates() {
         let credential = HarnessOperatorCredential::parse(format!(
             "g4aho_{}",
             "a".repeat(64),
@@ -6928,17 +6679,8 @@ mod tests {
             after_node_id: None,
             limit: HARNESS_RUNTIME_INVENTORY_PAGE_LIMIT_MAX,
         };
-        let v2 = HarnessOperatorEnvelopeV1 {
-            version: HARNESS_OPERATOR_WIRE_VERSION_V2,
-            credential: credential.clone(),
-            request: request.clone(),
-        };
-        assert!(matches!(
-            v2.validate(),
-            Err(HarnessOperatorApiError::UnsupportedVersion),
-        ));
         assert!(HarnessOperatorEnvelopeV1 {
-            version: HARNESS_OPERATOR_WIRE_VERSION_V3,
+            version: HARNESS_OPERATOR_WIRE_VERSION,
             credential,
             request,
         }.validate().is_ok());
@@ -7008,7 +6750,7 @@ mod tests {
     }
 
     #[test]
-    fn native_history_v3_is_exact_bounded_and_excludes_sensitive_fields() {
+    fn native_history_is_exact_bounded_and_excludes_sensitive_fields() {
         let credential = HarnessOperatorCredential::parse(format!(
             "g4aho_{}",
             "a".repeat(64),
@@ -7044,14 +6786,8 @@ mod tests {
                 message_limit: HARNESS_NATIVE_SESSION_PREVIEW_MESSAGE_LIMIT_MAX,
             },
         ] {
-            assert!(request.requires_v3());
-            assert!(HarnessOperatorEnvelopeV1 {
-                version: HARNESS_OPERATOR_WIRE_VERSION_V2,
-                credential: credential.clone(),
-                request: request.clone(),
-            }.validate().is_err());
             HarnessOperatorEnvelopeV1 {
-                version: HARNESS_OPERATOR_WIRE_VERSION_V3,
+                version: HARNESS_OPERATOR_WIRE_VERSION,
                 credential: credential.clone(),
                 request,
             }.validate().unwrap();
@@ -7139,7 +6875,7 @@ mod tests {
     }
 
     #[test]
-    fn operator_v4_run_workspace_requests_are_exact_harness_only_round_trips() {
+    fn operator_run_workspace_requests_are_exact_harness_only_round_trips() {
         let run_id = run_workspace_origin().run_id;
         let path = HarnessRepositoryPathV1::new("src/lib.rs").unwrap();
         let object_id = HarnessGitObjectIdV1::new("a".repeat(40)).unwrap();
@@ -7164,8 +6900,7 @@ mod tests {
             },
         ];
         for request in requests {
-            request.validate().expect("valid V4 workspace request");
-            assert_eq!(request.minimum_wire_version(), HARNESS_OPERATOR_WIRE_VERSION_V4);
+            request.validate().expect("valid workspace request");
             let encoded = serde_json::to_string(&request).unwrap();
             for forbidden in [
                 "node_id",
@@ -7630,7 +7365,7 @@ mod tests {
     }
 
     #[test]
-    fn operator_v7_reverse_attribution_is_exact_private_and_fails_closed_on_v6() {
+    fn operator_reverse_attribution_is_exact_and_private() {
         let subject = HarnessReverseAttributionSubjectV1::FileScope {
             workspace: reverse_attribution_workspace(),
             relative_path: HarnessRepositoryPathV1::new("src/lib.rs").unwrap(),
@@ -7638,22 +7373,13 @@ mod tests {
         let request = HarnessOperatorRequestV1::ReverseAttributionGet {
             subject: subject.clone(),
         };
-        assert_eq!(request.minimum_wire_version(), HARNESS_OPERATOR_WIRE_VERSION_V7);
         request.validate().unwrap();
         let credential = HarnessOperatorCredential::parse(format!(
             "g4aho_{}",
             "a".repeat(64),
         )).unwrap();
-        assert!(matches!(
-            HarnessOperatorEnvelopeV1 {
-                version: HARNESS_OPERATOR_WIRE_VERSION_V6,
-                credential: credential.clone(),
-                request: request.clone(),
-            }.validate(),
-            Err(HarnessOperatorApiError::UnsupportedVersion),
-        ));
         HarnessOperatorEnvelopeV1 {
-            version: HARNESS_OPERATOR_WIRE_VERSION_V7,
+            version: HARNESS_OPERATOR_WIRE_VERSION,
             credential,
             request,
         }.validate().unwrap();
@@ -7835,7 +7561,7 @@ mod tests {
     }
 
     #[test]
-    fn operator_v9_node_workspace_requests_are_exact_round_trips_and_fail_closed_on_v8() {
+    fn operator_node_workspace_requests_are_exact_round_trips() {
         let node_id = node_workspace_origin().node_id;
         let workspace_id = node_workspace_origin().workspace_id;
         let path = HarnessRepositoryPathV1::new("src/lib.rs").unwrap();
@@ -7869,24 +7595,15 @@ mod tests {
             "a".repeat(64),
         )).unwrap();
         for request in requests {
-            request.validate().expect("valid V9 node-workspace request");
-            assert_eq!(request.minimum_wire_version(), HARNESS_OPERATOR_WIRE_VERSION_V9);
+            request.validate().expect("valid node-workspace request");
             let encoded = serde_json::to_string(&request).unwrap();
             for forbidden in ["run_id", "endpoint", "root", "worktree", "environment"] {
                 assert!(!encoded.contains(forbidden), "request exposed {forbidden}");
             }
             let decoded: HarnessOperatorRequestV1 = serde_json::from_str(&encoded).unwrap();
             assert_eq!(decoded, request);
-            assert!(matches!(
-                HarnessOperatorEnvelopeV1 {
-                    version: HARNESS_OPERATOR_WIRE_VERSION_V8,
-                    credential: credential.clone(),
-                    request: request.clone(),
-                }.validate(),
-                Err(HarnessOperatorApiError::UnsupportedVersion),
-            ));
             HarnessOperatorEnvelopeV1 {
-                version: HARNESS_OPERATOR_WIRE_VERSION_V9,
+                version: HARNESS_OPERATOR_WIRE_VERSION,
                 credential: credential.clone(),
                 request,
             }.validate().unwrap();
@@ -7985,7 +7702,7 @@ mod tests {
     }
 
     #[test]
-    fn operator_v11_node_workspace_write_verbs_are_exact_round_trips_and_fail_closed_on_v10() {
+    fn operator_node_workspace_write_verbs_are_exact_round_trips() {
         let node_id = node_workspace_origin().node_id;
         let workspace_id = node_workspace_origin().workspace_id;
         let path = HarnessRepositoryPathV1::new("src/lib.rs").unwrap();
@@ -8014,24 +7731,15 @@ mod tests {
             "a".repeat(64),
         )).unwrap();
         for request in requests {
-            request.validate().expect("valid V11 node-workspace write request");
-            assert_eq!(request.minimum_wire_version(), HARNESS_OPERATOR_WIRE_VERSION_V11);
+            request.validate().expect("valid node-workspace write request");
             let encoded = serde_json::to_string(&request).unwrap();
             for forbidden in ["run_id", "endpoint", "root", "worktree", "environment"] {
                 assert!(!encoded.contains(forbidden), "request exposed {forbidden}");
             }
             let decoded: HarnessOperatorRequestV1 = serde_json::from_str(&encoded).unwrap();
             assert_eq!(decoded, request);
-            assert!(matches!(
-                HarnessOperatorEnvelopeV1 {
-                    version: HARNESS_OPERATOR_WIRE_VERSION_V10,
-                    credential: credential.clone(),
-                    request: request.clone(),
-                }.validate(),
-                Err(HarnessOperatorApiError::UnsupportedVersion),
-            ));
             HarnessOperatorEnvelopeV1 {
-                version: HARNESS_OPERATOR_WIRE_VERSION_V11,
+                version: HARNESS_OPERATOR_WIRE_VERSION,
                 credential: credential.clone(),
                 request,
             }.validate().unwrap();
@@ -8148,12 +7856,11 @@ mod tests {
     }
 
     #[test]
-    fn operator_v8_context_source_observation_is_exact_private_and_fails_closed_on_v7() {
+    fn operator_context_source_observation_is_exact_and_private() {
         let run_id = HarnessRunId::new(format!("hrun_{}", "8".repeat(24))).unwrap();
         let request = HarnessOperatorRequestV1::ObserveRunContextSource {
             run_id: run_id.clone(),
         };
-        assert_eq!(request.minimum_wire_version(), HARNESS_OPERATOR_WIRE_VERSION_V8);
         request.validate().unwrap();
         let request_json = serde_json::to_value(&request).unwrap();
         assert_eq!(
@@ -8170,16 +7877,8 @@ mod tests {
             "g4aho_{}",
             "a".repeat(64),
         )).unwrap();
-        assert!(matches!(
-            HarnessOperatorEnvelopeV1 {
-                version: HARNESS_OPERATOR_WIRE_VERSION_V7,
-                credential: credential.clone(),
-                request: request.clone(),
-            }.validate(),
-            Err(HarnessOperatorApiError::UnsupportedVersion),
-        ));
         HarnessOperatorEnvelopeV1 {
-            version: HARNESS_OPERATOR_WIRE_VERSION_V8,
+            version: HARNESS_OPERATOR_WIRE_VERSION,
             credential,
             request,
         }.validate().unwrap();
@@ -8415,7 +8114,7 @@ mod tests {
     }
 
     #[test]
-    fn operator_v10_session_verbs_are_exact_round_trips_and_fail_closed_on_v9() {
+    fn operator_session_verbs_are_exact_round_trips() {
         let session = session_address(41, 3);
         let requests = vec![
             HarnessOperatorRequestV1::SpawnSession {
@@ -8444,21 +8143,12 @@ mod tests {
             "a".repeat(64),
         )).unwrap();
         for request in requests {
-            request.validate().expect("valid V10 session verb request");
-            assert_eq!(request.minimum_wire_version(), HARNESS_OPERATOR_WIRE_VERSION_V10);
+            request.validate().expect("valid session verb request");
             let encoded = serde_json::to_string(&request).unwrap();
             let decoded: HarnessOperatorRequestV1 = serde_json::from_str(&encoded).unwrap();
             assert_eq!(decoded, request);
-            assert!(matches!(
-                HarnessOperatorEnvelopeV1 {
-                    version: HARNESS_OPERATOR_WIRE_VERSION_V9,
-                    credential: credential.clone(),
-                    request: request.clone(),
-                }.validate(),
-                Err(HarnessOperatorApiError::UnsupportedVersion),
-            ));
             HarnessOperatorEnvelopeV1 {
-                version: HARNESS_OPERATOR_WIRE_VERSION_V10,
+                version: HARNESS_OPERATOR_WIRE_VERSION,
                 credential: credential.clone(),
                 request,
             }.validate().unwrap();
@@ -8551,7 +8241,7 @@ mod tests {
     }
 
     #[test]
-    fn operator_v11_session_control_verbs_are_exact_round_trips_and_fail_closed_on_v10() {
+    fn operator_session_control_verbs_are_exact_round_trips() {
         let session = session_address(41, 3);
         let requests = vec![
             HarnessOperatorRequestV1::ControlSession {
@@ -8579,21 +8269,12 @@ mod tests {
             "a".repeat(64),
         )).unwrap();
         for request in requests {
-            request.validate().expect("valid V11 session control verb request");
-            assert_eq!(request.minimum_wire_version(), HARNESS_OPERATOR_WIRE_VERSION_V11);
+            request.validate().expect("valid session control verb request");
             let encoded = serde_json::to_string(&request).unwrap();
             let decoded: HarnessOperatorRequestV1 = serde_json::from_str(&encoded).unwrap();
             assert_eq!(decoded, request);
-            assert!(matches!(
-                HarnessOperatorEnvelopeV1 {
-                    version: HARNESS_OPERATOR_WIRE_VERSION_V10,
-                    credential: credential.clone(),
-                    request: request.clone(),
-                }.validate(),
-                Err(HarnessOperatorApiError::UnsupportedVersion),
-            ));
             HarnessOperatorEnvelopeV1 {
-                version: HARNESS_OPERATOR_WIRE_VERSION_V11,
+                version: HARNESS_OPERATOR_WIRE_VERSION,
                 credential: credential.clone(),
                 request,
             }.validate().unwrap();
@@ -8707,7 +8388,7 @@ mod tests {
     }
 
     #[test]
-    fn operator_session_record_family_requests_are_exact_round_trips_and_fail_closed_on_v10() {
+    fn operator_session_record_family_requests_are_exact_round_trips() {
         let requests = vec![
             HarnessOperatorRequestV1::PreviewSessionRecord {
                 node_id: "node-a".to_owned(),
@@ -8759,20 +8440,11 @@ mod tests {
         )).unwrap();
         for request in requests {
             request.validate().expect("valid session-record family request");
-            assert_eq!(request.minimum_wire_version(), HARNESS_OPERATOR_WIRE_VERSION_V11);
             let encoded = serde_json::to_string(&request).unwrap();
             let decoded: HarnessOperatorRequestV1 = serde_json::from_str(&encoded).unwrap();
             assert_eq!(decoded, request);
-            assert!(matches!(
-                HarnessOperatorEnvelopeV1 {
-                    version: HARNESS_OPERATOR_WIRE_VERSION_V10,
-                    credential: credential.clone(),
-                    request: request.clone(),
-                }.validate(),
-                Err(HarnessOperatorApiError::UnsupportedVersion),
-            ));
             HarnessOperatorEnvelopeV1 {
-                version: HARNESS_OPERATOR_WIRE_VERSION_V11,
+                version: HARNESS_OPERATOR_WIRE_VERSION,
                 credential: credential.clone(),
                 request,
             }.validate().unwrap();
@@ -9009,7 +8681,7 @@ mod tests {
     }
 
     #[test]
-    fn operator_resource_mutation_family_requests_are_exact_round_trips_and_fail_closed_on_v10() {
+    fn operator_resource_mutation_family_requests_are_exact_round_trips() {
         let requests = vec![
             HarnessOperatorRequestV1::BrowseHostDirectories {
                 node_id: "node-a".to_owned(),
@@ -9056,20 +8728,11 @@ mod tests {
         )).unwrap();
         for request in requests {
             request.validate().expect("valid resource-mutation family request");
-            assert_eq!(request.minimum_wire_version(), HARNESS_OPERATOR_WIRE_VERSION_V11);
             let encoded = serde_json::to_string(&request).unwrap();
             let decoded: HarnessOperatorRequestV1 = serde_json::from_str(&encoded).unwrap();
             assert_eq!(decoded, request);
-            assert!(matches!(
-                HarnessOperatorEnvelopeV1 {
-                    version: HARNESS_OPERATOR_WIRE_VERSION_V10,
-                    credential: credential.clone(),
-                    request: request.clone(),
-                }.validate(),
-                Err(HarnessOperatorApiError::UnsupportedVersion),
-            ));
             HarnessOperatorEnvelopeV1 {
-                version: HARNESS_OPERATOR_WIRE_VERSION_V11,
+                version: HARNESS_OPERATOR_WIRE_VERSION,
                 credential: credential.clone(),
                 request,
             }.validate().unwrap();
@@ -9318,10 +8981,9 @@ mod tests {
     }
 
     #[test]
-    fn operator_v11_subscribe_events_is_exact_round_trip_and_fails_closed_on_v10() {
+    fn operator_subscribe_events_is_exact_round_trip() {
         let request = HarnessOperatorRequestV1::SubscribeEvents {};
-        request.validate().expect("valid v11 subscribe request");
-        assert_eq!(request.minimum_wire_version(), HARNESS_OPERATOR_WIRE_VERSION_V11);
+        request.validate().expect("valid subscribe request");
         let encoded = serde_json::to_string(&request).unwrap();
         let decoded: HarnessOperatorRequestV1 = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, request);
@@ -9330,28 +8992,19 @@ mod tests {
             "g4aho_{}",
             "a".repeat(64),
         )).unwrap();
-        assert!(matches!(
-            HarnessOperatorEnvelopeV1 {
-                version: HARNESS_OPERATOR_WIRE_VERSION_V10,
-                credential: credential.clone(),
-                request: request.clone(),
-            }.validate(),
-            Err(HarnessOperatorApiError::UnsupportedVersion),
-        ));
         HarnessOperatorEnvelopeV1 {
-            version: HARNESS_OPERATOR_WIRE_VERSION_V11,
+            version: HARNESS_OPERATOR_WIRE_VERSION,
             credential,
             request,
         }.validate().unwrap();
     }
 
     #[test]
-    fn operator_v12_subscribe_terminal_is_exact_round_trip_and_fails_closed_on_v11() {
+    fn operator_subscribe_terminal_is_exact_round_trip() {
         let request = HarnessOperatorRequestV1::SubscribeTerminal {
             sessions: vec![session_address(1, 1), session_address(2, 1)],
         };
-        request.validate().expect("valid v12 subscribe-terminal request");
-        assert_eq!(request.minimum_wire_version(), HARNESS_OPERATOR_WIRE_VERSION_V12);
+        request.validate().expect("valid subscribe-terminal request");
         let encoded = serde_json::to_string(&request).unwrap();
         let decoded: HarnessOperatorRequestV1 = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, request);
@@ -9360,40 +9013,41 @@ mod tests {
             "g4aho_{}",
             "a".repeat(64),
         )).unwrap();
-        assert!(matches!(
-            HarnessOperatorEnvelopeV1 {
-                version: HARNESS_OPERATOR_WIRE_VERSION_V11,
-                credential: credential.clone(),
-                request: request.clone(),
-            }.validate(),
-            Err(HarnessOperatorApiError::UnsupportedVersion),
-        ));
         HarnessOperatorEnvelopeV1 {
-            version: HARNESS_OPERATOR_WIRE_VERSION_V12,
+            version: HARNESS_OPERATOR_WIRE_VERSION,
             credential,
             request,
         }.validate().unwrap();
     }
 
-    /// V13 gates a reply FIELD (`screen_state`), not any request's minimum
-    /// version -- so a request that already required V12 must still
-    /// validate at V13 unchanged, proving the new accepted-version entry
-    /// regresses nothing already served at an older accepted version.
+    /// The single accepted version, both directions: a lower AND a higher
+    /// declared version are both rejected, and the error names both the
+    /// expected and the received number -- the diagnostic a silent
+    /// binary-skew incident previously had neither of.
     #[test]
-    fn operator_v13_is_accepted_and_a_v12_minimum_request_still_validates_at_v13() {
-        let request = HarnessOperatorRequestV1::SubscribeTerminal {
-            sessions: vec![session_address(1, 1)],
-        };
-        assert_eq!(request.minimum_wire_version(), HARNESS_OPERATOR_WIRE_VERSION_V12);
+    fn envelope_with_a_different_version_is_rejected_naming_both_versions() {
         let credential = HarnessOperatorCredential::parse(format!(
             "g4aho_{}",
             "a".repeat(64),
         )).unwrap();
-        HarnessOperatorEnvelopeV1 {
-            version: HARNESS_OPERATOR_WIRE_VERSION_V13,
-            credential,
-            request,
-        }.validate().unwrap();
+        for alien_version in [HARNESS_OPERATOR_WIRE_VERSION - 1, HARNESS_OPERATOR_WIRE_VERSION + 1] {
+            let envelope = HarnessOperatorEnvelopeV1 {
+                version: alien_version,
+                credential: credential.clone(),
+                request: HarnessOperatorRequestV1::SubscribeEvents {},
+            };
+            let error = envelope.validate().expect_err("alien version must be rejected");
+            assert!(matches!(
+                error,
+                HarnessOperatorApiError::WireVersionMismatch {
+                    expected: HARNESS_OPERATOR_WIRE_VERSION,
+                    received,
+                } if received == alien_version,
+            ));
+            let message = error.to_string();
+            assert!(message.contains(&HARNESS_OPERATOR_WIRE_VERSION.to_string()));
+            assert!(message.contains(&alien_version.to_string()));
+        }
     }
 
     #[test]

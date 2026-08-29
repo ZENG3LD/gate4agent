@@ -67,17 +67,11 @@ use crate::LightState;
 pub(crate) async fn handle_request(
     state: &LightState,
     request: HarnessOperatorRequestV1,
-    // This connection's own declared `HarnessOperatorEnvelopeV1::version`,
-    // read by `lib.rs`'s `handle_connection` before `request` moves here.
-    // Threaded only to `TerminalRead` (the one response this dispatcher
-    // builds that carries a version-gated field, `HarnessRuntimeTerminalFrameV1
-    // ::screen_state`) -- see `terminal_frame_to_wire`.
-    wire_version: u16,
 ) -> HarnessOperatorReplyV1 {
     let operation = operation_name(&request);
     match request {
         HarnessOperatorRequestV1::RuntimeInventoryList { after_node_id, limit } => {
-            crate::inventory::list(&state.inventory, after_node_id, limit, wire_version).await
+            crate::inventory::list(&state.inventory, after_node_id, limit).await
         }
 
         HarnessOperatorRequestV1::SpawnSession {
@@ -256,7 +250,7 @@ pub(crate) async fn handle_request(
         }
 
         HarnessOperatorRequestV1::TerminalRead { session, after_sequence, limit } => {
-            crate::terminal::read(&state.terminal, session, after_sequence, limit, wire_version).await
+            crate::terminal::read(&state.terminal, session, after_sequence, limit).await
         }
 
         HarnessOperatorRequestV1::TasksList { .. } => {

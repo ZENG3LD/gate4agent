@@ -41,6 +41,28 @@ pub struct PtyShutdownOutcome {
     pub terminal: PtyTerminalSnapshot,
 }
 
+/// Where the wall-clock time in one foreground probe actually went.
+///
+/// A single total for `observe_foreground` mixes three things that lead to
+/// opposite conclusions about the same measurement: half a second of
+/// `queued` is idle waiting behind unrelated work on tokio's blocking pool,
+/// while half a second of `walk` is this probe genuinely burning CPU on the
+/// OS process-table walk. `walk` is the only field of the three that is
+/// unambiguously CPU spent by this probe.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ForegroundProbeTiming {
+    /// Call until the blocking closure began running: tokio's blocking-pool
+    /// queue. Waiting, not work -- a PTY read parked on a pool thread can
+    /// put a probe behind it without either of them burning a cycle.
+    pub queued: Duration,
+    /// Inside the closure, waiting for the PTY mutex, which live PTY I/O
+    /// also holds.
+    pub lock_wait: Duration,
+    /// The OS process-table walk itself. The only one of the three that is
+    /// unambiguously CPU this probe spent.
+    pub walk: Duration,
+}
+
 /// Conversion from the internal PtyError to the public AgentError.
 impl From<PtyError> for AgentError {
     fn from(e: PtyError) -> Self {
@@ -349,19 +371,53 @@ impl PtySession {
 
     /// Take a fresh, bounded OS process-table observation for readiness.
     pub async fn observe_foreground(&self) -> Result<PtyForegroundObservation, AgentError> {
+        self.observe_foreground_timed()
+            .await
+            .map(|(observation, _timing)| observation)
+    }
+
+    /// The same probe as [`Self::observe_foreground`], with the wall-clock
+    /// time it spent broken into where it actually went. A single total for
+    /// this probe is not interpretable: `spawn_blocking` queueing is tokio's
+    /// blocking pool -- pure waiting, possibly behind a parked PTY read, that
+    /// can cost no CPU at all -- and `lock_wait` is contention with live PTY
+    /// I/O for the same mutex, also waiting. Only `walk`, the OS
+    /// process-table scan itself, is unambiguously CPU this probe spent.
+    ///
+    /// Implemented as the body that `observe_foreground` delegates to, so
+    /// the two cannot drift apart and the same `ForegroundProcess` event is
+    /// published exactly once regardless of which one is called.
+    pub async fn observe_foreground_timed(
+        &self,
+    ) -> Result<(PtyForegroundObservation, ForegroundProbeTiming), AgentError> {
         let pty = self.pty.clone();
         let spec = self.process_spec.clone();
-        let observation = tokio::task::spawn_blocking(move || {
+        let dispatched_at = Instant::now();
+        let (observation, timing) = tokio::task::spawn_blocking(move || {
+            let started_at = Instant::now();
+            let queued = started_at.duration_since(dispatched_at);
+            let lock_started_at = Instant::now();
             let guard = pty
                 .lock()
                 .map_err(|_| AgentError::Pty("PTY mutex poisoned".into()))?;
-            guard.observe_foreground(&spec).map_err(AgentError::from)
+            let lock_wait = lock_started_at.elapsed();
+            let walk_started_at = Instant::now();
+            let observation = guard.observe_foreground(&spec).map_err(AgentError::from)?;
+            let walk = walk_started_at.elapsed();
+            Ok::<_, AgentError>((
+                observation,
+                ForegroundProbeTiming {
+                    queued,
+                    lock_wait,
+                    walk,
+                },
+            ))
         })
         .await
         .map_err(|_| AgentError::Pty("spawn_blocking panicked".into()))??;
         self.events
             .publish(PtyEvent::ForegroundProcess(observation.clone()));
-        Ok(observation)
+        Ok((observation, timing))
     }
 
     /// Get the write handle for sending input to the PTY.

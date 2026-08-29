@@ -14,7 +14,10 @@ pub mod cli;
 
 pub use wrapper::{PtyError, PtyWrapper};
 pub use wrapper::{PTY_OUTPUT_HIGH_WATER_BYTES, PTY_OUTPUT_LOW_WATER_BYTES};
-pub use session::{PtySession, PtyShutdownOutcome, PtyWriteHandle, PTY_SHUTDOWN_TIMEOUT_MS};
+pub use session::{
+    ForegroundProbeTiming, PtySession, PtyShutdownOutcome, PtyWriteHandle,
+    PTY_SHUTDOWN_TIMEOUT_MS,
+};
 pub use event::{
     PtyAttachError, PtyAttachment, PtyEvent, PtyEventEnvelope, PtyEventReceiver, PtyEventRecvError,
     PtyGapReason, PtyReplayCursor, PtySignal, PtySignalOutcome, PtySize, PtyTerminalSnapshot,

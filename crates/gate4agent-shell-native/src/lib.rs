@@ -4,6 +4,11 @@ mod efficiency;
 mod provider_supervisor;
 
 pub use efficiency::ShellEfficiencyFacts;
+// Re-exported so a caller of `ShellEfficiencyFacts::record_foreground_probe`
+// (e.g. `gate4agent-runtime-native`, which does not itself depend on the
+// `gate4agent` crate) can name the type of the value it is handing in
+// without picking up a new dependency edge for it.
+pub use gate4agent::pty::ForegroundProbeTiming;
 pub use provider_supervisor::{
     NativeProviderExecutor, NativeProviderExit, NativeProviderOperation,
     NativeProviderOperationError, NativeProviderResultPoll, PhysicalExitAck,
@@ -1578,8 +1583,9 @@ impl NativeEffectShell {
     ///
     /// Deliberately not folded into `collect_terminal_frames`: that method
     /// is synchronous and only pays for a real capture when the terminal
-    /// sequence says the screen changed, but `PtySession::observe_foreground`
-    /// is async and walks the live OS process tree
+    /// sequence says the screen changed, but
+    /// `PtySession::observe_foreground_timed` is async and walks the live OS
+    /// process tree
     /// (`CreateToolhelp32Snapshot` on Windows) unconditionally every time
     /// it is called. Running that walk once per changed frame would scale
     /// a syscall with output rate -- exactly the cost
@@ -1604,13 +1610,22 @@ impl NativeEffectShell {
             let Some(owned) = self.pty_sessions.get_mut(&key) else {
                 continue;
             };
-            let probe_start = Instant::now();
-            let probe_result = owned.session.observe_foreground().await;
-            // Recorded unconditionally -- the OS process-tree walk this
-            // module doc describes is paid for whether or not it succeeds.
-            self.efficiency_facts.record_foreground_probe(probe_start.elapsed());
+            let probe_result = owned.session.observe_foreground_timed().await;
             match probe_result {
-                Ok(observation) => {
+                Ok((observation, timing)) => {
+                    // Recorded on success only: `timing` covers all three
+                    // components (queue, lock wait, walk) exactly when the
+                    // walk itself ran to completion and returned a real
+                    // observation. On error (see below) the walk may have
+                    // failed partway through, in the mutex, or never been
+                    // dispatched at all (`spawn_blocking` panicked), so
+                    // there is no single component that is reliably "the
+                    // cost of this probe" to attribute a failure to -- unlike
+                    // `terminal_state_capture`, which always completes or
+                    // never starts, a foreground probe can fail after
+                    // dispatch, after acquiring the lock, or during the walk,
+                    // and only the success path knows which.
+                    self.efficiency_facts.record_foreground_probe(timing);
                     let verdict = match catalog.get(&owned.agent_id) {
                         Some(spec) => resolve_foreground_verdict(
                             spec,

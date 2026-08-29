@@ -264,11 +264,20 @@ fn metrics_body(shared: &NodeShared) -> Value {
                 distribution_body(shell_efficiency.terminal_frame_bytes, "_bytes"),
             "terminal_frames_published_total": shell_efficiency.terminal_frames_published_total,
             "terminal_frame_bytes_total": shell_efficiency.terminal_frame_bytes_total,
-            // `reclassify_foreground`'s OS process-tree probes -- on a node
-            // whose sessions are all `PtyScreenState::Ready`,
-            // `probes_total` must stop rising; that is the disarm claim on
-            // that method's own doc comment.
-            "foreground_probe_us": distribution_body(shell_efficiency.foreground_probe_us, "_us"),
+            // `reclassify_foreground`'s OS process-tree probes, broken into
+            // the three places one probe's wall-clock time actually goes --
+            // see `gate4agent::pty::ForegroundProbeTiming` for what each
+            // means. `queued` and `lock_wait` are both waiting, not work;
+            // `walk` alone is CPU this probe spent. On a node whose sessions
+            // are all `PtyScreenState::Ready`, `probes_total` must stop
+            // rising; that is the disarm claim on that method's own doc
+            // comment.
+            "foreground_probe_phases_us": {
+                "queued": distribution_body(shell_efficiency.foreground_probe_queued_us, "_us"),
+                "lock_wait":
+                    distribution_body(shell_efficiency.foreground_probe_lock_wait_us, "_us"),
+                "walk": distribution_body(shell_efficiency.foreground_probe_walk_us, "_us"),
+            },
             "foreground_probes_total": shell_efficiency.foreground_probes_total,
         },
         // Lifetime totals across every connection served. Read them twice
@@ -645,11 +654,17 @@ mod tests {
         for field in [
             "terminal_state_us", "terminal_state_captures_total", "terminal_state_skips_total",
             "terminal_frame_bytes", "terminal_frames_published_total",
-            "terminal_frame_bytes_total", "foreground_probe_us", "foreground_probes_total",
+            "terminal_frame_bytes_total", "foreground_probes_total",
         ] {
             assert!(
                 metrics.contains(&format!("\"{field}\"")),
                 "missing shell_efficiency.{field} in {metrics}",
+            );
+        }
+        for phase in ["queued", "lock_wait", "walk"] {
+            assert!(
+                metrics.contains(&format!("\"{phase}\"")),
+                "missing shell_efficiency.foreground_probe_phases_us.{phase} in {metrics}",
             );
         }
         assert!(metrics.contains("\"drive_loop_iterations\""));

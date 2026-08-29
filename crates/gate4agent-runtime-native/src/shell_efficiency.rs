@@ -43,11 +43,20 @@ pub struct ShellEfficiencyProfileSnapshot {
     pub terminal_frames_published_total: u64,
     /// Lifetime total bytes across every frame published.
     pub terminal_frame_bytes_total: u64,
-    /// Duration of `reclassify_foreground`'s OS process-tree probes --
-    /// verifies the foreground-reclassify cost claim in that method's own
-    /// doc comment.
-    pub foreground_probe_us: Distribution,
-    /// Lifetime count of those probes.
+    /// The three components of `reclassify_foreground`'s OS process-tree
+    /// probes -- see `gate4agent::pty::ForegroundProbeTiming` for what each
+    /// one means. Kept as three independent series rather than one combined
+    /// duration: a total mixing pure `spawn_blocking`-queue waiting with
+    /// the mutex-contention wait and the actual process-table walk's CPU
+    /// leads to opposite conclusions depending on which of the three
+    /// dominates, so collapsing them back into one number would throw away
+    /// exactly what this split exists to preserve.
+    pub foreground_probe_queued_us: Distribution,
+    pub foreground_probe_lock_wait_us: Distribution,
+    pub foreground_probe_walk_us: Distribution,
+    /// Lifetime count of probes, not components -- one probe increments
+    /// this by one regardless of how many of the three series above it
+    /// also fed.
     pub foreground_probes_total: u64,
 }
 
@@ -65,7 +74,9 @@ pub struct ShellEfficiencyProfile {
     terminal_frame_bytes: RingStats<SAMPLE_WINDOW>,
     terminal_frames_published_total: u64,
     terminal_frame_bytes_total: u64,
-    foreground_probe_us: RingStats<SAMPLE_WINDOW>,
+    foreground_probe_queued_us: RingStats<SAMPLE_WINDOW>,
+    foreground_probe_lock_wait_us: RingStats<SAMPLE_WINDOW>,
+    foreground_probe_walk_us: RingStats<SAMPLE_WINDOW>,
     foreground_probes_total: u64,
 }
 
@@ -94,8 +105,14 @@ impl ShellEfficiencyProfile {
             .terminal_frame_bytes_total
             .saturating_add(facts.terminal_frame_bytes_total());
 
-        for &sample in facts.foreground_probe_samples() {
-            self.foreground_probe_us.push(duration_micros(sample));
+        for &sample in facts.foreground_probe_queued_samples() {
+            self.foreground_probe_queued_us.push(duration_micros(sample));
+        }
+        for &sample in facts.foreground_probe_lock_wait_samples() {
+            self.foreground_probe_lock_wait_us.push(duration_micros(sample));
+        }
+        for &sample in facts.foreground_probe_walk_samples() {
+            self.foreground_probe_walk_us.push(duration_micros(sample));
         }
         self.foreground_probes_total = self
             .foreground_probes_total
@@ -110,7 +127,9 @@ impl ShellEfficiencyProfile {
             terminal_frame_bytes: self.terminal_frame_bytes.stats(),
             terminal_frames_published_total: self.terminal_frames_published_total,
             terminal_frame_bytes_total: self.terminal_frame_bytes_total,
-            foreground_probe_us: self.foreground_probe_us.stats(),
+            foreground_probe_queued_us: self.foreground_probe_queued_us.stats(),
+            foreground_probe_lock_wait_us: self.foreground_probe_lock_wait_us.stats(),
+            foreground_probe_walk_us: self.foreground_probe_walk_us.stats(),
             foreground_probes_total: self.foreground_probes_total,
         }
     }
@@ -119,6 +138,7 @@ impl ShellEfficiencyProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gate4agent_shell_native::ForegroundProbeTiming;
     use std::time::Duration;
 
     #[test]
@@ -127,7 +147,11 @@ mod tests {
         facts.record_terminal_state_capture(Duration::from_micros(1_500));
         facts.record_terminal_state_skip();
         facts.record_terminal_frame_published(4_096);
-        facts.record_foreground_probe(Duration::from_micros(2_500));
+        facts.record_foreground_probe(ForegroundProbeTiming {
+            queued: Duration::from_micros(2_500),
+            lock_wait: Duration::from_micros(700),
+            walk: Duration::from_micros(300),
+        });
         let drained = facts.take();
 
         let mut profile = ShellEfficiencyProfile::default();
@@ -140,8 +164,33 @@ mod tests {
         assert_eq!(snapshot.terminal_frame_bytes.max, 4_096);
         assert_eq!(snapshot.terminal_frames_published_total, 1);
         assert_eq!(snapshot.terminal_frame_bytes_total, 4_096);
-        assert_eq!(snapshot.foreground_probe_us.max, 2_500);
+        // Distinct values per component -- a copy-paste that recorded the
+        // same duration into all three series would pass an assertion that
+        // only checked one of them.
+        assert_eq!(snapshot.foreground_probe_queued_us.max, 2_500);
+        assert_eq!(snapshot.foreground_probe_lock_wait_us.max, 700);
+        assert_eq!(snapshot.foreground_probe_walk_us.max, 300);
         assert_eq!(snapshot.foreground_probes_total, 1);
+    }
+
+    #[test]
+    fn one_probe_increments_the_lifetime_count_by_one_not_by_the_component_count() {
+        let mut facts = ShellEfficiencyFacts::default();
+        facts.record_foreground_probe(ForegroundProbeTiming {
+            queued: Duration::from_micros(10),
+            lock_wait: Duration::from_micros(20),
+            walk: Duration::from_micros(30),
+        });
+        let drained = facts.take();
+
+        let mut profile = ShellEfficiencyProfile::default();
+        profile.fold(&drained);
+        let snapshot = profile.snapshot();
+
+        assert_eq!(snapshot.foreground_probes_total, 1);
+        assert_eq!(snapshot.foreground_probe_queued_us.count, 1);
+        assert_eq!(snapshot.foreground_probe_lock_wait_us.count, 1);
+        assert_eq!(snapshot.foreground_probe_walk_us.count, 1);
     }
 
     #[test]

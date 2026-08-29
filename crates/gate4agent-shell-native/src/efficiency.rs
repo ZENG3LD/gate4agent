@@ -18,6 +18,8 @@
 //! downstream consumer.
 use std::time::Duration;
 
+use gate4agent::pty::ForegroundProbeTiming;
+
 /// Upper bound on how many raw timing/byte samples one metric inside
 /// [`ShellEfficiencyFacts`] can hold between drains.
 ///
@@ -57,8 +59,21 @@ pub struct ShellEfficiencyFacts {
     terminal_frame_byte_sample_count: usize,
     terminal_frames_published: u64,
     terminal_frame_bytes_total: u64,
-    foreground_probe_samples: [Duration; MAX_EFFICIENCY_SAMPLES],
-    foreground_probe_sample_count: usize,
+    /// The three components of one `observe_foreground_timed()` call --
+    /// see [`ForegroundProbeTiming`] for what each one means and why a
+    /// single combined duration is not interpretable. Kept as three
+    /// independent series, not folded into one, for the same reason: a
+    /// reader can add three numbers, but a fourth series that must equal
+    /// their sum is a thing that can silently disagree with them.
+    foreground_probe_queued_samples: [Duration; MAX_EFFICIENCY_SAMPLES],
+    foreground_probe_queued_sample_count: usize,
+    foreground_probe_lock_wait_samples: [Duration; MAX_EFFICIENCY_SAMPLES],
+    foreground_probe_lock_wait_sample_count: usize,
+    foreground_probe_walk_samples: [Duration; MAX_EFFICIENCY_SAMPLES],
+    foreground_probe_walk_sample_count: usize,
+    /// Count of probes, not components -- one `record_foreground_probe`
+    /// call increments this by one regardless of how many of the three
+    /// component arrays above it also wrote into.
     foreground_probes: u64,
 }
 
@@ -73,8 +88,12 @@ impl Default for ShellEfficiencyFacts {
             terminal_frame_byte_sample_count: 0,
             terminal_frames_published: 0,
             terminal_frame_bytes_total: 0,
-            foreground_probe_samples: [Duration::ZERO; MAX_EFFICIENCY_SAMPLES],
-            foreground_probe_sample_count: 0,
+            foreground_probe_queued_samples: [Duration::ZERO; MAX_EFFICIENCY_SAMPLES],
+            foreground_probe_queued_sample_count: 0,
+            foreground_probe_lock_wait_samples: [Duration::ZERO; MAX_EFFICIENCY_SAMPLES],
+            foreground_probe_lock_wait_sample_count: 0,
+            foreground_probe_walk_samples: [Duration::ZERO; MAX_EFFICIENCY_SAMPLES],
+            foreground_probe_walk_sample_count: 0,
             foreground_probes: 0,
         }
     }
@@ -107,13 +126,27 @@ impl ShellEfficiencyFacts {
         }
     }
 
-    /// Record one `observe_foreground()` OS process-tree probe, successful
-    /// or not -- the walk was paid for either way.
-    pub fn record_foreground_probe(&mut self, elapsed: Duration) {
+    /// Record one `observe_foreground_timed()` OS process-tree probe,
+    /// successful or not -- the walk was paid for either way. Increments
+    /// `foreground_probes` by exactly one call, and records each of the
+    /// three timing components into its own series -- see the field docs
+    /// above for why they stay separate.
+    pub fn record_foreground_probe(&mut self, timing: ForegroundProbeTiming) {
         self.foreground_probes = self.foreground_probes.saturating_add(1);
-        if self.foreground_probe_sample_count < MAX_EFFICIENCY_SAMPLES {
-            self.foreground_probe_samples[self.foreground_probe_sample_count] = elapsed;
-            self.foreground_probe_sample_count += 1;
+        if self.foreground_probe_queued_sample_count < MAX_EFFICIENCY_SAMPLES {
+            self.foreground_probe_queued_samples[self.foreground_probe_queued_sample_count] =
+                timing.queued;
+            self.foreground_probe_queued_sample_count += 1;
+        }
+        if self.foreground_probe_lock_wait_sample_count < MAX_EFFICIENCY_SAMPLES {
+            self.foreground_probe_lock_wait_samples[self.foreground_probe_lock_wait_sample_count] =
+                timing.lock_wait;
+            self.foreground_probe_lock_wait_sample_count += 1;
+        }
+        if self.foreground_probe_walk_sample_count < MAX_EFFICIENCY_SAMPLES {
+            self.foreground_probe_walk_samples[self.foreground_probe_walk_sample_count] =
+                timing.walk;
+            self.foreground_probe_walk_sample_count += 1;
         }
     }
 
@@ -149,8 +182,16 @@ impl ShellEfficiencyFacts {
         self.terminal_frame_bytes_total
     }
 
-    pub fn foreground_probe_samples(&self) -> &[Duration] {
-        &self.foreground_probe_samples[..self.foreground_probe_sample_count]
+    pub fn foreground_probe_queued_samples(&self) -> &[Duration] {
+        &self.foreground_probe_queued_samples[..self.foreground_probe_queued_sample_count]
+    }
+
+    pub fn foreground_probe_lock_wait_samples(&self) -> &[Duration] {
+        &self.foreground_probe_lock_wait_samples[..self.foreground_probe_lock_wait_sample_count]
+    }
+
+    pub fn foreground_probe_walk_samples(&self) -> &[Duration] {
+        &self.foreground_probe_walk_samples[..self.foreground_probe_walk_sample_count]
     }
 
     pub fn foreground_probes(&self) -> u64 {

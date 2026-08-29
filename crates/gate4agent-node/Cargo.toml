@@ -13,11 +13,13 @@ name = "gate4agent-node"
 path = "src/main.rs"
 
 [dependencies]
+gate4agent-adapters = { path = "../gate4agent-adapters" }
 gate4agent-catalog = { path = "../gate4agent-catalog" }
 gate4agent-handle = { path = "../gate4agent-handle" }
 gate4agent-node-protocol = { path = "../gate4agent-node-protocol" }
 gate4agent-node-wire = { path = "../gate4agent-node-wire" }
 gate4agent-runtime-native = { path = "../gate4agent-runtime-native" }
+gate4agent-shell-managed-hooks = { path = "../gate4agent-shell-managed-hooks" }
 gate4agent-testkit = { path = "../gate4agent-testkit", optional = true }
 gate4agent-types = { path = "../gate4agent-types" }
 ring = "=0.17.14"

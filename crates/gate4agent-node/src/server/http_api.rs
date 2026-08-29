@@ -210,6 +210,10 @@ fn metrics_body(shared: &NodeShared) -> Value {
                 .snapshot()
         })
         .unwrap_or_default();
+    let (hook_outcomes, hook_routes) = *shared
+        .hook_ingress_outcomes
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let native_pty_sessions = shared.native_session_gauge.load(Ordering::Relaxed);
     // The control plane's own session bookkeeping: every session the
     // kernel's backend snapshot still carries, live or already exited but
@@ -238,6 +242,18 @@ fn metrics_body(shared: &NodeShared) -> Value {
             "publish_step": distribution_body(runtime_tick.publish_step_us, "_us"),
             "provider_supervisors":
                 distribution_body(runtime_tick.provider_supervisors_us, "_us"),
+        },
+        // Why events are or are not arriving from a provider's own hooks.
+        // The ingress answers 204 whether it dispatched, reduced to
+        // nothing, or refused -- so `rejected` rising while `dispatched`
+        // stays flat is the shape of a contract mismatch, and everything
+        // flat means the provider is not calling us at all.
+        "hook_ingress": {
+            "active_routes": hook_routes,
+            "events_dispatched_total": hook_outcomes.dispatched,
+            "events_empty_total": hook_outcomes.empty,
+            "events_rejected_total": hook_outcomes.rejected,
+            "events_undeliverable_total": hook_outcomes.undeliverable,
         },
         "sessions": {
             "native_pty": native_pty_sessions,

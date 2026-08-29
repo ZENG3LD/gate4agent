@@ -43,7 +43,9 @@ use gate4agent_shell_capabilities::NativeCapabilityProbeAuthority;
 use gate4agent_shell_history::NativeHistoryAuthority;
 pub use gate4agent_shell_history::{orca_home_roots, NativeHistoryConfig, NativeHistoryRoot};
 pub use gate4agent_adapters::{HistorySourceLayout, OneShotSessionPersistence};
-pub use gate4agent_shell_hooks::{HookIngressConfig, HookIngressEndpoint};
+pub use gate4agent_shell_hooks::{
+    HookIngressConfig, HookIngressEndpoint, HookIngressEventOutcomes,
+};
 use gate4agent_shell_hooks::{HookIngressControl, HookIngressServer, HookIngressStartError};
 pub use gate4agent_shell_native::{
     NativeProviderExecutor, NativeProviderExit, NativeProviderOperation,
@@ -1761,6 +1763,19 @@ impl NativeRuntime {
             .as_ref()
             .filter(|server| server.is_running())
             .map(HookIngressServer::endpoint)
+    }
+
+    /// Lifetime outcome totals for every hook event the ingress accepted.
+    ///
+    /// The ingress answers `204` whether it dispatched an event, reduced it
+    /// to nothing, or refused it outright -- correct for a fire-and-forget
+    /// hook script, and the reason "why are no events arriving" had no
+    /// answer anywhere before these counters existed.
+    pub fn hook_event_outcomes(&self) -> gate4agent_shell_hooks::HookIngressEventOutcomes {
+        self.hook_ingress
+            .as_ref()
+            .map(|server| server.control().event_outcomes())
+            .unwrap_or_default()
     }
 
     pub fn active_hook_routes(&self) -> usize {

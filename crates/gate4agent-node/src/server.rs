@@ -63,6 +63,7 @@ use crate::workspace_file_windows::{
     WORKSPACE_ENTRY_CREATE_CANCELED, WORKSPACE_ENTRY_CREATE_COMMITTING,
     WORKSPACE_ENTRY_CREATE_PENDING,
 };
+use crate::managed_hooks;
 use crate::platform;
 use crate::provider_runtime::{
     require_policy, ProviderRuntimeAdmissionError, ProviderRuntimeMonitor,
@@ -2402,10 +2403,31 @@ try { $contextHash = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadA
         shared.reconcile_materializations();
         shared.reconcile_managed_worktrees().await;
         shared.reconcile_context_pack_exports().await;
-        runtime
+        let hook_ingress_endpoint = runtime
             .start_hook_ingress(HookIngressConfig::default())
             .await
             .map_err(|error| NodeServerError::HookIngressStartup(error.to_string()))?;
+        // Installs the fleet's native provider Hook contract (Grok's
+        // hooks/gate4agent-status.json, Kimi's config.toml block, ...) so
+        // this loopback ingress actually receives events. This is an
+        // observability channel, not a dependency: every generated script
+        // reads GATE4AGENT_HOOK_URL/_TOKEN/_ROUTE from the environment at
+        // invocation time and exits 0 silently when any is missing, so it
+        // is safe to install once here and leave it behind across restarts
+        // -- a provider without it still spawns, still runs, still
+        // delivers prompts. A failure to install for one provider is
+        // logged and never stops another provider or fails node startup.
+        match active_registry() {
+            Ok(fleet) => {
+                if let Some(manager) = managed_hooks::resolve_manager_from_environment() {
+                    managed_hooks::install_fleet(&manager, fleet.iter(), &hook_ingress_endpoint);
+                }
+            }
+            Err(error) => tracing::warn!(
+                error = %error,
+                "failed to resolve the managed-hook fleet catalog; skipping managed provider hook installation"
+            ),
+        }
         let endpoint = config.endpoint.clone();
         let call_home = config.call_home;
         let api_listen = config.api_listen;
@@ -2470,6 +2492,14 @@ try { $contextHash = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadA
             }
         };
         runtime.stop_hook_ingress().await;
+        // Only the published endpoint file goes -- it carries a live
+        // token. The provider Hook configuration and generated scripts
+        // stay installed: they are already inert without this file, so
+        // uninstalling them on every stop would churn the user's provider
+        // config for no gain.
+        if let Some(manager) = managed_hooks::resolve_manager_from_environment() {
+            managed_hooks::remove_published_endpoint(&manager);
+        }
         result
     }
 }
@@ -2598,6 +2628,11 @@ async fn drive_runtime_until_shutdown(
         // so "nothing" here means nothing OBSERVABLE left this iteration,
         // matching what a reader would assume from `drive_loop_iterations`'s
         // own field name, not that the tick itself was free of work.
+        *shared
+            .hook_ingress_outcomes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            (runtime.hook_event_outcomes(), runtime.active_hook_routes());
         shared.drive_loop_iterations_total.fetch_add(1, Ordering::Relaxed);
         if tick_result.observations_applied == 0 && events_drained == 0 {
             shared.drive_loop_iterations_idle.fetch_add(1, Ordering::Relaxed);
@@ -2988,6 +3023,11 @@ struct NodeShared {
     /// `drive_runtime_until_shutdown` that increments these. Read twice
     /// and divide by the interval, same rule as `connections` above --
     /// `idle / total` is backlog item 5's "wake on work" number.
+    /// Latest read of the hook ingress's outcome counters plus its live
+    /// route count, refreshed once per drive-loop iteration alongside the
+    /// other profiles. Both are plain integers -- no percentile sort behind
+    /// them -- so unlike a profile snapshot this costs nothing to keep warm.
+    hook_ingress_outcomes: Mutex<(gate4agent_runtime_native::HookIngressEventOutcomes, usize)>,
     drive_loop_iterations_total: AtomicU64,
     drive_loop_iterations_idle: AtomicU64,
     #[cfg(feature = "fixture")]
@@ -3319,6 +3359,7 @@ impl NodeShared {
             native_session_gauge: AtomicUsize::new(0),
             connection_loop_iterations: AtomicU64::new(0),
             connection_events_sent: AtomicU64::new(0),
+            hook_ingress_outcomes: Mutex::new(Default::default()),
             drive_loop_iterations_total: AtomicU64::new(0),
             drive_loop_iterations_idle: AtomicU64::new(0),
             #[cfg(feature = "fixture")]

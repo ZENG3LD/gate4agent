@@ -175,6 +175,29 @@ struct HookRouteTable {
     by_session: HashMap<SessionKey, String>,
 }
 
+/// What happened to every hook event this ingress has accepted.
+///
+/// The HTTP reply cannot carry this: a provider's hook script is
+/// fire-and-forget, and the handler answers `204 No Content` on three
+/// different outcomes -- the reducer refused the envelope, the reducer
+/// produced nothing to dispatch, or the dispatch succeeded. That is correct
+/// for the wire (a hook has nothing useful to do with a failure and must
+/// never block its CLI on one) and useless for anyone asking why events are
+/// not arriving, which is exactly the question these counters exist to
+/// answer. Lifetime totals, read through `GET /metrics`.
+#[derive(Debug, Default)]
+struct HookIngressCounters {
+    /// Reduced to at least one event and handed to the control handle.
+    dispatched: AtomicU64,
+    /// Well-formed and understood, but the reducer had nothing to emit --
+    /// routine for events that only advance its internal state.
+    empty: AtomicU64,
+    /// The reducer refused the envelope outright. Never routine.
+    rejected: AtomicU64,
+    /// Authenticated and routed, but the control handle would not take it.
+    undeliverable: AtomicU64,
+}
+
 struct HookIngressShared {
     endpoint: HookIngressEndpoint,
     handle: Gate4AgentHandle,
@@ -182,6 +205,17 @@ struct HookIngressShared {
     next_command_id: AtomicU64,
     active: AtomicBool,
     max_routes: usize,
+    counters: HookIngressCounters,
+}
+
+/// A read of [`HookIngressControl::event_outcomes`]. Lifetime totals; take
+/// two reads and difference them for a rate.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HookIngressEventOutcomes {
+    pub dispatched: u64,
+    pub empty: u64,
+    pub rejected: u64,
+    pub undeliverable: u64,
 }
 
 #[derive(Clone)]
@@ -196,6 +230,17 @@ impl HookIngressControl {
 
     pub fn is_running(&self) -> bool {
         self.shared.active.load(Ordering::Acquire)
+    }
+
+    /// Lifetime outcome totals for every event this ingress has accepted --
+    /// see [`HookIngressCounters`] for why the HTTP reply cannot carry them.
+    pub fn event_outcomes(&self) -> HookIngressEventOutcomes {
+        HookIngressEventOutcomes {
+            dispatched: self.shared.counters.dispatched.load(Ordering::Relaxed),
+            empty: self.shared.counters.empty.load(Ordering::Relaxed),
+            rejected: self.shared.counters.rejected.load(Ordering::Relaxed),
+            undeliverable: self.shared.counters.undeliverable.load(Ordering::Relaxed),
+        }
     }
 
     pub fn active_route_count(&self) -> usize {
@@ -351,6 +396,7 @@ impl HookIngressServer {
             next_command_id: AtomicU64::new(1),
             active: AtomicBool::new(true),
             max_routes: config.max_routes,
+            counters: HookIngressCounters::default(),
         });
         let control = HookIngressControl {
             shared: Arc::clone(&shared),
@@ -807,9 +853,13 @@ fn handle_request(shared: &HookIngressShared, request: HttpRequest) -> HttpStatu
         payload: body.payload,
     }) {
         Ok(reduction) => reduction,
-        Err(_) => return HttpStatus::NoContent,
+        Err(_) => {
+            shared.counters.rejected.fetch_add(1, Ordering::Relaxed);
+            return HttpStatus::NoContent;
+        }
     };
     if reduction.events.is_empty() {
+        shared.counters.empty.fetch_add(1, Ordering::Relaxed);
         route.reducer = reducer;
         route.next_receipt_sequence = route.next_receipt_sequence.saturating_add(1).max(1);
         route.next_dispatch_sequence = route
@@ -843,9 +893,11 @@ fn handle_request(shared: &HookIngressShared, request: HttpRequest) -> HttpStatu
             route.reducer = reducer;
             route.next_receipt_sequence = route.next_receipt_sequence.saturating_add(1).max(1);
             route.next_dispatch_sequence = dispatch_source_sequence.saturating_add(1).max(1);
+            shared.counters.dispatched.fetch_add(1, Ordering::Relaxed);
             HttpStatus::NoContent
         }
         Err(PortDispatchError::Full | PortDispatchError::Disconnected) => {
+            shared.counters.undeliverable.fetch_add(1, Ordering::Relaxed);
             HttpStatus::ServiceUnavailable
         }
     }

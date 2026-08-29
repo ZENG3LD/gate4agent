@@ -17,7 +17,7 @@ use gate4agent_c2_protocol::NodeRoute;
 use gate4agent_harness_api::{
     HarnessOperatorTerminalEventV1, HarnessRuntimeMouseProtocolEncodingV1,
     HarnessRuntimeSessionAddressV1, HarnessRuntimeTerminalFrameV1, HarnessRuntimeTerminalSizeV1,
-    PtyScreenStateV1, HARNESS_OPERATOR_WIRE_VERSION_V13,
+    PtyScreenStateV1, HARNESS_OPERATOR_WIRE_VERSION_V13, HARNESS_OPERATOR_WIRE_VERSION_V14,
 };
 use gate4agent_observation_api::RuntimeSessionKey;
 use gate4agent_types::{PtyScreenState, TerminalFrame, TerminalMouseProtocolEncoding};
@@ -161,9 +161,11 @@ fn frame_byte_footprint(frame: &TerminalFrame) -> usize {
 /// `wire_version` is the REQUESTING PEER's own declared
 /// `HarnessOperatorEnvelopeV1::version` -- never a default or a constant --
 /// because `screen_state` is only ever present in the JSON for a peer that
-/// declared `>= HARNESS_OPERATOR_WIRE_VERSION_V13`; a pre-V13 peer's
-/// `deny_unknown_fields` decoder would reject the whole frame if the key
-/// were sent regardless. Both call paths of this function -- the poll
+/// declared `>= HARNESS_OPERATOR_WIRE_VERSION_V13`, and `bracketed_paste`
+/// only for one that declared `>= HARNESS_OPERATOR_WIRE_VERSION_V14`; a
+/// decoder below either threshold has `deny_unknown_fields` and would
+/// reject the whole frame if the corresponding key were sent regardless.
+/// Both call paths of this function -- the poll
 /// (`TerminalRead`) and push (`SubscribeTerminal`) sides -- know their own
 /// connection's declared version at the point they call this, unlike
 /// `redact_runtime_inventory`'s cache-refresh call sites, which are
@@ -201,10 +203,15 @@ pub fn terminal_frame_to_wire(
         produced_at_unix_ms: frame.produced_at_unix_ms,
         screen_state: (wire_version >= HARNESS_OPERATOR_WIRE_VERSION_V13)
             .then(|| map_screen_state(&frame.screen_state)),
-        // Unlike `screen_state`, not gated on `wire_version` -- see
-        // `HarnessRuntimeTerminalFrameV1::bracketed_paste`'s own doc for why
-        // there is no separate "peer didn't ask" state to distinguish.
-        bracketed_paste: frame.bracketed_paste,
+        // Gated on `wire_version` the same way `screen_state` is, one
+        // version later -- see `HarnessRuntimeTerminalFrameV1::
+        // bracketed_paste`'s own doc for why an ungated field here would put
+        // the key on every frame regardless of the recipient's declared
+        // version (the node reports `Some` in practice, so
+        // `skip_serializing_if` alone never actually omits it).
+        bracketed_paste: (wire_version >= HARNESS_OPERATOR_WIRE_VERSION_V14)
+            .then(|| frame.bracketed_paste)
+            .flatten(),
     }
 }
 
@@ -580,6 +587,24 @@ mod tests {
 
         let v13 = terminal_frame_to_wire(&frame, HARNESS_OPERATOR_WIRE_VERSION_V13);
         assert_eq!(v13.screen_state, Some(map_screen_state(&frame.screen_state)));
+    }
+
+    /// Sibling to `terminal_frame_to_wire_gates_screen_state_on_the_callers_
+    /// declared_wire_version`, one version later: the same input frame
+    /// produces `None` for a peer declared below V14 (including a V13 peer,
+    /// which already sees `screen_state` but must not yet see
+    /// `bracketed_paste`) and `Some` reflecting the real captured value for
+    /// a V14 peer.
+    #[test]
+    fn terminal_frame_to_wire_gates_bracketed_paste_on_the_callers_declared_wire_version() {
+        let mut frame = sample_frame(1);
+        frame.bracketed_paste = Some(true);
+
+        let pre_v14 = terminal_frame_to_wire(&frame, HARNESS_OPERATOR_WIRE_VERSION_V13);
+        assert!(pre_v14.bracketed_paste.is_none());
+
+        let v14 = terminal_frame_to_wire(&frame, HARNESS_OPERATOR_WIRE_VERSION_V14);
+        assert_eq!(v14.bracketed_paste, Some(true));
     }
 
     // `sessions: Vec::new()` is structurally invalid for `SubscribeTerminal`

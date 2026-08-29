@@ -81,6 +81,20 @@ pub const HARNESS_OPERATOR_WIRE_VERSION_V12: u16 = 12;
 /// `screen_state`. Do not add `requires_v13()` by analogy with V4..V12;
 /// there is no request this version makes newly valid.
 pub const HARNESS_OPERATOR_WIRE_VERSION_V13: u16 = 13;
+/// V14 gates `bracketed_paste` on `HarnessRuntimeTerminalFrameV1`, the same
+/// way V13 gates that struct's (and `HarnessRuntimeSessionV1`'s) two
+/// `screen_state` fields: present in the JSON only for a peer that declared
+/// `>= HARNESS_OPERATOR_WIRE_VERSION_V14`, absent (never `null`) below it,
+/// because the struct carries `#[serde(deny_unknown_fields)]` and a pre-V14
+/// decoder would reject the whole frame if the key reached it regardless of
+/// its value. Deliberately NOT wired into `requires_v14()`/
+/// `minimum_wire_version()` for the identical reason `HARNESS_OPERATOR_WIRE_
+/// VERSION_V13`'s own doc comment gives: this gates a RESPONSE field, not
+/// any request shape, so every request kind stays servable at any accepted
+/// version regardless of whether its reply happens to carry
+/// `bracketed_paste`. Do not add `requires_v14()` by analogy with V4..V12;
+/// there is no request this version makes newly valid.
+pub const HARNESS_OPERATOR_WIRE_VERSION_V14: u16 = 14;
 // Realistic multi-pane ceiling with headroom; bounds the harness-side
 // per-subscriber HashSet<RuntimeSessionKey> and the connect-time seed burst
 // `SubscribeTerminal`'s handler sends immediately after registering (see
@@ -251,6 +265,7 @@ impl HarnessOperatorEnvelopeV1 {
                 | HARNESS_OPERATOR_WIRE_VERSION_V11
                 | HARNESS_OPERATOR_WIRE_VERSION_V12
                 | HARNESS_OPERATOR_WIRE_VERSION_V13
+                | HARNESS_OPERATOR_WIRE_VERSION_V14
         ) || self.version < self.request.minimum_wire_version()
         {
             return Err(HarnessOperatorApiError::UnsupportedVersion);
@@ -4146,15 +4161,20 @@ pub struct HarnessRuntimeTerminalFrameV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub screen_state: Option<PtyScreenStateV1>,
     /// Mirrors `gate4agent_types::TerminalFrame::bracketed_paste` onto the
-    /// operator wire, carried through unconditionally (unlike
-    /// `screen_state`, this is not gated on the requesting peer's declared
-    /// wire version -- `None` already means "no value", so there is no
-    /// separate "this peer didn't ask" state to distinguish it from).
-    /// `skip_serializing_if` is load-bearing the same way it is on
-    /// `screen_state`: the key must be ABSENT from the JSON, not `null`, or
-    /// a pre-existing `deny_unknown_fields` decoder rejects the whole
-    /// message. `#[serde(default)]` so an operator client built before this
-    /// field existed still decodes the frame.
+    /// operator wire, present only when the requesting peer declared
+    /// `>= HARNESS_OPERATOR_WIRE_VERSION_V14`. `skip_serializing_if` is
+    /// load-bearing the same way it is on `screen_state`: the key must be
+    /// ABSENT from the JSON, not `null`, or a pre-V14 `deny_unknown_fields`
+    /// decoder rejects the whole message. The node always reports `Some`
+    /// here in practice, so an ungated field would be present on every
+    /// frame regardless of the recipient's declared version -- exactly the
+    /// shape of bug this gate exists to prevent. `None` means either "this
+    /// peer did not ask for a version that carries it" or "the node hasn't
+    /// captured a value yet"; unlike `screen_state`'s `Unknown` variant,
+    /// `bracketed_paste` has no separate "asked, nothing captured yet" state
+    /// to distinguish the two, so callers must not read anything into which
+    /// one occurred. `#[serde(default)]` so an operator client built before
+    /// this field existed still decodes the frame.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bracketed_paste: Option<bool>,
 }

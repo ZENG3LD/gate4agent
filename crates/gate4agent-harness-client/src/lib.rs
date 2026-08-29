@@ -182,6 +182,43 @@ impl HarnessReadClient {
     }
 }
 
+/// The wire version this client actually DECLARES in the envelope for a
+/// given request -- distinct from `HarnessOperatorRequestV1::minimum_wire_
+/// version()`, which is only ever a FLOOR (`HarnessOperatorEnvelopeV1::
+/// validate` rejects a version below it, never one above). See
+/// `HARNESS_OPERATOR_WIRE_VERSION_V13`'s own doc comment in
+/// `gate4agent-harness-api` for why `requires_v13()` is deliberately absent
+/// from that floor computation: V13 gates a RESPONSE field
+/// (`PtyScreenStateV1` on `HarnessRuntimeSessionV1`/
+/// `HarnessRuntimeTerminalFrameV1`), not any request shape, so every
+/// request kind remains servable at any accepted version regardless of
+/// whether the host's reply happens to carry it.
+///
+/// The four request kinds whose reply CAN carry that field --
+/// `RuntimeInventoryList` and its push counterpart `SubscribeEvents` (whose
+/// `SnapshotBaseline`/`RuntimeInventoryChanged` events carry the same
+/// runtime inventory), and the two terminal-frame paths `TerminalRead`
+/// (poll) and `SubscribeTerminal` (push) -- therefore always declare at
+/// least `HARNESS_OPERATOR_WIRE_VERSION_V13` here, never merely their own
+/// floor; declaring above the floor has always been legal, this is simply
+/// this client choosing to. Every other request kind is untouched and
+/// keeps declaring exactly its own floor, so no other request's envelope
+/// version changes.
+fn declared_wire_version(request: &HarnessOperatorRequestV1) -> u16 {
+    let floor = request.minimum_wire_version();
+    if matches!(
+        request,
+        HarnessOperatorRequestV1::RuntimeInventoryList { .. }
+            | HarnessOperatorRequestV1::TerminalRead { .. }
+            | HarnessOperatorRequestV1::SubscribeTerminal { .. }
+            | HarnessOperatorRequestV1::SubscribeEvents {}
+    ) {
+        floor.max(HARNESS_OPERATOR_WIRE_VERSION_V13)
+    } else {
+        floor
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct HarnessOperatorClient {
     endpoint: SocketAddr,
@@ -1214,7 +1251,7 @@ impl HarnessOperatorClient {
     pub fn subscribe_events(&self) -> Result<HarnessEventSubscription, HarnessOperatorClientError> {
         let request = HarnessOperatorRequestV1::SubscribeEvents {};
         request.validate()?;
-        let version = request.minimum_wire_version();
+        let version = declared_wire_version(&request);
         let envelope = HarnessOperatorEnvelopeV1 {
             version,
             credential: self.credential.clone(),
@@ -1257,7 +1294,7 @@ impl HarnessOperatorClient {
     ) -> Result<HarnessTerminalSubscription, HarnessOperatorClientError> {
         let request = HarnessOperatorRequestV1::SubscribeTerminal { sessions };
         request.validate()?;
-        let version = request.minimum_wire_version();
+        let version = declared_wire_version(&request);
         let envelope = HarnessOperatorEnvelopeV1 {
             version,
             credential: self.credential.clone(),
@@ -1363,7 +1400,7 @@ impl HarnessOperatorClient {
             self.deadline
         };
         request.validate()?;
-        let version = request.minimum_wire_version();
+        let version = declared_wire_version(&request);
         let envelope = HarnessOperatorEnvelopeV1 {
             version,
             credential: self.credential.clone(),
@@ -3070,6 +3107,40 @@ mod tests {
         );
     }
 
+    /// Pins `declared_wire_version`'s own contract directly, without a
+    /// socket: the four request kinds whose reply can carry `screen_state`
+    /// (`RuntimeInventoryList`, `TerminalRead`, `SubscribeTerminal`,
+    /// `SubscribeEvents`) declare `HARNESS_OPERATOR_WIRE_VERSION_V13`
+    /// regardless of their own, lower `minimum_wire_version()` floor, and
+    /// an unrelated request kind (`StopSession`, floor V10) keeps declaring
+    /// exactly its own floor -- this change must not silently raise every
+    /// request's wire version.
+    #[test]
+    fn declared_wire_version_bumps_only_the_four_request_kinds_whose_reply_can_carry_screen_state() {
+        let session = sample_session_address();
+
+        let inventory_list =
+            HarnessOperatorRequestV1::RuntimeInventoryList { after_node_id: None, limit: 16 };
+        assert_eq!(declared_wire_version(&inventory_list), HARNESS_OPERATOR_WIRE_VERSION_V13);
+
+        let terminal_read = HarnessOperatorRequestV1::TerminalRead {
+            session: session.clone(),
+            after_sequence: None,
+            limit: 16,
+        };
+        assert_eq!(declared_wire_version(&terminal_read), HARNESS_OPERATOR_WIRE_VERSION_V13);
+
+        let subscribe_terminal =
+            HarnessOperatorRequestV1::SubscribeTerminal { sessions: vec![session.clone()] };
+        assert_eq!(declared_wire_version(&subscribe_terminal), HARNESS_OPERATOR_WIRE_VERSION_V13);
+
+        let subscribe_events = HarnessOperatorRequestV1::SubscribeEvents {};
+        assert_eq!(declared_wire_version(&subscribe_events), HARNESS_OPERATOR_WIRE_VERSION_V13);
+
+        let stop_session = HarnessOperatorRequestV1::StopSession { session, force: false };
+        assert_eq!(declared_wire_version(&stop_session), HARNESS_OPERATOR_WIRE_VERSION_V10);
+    }
+
     fn sample_session_address() -> HarnessRuntimeSessionAddressV1 {
         HarnessRuntimeSessionAddressV1 {
             node_id: "node-a".to_owned(),
@@ -3097,13 +3168,16 @@ mod tests {
     }
 
     /// The wire-framing proof step 5's own integration test builds on: the
-    /// request envelope carries the v12 `subscribe-terminal` kind with the
-    /// exact requested sessions, and `next_event` decodes a pushed
-    /// `TerminalFrame` followed by a `Ping` off the SAME connection, in
-    /// order -- the connect-once, read-repeatedly shape `subscribe_events`'
-    /// own doc comment describes, exercised here for its terminal sibling.
+    /// request envelope carries the `subscribe-terminal` kind at
+    /// `HARNESS_OPERATOR_WIRE_VERSION_V13` (`declared_wire_version` bumps
+    /// this request kind above its bare `requires_v12()` floor so the
+    /// host's pushed frames actually carry `screen_state`) with the exact
+    /// requested sessions, and `next_event` decodes a pushed `TerminalFrame`
+    /// followed by a `Ping` off the SAME connection, in order -- the
+    /// connect-once, read-repeatedly shape `subscribe_events`' own doc
+    /// comment describes, exercised here for its terminal sibling.
     #[test]
-    fn operator_client_subscribe_terminal_sends_v12_envelope_and_streams_pushed_frames() {
+    fn operator_client_subscribe_terminal_declares_v13_so_pushed_frames_can_carry_screen_state() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
         let endpoint = listener.local_addr().expect("address");
         let session = sample_session_address();
@@ -3114,7 +3188,7 @@ mod tests {
             stream.read_to_string(&mut request).expect("request");
             let envelope: HarnessOperatorEnvelopeV1 =
                 serde_json::from_str(request.trim_end()).expect("envelope");
-            assert_eq!(envelope.version, HARNESS_OPERATOR_WIRE_VERSION_V12);
+            assert_eq!(envelope.version, HARNESS_OPERATOR_WIRE_VERSION_V13);
             assert!(matches!(
                 &envelope.request,
                 HarnessOperatorRequestV1::SubscribeTerminal { sessions }

@@ -62,6 +62,7 @@ use gate4agent_harness_client::{
     HarnessRuntimeManagedStateV1, HarnessRuntimeNodeInventoryV1,
     HarnessRuntimeMouseProtocolEncodingV1, HarnessRuntimeSessionAddressV1,
     HarnessRuntimeSessionStatusV1, HarnessRuntimeSessionV1, HarnessRuntimeTerminalFrameV1,
+    PtyScreenStateV1,
     HarnessRuntimeTerminalPageV1, HarnessRuntimeTerminalSizeV1, HarnessRuntimeTransportV1,
     HarnessRuntimeLaunchInventoryV1,
     HarnessNodeWorkspaceFileV1, HarnessNodeWorkspaceInspectionV1, HarnessNodeWorkspaceDirectoryV1,
@@ -6257,9 +6258,7 @@ fn terminal_frame_from_harness(frame: HarnessRuntimeTerminalFrameV1) -> Terminal
             HarnessRuntimeMouseProtocolEncodingV1::Utf8 => TerminalMouseProtocolEncoding::Utf8,
             HarnessRuntimeMouseProtocolEncodingV1::Sgr => TerminalMouseProtocolEncoding::Sgr,
         },
-        // `HarnessRuntimeTerminalFrameV1` does not carry a screen
-        // classification yet, so there is nothing to convert here.
-        screen_state: PtyScreenState::Unknown,
+        screen_state: project_pty_screen_state(frame.screen_state),
     }
 }
 
@@ -6548,6 +6547,29 @@ fn report_harness_terminal_subscription_error(
     });
 }
 
+/// Projects the wire's `Option<PtyScreenStateV1>` onto the app's own
+/// `PtyScreenState`. `None` means the connection this session arrived on
+/// did not declare a wire version that carries the field at all (see
+/// `HarnessRuntimeSessionV1::screen_state`'s own doc comment,
+/// `gate4agent-harness-api`) -- a DIFFERENT fact from `Some(Unknown)` ("the
+/// node has not classified this generation's screen yet"). Both map to
+/// `PtyScreenState::Unknown` here, which is the safe direction: an absent
+/// field means the harness told us nothing, and `Unknown` is defined
+/// (`PtyScreenState::admits_blind_write`) to be treated exactly like
+/// `NotAgent` by anything deciding whether to write blindly -- conflating
+/// the two into an optimistic default would be the one wrong reading.
+fn project_pty_screen_state(state: Option<PtyScreenStateV1>) -> PtyScreenState {
+    match state {
+        None | Some(PtyScreenStateV1::Unknown) => PtyScreenState::Unknown,
+        Some(PtyScreenStateV1::NotAgent { observed_process }) => {
+            PtyScreenState::NotAgent { observed_process }
+        }
+        Some(PtyScreenStateV1::OperatorGate { gate }) => PtyScreenState::OperatorGate { gate },
+        Some(PtyScreenStateV1::Failing { reason }) => PtyScreenState::Failing { reason },
+        Some(PtyScreenStateV1::Ready) => PtyScreenState::Ready,
+    }
+}
+
 fn project_harness_inventory_session(
     node_id: &str,
     workspace_id: &str,
@@ -6566,6 +6588,7 @@ fn project_harness_inventory_session(
         HarnessRuntimeSessionStatusV1::Exited => ("exited", false, false, true, true),
         HarnessRuntimeSessionStatusV1::Failed => ("failed", false, false, true, true),
     };
+    let screen_state = project_pty_screen_state(session.screen_state);
     Ok(Some(SessionView {
         address: SessionAddress {
             node_id: node_id.to_owned(),
@@ -6588,6 +6611,7 @@ fn project_harness_inventory_session(
         terminal_mouse_protocol_enabled: false,
         terminal_mouse_protocol_encoding: TerminalMouseProtocolEncoding::Default,
         terminal_cursor: None,
+        screen_state,
     }))
 }
 
@@ -6805,6 +6829,7 @@ fn project_c2_session(
         terminal_mouse_protocol_enabled,
         terminal_mouse_protocol_encoding,
         terminal_cursor,
+        screen_state: session.screen_state,
     })
 }
 
@@ -7670,6 +7695,7 @@ mod tests {
                                 ),
                                 operation_pending: false,
                                 input_pending: false,
+                                screen_state: None,
                             },
                             HarnessRuntimeSessionV1 {
                                 instance_id: 8,
@@ -7681,6 +7707,7 @@ mod tests {
                                 terminal_size: None,
                                 operation_pending: false,
                                 input_pending: false,
+                                screen_state: None,
                             },
                         ],
                         session_count: 2,
@@ -7768,6 +7795,71 @@ mod tests {
                 && record.context.is_none()
                 && record.task_binding.is_none()
         }));
+    }
+
+    /// Minimal valid `HarnessRuntimeSessionV1`, varying only `screen_state`
+    /// -- the field under test in the two projections immediately below.
+    fn wire_session_with_screen_state(
+        screen_state: Option<PtyScreenStateV1>,
+    ) -> HarnessRuntimeSessionV1 {
+        HarnessRuntimeSessionV1 {
+            instance_id: 7,
+            generation: 3,
+            provider: "codex".to_owned(),
+            transport: HarnessRuntimeTransportV1::Pty,
+            status: HarnessRuntimeSessionStatusV1::Running,
+            process_id: Some(700),
+            terminal_size: None,
+            operation_pending: false,
+            input_pending: false,
+            screen_state,
+        }
+    }
+
+    /// `screen_state: None` on the wire is the shape a peer that declared a
+    /// pre-V13 version decodes (`HarnessRuntimeSessionV1::screen_state`'s
+    /// own doc comment) -- it must project to `PtyScreenState::Unknown` on
+    /// `SessionView`, and explicitly NOT `Ready`: an absent field means the
+    /// harness told us nothing, never a fabricated "safe to write".
+    #[test]
+    fn harness_session_with_no_wire_screen_state_projects_to_unknown_not_ready() {
+        let session = wire_session_with_screen_state(None);
+        let view = project_harness_inventory_session("node-a", "workspace-a", session)
+            .unwrap()
+            .unwrap();
+        assert_eq!(view.screen_state, PtyScreenState::Unknown);
+        assert_ne!(view.screen_state, PtyScreenState::Ready);
+    }
+
+    /// Every `PtyScreenStateV1` variant present on the wire projects
+    /// through unchanged onto `PtyScreenState` -- asserted per variant so a
+    /// variant added to either enum without updating `project_pty_screen_
+    /// state` is caught here rather than silently falling through.
+    #[test]
+    fn harness_session_wire_screen_state_projects_through_unchanged_for_every_variant() {
+        let cases = [
+            (PtyScreenStateV1::Unknown, PtyScreenState::Unknown),
+            (
+                PtyScreenStateV1::NotAgent { observed_process: "npm".to_owned() },
+                PtyScreenState::NotAgent { observed_process: "npm".to_owned() },
+            ),
+            (
+                PtyScreenStateV1::OperatorGate { gate: "workspace-trust".to_owned() },
+                PtyScreenState::OperatorGate { gate: "workspace-trust".to_owned() },
+            ),
+            (
+                PtyScreenStateV1::Failing { reason: "crash-loop".to_owned() },
+                PtyScreenState::Failing { reason: "crash-loop".to_owned() },
+            ),
+            (PtyScreenStateV1::Ready, PtyScreenState::Ready),
+        ];
+        for (wire, expected) in cases {
+            let session = wire_session_with_screen_state(Some(wire));
+            let view = project_harness_inventory_session("node-a", "workspace-a", session)
+                .unwrap()
+                .unwrap();
+            assert_eq!(view.screen_state, expected);
+        }
     }
 
     #[test]
@@ -7946,6 +8038,7 @@ mod tests {
                     terminal_mouse_protocol_enabled: false,
                     terminal_mouse_protocol_encoding: TerminalMouseProtocolEncoding::Default,
                 terminal_cursor: Some((99, 99)),
+                screen_state: PtyScreenState::Unknown,
             }],
                 worktree_service_mode: None,
                 managed_worktree_profiles: None,
@@ -9885,6 +9978,7 @@ mod tests {
                     terminal_mouse_protocol_enabled: false,
                     terminal_mouse_protocol_encoding: TerminalMouseProtocolEncoding::Default,
                     terminal_cursor: None,
+                    screen_state: PtyScreenState::Unknown,
                 }],
                 worktree_service_mode: None,
                 managed_worktree_profiles: None,
@@ -9905,6 +9999,12 @@ mod tests {
             alternate_screen: false,
             mouse_protocol_enabled: false,
             mouse_protocol_encoding: HarnessRuntimeMouseProtocolEncodingV1::Default,
+            // This fixture predates `screen_state`'s wire gate -- `None`
+            // is what a peer that asked for a pre-V13 version actually
+            // decodes, and `terminal_frame_from_harness` must still turn
+            // that into `PtyScreenState::Unknown`, not a fabricated
+            // `Ready`.
+            screen_state: None,
         };
         let page = |frames: Vec<HarnessRuntimeTerminalFrameV1>| WorkerUpdate::HarnessTerminalRead(
             HarnessRuntimeTerminalPageV1 {
@@ -9967,6 +10067,7 @@ mod tests {
             terminal_mouse_protocol_enabled: false,
             terminal_mouse_protocol_encoding: TerminalMouseProtocolEncoding::Default,
             terminal_cursor: None,
+            screen_state: PtyScreenState::Unknown,
         };
         let mut app = App::default();
         app.nodes.push(NodeView {
@@ -10130,6 +10231,7 @@ mod tests {
                 alternate_screen: false,
                 mouse_protocol_enabled: false,
                 mouse_protocol_encoding: HarnessRuntimeMouseProtocolEncodingV1::Default,
+                screen_state: None,
             },
             coalesced_since_last: 0,
         };

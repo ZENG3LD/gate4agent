@@ -7,7 +7,7 @@ use gate4agent_c2_protocol::{
     NodeTransportState, RoutedNodeResponse,
 };
 use gate4agent_node_protocol::{NodeId, NodeRequest, SessionMode, WorkspaceId};
-use gate4agent_types::{AgentId, TerminalFrame, TerminalSize};
+use gate4agent_types::{AgentId, PtyScreenState, TerminalFrame, TerminalSize};
 use thiserror::Error;
 use tokio::time::{sleep, timeout};
 
@@ -45,6 +45,14 @@ struct SeedEvidence {
     observed_running_pid: bool,
     pty_output: bool,
     final_status: Option<C2SessionStatus>,
+    /// The session's own screen classification as of the LATEST poll --
+    /// overwritten each observation, like `final_status`, never OR-
+    /// accumulated the way `observed_running_pid`/`pty_output` are: a
+    /// screen state is a current fact about what is painted right now, not
+    /// a "did this ever happen" flag. Defaults to `Unknown`
+    /// (`PtyScreenState::default()`), the correct starting value before
+    /// any poll has observed a session at all.
+    screen_state: PtyScreenState,
 }
 
 #[derive(serde::Serialize)]
@@ -71,13 +79,18 @@ enum SeedError {
     #[error("provider {provider} session identity did not match")]
     SessionMismatch { provider: AgentId },
     #[error(
-        "provider {provider} readiness incomplete (running_pid={observed_running_pid}, pty_output={pty_output}, final_status={final_status})"
+        "provider {provider} readiness incomplete (running_pid={observed_running_pid}, pty_output={pty_output}, final_status={final_status}, screen={screen_state})"
     )]
     ProviderReadinessTimedOut {
         provider: AgentId,
         observed_running_pid: bool,
         pty_output: bool,
         final_status: &'static str,
+        /// Pre-formatted via `screen_state_display` -- the operator-facing
+        /// point of this field: "the screen was showing a vendor update"
+        /// instead of three bare booleans. See that fn's own doc comment
+        /// for the exact shape.
+        screen_state: String,
     },
     #[error("provider sessions did not produce a visible terminal screen")]
     ReadinessTimedOut,
@@ -275,11 +288,48 @@ fn observe_session(
         .as_ref()
         .is_some_and(frame_has_pty_output);
     seeded.evidence.final_status = Some(session.status.clone());
+    seeded.evidence.screen_state = session.screen_state.clone();
     Ok(())
 }
 
+/// `observed_running_pid && pty_output` is precisely the inference an
+/// npm auto-updater falsifies: a live PID and a full screen, from a
+/// process that is not the agent at all. Requiring `screen_state.
+/// admits_blind_write()` on top closes that gap WITHOUT dropping the
+/// other two -- a `Ready` classification says the screen is not showing
+/// something else, never that the process is up or producing output; all
+/// three facts are still wanted together, so this is an additional `&&`,
+/// not a replacement.
+///
+/// An `Unknown` screen state (`PtyScreenState::default()`, what a session
+/// this seeder has never polled reports, and also what an older node that
+/// predates this classification would send) is deliberately NOT special-
+/// cased here: `admits_blind_write()` already refuses it exactly like
+/// `NotAgent`, and that is the correct answer for BOTH readings. This
+/// binary and the node it talks to are built and shipped from this same
+/// tree, so "an older node" cannot actually happen in practice -- but even
+/// if it could, treating an unclassified screen as ready-by-default would
+/// reproduce the exact optimistic read this whole feature exists to
+/// remove. A caller that legitimately cannot observe a screen classification
+/// times out and reports `screen=unknown`, same as any other stuck state.
 fn evidence_is_ready(evidence: &SeedEvidence) -> bool {
-    evidence.observed_running_pid && evidence.pty_output
+    evidence.observed_running_pid && evidence.pty_output && evidence.screen_state.admits_blind_write()
+}
+
+/// Operator-facing rendering of a `PtyScreenState` for
+/// `SeedError::ProviderReadinessTimedOut` -- carries the SAME label an
+/// operator reading the pane would see, so a timeout reads "the screen was
+/// showing a vendor update" instead of a bare boolean. Mirrors `gate4agent-
+/// tui`'s own `control_plane::screen_state_label` in spirit (not shared:
+/// different crate, different error shape), never a raw `{:?}` dump.
+fn screen_state_display(state: &PtyScreenState) -> String {
+    match state {
+        PtyScreenState::Unknown => "unknown".to_owned(),
+        PtyScreenState::Ready => "ready".to_owned(),
+        PtyScreenState::NotAgent { observed_process } => format!("not-agent({observed_process})"),
+        PtyScreenState::OperatorGate { gate } => format!("operator-gate({gate})"),
+        PtyScreenState::Failing { reason } => format!("failing({reason})"),
+    }
 }
 
 fn readiness_timeout_error(sessions: &[SeededSession]) -> SeedError {
@@ -299,6 +349,7 @@ fn readiness_timeout_error(sessions: &[SeededSession]) -> SeedError {
             .as_ref()
             .map(status_name)
             .unwrap_or("unobserved"),
+        screen_state: screen_state_display(&session.evidence.screen_state),
     }
 }
 
@@ -509,7 +560,13 @@ mod tests {
             provider_activity: ProviderActivity::Idle,
             provider_interaction_pending: false,
             provider_identity_present: false,
-            screen_state: PtyScreenState::default(),
+            // `Ready`, never the default `Unknown` -- this fixture models
+            // an agent's own screen, and every pre-existing readiness test
+            // below still expects `evidence_is_ready` to reach `true` once
+            // pid+output evidence accumulates. The incident-regression
+            // case (`OperatorGate` etc.) is covered by its own dedicated
+            // tests, which override this field on top of the fixture.
+            screen_state: PtyScreenState::Ready,
         }
     }
 
@@ -761,6 +818,40 @@ mod tests {
         assert!(!seeded[0].evidence.pty_output);
     }
 
+    /// THE incident's own regression test: an npm auto-updater has a live
+    /// PID and fills the screen with output -- exactly the evidence
+    /// `observed_running_pid && pty_output` alone called "ready" before
+    /// this change. A session reporting that SAME evidence, plus an
+    /// `OperatorGate` screen, must NOT be ready.
+    #[test]
+    fn seed_vendor_pty_readiness_refuses_a_running_session_whose_screen_is_not_the_agent() {
+        let workspace_id = WorkspaceId::new("primary").unwrap();
+        let mut seeded = [seeded_session(agent("codex"), &workspace_id, 20)];
+        let mut session = fixture_session(agent("codex"), 20);
+        session.screen_state = PtyScreenState::OperatorGate { gate: "vendor update".to_owned() };
+        let snapshot = fixture_snapshot(&workspace_id, session);
+        assert!(!evaluate_readiness(&snapshot, &workspace_id, &mut seeded).unwrap());
+        assert!(seeded[0].evidence.observed_running_pid);
+        assert!(seeded[0].evidence.pty_output);
+        assert_eq!(
+            seeded[0].evidence.screen_state,
+            PtyScreenState::OperatorGate { gate: "vendor update".to_owned() },
+        );
+    }
+
+    /// Sibling of the regression test above: the SAME running-pid+output
+    /// evidence, but a `Ready` screen, IS ready -- proves the new check
+    /// adds a refusal for a bad screen and changes nothing for a good one.
+    #[test]
+    fn seed_vendor_pty_readiness_accepts_a_running_session_with_a_ready_screen() {
+        let workspace_id = WorkspaceId::new("primary").unwrap();
+        let mut seeded = [seeded_session(agent("codex"), &workspace_id, 21)];
+        let mut session = fixture_session(agent("codex"), 21);
+        session.screen_state = PtyScreenState::Ready;
+        let snapshot = fixture_snapshot(&workspace_id, session);
+        assert!(evaluate_readiness(&snapshot, &workspace_id, &mut seeded).unwrap());
+    }
+
     #[test]
     fn seed_vendor_pty_timeout_reports_only_safe_first_pending_evidence() {
         let workspace = WorkspaceId::new("workspace-a").unwrap();
@@ -772,13 +863,37 @@ mod tests {
         seeded[0].evidence.final_status = Some(C2SessionStatus::Exited {
             exit_code: Some(1),
         });
+        // codex is otherwise fully ready (pid, output, AND a ready screen)
+        // -- only claude is genuinely pending, and the assertion below
+        // pins that it alone is named.
         seeded[1].evidence.observed_running_pid = true;
         seeded[1].evidence.pty_output = true;
+        seeded[1].evidence.screen_state = PtyScreenState::Ready;
         seeded[1].evidence.final_status = Some(C2SessionStatus::Running);
 
         assert_eq!(
             readiness_timeout_error(&seeded).to_string(),
-            "provider claude readiness incomplete (running_pid=true, pty_output=false, final_status=exited)"
+            "provider claude readiness incomplete (running_pid=true, pty_output=false, final_status=exited, screen=unknown)"
+        );
+    }
+
+    /// The timeout error must NAME the screen state, not just the three
+    /// booleans -- a message that can say "the screen was showing a vendor
+    /// update" instead of a bare `screen_state=false` triple is the entire
+    /// operator-facing point of carrying this field at all.
+    #[test]
+    fn seed_vendor_pty_timeout_names_the_screen_state() {
+        let workspace = WorkspaceId::new("workspace-a").unwrap();
+        let mut seeded = [seeded_session(agent("codex"), &workspace, 1)];
+        seeded[0].evidence.observed_running_pid = true;
+        seeded[0].evidence.pty_output = true;
+        seeded[0].evidence.screen_state =
+            PtyScreenState::OperatorGate { gate: "vendor update".to_owned() };
+        seeded[0].evidence.final_status = Some(C2SessionStatus::Running);
+
+        assert_eq!(
+            readiness_timeout_error(&seeded).to_string(),
+            "provider codex readiness incomplete (running_pid=true, pty_output=true, final_status=running, screen=operator-gate(vendor update))"
         );
     }
 }

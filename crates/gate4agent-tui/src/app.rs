@@ -39,7 +39,8 @@ use gate4agent_observation_engine::{
 use gate4agent_types::{
     AgentId, HistoryCandidateSummary, NativeSessionCatalogScope,
     NativeSessionCatalogSummary, NativeSessionCatalogWindow, NativeSessionExternalGroup,
-    NativeSessionExternalGroupKind, ProviderSessionIdentity, ProviderSessionKey, TerminalControl, TerminalFrame,
+    NativeSessionExternalGroupKind, ProviderSessionIdentity, ProviderSessionKey, PtyScreenState,
+    TerminalControl, TerminalFrame,
     TerminalMouseProtocolEncoding, PROVIDER_EVENT_ID_MAX_BYTES, TERMINAL_INPUT_MAX_BYTES,
 };
 use gate4agent_harness_client::{
@@ -225,6 +226,13 @@ pub struct SessionView {
     pub terminal_mouse_protocol_enabled: bool,
     pub terminal_mouse_protocol_encoding: TerminalMouseProtocolEncoding,
     pub terminal_cursor: Option<(u16, u16)>,
+    /// The session's CURRENT screen classification, independent of
+    /// `status`/`running`/`attention` -- see `PtyScreenState`'s own doc
+    /// comment for why a session can be `running` while its screen shows
+    /// something unrelated to the agent. Never a reinterpretation of those
+    /// existing fields: they keep their exact prior meanings, this is a new
+    /// field a caller consults separately (`admits_blind_write()`).
+    pub screen_state: PtyScreenState,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -25350,6 +25358,7 @@ mod tests {
                     terminal_mouse_protocol_enabled: false,
                     terminal_mouse_protocol_encoding: TerminalMouseProtocolEncoding::Default,
                     terminal_cursor: Some((0, 5)),
+                    screen_state: PtyScreenState::Unknown,
                 }],
             }],
         });

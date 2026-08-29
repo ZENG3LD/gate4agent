@@ -84,7 +84,7 @@ use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use gate4agent_types::TERMINAL_INPUT_MAX_BYTES;
+use gate4agent_types::{PtyScreenState, TERMINAL_INPUT_MAX_BYTES};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
@@ -443,6 +443,19 @@ enum ControlErrorV1 {
     /// against the same session would have silently dropped for -- see
     /// this module's own doc comment.
     NodeIncarnationUnknown,
+    /// `WriteSession` targeted a session whose `PtyScreenState` does not
+    /// `admits_blind_write()` -- refused immediately after the
+    /// `SessionNotRunning` check and BEFORE `App::route_harness_session_
+    /// verb` ever runs (screen readiness does not depend on incarnation
+    /// resolution, and checking it first is cheaper than a routing call).
+    /// Carries the SAME state kind/label a human looking at the pane would
+    /// see: `state_kind` mirrors `PtyScreenState`'s own variant name
+    /// (`"unknown"`, `"not-agent"`, `"operator-gate"`, `"failing"`), and
+    /// `label` is that variant's own text (`observed_process`/`gate`/
+    /// `reason`) where it has one, `None` for `Unknown`. A bare refusal
+    /// with no reason would reproduce the exact bare-timeout problem this
+    /// change exists to fix.
+    ScreenNotReady { state_kind: &'static str, label: Option<String> },
     /// `WriteSession`'s `Text` payload exceeded [`TERMINAL_INPUT_MAX_BYTES`]
     /// -- the same bound the real Ctrl+V paste path enforces.
     WriteTooLarge,
@@ -878,6 +891,26 @@ pub(crate) fn apply(app: &mut App, terminal: &TerminalWatermarks, command: Contr
     }
 }
 
+/// Splits a `PtyScreenState` into the `(state_kind, label)` pair
+/// `ControlErrorV1::ScreenNotReady` carries -- the one place this mapping
+/// is written, so [`write_pty`]'s own refusal and this fn's callers never
+/// drift from `PtyScreenState`'s own variant names. `Ready` is included
+/// only for exhaustiveness: [`write_pty`] never calls this for a `Ready`
+/// state (its `admits_blind_write()` guard runs first), so this arm never
+/// actually executes there, but the fn stays total rather than panicking
+/// on a state a future caller might legitimately pass it.
+fn screen_state_label(state: &PtyScreenState) -> (&'static str, Option<String>) {
+    match state {
+        PtyScreenState::Unknown => ("unknown", None),
+        PtyScreenState::NotAgent { observed_process } => {
+            ("not-agent", Some(observed_process.clone()))
+        }
+        PtyScreenState::OperatorGate { gate } => ("operator-gate", Some(gate.clone())),
+        PtyScreenState::Failing { reason } => ("failing", Some(reason.clone())),
+        PtyScreenState::Ready => ("ready", None),
+    }
+}
+
 /// Resolves and writes to a session directly by [`ControlSessionAddressV1`],
 /// NEVER through `App::focus`/`App::surface`'s active-pane/active-tab/
 /// overlay dispatch chain `InjectKey` rides -- a session address is stable
@@ -887,12 +920,16 @@ pub(crate) fn apply(app: &mut App, terminal: &TerminalWatermarks, command: Contr
 /// focused_session` does for a real click-focused pane. Runs the SAME
 /// running-session guard `App::reduce_viewport` runs before dispatching ANY
 /// key (`SessionNotRunning` == its "stopped PTY is read-only" flash), then
-/// the SAME `App::route_harness_session_verb` rewrite `client::send_
-/// operator_action` applies to every real keystroke's `AppAction::Input`/
-/// `TerminalBytes` before it can become a `HarnessWriteSessionInput`/
-/// `HarnessWriteSessionBytes` -- so a `WriteSession` that returns `Ok` is
-/// provably the same action a real keystroke at a real, running, correctly-
-/// routed PTY would have produced, not a lookalike.
+/// the same `PtyScreenState::admits_blind_write()` predicate that gates
+/// every other blind writer in this crate (`ScreenNotReady` -- screen
+/// readiness does not depend on incarnation resolution, so this runs
+/// BEFORE the rewrite below, not after), then the SAME `App::route_
+/// harness_session_verb` rewrite `client::send_operator_action` applies to
+/// every real keystroke's `AppAction::Input`/`TerminalBytes` before it can
+/// become a `HarnessWriteSessionInput`/`HarnessWriteSessionBytes` -- so a
+/// `WriteSession` that returns `Ok` is provably the same action a real
+/// keystroke at a real, running, screen-ready, correctly-routed PTY would
+/// have produced, not a lookalike.
 ///
 /// When that rewrite degrades to `AppAction::None` (`App::harness_session_
 /// address`'s own `?` -- the node's harness incarnation isn't known to
@@ -911,6 +948,10 @@ fn write_pty(
     };
     if !view.running {
         return Err(ControlErrorV1::SessionNotRunning);
+    }
+    if !view.screen_state.admits_blind_write() {
+        let (state_kind, label) = screen_state_label(&view.screen_state);
+        return Err(ControlErrorV1::ScreenNotReady { state_kind, label });
     }
     let direct_action = match payload {
         ControlWritePayloadV1::Text { value } => {
@@ -1107,7 +1148,7 @@ mod tests {
     use std::io::BufRead;
 
     use gate4agent_node_protocol::{NodeIncarnationId, OpaqueHostPath};
-    use gate4agent_types::TerminalMouseProtocolEncoding;
+    use gate4agent_types::{PtyScreenState, TerminalMouseProtocolEncoding};
 
     use crate::app::{ConnectionState, NodeView, Provider, SessionView, WorkspaceView};
 
@@ -1306,6 +1347,14 @@ mod tests {
                     terminal_mouse_protocol_enabled: false,
                     terminal_mouse_protocol_encoding: TerminalMouseProtocolEncoding::Default,
                     terminal_cursor: None,
+                    // `Ready` (never the default `Unknown`) so every
+                    // pre-existing test built on this fixture keeps
+                    // reaching `write_pty`'s rewrite step exactly as
+                    // before -- the fixture models a session whose screen
+                    // already looks like the agent; the `ScreenNotReady`
+                    // gate itself is covered by its own dedicated tests,
+                    // which override this field on top of the fixture.
+                    screen_state: PtyScreenState::Ready,
                 }],
                 worktree_service_mode: None,
                 managed_worktree_profiles: None,
@@ -1313,6 +1362,21 @@ mod tests {
         });
         app.surface.open_in_focused(SurfaceTab::Pty(address));
         app.focus = Focus::Viewport;
+        app
+    }
+
+    /// Sibling of [`pty_pane_app`] that also overrides `SessionView::
+    /// screen_state` on top of it -- every `ScreenNotReady`-focused test
+    /// below builds its fixture through this rather than repeating the
+    /// whole `App`/`NodeView`/`WorkspaceView` construction `pty_pane_app`
+    /// already owns.
+    fn pty_pane_app_with_screen_state(
+        running: bool,
+        incarnation_id: Option<NodeIncarnationId>,
+        screen_state: PtyScreenState,
+    ) -> App {
+        let mut app = pty_pane_app(running, incarnation_id);
+        app.nodes[0].workspaces[0].sessions[0].screen_state = screen_state;
         app
     }
 
@@ -1593,6 +1657,162 @@ mod tests {
         assert!(matches!(error, ControlErrorV1::SessionNotFound));
     }
 
+    /// `NotAgent` half of the `ScreenNotReady` refusal: the observed
+    /// process reaches the caller unchanged, exactly like an operator
+    /// reading the pane themselves would see it, not a bare "not ready".
+    #[test]
+    fn write_pty_refuses_a_not_agent_screen_and_names_the_observed_process() {
+        let mut app = pty_pane_app_with_screen_state(
+            true,
+            Some(NodeIncarnationId::from_bytes([9; 16])),
+            PtyScreenState::NotAgent { observed_process: "npm".to_owned() },
+        );
+        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+        let command = ControlCommand {
+            request: ControlRequestV1::WriteSession {
+                session: test_session_address(),
+                payload: ControlWritePayloadV1::Text { value: "x".to_owned() },
+            },
+            reply: reply_tx,
+        };
+        let action = apply(&mut app, &TerminalWatermarks::default(), command);
+        assert_eq!(action, AppAction::None);
+        let ControlReplyV1::Error { error } = reply_rx.try_recv().unwrap() else {
+            panic!("expected an Error reply naming why the write was refused");
+        };
+        let ControlErrorV1::ScreenNotReady { state_kind, label } = error else {
+            panic!("expected ScreenNotReady");
+        };
+        assert_eq!(state_kind, "not-agent");
+        assert_eq!(label.as_deref(), Some("npm"));
+    }
+
+    /// `OperatorGate` half of the `ScreenNotReady` refusal: the gate label
+    /// (e.g. a workspace-trust prompt) reaches the caller unchanged.
+    #[test]
+    fn write_pty_refuses_an_operator_gate_screen_and_names_the_gate() {
+        let mut app = pty_pane_app_with_screen_state(
+            true,
+            Some(NodeIncarnationId::from_bytes([9; 16])),
+            PtyScreenState::OperatorGate { gate: "workspace-trust".to_owned() },
+        );
+        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+        let command = ControlCommand {
+            request: ControlRequestV1::WriteSession {
+                session: test_session_address(),
+                payload: ControlWritePayloadV1::Text { value: "x".to_owned() },
+            },
+            reply: reply_tx,
+        };
+        let action = apply(&mut app, &TerminalWatermarks::default(), command);
+        assert_eq!(action, AppAction::None);
+        let ControlReplyV1::Error { error } = reply_rx.try_recv().unwrap() else {
+            panic!("expected an Error reply naming why the write was refused");
+        };
+        let ControlErrorV1::ScreenNotReady { state_kind, label } = error else {
+            panic!("expected ScreenNotReady");
+        };
+        assert_eq!(state_kind, "operator-gate");
+        assert_eq!(label.as_deref(), Some("workspace-trust"));
+    }
+
+    /// `Failing` half of the `ScreenNotReady` refusal: kept distinct from
+    /// `OperatorGate` above -- same refusal, different `state_kind`/label,
+    /// because `PtyScreenState::Failing`'s own doc comment is explicit that
+    /// collapsing "broken" into "waiting for you" loses the diagnosis an
+    /// operator needs.
+    #[test]
+    fn write_pty_refuses_a_failing_screen_and_names_the_reason() {
+        let mut app = pty_pane_app_with_screen_state(
+            true,
+            Some(NodeIncarnationId::from_bytes([9; 16])),
+            PtyScreenState::Failing { reason: "crash-loop".to_owned() },
+        );
+        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+        let command = ControlCommand {
+            request: ControlRequestV1::WriteSession {
+                session: test_session_address(),
+                payload: ControlWritePayloadV1::Text { value: "x".to_owned() },
+            },
+            reply: reply_tx,
+        };
+        let action = apply(&mut app, &TerminalWatermarks::default(), command);
+        assert_eq!(action, AppAction::None);
+        let ControlReplyV1::Error { error } = reply_rx.try_recv().unwrap() else {
+            panic!("expected an Error reply naming why the write was refused");
+        };
+        let ControlErrorV1::ScreenNotReady { state_kind, label } = error else {
+            panic!("expected ScreenNotReady");
+        };
+        assert_eq!(state_kind, "failing");
+        assert_eq!(label.as_deref(), Some("crash-loop"));
+    }
+
+    /// `Unknown` half of the `ScreenNotReady` refusal: no label to carry
+    /// (nothing has been observed yet), but the refusal itself must still
+    /// fire -- `PtyScreenState::admits_blind_write`'s own doc comment is
+    /// explicit that `Unknown` must be treated exactly like `NotAgent` by a
+    /// blind writer, never optimistically.
+    #[test]
+    fn write_pty_refuses_an_unknown_screen_with_no_label() {
+        let mut app = pty_pane_app_with_screen_state(
+            true,
+            Some(NodeIncarnationId::from_bytes([9; 16])),
+            PtyScreenState::Unknown,
+        );
+        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+        let command = ControlCommand {
+            request: ControlRequestV1::WriteSession {
+                session: test_session_address(),
+                payload: ControlWritePayloadV1::Text { value: "x".to_owned() },
+            },
+            reply: reply_tx,
+        };
+        let action = apply(&mut app, &TerminalWatermarks::default(), command);
+        assert_eq!(action, AppAction::None);
+        let ControlReplyV1::Error { error } = reply_rx.try_recv().unwrap() else {
+            panic!("expected an Error reply naming why the write was refused");
+        };
+        let ControlErrorV1::ScreenNotReady { state_kind, label } = error else {
+            panic!("expected ScreenNotReady");
+        };
+        assert_eq!(state_kind, "unknown");
+        assert_eq!(label, None);
+    }
+
+    /// Pins the ordering [`write_pty`]'s own doc comment promises: the
+    /// `screen_state` check runs BEFORE `App::route_harness_session_verb`,
+    /// so a session that is BOTH screen-not-ready AND missing its node's
+    /// harness incarnation returns `ScreenNotReady`, never
+    /// `NodeIncarnationUnknown` -- screen readiness does not depend on
+    /// incarnation resolution, so there is no reason to pay for (or report)
+    /// the routing failure first.
+    #[test]
+    fn write_pty_refuses_on_screen_state_before_it_would_resolve_an_unknown_incarnation() {
+        let mut app = pty_pane_app_with_screen_state(
+            true,
+            None, // incarnation unknown -- would ALSO fail `NodeIncarnationUnknown`
+            PtyScreenState::NotAgent { observed_process: "npm".to_owned() },
+        );
+        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+        let command = ControlCommand {
+            request: ControlRequestV1::WriteSession {
+                session: test_session_address(),
+                payload: ControlWritePayloadV1::Text { value: "x".to_owned() },
+            },
+            reply: reply_tx,
+        };
+        let action = apply(&mut app, &TerminalWatermarks::default(), command);
+        assert_eq!(action, AppAction::None);
+        let ControlReplyV1::Error { error } = reply_rx.try_recv().unwrap() else {
+            panic!("expected an Error reply naming why the write was refused");
+        };
+        assert!(
+            matches!(error, ControlErrorV1::ScreenNotReady { .. }),
+            "must refuse on screen state before ever reaching NodeIncarnationUnknown",
+        );
+    }
+
     /// Same bound the real Ctrl+V paste path enforces
     /// (`App::reduce_viewport`'s own `UiKey::Ctrl('v')` arm) -- proven here
     /// so `write_pty` can never become the "just script around the clipboard
@@ -1677,6 +1897,44 @@ mod tests {
         assert!(
             matches!(direct_action, AppAction::HarnessWriteSessionBytes { .. }),
             "expected a routed harness byte write, got {direct_action:?}",
+        );
+        assert!(matches!(
+            reply_rx.try_recv(),
+            Ok(ControlReplyV1::Ok { response: ControlResponseV1::Written }),
+        ));
+    }
+
+    /// Requirement pin for the `ScreenNotReady` gate itself: for a `Ready`
+    /// screen, `write_pty` must produce EXACTLY the `AppAction` the
+    /// pre-gate code produced -- computed independently here via the same
+    /// two-step `App::reduce`/`App::route_harness_session_verb` path the
+    /// OLD `write_pty` body was (find session, check running, route),
+    /// never touching the new `screen_state` check at all. Proves the gate
+    /// adds a refusal for the non-`Ready` states above and changes nothing
+    /// else.
+    #[test]
+    fn write_pty_against_a_ready_screen_produces_the_same_action_the_pre_gate_code_did() {
+        let incarnation = NodeIncarnationId::from_bytes([9; 16]);
+        let mut app_direct =
+            pty_pane_app_with_screen_state(true, Some(incarnation), PtyScreenState::Ready);
+        let raw_action = app_direct.reduce(UiKey::Char('x'));
+        let pre_gate_action = app_direct.route_harness_session_verb(raw_action);
+
+        let mut app_via_control =
+            pty_pane_app_with_screen_state(true, Some(incarnation), PtyScreenState::Ready);
+        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+        let command = ControlCommand {
+            request: ControlRequestV1::WriteSession {
+                session: test_session_address(),
+                payload: ControlWritePayloadV1::Text { value: "x".to_owned() },
+            },
+            reply: reply_tx,
+        };
+        let control_action = apply(&mut app_via_control, &TerminalWatermarks::default(), command);
+        assert_eq!(pre_gate_action, control_action);
+        assert!(
+            matches!(pre_gate_action, AppAction::HarnessWriteSessionInput { .. }),
+            "expected a routed harness write, got {pre_gate_action:?}",
         );
         assert!(matches!(
             reply_rx.try_recv(),

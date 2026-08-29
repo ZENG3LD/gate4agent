@@ -47,6 +47,7 @@ use gate4agent_harness_client::{
     HarnessReverseAttributionOutcomeV1, HarnessReverseAttributionRelationV1,
     HarnessReverseAttributionSubjectV1, SessionMonitorV1 as HarnessSessionMonitorV1,
 };
+use gate4agent_types::PtyScreenState;
 
 use crate::app::{
     clock_offset_label, compact_task_id, host_path_display, managed_state_label, repository_path_display,
@@ -15451,9 +15452,50 @@ fn workspace_state(node: &NodeView, workspace: &WorkspaceView, theme: Theme) -> 
     }
 }
 
+/// Non-`Unknown`, non-`Ready` half of `PtyScreenState` as a `(color, label)`
+/// pair for [`session_state`] -- `None` for `Unknown`/`Ready`, the two
+/// states that must render exactly like today: `Unknown` is every
+/// session's pre-observation state for its first moments, so painting it
+/// as a warning would flag every healthy session at startup; `Ready` IS
+/// the healthy state `session_state`'s other branches already color.
+///
+/// `NotAgent`/`Failing` both use `theme.red`, the same severity `attention`
+/// already claims for "blocked" -- their OWN label (the observed process /
+/// crash reason, borrowed straight from the session, never a generic word)
+/// is what keeps each distinguishable from `attention` and from each
+/// other, not the color. `OperatorGate` uses `theme.yellow` instead:
+/// unlike the other two, resolving it means typing into the pane
+/// (`PtyScreenState::OperatorGate`'s own doc comment), the same "needs a
+/// look, not necessarily broken" register `stoppable`'s yellow already
+/// uses a few lines below in `session_state`.
+fn screen_state_alert(state: &PtyScreenState, theme: Theme) -> Option<(Color, &str)> {
+    match state {
+        PtyScreenState::Unknown | PtyScreenState::Ready => None,
+        PtyScreenState::NotAgent { observed_process } => {
+            Some((theme.red, observed_process.as_str()))
+        }
+        PtyScreenState::OperatorGate { gate } => Some((theme.yellow, gate.as_str())),
+        PtyScreenState::Failing { reason } => Some((theme.red, reason.as_str())),
+    }
+}
+
+/// Priority order, highest first: `attention` (a structured, provider-
+/// confirmed signal, kept on top because it is the higher-fidelity source
+/// where it exists at all -- it only exists for a provider with a
+/// `pty_sidecar` adapter bound) -- `screen_state` (a text-derived signal
+/// that works for EVERY provider, including Kimi/OpenCode, which emit no
+/// structured events at all) -- `running` -- `stoppable` -- `restartable`
+/// -- idle. `screen_state` must outrank `running`/`stoppable`/
+/// `restartable`: those three read process liveness/lifecycle, which is
+/// exactly the false-positive this type exists to correct -- a process can
+/// be `running` while its screen shows an unrelated vendor updater, and
+/// painting that pane plain "working" yellow would repeat the incident
+/// this whole feature fixes.
 fn session_state<'a>(session: &'a SessionView, theme: Theme) -> (&'static str, Color, &'a str) {
     if session.attention {
         ("●", theme.red, "blocked")
+    } else if let Some((color, label)) = screen_state_alert(&session.screen_state, theme) {
+        ("●", color, label)
     } else if session.running {
         ("●", theme.yellow, "working")
     } else if session.stoppable {
@@ -15698,6 +15740,82 @@ mod tests {
 
     fn provider(value: &str) -> Provider {
         AgentId::new(value).unwrap()
+    }
+
+    /// A running, non-attention, `Unknown`-screen session -- the baseline
+    /// [`session_state`]'s own tests below start from and override one
+    /// field on top of, rather than repeating this whole literal per test.
+    fn base_session_view(address: SessionAddress) -> SessionView {
+        SessionView {
+            address,
+            provider: provider("codex"),
+            status: "running".to_owned(),
+            running: true,
+            stoppable: true,
+            removable: false,
+            restartable: false,
+            attention: false,
+            has_provider_session_identity: true,
+            progress: None,
+            terminal_formatted: Vec::new(),
+            terminal_scrollback: Vec::new(),
+            terminal_alternate_screen: false,
+            terminal_mouse_protocol_enabled: false,
+            terminal_mouse_protocol_encoding: TerminalMouseProtocolEncoding::Default,
+            terminal_cursor: None,
+            screen_state: PtyScreenState::Unknown,
+        }
+    }
+
+    fn test_session_view_address() -> SessionAddress {
+        SessionAddress {
+            node_id: "node-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            instance_id: 2,
+            generation: 1,
+        }
+    }
+
+    /// `OperatorGate`, `Failing`, and `attention` must be visually
+    /// distinguishable from one another -- distinct labels, asserted side
+    /// by side so the three provably differ, not merely each differ from
+    /// "blocked" in isolation (which a shared fallback label could still
+    /// pass).
+    #[test]
+    fn session_state_distinguishes_operator_gate_failing_and_attention() {
+        let theme = Theme::for_mode(PtyColorMode::Inherited);
+        let address = test_session_view_address();
+
+        let mut gated = base_session_view(address.clone());
+        gated.screen_state = PtyScreenState::OperatorGate { gate: "workspace-trust".to_owned() };
+        let (_, _, gated_label) = session_state(&gated, theme);
+
+        let mut failing = base_session_view(address.clone());
+        failing.screen_state = PtyScreenState::Failing { reason: "crash-loop".to_owned() };
+        let (_, _, failing_label) = session_state(&failing, theme);
+
+        let mut attention = base_session_view(address);
+        attention.attention = true;
+        let (_, _, attention_label) = session_state(&attention, theme);
+
+        assert_eq!(gated_label, "workspace-trust");
+        assert_eq!(failing_label, "crash-loop");
+        assert_eq!(attention_label, "blocked");
+        assert_ne!(gated_label, failing_label);
+        assert_ne!(gated_label, attention_label);
+        assert_ne!(failing_label, attention_label);
+    }
+
+    /// `Unknown` -- every session's pre-observation default -- must render
+    /// EXACTLY as it did before `screen_state` existed: `running` alone
+    /// decides "working" yellow, with no alert layered on top that would
+    /// paint a warning on a healthy, freshly-observed session at startup.
+    #[test]
+    fn session_state_renders_an_unknown_screen_exactly_like_before_this_feature() {
+        let theme = Theme::for_mode(PtyColorMode::Inherited);
+        let mut session = base_session_view(test_session_view_address());
+        session.screen_state = PtyScreenState::Unknown;
+        assert_eq!(session_state(&session, theme), ("●", theme.yellow, "working"));
     }
 
     fn buffer_text(buf: &TerminalBuffer) -> String {
@@ -17495,6 +17613,7 @@ mod tests {
             terminal_mouse_protocol_enabled: false,
             terminal_mouse_protocol_encoding: TerminalMouseProtocolEncoding::Default,
             terminal_cursor: None,
+            screen_state: PtyScreenState::Unknown,
         });
         assert!(
             !app.surface.all_tabs().iter().any(|tab| **tab == SurfaceTab::Pty(direct_address.clone())),
@@ -17656,6 +17775,7 @@ mod tests {
                     terminal_mouse_protocol_enabled: false,
                     terminal_mouse_protocol_encoding: TerminalMouseProtocolEncoding::Default,
                     terminal_cursor: Some((0, 1)),
+                    screen_state: PtyScreenState::Unknown,
                 }],
             }],
         });

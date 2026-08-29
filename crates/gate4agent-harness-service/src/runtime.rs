@@ -6523,6 +6523,22 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                     };
                                     terminal_buffers.ingest(key.clone(), frame.clone());
                                     terminal_subscribers.publish(&key, frame);
+                                    // The frame is also how the inventory
+                                    // learns this session's screen changed
+                                    // -- see `apply_screen_state` for why
+                                    // the resync cadence is not enough for
+                                    // this one field.
+                                    if let Some(node) = runtime_inventory
+                                        .apply_screen_state(&key, &frame.screen_state)
+                                    {
+                                        let node = node.clone();
+                                        subscribers.emit(|sequence| {
+                                            HarnessOperatorEventV1::RuntimeInventoryChanged {
+                                                sequence,
+                                                node: node.clone(),
+                                            }
+                                        });
+                                    }
                                 }
                                 C2NodeEvent::ResyncRequired { .. } => {
                                     terminal_buffers.invalidate(&NodeRoute {
@@ -7264,6 +7280,49 @@ struct ManagedWorktreeProfileOptionsCache {
 }
 
 impl HarnessRuntimeInventoryCache {
+    /// Applies a terminal frame's screen classification onto the cached
+    /// session, returning the refreshed node projection when the value
+    /// actually changed.
+    ///
+    /// `refresh` is the only other writer here and it runs exclusively on
+    /// an observation resync -- a recovery path. That is the right cadence
+    /// for everything else the projection carries, all of which changes
+    /// only when a session's lifecycle does. `screen_state` is the one
+    /// field that does not: a pane can go from the agent's own composer to
+    /// a vendor-update prompt without any lifecycle event at all, and an
+    /// inventory that only learns about it at the next resync would keep
+    /// answering `Ready` for a screen that has since stopped being ready.
+    /// For a value whose entire purpose is gating work, stale-optimistic is
+    /// the one direction that must not happen.
+    ///
+    /// This needs no new transport: `C2NodeEvent::TerminalFrame` already
+    /// arrives continuously to fill the terminal ring, and it already
+    /// carries the classification stamped at that frame. The node only
+    /// republishes a changed classification, but a frame carries the
+    /// current one on every frame, so the comparison below is what keeps
+    /// this from emitting an inventory event per frame.
+    fn apply_screen_state(
+        &mut self,
+        key: &RuntimeSessionKey,
+        screen_state: &gate4agent_types::PtyScreenState,
+    ) -> Option<&HarnessRuntimeNodeInventoryV1> {
+        let node = self.nodes.get_mut(&key.node_id)?;
+        if node.incarnation_id != key.incarnation_id.to_string() {
+            return None;
+        }
+        let workspace = node.inventory.workspaces.get_mut(key.workspace_id.as_str())?;
+        let session = workspace.sessions.iter_mut().find(|session| {
+            session.instance_id == key.instance_id.0 && session.generation == key.generation.0
+        })?;
+        let projected = Some(crate::terminal::map_screen_state(screen_state));
+        if session.screen_state == projected {
+            return None;
+        }
+        session.screen_state = projected;
+        self.nodes.get(&key.node_id)
+    }
+
+
     /// Returns the freshly built node projection when it actually differs
     /// from whatever was cached for this node id before this call (or when
     /// there was nothing cached yet) -- `None` when the refresh landed the
@@ -11669,6 +11728,68 @@ mod tests {
             event_sequence: 5,
             inventory: redact_runtime_inventory(sample_slim_node_inventory(screen_state)),
         }
+    }
+
+    /// The inventory's `screen_state` must track a terminal frame, not wait
+    /// for the next observation resync.
+    ///
+    /// Measured against the live stack before this existed: a freshly
+    /// spawned session's inventory entry read `unknown` for over twenty
+    /// seconds while the node itself already said `ready`, and it only
+    /// corrected when an unrelated resize forced a resync. Every other
+    /// field the projection carries changes only when a session's lifecycle
+    /// does, so the resync cadence suits them; a screen does not, and an
+    /// inventory answering `Ready` for a pane that has since put up a
+    /// vendor-update prompt is stale in the one direction a gate cannot
+    /// tolerate.
+    #[test]
+    fn a_terminal_frame_refreshes_the_cached_screen_state_without_a_resync() {
+        let mut cache = HarnessRuntimeInventoryCache::default();
+        let node_id = NodeId::new("node-a").unwrap();
+        cache.nodes.insert(
+            node_id.clone(),
+            sample_runtime_node_inventory(PtyScreenState::Unknown),
+        );
+        let key = RuntimeSessionKey {
+            node_id: node_id.clone(),
+            // `sample_runtime_node_inventory` stamps its incarnation as the
+            // hex string "1" x 32, which is these bytes.
+            incarnation_id: NodeIncarnationId::from_bytes([0x11; 16]),
+            workspace_id: gate4agent_node_protocol::WorkspaceId::new("workspace-a").unwrap(),
+            instance_id: AgentInstanceId(7),
+            generation: SessionGeneration(1),
+        };
+
+        let refreshed = cache
+            .apply_screen_state(&key, &PtyScreenState::Ready)
+            .expect("a changed classification refreshes the node projection");
+        assert_eq!(
+            refreshed.inventory.workspaces["workspace-a"].sessions[0].screen_state,
+            Some(map_screen_state(&PtyScreenState::Ready)),
+        );
+
+        // A frame carries the CURRENT classification on every frame, while
+        // the node only republishes a changed one. Without this comparison
+        // the harness would emit a `RuntimeInventoryChanged` per frame --
+        // roughly fifty a second per live session -- so the second identical
+        // application must report no change at all.
+        assert!(cache.apply_screen_state(&key, &PtyScreenState::Ready).is_none());
+
+        // A session that is not this one is never touched, however similar
+        // its address: a wrong generation is a different session's screen.
+        let stale_generation = RuntimeSessionKey {
+            generation: SessionGeneration(2),
+            ..key.clone()
+        };
+        assert!(cache
+            .apply_screen_state(&stale_generation, &PtyScreenState::Failing {
+                reason: "crash".to_owned(),
+            })
+            .is_none());
+        assert_eq!(
+            cache.nodes[&node_id].inventory.workspaces["workspace-a"].sessions[0].screen_state,
+            Some(map_screen_state(&PtyScreenState::Ready)),
+        );
     }
 
     /// `redact_runtime_inventory` always populates `screen_state: Some(..)`

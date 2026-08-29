@@ -1492,6 +1492,19 @@ fn remove_codex_trust_blocks(text: &str, keys: &[String]) -> String {
 }
 
 fn is_managed_command(spec: &ManagedHookAdapterSpec, command: &str) -> bool {
+    if command_names_managed_script(spec, command) {
+        return true;
+    }
+    // Windows hook commands wrap the real command as a PowerShell
+    // `-EncodedCommand` base64/UTF-16LE blob, so the managed script path
+    // never appears as plaintext in `command`. Decode that form the same
+    // way `base64_utf16le` produced it and re-run the same substring
+    // check against the decoded text.
+    decode_encoded_command_argument(command)
+        .is_some_and(|decoded| command_names_managed_script(spec, &decoded))
+}
+
+fn command_names_managed_script(spec: &ManagedHookAdapterSpec, command: &str) -> bool {
     let normalized = command.replace('\\', "/").to_ascii_lowercase();
     ["cmd", "ps1", "sh"].iter().any(|extension| {
         normalized.contains(&format!(
@@ -1499,6 +1512,29 @@ fn is_managed_command(spec: &ManagedHookAdapterSpec, command: &str) -> bool {
             spec.script_stem, extension
         ))
     })
+}
+
+/// Extracts the token following a PowerShell `-EncodedCommand` argument and
+/// decodes it as base64 -> UTF-16LE, mirroring `base64_utf16le` in reverse.
+/// Any malformed input (bad base64, odd byte count, invalid UTF-16) yields
+/// `None` rather than panicking.
+fn decode_encoded_command_argument(command: &str) -> Option<String> {
+    const MARKER: &str = "-encodedcommand";
+    let marker_start = command.to_ascii_lowercase().find(MARKER)?;
+    let token = command[marker_start + MARKER.len()..]
+        .trim_start()
+        .split_whitespace()
+        .next()?
+        .trim_matches(|character| character == '"' || character == '\'');
+    let bytes = base64_decode(token)?;
+    if bytes.is_empty() || bytes.len() % 2 != 0 {
+        return None;
+    }
+    let units = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect::<Vec<_>>();
+    String::from_utf16(&units).ok()
 }
 
 fn json_disabled(spec: &ManagedHookAdapterSpec, config: &Value) -> bool {
@@ -1615,6 +1651,33 @@ fn base64(bytes: &[u8]) -> String {
         });
     }
     output
+}
+
+/// Decodes the alphabet produced by `base64`. Returns `None` for anything
+/// that is not well-formed base64 (wrong length, stray padding, characters
+/// outside the alphabet) instead of panicking.
+fn base64_decode(value: &str) -> Option<Vec<u8>> {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    if value.is_empty() || value.len() % 4 != 0 {
+        return None;
+    }
+    let body = value.trim_end_matches('=');
+    if body.is_empty() {
+        return None;
+    }
+    let mut bits: u32 = 0;
+    let mut bit_count: u32 = 0;
+    let mut output = Vec::with_capacity(value.len() / 4 * 3);
+    for symbol in body.bytes() {
+        let sextet = TABLE.iter().position(|&candidate| candidate == symbol)? as u32;
+        bits = (bits << 6) | sextet;
+        bit_count += 6;
+        if bit_count >= 8 {
+            bit_count -= 8;
+            output.push(((bits >> bit_count) & 0xFF) as u8);
+        }
+    }
+    Some(output)
 }
 
 fn not_installed(spec: &ManagedHookAdapterSpec, path: PathBuf) -> ManagedHookStatus {
@@ -2527,5 +2590,217 @@ mod tests {
         assert!(command_code_script.contains("endpoint.cmd"));
         assert!(command_code_script.contains("GATE4AGENT_HOOK_TOKEN=%~2"));
         assert!(!command_code_script.contains("x-gate4agent-hook-token: 00000000"));
+    }
+
+    #[test]
+    fn all_pinned_targets_round_trip_through_explicit_plans_on_windows() {
+        let root = TestRoot::new("round-trip-windows");
+        let manager = root.manager_for(RuntimePlatform::Windows);
+        for target in [
+            "claude",
+            "openclaude",
+            "codex",
+            "gemini",
+            "antigravity",
+            "amp",
+            "cursor",
+            "droid",
+            "command-code",
+            "grok",
+            "copilot",
+            "hermes",
+            "devin",
+            "kimi",
+        ] {
+            let binding = binding(target);
+            assert_eq!(
+                manager.status(&binding).unwrap().state,
+                ManagedHookState::NotInstalled,
+                "initial status for {target}"
+            );
+
+            let install = manager
+                .plan(&binding, ManagedHookOperation::Install)
+                .unwrap();
+            assert!(!install.is_noop(), "install plan for {target}");
+            let expected_installed = if target == "codex" {
+                ManagedHookState::ApprovalRequired
+            } else {
+                ManagedHookState::Installed
+            };
+            assert_eq!(
+                manager.apply(install).unwrap().state,
+                expected_installed,
+                "installed status for {target}"
+            );
+            assert!(
+                manager
+                    .plan(&binding, ManagedHookOperation::Install)
+                    .unwrap()
+                    .is_noop(),
+                "idempotent Windows install for {target}"
+            );
+
+            let remove = manager
+                .plan(&binding, ManagedHookOperation::Remove)
+                .unwrap();
+            assert!(!remove.is_noop(), "remove plan for {target}");
+            assert_eq!(
+                manager.apply(remove).unwrap().state,
+                ManagedHookState::NotInstalled,
+                "removed status for {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_encoded_duplicates_collapse_to_one_on_reinstall() {
+        let root = TestRoot::new("windows-encoded-duplicates");
+        let manager = root.manager_for(RuntimePlatform::Windows);
+        let target_binding = binding("codex");
+        let spec = managed_hook_spec(&target_binding).unwrap();
+        let event = spec
+            .events
+            .iter()
+            .find(|event| event.name == "PreToolUse")
+            .unwrap();
+        let managed_command = manager.managed_command(spec, event).unwrap();
+        let config_path = manager.config_path(spec).unwrap();
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+
+        // Reproduces the observed defect on disk: seven identical copies of
+        // the same Windows-encoded managed hook accumulated in one event,
+        // the way `apply_json_install` used to append without ever matching
+        // `is_managed_command` against its own prior writes.
+        let duplicate = json!({
+            "hooks": [{"type": "command", "command": managed_command, "timeout": 10}],
+        });
+        let config = json!({
+            "hooks": {
+                "PreToolUse": vec![duplicate; 7],
+            },
+        });
+        fs::write(
+            &config_path,
+            format!("{}\n", serde_json::to_string_pretty(&config).unwrap()),
+        )
+        .unwrap();
+
+        manager
+            .apply(
+                manager
+                    .plan(&target_binding, ManagedHookOperation::Install)
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let installed: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+        let pre_tool_use = installed["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(
+            pre_tool_use
+                .iter()
+                .filter(|definition| definition_has_exact_command(definition, &managed_command))
+                .count(),
+            1,
+            "seven accumulated copies of the managed PreToolUse hook must collapse to one"
+        );
+        for definitions in installed["hooks"].as_object().unwrap().values() {
+            assert_eq!(
+                definitions.as_array().unwrap().len(),
+                1,
+                "every codex event keeps exactly one managed definition after reinstall"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_install_removes_only_managed_entries_and_keeps_foreign_ones() {
+        let root = TestRoot::new("windows-foreign-survives");
+        let manager = root.manager_for(RuntimePlatform::Windows);
+        let target_binding = binding("claude");
+        let spec = managed_hook_spec(&target_binding).unwrap();
+        let event = spec
+            .events
+            .iter()
+            .find(|event| event.name == "PreToolUse")
+            .unwrap();
+        let managed_command = manager.managed_command(spec, event).unwrap();
+        let config_path = manager.config_path(spec).unwrap();
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+
+        let managed_definition = json!({
+            "matcher": "*",
+            "hooks": [{"type": "command", "command": managed_command, "timeout": 10}],
+        });
+        let foreign_definition = json!({
+            "matcher": "*",
+            "hooks": [{"type": "command", "command": "C:/Users/owner/own-hook.ps1"}],
+        });
+        let mut pre_tool_use = vec![managed_definition; 3];
+        pre_tool_use.push(foreign_definition.clone());
+        let config = json!({ "hooks": { "PreToolUse": pre_tool_use } });
+        fs::write(
+            &config_path,
+            format!("{}\n", serde_json::to_string_pretty(&config).unwrap()),
+        )
+        .unwrap();
+
+        manager
+            .apply(
+                manager
+                    .plan(&target_binding, ManagedHookOperation::Install)
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let installed: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+        let pre_tool_use = installed["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(
+            pre_tool_use
+                .iter()
+                .filter(|definition| definition_has_exact_command(definition, &managed_command))
+                .count(),
+            1,
+            "duplicate managed PreToolUse entries collapse to one"
+        );
+        assert!(
+            pre_tool_use
+                .iter()
+                .any(|definition| *definition == foreign_definition),
+            "the owner's own PreToolUse hook must survive install untouched"
+        );
+    }
+
+    #[test]
+    fn is_managed_command_decodes_windows_encoded_form_and_tolerates_malformed_input() {
+        let root = TestRoot::new("encoded-command-decode");
+        let manager = root.manager_for(RuntimePlatform::Windows);
+        let target_binding = binding("claude");
+        let spec = managed_hook_spec(&target_binding).unwrap();
+        let event = spec
+            .events
+            .iter()
+            .find(|event| event.name == "PreToolUse")
+            .unwrap();
+        let managed_command = manager.managed_command(spec, event).unwrap();
+        assert!(is_managed_command(spec, &managed_command));
+
+        assert!(!is_managed_command(
+            spec,
+            "powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand not-valid-base64!!"
+        ));
+        assert!(!is_managed_command(
+            spec,
+            "powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand QQ=="
+        ));
+        let lone_surrogate = base64(&[0x00, 0xD8]);
+        assert!(!is_managed_command(
+            spec,
+            &format!("powershell -EncodedCommand {lone_surrogate}")
+        ));
+        assert!(!is_managed_command(
+            spec,
+            "powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand"
+        ));
     }
 }

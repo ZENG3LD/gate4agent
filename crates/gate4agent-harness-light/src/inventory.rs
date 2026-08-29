@@ -327,10 +327,21 @@ pub(crate) async fn handle_event(state: &LightState, event: &RoutedNodeEvent) {
 /// cursor-paged read over the sorted map, no C2 round trip. `limit` is
 /// trusted as already bounded by `HarnessOperatorRequestV1::validate()`
 /// (run by `crate::dispatch` before this is called).
+///
+/// `wire_version` is this request's own declared `HarnessOperatorEnvelopeV1
+/// ::version`, threaded in from `crate::dispatch::handle_request`. Every
+/// entry in `inventory` was built by `redact_runtime_inventory`, which
+/// always populates `screen_state: Some(..)` -- this function is the poll
+/// edge where that shared, canonical value stops being shared and becomes
+/// one connection's own copy, so `downgrade_runtime_inventory` runs here on
+/// each node before paging, the same way `gate4agent-harness-service::
+/// runtime`'s own `RuntimeInventoryList` handler and `write_operator_event`
+/// do at their own per-connection edges.
 pub(crate) async fn list(
     inventory: &SharedInventory,
     after_node_id: Option<String>,
     limit: u16,
+    wire_version: u16,
 ) -> HarnessOperatorReplyV1 {
     let limit = usize::from(limit);
     let guard = inventory.read().await;
@@ -346,7 +357,10 @@ pub(crate) async fn list(
         ),
         None => Box::new(guard.values()),
     };
-    let nodes = iter.by_ref().take(limit).cloned().collect::<Vec<_>>();
+    let mut nodes = iter.by_ref().take(limit).cloned().collect::<Vec<_>>();
+    for node in &mut nodes {
+        gate4agent_harness_service::runtime::downgrade_runtime_inventory(node, wire_version);
+    }
     // A `next_cursor` is only meaningful once the page actually stopped
     // short of the full roster: probing `iter` for one more item (past what
     // `take(limit)` already consumed) is how `HarnessRuntimeInventoryPageV1
@@ -380,7 +394,7 @@ pub(crate) async fn list(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gate4agent_harness_api::HarnessRuntimeInventoryV1;
+    use gate4agent_harness_api::{HarnessRuntimeInventoryV1, HARNESS_OPERATOR_WIRE_VERSION_V13};
 
     /// A minimal, wire-valid `HarnessRuntimeNodeInventoryV1` -- the
     /// "synthetic snapshot" this module's tests build sequences of, standing
@@ -428,7 +442,7 @@ mod tests {
 
         let HarnessOperatorReplyV1::Ok {
             response: HarnessOperatorResponseV1::RuntimeInventory(first_page),
-        } = list(&inventory, None, 2).await else {
+        } = list(&inventory, None, 2, HARNESS_OPERATOR_WIRE_VERSION_V13).await else {
             panic!("expected an Ok RuntimeInventory reply");
         };
         assert_eq!(
@@ -439,7 +453,7 @@ mod tests {
 
         let HarnessOperatorReplyV1::Ok {
             response: HarnessOperatorResponseV1::RuntimeInventory(second_page),
-        } = list(&inventory, first_page.next_cursor, 2).await else {
+        } = list(&inventory, first_page.next_cursor, 2, HARNESS_OPERATOR_WIRE_VERSION_V13).await else {
             panic!("expected an Ok RuntimeInventory reply");
         };
         assert_eq!(
@@ -454,7 +468,7 @@ mod tests {
         let inventory = new_shared();
         let HarnessOperatorReplyV1::Ok {
             response: HarnessOperatorResponseV1::RuntimeInventory(page),
-        } = list(&inventory, None, 16).await else {
+        } = list(&inventory, None, 16, HARNESS_OPERATOR_WIRE_VERSION_V13).await else {
             panic!("expected an Ok RuntimeInventory reply");
         };
         assert!(page.nodes.is_empty());

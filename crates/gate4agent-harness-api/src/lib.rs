@@ -70,6 +70,17 @@ pub const HARNESS_OPERATOR_WIRE_VERSION_V9: u16 = 9;
 pub const HARNESS_OPERATOR_WIRE_VERSION_V10: u16 = 10;
 pub const HARNESS_OPERATOR_WIRE_VERSION_V11: u16 = 11;
 pub const HARNESS_OPERATOR_WIRE_VERSION_V12: u16 = 12;
+/// V13 gates the two `screen_state` fields on `HarnessRuntimeTerminalFrameV1`
+/// and `HarnessRuntimeSessionV1` (see `PtyScreenStateV1`). Deliberately NOT
+/// wired into `requires_v13()`/`minimum_wire_version()`: those exist to
+/// reject an OLDER peer's request for something newer than it declared
+/// (e.g. an action added at V6 sent by a V4 caller). V13 gates the opposite
+/// direction -- what a RESPONSE field contains for a peer that already
+/// asked at any accepted version -- and every request is servable at any
+/// accepted version regardless of whether its reply happens to carry
+/// `screen_state`. Do not add `requires_v13()` by analogy with V4..V12;
+/// there is no request this version makes newly valid.
+pub const HARNESS_OPERATOR_WIRE_VERSION_V13: u16 = 13;
 // Realistic multi-pane ceiling with headroom; bounds the harness-side
 // per-subscriber HashSet<RuntimeSessionKey> and the connect-time seed burst
 // `SubscribeTerminal`'s handler sends immediately after registering (see
@@ -239,6 +250,7 @@ impl HarnessOperatorEnvelopeV1 {
                 | HARNESS_OPERATOR_WIRE_VERSION_V10
                 | HARNESS_OPERATOR_WIRE_VERSION_V11
                 | HARNESS_OPERATOR_WIRE_VERSION_V12
+                | HARNESS_OPERATOR_WIRE_VERSION_V13
         ) || self.version < self.request.minimum_wire_version()
         {
             return Err(HarnessOperatorApiError::UnsupportedVersion);
@@ -4004,6 +4016,59 @@ pub struct HarnessRuntimeTerminalSizeV1 {
     pub columns: u16,
 }
 
+/// Mirrors `gate4agent_types::FOREGROUND_PROCESS_NAME_MAX_BYTES`, the bound
+/// on `PtyScreenStateV1::NotAgent`'s `observed_process`. Hand-kept in step
+/// with the source constant for the same reason the enum itself is
+/// hand-duplicated below.
+pub const HARNESS_SCREEN_STATE_PROCESS_MAX_BYTES: usize = 512;
+/// Mirrors `gate4agent_types::PTY_SCREEN_GATE_NAME_MAX_BYTES`, the bound on
+/// both `PtyScreenStateV1::OperatorGate`'s `gate` and `Failing`'s `reason`.
+pub const HARNESS_SCREEN_STATE_GATE_MAX_BYTES: usize = 128;
+
+/// Exact mirror of `gate4agent_types::PtyScreenState`: this crate has no
+/// dependency on `gate4agent-types` (see the doc comment on
+/// `HarnessTerminalControlV1`), so the node's screen-content classification
+/// is duplicated here as its own closed wire enum rather than imported.
+/// `gate4agent-harness-service` is the single place that maps one into the
+/// other, so a variant added to one side without the other fails to compile
+/// there.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum PtyScreenStateV1 {
+    #[default]
+    Unknown,
+    NotAgent { observed_process: String },
+    OperatorGate { gate: String },
+    Failing { reason: String },
+    Ready,
+}
+
+impl PtyScreenStateV1 {
+    /// True only for `Ready` -- mirrors
+    /// `gate4agent_types::PtyScreenState::admits_blind_write`, so a wire
+    /// consumer has the same single predicate and no call site open-codes
+    /// `matches!(.., Ready)` and gets `Unknown` wrong.
+    pub fn admits_blind_write(&self) -> bool {
+        matches!(self, Self::Ready)
+    }
+
+    fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        let ok = match self {
+            Self::Unknown | Self::Ready => true,
+            Self::NotAgent { observed_process } => {
+                valid_native_single_line(observed_process, HARNESS_SCREEN_STATE_PROCESS_MAX_BYTES, true)
+            }
+            Self::OperatorGate { gate } => {
+                valid_native_single_line(gate, HARNESS_SCREEN_STATE_GATE_MAX_BYTES, true)
+            }
+            Self::Failing { reason } => {
+                valid_native_single_line(reason, HARNESS_SCREEN_STATE_GATE_MAX_BYTES, true)
+            }
+        };
+        if ok { Ok(()) } else { Err(HarnessOperatorApiError::InvalidRuntimeInventory) }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HarnessRuntimeSessionV1 {
@@ -4016,6 +4081,16 @@ pub struct HarnessRuntimeSessionV1 {
     pub terminal_size: Option<HarnessRuntimeTerminalSizeV1>,
     pub operation_pending: bool,
     pub input_pending: bool,
+    /// The node's current screen classification, present only when the
+    /// requesting peer declared `>= HARNESS_OPERATOR_WIRE_VERSION_V13`.
+    /// `skip_serializing_if` is load-bearing: the key must be ABSENT from
+    /// the JSON, not `null`, or a pre-V13 `deny_unknown_fields` decoder
+    /// rejects the whole message. `None` means "this peer did not ask for a
+    /// version that carries it" -- it is NOT the same as `Some(Unknown)`
+    /// ("asked, and nothing is classified yet"); a consumer must not
+    /// conflate the two.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screen_state: Option<PtyScreenStateV1>,
 }
 
 impl HarnessRuntimeSessionV1 {
@@ -4026,6 +4101,9 @@ impl HarnessRuntimeSessionV1 {
             || self.terminal_size.is_some_and(|size| size.rows == 0 || size.columns == 0)
         {
             return Err(HarnessOperatorApiError::InvalidRuntimeInventory);
+        }
+        if let Some(screen_state) = &self.screen_state {
+            screen_state.validate()?;
         }
         Ok(())
     }
@@ -4057,6 +4135,16 @@ pub struct HarnessRuntimeTerminalFrameV1 {
     /// existed still decodes the frame -- it just can't answer "how stale".
     #[serde(default)]
     pub produced_at_unix_ms: u64,
+    /// The screen classification stamped at the instant this frame's screen
+    /// was materialized, present only when the requesting peer declared
+    /// `>= HARNESS_OPERATOR_WIRE_VERSION_V13`. `skip_serializing_if` is
+    /// load-bearing: the key must be ABSENT from the JSON, not `null`, or a
+    /// pre-V13 `deny_unknown_fields` decoder rejects the whole message.
+    /// `None` means "this peer did not ask for a version that carries it"
+    /// -- it is NOT the same as `Some(Unknown)` ("asked, and nothing is
+    /// classified yet"); a consumer must not conflate the two.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screen_state: Option<PtyScreenStateV1>,
 }
 // NOTE: gate4agent_types::TerminalFrame::contents (plain-text render) is
 // deliberately dropped on the wire -- gate4agent-tui's apply_terminal_frame
@@ -4075,6 +4163,9 @@ impl HarnessRuntimeTerminalFrameV1 {
             .fold(0usize, usize::saturating_add);
         if self.formatted.len().saturating_add(scrollback_bytes) > HARNESS_TERMINAL_FRAME_MAX_BYTES {
             return Err(HarnessOperatorApiError::InvalidTerminalPage);
+        }
+        if let Some(screen_state) = &self.screen_state {
+            screen_state.validate()?;
         }
         Ok(())
     }
@@ -8178,6 +8269,115 @@ mod tests {
             mouse_protocol_enabled: false,
             mouse_protocol_encoding: HarnessRuntimeMouseProtocolEncodingV1::Default,
             produced_at_unix_ms: 1_000,
+            screen_state: None,
+        }
+    }
+
+    fn sample_runtime_session(instance_id: u64, generation: u64) -> HarnessRuntimeSessionV1 {
+        HarnessRuntimeSessionV1 {
+            instance_id,
+            generation,
+            provider: "codex".to_owned(),
+            transport: HarnessRuntimeTransportV1::Pty,
+            status: HarnessRuntimeSessionStatusV1::Running,
+            process_id: Some(1234),
+            terminal_size: Some(HarnessRuntimeTerminalSizeV1 { rows: 24, columns: 80 }),
+            operation_pending: false,
+            input_pending: false,
+            screen_state: None,
+        }
+    }
+
+    /// Every `PtyScreenStateV1` variant, for the round-trip and validation
+    /// sweeps below -- kept as one list so a variant added to the enum
+    /// without a matching addition here is caught by a stale sweep rather
+    /// than silently under-covered.
+    fn every_screen_state_variant() -> Vec<PtyScreenStateV1> {
+        vec![
+            PtyScreenStateV1::Unknown,
+            PtyScreenStateV1::NotAgent { observed_process: "installer.exe".to_owned() },
+            PtyScreenStateV1::OperatorGate { gate: "workspace-trust".to_owned() },
+            PtyScreenStateV1::Failing { reason: "crash-loop".to_owned() },
+            PtyScreenStateV1::Ready,
+        ]
+    }
+
+    /// The literal proof the `deny_unknown_fields` hazard is closed: a
+    /// pre-V13 reply (`screen_state: None`) must omit the KEY entirely, not
+    /// serialize it as `null` -- an older client's struct has no such field
+    /// at all, so a `null` value would still trip `deny_unknown_fields`.
+    #[test]
+    fn a_terminal_frame_with_no_screen_state_serializes_without_the_key_at_all() {
+        let frame = sample_terminal_frame(1);
+        assert!(frame.screen_state.is_none());
+        let value = serde_json::to_value(&frame).unwrap();
+        assert!(
+            value.as_object().unwrap().get("screen_state").is_none(),
+            "expected no screen_state key in {value}",
+        );
+    }
+
+    /// Sibling of the above for `HarnessRuntimeSessionV1` -- the session
+    /// inventory's own reply carries the identical hazard and the identical
+    /// fix.
+    #[test]
+    fn a_runtime_session_with_no_screen_state_serializes_without_the_key_at_all() {
+        let session = sample_runtime_session(1, 1);
+        assert!(session.screen_state.is_none());
+        let value = serde_json::to_value(&session).unwrap();
+        assert!(
+            value.as_object().unwrap().get("screen_state").is_none(),
+            "expected no screen_state key in {value}",
+        );
+    }
+
+    /// `Some(..)` round-trips byte-exact for every variant, on both wire
+    /// types that carry it.
+    #[test]
+    fn some_screen_state_round_trips_exactly_for_every_variant_on_both_carriers() {
+        for variant in every_screen_state_variant() {
+            let mut frame = sample_terminal_frame(1);
+            frame.screen_state = Some(variant.clone());
+            let decoded_frame: HarnessRuntimeTerminalFrameV1 = serde_json::from_slice(
+                &serde_json::to_vec(&frame).unwrap(),
+            ).unwrap();
+            assert_eq!(decoded_frame, frame);
+
+            let mut session = sample_runtime_session(1, 1);
+            session.screen_state = Some(variant.clone());
+            let decoded_session: HarnessRuntimeSessionV1 = serde_json::from_slice(
+                &serde_json::to_vec(&session).unwrap(),
+            ).unwrap();
+            assert_eq!(decoded_session, session);
+        }
+    }
+
+    /// `validate()` rejects an oversized carried string inside a present
+    /// `screen_state`, on both carriers -- the bound is enforced regardless
+    /// of which wire type happens to hold the value.
+    #[test]
+    fn validate_rejects_an_oversized_string_inside_a_present_screen_state() {
+        let oversized_process = "x".repeat(HARNESS_SCREEN_STATE_PROCESS_MAX_BYTES + 1);
+        let oversized_gate = "x".repeat(HARNESS_SCREEN_STATE_GATE_MAX_BYTES + 1);
+        let cases = [
+            PtyScreenStateV1::NotAgent { observed_process: oversized_process },
+            PtyScreenStateV1::OperatorGate { gate: oversized_gate.clone() },
+            PtyScreenStateV1::Failing { reason: oversized_gate },
+        ];
+        for case in cases {
+            let mut frame = sample_terminal_frame(1);
+            frame.screen_state = Some(case.clone());
+            assert!(
+                matches!(frame.validate(), Err(HarnessOperatorApiError::InvalidRuntimeInventory)),
+                "expected frame validate() to reject {case:?}",
+            );
+
+            let mut session = sample_runtime_session(1, 1);
+            session.screen_state = Some(case.clone());
+            assert!(
+                matches!(session.validate(), Err(HarnessOperatorApiError::InvalidRuntimeInventory)),
+                "expected session validate() to reject {case:?}",
+            );
         }
     }
 
@@ -9137,6 +9337,27 @@ mod tests {
         ));
         HarnessOperatorEnvelopeV1 {
             version: HARNESS_OPERATOR_WIRE_VERSION_V12,
+            credential,
+            request,
+        }.validate().unwrap();
+    }
+
+    /// V13 gates a reply FIELD (`screen_state`), not any request's minimum
+    /// version -- so a request that already required V12 must still
+    /// validate at V13 unchanged, proving the new accepted-version entry
+    /// regresses nothing already served at an older accepted version.
+    #[test]
+    fn operator_v13_is_accepted_and_a_v12_minimum_request_still_validates_at_v13() {
+        let request = HarnessOperatorRequestV1::SubscribeTerminal {
+            sessions: vec![session_address(1, 1)],
+        };
+        assert_eq!(request.minimum_wire_version(), HARNESS_OPERATOR_WIRE_VERSION_V12);
+        let credential = HarnessOperatorCredential::parse(format!(
+            "g4aho_{}",
+            "a".repeat(64),
+        )).unwrap();
+        HarnessOperatorEnvelopeV1 {
+            version: HARNESS_OPERATOR_WIRE_VERSION_V13,
             credential,
             request,
         }.validate().unwrap();

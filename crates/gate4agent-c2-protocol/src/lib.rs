@@ -69,8 +69,8 @@ use gate4agent_node_protocol::{
     SessionAddress, SessionMode, SessionRecordId, WorkspaceId,
 };
 use gate4agent_types::{
-    AgentInstanceId, OperationId, PreparedInputKind, ProviderActivity, SessionGeneration,
-    SessionStatus, TerminalFrame, TerminalSize, TransportKind,
+    AgentInstanceId, OperationId, PreparedInputKind, ProviderActivity, PtyScreenState,
+    SessionGeneration, SessionStatus, TerminalFrame, TerminalSize, TransportKind,
 };
 use serde::de::{SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -549,6 +549,15 @@ pub struct C2SessionSnapshot {
     pub provider_activity: ProviderActivity,
     pub provider_interaction_pending: bool,
     pub provider_identity_present: bool,
+    /// The session's CURRENT screen classification, projected from
+    /// `gate4agent_types::SessionSnapshot::screen_state` the same way
+    /// `provider_activity`/`provider_interaction_pending` are: as its own
+    /// field rather than something a reader reconstructs from
+    /// `terminal_frame`, which only carries the classification stamped at
+    /// one past frame, not the session's current one. `#[serde(default)]`
+    /// so a peer that predates this field decodes it as `Unknown`.
+    #[serde(default)]
+    pub screen_state: PtyScreenState,
 }
 
 impl From<&gate4agent_types::SessionSnapshot> for C2SessionSnapshot {
@@ -567,6 +576,7 @@ impl From<&gate4agent_types::SessionSnapshot> for C2SessionSnapshot {
             provider_activity: session.provider.activity,
             provider_interaction_pending: !session.provider.interactions.is_empty(),
             provider_identity_present: session.provider.session.is_some(),
+            screen_state: session.screen_state.clone(),
         }
     }
 }
@@ -2661,6 +2671,13 @@ pub struct SlimSession {
     pub terminal_size: Option<TerminalSize>,
     pub operation_pending: bool,
     pub input_pending: bool,
+    /// The node's current screen classification for this session, carried
+    /// on the inventory rather than only on terminal frames so a consumer
+    /// deciding whether to hand this session work can read it without
+    /// subscribing to frames for every session it owns. `#[serde(default)]`
+    /// decodes an older node's silence as `Unknown`.
+    #[serde(default)]
+    pub screen_state: PtyScreenState,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2792,6 +2809,7 @@ impl SlimNodeInventory {
                 terminal_size: session.terminal_size,
                 operation_pending: session.pending_operation.is_some(),
                 input_pending: session.pending_input.is_some(),
+                screen_state: session.screen_state.clone(),
             }).collect();
             remaining_sessions -= take;
             let display_root = sanitize_host_path_display(&workspace.canonical_root);
@@ -2870,6 +2888,7 @@ impl SlimNodeInventory {
                 terminal_size: session.terminal_size,
                 operation_pending: session.pending_operation.is_some(),
                 input_pending: session.pending_input.is_some(),
+                screen_state: session.screen_state.clone(),
             }).collect();
             remaining_sessions -= take;
             let display_root = sanitize_host_path_display(&workspace.canonical_root);
@@ -4815,6 +4834,56 @@ mod tests {
         let json = serde_json::to_string(&slim).unwrap();
         assert!(!json.contains("terminal_frame"));
         assert!(!json.contains("history"));
+    }
+
+    /// A `SlimSession` payload from a node that predates `screen_state`
+    /// decodes the missing key as `Unknown`, never as the optimistic
+    /// `Ready` -- the entire point of `#[serde(default)]` on that field.
+    #[test]
+    fn slim_session_json_omitting_screen_state_decodes_to_unknown_not_ready() {
+        let json = r#"{
+            "instance_id": 7,
+            "generation": 2,
+            "agent_id": "codex",
+            "transport": "pty",
+            "status": "running",
+            "process_id": 1234,
+            "terminal_size": null,
+            "operation_pending": true,
+            "input_pending": false
+        }"#;
+        let session = serde_json::from_str::<SlimSession>(json).unwrap();
+        assert_eq!(session.screen_state, PtyScreenState::Unknown);
+        assert_ne!(session.screen_state, PtyScreenState::Ready);
+    }
+
+    /// The slim projection carries the session's non-default screen
+    /// classification through unchanged from the `SessionSnapshot` it was
+    /// built from -- proving `SlimNodeInventory::from_snapshot` does not
+    /// silently drop it back to the default the way an unset field would.
+    #[test]
+    fn slim_inventory_projection_carries_a_non_default_screen_state_from_the_session_snapshot() {
+        let mut session = fixture_session();
+        session.screen_state = PtyScreenState::OperatorGate { gate: "workspace-trust".to_owned() };
+        let snapshot = NodeSnapshot {
+            node_id: NodeId::new("node-a").unwrap(),
+            enabled_providers: vec![provider("codex")],
+            provider_runtime_statuses: ProviderRuntimeStatuses::default(),
+            workspaces: vec![WorkspaceSnapshot {
+                workspace_id: WorkspaceId::new("a-work").unwrap(),
+                canonical_root: host_path("a"),
+                sessions: vec![session.clone()],
+                worktree_service_mode: None,
+                managed_worktree_profiles: None,
+            }],
+            session_records: Vec::new(),
+            managed_worktrees: Vec::new(),
+            launch_inventory: None,
+            agent_progress: Vec::new(),
+        };
+        let slim = SlimNodeInventory::from_snapshot(&snapshot);
+        let slim_session = &slim.workspaces[&WorkspaceId::new("a-work").unwrap()].sessions[0];
+        assert_eq!(slim_session.screen_state, session.screen_state);
     }
 
     #[test]

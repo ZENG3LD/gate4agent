@@ -495,11 +495,11 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<LightState>) {
             let (sender, receiver) = mpsc::channel(LIGHT_SUBSCRIBER_QUEUE_CAPACITY);
             state.commands.send(LightCommand::Subscribe { sender, identity }).await
                 .map_err(|_| HarnessRuntimeError::HostStopped)?;
-            subscription = Some((receiver, subscriber_permit));
+            subscription = Some((receiver, subscriber_permit, envelope.version));
             return Ok(());
         }
 
-        let reply = dispatch::handle_request(&state, envelope.request).await;
+        let reply = dispatch::handle_request(&state, envelope.request, envelope.version).await;
         match write_operator_reply(&mut stream, reply).await {
             Err(HarnessRuntimeError::ResponseTooLarge) => write_operator_reply(
                 &mut stream,
@@ -511,8 +511,10 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<LightState>) {
 
     match outcome {
         Ok(Ok(())) => {
-            if let Some((receiver, subscriber_permit)) = subscription {
-                let _ = run_operator_event_subscription(stream, receiver, subscriber_permit).await;
+            if let Some((receiver, subscriber_permit, wire_version)) = subscription {
+                let _ = run_operator_event_subscription(
+                    stream, receiver, subscriber_permit, wire_version,
+                ).await;
             }
         }
         Ok(Err(error)) => {

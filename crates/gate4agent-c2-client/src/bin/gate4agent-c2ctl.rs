@@ -509,6 +509,7 @@ mod tests {
             provider_activity: ProviderActivity::Idle,
             provider_interaction_pending: false,
             provider_identity_present: false,
+            screen_state: PtyScreenState::default(),
         }
     }
 

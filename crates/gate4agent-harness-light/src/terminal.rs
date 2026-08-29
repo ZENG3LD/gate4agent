@@ -95,6 +95,7 @@ pub(crate) async fn read(
     session: HarnessRuntimeSessionAddressV1,
     after_sequence: Option<u64>,
     limit: u16,
+    wire_version: u16,
 ) -> HarnessOperatorReplyV1 {
     let key = match terminal_session_key(&session) {
         Ok(key) => key,
@@ -120,7 +121,9 @@ pub(crate) async fn read(
     };
     let response = HarnessRuntimeTerminalPageV1 {
         session,
-        frames: page.frames.into_iter().map(terminal_frame_to_wire).collect(),
+        frames: page.frames.into_iter()
+            .map(|frame| terminal_frame_to_wire(frame, wire_version))
+            .collect(),
         dropped: page.dropped,
         transport_incomplete: page.transport_incomplete,
         next_cursor: page.next_cursor,
@@ -150,6 +153,7 @@ fn terminal_session_key(session: &HarnessRuntimeSessionAddressV1) -> Result<Runt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gate4agent_harness_api::HARNESS_OPERATOR_WIRE_VERSION_V13;
     use gate4agent_node_protocol::NodeIncarnationId;
     use gate4agent_types::{
         PtyScreenState, TerminalFrame, TerminalMouseProtocolEncoding, TerminalSize,
@@ -209,7 +213,7 @@ mod tests {
         let address = sample_address(&key);
 
         let HarnessOperatorReplyV1::Ok { response: HarnessOperatorResponseV1::TerminalRead(page) } =
-            read(&registry, address.clone(), None, 2).await
+            read(&registry, address.clone(), None, 2, HARNESS_OPERATOR_WIRE_VERSION_V13).await
         else {
             panic!("expected an Ok TerminalRead reply");
         };
@@ -219,7 +223,7 @@ mod tests {
         assert!(!page.transport_incomplete);
 
         let HarnessOperatorReplyV1::Ok { response: HarnessOperatorResponseV1::TerminalRead(page) } =
-            read(&registry, address, page.next_cursor, 16).await
+            read(&registry, address, page.next_cursor, 16, HARNESS_OPERATOR_WIRE_VERSION_V13).await
         else {
             panic!("expected an Ok TerminalRead reply");
         };
@@ -234,7 +238,7 @@ mod tests {
         let registry = new_shared();
         let address = sample_address(&sample_key("node-a", 'a'));
 
-        let reply = read(&registry, address, None, 16).await;
+        let reply = read(&registry, address, None, 16, HARNESS_OPERATOR_WIRE_VERSION_V13).await;
         assert!(matches!(
             reply,
             HarnessOperatorReplyV1::Error { error: HarnessOperatorHostErrorV1::NotFound },
@@ -266,7 +270,7 @@ mod tests {
         handle_event(&registry, &frame_event).await;
         let address = sample_address(&key);
         assert!(matches!(
-            read(&registry, address.clone(), None, 16).await,
+            read(&registry, address.clone(), None, 16, HARNESS_OPERATOR_WIRE_VERSION_V13).await,
             HarnessOperatorReplyV1::Ok { response: HarnessOperatorResponseV1::TerminalRead(_) },
         ));
 
@@ -277,7 +281,7 @@ mod tests {
         };
         handle_event(&registry, &resync_event).await;
         assert!(matches!(
-            read(&registry, address, None, 16).await,
+            read(&registry, address, None, 16, HARNESS_OPERATOR_WIRE_VERSION_V13).await,
             HarnessOperatorReplyV1::Error { error: HarnessOperatorHostErrorV1::NotFound },
         ));
     }

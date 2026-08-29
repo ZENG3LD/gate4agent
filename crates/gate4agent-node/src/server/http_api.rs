@@ -255,6 +255,9 @@ fn metrics_body(shared: &NodeShared) -> Value {
             "events_rejected_total": hook_outcomes.rejected,
             "events_undeliverable_total": hook_outcomes.undeliverable,
         },
+        "control_commands": {
+            "rejected_total": shared.rejected_commands_total.load(Ordering::Relaxed),
+        },
         "sessions": {
             "native_pty": native_pty_sessions,
             "control_plane": control_plane_sessions,

@@ -2224,10 +2224,19 @@ impl Gate4AgentEngine {
             .iter()
             .any(provider_event_carries_session_identity)
         {
-            require_runtime_capability(
-                state.runtime_policy,
-                ProviderRuntimeCapability::ProviderSessionIdentity,
-            )?;
+            // `HookSemantics` authorizes the hook source entirely, session
+            // identity included. Splitting a hook's authority across two
+            // capabilities would invent a distinction with no trust basis
+            // behind it: the same authenticated route reports the session id
+            // and everything else in the same payload, and neither half is
+            // inferred from terminal text. `ProviderSessionIdentity` keeps
+            // guarding the sources that ARE inferred.
+            let capability = if source.family == AdapterFamily::Hook {
+                ProviderRuntimeCapability::HookSemantics
+            } else {
+                ProviderRuntimeCapability::ProviderSessionIdentity
+            };
+            require_runtime_capability(state.runtime_policy, capability)?;
         }
         let canonical_steps = events.len() as u64 + u64::from(missed > 0);
         if state

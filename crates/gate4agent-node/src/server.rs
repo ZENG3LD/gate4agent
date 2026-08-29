@@ -2529,6 +2529,23 @@ async fn drive_runtime_until_shutdown(
         let runtime_tick_elapsed = runtime_tick_start.elapsed();
 
         let event_drain_start = Instant::now();
+        // Every command the kernel refused, named. `NativeRuntimeTick`
+        // has carried these outcomes all along and nothing read them, so a
+        // rejected command -- a hook event denied by runtime policy, a
+        // stale generation, an unsupported capability -- vanished at the
+        // last step of the loop that produced it. A refusal the operator
+        // cannot see is indistinguishable from an event that never arrived,
+        // and telling those two apart is most of debugging this stack.
+        for outcome in &tick_result.command_outcomes {
+            if let Err(error) = &outcome.result {
+                shared.rejected_commands_total.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    command_id = outcome.command_id.0,
+                    cause = %error,
+                    "control command rejected"
+                );
+            }
+        }
         let mut events_drained: u64 = 0;
         while let Ok(event) = events.try_recv() {
             events_drained += 1;
@@ -3028,6 +3045,11 @@ struct NodeShared {
     /// other profiles. Both are plain integers -- no percentile sort behind
     /// them -- so unlike a profile snapshot this costs nothing to keep warm.
     hook_ingress_outcomes: Mutex<(gate4agent_runtime_native::HookIngressEventOutcomes, usize)>,
+    /// Lifetime count of control commands the kernel refused. Read it
+    /// against the hook ingress's own dispatched total: events arriving and
+    /// commands being rejected at the same rate is a policy refusal, not a
+    /// delivery failure.
+    rejected_commands_total: AtomicU64,
     drive_loop_iterations_total: AtomicU64,
     drive_loop_iterations_idle: AtomicU64,
     #[cfg(feature = "fixture")]
@@ -3360,6 +3382,7 @@ impl NodeShared {
             connection_loop_iterations: AtomicU64::new(0),
             connection_events_sent: AtomicU64::new(0),
             hook_ingress_outcomes: Mutex::new(Default::default()),
+            rejected_commands_total: AtomicU64::new(0),
             drive_loop_iterations_total: AtomicU64::new(0),
             drive_loop_iterations_idle: AtomicU64::new(0),
             #[cfg(feature = "fixture")]

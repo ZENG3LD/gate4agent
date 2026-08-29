@@ -22,3 +22,7 @@ crates/gate4agent-tui/tools/.codicon-cache/
 # Same, for the upstream Lucide source SVGs (alongside codicons -- see
 # `app::IconFamily`'s own doc comment).
 crates/gate4agent-tui/tools/.lucide-cache/
+
+# Python bytecode from the icon-baking tool
+__pycache__/
+*.pyc

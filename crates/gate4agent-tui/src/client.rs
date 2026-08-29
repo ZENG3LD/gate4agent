@@ -77,7 +77,7 @@ use gate4agent_harness_protocol::HarnessSelectorV1;
 use gate4agent_types::{
     AgentId, AgentInstanceId, ProviderActivity, ProviderSessionIdentity,
     HistoryMessageRole, NativeSessionExternalGroup, NativeSessionExternalGroupKind,
-    NativeSessionPreviewMessage, SessionGeneration,
+    NativeSessionPreviewMessage, PtyScreenState, SessionGeneration,
     TerminalFrame, TerminalSize,
     TerminalMouseProtocolEncoding, TransportKind,
 };
@@ -6257,6 +6257,9 @@ fn terminal_frame_from_harness(frame: HarnessRuntimeTerminalFrameV1) -> Terminal
             HarnessRuntimeMouseProtocolEncodingV1::Utf8 => TerminalMouseProtocolEncoding::Utf8,
             HarnessRuntimeMouseProtocolEncodingV1::Sgr => TerminalMouseProtocolEncoding::Sgr,
         },
+        // `HarnessRuntimeTerminalFrameV1` does not carry a screen
+        // classification yet, so there is nothing to convert here.
+        screen_state: PtyScreenState::Unknown,
     }
 }
 

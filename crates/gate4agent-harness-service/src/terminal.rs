@@ -464,7 +464,7 @@ mod tests {
     use gate4agent_observation_api::{
         AgentInstanceId, NodeId, NodeIncarnationId, SessionGeneration, WorkspaceId,
     };
-    use gate4agent_types::TerminalSize;
+    use gate4agent_types::{PtyScreenState, TerminalSize};
 
     fn sample_key(node_id: &str, incarnation: char) -> RuntimeSessionKey {
         RuntimeSessionKey {
@@ -489,6 +489,7 @@ mod tests {
             mouse_protocol_enabled: false,
             mouse_protocol_encoding: TerminalMouseProtocolEncoding::Default,
             produced_at_unix_ms: 0,
+            screen_state: PtyScreenState::default(),
         }
     }
 

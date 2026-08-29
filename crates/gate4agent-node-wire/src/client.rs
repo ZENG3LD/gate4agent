@@ -2746,8 +2746,8 @@ mod tests {
     }
     use gate4agent_types::{
         AgentInstanceId, CapabilitySnapshot, ForegroundSnapshot, HistorySnapshot,
-        ProviderSnapshot, ResumeSnapshot, SessionGeneration, SessionSnapshot, SessionStatus,
-        TerminalFrame, TerminalSize, TransportKind,
+        ProviderSnapshot, PtyScreenState, ResumeSnapshot, SessionGeneration, SessionSnapshot,
+        SessionStatus, TerminalFrame, TerminalSize, TransportKind,
     };
 
     fn agent(value: &str) -> AgentId {
@@ -2829,6 +2829,7 @@ mod tests {
             resume: ResumeSnapshot::default(),
             foreground: ForegroundSnapshot::default(),
             provider: ProviderSnapshot::default(),
+            screen_state: PtyScreenState::default(),
         }
     }
 
@@ -3793,6 +3794,7 @@ mod tests {
                     mouse_protocol_enabled: false,
                     mouse_protocol_encoding: Default::default(),
                     produced_at_unix_ms: 0,
+                    screen_state: PtyScreenState::default(),
                 },
             },
         });
@@ -3880,6 +3882,7 @@ mod tests {
                         mouse_protocol_enabled: false,
                         mouse_protocol_encoding: Default::default(),
                         produced_at_unix_ms: 0,
+                        screen_state: PtyScreenState::default(),
                     },
                 },
             }

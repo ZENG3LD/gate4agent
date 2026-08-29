@@ -42,8 +42,8 @@ use gate4agent_types::{
     ForegroundRequirement, InputAction, ObservationEnvelope, OperationId, PipeProtocol,
     PreparedInputKind, PromptPayload, ProviderEvent, ProviderInteractionKind,
     ProviderRuntimeCapability, ProviderRuntimePolicy, ProviderSessionIdentity, ProviderSessionKey,
-    ProviderSource, ResumeLaunchRequest, SessionGeneration, StartRequest, TerminalFrame,
-    TerminalMouseProtocolEncoding, TerminalSize, TokenUsage, TransportKind,
+    ProviderSource, PtyScreenState, ResumeLaunchRequest, SessionGeneration, StartRequest,
+    TerminalFrame, TerminalMouseProtocolEncoding, TerminalSize, TokenUsage, TransportKind,
     CONTROL_PROTOCOL_VERSION, WORKING_DIRECTORY_MAX_BYTES,
 };
 use std::collections::{BTreeMap, VecDeque};
@@ -2315,6 +2315,9 @@ fn terminal_frame(snapshot: PtyTerminalSnapshot) -> TerminalFrame {
         // Carried through unchanged from the PTY snapshot -- this crate does
         // not restamp it, see `TerminalFrame::produced_at_unix_ms`'s own doc.
         produced_at_unix_ms: snapshot.produced_at_unix_ms,
+        // No classifier is wired in yet -- the process/text match that
+        // produces a real `PtyScreenState` lands in a later slice.
+        screen_state: PtyScreenState::Unknown,
     }
 }
 

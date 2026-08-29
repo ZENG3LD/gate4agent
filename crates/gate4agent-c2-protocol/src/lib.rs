@@ -3048,8 +3048,8 @@ mod tests {
         CapabilitySnapshot, ControlEvent, ControlEventKind, ForegroundSnapshot, HistorySnapshot,
         OperationId, PreparedInputKind, ProviderEvent, ProviderInteractionOutcome,
         ProviderSessionIdentity, ProviderSessionKey, ProviderSnapshot, ProviderSource,
-        ResumeSessionSummary, ResumeSnapshot, SessionGeneration, SessionSnapshot, SessionStatus,
-        TerminalSize, TransportKind,
+        PtyScreenState, ResumeSessionSummary, ResumeSnapshot, SessionGeneration, SessionSnapshot,
+        SessionStatus, TerminalSize, TransportKind,
     };
 
     #[test]
@@ -3145,6 +3145,7 @@ mod tests {
             resume: ResumeSnapshot::default(),
             foreground: ForegroundSnapshot::default(),
             provider: ProviderSnapshot::default(),
+            screen_state: PtyScreenState::default(),
         }
     }
 
@@ -3518,13 +3519,14 @@ mod tests {
                 mouse_protocol_encoding:
                     gate4agent_types::TerminalMouseProtocolEncoding::Default,
                 produced_at_unix_ms: 0,
+                screen_state: gate4agent_types::PtyScreenState::default(),
             },
         };
         let event = C2NodeEvent::from(&source);
         let json = serde_json::to_string(&event).unwrap();
         assert_eq!(
             json,
-            r#"{"kind":"terminal-frame","address":{"workspace_id":"primary","session":{"instance_id":7,"generation":3}},"frame":{"sequence":11,"size":{"rows":24,"columns":80},"cursor_row":2,"cursor_column":4,"contents":"ready","formatted":[114,101,97,100,121],"scrollback_formatted":[[112,114,101,118,105,111,117,115]],"alternate_screen":false,"mouse_protocol_enabled":false,"mouse_protocol_encoding":"default","produced_at_unix_ms":0}}"#,
+            r#"{"kind":"terminal-frame","address":{"workspace_id":"primary","session":{"instance_id":7,"generation":3}},"frame":{"sequence":11,"size":{"rows":24,"columns":80},"cursor_row":2,"cursor_column":4,"contents":"ready","formatted":[114,101,97,100,121],"scrollback_formatted":[[112,114,101,118,105,111,117,115]],"alternate_screen":false,"mouse_protocol_enabled":false,"mouse_protocol_encoding":"default","produced_at_unix_ms":0,"screen_state":{"kind":"unknown"}}}"#,
         );
         assert_eq!(serde_json::from_str::<C2NodeEvent>(&json).unwrap(), event);
     }

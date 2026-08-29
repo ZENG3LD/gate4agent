@@ -18223,6 +18223,7 @@ mod tests {
             resume: gate4agent_types::ResumeSnapshot::default(),
             foreground: gate4agent_types::ForegroundSnapshot::default(),
             provider: gate4agent_types::ProviderSnapshot::default(),
+            screen_state: gate4agent_types::PtyScreenState::default(),
         };
         let original = NodeSnapshot {
             node_id: NodeId::new("node-terminal-test").unwrap(),
@@ -20256,6 +20257,7 @@ mod tests {
             mouse_protocol_enabled: false,
             mouse_protocol_encoding: Default::default(),
             produced_at_unix_ms: 0,
+            screen_state: gate4agent_types::PtyScreenState::default(),
         }
     }
 

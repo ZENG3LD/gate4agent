@@ -2787,8 +2787,8 @@ mod tests {
         WorkspaceId,
     };
     use gate4agent_types::{
-        AgentInstanceId, ProviderSessionIdentity, ProviderSessionKey, SessionGeneration,
-        TerminalFrame, TerminalSize,
+        AgentInstanceId, ProviderSessionIdentity, ProviderSessionKey, PtyScreenState,
+        SessionGeneration, TerminalFrame, TerminalSize,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2902,6 +2902,7 @@ mod tests {
                 mouse_protocol_enabled: false,
                 mouse_protocol_encoding: Default::default(),
                 produced_at_unix_ms: 0,
+                screen_state: PtyScreenState::default(),
             },
         }
     }

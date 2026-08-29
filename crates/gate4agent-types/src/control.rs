@@ -215,9 +215,20 @@ pub struct TerminalFrame {
     /// gap as pure network/queue latency.
     #[serde(default)]
     pub produced_at_unix_ms: u64,
+    /// The screen classification at the instant THIS frame's screen was
+    /// materialized -- stamped once at the node from the same snapshot that
+    /// produced `contents`/`formatted`, and carried through every hop
+    /// unchanged like `produced_at_unix_ms`; no hop may recompute it against
+    /// its own (possibly staler) copy of the screen. `#[serde(default)]` so a
+    /// peer that predates this field decodes it as `Unknown` -- "not
+    /// classified" -- rather than a fabricated `Ready`; defaulting to
+    /// `Unknown` and not `Ready` is the entire point of that default.
+    #[serde(default)]
+    pub screen_state: PtyScreenState,
 }
 
 pub const FOREGROUND_PROCESS_NAME_MAX_BYTES: usize = 512;
+pub const PTY_SCREEN_GATE_NAME_MAX_BYTES: usize = 128;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
@@ -263,6 +274,92 @@ pub struct ForegroundSnapshot {
     pub authority: ForegroundAuthority,
     pub process: Option<ForegroundProcess>,
     pub stale_reason: Option<String>,
+}
+
+/// Whether the screen currently painted at a PTY looks like the agent's own
+/// composer, as classified by the node from the same terminal text a human
+/// would read. This is a screen-content judgement, never a process-liveness
+/// one -- `SessionStatus` already answers "is something running", and a
+/// consumer must not fold the two into a single "is it running" question:
+/// a process can be `Running` while its screen sits on an unrelated
+/// installer prompt, and that combination is exactly the case this type
+/// exists to distinguish.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum PtyScreenState {
+    /// No observation has been made for this generation yet, or the most
+    /// recent observation attempt failed. A caller deciding whether to write
+    /// to the PTY blindly must treat this exactly like `NotAgent` -- there is
+    /// no "probably fine" reading of "unclassified". Never optimistic.
+    #[default]
+    Unknown,
+    /// The PTY's foreground process is neither the agent's own binary nor a
+    /// tolerated wrapper that spawns it. `observed_process` records what was
+    /// actually seen there, so an operator reading this gets "an update is
+    /// installing" rather than a bare timeout with no explanation.
+    NotAgent { observed_process: String },
+    /// The foreground process matches, but the screen itself is showing a
+    /// recognized blocking pattern -- workspace trust, authentication,
+    /// a vendor update, first-run onboarding. This is the state that wants a
+    /// human specifically, because resolving it means typing into the pane
+    /// rather than dispatching another agent turn.
+    OperatorGate { gate: String },
+    /// The foreground process matches, but the screen shows the agent came
+    /// up wrong or fell over -- a crash/stack trace, an expired or rejected
+    /// login, a fatal startup error. Kept distinct from `OperatorGate` on
+    /// purpose: a gate is a screen a human resolves BY typing into it, while
+    /// nothing typed into this screen fixes it. Collapsing the two would
+    /// lose exactly the diagnosis an operator needs -- "waiting for you"
+    /// versus "broken". For write-gating it behaves like every other
+    /// non-`Ready` state (refused); the split buys a correct label, not
+    /// different gating. `reason` is a short classifier label, the same
+    /// shape as `OperatorGate::gate`, never raw terminal text -- nothing in
+    /// this enum carries screen contents. Where a provider has a
+    /// `pty_sidecar` adapter bound, structured signals (rate limits arriving
+    /// as a `ProviderEvent`) remain the authority for those specific
+    /// conditions; this variant is the text-derived fallback, and the only
+    /// signal at all for providers that emit no structured events.
+    Failing { reason: String },
+    /// The foreground process matches AND no known gate or failure pattern
+    /// is showing. This is explicitly NOT a claim that the agent is idle,
+    /// waiting for input, or will do anything useful with a write -- it only
+    /// means the screen is not known to be showing something else. Reading
+    /// `Ready` as "safe to act on" beyond that is the over-read this type
+    /// exists to prevent. Note the asymmetry with the other four variants:
+    /// each of them fires from a single signal (process mismatch, or a
+    /// recognized gate/failure pattern alone), while `Ready` requires both
+    /// the process and text signals to agree -- a screen the text matcher
+    /// does not recognize never reaches `Ready` on that basis alone.
+    Ready,
+}
+
+impl PtyScreenState {
+    /// True only for `Ready`. The one predicate a blind/automated writer
+    /// should consult; written as a method so no call site open-codes
+    /// `matches!(.., Ready)` and quietly gets the `Unknown` case wrong.
+    pub fn admits_blind_write(&self) -> bool {
+        matches!(self, Self::Ready)
+    }
+
+    /// Bounds check matching `ForegroundProcess::is_valid_for`: the carried
+    /// strings must be non-empty, control-character free, and within the
+    /// per-field byte caps, since both travel over the wire into an operator
+    /// UI and a raw process/gate label is not something to trust unbounded.
+    pub fn is_valid(&self) -> bool {
+        match self {
+            Self::Unknown | Self::Ready => true,
+            Self::NotAgent { observed_process } => {
+                !observed_process.trim().is_empty()
+                    && observed_process.len() <= FOREGROUND_PROCESS_NAME_MAX_BYTES
+                    && !observed_process.chars().any(char::is_control)
+            }
+            Self::OperatorGate { gate } | Self::Failing { reason: gate } => {
+                !gate.trim().is_empty()
+                    && gate.len() <= PTY_SCREEN_GATE_NAME_MAX_BYTES
+                    && !gate.chars().any(char::is_control)
+            }
+        }
+    }
 }
 
 impl TerminalSize {
@@ -610,6 +707,14 @@ pub struct SessionSnapshot {
     pub resume: ResumeSnapshot,
     pub foreground: ForegroundSnapshot,
     pub provider: ProviderSnapshot,
+    /// The session's CURRENT screen classification, as opposed to
+    /// `terminal_frame`'s per-frame stamp -- both are read off one value
+    /// computed at the node, but this one is what a consumer reads when it
+    /// wants the state now without subscribing to terminal frames, which is
+    /// what makes gating a dispatch possible for a caller holding only the
+    /// session inventory.
+    #[serde(default)]
+    pub screen_state: PtyScreenState,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -1569,13 +1674,17 @@ mod tests {
 
     use crate::AgentId;
     use super::{
-        ContextWindowUsage, ForegroundProcess, ForegroundProcessKind, ProviderEvent,
+        AgentInstanceId, CapabilitySnapshot, ContextWindowUsage, ForegroundProcess,
+        ForegroundProcessKind, ForegroundSnapshot, HistorySnapshot, ProviderEvent,
         ProviderEventValidationError,
         ProviderInteractionKind, ProviderInteractionOutcome, ProviderInteractionResponse,
         ProviderInteractionResponseError, ProviderRuntimeCapability, ProviderRuntimePolicy,
         ProviderRuntimePolicyError,
-        ProviderSessionIdentity, ProviderSessionKey, TerminalFrame, TerminalMouseProtocolEncoding,
+        ProviderSessionIdentity, ProviderSessionKey, ProviderSnapshot, PtyScreenState,
+        ResumeSnapshot, SessionGeneration, SessionSnapshot, SessionStatus, TerminalFrame,
+        TerminalMouseProtocolEncoding, TransportKind,
         FOREGROUND_PROCESS_NAME_MAX_BYTES, PROVIDER_INTERACTION_RESPONSE_MAX_BYTES,
+        PTY_SCREEN_GATE_NAME_MAX_BYTES,
     };
 
     #[test]
@@ -1701,6 +1810,151 @@ mod tests {
         assert!(!frame.mouse_protocol_enabled);
         assert_eq!(frame.mouse_protocol_encoding, TerminalMouseProtocolEncoding::Default);
         assert_eq!(frame.produced_at_unix_ms, 0);
+    }
+
+    #[test]
+    fn a_terminal_frame_that_omits_screen_state_decodes_as_unknown_not_ready() {
+        let frame: TerminalFrame = serde_json::from_str(
+            r#"{"sequence":1,"size":{"rows":24,"columns":80},"cursor_row":0,"cursor_column":0,"contents":"ready","formatted":[114]}"#,
+        )
+        .expect("legacy terminal frame");
+
+        assert_eq!(frame.screen_state, PtyScreenState::Unknown);
+        // A peer that predates this field carries no classification at all --
+        // reading that silence as `Ready` would hand a blind writer a green
+        // light nobody ever actually gave.
+        assert_ne!(frame.screen_state, PtyScreenState::Ready);
+    }
+
+    #[test]
+    fn a_session_snapshot_that_omits_screen_state_decodes_as_unknown_not_ready() {
+        let populated = SessionSnapshot {
+            instance_id: AgentInstanceId(1),
+            agent_id: AgentId::new("claude").unwrap(),
+            transport: TransportKind::Pty,
+            generation: SessionGeneration(1),
+            status: SessionStatus::Running,
+            pending_operation: None,
+            pending_input: None,
+            process_id: None,
+            terminal_size: None,
+            terminal_frame: None,
+            terminal_stale: None,
+            session_options: None,
+            capabilities: CapabilitySnapshot::default(),
+            history: HistorySnapshot::default(),
+            resume: ResumeSnapshot::default(),
+            foreground: ForegroundSnapshot::default(),
+            provider: ProviderSnapshot::default(),
+            screen_state: PtyScreenState::Ready,
+        };
+        let mut wire = serde_json::to_value(&populated).unwrap();
+        wire.as_object_mut().unwrap().remove("screen_state");
+        let decoded: SessionSnapshot = serde_json::from_value(wire).unwrap();
+
+        assert_eq!(decoded.screen_state, PtyScreenState::Unknown);
+        // Same reasoning as the terminal-frame case: an old peer's silence
+        // on this field must never be upgraded into a claim it never made.
+        assert_ne!(decoded.screen_state, PtyScreenState::Ready);
+    }
+
+    #[test]
+    fn every_pty_screen_state_variant_round_trips_through_serde() {
+        let variants = [
+            PtyScreenState::Unknown,
+            PtyScreenState::NotAgent {
+                observed_process: "npm".to_owned(),
+            },
+            PtyScreenState::OperatorGate {
+                gate: "workspace-trust".to_owned(),
+            },
+            PtyScreenState::Failing {
+                reason: "startup-crash".to_owned(),
+            },
+            PtyScreenState::Ready,
+        ];
+        for variant in variants {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(
+                serde_json::from_str::<PtyScreenState>(&json).unwrap(),
+                variant,
+            );
+        }
+    }
+
+    #[test]
+    fn admits_blind_write_is_true_only_for_ready() {
+        assert!(!PtyScreenState::Unknown.admits_blind_write());
+        assert!(!PtyScreenState::NotAgent {
+            observed_process: "npm".to_owned(),
+        }
+        .admits_blind_write());
+        assert!(!PtyScreenState::OperatorGate {
+            gate: "workspace-trust".to_owned(),
+        }
+        .admits_blind_write());
+        assert!(!PtyScreenState::Failing {
+            reason: "startup-crash".to_owned(),
+        }
+        .admits_blind_write());
+        assert!(PtyScreenState::Ready.admits_blind_write());
+    }
+
+    #[test]
+    fn pty_screen_state_is_valid_rejects_oversized_empty_and_control_carrying_fields() {
+        assert!(PtyScreenState::NotAgent {
+            observed_process: "npm install".to_owned(),
+        }
+        .is_valid());
+        assert!(!PtyScreenState::NotAgent {
+            observed_process: "x".repeat(FOREGROUND_PROCESS_NAME_MAX_BYTES + 1),
+        }
+        .is_valid());
+        assert!(!PtyScreenState::NotAgent {
+            observed_process: String::new(),
+        }
+        .is_valid());
+        assert!(!PtyScreenState::NotAgent {
+            observed_process: "bad\u{0000}process".to_owned(),
+        }
+        .is_valid());
+
+        assert!(PtyScreenState::OperatorGate {
+            gate: "workspace-trust".to_owned(),
+        }
+        .is_valid());
+        assert!(!PtyScreenState::OperatorGate {
+            gate: "x".repeat(PTY_SCREEN_GATE_NAME_MAX_BYTES + 1),
+        }
+        .is_valid());
+        assert!(!PtyScreenState::OperatorGate {
+            gate: String::new(),
+        }
+        .is_valid());
+        assert!(!PtyScreenState::OperatorGate {
+            gate: "bad\u{0000}gate".to_owned(),
+        }
+        .is_valid());
+
+        assert!(PtyScreenState::Failing {
+            reason: "startup-crash".to_owned(),
+        }
+        .is_valid());
+        assert!(!PtyScreenState::Failing {
+            reason: "x".repeat(PTY_SCREEN_GATE_NAME_MAX_BYTES + 1),
+        }
+        .is_valid());
+        assert!(!PtyScreenState::Failing {
+            reason: String::new(),
+        }
+        .is_valid());
+        assert!(!PtyScreenState::Failing {
+            reason: "bad\u{0000}reason".to_owned(),
+        }
+        .is_valid());
+
+        assert!(PtyScreenState::Unknown.is_valid());
+        assert!(PtyScreenState::Ready.is_valid());
     }
 
     #[test]

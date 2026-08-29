@@ -2816,8 +2816,8 @@ mod tests {
         SessionRecordId, WorkspaceEntry, WorkspaceEntryKind, WorkspaceId,
     };
     use gate4agent_types::{
-        AgentInstanceId, ProviderActivity, SessionGeneration, TerminalFrame, TerminalSize,
-        TransportKind,
+        AgentInstanceId, ProviderActivity, PtyScreenState, SessionGeneration, TerminalFrame,
+        TerminalSize, TransportKind,
     };
     use tokio::io::AsyncReadExt;
 
@@ -2966,6 +2966,7 @@ mod tests {
             mouse_protocol_enabled: false,
             mouse_protocol_encoding: Default::default(),
             produced_at_unix_ms: 0,
+            screen_state: PtyScreenState::default(),
         }
     }
 

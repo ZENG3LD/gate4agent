@@ -14,7 +14,7 @@ use gate4agent_types::{
     ProviderInteractionOutcome, ProviderInteractionResponse, ProviderInteractionResponseKind,
     ProviderInteractionStatus, ProviderInteractionTarget, ProviderSessionIdentity,
     ProviderRuntimeCapability, ProviderRuntimePolicy, ProviderSessionKey, ProviderSnapshot,
-    ProviderSource, ProviderSourceCursor, ProviderSubagent,
+    ProviderSource, ProviderSourceCursor, ProviderSubagent, PtyScreenState,
     ResumeAuthorityTarget, ResumeLaunchRequest, ResumePhase, ResumeSessionSummary, ResumeSnapshot,
     ResumeTarget, SessionGeneration, SessionSnapshot, SessionStatus, StartRequest, TerminalControl,
     TerminalSize, TokenUsage, TransportKind, CONTROL_INSTANCE_IDENTITIES_CAPACITY,
@@ -147,6 +147,8 @@ impl Gate4AgentEngine {
                             resume: ResumeSnapshot::default(),
                             foreground: ForegroundSnapshot::default(),
                             provider: ProviderSnapshot::default(),
+                            // No observation exists yet for a freshly registered session.
+                            screen_state: PtyScreenState::Unknown,
                         },
                         runtime_policy: ProviderRuntimePolicy::raw_pty(),
                         pending_terminal_size: None,
@@ -5757,6 +5759,7 @@ mod tests {
             mouse_protocol_enabled: false,
             mouse_protocol_encoding: Default::default(),
             produced_at_unix_ms: 0,
+            screen_state: PtyScreenState::default(),
         };
         engine.apply_observation(ObservationEnvelope {
             protocol_version: CONTROL_PROTOCOL_VERSION,
@@ -5791,6 +5794,7 @@ mod tests {
                     mouse_protocol_enabled: false,
                     mouse_protocol_encoding: Default::default(),
                     produced_at_unix_ms: 0,
+                    screen_state: PtyScreenState::default(),
                 },
             },
         });

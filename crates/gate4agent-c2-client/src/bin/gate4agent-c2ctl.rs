@@ -469,7 +469,7 @@ mod tests {
     use gate4agent_c2_protocol::C2WorkspaceSnapshot;
     use gate4agent_node_protocol::{NodeIncarnationId, SessionAddress, SessionKey};
     use gate4agent_types::{
-        AgentId, AgentInstanceId, ProviderActivity, SessionGeneration,
+        AgentId, AgentInstanceId, ProviderActivity, PtyScreenState, SessionGeneration,
         TerminalMouseProtocolEncoding, TransportKind,
     };
 
@@ -504,6 +504,7 @@ mod tests {
                 mouse_protocol_enabled: false,
                 mouse_protocol_encoding: TerminalMouseProtocolEncoding::Default,
                 produced_at_unix_ms: 0,
+                screen_state: PtyScreenState::default(),
             }),
             provider_activity: ProviderActivity::Idle,
             provider_interaction_pending: false,

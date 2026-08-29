@@ -151,7 +151,9 @@ fn terminal_session_key(session: &HarnessRuntimeSessionAddressV1) -> Result<Runt
 mod tests {
     use super::*;
     use gate4agent_node_protocol::NodeIncarnationId;
-    use gate4agent_types::{TerminalFrame, TerminalMouseProtocolEncoding, TerminalSize};
+    use gate4agent_types::{
+        PtyScreenState, TerminalFrame, TerminalMouseProtocolEncoding, TerminalSize,
+    };
 
     fn sample_key(node_id: &str, incarnation: char) -> RuntimeSessionKey {
         RuntimeSessionKey {
@@ -176,6 +178,7 @@ mod tests {
             mouse_protocol_enabled: false,
             mouse_protocol_encoding: TerminalMouseProtocolEncoding::Default,
             produced_at_unix_ms: 0,
+            screen_state: PtyScreenState::default(),
         }
     }
 

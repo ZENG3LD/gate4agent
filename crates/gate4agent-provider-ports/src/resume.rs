@@ -325,12 +325,22 @@ mod tests {
         assert_eq!(authority.calls, 1);
     }
 
+    /// A provider with no resume adapter is refused here, before the
+    /// authority port is ever consulted.
+    ///
+    /// Subject is `qwen-code`, whose missing resume adapter
+    /// `gate4agent-catalog`'s own builtin test pins explicitly. This drove
+    /// the case with `kimi` until kimi GAINED a resume adapter, at which
+    /// point the negative case had no negative left in it and the
+    /// assertion simply failed -- red ever since, without telling anyone
+    /// the capability had moved.
     #[test]
     fn negative_capability_fails_before_the_authority_port() {
         let registry = builtin_registry();
-        let kimi = registry.get_by_id("kimi").unwrap();
+        let unsupported = registry.get_by_id("qwen-code").unwrap();
+        assert!(unsupported.capabilities.adapters.resume.is_none());
         assert!(matches!(
-            ResumeRequest::from_spec(kimi, "session-1", None),
+            ResumeRequest::from_spec(unsupported, "session-1", None),
             Err(ProviderPortValidationError::UnsupportedFamily { .. })
         ));
     }

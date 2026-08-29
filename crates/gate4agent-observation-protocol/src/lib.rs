@@ -1150,49 +1150,91 @@ mod tests {
         );
     }
 
+    /// A `PtyHint` may report activity and nothing else: every workflow
+    /// fact below is refused for it.
+    ///
+    /// Paired with the error each one actually produces, rather than
+    /// asserting a single blanket verdict over the whole list. The blanket
+    /// form was wrong and had been failing: `ContextWindowUsage` is checked
+    /// by a NARROWER rule that runs first and demands
+    /// `StructuredProvider` specifically, so it never reaches the
+    /// pty-hint rule at all. Rejection was never in doubt -- the fixture
+    /// was refused the whole time -- but a test that cannot say WHICH rule
+    /// refused it is not testing that rule, and it went red rather than
+    /// telling anyone the ordering had changed.
+    ///
+    /// Written as pairs, the ordering itself is now the thing under test:
+    /// move the context-window check after the pty-hint one and this fails,
+    /// which is the correct outcome, because the more specific diagnosis is
+    /// the one an operator should get.
     #[test]
     fn pty_hint_cannot_claim_authoritative_workflow_facts() {
         let rejected = [
-            ObservationKindV1::TurnCompleted,
-            ObservationKindV1::ToolCompleted {
-                correlation_id: "tool-0123456789abcdef".to_string(),
-                class: "command".to_string(),
-                success: true,
-                duration_ms: Some(5),
-            },
-            ObservationKindV1::SubagentCompleted {
-                correlation_id: "child-1".to_string(),
-                success: Some(true),
-            },
-            ObservationKindV1::TodoSnapshot {
-                revision: 1,
-                items: Vec::new(),
-                complete: true,
-            },
-            ObservationKindV1::FileChanged {
-                path: Some("src/lib.rs".to_string()),
-            },
-            ObservationKindV1::HistorySnapshot {
-                message_count: 1,
-                message_count_exact: true,
-                completed_turn_count: None,
-                total_tokens: None,
-            },
-            ObservationKindV1::ContextWindowUsage {
-                uncached_input_tokens: 1,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
-                output_tokens: 0,
-                unattributed_tokens: 0,
-                used_tokens: 1,
-                capacity_tokens: 1,
-            },
+            (
+                ObservationKindV1::TurnCompleted,
+                ObservationValidationError::PtyHintClaimsAuthoritativeFact,
+            ),
+            (
+                ObservationKindV1::ToolCompleted {
+                    correlation_id: "tool-0123456789abcdef".to_string(),
+                    class: "command".to_string(),
+                    success: true,
+                    duration_ms: Some(5),
+                },
+                ObservationValidationError::PtyHintClaimsAuthoritativeFact,
+            ),
+            (
+                ObservationKindV1::SubagentCompleted {
+                    correlation_id: "child-1".to_string(),
+                    success: Some(true),
+                },
+                ObservationValidationError::PtyHintClaimsAuthoritativeFact,
+            ),
+            (
+                ObservationKindV1::TodoSnapshot {
+                    revision: 1,
+                    items: Vec::new(),
+                    complete: true,
+                },
+                ObservationValidationError::PtyHintClaimsAuthoritativeFact,
+            ),
+            (
+                ObservationKindV1::FileChanged {
+                    path: Some("src/lib.rs".to_string()),
+                },
+                ObservationValidationError::PtyHintClaimsAuthoritativeFact,
+            ),
+            (
+                ObservationKindV1::HistorySnapshot {
+                    message_count: 1,
+                    message_count_exact: true,
+                    completed_turn_count: None,
+                    total_tokens: None,
+                },
+                ObservationValidationError::PtyHintClaimsAuthoritativeFact,
+            ),
+            (
+                // The one that is NOT refused by the pty-hint rule: its own
+                // check sits earlier and admits only `StructuredProvider`,
+                // so a pty hint is turned away before evidence class is
+                // even considered as a general question.
+                ObservationKindV1::ContextWindowUsage {
+                    uncached_input_tokens: 1,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                    output_tokens: 0,
+                    unattributed_tokens: 0,
+                    used_tokens: 1,
+                    capacity_tokens: 1,
+                },
+                ObservationValidationError::ContextWindowUsageRequiresStructuredProvider,
+            ),
         ];
 
-        for kind in rejected {
+        for (kind, expected) in rejected {
             assert_eq!(
                 observation(ObservationEvidenceV1::PtyHint, kind).validate(),
-                Err(ObservationValidationError::PtyHintClaimsAuthoritativeFact)
+                Err(expected),
             );
         }
         observation(ObservationEvidenceV1::PtyHint, ObservationKindV1::Working)

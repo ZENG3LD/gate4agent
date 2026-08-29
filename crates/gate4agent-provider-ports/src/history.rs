@@ -318,9 +318,14 @@ mod tests {
     #[test]
     fn launch_only_agents_and_unbounded_requests_fail_before_authority() {
         let registry = builtin_registry();
-        let qwen = registry.get_by_id("qwen-code").unwrap();
+        // `amp` carries a hook adapter but no history one, pinned green in
+        // `gate4agent-adapters`' own registry test. This was `qwen-code`
+        // until qwen gained a history adapter, which left the negative case
+        // with nothing negative about it.
+        let unsupported = registry.get_by_id("amp").unwrap();
+        assert!(unsupported.capabilities.adapters.history.is_none());
         assert!(matches!(
-            HistoryDiscoveryRequest::from_spec(qwen, None, 1),
+            HistoryDiscoveryRequest::from_spec(unsupported, None, 1),
             Err(ProviderPortValidationError::UnsupportedFamily { .. })
         ));
 

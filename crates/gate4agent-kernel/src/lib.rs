@@ -1546,21 +1546,42 @@ mod tests {
         ));
     }
 
+    /// The one-shot pipe path fills in a provider's own session-option
+    /// defaults when a `Start` names none, and the same resolved selection
+    /// reaches the spawn effect.
+    ///
+    /// Subject is `cursor`, and it has to be: this used to drive the case
+    /// with `claude`, which stopped being a one-shot provider when its pipe
+    /// transport became `StructuredJsonl` (pinned, green, in
+    /// `gate4agent-catalog`'s own builtin test). The kernel's one-shot
+    /// branch is gated on `PipeProtocol::OneShotText`, so with `claude` it
+    /// simply never ran and the test asserted defaults against a path it
+    /// was no longer on -- red ever since, which is how a test stops being
+    /// read. `cursor` is the one provider that is both one-shot by pipe and
+    /// carries a session-option adapter, so it is the only subject that
+    /// exercises what this test is named for.
+    ///
+    /// The expectation is derived from `resolve_one_shot_plan`, the same
+    /// resolver the kernel calls, rather than frozen as a literal model
+    /// name. A frozen literal is what rotted the previous version: the
+    /// defaults belong to the catalog and move with it, while what this
+    /// test is actually about -- that the kernel APPLIES them instead of
+    /// leaving `session_options` at `None` -- does not.
     #[test]
     fn one_shot_pipe_defaults_and_validates_options_before_effect_creation() {
-        let mut claude = Gate4AgentKernel::default();
-        claude.step(
+        let mut cursor = Gate4AgentKernel::default();
+        cursor.step(
             [command(
                 1,
                 ControlCommand::Register {
                     instance_id: instance(),
-                    agent_id: AgentId::new("claude").unwrap(),
+                    agent_id: AgentId::new("cursor").unwrap(),
                     transport: TransportKind::Pipe,
                 },
             )],
             [],
         );
-        let started = claude.step(
+        let started = cursor.step(
             [command(
                 2,
                 ControlCommand::Start {
@@ -1579,7 +1600,23 @@ mod tests {
             )],
             [],
         );
-        let expected = SessionOptionSelection::new("sonnet").with_value("thinking-level", "low");
+        let spec = builtin_registry()
+            .get_by_id("cursor")
+            .expect("cursor is a builtin provider");
+        let binding = spec
+            .capabilities
+            .adapters
+            .one_shot
+            .as_ref()
+            .expect("cursor declares a one-shot adapter");
+        let expected = resolve_one_shot_plan(&binding.id, &spec.launch, "summarize", None)
+            .expect("cursor resolves its own defaults")
+            .applied;
+        // Stated on its own: the defect this guards against is the kernel
+        // leaving the field untouched, and `assert_eq!` against a resolved
+        // value would report that as a mismatch rather than as the absence
+        // it is.
+        assert!(started.snapshot.sessions[0].session_options.is_some());
         assert_eq!(
             started.snapshot.sessions[0].session_options.as_ref(),
             Some(&expected)
@@ -1630,13 +1667,16 @@ mod tests {
         ));
         assert!(rejected.effects.is_empty());
 
+        // `codex` drove this half until its pipe transport became
+        // `StructuredJsonl` too, which routes it away from the one-shot
+        // prompt validation the half exists to check.
         let mut missing_prompt = Gate4AgentKernel::default();
         missing_prompt.step(
             [command(
                 5,
                 ControlCommand::Register {
                     instance_id: instance(),
-                    agent_id: AgentId::new("codex").unwrap(),
+                    agent_id: AgentId::new("cursor").unwrap(),
                     transport: TransportKind::Pipe,
                 },
             )],
@@ -1934,8 +1974,15 @@ mod tests {
             gate4agent_types::ControlEffect::DiscoverHistory { .. }
         ));
 
+        // Subject is `amp`: it carries a hook adapter but no history one,
+        // which `gate4agent-adapters`' own registry test pins green. This
+        // used to be `qwen-code`, which has since GAINED a history adapter
+        // (pinned just as explicitly in `gate4agent-catalog`), so the
+        // command it was supposed to be refused for started being accepted
+        // and this half has been asserting a rejection that no longer
+        // happens.
         let mut unsupported = Gate4AgentKernel::default();
-        unsupported.step([register(1, "qwen-code")], []);
+        unsupported.step([register(1, "amp")], []);
         let rejected = unsupported.step(
             [command(
                 2,

@@ -1,7 +1,9 @@
 //! Native effect execution for gate4agent control-plane sessions.
 
+mod efficiency;
 mod provider_supervisor;
 
+pub use efficiency::ShellEfficiencyFacts;
 pub use provider_supervisor::{
     NativeProviderExecutor, NativeProviderExit, NativeProviderOperation,
     NativeProviderOperationError, NativeProviderResultPoll, PhysicalExitAck,
@@ -309,6 +311,11 @@ pub struct NativeEffectShell {
     one_shot_sessions: BTreeMap<NativeSessionKey, OwnedProviderSession<NativeOneShotSession>>,
     acp_sessions: BTreeMap<NativeSessionKey, OwnedProviderSession<AcpSession>>,
     pending_observations: VecDeque<ObservationEnvelope>,
+    /// Plain efficiency facts from `collect_terminal_frames` and
+    /// `reclassify_foreground` -- see `ShellEfficiencyFacts`'s own doc
+    /// comment for why this crate stops at plain facts rather than
+    /// computing a distribution itself.
+    efficiency_facts: ShellEfficiencyFacts,
 }
 
 impl NativeEffectShell {
@@ -333,7 +340,17 @@ impl NativeEffectShell {
             one_shot_sessions: BTreeMap::new(),
             acp_sessions: BTreeMap::new(),
             pending_observations: VecDeque::new(),
+            efficiency_facts: ShellEfficiencyFacts::default(),
         }
+    }
+
+    /// Hand the caller everything `collect_terminal_frames` and
+    /// `reclassify_foreground` recorded since the last call, and reset the
+    /// facts back to empty. Called once per worker-loop iteration by
+    /// `gate4agent-runtime-native::publish_shell_observations`, the only
+    /// place with somewhere to fold these into a distribution.
+    pub fn take_efficiency_facts(&mut self) -> ShellEfficiencyFacts {
+        self.efficiency_facts.take()
     }
 
     pub fn active_session_count(&self) -> usize {
@@ -1464,14 +1481,25 @@ impl NativeEffectShell {
     /// answers the same question by reading one integer.
     pub fn collect_terminal_frames(&mut self) -> Vec<ObservationEnvelope> {
         let mut observations = Vec::new();
-        for (key, owned) in &mut self.pty_sessions {
-            if matches!(
+        // Split borrows taken up front: the loop below needs a mutable
+        // borrow of `pty_sessions` for its whole body, and `efficiency_facts`
+        // is a disjoint field this function also writes to on every branch
+        // -- see `ShellEfficiencyFacts`'s own doc comment for why this crate
+        // is the one recording facts rather than a distribution.
+        let pty_sessions = &mut self.pty_sessions;
+        let efficiency_facts = &mut self.efficiency_facts;
+        for (key, owned) in pty_sessions {
+            if terminal_state_capture_should_skip(
                 owned.session.terminal_sequence(),
-                Ok(sequence) if sequence <= owned.last_terminal_sequence
+                owned.last_terminal_sequence,
             ) {
+                efficiency_facts.record_terminal_state_skip();
                 continue;
             }
-            match owned.session.terminal_state() {
+            let capture_start = Instant::now();
+            let terminal_state = owned.session.terminal_state();
+            efficiency_facts.record_terminal_state_capture(capture_start.elapsed());
+            match terminal_state {
                 Ok(snapshot) if snapshot.sequence > owned.last_terminal_sequence => {
                     owned.last_terminal_sequence = snapshot.sequence;
                     owned.terminal_stale_published = false;
@@ -1516,14 +1544,14 @@ impl NativeEffectShell {
                         });
                     }
 
+                    let frame = terminal_frame(snapshot, merged);
+                    efficiency_facts.record_terminal_frame_published(terminal_frame_byte_len(&frame));
                     observations.push(ObservationEnvelope {
                         protocol_version: CONTROL_PROTOCOL_VERSION,
                         operation_id: None,
                         instance_id: key.instance_id,
                         generation: key.generation,
-                        observation: ControlObservation::TerminalFrame {
-                            frame: terminal_frame(snapshot, merged),
-                        },
+                        observation: ControlObservation::TerminalFrame { frame },
                     });
                 }
                 Ok(_) => {}
@@ -1576,7 +1604,12 @@ impl NativeEffectShell {
             let Some(owned) = self.pty_sessions.get_mut(&key) else {
                 continue;
             };
-            match owned.session.observe_foreground().await {
+            let probe_start = Instant::now();
+            let probe_result = owned.session.observe_foreground().await;
+            // Recorded unconditionally -- the OS process-tree walk this
+            // module doc describes is paid for whether or not it succeeds.
+            self.efficiency_facts.record_foreground_probe(probe_start.elapsed());
+            match probe_result {
                 Ok(observation) => {
                     let verdict = match catalog.get(&owned.agent_id) {
                         Some(spec) => resolve_foreground_verdict(
@@ -2489,6 +2522,27 @@ fn terminal_frame(snapshot: PtyTerminalSnapshot, screen_state: PtyScreenState) -
         produced_at_unix_ms: snapshot.produced_at_unix_ms,
         screen_state,
     }
+}
+
+/// Whether the cheap `terminal_sequence()` gate should skip the expensive
+/// `terminal_state()` call outright -- true exactly when the sequence read
+/// is no newer than what this session already captured. An `Err` from the
+/// cheap read does NOT skip: it falls through so the real call is attempted
+/// (and reports its own failure through the normal `terminal_state()`
+/// error path), matching the pre-instrumentation behaviour of the
+/// `matches!` this replaces.
+fn terminal_state_capture_should_skip<E>(sequence: Result<u64, E>, last_captured: u64) -> bool {
+    matches!(sequence, Ok(sequence) if sequence <= last_captured)
+}
+
+/// Total wire-relevant byte size of one [`TerminalFrame`] -- `formatted`
+/// plus every row of `scrollback_formatted` summed. This is exactly what
+/// gets handed to the c2 relay/harness/operator wire per frame (`contents`
+/// never leaves the node), which is why it is the number the frame-bytes
+/// distribution reports.
+fn terminal_frame_byte_len(frame: &TerminalFrame) -> u64 {
+    let scrollback_bytes: usize = frame.scrollback_formatted.iter().map(Vec::len).sum();
+    (frame.formatted.len() + scrollback_bytes) as u64
 }
 
 fn canonical_foreground(
@@ -3647,7 +3701,8 @@ mod tests {
         NativeEffectShell,
         OwnedQwenDualOutput, QwenDualOutputLaunch, QWEN_SIDECAR_READ_MAX_BYTES_PER_TICK,
         should_attach_pty_provider_stream, should_probe_pty_identity, startup_operator_gate,
-        terminal_frame, validate_instance_launch_arguments, validate_spawn_runtime_policy,
+        terminal_frame, terminal_frame_byte_len, terminal_state_capture_should_skip,
+        validate_instance_launch_arguments, validate_spawn_runtime_policy,
         ForegroundProbeSchedule, ForegroundVerdict, ReadinessDiagnostics, Utf8ChunkDecoder,
     };
     use gate4agent_adapters::builtin_adapter_registry;
@@ -3705,6 +3760,30 @@ mod tests {
         assert_eq!(frame.mouse_protocol_encoding, TerminalMouseProtocolEncoding::Sgr);
         // `terminal_frame` must carry the stamp through, never recompute it.
         assert_eq!(frame.produced_at_unix_ms, 1_700_000_000_000);
+    }
+
+    #[test]
+    fn terminal_frame_byte_len_sums_formatted_and_every_scrollback_row() {
+        let mut snapshot = snapshot(9, "visible");
+        snapshot.formatted = b"\x1b[2Jvisible".to_vec();
+        snapshot.scrollback_formatted =
+            vec![b"row one".to_vec(), b"row two, longer".to_vec()];
+        let expected = snapshot.formatted.len()
+            + snapshot.scrollback_formatted[0].len()
+            + snapshot.scrollback_formatted[1].len();
+
+        let frame = terminal_frame(snapshot, PtyScreenState::default());
+        assert_eq!(terminal_frame_byte_len(&frame), expected as u64);
+    }
+
+    #[test]
+    fn the_sequence_gate_skips_only_when_the_sequence_did_not_advance() {
+        assert!(terminal_state_capture_should_skip(Ok::<u64, ()>(5), 5));
+        assert!(terminal_state_capture_should_skip(Ok::<u64, ()>(4), 5));
+        assert!(!terminal_state_capture_should_skip(Ok::<u64, ()>(6), 5));
+        // A failed cheap read never skips -- the real call is attempted so
+        // its own error path (stale-published bookkeeping) still runs.
+        assert!(!terminal_state_capture_should_skip(Err::<u64, ()>(()), 5));
     }
 
     #[test]

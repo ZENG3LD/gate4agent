@@ -161,6 +161,8 @@ use gate4agent_runtime_native::{
     NativeSessionCatalogAuthority, NativeSessionCatalogError, NativeSessionPreviewError,
     ScopedNativeSessionCatalogEntry,
 };
+use gate4agent_runtime_native::shell_efficiency::ShellEfficiencyProfile;
+use std::sync::OnceLock;
 use gate4agent_runtime_native::tick_profile::TickProfileSnapshot;
 use drive_loop_profile::DriveLoopProfiler;
 #[cfg(test)]
@@ -2478,6 +2480,12 @@ async fn drive_runtime_until_shutdown(
     shared: Arc<NodeShared>,
     shutdown_timeout: Duration,
 ) -> Result<(), NodeServerError> {
+    // Published once, never per iteration. The worker loops inside
+    // `NativeRuntime` fold into this profile continuously; turning it into
+    // percentiles is what costs, and that is `GET /metrics`'s bill to pay.
+    let _ = shared
+        .shell_efficiency_profile
+        .set(runtime.shell_efficiency_profile());
     let mut shutdown_started = None;
     loop {
         // Every phase below is timed unconditionally -- see
@@ -2487,11 +2495,13 @@ async fn drive_runtime_until_shutdown(
         // phases are calls made directly from this loop, not something a
         // callee could time on our behalf.
         let runtime_tick_start = Instant::now();
-        runtime.tick().await;
+        let tick_result = runtime.tick().await;
         let runtime_tick_elapsed = runtime_tick_start.elapsed();
 
         let event_drain_start = Instant::now();
+        let mut events_drained: u64 = 0;
         while let Ok(event) = events.try_recv() {
+            events_drained += 1;
             let clean_exit = matches!(
                 event.event,
                 ControlEventKind::Exited { exit_code: Some(0), forced: false },
@@ -2575,6 +2585,22 @@ async fn drive_runtime_until_shutdown(
             profile.record_publish_terminal_frames(publish_terminal_frames_elapsed);
             profile.record_remainder(remainder_elapsed);
             profile.note_iteration(Instant::now());
+        }
+
+        // "Produced nothing" means this iteration's `NativeRuntime::tick`
+        // applied zero observations (`tick_result.observations_applied`,
+        // which already folds in any terminal frames collected -- see
+        // `NativeEffectDispatcher::drain_observations`) AND the
+        // control-event subscription drained above forwarded zero events.
+        // Command ingress and dispatched effects are deliberately NOT part
+        // of this definition: an idle node still runs `step_control_plane`
+        // and every provider supervisor's `tick` regardless, every 10ms --
+        // so "nothing" here means nothing OBSERVABLE left this iteration,
+        // matching what a reader would assume from `drive_loop_iterations`'s
+        // own field name, not that the tick itself was free of work.
+        shared.drive_loop_iterations_total.fetch_add(1, Ordering::Relaxed);
+        if tick_result.observations_applied == 0 && events_drained == 0 {
+            shared.drive_loop_iterations_idle.fetch_add(1, Ordering::Relaxed);
         }
 
         sleep(Duration::from_millis(10)).await;
@@ -2916,6 +2942,18 @@ struct NodeShared {
     /// `drive_runtime_until_shutdown`), so this is how its own per-phase
     /// tick timings reach `GET /metrics`.
     runtime_tick_profile: Mutex<TickProfileSnapshot>,
+    /// The live shell-efficiency profile, shared with the per-instance
+    /// worker loops that fold into it.
+    ///
+    /// Deliberately NOT the per-iteration snapshot copy `runtime_tick_
+    /// profile` above keeps: producing a snapshot sorts every ring behind
+    /// it, and that sort belongs on the read. A `OnceLock` rather than a
+    /// field set at construction because `NodeShared` is built before the
+    /// `NativeRuntime` that owns the profile exists -- the drive loop
+    /// publishes it once, before its first iteration. Unset means the
+    /// runtime has not started driving yet, which `GET /metrics` reports as
+    /// empty series rather than as zeroes it never measured.
+    shell_efficiency_profile: OnceLock<Arc<Mutex<ShellEfficiencyProfile>>>,
     /// Physical PTY sessions the native runtime currently owns
     /// (`NativeRuntime::active_native_sessions`), refreshed once per drive
     /// loop iteration -- deliberately a separate count from
@@ -2935,6 +2973,15 @@ struct NodeShared {
     /// says whether it is spinning over real work or over nothing.
     connection_loop_iterations: AtomicU64,
     connection_events_sent: AtomicU64,
+    /// Lifetime totals for `drive_runtime_until_shutdown`'s own iterations
+    /// -- `drive_loop_iterations_idle` counts iterations that applied zero
+    /// `NativeRuntime::tick` observations AND forwarded zero control
+    /// events; see the exact "produced nothing" definition at the site in
+    /// `drive_runtime_until_shutdown` that increments these. Read twice
+    /// and divide by the interval, same rule as `connections` above --
+    /// `idle / total` is backlog item 5's "wake on work" number.
+    drive_loop_iterations_total: AtomicU64,
+    drive_loop_iterations_idle: AtomicU64,
     #[cfg(feature = "fixture")]
     fixture_semantic_hook_policy: bool,
     #[cfg(feature = "fixture")]
@@ -3260,9 +3307,12 @@ impl NodeShared {
             input_settle_timeout_ms,
             drive_loop_profile: Mutex::new(DriveLoopProfiler::default()),
             runtime_tick_profile: Mutex::new(TickProfileSnapshot::default()),
+            shell_efficiency_profile: OnceLock::new(),
             native_session_gauge: AtomicUsize::new(0),
             connection_loop_iterations: AtomicU64::new(0),
             connection_events_sent: AtomicU64::new(0),
+            drive_loop_iterations_total: AtomicU64::new(0),
+            drive_loop_iterations_idle: AtomicU64::new(0),
             #[cfg(feature = "fixture")]
             fixture_semantic_hook_policy: false,
             #[cfg(feature = "fixture")]

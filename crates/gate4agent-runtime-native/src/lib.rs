@@ -1,6 +1,7 @@
 //! Tick-driven native runtime for embedding gate4agent in an owning app core.
 
 mod launch_profiles;
+pub mod shell_efficiency;
 pub mod tick_profile;
 mod vendor_contract;
 
@@ -54,6 +55,7 @@ use gate4agent_shell_native::{
     NativeEffectShell, ProviderSupervisor, ProviderSupervisorBuildError, QwenDualOutputLaunch,
     MAX_PROVIDER_SUPERVISOR_EVENTS,
 };
+use shell_efficiency::ShellEfficiencyProfile;
 use gate4agent_tool_engine::{
     CapabilityOwner, CapabilityProviderDescriptor, ProviderBindingId, ToolEngineError,
     ToolProviderId,
@@ -1585,6 +1587,29 @@ impl NativeRuntime {
         self.tick_profile.snapshot()
     }
 
+    /// Snapshot of every shell-efficiency series folded in from the
+    /// per-instance worker loops -- see `shell_efficiency`'s own doc
+    /// comment. Locked only for this read, mirroring `tick_profile_snapshot`.
+    pub fn shell_efficiency_snapshot(&self) -> shell_efficiency::ShellEfficiencyProfileSnapshot {
+        self.effects
+            .shell_efficiency
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .snapshot()
+    }
+
+    /// The live profile, for a consumer that wants to decide WHEN to pay
+    /// for a snapshot.
+    ///
+    /// `snapshot()` sorts every ring it reads to produce percentiles, and
+    /// both this module and `tick_profile` state that the sort belongs on
+    /// the read rather than on the tick. Handing out the `Arc` lets `GET
+    /// /metrics` pay it per request instead of the node's drive loop paying
+    /// it ninety times a second to keep a copy nobody has asked for warm.
+    pub fn shell_efficiency_profile(&self) -> Arc<Mutex<ShellEfficiencyProfile>> {
+        Arc::clone(&self.effects.shell_efficiency)
+    }
+
     fn collect_provider_supervisor_events(&mut self) {
         self.collect_provider_exit_acks();
         self.collect_provider_faults();
@@ -1831,6 +1856,11 @@ struct NativeWorkerContext {
     terminal_frames: Arc<Mutex<BTreeMap<TerminalFrameKey, ObservationEnvelope>>>,
     active_sessions: Arc<AtomicUsize>,
     hook_ingress: Arc<RwLock<Option<HookIngressControl>>>,
+    /// Shared with every other instance's worker and with
+    /// `NativeEffectDispatcher` -- see `shell_efficiency`'s own doc comment
+    /// for why folding here, once per worker-loop iteration, is the only
+    /// place a shell-native fact can become part of a distribution.
+    shell_efficiency: Arc<Mutex<ShellEfficiencyProfile>>,
     poll_interval: Duration,
     idle_timeout: Duration,
 }
@@ -1849,6 +1879,7 @@ struct NativeEffectDispatcher {
     terminal_frames: Arc<Mutex<BTreeMap<TerminalFrameKey, ObservationEnvelope>>>,
     active_sessions: Arc<AtomicUsize>,
     hook_ingress: Arc<RwLock<Option<HookIngressControl>>>,
+    shell_efficiency: Arc<Mutex<ShellEfficiencyProfile>>,
 }
 
 impl NativeEffectDispatcher {
@@ -1872,6 +1903,7 @@ impl NativeEffectDispatcher {
             terminal_frames: Arc::new(Mutex::new(BTreeMap::new())),
             active_sessions: Arc::new(AtomicUsize::new(0)),
             hook_ingress: Arc::new(RwLock::new(None)),
+            shell_efficiency: Arc::new(Mutex::new(ShellEfficiencyProfile::default())),
         }
     }
 
@@ -2200,6 +2232,7 @@ impl NativeEffectDispatcher {
                 terminal_frames: Arc::clone(&self.terminal_frames),
                 active_sessions: Arc::clone(&self.active_sessions),
                 hook_ingress: Arc::clone(&self.hook_ingress),
+                shell_efficiency: Arc::clone(&self.shell_efficiency),
                 poll_interval: Duration::from_millis(self.config.worker_poll_interval_ms.max(1)),
                 idle_timeout: Duration::from_millis(self.config.worker_idle_timeout_ms.max(1)),
             },
@@ -2729,6 +2762,16 @@ async fn publish_shell_observations(
             return false;
         }
     }
+
+    // Drain this iteration's shell-side efficiency facts (both calls above
+    // recorded into them) and fold them into the shared profile
+    // `NativeRuntime::shell_efficiency_snapshot` reads -- locked only for
+    // this fold, dropped before `collect_exits`'s own `.await` below.
+    context
+        .shell_efficiency
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .fold(&shell.take_efficiency_facts());
 
     let before = shell.active_session_count();
     for observation in shell.collect_exits().await {

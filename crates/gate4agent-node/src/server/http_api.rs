@@ -157,9 +157,10 @@ fn ready_body(shared: &NodeShared) -> Value {
 }
 
 /// One windowed distribution as `{p50, p95, max, count}` -- `unit_suffix`
-/// picks between microsecond-labelled fields (the phase timings) and
-/// bare fields (the iteration-rate series, whose samples are a per-second
-/// count, not a duration).
+/// picks between microsecond-labelled fields (the phase timings),
+/// byte-labelled fields (`terminal_frame_bytes`), and bare fields (the
+/// iteration-rate series, whose samples are a per-second count, not a
+/// duration).
 fn distribution_body(distribution: Distribution, unit_suffix: &str) -> Value {
     json!({
         format!("p50{unit_suffix}"): distribution.p50,
@@ -178,9 +179,12 @@ fn distribution_body(distribution: Distribution, unit_suffix: &str) -> Value {
 /// Answers "where does an idle drive-loop iteration's own CPU go," split
 /// into the loop's own three phases plus whatever remains before the
 /// trailing sleep, `NativeRuntime::tick`'s own six internal phases, the
-/// loop's actual (not merely configured) iteration rate, and the two
-/// session counts that can legitimately disagree -- see
-/// `native_pty_sessions`'s own field comment for why.
+/// loop's actual (not merely configured) iteration rate, the two session
+/// counts that can legitimately disagree -- see `native_pty_sessions`'s own
+/// field comment for why -- and what each live session actually costs per
+/// tick: real screen-capture and foreground-probe timings, and published
+/// frame size, all in `shell_efficiency` right next to `sessions` so
+/// dividing one by `sessions.native_pty` is the obvious next step.
 fn metrics_body(shared: &NodeShared) -> Value {
     let drive_loop = shared
         .drive_loop_profile
@@ -191,6 +195,21 @@ fn metrics_body(shared: &NodeShared) -> Value {
         .runtime_tick_profile
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Snapshotting sorts every ring behind these series, which is exactly
+    // why it happens on the request and not in the drive loop -- see
+    // `NodeShared::shell_efficiency_profile`. Absent until the runtime
+    // starts driving; the default reports empty series (`count: 0`) rather
+    // than zeroes that would read as measurements.
+    let shell_efficiency = shared
+        .shell_efficiency_profile
+        .get()
+        .map(|profile| {
+            profile
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .snapshot()
+        })
+        .unwrap_or_default();
     let native_pty_sessions = shared.native_session_gauge.load(Ordering::Relaxed);
     // The control plane's own session bookkeeping: every session the
     // kernel's backend snapshot still carries, live or already exited but
@@ -224,6 +243,34 @@ fn metrics_body(shared: &NodeShared) -> Value {
             "native_pty": native_pty_sessions,
             "control_plane": control_plane_sessions,
         },
+        // What a live session actually costs, folded in from every
+        // per-instance worker loop's `ShellEfficiencyFacts` -- see
+        // `gate4agent_runtime_native::shell_efficiency`'s own doc comment.
+        // Every `_total` field below is a LIFETIME total, same rule as
+        // `connections`: read twice and divide by the interval for a rate,
+        // or divide by `sessions.native_pty` above for a per-session cost.
+        "shell_efficiency": {
+            // Real `terminal_state()` captures -- the sequence gate already
+            // filtered out the cheap no-op case, so this is exactly the
+            // "changed-screen capture" cost, and `skips_total` against
+            // `captures_total` is the skip/capture ratio that decides
+            // whether that gate's remaining cost is worth attacking.
+            "terminal_state_us": distribution_body(shell_efficiency.terminal_state_us, "_us"),
+            "terminal_state_captures_total": shell_efficiency.terminal_state_captures_total,
+            "terminal_state_skips_total": shell_efficiency.terminal_state_skips_total,
+            // Published `TerminalFrame` wire size -- `formatted` plus every
+            // `scrollback_formatted` row.
+            "terminal_frame_bytes":
+                distribution_body(shell_efficiency.terminal_frame_bytes, "_bytes"),
+            "terminal_frames_published_total": shell_efficiency.terminal_frames_published_total,
+            "terminal_frame_bytes_total": shell_efficiency.terminal_frame_bytes_total,
+            // `reclassify_foreground`'s OS process-tree probes -- on a node
+            // whose sessions are all `PtyScreenState::Ready`,
+            // `probes_total` must stop rising; that is the disarm claim on
+            // that method's own doc comment.
+            "foreground_probe_us": distribution_body(shell_efficiency.foreground_probe_us, "_us"),
+            "foreground_probes_total": shell_efficiency.foreground_probes_total,
+        },
         // Lifetime totals across every connection served. Read them twice
         // and divide by the interval for a rate. `iterations` far
         // outrunning `events_sent` means the serve loop is spinning rather
@@ -232,6 +279,16 @@ fn metrics_body(shared: &NodeShared) -> Value {
         "connections": {
             "loop_iterations": shared.connection_loop_iterations.load(Ordering::Relaxed),
             "events_sent": shared.connection_events_sent.load(Ordering::Relaxed),
+        },
+        // Lifetime totals for `drive_runtime_until_shutdown`'s own
+        // iterations. Read twice and divide by the interval, same rule as
+        // `connections` above. `idle_total / total` is how large a
+        // fraction of the drive loop's ~10ms cadence does nothing
+        // observable -- see the exact "produced nothing" definition at the
+        // site in `drive_runtime_until_shutdown` that increments these.
+        "drive_loop_iterations": {
+            "total": shared.drive_loop_iterations_total.load(Ordering::Relaxed),
+            "idle_total": shared.drive_loop_iterations_idle.load(Ordering::Relaxed),
         },
     })
 }
@@ -585,6 +642,18 @@ mod tests {
         }
         assert!(metrics.contains("\"native_pty\":0"));
         assert!(metrics.contains("\"control_plane\":0"));
+        for field in [
+            "terminal_state_us", "terminal_state_captures_total", "terminal_state_skips_total",
+            "terminal_frame_bytes", "terminal_frames_published_total",
+            "terminal_frame_bytes_total", "foreground_probe_us", "foreground_probes_total",
+        ] {
+            assert!(
+                metrics.contains(&format!("\"{field}\"")),
+                "missing shell_efficiency.{field} in {metrics}",
+            );
+        }
+        assert!(metrics.contains("\"drive_loop_iterations\""));
+        assert!(metrics.contains("\"idle_total\""));
         assert!(!metrics.contains("test-token"));
 
         let posted = request(address, "POST /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n").await;

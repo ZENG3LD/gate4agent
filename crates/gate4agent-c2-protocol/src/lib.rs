@@ -3189,7 +3189,11 @@ mod tests {
                     reasoning_tokens: 13,
                 }),
                 current: AgentProgressCurrentV1::Working,
-                active_tool_labels: vec!["shell".to_owned()],
+                // Capitalized because `validate_agent_progress_tool_label`
+                // accepts a fixed capitalized class vocabulary. Lowercase
+                // decodes as a label outside it, so this fixture stood for
+                // an invalid value rather than the safe class it meant.
+                active_tool_labels: vec!["Shell".to_owned()],
                 active_tool_count: 1,
                 attention: None,
                 subagent_count: 2,
@@ -3443,21 +3447,61 @@ mod tests {
         }
     }
 
+    /// Pins the SHAPE of the legacy hello -- which keys, in what order,
+    /// and that `compatibility` is absent rather than serialized as
+    /// `null` -- against a decoder that predates negotiation and would
+    /// reject an unknown key.
+    ///
+    /// The version is interpolated from `C2_CONTROL_PROTOCOL_VERSION`
+    /// rather than frozen, because freezing it could not survive its own
+    /// design: `C2ClientHello::new` fills that field FROM the constant, so
+    /// the frozen form asserted the constant still equalled a copy of
+    /// itself taken when the test was written. It went red on the first
+    /// bump and stayed red across the next two, which is how a test stops
+    /// being read at all. The key set and their order are what must not
+    /// drift, and those are still pinned literally.
     #[test]
-    fn c2_compatibility_legacy_client_hello_json_is_byte_equivalent() {
+    fn the_legacy_client_hello_json_carries_exactly_these_keys_in_this_order() {
         let hello = C2ClientHello::new([0; C2_AUTH_NONCE_BYTES]);
         let json = serde_json::to_string(&hello).unwrap();
-        let expected = concat!(
-            r#"{"protocol_version":2,"client_nonce":["#,
-            "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,",
-            "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}"
+        let owned = format!(
+            concat!(
+                r#"{{"protocol_version":{},"client_nonce":["#,
+                "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,",
+                "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}}"
+            ),
+            C2_CONTROL_PROTOCOL_VERSION,
         );
+        let expected = owned.as_str();
 
         assert_eq!(json, expected);
+        // Stated separately so it cannot read as incidental to the string
+        // above: to a strict decoder an absent key and a null one are
+        // different messages.
+        assert!(!json.contains("compatibility"));
         assert_eq!(
             serde_json::from_str::<C2ClientHello>(expected).unwrap(),
             hello,
         );
+    }
+
+    /// `C2_CONTROL_PROTOCOL_VERSION` as the two little-endian hex bytes a
+    /// bound-auth transcript encodes it as.
+    ///
+    /// The transcript tests below still pin their entire byte layout
+    /// literally -- domain tag, direction byte, both nonces, the offer and
+    /// selection blocks with their length prefixes, the host descriptor --
+    /// and interpolate only this. That split is deliberate: reorder a
+    /// field, drop a length prefix, or change an encoding and they still
+    /// fail; bump the protocol and they do not, because the transcript
+    /// derives its version from the same constant the expectation does.
+    /// Freezing the version alongside the layout is what left these red.
+    fn protocol_version_hex() -> String {
+        C2_CONTROL_PROTOCOL_VERSION
+            .to_le_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
     }
 
     #[test]
@@ -3760,16 +3804,27 @@ mod tests {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
+        let version = protocol_version_hex();
         assert_eq!(
             hex,
-            concat!(
-                "67617465346167656e742d63322d636f6e74726f6c2d617574682d76322d636f6d7061746962696c69747900",
-                "020001",
-                "1111111111111111111111111111111111111111111111111111111111111111",
-                "2222222222222222222222222222222222222222222222222222222222222222",
-                "6f666665720002000200010018007465726d696e616c2d6672616d652d6576656e74732d763100",
-                "73656c6563746564000200010018007465726d696e616c2d6672616d652d6576656e74732d7631",
-                "060064617277696e0700616172636836340201",
+            format!(
+                concat!(
+                    "67617465346167656e742d63322d636f6e74726f6c2d617574682d76322d636f6d7061746962696c69747900",
+                    "{version}",
+                    "01",
+                    "1111111111111111111111111111111111111111111111111111111111111111",
+                    "2222222222222222222222222222222222222222222222222222222222222222",
+                    "6f6666657200",
+                    "{version}{version}",
+                    "0100",
+                    "18007465726d696e616c2d6672616d652d6576656e74732d763100",
+                    "73656c656374656400",
+                    "{version}",
+                    "0100",
+                    "18007465726d696e616c2d6672616d652d6576656e74732d7631",
+                    "060064617277696e0700616172636836340201",
+                ),
+                version = version,
             ),
         );
     }
@@ -4613,16 +4668,27 @@ mod tests {
         ).unwrap();
         let hex = transcript.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
 
+        let version = protocol_version_hex();
         assert_eq!(
             hex,
-            concat!(
-                "67617465346167656e742d63322d636f6e74726f6c2d617574682d76322d636f6d7061746962696c69747900",
-                "020001",
-                "1111111111111111111111111111111111111111111111111111111111111111",
-                "2222222222222222222222222222222222222222222222222222222222222222",
-                "6f66666572000200020001001600636f6d7061746962696c6974792e6d6574616461746100",
-                "73656c656374656400020001001600636f6d7061746962696c6974792e6d65746164617461",
-                "070077696e646f777306007838365f36340101",
+            format!(
+                concat!(
+                    "67617465346167656e742d63322d636f6e74726f6c2d617574682d76322d636f6d7061746962696c69747900",
+                    "{version}",
+                    "01",
+                    "1111111111111111111111111111111111111111111111111111111111111111",
+                    "2222222222222222222222222222222222222222222222222222222222222222",
+                    "6f6666657200",
+                    "{version}{version}",
+                    "0100",
+                    "1600636f6d7061746962696c6974792e6d6574616461746100",
+                    "73656c656374656400",
+                    "{version}",
+                    "0100",
+                    "1600636f6d7061746962696c6974792e6d65746164617461",
+                    "070077696e646f777306007838365f36340101",
+                ),
+                version = version,
             ),
         );
 

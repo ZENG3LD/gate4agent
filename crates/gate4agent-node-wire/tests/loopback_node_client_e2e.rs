@@ -33,6 +33,7 @@ fn snapshot() -> NodeSnapshot {
         session_records: Vec::new(),
         managed_worktrees: Vec::new(),
         launch_inventory: None,
+        agent_progress: Vec::new(),
     }
 }
 

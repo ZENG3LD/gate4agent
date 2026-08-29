@@ -60,6 +60,32 @@ pub struct ProviderRuntimePolicy {
     pub structured_prompt: bool,
     pub provider_session_identity: bool,
     pub semantic_resume: bool,
+    /// Whether this session's provider-event ingestion may come from a
+    /// declared hook adapter -- a native hooks contract the provider CLI
+    /// itself calls over the authenticated loopback ingress route, with the
+    /// node's own adapter normalizing the payload before it ever reaches the
+    /// engine.
+    ///
+    /// This is deliberately NOT `semantic_readiness`, and granting one must
+    /// never imply the other. `semantic_readiness` (and the `structured_
+    /// prompt`/`provider_session_identity`/`semantic_resume` capabilities
+    /// chained off it) authorize INFERRING provider semantics by parsing PTY
+    /// terminal text -- that inference is only sound for a CLI version this
+    /// build has a verified vendor terminal contract for (see
+    /// `gate4agent-runtime-native`'s `VERIFIED_PROFILES`). A hook event is
+    /// not an inference: the CLI is asserting it directly over a route this
+    /// node authenticated, and the node's hook adapter -- not a terminal
+    /// screen scanner -- turns it into a `ProviderEvent`. None of the
+    /// terminal-behaviour verification a vendor contract encodes is
+    /// relevant to that trust story, so `hook_semantics` is derived purely
+    /// from "does the catalog declare a hook adapter for this provider" and
+    /// never from a vendor version probe. Conflating the two would let a
+    /// provider that merely declares a hook adapter silently unlock
+    /// PTY-parsing semantics it was never verified for, or -- the bug this
+    /// field fixes -- let a verified-semantic gate silently swallow every
+    /// hook event a provider with no verified profile at all (grok, codex,
+    /// kimi) sends over a route that is otherwise working end to end.
+    pub hook_semantics: bool,
 }
 
 impl ProviderRuntimePolicy {
@@ -69,6 +95,7 @@ impl ProviderRuntimePolicy {
         structured_prompt: bool,
         provider_session_identity: bool,
         semantic_resume: bool,
+        hook_semantics: bool,
     ) -> Result<Self, ProviderRuntimePolicyError> {
         let policy = Self {
             raw_pty_lifecycle,
@@ -76,6 +103,7 @@ impl ProviderRuntimePolicy {
             structured_prompt,
             provider_session_identity,
             semantic_resume,
+            hook_semantics,
         };
         policy.validate()?;
         Ok(policy)
@@ -88,6 +116,7 @@ impl ProviderRuntimePolicy {
             structured_prompt: false,
             provider_session_identity: false,
             semantic_resume: false,
+            hook_semantics: false,
         }
     }
 
@@ -95,7 +124,8 @@ impl ProviderRuntimePolicy {
         if (self.semantic_readiness
             || self.structured_prompt
             || self.provider_session_identity
-            || self.semantic_resume)
+            || self.semantic_resume
+            || self.hook_semantics)
             && !self.raw_pty_lifecycle
         {
             return Err(ProviderRuntimePolicyError::SemanticCapabilityRequiresRawPty);
@@ -118,6 +148,7 @@ impl ProviderRuntimePolicy {
                 self.provider_session_identity
             }
             ProviderRuntimeCapability::SemanticResume => self.semantic_resume,
+            ProviderRuntimeCapability::HookSemantics => self.hook_semantics,
         }
     }
 }
@@ -134,6 +165,7 @@ impl<'de> Deserialize<'de> for ProviderRuntimePolicy {
             structured_prompt: bool,
             provider_session_identity: bool,
             semantic_resume: bool,
+            hook_semantics: bool,
         }
 
         let wire = WirePolicy::deserialize(deserializer)?;
@@ -143,6 +175,7 @@ impl<'de> Deserialize<'de> for ProviderRuntimePolicy {
             wire.structured_prompt,
             wire.provider_session_identity,
             wire.semantic_resume,
+            wire.hook_semantics,
         )
         .map_err(serde::de::Error::custom)
     }
@@ -167,6 +200,10 @@ pub enum ProviderRuntimeCapability {
     StructuredPrompt,
     ProviderSessionIdentity,
     SemanticResume,
+    /// Admits provider-event ingestion sourced from a declared hook adapter.
+    /// Independent of `SemanticReadiness` -- see `ProviderRuntimePolicy::
+    /// hook_semantics` for why the two must never stand in for each other.
+    HookSemantics,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1743,21 +1780,43 @@ mod tests {
         let raw = ProviderRuntimePolicy::raw_pty();
         assert!(raw.admits(ProviderRuntimeCapability::RawPtyLifecycle));
         assert!(!raw.admits(ProviderRuntimeCapability::SemanticReadiness));
+        assert!(!raw.admits(ProviderRuntimeCapability::HookSemantics));
         assert_eq!(raw.validate(), Ok(()));
 
         assert_eq!(
-            ProviderRuntimePolicy::new(false, true, false, false, false),
+            ProviderRuntimePolicy::new(false, true, false, false, false, false),
             Err(ProviderRuntimePolicyError::SemanticCapabilityRequiresRawPty),
         );
         assert_eq!(
-            ProviderRuntimePolicy::new(true, false, true, false, false),
+            ProviderRuntimePolicy::new(true, false, true, false, false, false),
             Err(ProviderRuntimePolicyError::StructuredPromptRequiresReadiness),
         );
         assert_eq!(
-            ProviderRuntimePolicy::new(true, true, true, false, true),
+            ProviderRuntimePolicy::new(true, true, true, false, true, false),
             Err(ProviderRuntimePolicyError::ResumeRequiresSessionIdentity),
         );
-        assert!(ProviderRuntimePolicy::new(true, true, true, true, true).is_ok());
+        assert_eq!(
+            ProviderRuntimePolicy::new(false, false, false, false, false, true),
+            Err(ProviderRuntimePolicyError::SemanticCapabilityRequiresRawPty),
+        );
+        assert!(ProviderRuntimePolicy::new(true, true, true, true, true, true).is_ok());
+    }
+
+    /// The pair that makes hook ingestion work for a provider like grok: a
+    /// hook adapter with no verified vendor terminal contract still admits
+    /// its own events, and that admission never leaks into the PTY-parsing
+    /// `SemanticReadiness` capability it is deliberately independent from.
+    #[test]
+    fn hook_semantics_and_semantic_readiness_are_independently_grantable() {
+        let hook_only = ProviderRuntimePolicy::new(true, false, false, false, false, true)
+            .expect("hook semantics alone requires only the raw PTY lifecycle");
+        assert!(hook_only.admits(ProviderRuntimeCapability::HookSemantics));
+        assert!(!hook_only.admits(ProviderRuntimeCapability::SemanticReadiness));
+
+        let semantic_only = ProviderRuntimePolicy::new(true, true, false, false, false, false)
+            .expect("semantic readiness alone requires only the raw PTY lifecycle");
+        assert!(semantic_only.admits(ProviderRuntimeCapability::SemanticReadiness));
+        assert!(!semantic_only.admits(ProviderRuntimeCapability::HookSemantics));
     }
 
     #[test]
@@ -1766,18 +1825,18 @@ mod tests {
         let encoded = serde_json::to_string(&raw).unwrap();
         assert_eq!(
             encoded,
-            r#"{"raw_pty_lifecycle":true,"semantic_readiness":false,"structured_prompt":false,"provider_session_identity":false,"semantic_resume":false}"#,
+            r#"{"raw_pty_lifecycle":true,"semantic_readiness":false,"structured_prompt":false,"provider_session_identity":false,"semantic_resume":false,"hook_semantics":false}"#,
         );
         assert_eq!(
             serde_json::from_str::<ProviderRuntimePolicy>(&encoded).unwrap(),
             raw,
         );
         assert!(serde_json::from_str::<ProviderRuntimePolicy>(
-            r#"{"raw_pty_lifecycle":true,"semantic_readiness":false,"structured_prompt":false,"provider_session_identity":false}"#,
+            r#"{"raw_pty_lifecycle":true,"semantic_readiness":false,"structured_prompt":false,"provider_session_identity":false,"semantic_resume":false}"#,
         )
         .is_err());
         assert!(serde_json::from_str::<ProviderRuntimePolicy>(
-            r#"{"raw_pty_lifecycle":true,"semantic_readiness":false,"structured_prompt":true,"provider_session_identity":false,"semantic_resume":false}"#,
+            r#"{"raw_pty_lifecycle":true,"semantic_readiness":false,"structured_prompt":true,"provider_session_identity":false,"semantic_resume":false,"hook_semantics":false}"#,
         )
         .is_err());
         assert!(serde_json::from_str::<super::ControlCommand>(

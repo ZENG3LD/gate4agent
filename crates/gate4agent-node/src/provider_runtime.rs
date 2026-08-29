@@ -42,6 +42,7 @@ struct ProviderStaticCapabilities {
     semantic_pty_adapter: bool,
     resume_adapter: bool,
     pty_sidecar_observation: bool,
+    hook_adapter: bool,
 }
 
 impl ProviderRuntimeMonitor {
@@ -66,6 +67,7 @@ impl ProviderRuntimeMonitor {
                                 .adapters
                                 .pty_sidecar
                                 .is_some(),
+                            hook_adapter: spec.capabilities.adapters.hook.is_some(),
                         },
                     )
                 })
@@ -107,12 +109,19 @@ impl ProviderRuntimeMonitor {
             );
         };
         if static_capabilities.pty_sidecar_observation {
+            // The pipe sidecar observes structured events over its own
+            // adapter, not a hook route -- honestly derive hook_semantics
+            // the same way the primary path does rather than hardcoding it,
+            // even though the catalog never declares both adapters for one
+            // provider today.
+            let hook_semantics = static_capabilities.raw_pty && static_capabilities.hook_adapter;
             let policy = ProviderRuntimePolicy::new(
                 static_capabilities.raw_pty,
                 true,
                 false,
                 false,
                 false,
+                hook_semantics,
             )
             .expect("catalog-declared PTY sidecar policy is internally valid");
             return (
@@ -158,10 +167,16 @@ pub(crate) fn admit_status(
             return Err(ProviderRuntimeAdmissionError::LauncherUnavailable);
         }
         ProviderRuntimeMode::RawPassthrough => ProviderRuntimePolicy::raw_pty(),
+        // This coarse fallback answers only the requirements in
+        // `ProviderRuntimeRequirement` (raw PTY / semantic prompt / resume),
+        // none of which reference `HookSemantics` -- it carries no hook
+        // signal because it is not derived from the catalog's adapter
+        // declarations at all.
         ProviderRuntimeMode::VerifiedSemantic => ProviderRuntimePolicy::new(
             true,
             true,
             true,
+            false,
             false,
             false,
         )
@@ -234,12 +249,23 @@ fn policy_from_capability_flags(
     let semantic_resume = provider_session_identity
         && static_capabilities.resume_adapter
         && live_semantic_resume;
+    // Hook-sourced events are asserted directly by the provider CLI over an
+    // authenticated route and normalized by the node's own hook adapter --
+    // there is no terminal behaviour to verify, so unlike every other
+    // capability above this one carries no `live_*` term at all. The vendor
+    // contract table (`VERIFIED_PROFILES`) has nothing to say about a
+    // channel the vendor drives itself, and gating it on that table is
+    // exactly the bug this capability exists to fix: a provider with a
+    // declared hook adapter but no verified terminal contract (grok, codex,
+    // kimi) would otherwise never admit a single hook event.
+    let hook_semantics = raw_pty_lifecycle && static_capabilities.hook_adapter;
     ProviderRuntimePolicy::new(
         raw_pty_lifecycle,
         semantic_readiness,
         structured_prompt,
         provider_session_identity,
         semantic_resume,
+        hook_semantics,
     )
     .expect("static and live provider capability intersection is internally valid")
 }
@@ -384,7 +410,7 @@ mod tests {
                 &verified,
                 ProviderRuntimeRequirement::SemanticPrompt,
             ),
-            Ok(ProviderRuntimePolicy::new(true, true, true, false, false).unwrap()),
+            Ok(ProviderRuntimePolicy::new(true, true, true, false, false, false).unwrap()),
         );
         assert_eq!(
             admit_status(&statuses, &unavailable, ProviderRuntimeRequirement::RawPty),
@@ -429,6 +455,34 @@ mod tests {
         );
     }
 
+    /// Grok declares a hook adapter and no PTY-semantic adapter, and has no
+    /// verified vendor terminal contract at all. It must admit hook-sourced
+    /// ingestion without ever being read as having verified PTY-parsing
+    /// semantics -- the pair is the whole point of splitting the two
+    /// capabilities, so both halves are asserted here.
+    #[test]
+    fn grok_admits_hook_semantics_without_semantic_readiness() {
+        let launcher = std::env::temp_dir().join(format!(
+            "gate4agent-grok-hook-semantics-runtime-monitor-{}{}",
+            std::process::id(),
+            std::env::consts::EXE_SUFFIX,
+        ));
+        std::fs::write(&launcher, b"fixture launcher identity").unwrap();
+        let mut spec = builtin_registry().get_by_id("grok").unwrap().clone();
+        assert!(spec.capabilities.adapters.hook.is_some());
+        assert!(spec.capabilities.transports.pty_adapter.is_none());
+        spec.launch.program = launcher.to_string_lossy().into_owned();
+        let catalog = AgentRegistry::new([spec]).unwrap();
+        let monitor = ProviderRuntimeMonitor::new(&catalog);
+
+        let (_, admitted) = monitor.evaluate(&AgentId::new("grok").unwrap());
+        let policy = admitted.unwrap();
+        assert!(policy.hook_semantics);
+        assert!(!policy.semantic_readiness);
+
+        std::fs::remove_file(&launcher).unwrap();
+    }
+
     #[test]
     fn qwen_sidecar_admission_skips_version_probe_and_non_qwen_does_not() {
         let launcher = std::env::temp_dir().join(format!(
@@ -450,7 +504,7 @@ mod tests {
         assert_eq!(qwen_status.unwrap().mode(), ProviderRuntimeMode::RawPassthrough);
         assert_eq!(
             qwen_admission,
-            Ok(ProviderRuntimePolicy::new(true, true, false, false, false).unwrap())
+            Ok(ProviderRuntimePolicy::new(true, true, false, false, false, false).unwrap())
         );
         let (grok_status, grok_admission) = monitor.evaluate(&AgentId::new("grok").unwrap());
         assert!(grok_status.is_none());
@@ -490,6 +544,7 @@ mod tests {
             semantic_pty_adapter: true,
             resume_adapter: true,
             pty_sidecar_observation: false,
+            hook_adapter: true,
         };
         let full = policy_from_capability_flags(
             &full_static,
@@ -501,7 +556,7 @@ mod tests {
         );
         assert_eq!(
             full,
-            ProviderRuntimePolicy::new(true, true, true, true, true).unwrap(),
+            ProviderRuntimePolicy::new(true, true, true, true, true, true).unwrap(),
         );
 
         let no_static_resume = ProviderStaticCapabilities {
@@ -517,7 +572,7 @@ mod tests {
                 true,
                 true,
             ),
-            ProviderRuntimePolicy::new(true, true, true, true, false).unwrap(),
+            ProviderRuntimePolicy::new(true, true, true, true, false, true).unwrap(),
         );
 
         assert_eq!(
@@ -529,16 +584,39 @@ mod tests {
                 true,
                 true,
             ),
-            ProviderRuntimePolicy::new(true, false, false, true, true).unwrap(),
+            ProviderRuntimePolicy::new(true, false, false, true, true, true).unwrap(),
         );
 
+        // Grok's exact shape: no PTY-semantic adapter, but a declared hook
+        // adapter. `hook_semantics` carries no `live_*` term, so it stays
+        // admitted here even though `semantic_readiness` collapses to
+        // false -- the split this whole capability exists for.
         let no_semantic_adapter = ProviderStaticCapabilities {
             semantic_pty_adapter: false,
             ..full_static
         };
+        let hook_only = policy_from_capability_flags(
+            &no_semantic_adapter,
+            true,
+            true,
+            true,
+            true,
+            true,
+        );
+        assert_eq!(
+            hook_only,
+            ProviderRuntimePolicy::new(true, false, false, false, false, true).unwrap(),
+        );
+        assert!(hook_only.hook_semantics);
+        assert!(!hook_only.semantic_readiness);
+
+        let no_static_hook = ProviderStaticCapabilities {
+            hook_adapter: false,
+            ..no_semantic_adapter
+        };
         assert_eq!(
             policy_from_capability_flags(
-                &no_semantic_adapter,
+                &no_static_hook,
                 true,
                 true,
                 true,

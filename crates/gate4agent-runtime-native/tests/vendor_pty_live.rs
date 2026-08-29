@@ -14,7 +14,7 @@ use gate4agent_types::{
 };
 
 fn semantic_runtime_policy() -> ProviderRuntimePolicy {
-    ProviderRuntimePolicy::new(true, true, true, true, true).unwrap()
+    ProviderRuntimePolicy::new(true, true, true, true, true, false).unwrap()
 }
 
 const LIVE_CANARY_ENV: &str = "GATE4AGENT_VENDOR_PTY_CANARY";

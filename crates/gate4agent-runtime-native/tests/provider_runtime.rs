@@ -19,7 +19,7 @@ use gate4agent_types::{
 };
 
 fn semantic_runtime_policy() -> ProviderRuntimePolicy {
-    ProviderRuntimePolicy::new(true, true, true, true, true).unwrap()
+    ProviderRuntimePolicy::new(true, true, true, true, true, true).unwrap()
 }
 
 fn command(id: u64, command: ControlCommand) -> CommandEnvelope {
@@ -678,7 +678,7 @@ async fn loopback_hook_listener_injects_a_route_without_identity_authority() {
             61,
             ControlCommand::Start {
                 instance_id,
-                runtime_policy: ProviderRuntimePolicy::new(true, true, true, false, false)
+                runtime_policy: ProviderRuntimePolicy::new(true, true, true, false, false, true)
                     .unwrap(),
                 request: StartRequest {
                     working_directory: std::env::current_dir()

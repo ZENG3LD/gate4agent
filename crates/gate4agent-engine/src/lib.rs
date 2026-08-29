@@ -3,7 +3,8 @@
 use gate4agent_types::{
     normalize_semantic_prompt, prepare_agent_command, prepare_input, prepare_shell_command,
     validate_candidate_id, validate_capability_models, validate_history_error,
-    validate_resume_error, ActiveProviderTool, AgentInstanceId, CapabilityProbeRequest,
+    validate_resume_error, ActiveProviderTool, AdapterFamily, AgentInstanceId,
+    CapabilityProbeRequest,
     CapabilitySnapshot, CommandEnvelope, CommandId, ControlCommand, ControlEffect, ControlError,
     ControlEvent, ControlEventKind, ControlHealth, ControlObservation, ControlSnapshot,
     EffectEnvelope, ForegroundAuthority, ForegroundRequirement, ForegroundSnapshot,
@@ -2207,10 +2208,17 @@ impl Gate4AgentEngine {
                 .iter()
                 .any(|event| !matches!(event, ProviderEvent::SessionIdentityObserved { .. }))
         {
-            require_runtime_capability(
-                state.runtime_policy,
-                ProviderRuntimeCapability::SemanticReadiness,
-            )?;
+            // A hook-sourced batch is authenticated by the ingress route and
+            // normalized by the node's own hook adapter, not inferred from
+            // PTY terminal text -- it is gated on `HookSemantics`, never on
+            // `SemanticReadiness`. Every other source family still proves
+            // its semantics by the PTY-parsing verification chain.
+            let capability = if source.family == AdapterFamily::Hook {
+                ProviderRuntimeCapability::HookSemantics
+            } else {
+                ProviderRuntimeCapability::SemanticReadiness
+            };
+            require_runtime_capability(state.runtime_policy, capability)?;
         }
         if events
             .iter()
@@ -3453,7 +3461,7 @@ mod tests {
     }
 
     fn verified_runtime_policy() -> ProviderRuntimePolicy {
-        ProviderRuntimePolicy::new(true, true, true, true, true).unwrap()
+        ProviderRuntimePolicy::new(true, true, true, true, true, true).unwrap()
     }
 
     fn start(command_id: u64) -> CommandEnvelope {
@@ -3646,6 +3654,51 @@ mod tests {
         );
     }
 
+    /// `HookSemantics` and `SemanticReadiness` do not stand in for each
+    /// other: a policy that admits the former but not the latter accepts a
+    /// hook-sourced ingress batch and still refuses one sourced from a
+    /// PTY-parsing adapter family.
+    #[test]
+    fn hook_semantics_admits_hook_ingress_and_never_substitutes_for_semantic_readiness() {
+        let hook_only_policy =
+            ProviderRuntimePolicy::new(true, false, false, false, false, true).unwrap();
+        let (mut engine, spawn) = running_engine_with_policy(hook_only_policy);
+
+        engine
+            .apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(5),
+                command: ControlCommand::IngestProvider {
+                    instance_id: instance(),
+                    generation: spawn.generation,
+                    source: hook_source(),
+                    source_sequence: 1,
+                    events: vec![ProviderEvent::TurnStarted {
+                        prompt: Some("ground hook".to_owned()),
+                    }],
+                },
+            })
+            .expect("hook-sourced ingress is admitted by HookSemantics alone");
+
+        assert_eq!(
+            engine.apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(6),
+                command: ControlCommand::IngestProvider {
+                    instance_id: instance(),
+                    generation: spawn.generation,
+                    source: provider_source(),
+                    source_sequence: 1,
+                    events: vec![ProviderEvent::WorkingObserved],
+                },
+            }),
+            Err(ControlError::ProviderRuntimePolicyDenied {
+                capability: ProviderRuntimeCapability::SemanticReadiness,
+            }),
+            "a PTY-parsing-sourced batch must not be admitted by HookSemantics",
+        );
+    }
+
     #[test]
     fn runtime_policy_rejects_invalid_start_contract() {
         let mut engine = Gate4AgentEngine::new();
@@ -3656,6 +3709,7 @@ mod tests {
             structured_prompt: false,
             provider_session_identity: false,
             semantic_resume: false,
+            hook_semantics: false,
         };
         assert_eq!(
             engine.apply_command(start_with_policy(2, invalid)),

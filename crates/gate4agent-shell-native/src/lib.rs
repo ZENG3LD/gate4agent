@@ -4323,7 +4323,7 @@ mod tests {
             .binding(AdapterFamily::PtySemantic, "kimi")
             .expect("Kimi PTY binding");
         let without_structured_prompt =
-            ProviderRuntimePolicy::new(true, true, false, true, false)
+            ProviderRuntimePolicy::new(true, true, false, true, false, false)
                 .expect("identity observation policy without structured prompt");
 
         assert!(!should_probe_pty_identity(
@@ -4340,7 +4340,7 @@ mod tests {
         ));
 
         let with_structured_prompt =
-            ProviderRuntimePolicy::new(true, true, true, true, false)
+            ProviderRuntimePolicy::new(true, true, true, true, false, false)
                 .expect("identity probe policy");
         assert!(should_probe_pty_identity(
             with_structured_prompt,
@@ -4368,8 +4368,9 @@ mod tests {
             .unwrap_err()
             .contains("SemanticReadiness"));
 
-        let resume_without_prompt = ProviderRuntimePolicy::new(true, false, false, true, true)
-            .expect("identity and resume policy");
+        let resume_without_prompt =
+            ProviderRuntimePolicy::new(true, false, false, true, true, false)
+                .expect("identity and resume policy");
         assert!(validate_spawn_runtime_policy(
             resume_without_prompt,
             TransportKind::Pty,

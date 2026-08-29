@@ -28,7 +28,8 @@ fn handle_drives_kernel_and_publishes_one_authoritative_snapshot() {
             id: CommandId(2),
             command: ControlCommand::Start {
                 instance_id,
-                runtime_policy: ProviderRuntimePolicy::new(true, true, true, true, true).unwrap(),
+                runtime_policy: ProviderRuntimePolicy::new(true, true, true, true, true, false)
+                    .unwrap(),
                 request: StartRequest {
                     working_directory: ".".to_owned(),
                     terminal_size: TerminalSize {

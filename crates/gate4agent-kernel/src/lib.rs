@@ -1172,7 +1172,7 @@ mod tests {
     }
 
     fn verified_runtime_policy() -> ProviderRuntimePolicy {
-        ProviderRuntimePolicy::new(true, true, true, true, true).unwrap()
+        ProviderRuntimePolicy::new(true, true, true, true, true, true).unwrap()
     }
 
     fn command(id: u64, command: ControlCommand) -> CommandEnvelope {

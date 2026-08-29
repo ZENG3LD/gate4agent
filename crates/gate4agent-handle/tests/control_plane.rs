@@ -132,7 +132,8 @@ fn start_running(
         2,
         ControlCommand::Start {
             instance_id: instance(),
-            runtime_policy: ProviderRuntimePolicy::new(true, true, true, true, true).unwrap(),
+            runtime_policy: ProviderRuntimePolicy::new(true, true, true, true, true, false)
+                .unwrap(),
             request: StartRequest {
                 working_directory: ".".to_owned(),
                 terminal_size: TerminalSize {

@@ -343,7 +343,7 @@ async fn loaded_history_resume_is_authorized_then_spawned_with_exact_provider_ar
             ControlCommand::Resume {
                 instance_id,
                 target: ResumeTarget::HistoryCandidate { candidate_id },
-                runtime_policy: ProviderRuntimePolicy::new(true, false, false, true, true)
+                runtime_policy: ProviderRuntimePolicy::new(true, false, false, true, true, false)
                     .unwrap(),
                 request: ResumeLaunchRequest {
                     working_directory,

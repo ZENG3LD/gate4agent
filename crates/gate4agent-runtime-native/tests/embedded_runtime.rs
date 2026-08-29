@@ -13,7 +13,7 @@ use gate4agent_types::{
 const FIXTURE_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn semantic_runtime_policy() -> ProviderRuntimePolicy {
-    ProviderRuntimePolicy::new(true, true, true, true, true).unwrap()
+    ProviderRuntimePolicy::new(true, true, true, true, true, false).unwrap()
 }
 
 fn command(id: u64, command: ControlCommand) -> CommandEnvelope {

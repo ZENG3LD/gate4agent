@@ -779,7 +779,7 @@ async fn selected_native_launch_profile_overlays_only_future_exact_pty_spawns() 
             8,
             ControlCommand::Start {
                 instance_id: mismatched_instance,
-                runtime_policy: ProviderRuntimePolicy::new(true, true, true, true, true).unwrap(),
+                runtime_policy: ProviderRuntimePolicy::new(true, true, true, true, true, false).unwrap(),
                 request: StartRequest {
                     working_directory: std::env::current_dir()
                         .unwrap()
@@ -993,7 +993,7 @@ async fn native_launch_profile_control_selects_before_spawn_for_exact_one_shot_p
             61,
             ControlCommand::Start {
                 instance_id,
-                runtime_policy: ProviderRuntimePolicy::new(true, true, true, true, true).unwrap(),
+                runtime_policy: ProviderRuntimePolicy::new(true, true, true, true, true, false).unwrap(),
                 request: StartRequest {
                     working_directory: std::env::current_dir()
                         .unwrap()
@@ -1108,7 +1108,7 @@ async fn persistent_codex_pipe_policy_reaches_the_exact_one_shot_spawn() {
             81,
             ControlCommand::Start {
                 instance_id,
-                runtime_policy: ProviderRuntimePolicy::new(true, true, true, true, true).unwrap(),
+                runtime_policy: ProviderRuntimePolicy::new(true, true, true, true, true, false).unwrap(),
                 request: StartRequest {
                     working_directory: std::env::current_dir()
                         .unwrap()
@@ -1196,7 +1196,7 @@ async fn selected_native_launch_profile_mismatch_fails_closed_before_resolver_or
             71,
             ControlCommand::Start {
                 instance_id,
-                runtime_policy: ProviderRuntimePolicy::new(true, true, true, true, true).unwrap(),
+                runtime_policy: ProviderRuntimePolicy::new(true, true, true, true, true, false).unwrap(),
                 request: StartRequest {
                     working_directory: std::env::current_dir()
                         .unwrap()

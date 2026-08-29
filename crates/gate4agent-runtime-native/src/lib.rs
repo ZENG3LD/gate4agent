@@ -3678,7 +3678,7 @@ mod tests {
             .await
             .unwrap();
         let hook_monitoring_policy =
-            ProviderRuntimePolicy::new(true, true, true, false, false).unwrap();
+            ProviderRuntimePolicy::new(true, true, true, false, false, true).unwrap();
         assert!(!hook_monitoring_policy.provider_session_identity);
         let spawn = |operation_id, instance_id, agent_id, transport, runtime_policy| {
             EffectEnvelope {
@@ -3740,7 +3740,7 @@ mod tests {
             11,
             HOOK_POSTING_FIXTURE_ID,
             TransportKind::Pipe,
-            ProviderRuntimePolicy::new(true, true, true, true, true).unwrap(),
+            ProviderRuntimePolicy::new(true, true, true, true, true, true).unwrap(),
         );
         assert!(runtime
             .effects

@@ -3448,6 +3448,7 @@ impl NodeShared {
                 requirement,
             )
         };
+        let admission = admission.map(|policy| self.admit_declared_hook_semantics(provider, policy));
         admission.map_err(|error| match error {
             ProviderRuntimeAdmissionError::LauncherUnavailable => failure(
                 NodeFailureCode::BackendOperationFailed,
@@ -3462,6 +3463,46 @@ impl NodeShared {
                 "provider runtime probe is already in progress",
             ),
         })
+    }
+
+    /// Grants hook ingestion to a provider whose catalog entry declares a
+    /// Hook adapter, whatever runtime mode its launcher probe landed in.
+    ///
+    /// `admit_status`'s `RawPassthrough` arm hands back
+    /// `ProviderRuntimePolicy::raw_pty()`, which grants nothing semantic --
+    /// correct for everything it was written to answer, and wrong for hooks
+    /// specifically. A hook event is not inferred from terminal behaviour,
+    /// so it has nothing to do with whether a launcher probe verified this
+    /// CLI version's PTY contract; the authority is the catalog declaring
+    /// the adapter plus the ingress authenticating the route. Without this
+    /// the node installs a provider's hooks, the CLI faithfully calls them,
+    /// and every event is refused -- which is exactly the state grok was in.
+    ///
+    /// Applied to both admission paths so the monitor's own derivation and
+    /// this coarse fallback cannot disagree about the same provider.
+    fn admit_declared_hook_semantics(
+        &self,
+        provider: &AgentId,
+        policy: ProviderRuntimePolicy,
+    ) -> ProviderRuntimePolicy {
+        if policy.hook_semantics || !policy.raw_pty_lifecycle {
+            return policy;
+        }
+        let declares_hook = self.provider_adapter_contracts.iter().any(|contract| {
+            contract.provider == *provider && contract.family == AdapterFamily::Hook
+        });
+        if !declares_hook {
+            return policy;
+        }
+        ProviderRuntimePolicy::new(
+            policy.raw_pty_lifecycle,
+            policy.semantic_readiness,
+            policy.structured_prompt,
+            policy.provider_session_identity,
+            policy.semantic_resume,
+            true,
+        )
+        .expect("granting hook semantics over a raw-PTY policy is internally valid")
     }
 
     fn admit_qwen_sidecar_observation_policy(
@@ -3486,6 +3527,7 @@ impl NodeShared {
             policy.structured_prompt,
             policy.provider_session_identity,
             policy.semantic_resume,
+            policy.hook_semantics,
         )
         .expect("exact Qwen sidecar observation policy is internally valid")
     }
@@ -11322,7 +11364,7 @@ impl NodeShared {
     ) -> ProviderRuntimePolicy {
         #[cfg(feature = "fixture")]
         let runtime_policy = if self.fixture_semantic_hook_policy {
-            ProviderRuntimePolicy::new(true, true, true, true, false)
+            ProviderRuntimePolicy::new(true, true, true, true, false, true)
                 .expect("monitoring Hook fixture policy is internally valid")
         } else {
             runtime_policy
@@ -17031,7 +17073,7 @@ mod observation_projection_tests {
         shared.bind_managed_session(
             &address,
             pending_record_id.clone(),
-            ProviderRuntimePolicy::new(true, true, true, true, true).unwrap(),
+            ProviderRuntimePolicy::new(true, true, true, true, true, true).unwrap(),
             None,
         );
 
@@ -17085,7 +17127,7 @@ mod observation_projection_tests {
         let address = address();
         shared.bind_session_with_policy(
             &address,
-            ProviderRuntimePolicy::new(true, true, true, true, true).unwrap(),
+            ProviderRuntimePolicy::new(true, true, true, true, true, true).unwrap(),
             None,
         );
 
@@ -17965,7 +18007,7 @@ mod tests {
                 &address,
                 agent("codex"),
                 SessionMode::Pty,
-                ProviderRuntimePolicy::new(true, false, false, true, false).unwrap(),
+                ProviderRuntimePolicy::new(true, false, false, true, false, false).unwrap(),
                 SpawnRecordPolicy::ProviderIdentityOnly,
                 Some(receipt.clone()),
                 Some(bundle_receipt.clone()),
@@ -18050,7 +18092,7 @@ mod tests {
             .install_prepared_launch_overlay(address.session.instance_id, overlay.unwrap())
             .unwrap()
             .is_none());
-        let policy = ProviderRuntimePolicy::new(true, false, false, true, false).unwrap();
+        let policy = ProviderRuntimePolicy::new(true, false, false, true, false, false).unwrap();
         let record_id = shared
             .bind_spawn_session_with_materialization(
                 &address,
@@ -18763,7 +18805,7 @@ mod tests {
             .install_prepared_launch_overlay(address.session.instance_id, overlay.unwrap())
             .unwrap()
             .is_none());
-        let policy = ProviderRuntimePolicy::new(true, false, false, true, false).unwrap();
+        let policy = ProviderRuntimePolicy::new(true, false, false, true, false, false).unwrap();
         let record_id = shared
             .bind_spawn_session_with_materialization(
                 &address,
@@ -23441,7 +23483,7 @@ mod tests {
         shared.bind_managed_session(
             &address,
             current_id.clone(),
-            ProviderRuntimePolicy::new(true, true, true, true, true).unwrap(),
+            ProviderRuntimePolicy::new(true, true, true, true, true, false).unwrap(),
             None,
         );
         let event = ControlEvent {
@@ -23585,7 +23627,7 @@ mod tests {
         shared.bind_managed_session(
             &address,
             pending_id.clone(),
-            ProviderRuntimePolicy::new(true, true, true, true, true).unwrap(),
+            ProviderRuntimePolicy::new(true, true, true, true, true, false).unwrap(),
             None,
         );
         let observed_identity = gate4agent_types::ProviderSessionIdentity {
@@ -23902,7 +23944,7 @@ mod tests {
             .arm_resume(
                 &original,
                 CommandId(41),
-                ProviderRuntimePolicy::new(true, true, true, true, true).unwrap(),
+                ProviderRuntimePolicy::new(true, true, true, true, true, false).unwrap(),
             )
             .unwrap();
 

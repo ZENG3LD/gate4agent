@@ -1738,7 +1738,7 @@ impl NodeServer {
                 "context pack proof path is not valid Unicode".to_owned(),
             )
         })?;
-        let providers = ["claude", "codex", "grok", "kimi", "qwen-code"];
+        let providers = ["claude", "codex", "grok", "kimi"];
         let builtins = builtin_registry();
         let mut specs = Vec::with_capacity(providers.len());
         for provider_id in providers {
@@ -2642,15 +2642,23 @@ async fn wait_for_ctrl_signal() -> Result<(), NodeServerError> {
     }
 }
 
+/// The providers this node actually runs.
+///
+/// `builtin_registry()` is a reference catalog of everything the project has
+/// ever described; the fleet is this list, and it is deliberately short. A
+/// provider only belongs here if it can be exercised for real -- there is a
+/// subscription behind it and a failure in it can be reproduced and
+/// debugged. Carrying one that cannot is carrying code nobody can verify,
+/// which is worse than not supporting it: it looks supported.
+///
+/// `qwen-code` was removed on that rule. Its catalog entry and its
+/// structured JSON sidecar stay where they are -- they are correct, and
+/// re-admitting it is a one-word change if a subscription appears -- but it
+/// is not part of the fleet and nothing about it is claimed to work.
 fn active_registry() -> Result<AgentRegistry, NodeServerError> {
     let specs = builtin_registry()
         .iter()
-        .filter(|spec| {
-            matches!(
-                spec.id.as_str(),
-                "claude" | "codex" | "grok" | "kimi" | "qwen-code"
-            )
-        })
+        .filter(|spec| matches!(spec.id.as_str(), "claude" | "codex" | "grok" | "kimi"))
         .cloned()
         .collect::<Vec<_>>();
     AgentRegistry::new(specs).map_err(|error| NodeServerError::Registry(error.to_string()))
@@ -16044,8 +16052,16 @@ mod observation_projection_tests {
         assert!(observation_evidence(AdapterFamily::History).is_none());
     }
 
+    /// Pins the fleet and every adapter each member declares.
+    ///
+    /// Named without a count on purpose: it used to say "five", so admitting
+    /// or dropping a provider meant renaming the test, and a test whose name
+    /// has to change with its data invites being updated carelessly. What it
+    /// guards is that the fleet is exactly what `active_registry` says and
+    /// that each member's adapters are exactly what the catalog declares --
+    /// not how many there happen to be.
     #[test]
-    fn current_five_enabled_provider_matrix_is_exact() {
+    fn the_enabled_provider_matrix_is_exact() {
         let registry = active_registry().unwrap();
         let (providers, adapters) = provider_contract_manifest(&registry).unwrap();
         assert_eq!(
@@ -16053,7 +16069,7 @@ mod observation_projection_tests {
                 .iter()
                 .map(|contract| contract.provider.as_str())
                 .collect::<Vec<_>>(),
-            vec!["claude", "codex", "grok", "kimi", "qwen-code"],
+            vec!["claude", "codex", "grok", "kimi"],
         );
         assert_eq!(
             adapters
@@ -16324,10 +16340,27 @@ mod observation_projection_tests {
         }
     }
 
+    /// Qwen's structured sidecar still projects what it always did.
+    ///
+    /// Qwen is no longer in the fleet -- there is no subscription behind it,
+    /// so a failure in it could not be reproduced, and `active_registry`
+    /// stopped admitting it. The sidecar and its catalog entry are correct
+    /// and were left in place, so this keeps pinning their projection policy
+    /// against bit-rot. It therefore builds its contracts from the CATALOG
+    /// rather than from the fleet: reading the fleet here would be asserting
+    /// behaviour for a provider the node does not run.
     #[test]
     fn qwen_pipe_events_project_private_categorical_tools_attention_and_usage() {
         let mut shared = observation_test_shared();
-        let (_, adapters) = provider_contract_manifest(&active_registry().unwrap()).unwrap();
+        let qwen_only = AgentRegistry::new(
+            builtin_registry()
+                .iter()
+                .filter(|spec| spec.id.as_str() == "qwen-code")
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let (_, adapters) = provider_contract_manifest(&qwen_only).unwrap();
         shared.provider_adapter_contracts = adapters;
         let raw = ProviderRuntimePolicy::raw_pty();
         let observed = shared.admit_qwen_sidecar_observation_policy(
@@ -21749,7 +21782,6 @@ mod tests {
                 ("codex", "orca:d8629c41c832436463d5f0b4e4deb95f867fdc42"),
                 ("grok", "orca:d8629c41c832436463d5f0b4e4deb95f867fdc42"),
                 ("kimi", "orca:d8629c41c832436463d5f0b4e4deb95f867fdc42"),
-                ("qwen-code", "orca:d8629c41c832436463d5f0b4e4deb95f867fdc42"),
             ]
         );
         assert_eq!(
@@ -21790,8 +21822,6 @@ mod tests {
                 ("kimi", AdapterFamily::OneShot, "kimi", "gate4agent-inline/kimi-code-0.31/v1"),
                 ("kimi", AdapterFamily::History, "kimi", "gate4agent-adapter/v1"),
                 ("kimi", AdapterFamily::Resume, "kimi", "gate4agent-adapter/v1"),
-                ("qwen-code", AdapterFamily::Pipe, "qwen-code", "qwen-code-dual-output/v1"),
-                ("qwen-code", AdapterFamily::History, "qwen-code", "gate4agent-adapter/v1"),
             ]
         );
     }
@@ -21874,11 +21904,19 @@ mod tests {
         AgentRegistry::new_with_adapters(specs, &adapters).unwrap()
     }
 
+    /// The real fleet's manifest is accepted by a real server construction.
+    ///
+    /// The count is asserted against `active_registry` itself rather than a
+    /// literal, so this stays a test that construction succeeds for whatever
+    /// the fleet is -- which is the property worth guarding -- instead of a
+    /// second place the fleet size is written down and has to be kept in
+    /// step with the first.
     #[test]
-    fn node_server_construction_accepts_five_provider_production_manifest() {
+    fn node_server_construction_accepts_the_production_manifest() {
         let registry = active_registry().unwrap();
         let (providers, _) = provider_contract_manifest(&registry).unwrap();
-        assert_eq!(providers.len(), 5);
+        assert_eq!(providers.len(), registry.iter().count());
+        assert!(!providers.is_empty());
         let server = NodeServer::new_with_registry(
             construction_test_config("manifest-production-bound"),
             registry,

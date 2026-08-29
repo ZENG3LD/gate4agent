@@ -344,22 +344,43 @@ mod tests {
         );
     }
 
+    /// Pins the MESSAGE the proof is an HMAC of, field by field, instead of
+    /// pinning the proof itself.
+    ///
+    /// It used to pin the proof, and could not have worked: `auth_proof`
+    /// mixes `NODE_PROTOCOL_VERSION` into that message on purpose, so a
+    /// peer on another version cannot authenticate. A frozen output is
+    /// therefore only valid for one version, and this one froze at a
+    /// version long gone -- red for every bump since, which is exactly how
+    /// a test stops being read.
+    ///
+    /// What must not drift is the layout: the domain tag, the version, the
+    /// direction and role bytes, and the two nonces in that order. Reorder
+    /// any of it, drop the version, or collide the direction/role encoding
+    /// and this fails; bump the protocol and it still passes, because the
+    /// expectation is built from the same version the code uses.
     #[test]
-    fn legacy_auth_proof_remains_byte_exact() {
-        let proof = auth_proof(
-            b"local-secret",
-            AuthDirection::Server,
-            ClientRole::Operator,
-            &[3; NODE_AUTH_NONCE_BYTES],
-            &[7; NODE_AUTH_NONCE_BYTES],
-        )
-        .unwrap();
+    fn the_legacy_auth_proof_is_an_hmac_over_exactly_this_message() {
+        let client_nonce = [3; NODE_AUTH_NONCE_BYTES];
+        let server_nonce = [7; NODE_AUTH_NONCE_BYTES];
+        let mut expected_message = Vec::new();
+        expected_message.extend_from_slice(b"gate4agent-node-auth-v3\0");
+        expected_message.extend_from_slice(&NODE_PROTOCOL_VERSION.to_le_bytes());
+        expected_message.push(1); // AuthDirection::Server
+        expected_message.push(1); // ClientRole::Operator
+        expected_message.extend_from_slice(&client_nonce);
+        expected_message.extend_from_slice(&server_nonce);
+
         assert_eq!(
-            proof,
-            [
-                3, 223, 60, 233, 83, 165, 237, 88, 37, 4, 161, 140, 80, 94, 154, 41,
-                127, 184, 168, 120, 191, 162, 156, 3, 208, 139, 243, 60, 48, 21, 233, 64,
-            ],
+            auth_proof(
+                b"local-secret",
+                AuthDirection::Server,
+                ClientRole::Operator,
+                &client_nonce,
+                &server_nonce,
+            )
+            .unwrap(),
+            local_hmac_sha256(b"local-secret", &expected_message).unwrap(),
         );
     }
 
@@ -396,8 +417,18 @@ mod tests {
         assert!(proofs_match(&server, &server));
     }
 
+    /// Same correction as its legacy sibling, plus the part that was
+    /// always right: the negotiated proof is bound to the offer AND to the
+    /// selection, so neither can be tampered with between the two ends.
+    ///
+    /// The layout here carries one thing the legacy message does not -- a
+    /// length prefix ahead of the compatibility binding -- and that prefix
+    /// is what stops a crafted offer/selection pair from shifting bytes
+    /// across the boundary into the nonces. Pinning the layout keeps it
+    /// checked; pinning the output never did, because the version inside
+    /// it moves by design.
     #[test]
-    fn negotiated_auth_proof_remains_byte_exact_and_bound() {
+    fn the_negotiated_auth_proof_is_an_hmac_over_exactly_this_message_and_is_bound() {
         let (offer, selected) = negotiated_fixture();
         let client_nonce = [3; NODE_AUTH_NONCE_BYTES];
         let server_nonce = [7; NODE_AUTH_NONCE_BYTES];
@@ -411,14 +442,37 @@ mod tests {
             &selected,
         )
         .unwrap();
+
+        let binding = encode_node_compatibility_auth_binding(&offer, &selected).unwrap();
+        let mut expected_message = Vec::new();
+        expected_message.extend_from_slice(b"gate4agent-node-auth-negotiated-v1\0");
+        expected_message.extend_from_slice(&NODE_PROTOCOL_VERSION.to_le_bytes());
+        expected_message.push(1); // AuthDirection::Server
+        expected_message.push(1); // ClientRole::Operator
+        expected_message.extend_from_slice(&client_nonce);
+        expected_message.extend_from_slice(&server_nonce);
+        expected_message
+            .extend_from_slice(&u32::try_from(binding.len()).unwrap().to_le_bytes());
+        expected_message.extend_from_slice(&binding);
         assert_eq!(
             proof,
-            [
-                193, 68, 218, 167, 15, 163, 252, 198, 158, 232, 189, 176, 101, 170, 37,
-                34, 175, 88, 202, 213, 175, 46, 15, 204, 51, 179, 165, 120, 82, 40, 19,
-                53,
-            ],
+            local_hmac_sha256(b"local-secret", &expected_message).unwrap(),
         );
+
+        // The two domains must not collide: a legacy proof over the same
+        // token, direction, role and nonces is a different value, so a
+        // peer cannot replay one handshake's proof into the other.
+        assert!(!proofs_match(
+            &proof,
+            &auth_proof(
+                b"local-secret",
+                AuthDirection::Server,
+                ClientRole::Operator,
+                &client_nonce,
+                &server_nonce,
+            )
+            .unwrap(),
+        ));
 
         let mut tampered_offer = offer.clone();
         tampered_offer.capabilities.clear();

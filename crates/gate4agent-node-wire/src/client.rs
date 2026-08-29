@@ -48,7 +48,7 @@ use crate::{
 #[cfg(test)]
 use gate4agent_node_protocol::{
     NodeIncarnationId, ProtocolRange, StateSchemaSupport, NODE_INCARNATION_ID_BYTES,
-    NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V8,
+    NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V10,
 };
 #[cfg(test)]
 use crate::auth_proof;
@@ -3116,6 +3116,45 @@ mod tests {
         })
     }
 
+    /// Every capability `ensure_node_request_required_capability` can
+    /// demand of a spawn request, in the order that function checks them.
+    ///
+    /// The tests below each assert that ONE withheld capability is the one
+    /// reported, and that only isolates the capability under test if every
+    /// other one is granted. Written as hand-listed pairs, they did not:
+    /// when `requires_spawn_profile_revision_capability` became true for
+    /// every spawn request, the gate started reporting the profile-revision
+    /// capability first and four tests began asserting against a name they
+    /// were not about. They stayed red.
+    ///
+    /// Nothing was ever unguarded -- the gate refused those requests the
+    /// whole time, just for a different missing capability -- but a test
+    /// that cannot say which guard fired is not testing that guard. Listed
+    /// once here so the next capability added to the gate is added in one
+    /// place instead of silently retargeting every assertion.
+    const SPAWN_GATE_CAPABILITIES: [&str; 6] = [
+        NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY,
+        NODE_SPAWN_PROFILE_REVISION_CAPABILITY,
+        NODE_WORKTREE_SELECTION_CAPABILITY,
+        NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
+        NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY,
+        NODE_HISTORY_CONTEXT_PACK_CAPABILITY,
+    ];
+
+    /// The whole spawn-gate set with exactly one capability withheld --
+    /// "a fully negotiated client, except for this".
+    fn spawn_gate_capabilities_without(withheld: &str) -> Vec<CapabilityId> {
+        assert!(
+            SPAWN_GATE_CAPABILITIES.contains(&withheld),
+            "{withheld} is not one of the capabilities this gate demands",
+        );
+        SPAWN_GATE_CAPABILITIES
+            .into_iter()
+            .filter(|capability| *capability != withheld)
+            .map(|capability| CapabilityId::new(capability).unwrap())
+            .collect()
+    }
+
     fn spawn_spec_request() -> NodeRequest {
         let mut overrides = SpawnOverrides::default();
         overrides.context_id = gate4agent_node_protocol::SpawnOverride::Clear;
@@ -3362,7 +3401,19 @@ mod tests {
     }
 
     #[test]
-    fn client_offer_accepts_open_provider_ids_and_durable_state_schema_v1_through_v8() {
+    /// The version was in this test's NAME and pinned in its body, and
+    /// both went stale: the offer advertises through `NODE_STATE_SCHEMA_
+    /// V10` and the assertion still demanded V8, so it has been red since
+    /// the schema moved. A range that grows by design cannot be pinned by
+    /// a literal without going red on every growth.
+    ///
+    /// The invariant that does not move is the MINIMUM. A node that stops
+    /// offering `NODE_STATE_SCHEMA_V1` has dropped support for every state
+    /// file written before it, and that is a compatibility break rather
+    /// than a version bump -- so that end is asserted against the constant
+    /// it must never leave, and the other against the newest schema this
+    /// crate family defines.
+    fn the_client_offer_carries_the_open_provider_capabilities_and_the_whole_schema_range() {
         let offer = client_compatibility_offer().unwrap();
         assert_eq!(
             offer.protocol_versions,
@@ -3401,9 +3452,16 @@ mod tests {
         assert!(offer.capabilities.contains(
             &CapabilityId::new(NODE_HISTORY_CONTEXT_PACK_CAPABILITY).unwrap(),
         ));
+        let versions = offer.state_schema.unwrap().versions;
         assert_eq!(
-            offer.state_schema.unwrap().versions,
-            ProtocolRange::new(NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V8).unwrap(),
+            versions.minimum(),
+            NODE_STATE_SCHEMA_V1,
+            "dropping the oldest state schema is a compatibility break, not a bump",
+        );
+        assert_eq!(
+            versions.maximum(),
+            NODE_STATE_SCHEMA_V10,
+            "the client must offer every schema this crate family can write",
         );
     }
 
@@ -4418,10 +4476,9 @@ mod tests {
         ));
         assert_eq!(next_request_id, 73);
 
-        let capabilities = vec![
-            CapabilityId::new(NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY).unwrap(),
-            CapabilityId::new(NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY).unwrap(),
-        ];
+        // Everything but worktree selection, which the second half of this
+        // test withholds on purpose to check the worktree guard.
+        let capabilities = spawn_gate_capabilities_without(NODE_WORKTREE_SELECTION_CAPABILITY);
         assert_eq!(
             reserve_request_id(
                 &mut next_request_id,
@@ -4513,20 +4570,11 @@ mod tests {
             gate4agent_node_protocol::SpawnOverride::Set {
                 value: SpawnEnvironmentProfileId::new("local-default").unwrap(),
             };
-        let spawn_capability =
-            CapabilityId::new(NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY).unwrap();
-        let bundle_capability =
-            CapabilityId::new(NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY).unwrap();
+        let granted =
+            spawn_gate_capabilities_without(NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY);
         let mut next_request_id = 91;
         assert!(matches!(
-            reserve_request_id(
-                &mut next_request_id,
-                &request,
-                false,
-                false,
-                false,
-                &[spawn_capability.clone(), bundle_capability.clone()],
-            ),
+            reserve_request_id(&mut next_request_id, &request, false, false, false, &granted),
             Err(NodeClientError::UnsupportedCapability(capability))
                 if capability == NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY
         ));
@@ -4546,7 +4594,7 @@ mod tests {
                 false,
                 false,
                 false,
-                &[spawn_capability.clone(), bundle_capability.clone()],
+                &granted,
             )
             .unwrap(),
             101,
@@ -4554,6 +4602,8 @@ mod tests {
 
         let environment_capability =
             CapabilityId::new(NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY).unwrap();
+        let mut fully_granted = granted.clone();
+        fully_granted.push(environment_capability.clone());
         assert_eq!(
             reserve_request_id(
                 &mut next_request_id,
@@ -4561,11 +4611,7 @@ mod tests {
                 false,
                 false,
                 false,
-                &[
-                    spawn_capability.clone(),
-                    environment_capability.clone(),
-                    bundle_capability,
-                ],
+                &fully_granted,
             )
             .unwrap(),
             91,
@@ -4579,34 +4625,25 @@ mod tests {
         });
         let frame = response_frame(NodeResponse::SpawnSpecAccepted { receipt });
         assert!(matches!(
-            ensure_server_frame_required_capability(&frame, &[spawn_capability.clone()]),
+            ensure_server_frame_required_capability(&frame, &granted),
             Err(NodeClientError::Protocol(ref message))
                 if message.contains("child environment profile metadata")
         ));
-        assert!(ensure_server_frame_required_capability(
-            &frame,
-            &[spawn_capability, environment_capability],
-        )
-        .is_ok());
+        assert!(ensure_server_frame_required_capability(&frame, &fully_granted).is_ok());
     }
 
     #[test]
     fn session_bundle_materialization_is_gated_before_write_and_on_recursive_read() {
-        let spawn_capability =
-            CapabilityId::new(NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY).unwrap();
         let bundle_capability =
             CapabilityId::new(NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY).unwrap();
+        let granted =
+            spawn_gate_capabilities_without(NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY);
+        let mut fully_granted = granted.clone();
+        fully_granted.push(bundle_capability.clone());
         let request = spawn_spec_request();
         let mut next_request_id = 111;
         assert!(matches!(
-            reserve_request_id(
-                &mut next_request_id,
-                &request,
-                false,
-                false,
-                false,
-                &[spawn_capability.clone()],
-            ),
+            reserve_request_id(&mut next_request_id, &request, false, false, false, &granted),
             Err(NodeClientError::UnsupportedCapability(capability))
                 if capability == NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY
         ));
@@ -4618,7 +4655,7 @@ mod tests {
                 false,
                 false,
                 false,
-                &[spawn_capability.clone(), bundle_capability.clone()],
+                &fully_granted,
             )
             .unwrap(),
             111,
@@ -4637,7 +4674,7 @@ mod tests {
                 false,
                 false,
                 false,
-                &[spawn_capability.clone()],
+                &granted,
             )
             .unwrap(),
             121,
@@ -4654,15 +4691,11 @@ mod tests {
         });
         let frame = response_frame(NodeResponse::SpawnSpecAccepted { receipt });
         assert!(matches!(
-            ensure_server_frame_required_capability(&frame, &[spawn_capability.clone()]),
+            ensure_server_frame_required_capability(&frame, &granted),
             Err(NodeClientError::Protocol(ref message))
                 if message.contains("session bundle materialization metadata")
         ));
-        assert!(ensure_server_frame_required_capability(
-            &frame,
-            &[spawn_capability, bundle_capability],
-        )
-        .is_ok());
+        assert!(ensure_server_frame_required_capability(&frame, &fully_granted).is_ok());
     }
 
     #[test]
@@ -4812,10 +4845,7 @@ mod tests {
     fn history_context_pack_nested_metadata_fails_closed() {
         let history_capability =
             CapabilityId::new(NODE_HISTORY_CONTEXT_PACK_CAPABILITY).unwrap();
-        let spawn_capability =
-            CapabilityId::new(NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY).unwrap();
-        let bundle_capability =
-            CapabilityId::new(NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY).unwrap();
+        let granted = spawn_gate_capabilities_without(NODE_HISTORY_CONTEXT_PACK_CAPABILITY);
         let mut request = spawn_spec_request();
         let NodeRequest::SpawnSpec { spec } = &mut request else {
             unreachable!("spawn spec helper changed variant");
@@ -4824,22 +4854,13 @@ mod tests {
             value: SpawnContextId::new("context-a").unwrap(),
         };
         assert!(matches!(
-            ensure_node_request_required_capability(
-                &request,
-                &[spawn_capability.clone(), bundle_capability.clone()],
-            ),
+            ensure_node_request_required_capability(&request, &granted),
             Err(NodeClientError::UnsupportedCapability(ref required))
                 if required == NODE_HISTORY_CONTEXT_PACK_CAPABILITY
         ));
-        assert!(ensure_node_request_required_capability(
-            &request,
-            &[
-                spawn_capability.clone(),
-                bundle_capability,
-                history_capability.clone(),
-            ],
-        )
-        .is_ok());
+        let mut fully_granted = granted.clone();
+        fully_granted.push(history_capability.clone());
+        assert!(ensure_node_request_required_capability(&request, &fully_granted).is_ok());
 
         let context = context_pack_receipt();
         let mut receipt = spawn_spec_receipt();
@@ -4847,18 +4868,13 @@ mod tests {
         receipt.context = Some(context.clone());
         let receipt_frame = response_frame(NodeResponse::SpawnSpecAccepted { receipt });
         assert!(matches!(
-            ensure_server_frame_required_capability(
-                &receipt_frame,
-                std::slice::from_ref(&spawn_capability),
-            ),
+            ensure_server_frame_required_capability(&receipt_frame, &granted),
             Err(NodeClientError::Protocol(ref message))
                 if message.contains("history context pack metadata")
         ));
-        assert!(ensure_server_frame_required_capability(
-            &receipt_frame,
-            &[spawn_capability, history_capability.clone()],
-        )
-        .is_ok());
+        assert!(
+            ensure_server_frame_required_capability(&receipt_frame, &fully_granted).is_ok(),
+        );
 
         let mut record = session_record_with_path(utf8_path());
         record.context_id = Some(context.id.clone());
@@ -4900,6 +4916,7 @@ mod tests {
         };
         let managed = CapabilityId::new(NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY).unwrap();
         let spawn = CapabilityId::new(NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY).unwrap();
+        let revision = CapabilityId::new(NODE_SPAWN_PROFILE_REVISION_CAPABILITY).unwrap();
         let worktree = CapabilityId::new(NODE_WORKTREE_SELECTION_CAPABILITY).unwrap();
         let bundle =
             CapabilityId::new(NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY).unwrap();
@@ -4921,6 +4938,11 @@ mod tests {
             Err(NodeClientError::UnsupportedCapability(capability))
                 if capability == NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY
         ));
+        // Every spawn request needs the profile-revision capability, so it
+        // is demanded here -- between the overrides capability and worktree
+        // selection. This rung was missing, which is not a gap in the gate
+        // but a gap in the ladder: the two steps below it were asserting
+        // against the name this one reports.
         assert!(matches!(
             reserve_request_id(
                 &mut next_request_id,
@@ -4931,6 +4953,18 @@ mod tests {
                 &[managed.clone(), spawn.clone()],
             ),
             Err(NodeClientError::UnsupportedCapability(capability))
+                if capability == NODE_SPAWN_PROFILE_REVISION_CAPABILITY
+        ));
+        assert!(matches!(
+            reserve_request_id(
+                &mut next_request_id,
+                &request,
+                false,
+                false,
+                false,
+                &[managed.clone(), spawn.clone(), revision.clone()],
+            ),
+            Err(NodeClientError::UnsupportedCapability(capability))
                 if capability == NODE_WORKTREE_SELECTION_CAPABILITY
         ));
         assert!(matches!(reserve_request_id(
@@ -4939,7 +4973,7 @@ mod tests {
             false,
             false,
             false,
-            &[managed.clone(), spawn.clone(), worktree.clone()],
+            &[managed.clone(), spawn.clone(), revision.clone(), worktree.clone()],
         ), Err(NodeClientError::UnsupportedCapability(capability))
             if capability == NODE_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY));
         assert!(reserve_request_id(
@@ -4948,7 +4982,7 @@ mod tests {
             false,
             false,
             false,
-            &[managed.clone(), spawn.clone(), worktree.clone(), bundle],
+            &[managed.clone(), spawn.clone(), revision.clone(), worktree.clone(), bundle],
         )
         .is_ok());
 
@@ -5003,9 +5037,12 @@ mod tests {
             &[managed.clone(), worktree.clone()],
         )
         .is_err());
+        // The receipt carries a resolved profile revision, so reading it
+        // needs that capability too -- the response gate mirrors the
+        // request gate, and this assertion had the same missing rung.
         assert!(ensure_server_frame_required_capability(
             &reply,
-            &[managed, worktree, spawn],
+            &[managed, worktree, spawn, revision],
         )
         .is_ok());
     }

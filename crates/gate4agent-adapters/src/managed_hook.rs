@@ -246,6 +246,16 @@ const DEVIN_EVENTS: &[ManagedHookEventSpec] = &[
 ];
 
 const KIMI_EVENTS: &[ManagedHookEventSpec] = &[
+    // Read off Kimi's own shipped bundle rather than assumed: its dist
+    // carries SessionStart, SessionEnd and Notification alongside the
+    // events we already request, at the same frequency, so the contract we
+    // were writing was simply short. SessionStart is the one that matters
+    // most -- it is the only event here that fires without the agent doing
+    // any work, which is what lets the node learn "the agent came up"
+    // without spending a model turn to find out.
+    direct("SessionStart", false),
+    direct("SessionEnd", false),
+    direct("Notification", false),
     direct("UserPromptSubmit", false),
     direct("PreToolUse", false),
     direct("PostToolUse", false),

@@ -76,7 +76,7 @@ impl ContextTracker {
             // Per-turn delta: accumulate output (generated tokens grow the
             // context), but REPLACE cache & input counters.
             //
-            // Why replace?  Claude/Gemini report per-request cache stats:
+            // Why replace?  Claude reports per-request cache stats:
             //   cache_read  = tokens served from prompt cache THIS turn
             //   cache_write = tokens written to cache THIS turn
             //   input       = tokens NOT in cache THIS turn
@@ -97,7 +97,7 @@ impl ContextTracker {
 
     /// Total tokens occupying the context window.
     ///
-    /// For providers with prompt caching (Claude, Gemini), the real context
+    /// For providers with prompt caching (Claude), the real context
     /// size is `cache_read + cache_write + uncached_input + output`.
     /// `input_tokens` from the API is only the uncached portion, so we must
     /// add cache counters to get the true window occupancy.

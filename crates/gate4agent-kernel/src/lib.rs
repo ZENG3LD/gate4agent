@@ -1229,8 +1229,9 @@ mod tests {
         ResourceScopeId::new("active-page").unwrap()
     }
 
-    /// `cursor`, `amp`, `copilot`, and `qwen-code` are not part of the
-    /// current fleet's built-in registry. Kernel adapter-family gating
+    /// `cursor`, `amp`, `no-resume-fixture`, and `pty-sidecar-fixture` are
+    /// not part of the current fleet's built-in registry. Kernel
+    /// adapter-family gating
     /// tests need provider capability shapes the four-member fleet does not
     /// naturally offer on its own -- e.g. a Pipe transport still resolving
     /// through the legacy `OneShotText` one-shot path (every fleet member's
@@ -1272,10 +1273,10 @@ mod tests {
         AgentRegistry::new(builtin_registry().iter().cloned().chain([cursor])).unwrap()
     }
 
-    /// `qwen-code`, carrying a PTY sidecar binding reusing `claude`'s real,
-    /// globally-registered Pipe binding -- the kernel's ingress gate only
-    /// compares bindings for exact equality, so which real family member it
-    /// is borrowed from is not load-bearing.
+    /// `pty-sidecar-fixture`, carrying a PTY sidecar binding reusing
+    /// `claude`'s real, globally-registered Pipe binding -- the kernel's
+    /// ingress gate only compares bindings for exact equality, so which
+    /// real family member it is borrowed from is not load-bearing.
     fn legacy_pty_sidecar_fixture_catalog() -> AgentRegistry {
         let sidecar = builtin_registry()
             .get_by_id("claude")
@@ -1286,16 +1287,16 @@ mod tests {
             .clone()
             .unwrap()
             .adapter;
-        let mut qwen = legacy_fixture("qwen-code");
+        let mut sidecar_fixture = legacy_fixture("pty-sidecar-fixture");
         // Cleared, not just left inherited from the `codex` skeleton: the
         // ingress-exactness assertion below reuses `codex`'s own Pipe
         // binding as the "foreign" one, and `declared_provider_binding`
         // accepts a Pipe-family source matching EITHER the sidecar binding
         // or the transport's own adapter, so leaving this set would let the
         // "foreign" binding match right back through it.
-        qwen.capabilities.transports.pipe = None;
-        qwen.capabilities.adapters.pty_sidecar = Some(sidecar);
-        AgentRegistry::new(builtin_registry().iter().cloned().chain([qwen])).unwrap()
+        sidecar_fixture.capabilities.transports.pipe = None;
+        sidecar_fixture.capabilities.adapters.pty_sidecar = Some(sidecar);
+        AgentRegistry::new(builtin_registry().iter().cloned().chain([sidecar_fixture])).unwrap()
     }
 
     /// `amp`, carrying a Hook binding but no History one.
@@ -1305,11 +1306,11 @@ mod tests {
         AgentRegistry::new(builtin_registry().iter().cloned().chain([amp])).unwrap()
     }
 
-    /// `copilot`, carrying every adapter family except Resume.
+    /// `no-resume-fixture`, carrying every adapter family except Resume.
     fn legacy_no_resume_fixture_catalog() -> AgentRegistry {
-        let mut copilot = legacy_fixture("copilot");
-        copilot.capabilities.adapters.resume = None;
-        AgentRegistry::new(builtin_registry().iter().cloned().chain([copilot])).unwrap()
+        let mut no_resume_fixture = legacy_fixture("no-resume-fixture");
+        no_resume_fixture.capabilities.adapters.resume = None;
+        AgentRegistry::new(builtin_registry().iter().cloned().chain([no_resume_fixture])).unwrap()
     }
 
     fn tool_provider() -> CapabilityProviderDescriptor {
@@ -1983,7 +1984,7 @@ mod tests {
     #[test]
     fn pipe_provider_ingress_accepts_exact_pty_sidecar_binding_only() {
         let mut kernel = Gate4AgentKernel::new(legacy_pty_sidecar_fixture_catalog());
-        kernel.step([register(1, "qwen-code")], []);
+        kernel.step([register(1, "pty-sidecar-fixture")], []);
         let started = kernel.step(
             [command(
                 2,
@@ -2006,7 +2007,7 @@ mod tests {
         let generation = started.snapshot.sessions[0].generation;
         let sidecar = kernel
             .catalog()
-            .get_by_id("qwen-code")
+            .get_by_id("pty-sidecar-fixture")
             .unwrap()
             .capabilities
             .adapters
@@ -2163,7 +2164,7 @@ mod tests {
         };
 
         let mut unsupported = Gate4AgentKernel::new(legacy_no_resume_fixture_catalog());
-        unsupported.step([register(1, "copilot")], []);
+        unsupported.step([register(1, "no-resume-fixture")], []);
         let rejected = unsupported.step([resume(None)], []);
         assert!(matches!(
             rejected.command_outcomes[0].result,

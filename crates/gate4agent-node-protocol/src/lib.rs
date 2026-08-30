@@ -7405,9 +7405,9 @@ mod tests {
             assert_eq!(serde_json::from_str::<AgentId>(expected).unwrap(), provider);
         }
 
-        let open = agent("qwen-3");
+        let open = agent("third-party-agent");
         assert!(!provider_id_is_legacy(&open));
-        assert_eq!(serde_json::to_string(&open).unwrap(), r#""qwen-3""#);
+        assert_eq!(serde_json::to_string(&open).unwrap(), r#""third-party-agent""#);
     }
 
     #[test]
@@ -7579,8 +7579,8 @@ mod tests {
         support.protocol_versions = ProtocolRange::new(7, NODE_PROTOCOL_VERSION).unwrap();
         support.capabilities = vec![manifest_capability.clone(), open_capability.clone()];
         support.provider_contracts = vec![ProviderContractSupport {
-            provider: agent("qwen"),
-            revision: ProviderContractRevision::new("qwen.2026-08").unwrap(),
+            provider: agent("third-party-agent"),
+            revision: ProviderContractRevision::new("third-party.2026-08").unwrap(),
         }];
         support.provider_adapter_contracts.clear();
         let offer = ClientCompatibilityOffer {
@@ -7594,7 +7594,7 @@ mod tests {
         let encoded = encode_node_compatibility_auth_binding(&offer, &selected).unwrap();
         assert_eq!(
             String::from_utf8(encoded).unwrap(),
-            r#"{"offer":{"protocol_versions":{"minimum":11,"maximum":11},"capabilities":["provider-contract-manifest-v1","provider-id.open-v1"]},"selected":{"protocol_version":11,"capabilities":["provider-contract-manifest-v1","provider-id.open-v1"],"host":{"operating_system":"windows","architecture":"x86_64"},"path_semantics":{"style":"windows","encoding":"utf8"},"local_transport":"windows-named-pipe","provider_contracts":[{"provider":"qwen","revision":"qwen.2026-08"}]}}"#,
+            r#"{"offer":{"protocol_versions":{"minimum":11,"maximum":11},"capabilities":["provider-contract-manifest-v1","provider-id.open-v1"]},"selected":{"protocol_version":11,"capabilities":["provider-contract-manifest-v1","provider-id.open-v1"],"host":{"operating_system":"windows","architecture":"x86_64"},"path_semantics":{"style":"windows","encoding":"utf8"},"local_transport":"windows-named-pipe","provider_contracts":[{"provider":"third-party-agent","revision":"third-party.2026-08"}]}}"#,
         );
     }
 

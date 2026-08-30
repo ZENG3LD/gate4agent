@@ -110,7 +110,6 @@ pub trait CliCommandBuilder {
     /// `prompt` delivery differs per CLI:
     /// - Claude: prompt goes via stdin (not in argv) — builder omits it
     /// - Codex: prompt is the final positional arg
-    /// - Gemini: prompt follows `-p`
     ///
     /// This is encoded per-CLI in the implementation — the trait does not
     /// prescribe how the prompt appears in argv.

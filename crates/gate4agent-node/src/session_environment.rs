@@ -2013,13 +2013,13 @@ mod tests {
                     generation: SessionGeneration(3),
                 },
             },
-            source_provider: gate4agent_types::AgentId::new("qwen-code").unwrap(),
+            source_provider: gate4agent_types::AgentId::new("codex").unwrap(),
         };
         let history = gate4agent_types::HistorySessionRecord {
-            session_id: "qwen-session".to_owned(),
+            session_id: "fixture-session".to_owned(),
             title: Some("review".to_owned()),
             cwd: Some(r"C:\private\source".to_owned()),
-            model: Some("qwen3-coder".to_owned()),
+            model: Some("codex-5".to_owned()),
             message_count: 2,
             completed_turn_count: None,
             total_tokens: 17,

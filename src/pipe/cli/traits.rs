@@ -73,8 +73,8 @@ pub trait NdjsonParser: Send {
     /// Returns the CLI-native session ID if one has been observed.
     ///
     /// Default implementation delegates to `session_id()`. Parsers that use a
-    /// CLI-specific session-ID format (e.g. OpenCode's `ses_XXXX` prefix) may
-    /// override this to return a distinct value from their internal state.
+    /// CLI-specific session-ID format (e.g. a provider-prefixed session token)
+    /// may override this to return a distinct value from their internal state.
     fn detected_session_id(&self) -> Option<&str> {
         self.session_id()
     }

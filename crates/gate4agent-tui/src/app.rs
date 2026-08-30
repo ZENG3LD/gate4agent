@@ -23693,7 +23693,7 @@ fn cycle_provider(enabled: &[Provider], current: &Provider, forward: bool) -> Pr
 fn provider_has_native_history(provider: &Provider) -> bool {
     matches!(
         provider.to_string().as_str(),
-        "claude" | "codex" | "grok" | "kimi" | "qwen-code"
+        "claude" | "codex" | "grok" | "kimi"
     )
 }
 
@@ -25305,7 +25305,7 @@ mod tests {
     }
 
     fn fixture_providers() -> Vec<Provider> {
-        ["claude", "codex", "kimi", "qwen-code", "grok"]
+        ["claude", "codex", "kimi", "grok"]
             .into_iter()
             .map(provider)
             .collect()
@@ -25941,6 +25941,7 @@ mod tests {
         workspace_b.sessions.clear();
         app.nodes[0].workspaces.push(workspace_b);
         assert!(app.nodes[0].session_records.is_empty());
+        let native_history_provider_count = fixture_providers().len();
         let action = app.select_roster_mode(RosterMode::Agents);
         assert!(matches!(
             action,
@@ -25951,13 +25952,13 @@ mod tests {
                 token,
             } if node_id == "node-a"
                 && token != 0
-                && routes.len() == 15
-                && routes.iter().filter(|route| route.workspace_id.as_deref() == Some("workspace-a")).count() == 5
-                && routes.iter().filter(|route| route.workspace_id.as_deref() == Some("workspace-b")).count() == 5
-                && routes.iter().filter(|route| route.scope == NativeSessionCatalogScope::Unregistered).count() == 5
+                && routes.len() == native_history_provider_count * 3
+                && routes.iter().filter(|route| route.workspace_id.as_deref() == Some("workspace-a")).count() == native_history_provider_count
+                && routes.iter().filter(|route| route.workspace_id.as_deref() == Some("workspace-b")).count() == native_history_provider_count
+                && routes.iter().filter(|route| route.scope == NativeSessionCatalogScope::Unregistered).count() == native_history_provider_count
         ));
         let dialog = app.existing_session.as_ref().unwrap();
-        assert_eq!(dialog.pending_routes.len(), 15);
+        assert_eq!(dialog.pending_routes.len(), native_history_provider_count * 3);
         assert_eq!(app.roster_mode, RosterMode::Agents);
 
         let original_token = dialog.request_token;
@@ -26073,7 +26074,7 @@ mod tests {
         );
         let dialog = app.existing_session.as_ref().unwrap();
         assert!(dialog.rows.is_empty());
-        assert_eq!(dialog.pending_routes.len(), 10);
+        assert_eq!(dialog.pending_routes.len(), fixture_providers().len() * 2);
     }
 
     #[test]
@@ -28193,12 +28194,12 @@ mod tests {
     fn open_provider_ids_are_selectable_without_tui_enum_changes() {
         let mut app = fixture();
         app.nodes[0].workspaces[0].providers = vec![
-            ProviderInventory { provider: provider("qwen-code"), enabled: true },
+            ProviderInventory { provider: provider("third-party-agent"), enabled: true },
             ProviderInventory { provider: provider("grok"), enabled: true },
         ];
         app.focus = Focus::Agents;
         assert_eq!(app.reduce(UiKey::Ctrl('n')), AppAction::None);
-        assert_eq!(app.spawn.as_ref().unwrap().provider, provider("qwen-code"));
+        assert_eq!(app.spawn.as_ref().unwrap().provider, provider("third-party-agent"));
         app.reduce(UiKey::Tab);
         app.reduce(UiKey::Tab);
         app.reduce(UiKey::Tab);

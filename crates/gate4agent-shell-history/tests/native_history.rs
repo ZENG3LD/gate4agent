@@ -9,7 +9,6 @@ use gate4agent_shell_history::{
     NativeHistoryError, NativeHistoryLimits, NativeHistoryRoot,
 };
 use gate4agent_types::{AdapterId, ProviderSessionKey};
-use rusqlite::Connection;
 use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -56,7 +55,7 @@ fn orca_roots_cover_pinned_native_sources_without_exposing_paths_in_debug() {
     let fixture = FixtureDir::new("roots");
     let roots = orca_home_roots(fixture.path()).unwrap();
 
-    assert_eq!(roots.len(), 21);
+    assert_eq!(roots.len(), 11);
     assert_eq!(
         roots
             .iter()
@@ -67,7 +66,7 @@ fn orca_roots_cover_pinned_native_sources_without_exposing_paths_in_debug() {
     assert_eq!(
         roots
             .iter()
-            .filter(|root| root.adapter_id().as_str() == "opencode")
+            .filter(|root| root.adapter_id().as_str() == "openclaw")
             .count(),
         2
     );
@@ -76,8 +75,8 @@ fn orca_roots_cover_pinned_native_sources_without_exposing_paths_in_debug() {
             && root.layout() == HistorySourceLayout::SummaryJsonWithSiblingNdjson
     }));
     assert!(roots.iter().any(|root| {
-        root.adapter_id().as_str() == "qwen-code"
-            && root.layout() == HistorySourceLayout::SingleNdjson
+        root.adapter_id().as_str() == "kimi"
+            && root.layout() == HistorySourceLayout::StateJsonWithIndexAndSiblingNdjson
     }));
     assert!(format!("{:?}", roots[0]).contains("[REDACTED]"));
     assert!(!format!("{:?}", roots[0]).contains(&fixture.path().display().to_string()));
@@ -140,7 +139,7 @@ fn grok_sibling_load_is_opaque_bounded_and_cache_coherent() {
 }
 
 #[test]
-fn discovery_applies_claude_and_antigravity_resume_filters() {
+fn discovery_applies_the_claude_subagents_resume_filter() {
     let fixture = FixtureDir::new("filters");
     let claude = fixture.path().join("claude");
     write(&claude.join("project").join("parent.jsonl"), "{}");
@@ -164,29 +163,6 @@ fn discovery_applies_claude_and_antigravity_resume_filters() {
     let candidates = discover_history(&mut authority, &claude_request).unwrap();
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].session_id_hint(), "parent");
-
-    let brain = fixture.path().join("brain");
-    write(
-        &brain
-            .join("conversation-1")
-            .join(".system_generated")
-            .join("logs")
-            .join("transcript.jsonl"),
-        "{}",
-    );
-    write(&brain.join("noise").join("transcript.jsonl"), "{}");
-    let mut authority = NativeHistoryAuthority::new(
-        NativeHistoryConfig::new(vec![root(
-            "antigravity",
-            HistorySourceLayout::SingleNdjson,
-            &brain,
-        )])
-        .unwrap(),
-    );
-    let antigravity_request = request("antigravity", 8);
-    let candidates = discover_history(&mut authority, &antigravity_request).unwrap();
-    assert_eq!(candidates.len(), 1);
-    assert_eq!(candidates[0].session_id_hint(), "conversation-1");
 }
 
 #[test]
@@ -473,110 +449,6 @@ fn locator_scan_reports_internal_overflow_without_poisoning_public_page() {
     assert!(authority.take_discovery_issues().iter().any(|issue| {
         issue.kind == NativeHistoryDiscoveryIssueKind::CandidateLimitReached
     }));
-}
-
-#[test]
-fn qwen_project_chat_load_is_bounded_to_the_active_real_user_chain() {
-    let fixture = FixtureDir::new("qwen");
-    let projects = fixture.path().join("projects");
-    let chats = projects.join("c--repo").join("chats");
-    let session_id = "11111111-1111-4111-8111-111111111111";
-    write(
-        &chats.join(format!("{session_id}.jsonl")),
-        &[
-            r#"{"uuid":"u1","parentUuid":null,"sessionId":"11111111-1111-4111-8111-111111111111","timestamp":"2026-08-10T00:00:00Z","type":"user","provenance":"real_user","cwd":"C:/repo","version":"0.21.6","gitBranch":"main","message":{"role":"user","parts":[{"text":"<system-reminder>internal</system-reminder> real request"}]}}"#,
-            r#"{"uuid":"system-user","parentUuid":"u1","sessionId":"11111111-1111-4111-8111-111111111111","type":"user","subtype":"notification","provenance":"system","cwd":"C:/repo","message":{"role":"user","parts":[{"text":"hidden notification"}]}}"#,
-            r#"{"uuid":"a1","parentUuid":"system-user","sessionId":"11111111-1111-4111-8111-111111111111","type":"assistant","provenance":"assistant_output","cwd":"C:/repo","model":"qwen3-coder","usageMetadata":{"promptTokenCount":4,"candidatesTokenCount":5,"totalTokenCount":9},"message":{"role":"model","parts":[{"text":"private chain of thought","thought":true},{"text":"visible answer"},{"functionCall":{"name":"hidden_tool"}}]}}"#,
-            r#"{"uuid":"tool","parentUuid":"a1","sessionId":"11111111-1111-4111-8111-111111111111","type":"tool_result","provenance":"tool_result","cwd":"C:/repo","message":{"role":"user","parts":[{"text":"secret tool output"}]}}"#,
-            r#"{"uuid":"title","parentUuid":"tool","sessionId":"11111111-1111-4111-8111-111111111111","type":"system","subtype":"custom_title","cwd":"C:/repo","version":"0.21.6","systemPayload":{"customTitle":"Qwen native history","titleSource":"manual"}}"#,
-        ]
-        .join("\n"),
-    );
-    write(
-        &chats
-            .join("archive")
-            .join("22222222-2222-4222-8222-222222222222.jsonl"),
-        "{}",
-    );
-    write(&chats.join("not-a-session.jsonl"), "{}");
-    let mut authority = NativeHistoryAuthority::new(
-        NativeHistoryConfig::new(vec![root(
-            "qwen-code",
-            HistorySourceLayout::SingleNdjson,
-            &projects,
-        )])
-        .unwrap(),
-    );
-    let discovery = request("qwen-code", 8);
-    let candidates = discover_history(&mut authority, &discovery).unwrap();
-    assert_eq!(candidates.len(), 1);
-    assert_eq!(candidates[0].session_id_hint(), session_id);
-    let load = HistoryLoadRequest::new(&discovery, candidates[0].clone()).unwrap();
-    let parsed = load_history_session(&mut authority, &load).unwrap();
-
-    assert_eq!(parsed.session_id, session_id);
-    assert_eq!(parsed.title.as_deref(), Some("Qwen native history"));
-    assert_eq!(parsed.cwd.as_deref(), Some("C:/repo"));
-    assert_eq!(parsed.model.as_deref(), Some("qwen3-coder"));
-    assert_eq!(parsed.total_tokens, 9);
-    assert_eq!(parsed.message_count, 2);
-    assert_eq!(parsed.messages.len(), 2);
-    assert_eq!(parsed.messages[0].text, "real request");
-    assert_eq!(parsed.messages[1].text, "visible answer");
-    assert!(!parsed.messages.iter().any(|message| {
-        message.text.contains("private chain of thought")
-    }));
-}
-
-#[test]
-fn opencode_sqlite_wins_legacy_dedupe_and_loads_readonly_projection() {
-    let fixture = FixtureDir::new("opencode");
-    let storage = fixture.path().join("storage");
-    write(
-        &storage.join("session").join("project").join("ses_1.json"),
-        r#"{"id":"ses_1","title":"stale legacy"}"#,
-    );
-    let database = fixture.path().join("opencode.db");
-    let connection = Connection::open(&database).unwrap();
-    connection
-        .execute_batch(
-            "CREATE TABLE session (id TEXT PRIMARY KEY, title TEXT, directory TEXT, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, model TEXT, tokens_input INTEGER, tokens_output INTEGER, tokens_reasoning INTEGER, tokens_cache_read INTEGER, parent_id TEXT, time_archived INTEGER);\
-             CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, data TEXT NOT NULL);\
-             CREATE TABLE part (message_id TEXT NOT NULL, time_created INTEGER NOT NULL, data TEXT NOT NULL);\
-             INSERT INTO session VALUES ('ses_1','SQLite title','/repo',10,20,'{\"id\":\"glm-5\"}',3,4,2,1,NULL,NULL);\
-             INSERT INTO message VALUES ('msg_1','ses_1','{\"role\":\"user\",\"summary\":{\"title\":\"Question\"}}');\
-             INSERT INTO part VALUES ('msg_1',11,'{\"type\":\"text\",\"text\":\"hello\"}');",
-        )
-        .unwrap();
-    drop(connection);
-
-    let mut authority = NativeHistoryAuthority::new(
-        NativeHistoryConfig::new(vec![
-            root(
-                "opencode",
-                HistorySourceLayout::SessionJsonWithSiblingMessageJson,
-                &storage,
-            ),
-            root(
-                "opencode",
-                HistorySourceLayout::ReadOnlySqliteProjection,
-                fixture.path(),
-            ),
-        ])
-        .unwrap(),
-    );
-    let discovery = request("opencode", 8);
-    let candidates = discover_history(&mut authority, &discovery).unwrap();
-    assert_eq!(candidates.len(), 1);
-    assert_eq!(candidates[0].session_id_hint(), "ses_1");
-    let load = HistoryLoadRequest::new(&discovery, candidates[0].clone()).unwrap();
-    let parsed = load_history_session(&mut authority, &load).unwrap();
-
-    assert_eq!(parsed.title.as_deref(), Some("SQLite title"));
-    assert_eq!(parsed.cwd.as_deref(), Some("/repo"));
-    assert_eq!(parsed.model.as_deref(), Some("glm-5"));
-    assert_eq!(parsed.total_tokens, 10);
-    assert_eq!(parsed.messages.len(), 1);
 }
 
 #[test]

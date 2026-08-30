@@ -409,21 +409,21 @@ mod tests {
 
     #[test]
     fn resolves_windows_wrappers_and_paths() {
-        let registry = AgentRegistry::new([spec("qwen-code", "qwen")]).unwrap();
+        let registry = AgentRegistry::new([spec("fixture-tool", "fixture")]).unwrap();
         let found = registry
-            .find_by_command(r"C:\Users\dev\bin\QWEN.CMD", RuntimePlatform::Windows)
+            .find_by_command(r"C:\Users\dev\bin\FIXTURE.CMD", RuntimePlatform::Windows)
             .unwrap();
-        assert_eq!(found.id.as_str(), "qwen-code");
+        assert_eq!(found.id.as_str(), "fixture-tool");
     }
 
     #[test]
     fn unix_matching_remains_case_sensitive() {
-        let registry = AgentRegistry::new([spec("qwen-code", "qwen")]).unwrap();
+        let registry = AgentRegistry::new([spec("fixture-tool", "fixture")]).unwrap();
         assert!(registry
-            .find_by_command("QWEN", RuntimePlatform::Linux)
+            .find_by_command("FIXTURE", RuntimePlatform::Linux)
             .is_none());
         assert!(registry
-            .find_by_command("qwen", RuntimePlatform::Linux)
+            .find_by_command("fixture", RuntimePlatform::Linux)
             .is_some());
     }
 

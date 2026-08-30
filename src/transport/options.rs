@@ -15,7 +15,6 @@ pub struct SpawnOptions {
     ///
     /// - Claude: `--resume <id>`
     /// - Codex: `exec resume <id>` sub-sub-command
-    /// - Gemini: `--resume <id>` (pass `"latest"` for most recent session)
     /// - Others: ignored.
     pub resume_session_id: Option<String>,
 
@@ -23,7 +22,6 @@ pub struct SpawnOptions {
     ///
     /// - Claude: `--model <model>`
     /// - Codex: `--model <model>`
-    /// - OpenCode: `-m <model>`
     /// - Others: ignored.
     pub model: Option<String>,
 
@@ -43,8 +41,8 @@ pub struct SpawnOptions {
     ///
     /// - Claude: `--continue`
     /// - Codex: `exec resume --last`
-    /// - OpenCode: `--continue`
-    /// - Gemini: NOT supported (use `resume_session_id` with `"latest"` instead).
+    /// - Kimi: `-c`
+    /// - Others: ignored.
     ///
     /// Ignored when `resume_session_id` is also set.
     pub continue_last: bool,
@@ -73,12 +71,6 @@ pub struct SpawnOptions {
     /// - Claude: `--max-turns <N>`
     /// - Others: ignored.
     pub max_turns: Option<u32>,
-
-    /// Run tool execution in a sandbox/container.
-    ///
-    /// - Gemini: `--sandbox`
-    /// - Others: ignored.
-    pub sandbox: bool,
 }
 
 impl Default for SpawnOptions {
@@ -96,7 +88,6 @@ impl Default for SpawnOptions {
             permission_mode: None,
             mcp_config: None,
             max_turns: None,
-            sandbox: false,
         }
     }
 }

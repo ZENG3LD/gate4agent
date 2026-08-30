@@ -826,14 +826,3 @@ async fn windows_live_codex_inline_inflight_stop() {
     );
 }
 
-#[tokio::test]
-#[ignore = "requires GATE4AGENT_VENDOR_CANARY=1 and an installed authenticated Gemini CLI"]
-async fn native_runtime_pipe_live_gemini() {
-    run_pipe_canary("gemini", 9_004).await;
-}
-
-#[tokio::test]
-#[ignore = "requires GATE4AGENT_VENDOR_CANARY=1 and an installed authenticated OpenCode CLI"]
-async fn native_runtime_pipe_live_opencode() {
-    run_pipe_canary("opencode", 9_005).await;
-}

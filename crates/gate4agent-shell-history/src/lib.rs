@@ -1,12 +1,11 @@
 //! Native, bounded history discovery/load/cache authority.
 //!
-//! Host paths and SQLite handles stay behind opaque candidate IDs. The crate
-//! owns filesystem effects, while `gate4agent-adapters` remains the only owner
-//! of provider transcript semantics.
+//! Host paths stay behind opaque candidate IDs. The crate owns filesystem
+//! effects, while `gate4agent-adapters` remains the only owner of provider
+//! transcript semantics.
 
 mod discovery;
 mod load;
-mod sqlite;
 
 use gate4agent_adapters::{
     history_source_variants, parse_history, HistoryDocument, HistorySession, HistorySourceLayout,
@@ -196,45 +195,14 @@ pub fn orca_home_roots(
         home.join(".codex").join("sessions"),
     )?;
     push(
-        "gemini",
-        HistorySourceLayout::JsonOrNdjson,
-        home.join(".gemini").join("tmp"),
-    )?;
-    push(
-        "antigravity",
-        HistorySourceLayout::SingleNdjson,
-        home.join(".gemini").join("antigravity-cli").join("brain"),
-    )?;
-    push(
-        "copilot",
-        HistorySourceLayout::SingleNdjson,
-        home.join(".copilot").join("session-state"),
-    )?;
-    push(
         "cursor",
         HistorySourceLayout::SingleNdjson,
         home.join(".cursor").join("projects"),
-    )?;
-    let opencode = home.join(".local").join("share").join("opencode");
-    push(
-        "opencode",
-        HistorySourceLayout::SessionJsonWithSiblingMessageJson,
-        opencode.join("storage"),
-    )?;
-    push(
-        "opencode",
-        HistorySourceLayout::ReadOnlySqliteProjection,
-        opencode,
     )?;
     push(
         "grok",
         HistorySourceLayout::SummaryJsonWithSiblingNdjson,
         home.join(".grok").join("sessions"),
-    )?;
-    push(
-        "hermes",
-        HistorySourceLayout::SingleJson,
-        home.join(".hermes").join("sessions"),
     )?;
     push(
         "rovo",
@@ -259,29 +227,9 @@ pub fn orca_home_roots(
         home.join(".omp").join("agent").join("sessions"),
     )?;
     push(
-        "devin",
-        HistorySourceLayout::SingleJson,
-        home.join(".local")
-            .join("share")
-            .join("devin")
-            .join("cli")
-            .join("transcripts"),
-    )?;
-    for droid_root in [
-        home.join(".factory").join("sessions"),
-        home.join(".factory").join("projects"),
-    ] {
-        push("droid", HistorySourceLayout::SingleNdjson, droid_root)?;
-    }
-    push(
         "kimi",
         HistorySourceLayout::StateJsonWithIndexAndSiblingNdjson,
         home.join(".kimi-code").join("sessions"),
-    )?;
-    push(
-        "qwen-code",
-        HistorySourceLayout::SingleNdjson,
-        home.join(".qwen").join("projects"),
     )?;
     Ok(roots)
 }
@@ -315,10 +263,6 @@ enum CandidateLocator {
         root: PathBuf,
         primary: PathBuf,
         layout: HistorySourceLayout,
-    },
-    Sqlite {
-        database: PathBuf,
-        session_id: String,
     },
 }
 
@@ -569,7 +513,7 @@ impl NativeHistoryAuthority {
             discovered.extend(result.candidates);
             self.issues.extend(result.issues);
         }
-        discovery::dedupe_and_sort(&request.binding().id, &mut discovered);
+        discovery::dedupe_and_sort(&mut discovered);
         let scan_limit = scan_limit.min(self.config.limits.max_candidates);
         if discovered.len() > scan_limit && report_candidate_overflow {
             self.issues.push(NativeHistoryDiscoveryIssue {
@@ -650,9 +594,7 @@ impl NativeHistoryAuthority {
             return Err(NativeHistoryError::CandidateSourceMismatch);
         }
         let transcript_path = if request.binding().id.as_str() == "pi" {
-            let CandidateLocator::File { root, primary, .. } = &record.key.locator else {
-                return Err(NativeHistoryError::CandidateSourceMismatch);
-            };
+            let CandidateLocator::File { root, primary, .. } = &record.key.locator;
             Some(
                 load::validated_resume_file(root, primary)?
                     .to_str()
@@ -663,11 +605,7 @@ impl NativeHistoryAuthority {
             None
         };
         Ok(ProviderSessionIdentity {
-            key: if request.binding().id.as_str() == "antigravity" {
-                ProviderSessionKey::ConversationId
-            } else {
-                ProviderSessionKey::SessionId
-            },
+            key: ProviderSessionKey::SessionId,
             id: session_id.into(),
             transcript_path,
         })

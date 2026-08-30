@@ -38,7 +38,6 @@ use gate4agent::{
 use gate4agent_adapters::{
     build_resume_plan_for_identity, builtin_adapter_registry, AdapterRuntimeRegistry,
     CodexPtySessionIdentityExtractor, KimiPtySessionIdentityExtractor, OneShotSessionPersistence,
-    QwenDualOutputLine, QwenDualOutputParser, QWEN_DUAL_OUTPUT_MAX_LINE_BYTES,
 };
 use gate4agent_catalog::{AgentRegistry, AgentSpec, EnvMutation};
 use gate4agent_shell_one_shot::NativeOneShotSession;
@@ -58,9 +57,7 @@ use gate4agent_types::{
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{OsStr, OsString};
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
@@ -69,8 +66,6 @@ use uuid::Uuid;
 const INSTANCE_LAUNCH_ARGS_MAX: usize = 128;
 const INSTANCE_LAUNCH_ARG_MAX_BYTES: usize = 65_536;
 const INSTANCE_LAUNCH_ARGS_TOTAL_MAX_BYTES: usize = 262_144;
-const QWEN_SIDECAR_READ_MAX_BYTES_PER_TICK: usize = 262_144;
-const QWEN_SIDECAR_READ_CHUNK_BYTES: usize = 16_384;
 const RESERVED_CLAUDE_LAUNCH_FLAGS: &[&str] = &[
     "--continue",
     "--print",
@@ -82,7 +77,6 @@ const RESERVED_CLAUDE_LAUNCH_FLAGS: &[&str] = &[
     "-p",
     "-r",
 ];
-const RESERVED_QWEN_SIDECAR_FLAGS: &[&str] = &["--json-fd", "--json-file"];
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct NativeSessionKey {
@@ -99,7 +93,6 @@ struct NativeSpawnRequest {
     instance_extra_args: Vec<OsString>,
     resumed_provider_session: Option<gate4agent_types::ProviderSessionIdentity>,
     one_shot_session_persistence: OneShotSessionPersistence,
-    qwen_sidecar: Option<QwenDualOutputLaunch>,
 }
 
 struct OwnedPtySession {
@@ -109,7 +102,6 @@ struct OwnedPtySession {
     terminal_stale_published: bool,
     runtime_policy: ProviderRuntimePolicy,
     provider: Option<OwnedPtyProvider>,
-    qwen_sidecar: Option<OwnedQwenDualOutput>,
     /// Set once at the spawn site and never mutated -- this is what lets
     /// `reclassify_foreground` resolve the session's `AgentSpec` from
     /// `NativeEffectShell::catalog` without holding a borrow of `session`
@@ -140,118 +132,6 @@ struct OwnedPtySession {
     /// `NativeEffectShell::reclassify_foreground` for the cadence this
     /// drives.
     next_foreground_probe: Option<Instant>,
-}
-
-pub struct QwenDualOutputLaunch {
-    binding: gate4agent_types::AdapterBinding,
-    directory: Option<PathBuf>,
-    output_file: Option<PathBuf>,
-    initial_gap: bool,
-}
-
-impl QwenDualOutputLaunch {
-    pub fn prepare(binding: gate4agent_types::AdapterBinding) -> Result<Self, String> {
-        let directory = std::env::temp_dir().join(format!(
-            "gate4agent-qwen-sidecar-{}",
-            Uuid::new_v4()
-        ));
-        create_private_directory(&directory).map_err(|error| {
-            format!("failed to create private Qwen dual-output directory: {error}")
-        })?;
-        let output_file = directory.join("events.jsonl");
-        if let Err(error) = File::create(&output_file) {
-            let _ = std::fs::remove_dir_all(&directory);
-            return Err(format!("failed to create Qwen dual-output file: {error}"));
-        }
-        Ok(Self {
-            binding,
-            directory: Some(directory),
-            output_file: Some(output_file),
-            initial_gap: false,
-        })
-    }
-
-    pub fn unavailable(binding: gate4agent_types::AdapterBinding) -> Self {
-        Self {
-            binding,
-            directory: None,
-            output_file: None,
-            initial_gap: true,
-        }
-    }
-
-    pub fn append_launch_arguments(&self, arguments: &mut Vec<OsString>) {
-        if let Some(path) = &self.output_file {
-            arguments.push(OsString::from("--json-file"));
-            arguments.push(path.as_os_str().to_owned());
-        }
-    }
-
-    #[cfg(test)]
-    fn output_file(&self) -> Option<&Path> {
-        self.output_file.as_deref()
-    }
-}
-
-impl Drop for QwenDualOutputLaunch {
-    fn drop(&mut self) {
-        if let Some(directory) = self.directory.take() {
-            let _ = std::fs::remove_dir_all(directory);
-        }
-    }
-}
-
-struct OwnedQwenDualOutput {
-    source: ProviderSource,
-    directory: Option<PathBuf>,
-    output_file: Option<PathBuf>,
-    offset: u64,
-    pending: Vec<u8>,
-    discarding_oversized_line: bool,
-    parser: QwenDualOutputParser,
-    next_provider_sequence: u64,
-    gap_pending: u64,
-    tail_unavailable: bool,
-}
-
-impl From<QwenDualOutputLaunch> for OwnedQwenDualOutput {
-    fn from(mut launch: QwenDualOutputLaunch) -> Self {
-        Self {
-            source: ProviderSource {
-                family: AdapterFamily::Pipe,
-                binding: launch.binding.clone(),
-            },
-            directory: launch.directory.take(),
-            output_file: launch.output_file.take(),
-            offset: 0,
-            pending: Vec::new(),
-            discarding_oversized_line: false,
-            parser: QwenDualOutputParser::default(),
-            next_provider_sequence: 1,
-            gap_pending: u64::from(launch.initial_gap),
-            tail_unavailable: launch.initial_gap,
-        }
-    }
-}
-
-impl Drop for OwnedQwenDualOutput {
-    fn drop(&mut self) {
-        if let Some(directory) = self.directory.take() {
-            let _ = std::fs::remove_dir_all(directory);
-        }
-    }
-}
-
-#[cfg(unix)]
-fn create_private_directory(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-    let mut builder = std::fs::DirBuilder::new();
-    builder.mode(0o700).create(path)
-}
-
-#[cfg(not(unix))]
-fn create_private_directory(path: &Path) -> std::io::Result<()> {
-    std::fs::create_dir(path)
 }
 
 struct OwnedPtyProvider {
@@ -528,7 +408,6 @@ impl NativeEffectShell {
             environment,
             extra_args,
             one_shot_session_persistence,
-            None,
         )
         .await
     }
@@ -539,7 +418,6 @@ impl NativeEffectShell {
         environment: Vec<EnvMutation>,
         extra_args: Vec<OsString>,
         one_shot_session_persistence: OneShotSessionPersistence,
-        qwen_sidecar: Option<QwenDualOutputLaunch>,
     ) -> ObservationEnvelope {
         let EffectEnvelope {
             protocol_version,
@@ -580,7 +458,6 @@ impl NativeEffectShell {
                             instance_extra_args: extra_args,
                             resumed_provider_session: None,
                             one_shot_session_persistence,
-                            qwen_sidecar,
                         },
                         environment,
                     )
@@ -604,7 +481,6 @@ impl NativeEffectShell {
                         environment,
                         extra_args,
                         one_shot_session_persistence,
-                        qwen_sidecar,
                     )
                     .await
                 }
@@ -821,7 +697,6 @@ impl NativeEffectShell {
             instance_extra_args,
             resumed_provider_session,
             one_shot_session_persistence,
-            qwen_sidecar,
         } = spawn;
         if let Err(message) =
             validate_instance_launch_arguments(&agent_id, transport, &instance_extra_args)
@@ -862,16 +737,6 @@ impl NativeEffectShell {
                 message: format!("agent '{agent_id}' is absent from native catalog"),
             };
         };
-        if let Some(sidecar) = &qwen_sidecar {
-            if transport != TransportKind::Pty
-                || spec.capabilities.adapters.pty_sidecar.as_ref() != Some(&sidecar.binding)
-            {
-                return ControlObservation::SpawnFailed {
-                    message: "Qwen dual-output sidecar requires its exact catalog PTY binding"
-                        .to_owned(),
-                };
-            }
-        }
         let working_dir = PathBuf::from(&request.working_directory);
 
         match transport {
@@ -886,9 +751,6 @@ impl NativeEffectShell {
                 // no terminal device behind it, so `pty_env` is left as the
                 // caller passed it there.
                 let pty_env = with_pty_terminal_capability_defaults(pty_env);
-                if let Some(sidecar) = &qwen_sidecar {
-                    sidecar.append_launch_arguments(&mut launch_extra_args);
-                }
                 let fresh_provider_session = prepare_fresh_pty_provider_session(
                     spec.capabilities.transports.pty_adapter.as_ref(),
                     resumed_provider_session.is_some(),
@@ -1060,7 +922,6 @@ impl NativeEffectShell {
                             terminal_stale_published: false,
                             runtime_policy,
                             provider,
-                            qwen_sidecar: qwen_sidecar.map(OwnedQwenDualOutput::from),
                             agent_id,
                             last_screen_gate: None,
                             last_screen_failure: None,
@@ -1317,7 +1178,6 @@ impl NativeEffectShell {
         pty_env: Vec<EnvMutation>,
         instance_extra_args: Vec<OsString>,
         one_shot_session_persistence: OneShotSessionPersistence,
-        qwen_sidecar: Option<QwenDualOutputLaunch>,
     ) -> ControlObservation {
         if let Err(message) = validate_spawn_runtime_policy(
             runtime_policy,
@@ -1391,7 +1251,6 @@ impl NativeEffectShell {
                 instance_extra_args,
                 resumed_provider_session: Some(provider_session),
                 one_shot_session_persistence,
-                qwen_sidecar,
             },
             pty_env,
         )
@@ -1399,12 +1258,8 @@ impl NativeEffectShell {
     }
 
     async fn stop_native(&mut self, key: NativeSessionKey, force: bool) -> ControlObservation {
-        if let Some(mut owned) = self.pty_sessions.remove(&key) {
+        if let Some(owned) = self.pty_sessions.remove(&key) {
             let shutdown = owned.session.shutdown().await;
-            if let Some(sidecar) = &mut owned.qwen_sidecar {
-                self.pending_observations.extend(drain_qwen_sidecar(key, sidecar));
-                self.pending_observations.extend(finish_qwen_sidecar(key, sidecar));
-            }
             return match shutdown {
                 Ok(outcome) => ControlObservation::StopCompleted {
                     forced: force || outcome.termination.is_some(),
@@ -1506,7 +1361,7 @@ impl NativeEffectShell {
             .collect();
         let mut observations = Vec::with_capacity(completed.len());
         for key in completed {
-            let mut owned = self
+            let owned = self
                 .pty_sessions
                 .remove(&key)
                 .expect("completed key came from the owned session map");
@@ -1518,10 +1373,6 @@ impl NativeEffectShell {
                 ),
                 Err(_) => (None, None),
             };
-            if let Some(sidecar) = &mut owned.qwen_sidecar {
-                observations.extend(drain_qwen_sidecar(key, sidecar));
-                observations.extend(finish_qwen_sidecar(key, sidecar));
-            }
             observations.push(ObservationEnvelope {
                 protocol_version: CONTROL_PROTOCOL_VERSION,
                 operation_id: None,
@@ -1552,9 +1403,6 @@ impl NativeEffectShell {
         for (key, owned) in &mut self.pty_sessions {
             if let Some(provider) = &mut owned.provider {
                 drain_pty_provider(*key, provider, &mut observations);
-            }
-            if let Some(sidecar) = &mut owned.qwen_sidecar {
-                observations.extend(drain_qwen_sidecar(*key, sidecar));
             }
         }
         collect_provider_map(&mut self.pipe_sessions, &mut observations);
@@ -1916,19 +1764,6 @@ fn validate_instance_launch_arguments(
                     .to_owned(),
             );
         }
-        if agent_id.as_str() == "qwen-code"
-            && RESERVED_QWEN_SIDECAR_FLAGS.iter().any(|reserved| {
-                argument == *reserved
-                    || argument
-                        .strip_prefix(reserved)
-                        .is_some_and(|suffix| suffix.starts_with('='))
-            })
-        {
-            return Err(
-                "native instance launch arguments conflict with Qwen sidecar output authority"
-                    .to_owned(),
-            );
-        }
     }
     Ok(())
 }
@@ -2025,176 +1860,6 @@ fn prepare_fresh_pty_provider_session(
     launch_extra_args.push(OsString::from("--session-id"));
     launch_extra_args.push(OsString::from(&identity.id));
     Some(identity)
-}
-
-fn drain_qwen_sidecar(
-    key: NativeSessionKey,
-    sidecar: &mut OwnedQwenDualOutput,
-) -> Vec<ObservationEnvelope> {
-    let mut observations = Vec::new();
-    publish_qwen_pending_gap(key, sidecar, &mut observations);
-    let Some(path) = sidecar.output_file.clone() else {
-        return observations;
-    };
-    let length = match std::fs::metadata(&path) {
-        Ok(metadata) => metadata.len(),
-        Err(_) => {
-            publish_qwen_tail_failure(key, sidecar, &mut observations);
-            return observations;
-        }
-    };
-    if length < sidecar.offset {
-        sidecar.offset = 0;
-        sidecar.pending.clear();
-        sidecar.discarding_oversized_line = false;
-        sidecar.gap_pending = sidecar.gap_pending.saturating_add(1);
-    }
-    let mut file = match OpenOptions::new().read(true).open(&path) {
-        Ok(file) => file,
-        Err(_) => {
-            publish_qwen_tail_failure(key, sidecar, &mut observations);
-            return observations;
-        }
-    };
-    if file.seek(SeekFrom::Start(sidecar.offset)).is_err() {
-        publish_qwen_tail_failure(key, sidecar, &mut observations);
-        return observations;
-    }
-    sidecar.tail_unavailable = false;
-    let mut read_total = 0usize;
-    let mut chunk = [0u8; QWEN_SIDECAR_READ_CHUNK_BYTES];
-    while read_total < QWEN_SIDECAR_READ_MAX_BYTES_PER_TICK {
-        let limit = (QWEN_SIDECAR_READ_MAX_BYTES_PER_TICK - read_total).min(chunk.len());
-        let read = match file.read(&mut chunk[..limit]) {
-            Ok(0) => break,
-            Ok(read) => read,
-            Err(_) => {
-                publish_qwen_tail_failure(key, sidecar, &mut observations);
-                break;
-            }
-        };
-        read_total += read;
-        sidecar.offset = sidecar.offset.saturating_add(read as u64);
-        consume_qwen_bytes(key, sidecar, &chunk[..read], &mut observations);
-    }
-    publish_qwen_pending_gap(key, sidecar, &mut observations);
-    observations
-}
-
-fn finish_qwen_sidecar(
-    key: NativeSessionKey,
-    sidecar: &mut OwnedQwenDualOutput,
-) -> Vec<ObservationEnvelope> {
-    let mut observations = Vec::new();
-    if !sidecar.pending.is_empty() {
-        sidecar.pending.clear();
-        sidecar.gap_pending = sidecar.gap_pending.saturating_add(1);
-    }
-    if !sidecar.parser.clean_end_seen() {
-        sidecar.gap_pending = sidecar.gap_pending.saturating_add(1);
-    }
-    publish_qwen_pending_gap(key, sidecar, &mut observations);
-    observations
-}
-
-fn consume_qwen_bytes(
-    key: NativeSessionKey,
-    sidecar: &mut OwnedQwenDualOutput,
-    bytes: &[u8],
-    observations: &mut Vec<ObservationEnvelope>,
-) {
-    for byte in bytes {
-        if sidecar.discarding_oversized_line {
-            if *byte == b'\n' {
-                sidecar.discarding_oversized_line = false;
-            }
-            continue;
-        }
-        if *byte == b'\n' {
-            if sidecar.pending.last() == Some(&b'\r') {
-                sidecar.pending.pop();
-            }
-            let line = std::mem::take(&mut sidecar.pending);
-            match sidecar.parser.parse_line(&line) {
-                QwenDualOutputLine::Events(events) => {
-                    publish_qwen_pending_gap(key, sidecar, observations);
-                    for event in events {
-                        push_qwen_provider_observation(key, sidecar, event, observations);
-                    }
-                }
-                QwenDualOutputLine::Ignored => {}
-                QwenDualOutputLine::Gap => {
-                    sidecar.gap_pending = sidecar.gap_pending.saturating_add(1);
-                    publish_qwen_pending_gap(key, sidecar, observations);
-                }
-            }
-        } else if sidecar.pending.len() == QWEN_DUAL_OUTPUT_MAX_LINE_BYTES {
-            sidecar.pending.clear();
-            sidecar.discarding_oversized_line = true;
-            sidecar.gap_pending = sidecar.gap_pending.saturating_add(1);
-            publish_qwen_pending_gap(key, sidecar, observations);
-        } else {
-            sidecar.pending.push(*byte);
-        }
-    }
-}
-
-fn publish_qwen_tail_failure(
-    key: NativeSessionKey,
-    sidecar: &mut OwnedQwenDualOutput,
-    observations: &mut Vec<ObservationEnvelope>,
-) {
-    if !sidecar.tail_unavailable {
-        sidecar.tail_unavailable = true;
-        sidecar.gap_pending = sidecar.gap_pending.saturating_add(1);
-    }
-    publish_qwen_pending_gap(key, sidecar, observations);
-}
-
-fn publish_qwen_pending_gap(
-    key: NativeSessionKey,
-    sidecar: &mut OwnedQwenDualOutput,
-    observations: &mut Vec<ObservationEnvelope>,
-) {
-    let missed = std::mem::take(&mut sidecar.gap_pending);
-    let Some(source_sequence) = reserve_provider_gap_sequence(
-        &mut sidecar.next_provider_sequence,
-        missed,
-    ) else {
-        return;
-    };
-    observations.push(ObservationEnvelope {
-        protocol_version: CONTROL_PROTOCOL_VERSION,
-        operation_id: None,
-        instance_id: key.instance_id,
-        generation: key.generation,
-        observation: ControlObservation::ProviderGap {
-            source: sidecar.source.clone(),
-            source_sequence,
-            missed,
-        },
-    });
-}
-
-fn push_qwen_provider_observation(
-    key: NativeSessionKey,
-    sidecar: &mut OwnedQwenDualOutput,
-    event: ProviderEvent,
-    observations: &mut Vec<ObservationEnvelope>,
-) {
-    let sequence = sidecar.next_provider_sequence;
-    sidecar.next_provider_sequence = sidecar.next_provider_sequence.saturating_add(1);
-    observations.push(ObservationEnvelope {
-        protocol_version: CONTROL_PROTOCOL_VERSION,
-        operation_id: None,
-        instance_id: key.instance_id,
-        generation: key.generation,
-        observation: ControlObservation::ProviderEvent {
-            source: sidecar.source.clone(),
-            sequence,
-            event,
-        },
-    });
 }
 
 fn drain_pty_provider(
@@ -4145,22 +3810,20 @@ fn elapsed_ms(started: Instant) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        argument_looks_like_credential, classify_operator_gate_option_semantics,
-        classify_pty_screen_state, drain_qwen_sidecar,
-        finish_qwen_sidecar, foreground_probe_rearms_immediately, foreground_probe_schedule,
+        classify_operator_gate_option_semantics,
+        classify_pty_screen_state,
+        foreground_probe_rearms_immediately, foreground_probe_schedule,
         parse_operator_gate_options, prepare_fresh_pty_provider_session,
-        prompt_render_probe, prompt_rendered, redact_provider_argument, redact_provider_arguments,
+        prompt_render_probe, prompt_rendered,
         reserve_provider_gap_sequence, resolve_foreground_verdict, screen_failure,
-        screen_failure_for_generation, with_pty_terminal_capability_defaults, NativeSessionKey,
-        NativeEffectShell,
-        OwnedQwenDualOutput, QwenDualOutputLaunch, QWEN_SIDECAR_READ_MAX_BYTES_PER_TICK,
+        screen_failure_for_generation, with_pty_terminal_capability_defaults,
         should_attach_pty_provider_stream, should_probe_pty_identity, startup_operator_gate,
         terminal_frame, terminal_frame_byte_len, terminal_state_capture_should_skip,
         validate_instance_launch_arguments, validate_spawn_runtime_policy,
         ForegroundProbeSchedule, ForegroundVerdict, ReadinessDiagnostics, RateLimitFeed,
         Utf8ChunkDecoder,
     };
-    use gate4agent_adapters::{builtin_adapter_registry, QWEN_DUAL_OUTPUT_REVISION};
+    use gate4agent_adapters::builtin_adapter_registry;
     use gate4agent_catalog::EnvMutation;
     use gate4agent::agent::ForegroundObservation;
     use gate4agent::core::types::{
@@ -4170,18 +3833,12 @@ mod tests {
     use gate4agent::pty::{PtyForegroundObservation, PtyForegroundSource, RateLimitDetector};
     use gate4agent::CliTool;
     use gate4agent_types::{
-        AdapterBinding, AdapterFamily, AdapterId, AdapterVerification, AgentId, AgentInstanceId,
-        ControlEffect, ControlObservation, EffectEnvelope, OperationId, OperatorGateInput,
+        AdapterFamily, AgentId, OperatorGateInput,
         OperatorGateKind, OperatorGateOptionSemantics, OperatorGateState, OperatorGateSubject,
-        ProviderEvent, ProviderRuntimePolicy, PtyScreenState, RuntimePlatform, SessionGeneration,
-        StartRequest, TerminalMouseProtocolEncoding, TerminalSize, TransportKind,
-        CONTROL_PROTOCOL_VERSION,
+        ProviderEvent, ProviderRuntimePolicy, PtyScreenState, RuntimePlatform,
+        TerminalMouseProtocolEncoding, TransportKind,
     };
     use std::ffi::{OsStr, OsString};
-    use std::fs::{File, OpenOptions};
-    use std::io::Write;
-    use std::path::{Path, PathBuf};
-    use std::time::Duration;
 
     fn snapshot(sequence: u64, contents: &str) -> super::PtyTerminalSnapshot {
         super::PtyTerminalSnapshot {
@@ -5308,455 +4965,6 @@ mod tests {
         next = u64::MAX;
         assert_eq!(reserve_provider_gap_sequence(&mut next, 1), None);
         assert_eq!(next, u64::MAX);
-    }
-
-    /// `qwen-code` is not part of the current fleet's built-in registry, so
-    /// this constructs the same shape of `Pipe`-family binding the sidecar
-    /// mechanism itself expects, standing in for a live registry lookup.
-    fn qwen_sidecar_binding() -> AdapterBinding {
-        AdapterBinding::new(
-            AdapterId::new("qwen-code").unwrap(),
-            QWEN_DUAL_OUTPUT_REVISION,
-            AdapterVerification::Reference,
-        )
-        .unwrap()
-    }
-
-    fn qwen_sidecar_fixture() -> (OwnedQwenDualOutput, PathBuf, PathBuf) {
-        let binding = qwen_sidecar_binding();
-        let launch = QwenDualOutputLaunch::prepare(binding).unwrap();
-        let path = launch.output_file().unwrap().to_owned();
-        let directory = launch.directory.as_ref().unwrap().clone();
-        (launch.into(), path, directory)
-    }
-
-    fn qwen_key() -> NativeSessionKey {
-        NativeSessionKey {
-            instance_id: AgentInstanceId(91),
-            generation: SessionGeneration(3),
-        }
-    }
-
-    fn append(path: &Path, bytes: &[u8]) {
-        OpenOptions::new()
-            .append(true)
-            .open(path)
-            .unwrap()
-            .write_all(bytes)
-            .unwrap();
-    }
-
-    #[test]
-    fn qwen_sidecar_split_utf8_and_partial_line_emit_only_complete_facts() {
-        let (mut sidecar, path, directory) = qwen_sidecar_fixture();
-        append(&path, b"{\"type\":\"system\",\"subtype\":\"session_start\"}\n");
-        let line = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"tool-utf8\",\"name\":\"read_файл\",\"input\":{}}]}}\n";
-        let split = line.find('ф').unwrap() + 1;
-        append(&path, &line.as_bytes()[..split]);
-        let first = drain_qwen_sidecar(qwen_key(), &mut sidecar);
-        assert_eq!(first.len(), 1);
-        assert!(matches!(
-            first[0].observation,
-            ControlObservation::ProviderEvent { event: ProviderEvent::Ready, .. }
-        ));
-        append(&path, &line.as_bytes()[split..]);
-        let second = drain_qwen_sidecar(qwen_key(), &mut sidecar);
-        assert!(second.iter().any(|observation| matches!(
-            &observation.observation,
-            ControlObservation::ProviderEvent {
-                event: ProviderEvent::ToolStarted { id, name, input_json, .. },
-                ..
-            } if id == "tool-utf8" && name == "read_файл" && input_json.is_empty()
-        )));
-        drop(sidecar);
-        assert!(!directory.exists());
-    }
-
-    #[test]
-    fn qwen_sidecar_malformed_oversize_truncation_and_backlog_are_bounded_gaps() {
-        let (mut sidecar, path, _) = qwen_sidecar_fixture();
-        append(&path, b"malformed\n");
-        append(
-            &path,
-            &vec![b'x'; gate4agent_adapters::QWEN_DUAL_OUTPUT_MAX_LINE_BYTES + 1],
-        );
-        append(&path, b"\n{\"type\":\"system\",\"subtype\":\"session_start\"}\n");
-        let mut observed = Vec::new();
-        for tick in 1..=8 {
-            observed.extend(drain_qwen_sidecar(qwen_key(), &mut sidecar));
-            assert!(
-                sidecar.offset
-                    <= tick * QWEN_SIDECAR_READ_MAX_BYTES_PER_TICK as u64
-            );
-            if sidecar.parser.handshake_seen() {
-                break;
-            }
-        }
-        assert!(sidecar.parser.handshake_seen());
-        assert_eq!(
-            observed
-                .iter()
-                .filter_map(|observation| match observation.observation {
-                    ControlObservation::ProviderGap { source_sequence, .. } => {
-                        Some(source_sequence)
-                    }
-                    ControlObservation::ProviderEvent { sequence, .. } => Some(sequence),
-                    _ => None,
-                })
-                .collect::<Vec<_>>(),
-            vec![1, 2, 3]
-        );
-        assert_eq!(
-            observed
-                .iter()
-                .filter(|observation| matches!(
-                    observation.observation,
-                    ControlObservation::ProviderGap { .. }
-                ))
-                .count(),
-            2
-        );
-        File::create(&path)
-            .unwrap()
-            .write_all(b"{\"type\":\"system\",\"subtype\":\"session_end\"}\n")
-            .unwrap();
-        let after_truncation = drain_qwen_sidecar(qwen_key(), &mut sidecar);
-        assert!(matches!(
-            after_truncation[0].observation,
-            ControlObservation::ProviderGap { .. }
-        ));
-        assert!(after_truncation.iter().any(|observation| matches!(
-            observation.observation,
-            ControlObservation::ProviderEvent { event: ProviderEvent::SessionEnded { .. }, .. }
-        )));
-    }
-
-    #[test]
-    fn qwen_sidecar_abrupt_eof_is_gap_but_clean_session_end_is_not() {
-        let (mut abrupt, abrupt_path, _) = qwen_sidecar_fixture();
-        append(&abrupt_path, b"{\"type\":\"system\",\"subtype\":\"session_start\"}\n");
-        assert_eq!(drain_qwen_sidecar(qwen_key(), &mut abrupt).len(), 1);
-        let abrupt_end = finish_qwen_sidecar(qwen_key(), &mut abrupt);
-        assert_eq!(abrupt_end.len(), 1);
-        assert!(matches!(
-            abrupt_end[0].observation,
-            ControlObservation::ProviderGap { .. }
-        ));
-
-        let (mut clean, clean_path, _) = qwen_sidecar_fixture();
-        append(&clean_path, b"{\"type\":\"system\",\"subtype\":\"session_start\"}\n{\"type\":\"system\",\"subtype\":\"session_end\"}\n");
-        assert_eq!(drain_qwen_sidecar(qwen_key(), &mut clean).len(), 2);
-        assert!(finish_qwen_sidecar(qwen_key(), &mut clean).is_empty());
-    }
-
-    #[test]
-    fn unavailable_qwen_sidecar_emits_one_gap_without_launch_arguments() {
-        let binding = qwen_sidecar_binding();
-        let launch = QwenDualOutputLaunch::unavailable(binding);
-        let mut arguments = Vec::new();
-        launch.append_launch_arguments(&mut arguments);
-        assert!(arguments.is_empty());
-        let mut sidecar = OwnedQwenDualOutput::from(launch);
-        assert_eq!(drain_qwen_sidecar(qwen_key(), &mut sidecar).len(), 1);
-        assert!(drain_qwen_sidecar(qwen_key(), &mut sidecar).is_empty());
-    }
-
-    #[test]
-    fn qwen_sidecar_launch_cleanup_covers_pre_spawn_and_owned_lifetimes() {
-        let binding = qwen_sidecar_binding();
-        let launch = QwenDualOutputLaunch::prepare(binding.clone()).unwrap();
-        let pre_spawn_directory = launch.directory.as_ref().unwrap().clone();
-        drop(launch);
-        assert!(!pre_spawn_directory.exists());
-
-        let launch = QwenDualOutputLaunch::prepare(binding).unwrap();
-        let owned_directory = launch.directory.as_ref().unwrap().clone();
-        let owned = OwnedQwenDualOutput::from(launch);
-        drop(owned);
-        assert!(!owned_directory.exists());
-    }
-
-    #[tokio::test]
-    async fn qwen_sidecar_spawn_failure_cleans_private_directory() {
-        let binding = qwen_sidecar_binding();
-        let mut spec = gate4agent_testkit::interactive_agent_spec();
-        spec.id = AgentId::new("qwen-code").unwrap();
-        spec.capabilities.adapters.pty_sidecar = Some(binding.clone());
-        // `qwen-code` is not part of the current fleet's built-in adapter
-        // registry, so this validates the spec against a consumer-extended
-        // registry carrying just the sidecar binding under test.
-        let adapters = gate4agent_catalog::AdapterRegistry::new([gate4agent_catalog::AdapterDescriptor {
-            family: AdapterFamily::Pipe,
-            binding: binding.clone(),
-            agents: vec![AgentId::new("qwen-code").unwrap()],
-        }])
-        .unwrap();
-        let mut shell = NativeEffectShell::new(
-            gate4agent_catalog::AgentRegistry::new_with_adapters([spec], &adapters).unwrap(),
-        );
-        let launch = QwenDualOutputLaunch::prepare(binding).unwrap();
-        let directory = launch.directory.as_ref().unwrap().clone();
-        let failed = shell
-            .execute_with_launch_context(
-                EffectEnvelope {
-                    protocol_version: CONTROL_PROTOCOL_VERSION,
-                    operation_id: OperationId(80),
-                    instance_id: AgentInstanceId(90),
-                    generation: SessionGeneration(1),
-                    effect: ControlEffect::Spawn {
-                        agent_id: AgentId::new("qwen-code").unwrap(),
-                        transport: TransportKind::Pty,
-                        runtime_policy: ProviderRuntimePolicy::raw_pty(),
-                        request: StartRequest {
-                            working_directory: String::new(),
-                            terminal_size: TerminalSize { rows: 24, columns: 80 },
-                            initial_prompt: None,
-                            session_options: None,
-                        },
-                    },
-                },
-                Vec::new(),
-                Vec::new(),
-                gate4agent_adapters::OneShotSessionPersistence::Ephemeral,
-                Some(launch),
-            )
-            .await;
-        assert!(matches!(failed.observation, ControlObservation::SpawnFailed { .. }));
-        assert!(!directory.exists());
-    }
-
-    #[test]
-    fn credential_shaped_arguments_are_redacted_but_ordinary_ones_pass_through() {
-        assert!(argument_looks_like_credential("sk-ant-abcdef123456"));
-        assert!(argument_looks_like_credential("Bearer abcdef123456"));
-        assert!(argument_looks_like_credential("--api-key=abcdef123456"));
-        assert!(argument_looks_like_credential("token=abcdef123456"));
-        assert!(!argument_looks_like_credential("--resume"));
-        assert!(!argument_looks_like_credential(
-            "0f1e2d3c-4b5a-6978-8899-aabbccddeeff"
-        ));
-        assert!(!argument_looks_like_credential("--model"));
-        assert!(!argument_looks_like_credential("opus"));
-
-        assert_eq!(
-            redact_provider_argument(OsStr::new("sk-ant-abcdef123456")),
-            "[redacted-credential-shaped-argument]",
-        );
-        assert_eq!(
-            redact_provider_arguments(&[
-                OsString::from("--resume"),
-                OsString::from("g4aho_deadbeef"),
-            ]),
-            vec!["--resume".to_owned(), "[redacted-credential-shaped-argument]".to_owned()],
-        );
-    }
-
-    /// The logging itself is the contract here: a spawn failure must record
-    /// its actual OS-level cause, not a bare "failed". This is the exact gap
-    /// that left the live node silent while a real spawn attempt failed.
-    #[tokio::test]
-    async fn pty_spawn_failure_logs_the_os_error_cause() {
-        #[derive(Clone, Default)]
-        struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-        impl std::io::Write for CapturedLog {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .extend_from_slice(buf);
-                Ok(buf.len())
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
-            type Writer = CapturedLog;
-
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-
-        let captured = CapturedLog::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(captured.clone())
-            .with_ansi(false)
-            .finish();
-        let _default_guard = tracing::subscriber::set_default(subscriber);
-
-        let mut spec = gate4agent_testkit::interactive_agent_spec();
-        let missing_launcher = std::env::temp_dir().join(format!(
-            "gate4agent-shell-native-missing-launcher-{}{}",
-            std::process::id(),
-            std::env::consts::EXE_SUFFIX,
-        ));
-        spec.launch.program = missing_launcher.to_string_lossy().into_owned();
-        let agent_id = spec.id.clone();
-        let mut shell =
-            NativeEffectShell::new(gate4agent_catalog::AgentRegistry::new([spec]).unwrap());
-
-        let failed = shell
-            .execute(EffectEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
-                operation_id: OperationId(1),
-                instance_id: AgentInstanceId(1),
-                generation: SessionGeneration(1),
-                effect: ControlEffect::Spawn {
-                    agent_id,
-                    transport: TransportKind::Pty,
-                    runtime_policy: ProviderRuntimePolicy::raw_pty(),
-                    request: StartRequest {
-                        working_directory: std::env::current_dir()
-                            .expect("test process has a current directory")
-                            .to_string_lossy()
-                            .into_owned(),
-                        terminal_size: TerminalSize { rows: 24, columns: 80 },
-                        initial_prompt: None,
-                        session_options: None,
-                    },
-                },
-            })
-            .await;
-        assert!(matches!(failed.observation, ControlObservation::SpawnFailed { .. }));
-
-        drop(_default_guard);
-        let log_text = String::from_utf8(
-            captured
-                .0
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone(),
-        )
-        .expect("captured log output is valid UTF-8");
-        assert!(
-            log_text.contains("provider process failed to start"),
-            "expected the spawn-failure log line, got: {log_text}",
-        );
-        assert!(
-            log_text.contains("os error"),
-            "expected the log to name the OS spawn failure cause, got: {log_text}",
-        );
-    }
-
-    #[tokio::test]
-    async fn controlled_qwen_pty_fixture_delivers_sidecar_provider_events_and_cleans_up() {
-        gate4agent_testkit::suppress_windows_fault_dialogs_for_test();
-        gate4agent_testkit::require_windows_headless_supervisor_for_test();
-        let binding = qwen_sidecar_binding();
-        let mut spec = gate4agent_testkit::interactive_agent_spec();
-        spec.id = AgentId::new("qwen-code").unwrap();
-        spec.capabilities.adapters.pty_sidecar = Some(binding.clone());
-        #[cfg(windows)]
-        {
-            *spec.launch.fixed_args.last_mut().unwrap() = r#"& { param([Parameter(ValueFromRemainingArguments=$true)][string[]]$sidecarArgs) $index=[Array]::IndexOf($sidecarArgs,'--json-file'); if ($index -lt 0 -or $index + 1 -ge $sidecarArgs.Count) { exit 41 }; $path=$sidecarArgs[$index+1]; [IO.File]::AppendAllText($path, '{"type":"system","subtype":"session_start","data":{"protocol_version":2}}' + [Environment]::NewLine + '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"fixture-tool","name":"read_file","input":{"path":"private"}}]}}' + [Environment]::NewLine + '{"type":"control_request","request_id":"fixture-approval","request":{"subtype":"can_use_tool","tool_name":"read_file","tool_use_id":"fixture-tool","input":{"path":"private"}}}' + [Environment]::NewLine + '{"type":"control_response","response":{"subtype":"success","request_id":"fixture-approval","response":{"allowed":true}}}' + [Environment]::NewLine + '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"fixture-tool","content":"private","is_error":false}]}}' + [Environment]::NewLine + '{"type":"result","subtype":"success","usage":{"input_tokens":2,"output_tokens":3}}' + [Environment]::NewLine + '{"type":"system","subtype":"session_end"}' + [Environment]::NewLine); [Console]::Write('fixture-qwen-sidecar'); Start-Sleep -Milliseconds 200 }"#.to_owned();
-        }
-        #[cfg(not(windows))]
-        {
-            *spec.launch.fixed_args.last_mut().unwrap() = r#"printf '%s\n' '{"type":"system","subtype":"session_start","data":{"protocol_version":2}}' '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"fixture-tool","name":"read_file","input":{"path":"private"}}]}}' '{"type":"control_request","request_id":"fixture-approval","request":{"subtype":"can_use_tool","tool_name":"read_file","tool_use_id":"fixture-tool","input":{"path":"private"}}}' '{"type":"control_response","response":{"subtype":"success","request_id":"fixture-approval","response":{"allowed":true}}}' '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"fixture-tool","content":"private","is_error":false}]}}' '{"type":"result","subtype":"success","usage":{"input_tokens":2,"output_tokens":3}}' '{"type":"system","subtype":"session_end"}' > "$1"; printf 'fixture-qwen-sidecar'; sleep 0.2"#.to_owned();
-        }
-        let catalog = gate4agent_catalog::AgentRegistry::new([spec]).unwrap();
-        let mut shell = NativeEffectShell::new(catalog);
-        let launch = QwenDualOutputLaunch::prepare(binding).unwrap();
-        let directory = launch.directory.as_ref().unwrap().clone();
-        let key = qwen_key();
-        let spawned = shell
-            .execute_with_launch_context(
-                EffectEnvelope {
-                    protocol_version: CONTROL_PROTOCOL_VERSION,
-                    operation_id: OperationId(81),
-                    instance_id: key.instance_id,
-                    generation: key.generation,
-                    effect: ControlEffect::Spawn {
-                        agent_id: AgentId::new("qwen-code").unwrap(),
-                        transport: TransportKind::Pty,
-                        runtime_policy: ProviderRuntimePolicy::raw_pty(),
-                        request: StartRequest {
-                            working_directory: std::env::current_dir()
-                                .unwrap()
-                                .to_string_lossy()
-                                .into_owned(),
-                            terminal_size: TerminalSize { rows: 24, columns: 80 },
-                            initial_prompt: None,
-                            session_options: None,
-                        },
-                    },
-                },
-                Vec::new(),
-                Vec::new(),
-                gate4agent_adapters::OneShotSessionPersistence::Ephemeral,
-                Some(launch),
-            )
-            .await;
-        assert!(matches!(spawned.observation, ControlObservation::Spawned { .. }));
-
-        let mut provider = Vec::new();
-        let mut exited = false;
-        for _ in 0..200 {
-            provider.extend(shell.collect_provider_events());
-            let exit_observations = shell.collect_exits().await;
-            if !exit_observations.is_empty() {
-                provider.extend(exit_observations);
-                provider.extend(shell.collect_provider_events());
-                exited = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        if !exited {
-            let _ = shell
-                .execute(EffectEnvelope {
-                    protocol_version: CONTROL_PROTOCOL_VERSION,
-                    operation_id: OperationId(82),
-                    instance_id: key.instance_id,
-                    generation: key.generation,
-                    effect: ControlEffect::Stop { force: true },
-                })
-                .await;
-        }
-        assert!(exited);
-        assert!(!directory.exists());
-        let events = provider
-            .iter()
-            .filter_map(|observation| match &observation.observation {
-                ControlObservation::ProviderEvent { source, sequence, event } => {
-                    assert_eq!(source.family, AdapterFamily::Pipe);
-                    assert_eq!(source.binding.id.as_str(), "qwen-code");
-                    Some((*sequence, event))
-                }
-                ControlObservation::ProviderGap { .. } => {
-                    panic!("clean fixture emitted a gap: {provider:?}")
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            events.iter().map(|(sequence, _)| *sequence).collect::<Vec<_>>(),
-            (1..=events.len() as u64).collect::<Vec<_>>()
-        );
-        assert!(events.iter().any(|(_, event)| matches!(event, ProviderEvent::Ready)));
-        assert!(events.iter().any(|(_, event)| matches!(event, ProviderEvent::ToolStarted { .. })));
-        assert!(events.iter().any(|(_, event)| matches!(
-            event,
-            ProviderEvent::InteractionRequested {
-                request_id: Some(request_id),
-                prompt,
-                ..
-            } if request_id == "fixture-approval" && prompt.is_empty()
-        )));
-        assert!(events.iter().any(|(_, event)| matches!(
-            event,
-            ProviderEvent::InteractionResolved {
-                request_id,
-                outcome: gate4agent_types::ProviderInteractionOutcome::Approved,
-            } if request_id == "fixture-approval"
-        )));
-        assert!(events.iter().any(|(_, event)| matches!(event, ProviderEvent::ToolCompleted { .. })));
-        assert!(events.iter().any(|(_, event)| matches!(event, ProviderEvent::TurnCompleted { .. })));
-        assert!(events.iter().any(|(_, event)| matches!(event, ProviderEvent::SessionEnded { .. })));
     }
 
     // --- RateLimitFeed: ANSI-stripping and chunk reassembly ---

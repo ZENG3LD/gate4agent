@@ -250,8 +250,6 @@ fn recognize_node_package_entrypoint(
     let path = comparable_path(token);
     let (command, marker) = if path.contains("node_modules/@openai/codex/") {
         ("codex", "codex")
-    } else if path.contains("node_modules/@google/gemini-cli/") {
-        ("gemini", "gemini")
     } else {
         return None;
     };

@@ -50,11 +50,11 @@ use gate4agent_types::{AdapterId, AgentId, TerminalSize};
 use serde_json::{json, Value};
 use tokio::time::{sleep, timeout};
 
-const QWEN_HISTORY_SESSION_ID: &str = "11111111-1111-4111-8111-111111111111";
-const QWEN_HISTORY_TITLE: &str = "Harness-owned Qwen history";
-const QWEN_HISTORY_USER: &str = "show this bounded history through Harness";
-const QWEN_HISTORY_ASSISTANT: &str = "Harness returned the visible native session preview";
-const QWEN_PRIVATE_THOUGHT: &str = "fixture-private-qwen-thought";
+const FIXTURE_HISTORY_SESSION_ID: &str = "11111111-1111-4111-8111-111111111111";
+const FIXTURE_HISTORY_TITLE: &str = "Harness-owned fixture history";
+const FIXTURE_HISTORY_USER: &str = "show this bounded history through Harness";
+const FIXTURE_HISTORY_ASSISTANT: &str = "Harness returned the visible native session preview";
+const FIXTURE_PRIVATE_THOUGHT: &str = "fixture-private-thought";
 
 struct FixturePaths {
     root: PathBuf,
@@ -126,58 +126,38 @@ fn write_json_lines(path: &Path, values: &[Value]) {
     fs::write(path, bytes).unwrap();
 }
 
-fn qwen_history(root: &Path, workspace: &Path) -> gate4agent_node::NativeHistoryConfig {
+fn history_fixture(root: &Path, workspace: &Path) -> gate4agent_node::NativeHistoryConfig {
     let projects = root.join("projects");
     write_json_lines(
-        &projects
-            .join("c--harness-history-fixture")
-            .join("chats")
-            .join(format!("{QWEN_HISTORY_SESSION_ID}.jsonl")),
+        &projects.join("project").join("harness-history-fixture.jsonl"),
         &[
             json!({
-                "uuid": "u1",
-                "parentUuid": null,
-                "sessionId": QWEN_HISTORY_SESSION_ID,
-                "timestamp": "2026-08-15T00:00:00Z",
                 "type": "user",
-                "provenance": "real_user",
+                "sessionId": FIXTURE_HISTORY_SESSION_ID,
                 "cwd": workspace.to_string_lossy(),
-                "message": { "role": "user", "parts": [{ "text": QWEN_HISTORY_USER }] },
+                "message": { "content": FIXTURE_HISTORY_USER },
             }),
             json!({
-                "uuid": "a1",
-                "parentUuid": "u1",
-                "sessionId": QWEN_HISTORY_SESSION_ID,
-                "timestamp": "2026-08-15T00:00:01Z",
                 "type": "assistant",
-                "provenance": "assistant_output",
-                "cwd": workspace.to_string_lossy(),
-                "model": "qwen-harness-fixture",
+                "sessionId": FIXTURE_HISTORY_SESSION_ID,
                 "message": {
-                    "role": "model",
-                    "parts": [
-                        { "text": QWEN_PRIVATE_THOUGHT, "thought": true },
-                        { "text": QWEN_HISTORY_ASSISTANT },
+                    "model": "claude-harness-fixture",
+                    "content": [
+                        { "type": "thinking", "thinking": FIXTURE_PRIVATE_THOUGHT },
+                        { "type": "text", "text": FIXTURE_HISTORY_ASSISTANT },
                     ],
                 },
             }),
             json!({
-                "uuid": "title",
-                "parentUuid": "a1",
-                "sessionId": QWEN_HISTORY_SESSION_ID,
-                "type": "system",
-                "subtype": "custom_title",
-                "cwd": workspace.to_string_lossy(),
-                "systemPayload": {
-                    "customTitle": QWEN_HISTORY_TITLE,
-                    "titleSource": "manual",
-                },
+                "type": "ai-title",
+                "sessionId": FIXTURE_HISTORY_SESSION_ID,
+                "aiTitle": FIXTURE_HISTORY_TITLE,
             }),
         ],
     );
     gate4agent_node::NativeHistoryConfig::new(vec![
         gate4agent_node::NativeHistoryRoot::new(
-            AdapterId::new("qwen-code").unwrap(),
+            AdapterId::new("claude-code").unwrap(),
             gate4agent_node::HistorySourceLayout::SingleNdjson,
             projects,
         ).unwrap(),
@@ -302,7 +282,7 @@ async fn wait_node_inventory(
     }).await.expect("Harness runtime inventory did not expose the history fixture Node")
 }
 
-fn assert_qwen_history_visible_through_harness(
+fn assert_fixture_history_visible_through_harness(
     client: &HarnessOperatorClient,
     route: HarnessNativeSessionRouteV1,
     fixture_path_canary: &str,
@@ -313,7 +293,7 @@ fn assert_qwen_history_visible_through_harness(
     let entry = &catalog.entries[0];
     assert_eq!(entry.title, None);
     assert_eq!(entry.message_count, 0);
-    assert_ne!(entry.selection_id, QWEN_HISTORY_SESSION_ID);
+    assert_ne!(entry.selection_id, FIXTURE_HISTORY_SESSION_ID);
     assert!(!entry.selection_id.contains(['/', '\\', ':']));
     let summary = catalog.summary.as_ref()
         .expect("initial native history catalog omitted its bounded revision authority");
@@ -325,26 +305,26 @@ fn assert_qwen_history_visible_through_harness(
     };
     let catalog_json = serde_json::to_string(&catalog).unwrap();
     assert!(!catalog_json.contains(fixture_path_canary));
-    assert!(!catalog_json.contains(QWEN_PRIVATE_THOUGHT));
+    assert!(!catalog_json.contains(FIXTURE_PRIVATE_THOUGHT));
 
     let previewed = client.preview_native_session(selection.clone(), 8).unwrap();
     assert_eq!(previewed.selection, selection);
-    assert_eq!(previewed.preview.title.as_deref(), Some(QWEN_HISTORY_TITLE));
+    assert_eq!(previewed.preview.title.as_deref(), Some(FIXTURE_HISTORY_TITLE));
     assert_eq!(previewed.preview.message_count, 2);
     assert_eq!(previewed.preview.messages.len(), 2);
     assert_eq!(
         previewed.preview.messages[0].role,
         HarnessNativeSessionPreviewRoleV1::User,
     );
-    assert_eq!(previewed.preview.messages[0].text, QWEN_HISTORY_USER);
+    assert_eq!(previewed.preview.messages[0].text, FIXTURE_HISTORY_USER);
     assert_eq!(
         previewed.preview.messages[1].role,
         HarnessNativeSessionPreviewRoleV1::Assistant,
     );
-    assert_eq!(previewed.preview.messages[1].text, QWEN_HISTORY_ASSISTANT);
+    assert_eq!(previewed.preview.messages[1].text, FIXTURE_HISTORY_ASSISTANT);
     let preview_json = serde_json::to_string(&previewed).unwrap();
     assert!(!preview_json.contains(fixture_path_canary));
-    assert!(!preview_json.contains(QWEN_PRIVATE_THOUGHT));
+    assert!(!preview_json.contains(FIXTURE_PRIVATE_THOUGHT));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -670,7 +650,7 @@ async fn tui_skin_reconnect_preserves_harness_owned_c2_workflow() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn tui_skin_reads_explicit_qwen_history_only_through_harness() {
+async fn tui_skin_reads_explicit_history_only_through_harness() {
     require_headless_supervisor();
     let fixture = FixturePaths::new();
     let node_endpoint = pipe("history-node");
@@ -685,7 +665,7 @@ async fn tui_skin_reads_explicit_qwen_history_only_through_harness() {
     )).unwrap();
     let workspace = fixture.root.join("workspace");
     fs::create_dir(&workspace).unwrap();
-    let history = qwen_history(&fixture.root.join("qwen-history"), &workspace);
+    let history = history_fixture(&fixture.root.join("harness-history"), &workspace);
     let fixture_path_canary = fixture.root.file_name().unwrap().to_string_lossy().into_owned();
 
     let node_config = NodeServerConfig::new(
@@ -748,9 +728,9 @@ async fn tui_skin_reads_explicit_qwen_history_only_through_harness() {
         incarnation_id: node_inventory.incarnation_id.clone(),
         scope: HarnessNativeSessionCatalogScopeV1::Workspace,
         workspace_id: Some(workspace_id.as_str().to_owned()),
-        provider: "qwen-code".to_owned(),
+        provider: "claude-code".to_owned(),
     };
-    assert_qwen_history_visible_through_harness(
+    assert_fixture_history_visible_through_harness(
         &tui,
         history_route.clone(),
         &fixture_path_canary,
@@ -762,7 +742,7 @@ async fn tui_skin_reads_explicit_qwen_history_only_through_harness() {
     assert!(c2_client.ready().await.unwrap().ready, "dropping TUI client stopped C2");
 
     let reconnected_tui = tui_harness_client(harness_endpoint, operator_credential);
-    assert_qwen_history_visible_through_harness(
+    assert_fixture_history_visible_through_harness(
         &reconnected_tui,
         history_route,
         &fixture_path_canary,

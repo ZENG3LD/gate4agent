@@ -4351,7 +4351,7 @@ mod tests {
             route: route(),
             request: NodeRequest::Spawn {
                 workspace_id: WorkspaceId::new("primary").unwrap(),
-                provider: gate4agent_c2_protocol::AgentId::new("qwen-code").unwrap(),
+                provider: gate4agent_c2_protocol::AgentId::new("third-party-agent").unwrap(),
                 mode: SessionMode::Pty,
                 terminal_size: TerminalSize { rows: 40, columns: 120 },
                 initial_prompt: None,
@@ -4669,7 +4669,7 @@ mod tests {
                         snapshot: gate4agent_c2_protocol::C2NodeSnapshot {
                             node_id: NodeId::new("node-a").unwrap(),
                             enabled_providers: vec![
-                                gate4agent_c2_protocol::AgentId::new("qwen-code").unwrap(),
+                                gate4agent_c2_protocol::AgentId::new("third-party-agent").unwrap(),
                             ],
                             provider_runtime_statuses: Default::default(),
                             workspaces: Vec::new(),

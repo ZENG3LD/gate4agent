@@ -1364,9 +1364,3 @@ async fn windows_live_parallel_codex_kimi_pty_process_isolation() {
         "vendor_pty_parallel agents=codex,kimi concurrent_active=2 stop_one_survivor_running=true survivor_followup=true cross_session_marker_leak=false active_sessions=0"
     );
 }
-
-#[tokio::test]
-#[ignore = "requires GATE4AGENT_VENDOR_PTY_CANARY=1 and an installed Qwen Code CLI without completed login"]
-async fn windows_live_qwen_pty_without_login_fails_closed() {
-    run_expected_startup_block_canary("qwen-code", 10_004, "readiness-timeout").await;
-}

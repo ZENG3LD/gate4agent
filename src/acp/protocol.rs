@@ -143,13 +143,13 @@ pub enum SessionUpdate {
     #[serde(rename = "agent_message_chunk")]
     AgentMessageChunk {
         /// Can be a single content block object, an array of content blocks,
-        /// or absent. Gemini ACP sends a single object; Claude ACP sends an array.
+        /// or absent. Some ACP agents send a single object; Claude ACP sends an array.
         #[serde(default)]
         content: Value,
     },
     #[serde(rename = "agent_thought_chunk")]
     AgentThoughtChunk {
-        /// Can be `{"thought": "..."}` (Gemini ACP) or a plain string.
+        /// Can be `{"thought": "..."}` (some ACP agents) or a plain string.
         #[serde(default)]
         content: Value,
     },
@@ -280,7 +280,7 @@ pub struct AgentInfo {
 /// Tries multiple known shapes:
 /// 1. ACP canonical camelCase: `{"inputTokens": N, "outputTokens": N}`
 /// 2. Claude-nested usage: `{"usage": {"input_tokens": N, "output_tokens": N}}`
-/// 3. Gemini-nested stats: `{"stats": {"input_tokens": N, "output_tokens": N}}`
+/// 3. Stats-nested: `{"stats": {"input_tokens": N, "output_tokens": N}}`
 ///
 /// Returns `(0, 0)` if nothing matches.
 pub(crate) fn extract_token_usage(v: &Value) -> (u64, u64) {
@@ -302,7 +302,7 @@ pub(crate) fn extract_token_usage(v: &Value) -> (u64, u64) {
         }
     }
 
-    // 3. Nested under "stats" (Gemini ACP)
+    // 3. Nested under "stats"
     if let Some(stats) = v.get("stats") {
         if let (Some(i), Some(o)) = (
             stats.get("input_tokens").and_then(|x| x.as_u64()),
@@ -316,7 +316,7 @@ pub(crate) fn extract_token_usage(v: &Value) -> (u64, u64) {
 }
 
 /// Extract text from a content value that may be:
-/// - A single object `{"type": "text", "text": "..."}` (Gemini ACP)
+/// - A single object `{"type": "text", "text": "..."}` (some ACP agents)
 /// - An array of content blocks `[{"type": "text", "text": "..."}, ...]` (Claude ACP)
 /// - A plain string
 fn extract_text_from_content(content: &Value) -> String {
@@ -446,7 +446,7 @@ mod tests {
 
     #[test]
     fn update_to_event_text_delta_single_object() {
-        // Gemini ACP: content is a single object, not an array
+        // Some ACP agents: content is a single object, not an array
         let p = make_update(SessionUpdate::AgentMessageChunk {
             content: json!({"type": "text", "text": "hello"}),
         });
@@ -487,7 +487,7 @@ mod tests {
 
     #[test]
     fn update_to_event_thinking_thought_field() {
-        // Gemini ACP: thought wrapped in {"thought": "..."}
+        // Some ACP agents: thought wrapped in {"thought": "..."}
         let p = make_update(SessionUpdate::AgentThoughtChunk {
             content: json!({"thought": "deep thought"}),
         });
@@ -555,7 +555,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_token_usage_gemini_nested() {
+    fn extract_token_usage_stats_nested() {
         let v = json!({"stats": {"input_tokens": 10, "output_tokens": 5}});
         assert_eq!(extract_token_usage(&v), (10, 5));
     }
@@ -591,8 +591,8 @@ mod tests {
     }
 
     #[test]
-    fn session_update_params_gemini_round_trip() {
-        // Simulate Gemini ACP wire format: single object, not array
+    fn session_update_params_single_object_content_round_trip() {
+        // Simulate an ACP agent whose wire format uses a single object, not an array
         let raw = r#"{"sessionId":"s1","update":{"content":{"text":"hello","type":"text"},"sessionUpdate":"agent_message_chunk"}}"#;
         let params: SessionUpdateParams = serde_json::from_str(raw).unwrap();
         let events = update_to_event(&params);

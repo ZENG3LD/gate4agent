@@ -321,9 +321,8 @@ mod tests {
         // Every fleet member now declares a history adapter (pinned green
         // in `gate4agent-adapters`' own registry test), so the negative
         // case needs a fixture that omits one rather than a live fleet
-        // example -- `amp` and, before it, `qwen-code` both used to be that
-        // example until they gained one, leaving the negative case with
-        // nothing negative about it.
+        // example -- `amp` used to be that example until it gained one,
+        // leaving the negative case with nothing negative about it.
         let mut unsupported = registry.get_by_id("codex").unwrap().clone();
         unsupported.capabilities.adapters.history = None;
         assert!(unsupported.capabilities.adapters.history.is_none());

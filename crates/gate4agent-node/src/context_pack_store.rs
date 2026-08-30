@@ -303,7 +303,7 @@ mod tests {
                     generation: SessionGeneration(1),
                 },
             },
-            source_provider: AgentId::new("qwen-code").unwrap(),
+            source_provider: AgentId::new("codex").unwrap(),
         }
     }
 

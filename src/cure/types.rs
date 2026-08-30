@@ -1,7 +1,6 @@
 //! Core types for the cure module: model discovery and caching.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -30,12 +29,10 @@ impl CureCache {
 /// Which external source was used to populate a [`CureCache`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CureSource {
-    /// Parsed from `~/.cache/opencode/models.json` (no network required).
-    OpenCodeCache,
     /// Fetched live from `https://openrouter.ai/api/v1/models` (requires
     /// the `cure-network` feature and an active internet connection).
     OpenRouter,
-    /// Neither source was available; a marker file was written so future
+    /// No source was available; a marker file was written so future
     /// callers can skip re-trying until the app is restarted.
     Hardcoded,
 }
@@ -56,14 +53,6 @@ pub struct CuredModel {
 /// Error type for the cure module.
 #[derive(Debug, thiserror::Error)]
 pub enum CureError {
-    /// The OpenCode cache file did not exist at the expected path.
-    #[error("OpenCode cache not found at {path}")]
-    OpenCodeCacheNotFound { path: PathBuf },
-
-    /// The OpenCode cache file existed but could not be parsed.
-    #[error("failed to parse OpenCode cache: {0}")]
-    OpenCodeCacheParse(#[from] serde_json::Error),
-
     /// A filesystem I/O error occurred while reading or writing the cure cache.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

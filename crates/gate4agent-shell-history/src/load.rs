@@ -1,5 +1,5 @@
 use crate::{
-    metadata_limit, sqlite, transcript_limit, CandidateLocator, CandidateRecord,
+    metadata_limit, transcript_limit, CandidateLocator, CandidateRecord,
     ComponentSignature, LoadedDocument, NativeHistoryError, NativeHistoryLimits,
     HISTORY_AUXILIARY_INDEX_MAX_BYTES,
 };
@@ -21,10 +21,7 @@ pub(crate) fn load_preview_document(
         root,
         primary,
         layout,
-    } = &record.key.locator
-    else {
-        return load_document(record, limits).map(|loaded| (loaded.document, false));
-    };
+    } = &record.key.locator;
     let adapter = record.key.source.binding.id.as_str();
     let mut signatures = Vec::new();
     let mut document = HistoryDocument {
@@ -34,7 +31,7 @@ pub(crate) fn load_preview_document(
     };
     let mut source_truncated = false;
     match (adapter, layout) {
-        ("claude-code" | "qwen-code", HistorySourceLayout::SingleNdjson) => {
+        ("claude-code", HistorySourceLayout::SingleNdjson) => {
             let source_generation = required_file_signature(primary)?;
             let locator = load_ndjson_locator_document(
                 adapter,
@@ -131,15 +128,15 @@ pub(crate) fn load_locator_document(
     limits: NativeHistoryLimits,
 ) -> Result<HistoryDocument, NativeHistoryError> {
     match &record.key.locator {
-        CandidateLocator::File {
-            root,
-            primary,
-            layout,
-        } if matches!(
-            layout,
-            HistorySourceLayout::SingleJson
-                | HistorySourceLayout::SessionJsonWithSiblingMessageJson
-        ) => load_document(record, limits).map(|loaded| loaded.document),
+        CandidateLocator::File { layout, .. }
+            if matches!(
+                layout,
+                HistorySourceLayout::SingleJson
+                    | HistorySourceLayout::SessionJsonWithSiblingMessageJson
+            ) =>
+        {
+            load_document(record, limits).map(|loaded| loaded.document)
+        }
         CandidateLocator::File {
             root,
             primary,
@@ -151,9 +148,6 @@ pub(crate) fn load_locator_document(
             *layout,
             &record.session_id_hint,
         ),
-        CandidateLocator::Sqlite { .. } => {
-            load_document(record, limits).map(|loaded| loaded.document)
-        }
     }
 }
 
@@ -235,14 +229,6 @@ fn load_ndjson_locator_document(
         "codex" => serde_json::json!({
             "type": "session_meta",
             "payload": { "id": session_id, "cwd": cwd },
-        }),
-        "qwen-code" => serde_json::json!({
-            "uuid": "gate4agent-locator",
-            "parentUuid": null,
-            "sessionId": session_id,
-            "type": "user",
-            "provenance": "system",
-            "cwd": cwd,
         }),
         _ => serde_json::json!({
             "type": "progress",
@@ -430,21 +416,6 @@ pub(crate) fn load_document(
             primary,
             layout,
         } => load_file_layout(root, primary, *layout, &record.session_id_hint, limits),
-        CandidateLocator::Sqlite {
-            database,
-            session_id,
-        } => {
-            validate_database(database)?;
-            let document = sqlite::load_session(database, session_id)?;
-            let signatures = sqlite_component_paths(database)
-                .into_iter()
-                .map(|path| component_signature(&path))
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(LoadedDocument {
-                document,
-                signatures,
-            })
-        }
     }
 }
 
@@ -511,7 +482,7 @@ fn load_file_layout(
         }
         HistorySourceLayout::SessionJsonWithSiblingMessageJson => {
             document.metadata_json = Some(primary_content);
-            document.transcript = load_opencode_messages(
+            document.transcript = load_sibling_message_files(
                 root,
                 primary,
                 document.metadata_json.as_deref().unwrap_or("{}"),
@@ -583,7 +554,7 @@ fn load_codex_index(
     Ok(title.map(|title| serde_json::json!({ "indexed_title": title }).to_string()))
 }
 
-fn load_opencode_messages(
+fn load_sibling_message_files(
     storage_root: &Path,
     primary: &Path,
     metadata: &str,
@@ -808,17 +779,6 @@ fn validate_directory(root: &Path, path: &Path) -> Result<(), NativeHistoryError
     Ok(())
 }
 
-fn validate_database(database: &Path) -> Result<(), NativeHistoryError> {
-    let metadata = fs::symlink_metadata(database).map_err(|_| NativeHistoryError::SourceChanged)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(NativeHistoryError::SourceChanged);
-    }
-    if fs::canonicalize(database).map_err(|_| NativeHistoryError::SourceChanged)? != database {
-        return Err(NativeHistoryError::SourceChanged);
-    }
-    Ok(())
-}
-
 fn component_signature(path: &Path) -> Result<ComponentSignature, NativeHistoryError> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -849,14 +809,6 @@ fn component_signature(path: &Path) -> Result<ComponentSignature, NativeHistoryE
         len: metadata.len(),
         modified_nanos,
     })
-}
-
-fn sqlite_component_paths(database: &Path) -> [PathBuf; 3] {
-    let mut wal = database.as_os_str().to_owned();
-    wal.push("-wal");
-    let mut shm = database.as_os_str().to_owned();
-    shm.push("-shm");
-    [database.to_owned(), PathBuf::from(wal), PathBuf::from(shm)]
 }
 
 fn primary_limit(layout: HistorySourceLayout) -> usize {

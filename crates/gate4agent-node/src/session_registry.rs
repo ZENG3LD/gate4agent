@@ -2521,7 +2521,7 @@ mod tests {
                         generation: gate4agent_types::SessionGeneration(3),
                     },
                 },
-                source_provider: agent("qwen"),
+                source_provider: agent("codex"),
             },
             source_message_count: 12,
             retained_message_count: 9,
@@ -3118,18 +3118,18 @@ mod tests {
     fn v3_state_round_trips_open_provider_id_exactly() {
         let path = temp_path("v3-open-provider-round-trip");
         let (node_id, workspaces, mut record) = fixture(&path);
-        record.provider = agent("qwen-code");
+        record.provider = agent("third-party-agent");
         save(Some(&path), &node_id, &workspaces, &[record.clone()]).unwrap();
 
         let persisted: PersistedNodeStateV3 =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(persisted.version, NODE_STATE_SCHEMA_V3);
         assert_eq!(persisted.session_records.len(), 1);
-        assert_eq!(persisted.session_records[0].provider, agent("qwen-code"));
+        assert_eq!(persisted.session_records[0].provider, agent("third-party-agent"));
 
         let loaded = load(Some(&path), &node_id).unwrap();
         assert_eq!(loaded.records.len(), 1);
-        assert_eq!(loaded.records[0].provider, agent("qwen-code"));
+        assert_eq!(loaded.records[0].provider, agent("third-party-agent"));
         assert_eq!(loaded.records[0].record_id, record.record_id);
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
@@ -3851,7 +3851,7 @@ mod tests {
         let path = temp_path("v8-context-roundtrip");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let (node_id, workspaces, mut record) = fixture(&path);
-        let context = context_receipt("ctx-qwen-codex", 'a');
+        let context = context_receipt("ctx-context-roundtrip", 'a');
         record.context_id = Some(context.id.clone());
         record.context = Some(context.clone());
         let ownership = context_materialization(
@@ -3876,7 +3876,7 @@ mod tests {
         assert_eq!(serialized["version"], NODE_STATE_SCHEMA_V8);
         assert_eq!(
             serialized["session_records"][0]["context"]["id"],
-            "ctx-qwen-codex",
+            "ctx-context-roundtrip",
         );
         assert!(serialized["session_records"][0]["context"].get("messages").is_none());
         assert!(serialized["materializations"][0]["context"].get("messages").is_none());

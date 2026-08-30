@@ -27,7 +27,6 @@ pub enum ManagedHookConfigKind {
         require_version_one: bool,
     },
     AmpPlugin,
-    HermesPlugin,
     KimiToml,
 }
 
@@ -39,9 +38,6 @@ pub enum ManagedHookEventShape {
     },
     DirectCommand {
         timeout: u64,
-    },
-    CopilotCommand {
-        timeout_seconds: u64,
     },
 }
 

@@ -12700,7 +12700,6 @@ enum ProviderPreviewSkin {
     Codex,
     Kimi,
     Grok,
-    Qwen,
     Generic,
 }
 
@@ -12711,7 +12710,6 @@ impl ProviderPreviewSkin {
             "codex" => Self::Codex,
             "kimi" => Self::Kimi,
             "grok" => Self::Grok,
-            "qwen" | "qwen-code" => Self::Qwen,
             _ => Self::Generic,
         }
     }
@@ -12722,7 +12720,6 @@ impl ProviderPreviewSkin {
             Self::Codex => "CODEX",
             Self::Kimi => "KIMI",
             Self::Grok => "GROK",
-            Self::Qwen => "QWEN",
             Self::Generic => "SESSION",
         }
     }
@@ -12733,7 +12730,6 @@ impl ProviderPreviewSkin {
             Self::Codex => "CODEX",
             Self::Kimi => "KIMI",
             Self::Grok => "GROK",
-            Self::Qwen => "QWEN",
             Self::Generic => "AGENT",
         }
     }
@@ -12744,7 +12740,6 @@ impl ProviderPreviewSkin {
             Self::Codex => theme.green,
             Self::Kimi => theme.teal,
             Self::Grok => theme.text,
-            Self::Qwen => theme.accent,
             Self::Generic => theme.muted,
         }
     }
@@ -15493,7 +15488,7 @@ fn screen_state_alert(state: &PtyScreenState, theme: Theme) -> Option<(Color, &s
 /// confirmed signal, kept on top because it is the higher-fidelity source
 /// where it exists at all -- it only exists for a provider with a
 /// `pty_sidecar` adapter bound) -- `screen_state` (a text-derived signal
-/// that works for EVERY provider, including Kimi/OpenCode, which emit no
+/// that works for EVERY provider, including Kimi, which emits no
 /// structured events at all) -- `running` -- `stoppable` -- `restartable`
 /// -- idle. `screen_state` must outrank `running`/`stoppable`/
 /// `restartable`: those three read process liveness/lifecycle, which is
@@ -19145,11 +19140,11 @@ mod tests {
         assert!(!roster_text.contains("Existing sessions"));
 
         let dialog = app.existing_session.as_mut().unwrap();
-        dialog.provider = provider("qwen-code");
-        dialog.rows[0].route.provider = provider("qwen-code");
+        dialog.provider = provider("third-party-agent");
+        dialog.rows[0].route.provider = provider("third-party-agent");
         dialog.preview = Some(NativeSessionPreviewState::Ready(
             crate::app::NativeSessionPreviewView {
-                title: Some("Recovered Qwen".to_owned()),
+                title: Some("Recovered third-party".to_owned()),
                 modified_at: None,
                 model: None,
                 message_count: 0,
@@ -19164,12 +19159,12 @@ mod tests {
             },
         ));
         app.focus = Focus::ExistingSession;
-        let qwen_modal = render(&app, &mut buf);
-        assert!(!qwen_modal.hits.iter().any(|hit| {
+        let unresumable_modal = render(&app, &mut buf);
+        assert!(!unresumable_modal.hits.iter().any(|hit| {
             hit.target == HitTarget::ExistingSessionNativeResume
         }));
         assert!(buffer_text(&buf).contains(
-            "qwen-code history and preview are available; native resume is not supported"
+            "third-party-agent history and preview are available; native resume is not supported"
         ));
         assert!(buffer_text(&buf).contains("showing latest 1"));
         assert!(!buffer_text(&buf).contains("of 0"));
@@ -19362,7 +19357,6 @@ mod tests {
             ("codex", "CODEX", true),
             ("kimi", "KIMI", true),
             ("grok", "GROK", true),
-            ("qwen-code", "QWEN", false),
             ("other-provider", "AGENT", false),
         ];
 
@@ -19435,11 +19429,6 @@ mod tests {
             );
             assert_eq!(text.contains("[Resume session]"), can_resume, "{provider_id}");
         }
-
-        assert_eq!(
-            ProviderPreviewSkin::for_provider("qwen"),
-            ProviderPreviewSkin::Qwen,
-        );
     }
 
     #[test]
@@ -19614,13 +19603,13 @@ mod tests {
     }
 
     #[test]
-    fn managed_and_native_preview_keys_share_qwen_skin_and_no_resume_policy() {
+    fn managed_and_native_preview_keys_share_generic_skin_and_no_resume_policy() {
         let tab = crate::app::PreviewTabView {
-            title: "Qwen archive".to_owned(),
+            title: "Third-party archive".to_owned(),
             workspace_id: "workspace-a".to_owned(),
-            provider: provider("qwen-code"),
+            provider: provider("third-party-agent"),
             preview: NativeSessionPreviewState::Ready(crate::app::NativeSessionPreviewView {
-                title: Some("Qwen archive".to_owned()),
+                title: Some("Third-party archive".to_owned()),
                 modified_at: None,
                 model: None,
                 message_count: 1,
@@ -19638,21 +19627,21 @@ mod tests {
             scroll: 0,
             request_token: 1,
             resume_available: true,
-            record_id: Some("record-qwen".to_owned()),
+            record_id: Some("record-third-party".to_owned()),
         };
         let managed_key = crate::app::PreviewTabKey::ManagedRecord {
             node_id: "node-a".to_owned(),
-            record_id: "record-qwen".to_owned(),
+            record_id: "record-third-party".to_owned(),
         };
         let native_key = crate::app::PreviewTabKey::NativeSelection {
             node_id: "node-a".to_owned(),
             route: crate::app::NativeSessionCatalogRoute::workspace(
                 "workspace-a".to_owned(),
-                provider("qwen-code"),
+                provider("third-party-agent"),
             ),
             catalog_revision: 7,
             recent_cutoff_unix_ms: 10,
-            selection_id: "native-qwen".to_owned(),
+            selection_id: "native-third-party".to_owned(),
         };
         let render_key = |key: crate::app::PreviewTabKey| {
             let mut app = fixture(PtyColorMode::Inherited);
@@ -19668,7 +19657,7 @@ mod tests {
         let (native_text, native_layout) = render_key(native_key);
         assert_eq!(managed_text, native_text);
         assert!(managed_text.contains("read-only"));
-        assert!(managed_text.contains("QWEN"));
+        assert!(managed_text.contains("AGENT"));
         assert!(managed_text.contains("same bounded history"));
         assert!(!managed_layout.hits.iter().any(|hit| {
             matches!(hit.target, HitTarget::PreviewResume(_))

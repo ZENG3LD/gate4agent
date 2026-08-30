@@ -23,7 +23,7 @@ use gate4agent_types::LaunchSpec;
 ///
 /// All fields are `'static` references — no heap allocation at call time.
 pub(crate) struct AcpSpawnSpec {
-    /// Base program name (e.g. `"gemini"`, `"npx"`).
+    /// Base program name (e.g. `"grok"`, `"npx"`).
     pub program: &'static str,
     /// Arguments passed after the program (e.g. `["--experimental-acp"]`).
     pub args: &'static [&'static str],

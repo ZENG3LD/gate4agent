@@ -218,13 +218,13 @@ mod tests {
 
     #[test]
     fn inline_and_other_pty_providers_are_rejected() {
-        for provider in ["claude", "kimi", "codex", "qwen-code", "grok", "other"] {
+        for provider in ["claude", "kimi", "codex", "grok", "other"] {
             assert_eq!(
                 resolve_layout(&agent(provider), SessionMode::Inline, true),
                 Err(BundleProviderError::UnsupportedBinding),
             );
         }
-        for provider in ["qwen-code", "grok", "other"] {
+        for provider in ["grok", "other"] {
             assert_eq!(
                 resolve_layout(&agent(provider), SessionMode::Pty, true),
                 Err(BundleProviderError::UnsupportedBinding),

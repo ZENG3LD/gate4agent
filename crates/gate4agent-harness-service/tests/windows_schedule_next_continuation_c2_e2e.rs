@@ -58,7 +58,7 @@ use tokio::time::{sleep, timeout};
 
 const CONTEXT_USER: &str = "continue the bounded parent run through native C2";
 const CONTEXT_ASSISTANT: &str = "the exact parent context is ready for the child run";
-const QWEN_SESSION_ID: &str = "11111111-1111-4111-8111-111111111111";
+const SOURCE_SESSION_ID: &str = "11111111-1111-4111-8111-111111111111";
 const CONTEXT_SCHEMA: &str = "g4a-context-pack-v1";
 
 struct FixturePaths {
@@ -214,13 +214,13 @@ fn apply(service: &mut HarnessService, mut mutation: HarnessMutationV1) {
 
 fn source_plan(node_id: &NodeId, workspace_id: &WorkspaceId) -> HarnessLaunchPlanV1 {
     HarnessLaunchPlanV1 {
-        plan_id: selector("source-qwen"),
+        plan_id: selector("source-codex"),
         revision: revision(1),
         node_id: selector(node_id.as_str()),
         workspace_id: selector(workspace_id.as_str()),
         worktree: HarnessWorktreeIntentV1::Existing,
-        provider_profile: selector("source-qwen"),
-        provider: AgentId::new("qwen-code").unwrap(),
+        provider_profile: selector("source-codex"),
+        provider: AgentId::new("codex").unwrap(),
         mode: HarnessExecutionModeV1::Pty,
         terminal_size: TerminalSize { rows: 30, columns: 120 },
         prompt_source: HarnessPromptSourceV1::Clear,
@@ -265,46 +265,35 @@ fn write_json_lines(path: &Path, values: &[Value]) {
     fs::write(path, bytes).unwrap();
 }
 
-fn qwen_history(root: &Path, private_cwd: &str) -> NativeHistoryConfig {
-    let projects = root.join("qwen-projects");
+fn source_history(root: &Path, private_cwd: &str) -> NativeHistoryConfig {
+    let projects = root.join("codex-projects");
     write_json_lines(
         &projects
             .join("c--fixture")
             .join("chats")
-            .join(format!("{QWEN_SESSION_ID}.jsonl")),
+            .join(format!("{SOURCE_SESSION_ID}.jsonl")),
         &[
             json!({
-                "uuid": "u1",
-                "parentUuid": null,
-                "sessionId": QWEN_SESSION_ID,
-                "timestamp": "2026-08-15T00:00:00Z",
-                "type": "user",
-                "provenance": "real_user",
-                "cwd": private_cwd,
-                "message": { "role": "user", "parts": [{ "text": CONTEXT_USER }] },
+                "type": "turn_context",
+                "payload": { "cwd": private_cwd },
             }),
             json!({
-                "uuid": "a1",
-                "parentUuid": "u1",
-                "sessionId": QWEN_SESSION_ID,
-                "timestamp": "2026-08-15T00:00:01Z",
-                "type": "assistant",
-                "provenance": "assistant_output",
-                "cwd": private_cwd,
-                "model": "qwen-fixture",
-                "message": {
-                    "role": "model",
-                    "parts": [
-                        { "text": "private qwen thought", "thought": true },
-                        { "text": CONTEXT_ASSISTANT }
-                    ]
-                },
+                "type": "event_msg",
+                "payload": { "type": "user_message", "message": CONTEXT_USER },
+            }),
+            json!({
+                "type": "event_msg",
+                "payload": { "type": "agent_reasoning", "text": "private codex thought" },
+            }),
+            json!({
+                "type": "event_msg",
+                "payload": { "type": "agent_message", "message": CONTEXT_ASSISTANT },
             }),
         ],
     );
     NativeHistoryConfig::new(vec![
         NativeHistoryRoot::new(
-            AdapterId::new("qwen-code").unwrap(),
+            AdapterId::new("codex").unwrap(),
             HistorySourceLayout::SingleNdjson,
             projects,
         )
@@ -462,7 +451,7 @@ async fn load_source_history_through_c2(
     };
     assert_eq!(session, source);
     assert_eq!(candidates.len(), 1);
-    assert_eq!(candidates[0].session_id_hint, QWEN_SESSION_ID);
+    assert_eq!(candidates[0].session_id_hint, SOURCE_SESSION_ID);
 
     let loaded = control
         .request(
@@ -486,7 +475,7 @@ async fn load_source_history_through_c2(
         panic!("typed C2 history load returned another response");
     };
     assert_eq!(session, source);
-    assert_eq!(session_id, QWEN_SESSION_ID);
+    assert_eq!(session_id, SOURCE_SESSION_ID);
     assert_eq!(message_count, 2);
     drop(control);
     event_drain.abort();
@@ -606,13 +595,13 @@ async fn schedule_next_continuation_exports_restores_and_restart_does_not_repeat
     let operator_secret = format!("g4aho_{}", "c".repeat(64));
     let operator_credential = HarnessOperatorCredential::parse(operator_secret.clone()).unwrap();
     let private_cwd = fixture.root.join("private-source-cwd");
-    let history = qwen_history(&fixture.root.join("history"), &private_cwd.to_string_lossy());
+    let history = source_history(&fixture.root.join("history"), &private_cwd.to_string_lossy());
 
     let profiles = SpawnProfileRegistry::new([
         SpawnProfileDefaults {
-            profile_id: SpawnProfileId::new("source-qwen").unwrap(),
-            revision: SpawnProfileRevision::new("source-qwen-r1").unwrap(),
-            provider: AgentId::new("qwen-code").unwrap(),
+            profile_id: SpawnProfileId::new("source-codex").unwrap(),
+            revision: SpawnProfileRevision::new("source-codex-r1").unwrap(),
+            provider: AgentId::new("codex").unwrap(),
             mode: SessionMode::Pty,
             terminal_size: TerminalSize { rows: 30, columns: 120 },
             prompt: None,
@@ -725,7 +714,7 @@ async fn schedule_next_continuation_exports_restores_and_restart_does_not_repeat
     let source_dispatch = match source_client
         .schedule_next(HarnessScheduleNextRequestV1 {
             authority: authority('b'),
-            plan_id: Some(selector("source-qwen")),
+            plan_id: Some(selector("source-codex")),
         })
         .unwrap()
     {
@@ -762,7 +751,7 @@ async fn schedule_next_continuation_exports_restores_and_restart_does_not_repeat
     assert_eq!(source_context.node_id, source_binding.node_id);
     assert_eq!(source_context.node_incarnation_id, source_binding.node_incarnation);
     assert_eq!(source_context.workspace_id, source_binding.workspace_id);
-    assert_eq!(source_context.expected_provider.as_str(), "qwen-code");
+    assert_eq!(source_context.expected_provider.as_str(), "codex");
     let (source_route, source_address) = source_route_and_address(&source_binding);
     seed_target_task_and_grant(&mut service, &source_dispatch.run_id);
     service.close().unwrap();
@@ -966,7 +955,7 @@ async fn schedule_next_continuation_exports_restores_and_restart_does_not_repeat
         workspace_display.as_ref(),
         CONTEXT_USER,
         CONTEXT_ASSISTANT,
-        "private qwen thought",
+        "private codex thought",
     ] {
         assert!(!transfer_wire.contains(private));
     }
@@ -996,7 +985,7 @@ async fn schedule_next_continuation_exports_restores_and_restart_does_not_repeat
     assert_eq!(continuation_before.source_binding, source_binding);
     assert_eq!(continuation_before.target_binding.as_ref(), target_run.binding.as_ref());
     let context_receipt = continuation_before.context.as_ref().unwrap();
-    assert_eq!(context_receipt.lineage.source_provider.as_str(), "qwen-code");
+    assert_eq!(context_receipt.lineage.source_provider.as_str(), "codex");
     assert_eq!(context_receipt.source_message_count, 2);
     assert_eq!(context_receipt.retained_message_count, 2);
     assert!(!context_receipt.truncated);
@@ -1007,11 +996,11 @@ async fn schedule_next_continuation_exports_restores_and_restart_does_not_repeat
     let context_bytes = fs::read(&context_files[0]).unwrap();
     let document: Value = serde_json::from_slice(&context_bytes).unwrap();
     assert_eq!(document["schema"], CONTEXT_SCHEMA);
-    assert_eq!(document["source_provider"], "qwen-code");
+    assert_eq!(document["source_provider"], "codex");
     assert!(document.get("cwd").is_none());
     assert_eq!(document["retained_messages"][0]["text"], CONTEXT_USER);
     assert_eq!(document["retained_messages"][1]["text"], CONTEXT_ASSISTANT);
-    assert!(!String::from_utf8_lossy(&context_bytes).contains("private qwen thought"));
+    assert!(!String::from_utf8_lossy(&context_bytes).contains("private codex thought"));
     let proof_before = fs::read(&fixture.proof).unwrap();
     let proof_text = String::from_utf8(proof_before.clone()).unwrap();
     let proof = proof_text.lines().collect::<Vec<_>>();
@@ -1032,7 +1021,7 @@ async fn schedule_next_continuation_exports_restores_and_restart_does_not_repeat
         .collect::<String>();
     assert_eq!(proof[3], materialized_context_hash);
     assert_eq!(proof[4], CONTEXT_SCHEMA);
-    assert_eq!(proof[5], "qwen-code");
+    assert_eq!(proof[5], "codex");
     assert_eq!(proof[6], "2");
 
     let (adapter, events) = connect_harness_adapter(&control_endpoint, c2_token).await;
@@ -1142,7 +1131,7 @@ async fn schedule_next_continuation_exports_restores_and_restart_does_not_repeat
         &[
             CONTEXT_USER,
             CONTEXT_ASSISTANT,
-            "private qwen thought",
+            "private codex thought",
             private_cwd.to_string_lossy().as_ref(),
             c2_token,
             node_token,

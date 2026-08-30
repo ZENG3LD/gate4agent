@@ -478,15 +478,8 @@ fn observation_source_capabilities(
         AdapterFamily::Pipe => (
             ObservationSourceFamilyV1::Pipe,
             ObservationCapabilitiesV1 {
-                tools: matches!(
-                    adapter,
-                    "claude-code" | "codex" | "gemini" | "opencode" | "kimi" | "qwen-code"
-                ),
-                attention: adapter == "qwen-code",
-                usage: matches!(
-                    adapter,
-                    "claude-code" | "codex" | "gemini" | "opencode" | "qwen-code"
-                ),
+                tools: matches!(adapter, "claude-code" | "codex" | "kimi"),
+                usage: matches!(adapter, "claude-code" | "codex"),
                 ..ObservationCapabilitiesV1::default()
             },
         ),
@@ -523,38 +516,22 @@ fn hook_observation_capabilities(adapter: &str) -> ObservationCapabilitiesV1 {
             adapter,
             "claude-code"
                 | "codex"
-                | "gemini"
                 | "pi"
                 | "omp"
-                | "antigravity"
                 | "amp"
-                | "command-code"
-                | "hermes"
-                | "devin"
                 | "grok"
                 | "kimi"
-                | "copilot"
-                | "droid"
                 | "cursor"
         ),
         attention: matches!(
             adapter,
             "claude-code"
                 | "codex"
-                | "opencode"
                 | "mimo-code"
-                | "antigravity"
-                | "hermes"
-                | "devin"
                 | "grok"
                 | "kimi"
-                | "copilot"
-                | "droid"
         ),
-        subagents: matches!(
-            adapter,
-            "claude-code" | "grok" | "kimi" | "copilot" | "droid" | "cursor"
-        ),
+        subagents: matches!(adapter, "claude-code" | "grok" | "kimi" | "cursor"),
         ..ObservationCapabilitiesV1::default()
     }
 }
@@ -1836,7 +1813,7 @@ foreach ($property in $requiredTopLevel) {
     if ($null -eq $document.PSObject.Properties[$property]) { exit 104 }
 }
 if ($document.schema -cne 'g4a-context-pack-v1' -or $null -ne $document.PSObject.Properties['cwd']) { exit 105 }
-if (@('claude', 'codex', 'grok', 'kimi', 'qwen-code') -cnotcontains [string]$document.source_provider) { exit 106 }
+if (@('claude', 'codex', 'grok', 'kimi') -cnotcontains [string]$document.source_provider) { exit 106 }
 $messages = @($document.retained_messages)
 if ($messages.Count -eq 0) { exit 107 }
 foreach ($message in $messages) {
@@ -1877,7 +1854,7 @@ $separator = [IO.Path]::DirectorySeparatorChar
 if ($contextFull.Equals($cwdFull, [StringComparison]::OrdinalIgnoreCase) -or $contextFull.StartsWith($cwdFull + $separator, [StringComparison]::OrdinalIgnoreCase) -or $cwdFull.StartsWith($contextFull + $separator, [StringComparison]::OrdinalIgnoreCase)) { exit 95 }
 try { $document = [IO.File]::ReadAllText($contextPath) | ConvertFrom-Json -ErrorAction Stop } catch { exit 96 }
 if ($document.schema -cne 'g4a-context-pack-v1' -or $null -ne $document.PSObject.Properties['cwd']) { exit 97 }
-if (@('claude', 'codex', 'grok', 'kimi', 'qwen-code') -cnotcontains [string]$document.source_provider) { exit 98 }
+if (@('claude', 'codex', 'grok', 'kimi') -cnotcontains [string]$document.source_provider) { exit 98 }
 $messages = @($document.retained_messages)
 if ($messages.Count -eq 0) { exit 99 }
 $hasUser = $false
@@ -1912,7 +1889,7 @@ try { $contextHash = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadA
         agent_id: AgentId,
         launcher: String,
     ) -> Result<Self, NodeServerError> {
-        if !matches!(agent_id.as_str(), "claude" | "codex" | "grok" | "kimi" | "qwen-code") {
+        if !matches!(agent_id.as_str(), "claude" | "codex" | "grok" | "kimi") {
             return Err(NodeServerError::Registry(
                 "exact launcher fixture requires a supported provider".to_owned(),
             ));
@@ -2004,80 +1981,6 @@ try { $contextHash = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadA
         spec.launch.program = program;
         spec.launch.fixed_args = fixed_args;
         config.fixture_raw_pty_runtime = true;
-        Self::new_fixture_with_spec(config, spec)
-    }
-
-    #[cfg(feature = "fixture")]
-    pub fn new_qwen_dual_output_fixture(
-        mut config: NodeServerConfig,
-        launcher: String,
-        fixed_args: Vec<String>,
-    ) -> Result<Self, NodeServerError> {
-        const FIXTURE_ARGUMENTS_MAX: usize = 32;
-        const FIXTURE_ARGUMENT_BYTES_MAX: usize = 65_536;
-
-        if launcher.contains('\0') {
-            return Err(NodeServerError::Registry(
-                "Qwen dual-output fixture path contains NUL".to_owned(),
-            ));
-        }
-        let launcher_path = Path::new(&launcher);
-        if !launcher_path.is_absolute() {
-            return Err(NodeServerError::Registry(
-                "Qwen dual-output fixture path must be absolute".to_owned(),
-            ));
-        }
-        let metadata = std::fs::metadata(launcher_path).map_err(|_| {
-            NodeServerError::Registry(
-                "Qwen dual-output fixture path is unavailable".to_owned(),
-            )
-        })?;
-        if !metadata.is_file() {
-            return Err(NodeServerError::Registry(
-                "Qwen dual-output fixture path must be a regular file".to_owned(),
-            ));
-        }
-        let argument_bytes = fixed_args
-            .iter()
-            .try_fold(0usize, |total, argument| total.checked_add(argument.len()));
-        if fixed_args.len() > FIXTURE_ARGUMENTS_MAX
-            || fixed_args.iter().any(|argument| argument.contains('\0'))
-            || !matches!(argument_bytes, Some(total) if total <= FIXTURE_ARGUMENT_BYTES_MAX)
-        {
-            return Err(NodeServerError::Registry(
-                "Qwen dual-output fixture arguments are invalid".to_owned(),
-            ));
-        }
-        let qwen_id = AgentId::new("qwen-code")
-            .map_err(|error| NodeServerError::Registry(error.to_string()))?;
-        let mut spec = builtin_registry()
-            .get(&qwen_id)
-            .ok_or_else(|| {
-                NodeServerError::Registry(
-                    "Qwen dual-output fixture provider is unavailable".to_owned(),
-                )
-            })?
-            .clone();
-        if spec.capabilities.adapters.pty_sidecar.is_none() {
-            return Err(NodeServerError::Registry(
-                "Qwen dual-output fixture sidecar binding is unavailable".to_owned(),
-            ));
-        }
-        let mut spawn_profile = config
-            .spawn_profiles
-            .iter()
-            .next()
-            .cloned()
-            .ok_or_else(|| {
-                NodeServerError::Registry(
-                    "Qwen dual-output fixture spawn profile is unavailable".to_owned(),
-                )
-            })?;
-        spawn_profile.provider = qwen_id;
-        config.spawn_profiles = SpawnProfileRegistry::new([spawn_profile])
-            .map_err(|error| NodeServerError::Registry(error.to_string()))?;
-        spec.launch.program = launcher;
-        spec.launch.fixed_args = fixed_args;
         Self::new_fixture_with_spec(config, spec)
     }
 
@@ -2738,10 +2641,9 @@ async fn wait_for_ctrl_signal() -> Result<(), NodeServerError> {
 /// debugged. Carrying one that cannot is carrying code nobody can verify,
 /// which is worse than not supporting it: it looks supported.
 ///
-/// `qwen-code` was removed on that rule. Its catalog entry and its
-/// structured JSON sidecar stay where they are -- they are correct, and
-/// re-admitting it is a one-word change if a subscription appears -- but it
-/// is not part of the fleet and nothing about it is claimed to work.
+/// A provider dropped from the fleet by this rule is removed outright, not
+/// carried dark: no catalog entry, no adapter, no dead code claiming support
+/// for something nobody can verify runs.
 fn active_registry() -> Result<AgentRegistry, NodeServerError> {
     let specs = builtin_registry()
         .iter()
@@ -3629,33 +3531,6 @@ impl NodeShared {
             true,
         )
         .expect("granting hook semantics over a raw-PTY policy is internally valid")
-    }
-
-    fn admit_qwen_sidecar_observation_policy(
-        &self,
-        provider: &AgentId,
-        mode: SessionMode,
-        policy: ProviderRuntimePolicy,
-    ) -> ProviderRuntimePolicy {
-        let exact_qwen_sidecar = mode == SessionMode::Pty
-            && provider.as_str() == "qwen-code"
-            && self.provider_adapter_contracts.iter().any(|contract| {
-                contract.provider == *provider
-                    && contract.family == AdapterFamily::Pipe
-                    && contract.adapter_id.as_str() == "qwen-code"
-            });
-        if !exact_qwen_sidecar || policy.semantic_readiness {
-            return policy;
-        }
-        ProviderRuntimePolicy::new(
-            policy.raw_pty_lifecycle,
-            true,
-            policy.structured_prompt,
-            policy.provider_session_identity,
-            policy.semantic_resume,
-            policy.hook_semantics,
-        )
-        .expect("exact Qwen sidecar observation policy is internally valid")
     }
 
     fn resolve_environment_profile(
@@ -10549,7 +10424,8 @@ impl NodeShared {
         // `provider_session` is `Some` only for a provider whose resolved
         // runtime policy admits live identity verification (raw PTY plus a
         // semantic PTY adapter -- `provider_runtime::policy_from_capability_flags`).
-        // The PTY-sidecar-observation shape (currently qwen-code) hardcodes
+        // The PTY-sidecar-observation shape (no fleet provider today, but
+        // capability-keyed rather than vendor-locked) hardcodes
         // `provider_session_identity: false` in `provider_runtime::evaluate`,
         // so its records go straight to `Live` with `provider_session: None`
         // and stay that way for the record's entire life -- that is this
@@ -11244,11 +11120,7 @@ impl NodeShared {
         } else {
             self.admit_provider_runtime(&provider, runtime_requirement).await?
         };
-        let runtime_policy = self.effective_spawn_runtime_policy(
-            &provider,
-            mode,
-            runtime_policy,
-        );
+        let runtime_policy = self.effective_spawn_runtime_policy(runtime_policy);
         if required_capabilities
             .iter()
             .any(|capability| !runtime_policy.admits(*capability))
@@ -11587,8 +11459,6 @@ impl NodeShared {
 
     fn effective_spawn_runtime_policy(
         &self,
-        provider: &AgentId,
-        mode: SessionMode,
         runtime_policy: ProviderRuntimePolicy,
     ) -> ProviderRuntimePolicy {
         #[cfg(feature = "fixture")]
@@ -11598,7 +11468,7 @@ impl NodeShared {
         } else {
             runtime_policy
         };
-        self.admit_qwen_sidecar_observation_policy(provider, mode, runtime_policy)
+        runtime_policy
     }
 
     fn verify_harness_mcp_before_start(
@@ -16301,20 +16171,12 @@ mod observation_projection_tests {
         for (adapter, tools, attention, subagents) in [
             ("claude-code", true, true, true),
             ("codex", true, true, false),
-            ("gemini", true, false, false),
-            ("opencode", false, true, false),
             ("mimo-code", false, true, false),
             ("pi", true, false, false),
             ("omp", true, false, false),
-            ("antigravity", true, true, false),
             ("amp", true, false, false),
-            ("command-code", true, false, false),
-            ("hermes", true, true, false),
-            ("devin", true, true, false),
             ("grok", true, true, true),
             ("kimi", true, true, true),
-            ("copilot", true, true, true),
-            ("droid", true, true, true),
             ("cursor", true, false, true),
         ] {
             let (family, actual) = observation_source_capabilities(&provider_source(
@@ -16356,12 +16218,6 @@ mod observation_projection_tests {
         ));
         assert!(kimi_pipe.tools);
         assert!(!kimi_pipe.usage);
-        let (_, qwen_pipe) = observation_source_capabilities(&provider_source(
-            AdapterFamily::Pipe,
-            "qwen-code",
-        ));
-        assert!(qwen_pipe.tools && qwen_pipe.attention && qwen_pipe.usage);
-        assert!(!qwen_pipe.subagents && !qwen_pipe.todo && !qwen_pipe.file_changes);
         assert!(observation_evidence(AdapterFamily::History).is_none());
     }
 
@@ -16397,10 +16253,6 @@ mod observation_projection_tests {
                 ("kimi", "kimi"),
             ],
         );
-        assert!(!adapters.iter().any(|contract| {
-            contract.provider.as_str() == "qwen-code" && contract.family == AdapterFamily::Hook
-        }));
-
         for (adapter, subagents) in [
             ("claude-code", true),
             ("codex", false),
@@ -16421,28 +16273,15 @@ mod observation_projection_tests {
 
     #[test]
     fn subagent_capability_is_exact() {
-        for adapter in [
-            "claude-code",
-            "grok",
-            "kimi",
-            "copilot",
-            "droid",
-            "cursor",
-        ] {
+        for adapter in ["claude-code", "grok", "kimi", "cursor"] {
             assert!(hook_observation_capabilities(adapter).subagents, "{adapter}");
         }
         for adapter in [
             "codex",
-            "gemini",
-            "opencode",
             "mimo-code",
             "pi",
             "omp",
-            "antigravity",
             "amp",
-            "command-code",
-            "hermes",
-            "devin",
             "unsupported",
         ] {
             assert!(!hook_observation_capabilities(adapter).subagents, "{adapter}");
@@ -16653,71 +16492,23 @@ mod observation_projection_tests {
         }
     }
 
-    /// Qwen's structured sidecar still projects what it always did.
-    ///
-    /// Qwen is no longer in the fleet, and unlike the earlier design its
-    /// catalog entry does not stay behind it either -- `qwen-code` was cut
-    /// from the catalog outright, along with every other non-fleet
-    /// provider. `admit_qwen_sidecar_observation_policy` still gates on the
-    /// literal `"qwen-code"` id plus a declared Pipe-family contract for it,
-    /// so this constructs that one contract directly instead of deriving it
-    /// from a registry lookup, keeping the projection policy pinned against
-    /// bit-rot without asserting catalog membership the fleet no longer has.
+    /// A fleet Pipe adapter's structured stream projects private categorical
+    /// observations end to end: source capabilities, a redacted tool start,
+    /// an approval request/resolution round-trip, and usage.
     #[test]
-    fn qwen_pipe_events_project_private_categorical_tools_attention_and_usage() {
-        let mut shared = observation_test_shared();
-        shared.provider_adapter_contracts = vec![ProviderAdapterContractSupport {
-            provider: AgentId::new("qwen-code").unwrap(),
-            family: AdapterFamily::Pipe,
-            adapter_id: gate4agent_types::AdapterId::new("qwen-code").unwrap(),
-            revision: crate::protocol::AdapterContractRevision::new(
-                gate4agent_adapters::QWEN_DUAL_OUTPUT_REVISION,
-            )
-            .unwrap(),
-        }];
-        let raw = ProviderRuntimePolicy::raw_pty();
-        let observed = shared.admit_qwen_sidecar_observation_policy(
-            &AgentId::new("qwen-code").unwrap(),
-            SessionMode::Pty,
-            raw,
-        );
-        assert!(observed.raw_pty_lifecycle && observed.semantic_readiness);
-        assert!(!observed.structured_prompt);
-        assert!(!observed.provider_session_identity);
-        assert!(!observed.semantic_resume);
-        assert_eq!(
-            shared.admit_qwen_sidecar_observation_policy(
-                &AgentId::new("qwen-code").unwrap(),
-                SessionMode::Inline,
-                raw,
-            ),
-            raw
-        );
-        assert_eq!(
-            shared.admit_qwen_sidecar_observation_policy(
-                &AgentId::new("codex").unwrap(),
-                SessionMode::Pty,
-                raw,
-            ),
-            raw
-        );
-
-        let ready = provider_control_event_at(
-            AdapterFamily::Pipe,
-            "qwen-code",
-            1,
-            ProviderEvent::Ready,
-        );
+    fn pipe_events_project_private_categorical_tools_and_usage() {
+        let ready = provider_control_event_at(AdapterFamily::Pipe, "codex", 1, ProviderEvent::Ready);
         let projected = provider_observations(&ready);
         let ObservationKindV1::SourceCapabilities { capabilities, .. } = &projected[0].kind else {
             panic!("expected source capabilities");
         };
-        assert!(capabilities.tools && capabilities.attention && capabilities.usage);
+        assert!(capabilities.tools && capabilities.usage);
+        assert!(!capabilities.attention);
         assert!(!capabilities.subagents && !capabilities.todo && !capabilities.file_changes);
 
         let tool = provider_observations(&provider_control_event_at(
             AdapterFamily::Pipe,
-            "qwen-code",
+            "codex",
             2,
             ProviderEvent::ToolStarted {
                 id: "private-provider-tool-id".to_owned(),
@@ -16732,7 +16523,7 @@ mod observation_projection_tests {
         ));
         let attention = provider_observations(&provider_control_event_at(
             AdapterFamily::Pipe,
-            "qwen-code",
+            "codex",
             3,
             ProviderEvent::InteractionRequested {
                 request_id: Some("private-request-id".to_owned()),
@@ -16746,13 +16537,13 @@ mod observation_projection_tests {
             correlation_id: requested_correlation,
             tool_class,
         } = &timeline_observations(&attention)[0].kind else {
-            panic!("expected Qwen approval observation");
+            panic!("expected approval observation");
         };
         assert_eq!(tool_class, "Shell");
         let requested_correlation = requested_correlation.clone();
         let raw_resolution = provider_observations(&provider_control_event_at(
             AdapterFamily::Pipe,
-            "qwen-code",
+            "codex",
             4,
             ProviderEvent::InteractionResolved {
                 request_id: "private-request-id".to_owned(),
@@ -16775,13 +16566,13 @@ mod observation_projection_tests {
             correlation_id,
             outcome,
         } = &resolved[0].kind else {
-            panic!("expected Qwen interaction resolution observation");
+            panic!("expected interaction resolution observation");
         };
         assert_eq!(correlation_id, &requested_correlation);
         assert_eq!(*outcome, ObservationInteractionOutcomeV1::Approved);
         let usage = provider_observations(&provider_control_event_at(
             AdapterFamily::Pipe,
-            "qwen-code",
+            "codex",
             5,
             ProviderEvent::TurnCompleted {
                 usage: TokenUsage {
@@ -18562,7 +18353,7 @@ mod tests {
             lineage: ContextPackLineageReceipt {
                 source_node_id: NodeId::new("node-source").unwrap(),
                 source_session: terminal_address(1),
-                source_provider: agent("qwen-code"),
+                source_provider: agent("kimi"),
             },
             source_message_count: 2,
             retained_message_count: 2,
@@ -18575,7 +18366,7 @@ mod tests {
         bound_record.context = Some(context.clone());
         let session = gate4agent_types::SessionSnapshot {
             instance_id: AgentInstanceId(91),
-            agent_id: agent("qwen-code"),
+            agent_id: agent("kimi"),
             transport: TransportKind::Pty,
             generation: SessionGeneration(3),
             status: SessionStatus::Running,
@@ -18623,7 +18414,7 @@ mod tests {
         };
         let original = NodeSnapshot {
             node_id: NodeId::new("node-terminal-test").unwrap(),
-            enabled_providers: vec![agent("qwen-code"), agent("codex")],
+            enabled_providers: vec![agent("kimi"), agent("codex")],
             provider_runtime_statuses: ProviderRuntimeStatuses::default(),
             workspaces: vec![WorkspaceSnapshot {
                 workspace_id: WorkspaceId::new("primary").unwrap(),
@@ -19588,11 +19379,8 @@ mod tests {
             },
         };
         let pre_admission_policy = ProviderRuntimePolicy::raw_pty();
-        let effective_runtime_policy = shared.effective_spawn_runtime_policy(
-            &agent("claude"),
-            SessionMode::Pty,
-            pre_admission_policy,
-        );
+        let effective_runtime_policy =
+            shared.effective_spawn_runtime_policy(pre_admission_policy);
         assert_ne!(effective_runtime_policy, pre_admission_policy);
         assert!(effective_runtime_policy.provider_session_identity);
 
@@ -20954,9 +20742,10 @@ mod tests {
         assert_eq!(ambiguous.code, NodeFailureCode::SessionRecordConflict);
     }
 
-    /// The PTY-sidecar-observation shape (qwen-code) never carries a
-    /// verified `provider_session`; its record-bound export instead falls
-    /// back to "exactly one discovered candidate" (see
+    /// The PTY-sidecar-observation shape (no fleet provider today, but
+    /// capability-keyed rather than vendor-locked) never carries a verified
+    /// `provider_session`; its record-bound export instead falls back to
+    /// "exactly one discovered candidate" (see
     /// `export_context_pack_for_session_record_inner`). This is the same
     /// ambiguity refusal as the identity-filtered path, just without an
     /// identity to filter by.
@@ -20968,7 +20757,7 @@ mod tests {
             modified_at_unix_ms: None,
         };
         assert_eq!(
-            select_history_candidate(&[candidate("candidate-sole", "qwen-session")], None)
+            select_history_candidate(&[candidate("candidate-sole", "sidecar-session")], None)
                 .unwrap(),
             "candidate-sole",
         );
@@ -20976,8 +20765,8 @@ mod tests {
         assert_eq!(missing.code, NodeFailureCode::SessionRecordConflict);
         let ambiguous = select_history_candidate(
             &[
-                candidate("candidate-a", "qwen-session-a"),
-                candidate("candidate-b", "qwen-session-b"),
+                candidate("candidate-a", "sidecar-session-a"),
+                candidate("candidate-b", "sidecar-session-b"),
             ],
             None,
         )
@@ -21074,13 +20863,14 @@ mod tests {
 
     /// Mirrors `session_record_context_export_revalidation_rejects_record_change`
     /// for a record whose provider never carries a verified identity (the
-    /// PTY-sidecar-observation shape, e.g. qwen-code): `identity` is `None`
-    /// throughout, and the exactness check falls back to comparing
-    /// `provider_session` itself, which must still be `None` on both sides.
+    /// PTY-sidecar-observation shape -- capability-keyed, no fleet provider
+    /// declares one today): `identity` is `None` throughout, and the
+    /// exactness check falls back to comparing `provider_session` itself,
+    /// which must still be `None` on both sides.
     #[test]
     fn session_record_context_export_binding_is_exact_without_identity() {
         let session = terminal_address(1);
-        let mut expected = record("qwen-code", "record-context-export-no-identity");
+        let mut expected = record("pty-sidecar-fixture", "record-context-export-no-identity");
         expected.state = ManagedSessionState::Live;
         expected.active_session = Some(session.clone());
         let binding = SessionBinding {
@@ -21720,7 +21510,7 @@ mod tests {
             "$entries.Count -ne 1",
             "g4a-context-pack-v1",
             "$document.PSObject.Properties['cwd']",
-            "'claude', 'codex', 'grok', 'kimi', 'qwen-code'",
+            "'claude', 'codex', 'grok', 'kimi'",
             "$hasUser",
             "$hasAssistant",
             "SHA256",
@@ -21829,7 +21619,7 @@ mod tests {
                         generation: SessionGeneration(1),
                     },
                 },
-                source_provider: agent("qwen-code"),
+                source_provider: agent("codex"),
             },
             &history,
         )
@@ -22036,7 +21826,7 @@ mod tests {
         );
         assert_eq!(lines[3], expected_context_hash);
         assert_eq!(lines[4], "g4a-context-pack-v1");
-        assert_eq!(lines[5], "qwen-code");
+        assert_eq!(lines[5], "codex");
         assert_eq!(lines[6], "2");
         assert!(shared.handle.snapshot().sessions.iter().any(|session| {
             session.instance_id == receipt.session.session.instance_id
@@ -22476,7 +22266,7 @@ mod tests {
         for request in &address_requests {
             assert!(request_requires_open_provider_ids_with(
                 request,
-                |_| Some(agent("qwen-code")),
+                |_| Some(agent("third-party-agent")),
                 |_| Some(agent("claude")),
             ));
             assert!(!request_requires_open_provider_ids_with(
@@ -22524,7 +22314,7 @@ mod tests {
         assert!(request_requires_open_provider_ids_with(
             &NodeRequest::Spawn {
                 workspace_id: WorkspaceId::new("primary").unwrap(),
-                provider: agent("qwen-code"),
+                provider: agent("third-party-agent"),
                 mode: SessionMode::Pty,
                 terminal_size: size,
                 initial_prompt: None,

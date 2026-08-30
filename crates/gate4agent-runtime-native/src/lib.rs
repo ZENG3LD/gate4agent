@@ -54,7 +54,7 @@ pub use gate4agent_shell_native::{
     ProviderSupervisorFaultKind, ProviderSupervisorSnapshot, ProviderSupervisorState,
 };
 use gate4agent_shell_native::{
-    NativeEffectShell, ProviderSupervisor, ProviderSupervisorBuildError, QwenDualOutputLaunch,
+    NativeEffectShell, ProviderSupervisor, ProviderSupervisorBuildError,
     MAX_PROVIDER_SUPERVISOR_EVENTS,
 };
 use shell_efficiency::ShellEfficiencyProfile;
@@ -1843,7 +1843,6 @@ struct NativeSpawnOverlay {
     environment: Vec<EnvMutation>,
     extra_args: Vec<OsString>,
     one_shot_session_persistence: OneShotSessionPersistence,
-    qwen_sidecar: Option<QwenDualOutputLaunch>,
 }
 
 impl Default for NativeSpawnOverlay {
@@ -1852,7 +1851,6 @@ impl Default for NativeSpawnOverlay {
             environment: Vec::new(),
             extra_args: Vec::new(),
             one_shot_session_persistence: OneShotSessionPersistence::Ephemeral,
-            qwen_sidecar: None,
         }
     }
 }
@@ -1862,7 +1860,6 @@ struct NativeEffectRequest {
     spawn_env: Vec<EnvMutation>,
     spawn_extra_args: Vec<OsString>,
     one_shot_session_persistence: OneShotSessionPersistence,
-    qwen_sidecar: Option<QwenDualOutputLaunch>,
 }
 
 #[derive(Clone)]
@@ -1963,7 +1960,6 @@ impl NativeEffectDispatcher {
             spawn_env: spawn_overlay.environment,
             spawn_extra_args: spawn_overlay.extra_args,
             one_shot_session_persistence: spawn_overlay.one_shot_session_persistence,
-            qwen_sidecar: spawn_overlay.qwen_sidecar,
         };
         for _ in 0..2 {
             let sender = self.worker_sender(instance_id);
@@ -1996,7 +1992,6 @@ impl NativeEffectDispatcher {
             spawn_env: Vec::new(),
             spawn_extra_args: Vec::new(),
             one_shot_session_persistence: OneShotSessionPersistence::Ephemeral,
-            qwen_sidecar: None,
         };
         for _ in 0..2 {
             let sender = self.capability_sender();
@@ -2057,7 +2052,6 @@ impl NativeEffectDispatcher {
             spawn_env: Vec::new(),
             spawn_extra_args: Vec::new(),
             one_shot_session_persistence: OneShotSessionPersistence::Ephemeral,
-            qwen_sidecar: None,
         };
         for _ in 0..2 {
             let sender = self.authority_sender();
@@ -2149,35 +2143,7 @@ impl NativeEffectDispatcher {
     ) -> Result<NativeSpawnOverlay, String> {
         let mut overlay = self.profile_spawn_overlay(effect)?;
         overlay.environment.extend(self.hook_pty_env(effect)?);
-        overlay.qwen_sidecar = self.qwen_pty_sidecar(effect);
         Ok(overlay)
-    }
-
-    fn qwen_pty_sidecar(&self, effect: &EffectEnvelope) -> Option<QwenDualOutputLaunch> {
-        let agent_id = match &effect.effect {
-            ControlEffect::Spawn {
-                agent_id,
-                transport: TransportKind::Pty,
-                ..
-            }
-            | ControlEffect::SpawnResume {
-                agent_id,
-                transport: TransportKind::Pty,
-                ..
-            } => agent_id,
-            _ => return None,
-        };
-        let binding = self
-            .catalog
-            .get(agent_id)?
-            .capabilities
-            .adapters
-            .pty_sidecar
-            .clone()?;
-        Some(
-            QwenDualOutputLaunch::prepare(binding.clone())
-                .unwrap_or_else(|_| QwenDualOutputLaunch::unavailable(binding)),
-        )
     }
 
     fn profile_spawn_overlay(&self, effect: &EffectEnvelope) -> Result<NativeSpawnOverlay, String> {
@@ -2212,7 +2178,6 @@ impl NativeEffectDispatcher {
                 environment: overlay.environment,
                 extra_args: overlay.extra_args,
                 one_shot_session_persistence: overlay.one_shot_session_persistence,
-                qwen_sidecar: None,
             })
             .map_err(|error| error.to_string())
     }
@@ -2699,7 +2664,6 @@ async fn run_effect_worker(
                         request.spawn_env,
                         request.spawn_extra_args,
                         request.one_shot_session_persistence,
-                        request.qwen_sidecar,
                     )
                     .await;
                 update_active_count(&context.active_sessions, before, shell.active_session_count());
@@ -3133,40 +3097,6 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// `qwen-code` is not part of the current fleet's built-in registry, so
-    /// this augments a clone of the fleet registry with a synthetic
-    /// `History`-family binding for it, standing in for a live registry
-    /// lookup.
-    fn qwen_augmented_catalog_with_history() -> AgentRegistry {
-        let history_binding = gate4agent_types::AdapterBinding::new(
-            gate4agent_types::AdapterId::new("qwen-code").unwrap(),
-            gate4agent_adapters::BUILTIN_ADAPTER_REVISION,
-            gate4agent_types::AdapterVerification::Reference,
-        )
-        .unwrap();
-        let adapters = gate4agent_catalog::AdapterRegistry::new(
-            gate4agent_adapters::builtin_adapter_registry()
-                .iter()
-                .cloned()
-                .chain([gate4agent_catalog::AdapterDescriptor {
-                    family: gate4agent_types::AdapterFamily::History,
-                    binding: history_binding.clone(),
-                    agents: vec![AgentId::new("qwen-code").unwrap()],
-                }]),
-        )
-        .unwrap();
-        let mut qwen = builtin_registry().get_by_id("codex").unwrap().clone();
-        qwen.id = AgentId::new("qwen-code").unwrap();
-        qwen.detection.command = "qwen".to_owned();
-        qwen.launch.program = "qwen".to_owned();
-        qwen.capabilities.adapters.history = Some(history_binding);
-        AgentRegistry::new_with_adapters(
-            builtin_registry().iter().cloned().chain([qwen]),
-            &adapters,
-        )
-        .unwrap()
-    }
-
     #[test]
     fn native_catalog_keeps_provider_candidate_indexes_isolated() {
         let unique = std::time::SystemTime::now()
@@ -3179,11 +3109,10 @@ mod tests {
         ));
         let workspace = root.join("workspace");
         let claude_history = root.join("claude-history");
-        let qwen_history = root.join("qwen-history");
-        let qwen_chats = qwen_history.join("project").join("chats");
+        let second_history = root.join("codex-history");
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::create_dir_all(&claude_history).unwrap();
-        std::fs::create_dir_all(&qwen_chats).unwrap();
+        std::fs::create_dir_all(&second_history).unwrap();
         let cwd = workspace
             .to_str()
             .unwrap()
@@ -3197,12 +3126,12 @@ mod tests {
             ),
         )
         .unwrap();
-        let qwen_session = "11111111-1111-4111-8111-111111111111";
         std::fs::write(
-            qwen_chats.join(format!("{qwen_session}.jsonl")),
+            second_history.join("codex-session.jsonl"),
             format!(
-                "{{\"uuid\":\"u1\",\"parentUuid\":null,\"sessionId\":\"{qwen_session}\",\"type\":\"user\",\"provenance\":\"real_user\",\"cwd\":\"{cwd}\",\"message\":{{\"role\":\"user\",\"parts\":[{{\"text\":\"question\"}}]}}}}\n\
-                 {{\"uuid\":\"a1\",\"parentUuid\":\"u1\",\"sessionId\":\"{qwen_session}\",\"type\":\"assistant\",\"provenance\":\"assistant_output\",\"cwd\":\"{cwd}\",\"message\":{{\"role\":\"model\",\"parts\":[{{\"text\":\"answer\"}}]}}}}"
+                "{{\"type\":\"turn_context\",\"payload\":{{\"cwd\":\"{cwd}\"}}}}\n\
+                 {{\"type\":\"event_msg\",\"payload\":{{\"type\":\"user_message\",\"message\":\"question\"}}}}\n\
+                 {{\"type\":\"event_msg\",\"payload\":{{\"type\":\"agent_message\",\"message\":\"answer\"}}}}"
             ),
         )
         .unwrap();
@@ -3219,9 +3148,9 @@ mod tests {
                 )
                 .unwrap(),
                 NativeHistoryRoot::new(
-                    gate4agent_types::AdapterId::new("qwen-code").unwrap(),
-                    HistorySourceLayout::SingleNdjson,
-                    &qwen_history,
+                    gate4agent_types::AdapterId::new("codex").unwrap(),
+                    HistorySourceLayout::NdjsonWithOptionalIndex,
+                    &second_history,
                 )
                 .unwrap(),
             ],
@@ -3229,7 +3158,7 @@ mod tests {
         )
         .unwrap();
         let mut catalog = NativeSessionCatalogAuthority {
-            catalog: qwen_augmented_catalog_with_history(),
+            catalog: builtin_registry().clone(),
             history_config: config,
             authorities: HashMap::new(),
             indexes: HashMap::new(),
@@ -3237,12 +3166,12 @@ mod tests {
         let claude = catalog
             .catalog(&AgentId::new("claude").unwrap(), &workspace, 1)
             .unwrap();
-        let qwen = catalog
-            .catalog(&AgentId::new("qwen-code").unwrap(), &workspace, 1)
+        let second = catalog
+            .catalog(&AgentId::new("codex").unwrap(), &workspace, 1)
             .unwrap();
 
         assert_eq!(claude.len(), 1);
-        assert_eq!(qwen.len(), 1);
+        assert_eq!(second.len(), 1);
         let preview = catalog
             .preview(
                 &AgentId::new("claude").unwrap(),
@@ -3863,89 +3792,6 @@ mod tests {
         ] {
             assert_eq!(distribution.count, IDLE_TICKS);
         }
-    }
-
-    /// `qwen-code` is not part of the current fleet's built-in registry, so
-    /// this augments a clone of the fleet registry with a synthetic
-    /// `Pipe`-family PTY-sidecar binding for it, standing in for a live
-    /// registry lookup.
-    fn qwen_augmented_catalog_with_pty_sidecar() -> AgentRegistry {
-        let sidecar_binding = gate4agent_types::AdapterBinding::new(
-            gate4agent_types::AdapterId::new("qwen-code").unwrap(),
-            gate4agent_adapters::QWEN_DUAL_OUTPUT_REVISION,
-            gate4agent_types::AdapterVerification::Reference,
-        )
-        .unwrap();
-        let adapters = gate4agent_catalog::AdapterRegistry::new(
-            gate4agent_adapters::builtin_adapter_registry()
-                .iter()
-                .cloned()
-                .chain([gate4agent_catalog::AdapterDescriptor {
-                    family: gate4agent_types::AdapterFamily::Pipe,
-                    binding: sidecar_binding.clone(),
-                    agents: vec![AgentId::new("qwen-code").unwrap()],
-                }]),
-        )
-        .unwrap();
-        let mut qwen = builtin_registry().get_by_id("codex").unwrap().clone();
-        qwen.id = AgentId::new("qwen-code").unwrap();
-        qwen.detection.command = "qwen".to_owned();
-        qwen.launch.program = "qwen".to_owned();
-        qwen.capabilities.adapters.pty_sidecar = Some(sidecar_binding);
-        AgentRegistry::new_with_adapters(
-            builtin_registry().iter().cloned().chain([qwen]),
-            &adapters,
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn qwen_dual_output_overlay_is_exactly_pty_only_and_hook_independent() {
-        let catalog = qwen_augmented_catalog_with_pty_sidecar();
-        let (_, runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
-        let spawn = |operation_id, instance_id, agent_id, transport| EffectEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
-            operation_id: OperationId(operation_id),
-            instance_id: AgentInstanceId(instance_id),
-            generation: SessionGeneration(1),
-            effect: ControlEffect::Spawn {
-                agent_id: AgentId::new(agent_id).unwrap(),
-                transport,
-                runtime_policy: ProviderRuntimePolicy::raw_pty(),
-                request: StartRequest {
-                    working_directory: ".".to_owned(),
-                    terminal_size: TerminalSize { rows: 24, columns: 80 },
-                    initial_prompt: None,
-                    session_options: None,
-                },
-            },
-        };
-
-        let qwen_pty = runtime
-            .effects
-            .compose_spawn_overlay(&spawn(21, 21, "qwen-code", TransportKind::Pty))
-            .unwrap();
-        assert!(qwen_pty.environment.is_empty());
-        let mut sidecar_args = Vec::new();
-        qwen_pty
-            .qwen_sidecar
-            .as_ref()
-            .unwrap()
-            .append_launch_arguments(&mut sidecar_args);
-        assert_eq!(sidecar_args.len(), 2);
-        assert_eq!(sidecar_args[0], OsString::from("--json-file"));
-        assert!(sidecar_args[1].to_string_lossy().ends_with("events.jsonl"));
-
-        let qwen_pipe = runtime
-            .effects
-            .compose_spawn_overlay(&spawn(22, 22, "qwen-code", TransportKind::Pipe))
-            .unwrap();
-        assert!(qwen_pipe.qwen_sidecar.is_none());
-        let codex_pty = runtime
-            .effects
-            .compose_spawn_overlay(&spawn(23, 23, "codex", TransportKind::Pty))
-            .unwrap();
-        assert!(codex_pty.qwen_sidecar.is_none());
     }
 
     #[test]

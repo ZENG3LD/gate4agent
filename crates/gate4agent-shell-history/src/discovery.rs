@@ -1,15 +1,13 @@
 use crate::{
-    sqlite, CandidateLocator, DiscoveredCandidate, NativeHistoryDiscoveryIssue,
+    CandidateLocator, DiscoveredCandidate, NativeHistoryDiscoveryIssue,
     NativeHistoryDiscoveryIssueKind, NativeHistoryLimits, NativeHistoryRoot,
 };
 use gate4agent_adapters::HistorySourceLayout;
-use gate4agent_types::AdapterId;
 use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::time::UNIX_EPOCH;
-use uuid::Uuid;
 
 pub(crate) struct DiscoveryResult {
     pub(crate) candidates: Vec<DiscoveredCandidate>,
@@ -23,10 +21,6 @@ pub(crate) fn discover_root(
     requested_limit: usize,
     report_candidate_overflow: bool,
 ) -> DiscoveryResult {
-    if root.layout == HistorySourceLayout::ReadOnlySqliteProjection {
-        return sqlite::discover_sessions(root, root_slot, limits, requested_limit);
-    }
-
     let mut result = DiscoveryResult {
         candidates: Vec::new(),
         issues: Vec::new(),
@@ -91,7 +85,7 @@ pub(crate) fn discover_root(
             let path = entry.path();
             if file_type.is_dir() {
                 if depth < limits.max_walk_depth
-                    && should_descend(root.adapter_id.as_str(), &path, depth)
+                    && should_descend(root.adapter_id.as_str(), &path)
                 {
                     stack.push((path, depth + 1));
                 }
@@ -144,54 +138,19 @@ pub(crate) fn discover_root(
     result
 }
 
-pub(crate) fn dedupe_and_sort(adapter_id: &AdapterId, candidates: &mut Vec<DiscoveredCandidate>) {
-    if adapter_id.as_str() == "opencode" {
-        let mut by_session = HashMap::<String, DiscoveredCandidate>::new();
-        for candidate in candidates.drain(..) {
-            let replace = by_session
-                .get(&candidate.session_id_hint)
-                .is_none_or(|current| prefer_opencode_candidate(&candidate, current));
-            if replace {
-                by_session.insert(candidate.session_id_hint.clone(), candidate);
-            }
-        }
-        candidates.extend(by_session.into_values());
-    }
+pub(crate) fn dedupe_and_sort(candidates: &mut Vec<DiscoveredCandidate>) {
     candidates.sort_by(|left, right| {
         Reverse(left.modified_at_unix_ms)
             .cmp(&Reverse(right.modified_at_unix_ms))
-            .then_with(|| locator_rank(&right.locator).cmp(&locator_rank(&left.locator)))
             .then_with(|| locator_sort_key(&left.locator).cmp(&locator_sort_key(&right.locator)))
     });
-    if adapter_id.as_str() != "opencode" {
-        let mut seen = HashSet::new();
-        candidates.retain(|candidate| seen.insert(locator_sort_key(&candidate.locator)));
-    }
-}
-
-fn prefer_opencode_candidate(
-    candidate: &DiscoveredCandidate,
-    current: &DiscoveredCandidate,
-) -> bool {
-    locator_rank(&candidate.locator) > locator_rank(&current.locator)
-        || (locator_rank(&candidate.locator) == locator_rank(&current.locator)
-            && candidate.modified_at_unix_ms > current.modified_at_unix_ms)
-}
-
-fn locator_rank(locator: &CandidateLocator) -> u8 {
-    match locator {
-        CandidateLocator::Sqlite { .. } => 1,
-        CandidateLocator::File { .. } => 0,
-    }
+    let mut seen = HashSet::new();
+    candidates.retain(|candidate| seen.insert(locator_sort_key(&candidate.locator)));
 }
 
 fn locator_sort_key(locator: &CandidateLocator) -> String {
     match locator {
         CandidateLocator::File { primary, .. } => primary.to_string_lossy().into_owned(),
-        CandidateLocator::Sqlite {
-            database,
-            session_id,
-        } => format!("{}#{session_id}", database.to_string_lossy()),
     }
 }
 
@@ -215,11 +174,8 @@ fn matches_file(adapter_id: &str, path: &Path) -> bool {
         .unwrap_or("")
         .to_ascii_lowercase();
     match adapter_id {
-        "gemini" => matches!(extension.as_str(), "json" | "jsonl"),
         "grok" => name == "summary.json",
         "rovo" => name == "metadata.json",
-        "hermes" => extension == "json" && name.starts_with("session_"),
-        "devin" | "opencode" => extension == "json",
         "kimi" => {
             name == "state.json"
                 && path
@@ -228,17 +184,15 @@ fn matches_file(adapter_id: &str, path: &Path) -> bool {
                     .and_then(|name| name.to_str())
                     .is_some_and(|name| name.starts_with("session_"))
         }
-        "qwen-code" => qwen_session_id(path).is_some(),
         "cursor" => extension == "jsonl" && has_component(path, "agent-transcripts"),
         "openclaw" => extension == "jsonl" && has_component(path, "sessions"),
-        "antigravity" => antigravity_session_id(path).is_some(),
         "claude-code" => extension == "jsonl" && !has_component(path, "subagents"),
-        "codex" | "copilot" | "pi" | "omp" | "droid" => extension == "jsonl",
+        "codex" | "pi" | "omp" => extension == "jsonl",
         _ => false,
     }
 }
 
-fn should_descend(adapter_id: &str, path: &Path, parent_depth: usize) -> bool {
+fn should_descend(adapter_id: &str, path: &Path) -> bool {
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -246,57 +200,16 @@ fn should_descend(adapter_id: &str, path: &Path, parent_depth: usize) -> bool {
     if adapter_id == "claude-code" && name == "subagents" {
         return false;
     }
-    if adapter_id == "antigravity" {
-        return match parent_depth {
-            0 => true,
-            1 => name == ".system_generated",
-            2 => name == "logs",
-            _ => false,
-        };
-    }
-    if adapter_id == "qwen-code" {
-        return match parent_depth {
-            0 => true,
-            1 => name == "chats",
-            _ => false,
-        };
-    }
     true
 }
 
 fn session_id_hint(adapter_id: &str, path: &Path) -> Option<String> {
     let hint = match adapter_id {
-        "antigravity" => antigravity_session_id(path)?,
         "grok" | "rovo" | "kimi" => path.parent()?.file_name()?.to_str()?.to_owned(),
-        "qwen-code" => qwen_session_id(path)?,
         _ => path.file_stem()?.to_str()?.to_owned(),
     };
     let hint = hint.trim();
     (!hint.is_empty()).then(|| hint.to_owned())
-}
-
-fn antigravity_session_id(path: &Path) -> Option<String> {
-    if path.file_name()?.to_str()? != "transcript.jsonl" {
-        return None;
-    }
-    let logs = path.parent()?;
-    if logs.file_name()?.to_str()? != "logs" {
-        return None;
-    }
-    let generated = logs.parent()?;
-    if generated.file_name()?.to_str()? != ".system_generated" {
-        return None;
-    }
-    Some(generated.parent()?.file_name()?.to_str()?.to_owned())
-}
-
-fn qwen_session_id(path: &Path) -> Option<String> {
-    if path.parent()?.file_name()?.to_str()? != "chats" {
-        return None;
-    }
-    let session_id = path.file_stem()?.to_str()?.trim();
-    Uuid::parse_str(session_id).ok()?;
-    Some(session_id.to_owned())
 }
 
 fn has_component(path: &Path, expected: &str) -> bool {

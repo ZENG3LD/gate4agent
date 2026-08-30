@@ -56,7 +56,7 @@ mod tests {
         );
         CureCache {
             updated_at: 1_744_500_000,
-            source: CureSource::OpenCodeCache,
+            source: CureSource::Hardcoded,
             tools,
         }
     }
@@ -95,7 +95,7 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         let loaded: CureCache = serde_json::from_str(&content).unwrap();
 
-        assert_eq!(loaded.source, CureSource::OpenCodeCache);
+        assert_eq!(loaded.source, CureSource::Hardcoded);
         assert_eq!(loaded.updated_at, 1_744_500_000);
         let models = loaded.tools.get("claude_code").unwrap();
         assert_eq!(models[0].id, "claude-opus-4-6");

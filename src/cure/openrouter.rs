@@ -1,8 +1,7 @@
-//! Source 2: fetch live model list from `https://openrouter.ai/api/v1/models`.
+//! Source 1: fetch live model list from `https://openrouter.ai/api/v1/models`.
 //!
 //! Gated behind the `cure-network` feature. When this feature is enabled,
-//! `reqwest` is available and `cure_async()` will call this module after
-//! trying the OpenCode disk cache.
+//! `reqwest` is available and `cure_async()` calls this module first.
 
 #![cfg(feature = "cure-network")]
 
@@ -72,7 +71,6 @@ fn openrouter_provider_to_tool_id(provider: &str) -> Option<&'static str> {
     match provider {
         "anthropic" => Some("claude_code"),
         "openai"    => Some("codex"),
-        "google"    => Some("gemini"),
         _           => None,
     }
 }

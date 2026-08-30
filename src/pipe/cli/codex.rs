@@ -144,7 +144,7 @@ impl NdjsonParser for CodexNdjsonParser {
                                 .and_then(|v| v.as_u64());
                             // Codex `input_tokens` INCLUDES cached — subtract
                             // to match the normalized convention where input =
-                            // uncached portion only (same as OpenCode/Claude).
+                            // uncached portion only (same as Claude).
                             // Formula: used = input + output + cache_read + cache_write
                             let net_input = input.saturating_sub(cached);
                             events.push(CliEvent::TurnComplete {

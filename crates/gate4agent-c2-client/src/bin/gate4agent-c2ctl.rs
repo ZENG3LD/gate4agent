@@ -627,7 +627,7 @@ mod tests {
                 "--provider",
                 "kimi",
                 "--provider",
-                "qwen-code",
+                "third-party-agent",
                 "--provider",
                 "grok",
             ]),
@@ -640,7 +640,7 @@ mod tests {
         let ParseOutcome::Run(parsed) = parsed else { panic!("expected run options") };
         assert_eq!(
             parsed.providers,
-            [agent("claude"), agent("codex"), agent("kimi"), agent("qwen-code"), agent("grok")],
+            [agent("claude"), agent("codex"), agent("kimi"), agent("third-party-agent"), agent("grok")],
         );
         assert_eq!(parsed.token, "fixture-secret");
     }
@@ -648,7 +648,7 @@ mod tests {
     #[test]
     fn seed_vendor_pty_requests_are_raw_pty_without_prompt_or_auth_data() {
         let workspace = WorkspaceId::new("primary").unwrap();
-        for provider in [agent("claude"), agent("codex"), agent("kimi"), agent("qwen-code"), agent("grok")] {
+        for provider in [agent("claude"), agent("codex"), agent("kimi"), agent("third-party-agent"), agent("grok")] {
             assert!(matches!(
                 spawn_request(&workspace, provider.clone()),
                 NodeRequest::Spawn {
@@ -717,20 +717,20 @@ mod tests {
             C2SessionStatus::Exited { exit_code: Some(2) },
             C2SessionStatus::Failed,
         ] {
-            let mut seeded = [seeded_session(agent("qwen-code"), &workspace_id, 11)];
-            let mut session = fixture_session(agent("qwen-code"), 11);
+            let mut seeded = [seeded_session(agent("third-party-agent"), &workspace_id, 11)];
+            let mut session = fixture_session(agent("third-party-agent"), 11);
             session.status = status;
             let snapshot = fixture_snapshot(&workspace_id, session);
             assert!(!evaluate_readiness(&snapshot, &workspace_id, &mut seeded).unwrap());
         }
 
-        let mut seeded = [seeded_session(agent("qwen-code"), &workspace_id, 11)];
-        let mut session = fixture_session(agent("qwen-code"), 11);
+        let mut seeded = [seeded_session(agent("third-party-agent"), &workspace_id, 11)];
+        let mut session = fixture_session(agent("third-party-agent"), 11);
         session.process_id = None;
         let snapshot = fixture_snapshot(&workspace_id, session.clone());
         assert!(!evaluate_readiness(&snapshot, &workspace_id, &mut seeded).unwrap());
 
-        let mut seeded = [seeded_session(agent("qwen-code"), &workspace_id, 11)];
+        let mut seeded = [seeded_session(agent("third-party-agent"), &workspace_id, 11)];
         session.process_id = Some(7011);
         let frame = session.terminal_frame.as_mut().unwrap();
         frame.formatted.clear();
@@ -747,14 +747,14 @@ mod tests {
             Err(SeedError::SessionMismatch { provider }) if provider == agent("claude")
         ));
 
-        let mut seeded = [seeded_session(agent("qwen-code"), &workspace_id, 11)];
+        let mut seeded = [seeded_session(agent("third-party-agent"), &workspace_id, 11)];
         seeded[0].address.workspace_id = WorkspaceId::new("other").unwrap();
         assert!(matches!(
             evaluate_readiness(&snapshot, &workspace_id, &mut seeded),
             Err(SeedError::SessionMismatch { .. })
         ));
 
-        let mut seeded = [seeded_session(agent("qwen-code"), &workspace_id, 11)];
+        let mut seeded = [seeded_session(agent("third-party-agent"), &workspace_id, 11)];
         session.transport = TransportKind::Pipe;
         let snapshot = fixture_snapshot(&workspace_id, session);
         assert!(matches!(

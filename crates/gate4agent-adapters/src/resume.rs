@@ -19,15 +19,10 @@ pub fn build_resume_plan(
     adapter_id: &AdapterId,
     session_id: &str,
 ) -> Result<Option<ResumePlan>, ResumeAdapterError> {
-    let key = if adapter_id.as_str() == "antigravity" {
-        ProviderSessionKey::ConversationId
-    } else {
-        ProviderSessionKey::SessionId
-    };
     build_resume_plan_for_identity(
         adapter_id,
         &ProviderSessionIdentity {
-            key,
+            key: ProviderSessionKey::SessionId,
             id: session_id.to_owned(),
             transcript_path: None,
         },
@@ -57,24 +52,6 @@ pub fn build_resume_plan_for_identity(
             ProviderSessionKey::SessionId,
             false,
         )),
-        "gemini" => Some((
-            "gemini",
-            &["--resume"][..],
-            ProviderSessionKey::SessionId,
-            false,
-        )),
-        "antigravity" => Some((
-            "agy",
-            &["--conversation"][..],
-            ProviderSessionKey::ConversationId,
-            false,
-        )),
-        "opencode" => Some((
-            "opencode",
-            &["--session"][..],
-            ProviderSessionKey::SessionId,
-            false,
-        )),
         "pi" => Some((
             "pi",
             &["--session"][..],
@@ -87,27 +64,13 @@ pub fn build_resume_plan_for_identity(
             ProviderSessionKey::SessionId,
             false,
         )),
-        "droid" => Some((
-            "droid",
-            &["--resume"][..],
-            ProviderSessionKey::SessionId,
-            false,
-        )),
         "grok" => Some((
             "grok",
             &["--resume"][..],
             ProviderSessionKey::SessionId,
             false,
         )),
-        "devin" => Some((
-            "devin",
-            &["--resume"][..],
-            ProviderSessionKey::SessionId,
-            false,
-        )),
-        "copilot" | "cursor" | "qwen-code" | "omp" | "amp" | "command-code" | "hermes" => {
-            None
-        }
+        "cursor" | "omp" | "amp" => None,
         id => return Err(ResumeAdapterError::UnsupportedAdapter(id.to_owned())),
     }) else {
         return Ok(None);
@@ -195,13 +158,8 @@ mod tests {
             ("claude-code", "claude", vec!["--resume", "s1"]),
             ("codex", "codex", vec!["resume", "s1"]),
             ("kimi", "kimi", vec!["--session", "s1"]),
-            ("gemini", "gemini", vec!["--resume", "s1"]),
-            ("antigravity", "agy", vec!["--conversation", "s1"]),
-            ("opencode", "opencode", vec!["--session", "s1"]),
             ("mimo-code", "mimo", vec!["--session", "s1"]),
-            ("droid", "droid", vec!["--resume", "s1"]),
             ("grok", "grok", vec!["--resume", "s1"]),
-            ("devin", "devin", vec!["--resume", "s1"]),
         ];
         for (adapter, program, args) in cases {
             let plan = build_resume_plan(&id(adapter), "s1").unwrap().unwrap();
@@ -231,12 +189,12 @@ mod tests {
     #[test]
     fn provider_session_key_must_match_the_resume_contract() {
         let identity = ProviderSessionIdentity {
-            key: ProviderSessionKey::SessionId,
+            key: ProviderSessionKey::ConversationId,
             id: "conversation-1".to_owned(),
             transcript_path: None,
         };
         assert_eq!(
-            build_resume_plan_for_identity(&id("antigravity"), &identity),
+            build_resume_plan_for_identity(&id("claude-code"), &identity),
             Err(ResumeAdapterError::InvalidSessionKey)
         );
     }
@@ -287,7 +245,7 @@ mod tests {
 
     #[test]
     fn unsupported_and_explicit_negative_capabilities_are_distinct() {
-        assert_eq!(build_resume_plan(&id("qwen-code"), "s1").unwrap(), None);
+        assert_eq!(build_resume_plan(&id("cursor"), "s1").unwrap(), None);
         assert!(matches!(
             build_resume_plan(&id("future-provider"), "s1"),
             Err(ResumeAdapterError::UnsupportedAdapter(_))

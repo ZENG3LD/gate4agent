@@ -153,7 +153,6 @@ pub fn session_option_catalog(
     match adapter_id.as_str() {
         "claude-code" => Ok(claude_catalog(adapter_id.clone())),
         "codex" => Ok(codex_catalog(adapter_id.clone())),
-        "gemini" => Ok(gemini_catalog(adapter_id.clone())),
         "cursor" => Ok(cursor_catalog(adapter_id.clone())),
         id => Err(SessionOptionAdapterError::UnsupportedAdapter(id.to_owned())),
     }
@@ -861,43 +860,6 @@ fn codex_catalog(adapter_id: AdapterId) -> AgentSessionOptionCatalog {
     }
 }
 
-fn gemini_catalog(adapter_id: AdapterId) -> AgentSessionOptionCatalog {
-    AgentSessionOptionCatalog {
-        adapter_id,
-        revision: SESSION_OPTION_CATALOG_REVISION.to_owned(),
-        models: vec![
-            model(
-                "gemini-3-pro-preview",
-                "Gemini 3 Pro Preview",
-                false,
-                Vec::new(),
-            ),
-            model(
-                "gemini-3-flash-preview",
-                "Gemini 3 Flash Preview",
-                false,
-                Vec::new(),
-            ),
-            model("gemini-2.5-pro", "Gemini 2.5 Pro", false, Vec::new()),
-            model("gemini-2.5-flash", "Gemini 2.5 Flash", false, Vec::new()),
-        ],
-        model_apply: SessionOptionApply {
-            launch: Some(SessionOptionLaunchApplication::Flag {
-                flag: "-m".to_owned(),
-            }),
-            argument_override: Some(SessionOptionArgumentOverride::Flags(vec![
-                "-m".to_owned(),
-                "--model".to_owned(),
-            ])),
-            composed_into_model: false,
-            mid_session: SessionOptionMidSessionApplication::AgentPicker {
-                command: "/model".to_owned(),
-            },
-        },
-        model_list: None,
-    }
-}
-
 fn cursor_catalog(adapter_id: AdapterId) -> AgentSessionOptionCatalog {
     let effort = || {
         select_option(
@@ -1097,15 +1059,6 @@ mod tests {
                     "gpt-5.2-codex",
                 ],
             ),
-            (
-                "gemini",
-                vec![
-                    "gemini-3-pro-preview",
-                    "gemini-3-flash-preview",
-                    "gemini-2.5-pro",
-                    "gemini-2.5-flash",
-                ],
-            ),
             ("cursor", vec!["auto", "gpt-5.3-codex", "claude-opus-4-8"]),
         ] {
             let actual = session_option_catalog(&id(adapter))
@@ -1279,7 +1232,7 @@ mod tests {
     #[test]
     fn unsupported_or_unsafe_values_fail_typed_without_fallback() {
         assert!(matches!(
-            session_option_catalog(&id("opencode")),
+            session_option_catalog(&id("grok")),
             Err(SessionOptionAdapterError::UnsupportedAdapter(_))
         ));
         let future = resolve_session_option_launch(

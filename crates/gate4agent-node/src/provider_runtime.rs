@@ -604,41 +604,41 @@ mod tests {
     }
 
     #[test]
-    fn qwen_sidecar_admission_skips_version_probe_and_non_qwen_does_not() {
+    fn pty_sidecar_admission_skips_version_probe_and_a_non_sidecar_provider_does_not() {
         let launcher = std::env::temp_dir().join(format!(
-            "gate4agent-qwen-sidecar-runtime-monitor-{}{}",
+            "gate4agent-pty-sidecar-runtime-monitor-{}{}",
             std::process::id(),
             std::env::consts::EXE_SUFFIX,
         ));
         std::fs::write(&launcher, b"fixture launcher identity").unwrap();
-        // `qwen-code` is not part of the current fleet's built-in registry:
-        // this reuses `codex`'s own real, globally-registered Pipe binding
-        // as a synthetic PTY sidecar, standing in for a live registry
-        // lookup. `pty_sidecar_observation` is generic (keyed on the
-        // binding's presence, not on any literal provider id), so which
-        // real Pipe binding it is built from is not load-bearing.
-        let mut qwen = builtin_registry().get_by_id("codex").unwrap().clone();
-        qwen.id = AgentId::new("qwen-code").unwrap();
-        qwen.detection.command = "qwen".to_owned();
-        let sidecar = qwen.capabilities.transports.pipe.clone().unwrap().adapter;
-        qwen.capabilities.transports.pipe = None;
-        qwen.capabilities.adapters.pty_sidecar = Some(sidecar);
-        // The real (now removed) `qwen-code` spec carried no Hook adapter --
-        // matched here so `hook_semantics` reflects the shape under test,
-        // not an artifact of the `codex` skeleton it was cloned from.
-        qwen.capabilities.adapters.hook = None;
-        qwen.launch.program = launcher.to_string_lossy().into_owned();
+        // No fleet provider declares a PTY sidecar today, so this augments a
+        // clone of `codex`'s own real, globally-registered Pipe binding into
+        // a synthetic PTY sidecar, standing in for a live registry lookup.
+        // `pty_sidecar_observation` is generic (keyed on the binding's
+        // presence, not on any literal provider id), so which real Pipe
+        // binding it is built from is not load-bearing.
+        let mut sidecar_fixture = builtin_registry().get_by_id("codex").unwrap().clone();
+        sidecar_fixture.id = AgentId::new("pty-sidecar-fixture").unwrap();
+        sidecar_fixture.detection.command = "pty-sidecar-fixture".to_owned();
+        let sidecar = sidecar_fixture.capabilities.transports.pipe.clone().unwrap().adapter;
+        sidecar_fixture.capabilities.transports.pipe = None;
+        sidecar_fixture.capabilities.adapters.pty_sidecar = Some(sidecar);
+        // No Hook adapter -- matched here so `hook_semantics` reflects the
+        // shape under test, not an artifact of the `codex` skeleton it was
+        // cloned from.
+        sidecar_fixture.capabilities.adapters.hook = None;
+        sidecar_fixture.launch.program = launcher.to_string_lossy().into_owned();
         let mut grok = builtin_registry().get_by_id("grok").unwrap().clone();
         grok.launch.program = launcher.to_string_lossy().into_owned();
-        let catalog = AgentRegistry::new([qwen, grok]).unwrap();
+        let catalog = AgentRegistry::new([sidecar_fixture, grok]).unwrap();
         let monitor = ProviderRuntimeMonitor::new(&catalog);
         let cache_guard = monitor.probe_cache.lock().unwrap();
 
-        let (qwen_status, qwen_admission) =
-            monitor.evaluate(&AgentId::new("qwen-code").unwrap());
-        assert_eq!(qwen_status.unwrap().mode(), ProviderRuntimeMode::RawPassthrough);
+        let (sidecar_status, sidecar_admission) =
+            monitor.evaluate(&AgentId::new("pty-sidecar-fixture").unwrap());
+        assert_eq!(sidecar_status.unwrap().mode(), ProviderRuntimeMode::RawPassthrough);
         assert_eq!(
-            qwen_admission,
+            sidecar_admission,
             Ok(ProviderRuntimePolicy::new(true, true, false, false, false, false).unwrap())
         );
         let (grok_status, grok_admission) = monitor.evaluate(&AgentId::new("grok").unwrap());
@@ -820,17 +820,17 @@ mod tests {
     }
 
     /// Claude declares a Pipe transport in the catalog
-    /// (`transports.pipe.is_some()`); Qwen Code does not -- it only carries a
-    /// PTY sidecar adapter (see `gate4agent_catalog::builtin::capabilities`).
+    /// (`transports.pipe.is_some()`); a provider observed only through a PTY
+    /// sidecar does not (see `gate4agent_catalog::builtin::capabilities`).
     /// `ProviderRuntimeMonitor::supports_pipe_transport` must derive exactly
     /// that catalog fact, and `require_policy` must honour it end to end
     /// through the real monitor and the real built-in registry, not just the
     /// bare policy check above.
     ///
-    /// `qwen-code` is not part of the current fleet's built-in registry: the
-    /// "Pipe" half is a synthetic fixture reusing `codex`'s own real,
-    /// globally-registered Pipe binding as a PTY sidecar instead, standing
-    /// in for a live registry lookup.
+    /// No fleet provider declares a PTY sidecar today: the "Pipe" half is a
+    /// synthetic fixture reusing `codex`'s own real, globally-registered
+    /// Pipe binding as a PTY sidecar instead, standing in for a live
+    /// registry lookup.
     #[test]
     fn monitor_admits_inline_for_a_provider_with_declared_pipe_and_rejects_one_without() {
         let launcher = std::env::temp_dir().join(format!(
@@ -842,21 +842,21 @@ mod tests {
         let mut claude = builtin_registry().get_by_id("claude").unwrap().clone();
         assert!(claude.capabilities.transports.pipe.is_some());
         claude.launch.program = launcher.to_string_lossy().into_owned();
-        let mut qwen = builtin_registry().get_by_id("codex").unwrap().clone();
-        qwen.id = AgentId::new("qwen-code").unwrap();
-        qwen.detection.command = "qwen".to_owned();
-        let sidecar = qwen.capabilities.transports.pipe.clone().unwrap().adapter;
-        qwen.capabilities.transports.pipe = None;
-        qwen.capabilities.adapters.pty_sidecar = Some(sidecar);
-        assert!(qwen.capabilities.transports.pipe.is_none());
-        qwen.launch.program = launcher.to_string_lossy().into_owned();
-        let catalog = AgentRegistry::new([claude, qwen]).unwrap();
+        let mut sidecar_fixture = builtin_registry().get_by_id("codex").unwrap().clone();
+        sidecar_fixture.id = AgentId::new("pty-sidecar-fixture").unwrap();
+        sidecar_fixture.detection.command = "pty-sidecar-fixture".to_owned();
+        let sidecar = sidecar_fixture.capabilities.transports.pipe.clone().unwrap().adapter;
+        sidecar_fixture.capabilities.transports.pipe = None;
+        sidecar_fixture.capabilities.adapters.pty_sidecar = Some(sidecar);
+        assert!(sidecar_fixture.capabilities.transports.pipe.is_none());
+        sidecar_fixture.launch.program = launcher.to_string_lossy().into_owned();
+        let catalog = AgentRegistry::new([claude, sidecar_fixture]).unwrap();
         let monitor = ProviderRuntimeMonitor::new(&catalog);
         let claude_id = AgentId::new("claude").unwrap();
-        let qwen_id = AgentId::new("qwen-code").unwrap();
+        let sidecar_id = AgentId::new("pty-sidecar-fixture").unwrap();
 
         assert!(monitor.supports_pipe_transport(&claude_id));
-        assert!(!monitor.supports_pipe_transport(&qwen_id));
+        assert!(!monitor.supports_pipe_transport(&sidecar_id));
 
         let (_, claude_admission) = monitor.evaluate(&claude_id);
         assert_eq!(
@@ -869,11 +869,11 @@ mod tests {
             Ok(()),
         );
 
-        let (_, qwen_admission) = monitor.evaluate(&qwen_id);
+        let (_, sidecar_admission) = monitor.evaluate(&sidecar_id);
         assert_eq!(
             require_policy(
-                qwen_admission.unwrap(),
-                monitor.supports_pipe_transport(&qwen_id),
+                sidecar_admission.unwrap(),
+                monitor.supports_pipe_transport(&sidecar_id),
                 false,
                 ProviderRuntimeRequirement::Inline,
             ),

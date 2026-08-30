@@ -41,9 +41,6 @@ chrono = { version = "0.4", features = ["serde"] }
 # PtyError, AgentError
 thiserror = "2"
 
-# SQLite reader for OpenCode history (bundled so no system SQLite required)
-rusqlite = { version = "0.31", features = ["bundled"] }
-
 # RateLimitDetector patterns, OutputParser regex matching
 regex = "1"
 
@@ -53,8 +50,8 @@ reqwest = { version = "0.12", features = ["json"], optional = true }
 [features]
 default = []
 # Enable live model discovery via https://openrouter.ai/api/v1/models.
-# Adds reqwest as a dependency. Consumers that only need disk-based cure
-# (OpenCode cache) do not need this feature.
+# Adds reqwest as a dependency. Without it, cure() always falls through to
+# the Hardcoded marker (no live source to try).
 cure-network = ["dep:reqwest"]
 
 [dev-dependencies]

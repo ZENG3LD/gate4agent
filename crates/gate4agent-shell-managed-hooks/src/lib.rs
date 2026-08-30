@@ -26,7 +26,6 @@ const MANAGED_MARKER: &str = "Managed by Gate4Agent. Do not edit; changes may be
 const KIMI_BLOCK_START: &str =
     "# >>> gate4agent-managed-kimi-hooks (managed by Gate4Agent; do not edit) >>>";
 const KIMI_BLOCK_END: &str = "# <<< gate4agent-managed-kimi-hooks <<<";
-const HERMES_PLUGIN_NAME: &str = "gate4agent-status";
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -203,7 +202,6 @@ impl ManagedHookManager {
         let mut actions = match spec.config_kind {
             ManagedHookConfigKind::JsonHooks { .. } => self.plan_json(spec, operation)?,
             ManagedHookConfigKind::AmpPlugin => self.plan_amp(spec, operation)?,
-            ManagedHookConfigKind::HermesPlugin => self.plan_hermes(spec, operation)?,
             ManagedHookConfigKind::KimiToml => self.plan_kimi(spec, operation)?,
         };
         actions.retain(|action| !mutation_is_noop(action));
@@ -362,8 +360,6 @@ impl ManagedHookManager {
     fn script_path(&self, spec: &ManagedHookAdapterSpec) -> Result<PathBuf, ManagedHookError> {
         let extension = if spec.target == "kimi" {
             "sh"
-        } else if self.roots.platform == RuntimePlatform::Windows && spec.target == "copilot" {
-            "ps1"
         } else if self.roots.platform == RuntimePlatform::Windows {
             "cmd"
         } else {
@@ -383,12 +379,7 @@ impl ManagedHookManager {
     }
 
     fn managed_script(&self, spec: &ManagedHookAdapterSpec) -> Result<String, ManagedHookError> {
-        let endpoint_paths = self.endpoint_paths()?;
-        Ok(managed_script(
-            self.roots.platform,
-            spec.target,
-            &endpoint_paths,
-        ))
+        Ok(managed_script(self.roots.platform, spec.target))
     }
 
     fn managed_command(
@@ -443,7 +434,6 @@ impl ManagedHookManager {
         match spec.config_kind {
             ManagedHookConfigKind::JsonHooks { .. } => self.status_json(spec),
             ManagedHookConfigKind::AmpPlugin => self.status_amp(spec),
-            ManagedHookConfigKind::HermesPlugin => self.status_hermes(spec),
             ManagedHookConfigKind::KimiToml => self.status_kimi(spec),
         }
     }
@@ -487,7 +477,7 @@ impl ManagedHookManager {
                 })
             });
         }
-        let definitions_complete = present == spec.events.len() && !json_disabled(spec, &config);
+        let definitions_complete = present == spec.events.len();
         let approval_required = definitions_complete
             && spec.target == "codex"
             && !codex_hooks_are_trusted(self, spec, &config_path, &config)?;
@@ -504,9 +494,6 @@ impl ManagedHookManager {
             ManagedHookState::ApprovalRequired => Some(
                 "managed definitions are installed; approve them through Codex /hooks".to_owned(),
             ),
-            ManagedHookState::Partial if json_disabled(spec, &config) => {
-                Some("provider configuration disables managed hooks".to_owned())
-            }
             ManagedHookState::Partial => Some(format!(
                 "managed hooks present for {present}/{} events",
                 spec.events.len()
@@ -718,114 +705,6 @@ impl ManagedHookManager {
         }
     }
 
-    fn hermes_paths(
-        &self,
-        spec: &ManagedHookAdapterSpec,
-    ) -> Result<(PathBuf, PathBuf, PathBuf), ManagedHookError> {
-        let config = self.config_path(spec)?;
-        let home = config
-            .parent()
-            .ok_or_else(|| ManagedHookError::InvalidDerivedPath(config.clone()))?;
-        let plugin_dir = checked_join(home, &format!("plugins/{HERMES_PLUGIN_NAME}"))?;
-        Ok((
-            config,
-            plugin_dir.join("plugin.yaml"),
-            plugin_dir.join("__init__.py"),
-        ))
-    }
-
-    fn status_hermes(
-        &self,
-        spec: &ManagedHookAdapterSpec,
-    ) -> Result<ManagedHookStatus, ManagedHookError> {
-        let (config, manifest, init) = self.hermes_paths(spec)?;
-        let config_text = read_optional_bounded(&config)?
-            .map(|bytes| {
-                String::from_utf8(bytes).map_err(|_| ManagedHookError::InvalidUtf8(config.clone()))
-            })
-            .transpose()?
-            .unwrap_or_default();
-        let yaml = inspect_hermes_yaml(&config_text)?;
-        let manifest_managed = read_optional_bounded(&manifest)?
-            .is_some_and(|bytes| String::from_utf8_lossy(&bytes).contains(MANAGED_MARKER));
-        let init_managed = read_optional_bounded(&init)?
-            .is_some_and(|bytes| String::from_utf8_lossy(&bytes).contains(MANAGED_MARKER));
-        let managed = manifest_managed && init_managed;
-        let state = if managed && yaml.enabled && !yaml.disabled {
-            ManagedHookState::Installed
-        } else if !managed && !yaml.enabled {
-            ManagedHookState::NotInstalled
-        } else {
-            ManagedHookState::Partial
-        };
-        Ok(ManagedHookStatus {
-            target: spec.target.to_owned(),
-            state,
-            config_path: config,
-            managed_hooks_present: managed,
-            detail: (state == ManagedHookState::Partial)
-                .then(|| "Hermes plugin files or YAML enablement are incomplete".to_owned()),
-        })
-    }
-
-    fn plan_hermes(
-        &self,
-        spec: &ManagedHookAdapterSpec,
-        operation: ManagedHookOperation,
-    ) -> Result<Vec<PlannedFileMutation>, ManagedHookError> {
-        let (config, manifest, init) = self.hermes_paths(spec)?;
-        let config_original = read_optional_bounded(&config)?;
-        let config_text = config_original
-            .as_ref()
-            .map(|bytes| {
-                String::from_utf8(bytes.clone())
-                    .map_err(|_| ManagedHookError::InvalidUtf8(config.clone()))
-            })
-            .transpose()?
-            .unwrap_or_default();
-        let manifest_original = read_optional_bounded(&manifest)?;
-        let init_original = read_optional_bounded(&init)?;
-        for (path, bytes) in [(&manifest, &manifest_original), (&init, &init_original)] {
-            if bytes
-                .as_ref()
-                .is_some_and(|bytes| !String::from_utf8_lossy(bytes).contains(MANAGED_MARKER))
-            {
-                return Err(ManagedHookError::UnmanagedConflict(path.clone()));
-            }
-        }
-        match operation {
-            ManagedHookOperation::Install => Ok(vec![
-                mutation(
-                    manifest,
-                    manifest_original,
-                    Some(hermes_manifest(spec).into_bytes()),
-                    false,
-                ),
-                mutation(
-                    init,
-                    init_original,
-                    Some(hermes_plugin_source(spec).into_bytes()),
-                    false,
-                ),
-                mutation(
-                    config,
-                    config_original,
-                    Some(update_hermes_yaml(&config_text, true)?.into_bytes()),
-                    false,
-                ),
-            ]),
-            ManagedHookOperation::Remove => Ok(vec![
-                mutation(
-                    config,
-                    config_original,
-                    Some(update_hermes_yaml(&config_text, false)?.into_bytes()),
-                    false,
-                ),
-                mutation(init, init_original, None, false),
-                mutation(manifest, manifest_original, None, false),
-            ]),
-        }
-    }
 }
 
 fn checked_join(root: &Path, relative: &str) -> Result<PathBuf, ManagedHookError> {
@@ -1020,100 +899,13 @@ fn parse_json_config(
 ) -> Result<Value, ManagedHookError> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| ManagedHookError::InvalidUtf8(PathBuf::from(spec.target)))?;
-    let parsed: Value = if spec.target == "devin" {
-        serde_json::from_str(&strip_jsonc_comments(text))?
-    } else {
-        serde_json::from_str(text)?
-    };
+    let parsed: Value = serde_json::from_str(text)?;
     if !parsed.is_object() {
         return Err(ManagedHookError::ConfigRootMustBeObject(
             spec.target.to_owned(),
         ));
     }
     Ok(parsed)
-}
-
-fn strip_jsonc_comments(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    let mut in_string = false;
-    let mut escaped = false;
-    while let Some(character) = chars.next() {
-        if in_string {
-            out.push(character);
-            if escaped {
-                escaped = false;
-            } else if character == '\\' {
-                escaped = true;
-            } else if character == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-        if character == '"' {
-            in_string = true;
-            out.push(character);
-        } else if character == '/' && chars.peek() == Some(&'/') {
-            chars.next();
-            for next in chars.by_ref() {
-                if next == '\n' {
-                    out.push('\n');
-                    break;
-                }
-            }
-        } else if character == '/' && chars.peek() == Some(&'*') {
-            chars.next();
-            let mut previous = '\0';
-            for next in chars.by_ref() {
-                if next == '\n' {
-                    out.push('\n');
-                }
-                if previous == '*' && next == '/' {
-                    break;
-                }
-                previous = next;
-            }
-        } else {
-            out.push(character);
-        }
-    }
-    strip_jsonc_trailing_commas(&out)
-}
-
-fn strip_jsonc_trailing_commas(input: &str) -> String {
-    let characters = input.chars().collect::<Vec<_>>();
-    let mut out = String::with_capacity(input.len());
-    let mut in_string = false;
-    let mut escaped = false;
-    for (index, character) in characters.iter().copied().enumerate() {
-        if in_string {
-            out.push(character);
-            if escaped {
-                escaped = false;
-            } else if character == '\\' {
-                escaped = true;
-            } else if character == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-        if character == '"' {
-            in_string = true;
-            out.push(character);
-            continue;
-        }
-        if character == ','
-            && characters[index + 1..]
-                .iter()
-                .copied()
-                .find(|candidate| !candidate.is_whitespace())
-                .is_some_and(|candidate| matches!(candidate, '}' | ']'))
-        {
-            continue;
-        }
-        out.push(character);
-    }
-    out
 }
 
 fn apply_json_install(
@@ -1150,7 +942,7 @@ fn apply_json_install(
                     target: spec.target.to_owned(),
                     event: event.name.to_owned(),
                 })?;
-        let definition = build_definition(manager.roots.platform, event, command);
+        let definition = build_definition(event, command);
         if spec.target == "codex" {
             // Pinned Orca runs status evidence before user hooks so a slow
             // user Stop/PostToolUse hook cannot leave the monitor stale.
@@ -1161,9 +953,6 @@ fn apply_json_install(
     }
     if require_version_one {
         root.insert("version".to_owned(), json!(1));
-    }
-    if spec.target == "copilot" {
-        root.remove("disableAllHooks");
     }
     if spec.target == "codex" {
         let hooks = root.remove("hooks").unwrap_or_else(|| json!({}));
@@ -1245,11 +1034,7 @@ fn clean_definition(spec: &ManagedHookAdapterSpec, definition: &Value) -> Option
     has_command.then_some(Value::Object(object))
 }
 
-fn build_definition(
-    platform: RuntimePlatform,
-    event: &ManagedHookEventSpec,
-    command: String,
-) -> Value {
+fn build_definition(event: &ManagedHookEventSpec, command: String) -> Value {
     match event.shape {
         ManagedHookEventShape::NestedCommand { matcher, timeout } => {
             let mut definition = Map::new();
@@ -1271,13 +1056,6 @@ fn build_definition(
             "command": command,
             "timeout": timeout,
         }),
-        ManagedHookEventShape::CopilotCommand { timeout_seconds } => {
-            if platform == RuntimePlatform::Windows {
-                json!({"type": "command", "powershell": command, "timeoutSec": timeout_seconds})
-            } else {
-                json!({"type": "command", "bash": command, "timeoutSec": timeout_seconds})
-            }
-        }
     }
 }
 
@@ -1537,81 +1315,33 @@ fn decode_encoded_command_argument(command: &str) -> Option<String> {
     String::from_utf16(&units).ok()
 }
 
-fn json_disabled(spec: &ManagedHookAdapterSpec, config: &Value) -> bool {
-    (spec.target == "droid" && config.get("hooksDisabled") == Some(&Value::Bool(true)))
-        || (spec.target == "copilot" && config.get("disableAllHooks") == Some(&Value::Bool(true)))
-}
-
-fn managed_script(
-    platform: RuntimePlatform,
-    target: &str,
-    endpoints: &PublishedHookEndpoint,
-) -> String {
-    if platform == RuntimePlatform::Windows && target == "copilot" {
-        return managed_powershell_script();
-    }
+fn managed_script(platform: RuntimePlatform, target: &str) -> String {
     if platform == RuntimePlatform::Windows && target != "kimi" {
-        return managed_cmd_script(target, &endpoints.windows_path);
+        return managed_cmd_script(target);
     }
-    managed_posix_script(target, &endpoints.posix_path)
+    managed_posix_script(target)
 }
 
-fn managed_posix_script(target: &str, endpoint_path: &Path) -> String {
-    let response = match target {
-        "antigravity" => "if [ \"$GATE4AGENT_HOOK_EVENT\" = \"Stop\" ]; then printf '{\"decision\":\"\"}\\n'; else printf '{}\\n'; fi\n",
-        "gemini" | "copilot" => "printf '{}\\n'\n",
-        _ => "",
-    };
+fn managed_posix_script(target: &str) -> String {
     let skip_devin = if target == "claude" {
         "if [ -n \"$DEVIN_PROJECT_DIR\" ]; then cat >/dev/null; exit 0; fi\n"
     } else {
         ""
     };
-    let command_code_recovery = if target == "command-code" {
-        let endpoint = posix_quote(&endpoint_path.to_string_lossy().replace('\\', "/"));
-        format!(
-            "if [ -z \"$GATE4AGENT_HOOK_TOKEN\" ] && [ -r {endpoint} ]; then\n  while IFS='=' read -r key value; do\n    case \"$key\" in GATE4AGENT_HOOK_PORT|GATE4AGENT_HOOK_TOKEN|GATE4AGENT_HOOK_VERSION) export \"$key=$value\" ;; esac\n  done < {endpoint}\nfi\nif [ -z \"$GATE4AGENT_HOOK_URL\" ] && [ -n \"$GATE4AGENT_HOOK_PORT\" ]; then GATE4AGENT_HOOK_URL=\"http://127.0.0.1:$GATE4AGENT_HOOK_PORT/hook/command-code\"; fi\n"
-        )
-    } else {
-        String::new()
-    };
     format!(
-        "#!/bin/sh\n# {MANAGED_MARKER}\n{response}{skip_devin}payload=$(cat)\n{command_code_recovery}if [ -z \"$GATE4AGENT_HOOK_URL\" ] || [ -z \"$GATE4AGENT_HOOK_TOKEN\" ] || [ -z \"$GATE4AGENT_HOOK_ROUTE\" ]; then exit 0; fi\nprintf '%s' \"$payload\" | curl -sS -X POST \"$GATE4AGENT_HOOK_URL\" --connect-timeout 0.5 --max-time 1.5 -H \"Content-Type: application/x-www-form-urlencoded\" -H \"x-gate4agent-hook-token: $GATE4AGENT_HOOK_TOKEN\" -H \"x-gate4agent-hook-route: $GATE4AGENT_HOOK_ROUTE\" --data-urlencode \"event_name=$GATE4AGENT_HOOK_EVENT\" --data-urlencode \"payload@-\" >/dev/null 2>&1 || true\nexit 0\n"
+        "#!/bin/sh\n# {MANAGED_MARKER}\n{skip_devin}payload=$(cat)\nif [ -z \"$GATE4AGENT_HOOK_URL\" ] || [ -z \"$GATE4AGENT_HOOK_TOKEN\" ] || [ -z \"$GATE4AGENT_HOOK_ROUTE\" ]; then exit 0; fi\nprintf '%s' \"$payload\" | curl -sS -X POST \"$GATE4AGENT_HOOK_URL\" --connect-timeout 0.5 --max-time 1.5 -H \"Content-Type: application/x-www-form-urlencoded\" -H \"x-gate4agent-hook-token: $GATE4AGENT_HOOK_TOKEN\" -H \"x-gate4agent-hook-route: $GATE4AGENT_HOOK_ROUTE\" --data-urlencode \"event_name=$GATE4AGENT_HOOK_EVENT\" --data-urlencode \"payload@-\" >/dev/null 2>&1 || true\nexit 0\n"
     )
 }
 
-fn managed_cmd_script(target: &str, endpoint_path: &Path) -> String {
-    let response = match target {
-        "antigravity" => "if /I \"%GATE4AGENT_HOOK_EVENT%\"==\"Stop\" (echo {\"decision\":\"\"}) else (echo {})\r\n",
-        "gemini" => "echo {}\r\n",
-        _ => "",
-    };
+fn managed_cmd_script(target: &str) -> String {
     let skip_devin = if target == "claude" {
         "if not \"%DEVIN_PROJECT_DIR%\"==\"\" goto :drain\r\n"
     } else {
         ""
     };
-    let command_code_recovery = if target == "command-code" {
-        format!(
-            "if \"%GATE4AGENT_HOOK_TOKEN%\"==\"\" if exist \"{}\" for /f \"usebackq tokens=1,* delims==\" %%A in (\"{}\") do call :endpointValue \"%%A\" \"%%B\"\r\nif \"%GATE4AGENT_HOOK_URL%\"==\"\" if not \"%GATE4AGENT_HOOK_PORT%\"==\"\" set \"GATE4AGENT_HOOK_URL=http://127.0.0.1:%GATE4AGENT_HOOK_PORT%/hook/command-code\"\r\n",
-            endpoint_path.display(),
-            endpoint_path.display()
-        )
-    } else {
-        String::new()
-    };
-    let endpoint_label = if target == "command-code" {
-        ":endpointValue\r\nif /I \"%~1\"==\"GATE4AGENT_HOOK_PORT\" set \"GATE4AGENT_HOOK_PORT=%~2\"\r\nif /I \"%~1\"==\"GATE4AGENT_HOOK_TOKEN\" set \"GATE4AGENT_HOOK_TOKEN=%~2\"\r\nif /I \"%~1\"==\"GATE4AGENT_HOOK_VERSION\" set \"GATE4AGENT_HOOK_VERSION=%~2\"\r\nexit /b 0\r\n"
-    } else {
-        ""
-    };
     format!(
-        "@echo off\r\nrem {MANAGED_MARKER}\r\nsetlocal\r\n{response}{skip_devin}{command_code_recovery}if \"%GATE4AGENT_HOOK_URL%\"==\"\" goto :drain\r\nif \"%GATE4AGENT_HOOK_TOKEN%\"==\"\" goto :drain\r\nif \"%GATE4AGENT_HOOK_ROUTE%\"==\"\" goto :drain\r\n\"%SystemRoot%\\System32\\curl.exe\" -sS -X POST \"%GATE4AGENT_HOOK_URL%\" --connect-timeout 0.5 --max-time 1.5 -H \"Content-Type: application/x-www-form-urlencoded\" -H \"x-gate4agent-hook-token: %GATE4AGENT_HOOK_TOKEN%\" -H \"x-gate4agent-hook-route: %GATE4AGENT_HOOK_ROUTE%\" --data-urlencode \"event_name=%GATE4AGENT_HOOK_EVENT%\" --data-urlencode \"payload@-\" >nul 2>nul\r\nexit /b 0\r\n:drain\r\nmore >nul\r\nexit /b 0\r\n{endpoint_label}"
+        "@echo off\r\nrem {MANAGED_MARKER}\r\nsetlocal\r\n{skip_devin}if \"%GATE4AGENT_HOOK_URL%\"==\"\" goto :drain\r\nif \"%GATE4AGENT_HOOK_TOKEN%\"==\"\" goto :drain\r\nif \"%GATE4AGENT_HOOK_ROUTE%\"==\"\" goto :drain\r\n\"%SystemRoot%\\System32\\curl.exe\" -sS -X POST \"%GATE4AGENT_HOOK_URL%\" --connect-timeout 0.5 --max-time 1.5 -H \"Content-Type: application/x-www-form-urlencoded\" -H \"x-gate4agent-hook-token: %GATE4AGENT_HOOK_TOKEN%\" -H \"x-gate4agent-hook-route: %GATE4AGENT_HOOK_ROUTE%\" --data-urlencode \"event_name=%GATE4AGENT_HOOK_EVENT%\" --data-urlencode \"payload@-\" >nul 2>nul\r\nexit /b 0\r\n:drain\r\nmore >nul\r\nexit /b 0\r\n"
     )
-}
-
-fn managed_powershell_script() -> String {
-    format!("# {MANAGED_MARKER}\r\nWrite-Output '{{}}'\r\n$payload = [Console]::In.ReadToEnd()\r\nif (-not $env:GATE4AGENT_HOOK_URL -or -not $env:GATE4AGENT_HOOK_TOKEN -or -not $env:GATE4AGENT_HOOK_ROUTE) {{ exit 0 }}\r\ntry {{\r\n  $body = @{{ event_name = $env:GATE4AGENT_HOOK_EVENT; payload = $payload }} | ConvertTo-Json -Compress\r\n  Invoke-WebRequest -UseBasicParsing -Method Post -Uri $env:GATE4AGENT_HOOK_URL -Headers @{{ 'Content-Type'='application/json'; 'x-gate4agent-hook-token'=$env:GATE4AGENT_HOOK_TOKEN; 'x-gate4agent-hook-route'=$env:GATE4AGENT_HOOK_ROUTE }} -Body $body -TimeoutSec 2 | Out-Null\r\n}} catch {{}}\r\nexit 0\r\n")
 }
 
 fn posix_quote(value: &str) -> String {
@@ -1821,267 +1551,6 @@ fn toml_escape(value: &str) -> String {
         .replace('\t', "\\t")
 }
 
-#[derive(Clone, Copy)]
-struct HermesYamlState {
-    enabled: bool,
-    disabled: bool,
-}
-
-fn inspect_hermes_yaml(text: &str) -> Result<HermesYamlState, ManagedHookError> {
-    let enabled = yaml_list_contains(text, "enabled")?;
-    let disabled = yaml_list_contains(text, "disabled")?;
-    Ok(HermesYamlState { enabled, disabled })
-}
-
-fn yaml_list_contains(text: &str, key: &str) -> Result<bool, ManagedHookError> {
-    let lines = text.lines().collect::<Vec<_>>();
-    let Some(plugins) = lines
-        .iter()
-        .position(|line| line.trim_end() == "plugins:" && !line.starts_with(char::is_whitespace))
-    else {
-        return Ok(false);
-    };
-    let end = lines[plugins + 1..]
-        .iter()
-        .position(|line| !line.trim().is_empty() && !line.starts_with(char::is_whitespace))
-        .map(|relative| plugins + 1 + relative)
-        .unwrap_or(lines.len());
-    for index in plugins + 1..end {
-        let line = lines[index];
-        if line.starts_with("  ") && line.trim_start().starts_with(&format!("{key}:")) {
-            let tail = line.trim_start()[key.len() + 1..].trim();
-            if tail.starts_with('[') {
-                return Ok(tail
-                    .trim_matches(|c| c == '[' || c == ']')
-                    .split(',')
-                    .any(|item| item.trim().trim_matches(['\'', '"']) == HERMES_PLUGIN_NAME));
-            }
-            if !tail.is_empty() {
-                return Err(ManagedHookError::UnsupportedHermesYaml);
-            }
-            return Ok(lines[index + 1..end]
-                .iter()
-                .take_while(|candidate| {
-                    candidate.starts_with("    ") || candidate.trim().is_empty()
-                })
-                .any(|candidate| {
-                    candidate
-                        .trim_start()
-                        .strip_prefix("- ")
-                        .is_some_and(|value| value.trim_matches(['\'', '"']) == HERMES_PLUGIN_NAME)
-                }));
-        }
-    }
-    Ok(false)
-}
-
-fn update_hermes_yaml(text: &str, enable: bool) -> Result<String, ManagedHookError> {
-    let mut lines = text.lines().map(str::to_owned).collect::<Vec<_>>();
-    let plugins = lines.iter().position(|line| line == "plugins:");
-    if plugins.is_none() {
-        if !enable {
-            return Ok(text.to_owned());
-        }
-        if !lines.is_empty() && !lines.last().is_some_and(|line| line.is_empty()) {
-            lines.push(String::new());
-        }
-        lines.extend([
-            "plugins:".to_owned(),
-            "  enabled:".to_owned(),
-            format!("    - {HERMES_PLUGIN_NAME}"),
-        ]);
-        return Ok(format!("{}\n", lines.join("\n")));
-    }
-    let plugins = plugins.unwrap();
-    let end = lines[plugins + 1..]
-        .iter()
-        .position(|line| !line.trim().is_empty() && !line.starts_with(char::is_whitespace))
-        .map(|relative| plugins + 1 + relative)
-        .unwrap_or(lines.len());
-    update_yaml_list(&mut lines, plugins + 1, end, "disabled", false)?;
-    let end = lines[plugins + 1..]
-        .iter()
-        .position(|line| !line.trim().is_empty() && !line.starts_with(char::is_whitespace))
-        .map(|relative| plugins + 1 + relative)
-        .unwrap_or(lines.len());
-    update_yaml_list(&mut lines, plugins + 1, end, "enabled", enable)?;
-    Ok(format!("{}\n", lines.join("\n").trim_end()))
-}
-
-fn update_yaml_list(
-    lines: &mut Vec<String>,
-    start: usize,
-    end: usize,
-    key: &str,
-    include: bool,
-) -> Result<(), ManagedHookError> {
-    let key_line = lines[start..end]
-        .iter()
-        .position(|line| {
-            line.starts_with("  ") && line.trim_start().starts_with(&format!("{key}:"))
-        })
-        .map(|relative| start + relative);
-    let Some(index) = key_line else {
-        if include {
-            lines.splice(
-                end..end,
-                [format!("  {key}:"), format!("    - {HERMES_PLUGIN_NAME}")],
-            );
-        }
-        return Ok(());
-    };
-    let tail = lines[index].trim_start()[key.len() + 1..].trim().to_owned();
-    if tail.starts_with('[') {
-        let mut values = tail
-            .trim_matches(|c| c == '[' || c == ']')
-            .split(',')
-            .map(|item| item.trim().trim_matches(['\'', '"']).to_owned())
-            .filter(|item| !item.is_empty() && item != HERMES_PLUGIN_NAME)
-            .collect::<Vec<_>>();
-        if include {
-            values.push(HERMES_PLUGIN_NAME.to_owned());
-        }
-        lines[index] = format!("  {key}: [{}]", values.join(", "));
-        return Ok(());
-    }
-    if !tail.is_empty() {
-        return Err(ManagedHookError::UnsupportedHermesYaml);
-    }
-    let list_end = lines[index + 1..end]
-        .iter()
-        .position(|line| !line.trim().is_empty() && !line.starts_with("    "))
-        .map(|relative| index + 1 + relative)
-        .unwrap_or(end);
-    let retained = lines[index + 1..list_end]
-        .iter()
-        .filter(|line| {
-            line.trim_start()
-                .strip_prefix("- ")
-                .is_none_or(|value| value.trim_matches(['\'', '"']) != HERMES_PLUGIN_NAME)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    lines.splice(index + 1..list_end, retained);
-    if include {
-        lines.insert(index + 1, format!("    - {HERMES_PLUGIN_NAME}"));
-    }
-    Ok(())
-}
-
-fn hermes_manifest(spec: &ManagedHookAdapterSpec) -> String {
-    let hooks = spec
-        .events
-        .iter()
-        .map(|event| format!("  - {}", event.name))
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!("# {MANAGED_MARKER}\nname: {HERMES_PLUGIN_NAME}\nversion: 1.0.0\ndescription: \"Reports Hermes lifecycle events to Gate4Agent.\"\nauthor: \"Gate4Agent\"\nkind: standalone\nprovides_hooks:\n{hooks}\n")
-}
-
-fn hermes_plugin_source(spec: &ManagedHookAdapterSpec) -> String {
-    let events = spec
-        .events
-        .iter()
-        .map(|event| format!("\"{}\"", event.name))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        r#"# {MANAGED_MARKER}
-from __future__ import annotations
-import json
-import os
-import urllib.error
-import urllib.request
-from typing import Any, Callable, Optional
-
-EVENTS = [{events}]
-MAX_JSONABLE_DEPTH = 5
-MAX_JSONABLE_ITEMS = 50
-MAX_JSONABLE_NODES = 500
-MAX_JSONABLE_STRING = 8192
-TRUNCATED = "...[truncated]"
-SELECTED_KEYS = {{
-    "on_session_start": ("session_id", "model", "platform"),
-    "pre_llm_call": ("session_id", "user_message", "is_first_turn", "model", "platform", "sender_id"),
-    "post_llm_call": ("session_id", "user_message", "assistant_response", "model", "platform"),
-    "pre_tool_call": ("session_id", "task_id", "tool_call_id", "tool_name", "args"),
-    "post_tool_call": ("session_id", "task_id", "tool_call_id", "tool_name", "args", "result", "duration_ms"),
-    "pre_approval_request": ("command", "description", "pattern_key", "pattern_keys", "session_key", "surface"),
-    "post_approval_response": ("command", "description", "pattern_key", "pattern_keys", "session_key", "surface", "choice"),
-    "on_session_end": ("session_id",),
-    "on_session_finalize": ("session_id", "platform"),
-    "on_session_reset": ("session_id", "platform"),
-}}
-
-def _truncate_string(value: str) -> str:
-    if len(value) <= MAX_JSONABLE_STRING:
-        return value
-    return value[:MAX_JSONABLE_STRING] + TRUNCATED
-
-def _jsonable(value: Any, depth: int = 0, budget: Optional[list[int]] = None) -> Any:
-    if budget is None:
-        budget = [MAX_JSONABLE_NODES]
-    if budget[0] <= 0:
-        return TRUNCATED
-    budget[0] -= 1
-    if depth > MAX_JSONABLE_DEPTH:
-        return _truncate_string(repr(value))
-    if value is None or isinstance(value, (int, float, bool)):
-        return value
-    if isinstance(value, str):
-        return _truncate_string(value)
-    if isinstance(value, dict):
-        out: dict[str, Any] = {{}}
-        for index, (key, child) in enumerate(value.items()):
-            if index >= MAX_JSONABLE_ITEMS:
-                out[TRUNCATED] = True
-                break
-            out[_truncate_string(str(key))] = _jsonable(child, depth + 1, budget)
-        return out
-    if isinstance(value, (list, tuple, set)):
-        out = []
-        for index, item in enumerate(value):
-            if index >= MAX_JSONABLE_ITEMS:
-                out.append(TRUNCATED)
-                break
-            out.append(_jsonable(item, depth + 1, budget))
-        return out
-    return _truncate_string(repr(value))
-
-def _post(event_name: str, payload: dict[str, Any]) -> None:
-    url = os.environ.get("GATE4AGENT_HOOK_URL", "")
-    token = os.environ.get("GATE4AGENT_HOOK_TOKEN", "")
-    route = os.environ.get("GATE4AGENT_HOOK_ROUTE", "")
-    if not url or not token or not route:
-        return
-    try:
-        body = json.dumps({{"event_name": event_name, "payload": payload}}, separators=(",", ":")).encode("utf-8")
-        request = urllib.request.Request(url, data=body, method="POST", headers={{
-            "Content-Type": "application/json",
-            "x-gate4agent-hook-token": token,
-            "x-gate4agent-hook-route": route,
-        }})
-        with urllib.request.urlopen(request, timeout=0.75):
-            pass
-    except (OSError, TypeError, ValueError, urllib.error.URLError):
-        return
-
-def _make_hook(event_name: str) -> Callable[..., None]:
-    def _hook(**kwargs: Any) -> None:
-        payload = {{"hook_event_name": event_name, "cwd": os.getcwd()}}
-        for key in SELECTED_KEYS.get(event_name, ()):
-            if key in kwargs:
-                payload[key] = _jsonable(kwargs[key])
-        _post(event_name, payload)
-    return _hook
-
-def register(ctx: Any) -> None:
-    for event_name in EVENTS:
-        ctx.register_hook(event_name, _make_hook(event_name))
-"#
-    )
-}
-
 #[derive(Debug, Error)]
 pub enum ManagedHookError {
     #[error(transparent)]
@@ -2096,7 +1565,7 @@ pub enum ManagedHookError {
     MissingWindowsSystemRoot,
     #[error("Windows system root is unsafe to embed in a provider command")]
     UnsafeWindowsSystemRoot,
-    #[error("Windows Devin configuration requires an explicit app-data root")]
+    #[error("Windows app-data-relative managed Hook configuration requires an explicit app-data root")]
     MissingAppData,
     #[error("invalid managed Hook relative path: {0}")]
     InvalidRelativePath(PathBuf),
@@ -2126,8 +1595,6 @@ pub enum ManagedHookError {
     ApplyRollbackFailed { apply: String, rollback: String },
     #[error("refusing to overwrite or remove an unmanaged provider file: {0}")]
     UnmanagedConflict(PathBuf),
-    #[error("Hermes config.yaml uses an unsupported plugins list shape")]
-    UnsupportedHermesYaml,
 }
 
 #[cfg(test)]
@@ -2331,25 +1798,13 @@ mod tests {
         // The whole-file-ownership conflict shape below (`amp`'s TS plugin:
         // an unmanaged file entirely occupies the config path, reported as
         // `ManagedHookState::Conflict`) has no fleet-relevant example left:
-        // `AmpPlugin`/`HermesPlugin` are the only config kinds that ever
-        // produce that state, and no fleet member uses either -- the fleet's
-        // JsonHooks and KimiToml kinds both merge in place instead of
-        // claiming a whole file, so `status_amp`'s `conflict()` call is
-        // unreachable from any declared fleet spec.
+        // `AmpPlugin` is the only config kind that ever produces that state,
+        // and no fleet member uses it -- the fleet's JsonHooks and KimiToml
+        // kinds both merge in place instead of claiming a whole file, so
+        // `status_amp`'s `conflict()` call is unreachable from any declared
+        // fleet spec.
     }
 
-    // The YAML plugin-membership merge shape (`hermes`'s `config.yaml`,
-    // preserving unrelated `enabled`/`disabled` entries across install and
-    // remove) has no fleet-relevant example left: `HermesPlugin` is the
-    // only config kind that ever exercises it, and no fleet member uses
-    // it -- `plan_hermes`'s YAML merge is unreachable from any declared
-    // fleet spec.
-
-    // JSONC comment tolerance in `parse_json_config` is hardcoded to
-    // `spec.target == "devin"`, not a generic JsonHooks property, and no
-    // fleet member gets it -- `devin`'s branch is unreachable from any
-    // declared fleet spec, so only the malformed-JSON-is-rejected half
-    // below (which every JsonHooks target exercises) still applies.
     #[test]
     fn json_hooks_fail_closed_on_malformed_json() {
         let root = TestRoot::new("json-malformed");
@@ -2416,11 +1871,10 @@ mod tests {
 
     #[test]
     fn generated_scripts_keep_provider_specific_safety_contracts() {
-        // `command-code`, `antigravity`, `amp`, and `hermes` are not part of
-        // the current fleet, so their generated-script safety contracts
-        // (curl posting, decision JSON shape, TS plugin body) are no longer
-        // exercised here -- `claude` is the one fleet-relevant example this
-        // test already carried.
+        // The other non-fleet-specific script bodies this test used to also
+        // assert on were removed along with those vendors; `amp`'s TS plugin
+        // body still has no fleet-relevant example -- `claude` is the one
+        // fleet-relevant example this test carries.
         let root = TestRoot::new("script-contracts");
         let manager = root.manager();
         for target in ["claude"] {
@@ -2479,12 +1933,9 @@ mod tests {
                 .unwrap();
         }
         // The `endpoint.cmd`-recovery safety contract asserted here before
-        // was `command-code`-specific (`managed_cmd_script`'s
-        // `endpoint_label`, gated on `target == "command-code"`), and
-        // `command-code` is not part of the current fleet -- unreachable
-        // from any declared fleet spec. `claude`'s own Windows-script
-        // safety contract (skipping Devin's own hook re-entry) remains
-        // fleet-relevant.
+        // was specific to a now-removed non-fleet vendor. `claude`'s own
+        // Windows-script safety contract (skipping Devin's own hook
+        // re-entry) remains fleet-relevant.
         assert!(claude_script.contains("%DEVIN_PROJECT_DIR%"));
         assert!(claude_script.contains("goto :drain"));
         assert!(!claude_script.contains("x-gate4agent-hook-token: 00000000"));

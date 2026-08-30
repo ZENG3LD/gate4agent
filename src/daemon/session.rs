@@ -5,7 +5,7 @@ use crate::core::types::AgentEvent;
 use crate::core::error::AgentError;
 use super::config::DaemonConfig;
 
-/// Session connected to a daemon (OpenCode serve or OpenClaw).
+/// Session connected to a daemon (OpenClaw).
 ///
 /// Parallel to `PipeSession` but for HTTP/WebSocket daemons.
 /// NOT YET FUNCTIONAL — skeleton for future implementation.
@@ -37,7 +37,7 @@ impl DaemonSession {
 
     /// Send a follow-up prompt to the daemon session.
     pub async fn send_prompt(&self, _prompt: &str) -> Result<(), AgentError> {
-        // TODO: POST /session/:id/message (OpenCode) or WS frame (OpenClaw)
+        // TODO: WS frame (OpenClaw)
         Err(AgentError::SpawnFailed(
             "DaemonSession::send_prompt not yet implemented".into(),
         ))

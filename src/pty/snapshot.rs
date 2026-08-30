@@ -254,7 +254,7 @@ pub struct AgentRenderSnapshot {
     pub session_active: bool,
     /// Live in-progress status (spinner text at bottom of chat).
     pub live_status: LiveStatus,
-    /// Active pipe session ID (OpenCode resume token). `None` when no session
+    /// Active pipe session ID (provider resume token). `None` when no session
     /// has been established yet or the instance is in PTY mode.
     pub pipe_session_id: Option<String>,
     /// Context window usage percentage (0.0–100.0), or `None` if unknown.

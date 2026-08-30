@@ -112,7 +112,7 @@ mod tests {
 
     #[test]
     fn accepts_stable_slugs() {
-        assert_eq!(AgentId::new("qwen-code").unwrap().as_str(), "qwen-code");
+        assert_eq!(AgentId::new("third-party-agent").unwrap().as_str(), "third-party-agent");
         assert_eq!(AgentId::new("agent_2").unwrap().as_str(), "agent_2");
     }
 

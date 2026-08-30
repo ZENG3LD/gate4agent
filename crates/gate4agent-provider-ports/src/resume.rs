@@ -29,11 +29,7 @@ impl ResumeRequest {
         if binding.id.as_str() == "pi" {
             return Err(ProviderPortValidationError::MissingResumeTranscriptPath);
         }
-        let key = if binding.id.as_str() == "antigravity" {
-            ProviderSessionKey::ConversationId
-        } else {
-            ProviderSessionKey::SessionId
-        };
+        let key = ProviderSessionKey::SessionId;
         Self::from_parts(
             spec,
             binding,
@@ -349,9 +345,7 @@ mod tests {
     /// A provider with no resume adapter is refused here, before the
     /// authority port is ever consulted.
     ///
-    /// Subject is `qwen-code`, whose missing resume adapter
-    /// `gate4agent-catalog`'s own builtin test pins explicitly. This drove
-    /// the case with `kimi` until kimi GAINED a resume adapter, at which
+    /// `kimi` drove this case until it GAINED a resume adapter, at which
     /// point the negative case had no negative left in it and the
     /// assertion simply failed -- red ever since, without telling anyone
     /// the capability had moved.

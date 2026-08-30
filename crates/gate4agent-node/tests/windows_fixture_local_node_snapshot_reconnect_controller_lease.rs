@@ -268,7 +268,6 @@ async fn windows_production_named_pipe_negotiates_exact_provider_contract_manife
             ("codex", "orca:d8629c41c832436463d5f0b4e4deb95f867fdc42"),
             ("grok", "orca:d8629c41c832436463d5f0b4e4deb95f867fdc42"),
             ("kimi", "orca:d8629c41c832436463d5f0b4e4deb95f867fdc42"),
-            ("qwen-code", "orca:d8629c41c832436463d5f0b4e4deb95f867fdc42"),
         ]
     );
     assert_eq!(

@@ -80,18 +80,6 @@ pub fn history_source_variants(
         requires_auxiliary_index: false,
         requires_readonly_database: false,
     };
-    const JSON: HistorySourceVariant = HistorySourceVariant {
-        layout: HistorySourceLayout::SingleJson,
-        requires_sibling_reads: false,
-        requires_auxiliary_index: false,
-        requires_readonly_database: false,
-    };
-    const JSON_OR_NDJSON: HistorySourceVariant = HistorySourceVariant {
-        layout: HistorySourceLayout::JsonOrNdjson,
-        requires_sibling_reads: false,
-        requires_auxiliary_index: false,
-        requires_readonly_database: false,
-    };
     const CODEX: HistorySourceVariant = HistorySourceVariant {
         layout: HistorySourceLayout::NdjsonWithOptionalIndex,
         requires_sibling_reads: false,
@@ -110,18 +98,6 @@ pub fn history_source_variants(
         requires_auxiliary_index: false,
         requires_readonly_database: false,
     };
-    const OPENCODE_FILES: HistorySourceVariant = HistorySourceVariant {
-        layout: HistorySourceLayout::SessionJsonWithSiblingMessageJson,
-        requires_sibling_reads: true,
-        requires_auxiliary_index: false,
-        requires_readonly_database: false,
-    };
-    const OPENCODE_SQLITE: HistorySourceVariant = HistorySourceVariant {
-        layout: HistorySourceLayout::ReadOnlySqliteProjection,
-        requires_sibling_reads: false,
-        requires_auxiliary_index: false,
-        requires_readonly_database: true,
-    };
     const KIMI: HistorySourceVariant = HistorySourceVariant {
         layout: HistorySourceLayout::StateJsonWithIndexAndSiblingNdjson,
         requires_sibling_reads: true,
@@ -130,14 +106,10 @@ pub fn history_source_variants(
     };
 
     match adapter_id.as_str() {
-        "claude-code" | "copilot" | "cursor" | "openclaw" | "pi" | "omp" | "droid"
-        | "antigravity" | "qwen-code" => Ok(&[NDJSON]),
+        "claude-code" | "cursor" | "openclaw" | "pi" | "omp" => Ok(&[NDJSON]),
         "codex" => Ok(&[CODEX]),
-        "gemini" => Ok(&[JSON_OR_NDJSON]),
-        "hermes" | "devin" => Ok(&[JSON]),
         "grok" => Ok(&[GROK]),
         "rovo" => Ok(&[ROVO]),
-        "opencode" => Ok(&[OPENCODE_FILES, OPENCODE_SQLITE]),
         "kimi" => Ok(&[KIMI]),
         id => Err(HistoryAdapterError::UnsupportedAdapter(id.to_owned())),
     }
@@ -151,18 +123,10 @@ pub fn parse_history(
     match adapter_id.as_str() {
         "claude-code" => parse_claude(document),
         "codex" => parse_codex(document),
-        "gemini" => parse_gemini(document),
-        "antigravity" => parse_antigravity(document),
-        "opencode" => parse_opencode(document),
-        "hermes" => parse_hermes(document),
         "rovo" => parse_rovo(document),
         "openclaw" | "pi" | "omp" => parse_message_graph(document),
-        "devin" => parse_devin(document),
         "grok" => parse_grok(document),
         "kimi" => parse_kimi(document),
-        "qwen-code" => parse_qwen(document),
-        "copilot" => parse_copilot(document),
-        "droid" => parse_droid(document),
         "cursor" => parse_cursor(document),
         id => Err(HistoryAdapterError::UnsupportedAdapter(id.to_owned())),
     }
@@ -352,79 +316,6 @@ fn parse_codex(document: &HistoryDocument) -> Result<HistorySession, HistoryAdap
     Ok(session.finish())
 }
 
-fn parse_gemini(document: &HistoryDocument) -> Result<HistorySession, HistoryAdapterError> {
-    let trimmed = document.transcript.trim();
-    let legacy = serde_json::from_str::<Value>(trimmed)
-        .ok()
-        .and_then(|value| value.as_object().cloned())
-        .filter(|record| record.get("messages").is_some());
-    let mut session = SessionBuilder::new(document.session_id_hint.trim().to_owned());
-    if let Some(record) = legacy {
-        if let Some(id) = string(&record, &["sessionId"]) {
-            session.session_id = select_session_id(Some(id), &session.session_id)?;
-        }
-        if let Some(messages) = record.get("messages").and_then(Value::as_array) {
-            for message in messages {
-                if let Some(message) = message.as_object() {
-                    consume_gemini_message(&mut session, message);
-                }
-            }
-        }
-    } else {
-        for record in ndjson_records(&document.transcript) {
-            if record.get("$set").and_then(Value::as_object).is_some() {
-                continue;
-            }
-            if let Some(id) = string(&record, &["sessionId"]) {
-                session.session_id = select_session_id(Some(id), &session.session_id)?;
-            }
-            consume_gemini_message(&mut session, &record);
-        }
-    }
-    Ok(session.finish())
-}
-
-fn consume_gemini_message(session: &mut SessionBuilder, record: &Map<String, Value>) {
-    match record.get("type").and_then(Value::as_str) {
-        Some("user") => session.push(
-            HistoryRole::User,
-            record.get("content").and_then(content_text),
-        ),
-        Some("gemini") => {
-            session.model = string(record, &["model"]).or(session.model.take());
-            if let Some(tokens) = record.get("tokens") {
-                session.add_total_tokens(token_total(tokens));
-            }
-            session.push(
-                HistoryRole::Assistant,
-                record.get("content").and_then(content_text),
-            );
-        }
-        _ => {}
-    }
-}
-
-fn parse_antigravity(document: &HistoryDocument) -> Result<HistorySession, HistoryAdapterError> {
-    let mut session = SessionBuilder::new(document.session_id_hint.trim().to_owned());
-    for record in ndjson_records(&document.transcript) {
-        let source = string(&record, &["source"]);
-        let kind = string(&record, &["type"]);
-        let content = string(&record, &["content"]);
-        if matches!(source.as_deref(), Some("USER_EXPLICIT" | "USER"))
-            && matches!(kind.as_deref(), Some("USER_INPUT" | "REQUEST"))
-        {
-            session.push(
-                HistoryRole::User,
-                content.and_then(extract_antigravity_user_request),
-            );
-        } else if source.as_deref() == Some("MODEL") && kind.as_deref() == Some("PLANNER_RESPONSE")
-        {
-            session.push(HistoryRole::Assistant, content);
-        }
-    }
-    Ok(session.finish())
-}
-
 fn parse_grok(document: &HistoryDocument) -> Result<HistorySession, HistoryAdapterError> {
     let metadata = metadata_object(document)?;
     let info = metadata.get("info").and_then(Value::as_object);
@@ -532,153 +423,6 @@ fn parse_kimi(document: &HistoryDocument) -> Result<HistorySession, HistoryAdapt
     Ok(session.finish())
 }
 
-fn parse_qwen(document: &HistoryDocument) -> Result<HistorySession, HistoryAdapterError> {
-    let records = qwen_active_records(&document.transcript);
-    let mut session = SessionBuilder::new(document.session_id_hint.trim().to_owned());
-    let mut custom_title = None;
-
-    for record in records {
-        if let Some(id) = string(&record, &["sessionId"]) {
-            session.session_id = select_session_id(Some(id), &session.session_id)?;
-        }
-        session.cwd = string(&record, &["cwd"]).or(session.cwd);
-        match (
-            record.get("type").and_then(Value::as_str),
-            record.get("provenance").and_then(Value::as_str),
-        ) {
-            (Some("user"), Some("real_user"))
-                if matches!(
-                    record.get("subtype").and_then(Value::as_str),
-                    None | Some("mid_turn_user_message")
-                ) =>
-            {
-                let text = qwen_message_text(&record).filter(|text| {
-                    !is_known_harness_injected_user_turn(text)
-                });
-                session.push(HistoryRole::User, text);
-            }
-            (Some("assistant"), Some("assistant_output"))
-                if record.get("subtype").is_none() =>
-            {
-                session.model = string(&record, &["model"]).or(session.model);
-                if let Some(usage) = record.get("usageMetadata") {
-                    session.add_total_tokens(qwen_usage_total(usage));
-                }
-                session.push(HistoryRole::Assistant, qwen_message_text(&record));
-            }
-            (Some("system"), _)
-                if record.get("subtype").and_then(Value::as_str)
-                    == Some("custom_title") =>
-            {
-                custom_title = record
-                    .get("systemPayload")
-                    .and_then(Value::as_object)
-                    .and_then(|payload| string(payload, &["customTitle"]))
-                    .and_then(normalize_title)
-                    .or(custom_title);
-            }
-            _ => {}
-        }
-    }
-    session.title = custom_title.or(session.title);
-    Ok(session.finish())
-}
-
-fn parse_copilot(document: &HistoryDocument) -> Result<HistorySession, HistoryAdapterError> {
-    let mut session = SessionBuilder::new(document.session_id_hint.trim().to_owned());
-    for record in ndjson_records(&document.transcript) {
-        let data = record.get("data").and_then(Value::as_object);
-        match record.get("type").and_then(Value::as_str) {
-            Some("session.start") => {
-                if let Some(id) = data.and_then(|value| string(value, &["sessionId"])) {
-                    session.session_id = select_session_id(Some(id), &session.session_id)?;
-                }
-            }
-            Some("session.model_change") => {
-                session.model = data
-                    .and_then(|value| string(value, &["newModel"]))
-                    .or(session.model);
-            }
-            Some("session.info") => {
-                session.cwd = data
-                    .and_then(|value| {
-                        string(value, &["trustedFolder", "cwd"]).or_else(|| {
-                            string(value, &["message"]).and_then(copilot_trusted_folder)
-                        })
-                    })
-                    .or(session.cwd);
-            }
-            Some("user.message") => session.push(
-                HistoryRole::User,
-                data.and_then(|value| string(value, &["transformedContent", "content"])),
-            ),
-            Some("assistant.message") => session.push(
-                HistoryRole::Assistant,
-                data.and_then(|value| string(value, &["content"])),
-            ),
-            Some("session.shutdown") => {
-                session.model = data
-                    .and_then(|value| string(value, &["currentModel"]))
-                    .or(session.model);
-                if let Some(data) = data {
-                    session.add_total_tokens(u64_value(data, &["currentTokens"]));
-                    if let Some(metrics) = data.get("modelMetrics") {
-                        session.add_total_tokens(copilot_model_metrics_total(metrics));
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(session.finish())
-}
-
-fn parse_droid(document: &HistoryDocument) -> Result<HistorySession, HistoryAdapterError> {
-    let mut session = SessionBuilder::new(document.session_id_hint.trim().to_owned());
-    for record in ndjson_records(&document.transcript) {
-        if let Some(id) = string(&record, &["session_id", "sessionId"]) {
-            session.session_id = select_session_id(Some(id), &session.session_id)?;
-        }
-        match record.get("type").and_then(Value::as_str) {
-            Some("session_start") => {
-                if let Some(id) = string(&record, &["id"]) {
-                    session.session_id = select_session_id(Some(id), &session.session_id)?;
-                }
-                session.title = string(&record, &["title"]).and_then(normalize_title);
-                session.cwd = string(&record, &["cwd"]).or(session.cwd);
-            }
-            Some("system") => {
-                session.cwd = string(&record, &["cwd"]).or(session.cwd);
-                session.model = string(&record, &["model"]).or(session.model);
-            }
-            Some("message") => {
-                let nested = record.get("message").and_then(Value::as_object);
-                let role = role_from_value(
-                    record
-                        .get("role")
-                        .or_else(|| nested.and_then(|message| message.get("role"))),
-                );
-                if let Some(role) = role {
-                    let text = string(&record, &["text"]).or_else(|| {
-                        nested
-                            .and_then(|message| message.get("content"))
-                            .and_then(content_text)
-                    });
-                    session.push(role, text);
-                }
-            }
-            Some("completion") => {
-                session.push(HistoryRole::Assistant, string(&record, &["finalText"]));
-                if let Some(usage) = record.get("usage") {
-                    session.add_total_tokens(token_total(usage));
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(session.finish())
-}
-
 fn parse_cursor(document: &HistoryDocument) -> Result<HistorySession, HistoryAdapterError> {
     let mut session = SessionBuilder::new(document.session_id_hint.trim().to_owned());
     for record in ndjson_records(&document.transcript) {
@@ -696,88 +440,6 @@ fn parse_cursor(document: &HistoryDocument) -> Result<HistorySession, HistoryAda
             .or_else(|| record.get("content"))
             .and_then(content_text);
         session.push(role, text);
-    }
-    Ok(session.finish())
-}
-
-fn parse_opencode(document: &HistoryDocument) -> Result<HistorySession, HistoryAdapterError> {
-    let metadata = metadata_object(document)?;
-    let mut session = SessionBuilder::new(select_session_id(
-        string(&metadata, &["id"]),
-        &document.session_id_hint,
-    )?);
-    session.title = string(&metadata, &["title"]).and_then(normalize_title);
-    session.cwd = string(&metadata, &["directory"]);
-    session.model = opencode_model(&metadata);
-    session.replace_total_tokens(sum_named_numbers(
-        &metadata,
-        &[
-            "tokens_input",
-            "tokens_output",
-            "tokens_reasoning",
-            "tokens_cache_read",
-        ],
-    ));
-    let declared_count = u64_value(&metadata, &["message_count"]);
-
-    for record in ndjson_records(&document.transcript) {
-        let Some(role) = role_from_value(record.get("role")) else {
-            continue;
-        };
-        if role == HistoryRole::User && session.title.is_none() {
-            session.title = string(&record, &["summary_title", "summary_body"])
-                .or_else(|| {
-                    record
-                        .get("summary")
-                        .and_then(Value::as_object)
-                        .and_then(|summary| string(summary, &["title", "body"]))
-                })
-                .and_then(normalize_title);
-        }
-        let text = record
-            .get("part_data")
-            .and_then(Value::as_str)
-            .and_then(json_string_field_text)
-            .or_else(|| record.get("content").and_then(content_text))
-            .or_else(|| {
-                record
-                    .get("summary")
-                    .and_then(Value::as_object)
-                    .and_then(|summary| string(summary, &["body", "title"]))
-            });
-        session.push(role, text);
-        session.model = opencode_model(&record).or(session.model);
-        if let Some(tokens) = record.get("tokens") {
-            session.add_total_tokens(token_total(tokens));
-        }
-    }
-    if let Some(declared_count) = declared_count {
-        session.message_count = session.message_count.max(declared_count);
-    }
-    Ok(session.finish())
-}
-
-fn parse_hermes(document: &HistoryDocument) -> Result<HistorySession, HistoryAdapterError> {
-    let record = transcript_object(document, false)?;
-    let mut session = SessionBuilder::new(select_session_id(
-        string(&record, &["session_id"]),
-        &document.session_id_hint,
-    )?);
-    session.model = string(&record, &["model"]);
-    session.cwd = string(&record, &["cwd"]);
-    if let Some(messages) = record.get("messages").and_then(Value::as_array) {
-        for message in messages {
-            let Some(message) = message.as_object() else {
-                continue;
-            };
-            let Some(role) = role_from_value(message.get("role")) else {
-                continue;
-            };
-            session.push(role, message.get("content").and_then(content_text));
-        }
-    }
-    if session.message_count == 0 {
-        session.message_count = u64_value(&record, &["message_count"]).unwrap_or(0);
     }
     Ok(session.finish())
 }
@@ -868,60 +530,6 @@ fn parse_message_graph(document: &HistoryDocument) -> Result<HistorySession, His
     Ok(session.finish())
 }
 
-fn parse_devin(document: &HistoryDocument) -> Result<HistorySession, HistoryAdapterError> {
-    let record = transcript_object(document, false)?;
-    let mut session = SessionBuilder::new(select_session_id(
-        string(&record, &["session_id", "sessionId"]),
-        &document.session_id_hint,
-    )?);
-    let agent = record.get("agent").and_then(Value::as_object);
-    session.model = agent
-        .and_then(|agent| string(agent, &["model_name", "model"]))
-        .or_else(|| string(&record, &["generation_model"]));
-    session.cwd = string(&record, &["working_directory"]);
-    if let Some(steps) = record.get("steps").and_then(Value::as_array) {
-        for step in steps {
-            let Some(step) = step.as_object() else {
-                continue;
-            };
-            let metadata = step.get("metadata").and_then(Value::as_object);
-            let metrics = metadata
-                .and_then(|metadata| metadata.get("metrics"))
-                .and_then(Value::as_object);
-            session.model = metadata
-                .and_then(|metadata| string(metadata, &["generation_model"]))
-                .or_else(|| metrics.and_then(|metrics| string(metrics, &["generation_model"])))
-                .or(session.model);
-            session.add_total_tokens(devin_step_token_total(metadata, metrics));
-            let is_user = metadata
-                .and_then(|metadata| metadata.get("is_user_input"))
-                .and_then(Value::as_bool)
-                == Some(true);
-            let is_assistant = string(step, &["role"]).as_deref() == Some("assistant")
-                || step.get("tool_calls").is_some();
-            let role = if is_user {
-                Some(HistoryRole::User)
-            } else if is_assistant {
-                Some(HistoryRole::Assistant)
-            } else {
-                None
-            };
-            let Some(role) = role else {
-                continue;
-            };
-            let text = step
-                .get("message")
-                .and_then(Value::as_object)
-                .and_then(|message| message.get("content"))
-                .and_then(content_text)
-                .or_else(|| string(step, &["text"]))
-                .or_else(|| step.get("content").and_then(content_text));
-            session.push(role, text);
-        }
-    }
-    Ok(session.finish())
-}
-
 struct SessionBuilder {
     session_id: String,
     title: Option<String>,
@@ -953,12 +561,6 @@ impl SessionBuilder {
         let Some(total) = observed else { return; };
         self.total_tokens_observed = true;
         self.total_tokens = self.total_tokens.saturating_add(total);
-    }
-
-    fn replace_total_tokens(&mut self, observed: Option<u64>) {
-        let Some(total) = observed else { return; };
-        self.total_tokens_observed = true;
-        self.total_tokens = total;
     }
 
     fn push(&mut self, role: HistoryRole, text: Option<String>) {
@@ -1141,32 +743,6 @@ fn claude_completed_turn_message_id(
     has_visible_text.then(|| message_id.to_owned())
 }
 
-fn copilot_trusted_folder(message: String) -> Option<String> {
-    message
-        .strip_prefix("Folder ")
-        .and_then(|value| value.strip_suffix(" has been added to trusted folders."))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-}
-
-fn copilot_model_metrics_total(value: &Value) -> Option<u64> {
-    let mut observed = false;
-    let total = value
-        .as_object()
-        .into_iter()
-        .flat_map(|metrics| metrics.values())
-        .filter_map(Value::as_object)
-        .filter_map(|metric| metric.get("usage"))
-        .filter_map(|usage| {
-            let total = token_total(usage);
-            observed |= total.is_some();
-            total
-        })
-        .fold(0, u64::saturating_add);
-    observed.then_some(total)
-}
-
 #[derive(Clone, Copy, Debug, Default)]
 struct CodexUsage {
     input_tokens: u64,
@@ -1271,20 +847,6 @@ fn is_known_harness_injected_user_turn(text: &str) -> bool {
         .any(|prefix| normalized.starts_with(prefix))
 }
 
-fn extract_antigravity_user_request(content: String) -> Option<String> {
-    const OPEN: &str = "<USER_REQUEST>";
-    const CLOSE: &str = "</USER_REQUEST>";
-    let Some(start) = content.find(OPEN) else {
-        return normalize_message(content);
-    };
-    let body_start = start + OPEN.len();
-    let body_end = content[body_start..]
-        .find(CLOSE)
-        .map(|offset| body_start + offset)
-        .unwrap_or(content.len());
-    normalize_message(content[body_start..body_end].to_owned())
-}
-
 fn token_total(value: &Value) -> Option<u64> {
     let Some(usage) = value.as_object() else {
         return None;
@@ -1318,30 +880,6 @@ fn token_total(value: &Value) -> Option<u64> {
     )
 }
 
-fn opencode_model(record: &Map<String, Value>) -> Option<String> {
-    if let Some(model) = record.get("model").and_then(Value::as_object) {
-        return string(model, &["id", "modelID"]);
-    }
-    if let Some(model_json) = string(record, &["model_json"]) {
-        if let Some(model) = serde_json::from_str::<Value>(&model_json)
-            .ok()
-            .and_then(|value| value.as_object().cloned())
-            .and_then(|model| string(&model, &["id", "modelID"]))
-        {
-            return Some(model);
-        }
-    }
-    string(record, &["modelID"])
-}
-
-fn json_string_field_text(value: &str) -> Option<String> {
-    serde_json::from_str::<Value>(value)
-        .ok()
-        .and_then(|value| value.as_object().cloned())
-        .and_then(|record| string(&record, &["text"]))
-        .and_then(normalize_message)
-}
-
 fn rovo_parts_text(value: Option<&Value>, role: HistoryRole) -> Option<String> {
     let parts = value.and_then(Value::as_array)?;
     let mut text = Vec::new();
@@ -1363,30 +901,6 @@ fn rovo_parts_text(value: Option<&Value>, role: HistoryRole) -> Option<String> {
     normalize_message(text.join(" "))
 }
 
-fn devin_step_token_total(
-    metadata: Option<&Map<String, Value>>,
-    metrics: Option<&Map<String, Value>>,
-) -> Option<u64> {
-    let mut observed = false;
-    let total = [
-        &["total_input_tokens", "input_tokens"][..],
-        &["output_tokens"][..],
-        &["cache_read_tokens", "cache_read_input_tokens"][..],
-        &["cache_creation_tokens", "cache_creation_input_tokens"][..],
-    ]
-    .iter()
-    .map(|keys| {
-        [metadata, metrics]
-            .into_iter()
-            .flatten()
-            .find_map(|source| u64_value(source, keys))
-            .inspect(|_| observed = true)
-            .unwrap_or(0)
-    })
-    .fold(0, u64::saturating_add);
-    observed.then_some(total)
-}
-
 fn grok_content_text(value: &Value) -> Option<String> {
     let text = content_text(value)?;
     let lower = text.to_ascii_lowercase();
@@ -1399,70 +913,6 @@ fn grok_content_text(value: &Value) -> Option<String> {
         return Some(text);
     };
     normalize_message(text[start..end].to_owned()).or(Some(text))
-}
-
-fn qwen_active_records(content: &str) -> Vec<Map<String, Value>> {
-    let records = ndjson_records(content).collect::<Vec<_>>();
-    let by_uuid = records
-        .iter()
-        .enumerate()
-        .filter_map(|(index, record)| {
-            string(record, &["uuid"]).map(|uuid| (uuid, index))
-        })
-        .collect::<std::collections::HashMap<_, _>>();
-    let Some(mut current) = records
-        .iter()
-        .rev()
-        .find_map(|record| string(record, &["uuid"]))
-    else {
-        return Vec::new();
-    };
-    let mut active = std::collections::HashSet::new();
-    while let Some(index) = by_uuid.get(&current).copied() {
-        if !active.insert(index) {
-            break;
-        }
-        let Some(parent) = records[index]
-            .get("parentUuid")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|parent| !parent.is_empty())
-        else {
-            break;
-        };
-        current = parent.to_owned();
-    }
-    records
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, record)| active.contains(&index).then_some(record))
-        .collect()
-}
-
-fn qwen_message_text(record: &Map<String, Value>) -> Option<String> {
-    let parts = record
-        .get("message")
-        .and_then(Value::as_object)?
-        .get("parts")
-        .and_then(Value::as_array)?;
-    let text = parts
-        .iter()
-        .filter_map(Value::as_object)
-        .filter(|part| part.get("thought").and_then(Value::as_bool) != Some(true))
-        .filter_map(|part| part.get("text").and_then(Value::as_str))
-        .collect::<Vec<_>>()
-        .join(" ");
-    normalize_message(text)
-}
-
-fn qwen_usage_total(value: &Value) -> Option<u64> {
-    let Some(usage) = value.as_object() else {
-        return None;
-    };
-    u64_value(usage, &["totalTokenCount"])
-        .or_else(|| {
-            sum_named_numbers(usage, &["promptTokenCount", "candidatesTokenCount"])
-        })
 }
 
 fn content_text(value: &Value) -> Option<String> {
@@ -1840,59 +1290,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_gemini_json_and_jsonl_session_formats() {
-        let legacy = parse_history(
-            &id("gemini"),
-            &HistoryDocument {
-                session_id_hint: "fallback".to_owned(),
-                metadata_json: None,
-                transcript: r#"{"sessionId":"gemini-json","messages":[{"type":"user","content":"question"},{"type":"gemini","content":"answer","model":"gemini-3","tokens":{"input":2,"output":3}}]}"#.to_owned(),
-            },
-        )
-        .unwrap();
-        assert_eq!(legacy.session_id, "gemini-json");
-        assert_eq!(legacy.total_tokens, 5);
-
-        let jsonl = parse_history(
-            &id("gemini"),
-            &HistoryDocument {
-                session_id_hint: "fallback".to_owned(),
-                metadata_json: None,
-                transcript: [
-                    r#"{"sessionId":"gemini-jsonl","type":"user","content":"question"}"#,
-                    r#"{"type":"gemini","content":"answer","model":"gemini-3","tokens":{"totalTokens":7}}"#,
-                ]
-                .join("\n"),
-            },
-        )
-        .unwrap();
-        assert_eq!(jsonl.session_id, "gemini-jsonl");
-        assert_eq!(jsonl.message_count, 2);
-        assert_eq!(jsonl.total_tokens, 7);
-    }
-
-    #[test]
-    fn parses_antigravity_user_envelopes_and_planner_responses() {
-        let session = parse_history(
-            &id("antigravity"),
-            &HistoryDocument {
-                session_id_hint: "conversation-1".to_owned(),
-                metadata_json: None,
-                transcript: [
-                    r#"{"source":"USER_EXPLICIT","type":"USER_INPUT","content":"prefix<USER_REQUEST>ship it</USER_REQUEST>suffix"}"#,
-                    r#"{"source":"MODEL","type":"PLANNER_RESPONSE","content":"done"}"#,
-                    r#"{"source":"MODEL","type":"TOOL_RESPONSE","content":"hidden"}"#,
-                ]
-                .join("\n"),
-            },
-        )
-        .unwrap();
-        assert_eq!(session.title.as_deref(), Some("ship it"));
-        assert_eq!(session.message_count, 2);
-        assert_eq!(session.messages[1].text, "done");
-    }
-
-    #[test]
     fn parses_kimi_wire_chunks_and_excludes_injections() {
         let transcript = [
             r#"{"type":"config.update","modelAlias":"kimi-k2"}"#,
@@ -1918,136 +1315,24 @@ mod tests {
     }
 
     #[test]
-    fn parses_qwen_active_real_user_and_assistant_output_chain() {
-        let transcript = [
-            r#"{"uuid":"u1","parentUuid":null,"sessionId":"11111111-1111-4111-8111-111111111111","timestamp":"2026-08-10T00:00:00Z","type":"user","provenance":"real_user","cwd":"C:/repo","version":"0.21.6","gitBranch":"main","message":{"role":"user","parts":[{"text":"ship the adapter"}]}}"#,
-            r#"{"uuid":"ignored-user","parentUuid":"u1","sessionId":"11111111-1111-4111-8111-111111111111","type":"user","provenance":"system","cwd":"C:/repo","message":{"role":"user","parts":[{"text":"internal notification"}]}}"#,
-            r#"{"uuid":"notification","parentUuid":"ignored-user","sessionId":"11111111-1111-4111-8111-111111111111","type":"user","subtype":"notification","provenance":"system","cwd":"C:/repo","message":{"role":"user","parts":[{"text":"background"}]}}"#,
-            r#"{"uuid":"a1","parentUuid":"notification","sessionId":"11111111-1111-4111-8111-111111111111","type":"assistant","provenance":"assistant_output","cwd":"C:/repo","model":"qwen3-coder","usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":4,"totalTokenCount":7},"message":{"role":"model","parts":[{"text":"private chain of thought","thought":true},{"text":"adapter ready"},{"functionCall":{"name":"hidden_tool"}}]}}"#,
-            r#"{"uuid":"stale","parentUuid":"u1","sessionId":"11111111-1111-4111-8111-111111111111","type":"user","provenance":"real_user","cwd":"C:/repo","message":{"role":"user","parts":[{"text":"stale branch"}]}}"#,
-            r#"{"uuid":"injected","parentUuid":"a1","sessionId":"11111111-1111-4111-8111-111111111111","type":"user","provenance":"real_user","cwd":"C:/repo","message":{"role":"user","parts":[{"text":"<teammate-message>hidden harness</teammate-message>"}]}}"#,
-            r#"{"uuid":"title","parentUuid":"injected","sessionId":"11111111-1111-4111-8111-111111111111","type":"system","subtype":"custom_title","cwd":"C:/repo","version":"0.21.6","systemPayload":{"customTitle":"Qwen context pack","titleSource":"manual"}}"#,
-        ]
-        .join("\n");
+    fn parses_cursor_ndjson_shape() {
         let session = parse_history(
-            &id("qwen-code"),
+            &id("cursor"),
             &HistoryDocument {
-                session_id_hint: "fallback".to_owned(),
+                session_id_hint: "hint".to_owned(),
                 metadata_json: None,
-                transcript,
-            },
-        )
-        .unwrap();
-
-        assert_eq!(session.session_id, "11111111-1111-4111-8111-111111111111");
-        assert_eq!(session.title.as_deref(), Some("Qwen context pack"));
-        assert_eq!(session.cwd.as_deref(), Some("C:/repo"));
-        assert_eq!(session.model.as_deref(), Some("qwen3-coder"));
-        assert_eq!(session.total_tokens, 7);
-        assert_eq!(session.message_count, 3);
-        assert_eq!(session.messages.len(), 2);
-        assert_eq!(session.messages[0].text, "ship the adapter");
-        assert_eq!(session.messages[1].text, "adapter ready");
-        assert!(!session.messages.iter().any(|message| {
-            message.text.contains("private chain of thought")
-        }));
-    }
-
-    #[test]
-    fn parses_copilot_droid_and_cursor_ndjson_shapes() {
-        let fixtures = [
-            (
-                "copilot",
-                concat!(
-                    r#"{"type":"session.start","data":{"sessionId":"c1"}}"#,
-                    "\n",
-                    r#"{"type":"user.message","data":{"content":"question"}}"#,
-                    "\n",
-                    r#"{"type":"assistant.message","data":{"content":"answer"}}"#
-                ),
-                "c1",
-            ),
-            (
-                "droid",
-                concat!(
-                    r#"{"type":"session_start","id":"d1","cwd":"/repo"}"#,
-                    "\n",
-                    r#"{"type":"message","role":"user","text":"question"}"#,
-                    "\n",
-                    r#"{"type":"completion","finalText":"answer","usage":{"input":1,"output":2}}"#
-                ),
-                "d1",
-            ),
-            (
-                "cursor",
-                concat!(
+                transcript: concat!(
                     r#"{"role":"user","message":{"content":"question"}}"#,
                     "\n",
                     r#"{"role":"assistant","content":"answer"}"#
-                ),
-                "hint",
-            ),
-        ];
-        for (adapter, transcript, expected_id) in fixtures {
-            let session = parse_history(
-                &id(adapter),
-                &HistoryDocument {
-                    session_id_hint: "hint".to_owned(),
-                    metadata_json: None,
-                    transcript: transcript.to_owned(),
-                },
-            )
-            .unwrap();
-            assert_eq!(session.session_id, expected_id);
-            assert_eq!(session.message_count, 2);
-            assert_eq!(session.title.as_deref(), Some("question"));
-        }
-    }
-
-    #[test]
-    fn copilot_history_extracts_trusted_folder_and_only_usage_metrics() {
-        let session = parse_history(
-            &id("copilot"),
-            &HistoryDocument {
-                session_id_hint: "copilot-1".to_owned(),
-                metadata_json: None,
-                transcript: [
-                    r#"{"type":"session.info","data":{"message":"Folder /repo has been added to trusted folders."}}"#,
-                    r#"{"type":"session.shutdown","data":{"currentTokens":5,"modelMetrics":{"model-a":{"usage":{"total":7},"latency":999},"unrelated":42}}}"#,
-                ]
-                .join("\n"),
+                )
+                .to_owned(),
             },
         )
         .unwrap();
-        assert_eq!(session.cwd.as_deref(), Some("/repo"));
-        assert_eq!(session.total_tokens, 12);
-    }
-
-    #[test]
-    fn parses_opencode_legacy_and_sqlite_authority_shapes() {
-        let session = parse_history(
-            &id("opencode"),
-            &HistoryDocument {
-                session_id_hint: "fallback".to_owned(),
-                metadata_json: Some(
-                    r#"{"id":"ses_1","title":"OpenCode title","directory":"/repo","model_json":"{\"id\":\"glm-5.2\"}","tokens_input":5,"tokens_output":3,"tokens_reasoning":2,"message_count":3}"#
-                        .to_owned(),
-                ),
-                transcript: [
-                    r#"{"role":"user","part_data":"{\"type\":\"text\",\"text\":\"Plan the work\"}","summary_title":"fallback title"}"#,
-                    r#"{"role":"assistant","content":[{"type":"text","text":"Done"}],"tokens":{"input":1,"output":2}}"#,
-                ]
-                .join("\n"),
-            },
-        )
-        .unwrap();
-        assert_eq!(session.session_id, "ses_1");
-        assert_eq!(session.title.as_deref(), Some("OpenCode title"));
-        assert_eq!(session.cwd.as_deref(), Some("/repo"));
-        assert_eq!(session.model.as_deref(), Some("glm-5.2"));
-        assert_eq!(session.message_count, 3);
-        assert_eq!(session.total_tokens, 13);
-        assert_eq!(session.messages.len(), 2);
+        assert_eq!(session.session_id, "hint");
+        assert_eq!(session.message_count, 2);
+        assert_eq!(session.title.as_deref(), Some("question"));
     }
 
     #[test]
@@ -2078,19 +1363,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_hermes_rovo_and_devin_object_contracts() {
-        let hermes = parse_history(
-            &id("hermes"),
-            &HistoryDocument {
-                session_id_hint: "fallback".to_owned(),
-                metadata_json: None,
-                transcript: r#"{"session_id":"hermes-1","model":"qwen","cwd":"/repo","messages":[{"role":"user","content":"question"},{"role":"assistant","content":"answer"}]}"#.to_owned(),
-            },
-        )
-        .unwrap();
-        assert_eq!(hermes.session_id, "hermes-1");
-        assert_eq!(hermes.message_count, 2);
-
+    fn parses_rovo_object_contract() {
         let rovo = parse_history(
             &id("rovo"),
             &HistoryDocument {
@@ -2106,20 +1379,6 @@ mod tests {
         assert_eq!(rovo.title.as_deref(), Some("Rovo task"));
         assert_eq!(rovo.message_count, 2);
         assert_eq!(rovo.messages[1].text, "answer");
-
-        let devin = parse_history(
-            &id("devin"),
-            &HistoryDocument {
-                session_id_hint: "fallback".to_owned(),
-                metadata_json: None,
-                transcript: r#"{"session_id":"devin-1","working_directory":"/repo","agent":{"model_name":"sonnet"},"steps":[{"metadata":{"is_user_input":true,"total_input_tokens":2},"message":{"content":"question"}},{"role":"assistant","metadata":{"metrics":{"output_tokens":3,"cache_read_tokens":4}},"content":"answer"}]}"#.to_owned(),
-            },
-        )
-        .unwrap();
-        assert_eq!(devin.session_id, "devin-1");
-        assert_eq!(devin.model.as_deref(), Some("sonnet"));
-        assert_eq!(devin.total_tokens, 9);
-        assert_eq!(devin.message_count, 2);
     }
 
     #[test]
@@ -2239,14 +1498,10 @@ mod tests {
 
     #[test]
     fn source_contracts_keep_related_reads_in_the_effect_owning_shell() {
-        let opencode = history_source_variants(&id("opencode")).unwrap();
-        assert_eq!(opencode.len(), 2);
-        assert!(opencode.iter().any(|variant| {
-            variant.layout == HistorySourceLayout::ReadOnlySqliteProjection
-                && variant.requires_readonly_database
-        }));
-        assert!(opencode.iter().any(|variant| {
-            variant.layout == HistorySourceLayout::SessionJsonWithSiblingMessageJson
+        let rovo = history_source_variants(&id("rovo")).unwrap();
+        assert_eq!(rovo.len(), 1);
+        assert!(rovo.iter().any(|variant| {
+            variant.layout == HistorySourceLayout::MetadataJsonWithSiblingJson
                 && variant.requires_sibling_reads
         }));
 

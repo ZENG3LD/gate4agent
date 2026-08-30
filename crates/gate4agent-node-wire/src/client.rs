@@ -4001,20 +4001,20 @@ mod tests {
         for provider in [agent("claude"), agent("codex"), agent("kimi")] {
             assert!(ensure_outbound_provider_id_capability(&provider, false).is_ok());
         }
-        let error = ensure_outbound_provider_id_capability(&agent("qwen"), false)
+        let error = ensure_outbound_provider_id_capability(&agent("third-party-agent"), false)
             .unwrap_err();
         assert!(matches!(
             error,
             NodeClientError::UnsupportedCapability(capability)
                 if capability == NODE_PROVIDER_ID_OPEN_CAPABILITY
         ));
-        assert!(ensure_outbound_provider_id_capability(&agent("qwen"), true).is_ok());
+        assert!(ensure_outbound_provider_id_capability(&agent("third-party-agent"), true).is_ok());
     }
 
     #[test]
     fn inbound_open_provider_payloads_require_the_authenticated_capability() {
         let mut snapshot = empty_snapshot();
-        snapshot.enabled_providers.push(agent("qwen"));
+        snapshot.enabled_providers.push(agent("third-party-agent"));
         assert!(ensure_node_hello_provider_capability(
             &hello_with_snapshot(snapshot.clone()),
             false,
@@ -4038,7 +4038,7 @@ mod tests {
         .is_err());
 
         let mut record = session_record_with_path(utf8_path());
-        record.provider = agent("qwen");
+        record.provider = agent("third-party-agent");
         let reply = response_frame(NodeResponse::SessionRecordUpdated {
             record: record.clone(),
         });
@@ -4051,7 +4051,7 @@ mod tests {
         assert!(ensure_server_frame_provider_capability(&event, true).is_ok());
 
         let mut open_workspace = workspace_with_path(utf8_path());
-        open_workspace.sessions.push(session_snapshot("qwen-code"));
+        open_workspace.sessions.push(session_snapshot("third-party-agent"));
         let mut nested_snapshot = empty_snapshot();
         nested_snapshot.workspaces.push(open_workspace.clone());
         let nested_frames = [
@@ -4083,7 +4083,7 @@ mod tests {
         assert!(ensure_server_frame_provider_capability(&legacy_frame, false).is_ok());
 
         let mut context = context_pack_receipt();
-        context.lineage.source_provider = agent("qwen");
+        context.lineage.source_provider = agent("third-party-agent");
         let context_frame = response_frame(NodeResponse::ContextPackExported { context });
         assert!(ensure_server_frame_provider_capability(&context_frame, false).is_err());
         assert!(ensure_server_frame_provider_capability(&context_frame, true).is_ok());
@@ -4097,8 +4097,8 @@ mod tests {
         offer.capabilities.push(manifest_capability.clone());
         selected.capabilities.push(manifest_capability);
         selected.provider_contracts.push(ProviderContractSupport {
-            provider: agent("qwen"),
-            revision: ProviderContractRevision::new("qwen.2026-08").unwrap(),
+            provider: agent("third-party-agent"),
+            revision: ProviderContractRevision::new("third-party.2026-08").unwrap(),
         });
         assert!(matches!(
             validate_selected_compatibility(&offer, &selected),

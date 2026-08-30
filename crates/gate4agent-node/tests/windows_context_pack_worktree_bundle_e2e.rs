@@ -354,55 +354,6 @@ fn context_history_fixtures(root: &Path, private_cwd: &str) -> NativeHistoryConf
         ],
     );
 
-    let qwen_projects = root.join("qwen").join("projects");
-    let qwen_session_id = "11111111-1111-4111-8111-111111111111";
-    write_json_lines(
-        &qwen_projects
-            .join("c--fixture")
-            .join("chats")
-            .join(format!("{qwen_session_id}.jsonl")),
-        &[
-            json!({
-                "uuid": "u1",
-                "parentUuid": null,
-                "sessionId": qwen_session_id,
-                "timestamp": "2026-08-10T00:00:00Z",
-                "type": "user",
-                "provenance": "real_user",
-                "cwd": private_cwd,
-                "message": { "role": "user", "parts": [{ "text": CONTEXT_USER }] },
-            }),
-            json!({
-                "uuid": "a1",
-                "parentUuid": "u1",
-                "sessionId": qwen_session_id,
-                "type": "assistant",
-                "provenance": "assistant_output",
-                "cwd": private_cwd,
-                "model": "qwen-fixture",
-                "message": {
-                    "role": "model",
-                    "parts": [
-                        { "text": "private qwen thought", "thought": true },
-                        { "text": CONTEXT_ASSISTANT },
-                    ],
-                },
-            }),
-            json!({
-                "uuid": "title",
-                "parentUuid": "a1",
-                "sessionId": qwen_session_id,
-                "type": "system",
-                "subtype": "custom_title",
-                "cwd": private_cwd,
-                "systemPayload": {
-                    "customTitle": "Qwen fixture",
-                    "titleSource": "manual",
-                },
-            }),
-        ],
-    );
-
     NativeHistoryConfig::new(vec![
         NativeHistoryRoot::new(
             adapter("claude-code"),
@@ -426,12 +377,6 @@ fn context_history_fixtures(root: &Path, private_cwd: &str) -> NativeHistoryConf
             adapter("grok"),
             HistorySourceLayout::SummaryJsonWithSiblingNdjson,
             grok_sessions,
-        )
-        .unwrap(),
-        NativeHistoryRoot::new(
-            adapter("qwen-code"),
-            HistorySourceLayout::SingleNdjson,
-            qwen_projects,
         )
         .unwrap(),
     ])
@@ -709,7 +654,7 @@ fn simple_node_config(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn windows_public_node_history_context_pack_matrix_is_bounded_for_all_five_providers() {
+async fn windows_public_node_history_context_pack_matrix_is_bounded_for_the_fleet() {
     gate4agent_testkit::suppress_windows_fault_dialogs_for_test();
     gate4agent_testkit::require_windows_headless_supervisor_for_test();
     let root = fixture_root("matrix");
@@ -748,13 +693,6 @@ async fn windows_public_node_history_context_pack_matrix_is_bounded_for_all_five
             "grok-source",
             "grok fixture question",
             "grok fixture answer",
-        ),
-        (
-            "qwen-code",
-            "11111111-1111-4111-8111-111111111111",
-            "11111111-1111-4111-8111-111111111111",
-            CONTEXT_USER,
-            CONTEXT_ASSISTANT,
         ),
     ];
 
@@ -811,12 +749,7 @@ async fn windows_public_node_history_context_pack_matrix_is_bounded_for_all_five
             .await
             .unwrap();
         let source = spawn_source(&mut client, &workspace_id, provider).await;
-        let forbidden = [
-            private_cwd.as_str(),
-            provider_question,
-            provider_answer,
-            "private qwen thought",
-        ];
+        let forbidden = [private_cwd.as_str(), provider_question, provider_answer];
         let context = discover_load_export(
             &mut client,
             &source,
@@ -1063,14 +996,14 @@ async fn windows_public_node_transfers_codex_context_into_managed_worktree_with_
         .request(NodeRequest::AcquireController { lease_ms: 60_000 })
         .await
         .unwrap();
-    let source = spawn_source(&mut client, &workspace_id, "qwen-code").await;
+    let source = spawn_source(&mut client, &workspace_id, "codex").await;
     let private_history = [private_cwd.as_str(), CONTEXT_USER, CONTEXT_ASSISTANT];
     let context = discover_load_export(
         &mut client,
         &source,
-        "11111111-1111-4111-8111-111111111111",
-        "11111111-1111-4111-8111-111111111111",
-        "qwen-code",
+        "rollout-codex-source",
+        "codex-source",
+        "codex",
         &private_history,
     )
     .await;
@@ -1165,10 +1098,9 @@ async fn windows_public_node_transfers_codex_context_into_managed_worktree_with_
     );
     let context_bytes = std::fs::read(&context_path).unwrap();
     assert_eq!(context_bytes.len(), context.byte_len as usize);
-    assert!(!String::from_utf8_lossy(&context_bytes).contains("private qwen thought"));
     let document: Value = serde_json::from_slice(&context_bytes).unwrap();
     assert_eq!(document["schema"], CONTEXT_SCHEMA);
-    assert_eq!(document["source_provider"], "qwen-code");
+    assert_eq!(document["source_provider"], "codex");
     assert!(document.get("cwd").is_none());
     assert_eq!(document["retained_messages"][0]["text"], CONTEXT_USER);
     assert_eq!(
@@ -1222,7 +1154,7 @@ async fn windows_public_node_transfers_codex_context_into_managed_worktree_with_
     );
     assert_eq!(proof[5], sha256_hex(&context_bytes));
     assert_eq!(proof[6], CONTEXT_SCHEMA);
-    assert_eq!(proof[7], "qwen-code");
+    assert_eq!(proof[7], "codex");
     assert_eq!(proof[8], "2");
     assert_eq!(proof[9], CONTEXT_USER);
     assert_eq!(proof[10], CONTEXT_ASSISTANT);

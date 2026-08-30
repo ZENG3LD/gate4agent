@@ -4480,12 +4480,12 @@ mod tests {
             NodeIncarnationId::from_bytes([11; 16]),
         );
         let inventory = status.nodes.values_mut().next().unwrap().inventory.as_mut().unwrap();
-        inventory.enabled_providers = ["claude", "codex", "kimi", "qwen-code"]
+        inventory.enabled_providers = ["claude", "codex", "kimi", "third-party-agent"]
             .into_iter()
             .map(|provider| AgentId::new(provider).unwrap())
             .collect();
         inventory.provider_runtime_statuses = crate::protocol::ProviderRuntimeStatuses::new(
-            ["claude", "codex", "kimi", "qwen-code"].into_iter().map(|provider| {
+            ["claude", "codex", "kimi", "third-party-agent"].into_iter().map(|provider| {
                 crate::protocol::ProviderRuntimeStatus::raw_passthrough(
                     AgentId::new(provider).unwrap(),
                     None,
@@ -4493,20 +4493,20 @@ mod tests {
             }),
         ).unwrap();
         inventory.provider_contracts.push(ProviderContractSupport {
-            provider: AgentId::new("qwen-code").unwrap(),
+            provider: AgentId::new("third-party-agent").unwrap(),
             revision: ProviderContractRevision::new("open-contract").unwrap(),
         });
         inventory.provider_adapter_contracts.push(ProviderAdapterContractSupport {
-            provider: AgentId::new("qwen-code").unwrap(),
+            provider: AgentId::new("third-party-agent").unwrap(),
             family: AdapterFamily::PtySemantic,
-            adapter_id: AdapterId::new("qwen-code").unwrap(),
+            adapter_id: AdapterId::new("third-party-agent").unwrap(),
             revision: AdapterContractRevision::new("open-adapter-contract").unwrap(),
         });
         inventory.managed_sessions = vec![
             managed_record("claude-record", "claude", None),
             managed_record("codex-record", "codex", None),
             managed_record("kimi-record", "kimi", None),
-            managed_record("qwen-record", "qwen-code", None),
+            managed_record("third-party-record", "third-party-agent", None),
         ];
         inventory.managed_session_count = inventory.managed_sessions.len();
 
@@ -4531,7 +4531,7 @@ mod tests {
         );
         let json = serde_json::to_string(inventory).unwrap();
         assert!(json.contains(r#""enabled_providers":["claude","codex","kimi"]"#));
-        assert!(!json.contains("qwen-code"));
+        assert!(!json.contains("third-party-agent"));
     }
 
     #[test]
@@ -4545,7 +4545,7 @@ mod tests {
             workspaces: vec![C2WorkspaceSnapshot {
                 workspace_id: WorkspaceId::new("repo").unwrap(),
                 canonical_root: OpaqueHostPath::utf8(r"C:\repo".to_owned()).unwrap(),
-                sessions: vec![c2_session("codex", 1), c2_session("qwen-code", 2)],
+                sessions: vec![c2_session("codex", 1), c2_session("third-party-agent", 2)],
                 worktree_service_mode: None,
                 managed_worktree_profiles: None,
             }],
@@ -4666,7 +4666,7 @@ mod tests {
         let inventory = status.nodes.values_mut().next().unwrap().inventory.as_mut().unwrap();
         inventory.managed_sessions = vec![
             managed_record("legacy-record", "codex", Some(address(1))),
-            managed_record("open-record", "qwen-code", Some(address(2))),
+            managed_record("open-record", "third-party-agent", Some(address(2))),
         ];
         inventory.managed_session_count = inventory.managed_sessions.len();
         let routed = |request| crate::protocol::RoutedNodeRequest {
@@ -4713,7 +4713,7 @@ mod tests {
     fn legacy_provider_gate_blocks_open_spawn_before_dispatch() {
         let request = NodeRequest::Spawn {
             workspace_id: WorkspaceId::new("repo").unwrap(),
-            provider: AgentId::new("qwen-code").unwrap(),
+            provider: AgentId::new("third-party-agent").unwrap(),
             mode: SessionMode::Pty,
             terminal_size: TerminalSize { rows: 40, columns: 120 },
             initial_prompt: None,

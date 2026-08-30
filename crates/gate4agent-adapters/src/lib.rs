@@ -13,7 +13,6 @@ mod hook_session;
 mod managed_hook;
 mod one_shot;
 mod pty_identity;
-mod qwen_dual_output;
 mod resume;
 mod session_options;
 
@@ -35,7 +34,7 @@ pub use history::{
 };
 pub use hook::{
     normalize_hook_event, HookAdapterError, HOOK_EVENT_NAME_MAX_BYTES, HOOK_PAYLOAD_MAX_BYTES,
-    HOOK_TEXT_MAX_CHARS, OPENCODE_HOOK_TEXT_MAX_CHARS,
+    HOOK_TEXT_MAX_CHARS, MIMO_CODE_HOOK_TEXT_MAX_CHARS,
 };
 pub use hook_session::{
     HookEventDisposition, HookEventEnvelope, HookReduction, HookSessionReducer,
@@ -57,10 +56,6 @@ pub use one_shot::{
 pub use pty_identity::{
     CodexPtySessionIdentityExtractor, KimiPtySessionIdentityExtractor,
     KIMI_PTY_SESSION_ID_MAX_BYTES,
-};
-pub use qwen_dual_output::{
-    QwenDualOutputLine, QwenDualOutputParser, QWEN_DUAL_OUTPUT_MAX_LINE_BYTES,
-    QWEN_DUAL_OUTPUT_REVISION,
 };
 pub use resume::{
     build_resume_plan, build_resume_plan_for_identity, ResumeAdapterError, ResumePlan,

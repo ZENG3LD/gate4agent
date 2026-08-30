@@ -907,7 +907,7 @@ mod tests {
                     generation: SessionGeneration(2),
                 },
             },
-            source_provider: AgentId::new("qwen-code").unwrap(),
+            source_provider: AgentId::new("codex").unwrap(),
         }
     }
 
@@ -917,7 +917,7 @@ mod tests {
             session_id: "vendor-session".to_owned(),
             title: Some("review".to_owned()),
             cwd: Some(r"C:\private\repo".to_owned()),
-            model: Some("qwen3-coder".to_owned()),
+            model: Some("codex-5".to_owned()),
             message_count: 2,
             completed_turn_count: None,
             total_tokens: 19,

@@ -61,13 +61,7 @@ pub fn builtin_specs() -> Vec<AgentSpec> {
             },
         ),
         grok_spec(),
-        spec(
-            "kimi",
-            "Kimi Code",
-            "kimi",
-            &[],
-            InitialPromptMode::AfterReady,
-        ),
+        kimi_spec(),
         spec(
             "qwen-code",
             "Qwen Code",
@@ -209,6 +203,26 @@ fn grok_spec() -> AgentSpec {
     );
     value.expected_processes.push(ProcessMatcher::Prefix {
         prefix: "grok-".to_owned(),
+    });
+    value
+}
+
+fn kimi_spec() -> AgentSpec {
+    let mut value = spec(
+        "kimi",
+        "Kimi Code",
+        "kimi",
+        &[],
+        InitialPromptMode::AfterReady,
+    );
+    // macOS renders Kimi Code's own PTY foreground process as `kimi-code`,
+    // not the `kimi` launch command -- observed live on a clean macOS
+    // arm64 stand with no vendor login. Without this second matcher,
+    // `is_expected_agent_process` reported the confirmed Kimi session as
+    // foreign, which `classify_pty_screen_state` reads as `NotAgent` and
+    // that outranks even an already-recognized `OperatorGate`.
+    value.expected_processes.push(ProcessMatcher::Exact {
+        name: "kimi-code".to_owned(),
     });
     value
 }
@@ -427,6 +441,28 @@ mod tests {
         assert_eq!(
             registry.get_by_id("kimi").unwrap().readiness.draft_signal,
             DraftReadySignal::BracketedPaste
+        );
+    }
+
+    /// macOS renders Kimi Code's own PTY foreground process as `kimi-code`,
+    /// not the `kimi` launch command -- the spec must match both, the same
+    /// way `grok`/`codex` already carry a second matcher for their own
+    /// versioned/suffixed process names.
+    #[test]
+    fn kimi_spec_matches_both_the_launch_command_and_its_macos_process_name() {
+        let kimi = builtin_registry()
+            .get_by_id("kimi")
+            .expect("kimi spec must exist");
+        assert_eq!(
+            kimi.expected_processes,
+            vec![
+                ProcessMatcher::Exact {
+                    name: "kimi".to_owned()
+                },
+                ProcessMatcher::Exact {
+                    name: "kimi-code".to_owned()
+                },
+            ],
         );
     }
 

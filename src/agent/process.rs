@@ -422,6 +422,24 @@ mod tests {
         assert_eq!(grok.agent_id.as_str(), "grok");
     }
 
+    /// macOS renders Kimi Code's own PTY foreground process as `kimi-code`,
+    /// not the `kimi` launch command -- observed live on a clean macOS
+    /// arm64 stand. Both names must resolve to the same spec so a
+    /// foreground probe there does not read a confirmed Kimi session as
+    /// foreign.
+    #[test]
+    fn kimi_spec_recognizes_its_macos_process_name() {
+        let kimi = builtin_registry()
+            .get_by_id("kimi")
+            .expect("kimi spec must exist");
+        assert!(is_expected_agent_process(kimi, "kimi", RuntimePlatform::MacOs));
+        assert!(is_expected_agent_process(
+            kimi,
+            "kimi-code",
+            RuntimePlatform::MacOs
+        ));
+    }
+
     #[test]
     fn recognizes_interpreter_entrypoints_without_scanning_prompts() {
         assert_eq!(

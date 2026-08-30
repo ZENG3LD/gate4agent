@@ -3365,6 +3365,39 @@ fn startup_operator_gate(contents: &str) -> Option<OperatorGateState> {
             contents,
         ));
     }
+    // Claude's own login-method chooser: a numbered list ("1. Claude ...",
+    // "2. API usage billing", "3. 3rd-party platform ...") rendered under
+    // "Select login method:". It shares neither "sign in" nor
+    // "openai"/"chatgpt"/"codex" with the branch above, so that branch
+    // never catches it. The phrase itself is specific enough (no ordinary
+    // agent narration renders this exact prompt line) to stand alone,
+    // matching the precedent set by "select authentication method" and
+    // "choose how to authenticate" above.
+    if normalized.contains("select login method") {
+        return Some(operator_gate(
+            OperatorGateKind::Authentication,
+            OperatorGateSubject::Account,
+            contents,
+        ));
+    }
+    // Claude's OAuth wait screen: a URL to open in a browser plus a slot to
+    // paste back the authorization code once that flow completes. Required
+    // to co-occur with "paste code" (the screen's own field label) rather
+    // than matching on "sign in" alone -- "sign in" by itself is common
+    // enough in an agent's ordinary narration to be untrustworthy, the same
+    // reasoning the branch above already applies via its own companion
+    // words. No option list is rendered here -- it is one free-text slot,
+    // not a choice from a list -- so `input` is set directly to
+    // `TextEntry` rather than routed through `operator_gate`'s option-list
+    // parser, which would find nothing on this screen shape and fall back
+    // to `Unknown`.
+    if normalized.contains("sign in") && normalized.contains("paste code") {
+        return Some(
+            OperatorGateState::new(OperatorGateKind::Authentication)
+                .with_subject(OperatorGateSubject::Account)
+                .with_options(OperatorGateInput::TextEntry, Vec::new()),
+        );
+    }
     if normalized.contains("kimi code update available")
         && normalized.contains("install update now")
     {
@@ -3482,9 +3515,23 @@ fn parse_operator_gate_options(contents: &str) -> (OperatorGateInput, Vec<Operat
 /// not start with `<digits>.` -- an instruction line like `"Press enter to
 /// confirm or esc to go back"` is exactly this shape and is meant to fall
 /// through untouched.
+/// Cursor glyphs vendors draw ahead of the selected row of an option list.
+/// Kept as one set shared by both list parsers: which glyph a vendor picks
+/// says nothing about whether its list is numbered or marker-only, and
+/// teaching one parser a glyph the other does not know is exactly how the
+/// selected row went missing before.
+const GATE_CURSOR_GLYPHS: [char; 2] = ['\u{203a}', '\u{276f}'];
+
 fn parse_numbered_gate_option_line(line: &str) -> Option<OperatorGateOption> {
     let trimmed = line.trim_start();
-    let (selected, rest) = match trimmed.strip_prefix('\u{203a}') {
+    // Vendors mark the cursor row of a NUMBERED list with the marker BEFORE
+    // the number (`> 2. Dark mode`), and they do not agree on the glyph:
+    // Codex draws U+203A, Claude draws U+276F, and both appear ahead of the
+    // digit rather than ahead of the text. Recognizing only one of them cost
+    // the whole row -- the cursor line failed to parse as an option at all,
+    // so the list came back one item short and with nothing marked selected,
+    // observed live on Claude's theme chooser and Codex's login chooser.
+    let (selected, rest) = match trimmed.strip_prefix(GATE_CURSOR_GLYPHS) {
         Some(stripped) => (true, stripped.trim_start()),
         None => (false, trimmed),
     };
@@ -3539,7 +3586,7 @@ fn parse_arrow_gate_option_line(line: &str) -> Option<OperatorGateOption> {
     if lower.contains('\u{2191}') || lower.contains('\u{2193}') || lower.contains("navigate") {
         return None;
     }
-    let (selected, rest) = match trimmed.strip_prefix('\u{276f}') {
+    let (selected, rest) = match trimmed.strip_prefix(GATE_CURSOR_GLYPHS) {
         Some(stripped) => (true, stripped.trim()),
         None => (false, trimmed),
     };
@@ -3642,6 +3689,20 @@ fn screen_failure(contents: &str) -> Option<&'static str> {
             && contents.lines().any(looks_like_shell_prompt_line))
     {
         return Some("missing command");
+    }
+
+    // A provider CLI's own missing-credential banner at launch -- Grok with
+    // no key configured prints exactly this one line and never renders
+    // anything else again, which makes it a crash SHAPE in the same sense
+    // as the buckets above: nothing typed into this screen fixes it, only a
+    // restart with a credential configured. Required to co-occur with the
+    // literal `GROK_API_KEY` env var name rather than matching "api key
+    // required" alone -- that phrase in the abstract is common enough in an
+    // agent's own prose (explaining a DIFFERENT provider's setup, say) to be
+    // untrustworthy alone; the exact env var name is specific to this one
+    // banner.
+    if normalized.contains("api key required") && normalized.contains("grok_api_key") {
+        return Some("missing api key");
     }
 
     None
@@ -3966,7 +4027,7 @@ mod tests {
     use gate4agent_types::{
         AdapterFamily, AgentId, AgentInstanceId, ControlEffect, ControlObservation, EffectEnvelope,
         OperationId, OperatorGateInput, OperatorGateKind, OperatorGateOptionSemantics,
-        OperatorGateState, ProviderEvent, ProviderRuntimePolicy,
+        OperatorGateState, OperatorGateSubject, ProviderEvent, ProviderRuntimePolicy,
         PtyScreenState, RuntimePlatform,
         SessionGeneration, StartRequest, TerminalMouseProtocolEncoding, TerminalSize,
         TransportKind, CONTROL_PROTOCOL_VERSION,
@@ -4158,6 +4219,41 @@ mod tests {
             kind_of("Sign in with OpenAI to use Codex"),
             Some(OperatorGateKind::Authentication)
         );
+        // Claude's login-method chooser and its OAuth code-paste wait
+        // screen -- both previously misread as `Ready` because neither
+        // contains "openai"/"chatgpt"/"codex", so the branch above never
+        // caught them. Verbatim shape from `terminal-read` on a clean
+        // macOS arm64 stand with no vendor login.
+        assert_eq!(
+            kind_of(
+                "Claude Code can be used with your Claude subscription or billed based on \
+                 API usage through your Console account.\n\
+                 Select login method:\n\
+                 \u{276f} 1. Claude ...\n\
+                 2. API usage billing\n\
+                 3. 3rd-party platform \u{b7} Amazon Bedrock ..."
+            ),
+            Some(OperatorGateKind::Authentication)
+        );
+        assert_eq!(
+            kind_of(
+                "Browser didn't open? Use the url below to sign in (c to copy)\n\
+                 https://claude.com/oauth/authorize?client_id=abc&redirect_uri=https%3A%2F%2Fconsole.anthropic.com&code_challenge=xyz\n\
+                 Paste code here"
+            ),
+            Some(OperatorGateKind::Authentication)
+        );
+        // Ordinary narration reusing "sign in" and "paste" separately, but
+        // never as the screen's own "paste code" field label, must not
+        // false-positive -- the same companion-word discipline the
+        // OpenAI/Codex sign-in branch already applies above.
+        assert_eq!(
+            kind_of(
+                "Once you sign in, copy the generated token and paste it into your .env file; \
+                 no code entry happens on this screen."
+            ),
+            None
+        );
         assert_eq!(
             kind_of("Kimi Code Update Available\nInstall update now (0.32.0)\nEnter confirm"),
             Some(OperatorGateKind::VendorUpdate)
@@ -4325,6 +4421,62 @@ mod tests {
         assert!(gate.options.is_empty());
     }
 
+    /// Claude's login-method chooser renders its selected row with a `❯`
+    /// cursor glyph where Codex draws `›`, and both sit AHEAD of the number rather
+    /// than ahead of the text. `parse_numbered_gate_option_line` knew only
+    /// Codex's glyph, so the cursor row failed to parse as an option at
+    /// all: the list came back one item short AND with nothing marked
+    /// selected -- observed live on this screen and on Codex's own login
+    /// chooser. Both glyphs are read now, so all three options are present
+    /// and the cursor row carries `selected`.
+    #[test]
+    fn startup_operator_gate_parses_claudes_login_method_chooser_including_its_cursor_row() {
+        let contents = "Select login method:\n\
+             \u{276f} 1. Claude ...\n\
+             2. API usage billing\n\
+             3. 3rd-party platform \u{b7} Amazon Bedrock ...";
+        let gate = startup_operator_gate(contents).expect("authentication must classify");
+        assert_eq!(gate.kind, OperatorGateKind::Authentication);
+        assert_eq!(gate.subject, OperatorGateSubject::Account);
+        assert_eq!(gate.input, OperatorGateInput::NumberedList);
+        assert_eq!(
+            gate.options,
+            vec![
+                gate4agent_types::OperatorGateOption {
+                    text: "Claude ...".to_owned(),
+                    semantics: OperatorGateOptionSemantics::Unknown,
+                    selected: true,
+                },
+                gate4agent_types::OperatorGateOption {
+                    text: "API usage billing".to_owned(),
+                    semantics: OperatorGateOptionSemantics::Unknown,
+                    selected: false,
+                },
+                gate4agent_types::OperatorGateOption {
+                    text: "3rd-party platform \u{b7} Amazon Bedrock ...".to_owned(),
+                    semantics: OperatorGateOptionSemantics::Unknown,
+                    selected: false,
+                },
+            ],
+        );
+    }
+
+    /// Claude's OAuth wait screen has no option list at all -- a URL to
+    /// open and one free-text slot to paste the resulting code back into --
+    /// so `input` is `TextEntry` with no options, never routed through the
+    /// numbered/arrow option-list parser.
+    #[test]
+    fn startup_operator_gate_oauth_wait_screen_reports_text_entry_input() {
+        let contents = "Browser didn't open? Use the url below to sign in (c to copy)\n\
+             https://claude.com/oauth/authorize?client_id=abc&redirect_uri=https%3A%2F%2Fconsole.anthropic.com&code_challenge=xyz\n\
+             Paste code here";
+        let gate = startup_operator_gate(contents).expect("oauth wait screen must classify");
+        assert_eq!(gate.kind, OperatorGateKind::Authentication);
+        assert_eq!(gate.subject, OperatorGateSubject::Account);
+        assert_eq!(gate.input, OperatorGateInput::TextEntry);
+        assert!(gate.options.is_empty());
+    }
+
     /// `parse_operator_gate_options` is the parser both dedicated tests
     /// above exercise indirectly through `startup_operator_gate`; this pins
     /// it directly against the same two shapes so a regression in the
@@ -4411,6 +4563,31 @@ mod tests {
         // fine, so it is not a crash SHAPE this function trusts at all.
         assert_eq!(
             screen_failure("fooagent-installer: fatal error: missing header <stdio.h>"),
+            None
+        );
+    }
+
+    #[test]
+    fn screen_failure_recognizes_grok_missing_api_key_banner() {
+        // Verbatim transcript: Grok launched with no credential configured
+        // prints exactly this one line and never renders anything else --
+        // no gate to answer, no crash trace, just a dead PTY a blind
+        // `Ready` write would silently swallow.
+        assert_eq!(
+            screen_failure(
+                "\u{274c} Error: API key required. Set GROK_API_KEY environment variable, \
+                 use --api-key flag, or set \"apiKey\" field in ~/.grok/user-settings.json"
+            ),
+            Some("missing api key")
+        );
+        // Generic prose about needing an API key, with no vendor-specific
+        // env var name, must not false-positive -- an agent explaining a
+        // DIFFERENT provider's setup routinely says exactly this.
+        assert_eq!(
+            screen_failure(
+                "You'll need an API key for this provider before it works; check the docs \
+                 for how to configure one."
+            ),
             None
         );
     }

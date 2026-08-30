@@ -4386,6 +4386,8 @@ pub enum AgentProgressEventKindV1 {
     SubagentStarted,
     SubagentStopped,
     RateLimited,
+    HostRequestObserved,
+    UnrecognizedNotification,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

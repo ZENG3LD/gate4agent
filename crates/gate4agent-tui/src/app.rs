@@ -4841,6 +4841,8 @@ pub fn observation_kind_label(kind: &ObservationKindV1) -> &'static str {
         ObservationKindV1::Usage { .. } => "usage",
         ObservationKindV1::ContextWindowUsage { .. } => "context-window-usage",
         ObservationKindV1::RateLimited => "rate-limited",
+        ObservationKindV1::HostRequestObserved { .. } => "host-request-observed",
+        ObservationKindV1::UnrecognizedNotification { .. } => "unrecognized-notification",
         ObservationKindV1::OwnedProcessStarted { .. } => "process-started",
         ObservationKindV1::OwnedProcessExited { .. } => "process-exited",
         ObservationKindV1::FileChanged { .. } => "file-changed",

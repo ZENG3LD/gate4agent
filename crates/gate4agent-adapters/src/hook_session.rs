@@ -532,7 +532,9 @@ impl HookSessionReducer {
                 | ProviderEvent::InteractionResolved { .. }
                 | ProviderEvent::SubagentStarted { .. }
                 | ProviderEvent::SubagentStopped { .. }
-                | ProviderEvent::RateLimited { .. } => {}
+                | ProviderEvent::RateLimited { .. }
+                | ProviderEvent::HostRequestObserved { .. }
+                | ProviderEvent::UnrecognizedNotification { .. } => {}
             }
         }
     }

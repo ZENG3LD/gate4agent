@@ -167,6 +167,24 @@ pub enum ObservationKindV1 {
         capacity_tokens: u64,
     },
     RateLimited,
+    /// The agent asked the ACP host for something (`session/request_
+    /// permission`, `fs/read_text_file`, `terminal/create`, `terminal/
+    /// write`) and the host's policy decided on it. `class` is a coarse
+    /// bucket of the ACP method requested -- the same scale as `ToolStarted
+    /// ::class` -- never the raw request parameters: what path was read or
+    /// what command ran is never carried on this wire.
+    HostRequestObserved {
+        class: String,
+        granted: bool,
+    },
+    /// A JSON-RPC notification the reader received but could not classify
+    /// into any other kind here -- the protocol said something this build
+    /// does not parse. `method` is the bare JSON-RPC method string (a
+    /// small, protocol-defined vocabulary), never the notification's own
+    /// payload.
+    UnrecognizedNotification {
+        method: String,
+    },
     OwnedProcessStarted {
         correlation_id: String,
         class: String,
@@ -407,6 +425,14 @@ impl ObservationKindV1 {
             Self::Error { detail } => {
                 validate_required_text("error detail", detail, OBSERVATION_DETAIL_MAX_BYTES)
             }
+            Self::HostRequestObserved { class, .. } => {
+                validate_required_text("host request class", class, OBSERVATION_LABEL_MAX_BYTES)
+            }
+            Self::UnrecognizedNotification { method } => validate_required_text(
+                "unrecognized notification method",
+                method,
+                OBSERVATION_LABEL_MAX_BYTES,
+            ),
             _ => Ok(()),
         }
     }
@@ -596,6 +622,13 @@ impl ObservationKindV1 {
             Self::Error { detail } => {
                 len += ",\"detail\":".len() + json_string_len(detail);
             }
+            Self::HostRequestObserved { class, granted } => {
+                len += ",\"class\":".len() + json_string_len(class);
+                len += ",\"granted\":".len() + bool_json_len(*granted);
+            }
+            Self::UnrecognizedNotification { method } => {
+                len += ",\"method\":".len() + json_string_len(method);
+            }
             _ => {}
         }
         len + "}".len()
@@ -626,6 +659,8 @@ impl ObservationKindV1 {
             Self::Usage { .. } => "usage",
             Self::ContextWindowUsage { .. } => "context-window-usage",
             Self::RateLimited => "rate-limited",
+            Self::HostRequestObserved { .. } => "host-request-observed",
+            Self::UnrecognizedNotification { .. } => "unrecognized-notification",
             Self::OwnedProcessStarted { .. } => "owned-process-started",
             Self::OwnedProcessExited { .. } => "owned-process-exited",
             Self::FileChanged { .. } => "file-changed",

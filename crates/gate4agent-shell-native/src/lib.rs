@@ -2513,11 +2513,23 @@ fn provider_event(event: AgentEvent) -> Option<ProviderEvent> {
             agent_id: None,
         }),
         AgentEvent::RateLimit(info) => Some(rate_limit_event(info)),
-        AgentEvent::Started { .. }
-        | AgentEvent::Exited { .. }
-        | AgentEvent::PtyRaw { .. }
-        | AgentEvent::RpcNotification { .. }
-        | AgentEvent::RpcIncomingRequest { .. } => None,
+        AgentEvent::RpcIncomingRequest {
+            id: _,
+            method,
+            params,
+            granted,
+        } => Some(ProviderEvent::HostRequestObserved {
+            method,
+            params_json: params.map(|value| value.to_string()).unwrap_or_default(),
+            granted,
+        }),
+        AgentEvent::RpcNotification { method, params } => {
+            Some(ProviderEvent::UnrecognizedNotification {
+                method,
+                payload_json: params.to_string(),
+            })
+        }
+        AgentEvent::Started { .. } | AgentEvent::Exited { .. } | AgentEvent::PtyRaw { .. } => None,
     }
 }
 
@@ -4192,6 +4204,54 @@ mod tests {
             })
         );
         assert!(super::provider_event(AgentEvent::PtyRaw { data: b"105/100".to_vec() }).is_none());
+    }
+
+    #[test]
+    fn host_request_reaches_the_operator_with_method_and_host_decision() {
+        let denied = super::provider_event(AgentEvent::RpcIncomingRequest {
+            id: gate4agent::rpc::message::RpcId::Number(1),
+            method: "fs/read_text_file".to_owned(),
+            params: None,
+            granted: false,
+        });
+        assert_eq!(
+            denied,
+            Some(ProviderEvent::HostRequestObserved {
+                method: "fs/read_text_file".to_owned(),
+                params_json: String::new(),
+                granted: false,
+            })
+        );
+
+        let granted = super::provider_event(AgentEvent::RpcIncomingRequest {
+            id: gate4agent::rpc::message::RpcId::Number(2),
+            method: "terminal/create".to_owned(),
+            params: None,
+            granted: true,
+        });
+        assert_eq!(
+            granted,
+            Some(ProviderEvent::HostRequestObserved {
+                method: "terminal/create".to_owned(),
+                params_json: String::new(),
+                granted: true,
+            })
+        );
+    }
+
+    #[test]
+    fn unrecognized_notification_reaches_the_operator_as_a_raw_event_instead_of_vanishing() {
+        let mapped = super::provider_event(AgentEvent::RpcNotification {
+            method: "session/update".to_owned(),
+            params: Default::default(),
+        });
+        assert_eq!(
+            mapped,
+            Some(ProviderEvent::UnrecognizedNotification {
+                method: "session/update".to_owned(),
+                payload_json: "null".to_owned(),
+            })
+        );
     }
 
     #[test]

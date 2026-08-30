@@ -776,7 +776,8 @@ fn timeline_category(kind: &ObservationKindV1) -> TimelineCategoryV1 {
         | ObservationKindV1::QuestionRequested { .. }
         | ObservationKindV1::ApprovalResolved { .. }
         | ObservationKindV1::QuestionResolved { .. }
-        | ObservationKindV1::InteractionResolved { .. } => TimelineCategoryV1::Interaction,
+        | ObservationKindV1::InteractionResolved { .. }
+        | ObservationKindV1::HostRequestObserved { .. } => TimelineCategoryV1::Interaction,
         ObservationKindV1::SubagentStarted { .. }
         | ObservationKindV1::SubagentProgress { .. }
         | ObservationKindV1::SubagentCompleted { .. } => TimelineCategoryV1::Subagent,
@@ -892,6 +893,14 @@ fn timeline_entry(
         }
         ObservationKindV1::RateLimited => {
             (Some("rate-limit".to_owned()), TimelineStateV1::Waiting, None)
+        }
+        ObservationKindV1::HostRequestObserved { class, granted } => (
+            Some(class.clone()),
+            if *granted { TimelineStateV1::Completed } else { TimelineStateV1::Failed },
+            None,
+        ),
+        ObservationKindV1::UnrecognizedNotification { method } => {
+            (Some(method.clone()), TimelineStateV1::Unknown, None)
         }
         ObservationKindV1::OwnedProcessStarted { correlation_id, class } => (
             Some(class.clone()),

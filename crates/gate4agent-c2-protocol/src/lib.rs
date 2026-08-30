@@ -872,6 +872,8 @@ pub enum C2ProviderEventKind {
     SubagentStarted,
     SubagentStopped,
     RateLimited,
+    HostRequestObserved,
+    UnrecognizedNotification,
 }
 
 impl From<&gate4agent_types::ProviderEvent> for C2ProviderEventKind {
@@ -897,6 +899,8 @@ impl From<&gate4agent_types::ProviderEvent> for C2ProviderEventKind {
             ProviderEvent::SubagentStarted { .. } => Self::SubagentStarted,
             ProviderEvent::SubagentStopped { .. } => Self::SubagentStopped,
             ProviderEvent::RateLimited { .. } => Self::RateLimited,
+            ProviderEvent::HostRequestObserved { .. } => Self::HostRequestObserved,
+            ProviderEvent::UnrecognizedNotification { .. } => Self::UnrecognizedNotification,
         }
     }
 }

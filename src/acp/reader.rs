@@ -23,7 +23,7 @@ use tokio::sync::broadcast;
 use crate::core::types::AgentEvent;
 use crate::rpc::handler::HostHandler;
 use crate::rpc::message::{
-    classify_line, IncomingMessage, RpcResponse,
+    classify_line, IncomingMessage, RpcError, RpcResponse,
 };
 use crate::rpc::pending::PendingRequests;
 
@@ -109,6 +109,7 @@ pub(crate) fn acp_reader_loop(
                 // not block for long). Do NOT hold `process` mutex during this
                 // call to avoid deadlock with `write_line`.
                 let result = handler.handle(&method, params.clone());
+                let granted = request_granted(&result);
 
                 let response = match result {
                     Ok(val) => RpcResponse::success(id.clone(), val),
@@ -120,7 +121,12 @@ pub(crate) fn acp_reader_loop(
                 }
 
                 // Broadcast so observers can audit agent → host calls.
-                let _ = tx.send(AgentEvent::RpcIncomingRequest { id, method, params });
+                let _ = tx.send(AgentEvent::RpcIncomingRequest {
+                    id,
+                    method,
+                    params,
+                    granted,
+                });
             }
 
             IncomingMessage::Response { id, result, error } => {
@@ -190,6 +196,19 @@ pub(crate) fn acp_reader_loop(
 fn write_line_to_process(process: &Arc<Mutex<AcpProcess>>, line: &str) {
     if let Ok(mut guard) = process.lock() {
         let _ = guard.write_line(line.trim_end_matches('\n'));
+    }
+}
+
+/// Read the host's actual decision off the same `Result` the reader loop
+/// already computed by calling `HostHandler::handle` -- see
+/// `AgentEvent::RpcIncomingRequest::granted` for the full rationale.
+fn request_granted(result: &Result<Value, RpcError>) -> bool {
+    match result {
+        Err(_) => false,
+        Ok(value) => value
+            .get("allowed")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
     }
 }
 

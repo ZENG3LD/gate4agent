@@ -1317,6 +1317,33 @@ pub enum ProviderEvent {
         usage_percent: Option<String>,
         raw_message: String,
     },
+    /// The agent sent a JSON-RPC request to the ACP host -- `session/
+    /// request_permission`, `fs/read_text_file`, `terminal/create`,
+    /// `terminal/write` -- and the host's fixed, fail-closed policy
+    /// (`DefaultAcpHandler`) has already decided on it by the time this
+    /// event exists. This event does not change what the host does; it
+    /// exists purely so an operator sees the request AND the decision
+    /// instead of the request silently disappearing into a refusal nobody
+    /// downstream ever hears about. `granted` is read off the host's own
+    /// `Result` for the call, not re-derived here -- see the source
+    /// (`gate4agent`'s `AgentEvent::RpcIncomingRequest::granted`) for
+    /// exactly how.
+    HostRequestObserved {
+        method: String,
+        params_json: String,
+        granted: bool,
+    },
+    /// A JSON-RPC notification the reader received but could not classify
+    /// into any other `ProviderEvent` -- most commonly a `session/update`
+    /// whose `update` shape none of the known kinds matched, but also any
+    /// other notification method this build has no mapping for. This is a
+    /// raw protocol echo, NOT a normal operational event: nothing here has
+    /// been validated against a known shape, so a consumer must treat
+    /// `payload_json` as opaque vendor JSON, not a fact to act on.
+    UnrecognizedNotification {
+        method: String,
+        payload_json: String,
+    },
 }
 
 impl ProviderEvent {
@@ -1466,6 +1493,33 @@ impl ProviderEvent {
                 validate_text(
                     "rate limit message",
                     raw_message,
+                    PROVIDER_EVENT_TEXT_MAX_BYTES,
+                )?;
+            }
+            Self::HostRequestObserved {
+                method,
+                params_json,
+                ..
+            } => {
+                validate_required("host request method", method, PROVIDER_EVENT_ID_MAX_BYTES)?;
+                validate_text(
+                    "host request params",
+                    params_json,
+                    PROVIDER_EVENT_TEXT_MAX_BYTES,
+                )?;
+            }
+            Self::UnrecognizedNotification {
+                method,
+                payload_json,
+            } => {
+                validate_required(
+                    "unrecognized notification method",
+                    method,
+                    PROVIDER_EVENT_ID_MAX_BYTES,
+                )?;
+                validate_text(
+                    "unrecognized notification payload",
+                    payload_json,
                     PROVIDER_EVENT_TEXT_MAX_BYTES,
                 )?;
             }
@@ -2030,6 +2084,7 @@ mod tests {
         TerminalMouseProtocolEncoding, TransportKind,
         FOREGROUND_PROCESS_NAME_MAX_BYTES, OPERATOR_GATE_OPTIONS_MAX,
         OPERATOR_GATE_OPTION_TEXT_MAX_BYTES, OPERATOR_GATE_PATH_MAX_BYTES,
+        PROVIDER_EVENT_ID_MAX_BYTES, PROVIDER_EVENT_TEXT_MAX_BYTES,
         PROVIDER_INTERACTION_RESPONSE_MAX_BYTES,
         PTY_SCREEN_GATE_NAME_MAX_BYTES,
     };
@@ -2567,5 +2622,94 @@ mod tests {
                 .validate_ingress()
                 .is_err());
         }
+    }
+
+    /// The agent-to-host request event must carry a non-empty, bounded
+    /// method and a bounded params payload -- the same shape and bounds as
+    /// `ToolStarted`'s `id`/`input_json`, since this event carries the same
+    /// kind of vendor-controlled JSON.
+    #[test]
+    fn host_request_observed_is_bounded_at_ingress() {
+        let valid = ProviderEvent::HostRequestObserved {
+            method: "session/request_permission".to_owned(),
+            params_json: "{\"toolName\":\"bash\"}".to_owned(),
+            granted: false,
+        };
+        assert_eq!(valid.validate_ingress(), Ok(()));
+
+        assert!(matches!(
+            ProviderEvent::HostRequestObserved {
+                method: String::new(),
+                params_json: String::new(),
+                granted: false,
+            }
+            .validate_ingress(),
+            Err(ProviderEventValidationError::Empty { field: "host request method" })
+        ));
+
+        let oversized_method = "m".repeat(PROVIDER_EVENT_ID_MAX_BYTES + 1);
+        assert!(matches!(
+            ProviderEvent::HostRequestObserved {
+                method: oversized_method,
+                params_json: String::new(),
+                granted: true,
+            }
+            .validate_ingress(),
+            Err(ProviderEventValidationError::InvalidField {
+                field: "host request method",
+                ..
+            })
+        ));
+
+        let oversized_params = "p".repeat(PROVIDER_EVENT_TEXT_MAX_BYTES + 1);
+        assert!(matches!(
+            ProviderEvent::HostRequestObserved {
+                method: "fs/read_text_file".to_owned(),
+                params_json: oversized_params,
+                granted: true,
+            }
+            .validate_ingress(),
+            Err(ProviderEventValidationError::InvalidField {
+                field: "host request params",
+                ..
+            })
+        ));
+    }
+
+    /// The catch-all "protocol said something we don't parse" event must
+    /// still enforce the same bounds as every other provider event carrying
+    /// vendor JSON -- a hostile or garbled `session/update` payload cannot
+    /// ride this fallback path past `PROVIDER_EVENT_TEXT_MAX_BYTES`.
+    #[test]
+    fn unrecognized_notification_is_bounded_at_ingress() {
+        let valid = ProviderEvent::UnrecognizedNotification {
+            method: "session/some_future_update".to_owned(),
+            payload_json: "{\"unknown\":true}".to_owned(),
+        };
+        assert_eq!(valid.validate_ingress(), Ok(()));
+
+        assert!(matches!(
+            ProviderEvent::UnrecognizedNotification {
+                method: String::new(),
+                payload_json: String::new(),
+            }
+            .validate_ingress(),
+            Err(ProviderEventValidationError::Empty {
+                field: "unrecognized notification method"
+            })
+        ));
+
+        let oversized_payload = "p".repeat(PROVIDER_EVENT_TEXT_MAX_BYTES + 1);
+        assert!(matches!(
+            ProviderEvent::UnrecognizedNotification {
+                method: "session/update".to_owned(),
+                payload_json: oversized_payload,
+            }
+            .validate_ingress(),
+            Err(ProviderEventValidationError::InvalidField {
+                field: "unrecognized notification payload",
+                ..
+            })
+        ));
     }
 }

@@ -3125,7 +3125,9 @@ fn reduce_provider_event(
         }
         ProviderEvent::Text { .. }
         | ProviderEvent::Thinking { .. }
-        | ProviderEvent::ContextWindowUsage { .. } => {}
+        | ProviderEvent::ContextWindowUsage { .. }
+        | ProviderEvent::HostRequestObserved { .. }
+        | ProviderEvent::UnrecognizedNotification { .. } => {}
     }
     refresh_provider_activity(snapshot);
     provider_source_cursor_mut(snapshot, source).sequence = source_sequence;

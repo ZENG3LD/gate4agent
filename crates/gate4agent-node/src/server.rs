@@ -442,6 +442,10 @@ fn agent_progress_event_kind(event: &ProviderEvent) -> Option<AgentProgressEvent
         ProviderEvent::SubagentStarted { .. } => AgentProgressEventKindV1::SubagentStarted,
         ProviderEvent::SubagentStopped { .. } => AgentProgressEventKindV1::SubagentStopped,
         ProviderEvent::RateLimited { .. } => AgentProgressEventKindV1::RateLimited,
+        ProviderEvent::HostRequestObserved { .. } => AgentProgressEventKindV1::HostRequestObserved,
+        ProviderEvent::UnrecognizedNotification { .. } => {
+            AgentProgressEventKindV1::UnrecognizedNotification
+        }
         ProviderEvent::ContextWindowUsage { .. } => unreachable!("handled above"),
     })
 }
@@ -853,6 +857,17 @@ fn provider_observations(event: &ControlEvent) -> Vec<ObservationV1> {
             });
         }
         ProviderEvent::RateLimited { .. } => kinds.push(ObservationKindV1::RateLimited),
+        ProviderEvent::HostRequestObserved { method, granted, .. } => {
+            kinds.push(ObservationKindV1::HostRequestObserved {
+                class: observation_tool_class(method),
+                granted: *granted,
+            });
+        }
+        ProviderEvent::UnrecognizedNotification { method, .. } => {
+            kinds.push(ObservationKindV1::UnrecognizedNotification {
+                method: method.clone(),
+            });
+        }
         ProviderEvent::SessionIdentityObserved { .. }
         | ProviderEvent::Text { .. }
         | ProviderEvent::InteractionResolved { .. }

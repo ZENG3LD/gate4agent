@@ -216,9 +216,21 @@ pub enum AgentEvent {
     /// The `RpcSession` reader loop has already handled it via `HostHandler`
     /// and sent the response. This variant lets subscribers audit what the
     /// agent requested without needing their own handler.
+    ///
+    /// `granted` is the host's decision on the request, read off the same
+    /// `Result<Value, RpcError>` the reader loop already computed by calling
+    /// the handler -- `Err(_)` (e.g. `fs/read_text_file`'s or `terminal/
+    /// create`'s `PERMISSION_DENIED`/`UNSUPPORTED` refusal) means denied;
+    /// `Ok(value)` means granted, UNLESS `value` carries an `"allowed"` key
+    /// (the shape `session/request_permission` responds with even when
+    /// declining, since ACP models a declined permission as a normal
+    /// response, not an RPC error), in which case that key is the answer.
+    /// This does not change what the host does -- it only lets a subscriber
+    /// see the request and the decision the host already made.
     RpcIncomingRequest {
         id: crate::rpc::message::RpcId,
         method: String,
         params: Option<serde_json::Value>,
+        granted: bool,
     },
 }

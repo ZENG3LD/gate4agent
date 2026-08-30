@@ -28,7 +28,7 @@ use gate4agent::pty::cli::{create_pipeline, ClassificationPipeline, MessageClass
 use gate4agent::pty::event::PtyMouseProtocolEncoding;
 use gate4agent::pty::{
     PtyAttachment, PtyEvent, PtyEventEnvelope, PtyEventReceiver, PtyForegroundObservation,
-    PtyReplayCursor, PtySession, PtyTerminalSnapshot, RateLimitDetector,
+    PtyReplayCursor, PtySession, PtyTerminalSnapshot, RateLimitDetector, VteParser,
 };
 use gate4agent::{
     AcpSession, AcpSessionOptions, AgentEvent, CliTool, LaunchRequest, PipeProcessOptions,
@@ -261,12 +261,90 @@ struct OwnedPtyProvider {
     pending_events: VecDeque<ProviderEvent>,
     utf8: Utf8ChunkDecoder,
     pipeline: Mutex<ClassificationPipeline>,
-    rate_limits: RateLimitDetector,
+    rate_limits: RateLimitFeed,
     kimi_identity: Option<KimiPtySessionIdentityExtractor>,
     semantic_events: bool,
     provider_session_started: bool,
     next_provider_sequence: u64,
 }
+
+/// Buffers ANSI-stripped PTY output across output chunks before running
+/// rate-limit detection over it.
+///
+/// PTY reads are chunked arbitrarily -- neither the OS nor this crate's
+/// own reader loop promises "one call per terminal row" or even "one call
+/// per escape sequence". Two separate problems follow from that, and this
+/// type exists to solve both rather than hoping a caller's chunk
+/// boundaries are ever polite:
+///
+/// - An ANSI escape sequence split across two chunks must still be
+///   recognized as one escape, not leak its tail bytes into the visible
+///   text as a false line-break in the middle of `\x1b[m`. `VteParser`
+///   already solves this -- its own `vte::Parser` state machine persists
+///   across calls, so an escape completes correctly regardless of where
+///   a chunk boundary falls -- this type just keeps ONE `VteParser` alive
+///   for the provider's whole lifetime instead of a fresh, stateless one
+///   per chunk (which would forget an escape's first half).
+/// - A LOGICAL LINE (e.g. codex's `/status` quota-state row) can itself
+///   be split across chunks at a point that is not inside any escape.
+///   `VteParser::parse` only returns the printable text produced by the
+///   bytes handed to THAT call, so two separate calls can each return one
+///   half of the same row, and neither half alone matches the quota-state
+///   pattern. This type accumulates cleaned text across calls and runs
+///   detection over everything seen so far, keeping whatever has not yet
+///   been confirmed complete (the tail after the last newline) instead of
+///   discarding a still-forming row.
+struct RateLimitFeed {
+    detector: RateLimitDetector,
+    vte: VteParser,
+    buffer: String,
+}
+
+impl RateLimitFeed {
+    fn new_for_tool(tool: CliTool) -> Self {
+        Self {
+            detector: RateLimitDetector::new_for_tool(tool),
+            vte: VteParser::new(),
+            buffer: String::new(),
+        }
+    }
+
+    /// Strip ANSI from one more raw PTY chunk, fold it into the pending
+    /// line buffer, and run detection over everything accumulated so far
+    /// -- not just the newest chunk, since a match can straddle a chunk
+    /// boundary. Lines already terminated by `\n` are then dropped from
+    /// the buffer regardless of whether they matched: a later chunk
+    /// cannot retroactively extend a row that has already ended. The
+    /// unterminated tail (a row still in progress) is always kept -- but
+    /// see `RATE_LIMIT_FEED_BUFFER_MAX_BYTES` for what happens when that
+    /// tail itself grows unreasonably large.
+    fn detect(&mut self, raw: &str) -> Option<gate4agent::core::types::RateLimitInfo> {
+        let cleaned = self.vte.parse(raw);
+        self.buffer.push_str(&cleaned);
+        let info = self.detector.detect(&self.buffer);
+        if let Some(last_newline) = self.buffer.rfind('\n') {
+            self.buffer.drain(..=last_newline);
+        } else if self.buffer.len() > RATE_LIMIT_FEED_BUFFER_MAX_BYTES {
+            // A full-screen redraw (codex's main screen, not `/status`)
+            // can run for a long time using only cursor-addressing escapes
+            // and never emit a `\n` at all, so "no newline yet" cannot be
+            // trusted to mean "a row is still in progress" indefinitely.
+            // No real quota-state or refusal line approaches this length;
+            // past it, keep only the tail so an indefinitely long redraw
+            // cannot grow this buffer for the life of the session.
+            let mut cut = self.buffer.len() - RATE_LIMIT_FEED_BUFFER_MAX_BYTES;
+            while !self.buffer.is_char_boundary(cut) {
+                cut += 1;
+            }
+            self.buffer.drain(..cut);
+        }
+        info
+    }
+}
+
+/// Well past the longest quota-state or refusal line this detector
+/// recognizes (all under 200 bytes); see `RateLimitFeed::detect`.
+const RATE_LIMIT_FEED_BUFFER_MAX_BYTES: usize = 8192;
 
 #[derive(Default)]
 struct Utf8ChunkDecoder {
@@ -953,7 +1031,7 @@ impl NativeEffectShell {
                                         pending_events,
                                         utf8: Utf8ChunkDecoder::default(),
                                         pipeline: Mutex::new(create_pipeline(tool)),
-                                        rate_limits: RateLimitDetector::new_for_tool(tool),
+                                        rate_limits: RateLimitFeed::new_for_tool(tool),
                                         kimi_identity: (runtime_policy.provider_session_identity
                                             && is_kimi
                                             && !provider_session_started)
@@ -4089,16 +4167,18 @@ mod tests {
         should_attach_pty_provider_stream, should_probe_pty_identity, startup_operator_gate,
         terminal_frame, terminal_frame_byte_len, terminal_state_capture_should_skip,
         validate_instance_launch_arguments, validate_spawn_runtime_policy,
-        ForegroundProbeSchedule, ForegroundVerdict, ReadinessDiagnostics, Utf8ChunkDecoder,
+        ForegroundProbeSchedule, ForegroundVerdict, ReadinessDiagnostics, RateLimitFeed,
+        Utf8ChunkDecoder,
     };
     use gate4agent_adapters::builtin_adapter_registry;
     use gate4agent_catalog::EnvMutation;
     use gate4agent::agent::ForegroundObservation;
     use gate4agent::core::types::{
-        AgentEvent, ContextWindowUsage as AgentContextWindowUsage,
+        AgentEvent, ContextWindowUsage as AgentContextWindowUsage, RateLimitType,
     };
     use gate4agent::pty::event::PtyMouseProtocolEncoding;
-    use gate4agent::pty::{PtyForegroundObservation, PtyForegroundSource};
+    use gate4agent::pty::{PtyForegroundObservation, PtyForegroundSource, RateLimitDetector};
+    use gate4agent::CliTool;
     use gate4agent_types::{
         AdapterFamily, AgentId, AgentInstanceId, ControlEffect, ControlObservation, EffectEnvelope,
         OperationId, OperatorGateInput, OperatorGateKind, OperatorGateOptionSemantics,
@@ -5681,5 +5761,88 @@ mod tests {
         assert!(events.iter().any(|(_, event)| matches!(event, ProviderEvent::ToolCompleted { .. })));
         assert!(events.iter().any(|(_, event)| matches!(event, ProviderEvent::TurnCompleted { .. })));
         assert!(events.iter().any(|(_, event)| matches!(event, ProviderEvent::SessionEnded { .. })));
+    }
+
+    // --- RateLimitFeed: ANSI-stripping and chunk reassembly ---
+    //
+    // Regression coverage for a live-stand defect: `provider.rate_limits`
+    // used to be a bare `RateLimitDetector` fed the RAW PTY stream, escape
+    // codes and all. codex's own `/status` render puts `\x1b[m` between
+    // `limit:` and the progress bar, and `\x1b[2m` between `left` and
+    // `(resets ...)` -- both inside gaps the quota-state regex's `\s*`
+    // cannot see through -- so not one quota-state fact was ever observed
+    // on a real run, despite the pattern being correct on clean text.
+
+    /// The exact live bytes from the coordinator's capture (real `\x1b[m`
+    /// and `\x1b[2m`, real `\r\n`), transcribed verbatim.
+    const CODEX_STATUS_RAW_ANSI: &str = "│  5h limit:             \x1b[m[████████████████████] 100% left\x1b[2m (resets 00:08 on 31 Aug) │\r\n│  Weekly limit:         \x1b[m[████████████████████] 100% left\x1b[2m (resets 19:08 on 6 Sep)  │";
+
+    #[test]
+    fn bare_detector_misses_the_live_ansi_sample_that_rate_limit_feed_catches() {
+        // This is the defect itself: matching the untouched raw stream
+        // fails on real codex output, exactly as observed live.
+        let bare = RateLimitDetector::new_for_tool(CliTool::Codex);
+        assert!(bare.detect(CODEX_STATUS_RAW_ANSI).is_none());
+
+        // `RateLimitFeed` strips ANSI (via `VteParser`) before matching,
+        // so the same bytes must now be recognized.
+        let mut feed = RateLimitFeed::new_for_tool(CliTool::Codex);
+        let info = feed
+            .detect(CODEX_STATUS_RAW_ANSI)
+            .expect("quota-state line must be recognized once ANSI is stripped");
+        assert_eq!(info.limit_type, RateLimitType::Session);
+        assert_eq!(info.usage_percent, Some(0.0));
+        assert_eq!(info.resets_at_text.as_deref(), Some("00:08 on 31 Aug"));
+    }
+
+    #[test]
+    fn rate_limit_feed_reassembles_a_quota_state_line_split_mid_escape_and_mid_row() {
+        // A live PTY chunk boundary has no reason to land anywhere
+        // convenient -- here it falls INSIDE the `\x1b[2m` escape itself
+        // (right after the ESC byte), on top of splitting the row.
+        let first =
+            "│  5h limit:             \x1b[m[████████████████████] 100% left\x1b";
+        let second = "[2m (resets 00:08 on 31 Aug) │\r\n";
+
+        let mut feed = RateLimitFeed::new_for_tool(CliTool::Codex);
+        assert!(
+            feed.detect(first).is_none(),
+            "the row is not complete yet, so nothing should match on the first chunk"
+        );
+        let info = feed
+            .detect(second)
+            .expect("the row completes once the second chunk arrives");
+        assert_eq!(info.limit_type, RateLimitType::Session);
+        assert_eq!(info.resets_at_text.as_deref(), Some("00:08 on 31 Aug"));
+    }
+
+    #[test]
+    fn rate_limit_feed_strips_ansi_before_matching_a_colored_failure_message() {
+        // Failure patterns run through the same `RateLimitFeed::detect`
+        // entry point as quota-state ones, so a vendor coloring its own
+        // refusal text must not defeat detection either.
+        let raw = "\x1b[31mError: rate limit exceeded\x1b[0m. Please wait.";
+        let mut feed = RateLimitFeed::new_for_tool(CliTool::Codex);
+        let info = feed
+            .detect(raw)
+            .expect("a colored refusal message must still be recognized");
+        assert_eq!(info.limit_type, RateLimitType::Unknown);
+    }
+
+    #[test]
+    fn rate_limit_feed_bounds_its_buffer_across_a_newline_free_redraw() {
+        // A full-screen redraw with no `\n` at all (cursor-addressing
+        // only) must not grow the pending-line buffer without bound for
+        // as long as it runs -- and a real line must still be caught once
+        // it finally arrives.
+        let mut feed = RateLimitFeed::new_for_tool(CliTool::Codex);
+        let noise = "x".repeat(super::RATE_LIMIT_FEED_BUFFER_MAX_BYTES * 3);
+        assert!(feed.detect(&noise).is_none());
+        assert!(feed.buffer.len() <= super::RATE_LIMIT_FEED_BUFFER_MAX_BYTES);
+
+        let info = feed
+            .detect(CODEX_STATUS_RAW_ANSI)
+            .expect("a real quota-state line must still be recognized after the noise");
+        assert_eq!(info.limit_type, RateLimitType::Session);
     }
 }

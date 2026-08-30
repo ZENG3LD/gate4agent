@@ -44,6 +44,8 @@ struct ProviderStaticCapabilities {
     resume_adapter: bool,
     pty_sidecar_observation: bool,
     hook_adapter: bool,
+    pipe_transport: bool,
+    acp_transport: bool,
 }
 
 impl ProviderRuntimeMonitor {
@@ -69,12 +71,37 @@ impl ProviderRuntimeMonitor {
                                 .pty_sidecar
                                 .is_some(),
                             hook_adapter: spec.capabilities.adapters.hook.is_some(),
+                            pipe_transport: spec.capabilities.transports.pipe.is_some(),
+                            acp_transport: spec.capabilities.transports.acp.is_some(),
                         },
                     )
                 })
                 .collect(),
             probe_cache: Mutex::new(VendorVersionProbeCache::default()),
         }
+    }
+
+    /// Whether the catalog declares a Pipe transport for this provider --
+    /// `PipeSession` (NDJSON over stdio, no PTY) has no vendor terminal
+    /// contract to verify, so unlike `raw_pty_lifecycle` this fact is never
+    /// derived from a live probe, and it never changes once the catalog is
+    /// loaded. It is the sole authority `require_policy` uses to admit or
+    /// reject `ProviderRuntimeRequirement::Inline`.
+    pub(crate) fn supports_pipe_transport(&self, provider: &AgentId) -> bool {
+        self.providers
+            .get(provider)
+            .is_some_and(|capabilities| capabilities.pipe_transport)
+    }
+
+    /// Whether the catalog declares an ACP transport for this provider --
+    /// ACP speaks structured JSON-RPC over stdio, not a PTY, so exactly like
+    /// `pipe_transport` this is never derived from a live probe. It is the
+    /// sole authority `require_policy` uses to admit or reject
+    /// `ProviderRuntimeRequirement::Acp`.
+    pub(crate) fn supports_acp_transport(&self, provider: &AgentId) -> bool {
+        self.providers
+            .get(provider)
+            .is_some_and(|capabilities| capabilities.acp_transport)
     }
 
     pub(crate) fn collect(&self) -> ProviderRuntimeStatuses {
@@ -155,6 +182,8 @@ impl ProviderRuntimeMonitor {
 pub(crate) fn admit_status(
     statuses: &ProviderRuntimeStatuses,
     provider: &AgentId,
+    pipe_transport: bool,
+    acp_transport: bool,
     requirement: ProviderRuntimeRequirement,
 ) -> Result<ProviderRuntimePolicy, ProviderRuntimeAdmissionError> {
     let Some(status) = statuses
@@ -183,11 +212,17 @@ pub(crate) fn admit_status(
         )
         .expect("coarse verified semantic fallback policy is internally valid"),
     };
-    require_policy(policy, requirement).map(|()| policy)
+    // `admit_status` has no catalog reference of its own to consult -- the
+    // caller supplies whatever it already knows about the declared Pipe and
+    // ACP transports, the same way `require_policy` takes them as bare
+    // arguments rather than reading them off `policy`.
+    require_policy(policy, pipe_transport, acp_transport, requirement).map(|()| policy)
 }
 
 pub(crate) fn require_policy(
     policy: ProviderRuntimePolicy,
+    pipe_transport: bool,
+    acp_transport: bool,
     requirement: ProviderRuntimeRequirement,
 ) -> Result<(), ProviderRuntimeAdmissionError> {
     let admitted = match requirement {
@@ -195,14 +230,36 @@ pub(crate) fn require_policy(
         ProviderRuntimeRequirement::SemanticPrompt => {
             policy.semantic_readiness && policy.structured_prompt
         }
-        ProviderRuntimeRequirement::Inline => false,
+        // `PipeSession` (Inline) speaks NDJSON over stdio, not a PTY -- none
+        // of this policy's fields (all PTY-terminal-text-inference
+        // verification: raw_pty_lifecycle, semantic_readiness, ...) describe
+        // it, so there is nothing on `policy` to gate on, the same way ACP
+        // below has nothing to gate on. Unlike ACP, though, the catalog fact
+        // that answers "does this provider support inline" --
+        // `spec.capabilities.transports.pipe.is_some()` -- is NOT enforced
+        // anywhere this node can rely on: `gate4agent-kernel` re-checks the
+        // analogous fact for `TransportKind::Pipe` at its own `Register`
+        // time, but that crate models a different actor's session state
+        // machine and this node never links against it, so a request
+        // landing directly on this node's own RPC surface (`SpawnSession`,
+        // managed-worktree spawn) has no other gate in front of it. The
+        // caller supplies the catalog answer as `pipe_transport`, captured
+        // once into `ProviderStaticCapabilities` at `ProviderRuntimeMonitor`
+        // construction time.
+        ProviderRuntimeRequirement::Inline => pipe_transport,
         // ACP speaks a structured JSON-RPC protocol over stdio, not a PTY --
         // none of this policy's fields (all PTY-terminal-text-inference
         // verification: raw_pty_lifecycle, semantic_readiness, ...) describe
-        // it, so there is nothing here to gate on. The actual "does this
-        // provider support ACP" check is `spec.capabilities.transports.acp.
-        // is_some()`, enforced at kernel `Register` time.
-        ProviderRuntimeRequirement::Acp => true,
+        // it, so there is nothing on `policy` to gate on -- same reasoning
+        // as `Inline` immediately above, and the same fix: `gate4agent-node`
+        // never links `gate4agent-kernel`, so that crate's own `Register`-time
+        // check of `spec.capabilities.transports.acp.is_some()` governs a
+        // different actor's session state machine, not a request landing
+        // directly on this node's own RPC surface. The caller supplies the
+        // catalog answer as `acp_transport`, captured once into
+        // `ProviderStaticCapabilities` at `ProviderRuntimeMonitor`
+        // construction time, the same way `pipe_transport` is.
+        ProviderRuntimeRequirement::Acp => acp_transport,
         // A provider-native PTY resume is still a raw PTY launch. The durable
         // session record supplies the exact provider identity and workspace;
         // the native shell separately requires a declared resume adapter before
@@ -397,7 +454,7 @@ mod tests {
 
         for provider in [&unknown, &future, &verified] {
             assert_eq!(
-                admit_status(&statuses, provider, ProviderRuntimeRequirement::RawPty)
+                admit_status(&statuses, provider, false, false, ProviderRuntimeRequirement::RawPty)
                     .map(|policy| policy.raw_pty_lifecycle),
                 Ok(true),
             );
@@ -407,6 +464,8 @@ mod tests {
                 admit_status(
                     &statuses,
                     provider,
+                    false,
+                    false,
                     ProviderRuntimeRequirement::SemanticPrompt,
                 ),
                 Err(ProviderRuntimeAdmissionError::SemanticCapabilityUnverified),
@@ -416,21 +475,74 @@ mod tests {
             admit_status(
                 &statuses,
                 &verified,
+                false,
+                false,
                 ProviderRuntimeRequirement::SemanticPrompt,
             ),
             Ok(ProviderRuntimePolicy::new(true, true, true, false, false, false).unwrap()),
         );
         assert_eq!(
-            admit_status(&statuses, &unavailable, ProviderRuntimeRequirement::RawPty),
+            admit_status(&statuses, &unavailable, false, false, ProviderRuntimeRequirement::RawPty),
             Err(ProviderRuntimeAdmissionError::LauncherUnavailable),
         );
         assert_eq!(
             admit_status(
                 &statuses,
                 &AgentId::new("missing-status").unwrap(),
+                false,
+                false,
                 ProviderRuntimeRequirement::RawPty,
             ),
             Err(ProviderRuntimeAdmissionError::LauncherUnavailable),
+        );
+    }
+
+    /// `admit_status` never sees the catalog -- its only production caller
+    /// (the `fixture_raw_pty_runtime` bypass) always passes `false` for
+    /// `pipe_transport`, so Inline is rejected through this path exactly as
+    /// unconditionally as it is admitted through it when the caller says so.
+    /// This is the fallback-path half of the coverage
+    /// `ProviderRuntimeMonitor`'s own tests give the catalog-backed half.
+    #[test]
+    fn admit_status_honours_the_caller_supplied_pipe_transport_fact() {
+        let provider = AgentId::new("claude").unwrap();
+        let statuses = ProviderRuntimeStatuses::new([ProviderRuntimeStatus::raw_passthrough(
+            provider.clone(),
+            None,
+        )])
+        .unwrap();
+
+        assert_eq!(
+            admit_status(&statuses, &provider, false, false, ProviderRuntimeRequirement::Inline),
+            Err(ProviderRuntimeAdmissionError::SemanticCapabilityUnverified),
+        );
+        assert_eq!(
+            admit_status(&statuses, &provider, true, false, ProviderRuntimeRequirement::Inline)
+                .map(|policy| policy.raw_pty_lifecycle),
+            Ok(true),
+        );
+    }
+
+    /// Symmetric coverage for `acp_transport` through the same
+    /// catalog-blind fallback: rejected when the caller says no, admitted
+    /// when the caller says yes, independent of `pipe_transport`.
+    #[test]
+    fn admit_status_honours_the_caller_supplied_acp_transport_fact() {
+        let provider = AgentId::new("grok").unwrap();
+        let statuses = ProviderRuntimeStatuses::new([ProviderRuntimeStatus::raw_passthrough(
+            provider.clone(),
+            None,
+        )])
+        .unwrap();
+
+        assert_eq!(
+            admit_status(&statuses, &provider, false, false, ProviderRuntimeRequirement::Acp),
+            Err(ProviderRuntimeAdmissionError::SemanticCapabilityUnverified),
+        );
+        assert_eq!(
+            admit_status(&statuses, &provider, false, true, ProviderRuntimeRequirement::Acp)
+                .map(|policy| policy.raw_pty_lifecycle),
+            Ok(true),
         );
     }
 
@@ -553,6 +665,8 @@ mod tests {
             resume_adapter: true,
             pty_sidecar_observation: false,
             hook_adapter: true,
+            pipe_transport: true,
+            acp_transport: true,
         };
         let full = policy_from_capability_flags(
             &full_static,
@@ -640,12 +754,162 @@ mod tests {
         let raw = ProviderRuntimePolicy::raw_pty();
 
         assert_eq!(
-            require_policy(raw, ProviderRuntimeRequirement::Resume),
+            require_policy(raw, false, false, ProviderRuntimeRequirement::Resume),
             Ok(()),
         );
         assert_eq!(
-            require_policy(raw, ProviderRuntimeRequirement::ResumeWithPrompt),
+            require_policy(raw, false, false, ProviderRuntimeRequirement::ResumeWithPrompt),
             Err(ProviderRuntimeAdmissionError::SemanticCapabilityUnverified),
         );
+    }
+
+    /// Regression coverage for the defect this module used to carry: `Inline`
+    /// (`PipeSession`, NDJSON over stdio) was rejected unconditionally for
+    /// every provider regardless of what the catalog declared. The policy
+    /// argument here carries nothing relevant to Inline -- see the comment on
+    /// the `Inline` match arm -- so the whole decision must come from
+    /// `pipe_transport`, and both directions have to be exact.
+    #[test]
+    fn inline_requirement_is_admitted_only_when_pipe_transport_is_declared() {
+        let admitted = ProviderRuntimePolicy::raw_pty();
+
+        assert_eq!(
+            require_policy(admitted, true, false, ProviderRuntimeRequirement::Inline),
+            Ok(()),
+        );
+        assert_eq!(
+            require_policy(admitted, false, false, ProviderRuntimeRequirement::Inline),
+            Err(ProviderRuntimeAdmissionError::SemanticCapabilityUnverified),
+        );
+    }
+
+    /// Symmetric regression coverage for the same defect shape found in the
+    /// `Acp` arm: it used to admit every provider unconditionally on the
+    /// belief that `gate4agent-kernel`'s own `Register`-time check already
+    /// covered it, which does not hold for this node's own RPC surface (see
+    /// the comment on the `Acp` match arm). The policy argument carries
+    /// nothing relevant to ACP either, so the whole decision must come from
+    /// `acp_transport`, independent of `pipe_transport`.
+    #[test]
+    fn acp_requirement_is_admitted_only_when_acp_transport_is_declared() {
+        let admitted = ProviderRuntimePolicy::raw_pty();
+
+        assert_eq!(
+            require_policy(admitted, false, true, ProviderRuntimeRequirement::Acp),
+            Ok(()),
+        );
+        assert_eq!(
+            require_policy(admitted, false, false, ProviderRuntimeRequirement::Acp),
+            Err(ProviderRuntimeAdmissionError::SemanticCapabilityUnverified),
+        );
+    }
+
+    /// Claude declares a Pipe transport in the catalog
+    /// (`transports.pipe.is_some()`); Qwen Code does not -- it only carries a
+    /// PTY sidecar adapter (see `gate4agent_catalog::builtin::capabilities`).
+    /// `ProviderRuntimeMonitor::supports_pipe_transport` must derive exactly
+    /// that catalog fact, and `require_policy` must honour it end to end
+    /// through the real monitor and the real built-in registry, not just the
+    /// bare policy check above.
+    #[test]
+    fn monitor_admits_inline_for_a_provider_with_declared_pipe_and_rejects_one_without() {
+        let launcher = std::env::temp_dir().join(format!(
+            "gate4agent-inline-pipe-runtime-monitor-{}{}",
+            std::process::id(),
+            std::env::consts::EXE_SUFFIX,
+        ));
+        std::fs::write(&launcher, b"fixture launcher identity").unwrap();
+        let mut claude = builtin_registry().get_by_id("claude").unwrap().clone();
+        assert!(claude.capabilities.transports.pipe.is_some());
+        claude.launch.program = launcher.to_string_lossy().into_owned();
+        let mut qwen = builtin_registry().get_by_id("qwen-code").unwrap().clone();
+        assert!(qwen.capabilities.transports.pipe.is_none());
+        qwen.launch.program = launcher.to_string_lossy().into_owned();
+        let catalog = AgentRegistry::new([claude, qwen]).unwrap();
+        let monitor = ProviderRuntimeMonitor::new(&catalog);
+        let claude_id = AgentId::new("claude").unwrap();
+        let qwen_id = AgentId::new("qwen-code").unwrap();
+
+        assert!(monitor.supports_pipe_transport(&claude_id));
+        assert!(!monitor.supports_pipe_transport(&qwen_id));
+
+        let (_, claude_admission) = monitor.evaluate(&claude_id);
+        assert_eq!(
+            require_policy(
+                claude_admission.unwrap(),
+                monitor.supports_pipe_transport(&claude_id),
+                false,
+                ProviderRuntimeRequirement::Inline,
+            ),
+            Ok(()),
+        );
+
+        let (_, qwen_admission) = monitor.evaluate(&qwen_id);
+        assert_eq!(
+            require_policy(
+                qwen_admission.unwrap(),
+                monitor.supports_pipe_transport(&qwen_id),
+                false,
+                ProviderRuntimeRequirement::Inline,
+            ),
+            Err(ProviderRuntimeAdmissionError::SemanticCapabilityUnverified),
+        );
+
+        std::fs::remove_file(&launcher).unwrap();
+    }
+
+    /// Grok declares an ACP transport in the catalog
+    /// (`transports.acp.is_some()`); Claude does not -- it only carries PTY
+    /// and Pipe transports (see `gate4agent_catalog::builtin::capabilities`).
+    /// `ProviderRuntimeMonitor::supports_acp_transport` must derive exactly
+    /// that catalog fact, and `require_policy` must honour it end to end
+    /// through the real monitor and the real built-in registry, not just the
+    /// bare policy check above -- the same shape of coverage the Inline
+    /// fix above already has, for the arm this coordinator wrote.
+    #[test]
+    fn monitor_admits_acp_for_a_provider_with_declared_acp_and_rejects_one_without() {
+        let launcher = std::env::temp_dir().join(format!(
+            "gate4agent-acp-transport-runtime-monitor-{}{}",
+            std::process::id(),
+            std::env::consts::EXE_SUFFIX,
+        ));
+        std::fs::write(&launcher, b"fixture launcher identity").unwrap();
+        let mut grok = builtin_registry().get_by_id("grok").unwrap().clone();
+        assert!(grok.capabilities.transports.acp.is_some());
+        grok.launch.program = launcher.to_string_lossy().into_owned();
+        let mut claude = builtin_registry().get_by_id("claude").unwrap().clone();
+        assert!(claude.capabilities.transports.acp.is_none());
+        claude.launch.program = launcher.to_string_lossy().into_owned();
+        let catalog = AgentRegistry::new([grok, claude]).unwrap();
+        let monitor = ProviderRuntimeMonitor::new(&catalog);
+        let grok_id = AgentId::new("grok").unwrap();
+        let claude_id = AgentId::new("claude").unwrap();
+
+        assert!(monitor.supports_acp_transport(&grok_id));
+        assert!(!monitor.supports_acp_transport(&claude_id));
+
+        let (_, grok_admission) = monitor.evaluate(&grok_id);
+        assert_eq!(
+            require_policy(
+                grok_admission.unwrap(),
+                false,
+                monitor.supports_acp_transport(&grok_id),
+                ProviderRuntimeRequirement::Acp,
+            ),
+            Ok(()),
+        );
+
+        let (_, claude_admission) = monitor.evaluate(&claude_id);
+        assert_eq!(
+            require_policy(
+                claude_admission.unwrap(),
+                false,
+                monitor.supports_acp_transport(&claude_id),
+                ProviderRuntimeRequirement::Acp,
+            ),
+            Err(ProviderRuntimeAdmissionError::SemanticCapabilityUnverified),
+        );
+
+        std::fs::remove_file(&launcher).unwrap();
     }
 }

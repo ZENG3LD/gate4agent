@@ -3494,6 +3494,8 @@ impl NodeShared {
         requirement: ProviderRuntimeRequirement,
     ) -> Result<ProviderRuntimePolicy, NodeFailure> {
         let admission = if let Some(monitor) = self.provider_runtime_monitor.clone() {
+            let pipe_transport = monitor.supports_pipe_transport(provider);
+            let acp_transport = monitor.supports_acp_transport(provider);
             let provider = provider.clone();
             let refresh = tokio::task::spawn_blocking(move || monitor.evaluate(&provider));
             let (status, admission) = timeout(
@@ -3517,12 +3519,19 @@ impl NodeShared {
                     .insert(status.provider().clone(), status);
             }
             admission.and_then(|policy| {
-                require_policy(policy, requirement).map(|()| policy)
+                require_policy(policy, pipe_transport, acp_transport, requirement).map(|()| policy)
             })
         } else {
+            // No live monitor means no catalog to consult -- there is
+            // nothing here to confirm this provider declares a Pipe or ACP
+            // transport, so Inline/Acp are rejected the same conservative
+            // way an undeclared provider always was, rather than admitted
+            // on trust.
             crate::provider_runtime::admit_status(
                 &self.provider_runtime_statuses,
                 provider,
+                false,
+                false,
                 requirement,
             )
         };
@@ -3541,6 +3550,30 @@ impl NodeShared {
                 "provider runtime probe is already in progress",
             ),
         })
+    }
+
+    /// Whether the catalog declares a Pipe transport for `provider` --
+    /// the fact `require_policy` needs to admit or reject
+    /// `ProviderRuntimeRequirement::Inline`. With no live monitor there is no
+    /// catalog to consult, so this stays conservative and rejects, matching
+    /// `admit_provider_runtime`'s own no-monitor branch.
+    fn provider_supports_pipe_transport(&self, provider: &AgentId) -> bool {
+        match self.provider_runtime_monitor.as_deref() {
+            Some(monitor) => monitor.supports_pipe_transport(provider),
+            None => false,
+        }
+    }
+
+    /// Whether the catalog declares an ACP transport for `provider` -- the
+    /// fact `require_policy` needs to admit or reject
+    /// `ProviderRuntimeRequirement::Acp`. Mirrors
+    /// `provider_supports_pipe_transport` exactly, including the
+    /// conservative no-monitor default.
+    fn provider_supports_acp_transport(&self, provider: &AgentId) -> bool {
+        match self.provider_runtime_monitor.as_deref() {
+            Some(monitor) => monitor.supports_acp_transport(provider),
+            None => false,
+        }
     }
 
     /// Grants hook ingestion to a provider whose catalog entry declares a
@@ -8957,7 +8990,14 @@ impl NodeShared {
         if binding.generation != address.session.generation {
             return Err(failure(NodeFailureCode::StaleGeneration, "session generation is stale"));
         }
-        require_policy(binding.runtime_policy, requirement)
+        // Every caller of this method passes `Resume`, `ResumeWithPrompt`, or
+        // `SemanticPrompt` -- never `Inline` or `Acp` (transport admission is
+        // decided once at spawn time, before a `SessionBinding` even
+        // exists). The `pipe_transport`/`acp_transport` arguments are
+        // therefore inert here; they stay `false` rather than looking up
+        // the session's provider for facts this requirement can never
+        // consult.
+        require_policy(binding.runtime_policy, false, false, requirement)
             .map(|()| binding.runtime_policy)
             .map_err(|_| failure(
                 NodeFailureCode::UnsupportedCapability,
@@ -11166,7 +11206,9 @@ impl NodeShared {
             (SessionMode::Acp, _) => ProviderRuntimeRequirement::Acp,
         };
         let runtime_policy = if let Some(runtime_policy) = admitted_runtime_policy {
-            require_policy(runtime_policy, runtime_requirement).map_err(|_| failure(
+            let pipe_transport = self.provider_supports_pipe_transport(&provider);
+            let acp_transport = self.provider_supports_acp_transport(&provider);
+            require_policy(runtime_policy, pipe_transport, acp_transport, runtime_requirement).map_err(|_| failure(
                 NodeFailureCode::UnsupportedSpawnCapability,
                 "pre-admitted provider runtime no longer satisfies spawn requirements",
             ))?;
@@ -22068,6 +22110,7 @@ mod tests {
                 ("codex", AdapterFamily::History, "codex", "gate4agent-adapter/v1"),
                 ("codex", AdapterFamily::Resume, "codex", "gate4agent-adapter/v1"),
                 ("codex", AdapterFamily::SessionOptions, "codex", "gate4agent-session-options/orca-d8629c4/v1"),
+                ("grok", AdapterFamily::Acp, "grok", "gate4agent-adapter/v1"),
                 ("grok", AdapterFamily::Hook, "grok", "gate4agent-adapter/v1"),
                 ("grok", AdapterFamily::ManagedHook, "grok", "gate4agent-managed-hooks/orca-d8629c4/v1"),
                 ("grok", AdapterFamily::History, "grok", "gate4agent-adapter/v1"),

@@ -2191,22 +2191,7 @@ mod tests {
     fn all_pinned_targets_round_trip_through_explicit_plans() {
         let root = TestRoot::new("round-trip");
         let manager = root.manager();
-        for target in [
-            "claude",
-            "openclaude",
-            "codex",
-            "gemini",
-            "antigravity",
-            "amp",
-            "cursor",
-            "droid",
-            "command-code",
-            "grok",
-            "copilot",
-            "hermes",
-            "devin",
-            "kimi",
-        ] {
+        for target in ["claude", "codex", "grok", "kimi"] {
             let binding = binding(target);
             assert_eq!(
                 manager.status(&binding).unwrap().state,
@@ -2313,11 +2298,11 @@ mod tests {
     fn apply_rejects_config_drift_without_overwriting_it() {
         let root = TestRoot::new("drift");
         let manager = root.manager();
-        let binding = binding("cursor");
+        let binding = binding("claude");
         let plan = manager
             .plan(&binding, ManagedHookOperation::Install)
             .unwrap();
-        let config = root.0.join("home/.cursor/hooks.json");
+        let config = root.0.join("home/.claude/settings.json");
         fs::create_dir_all(config.parent().unwrap()).unwrap();
         fs::write(&config, b"{\"user\":true}\n").unwrap();
         assert!(matches!(
@@ -2327,7 +2312,7 @@ mod tests {
         assert_eq!(fs::read(&config).unwrap(), b"{\"user\":true}\n");
         assert!(!root
             .0
-            .join("home/.gate4agent/agent-hooks/cursor-hook.sh")
+            .join("home/.gate4agent/agent-hooks/claude-hook.sh")
             .exists());
     }
 
@@ -2343,87 +2328,37 @@ mod tests {
             Err(ManagedHookError::UnmanagedConflict(path)) if path == script
         ));
 
-        let amp = root
-            .0
-            .join("home/.config/amp/plugins/gate4agent-agent-status.ts");
-        fs::create_dir_all(amp.parent().unwrap()).unwrap();
-        fs::write(&amp, b"export default userPlugin\n").unwrap();
-        assert_eq!(
-            manager.status(&binding("amp")).unwrap().state,
-            ManagedHookState::Conflict
-        );
-        assert!(matches!(
-            manager.plan(&binding("amp"), ManagedHookOperation::Remove),
-            Err(ManagedHookError::UnmanagedConflict(path)) if path == amp
-        ));
+        // The whole-file-ownership conflict shape below (`amp`'s TS plugin:
+        // an unmanaged file entirely occupies the config path, reported as
+        // `ManagedHookState::Conflict`) has no fleet-relevant example left:
+        // `AmpPlugin`/`HermesPlugin` are the only config kinds that ever
+        // produce that state, and no fleet member uses either -- the fleet's
+        // JsonHooks and KimiToml kinds both merge in place instead of
+        // claiming a whole file, so `status_amp`'s `conflict()` call is
+        // unreachable from any declared fleet spec.
     }
 
+    // The YAML plugin-membership merge shape (`hermes`'s `config.yaml`,
+    // preserving unrelated `enabled`/`disabled` entries across install and
+    // remove) has no fleet-relevant example left: `HermesPlugin` is the
+    // only config kind that ever exercises it, and no fleet member uses
+    // it -- `plan_hermes`'s YAML merge is unreachable from any declared
+    // fleet spec.
+
+    // JSONC comment tolerance in `parse_json_config` is hardcoded to
+    // `spec.target == "devin"`, not a generic JsonHooks property, and no
+    // fleet member gets it -- `devin`'s branch is unreachable from any
+    // declared fleet spec, so only the malformed-JSON-is-rejected half
+    // below (which every JsonHooks target exercises) still applies.
     #[test]
-    fn hermes_yaml_preserves_other_plugin_memberships() {
-        let root = TestRoot::new("hermes-yaml");
+    fn json_hooks_fail_closed_on_malformed_json() {
+        let root = TestRoot::new("json-malformed");
         let manager = root.manager();
-        let path = root.0.join("home/.hermes/config.yaml");
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(
-            &path,
-            "model: test\nplugins:\n  enabled:\n    - user-plugin\n  disabled:\n    - blocked-plugin\nother: value\n",
-        )
-        .unwrap();
-        let binding = binding("hermes");
-        manager
-            .apply(
-                manager
-                    .plan(&binding, ManagedHookOperation::Install)
-                    .unwrap(),
-            )
-            .unwrap();
-        let installed = fs::read_to_string(&path).unwrap();
-        assert!(installed.contains("- user-plugin"));
-        assert!(installed.contains("- blocked-plugin"));
-        assert!(installed.contains("- gate4agent-status"));
-        assert!(installed.contains("other: value"));
-
-        manager
-            .apply(
-                manager
-                    .plan(&binding, ManagedHookOperation::Remove)
-                    .unwrap(),
-            )
-            .unwrap();
-        let removed = fs::read_to_string(&path).unwrap();
-        assert!(removed.contains("- user-plugin"));
-        assert!(removed.contains("- blocked-plugin"));
-        assert!(!removed.contains("- gate4agent-status"));
-        assert!(removed.contains("other: value"));
-    }
-
-    #[test]
-    fn devin_jsonc_is_accepted_but_invalid_json_is_fail_closed() {
-        let root = TestRoot::new("devin-jsonc");
-        let manager = root.manager();
-        let path = root.0.join("home/.config/devin/config.json");
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(
-            &path,
-            "{\n // user setting\n \"read_config_from\": false,\n}\n",
-        )
-        .unwrap();
-        let devin_binding = binding("devin");
-        manager
-            .apply(
-                manager
-                    .plan(&devin_binding, ManagedHookOperation::Install)
-                    .unwrap(),
-            )
-            .unwrap();
-        let config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(config["read_config_from"], false);
-
-        let broken = root.0.join("home/.gemini/settings.json");
+        let broken = root.0.join("home/.codex/hooks.json");
         fs::create_dir_all(broken.parent().unwrap()).unwrap();
         fs::write(&broken, b"{broken").unwrap();
         assert!(matches!(
-            manager.plan(&binding("gemini"), ManagedHookOperation::Install),
+            manager.plan(&binding("codex"), ManagedHookOperation::Install),
             Err(ManagedHookError::Json(_))
         ));
         assert_eq!(fs::read(broken).unwrap(), b"{broken");
@@ -2481,9 +2416,14 @@ mod tests {
 
     #[test]
     fn generated_scripts_keep_provider_specific_safety_contracts() {
+        // `command-code`, `antigravity`, `amp`, and `hermes` are not part of
+        // the current fleet, so their generated-script safety contracts
+        // (curl posting, decision JSON shape, TS plugin body) are no longer
+        // exercised here -- `claude` is the one fleet-relevant example this
+        // test already carried.
         let root = TestRoot::new("script-contracts");
         let manager = root.manager();
-        for target in ["command-code", "antigravity", "claude", "amp", "hermes"] {
+        for target in ["claude"] {
             let target_binding = binding(target);
             manager
                 .apply(
@@ -2493,68 +2433,19 @@ mod tests {
                 )
                 .unwrap();
         }
-        let command_code = fs::read_to_string(
-            root.0
-                .join("home/.gate4agent/agent-hooks/command-code-hook.sh"),
-        )
-        .unwrap();
-        assert!(command_code.contains("endpoint.env"));
-        assert!(command_code.contains("GATE4AGENT_HOOK_TOKEN"));
-        assert!(command_code.contains("/hook/command-code"));
-        assert!(command_code.contains("x-gate4agent-hook-route"));
-
-        let antigravity = fs::read_to_string(
-            root.0
-                .join("home/.gate4agent/agent-hooks/antigravity-hook.sh"),
-        )
-        .unwrap();
-        assert!(antigravity.contains("{\"decision\":\"\"}"));
-        assert!(antigravity.contains("GATE4AGENT_HOOK_EVENT"));
 
         let claude =
             fs::read_to_string(root.0.join("home/.gate4agent/agent-hooks/claude-hook.sh")).unwrap();
         assert!(claude.contains("DEVIN_PROJECT_DIR"));
         assert!(claude.contains("cat >/dev/null"));
-
-        let amp = fs::read_to_string(
-            root.0
-                .join("home/.config/amp/plugins/gate4agent-agent-status.ts"),
-        )
-        .unwrap();
-        assert!(amp.contains("const MAX_PENDING_POSTS = 50"));
-        assert!(amp.contains("jsonSafe(event.input)"));
-        assert!(amp.contains("previewValue(event.output)"));
-
-        let hermes = fs::read_to_string(
-            root.0
-                .join("home/.hermes/plugins/gate4agent-status/__init__.py"),
-        )
-        .unwrap();
-        assert!(hermes.contains("MAX_JSONABLE_NODES = 500"));
-        assert!(hermes.contains("payload[key] = _jsonable(kwargs[key])"));
     }
 
     #[test]
     fn windows_plans_round_trip_all_targets_without_embedding_authority() {
         let root = TestRoot::new("windows-round-trip");
         let manager = root.manager_for(RuntimePlatform::Windows);
-        let mut command_code_script = String::new();
-        for target in [
-            "claude",
-            "openclaude",
-            "codex",
-            "gemini",
-            "antigravity",
-            "amp",
-            "cursor",
-            "droid",
-            "command-code",
-            "grok",
-            "copilot",
-            "hermes",
-            "devin",
-            "kimi",
-        ] {
+        let mut claude_script = String::new();
+        for target in ["claude", "codex", "grok", "kimi"] {
             let target_binding = binding(target);
             let status = manager
                 .apply(
@@ -2572,10 +2463,10 @@ mod tests {
                 },
                 "Windows install status for {target}"
             );
-            if target == "command-code" {
-                command_code_script = fs::read_to_string(
+            if target == "claude" {
+                claude_script = fs::read_to_string(
                     root.0
-                        .join("home/.gate4agent/agent-hooks/command-code-hook.cmd"),
+                        .join("home/.gate4agent/agent-hooks/claude-hook.cmd"),
                 )
                 .unwrap();
             }
@@ -2587,31 +2478,23 @@ mod tests {
                 )
                 .unwrap();
         }
-        assert!(command_code_script.contains("endpoint.cmd"));
-        assert!(command_code_script.contains("GATE4AGENT_HOOK_TOKEN=%~2"));
-        assert!(!command_code_script.contains("x-gate4agent-hook-token: 00000000"));
+        // The `endpoint.cmd`-recovery safety contract asserted here before
+        // was `command-code`-specific (`managed_cmd_script`'s
+        // `endpoint_label`, gated on `target == "command-code"`), and
+        // `command-code` is not part of the current fleet -- unreachable
+        // from any declared fleet spec. `claude`'s own Windows-script
+        // safety contract (skipping Devin's own hook re-entry) remains
+        // fleet-relevant.
+        assert!(claude_script.contains("%DEVIN_PROJECT_DIR%"));
+        assert!(claude_script.contains("goto :drain"));
+        assert!(!claude_script.contains("x-gate4agent-hook-token: 00000000"));
     }
 
     #[test]
     fn all_pinned_targets_round_trip_through_explicit_plans_on_windows() {
         let root = TestRoot::new("round-trip-windows");
         let manager = root.manager_for(RuntimePlatform::Windows);
-        for target in [
-            "claude",
-            "openclaude",
-            "codex",
-            "gemini",
-            "antigravity",
-            "amp",
-            "cursor",
-            "droid",
-            "command-code",
-            "grok",
-            "copilot",
-            "hermes",
-            "devin",
-            "kimi",
-        ] {
+        for target in ["claude", "codex", "grok", "kimi"] {
             let binding = binding(target);
             assert_eq!(
                 manager.status(&binding).unwrap().state,

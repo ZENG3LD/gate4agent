@@ -611,7 +611,22 @@ mod tests {
             std::env::consts::EXE_SUFFIX,
         ));
         std::fs::write(&launcher, b"fixture launcher identity").unwrap();
-        let mut qwen = builtin_registry().get_by_id("qwen-code").unwrap().clone();
+        // `qwen-code` is not part of the current fleet's built-in registry:
+        // this reuses `codex`'s own real, globally-registered Pipe binding
+        // as a synthetic PTY sidecar, standing in for a live registry
+        // lookup. `pty_sidecar_observation` is generic (keyed on the
+        // binding's presence, not on any literal provider id), so which
+        // real Pipe binding it is built from is not load-bearing.
+        let mut qwen = builtin_registry().get_by_id("codex").unwrap().clone();
+        qwen.id = AgentId::new("qwen-code").unwrap();
+        qwen.detection.command = "qwen".to_owned();
+        let sidecar = qwen.capabilities.transports.pipe.clone().unwrap().adapter;
+        qwen.capabilities.transports.pipe = None;
+        qwen.capabilities.adapters.pty_sidecar = Some(sidecar);
+        // The real (now removed) `qwen-code` spec carried no Hook adapter --
+        // matched here so `hook_semantics` reflects the shape under test,
+        // not an artifact of the `codex` skeleton it was cloned from.
+        qwen.capabilities.adapters.hook = None;
         qwen.launch.program = launcher.to_string_lossy().into_owned();
         let mut grok = builtin_registry().get_by_id("grok").unwrap().clone();
         grok.launch.program = launcher.to_string_lossy().into_owned();
@@ -811,6 +826,11 @@ mod tests {
     /// that catalog fact, and `require_policy` must honour it end to end
     /// through the real monitor and the real built-in registry, not just the
     /// bare policy check above.
+    ///
+    /// `qwen-code` is not part of the current fleet's built-in registry: the
+    /// "Pipe" half is a synthetic fixture reusing `codex`'s own real,
+    /// globally-registered Pipe binding as a PTY sidecar instead, standing
+    /// in for a live registry lookup.
     #[test]
     fn monitor_admits_inline_for_a_provider_with_declared_pipe_and_rejects_one_without() {
         let launcher = std::env::temp_dir().join(format!(
@@ -822,7 +842,12 @@ mod tests {
         let mut claude = builtin_registry().get_by_id("claude").unwrap().clone();
         assert!(claude.capabilities.transports.pipe.is_some());
         claude.launch.program = launcher.to_string_lossy().into_owned();
-        let mut qwen = builtin_registry().get_by_id("qwen-code").unwrap().clone();
+        let mut qwen = builtin_registry().get_by_id("codex").unwrap().clone();
+        qwen.id = AgentId::new("qwen-code").unwrap();
+        qwen.detection.command = "qwen".to_owned();
+        let sidecar = qwen.capabilities.transports.pipe.clone().unwrap().adapter;
+        qwen.capabilities.transports.pipe = None;
+        qwen.capabilities.adapters.pty_sidecar = Some(sidecar);
         assert!(qwen.capabilities.transports.pipe.is_none());
         qwen.launch.program = launcher.to_string_lossy().into_owned();
         let catalog = AgentRegistry::new([claude, qwen]).unwrap();
@@ -859,12 +884,15 @@ mod tests {
     }
 
     /// Grok declares an ACP transport in the catalog
-    /// (`transports.acp.is_some()`); Claude does not -- it only carries PTY
-    /// and Pipe transports (see `gate4agent_catalog::builtin::capabilities`).
-    /// `ProviderRuntimeMonitor::supports_acp_transport` must derive exactly
-    /// that catalog fact, and `require_policy` must honour it end to end
-    /// through the real monitor and the real built-in registry, not just the
-    /// bare policy check above -- the same shape of coverage the Inline
+    /// (`transports.acp.is_some()`); every fleet member now does (Claude,
+    /// Codex, and Kimi Code all gained one too), so the "without" half needs
+    /// a fixture that carries every other transport declaration a real
+    /// provider would but omits ACP -- built from `claude` with `acp`
+    /// cleared, rather than a second live fleet example, since none exists
+    /// anymore. `ProviderRuntimeMonitor::supports_acp_transport` must derive
+    /// exactly that catalog fact, and `require_policy` must honour it end to
+    /// end through the real monitor and the real built-in registry, not just
+    /// the bare policy check above -- the same shape of coverage the Inline
     /// fix above already has, for the arm this coordinator wrote.
     #[test]
     fn monitor_admits_acp_for_a_provider_with_declared_acp_and_rejects_one_without() {
@@ -878,12 +906,15 @@ mod tests {
         assert!(grok.capabilities.transports.acp.is_some());
         grok.launch.program = launcher.to_string_lossy().into_owned();
         let mut claude = builtin_registry().get_by_id("claude").unwrap().clone();
+        claude.capabilities.transports.acp = None;
+        claude.id = AgentId::new("no-acp-fixture").unwrap();
+        claude.detection.command = "no-acp-fixture".to_owned();
         assert!(claude.capabilities.transports.acp.is_none());
         claude.launch.program = launcher.to_string_lossy().into_owned();
         let catalog = AgentRegistry::new([grok, claude]).unwrap();
         let monitor = ProviderRuntimeMonitor::new(&catalog);
         let grok_id = AgentId::new("grok").unwrap();
-        let claude_id = AgentId::new("claude").unwrap();
+        let claude_id = AgentId::new("no-acp-fixture").unwrap();
 
         assert!(monitor.supports_acp_transport(&grok_id));
         assert!(!monitor.supports_acp_transport(&claude_id));

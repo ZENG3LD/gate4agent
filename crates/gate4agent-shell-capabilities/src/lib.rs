@@ -309,6 +309,19 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    /// A minimal stand-in spec for `execute_probe` fixtures below. `id`,
+    /// `launch`, and `capabilities.adapters.capability_probe` are
+    /// overwritten by the caller; the rest just needs to be a valid spec.
+    /// No provider in the current fleet declares a capability-probe
+    /// adapter -- the feature existed to serve `cursor`'s `--list-models`,
+    /// and `cursor` is not part of the fleet -- so these fixtures exercise
+    /// `execute_probe` directly (spawn, timeout, output bounding) rather
+    /// than through the public `probe()`, which fails closed for every
+    /// real spec before ever reaching it.
+    fn probe_fixture_spec() -> AgentSpec {
+        builtin_registry().get_by_id("codex").unwrap().clone()
+    }
+
     fn fixture_dir(name: &str) -> std::path::PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -320,53 +333,6 @@ mod tests {
         ));
         fs::create_dir(&path).unwrap();
         path
-    }
-
-    #[tokio::test]
-    async fn structured_override_is_executed_once_and_cached_per_host() {
-        let directory = fixture_dir("cache");
-        let counter = directory.join("count.txt");
-        let script_path = directory.join(if cfg!(windows) {
-            "probe.cmd"
-        } else {
-            "probe.sh"
-        });
-        #[cfg(windows)]
-        let script = format!(
-            "@echo off\r\n>>\"{}\" echo x\r\necho auto - Auto ^(default^)\r\necho gpt-5.3-codex - GPT-5.3 Codex\r\n",
-            counter.display()
-        );
-        #[cfg(not(windows))]
-        let script = format!(
-            "printf x >> '{}'; printf 'auto - Auto (default)\\ngpt-5.3-codex - GPT-5.3 Codex\\n'",
-            counter.display().to_string().replace('\'', "'\\''")
-        );
-        fs::write(&script_path, script).unwrap();
-
-        let mut spec = builtin_registry().get_by_id("cursor").unwrap().clone();
-        #[cfg(windows)]
-        {
-            spec.launch.program = script_path.display().to_string();
-            spec.launch.fixed_args = Vec::new();
-        }
-        #[cfg(not(windows))]
-        {
-            spec.launch.program = "sh".to_owned();
-            spec.launch.fixed_args = vec![script_path.display().to_string()];
-        }
-        let mut authority = NativeCapabilityProbeAuthority::default();
-        let first = authority
-            .probe(&spec, directory.to_str().unwrap())
-            .await
-            .unwrap();
-        let second = authority
-            .probe(&spec, directory.to_str().unwrap())
-            .await
-            .unwrap();
-        assert_eq!(first, second);
-        assert_eq!(first.len(), 2);
-        assert_eq!(fs::read_to_string(&counter).unwrap().lines().count(), 1);
-        fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]
@@ -382,30 +348,31 @@ mod tests {
         #[cfg(not(windows))]
         let script = "printf 'auto - A label that exceeds the configured limit'";
         fs::write(&script_path, script).unwrap();
-        let mut spec = builtin_registry().get_by_id("cursor").unwrap().clone();
         #[cfg(windows)]
-        {
-            spec.launch.program = "powershell.exe".to_owned();
-            spec.launch.fixed_args = vec![
+        let (program, args) = (
+            "powershell.exe".to_owned(),
+            vec![
                 "-NoProfile".to_owned(),
                 "-NonInteractive".to_owned(),
                 "-File".to_owned(),
                 script_path.display().to_string(),
-            ];
-        }
-        #[cfg(not(windows))]
-        {
-            spec.launch.program = "sh".to_owned();
-            spec.launch.fixed_args = vec![script_path.display().to_string()];
-        }
-        let mut authority = NativeCapabilityProbeAuthority::new(NativeCapabilityProbeConfig {
-            timeout: Duration::from_secs(5),
-            output_max_bytes: 16,
-        });
-        assert_eq!(
-            authority.probe(&spec, directory.to_str().unwrap()).await,
-            Err(CapabilityProbeFailure::OutputLimitExceeded)
+            ],
         );
+        #[cfg(not(windows))]
+        let (program, args) = ("sh".to_owned(), vec![script_path.display().to_string()]);
+        let spec = probe_fixture_spec();
+        let result = execute_probe(
+            &spec,
+            &program,
+            &args,
+            directory.to_str().unwrap(),
+            NativeCapabilityProbeConfig {
+                timeout: Duration::from_secs(5),
+                output_max_bytes: 16,
+            },
+        )
+        .await;
+        assert_eq!(result, Err(CapabilityProbeFailure::OutputLimitExceeded));
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -422,25 +389,23 @@ mod tests {
         #[cfg(not(windows))]
         let script = "sleep 10";
         fs::write(&script_path, script).unwrap();
-        let mut spec = builtin_registry().get_by_id("cursor").unwrap().clone();
         #[cfg(windows)]
-        {
-            spec.launch.program = script_path.display().to_string();
-            spec.launch.fixed_args = Vec::new();
-        }
+        let (program, args) = (script_path.display().to_string(), Vec::new());
         #[cfg(not(windows))]
-        {
-            spec.launch.program = "sh".to_owned();
-            spec.launch.fixed_args = vec![script_path.display().to_string()];
-        }
-        let mut authority = NativeCapabilityProbeAuthority::new(NativeCapabilityProbeConfig {
-            timeout: Duration::from_millis(50),
-            output_max_bytes: 1_024,
-        });
-        assert_eq!(
-            authority.probe(&spec, directory.to_str().unwrap()).await,
-            Err(CapabilityProbeFailure::TimedOut)
-        );
+        let (program, args) = ("sh".to_owned(), vec![script_path.display().to_string()]);
+        let spec = probe_fixture_spec();
+        let result = execute_probe(
+            &spec,
+            &program,
+            &args,
+            directory.to_str().unwrap(),
+            NativeCapabilityProbeConfig {
+                timeout: Duration::from_millis(50),
+                output_max_bytes: 1_024,
+            },
+        )
+        .await;
+        assert_eq!(result, Err(CapabilityProbeFailure::TimedOut));
         fs::remove_dir_all(directory).unwrap();
     }
 }

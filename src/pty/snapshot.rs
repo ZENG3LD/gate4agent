@@ -7,9 +7,6 @@ use serde::{Deserialize, Serialize};
 pub enum AgentCli {
     Claude,
     Codex,
-    Gemini,
-    /// OpenCode (sst/opencode) — PIPE transport, own 5-event NDJSON schema.
-    OpenCode,
 }
 
 impl AgentCli {
@@ -18,8 +15,6 @@ impl AgentCli {
         match self {
             AgentCli::Claude => "claude",
             AgentCli::Codex => "codex",
-            AgentCli::Gemini => "gemini",
-            AgentCli::OpenCode => "opencode",
         }
     }
 
@@ -28,18 +23,14 @@ impl AgentCli {
         match self {
             AgentCli::Claude => "Claude",
             AgentCli::Codex => "Codex",
-            AgentCli::Gemini => "Gemini",
-            AgentCli::OpenCode => "OpenCode",
         }
     }
 
-    /// Returns the next CLI in cycle order: Claude → Codex → Gemini → OpenCode → Claude.
+    /// Returns the next CLI in cycle order: Claude → Codex → Claude.
     pub fn cycle(self) -> Self {
         match self {
             AgentCli::Claude => AgentCli::Codex,
-            AgentCli::Codex => AgentCli::Gemini,
-            AgentCli::Gemini => AgentCli::OpenCode,
-            AgentCli::OpenCode => AgentCli::Claude,
+            AgentCli::Codex => AgentCli::Claude,
         }
     }
 }

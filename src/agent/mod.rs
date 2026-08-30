@@ -51,8 +51,6 @@ impl From<CliTool> for AgentId {
             CliTool::ClaudeCode => "claude",
             CliTool::Codex => "codex",
             CliTool::KimiCode => "kimi",
-            CliTool::Gemini => "gemini",
-            CliTool::OpenCode => "opencode",
             CliTool::Grok => "grok",
         };
         AgentId::new(id).expect("legacy CLI tool IDs are valid")
@@ -67,8 +65,6 @@ impl TryFrom<&AgentId> for CliTool {
             "claude" => Ok(Self::ClaudeCode),
             "codex" => Ok(Self::Codex),
             "kimi" => Ok(Self::KimiCode),
-            "gemini" => Ok(Self::Gemini),
-            "opencode" => Ok(Self::OpenCode),
             "grok" => Ok(Self::Grok),
             _ => Err(LegacyCliToolError(id.clone())),
         }
@@ -87,8 +83,8 @@ mod tests {
     fn legacy_mapping_is_explicit_and_one_way_for_new_agents() {
         assert_eq!(AgentId::from(CliTool::ClaudeCode).as_str(), "claude");
         assert_eq!(
-            CliTool::try_from(&AgentId::new("opencode").unwrap()).unwrap(),
-            CliTool::OpenCode
+            CliTool::try_from(&AgentId::new("codex").unwrap()).unwrap(),
+            CliTool::Codex
         );
         // Grok now maps to a real CliTool variant (ACP transport) — the
         // closed legacy set is intentionally widened, not merely extended.

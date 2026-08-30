@@ -505,7 +505,7 @@ pub fn acp_agent_spec() -> AgentSpec {
             pty_adapter: None,
             pipe: None,
             acp: Some(AcpTransportSpec {
-                adapter: adapter(AdapterFamily::Acp, "gemini"),
+                adapter: adapter(AdapterFamily::Acp, "claude-code"),
                 launch_override: Some(launch),
             }),
         },

@@ -8,7 +8,6 @@ pub const ONE_SHOT_REVISION: &str = "gate4agent-one-shot/orca-d8629c4/v2";
 pub const CLAUDE_CODE_INLINE_REVISION: &str = "gate4agent-inline/claude-code-2.1/v1";
 pub const CODEX_CLI_INLINE_REVISION: &str = "gate4agent-inline/codex-cli-0.144/v1";
 pub const KIMI_CODE_INLINE_REVISION: &str = "gate4agent-inline/kimi-code-0.31/v1";
-pub const QWEN_CODE_INLINE_REVISION: &str = "gate4agent-inline/qwen-code-0.21/v1";
 pub const ONE_SHOT_OUTPUT_MAX_BYTES: usize = 4 * 1024 * 1024;
 pub const ONE_SHOT_TIMEOUT_SECONDS: u64 = 60;
 pub const ONE_SHOT_THINKING_OPTION_ID: &str = "thinking-level";
@@ -66,21 +65,10 @@ pub struct OneShotPlan {
 }
 
 pub fn one_shot_specs() -> Vec<OneShotAdapterSpec> {
-    [
-        "claude",
-        "codex",
-        "opencode",
-        "pi",
-        "amp",
-        "cursor",
-        "kimi",
-        "qwen-code",
-        "copilot",
-        "antigravity",
-    ]
-    .into_iter()
-    .map(|id| spec_for(id).expect("hardcoded one-shot adapter"))
-    .collect()
+    ["claude", "codex", "kimi"]
+        .into_iter()
+        .map(|id| spec_for(id).expect("hardcoded one-shot adapter"))
+        .collect()
 }
 
 pub fn one_shot_spec(adapter_id: &AdapterId) -> Result<OneShotAdapterSpec, OneShotAdapterError> {
@@ -160,78 +148,9 @@ pub fn resolve_one_shot_plan_with_persistence(
                 ]);
             }
         }
-        "opencode" => {
-            args.extend(strings(&[
-                "run", "--model", &model, "--agent", "build", "--format", "default",
-            ]));
-            if let Some(thinking) = &thinking {
-                args.extend(["--variant".to_owned(), thinking.clone()]);
-            }
-            args.push(prompt.to_owned());
-        }
-        "pi" => {
-            args.extend(strings(&[
-                "--print",
-                "--no-session",
-                "--no-tools",
-                "--no-extensions",
-                "--no-skills",
-                "--no-context-files",
-                "--mode",
-                "text",
-                "--model",
-                &model,
-            ]));
-            if let Some(thinking) = &thinking {
-                args.extend(["--thinking".to_owned(), thinking.clone()]);
-            }
-        }
-        "amp" => {
-            args.extend(strings(&[
-                "--execute",
-                "--no-notifications",
-                "--no-ide",
-                "--no-jetbrains",
-                "--mode",
-                &model,
-            ]));
-            if let Some(thinking) = &thinking {
-                args.extend(["--effort".to_owned(), thinking.clone()]);
-            }
-        }
-        "cursor" => args.extend(strings(&[
-            "--print",
-            "--mode",
-            "ask",
-            "--trust",
-            "--output-format",
-            "text",
-            "--model",
-            &model,
-            prompt,
-        ])),
         "kimi" => {
             args.extend(strings(&["-p", prompt, "--output-format", "text"]));
         }
-        "qwen-code" => {
-            args.extend(strings(&["-p", prompt, "--output-format", "text"]));
-        }
-        "copilot" => {
-            args.extend(strings(&[
-                "--prompt",
-                prompt,
-                "--silent",
-                "--stream",
-                "off",
-                "--no-custom-instructions",
-                "--model",
-                &model,
-            ]));
-            if let Some(thinking) = &thinking {
-                args.extend(["--effort".to_owned(), thinking.clone()]);
-            }
-        }
-        "antigravity" => args.extend(strings(&["--print", "--sandbox", "--model", &model])),
         id => return Err(OneShotAdapterError::UnsupportedAdapter(id.to_owned())),
     }
 
@@ -335,101 +254,12 @@ fn spec_for(id: &str) -> Result<OneShotAdapterSpec, OneShotAdapterError> {
             .collect(),
             "gpt-5.5",
         ),
-        "opencode" => (
-            "OpenCode",
-            // OpenCode 1.4.3 documents `run [message..]` and exits with empty
-            // output when the message is supplied only through stdin. This is
-            // live-vendor evidence that intentionally supersedes the pinned
-            // Orca stdin contract at d8629c4.
-            OneShotPromptDelivery::Positional,
-            OneShotModelSource::Dynamic,
-            vec![
-                model(
-                    "opencode/deepseek-v4-flash-free",
-                    "OpenCode DeepSeek V4 Flash Free",
-                    &[],
-                    None,
-                ),
-                model(
-                    "opencode/gpt-5.4-mini",
-                    "OpenCode GPT 5.4 Mini",
-                    &openai_thinking(),
-                    Some("low"),
-                ),
-            ],
-            "opencode/deepseek-v4-flash-free",
-        ),
-        "pi" => (
-            "Pi",
-            OneShotPromptDelivery::StdinClose,
-            OneShotModelSource::Dynamic,
-            vec![model(
-                "github-copilot/gpt-5.4-mini",
-                "Github Copilot GPT 5.4 Mini",
-                &[
-                    ("off", "Off"),
-                    ("low", "Low"),
-                    ("medium", "Medium"),
-                    ("high", "High"),
-                    ("xhigh", "Extra High"),
-                ],
-                Some("low"),
-            )],
-            "github-copilot/gpt-5.4-mini",
-        ),
-        "amp" => (
-            "Amp",
-            OneShotPromptDelivery::StdinClose,
-            OneShotModelSource::Static,
-            vec![
-                model("smart", "Smart", &[], None),
-                model("rush", "Rush", &[], None),
-                model("large", "Large", &basic_thinking(), Some("low")),
-                model("deep", "Deep", &basic_thinking(), Some("low")),
-            ],
-            "smart",
-        ),
-        "cursor" => (
-            "Cursor",
-            OneShotPromptDelivery::Positional,
-            OneShotModelSource::Dynamic,
-            vec![model("auto", "Auto", &[], None)],
-            "auto",
-        ),
         "kimi" => (
             "Kimi Code",
             OneShotPromptDelivery::Positional,
             OneShotModelSource::Static,
             vec![model("default", "Provider default", &[], None)],
             "default",
-        ),
-        "qwen-code" => (
-            "Qwen Code",
-            OneShotPromptDelivery::Positional,
-            OneShotModelSource::Static,
-            vec![model("default", "Provider default", &[], None)],
-            "default",
-        ),
-        "copilot" => (
-            "GitHub Copilot",
-            OneShotPromptDelivery::Positional,
-            OneShotModelSource::Static,
-            copilot_models(),
-            "gpt-5.4",
-        ),
-        "antigravity" => (
-            "Antigravity",
-            OneShotPromptDelivery::StdinClose,
-            OneShotModelSource::Dynamic,
-            [
-                "Gemini 3.5 Flash (Medium)",
-                "Gemini 3.5 Flash (High)",
-                "Gemini 3.5 Flash (Low)",
-            ]
-            .into_iter()
-            .map(|id| model(id, id, &[], None))
-            .collect(),
-            "Gemini 3.5 Flash (Medium)",
         ),
         id => return Err(OneShotAdapterError::UnsupportedAdapter(id.to_owned())),
     };
@@ -441,36 +271,6 @@ fn spec_for(id: &str) -> Result<OneShotAdapterSpec, OneShotAdapterError> {
         models,
         default_model_id: default_model_id.to_owned(),
     })
-}
-
-fn copilot_models() -> Vec<OneShotModelSpec> {
-    [
-        "auto",
-        "claude-haiku-4.5",
-        "claude-sonnet-4.5",
-        "claude-sonnet-4.6",
-        "claude-opus-4.5",
-        "claude-opus-4.6",
-        "claude-opus-4.6-fast",
-        "claude-opus-4.7",
-        "gpt-4.1",
-        "gpt-5-mini",
-        "gpt-5.2",
-        "gpt-5.2-codex",
-        "gpt-5.3-codex",
-        "gpt-5.4",
-        "gpt-5.4-mini",
-        "gpt-5.5",
-    ]
-    .into_iter()
-    .map(|id| {
-        if supports_openai_thinking(id) {
-            model(id, id, &openai_thinking(), Some("low"))
-        } else {
-            model(id, id, &[], None)
-        }
-    })
-    .collect()
 }
 
 fn model(
@@ -491,10 +291,6 @@ fn model(
             .collect(),
         default_thinking_level: default_thinking.map(str::to_owned),
     }
-}
-
-fn basic_thinking() -> [(&'static str, &'static str); 3] {
-    [("low", "Low"), ("medium", "Medium"), ("high", "High")]
 }
 
 fn openai_thinking() -> [(&'static str, &'static str); 4] {
@@ -566,30 +362,14 @@ mod tests {
             .iter()
             .map(|spec| spec.adapter_id.as_str())
             .collect::<BTreeSet<_>>();
-        assert_eq!(
-            actual,
-            [
-                "amp",
-                "antigravity",
-                "claude",
-                "codex",
-                "copilot",
-                "cursor",
-                "kimi",
-                "opencode",
-                "pi",
-                "qwen-code",
-            ]
-            .into_iter()
-            .collect()
-        );
+        assert_eq!(actual, ["claude", "codex", "kimi"].into_iter().collect());
         assert_eq!(
             specs
                 .iter()
-                .find(|spec| spec.adapter_id.as_str() == "copilot")
+                .find(|spec| spec.adapter_id.as_str() == "codex")
                 .unwrap()
                 .default_model_id,
-            "gpt-5.4"
+            "gpt-5.5"
         );
     }
 
@@ -629,33 +409,6 @@ mod tests {
             .args
             .contains(&"model_reasoning_effort=xhigh".to_owned()));
 
-        let opencode = resolve_one_shot_plan(
-            &AdapterId::new("opencode").unwrap(),
-            &launch("opencode"),
-            "prompt in argv",
-            None,
-        )
-        .unwrap();
-        assert_eq!(opencode.stdin_payload, None);
-        assert_eq!(
-            opencode.args.last().map(String::as_str),
-            Some("prompt in argv")
-        );
-
-        let cursor = resolve_one_shot_plan(
-            &AdapterId::new("cursor").unwrap(),
-            &launch("cursor-agent"),
-            "prompt in argv",
-            None,
-        )
-        .unwrap();
-        assert_eq!(cursor.stdin_payload, None);
-        assert_eq!(
-            cursor.args.last().map(String::as_str),
-            Some("prompt in argv")
-        );
-        assert!(cursor.args.contains(&"--trust".to_owned()));
-
         let kimi = resolve_one_shot_plan(
             &AdapterId::new("kimi").unwrap(),
             &launch("kimi"),
@@ -666,19 +419,6 @@ mod tests {
         assert_eq!(kimi.stdin_payload, None);
         assert_eq!(
             kimi.args,
-            ["fixed", "-p", "prompt in argv", "--output-format", "text"]
-        );
-
-        let qwen = resolve_one_shot_plan(
-            &AdapterId::new("qwen-code").unwrap(),
-            &launch("qwen"),
-            "prompt in argv",
-            None,
-        )
-        .unwrap();
-        assert_eq!(qwen.stdin_payload, None);
-        assert_eq!(
-            qwen.args,
             ["fixed", "-p", "prompt in argv", "--output-format", "text"]
         );
     }
@@ -753,14 +493,7 @@ mod tests {
         let expected_flag = [
             ("claude", "--permission-mode"),
             ("codex", "--ephemeral"),
-            ("opencode", "--agent"),
-            ("pi", "--no-tools"),
-            ("amp", "--no-notifications"),
-            ("cursor", "--trust"),
             ("kimi", "-p"),
-            ("qwen-code", "-p"),
-            ("copilot", "--no-custom-instructions"),
-            ("antigravity", "--sandbox"),
         ];
         for (id, flag) in expected_flag {
             let plan = resolve_one_shot_plan(
@@ -788,16 +521,16 @@ mod tests {
     fn static_models_fail_closed_while_dynamic_models_remain_discovery_compatible() {
         assert!(matches!(
             resolve_one_shot_plan(
-                &AdapterId::new("amp").unwrap(),
-                &launch("amp"),
+                &AdapterId::new("claude").unwrap(),
+                &launch("claude"),
                 "prompt",
                 Some(&SessionOptionSelection::new("unknown")),
             ),
             Err(OneShotAdapterError::UnknownModel(_))
         ));
         let dynamic = resolve_one_shot_plan(
-            &AdapterId::new("opencode").unwrap(),
-            &launch("opencode"),
+            &AdapterId::new("codex").unwrap(),
+            &launch("codex"),
             "prompt",
             Some(&SessionOptionSelection::new("vendor/new-model")),
         )

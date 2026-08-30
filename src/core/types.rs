@@ -13,9 +13,6 @@ pub enum CliTool {
     Codex,
     #[serde(alias = "kimi")]
     KimiCode,
-    Gemini,
-    /// OpenCode (sst/opencode) — PIPE transport, own 5-event NDJSON schema.
-    OpenCode,
     /// xAI Grok CLI — ACP transport (`grok agent stdio`).
     #[serde(alias = "grok")]
     Grok,
@@ -27,8 +24,6 @@ impl std::fmt::Display for CliTool {
             CliTool::ClaudeCode => write!(f, "Claude Code"),
             CliTool::Codex => write!(f, "Codex"),
             CliTool::KimiCode => write!(f, "Kimi Code"),
-            CliTool::Gemini => write!(f, "Gemini"),
-            CliTool::OpenCode => write!(f, "OpenCode"),
             CliTool::Grok => write!(f, "Grok"),
         }
     }
@@ -53,15 +48,12 @@ impl CliTool {
     /// ```
     pub fn capabilities(&self) -> crate::core::capabilities::CliCapabilities {
         use crate::core::capabilities::{
-            claude_capabilities, codex_capabilities, gemini_capabilities, grok_capabilities,
-            kimi_capabilities, opencode_capabilities,
+            claude_capabilities, codex_capabilities, grok_capabilities, kimi_capabilities,
         };
         match self {
             CliTool::ClaudeCode => claude_capabilities(),
             CliTool::Codex => codex_capabilities(),
             CliTool::KimiCode => kimi_capabilities(),
-            CliTool::Gemini => gemini_capabilities(),
-            CliTool::OpenCode => opencode_capabilities(),
             CliTool::Grok => grok_capabilities(),
         }
     }
@@ -72,9 +64,7 @@ impl CliTool {
     /// then overlays any model configured in tool-specific config files:
     ///
     /// - **Codex**: reads `~/.codex/config.toml` → `model = "…"`
-    /// - **OpenCode**: reads `./opencode.json` or `~/.config/opencode/opencode.json`
-    ///   → `{ "model": { "default": "…" } }`
-    /// - **Claude / Gemini**: returns defaults unchanged (no config-based model info).
+    /// - **Claude / Kimi / Grok**: returns defaults unchanged (no config-based model info).
     ///
     /// Falls back gracefully to defaults if any config file is absent or unreadable.
     /// Performs only synchronous filesystem I/O; safe to call from any thread.

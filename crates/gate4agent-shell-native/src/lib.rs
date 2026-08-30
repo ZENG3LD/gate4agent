@@ -2628,41 +2628,31 @@ fn provider_event(event: AgentEvent) -> Option<ProviderEvent> {
 }
 
 fn builtin_legacy_adapter_runtimes() -> AdapterRuntimeRegistry<CliTool> {
+    // Each of the four fleet providers registers only the transport families
+    // it actually declares in the built-in adapter registry -- Grok, for
+    // instance, is ACP-only and has no `PtySemantic`/`Pipe` descriptor.
+    // Absence of a family for a given provider is not an error; only a
+    // duplicate registration is.
     let definitions = [
         ("claude-code", CliTool::ClaudeCode),
         ("codex", CliTool::Codex),
-        ("gemini", CliTool::Gemini),
-        ("opencode", CliTool::OpenCode),
         ("kimi", CliTool::KimiCode),
+        ("grok", CliTool::Grok),
     ];
     let mut runtimes = AdapterRuntimeRegistry::default();
     for (id, tool) in definitions {
-        for family in [AdapterFamily::PtySemantic, AdapterFamily::Pipe] {
-            let binding = builtin_adapter_registry()
-                .binding(family, id)
-                .unwrap_or_else(|| panic!("missing built-in {family:?} adapter {id}"))
-                .clone();
+        for family in [
+            AdapterFamily::PtySemantic,
+            AdapterFamily::Pipe,
+            AdapterFamily::Acp,
+        ] {
+            let Some(binding) = builtin_adapter_registry().binding(family, id) else {
+                continue;
+            };
             runtimes
-                .insert(family, binding, tool)
+                .insert(family, binding.clone(), tool)
                 .expect("built-in native adapter runtime must be unique");
         }
-        if let Some(binding) = builtin_adapter_registry().binding(AdapterFamily::Acp, id) {
-            runtimes
-                .insert(AdapterFamily::Acp, binding.clone(), tool)
-                .expect("built-in native ACP adapter runtime must be unique");
-        }
-    }
-
-    // Grok is ACP-only: it has no `PtySemantic`/`Pipe` adapter descriptor, so
-    // it cannot go through the loop above (which requires both). Register its
-    // ACP runtime binding on its own.
-    for (id, tool) in [("grok", CliTool::Grok)] {
-        let binding = builtin_adapter_registry()
-            .binding(AdapterFamily::Acp, id)
-            .unwrap_or_else(|| panic!("missing built-in Acp adapter {id}"));
-        runtimes
-            .insert(AdapterFamily::Acp, binding.clone(), tool)
-            .expect("built-in native ACP adapter runtime must be unique");
     }
 
     runtimes
@@ -4170,7 +4160,7 @@ mod tests {
         ForegroundProbeSchedule, ForegroundVerdict, ReadinessDiagnostics, RateLimitFeed,
         Utf8ChunkDecoder,
     };
-    use gate4agent_adapters::builtin_adapter_registry;
+    use gate4agent_adapters::{builtin_adapter_registry, QWEN_DUAL_OUTPUT_REVISION};
     use gate4agent_catalog::EnvMutation;
     use gate4agent::agent::ForegroundObservation;
     use gate4agent::core::types::{
@@ -4180,12 +4170,12 @@ mod tests {
     use gate4agent::pty::{PtyForegroundObservation, PtyForegroundSource, RateLimitDetector};
     use gate4agent::CliTool;
     use gate4agent_types::{
-        AdapterFamily, AgentId, AgentInstanceId, ControlEffect, ControlObservation, EffectEnvelope,
-        OperationId, OperatorGateInput, OperatorGateKind, OperatorGateOptionSemantics,
-        OperatorGateState, OperatorGateSubject, ProviderEvent, ProviderRuntimePolicy,
-        PtyScreenState, RuntimePlatform,
-        SessionGeneration, StartRequest, TerminalMouseProtocolEncoding, TerminalSize,
-        TransportKind, CONTROL_PROTOCOL_VERSION,
+        AdapterBinding, AdapterFamily, AdapterId, AdapterVerification, AgentId, AgentInstanceId,
+        ControlEffect, ControlObservation, EffectEnvelope, OperationId, OperatorGateInput,
+        OperatorGateKind, OperatorGateOptionSemantics, OperatorGateState, OperatorGateSubject,
+        ProviderEvent, ProviderRuntimePolicy, PtyScreenState, RuntimePlatform, SessionGeneration,
+        StartRequest, TerminalMouseProtocolEncoding, TerminalSize, TransportKind,
+        CONTROL_PROTOCOL_VERSION,
     };
     use std::ffi::{OsStr, OsString};
     use std::fs::{File, OpenOptions};
@@ -5320,11 +5310,20 @@ mod tests {
         assert_eq!(next, u64::MAX);
     }
 
+    /// `qwen-code` is not part of the current fleet's built-in registry, so
+    /// this constructs the same shape of `Pipe`-family binding the sidecar
+    /// mechanism itself expects, standing in for a live registry lookup.
+    fn qwen_sidecar_binding() -> AdapterBinding {
+        AdapterBinding::new(
+            AdapterId::new("qwen-code").unwrap(),
+            QWEN_DUAL_OUTPUT_REVISION,
+            AdapterVerification::Reference,
+        )
+        .unwrap()
+    }
+
     fn qwen_sidecar_fixture() -> (OwnedQwenDualOutput, PathBuf, PathBuf) {
-        let binding = builtin_adapter_registry()
-            .binding(AdapterFamily::Pipe, "qwen-code")
-            .unwrap()
-            .clone();
+        let binding = qwen_sidecar_binding();
         let launch = QwenDualOutputLaunch::prepare(binding).unwrap();
         let path = launch.output_file().unwrap().to_owned();
         let directory = launch.directory.as_ref().unwrap().clone();
@@ -5452,10 +5451,7 @@ mod tests {
 
     #[test]
     fn unavailable_qwen_sidecar_emits_one_gap_without_launch_arguments() {
-        let binding = builtin_adapter_registry()
-            .binding(AdapterFamily::Pipe, "qwen-code")
-            .unwrap()
-            .clone();
+        let binding = qwen_sidecar_binding();
         let launch = QwenDualOutputLaunch::unavailable(binding);
         let mut arguments = Vec::new();
         launch.append_launch_arguments(&mut arguments);
@@ -5467,10 +5463,7 @@ mod tests {
 
     #[test]
     fn qwen_sidecar_launch_cleanup_covers_pre_spawn_and_owned_lifetimes() {
-        let binding = builtin_adapter_registry()
-            .binding(AdapterFamily::Pipe, "qwen-code")
-            .unwrap()
-            .clone();
+        let binding = qwen_sidecar_binding();
         let launch = QwenDualOutputLaunch::prepare(binding.clone()).unwrap();
         let pre_spawn_directory = launch.directory.as_ref().unwrap().clone();
         drop(launch);
@@ -5485,15 +5478,21 @@ mod tests {
 
     #[tokio::test]
     async fn qwen_sidecar_spawn_failure_cleans_private_directory() {
-        let binding = builtin_adapter_registry()
-            .binding(AdapterFamily::Pipe, "qwen-code")
-            .unwrap()
-            .clone();
+        let binding = qwen_sidecar_binding();
         let mut spec = gate4agent_testkit::interactive_agent_spec();
         spec.id = AgentId::new("qwen-code").unwrap();
         spec.capabilities.adapters.pty_sidecar = Some(binding.clone());
+        // `qwen-code` is not part of the current fleet's built-in adapter
+        // registry, so this validates the spec against a consumer-extended
+        // registry carrying just the sidecar binding under test.
+        let adapters = gate4agent_catalog::AdapterRegistry::new([gate4agent_catalog::AdapterDescriptor {
+            family: AdapterFamily::Pipe,
+            binding: binding.clone(),
+            agents: vec![AgentId::new("qwen-code").unwrap()],
+        }])
+        .unwrap();
         let mut shell = NativeEffectShell::new(
-            gate4agent_catalog::AgentRegistry::new([spec]).unwrap(),
+            gate4agent_catalog::AgentRegistry::new_with_adapters([spec], &adapters).unwrap(),
         );
         let launch = QwenDualOutputLaunch::prepare(binding).unwrap();
         let directory = launch.directory.as_ref().unwrap().clone();
@@ -5647,10 +5646,7 @@ mod tests {
     async fn controlled_qwen_pty_fixture_delivers_sidecar_provider_events_and_cleans_up() {
         gate4agent_testkit::suppress_windows_fault_dialogs_for_test();
         gate4agent_testkit::require_windows_headless_supervisor_for_test();
-        let binding = builtin_adapter_registry()
-            .binding(AdapterFamily::Pipe, "qwen-code")
-            .unwrap()
-            .clone();
+        let binding = qwen_sidecar_binding();
         let mut spec = gate4agent_testkit::interactive_agent_spec();
         spec.id = AgentId::new("qwen-code").unwrap();
         spec.capabilities.adapters.pty_sidecar = Some(binding.clone());

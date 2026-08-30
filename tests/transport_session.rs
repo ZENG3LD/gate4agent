@@ -6,7 +6,7 @@
 //! 3. The `CliTool` variants all dispatch through the right path in `spawn()`.
 //!
 //! Note: Live process spawning is NOT tested here — no real CLI binaries
-//! (claude, codex, gemini, etc.) are required. The synthesis logic is covered
+//! (claude, codex, kimi, grok) are required. The synthesis logic is covered
 //! by unit tests inside `src/transport/pipe_runner.rs`.
 
 use gate4agent::{CliTool, SpawnOptions, TransportSession};
@@ -19,8 +19,8 @@ fn all_cli_tool_variants_are_accessible() {
     let tools = [
         CliTool::ClaudeCode,
         CliTool::Codex,
-        CliTool::Gemini,
-        CliTool::OpenCode,
+        CliTool::KimiCode,
+        CliTool::Grok,
     ];
     assert_eq!(tools.len(), 4);
 }

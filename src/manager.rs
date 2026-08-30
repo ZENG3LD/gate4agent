@@ -1,13 +1,13 @@
 //! Multi-CLI agent session manager.
 //!
-//! `MultiCliManager` owns PTY and pipe sessions for Claude, Codex, and Gemini
+//! `MultiCliManager` owns PTY and pipe sessions for Claude and Codex
 //! simultaneously. Call `drain_events` every frame; call `snapshot(cli)` to
 //! get a render-safe snapshot for the active CLI.
 //!
 //! ## Architecture
 //!
 //! Internally the manager stores instances in a `HashMap<InstanceId, AgentInstance>`.
-//! Three "legacy" instances (one per `AgentCli`) are pre-created in `new()` so that
+//! Two "legacy" instances (one per `AgentCli`) are pre-created in `new()` so that
 //! all existing callers using the `cli: AgentCli` API continue to work unchanged.
 
 use std::collections::HashMap;
@@ -238,8 +238,8 @@ impl AgentInstance {
 pub struct MultiCliManager {
     config: ManagerConfig,
     instances: HashMap<InstanceId, AgentInstance>,
-    /// Pre-created legacy slots: index 0 = Claude, 1 = Codex, 2 = Gemini.
-    legacy_instances: [InstanceId; 3],
+    /// Pre-created legacy slots: index 0 = Claude, 1 = Codex.
+    legacy_instances: [InstanceId; 2],
     cols: u16,
     rows: u16,
 }
@@ -254,20 +254,17 @@ impl MultiCliManager {
 
         let claude_id = InstanceId::new();
         let codex_id = InstanceId::new();
-        let gemini_id = InstanceId::new();
 
         let claude_workdir = config.sessions_dir.join(AgentCli::Claude.as_str());
         let codex_workdir = config.sessions_dir.join(AgentCli::Codex.as_str());
-        let gemini_workdir = config.sessions_dir.join(AgentCli::Gemini.as_str());
 
         instances.insert(claude_id, AgentInstance::new(claude_id, AgentCli::Claude, InstanceMode::Pty, claude_workdir, rows, cols));
         instances.insert(codex_id, AgentInstance::new(codex_id, AgentCli::Codex, InstanceMode::Pty, codex_workdir, rows, cols));
-        instances.insert(gemini_id, AgentInstance::new(gemini_id, AgentCli::Gemini, InstanceMode::Pty, gemini_workdir, rows, cols));
 
         Self {
             config,
             instances,
-            legacy_instances: [claude_id, codex_id, gemini_id],
+            legacy_instances: [claude_id, codex_id],
             cols,
             rows,
         }
@@ -281,11 +278,6 @@ impl MultiCliManager {
         match cli {
             AgentCli::Claude => 0,
             AgentCli::Codex => 1,
-            AgentCli::Gemini => 2,
-            // OpenCode does not have a legacy slot — it is managed through
-            // the per-instance API. Map to slot 0 as a safe fallback;
-            // callers must not pass it to legacy methods.
-            AgentCli::OpenCode => 0,
         }
     }
 
@@ -298,8 +290,6 @@ impl MultiCliManager {
     // =========================================================================
 
     /// Register a new agent instance. Does NOT spawn any process.
-    ///
-    /// All 6 CLIs support Chat mode via `TransportSession` (pipe/daemon).
     pub fn create_instance(
         &mut self,
         cli: AgentCli,
@@ -706,13 +696,13 @@ impl MultiCliManager {
     }
 
     // =========================================================================
-    // Legacy 3-CLI public API (shims onto per-instance API)
+    // Legacy 2-CLI public API (shims onto per-instance API)
     // =========================================================================
 
     /// Returns the working directory for a given CLI.
     ///
     /// Each CLI runs isolated in `{sessions_dir}/{cli_name}/` so its dotfolder
-    /// (`.claude/`, `.codex/`, `.gemini/`) lives there.
+    /// (`.claude/`, `.codex/`) lives there.
     pub fn cli_workdir(&self, cli: AgentCli) -> PathBuf {
         self.config.sessions_dir.join(cli.as_str())
     }
@@ -1547,7 +1537,5 @@ fn cli_to_tool(cli: AgentCli) -> CliTool {
     match cli {
         AgentCli::Claude => CliTool::ClaudeCode,
         AgentCli::Codex => CliTool::Codex,
-        AgentCli::Gemini => CliTool::Gemini,
-        AgentCli::OpenCode => CliTool::OpenCode,
     }
 }

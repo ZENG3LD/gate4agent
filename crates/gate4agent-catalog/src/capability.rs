@@ -96,39 +96,33 @@ pub enum CapabilityProbeCatalogError {
 mod tests {
     use super::*;
     use crate::builtin_registry;
+    use gate4agent_types::{AdapterId, AdapterVerification};
 
     #[test]
-    fn cursor_probe_uses_structured_launch_override_and_adapter_owned_suffix() {
-        let mut cursor = builtin_registry().get_by_id("cursor").unwrap().clone();
-        cursor.launch.program = "npx".to_owned();
-        cursor.launch.fixed_args = vec!["cursor-agent".to_owned()];
-        assert_eq!(
-            resolve_capability_probe_for(&cursor).unwrap(),
-            ResolvedCapabilityProbePlan {
-                program: "npx".to_owned(),
-                args: vec!["cursor-agent".to_owned(), "--list-models".to_owned()],
-            }
-        );
+    fn undeclared_probe_binding_fails_closed() {
+        let registry = builtin_registry();
+        // No provider in the current fleet declares a capability probe.
+        for id in ["claude", "codex", "grok", "kimi"] {
+            assert!(matches!(
+                resolve_capability_probe_for(registry.get_by_id(id).unwrap()),
+                Err(CapabilityProbeCatalogError::UnsupportedAgent(_))
+            ));
+        }
     }
 
     #[test]
-    fn undeclared_and_stale_probe_bindings_fail_closed() {
-        let registry = builtin_registry();
+    fn stale_probe_binding_fails_closed() {
+        let mut claude = builtin_registry().get_by_id("claude").unwrap().clone();
+        claude.capabilities.adapters.capability_probe = Some(
+            AdapterBinding::new(
+                AdapterId::new("claude-code").unwrap(),
+                "stale",
+                AdapterVerification::SyntheticFixture,
+            )
+            .unwrap(),
+        );
         assert!(matches!(
-            resolve_capability_probe_for(registry.get_by_id("gemini").unwrap()),
-            Err(CapabilityProbeCatalogError::UnsupportedAgent(_))
-        ));
-
-        let mut cursor = registry.get_by_id("cursor").unwrap().clone();
-        cursor
-            .capabilities
-            .adapters
-            .capability_probe
-            .as_mut()
-            .unwrap()
-            .revision = "stale".to_owned();
-        assert!(matches!(
-            resolve_capability_probe_for(&cursor),
+            resolve_capability_probe_for(&claude),
             Err(CapabilityProbeCatalogError::UnavailableBinding { .. })
         ));
     }

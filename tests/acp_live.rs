@@ -109,20 +109,21 @@ async fn run_acp_test(tool: CliTool, binary_name: &str) {
 
 #[tokio::test]
 #[ignore = "requires an installed and authenticated vendor CLI"]
-async fn acp_live_gemini() {
-    run_acp_test(CliTool::Gemini, "gemini").await;
+async fn acp_live_grok() {
+    run_acp_test(CliTool::Grok, "grok").await;
 }
 
 #[tokio::test]
 #[ignore = "requires an installed and authenticated vendor CLI"]
-async fn acp_live_opencode() {
-    run_acp_test(CliTool::OpenCode, "opencode").await;
+async fn acp_live_kimi() {
+    // Kimi Code has a native ACP mode (`kimi acp`).
+    run_acp_test(CliTool::KimiCode, "kimi").await;
 }
 
 #[tokio::test]
 #[ignore = "requires an installed and authenticated vendor CLI"]
 async fn acp_live_claude() {
-    // ClaudeCode ACP adapter is invoked via npx (claude-agent-acp package).
+    // ClaudeCode ACP adapter is invoked via npx (@zed-industries/claude-code-acp).
     run_acp_test(CliTool::ClaudeCode, "npx").await;
 }
 

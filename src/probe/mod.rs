@@ -82,8 +82,7 @@ fn do_probe() -> ProbeResult {
         CliTool::ClaudeCode,
         CliTool::Codex,
         CliTool::KimiCode,
-        CliTool::Gemini,
-        CliTool::OpenCode,
+        CliTool::Grok,
     ];
 
     let probes = tools.iter().map(|&tool| {
@@ -155,7 +154,7 @@ mod tests {
         };
         assert!(result.for_tool(CliTool::ClaudeCode).is_some());
         assert!(result.for_tool(CliTool::Codex).is_some());
-        assert!(result.for_tool(CliTool::Gemini).is_none());
+        assert!(result.for_tool(CliTool::Grok).is_none());
     }
 
     #[test]
@@ -164,7 +163,7 @@ mod tests {
             probes: vec![
                 CliProbe { tool: CliTool::ClaudeCode, installed: true, capabilities: CliTool::ClaudeCode.capabilities() },
                 CliProbe { tool: CliTool::Codex, installed: false, capabilities: CliTool::Codex.capabilities() },
-                CliProbe { tool: CliTool::Gemini, installed: true, capabilities: CliTool::Gemini.capabilities() },
+                CliProbe { tool: CliTool::KimiCode, installed: true, capabilities: CliTool::KimiCode.capabilities() },
             ],
             probed_at: 0,
         };
@@ -193,9 +192,9 @@ mod tests {
     }
 
     #[test]
-    fn do_probe_returns_five_entries() {
+    fn do_probe_returns_four_entries() {
         let result = do_probe();
-        assert_eq!(result.probes.len(), 5);
+        assert_eq!(result.probes.len(), 4);
         assert!(result.probed_at > 0);
     }
 }

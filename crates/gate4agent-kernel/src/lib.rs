@@ -1229,6 +1229,89 @@ mod tests {
         ResourceScopeId::new("active-page").unwrap()
     }
 
+    /// `cursor`, `amp`, `copilot`, and `qwen-code` are not part of the
+    /// current fleet's built-in registry. Kernel adapter-family gating
+    /// tests need provider capability shapes the four-member fleet does not
+    /// naturally offer on its own -- e.g. a Pipe transport still resolving
+    /// through the legacy `OneShotText` one-shot path (every fleet member's
+    /// own Pipe transport is `StructuredJsonl`), a Hook binding with no
+    /// History one, a provider with no Resume adapter, or a bare PTY
+    /// sidecar binding -- so this clones a real fleet spec (`codex`, which
+    /// carries PTY, Hook, History, Resume, and ManagedHook) as the base and
+    /// gives it a fixture identity, leaving every adapter binding it
+    /// inherits pointed at a real, globally-registered implementation.
+    fn legacy_fixture(id: &str) -> gate4agent_types::AgentSpec {
+        let mut spec = builtin_registry().get_by_id("codex").unwrap().clone();
+        spec.id = AgentId::new(id).unwrap();
+        spec.detection.command = id.to_owned();
+        spec.detection.aliases = Vec::new();
+        spec.launch.program = id.to_owned();
+        spec.expected_processes = vec![gate4agent_types::ProcessMatcher::Exact {
+            name: id.to_owned(),
+        }];
+        spec
+    }
+
+    /// `cursor`, standing in as the one legacy fixture that is both
+    /// one-shot by Pipe and carries a session-option adapter -- bound to
+    /// `claude`'s real one-shot implementation, the same resolver the
+    /// kernel itself calls.
+    fn legacy_one_shot_fixture_catalog() -> AgentRegistry {
+        let claude = builtin_registry().get_by_id("claude").unwrap();
+        let one_shot = claude.capabilities.adapters.one_shot.clone().unwrap();
+        let session_options = claude.capabilities.adapters.session_options.clone();
+        let mut cursor = legacy_fixture("cursor");
+        cursor.capabilities.adapters.one_shot = Some(one_shot.clone());
+        cursor.capabilities.adapters.session_options = session_options;
+        cursor.capabilities.transports.pipe = Some(gate4agent_types::PipeTransportSpec {
+            adapter: one_shot,
+            protocol: PipeProtocol::OneShotText,
+            launch_override: None,
+            prompt_delivery: gate4agent_types::PipePromptDelivery::None,
+        });
+        AgentRegistry::new(builtin_registry().iter().cloned().chain([cursor])).unwrap()
+    }
+
+    /// `qwen-code`, carrying a PTY sidecar binding reusing `claude`'s real,
+    /// globally-registered Pipe binding -- the kernel's ingress gate only
+    /// compares bindings for exact equality, so which real family member it
+    /// is borrowed from is not load-bearing.
+    fn legacy_pty_sidecar_fixture_catalog() -> AgentRegistry {
+        let sidecar = builtin_registry()
+            .get_by_id("claude")
+            .unwrap()
+            .capabilities
+            .transports
+            .pipe
+            .clone()
+            .unwrap()
+            .adapter;
+        let mut qwen = legacy_fixture("qwen-code");
+        // Cleared, not just left inherited from the `codex` skeleton: the
+        // ingress-exactness assertion below reuses `codex`'s own Pipe
+        // binding as the "foreign" one, and `declared_provider_binding`
+        // accepts a Pipe-family source matching EITHER the sidecar binding
+        // or the transport's own adapter, so leaving this set would let the
+        // "foreign" binding match right back through it.
+        qwen.capabilities.transports.pipe = None;
+        qwen.capabilities.adapters.pty_sidecar = Some(sidecar);
+        AgentRegistry::new(builtin_registry().iter().cloned().chain([qwen])).unwrap()
+    }
+
+    /// `amp`, carrying a Hook binding but no History one.
+    fn legacy_no_history_fixture_catalog() -> AgentRegistry {
+        let mut amp = legacy_fixture("amp");
+        amp.capabilities.adapters.history = None;
+        AgentRegistry::new(builtin_registry().iter().cloned().chain([amp])).unwrap()
+    }
+
+    /// `copilot`, carrying every adapter family except Resume.
+    fn legacy_no_resume_fixture_catalog() -> AgentRegistry {
+        let mut copilot = legacy_fixture("copilot");
+        copilot.capabilities.adapters.resume = None;
+        AgentRegistry::new(builtin_registry().iter().cloned().chain([copilot])).unwrap()
+    }
+
     fn tool_provider() -> CapabilityProviderDescriptor {
         CapabilityProviderDescriptor {
             id: tool_provider_id(),
@@ -1429,10 +1512,12 @@ mod tests {
     #[test]
     fn session_options_require_a_declared_pty_catalog_and_cross_the_effect_boundary() {
         let mut kernel = Gate4AgentKernel::default();
-        kernel.step([register(1, "cursor")], []);
-        let selection = SessionOptionSelection::new("gpt-5.3-codex")
-            .with_value("effort", "high")
-            .with_value("fastMode", true);
+        kernel.step([register(1, "claude")], []);
+        // `fastMode` is deliberately absent: unlike `cursor`'s (composed
+        // into the model string), claude's has no `launch` application at
+        // all, so it never reaches `applied` regardless of what is
+        // selected -- only `effort` (a `--effort` flag) fully round-trips.
+        let selection = SessionOptionSelection::new("opus").with_value("effort", "high");
         let accepted = kernel.step(
             [command(
                 2,
@@ -1460,7 +1545,7 @@ mod tests {
         ));
 
         let mut unsupported = Gate4AgentKernel::default();
-        unsupported.step([register(1, "opencode")], []);
+        unsupported.step([register(1, "kimi")], []);
         let rejected = unsupported.step(
             [command(
                 2,
@@ -1527,7 +1612,7 @@ mod tests {
                 1,
                 ControlCommand::Register {
                     instance_id: instance(),
-                    agent_id: AgentId::new("gemini").unwrap(),
+                    agent_id: AgentId::new("codex").unwrap(),
                     transport: TransportKind::Pipe,
                 },
             )],
@@ -1546,7 +1631,7 @@ mod tests {
                             columns: 80,
                         },
                         initial_prompt: Some("hello".to_owned()),
-                        session_options: Some(SessionOptionSelection::new("gemini-3-pro-preview")),
+                        session_options: Some(SessionOptionSelection::new("gpt-5.5")),
                     },
                 },
             )],
@@ -1584,7 +1669,7 @@ mod tests {
     /// leaving `session_options` at `None` -- does not.
     #[test]
     fn one_shot_pipe_defaults_and_validates_options_before_effect_creation() {
-        let mut cursor = Gate4AgentKernel::default();
+        let mut cursor = Gate4AgentKernel::new(legacy_one_shot_fixture_catalog());
         cursor.step(
             [command(
                 1,
@@ -1615,9 +1700,10 @@ mod tests {
             )],
             [],
         );
-        let spec = builtin_registry()
+        let spec = cursor
+            .catalog()
             .get_by_id("cursor")
-            .expect("cursor is a builtin provider");
+            .expect("cursor is a legacy fixture provider");
         let binding = spec
             .capabilities
             .adapters
@@ -1645,13 +1731,13 @@ mod tests {
             } if request.session_options.as_ref() == Some(&expected)
         ));
 
-        let mut amp = Gate4AgentKernel::default();
+        let mut amp = Gate4AgentKernel::new(legacy_one_shot_fixture_catalog());
         amp.step(
             [command(
                 3,
                 ControlCommand::Register {
                     instance_id: instance(),
-                    agent_id: AgentId::new("amp").unwrap(),
+                    agent_id: AgentId::new("cursor").unwrap(),
                     transport: TransportKind::Pipe,
                 },
             )],
@@ -1685,7 +1771,7 @@ mod tests {
         // `codex` drove this half until its pipe transport became
         // `StructuredJsonl` too, which routes it away from the one-shot
         // prompt validation the half exists to check.
-        let mut missing_prompt = Gate4AgentKernel::default();
+        let mut missing_prompt = Gate4AgentKernel::new(legacy_one_shot_fixture_catalog());
         missing_prompt.step(
             [command(
                 5,
@@ -1723,11 +1809,71 @@ mod tests {
         assert!(rejected.effects.is_empty());
     }
 
+    /// Capability-probe existed to serve `cursor`'s `--list-models`, and
+    /// `cursor` is not part of the fleet: no fleet provider declares this
+    /// adapter, so the kernel rejects it before creating an effect for all
+    /// four; and a provider that DOES declare a capability-probe binding
+    /// still fails closed at resolution -- the binding is only valid
+    /// against a consumer-extended registry (built locally, standing in for
+    /// what the wider reference catalog used to provide), never the
+    /// process-global one the kernel resolves against.
     #[test]
-    fn capability_probe_requires_the_declared_cursor_adapter_before_effect_creation() {
-        let mut cursor = Gate4AgentKernel::default();
-        cursor.step([register(1, "cursor")], []);
-        let accepted = cursor.step(
+    fn capability_probe_is_unsupported_fleet_wide_and_fails_closed_on_an_unavailable_binding() {
+        for id in ["claude", "codex", "grok", "kimi"] {
+            let mut kernel = Gate4AgentKernel::default();
+            kernel.step([register(1, id)], []);
+            let rejected = kernel.step(
+                [command(
+                    2,
+                    ControlCommand::ProbeCapabilities {
+                        instance_id: instance(),
+                        request: CapabilityProbeRequest {
+                            working_directory: ".".to_owned(),
+                        },
+                    },
+                )],
+                [],
+            );
+            assert!(
+                matches!(
+                    rejected.command_outcomes[0].result,
+                    Err(KernelCommandError::UnsupportedCapability {
+                        capability: "capability-probe",
+                        ..
+                    })
+                ),
+                "{id}"
+            );
+            assert!(rejected.effects.is_empty(), "{id}");
+        }
+
+        let probe_binding = gate4agent_types::AdapterBinding::new(
+            gate4agent_types::AdapterId::new("cursor").unwrap(),
+            "cursor-capability-probe/v1",
+            gate4agent_types::AdapterVerification::Reference,
+        )
+        .unwrap();
+        let local_adapters = gate4agent_catalog::AdapterRegistry::new(
+            gate4agent_catalog::builtin_adapter_registry()
+                .iter()
+                .cloned()
+                .chain([gate4agent_catalog::AdapterDescriptor {
+                    family: AdapterFamily::CapabilityProbe,
+                    binding: probe_binding.clone(),
+                    agents: vec![AgentId::new("cursor").unwrap()],
+                }]),
+        )
+        .unwrap();
+        let mut cursor = legacy_fixture("cursor");
+        cursor.capabilities.adapters.capability_probe = Some(probe_binding);
+        let catalog = AgentRegistry::new_with_adapters(
+            builtin_registry().iter().cloned().chain([cursor]),
+            &local_adapters,
+        )
+        .unwrap();
+        let mut kernel = Gate4AgentKernel::new(catalog);
+        kernel.step([register(1, "cursor")], []);
+        let rejected = kernel.step(
             [command(
                 2,
                 ControlCommand::ProbeCapabilities {
@@ -1739,33 +1885,9 @@ mod tests {
             )],
             [],
         );
-        assert!(accepted.command_outcomes[0].result.is_ok());
-        assert!(matches!(
-            accepted.effects[0].effect,
-            gate4agent_types::ControlEffect::ProbeCapabilities { ref agent_id, .. }
-                if agent_id.as_str() == "cursor"
-        ));
-
-        let mut kimi = Gate4AgentKernel::default();
-        kimi.step([register(3, "kimi")], []);
-        let rejected = kimi.step(
-            [command(
-                4,
-                ControlCommand::ProbeCapabilities {
-                    instance_id: instance(),
-                    request: CapabilityProbeRequest {
-                        working_directory: ".".to_owned(),
-                    },
-                },
-            )],
-            [],
-        );
         assert!(matches!(
             rejected.command_outcomes[0].result,
-            Err(KernelCommandError::UnsupportedCapability {
-                capability: "capability-probe",
-                ..
-            })
+            Err(KernelCommandError::InvalidCapabilityProbe { .. })
         ));
         assert!(rejected.effects.is_empty());
     }
@@ -1860,7 +1982,7 @@ mod tests {
 
     #[test]
     fn pipe_provider_ingress_accepts_exact_pty_sidecar_binding_only() {
-        let mut kernel = Gate4AgentKernel::default();
+        let mut kernel = Gate4AgentKernel::new(legacy_pty_sidecar_fixture_catalog());
         kernel.step([register(1, "qwen-code")], []);
         let started = kernel.step(
             [command(
@@ -1989,14 +2111,12 @@ mod tests {
             gate4agent_types::ControlEffect::DiscoverHistory { .. }
         ));
 
-        // Subject is `amp`: it carries a hook adapter but no history one,
-        // which `gate4agent-adapters`' own registry test pins green. This
-        // used to be `qwen-code`, which has since GAINED a history adapter
-        // (pinned just as explicitly in `gate4agent-catalog`), so the
-        // command it was supposed to be refused for started being accepted
-        // and this half has been asserting a rejection that no longer
-        // happens.
-        let mut unsupported = Gate4AgentKernel::default();
+        // Subject is a legacy `amp` fixture: it carries a hook adapter but
+        // no history one. Every fleet member now declares both together
+        // (pinned in `gate4agent-adapters`' own registry test), so this
+        // shape does not occur naturally in the fleet anymore and needs a
+        // constructed fixture to stay exercised at all.
+        let mut unsupported = Gate4AgentKernel::new(legacy_no_history_fixture_catalog());
         unsupported.step([register(1, "amp")], []);
         let rejected = unsupported.step(
             [command(
@@ -2042,7 +2162,7 @@ mod tests {
             )
         };
 
-        let mut unsupported = Gate4AgentKernel::default();
+        let mut unsupported = Gate4AgentKernel::new(legacy_no_resume_fixture_catalog());
         unsupported.step([register(1, "copilot")], []);
         let rejected = unsupported.step([resume(None)], []);
         assert!(matches!(

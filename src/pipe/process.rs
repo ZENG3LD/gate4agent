@@ -65,7 +65,6 @@ impl PipeProcess {
     /// Each tool is launched with its headless NDJSON flags:
     /// - Claude: `claude -p --output-format stream-json --verbose`
     /// - Codex: `codex exec --json`
-    /// - Gemini: `gemini --output-format stream-json -p`
     /// - Kimi Code: `kimi -p <prompt> --output-format stream-json`
     pub fn new(
         tool: CliTool,
@@ -82,8 +81,8 @@ impl PipeProcess {
 
     /// Spawn a headless CLI process with stdin/stdout pipes and custom options.
     ///
-    /// Claude receives the initial prompt through stdin. Codex, Gemini, and
-    /// Kimi receive it as an argv element. Reviewed npm installations are
+    /// Claude receives the initial prompt through stdin. Codex and Kimi
+    /// receive it as an argv element. Reviewed npm installations are
     /// launched through their direct entrypoint on Windows so prompt bytes are
     /// not reparsed by `cmd.exe`.
     pub fn new_with_options(
@@ -158,7 +157,7 @@ impl PipeProcess {
 
         // Write prompt via stdin instead of CLI argument (avoids cmd.exe mangling).
         // Claude `-p` reads stdin until EOF, so we must drop (close) stdin after writing.
-        // For Codex and Gemini the prompt is already in the argv; stdin is closed immediately.
+        // For Codex the prompt is already in the argv; stdin is closed immediately.
         if let Some(mut s) = stdin {
             if let Some(prompt) = stdin_prompt {
                 s.write_all(prompt.as_bytes())?;
@@ -331,8 +330,8 @@ impl PipeProcess {
             ),
             // Grok's pipe transport is not fixture-verified (see catalog:
             // `transports.pipe` stays `None`), so this branch is unreachable
-            // for it in practice — grouped with the other unclassified tools.
-            CliTool::Gemini | CliTool::OpenCode | CliTool::Grok => return None,
+            // for it in practice.
+            CliTool::Grok => return None,
         };
         if let Some(entrypoint) = entrypoint {
             if !entrypoint.is_file() {
@@ -437,7 +436,7 @@ impl PipeProcess {
     /// Write input to the process stdin.
     ///
     /// Returns `BrokenPipe` if stdin is closed (all supported CLIs are one-shot:
-    /// Claude reads prompt from stdin then closes; Codex/Gemini/OpenCode take the
+    /// Claude reads prompt from stdin then closes; Codex/Kimi take the
     /// prompt as argv and never open stdin at all). Callers should use
     /// `resume_session_id` to continue a prior session rather than writing again.
     pub fn write(&mut self, data: &str) -> Result<(), std::io::Error> {
@@ -661,15 +660,15 @@ mod tests {
 
     #[test]
     #[cfg(not(windows))]
-    fn unix_gemini_build_command_is_bare_gemini() {
+    fn unix_kimi_build_command_is_bare_kimi() {
         use crate::transport::SpawnOptions;
 
         let opts = SpawnOptions {
             prompt: "test".to_string(),
             ..Default::default()
         };
-        let cmd = PipeProcess::build_for_test(CliTool::Gemini, &opts);
-        assert_eq!(cmd.get_program().to_str().unwrap(), "gemini");
+        let cmd = PipeProcess::build_for_test(CliTool::KimiCode, &opts);
+        assert_eq!(cmd.get_program().to_str().unwrap(), "kimi");
     }
 
     #[test]

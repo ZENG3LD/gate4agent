@@ -177,10 +177,8 @@ impl PtySession {
             process_spec,
             Some(tool),
             match tool {
-                CliTool::OpenCode | CliTool::KimiCode | CliTool::Grok => None,
-                CliTool::ClaudeCode | CliTool::Codex | CliTool::Gemini => {
-                    Some(AgentCommandMode::SlashLine)
-                }
+                CliTool::KimiCode | CliTool::Grok => None,
+                CliTool::ClaudeCode | CliTool::Codex => Some(AgentCommandMode::SlashLine),
             },
             pty,
             None,

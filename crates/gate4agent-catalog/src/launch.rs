@@ -373,10 +373,13 @@ mod tests {
     }
 
     #[test]
-    fn opencode_uses_a_prompt_flag_without_shell_quoting() {
-        let spec = builtin_registry().get_by_id("opencode").unwrap();
+    fn flag_initial_prompt_mode_delivers_without_shell_quoting() {
+        let mut spec = builtin_registry().get_by_id("claude").unwrap().clone();
+        spec.prompt.initial = InitialPromptMode::Flag {
+            flag: "--prompt".to_owned(),
+        };
         let prompt = "fix 'quotes'\nand Unicode: Привет";
-        let plan = plan_launch(spec, request(prompt)).unwrap();
+        let plan = plan_launch(&spec, request(prompt)).unwrap();
         assert_eq!(args_as_strings(&plan), ["--prompt", prompt]);
     }
 
@@ -503,8 +506,8 @@ mod tests {
     }
 
     #[test]
-    fn explicit_cursor_options_are_composed_but_untouched_launches_stay_vanilla() {
-        let spec = builtin_registry().get_by_id("cursor").unwrap();
+    fn explicit_claude_options_are_composed_but_untouched_launches_stay_vanilla() {
+        let spec = builtin_registry().get_by_id("claude").unwrap();
         let vanilla = plan_launch(
             spec,
             LaunchRequest {
@@ -516,9 +519,7 @@ mod tests {
         assert!(vanilla.args.is_empty());
         assert!(vanilla.applied_session_options.is_none());
 
-        let selected = SessionOptionSelection::new("gpt-5.3-codex")
-            .with_value("effort", "medium")
-            .with_value("fastMode", true);
+        let selected = SessionOptionSelection::new("opus").with_value("effort", "xhigh");
         let plan = plan_launch(
             spec,
             LaunchRequest {
@@ -528,16 +529,13 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(
-            args_as_strings(&plan),
-            ["--model", "gpt-5.3-codex-medium-fast"]
-        );
+        assert_eq!(args_as_strings(&plan), ["--model", "opus", "--effort", "xhigh"]);
         assert_eq!(plan.applied_session_options, Some(selected));
     }
 
     #[test]
     fn launch_only_agents_cannot_borrow_another_provider_option_catalog() {
-        let spec = builtin_registry().get_by_id("opencode").unwrap();
+        let spec = builtin_registry().get_by_id("kimi").unwrap();
         assert!(matches!(
             plan_launch(
                 spec,

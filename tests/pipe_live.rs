@@ -147,23 +147,12 @@ fn pipe_live_codex() {
 
 #[test]
 #[ignore = "requires an installed and authenticated vendor CLI"]
-fn pipe_live_gemini() {
-    if !cli_available("gemini") {
-        println!("[Gemini] SKIPPED — gemini not found on PATH");
+fn pipe_live_kimi() {
+    if !cli_available("kimi") {
+        println!("[KimiCode] SKIPPED — kimi not found on PATH");
         return;
     }
-    run_pipe_test(CliTool::Gemini, vec![]);
-}
-
-#[test]
-#[ignore = "requires an installed and authenticated vendor CLI"]
-fn pipe_live_opencode() {
-    if !cli_available("opencode") {
-        println!("[OpenCode] SKIPPED — opencode not found on PATH");
-        return;
-    }
-    // Default model is opencode/gpt-5-nano (free, via OpenCode Zen).
-    run_pipe_test(CliTool::OpenCode, vec![]);
+    run_pipe_test(CliTool::KimiCode, vec![]);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

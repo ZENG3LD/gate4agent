@@ -16655,26 +16655,26 @@ mod observation_projection_tests {
 
     /// Qwen's structured sidecar still projects what it always did.
     ///
-    /// Qwen is no longer in the fleet -- there is no subscription behind it,
-    /// so a failure in it could not be reproduced, and `active_registry`
-    /// stopped admitting it. The sidecar and its catalog entry are correct
-    /// and were left in place, so this keeps pinning their projection policy
-    /// against bit-rot. It therefore builds its contracts from the CATALOG
-    /// rather than from the fleet: reading the fleet here would be asserting
-    /// behaviour for a provider the node does not run.
+    /// Qwen is no longer in the fleet, and unlike the earlier design its
+    /// catalog entry does not stay behind it either -- `qwen-code` was cut
+    /// from the catalog outright, along with every other non-fleet
+    /// provider. `admit_qwen_sidecar_observation_policy` still gates on the
+    /// literal `"qwen-code"` id plus a declared Pipe-family contract for it,
+    /// so this constructs that one contract directly instead of deriving it
+    /// from a registry lookup, keeping the projection policy pinned against
+    /// bit-rot without asserting catalog membership the fleet no longer has.
     #[test]
     fn qwen_pipe_events_project_private_categorical_tools_attention_and_usage() {
         let mut shared = observation_test_shared();
-        let qwen_only = AgentRegistry::new(
-            builtin_registry()
-                .iter()
-                .filter(|spec| spec.id.as_str() == "qwen-code")
-                .cloned()
-                .collect::<Vec<_>>(),
-        )
-        .unwrap();
-        let (_, adapters) = provider_contract_manifest(&qwen_only).unwrap();
-        shared.provider_adapter_contracts = adapters;
+        shared.provider_adapter_contracts = vec![ProviderAdapterContractSupport {
+            provider: AgentId::new("qwen-code").unwrap(),
+            family: AdapterFamily::Pipe,
+            adapter_id: gate4agent_types::AdapterId::new("qwen-code").unwrap(),
+            revision: crate::protocol::AdapterContractRevision::new(
+                gate4agent_adapters::QWEN_DUAL_OUTPUT_REVISION,
+            )
+            .unwrap(),
+        }];
         let raw = ProviderRuntimePolicy::raw_pty();
         let observed = shared.admit_qwen_sidecar_observation_policy(
             &AgentId::new("qwen-code").unwrap(),
@@ -21553,7 +21553,7 @@ mod tests {
 
     #[cfg(feature = "fixture")]
     #[test]
-    fn five_provider_context_fixture_registry_is_unambiguous_and_history_bound() {
+    fn four_provider_context_fixture_registry_is_unambiguous_and_history_bound() {
         let root = temporary_workspace_root("context-fixture-registry");
         std::fs::create_dir_all(&root).unwrap();
         let proof_path = root.join("context.proof");
@@ -21579,7 +21579,7 @@ mod tests {
             .map(AgentId::as_str)
             .collect::<Vec<_>>();
         enabled.sort_unstable();
-        assert_eq!(enabled, ["claude", "codex", "grok", "kimi", "qwen-code"]);
+        assert_eq!(enabled, ["claude", "codex", "grok", "kimi"]);
         for provider in &server.shared.enabled_providers {
             assert!(server
                 .shared
@@ -21656,7 +21656,7 @@ mod tests {
         ] {
             assert!(codex_validation.contains(required), "missing privacy validation: {required}");
         }
-        for provider in ["grok", "kimi", "qwen-code"] {
+        for provider in ["grok", "kimi"] {
             let provider = AgentId::new(provider).unwrap();
             assert_eq!(monitoring.get(&provider), standard.get(&provider));
         }
@@ -22111,6 +22111,7 @@ mod tests {
             vec![
                 ("claude", AdapterFamily::PtySemantic, "claude-code", "gate4agent-adapter/v1"),
                 ("claude", AdapterFamily::Pipe, "claude-code", "gate4agent-adapter/v1"),
+                ("claude", AdapterFamily::Acp, "claude-code", "gate4agent-adapter/v1"),
                 ("claude", AdapterFamily::Hook, "claude-code", "gate4agent-adapter/v1"),
                 ("claude", AdapterFamily::ManagedHook, "claude", "gate4agent-managed-hooks/orca-d8629c4/v1"),
                 ("claude", AdapterFamily::OneShot, "claude", "gate4agent-inline/claude-code-2.1/v1"),
@@ -22119,6 +22120,7 @@ mod tests {
                 ("claude", AdapterFamily::SessionOptions, "claude-code", "gate4agent-session-options/orca-d8629c4/v1"),
                 ("codex", AdapterFamily::PtySemantic, "codex", "gate4agent-adapter/v1"),
                 ("codex", AdapterFamily::Pipe, "codex", "gate4agent-adapter/v1"),
+                ("codex", AdapterFamily::Acp, "codex", "gate4agent-adapter/v1"),
                 ("codex", AdapterFamily::Hook, "codex", "gate4agent-adapter/v1"),
                 ("codex", AdapterFamily::ManagedHook, "codex", "gate4agent-managed-hooks/orca-d8629c4/v1"),
                 ("codex", AdapterFamily::OneShot, "codex", "gate4agent-inline/codex-cli-0.144/v1"),
@@ -22132,6 +22134,7 @@ mod tests {
                 ("grok", AdapterFamily::Resume, "grok", "gate4agent-adapter/v1"),
                 ("kimi", AdapterFamily::PtySemantic, "kimi", "gate4agent-adapter/v1"),
                 ("kimi", AdapterFamily::Pipe, "kimi", "gate4agent-adapter/v1"),
+                ("kimi", AdapterFamily::Acp, "kimi", "gate4agent-adapter/v1"),
                 ("kimi", AdapterFamily::Hook, "kimi", "gate4agent-adapter/v1"),
                 ("kimi", AdapterFamily::ManagedHook, "kimi", "gate4agent-managed-hooks/orca-d8629c4/v1"),
                 ("kimi", AdapterFamily::OneShot, "kimi", "gate4agent-inline/kimi-code-0.31/v1"),

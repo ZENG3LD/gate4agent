@@ -3133,6 +3133,40 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// `qwen-code` is not part of the current fleet's built-in registry, so
+    /// this augments a clone of the fleet registry with a synthetic
+    /// `History`-family binding for it, standing in for a live registry
+    /// lookup.
+    fn qwen_augmented_catalog_with_history() -> AgentRegistry {
+        let history_binding = gate4agent_types::AdapterBinding::new(
+            gate4agent_types::AdapterId::new("qwen-code").unwrap(),
+            gate4agent_adapters::BUILTIN_ADAPTER_REVISION,
+            gate4agent_types::AdapterVerification::Reference,
+        )
+        .unwrap();
+        let adapters = gate4agent_catalog::AdapterRegistry::new(
+            gate4agent_adapters::builtin_adapter_registry()
+                .iter()
+                .cloned()
+                .chain([gate4agent_catalog::AdapterDescriptor {
+                    family: gate4agent_types::AdapterFamily::History,
+                    binding: history_binding.clone(),
+                    agents: vec![AgentId::new("qwen-code").unwrap()],
+                }]),
+        )
+        .unwrap();
+        let mut qwen = builtin_registry().get_by_id("codex").unwrap().clone();
+        qwen.id = AgentId::new("qwen-code").unwrap();
+        qwen.detection.command = "qwen".to_owned();
+        qwen.launch.program = "qwen".to_owned();
+        qwen.capabilities.adapters.history = Some(history_binding);
+        AgentRegistry::new_with_adapters(
+            builtin_registry().iter().cloned().chain([qwen]),
+            &adapters,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn native_catalog_keeps_provider_candidate_indexes_isolated() {
         let unique = std::time::SystemTime::now()
@@ -3194,7 +3228,12 @@ mod tests {
             limits,
         )
         .unwrap();
-        let mut catalog = NativeSessionCatalogAuthority::new(config);
+        let mut catalog = NativeSessionCatalogAuthority {
+            catalog: qwen_augmented_catalog_with_history(),
+            history_config: config,
+            authorities: HashMap::new(),
+            indexes: HashMap::new(),
+        };
         let claude = catalog
             .catalog(&AgentId::new("claude").unwrap(), &workspace, 1)
             .unwrap();
@@ -3826,9 +3865,43 @@ mod tests {
         }
     }
 
+    /// `qwen-code` is not part of the current fleet's built-in registry, so
+    /// this augments a clone of the fleet registry with a synthetic
+    /// `Pipe`-family PTY-sidecar binding for it, standing in for a live
+    /// registry lookup.
+    fn qwen_augmented_catalog_with_pty_sidecar() -> AgentRegistry {
+        let sidecar_binding = gate4agent_types::AdapterBinding::new(
+            gate4agent_types::AdapterId::new("qwen-code").unwrap(),
+            gate4agent_adapters::QWEN_DUAL_OUTPUT_REVISION,
+            gate4agent_types::AdapterVerification::Reference,
+        )
+        .unwrap();
+        let adapters = gate4agent_catalog::AdapterRegistry::new(
+            gate4agent_adapters::builtin_adapter_registry()
+                .iter()
+                .cloned()
+                .chain([gate4agent_catalog::AdapterDescriptor {
+                    family: gate4agent_types::AdapterFamily::Pipe,
+                    binding: sidecar_binding.clone(),
+                    agents: vec![AgentId::new("qwen-code").unwrap()],
+                }]),
+        )
+        .unwrap();
+        let mut qwen = builtin_registry().get_by_id("codex").unwrap().clone();
+        qwen.id = AgentId::new("qwen-code").unwrap();
+        qwen.detection.command = "qwen".to_owned();
+        qwen.launch.program = "qwen".to_owned();
+        qwen.capabilities.adapters.pty_sidecar = Some(sidecar_binding);
+        AgentRegistry::new_with_adapters(
+            builtin_registry().iter().cloned().chain([qwen]),
+            &adapters,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn qwen_dual_output_overlay_is_exactly_pty_only_and_hook_independent() {
-        let catalog = builtin_registry().clone();
+        let catalog = qwen_augmented_catalog_with_pty_sidecar();
         let (_, runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
         let spawn = |operation_id, instance_id, agent_id, transport| EffectEnvelope {
             protocol_version: CONTROL_PROTOCOL_VERSION,

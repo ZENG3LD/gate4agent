@@ -488,12 +488,26 @@ mod tests {
 
     #[test]
     fn pty_sidecar_requires_pty_transport() {
-        let mut qwen = crate::builtin_registry().get_by_id("qwen-code").unwrap().clone();
-        qwen.capabilities.transports.pty = false;
+        let binding = AdapterBinding::new(
+            AdapterId::new("custom-sidecar").unwrap(),
+            "custom-sidecar/v1",
+            AdapterVerification::SyntheticFixture,
+        )
+        .unwrap();
+        let adapters = AdapterRegistry::new([AdapterDescriptor {
+            family: AdapterFamily::Pipe,
+            binding: binding.clone(),
+            agents: vec![AgentId::new("custom").unwrap()],
+        }])
+        .unwrap();
+        let mut custom = spec("custom", "custom");
+        custom.capabilities.transports.pty = false;
+        custom.capabilities.adapters.pty_sidecar = Some(binding);
+
         assert!(matches!(
-            AgentRegistry::new([qwen]),
+            AgentRegistry::new_with_adapters([custom], &adapters),
             Err(RegistryError::PtySidecarRequiresPty(agent))
-                if agent.as_str() == "qwen-code"
+                if agent.as_str() == "custom"
         ));
     }
 }

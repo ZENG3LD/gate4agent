@@ -408,13 +408,13 @@ mod tests {
 
     #[test]
     fn recognizes_direct_and_versioned_processes() {
-        let qwen = recognize_agent_process(
+        let kimi = recognize_agent_process(
             builtin_registry(),
-            r"C:\Users\dev\npm\qwen.cmd",
+            r"C:\Users\dev\npm\kimi.cmd",
             RuntimePlatform::Windows,
         )
         .unwrap();
-        assert_eq!(qwen.agent_id.as_str(), "qwen-code");
+        assert_eq!(kimi.agent_id.as_str(), "kimi");
 
         let grok =
             recognize_agent_process(builtin_registry(), "grok-0.2.51", RuntimePlatform::Linux)
@@ -443,15 +443,15 @@ mod tests {
     #[test]
     fn recognizes_interpreter_entrypoints_without_scanning_prompts() {
         assert_eq!(
-            recognize("python -m aider").unwrap().agent_id.as_str(),
-            "aider"
+            recognize("python -m kimi").unwrap().agent_id.as_str(),
+            "kimi"
         );
         assert_eq!(
-            recognize("python3 /opt/homebrew/bin/hermes --tui")
+            recognize("python3 /opt/homebrew/bin/grok --tui")
                 .unwrap()
                 .agent_id
                 .as_str(),
-            "hermes"
+            "grok"
         );
         assert_eq!(
             recognize("node /home/dev/node_modules/@openai/codex/bin/codex.js")
@@ -460,7 +460,7 @@ mod tests {
                 .as_str(),
             "codex"
         );
-        assert!(recognize("node /tmp/not-an-agent.js compare opencode and kimi").is_none());
+        assert!(recognize("node /tmp/not-an-agent.js compare banana and kimi").is_none());
     }
 
     #[test]

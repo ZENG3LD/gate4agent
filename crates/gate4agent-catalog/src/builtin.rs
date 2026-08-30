@@ -20,13 +20,14 @@ pub fn builtin_registry() -> &'static AgentRegistry {
     })
 }
 
-/// Portable external-agent catalog for the registry migration.
+/// The gate4agent provider catalog.
 ///
-/// The first four entries preserve gate4agent identity while the additional
-/// entries establish first-class launch grounding for Orca's pinned external
-/// CLI catalog. Orca-owned `claude-agent-teams` is intentionally excluded.
-/// `SpecVerification::Reference` intentionally prevents a launch shape derived
-/// from Orca from being confused with live vendor verification.
+/// Exactly the fleet this project runs: Claude Code, Codex, Grok, and Kimi
+/// Code. This catalog is the single source of truth for provider identity —
+/// it does not carry reference-only or aspirational entries for CLIs the
+/// project does not actually spawn. `SpecVerification::Reference`
+/// intentionally prevents a launch shape derived from Orca from being
+/// confused with live vendor verification.
 pub fn builtin_specs() -> Vec<AgentSpec> {
     vec![
         with_native_draft_flag(
@@ -42,152 +43,8 @@ pub fn builtin_specs() -> Vec<AgentSpec> {
             "--prefill",
         ),
         codex_spec(),
-        spec(
-            "gemini",
-            "Gemini CLI",
-            "gemini",
-            &[],
-            InitialPromptMode::InteractiveFlag {
-                flag: "--prompt-interactive".to_owned(),
-            },
-        ),
-        spec(
-            "opencode",
-            "OpenCode",
-            "opencode",
-            &[],
-            InitialPromptMode::Flag {
-                flag: "--prompt".to_owned(),
-            },
-        ),
         grok_spec(),
         kimi_spec(),
-        spec(
-            "qwen-code",
-            "Qwen Code",
-            "qwen",
-            &[],
-            InitialPromptMode::AfterReady,
-        ),
-        spec(
-            "copilot",
-            "GitHub Copilot CLI",
-            "copilot",
-            &[],
-            InitialPromptMode::InteractiveFlag {
-                flag: "-i".to_owned(),
-            },
-        ),
-        with_native_draft_flag(
-            spec(
-                "openclaude",
-                "OpenClaude",
-                "openclaude",
-                &[],
-                InitialPromptMode::Positional {
-                    option_terminator: false,
-                },
-            ),
-            "--prefill",
-        ),
-        spec(
-            "autohand",
-            "Autohand Code",
-            "autohand",
-            &[],
-            InitialPromptMode::AfterReady,
-        ),
-        spec(
-            "mimo-code",
-            "MiMo Code",
-            "mimo",
-            &[],
-            InitialPromptMode::Flag {
-                flag: "--prompt".to_owned(),
-            },
-        ),
-        spec(
-            "pi",
-            "Pi",
-            "pi",
-            &[],
-            InitialPromptMode::Positional {
-                option_terminator: false,
-            },
-        ),
-        spec(
-            "omp",
-            "oh-my-pi",
-            "omp",
-            &[],
-            InitialPromptMode::Positional {
-                option_terminator: false,
-            },
-        ),
-        spec(
-            "antigravity",
-            "Google Antigravity CLI",
-            "agy",
-            &[],
-            InitialPromptMode::InteractiveFlag {
-                flag: "--prompt-interactive".to_owned(),
-            },
-        ),
-        after_ready("aider", "Aider", "aider", &[]),
-        after_ready("goose", "Goose", "goose", &[]),
-        after_ready("amp", "Amp", "amp", &[]),
-        after_ready("kilo", "Kilocode", "kilo", &[]),
-        with_fixed_args(
-            after_ready("kiro", "Kiro", "kiro-cli", &[]),
-            &["chat", "--tui"],
-        ),
-        after_ready("crush", "Charm Crush", "crush", &[]),
-        after_ready("aug", "Augment Code", "auggie", &[]),
-        after_ready("cline", "Cline", "cline", &[]),
-        after_ready("codebuff", "Codebuff", "codebuff", &[]),
-        spec(
-            "command-code",
-            "Command Code",
-            "command-code",
-            &[],
-            InitialPromptMode::Positional {
-                option_terminator: false,
-            },
-        ),
-        after_ready("continue", "Continue CLI", "cn", &[]),
-        spec(
-            "cursor",
-            "Cursor Agent",
-            "cursor-agent",
-            &[],
-            InitialPromptMode::Positional {
-                option_terminator: false,
-            },
-        ),
-        spec(
-            "droid",
-            "Factory Droid",
-            "droid",
-            &[],
-            InitialPromptMode::Positional {
-                option_terminator: false,
-            },
-        ),
-        after_ready("mistral-vibe", "Mistral Vibe", "vibe", &["mistral-vibe"]),
-        after_ready("rovo", "Rovo Dev", "rovo", &[]),
-        with_fixed_args(
-            spec(
-                "hermes",
-                "Hermes Agent",
-                "hermes",
-                &[],
-                InitialPromptMode::AgentNativeQuery,
-            ),
-            &["--tui"],
-        ),
-        after_ready("openclaw", "OpenClaw", "openclaw", &[]),
-        after_ready("devin", "Devin CLI", "devin", &[]),
-        after_ready("ante", "Ante", "ante", &[]),
     ]
 }
 
@@ -247,24 +104,6 @@ fn codex_spec() -> AgentSpec {
     value
 }
 
-fn after_ready(id: &str, display_name: &str, command: &str, aliases: &[&str]) -> AgentSpec {
-    spec(
-        id,
-        display_name,
-        command,
-        aliases,
-        InitialPromptMode::AfterReady,
-    )
-}
-
-fn with_fixed_args(mut spec: AgentSpec, fixed_args: &[&str]) -> AgentSpec {
-    spec.launch.fixed_args = fixed_args
-        .iter()
-        .map(|argument| (*argument).to_owned())
-        .collect();
-    spec
-}
-
 fn with_native_draft_flag(mut spec: AgentSpec, flag: &str) -> AgentSpec {
     spec.prompt.native_draft = Some(NativeDraftMode::Flag {
         flag: flag.to_owned(),
@@ -307,28 +146,12 @@ fn spec(
 }
 
 fn capabilities(id: &str) -> AgentCapabilities {
-    let adapter_id = if matches!(id, "claude" | "openclaude") {
-        "claude-code"
-    } else {
-        id
-    };
+    let adapter_id = if id == "claude" { "claude-code" } else { id };
     let transport_adapter_id = match id {
-        "claude" | "codex" | "gemini" | "opencode" | "kimi" | "grok" => Some(adapter_id),
+        "claude" | "codex" | "kimi" | "grok" => Some(adapter_id),
         _ => None,
     };
-    let one_shot_adapter_id = matches!(
-        id,
-        "claude"
-            | "codex"
-            | "opencode"
-            | "pi"
-            | "amp"
-            | "cursor"
-            | "kimi"
-            | "copilot"
-            | "antigravity"
-    )
-    .then_some(id);
+    let one_shot_adapter_id = matches!(id, "claude" | "codex" | "kimi").then_some(id);
     let structured_pipe_adapter_id =
         matches!(id, "claude" | "codex" | "kimi").then_some(adapter_id);
     let pipe = structured_pipe_adapter_id
@@ -360,8 +183,7 @@ fn capabilities(id: &str) -> AgentCapabilities {
                 })
         });
     AgentCapabilities {
-        agent_commands: matches!(id, "claude" | "codex" | "gemini" | "cursor")
-            .then_some(AgentCommandMode::SlashLine),
+        agent_commands: matches!(id, "claude" | "codex").then_some(AgentCommandMode::SlashLine),
         transports: AgentTransportCapabilities {
             pty: true,
             pty_adapter: transport_adapter_id
@@ -378,9 +200,8 @@ fn capabilities(id: &str) -> AgentCapabilities {
                 }),
         },
         adapters: AgentAdapterCapabilities {
-            pty_sidecar: matches!(id, "qwen-code")
-                .then(|| binding(AdapterFamily::Pipe, "qwen-code"))
-                .flatten(),
+            // No provider in the current fleet declares a PTY sidecar.
+            pty_sidecar: None,
             hook: binding(AdapterFamily::Hook, adapter_id),
             managed_hook: binding(AdapterFamily::ManagedHook, id),
             one_shot: one_shot_adapter_id
@@ -399,16 +220,14 @@ fn binding(family: AdapterFamily, id: &str) -> Option<AdapterBinding> {
 
 fn readiness(id: &str) -> AgentReadinessSpec {
     AgentReadinessSpec {
-        followup_requires_terminal: matches!(id, "claude" | "codex" | "kimi" | "qwen-code"),
+        followup_requires_terminal: matches!(id, "claude" | "codex" | "kimi"),
         draft_signal: match id {
             "codex" => DraftReadySignal::CodexComposerPrompt,
             "kimi" => DraftReadySignal::BracketedPaste,
             // Claude 2.1.224 on Windows enables Win32 input plus focus
             // reporting instead of bracketed paste. The scanner accepts that
             // full bootstrap or the older bracketed-paste contract.
-            "claude" | "opencode" | "mimo-code" => {
-                DraftReadySignal::CursorAfterBracketedPaste
-            }
+            "claude" => DraftReadySignal::CursorAfterBracketedPaste,
             _ => DraftReadySignal::QuietAfterBracketedPaste,
         },
         ..AgentReadinessSpec::default()
@@ -467,44 +286,20 @@ mod tests {
     }
 
     #[test]
-    fn portable_reference_catalog_is_stable_and_unique() {
+    fn fleet_catalog_is_stable_and_unique() {
         let registry = builtin_registry();
         let ids: Vec<_> = registry.iter().map(|spec| spec.id.as_str()).collect();
-        assert_eq!(ids.len(), 33);
-        for required in [
-            "claude",
-            "codex",
-            "gemini",
-            "opencode",
-            "grok",
-            "kimi",
-            "qwen-code",
-            "copilot",
-            "kiro",
-            "mistral-vibe",
-            "hermes",
-        ] {
+        assert_eq!(ids.len(), 4);
+        for required in ["claude", "codex", "grok", "kimi"] {
             assert!(ids.contains(&required), "missing built-in agent {required}");
         }
         assert!(!ids.contains(&"claude-agent-teams"));
 
-        for id in ["claude", "codex", "gemini", "opencode"] {
+        for id in ["claude", "codex", "kimi"] {
             let transports = &registry.get_by_id(id).unwrap().capabilities.transports;
-            assert!(transports.pty_adapter.is_some());
-            assert!(transports.pipe.is_some());
+            assert!(transports.pty_adapter.is_some(), "{id}");
+            assert!(transports.pipe.is_some(), "{id}");
         }
-        assert_eq!(
-            registry
-                .get_by_id("gemini")
-                .unwrap()
-                .capabilities
-                .transports
-                .pipe
-                .as_ref()
-                .unwrap()
-                .protocol,
-            PipeProtocol::SemanticNdjson
-        );
         for id in ["claude", "codex", "kimi"] {
             let spec = registry.get_by_id(id).unwrap();
             let pipe = spec.capabilities.transports.pipe.as_ref().unwrap();
@@ -514,30 +309,7 @@ mod tests {
                 if id == "claude" { "claude-code" } else { id }
             );
         }
-        for id in [
-            "opencode",
-            "pi",
-            "amp",
-            "cursor",
-            "copilot",
-            "antigravity",
-        ] {
-            let spec = registry.get_by_id(id).unwrap();
-            let pipe = spec.capabilities.transports.pipe.as_ref().unwrap();
-            assert_eq!(pipe.protocol, PipeProtocol::OneShotText, "{id}");
-            assert_eq!(pipe.adapter.id.as_str(), id);
-        }
-        for id in [
-            "claude",
-            "codex",
-            "opencode",
-            "pi",
-            "amp",
-            "cursor",
-            "kimi",
-            "copilot",
-            "antigravity",
-        ] {
+        for id in ["claude", "codex", "kimi"] {
             let binding = registry
                 .get_by_id(id)
                 .unwrap()
@@ -555,36 +327,23 @@ mod tests {
             };
             assert_eq!(binding.revision, expected_revision);
         }
-        let qwen = registry.get_by_id("qwen-code").unwrap();
-        assert!(qwen.capabilities.transports.pipe.is_none());
-        assert!(qwen.capabilities.adapters.one_shot.is_none());
-        let sidecar = qwen.capabilities.adapters.pty_sidecar.as_ref().unwrap();
-        assert_eq!(sidecar.id.as_str(), "qwen-code");
-        assert_eq!(
-            sidecar.revision,
-            gate4agent_adapters::QWEN_DUAL_OUTPUT_REVISION
-        );
+        // No provider in the current fleet declares a PTY sidecar.
         assert!(registry
             .iter()
-            .filter(|spec| spec.capabilities.adapters.pty_sidecar.is_some())
-            .all(|spec| spec.id.as_str() == "qwen-code"));
-        for id in ["gemini", "opencode", "grok"] {
-            assert!(registry
-                .get_by_id(id)
-                .unwrap()
-                .capabilities
-                .transports
-                .acp
-                .is_some());
-        }
-        for id in ["claude", "codex"] {
-            assert!(registry
-                .get_by_id(id)
-                .unwrap()
-                .capabilities
-                .transports
-                .acp
-                .is_none());
+            .all(|spec| spec.capabilities.adapters.pty_sidecar.is_none()));
+
+        // ACP is wired for all four fleet providers.
+        for id in ["claude", "codex", "grok", "kimi"] {
+            assert!(
+                registry
+                    .get_by_id(id)
+                    .unwrap()
+                    .capabilities
+                    .transports
+                    .acp
+                    .is_some(),
+                "missing ACP transport for {id}"
+            );
         }
         // Grok gets an ACP transport, but no PTY or pipe transport was
         // requested — it must stay conspicuously absent, not silently wired.
@@ -603,93 +362,26 @@ mod tests {
             .pipe
             .is_none());
 
-        for id in ["grok", "kimi", "copilot", "droid", "cursor"] {
+        for id in ["claude", "codex", "grok", "kimi"] {
             let adapters = &registry.get_by_id(id).unwrap().capabilities.adapters;
             assert!(adapters.hook.is_some(), "missing hook adapter for {id}");
             assert!(
                 adapters.history.is_some(),
                 "missing history adapter for {id}"
             );
-        }
-        for id in [
-            "claude",
-            "openclaude",
-            "codex",
-            "gemini",
-            "antigravity",
-            "amp",
-            "cursor",
-            "droid",
-            "command-code",
-            "grok",
-            "copilot",
-            "hermes",
-            "devin",
-            "kimi",
-        ] {
-            let binding = registry
-                .get_by_id(id)
-                .unwrap()
-                .capabilities
-                .adapters
+            assert!(
+                adapters.resume.is_some(),
+                "missing resume adapter for {id}"
+            );
+            let binding = adapters
                 .managed_hook
                 .as_ref()
                 .unwrap_or_else(|| panic!("missing managed Hook adapter for {id}"));
             assert_eq!(binding.id.as_str(), id);
             assert_eq!(binding.revision, gate4agent_adapters::MANAGED_HOOK_REVISION);
         }
-        let openclaude = &registry
-            .get_by_id("openclaude")
-            .unwrap()
-            .capabilities
-            .adapters;
-        assert_eq!(openclaude.hook.as_ref().unwrap().id.as_str(), "claude-code");
-        for id in [
-            "claude",
-            "codex",
-            "gemini",
-            "antigravity",
-            "opencode",
-            "pi",
-            "mimo-code",
-            "droid",
-            "grok",
-            "devin",
-            "kimi",
-        ] {
-            assert!(
-                registry
-                    .get_by_id(id)
-                    .unwrap()
-                    .capabilities
-                    .adapters
-                    .resume
-                    .is_some(),
-                "missing resume adapter for {id}"
-            );
-        }
-        for id in [
-            "copilot",
-            "cursor",
-            "qwen-code",
-            "omp",
-            "amp",
-            "command-code",
-            "hermes",
-        ] {
-            assert!(
-                registry
-                    .get_by_id(id)
-                    .unwrap()
-                    .capabilities
-                    .adapters
-                    .resume
-                    .is_none(),
-                "unexpected live resume adapter for {id}"
-            );
-        }
 
-        for id in ["claude", "codex", "gemini", "cursor"] {
+        for id in ["claude", "codex"] {
             let binding = registry
                 .get_by_id(id)
                 .unwrap()
@@ -703,7 +395,7 @@ mod tests {
                 gate4agent_adapters::SESSION_OPTION_CATALOG_REVISION
             );
         }
-        for id in ["opencode", "grok", "kimi", "qwen-code"] {
+        for id in ["grok", "kimi"] {
             assert!(
                 registry
                     .get_by_id(id)
@@ -715,12 +407,5 @@ mod tests {
                 "unexpected session-option adapter for {id}"
             );
         }
-
-        let qwen = registry.get_by_id("qwen-code").unwrap();
-        assert_eq!(qwen.prompt.initial, InitialPromptMode::AfterReady);
-        assert!(qwen.capabilities.adapters.hook.is_none());
-        assert!(qwen.capabilities.adapters.history.is_some());
-        assert!(qwen.capabilities.adapters.resume.is_none());
-        assert!(qwen.capabilities.transports.pty_adapter.is_none());
     }
 }

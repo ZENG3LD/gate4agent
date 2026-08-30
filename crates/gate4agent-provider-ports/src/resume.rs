@@ -285,10 +285,31 @@ mod tests {
         assert_eq!(authority.calls, 1);
     }
 
+    /// `pi` is not part of the current fleet's built-in registry.
+    /// `declared_binding` only reads `spec.capabilities.adapters.resume`
+    /// (no registry lookup), and `build_resume_plan_for_identity` dispatches
+    /// on the literal adapter id, so this stands in a synthetic spec with a
+    /// bare `pi`-identified resume binding for the same live resolver the
+    /// port itself calls, in place of a live registry lookup.
+    fn pi_resume_fixture() -> AgentSpec {
+        let mut spec = builtin_registry().get_by_id("codex").unwrap().clone();
+        spec.id = AgentId::new("pi").unwrap();
+        spec.detection.command = "pi".to_owned();
+        spec.launch.program = "pi".to_owned();
+        spec.capabilities.adapters.resume = Some(
+            AdapterBinding::new(
+                gate4agent_types::AdapterId::new("pi").expect("hardcoded adapter ID"),
+                "gate4agent-adapter/v1",
+                gate4agent_types::AdapterVerification::Reference,
+            )
+            .unwrap(),
+        );
+        spec
+    }
+
     #[test]
     fn pi_resume_preserves_the_authoritative_session_file_through_authorization() {
-        let registry = builtin_registry();
-        let pi = registry.get_by_id("pi").unwrap();
+        let pi = &pi_resume_fixture();
         assert_eq!(
             ResumeRequest::from_spec(pi, "pi-session-1", None),
             Err(ProviderPortValidationError::MissingResumeTranscriptPath)
@@ -336,11 +357,14 @@ mod tests {
     /// the capability had moved.
     #[test]
     fn negative_capability_fails_before_the_authority_port() {
-        let registry = builtin_registry();
-        let unsupported = registry.get_by_id("qwen-code").unwrap();
+        // Every fleet member now declares a resume adapter (pinned in
+        // `gate4agent-catalog`'s own builtin test), so the negative case
+        // needs a fixture that omits one rather than a live fleet example.
+        let mut unsupported = builtin_registry().get_by_id("codex").unwrap().clone();
+        unsupported.capabilities.adapters.resume = None;
         assert!(unsupported.capabilities.adapters.resume.is_none());
         assert!(matches!(
-            ResumeRequest::from_spec(unsupported, "session-1", None),
+            ResumeRequest::from_spec(&unsupported, "session-1", None),
             Err(ProviderPortValidationError::UnsupportedFamily { .. })
         ));
     }

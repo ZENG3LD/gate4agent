@@ -13,11 +13,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelInfo {
     /// CLI-level identifier passed to `--model` / `-m`.
-    /// e.g. `"claude-sonnet-4"`, `"gemini-2.5-pro"`, `"opencode/gpt-5-nano"`
+    /// e.g. `"claude-sonnet-4"`, `"gpt-5.4-codex"`
     pub id: String,
 
     /// Human-readable label for UI display.
-    /// e.g. `"Claude Sonnet 4"`, `"Gemini 2.5 Pro"`
+    /// e.g. `"Claude Sonnet 4"`, `"GPT-5.4 Codex"`
     pub display_name: String,
 
     /// Whether this is the tool's default when `SpawnOptions::model` is `None`.
@@ -255,121 +255,6 @@ pub(crate) fn kimi_capabilities() -> CliCapabilities {
     }
 }
 
-/// Returns the default (compile-time) capabilities for Gemini.
-pub(crate) fn gemini_capabilities() -> CliCapabilities {
-    CliCapabilities {
-        tool_id: "gemini".to_string(),
-        display_name: "Gemini".to_string(),
-        binary: "gemini".to_string(),
-        available_models: vec![
-            model("gemini-2.5-pro", "Gemini 2.5 Pro", false, false, Some(1_048_576)),
-            model("gemini-2.5-flash", "Gemini 2.5 Flash", false, true, Some(1_048_576)),
-            model("gemini-3.1-pro-preview", "Gemini 3.1 Pro", true, false, Some(1_048_576)),
-            model("gemini-3-flash-preview", "Gemini 3.0 Flash", false, true, Some(1_048_576)),
-        ],
-        permission_modes: vec![
-            perm("default", "Default", "Standard Gemini permissions.", true),
-            perm("auto-edit", "Auto Edit", "Auto-applies file edits.", false),
-            perm("yolo", "YOLO", "No permission prompts; maximum autonomy.", false),
-            perm("plan", "Plan", "Gemini shows a plan before executing tool calls.", false),
-        ],
-        features: CliFeatures {
-            thinking: false,
-            effort_control: false,
-            mcp: true,
-            resume: true,
-            continue_last: false, // Gemini has no --continue; use resume_session_id="latest"
-            allowed_tools_filter: false,
-            system_prompt_injection: false,
-            max_turns: false,
-            sandbox_mode: true,
-            ide_context: false,
-            plan_mode: true,
-            speed_toggle: false,
-            multi_provider: false,
-        },
-    }
-}
-
-/// Returns the default (compile-time) capabilities for OpenCode.
-pub(crate) fn opencode_capabilities() -> CliCapabilities {
-    CliCapabilities {
-        tool_id: "opencode".to_string(),
-        display_name: "OpenCode".to_string(),
-        binary: "opencode".to_string(),
-        available_models: vec![
-            // Free tier models (no API key required) — sorted alphabetically, default first
-            model("opencode/gpt-5-nano", "GPT-5 Nano (free)", true, true, Some(128_000)),
-            model("opencode/glm-4.7-free", "GLM 4.7 (free)", false, true, None),
-            model("opencode/glm-5-free", "GLM 5 (free)", false, true, None),
-            model("opencode/kimi-k2.5-free", "Kimi K2.5 (free)", false, true, None),
-            model("opencode/mimo-v2-flash-free", "Mimo V2 Flash (free)", false, true, None),
-            model("opencode/mimo-v2-omni-free", "Mimo V2 Omni (free)", false, true, None),
-            model("opencode/mimo-v2-pro-free", "Mimo V2 Pro (free)", false, true, None),
-            model("opencode/minimax-m2.1-free", "MiniMax M2.1 (free)", false, true, None),
-            model("opencode/minimax-m2.5-free", "MiniMax M2.5 (free)", false, true, None),
-            model("opencode/nemotron-3-super-free", "Nemotron 3 Super (free)", false, true, None),
-            model("opencode/qwen3.6-plus-free", "Qwen 3.6 Plus (free)", false, true, None),
-            model("opencode/trinity-large-preview-free", "Trinity Large Preview (free)", false, true, None),
-            // Paid models — sorted alphabetically
-            model("opencode/big-pickle", "Big Pickle", false, false, None),
-            model("opencode/claude-3-5-haiku", "Claude 3.5 Haiku", false, false, None),
-            model("opencode/claude-haiku-4-5", "Claude Haiku 4.5", false, false, None),
-            model("opencode/claude-opus-4-1", "Claude Opus 4.1", false, false, None),
-            model("opencode/claude-opus-4-5", "Claude Opus 4.5", false, false, None),
-            model("opencode/claude-opus-4-6", "Claude Opus 4.6", false, false, None),
-            model("opencode/claude-sonnet-4", "Claude Sonnet 4", false, false, None),
-            model("opencode/claude-sonnet-4-5", "Claude Sonnet 4.5", false, false, None),
-            model("opencode/claude-sonnet-4-6", "Claude Sonnet 4.6", false, false, None),
-            model("opencode/gemini-3-flash", "Gemini 3 Flash", false, false, None),
-            model("opencode/gemini-3-pro", "Gemini 3 Pro", false, false, None),
-            model("opencode/gemini-3.1-pro", "Gemini 3.1 Pro", false, false, None),
-            model("opencode/glm-4.6", "GLM 4.6", false, false, None),
-            model("opencode/glm-4.7", "GLM 4.7", false, false, None),
-            model("opencode/glm-5", "GLM 5", false, false, None),
-            model("opencode/glm-5.1", "GLM 5.1", false, false, None),
-            model("opencode/gpt-5", "GPT-5", false, false, None),
-            model("opencode/gpt-5-codex", "GPT-5 Codex", false, false, None),
-            model("opencode/gpt-5.1", "GPT-5.1", false, false, None),
-            model("opencode/gpt-5.1-codex", "GPT-5.1 Codex", false, false, None),
-            model("opencode/gpt-5.1-codex-max", "GPT-5.1 Codex Max", false, false, None),
-            model("opencode/gpt-5.1-codex-mini", "GPT-5.1 Codex Mini", false, false, None),
-            model("opencode/gpt-5.2", "GPT-5.2", false, false, None),
-            model("opencode/gpt-5.2-codex", "GPT-5.2 Codex", false, false, None),
-            model("opencode/gpt-5.3-codex", "GPT-5.3 Codex", false, false, None),
-            model("opencode/gpt-5.3-codex-spark", "GPT-5.3 Codex Spark", false, false, None),
-            model("opencode/gpt-5.4", "GPT-5.4", false, false, None),
-            model("opencode/gpt-5.4-mini", "GPT-5.4 Mini", false, false, None),
-            model("opencode/gpt-5.4-nano", "GPT-5.4 Nano", false, false, None),
-            model("opencode/gpt-5.4-pro", "GPT-5.4 Pro", false, false, None),
-            model("opencode/grok-code", "Grok Code", false, false, None),
-            model("opencode/kimi-k2", "Kimi K2", false, false, None),
-            model("opencode/kimi-k2-thinking", "Kimi K2 Thinking", false, false, None),
-            model("opencode/kimi-k2.5", "Kimi K2.5", false, false, None),
-            model("opencode/minimax-m2.1", "MiniMax M2.1", false, false, None),
-            model("opencode/minimax-m2.5", "MiniMax M2.5", false, false, None),
-            model("opencode/qwen3-coder", "Qwen3 Coder", false, false, None),
-        ],
-        // OpenCode has no permission modes concept.
-        permission_modes: vec![],
-        features: CliFeatures {
-            thinking: true, // depends on provider/model; surfaced when provider supports it
-            effort_control: false,
-            mcp: true,
-            resume: true,
-            continue_last: true,
-            allowed_tools_filter: false,
-            system_prompt_injection: false,
-            max_turns: false,
-            sandbox_mode: false,
-            ide_context: false,
-            plan_mode: false,
-            speed_toggle: false,
-            multi_provider: true,
-        },
-    }
-}
-
 /// Returns the verified baseline capabilities for Grok.
 ///
 /// Model list and permission modes are not yet fixture-verified for the
@@ -402,42 +287,6 @@ fn read_codex_config_model() -> Option<String> {
             let val = trimmed.split('=').nth(1)?.trim().trim_matches('"');
             if !val.is_empty() {
                 return Some(val.to_string());
-            }
-        }
-    }
-    None
-}
-
-/// Read the configured default model from an OpenCode config file.
-///
-/// Searches:
-/// 1. `$cwd/opencode.json`
-/// 2. `~/.config/opencode/opencode.json`
-///
-/// Expects: `{ "model": { "default": "anthropic/claude-sonnet-4-5" } }`
-fn read_opencode_config_model() -> Option<String> {
-    let candidates: Vec<PathBuf> = {
-        let mut v = Vec::new();
-        if let Ok(cwd) = std::env::current_dir() {
-            v.push(cwd.join("opencode.json"));
-        }
-        if let Some(home) = home_dir() {
-            v.push(home.join(".config").join("opencode").join("opencode.json"));
-        }
-        v
-    };
-
-    for path in candidates {
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                let model_id = json
-                    .get("model")
-                    .and_then(|m| m.get("default"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                if model_id.is_some() {
-                    return model_id;
-                }
             }
         }
     }
@@ -496,8 +345,6 @@ pub(crate) fn discover(
         CliTool::ClaudeCode => claude_capabilities(),
         CliTool::Codex => codex_capabilities(),
         CliTool::KimiCode => kimi_capabilities(),
-        CliTool::Gemini => gemini_capabilities(),
-        CliTool::OpenCode => opencode_capabilities(),
         CliTool::Grok => grok_capabilities(),
     };
 
@@ -514,13 +361,8 @@ pub(crate) fn discover(
                 update_default_model(&mut caps.available_models, &model_id);
             }
         }
-        CliTool::OpenCode => {
-            if let Some(model_id) = read_opencode_config_model() {
-                update_default_model(&mut caps.available_models, &model_id);
-            }
-        }
-        // Claude, Kimi, Gemini, and Grok have no verified config-based model discovery.
-        CliTool::ClaudeCode | CliTool::KimiCode | CliTool::Gemini | CliTool::Grok => {}
+        // Claude, Kimi, and Grok have no verified config-based model discovery.
+        CliTool::ClaudeCode | CliTool::KimiCode | CliTool::Grok => {}
     }
 
     caps
@@ -558,7 +400,7 @@ mod tests {
 
     #[test]
     fn each_tool_has_exactly_one_default_model() {
-        for tool in [CliTool::ClaudeCode, CliTool::Codex, CliTool::Gemini, CliTool::OpenCode] {
+        for tool in [CliTool::ClaudeCode, CliTool::Codex] {
             let caps = tool.capabilities();
             let default_count = caps.available_models.iter().filter(|m| m.is_default).count();
             assert_eq!(
@@ -573,7 +415,7 @@ mod tests {
 
     #[test]
     fn each_tool_with_modes_has_exactly_one_default_mode() {
-        for tool in [CliTool::ClaudeCode, CliTool::Codex, CliTool::Gemini] {
+        for tool in [CliTool::ClaudeCode, CliTool::Codex] {
             let caps = tool.capabilities();
             let default_count = caps.permission_modes.iter().filter(|p| p.is_default).count();
             assert_eq!(
@@ -584,21 +426,22 @@ mod tests {
                 default_count
             );
         }
-        // OpenCode has zero permission modes — that is valid.
-        assert!(CliTool::OpenCode.capabilities().permission_modes.is_empty());
+        // Kimi and Grok have zero permission modes — not yet fixture-verified.
+        assert!(CliTool::KimiCode.capabilities().permission_modes.is_empty());
+        assert!(CliTool::Grok.capabilities().permission_modes.is_empty());
     }
 
     #[test]
     fn capabilities_returns_correct_tool_id() {
         assert_eq!(CliTool::ClaudeCode.capabilities().tool_id, "claude_code");
         assert_eq!(CliTool::Codex.capabilities().tool_id, "codex");
-        assert_eq!(CliTool::Gemini.capabilities().tool_id, "gemini");
-        assert_eq!(CliTool::OpenCode.capabilities().tool_id, "opencode");
+        assert_eq!(CliTool::KimiCode.capabilities().tool_id, "kimi");
+        assert_eq!(CliTool::Grok.capabilities().tool_id, "grok");
     }
 
     #[test]
     fn model_ids_are_nonempty() {
-        for tool in [CliTool::ClaudeCode, CliTool::Codex, CliTool::Gemini, CliTool::OpenCode] {
+        for tool in [CliTool::ClaudeCode, CliTool::Codex] {
             let caps = tool.capabilities();
             for m in &caps.available_models {
                 assert!(
@@ -619,16 +462,6 @@ mod tests {
     #[test]
     fn codex_has_three_permission_modes() {
         assert_eq!(CliTool::Codex.capabilities().permission_modes.len(), 3);
-    }
-
-    #[test]
-    fn gemini_has_four_permission_modes() {
-        assert_eq!(CliTool::Gemini.capabilities().permission_modes.len(), 4);
-    }
-
-    #[test]
-    fn opencode_has_zero_permission_modes() {
-        assert_eq!(CliTool::OpenCode.capabilities().permission_modes.len(), 0);
     }
 
     #[test]
@@ -654,28 +487,24 @@ mod tests {
     }
 
     #[test]
-    fn gemini_features_correct() {
-        let f = CliTool::Gemini.capabilities().features;
-        assert!(f.sandbox_mode);
-        assert!(f.plan_mode);
+    fn kimi_features_correct() {
+        let f = CliTool::KimiCode.capabilities().features;
         assert!(f.resume);
+        assert!(f.continue_last);
+        assert!(!f.thinking);
+    }
+
+    #[test]
+    fn grok_features_correct() {
+        let f = CliTool::Grok.capabilities().features;
+        assert!(!f.resume);
         assert!(!f.continue_last);
         assert!(!f.thinking);
     }
 
     #[test]
-    fn opencode_features_correct() {
-        let f = CliTool::OpenCode.capabilities().features;
-        assert!(f.multi_provider);
-        assert!(f.resume);
-        assert!(f.thinking);
-        assert!(!f.plan_mode);
-        assert!(!f.sandbox_mode);
-    }
-
-    #[test]
     fn default_model_helper_works() {
-        for tool in [CliTool::ClaudeCode, CliTool::Codex, CliTool::Gemini, CliTool::OpenCode] {
+        for tool in [CliTool::ClaudeCode, CliTool::Codex] {
             let caps = tool.capabilities();
             let default_model = caps.default_model();
             assert!(
@@ -716,7 +545,7 @@ mod tests {
 
     #[test]
     fn discover_returns_valid_capabilities() {
-        for tool in [CliTool::ClaudeCode, CliTool::Codex, CliTool::Gemini, CliTool::OpenCode] {
+        for tool in [CliTool::ClaudeCode, CliTool::Codex] {
             let caps = tool.discover_capabilities();
             // Must still have exactly one default model.
             let default_count = caps.available_models.iter().filter(|m| m.is_default).count();
@@ -727,6 +556,10 @@ mod tests {
                 tool,
                 default_count
             );
+            assert_eq!(caps.tool_id, tool.capabilities().tool_id);
+        }
+        for tool in [CliTool::KimiCode, CliTool::Grok] {
+            let caps = tool.discover_capabilities();
             assert_eq!(caps.tool_id, tool.capabilities().tool_id);
         }
     }
@@ -755,26 +588,5 @@ mod tests {
             }
         }
         assert_eq!(found.as_deref(), Some("gpt-5-custom"));
-    }
-
-    #[test]
-    fn opencode_config_discovery_with_temp_file() {
-        let dir = std::env::temp_dir().join("gate4agent_test_opencode");
-        std::fs::create_dir_all(&dir).unwrap();
-        let config_path = dir.join("opencode.json");
-        std::fs::write(
-            &config_path,
-            r#"{"model":{"default":"anthropic/claude-opus-4-6"}}"#,
-        )
-        .unwrap();
-
-        let content = std::fs::read_to_string(&config_path).unwrap();
-        let json: serde_json::Value = serde_json::from_str(&content).unwrap();
-        let model_id = json
-            .get("model")
-            .and_then(|m| m.get("default"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        assert_eq!(model_id.as_deref(), Some("anthropic/claude-opus-4-6"));
     }
 }

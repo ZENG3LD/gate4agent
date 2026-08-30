@@ -53,7 +53,6 @@ pub use one_shot::{
     OneShotSessionPersistence, OneShotThinkingLevel, CLAUDE_CODE_INLINE_REVISION,
     CODEX_CLI_INLINE_REVISION, KIMI_CODE_INLINE_REVISION, ONE_SHOT_OUTPUT_MAX_BYTES,
     ONE_SHOT_REVISION, ONE_SHOT_THINKING_OPTION_ID, ONE_SHOT_TIMEOUT_SECONDS,
-    QWEN_CODE_INLINE_REVISION,
 };
 pub use pty_identity::{
     CodexPtySessionIdentityExtractor, KimiPtySessionIdentityExtractor,
@@ -296,35 +295,17 @@ pub fn builtin_adapter_registry() -> &'static AdapterRegistry {
 
 fn builtin_descriptors() -> Vec<AdapterDescriptor> {
     let mut descriptors = Vec::new();
-    for id in ["claude-code", "codex", "gemini", "opencode", "kimi"] {
+    for id in ["claude-code", "codex", "kimi"] {
         descriptors.push(descriptor(AdapterFamily::PtySemantic, id));
     }
-    for id in ["claude-code", "codex", "gemini", "opencode", "kimi"] {
+    for id in ["claude-code", "codex", "kimi"] {
         descriptors.push(descriptor(AdapterFamily::Pipe, id));
     }
-    descriptors.push(descriptor_with_revision_and_verification(
-        AdapterFamily::Pipe,
-        "qwen-code",
-        QWEN_DUAL_OUTPUT_REVISION,
-        AdapterVerification::Reference,
-    ));
-    for id in [
-        "claude",
-        "codex",
-        "opencode",
-        "pi",
-        "amp",
-        "cursor",
-        "kimi",
-        "qwen-code",
-        "copilot",
-        "antigravity",
-    ] {
+    for id in ["claude", "codex", "kimi"] {
         let (revision, verification) = match id {
             "claude" => (CLAUDE_CODE_INLINE_REVISION, AdapterVerification::VendorCanary),
             "codex" => (CODEX_CLI_INLINE_REVISION, AdapterVerification::VendorCanary),
             "kimi" => (KIMI_CODE_INLINE_REVISION, AdapterVerification::VendorCanary),
-            "qwen-code" => (QWEN_CODE_INLINE_REVISION, AdapterVerification::Reference),
             _ => (ONE_SHOT_REVISION, AdapterVerification::SyntheticFixture),
         };
         descriptors.push(descriptor_with_revision_and_verification(
@@ -334,90 +315,28 @@ fn builtin_descriptors() -> Vec<AdapterDescriptor> {
             verification,
         ));
     }
-    for id in ["gemini", "opencode", "grok"] {
+    for id in ["claude-code", "codex", "grok", "kimi"] {
         descriptors.push(descriptor(AdapterFamily::Acp, id));
     }
-    descriptors.push(descriptor(AdapterFamily::Hook, "claude-code"));
-    descriptors.push(descriptor(AdapterFamily::Hook, "codex"));
-    descriptors.push(descriptor(AdapterFamily::Hook, "gemini"));
-    descriptors.push(descriptor(AdapterFamily::Hook, "opencode"));
-    descriptors.push(descriptor(AdapterFamily::Hook, "mimo-code"));
-    descriptors.push(descriptor(AdapterFamily::Hook, "pi"));
-    descriptors.push(descriptor(AdapterFamily::Hook, "omp"));
-    descriptors.push(descriptor(AdapterFamily::Hook, "antigravity"));
-    descriptors.push(descriptor(AdapterFamily::Hook, "amp"));
-    descriptors.push(descriptor(AdapterFamily::Hook, "command-code"));
-    descriptors.push(descriptor(AdapterFamily::Hook, "hermes"));
-    descriptors.push(descriptor(AdapterFamily::Hook, "devin"));
-    for id in ["grok", "kimi", "copilot", "droid", "cursor"] {
+    for id in ["claude-code", "codex", "grok", "kimi"] {
         descriptors.push(descriptor(AdapterFamily::Hook, id));
         descriptors.push(descriptor(AdapterFamily::History, id));
+        descriptors.push(descriptor(AdapterFamily::Resume, id));
     }
-    for id in [
-        "claude",
-        "openclaude",
-        "codex",
-        "gemini",
-        "antigravity",
-        "amp",
-        "cursor",
-        "droid",
-        "command-code",
-        "grok",
-        "copilot",
-        "hermes",
-        "devin",
-        "kimi",
-    ] {
+    for id in ["claude", "codex", "grok", "kimi"] {
         descriptors.push(descriptor_with_revision(
             AdapterFamily::ManagedHook,
             id,
             MANAGED_HOOK_REVISION,
         ));
     }
-    for id in [
-        "claude-code",
-        "codex",
-        "gemini",
-        "antigravity",
-        "opencode",
-        "hermes",
-        "rovo",
-        "openclaw",
-        "pi",
-        "omp",
-        "devin",
-        "qwen-code",
-    ] {
-        descriptors.push(descriptor(AdapterFamily::History, id));
-    }
-    for id in [
-        "claude-code",
-        "codex",
-        "gemini",
-        "antigravity",
-        "opencode",
-        "pi",
-        "mimo-code",
-        "grok",
-        "droid",
-        "devin",
-        "kimi",
-    ] {
-        descriptors.push(descriptor(AdapterFamily::Resume, id));
-    }
-    for id in ["claude-code", "codex", "gemini", "cursor"] {
+    for id in ["claude-code", "codex"] {
         descriptors.push(descriptor_with_revision(
             AdapterFamily::SessionOptions,
             id,
             SESSION_OPTION_CATALOG_REVISION,
         ));
     }
-    descriptors.push(descriptor_with_revision(
-        AdapterFamily::CapabilityProbe,
-        "cursor",
-        CAPABILITY_PROBE_REVISION,
-    ));
     descriptors
 }
 
@@ -440,11 +359,7 @@ fn descriptor_with_revision_and_verification(
     revision: &str,
     verification: AdapterVerification,
 ) -> AdapterDescriptor {
-    let agent_ids = if family == AdapterFamily::Hook && id == "claude-code" {
-        vec!["claude", "openclaude"]
-    } else {
-        vec![if id == "claude-code" { "claude" } else { id }]
-    };
+    let agent_id = if id == "claude-code" { "claude" } else { id };
     AdapterDescriptor {
         family,
         binding: AdapterBinding::new(
@@ -453,10 +368,7 @@ fn descriptor_with_revision_and_verification(
             verification,
         )
         .expect("hardcoded adapter binding"),
-        agents: agent_ids
-            .into_iter()
-            .map(|agent_id| AgentId::new(agent_id).expect("hardcoded agent ID"))
-            .collect(),
+        agents: vec![AgentId::new(agent_id).expect("hardcoded agent ID")],
     }
 }
 
@@ -467,110 +379,54 @@ mod tests {
     #[test]
     fn family_is_part_of_the_registry_key() {
         let registry = builtin_adapter_registry();
-        let id = AdapterId::new("gemini").unwrap();
-        assert!(registry.get(AdapterFamily::PtySemantic, &id).is_some());
-        assert!(registry.get(AdapterFamily::Pipe, &id).is_some());
-        assert!(registry.get(AdapterFamily::Acp, &id).is_some());
-        assert!(registry.get(AdapterFamily::Hook, &id).is_some());
-        assert!(registry.get(AdapterFamily::History, &id).is_some());
         let claude = AdapterId::new("claude-code").unwrap();
+        assert!(registry.get(AdapterFamily::PtySemantic, &claude).is_some());
+        assert!(registry.get(AdapterFamily::Pipe, &claude).is_some());
+        assert!(registry.get(AdapterFamily::Acp, &claude).is_some());
         assert!(registry.get(AdapterFamily::Hook, &claude).is_some());
         assert!(registry.get(AdapterFamily::History, &claude).is_some());
-        for id in [
-            "codex",
-            "opencode",
-            "pi",
-            "omp",
-            "antigravity",
-            "hermes",
-            "devin",
-        ] {
+        for id in ["codex", "kimi"] {
             let id = AdapterId::new(id).unwrap();
+            assert!(registry.get(AdapterFamily::PtySemantic, &id).is_some());
+            assert!(registry.get(AdapterFamily::Pipe, &id).is_some());
+            assert!(registry.get(AdapterFamily::Acp, &id).is_some());
             assert!(registry.get(AdapterFamily::Hook, &id).is_some());
             assert!(registry.get(AdapterFamily::History, &id).is_some());
         }
-        for id in ["mimo-code", "amp", "command-code"] {
-            let id = AdapterId::new(id).unwrap();
-            assert!(registry.get(AdapterFamily::Hook, &id).is_some());
-            assert!(registry.get(AdapterFamily::History, &id).is_none());
-        }
-        for id in ["rovo", "openclaw"] {
-            let id = AdapterId::new(id).unwrap();
-            assert!(registry.get(AdapterFamily::Hook, &id).is_none());
-            assert!(registry.get(AdapterFamily::History, &id).is_some());
-        }
-        let qwen = AdapterId::new("qwen-code").unwrap();
-        assert!(registry.get(AdapterFamily::Hook, &qwen).is_none());
-        assert!(registry.get(AdapterFamily::History, &qwen).is_some());
-        let sidecar = registry.get(AdapterFamily::Pipe, &qwen).unwrap();
-        assert_eq!(sidecar.binding.revision, QWEN_DUAL_OUTPUT_REVISION);
-        assert_eq!(sidecar.binding.verification, AdapterVerification::Reference);
+        let grok = AdapterId::new("grok").unwrap();
+        assert!(registry.get(AdapterFamily::PtySemantic, &grok).is_none());
+        assert!(registry.get(AdapterFamily::Pipe, &grok).is_none());
+        assert!(registry.get(AdapterFamily::Acp, &grok).is_some());
+        assert!(registry.get(AdapterFamily::Hook, &grok).is_some());
+        assert!(registry.get(AdapterFamily::History, &grok).is_some());
     }
 
     #[test]
-    fn history_registry_matches_the_pinned_orca_source_inventory() {
+    fn history_registry_matches_the_fleet_source_inventory() {
         let actual = builtin_adapter_registry()
             .iter()
             .filter(|descriptor| descriptor.family == AdapterFamily::History)
             .map(|descriptor| descriptor.binding.id.as_str())
             .collect::<std::collections::BTreeSet<_>>();
-        let expected = [
-            "antigravity",
-            "claude-code",
-            "codex",
-            "copilot",
-            "cursor",
-            "devin",
-            "droid",
-            "gemini",
-            "grok",
-            "hermes",
-            "kimi",
-            "omp",
-            "opencode",
-            "openclaw",
-            "pi",
-            "qwen-code",
-            "rovo",
-        ]
-        .into_iter()
-        .collect::<std::collections::BTreeSet<_>>();
+        let expected = ["claude-code", "codex", "grok", "kimi"]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(actual, expected);
     }
 
     #[test]
-    fn hook_registry_matches_the_pinned_orca_source_inventory() {
+    fn hook_registry_matches_the_fleet_source_inventory() {
         let actual = builtin_adapter_registry()
             .iter()
             .filter(|descriptor| descriptor.family == AdapterFamily::Hook)
             .map(|descriptor| descriptor.binding.id.as_str())
             .collect::<std::collections::BTreeSet<_>>();
-        let expected = [
-            "amp",
-            "antigravity",
-            "claude-code",
-            "codex",
-            "command-code",
-            "copilot",
-            "cursor",
-            "devin",
-            "droid",
-            "gemini",
-            "grok",
-            "hermes",
-            "kimi",
-            "mimo-code",
-            "omp",
-            "opencode",
-            "pi",
-        ]
-        .into_iter()
-        .collect();
+        let expected = ["claude-code", "codex", "grok", "kimi"].into_iter().collect();
         assert_eq!(actual, expected);
     }
 
     #[test]
-    fn managed_hook_registry_matches_the_pinned_orca_control_inventory() {
+    fn managed_hook_registry_matches_the_fleet_control_inventory() {
         let actual = builtin_adapter_registry()
             .iter()
             .filter(|descriptor| descriptor.family == AdapterFamily::ManagedHook)
@@ -581,25 +437,10 @@ mod tests {
                 )
             })
             .collect::<std::collections::BTreeSet<_>>();
-        let expected = [
-            "amp",
-            "antigravity",
-            "claude",
-            "codex",
-            "command-code",
-            "copilot",
-            "cursor",
-            "devin",
-            "droid",
-            "gemini",
-            "grok",
-            "hermes",
-            "kimi",
-            "openclaude",
-        ]
-        .into_iter()
-        .map(|id| (id, MANAGED_HOOK_REVISION))
-        .collect();
+        let expected = ["claude", "codex", "grok", "kimi"]
+            .into_iter()
+            .map(|id| (id, MANAGED_HOOK_REVISION))
+            .collect();
         assert_eq!(actual, expected);
     }
 
@@ -616,16 +457,9 @@ mod tests {
             })
             .collect::<std::collections::BTreeSet<_>>();
         let expected = [
-            ("amp", ONE_SHOT_REVISION),
-            ("antigravity", ONE_SHOT_REVISION),
             ("claude", CLAUDE_CODE_INLINE_REVISION),
             ("codex", CODEX_CLI_INLINE_REVISION),
-            ("copilot", ONE_SHOT_REVISION),
-            ("cursor", ONE_SHOT_REVISION),
             ("kimi", KIMI_CODE_INLINE_REVISION),
-            ("opencode", ONE_SHOT_REVISION),
-            ("pi", ONE_SHOT_REVISION),
-            ("qwen-code", QWEN_CODE_INLINE_REVISION),
         ]
         .into_iter()
         .collect();
@@ -640,13 +474,6 @@ mod tests {
                 "{id}"
             );
         }
-        assert_eq!(
-            builtin_adapter_registry()
-                .binding(AdapterFamily::OneShot, "qwen-code")
-                .unwrap()
-                .verification,
-            AdapterVerification::Reference
-        );
     }
 
     #[test]
@@ -656,26 +483,12 @@ mod tests {
             .filter(|descriptor| descriptor.family == AdapterFamily::Resume)
             .map(|descriptor| descriptor.binding.id.as_str())
             .collect::<std::collections::BTreeSet<_>>();
-        let expected = [
-            "antigravity",
-            "claude-code",
-            "codex",
-            "devin",
-            "droid",
-            "gemini",
-            "grok",
-            "kimi",
-            "mimo-code",
-            "opencode",
-            "pi",
-        ]
-        .into_iter()
-        .collect();
+        let expected = ["claude-code", "codex", "grok", "kimi"].into_iter().collect();
         assert_eq!(actual, expected);
     }
 
     #[test]
-    fn session_option_registry_matches_the_pinned_orca_catalog_inventory() {
+    fn session_option_registry_matches_the_fleet_catalog_inventory() {
         let actual = builtin_adapter_registry()
             .iter()
             .filter(|descriptor| descriptor.family == AdapterFamily::SessionOptions)
@@ -686,7 +499,7 @@ mod tests {
                 )
             })
             .collect::<std::collections::BTreeSet<_>>();
-        let expected = ["claude-code", "codex", "cursor", "gemini"]
+        let expected = ["claude-code", "codex"]
             .into_iter()
             .map(|id| (id, SESSION_OPTION_CATALOG_REVISION))
             .collect();
@@ -694,23 +507,12 @@ mod tests {
     }
 
     #[test]
-    fn capability_probe_registry_matches_the_pinned_orca_executed_inventory() {
+    fn capability_probe_registry_is_empty_for_the_current_fleet() {
         let actual = builtin_adapter_registry()
             .iter()
             .filter(|descriptor| descriptor.family == AdapterFamily::CapabilityProbe)
-            .map(|descriptor| {
-                (
-                    descriptor.binding.id.as_str(),
-                    descriptor.binding.revision.as_str(),
-                )
-            })
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(
-            actual,
-            [("cursor", CAPABILITY_PROBE_REVISION)]
-                .into_iter()
-                .collect()
-        );
+            .count();
+        assert_eq!(actual, 0);
     }
 
     #[test]

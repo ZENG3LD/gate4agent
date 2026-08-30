@@ -49,11 +49,6 @@ impl RateLimitDetector {
             CliTool::ClaudeCode => Self::build_claude_patterns(),
             CliTool::Codex => Self::build_codex_patterns(),
             CliTool::KimiCode => Self::build_kimi_patterns(),
-            CliTool::Gemini => Self::build_gemini_patterns(),
-            // OpenCode will get its own pattern builder once real CLI
-            // output has been captured and rate-limit message formats confirmed.
-            // For now use an empty pattern set — no false positives, no detections.
-            CliTool::OpenCode => vec![],
             // Unreachable for Grok, but NOT because Grok lacks a PTY: it
             // runs over one every day, and its catalog entry declares
             // `pty: true`. What it lacks is a `pty_adapter`, so it is
@@ -99,14 +94,6 @@ impl RateLimitDetector {
                 regex: codex_quota_state_regex(),
             },
         ]
-    }
-
-    fn build_gemini_patterns() -> Vec<RateLimitPattern> {
-        vec![RateLimitPattern::Failure {
-            regex: Regex::new(r"(?i)rate\s*limit|quota\s*exceeded|resource\s*exhausted")
-                .expect("valid regex"),
-            limit_type: RateLimitType::Unknown,
-        }]
     }
 
     fn build_kimi_patterns() -> Vec<RateLimitPattern> {

@@ -2,8 +2,9 @@
 //!
 //! Provides [`AcpSession`] — a multi-turn bidirectional JSON-RPC 2.0 session
 //! over a subprocess stdio transport. Suitable for CLI tools that implement
-//! the Agent Client Protocol specification (Gemini, OpenCode, Cursor, and the
-//! Claude ACP adapter via `npx`).
+//! the Agent Client Protocol specification: Claude Code and Codex (via `npx`
+//! ACP adapters), Grok (native `grok agent stdio`), and Kimi Code (native
+//! `kimi acp`).
 //!
 //! ## Quick start
 //!
@@ -13,7 +14,7 @@
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let session = AcpSession::spawn(
-//!     CliTool::Gemini,
+//!     CliTool::Grok,
 //!     std::path::Path::new("."),
 //!     AcpSessionOptions::default(),
 //! ).await?;

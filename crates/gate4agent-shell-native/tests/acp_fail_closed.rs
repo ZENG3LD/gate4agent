@@ -21,7 +21,7 @@ async fn acp_session_handshake_and_host_callbacks_are_fail_closed() {
         ..AcpSessionOptions::default()
     };
     let session = AcpSession::spawn_with_launch(
-        CliTool::Gemini,
+        CliTool::ClaudeCode,
         &std::env::current_dir().expect("current directory"),
         options,
         &launch,

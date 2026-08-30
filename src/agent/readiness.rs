@@ -485,10 +485,10 @@ mod tests {
 
     #[test]
     fn marker_policy_does_not_fall_through_to_quiet() {
-        let mut tracker = tracker("opencode", ReadinessIntent::DraftPaste);
+        let mut tracker = tracker("claude", ReadinessIntent::DraftPaste);
         tracker.observe_foreground(
             &ForegroundObservation {
-                process_name: Some("opencode".to_owned()),
+                process_name: Some("claude".to_owned()),
                 has_child_processes: false,
                 is_shell: false,
             },
@@ -792,11 +792,11 @@ mod tests {
 
     #[test]
     fn unverified_followup_keeps_the_foreground_only_contract() {
-        let mut tracker = tracker("opencode", ReadinessIntent::FollowupPrompt);
+        let mut tracker = tracker("grok", ReadinessIntent::FollowupPrompt);
         assert_eq!(
             tracker.observe_foreground(
                 &ForegroundObservation {
-                    process_name: Some("opencode".to_owned()),
+                    process_name: Some("grok".to_owned()),
                     has_child_processes: false,
                     is_shell: false,
                 },

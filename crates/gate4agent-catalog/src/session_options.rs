@@ -160,9 +160,9 @@ mod tests {
                 .as_str(),
             "claude-code"
         );
-        let opencode = registry.get_by_id("opencode").unwrap();
+        let kimi = registry.get_by_id("kimi").unwrap();
         assert!(matches!(
-            session_option_catalog_for(opencode),
+            session_option_catalog_for(kimi),
             Err(SessionOptionCatalogError::UnsupportedAgent(_))
         ));
 
@@ -183,25 +183,23 @@ mod tests {
     #[test]
     fn spec_bound_mid_session_plans_never_fall_back_to_another_provider() {
         let registry = builtin_registry();
-        let cursor = registry.get_by_id("cursor").unwrap();
-        let current = SessionOptionSelection::new("gpt-5.3-codex")
-            .with_value("effort", "high")
-            .with_value("fastMode", false);
+        let claude = registry.get_by_id("claude").unwrap();
+        let current = SessionOptionSelection::new("opus").with_value("effort", "high");
         assert!(matches!(
-            plan_mid_session_option_for(cursor, &current, "fastMode", true.into()).unwrap(),
+            plan_mid_session_option_for(claude, &current, "model", "sonnet".into()).unwrap(),
             SessionOptionMidSessionPlan::Command { command, .. }
-                if command == "/model gpt-5.3-codex-high-fast"
+                if command == "/model sonnet"
         ));
         let control =
-            plan_mid_session_control_for(cursor, &current, "fastMode", true.into()).unwrap();
+            plan_mid_session_control_for(claude, &current, "model", "sonnet".into()).unwrap();
         assert_eq!(
             control.command,
             Some(AgentCommand {
-                agent_id: cursor.id.clone(),
+                agent_id: claude.id.clone(),
                 name: "model".to_owned(),
-                arguments: vec!["gpt-5.3-codex-high-fast".to_owned()],
+                arguments: vec!["sonnet".to_owned()],
             })
         );
-        gate4agent_types::prepare_agent_command(control.command.unwrap(), &cursor.id).unwrap();
+        gate4agent_types::prepare_agent_command(control.command.unwrap(), &claude.id).unwrap();
     }
 }

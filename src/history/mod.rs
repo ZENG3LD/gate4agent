@@ -8,8 +8,6 @@ use crate::pty::snapshot::{AgentCli, ChatMessage};
 
 pub mod claude;
 pub mod codex;
-pub mod gemini;
-pub mod opencode;
 
 pub use claude::invalidate_projects_dir_cache;
 
@@ -66,7 +64,5 @@ pub fn reader_for(cli: AgentCli) -> Box<dyn HistoryReader> {
     match cli {
         AgentCli::Claude => Box::new(claude::ClaudeHistoryReader),
         AgentCli::Codex => Box::new(codex::CodexHistoryReader),
-        AgentCli::Gemini => Box::new(gemini::GeminiHistoryReader),
-        AgentCli::OpenCode => Box::new(opencode::OpenCodeHistoryReader),
     }
 }

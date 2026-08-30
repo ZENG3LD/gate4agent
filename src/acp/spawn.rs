@@ -38,19 +38,9 @@ pub(crate) struct AcpSpawnSpec {
 /// Does not panic — all `CliTool` variants are handled.
 pub(crate) fn acp_command(tool: CliTool) -> Result<AcpSpawnSpec, std::io::Error> {
     let spec = match tool {
-        CliTool::Gemini => AcpSpawnSpec {
-            program: "gemini",
-            args: &["--experimental-acp"],
-            npm_tool: false,
-        },
-        CliTool::OpenCode => AcpSpawnSpec {
-            program: "opencode",
-            args: &["acp"],
-            npm_tool: false,
-        },
         CliTool::ClaudeCode => AcpSpawnSpec {
             program: "npx",
-            args: &["-y", "@agentclientprotocol/claude-agent-acp"],
+            args: &["-y", "@zed-industries/claude-code-acp"],
             npm_tool: true,
         },
         CliTool::Codex => AcpSpawnSpec {
@@ -63,12 +53,11 @@ pub(crate) fn acp_command(tool: CliTool) -> Result<AcpSpawnSpec, std::io::Error>
             args: &["agent", "stdio"],
             npm_tool: false,
         },
-        CliTool::KimiCode => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "Kimi Code does not declare an ACP transport",
-            ))
-        }
+        CliTool::KimiCode => AcpSpawnSpec {
+            program: "kimi",
+            args: &["acp"],
+            npm_tool: false,
+        },
     };
     Ok(spec)
 }
@@ -378,27 +367,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn acp_command_gemini() {
-        let spec = acp_command(CliTool::Gemini).unwrap();
-        assert_eq!(spec.program, "gemini");
-        assert_eq!(spec.args, &["--experimental-acp"]);
-        assert!(!spec.npm_tool);
-    }
-
-    #[test]
-    fn acp_command_opencode() {
-        let spec = acp_command(CliTool::OpenCode).unwrap();
-        assert_eq!(spec.program, "opencode");
-        assert_eq!(spec.args, &["acp"]);
-        assert!(!spec.npm_tool);
-    }
-
-    #[test]
     fn acp_command_claude_code() {
         let spec = acp_command(CliTool::ClaudeCode).unwrap();
         assert_eq!(spec.program, "npx");
         assert!(spec.npm_tool);
-        assert!(spec.args.contains(&"@agentclientprotocol/claude-agent-acp"));
+        assert!(spec.args.contains(&"@zed-industries/claude-code-acp"));
     }
 
     #[test]
@@ -418,11 +391,11 @@ mod tests {
     }
 
     #[test]
-    fn acp_command_kimi_is_explicitly_unsupported() {
-        let error = acp_command(CliTool::KimiCode)
-            .err()
-            .expect("Kimi ACP must be rejected");
-        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    fn acp_command_kimi_is_native() {
+        let spec = acp_command(CliTool::KimiCode).unwrap();
+        assert_eq!(spec.program, "kimi");
+        assert_eq!(spec.args, &["acp"]);
+        assert!(!spec.npm_tool);
     }
 
     #[test]

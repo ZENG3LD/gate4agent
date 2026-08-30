@@ -103,6 +103,18 @@ const fn copilot(name: &'static str) -> ManagedHookEventSpec {
 }
 
 const CLAUDE_EVENTS: &[ManagedHookEventSpec] = &[
+    // The only event here that fires without the agent doing any work, and
+    // the reason it matters: every other event on this list needs a real
+    // turn, a tool call or a subagent to exist first, so a freshly spawned
+    // session that is merely SITTING there produces nothing at all. That is
+    // exactly the condition the node most needs a provider-authored answer
+    // for -- "did the agent actually come up?" -- and without this event we
+    // could observe the channel for Claude only by spending a model turn.
+    // Grok's contract carries it and Grok is the one provider whose channel
+    // has been proven end to end; Codex carries it too. Claude supports it
+    // (the operator's own hand-written hook sits on this event in the same
+    // settings file) and we simply never asked for it.
+    nested("SessionStart", None),
     nested("UserPromptSubmit", None),
     nested("Stop", None),
     nested("StopFailure", None),

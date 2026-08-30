@@ -16,6 +16,9 @@ pub enum CliTool {
     Gemini,
     /// OpenCode (sst/opencode) — PIPE transport, own 5-event NDJSON schema.
     OpenCode,
+    /// xAI Grok CLI — ACP transport (`grok agent stdio`).
+    #[serde(alias = "grok")]
+    Grok,
 }
 
 impl std::fmt::Display for CliTool {
@@ -26,6 +29,7 @@ impl std::fmt::Display for CliTool {
             CliTool::KimiCode => write!(f, "Kimi Code"),
             CliTool::Gemini => write!(f, "Gemini"),
             CliTool::OpenCode => write!(f, "OpenCode"),
+            CliTool::Grok => write!(f, "Grok"),
         }
     }
 }
@@ -49,8 +53,8 @@ impl CliTool {
     /// ```
     pub fn capabilities(&self) -> crate::core::capabilities::CliCapabilities {
         use crate::core::capabilities::{
-            claude_capabilities, codex_capabilities, gemini_capabilities, kimi_capabilities,
-            opencode_capabilities,
+            claude_capabilities, codex_capabilities, gemini_capabilities, grok_capabilities,
+            kimi_capabilities, opencode_capabilities,
         };
         match self {
             CliTool::ClaudeCode => claude_capabilities(),
@@ -58,6 +62,7 @@ impl CliTool {
             CliTool::KimiCode => kimi_capabilities(),
             CliTool::Gemini => gemini_capabilities(),
             CliTool::OpenCode => opencode_capabilities(),
+            CliTool::Grok => grok_capabilities(),
         }
     }
 

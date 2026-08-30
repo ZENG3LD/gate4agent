@@ -53,6 +53,7 @@ impl From<CliTool> for AgentId {
             CliTool::KimiCode => "kimi",
             CliTool::Gemini => "gemini",
             CliTool::OpenCode => "opencode",
+            CliTool::Grok => "grok",
         };
         AgentId::new(id).expect("legacy CLI tool IDs are valid")
     }
@@ -68,6 +69,7 @@ impl TryFrom<&AgentId> for CliTool {
             "kimi" => Ok(Self::KimiCode),
             "gemini" => Ok(Self::Gemini),
             "opencode" => Ok(Self::OpenCode),
+            "grok" => Ok(Self::Grok),
             _ => Err(LegacyCliToolError(id.clone())),
         }
     }
@@ -88,7 +90,12 @@ mod tests {
             CliTool::try_from(&AgentId::new("opencode").unwrap()).unwrap(),
             CliTool::OpenCode
         );
-        assert!(CliTool::try_from(&AgentId::new("grok").unwrap()).is_err());
+        // Grok now maps to a real CliTool variant (ACP transport) — the
+        // closed legacy set is intentionally widened, not merely extended.
+        assert_eq!(
+            CliTool::try_from(&AgentId::new("grok").unwrap()).unwrap(),
+            CliTool::Grok
+        );
         assert_eq!(AgentId::from(CliTool::KimiCode).as_str(), "kimi");
         assert_eq!(
             CliTool::try_from(&AgentId::new("kimi").unwrap()).unwrap(),

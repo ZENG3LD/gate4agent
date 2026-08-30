@@ -5,9 +5,11 @@
 //! stdin open for the full session lifetime — required for multi-turn
 //! bidirectional JSON-RPC over stdio.
 
+use std::collections::VecDeque;
 use std::io::Write as _;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::core::types::CliTool;
@@ -56,6 +58,11 @@ pub(crate) fn acp_command(tool: CliTool) -> Result<AcpSpawnSpec, std::io::Error>
             args: &["@zed-industries/codex-acp"],
             npm_tool: true,
         },
+        CliTool::Grok => AcpSpawnSpec {
+            program: "grok",
+            args: &["agent", "stdio"],
+            npm_tool: false,
+        },
         CliTool::KimiCode => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -79,7 +86,16 @@ pub(crate) struct AcpProcess {
     child: Child,
     stdin: std::process::ChildStdin,
     output_rx: Receiver<String>,
+    /// Bounded ring buffer of the most recent stderr lines. Populated by a
+    /// background reader thread; read out via [`stderr_tail`](Self::stderr_tail)
+    /// to enrich handshake-failure diagnostics when the process exits before
+    /// producing any valid JSON-RPC line on stdout (e.g. an unauthenticated
+    /// CLI that prints a login prompt and exits).
+    stderr_tail: Arc<Mutex<VecDeque<String>>>,
 }
+
+/// Maximum number of trailing stderr lines retained per ACP process.
+const ACP_STDERR_TAIL_MAX_LINES: usize = 20;
 
 impl AcpProcess {
     /// Spawn the CLI tool in ACP mode.
@@ -101,7 +117,7 @@ impl AcpProcess {
         cmd.current_dir(working_dir);
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::null());
+        cmd.stderr(Stdio::piped());
 
         let mut child = cmd.spawn()?;
 
@@ -115,13 +131,23 @@ impl AcpProcess {
             .take()
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no stdout pipe"))?;
 
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no stderr pipe"))?;
+
         let (tx, rx) = mpsc::channel::<String>();
         thread::spawn(move || reader_thread(stdout, tx));
+
+        let stderr_tail = Arc::new(Mutex::new(VecDeque::with_capacity(ACP_STDERR_TAIL_MAX_LINES)));
+        let stderr_tail_writer = Arc::clone(&stderr_tail);
+        thread::spawn(move || stderr_reader_thread(stderr, stderr_tail_writer));
 
         Ok(Self {
             child,
             stdin,
             output_rx: rx,
+            stderr_tail,
         })
     }
 
@@ -138,7 +164,7 @@ impl AcpProcess {
         cmd.current_dir(working_dir);
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::null());
+        cmd.stderr(Stdio::piped());
         let mut child = cmd.spawn()?;
         let stdin = child
             .stdin
@@ -148,12 +174,22 @@ impl AcpProcess {
             .stdout
             .take()
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no stdout pipe"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no stderr pipe"))?;
         let (tx, rx) = mpsc::channel::<String>();
         thread::spawn(move || reader_thread(stdout, tx));
+
+        let stderr_tail = Arc::new(Mutex::new(VecDeque::with_capacity(ACP_STDERR_TAIL_MAX_LINES)));
+        let stderr_tail_writer = Arc::clone(&stderr_tail);
+        thread::spawn(move || stderr_reader_thread(stderr, stderr_tail_writer));
+
         Ok(Self {
             child,
             stdin,
             output_rx: rx,
+            stderr_tail,
         })
     }
 
@@ -196,6 +232,19 @@ impl AcpProcess {
 
     pub(crate) fn process_id(&self) -> u32 {
         self.child.id()
+    }
+
+    /// Snapshot of the most recent stderr lines, oldest first.
+    ///
+    /// Used to enrich handshake-failure diagnostics: a process that exits
+    /// before writing any valid JSON-RPC line to stdout (e.g. because the
+    /// vendor CLI is not authenticated) otherwise surfaces only a generic
+    /// "session closed" error with no indication of the underlying cause.
+    pub(crate) fn stderr_tail(&self) -> Vec<String> {
+        self.stderr_tail
+            .lock()
+            .map(|guard| guard.iter().cloned().collect())
+            .unwrap_or_default()
     }
 }
 
@@ -297,6 +346,29 @@ fn reader_thread(stdout: std::process::ChildStdout, tx: Sender<String>) {
     }
 }
 
+/// Reads stderr lines into a bounded ring buffer, oldest lines dropped first.
+///
+/// Runs for the lifetime of the child process's stderr pipe; exits when the
+/// pipe closes (process exit) or a read error occurs.
+fn stderr_reader_thread(stderr: std::process::ChildStderr, tail: Arc<Mutex<VecDeque<String>>>) {
+    use std::io::{BufRead, BufReader};
+
+    let reader = BufReader::new(stderr);
+    for line in reader.lines() {
+        let Ok(line) = line else { break };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(mut buffer) = tail.lock() {
+            if buffer.len() >= ACP_STDERR_TAIL_MAX_LINES {
+                buffer.pop_front();
+            }
+            buffer.push_back(trimmed.to_owned());
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
@@ -335,6 +407,14 @@ mod tests {
         assert_eq!(spec.program, "npx");
         assert!(spec.npm_tool);
         assert!(spec.args.contains(&"@zed-industries/codex-acp"));
+    }
+
+    #[test]
+    fn acp_command_grok() {
+        let spec = acp_command(CliTool::Grok).unwrap();
+        assert_eq!(spec.program, "grok");
+        assert_eq!(spec.args, &["agent", "stdio"]);
+        assert!(!spec.npm_tool);
     }
 
     #[test]

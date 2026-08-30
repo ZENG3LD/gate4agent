@@ -329,7 +329,10 @@ impl PipeProcess {
                         .join("main.mjs"),
                 ),
             ),
-            CliTool::Gemini | CliTool::OpenCode => return None,
+            // Grok's pipe transport is not fixture-verified (see catalog:
+            // `transports.pipe` stays `None`), so this branch is unreachable
+            // for it in practice — grouped with the other unclassified tools.
+            CliTool::Gemini | CliTool::OpenCode | CliTool::Grok => return None,
         };
         if let Some(entrypoint) = entrypoint {
             if !entrypoint.is_file() {

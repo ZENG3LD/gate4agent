@@ -370,6 +370,22 @@ pub(crate) fn opencode_capabilities() -> CliCapabilities {
     }
 }
 
+/// Returns the verified baseline capabilities for Grok.
+///
+/// Model list and permission modes are not yet fixture-verified for the
+/// `grok agent stdio` ACP transport — left empty until a live capture
+/// confirms them, matching the idiom already used for Kimi.
+pub(crate) fn grok_capabilities() -> CliCapabilities {
+    CliCapabilities {
+        tool_id: "grok".to_string(),
+        display_name: "Grok".to_string(),
+        binary: "grok".to_string(),
+        available_models: Vec::new(),
+        permission_modes: Vec::new(),
+        features: CliFeatures::default(),
+    }
+}
+
 // ── Config-based discovery helpers ────────────────────────────────────────────
 
 /// Read the configured model from `~/.codex/config.toml`.
@@ -482,6 +498,7 @@ pub(crate) fn discover(
         CliTool::KimiCode => kimi_capabilities(),
         CliTool::Gemini => gemini_capabilities(),
         CliTool::OpenCode => opencode_capabilities(),
+        CliTool::Grok => grok_capabilities(),
     };
 
     // Overlay context_window values from the cure cache (non-fatal if absent).
@@ -502,8 +519,8 @@ pub(crate) fn discover(
                 update_default_model(&mut caps.available_models, &model_id);
             }
         }
-        // Claude, Kimi, and Gemini have no verified config-based model discovery.
-        CliTool::ClaudeCode | CliTool::KimiCode | CliTool::Gemini => {}
+        // Claude, Kimi, Gemini, and Grok have no verified config-based model discovery.
+        CliTool::ClaudeCode | CliTool::KimiCode | CliTool::Gemini | CliTool::Grok => {}
     }
 
     caps

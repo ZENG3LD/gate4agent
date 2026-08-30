@@ -36,6 +36,9 @@ impl RateLimitDetector {
             // output has been captured and rate-limit message formats confirmed.
             // For now use an empty pattern set — no false positives, no detections.
             CliTool::OpenCode => vec![],
+            // Grok's PTY transport is not wired (ACP is its only supported
+            // transport), so this detector is unreachable for it in practice.
+            CliTool::Grok => vec![],
         };
         Self { patterns }
     }

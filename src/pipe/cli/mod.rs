@@ -4,6 +4,7 @@ pub mod traits;
 pub mod claude;
 pub mod codex;
 pub mod gemini;
+pub mod grok;
 pub mod kimi;
 pub mod opencode;
 
@@ -14,10 +15,14 @@ use crate::core::types::CliTool;
 use self::claude::{ClaudeNdjsonParser, ClaudePipeBuilder};
 use self::codex::{CodexNdjsonParser, CodexPipeBuilder};
 use self::gemini::{GeminiNdjsonParser, GeminiPipeBuilder};
+use self::grok::{GrokNdjsonParser, GrokPipeBuilder};
 use self::kimi::{KimiNdjsonParser, KimiPipeBuilder};
 use self::opencode::{OpenCodeNdjsonParser, OpenCodePipeBuilder};
 
 /// Create an NDJSON parser for the given CLI tool.
+///
+/// Grok's supported transport is ACP, not pipe — the catalog never enables
+/// `transports.pipe` for it, so this arm is unreachable in practice.
 pub fn create_ndjson_parser(tool: CliTool) -> Box<dyn NdjsonParser> {
     match tool {
         CliTool::ClaudeCode => Box::new(ClaudeNdjsonParser::new()),
@@ -25,6 +30,7 @@ pub fn create_ndjson_parser(tool: CliTool) -> Box<dyn NdjsonParser> {
         CliTool::KimiCode => Box::new(KimiNdjsonParser::new()),
         CliTool::Gemini => Box::new(GeminiNdjsonParser::new()),
         CliTool::OpenCode => Box::new(OpenCodeNdjsonParser::new()),
+        CliTool::Grok => Box::new(GrokNdjsonParser::new()),
     }
 }
 
@@ -32,6 +38,9 @@ pub fn create_ndjson_parser(tool: CliTool) -> Box<dyn NdjsonParser> {
 ///
 /// This is the single dispatch point used by `pipe/process.rs` to delegate
 /// command construction to the per-CLI builder.
+///
+/// Grok's supported transport is ACP, not pipe — this arm is unreachable in
+/// practice, same reasoning as `create_ndjson_parser`.
 pub fn cli_builder(tool: CliTool) -> Box<dyn CliCommandBuilder> {
     match tool {
         CliTool::ClaudeCode => Box::new(ClaudePipeBuilder),
@@ -39,5 +48,6 @@ pub fn cli_builder(tool: CliTool) -> Box<dyn CliCommandBuilder> {
         CliTool::KimiCode => Box::new(KimiPipeBuilder),
         CliTool::Gemini => Box::new(GeminiPipeBuilder),
         CliTool::OpenCode => Box::new(OpenCodePipeBuilder),
+        CliTool::Grok => Box::new(GrokPipeBuilder),
     }
 }

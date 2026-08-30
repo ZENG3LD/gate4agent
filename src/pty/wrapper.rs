@@ -333,6 +333,9 @@ impl PtyWrapper {
                 // OpenCode PTY integration will be added once
                 // its invocation shape is confirmed via live capture.
                 CliTool::OpenCode => "opencode",
+                // Grok's supported transport is ACP, not PTY — unreachable
+                // via this legacy `CliTool` PTY path in practice.
+                CliTool::Grok => "grok",
             };
             let mut c = CommandBuilder::new("cmd");
             c.args(["/Q", "/K", tool_name]);
@@ -347,6 +350,9 @@ impl PtyWrapper {
                 // OpenCode PTY integration will be added once
                 // its invocation shape is confirmed via live capture.
                 CliTool::OpenCode => CommandBuilder::new("opencode"),
+                // Grok's supported transport is ACP, not PTY — unreachable
+                // via this legacy `CliTool` PTY path in practice.
+                CliTool::Grok => CommandBuilder::new("grok"),
             }
         };
 

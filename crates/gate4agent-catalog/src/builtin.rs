@@ -313,7 +313,7 @@ fn capabilities(id: &str) -> AgentCapabilities {
         id
     };
     let transport_adapter_id = match id {
-        "claude" | "codex" | "gemini" | "opencode" | "kimi" => Some(adapter_id),
+        "claude" | "codex" | "gemini" | "opencode" | "kimi" | "grok" => Some(adapter_id),
         _ => None,
     };
     let one_shot_adapter_id = matches!(
@@ -568,7 +568,7 @@ mod tests {
             .iter()
             .filter(|spec| spec.capabilities.adapters.pty_sidecar.is_some())
             .all(|spec| spec.id.as_str() == "qwen-code"));
-        for id in ["gemini", "opencode"] {
+        for id in ["gemini", "opencode", "grok"] {
             assert!(registry
                 .get_by_id(id)
                 .unwrap()
@@ -577,7 +577,7 @@ mod tests {
                 .acp
                 .is_some());
         }
-        for id in ["claude", "codex", "grok"] {
+        for id in ["claude", "codex"] {
             assert!(registry
                 .get_by_id(id)
                 .unwrap()
@@ -586,12 +586,21 @@ mod tests {
                 .acp
                 .is_none());
         }
+        // Grok gets an ACP transport, but no PTY or pipe transport was
+        // requested — it must stay conspicuously absent, not silently wired.
         assert!(registry
             .get_by_id("grok")
             .unwrap()
             .capabilities
             .transports
             .pty_adapter
+            .is_none());
+        assert!(registry
+            .get_by_id("grok")
+            .unwrap()
+            .capabilities
+            .transports
+            .pipe
             .is_none());
 
         for id in ["grok", "kimi", "copilot", "droid", "cursor"] {

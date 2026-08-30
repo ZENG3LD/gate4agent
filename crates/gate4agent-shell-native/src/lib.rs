@@ -2536,6 +2536,19 @@ fn builtin_legacy_adapter_runtimes() -> AdapterRuntimeRegistry<CliTool> {
                 .expect("built-in native ACP adapter runtime must be unique");
         }
     }
+
+    // Grok is ACP-only: it has no `PtySemantic`/`Pipe` adapter descriptor, so
+    // it cannot go through the loop above (which requires both). Register its
+    // ACP runtime binding on its own.
+    for (id, tool) in [("grok", CliTool::Grok)] {
+        let binding = builtin_adapter_registry()
+            .binding(AdapterFamily::Acp, id)
+            .unwrap_or_else(|| panic!("missing built-in Acp adapter {id}"));
+        runtimes
+            .insert(AdapterFamily::Acp, binding.clone(), tool)
+            .expect("built-in native ACP adapter runtime must be unique");
+    }
+
     runtimes
 }
 

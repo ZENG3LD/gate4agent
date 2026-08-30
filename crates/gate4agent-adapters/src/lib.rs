@@ -334,7 +334,7 @@ fn builtin_descriptors() -> Vec<AdapterDescriptor> {
             verification,
         ));
     }
-    for id in ["gemini", "opencode"] {
+    for id in ["gemini", "opencode", "grok"] {
         descriptors.push(descriptor(AdapterFamily::Acp, id));
     }
     descriptors.push(descriptor(AdapterFamily::Hook, "claude-code"));

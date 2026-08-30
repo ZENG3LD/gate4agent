@@ -121,6 +121,9 @@ pub fn create_parser(tool: CliTool) -> Box<dyn OutputParser> {
         CliTool::KimiCode => Box::new(RawOutputParser::new(CliTool::KimiCode)),
         CliTool::Gemini => Box::new(GeminiOutputParser::new()),
         CliTool::OpenCode => Box::new(OpenCodeRawParser::new()),
+        // Grok's supported transport is ACP, not PTY — unreachable via this
+        // legacy `CliTool` PTY path in practice.
+        CliTool::Grok => Box::new(RawOutputParser::new(CliTool::Grok)),
     }
 }
 
@@ -135,6 +138,9 @@ pub fn create_submitter(tool: CliTool) -> Box<dyn PromptSubmitter> {
         CliTool::KimiCode => Box::new(UnsupportedPromptSubmitter::new(CliTool::KimiCode)),
         CliTool::Gemini => Box::new(GeminiPromptSubmitter::new()),
         CliTool::OpenCode => Box::new(OpenCodeUnsupportedSubmitter::new()),
+        // Grok's supported transport is ACP, not PTY — unreachable via this
+        // legacy `CliTool` PTY path in practice.
+        CliTool::Grok => Box::new(UnsupportedPromptSubmitter::new(CliTool::Grok)),
     }
 }
 

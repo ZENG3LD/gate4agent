@@ -14,6 +14,9 @@ pub const CONTROL_FIXTURE_ID: &str = "control-fixture";
 pub const PIPE_FIXTURE_ID: &str = "pipe-fixture";
 pub const ONE_SHOT_FIXTURE_ID: &str = "one-shot-fixture";
 pub const ACP_FIXTURE_ID: &str = "acp-fixture";
+/// Deliberately equal to the real catalog's `grok` agent ID — see
+/// `grok_acp_agent_spec` for why.
+pub const GROK_ACP_FIXTURE_ID: &str = "grok";
 pub const PTY_PROVIDER_FIXTURE_ID: &str = "pty-provider-fixture";
 pub const HOOK_POSTING_FIXTURE_ID: &str = "hook-posting-fixture";
 pub const MONITORING_HOOK_FIXTURE_ID: &str = "monitoring-hook-fixture";
@@ -380,7 +383,10 @@ pub fn one_shot_agent_spec() -> AgentSpec {
     spec
 }
 
-pub fn acp_agent_spec() -> AgentSpec {
+/// Shared synthetic-peer launch used by both [`acp_agent_spec`] and
+/// [`grok_acp_agent_spec`] — the ACP protocol handshake is transport-generic,
+/// so the same fixture script proves it for any agent ID / adapter binding.
+fn acp_fixture_launch() -> LaunchSpec {
     #[cfg(windows)]
     let script = r#"[Console]::OutputEncoding=[Text.Encoding]::UTF8
 function Write-JsonLine($value) {
@@ -485,6 +491,11 @@ while True:
         program: "python3".to_owned(),
         fixed_args: vec!["-u".to_owned(), "-c".to_owned(), script.to_owned()],
     };
+    launch
+}
+
+pub fn acp_agent_spec() -> AgentSpec {
+    let launch = acp_fixture_launch();
     provider_spec(
         ACP_FIXTURE_ID,
         "Control-plane ACP fixture",
@@ -495,6 +506,31 @@ while True:
             pipe: None,
             acp: Some(AcpTransportSpec {
                 adapter: adapter(AdapterFamily::Acp, "gemini"),
+                launch_override: Some(launch),
+            }),
+        },
+    )
+}
+
+/// Grok registered over ACP against the same synthetic peer as
+/// [`acp_agent_spec`], but bound to the real `grok` adapter ID (agent ID
+/// equal to `GROK_ACP_FIXTURE_ID`, i.e. the catalog's own `grok` agent ID).
+///
+/// Proves that a `Register` command for `grok` over `TransportKind::Acp`
+/// clears the kernel's transport-support check and reaches spawn, without
+/// depending on a live, authenticated `grok` CLI on the test box.
+pub fn grok_acp_agent_spec() -> AgentSpec {
+    let launch = acp_fixture_launch();
+    provider_spec(
+        GROK_ACP_FIXTURE_ID,
+        "Control-plane Grok ACP fixture",
+        launch.clone(),
+        AgentTransportCapabilities {
+            pty: false,
+            pty_adapter: None,
+            pipe: None,
+            acp: Some(AcpTransportSpec {
+                adapter: adapter(AdapterFamily::Acp, "grok"),
                 launch_override: Some(launch),
             }),
         },

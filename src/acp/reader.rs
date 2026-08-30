@@ -42,6 +42,10 @@ pub(crate) fn acp_reader_loop(
     handler: Arc<dyn HostHandler>,
 ) {
     let mut received_session_end = false;
+    // Reason handed to any still-pending request when the loop exits. Only
+    // enriched with stderr when the process itself exited (see below) — a
+    // reader-side mutex poison keeps the generic message.
+    let mut close_reason = "acp session closed".to_owned();
 
     loop {
         // Non-blocking line poll — hold the lock for the minimum duration.
@@ -64,6 +68,19 @@ pub(crate) fn acp_reader_loop(
 
                 if !still_running {
                     let exit_code = collect_exit_code(&process);
+                    let stderr_tail = process
+                        .lock()
+                        .ok()
+                        .map(|guard| guard.stderr_tail())
+                        .unwrap_or_default();
+                    close_reason = if stderr_tail.is_empty() {
+                        format!("acp process exited (code={exit_code})")
+                    } else {
+                        format!(
+                            "acp process exited (code={exit_code}); stderr: {}",
+                            stderr_tail.join(" | ")
+                        )
+                    };
 
                     if !received_session_end {
                         let _ = tx.send(AgentEvent::SessionEnd {
@@ -156,8 +173,11 @@ pub(crate) fn acp_reader_loop(
         }
     }
 
-    // Cancel all in-flight host → agent requests so callers don't hang.
-    pending.cancel_all("acp session closed");
+    // Cancel all in-flight host → agent requests so callers don't hang. When
+    // the process exited before answering, `close_reason` carries its stderr
+    // tail so a failed handshake reports why (e.g. an unauthenticated CLI),
+    // not just that the pipe closed.
+    pending.cancel_all(&close_reason);
 }
 
 // ---------------------------------------------------------------------------

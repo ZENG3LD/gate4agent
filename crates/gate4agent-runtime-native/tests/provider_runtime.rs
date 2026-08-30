@@ -5,9 +5,9 @@ use gate4agent_runtime_native::{
     HookIngressConfig, NativeHookIngressError, NativeRuntime, NativeRuntimeConfig,
 };
 use gate4agent_testkit::{
-    acp_agent_spec, hook_posting_agent_spec, interactive_agent_spec, pipe_agent_spec,
-    pty_provider_agent_spec, ACP_FIXTURE_ID, CONTROL_FIXTURE_ID, HOOK_POSTING_FIXTURE_ID,
-    PIPE_FIXTURE_ID, PTY_PROVIDER_FIXTURE_ID,
+    acp_agent_spec, grok_acp_agent_spec, hook_posting_agent_spec, interactive_agent_spec,
+    pipe_agent_spec, pty_provider_agent_spec, ACP_FIXTURE_ID, CONTROL_FIXTURE_ID,
+    GROK_ACP_FIXTURE_ID, HOOK_POSTING_FIXTURE_ID, PIPE_FIXTURE_ID, PTY_PROVIDER_FIXTURE_ID,
 };
 use gate4agent_types::{
     AdapterFamily, AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand,
@@ -224,6 +224,115 @@ async fn acp_multi_turn_prompt_streams_and_stops_through_public_handle() {
     handle
         .dispatch(command(
             13,
+            ControlCommand::Stop {
+                instance_id,
+                force: false,
+            },
+        ))
+        .unwrap();
+    drive_until(&mut runtime, &subscription, &mut events, |_, _| {
+        handle
+            .snapshot()
+            .sessions
+            .first()
+            .is_some_and(|session| matches!(session.status, SessionStatus::Exited { .. }))
+    })
+    .await;
+}
+
+/// Grok's catalog entry now declares an ACP transport (see
+/// `gate4agent-catalog::builtin`); this proves the `Register` command for it
+/// clears the kernel's `UnsupportedTransport` check and reaches spawn against
+/// a synthetic ACP peer — no live, authenticated `grok` CLI required.
+#[tokio::test]
+async fn acp_grok_registration_is_no_longer_rejected_and_reaches_spawn() {
+    let (handle, mut runtime) = runtime(grok_acp_agent_spec());
+    let subscription = handle.subscribe(64);
+    let instance_id = AgentInstanceId(44);
+    handle
+        .dispatch(command(
+            30,
+            ControlCommand::Register {
+                instance_id,
+                agent_id: AgentId::new(GROK_ACP_FIXTURE_ID).unwrap(),
+                transport: TransportKind::Acp,
+            },
+        ))
+        .unwrap();
+    handle
+        .dispatch(command(
+            31,
+            ControlCommand::Start {
+                instance_id,
+                runtime_policy: semantic_runtime_policy(),
+                request: StartRequest {
+                    working_directory: std::env::current_dir()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    terminal_size: TerminalSize {
+                        rows: 24,
+                        columns: 80,
+                    },
+                    initial_prompt: None,
+                    session_options: None,
+                },
+            },
+        ))
+        .unwrap();
+
+    let mut events = Vec::new();
+    drive_until(&mut runtime, &subscription, &mut events, |_, _| {
+        handle
+            .snapshot()
+            .sessions
+            .first()
+            .is_some_and(|session| session.status == SessionStatus::Running)
+    })
+    .await;
+
+    handle
+        .dispatch(command(
+            32,
+            ControlCommand::SendInput {
+                instance_id,
+                action: InputAction::SubmitPrompt(PromptPayload {
+                    text: "fixture turn".to_owned(),
+                    framing: PromptFraming::Literal,
+                }),
+            },
+        ))
+        .unwrap();
+    drive_until(&mut runtime, &subscription, &mut events, |_, _| {
+        handle
+            .snapshot()
+            .sessions
+            .first()
+            .is_some_and(|session| session.provider.completed_turns >= 1)
+    })
+    .await;
+
+    let snapshot = handle.snapshot();
+    let session = snapshot.sessions.first().expect("Grok ACP session snapshot");
+    assert_eq!(
+        session
+            .provider
+            .session
+            .as_ref()
+            .map(|identity| identity.id.as_str()),
+        Some("fixture-acp-session")
+    );
+    assert!(events.iter().any(|event| matches!(
+        &event.event,
+        ControlEventKind::ProviderEvent {
+            event: ProviderEvent::Text { text, .. },
+            ..
+        } if text == "fixture-acp-response"
+    )));
+
+    handle
+        .dispatch(command(
+            33,
             ControlCommand::Stop {
                 instance_id,
                 force: false,

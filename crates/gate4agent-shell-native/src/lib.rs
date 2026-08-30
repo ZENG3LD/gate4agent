@@ -118,12 +118,22 @@ struct OwnedPtySession {
     last_screen_failure: Option<&'static str>,
     last_foreground_verdict: Option<ForegroundVerdict>,
     last_screen_state: PtyScreenState,
-    /// Whether this generation's merged state has ever been `Ready`. Text
-    /// crash/missing-command markers are only trustworthy before this
-    /// flips -- see the gate in `collect_terminal_frames`. Never reset in
-    /// place; a new generation gets a fresh `OwnedPtySession`, so `false`
-    /// is simply this field's initial value at the spawn site.
+    /// Whether this generation's merged state has ever been `Ready` WITH
+    /// something on screen. Text crash/missing-command markers are only
+    /// trustworthy before this flips -- see the gate in
+    /// `collect_terminal_frames`. The screen-content half is load-bearing:
+    /// `Ready` is proved by foreground process identity and so arrives
+    /// within a frame or two of spawn, while the terminal is still blank,
+    /// and arming on a blank frame retires the failure detector before any
+    /// failure text can exist. Never reset in place; a new generation gets
+    /// a fresh `OwnedPtySession`, so `false` is simply this field's initial
+    /// value at the spawn site.
     ever_reached_ready: bool,
+    /// Whether any frame of this generation has carried non-blank screen
+    /// text yet. Read by the process-only path in `reclassify_foreground`,
+    /// which has no snapshot of its own to test and would otherwise arm
+    /// `ever_reached_ready` on a blank screen.
+    screen_had_content: bool,
     /// `None` means disarmed -- the session reached `Ready` and stays
     /// unprobed until its text disagrees again. See
     /// `NativeEffectShell::reclassify_foreground` for the cadence this
@@ -978,6 +988,7 @@ impl NativeEffectShell {
                             last_foreground_verdict: None,
                             last_screen_state: PtyScreenState::default(),
                             ever_reached_ready: false,
+                            screen_had_content: false,
                             // Armed immediately -- the first
                             // `reclassify_foreground` tick after spawn
                             // probes this session right away rather than
@@ -1532,7 +1543,20 @@ impl NativeEffectShell {
                         owned.last_screen_gate.as_ref(),
                         owned.last_screen_failure,
                     );
-                    if merged == PtyScreenState::Ready {
+                    // Arm the crash-marker window only on a `Ready` that had
+                    // SOMETHING on screen. `Ready` is proved by foreground
+                    // process identity, so it lands within a frame or two of
+                    // spawn, while the terminal is still blank -- measured at
+                    // frame 2 for all four providers. Arming on that blank
+                    // frame closed the window before any failure text could
+                    // exist: Grok without a key prints `API key required` at
+                    // frame 4 and sat at `Ready` forever, because the matcher
+                    // for it was never reached. A blank screen is not evidence
+                    // the agent came up, so it must not retire the detector.
+                    if !snapshot.contents.trim().is_empty() {
+                        owned.screen_had_content = true;
+                    }
+                    if merged == PtyScreenState::Ready && owned.screen_had_content {
                         owned.ever_reached_ready = true;
                     }
                     if merged != owned.last_screen_state {
@@ -1653,7 +1677,7 @@ impl NativeEffectShell {
                     // already clean; only the process signal was missing)
                     // must ALSO close the `screen_failure` window for
                     // future text passes -- see `collect_terminal_frames`.
-                    if merged == PtyScreenState::Ready {
+                    if merged == PtyScreenState::Ready && owned.screen_had_content {
                         owned.ever_reached_ready = true;
                     }
                     if merged != owned.last_screen_state {

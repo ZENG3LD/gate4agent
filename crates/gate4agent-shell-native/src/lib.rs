@@ -1765,17 +1765,27 @@ fn validate_spawn_runtime_policy(
     policy
         .validate()
         .map_err(|error| format!("provider runtime policy is invalid: {error}"))?;
-    require_runtime_capability(policy, ProviderRuntimeCapability::RawPtyLifecycle)?;
-    if transport != TransportKind::Pty {
-        require_runtime_capability(policy, ProviderRuntimeCapability::SemanticReadiness)?;
-    }
-    if has_initial_prompt {
-        require_runtime_capability(policy, ProviderRuntimeCapability::SemanticReadiness)?;
-        require_runtime_capability(policy, ProviderRuntimeCapability::StructuredPrompt)?;
-    }
-    if is_resume && has_initial_prompt {
-        require_runtime_capability(policy, ProviderRuntimeCapability::ProviderSessionIdentity)?;
-        require_runtime_capability(policy, ProviderRuntimeCapability::SemanticResume)?;
+    // ACP speaks a structured protocol over stdio, not a PTY -- none of the
+    // capabilities below describe anything that exists for it; they all
+    // gate inferring provider state from terminal text. The transport-
+    // support gate for ACP already lives in the kernel
+    // (`spec.capabilities.transports.acp.is_some()`), so this PTY-semantic
+    // policy simply does not apply here. Mirrors `gate4agent-runtime-native`'s
+    // `validate_effect_runtime_policy`, which enforces the same rule one
+    // layer up.
+    if transport != TransportKind::Acp {
+        require_runtime_capability(policy, ProviderRuntimeCapability::RawPtyLifecycle)?;
+        if transport != TransportKind::Pty {
+            require_runtime_capability(policy, ProviderRuntimeCapability::SemanticReadiness)?;
+        }
+        if has_initial_prompt {
+            require_runtime_capability(policy, ProviderRuntimeCapability::SemanticReadiness)?;
+            require_runtime_capability(policy, ProviderRuntimeCapability::StructuredPrompt)?;
+        }
+        if is_resume && has_initial_prompt {
+            require_runtime_capability(policy, ProviderRuntimeCapability::ProviderSessionIdentity)?;
+            require_runtime_capability(policy, ProviderRuntimeCapability::SemanticResume)?;
+        }
     }
     Ok(())
 }
@@ -5018,6 +5028,45 @@ mod tests {
         )
         .unwrap_err()
         .contains("SemanticReadiness"));
+    }
+
+    #[test]
+    fn acp_transport_bypasses_the_pty_semantic_policy_gate_pty_and_pipe_still_enforce_it() {
+        // A provider that speaks ACP and nothing else (no raw PTY, no
+        // verified terminal semantics) admits none of these capabilities --
+        // exactly grok's real policy. `TransportKind::Acp` must not care:
+        // ACP has no terminal to infer state from, so none of this policy
+        // applies to it.
+        let no_pty_capabilities_at_all = ProviderRuntimePolicy::new(
+            false, false, false, false, false, false,
+        )
+        .expect("an all-false policy is internally valid");
+        assert!(validate_spawn_runtime_policy(
+            no_pty_capabilities_at_all,
+            TransportKind::Acp,
+            false,
+            false,
+        )
+        .is_ok());
+        // The same all-false policy is still correctly refused for Pty and
+        // Pipe -- this fix narrows the gate to skip Acp specifically, it
+        // does not weaken it for the transports that do need it.
+        assert!(validate_spawn_runtime_policy(
+            no_pty_capabilities_at_all,
+            TransportKind::Pty,
+            false,
+            false,
+        )
+        .unwrap_err()
+        .contains("RawPtyLifecycle"));
+        assert!(validate_spawn_runtime_policy(
+            no_pty_capabilities_at_all,
+            TransportKind::Pipe,
+            false,
+            false,
+        )
+        .unwrap_err()
+        .contains("RawPtyLifecycle"));
     }
 
     #[test]

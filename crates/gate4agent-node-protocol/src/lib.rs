@@ -6620,6 +6620,15 @@ pub enum NodeFailureCode {
     SpawnIdempotencyCapacity,
     SpawnDeadlineExceeded,
     UnsupportedSpawnCapability,
+    /// The requested provider does not declare the requested transport
+    /// (the kernel's own `UnsupportedTransport` rejection, named rather
+    /// than folded into `BackendOperationFailed`/`UnsupportedCapability` so
+    /// a caller several layers up can carry the same "provider + transport"
+    /// specificity all the way to the operator instead of collapsing it
+    /// into a generic backend failure or -- if the underlying rejection
+    /// arrives asynchronously and is caught only by a blind commit-deadline
+    /// poll -- a `SpawnDeadlineExceeded` that names neither).
+    UnsupportedTransport,
     UnknownSession,
     UnknownSessionRecord,
     SessionRecordNotResumable,

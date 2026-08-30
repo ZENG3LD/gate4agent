@@ -223,6 +223,21 @@ const AUTH_FRAME_TIMEOUT_MS: u64 = 5_000;
 const FRAME_BODY_TIMEOUT_MS: u64 = 5_000;
 const CONNECTION_SHUTDOWN_GRACE_MS: u64 = 250;
 const SPAWN_DISPATCH_TIMEOUT_MS: u64 = 2_000;
+/// TTL for `NodeShared::rejected_command_reasons` entries -- see that
+/// field's own doc for why a spawn waiter needs this at all. Must outlive
+/// the longest a waiter can still be polling for this exact command's
+/// outcome: `gate4agent_node_protocol::MAX_SPAWN_DEADLINE_MS` (120s) is the
+/// largest `deadline_ms` any caller may request, and the margin on top
+/// absorbs the waiter's own poll cadence plus clock skew between the drive
+/// loop (writer) and the waiter (reader).
+const REJECTED_COMMAND_REASON_TTL_MS: u64 = 150_000;
+/// Bounds `NodeShared::rejected_command_reasons` against an unbounded
+/// backlog of asynchronously-rejected commands nobody ever collects (a
+/// waiter that stops polling, or a burst of always-rejected commands from a
+/// misbehaving caller): once at capacity, the oldest entry is evicted to
+/// make room for the newest, mirroring the eviction rule already used by
+/// `spawn_idempotency`.
+const REJECTED_COMMAND_REASON_MAX_ENTRIES: usize = 256;
 /// How long `wait_until_removed` waits between two `Remove` re-dispatches
 /// for the same session. The presence poll runs far faster (2ms); this
 /// only paces the sending, so an accepted `Remove` still in flight is not
@@ -2544,6 +2559,11 @@ async fn drive_runtime_until_shutdown(
                     cause = %error,
                     "control command rejected"
                 );
+                shared.record_rejected_command(
+                    outcome.command_id,
+                    error.to_string(),
+                    error.is_unsupported_transport(),
+                );
             }
         }
         let mut events_drained: u64 = 0;
@@ -2936,6 +2956,20 @@ fn merge_durable_state(
     Ok((workspaces.into_values().collect(), loaded.records, warning))
 }
 
+/// One entry of `NodeShared::rejected_command_reasons` -- see that field's
+/// own doc for the mechanism this exists to close.
+struct RejectedCommandReason {
+    message: String,
+    /// True when the kernel refused this command specifically because the
+    /// agent does not declare the requested transport (`KernelCommandError::
+    /// UnsupportedTransport`) -- lets the reader choose the named
+    /// `NodeFailureCode::UnsupportedTransport` over the generic
+    /// `BackendOperationFailed` bucket, so this one well-known rejection
+    /// keeps its identity all the way to the operator wire.
+    unsupported_transport: bool,
+    expires_at: Instant,
+}
+
 struct NodeShared {
     handle: Gate4AgentHandle,
     access_token: String,
@@ -3050,6 +3084,26 @@ struct NodeShared {
     /// commands being rejected at the same rate is a policy refusal, not a
     /// delivery failure.
     rejected_commands_total: AtomicU64,
+    /// The named reason behind a recent kernel rejection, by the
+    /// `CommandId` `dispatch_bounded` handed back when it enqueued that
+    /// command -- populated by `drive_runtime_until_shutdown` for every
+    /// `Err` in a tick's `command_outcomes`, and drained by whichever
+    /// spawn-dispatch waiter recognizes its own `Register`/`Start`
+    /// `CommandId` among them.
+    ///
+    /// A `ControlCommand` only ever fails synchronously (a `NodeFailure`
+    /// out of `dispatch`/`dispatch_bounded` itself) for a port-level ingress
+    /// problem -- full or disconnected -- never for the kernel refusing the
+    /// command's content (an unsupported transport, an unknown agent, ...);
+    /// that verdict exists only once `NativeRuntime::tick` has processed the
+    /// command, one drive-loop iteration later, in a different task than
+    /// whichever caller is awaiting the spawn. Without this map, a spawn
+    /// wait loop that polls `self.handle.snapshot()` for a session that
+    /// will now never appear has no way to learn why -- it can only spin
+    /// until its own commit deadline and report a generic "did not commit"
+    /// timeout, discarding a reason the kernel already named precisely (see
+    /// `KernelCommandError`'s variants, e.g. `UnsupportedTransport`).
+    rejected_command_reasons: Mutex<BTreeMap<CommandId, RejectedCommandReason>>,
     drive_loop_iterations_total: AtomicU64,
     drive_loop_iterations_idle: AtomicU64,
     #[cfg(feature = "fixture")]
@@ -3383,6 +3437,7 @@ impl NodeShared {
             connection_events_sent: AtomicU64::new(0),
             hook_ingress_outcomes: Mutex::new(Default::default()),
             rejected_commands_total: AtomicU64::new(0),
+            rejected_command_reasons: Mutex::new(BTreeMap::new()),
             drive_loop_iterations_total: AtomicU64::new(0),
             drive_loop_iterations_idle: AtomicU64::new(0),
             #[cfg(feature = "fixture")]
@@ -10145,6 +10200,55 @@ impl NodeShared {
         Ok(command_id)
     }
 
+    /// Records the kernel's own reason for asynchronously refusing
+    /// `command_id` -- see `rejected_command_reasons`'s doc for why a
+    /// spawn-dispatch waiter otherwise has no way to learn it. Bounded by
+    /// `REJECTED_COMMAND_REASON_MAX_ENTRIES`: expired entries are swept
+    /// first, and if the map is still at capacity after that, the single
+    /// oldest surviving entry is evicted -- `CommandId` is monotonically
+    /// assigned (`next_command_id.fetch_add`), so the `BTreeMap`'s first key
+    /// is always the oldest.
+    fn record_rejected_command(
+        &self,
+        command_id: CommandId,
+        message: String,
+        unsupported_transport: bool,
+    ) {
+        let now = Instant::now();
+        let mut reasons = self.rejected_command_reasons.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        reasons.retain(|_, reason| reason.expires_at > now);
+        if reasons.len() >= REJECTED_COMMAND_REASON_MAX_ENTRIES {
+            if let Some(&oldest) = reasons.keys().next() {
+                reasons.remove(&oldest);
+            }
+        }
+        reasons.insert(
+            command_id,
+            RejectedCommandReason {
+                message,
+                unsupported_transport,
+                expires_at: now + Duration::from_millis(REJECTED_COMMAND_REASON_TTL_MS),
+            },
+        );
+    }
+
+    /// Removes and returns the kernel's reason for refusing `command_id`,
+    /// if the drive loop has recorded one and it has not expired -- see
+    /// `rejected_command_reasons`'s doc. Consumed at most once: a spawn
+    /// wait loop calls this instead of blindly polling out its whole
+    /// deadline when the command it is waiting on turns out to have been
+    /// refused rather than merely slow.
+    fn take_rejected_command_reason(&self, command_id: CommandId) -> Option<RejectedCommandReason> {
+        let now = Instant::now();
+        let mut reasons = self.rejected_command_reasons.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match reasons.remove(&command_id) {
+            Some(reason) if reason.expires_at > now => Some(reason),
+            _ => None,
+        }
+    }
+
     async fn dispatch_bounded(
         &self,
         command: ControlCommand,
@@ -11211,7 +11315,7 @@ impl NodeShared {
             SessionMode::Acp => TransportKind::Acp,
         };
         let agent_id = provider;
-        if let Err(error) = self.dispatch_bounded(
+        let register_command_id = match self.dispatch_bounded(
             ControlCommand::Register {
                 instance_id,
                 agent_id,
@@ -11220,14 +11324,17 @@ impl NodeShared {
             dispatch_timeout,
         )
         .await {
-            if let Some(binding) = self.remove_binding(&address) {
-                self.cleanup_session_owned_materialization(&address, &binding)?;
+            Ok(command_id) => command_id,
+            Err(error) => {
+                if let Some(binding) = self.remove_binding(&address) {
+                    self.cleanup_session_owned_materialization(&address, &binding)?;
+                }
+                if let Some(record_id) = record_id.as_ref() {
+                    self.discard_record(record_id)?;
+                }
+                return Err(spawn_dispatch_error(error, deadline));
             }
-            if let Some(record_id) = record_id.as_ref() {
-                self.discard_record(record_id)?;
-            }
-            return Err(spawn_dispatch_error(error, deadline));
-        }
+        };
         let start_timeout = match spawn_dispatch_timeout(deadline) {
             Ok(timeout) => timeout,
             Err(error) => {
@@ -11283,36 +11390,72 @@ impl NodeShared {
                 start_timeout,
             )
             .await;
-        if let Err(start_error) = start_result {
-            let start_error = spawn_dispatch_error(start_error, deadline);
-            let recovery = self
-                .rollback_spawn(
-                    &address,
-                    Duration::from_millis(SPAWN_DISPATCH_TIMEOUT_MS),
-                )
-                .await;
-            return match recovery {
-                Ok(()) => {
-                    if let Some(record_id) = record_id.as_ref() {
-                        self.discard_record(record_id)?;
+        let start_command_id = match start_result {
+            Ok(command_id) => command_id,
+            Err(start_error) => {
+                let start_error = spawn_dispatch_error(start_error, deadline);
+                let recovery = self
+                    .rollback_spawn(
+                        &address,
+                        Duration::from_millis(SPAWN_DISPATCH_TIMEOUT_MS),
+                    )
+                    .await;
+                return match recovery {
+                    Ok(()) => {
+                        if let Some(record_id) = record_id.as_ref() {
+                            self.discard_record(record_id)?;
+                        }
+                        Err(start_error)
                     }
-                    Err(start_error)
-                }
-                Err(recovery_error) => {
-                    let diagnostic = format!(
-                        "start failed and registration recovery failed: {}",
-                        recovery_error.message,
-                    );
-                    if let Some(record_id) = record_id.as_ref() {
-                        self.mark_record_error(record_id, &diagnostic)?;
+                    Err(recovery_error) => {
+                        let diagnostic = format!(
+                            "start failed and registration recovery failed: {}",
+                            recovery_error.message,
+                        );
+                        if let Some(record_id) = record_id.as_ref() {
+                            self.mark_record_error(record_id, &diagnostic)?;
+                        }
+                        Err(failure(recovery_error.code, &diagnostic))
                     }
-                    Err(failure(recovery_error.code, &diagnostic))
-                }
-            };
-        }
+                };
+            }
+        };
 
         let commit_deadline = deadline.unwrap_or_else(|| Instant::now() + dispatch_timeout);
         loop {
+            // `Register`/`Start` only fail synchronously for a port-level
+            // ingress problem (see `dispatch_bounded`); the kernel refusing
+            // either command's content -- an unsupported transport, an
+            // unknown agent -- lands one drive-loop tick later, and no
+            // session ever appears in `self.handle.snapshot()` for it to
+            // notice below. Check for that named reason before falling
+            // through to the blind presence poll, so a rejected spawn
+            // reports why instead of just timing out.
+            if let Some(reason) = self.take_rejected_command_reason(register_command_id)
+                .or_else(|| self.take_rejected_command_reason(start_command_id))
+            {
+                self.rollback_spawn(
+                    &address,
+                    Duration::from_millis(SPAWN_DISPATCH_TIMEOUT_MS),
+                ).await.map_err(|error| {
+                        failure(
+                            error.code,
+                            &format!(
+                                "spawn was rejected ({}) and registration recovery failed: {}",
+                                reason.message, error.message
+                            ),
+                        )
+                    })?;
+                if let Some(record_id) = record_id.as_ref() {
+                    self.discard_record(record_id)?;
+                }
+                let code = if reason.unsupported_transport {
+                    NodeFailureCode::UnsupportedTransport
+                } else {
+                    NodeFailureCode::BackendOperationFailed
+                };
+                return Err(failure(code, &reason.message));
+            }
             if let Some(current) = self
                 .handle
                 .snapshot()
@@ -15775,6 +15918,7 @@ fn node_failure_category(code: NodeFailureCode) -> &'static str {
         NodeFailureCode::SpawnIdempotencyCapacity => "spawn-idempotency-capacity",
         NodeFailureCode::SpawnDeadlineExceeded => "spawn-deadline-exceeded",
         NodeFailureCode::UnsupportedSpawnCapability => "unsupported-spawn-capability",
+        NodeFailureCode::UnsupportedTransport => "unsupported-transport",
         NodeFailureCode::UnknownEnvironmentProfile => "unknown-environment-profile",
         NodeFailureCode::EnvironmentProfileBindingMismatch => {
             "environment-profile-binding-mismatch"
@@ -23345,6 +23489,61 @@ mod tests {
         );
         let snapshot = shared.snapshot();
         assert_eq!(snapshot.session_records, vec![record]);
+    }
+
+    /// Regression coverage for the "operator sees `deadline` instead of the
+    /// kernel's own named rejection" defect: a spawn-dispatch waiter must be
+    /// able to learn a command's asynchronous kernel rejection (here,
+    /// specifically classified as `UnsupportedTransport`) exactly once, and
+    /// must not still find it after that -- proving the fast path this
+    /// mechanism exists for (`spawn_session_with_deadline`'s commit-wait
+    /// loop) drains the reason instead of leaving it to be rediscovered (or
+    /// missed) on a later poll.
+    #[test]
+    fn rejected_command_reason_is_classified_and_consumed_exactly_once() {
+        let catalog = active_registry().unwrap();
+        let (handle, _runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
+        let workspace = WorkspaceConfig::new(
+            WorkspaceId::new("primary").unwrap(),
+            std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+        let shared = NodeShared::new(
+            handle,
+            "fixture-token".to_owned(),
+            NodeId::new("node-1").unwrap(),
+            vec![workspace],
+            vec![agent("claude")],
+        );
+
+        assert!(shared.take_rejected_command_reason(CommandId(1)).is_none());
+
+        shared.record_rejected_command(
+            CommandId(1),
+            "agent 'claude' does not support transport Acp".to_owned(),
+            true,
+        );
+        // An unrelated command_id must not see another command's reason.
+        assert!(shared.take_rejected_command_reason(CommandId(2)).is_none());
+
+        let reason = shared.take_rejected_command_reason(CommandId(1)).unwrap();
+        assert_eq!(reason.message, "agent 'claude' does not support transport Acp");
+        assert!(reason.unsupported_transport);
+
+        // Consumed: a second read for the same command_id finds nothing.
+        assert!(shared.take_rejected_command_reason(CommandId(1)).is_none());
+
+        // A rejection unrelated to transport support keeps its own
+        // classification distinct, so the reader can choose the generic
+        // `BackendOperationFailed` code instead of misreporting
+        // `UnsupportedTransport`.
+        shared.record_rejected_command(
+            CommandId(3),
+            "backend busy".to_owned(),
+            false,
+        );
+        let unclassified = shared.take_rejected_command_reason(CommandId(3)).unwrap();
+        assert!(!unclassified.unsupported_transport);
     }
 
     #[test]

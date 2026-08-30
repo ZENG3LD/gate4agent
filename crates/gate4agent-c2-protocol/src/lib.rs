@@ -288,6 +288,7 @@ impl From<&NodeFailure> for C2NodeFailure {
             NodeFailureCode::SpawnIdempotencyCapacity => "spawn idempotency capacity exhausted",
             NodeFailureCode::SpawnDeadlineExceeded => "spawn deadline exceeded",
             NodeFailureCode::UnsupportedSpawnCapability => "spawn capability unavailable",
+            NodeFailureCode::UnsupportedTransport => "provider does not support the requested transport",
             NodeFailureCode::UnknownSession => "session unavailable",
             NodeFailureCode::UnknownSessionRecord => "managed session unavailable",
             NodeFailureCode::SessionRecordNotResumable => "managed session cannot resume",

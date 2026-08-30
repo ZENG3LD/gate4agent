@@ -4313,6 +4313,7 @@ fn project_harness_read_failure(error: HarnessOperatorClientError) -> HarnessRea
             HarnessOperatorHostErrorV1::Busy => "busy",
             HarnessOperatorHostErrorV1::Unavailable => "unavailable",
             HarnessOperatorHostErrorV1::OutcomeUnknown => "outcome-unknown",
+            HarnessOperatorHostErrorV1::UnsupportedTransport { .. } => "unsupported-transport",
             HarnessOperatorHostErrorV1::Internal => "internal",
             // Added alongside `gate4agent-harness-light` (see
             // `HarnessOperatorHostErrorV1::Unsupported`'s own doc comment):

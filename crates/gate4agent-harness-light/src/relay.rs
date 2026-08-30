@@ -26,8 +26,9 @@ use gate4agent_harness_api::{
     HarnessNativeSessionCatalogWindowV1, HarnessNativeSessionRouteV1,
     HarnessNativeSessionSelectionV1, HarnessOperatorReplyV1, HarnessOperatorRequestV1,
     HarnessOperatorResponseV1, HarnessProviderSessionIdentityV1, HarnessRepositoryPathV1,
-    HarnessRuntimeSessionAddressV1, HarnessRuntimeTerminalSizeV1, HarnessSelectorV1,
-    HarnessSessionTaskTargetV1, HarnessTerminalControlV1, HarnessWorkspaceFileRevisionV1,
+    HarnessRuntimeSessionAddressV1, HarnessRuntimeTerminalSizeV1, HarnessRuntimeTransportV1,
+    HarnessSelectorV1, HarnessSessionTaskTargetV1, HarnessTerminalControlV1,
+    HarnessWorkspaceFileRevisionV1,
 };
 use gate4agent_harness_service::c2::{
     correlate_native_history_response, correlate_node_workspace_read_response,
@@ -39,11 +40,11 @@ use gate4agent_harness_service::c2::{
     ResourceMutationKind, SessionRecordMutationKind, WorkspaceReadKind, WorkspaceWriteKind,
 };
 use gate4agent_node_protocol::{
-    GitDiffMode, GitDiffRequest, GitObjectId, NodeId, NodeIncarnationId, OpaqueHostPath,
-    RepositoryPath, SessionAddress, SessionKey, SessionMode, SessionRecordId, SpawnContextId,
-    SpawnDeadlineMs, SpawnIdempotencyKey, SpawnOverride, SpawnOverrides, SpawnProfileId,
-    SpawnRequiredCapabilities, SpawnSpec, SpawnTarget, WorkspaceFileRevision, WorkspaceId,
-    CapabilityId, SPAWN_RUNTIME_RAW_PTY_LIFECYCLE,
+    GitDiffMode, GitDiffRequest, GitObjectId, NodeFailureCode, NodeId, NodeIncarnationId,
+    OpaqueHostPath, RepositoryPath, SessionAddress, SessionKey, SessionMode, SessionRecordId,
+    SpawnContextId, SpawnDeadlineMs, SpawnIdempotencyKey, SpawnOverride, SpawnOverrides,
+    SpawnProfileId, SpawnRequiredCapabilities, SpawnSpec, SpawnTarget, WorkspaceFileRevision,
+    WorkspaceId, CapabilityId, SPAWN_RUNTIME_RAW_PTY_LIFECYCLE,
 };
 use gate4agent_node_wire::random_nonce;
 use gate4agent_types::{AgentId, AgentInstanceId, SessionGeneration, TerminalControl, TerminalSize};
@@ -184,6 +185,18 @@ async fn spawn_session_inner(
     let receipt = match routed.response {
         Ok(C2NodeResponse::SpawnSpecAccepted { receipt }) => receipt,
         Ok(_) => return Err(LightRelayError::UnexpectedResponse),
+        // Named separately from the generic `NodeRejected(code)` below so
+        // `into_host_error` can carry the same "provider + transport"
+        // specificity the kernel's own `UnsupportedTransport` rejection
+        // already has, using the exact provider/mode this request itself
+        // asked for (the node's reply carries only the bare `code`) -- see
+        // `HarnessOperatorHostErrorV1::UnsupportedTransport`'s own doc.
+        Err(failure) if failure.code == NodeFailureCode::UnsupportedTransport => {
+            return Err(LightRelayError::NodeUnsupportedTransport {
+                agent: provider.to_owned(),
+                transport: harness_transport_for_mode(mode),
+            });
+        }
         Err(failure) => return Err(LightRelayError::NodeRejected(failure.code)),
     };
     let address = HarnessRuntimeSessionAddressV1 {
@@ -207,6 +220,19 @@ fn execution_mode(mode: HarnessExecutionModeV1) -> SessionMode {
         HarnessExecutionModeV1::Pty => SessionMode::Pty,
         HarnessExecutionModeV1::Inline => SessionMode::Inline,
         HarnessExecutionModeV1::Acp => SessionMode::Acp,
+    }
+}
+
+/// The transport a `HarnessExecutionModeV1` requests, in the wire's own
+/// `HarnessRuntimeTransportV1` vocabulary -- mirrors
+/// `gate4agent-harness-service::runtime`'s own `harness_transport_for_mode`.
+/// Only needed to name the transport a rejected spawn asked for (see
+/// `LightRelayError::NodeUnsupportedTransport`).
+fn harness_transport_for_mode(mode: HarnessExecutionModeV1) -> HarnessRuntimeTransportV1 {
+    match mode {
+        HarnessExecutionModeV1::Pty => HarnessRuntimeTransportV1::Pty,
+        HarnessExecutionModeV1::Inline => HarnessRuntimeTransportV1::Pipe,
+        HarnessExecutionModeV1::Acp => HarnessRuntimeTransportV1::Acp,
     }
 }
 

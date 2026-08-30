@@ -4618,7 +4618,7 @@ pub enum HarnessOperatorMutationOutcomeV1 {
     Replayed,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HarnessOperatorHostErrorV1 {
     InvalidRequest,
@@ -4635,6 +4635,25 @@ pub enum HarnessOperatorHostErrorV1 {
     // may or may not exist. This case exists to tell the operator "check the
     // runtime inventory before retrying", not "retry freely".
     OutcomeUnknown,
+    // Distinct from the generic `Unavailable`/`Internal` buckets a bare
+    // `NodeFailureCode::BackendOperationFailed` would otherwise collapse
+    // into: the node rejected this `SpawnSession` specifically because the
+    // requested provider profile does not declare the requested transport.
+    // Names its own inputs -- mirrors the kernel's own
+    // `KernelCommandError::UnsupportedTransport { agent_id, transport }`,
+    // which this variant exists to carry through to the operator instead of
+    // collapsing into a bare `Unavailable`/`Deadline` that names neither
+    // (see the `spawn_session_with_deadline` commit-wait loop in
+    // `gate4agent-node`'s `server.rs`, which used to lose exactly this
+    // reason to a blind commit-deadline poll). This is why the enum gave up
+    // `Copy` -- every other variant is a bare tag, but the whole point here
+    // is not making the operator already know what it asked for; it is
+    // proving the host actually looked at the same request the operator
+    // sent.
+    UnsupportedTransport {
+        agent: String,
+        transport: HarnessRuntimeTransportV1,
+    },
     Internal,
     // Added alongside `gate4agent-harness-light` (the P2.2 light-harness
     // extraction), riding the V11 era: distinct from `NotFound` (a request

@@ -460,6 +460,11 @@ enum HostCommand {
         result: Result<SpawnDispatchOutcome, HarnessC2Error>,
         reply: oneshot::Sender<HarnessOperatorReplyV1>,
         identity: OperatorRequestLogIdentity,
+        /// The transport this exact request asked for -- captured from
+        /// `PreparedSessionSpawn::mode` before `dispatch_session_spawn`
+        /// consumed it, so a `SpawnDispatchOutcome::Rejected` can name it on
+        /// the operator wire (see `map_session_spawn_node_failure`).
+        requested_transport: HarnessRuntimeTransportV1,
     },
     SessionControlFinished {
         result: Result<(), HarnessC2Error>,
@@ -2548,6 +2553,7 @@ fn start_session_spawn_worker(
     cancel: Option<oneshot::Receiver<()>>,
 ) {
     let route = prepared.route().clone();
+    let requested_transport = harness_transport_for_mode(prepared.mode());
     tokio::spawn(async move {
         let dispatch = adapter.dispatch_session_spawn(prepared, operation_id, idempotency_ref);
         let result = match cancel {
@@ -2570,7 +2576,13 @@ fn start_session_spawn_worker(
             None => dispatch.await,
         };
         let _ = commands
-            .send(HostCommand::SessionSpawnFinished { route, result, reply, identity })
+            .send(HostCommand::SessionSpawnFinished {
+                route,
+                result,
+                reply,
+                identity,
+                requested_transport,
+            })
             .await;
     });
 }
@@ -2918,9 +2930,34 @@ fn map_session_spawn_error(error: HarnessC2Error) -> HarnessOperatorHostErrorV1 
     }
 }
 
+/// The transport a `HarnessExecutionModeV1` requests -- exact mirror of
+/// `gate4agent-node`'s own `SessionMode` -> `TransportKind` match (`server.rs`)
+/// one layer further out, kept in the wire's own `HarnessRuntimeTransportV1`
+/// vocabulary rather than the node's. Only needed to name the transport a
+/// rejected spawn asked for (`map_session_spawn_node_failure`'s
+/// `agent`/`requested_transport` parameters); every other spawn path already
+/// has no need to know this.
+fn harness_transport_for_mode(mode: HarnessExecutionModeV1) -> HarnessRuntimeTransportV1 {
+    match mode {
+        HarnessExecutionModeV1::Pty => HarnessRuntimeTransportV1::Pty,
+        HarnessExecutionModeV1::Inline => HarnessRuntimeTransportV1::Pipe,
+        HarnessExecutionModeV1::Acp => HarnessRuntimeTransportV1::Acp,
+    }
+}
+
 /// `NodeFailureCode` branch for a spawn actually rejected by the Node (a
 /// `SpawnDispatchOutcome::Rejected{code}` reply, not a transport failure).
-fn map_session_spawn_node_failure(code: NodeFailureCode) -> HarnessOperatorHostErrorV1 {
+/// `agent`/`requested_transport` name the exact provider/transport the
+/// caller's own `SpawnSession` request asked for -- the node's response
+/// carries only the bare `code`, so `UnsupportedTransport`'s typed operator-
+/// wire payload is built from what this request's own caller
+/// (`start_session_spawn_worker`) already had in hand, not from anything
+/// decoded out of the node's reply.
+fn map_session_spawn_node_failure(
+    code: NodeFailureCode,
+    agent: &str,
+    requested_transport: HarnessRuntimeTransportV1,
+) -> HarnessOperatorHostErrorV1 {
     match code {
         NodeFailureCode::InvalidRequest => HarnessOperatorHostErrorV1::InvalidRequest,
         NodeFailureCode::UnknownWorkspace => HarnessOperatorHostErrorV1::NotFound,
@@ -2931,6 +2968,15 @@ fn map_session_spawn_node_failure(code: NodeFailureCode) -> HarnessOperatorHostE
         | NodeFailureCode::WorkspaceBusy
         | NodeFailureCode::BackendBusy => HarnessOperatorHostErrorV1::Busy,
         NodeFailureCode::SpawnDeadlineExceeded => HarnessOperatorHostErrorV1::Deadline,
+        // Named separately from the generic backend-failure bucket right
+        // below so the operator can tell "this exact provider/transport
+        // combination is not supported" apart from "the node is busy or
+        // unavailable for reasons unrelated to what was asked" -- see
+        // `HarnessOperatorHostErrorV1::UnsupportedTransport`'s own doc.
+        NodeFailureCode::UnsupportedTransport => HarnessOperatorHostErrorV1::UnsupportedTransport {
+            agent: agent.to_owned(),
+            transport: requested_transport,
+        },
         NodeFailureCode::UnsupportedCapability
         | NodeFailureCode::BackendDisconnected
         | NodeFailureCode::BackendOperationFailed
@@ -6127,7 +6173,9 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                             };
                             let _ = reply.send(reply_value);
                         }
-                        Some(HostCommand::SessionSpawnFinished { route, result, reply, identity }) => {
+                        Some(HostCommand::SessionSpawnFinished {
+                            route, result, reply, identity, requested_transport,
+                        }) => {
                             session_spawn_workers.finish();
                             let reply_value = match result {
                                 Ok(SpawnDispatchOutcome::Accepted(receipt)) => {
@@ -6157,7 +6205,11 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                         "session spawn rejected by the node",
                                     );
                                     HarnessOperatorReplyV1::Error {
-                                        error: map_session_spawn_node_failure(code),
+                                        error: map_session_spawn_node_failure(
+                                            code,
+                                            identity.provider(),
+                                            requested_transport,
+                                        ),
                                     }
                                 }
                                 Ok(SpawnDispatchOutcome::OutcomeUnknown { reason }) => {
@@ -13630,12 +13682,31 @@ mod tests {
             HarnessOperatorHostErrorV1::Deadline,
         );
         assert_eq!(
-            map_session_spawn_node_failure(NodeFailureCode::ControllerBusy),
+            map_session_spawn_node_failure(
+                NodeFailureCode::ControllerBusy,
+                "claude",
+                HarnessRuntimeTransportV1::Pty,
+            ),
             HarnessOperatorHostErrorV1::Busy,
         );
         assert_eq!(
-            map_session_spawn_node_failure(NodeFailureCode::UnknownWorkspace),
+            map_session_spawn_node_failure(
+                NodeFailureCode::UnknownWorkspace,
+                "claude",
+                HarnessRuntimeTransportV1::Pty,
+            ),
             HarnessOperatorHostErrorV1::NotFound,
+        );
+        assert_eq!(
+            map_session_spawn_node_failure(
+                NodeFailureCode::UnsupportedTransport,
+                "claude",
+                HarnessRuntimeTransportV1::Acp,
+            ),
+            HarnessOperatorHostErrorV1::UnsupportedTransport {
+                agent: "claude".to_owned(),
+                transport: HarnessRuntimeTransportV1::Acp,
+            },
         );
 
         let route = NodeRoute {

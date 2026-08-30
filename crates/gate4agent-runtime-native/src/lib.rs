@@ -2875,17 +2875,26 @@ fn validate_effect_runtime_policy(effect: &ControlEffect) -> Result<(), String> 
     policy
         .validate()
         .map_err(|error| format!("provider runtime policy is invalid: {error}"))?;
-    require_runtime_capability(policy, ProviderRuntimeCapability::RawPtyLifecycle)?;
-    if transport != TransportKind::Pty {
-        require_runtime_capability(policy, ProviderRuntimeCapability::SemanticReadiness)?;
-    }
-    if has_initial_prompt {
-        require_runtime_capability(policy, ProviderRuntimeCapability::SemanticReadiness)?;
-        require_runtime_capability(policy, ProviderRuntimeCapability::StructuredPrompt)?;
-    }
-    if is_resume && has_initial_prompt {
-        require_runtime_capability(policy, ProviderRuntimeCapability::ProviderSessionIdentity)?;
-        require_runtime_capability(policy, ProviderRuntimeCapability::SemanticResume)?;
+    // ACP speaks a structured protocol over stdio, not a PTY -- none of the
+    // capabilities below (raw-pty lifecycle, semantic readiness, structured
+    // prompt, provider session identity, semantic resume) describe anything
+    // that exists for it; they all gate inferring provider state from
+    // terminal text. The transport-support gate for ACP already lives in
+    // the kernel (`spec.capabilities.transports.acp.is_some()`), so this
+    // PTY-semantic policy simply does not apply here.
+    if transport != TransportKind::Acp {
+        require_runtime_capability(policy, ProviderRuntimeCapability::RawPtyLifecycle)?;
+        if transport != TransportKind::Pty {
+            require_runtime_capability(policy, ProviderRuntimeCapability::SemanticReadiness)?;
+        }
+        if has_initial_prompt {
+            require_runtime_capability(policy, ProviderRuntimeCapability::SemanticReadiness)?;
+            require_runtime_capability(policy, ProviderRuntimeCapability::StructuredPrompt)?;
+        }
+        if is_resume && has_initial_prompt {
+            require_runtime_capability(policy, ProviderRuntimeCapability::ProviderSessionIdentity)?;
+            require_runtime_capability(policy, ProviderRuntimeCapability::SemanticResume)?;
+        }
     }
     Ok(())
 }
@@ -3905,5 +3914,54 @@ mod tests {
         assert!(validate_effect_runtime_policy(&resume_with_prompt)
             .unwrap_err()
             .contains("SemanticReadiness"));
+    }
+
+    #[test]
+    fn acp_transport_bypasses_the_pty_semantic_policy_gate_pty_still_enforces_it() {
+        // No raw PTY, no verified terminal semantics -- exactly grok's real
+        // policy (ACP-only, no PTY transport at all). `TransportKind::Acp`
+        // must not care: it has no terminal to infer state from.
+        let no_pty_capabilities_at_all = ProviderRuntimePolicy::new(
+            false, false, false, false, false, false,
+        )
+        .expect("an all-false policy is internally valid");
+        let acp_spawn = ControlEffect::SpawnResume {
+            agent_id: AgentId::new("grok").unwrap(),
+            transport: TransportKind::Acp,
+            provider_session: gate4agent_types::ProviderSessionIdentity {
+                key: gate4agent_types::ProviderSessionKey::SessionId,
+                id: "session-1".to_owned(),
+                transcript_path: None,
+            },
+            runtime_policy: no_pty_capabilities_at_all,
+            request: ResumeLaunchRequest {
+                working_directory: ".".to_owned(),
+                terminal_size: gate4agent_types::TerminalSize { rows: 24, columns: 80 },
+                initial_prompt: None,
+            },
+        };
+        assert!(validate_effect_runtime_policy(&acp_spawn).is_ok());
+
+        // The same all-false policy is still correctly refused for Pty --
+        // this fix narrows the gate to skip Acp specifically, it does not
+        // weaken it for the transport that does need it.
+        let pty_spawn = ControlEffect::SpawnResume {
+            agent_id: AgentId::new("grok").unwrap(),
+            transport: TransportKind::Pty,
+            provider_session: gate4agent_types::ProviderSessionIdentity {
+                key: gate4agent_types::ProviderSessionKey::SessionId,
+                id: "session-1".to_owned(),
+                transcript_path: None,
+            },
+            runtime_policy: no_pty_capabilities_at_all,
+            request: ResumeLaunchRequest {
+                working_directory: ".".to_owned(),
+                terminal_size: gate4agent_types::TerminalSize { rows: 24, columns: 80 },
+                initial_prompt: None,
+            },
+        };
+        assert!(validate_effect_runtime_policy(&pty_spawn)
+            .unwrap_err()
+            .contains("RawPtyLifecycle"));
     }
 }

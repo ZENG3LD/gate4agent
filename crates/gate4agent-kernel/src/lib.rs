@@ -241,6 +241,21 @@ pub enum KernelCommandError {
     Control(#[from] ControlError),
 }
 
+impl KernelCommandError {
+    /// True for exactly the `UnsupportedTransport` variant. Exists so a
+    /// caller several layers up the stack -- `gate4agent-node`'s spawn-
+    /// dispatch waiter, specifically, which cannot and should not depend on
+    /// this crate directly (see this crate's own `Forbidden` list) -- can
+    /// classify one specific, already-well-known kernel rejection by
+    /// calling this inherent method on the value it already has (via
+    /// `gate4agent-runtime-native`'s `CommandOutcome` re-export), without
+    /// naming `KernelCommandError`'s own type path or matching its full
+    /// variant set.
+    pub fn is_unsupported_transport(&self) -> bool {
+        matches!(self, Self::UnsupportedTransport { .. })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelStep {
     pub command_outcomes: Vec<CommandOutcome>,

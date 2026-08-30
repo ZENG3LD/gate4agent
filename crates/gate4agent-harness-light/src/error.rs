@@ -12,7 +12,9 @@
 //! a promotion).
 
 use gate4agent_c2_client::C2ControlError;
-use gate4agent_harness_api::{HarnessOperatorApiError, HarnessOperatorHostErrorV1};
+use gate4agent_harness_api::{
+    HarnessOperatorApiError, HarnessOperatorHostErrorV1, HarnessRuntimeTransportV1,
+};
 use gate4agent_harness_service::c2::HarnessC2Error;
 use gate4agent_node_protocol::NodeFailureCode;
 use thiserror::Error;
@@ -54,6 +56,18 @@ pub(crate) enum LightRelayError {
     Transport(#[from] C2ControlError),
     #[error("node rejected the request: {0:?}")]
     NodeRejected(NodeFailureCode),
+    /// The node rejected a spawn specifically because the requested
+    /// provider does not declare the requested transport -- named
+    /// separately from the generic `NodeRejected(NodeFailureCode)` above so
+    /// `into_host_error` can carry the exact provider/mode this request's
+    /// own caller (`crate::relay::spawn_session_inner`) asked for, since the
+    /// node's reply itself carries only the bare `NodeFailureCode`. See
+    /// `HarnessOperatorHostErrorV1::UnsupportedTransport`'s own doc.
+    #[error("node rejected the spawn: provider '{agent}' does not support transport {transport:?}")]
+    NodeUnsupportedTransport {
+        agent: String,
+        transport: HarnessRuntimeTransportV1,
+    },
     #[error("c2 returned an unexpected response shape for this request")]
     UnexpectedResponse,
     #[error("the node's route incarnation changed mid-request")]
@@ -113,6 +127,12 @@ impl LightRelayError {
             Self::IncarnationChanged => HarnessOperatorHostErrorV1::Conflict,
             Self::UnexpectedResponse | Self::Crypto(_) => HarnessOperatorHostErrorV1::Internal,
             Self::NodeRejected(code) => map_node_failure(*code),
+            Self::NodeUnsupportedTransport { agent, transport } => {
+                HarnessOperatorHostErrorV1::UnsupportedTransport {
+                    agent: agent.clone(),
+                    transport: *transport,
+                }
+            }
             Self::Deadline => HarnessOperatorHostErrorV1::Deadline,
             // `NodeWorkspaceReadTooLarge` is the only member of this family
             // that is not a bare correlation/re-validation failure; every
@@ -202,7 +222,15 @@ fn map_node_failure(code: NodeFailureCode) -> HarnessOperatorHostErrorV1 {
         | NodeFailureCode::RepositoryFileWriteTimedOut
         | NodeFailureCode::RepositoryEntryCreateTimedOut => HarnessOperatorHostErrorV1::Deadline,
         NodeFailureCode::ResponseTooLarge => HarnessOperatorHostErrorV1::TooLarge,
-        NodeFailureCode::UnsupportedCapability
+        // This shared mapper has no `agent`/`transport` to name (unlike
+        // `spawn_session_inner`'s own `Err(failure) if failure.code ==
+        // UnsupportedTransport` arm, which constructs the typed
+        // `HarnessOperatorHostErrorV1::UnsupportedTransport` directly and
+        // never reaches here for a spawn) -- every OTHER verb family this
+        // function serves cannot produce this code from the node at all, so
+        // it falls into the same generic bucket as the codes right below.
+        NodeFailureCode::UnsupportedTransport
+        | NodeFailureCode::UnsupportedCapability
         | NodeFailureCode::BackendDisconnected
         | NodeFailureCode::BackendOperationFailed
         | NodeFailureCode::ShuttingDown

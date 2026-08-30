@@ -2560,6 +2560,13 @@ impl PreparedSessionSpawn {
     }
 
     pub(crate) fn route(&self) -> &NodeRoute { &self.route }
+
+    /// The requested execution mode, read before `dispatch_session_spawn`
+    /// consumes `self` -- lets `start_session_spawn_worker` capture the
+    /// transport a rejected spawn was actually asking for, so a later
+    /// `SpawnDispatchOutcome::Rejected` can name it on the operator wire
+    /// (see `HarnessOperatorHostErrorV1::UnsupportedTransport`).
+    pub(crate) fn mode(&self) -> HarnessExecutionModeV1 { self.mode }
 }
 
 /// The eight thin session-control verbs (`WriteSessionInput`/`ResizeSession`/

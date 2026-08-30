@@ -64,6 +64,16 @@ impl RpcError {
     pub const INVALID_STATE: i32 = -32003;
     pub const UNSUPPORTED: i32 = -32004;
 
+    /// Synthesized locally by the reader loop's process-exit path when the
+    /// child exited before any JSON-RPC response AND its stderr matched the
+    /// recognized "needs authentication" signature (see
+    /// `acp::reader::detect_authentication_required`). No real ACP agent
+    /// ever sends this code -- it never crosses the wire. Chosen from the
+    /// JSON-RPC "reserved for implementation-defined server errors" range
+    /// (-32000..=-32099) specifically so it cannot collide with a code an
+    /// agent could legitimately emit.
+    pub const AUTHENTICATION_REQUIRED: i32 = -32010;
+
     /// Create a "Method not found" error.
     pub fn method_not_found(method: &str) -> Self {
         Self {

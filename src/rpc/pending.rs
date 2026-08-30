@@ -67,16 +67,22 @@ impl PendingRequests {
             .unwrap_or(false)
     }
 
-    /// Cancel all pending requests with an internal error.
+    /// Cancel all pending requests with the given error.
     ///
     /// Called on session shutdown to wake all waiting `rpc_call` futures.
-    pub fn cancel_all(&self, reason: &str) {
+    /// Takes a full `RpcError` (rather than synthesizing one internally) so
+    /// callers that classified WHY the session closed -- e.g. the reader
+    /// loop recognizing an authentication-required stderr signature -- can
+    /// carry that classification through `RpcError::code`/`data` instead of
+    /// it being flattened to a fixed internal-error code before it reaches
+    /// the waiter.
+    pub fn cancel_all(&self, error: RpcError) {
         let mut guard = match self.inner.lock() {
             Ok(g) => g,
             Err(_) => return,
         };
         for (_id, tx) in guard.drain() {
-            let _ = tx.send(Err(RpcError::internal(reason)));
+            let _ = tx.send(Err(error.clone()));
         }
     }
 
@@ -121,7 +127,7 @@ mod tests {
         let pending = PendingRequests::new();
         let rx1 = pending.register(RpcId::Number(1));
         let rx2 = pending.register(RpcId::Number(2));
-        pending.cancel_all("session closed");
+        pending.cancel_all(RpcError::internal("session closed"));
         let r1 = rx1.await.unwrap();
         let r2 = rx2.await.unwrap();
         assert!(r1.is_err());

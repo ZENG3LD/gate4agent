@@ -22,9 +22,7 @@ use tokio::sync::broadcast;
 
 use crate::core::types::AgentEvent;
 use crate::rpc::handler::HostHandler;
-use crate::rpc::message::{
-    classify_line, IncomingMessage, RpcError, RpcResponse,
-};
+use crate::rpc::message::{classify_line, IncomingMessage, RpcError, RpcResponse};
 use crate::rpc::pending::PendingRequests;
 
 use super::protocol::{update_to_event, SessionUpdateParams};
@@ -42,10 +40,14 @@ pub(crate) fn acp_reader_loop(
     handler: Arc<dyn HostHandler>,
 ) {
     let mut received_session_end = false;
-    // Reason handed to any still-pending request when the loop exits. Only
+    // Error handed to any still-pending request when the loop exits. Only
     // enriched with stderr when the process itself exited (see below) — a
-    // reader-side mutex poison keeps the generic message.
-    let mut close_reason = "acp session closed".to_owned();
+    // reader-side mutex poison keeps the generic message. Starts as a plain
+    // internal error; the process-exit branch below may replace it with
+    // `RpcError::AUTHENTICATION_REQUIRED` once it recognizes a vendor
+    // stderr signature, so the classification survives the trip through
+    // `pending.cancel_all()` instead of being flattened to a string first.
+    let mut close_error = RpcError::internal("acp session closed");
 
     loop {
         // Non-blocking line poll — hold the lock for the minimum duration.
@@ -73,13 +75,21 @@ pub(crate) fn acp_reader_loop(
                         .ok()
                         .map(|guard| guard.stderr_tail())
                         .unwrap_or_default();
-                    close_reason = if stderr_tail.is_empty() {
+                    let close_reason = if stderr_tail.is_empty() {
                         format!("acp process exited (code={exit_code})")
                     } else {
                         format!(
                             "acp process exited (code={exit_code}); stderr: {}",
                             stderr_tail.join(" | ")
                         )
+                    };
+                    close_error = match detect_authentication_required(&stderr_tail) {
+                        Some(vendor_message) => RpcError {
+                            code: RpcError::AUTHENTICATION_REQUIRED,
+                            message: close_reason,
+                            data: Some(Value::String(vendor_message.to_owned())),
+                        },
+                        None => RpcError::internal(close_reason),
                     };
 
                     if !received_session_end {
@@ -180,10 +190,12 @@ pub(crate) fn acp_reader_loop(
     }
 
     // Cancel all in-flight host → agent requests so callers don't hang. When
-    // the process exited before answering, `close_reason` carries its stderr
+    // the process exited before answering, `close_error` carries its stderr
     // tail so a failed handshake reports why (e.g. an unauthenticated CLI),
-    // not just that the pipe closed.
-    pending.cancel_all(&close_reason);
+    // not just that the pipe closed -- and, when the stderr matched the
+    // recognized authentication signature, `close_error.code` carries that
+    // classification too (see `detect_authentication_required`).
+    pending.cancel_all(close_error);
 }
 
 // ---------------------------------------------------------------------------
@@ -219,4 +231,79 @@ fn collect_exit_code(process: &Arc<Mutex<AcpProcess>>) -> i32 {
         .ok()
         .map(|mut g| g.exit_code())
         .unwrap_or(0)
+}
+
+/// Recognize a "needs authentication" condition in the stderr tail of an ACP
+/// process that exited before producing any JSON-RPC line on stdout.
+///
+/// This is the ONLY signature this function knows -- captured live from an
+/// unauthenticated `grok agent stdio` run (xAI's Grok CLI, no `GROK_API_KEY`
+/// set, no `~/.grok/user-settings.json` key configured): the process prints
+/// nothing on stdout, exits with code 1, and stderr carries exactly this
+/// line:
+///
+/// ```text
+/// ❌ Error: API key required. Set GROK_API_KEY environment variable, use
+/// --api-key flag, or set "apiKey" field in ~/.grok/user-settings.json
+/// ```
+///
+/// The match is a combination of three stable markers found in that one
+/// line -- the `❌ Error:` prefix, the phrase fragment `"API key"`, and the
+/// word `"required"` -- rather than the whole sentence, so trailing wording
+/// this function does not need (the env var name, the flag, the settings
+/// path) can vary without breaking the match. It is deliberately NOT a
+/// single generic word like `"error"` or `"key"` alone, which would
+/// misclassify unrelated startup failures as an auth prompt.
+///
+/// No other vendor's unauthenticated-exit text has been observed through
+/// this path. Extend the check only from another live capture, never from a
+/// guessed phrase -- a false "not recognized" just falls through to the
+/// existing generic handshake failure; a false positive would tell an
+/// operator to re-authenticate when the real cause was something else.
+fn detect_authentication_required(stderr_tail: &[String]) -> Option<&str> {
+    stderr_tail.iter().map(String::as_str).find(|line| {
+        line.contains("❌ Error:") && line.contains("API key") && line.contains("required")
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verbatim capture from an unauthenticated `grok agent stdio` run (see
+    /// `detect_authentication_required`'s doc comment for provenance).
+    const GROK_MISSING_KEY_STDERR: &str = "❌ Error: API key required. Set GROK_API_KEY environment variable, use --api-key flag, or set \"apiKey\" field in ~/.grok/user-settings.json";
+
+    #[test]
+    fn detects_the_captured_grok_signature() {
+        let tail = vec![GROK_MISSING_KEY_STDERR.to_owned()];
+        assert_eq!(
+            detect_authentication_required(&tail),
+            Some(GROK_MISSING_KEY_STDERR)
+        );
+    }
+
+    #[test]
+    fn does_not_flag_an_unrelated_failure() {
+        let tail = vec!["Error: connection refused".to_owned()];
+        assert_eq!(detect_authentication_required(&tail), None);
+    }
+
+    #[test]
+    fn empty_stderr_is_not_authentication_required() {
+        let tail: Vec<String> = Vec::new();
+        assert_eq!(detect_authentication_required(&tail), None);
+    }
+
+    #[test]
+    fn partial_markers_alone_do_not_match() {
+        // Has "required" but neither the error prefix nor "API key" --
+        // a combination, not a single word, decides the match.
+        let tail = vec!["a value is required here".to_owned()];
+        assert_eq!(detect_authentication_required(&tail), None);
+    }
 }

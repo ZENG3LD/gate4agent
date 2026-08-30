@@ -66,6 +66,17 @@ pub enum AcpError {
     #[error("Handshake failed: {message}")]
     HandshakeFailed { message: String },
 
+    /// The ACP process exited during the handshake without ever answering,
+    /// and its stderr matched the one recognized "needs authentication"
+    /// signature (see `acp::reader::detect_authentication_required`) --
+    /// e.g. an unauthenticated `grok agent stdio` printing "API key
+    /// required" and exiting. `vendor_message` is that stderr line
+    /// verbatim: it is the only text that tells the operator WHAT to do
+    /// (which env var, which flag, which settings file), and callers must
+    /// surface it rather than dropping it in favor of the variant name.
+    #[error("Authentication required: {vendor_message}")]
+    AuthenticationRequired { vendor_message: String },
+
     #[error("Agent returned RPC error: {0}")]
     Agent(#[from] crate::rpc::message::RpcError),
 
@@ -140,6 +151,8 @@ impl AcpSession {
     ///
     /// - [`AcpError::Spawn`] — child process failed to start
     /// - [`AcpError::HandshakeTimeout`] — `initialize` or `session/new` timed out
+    /// - [`AcpError::AuthenticationRequired`] — the process exited before answering,
+    ///   with stderr matching the one recognized "needs authentication" signature
     /// - [`AcpError::HandshakeFailed`] — agent returned an RPC error during handshake
     pub async fn spawn(
         tool: CliTool,
@@ -232,13 +245,7 @@ impl AcpSession {
         let caps: AgentCapabilities = session
             .rpc_call_typed("initialize", json!(init_params), options.handshake_timeout, true)
             .await
-            .map_err(|e| match e {
-                AcpError::Timeout { .. } => AcpError::HandshakeTimeout { step: "initialize" },
-                AcpError::Agent(rpc_err) => AcpError::HandshakeFailed {
-                    message: rpc_err.to_string(),
-                },
-                other => other,
-            })?;
+            .map_err(|e| map_handshake_error("initialize", e))?;
         session.agent_caps = caps;
 
         // --- Handshake step 2: session/new ---
@@ -249,13 +256,7 @@ impl AcpSession {
         let new_result = session
             .rpc_call("session/new", Some(json!(new_params)), options.handshake_timeout)
             .await
-            .map_err(|e| match e {
-                AcpError::Timeout { .. } => AcpError::HandshakeTimeout { step: "session/new" },
-                AcpError::Agent(rpc_err) => AcpError::HandshakeFailed {
-                    message: rpc_err.to_string(),
-                },
-                other => other,
-            })?;
+            .map_err(|e| map_handshake_error("session/new", e))?;
 
         let acp_sid = new_result
             .get("sessionId")
@@ -529,6 +530,39 @@ impl AcpSession {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Classify a handshake-step failure into the error a caller should see.
+///
+/// Shared by both handshake steps (`initialize`, `session/new`) so the
+/// classification lives in exactly one place. A bare RPC timeout becomes
+/// [`AcpError::HandshakeTimeout`] naming `step`. An RPC-level failure is, in
+/// the common case, [`AcpError::HandshakeFailed`] -- but when the reader
+/// loop tagged it with `RpcError::AUTHENTICATION_REQUIRED` (the process
+/// exited and its stderr matched the recognized vendor signature, see
+/// `acp::reader::detect_authentication_required`), it becomes
+/// [`AcpError::AuthenticationRequired`] instead, carrying the vendor's own
+/// stderr line out of `rpc_err.data` rather than the generic handshake
+/// message.
+fn map_handshake_error(step: &'static str, error: AcpError) -> AcpError {
+    match error {
+        AcpError::Timeout { .. } => AcpError::HandshakeTimeout { step },
+        AcpError::Agent(rpc_err)
+            if rpc_err.code == crate::rpc::message::RpcError::AUTHENTICATION_REQUIRED =>
+        {
+            let vendor_message = rpc_err
+                .data
+                .as_ref()
+                .and_then(Value::as_str)
+                .unwrap_or(&rpc_err.message)
+                .to_owned();
+            AcpError::AuthenticationRequired { vendor_message }
+        }
+        AcpError::Agent(rpc_err) => AcpError::HandshakeFailed {
+            message: rpc_err.to_string(),
+        },
+        other => other,
+    }
+}
+
 fn generate_session_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let t = SystemTime::now()
@@ -582,6 +616,53 @@ mod tests {
 
         let e = AcpError::SessionClosed;
         assert!(!e.to_string().is_empty());
+
+        let e = AcpError::AuthenticationRequired {
+            vendor_message: "API key required".to_owned(),
+        };
+        assert!(e.to_string().contains("API key required"));
+    }
+
+    #[test]
+    fn map_handshake_error_recognizes_the_authentication_signature() {
+        use crate::rpc::message::RpcError;
+
+        let rpc_err = RpcError {
+            code: RpcError::AUTHENTICATION_REQUIRED,
+            message: "acp process exited (code=1); stderr: \u{274c} Error: API key required."
+                .to_owned(),
+            data: Some(Value::String("\u{274c} Error: API key required.".to_owned())),
+        };
+        match map_handshake_error("initialize", AcpError::Agent(rpc_err)) {
+            AcpError::AuthenticationRequired { vendor_message } => {
+                assert_eq!(vendor_message, "\u{274c} Error: API key required.");
+            }
+            other => panic!("expected AuthenticationRequired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_handshake_error_keeps_other_rpc_failures_generic() {
+        use crate::rpc::message::RpcError;
+
+        let rpc_err = RpcError::internal("acp process exited (code=1)");
+        match map_handshake_error("session/new", AcpError::Agent(rpc_err)) {
+            AcpError::HandshakeFailed { message } => {
+                assert!(message.contains("acp process exited"));
+            }
+            other => panic!("expected HandshakeFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_handshake_error_maps_timeout_with_the_given_step() {
+        let error = AcpError::Timeout {
+            method: "initialize".into(),
+        };
+        match map_handshake_error("initialize", error) {
+            AcpError::HandshakeTimeout { step } => assert_eq!(step, "initialize"),
+            other => panic!("expected HandshakeTimeout, got {other:?}"),
+        }
     }
 
     #[test]

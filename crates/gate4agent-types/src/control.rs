@@ -1356,10 +1356,12 @@ pub enum ProviderEvent {
         raw_message: String,
     },
     /// The agent sent a JSON-RPC request to the ACP host -- `session/
-    /// request_permission`, `fs/read_text_file`, `terminal/create`,
-    /// `terminal/write` -- and the host's fixed, fail-closed policy
-    /// (`DefaultAcpHandler`) has already decided on it by the time this
-    /// event exists. This event does not change what the host does; it
+    /// request_permission`, `fs/read_text_file`, `fs/write_text_file`,
+    /// `terminal/create`, `terminal/output`, `terminal/wait_for_exit`,
+    /// `terminal/kill`, `terminal/release` -- and the host's `HostPolicy`
+    /// (`Yolo`/`Auto`/`ReadOnly`/`Deny`; `Auto` unless a caller narrowed it,
+    /// e.g. to bound a child agent) has already decided on it by the time
+    /// this event exists. This event does not change what the host does; it
     /// exists purely so an operator sees the request AND the decision
     /// instead of the request silently disappearing into a refusal nobody
     /// downstream ever hears about. `granted` is read off the host's own

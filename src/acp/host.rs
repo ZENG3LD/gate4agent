@@ -1,20 +1,30 @@
-//! ACP host-side handler trait and bridge adapter.
+//! ACP host-side handler trait, host policy, and bridge adapter.
 //!
 //! Rather than forcing callers to implement the low-level [`HostHandler`] with
 //! raw string/JSON matching, this module provides a typed trait
 //! [`AcpHostHandler`] with safe defaults. Internally [`AcpHostAdapter`]
 //! bridges from [`HostHandler`] → [`AcpHostHandler`], so the reader loop can
 //! use the existing RPC infrastructure unchanged.
+//!
+//! [`HostPolicy`] is the one production implementation's decision function:
+//! it picks what `initialize` declares in `clientCapabilities` AND how
+//! `session/request_permission` answers, so the two can never drift apart
+//! (a policy that declares `terminal: false` also never selects an allow
+//! option for an `execute` tool call, and vice versa).
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::path::PathBuf;
 
 use serde_json::{json, Value};
 
 use crate::rpc::handler::HostHandler;
 use crate::rpc::message::RpcError;
 
-use super::protocol::{FsReadParams, PermissionRequestParams, TerminalCreateParams, TerminalWriteParams};
+use super::protocol::{
+    ClientCapabilities, FsCapabilities, FsReadParams, FsWriteParams, PermissionOption,
+    PermissionOptionKind, PermissionOutcome, PermissionRequestParams, PermissionToolCall,
+    TerminalCreateParams, TerminalExitStatus, TerminalIdParams, TerminalOutputResult,
+};
+use super::terminal::TerminalStore;
 
 // ---------------------------------------------------------------------------
 // AcpHostHandler — typed trait
@@ -29,231 +39,241 @@ use super::protocol::{FsReadParams, PermissionRequestParams, TerminalCreateParam
 /// the reader loop's blocking thread.
 pub(crate) trait AcpHostHandler: Send + Sync {
     /// Agent wants to read a file from the host filesystem.
-    ///
-    /// Return `Ok(content)` or `Err(human-readable message)`.
-    fn fs_read_text_file(&self, path: &str) -> Result<String, String> {
-        Err(format!("fs/read_text_file not supported: {}", path))
+    fn fs_read_text_file(&self, params: &FsReadParams) -> Result<String, String> {
+        Err(format!("fs/read_text_file not supported: {}", params.path))
     }
 
-    /// Agent wants to create a terminal session on the host.
-    ///
-    /// Return `Ok(terminal_id)` or `Err(human-readable message)`.
-    fn terminal_create(
-        &self,
-        _cwd: Option<&str>,
-        _env: Option<&HashMap<String, String>>,
-    ) -> Result<String, String> {
+    /// Agent wants to write (fully replace) a file on the host filesystem.
+    fn fs_write_text_file(&self, params: &FsWriteParams) -> Result<(), String> {
+        Err(format!("fs/write_text_file not supported: {}", params.path))
+    }
+
+    /// Agent wants to run a command on the host and get a terminal id back.
+    fn terminal_create(&self, params: &TerminalCreateParams) -> Result<String, String> {
+        let _ = params;
         Err("terminal/create not supported".to_string())
     }
 
-    /// Agent wants to write input to an existing terminal session.
+    /// Agent wants the accumulated output of a terminal it created earlier.
+    fn terminal_output(&self, params: &TerminalIdParams) -> Result<TerminalOutputResult, String> {
+        let _ = params;
+        Err("terminal/output not supported".to_string())
+    }
+
+    /// Agent wants to block until a terminal's command exits.
+    fn terminal_wait_for_exit(
+        &self,
+        params: &TerminalIdParams,
+    ) -> Result<TerminalExitStatus, String> {
+        let _ = params;
+        Err("terminal/wait_for_exit not supported".to_string())
+    }
+
+    /// Agent wants to kill a terminal's command without releasing the id.
+    fn terminal_kill(&self, params: &TerminalIdParams) -> Result<(), String> {
+        let _ = params;
+        Err("terminal/kill not supported".to_string())
+    }
+
+    /// Agent is done with a terminal — kill it if still running and forget it.
+    fn terminal_release(&self, params: &TerminalIdParams) -> Result<(), String> {
+        let _ = params;
+        Err("terminal/release not supported".to_string())
+    }
+
+    /// Agent is requesting permission to perform a tool call.
     ///
-    /// Return `Ok(output)` or `Err(human-readable message)`.
-    fn terminal_write(&self, terminal_id: &str, input: &str) -> Result<String, String> {
-        let _ = (terminal_id, input);
-        Err("terminal/write not supported".to_string())
+    /// Per the ACP spec, a client (host) "MAY automatically allow or reject
+    /// permission requests according to the user['s] settings" -- this is
+    /// not a UI hook, it's a decision function. The default is the safest
+    /// possible answer: never select any of the offered options.
+    fn request_permission(&self, params: &PermissionRequestParams) -> PermissionOutcome {
+        let _ = params;
+        PermissionOutcome::Cancelled
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HostPolicy
+// ---------------------------------------------------------------------------
+
+/// The host's authority mode for one ACP session — governs both what
+/// `clientCapabilities` `initialize` declares and how `session/request_
+/// permission` is answered. Modes exist primarily so a parent agent can
+/// bound a child agent's authority, not to prompt a human: every mode here
+/// resolves permission requests on its own, per the ACP spec's explicit
+/// allowance for a client to decide automatically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostPolicy {
+    /// Everything allowed, no distinctions. Prefers `allow_always` options
+    /// so an agent that respects them stops asking for the same class of
+    /// operation again this session.
+    Yolo,
+    /// Reads, writes, and command execution are all allowed without
+    /// prompting — the default. Prefers `allow_once` options over
+    /// `allow_always`, so each grant stays an individually observable
+    /// decision (see `AgentEvent::RpcIncomingRequest`) rather than one the
+    /// agent stops asking about.
+    Auto,
+    /// Only read-shaped operations (`fs/read_text_file`, and tool calls of
+    /// kind `read`/`search`/`think`/`fetch`) are allowed; writes, deletes,
+    /// moves, and command execution are refused.
+    ReadOnly,
+    /// Refuse everything. Today's behavior prior to `HostPolicy` existing;
+    /// kept reachable because it is load-bearing for the fail-closed tests.
+    Deny,
+}
+
+impl Default for HostPolicy {
+    /// `Auto` — the owner's decision: default to answering permission
+    /// requests without a human in the loop, not to fail closed.
+    fn default() -> Self {
+        HostPolicy::Auto
+    }
+}
+
+impl HostPolicy {
+    /// The `clientCapabilities` this policy declares at `initialize`.
+    pub(crate) fn client_capabilities(self) -> ClientCapabilities {
+        match self {
+            HostPolicy::Yolo | HostPolicy::Auto => ClientCapabilities {
+                fs: FsCapabilities { read_text_file: true, write_text_file: true },
+                terminal: true,
+            },
+            HostPolicy::ReadOnly => ClientCapabilities {
+                fs: FsCapabilities { read_text_file: true, write_text_file: false },
+                terminal: false,
+            },
+            HostPolicy::Deny => ClientCapabilities {
+                fs: FsCapabilities { read_text_file: false, write_text_file: false },
+                terminal: false,
+            },
+        }
     }
 
-    /// Agent is requesting permission to run a tool.
+    /// Whether this policy allows real file writes and command execution.
+    fn allows_mutation(self) -> bool {
+        matches!(self, HostPolicy::Yolo | HostPolicy::Auto)
+    }
+
+    /// Whether this policy allows real file reads.
+    fn allows_read(self) -> bool {
+        !matches!(self, HostPolicy::Deny)
+    }
+
+    /// Pick one of the agent's offered `options` for a `session/request_
+    /// permission` call, or decline to pick any of them.
     ///
-    /// Return `Ok(true)` to allow, `Ok(false)` to deny, `Err` for error.
-    /// Default: deny all requests (safe default).
-    fn request_permission(
-        &self,
-        _tool_name: &str,
-        _description: &str,
-        _session_id: &str,
-    ) -> Result<bool, String> {
-        Ok(false)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// DefaultAcpHandler
-// ---------------------------------------------------------------------------
-
-/// Default handler that denies all requests with safe defaults.
-///
-/// - `fs/read_text_file` → `Err("not supported")`
-/// - `terminal/create` → `Err("not supported")`
-/// - `terminal/write` → `Err("not supported")`
-/// - `session/request_permission` → `Ok(false)` (deny)
-pub(crate) struct DefaultAcpHandler;
-
-impl AcpHostHandler for DefaultAcpHandler {}
-
-// ---------------------------------------------------------------------------
-// FilesystemAcpHandler
-// ---------------------------------------------------------------------------
-
-/// ACP host handler that serves real filesystem reads and auto-allows
-/// permissions. Matches Pipe transport's `--dangerously-skip-permissions`
-/// behavior.
-#[cfg(test)]
-struct FilesystemAcpHandler {
-    /// Optional path prefix whitelist. `None` = allow all absolute paths.
-    pub allowed_roots: Option<Vec<std::path::PathBuf>>,
-}
-
-#[cfg(test)]
-impl FilesystemAcpHandler {
-    /// Check that `path` is within the whitelist (if any), then read it.
-    fn checked_read(&self, path: &str) -> Result<String, String> {
-        if let Some(ref roots) = self.allowed_roots {
-            let file_path = std::path::Path::new(path);
-            let canonical = file_path.canonicalize().map_err(|e| e.to_string())?;
-            let allowed = roots.iter().any(|root| {
-                root.canonicalize()
-                    .map(|r| canonical.starts_with(&r))
-                    .unwrap_or(false)
-            });
-            if !allowed {
-                return Err(format!("path outside allowed roots: {}", path));
+    /// `options` is whatever subset of the four
+    /// [`PermissionOptionKind`] values the agent chose to offer -- this
+    /// walks a preference order and returns the first offered kind that
+    /// matches, so it tolerates an agent that omits some (or three) of
+    /// them.
+    fn select_permission_option(
+        self,
+        tool_call: &PermissionToolCall,
+        options: &[PermissionOption],
+    ) -> PermissionOutcome {
+        let prefer_allow = match self {
+            HostPolicy::Yolo | HostPolicy::Auto => true,
+            HostPolicy::ReadOnly => tool_call.kind.is_read_only(),
+            HostPolicy::Deny => false,
+        };
+        let preference: &[PermissionOptionKind] = if prefer_allow {
+            if matches!(self, HostPolicy::Yolo) {
+                &[PermissionOptionKind::AllowAlways, PermissionOptionKind::AllowOnce]
+            } else {
+                &[PermissionOptionKind::AllowOnce, PermissionOptionKind::AllowAlways]
+            }
+        } else {
+            &[PermissionOptionKind::RejectOnce, PermissionOptionKind::RejectAlways]
+        };
+        for kind in preference {
+            if let Some(option) = options.iter().find(|option| option.kind == *kind) {
+                return PermissionOutcome::Selected { option_id: option.option_id.clone() };
             }
         }
-        std::fs::read_to_string(path).map_err(|e| e.to_string())
-    }
-}
-
-#[cfg(test)]
-impl AcpHostHandler for FilesystemAcpHandler {
-    fn fs_read_text_file(&self, path: &str) -> Result<String, String> {
-        self.checked_read(path)
-    }
-
-    fn request_permission(
-        &self,
-        _tool_name: &str,
-        _description: &str,
-        _session_id: &str,
-    ) -> Result<bool, String> {
-        Ok(true) // auto-allow, like --dangerously-skip-permissions
+        PermissionOutcome::Cancelled
     }
 }
 
 // ---------------------------------------------------------------------------
-// TerminalAcpHandler
+// PolicyHostHandler — the one production AcpHostHandler
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
-struct TerminalSession {
-    cwd: std::path::PathBuf,
-    env: HashMap<String, String>,
+/// The production [`AcpHostHandler`]: serves real filesystem reads/writes
+/// and real terminal execution, gated by a [`HostPolicy`]. This is the only
+/// handler `AcpSession` ever constructs outside tests.
+pub(crate) struct PolicyHostHandler {
+    policy: HostPolicy,
+    working_dir: PathBuf,
+    terminals: TerminalStore,
 }
 
-/// ACP host handler with real filesystem reads and terminal execution.
-///
-/// WARNING: No sandboxing. Use only with trusted agents.
-#[cfg(test)]
-struct TerminalAcpHandler {
-    /// Optional path prefix whitelist. `None` = allow all absolute paths.
-    pub allowed_roots: Option<Vec<std::path::PathBuf>>,
-    sessions: std::sync::Mutex<HashMap<String, TerminalSession>>,
+impl PolicyHostHandler {
+    pub(crate) fn new(policy: HostPolicy, working_dir: PathBuf) -> Self {
+        Self { policy, working_dir, terminals: TerminalStore::new() }
+    }
 }
 
-#[cfg(test)]
-impl TerminalAcpHandler {
-    /// Create a new handler. Pass `None` for `allowed_roots` to allow all paths.
-    pub fn new(allowed_roots: Option<Vec<std::path::PathBuf>>) -> Self {
-        Self {
-            allowed_roots,
-            sessions: std::sync::Mutex::new(HashMap::new()),
+/// Apply an ACP `fs/read_text_file` line window (`line` 1-based, `limit` a
+/// line count) to already-read file content. Absent both, the whole file.
+fn windowed_read(content: &str, line: Option<u32>, limit: Option<u32>) -> String {
+    if line.is_none() && limit.is_none() {
+        return content.to_owned();
+    }
+    let start = line.unwrap_or(1).saturating_sub(1) as usize;
+    let lines = content.split_inclusive('\n').skip(start);
+    match limit {
+        Some(n) => lines.take(n as usize).collect(),
+        None => lines.collect(),
+    }
+}
+
+impl AcpHostHandler for PolicyHostHandler {
+    fn fs_read_text_file(&self, params: &FsReadParams) -> Result<String, String> {
+        if !self.policy.allows_read() {
+            return Err(format!("fs/read_text_file denied by host policy: {}", params.path));
         }
+        let content = std::fs::read_to_string(&params.path).map_err(|e| e.to_string())?;
+        Ok(windowed_read(&content, params.line, params.limit))
     }
 
-    fn checked_read(&self, path: &str) -> Result<String, String> {
-        if let Some(ref roots) = self.allowed_roots {
-            let file_path = std::path::Path::new(path);
-            let canonical = file_path.canonicalize().map_err(|e| e.to_string())?;
-            let allowed = roots.iter().any(|root| {
-                root.canonicalize()
-                    .map(|r| canonical.starts_with(&r))
-                    .unwrap_or(false)
-            });
-            if !allowed {
-                return Err(format!("path outside allowed roots: {}", path));
-            }
+    fn fs_write_text_file(&self, params: &FsWriteParams) -> Result<(), String> {
+        if !self.policy.allows_mutation() {
+            return Err(format!("fs/write_text_file denied by host policy: {}", params.path));
         }
-        std::fs::read_to_string(path).map_err(|e| e.to_string())
-    }
-}
-
-#[cfg(test)]
-impl AcpHostHandler for TerminalAcpHandler {
-    fn fs_read_text_file(&self, path: &str) -> Result<String, String> {
-        self.checked_read(path)
+        std::fs::write(&params.path, &params.content).map_err(|e| e.to_string())
     }
 
-    fn terminal_create(
+    fn terminal_create(&self, params: &TerminalCreateParams) -> Result<String, String> {
+        if !self.policy.allows_mutation() {
+            return Err("terminal/create denied by host policy".to_string());
+        }
+        self.terminals.create(&self.working_dir, params)
+    }
+
+    fn terminal_output(&self, params: &TerminalIdParams) -> Result<TerminalOutputResult, String> {
+        self.terminals.output(&params.terminal_id)
+    }
+
+    fn terminal_wait_for_exit(
         &self,
-        cwd: Option<&str>,
-        env: Option<&HashMap<String, String>>,
-    ) -> Result<String, String> {
-        let id = {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            format!("term-{:x}", nanos)
-        };
-
-        let session = TerminalSession {
-            cwd: cwd
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default()),
-            env: env.cloned().unwrap_or_default(),
-        };
-
-        self.sessions
-            .lock()
-            .map_err(|e| e.to_string())?
-            .insert(id.clone(), session);
-
-        Ok(id)
+        params: &TerminalIdParams,
+    ) -> Result<TerminalExitStatus, String> {
+        self.terminals.wait_for_exit(&params.terminal_id)
     }
 
-    fn terminal_write(&self, terminal_id: &str, input: &str) -> Result<String, String> {
-        let sessions = self.sessions.lock().map_err(|e| e.to_string())?;
-        let session = sessions
-            .get(terminal_id)
-            .ok_or_else(|| format!("unknown terminal: {}", terminal_id))?;
-
-        let output = {
-            #[cfg(windows)]
-            {
-                std::process::Command::new("cmd")
-                    .args(["/C", input])
-                    .current_dir(&session.cwd)
-                    .envs(&session.env)
-                    .output()
-                    .map_err(|e| e.to_string())?
-            }
-            #[cfg(not(windows))]
-            {
-                std::process::Command::new("sh")
-                    .args(["-c", input])
-                    .current_dir(&session.cwd)
-                    .envs(&session.env)
-                    .output()
-                    .map_err(|e| e.to_string())?
-            }
-        };
-
-        let combined = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        Ok(combined)
+    fn terminal_kill(&self, params: &TerminalIdParams) -> Result<(), String> {
+        self.terminals.kill(&params.terminal_id)
     }
 
-    fn request_permission(
-        &self,
-        _tool_name: &str,
-        _description: &str,
-        _session_id: &str,
-    ) -> Result<bool, String> {
-        Ok(true) // auto-allow, like --dangerously-skip-permissions
+    fn terminal_release(&self, params: &TerminalIdParams) -> Result<(), String> {
+        self.terminals.release(&params.terminal_id)
+    }
+
+    fn request_permission(&self, params: &PermissionRequestParams) -> PermissionOutcome {
+        self.policy.select_permission_option(&params.tool_call, &params.options)
     }
 }
 
@@ -265,7 +285,7 @@ impl AcpHostHandler for TerminalAcpHandler {
 ///
 /// Wraps `Arc<dyn AcpHostHandler>` so it can be cloned cheaply without
 /// requiring `'static + Clone` bounds on the trait.
-pub(crate) struct AcpHostAdapter(pub Arc<dyn AcpHostHandler>);
+pub(crate) struct AcpHostAdapter(pub std::sync::Arc<dyn AcpHostHandler>);
 
 impl HostHandler for AcpHostAdapter {
     fn handle(&self, method: &str, params: Option<Value>) -> Result<Value, RpcError> {
@@ -273,8 +293,20 @@ impl HostHandler for AcpHostAdapter {
             "fs/read_text_file" => {
                 let p: FsReadParams = parse_params(params)?;
                 self.0
-                    .fs_read_text_file(&p.path)
+                    .fs_read_text_file(&p)
                     .map(|content| json!({ "content": content }))
+                    .map_err(|msg| RpcError {
+                        code: RpcError::PERMISSION_DENIED,
+                        message: msg,
+                        data: None,
+                    })
+            }
+
+            "fs/write_text_file" => {
+                let p: FsWriteParams = parse_params(params)?;
+                self.0
+                    .fs_write_text_file(&p)
+                    .map(|()| json!({}))
                     .map_err(|msg| RpcError {
                         code: RpcError::PERMISSION_DENIED,
                         message: msg,
@@ -285,37 +317,51 @@ impl HostHandler for AcpHostAdapter {
             "terminal/create" => {
                 let p: TerminalCreateParams = parse_params(params)?;
                 self.0
-                    .terminal_create(p.cwd.as_deref(), p.env.as_ref())
+                    .terminal_create(&p)
                     .map(|terminal_id| json!({ "terminalId": terminal_id }))
                     .map_err(|msg| RpcError {
-                        code: RpcError::UNSUPPORTED,
+                        code: RpcError::PERMISSION_DENIED,
                         message: msg,
                         data: None,
                     })
             }
 
-            "terminal/write" => {
-                let p: TerminalWriteParams = parse_params(params)?;
+            "terminal/output" => {
+                let p: TerminalIdParams = parse_params(params)?;
                 self.0
-                    .terminal_write(&p.terminal_id, &p.input)
-                    .map(|output| json!({ "output": output }))
-                    .map_err(|msg| RpcError {
-                        code: RpcError::UNSUPPORTED,
-                        message: msg,
-                        data: None,
-                    })
+                    .terminal_output(&p)
+                    .map(|result| serde_json::to_value(result).unwrap_or(Value::Null))
+                    .map_err(|msg| RpcError { code: RpcError::NOT_FOUND, message: msg, data: None })
+            }
+
+            "terminal/wait_for_exit" => {
+                let p: TerminalIdParams = parse_params(params)?;
+                self.0
+                    .terminal_wait_for_exit(&p)
+                    .map(|result| serde_json::to_value(result).unwrap_or(Value::Null))
+                    .map_err(|msg| RpcError { code: RpcError::NOT_FOUND, message: msg, data: None })
+            }
+
+            "terminal/kill" => {
+                let p: TerminalIdParams = parse_params(params)?;
+                self.0
+                    .terminal_kill(&p)
+                    .map(|()| json!({}))
+                    .map_err(|msg| RpcError { code: RpcError::NOT_FOUND, message: msg, data: None })
+            }
+
+            "terminal/release" => {
+                let p: TerminalIdParams = parse_params(params)?;
+                self.0
+                    .terminal_release(&p)
+                    .map(|()| json!({}))
+                    .map_err(|msg| RpcError { code: RpcError::NOT_FOUND, message: msg, data: None })
             }
 
             "session/request_permission" => {
                 let p: PermissionRequestParams = parse_params(params)?;
-                self.0
-                    .request_permission(&p.tool_name, &p.description, &p.session_id)
-                    .map(|allowed| json!({ "allowed": allowed }))
-                    .map_err(|msg| RpcError {
-                        code: RpcError::INTERNAL_ERROR,
-                        message: msg,
-                        data: None,
-                    })
+                let outcome = self.0.request_permission(&p);
+                Ok(serde_json::to_value(outcome).unwrap_or(Value::Null))
             }
 
             other => Err(RpcError::method_not_found(other)),
@@ -343,199 +389,342 @@ fn parse_params<T: serde::de::DeserializeOwned>(params: Option<Value>) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::protocol::ToolCallLocation;
     use serde_json::json;
+    use std::sync::Arc;
 
-    // -----------------------------------------------------------------------
-    // DefaultAcpHandler tests (kept from original)
-    // -----------------------------------------------------------------------
+    /// The trait's own baked-in defaults (deny everything), independent of
+    /// any concrete policy — proves nobody weakened the safe fallback.
+    struct Bare;
+    impl AcpHostHandler for Bare {}
 
-    fn default_adapter() -> AcpHostAdapter {
-        AcpHostAdapter(Arc::new(DefaultAcpHandler))
+    #[test]
+    fn trait_defaults_deny_fs_read() {
+        let params = FsReadParams { path: "/etc/passwd".to_owned(), session_id: String::new(), line: None, limit: None };
+        assert!(Bare.fs_read_text_file(&params).is_err());
     }
 
     #[test]
-    fn default_handler_denies_fs_read() {
-        let h = DefaultAcpHandler;
-        let result = h.fs_read_text_file("/etc/passwd");
-        assert!(result.is_err());
+    fn trait_defaults_deny_terminal_create() {
+        let params = TerminalCreateParams {
+            session_id: String::new(),
+            command: "ls".to_owned(),
+            args: vec![],
+            env: vec![],
+            cwd: None,
+            output_byte_limit: None,
+        };
+        assert!(Bare.terminal_create(&params).is_err());
     }
 
     #[test]
-    fn default_handler_denies_terminal() {
-        let h = DefaultAcpHandler;
-        let result = h.terminal_create(None, None);
-        assert!(result.is_err());
+    fn trait_defaults_cancel_permission() {
+        let params = PermissionRequestParams {
+            session_id: "s1".to_owned(),
+            tool_call: PermissionToolCall::default(),
+            options: vec![PermissionOption {
+                option_id: "a1".to_owned(),
+                name: "Allow".to_owned(),
+                kind: PermissionOptionKind::AllowOnce,
+            }],
+        };
+        assert_eq!(Bare.request_permission(&params), PermissionOutcome::Cancelled);
     }
 
-    #[test]
-    fn default_handler_denies_permission() {
-        let h = DefaultAcpHandler;
-        let result = h.request_permission("bash", "run command", "s1");
-        assert_eq!(result, Ok(false));
-    }
-
-    #[test]
-    fn adapter_dispatches_fs_read_returns_permission_denied() {
-        let adapter = default_adapter();
-        let result = adapter.handle(
-            "fs/read_text_file",
-            Some(json!({"path": "/etc/passwd"})),
-        );
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, RpcError::PERMISSION_DENIED);
-    }
-
-    #[test]
-    fn adapter_dispatches_permission_request_returns_denied() {
-        let adapter = default_adapter();
-        let result = adapter.handle(
-            "session/request_permission",
-            Some(json!({
-                "toolName": "bash",
-                "description": "run shell command",
-                "sessionId": "s1"
-            })),
-        );
-        // DefaultAcpHandler returns Ok(false) → adapter returns Ok({"allowed": false})
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap()["allowed"], false);
-    }
-
-    #[test]
-    fn adapter_unknown_method_returns_method_not_found() {
-        let adapter = default_adapter();
-        let result = adapter.handle("unknown/method", None);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, RpcError::METHOD_NOT_FOUND);
-    }
-
-    #[test]
-    fn adapter_invalid_params_returns_invalid_params_error() {
-        let adapter = default_adapter();
-        // fs/read_text_file requires a "path" field
-        let result = adapter.handle("fs/read_text_file", Some(json!({"wrong_key": 42})));
-        // DefaultAcpHandler denies, but parse should succeed with default missing fields
-        // (FsReadParams.path will be empty string via default deserialization if it has #[serde(default)])
-        // Actually FsReadParams.path is required so this should fail parse.
-        // It may either fail with INVALID_PARAMS or succeed with empty path then PERMISSION_DENIED.
-        // Either way it must be Err.
-        assert!(result.is_err());
+    fn adapter(policy: HostPolicy) -> AcpHostAdapter {
+        AcpHostAdapter(Arc::new(PolicyHostHandler::new(policy, std::env::temp_dir())))
     }
 
     // -----------------------------------------------------------------------
-    // FilesystemAcpHandler tests
+    // Capabilities per policy
     // -----------------------------------------------------------------------
 
     #[test]
-    fn filesystem_handler_allows_permission() {
-        let h = FilesystemAcpHandler { allowed_roots: None };
-        let result = h.request_permission("bash", "run command", "s1");
-        assert_eq!(result, Ok(true));
+    fn yolo_and_auto_declare_full_capabilities() {
+        for policy in [HostPolicy::Yolo, HostPolicy::Auto] {
+            let caps = policy.client_capabilities();
+            assert!(caps.fs.read_text_file);
+            assert!(caps.fs.write_text_file);
+            assert!(caps.terminal);
+        }
     }
 
     #[test]
-    fn filesystem_handler_reads_existing_file() {
+    fn read_only_declares_read_but_not_write_or_terminal() {
+        let caps = HostPolicy::ReadOnly.client_capabilities();
+        assert!(caps.fs.read_text_file);
+        assert!(!caps.fs.write_text_file);
+        assert!(!caps.terminal);
+    }
+
+    #[test]
+    fn deny_declares_nothing() {
+        let caps = HostPolicy::Deny.client_capabilities();
+        assert!(!caps.fs.read_text_file);
+        assert!(!caps.fs.write_text_file);
+        assert!(!caps.terminal);
+    }
+
+    #[test]
+    fn default_policy_is_auto() {
+        assert_eq!(HostPolicy::default(), HostPolicy::Auto);
+    }
+
+    // -----------------------------------------------------------------------
+    // fs/read_text_file, fs/write_text_file — real I/O
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn auto_reads_and_writes_a_real_file() {
         let dir = std::env::temp_dir();
-        let path = dir.join("gate4agent_test_read.txt");
-        std::fs::write(&path, "hello from test").unwrap();
+        let path = dir.join("gate4agent_host_test_rw.txt");
+        std::fs::write(&path, "before").unwrap();
 
-        let h = FilesystemAcpHandler { allowed_roots: None };
-        let result = h.fs_read_text_file(path.to_str().unwrap());
-        assert!(result.is_ok(), "expected Ok, got {:?}", result);
-        assert_eq!(result.unwrap(), "hello from test");
+        let handler = PolicyHostHandler::new(HostPolicy::Auto, dir.clone());
+        let read = handler
+            .fs_read_text_file(&FsReadParams {
+                path: path.to_string_lossy().into_owned(),
+                session_id: String::new(),
+                line: None,
+                limit: None,
+            })
+            .unwrap();
+        assert_eq!(read, "before");
+
+        handler
+            .fs_write_text_file(&FsWriteParams {
+                path: path.to_string_lossy().into_owned(),
+                session_id: String::new(),
+                content: "after".to_owned(),
+            })
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "after");
 
         std::fs::remove_file(&path).ok();
     }
 
     #[test]
-    fn filesystem_handler_errors_on_missing_file() {
-        let h = FilesystemAcpHandler { allowed_roots: None };
-        let result = h.fs_read_text_file("/nonexistent/path/that/does/not/exist.txt");
-        assert!(result.is_err());
+    fn read_only_reads_but_refuses_to_write() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("gate4agent_host_test_readonly.txt");
+        std::fs::write(&path, "content").unwrap();
+
+        let handler = PolicyHostHandler::new(HostPolicy::ReadOnly, dir);
+        assert!(handler
+            .fs_read_text_file(&FsReadParams {
+                path: path.to_string_lossy().into_owned(),
+                session_id: String::new(),
+                line: None,
+                limit: None,
+            })
+            .is_ok());
+        assert!(handler
+            .fs_write_text_file(&FsWriteParams {
+                path: path.to_string_lossy().into_owned(),
+                session_id: String::new(),
+                content: "nope".to_owned(),
+            })
+            .is_err());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn deny_refuses_read_and_write() {
+        let dir = std::env::temp_dir();
+        let handler = PolicyHostHandler::new(HostPolicy::Deny, dir);
+        assert!(handler
+            .fs_read_text_file(&FsReadParams {
+                path: "/etc/passwd".to_owned(),
+                session_id: String::new(),
+                line: None,
+                limit: None,
+            })
+            .is_err());
+        assert!(handler
+            .fs_write_text_file(&FsWriteParams {
+                path: "/tmp/should-not-be-written".to_owned(),
+                session_id: String::new(),
+                content: "x".to_owned(),
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn windowed_read_applies_line_and_limit() {
+        let content = "one\ntwo\nthree\nfour\n";
+        assert_eq!(windowed_read(content, None, None), content);
+        assert_eq!(windowed_read(content, Some(2), None), "two\nthree\nfour\n");
+        assert_eq!(windowed_read(content, Some(2), Some(1)), "two\n");
     }
 
     // -----------------------------------------------------------------------
-    // TerminalAcpHandler tests
+    // session/request_permission selection per policy
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn terminal_handler_create_returns_id() {
-        let h = TerminalAcpHandler::new(None);
-        let result = h.terminal_create(None, None);
-        assert!(result.is_ok(), "expected Ok, got {:?}", result);
-        let id = result.unwrap();
-        assert!(!id.is_empty(), "terminal id must not be empty");
-        assert!(id.starts_with("term-"), "id should start with 'term-'");
+    fn options_all_four() -> Vec<PermissionOption> {
+        vec![
+            PermissionOption { option_id: "ao".to_owned(), name: "Allow once".to_owned(), kind: PermissionOptionKind::AllowOnce },
+            PermissionOption { option_id: "aa".to_owned(), name: "Allow always".to_owned(), kind: PermissionOptionKind::AllowAlways },
+            PermissionOption { option_id: "ro".to_owned(), name: "Reject once".to_owned(), kind: PermissionOptionKind::RejectOnce },
+            PermissionOption { option_id: "ra".to_owned(), name: "Reject always".to_owned(), kind: PermissionOptionKind::RejectAlways },
+        ]
+    }
+
+    fn tool_call(kind: crate::acp::protocol::ToolKind) -> PermissionToolCall {
+        PermissionToolCall {
+            tool_call_id: "tc1".to_owned(),
+            title: "test".to_owned(),
+            kind,
+            locations: vec![ToolCallLocation { path: "/repo/file.txt".to_owned(), line: None }],
+        }
     }
 
     #[test]
-    fn terminal_handler_write_runs_echo() {
-        let h = TerminalAcpHandler::new(None);
-        let id = h.terminal_create(None, None).expect("create should succeed");
+    fn yolo_prefers_allow_always() {
+        let outcome = HostPolicy::Yolo
+            .select_permission_option(&tool_call(crate::acp::protocol::ToolKind::Execute), &options_all_four());
+        assert_eq!(outcome, PermissionOutcome::Selected { option_id: "aa".to_owned() });
+    }
 
+    #[test]
+    fn auto_prefers_allow_once_over_allow_always() {
+        let outcome = HostPolicy::Auto
+            .select_permission_option(&tool_call(crate::acp::protocol::ToolKind::Execute), &options_all_four());
+        assert_eq!(outcome, PermissionOutcome::Selected { option_id: "ao".to_owned() });
+    }
+
+    #[test]
+    fn read_only_allows_a_read_kind_tool_call() {
+        let outcome = HostPolicy::ReadOnly
+            .select_permission_option(&tool_call(crate::acp::protocol::ToolKind::Read), &options_all_four());
+        assert_eq!(outcome, PermissionOutcome::Selected { option_id: "ao".to_owned() });
+    }
+
+    #[test]
+    fn read_only_rejects_an_execute_kind_tool_call() {
+        let outcome = HostPolicy::ReadOnly
+            .select_permission_option(&tool_call(crate::acp::protocol::ToolKind::Execute), &options_all_four());
+        assert_eq!(outcome, PermissionOutcome::Selected { option_id: "ro".to_owned() });
+    }
+
+    #[test]
+    fn deny_always_rejects() {
+        let outcome = HostPolicy::Deny
+            .select_permission_option(&tool_call(crate::acp::protocol::ToolKind::Read), &options_all_four());
+        assert_eq!(outcome, PermissionOutcome::Selected { option_id: "ro".to_owned() });
+    }
+
+    #[test]
+    fn deny_cancels_when_the_agent_offers_only_allow_options() {
+        let options = vec![
+            PermissionOption { option_id: "ao".to_owned(), name: "Allow once".to_owned(), kind: PermissionOptionKind::AllowOnce },
+        ];
+        let outcome = HostPolicy::Deny
+            .select_permission_option(&tool_call(crate::acp::protocol::ToolKind::Execute), &options);
+        assert_eq!(outcome, PermissionOutcome::Cancelled);
+    }
+
+    #[test]
+    fn auto_falls_back_to_allow_always_when_agent_omits_allow_once() {
+        // Regression for "agent does not send all four kinds" — here it only
+        // offers allow_always and reject_once.
+        let options = vec![
+            PermissionOption { option_id: "aa".to_owned(), name: "Allow always".to_owned(), kind: PermissionOptionKind::AllowAlways },
+            PermissionOption { option_id: "ro".to_owned(), name: "Reject once".to_owned(), kind: PermissionOptionKind::RejectOnce },
+        ];
+        let outcome = HostPolicy::Auto
+            .select_permission_option(&tool_call(crate::acp::protocol::ToolKind::Execute), &options);
+        assert_eq!(outcome, PermissionOutcome::Selected { option_id: "aa".to_owned() });
+    }
+
+    // -----------------------------------------------------------------------
+    // Adapter dispatch
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn adapter_dispatches_fs_read_success() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("gate4agent_host_adapter_read.txt");
+        std::fs::write(&path, "adapter content").unwrap();
+
+        let result = adapter(HostPolicy::Auto)
+            .handle("fs/read_text_file", Some(json!({"path": path.to_string_lossy()})));
+        assert_eq!(result.unwrap()["content"], "adapter content");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn adapter_dispatches_fs_read_denied_under_deny() {
+        let result = adapter(HostPolicy::Deny)
+            .handle("fs/read_text_file", Some(json!({"path": "/etc/passwd"})));
+        assert_eq!(result.unwrap_err().code, RpcError::PERMISSION_DENIED);
+    }
+
+    #[test]
+    fn adapter_dispatches_permission_request() {
+        let result = adapter(HostPolicy::Yolo).handle(
+            "session/request_permission",
+            Some(json!({
+                "sessionId": "s1",
+                "toolCall": {"toolCallId": "tc1", "kind": "execute"},
+                "options": [
+                    {"optionId": "ao", "name": "Allow once", "kind": "allow_once"}
+                ]
+            })),
+        );
+        let value = result.unwrap();
+        assert_eq!(value["outcome"], "selected");
+        assert_eq!(value["optionId"], "ao");
+    }
+
+    #[test]
+    fn adapter_unknown_method_returns_method_not_found() {
+        let result = adapter(HostPolicy::Auto).handle("unknown/method", None);
+        assert_eq!(result.unwrap_err().code, RpcError::METHOD_NOT_FOUND);
+    }
+
+    #[test]
+    fn adapter_invalid_params_returns_invalid_params_error() {
+        // terminal/create requires a "command" field.
+        let result = adapter(HostPolicy::Auto).handle("terminal/create", Some(json!({})));
+        assert_eq!(result.unwrap_err().code, RpcError::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn adapter_terminal_lifecycle_end_to_end() {
+        let handler = adapter(HostPolicy::Auto);
         #[cfg(windows)]
-        let cmd = "echo hello";
+        let create_params = json!({"command": "cmd", "args": ["/C", "echo lifecycle"]});
         #[cfg(not(windows))]
-        let cmd = "echo hello";
+        let create_params = json!({"command": "sh", "args": ["-c", "echo lifecycle"]});
 
-        let result = h.terminal_write(&id, cmd);
-        assert!(result.is_ok(), "expected Ok, got {:?}", result);
-        let output = result.unwrap();
-        assert!(
-            output.contains("hello"),
-            "output should contain 'hello', got: {:?}",
-            output
-        );
+        let created = handler.handle("terminal/create", Some(create_params)).unwrap();
+        let terminal_id = created["terminalId"].as_str().unwrap().to_owned();
+
+        let waited = handler
+            .handle("terminal/wait_for_exit", Some(json!({"terminalId": terminal_id})))
+            .unwrap();
+        assert_eq!(waited["exitCode"], 0);
+
+        let output = handler
+            .handle("terminal/output", Some(json!({"terminalId": terminal_id})))
+            .unwrap();
+        assert!(output["output"].as_str().unwrap().contains("lifecycle"));
+
+        handler
+            .handle("terminal/release", Some(json!({"terminalId": terminal_id})))
+            .unwrap();
+
+        let after_release =
+            handler.handle("terminal/output", Some(json!({"terminalId": terminal_id})));
+        assert_eq!(after_release.unwrap_err().code, RpcError::NOT_FOUND);
     }
 
     #[test]
-    fn terminal_handler_write_unknown_terminal_errors() {
-        let h = TerminalAcpHandler::new(None);
-        let result = h.terminal_write("nonexistent-id", "echo hi");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("unknown terminal"));
-    }
-
-    // -----------------------------------------------------------------------
-    // Adapter dispatch tests for terminal/write
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn adapter_dispatches_terminal_write() {
-        let h = TerminalAcpHandler::new(None);
-        let id = h.terminal_create(None, None).expect("create should succeed");
-
-        let adapter = AcpHostAdapter(Arc::new(h));
-        let result = adapter.handle(
-            "terminal/write",
-            Some(json!({ "terminalId": id, "input": "echo adapter_test" })),
-        );
-        assert!(result.is_ok(), "expected Ok from adapter, got {:?}", result);
-        let val = result.unwrap();
-        let output = val["output"].as_str().unwrap_or("");
-        assert!(
-            output.contains("adapter_test"),
-            "output should contain 'adapter_test', got: {:?}",
-            output
-        );
-    }
-
-    #[test]
-    fn adapter_terminal_write_unknown_id_returns_unsupported_error() {
-        let h = TerminalAcpHandler::new(None);
-        let adapter = AcpHostAdapter(Arc::new(h));
-        let result = adapter.handle(
-            "terminal/write",
-            Some(json!({ "terminalId": "bad-id", "input": "echo hi" })),
-        );
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, RpcError::UNSUPPORTED);
-    }
-
-    #[test]
-    fn default_handler_denies_terminal_write() {
-        let h = DefaultAcpHandler;
-        let result = h.terminal_write("term-123", "echo hi");
-        assert!(result.is_err());
+    fn adapter_terminal_create_denied_under_read_only() {
+        let result = adapter(HostPolicy::ReadOnly)
+            .handle("terminal/create", Some(json!({"command": "echo", "args": []})));
+        assert_eq!(result.unwrap_err().code, RpcError::PERMISSION_DENIED);
     }
 }

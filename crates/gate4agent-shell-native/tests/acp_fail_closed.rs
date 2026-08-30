@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use gate4agent::acp::{AcpSession, AcpSessionOptions};
+use gate4agent::acp::{AcpSession, AcpSessionOptions, HostPolicy};
 use gate4agent::{AgentEvent, CliTool};
 use gate4agent_testkit::acp_agent_spec;
 
@@ -18,6 +18,10 @@ async fn acp_session_handshake_and_host_callbacks_are_fail_closed() {
     let options = AcpSessionOptions {
         handshake_timeout: Duration::from_secs(10),
         prompt_timeout: Duration::from_secs(10),
+        // `AcpSessionOptions::default()` is `HostPolicy::Auto` -- this test's
+        // whole point is proving `Deny` fidelity, so it must ask for `Deny`
+        // explicitly rather than relying on the default.
+        host_policy: HostPolicy::Deny,
         ..AcpSessionOptions::default()
     };
     let session = AcpSession::spawn_with_launch(
@@ -35,17 +39,20 @@ async fn acp_session_handshake_and_host_callbacks_are_fail_closed() {
         .await
         .expect("fixture accepted every denial");
 
-    let mut callback_methods = Vec::new();
+    let mut callbacks = Vec::new();
     let mut received_text = false;
     while let Ok(event) = events.try_recv() {
         match event {
-            AgentEvent::RpcIncomingRequest { method, .. } => callback_methods.push(method),
+            AgentEvent::RpcIncomingRequest { method, granted, .. } => {
+                callbacks.push((method, granted));
+            }
             AgentEvent::Text { text, .. } if text == "fixture-acp-response" => {
                 received_text = true;
             }
             _ => {}
         }
     }
+    let callback_methods: Vec<_> = callbacks.iter().map(|(method, _)| method.clone()).collect();
     assert_eq!(
         callback_methods,
         [
@@ -53,6 +60,10 @@ async fn acp_session_handshake_and_host_callbacks_are_fail_closed() {
             "terminal/create",
             "session/request_permission",
         ]
+    );
+    assert!(
+        callbacks.iter().all(|(_, granted)| !granted),
+        "every callback under HostPolicy::Deny must be denied: {callbacks:?}"
     );
     assert!(
         received_text,

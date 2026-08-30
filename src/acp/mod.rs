@@ -35,5 +35,7 @@ pub mod protocol;
 pub mod session;
 pub(crate) mod reader;
 pub(crate) mod spawn;
+mod terminal;
 
+pub use host::HostPolicy;
 pub use session::{AcpError, AcpSession, AcpSessionOptions};

@@ -394,14 +394,8 @@ function Write-JsonLine($value) {
 }
 
 $initialize = [Console]::ReadLine() | ConvertFrom-Json
-$fsCapabilities = $initialize.params.clientCapabilities.fs
-$initializeOk = ($initialize.method -eq 'initialize') -and
-    ($fsCapabilities.PSObject.Properties.Name -contains 'readTextFile') -and
-    ($fsCapabilities.readTextFile -eq $false) -and
-    ($initialize.params.clientCapabilities.PSObject.Properties.Name -contains 'terminal') -and
-    ($initialize.params.clientCapabilities.terminal -eq $false)
-if (-not $initializeOk) {
-    Write-JsonLine @{jsonrpc='2.0';id=$initialize.id;error=@{code=-32003;message='fixture expected fail-closed client capabilities'}}
+if ($initialize.method -ne 'initialize') {
+    Write-JsonLine @{jsonrpc='2.0';id=$initialize.id;error=@{code=-32003;message='fixture expected initialize first'}}
     exit 41
 }
 Write-JsonLine @{jsonrpc='2.0';id=$initialize.id;result=@{protocolVersion=1;agentCapabilities=@{loadSession=$false};agentInfo=@{name='fixture';title='Fixture ACP';version='1'}}}
@@ -422,24 +416,30 @@ while ($true) {
     $request = $line | ConvertFrom-Json
     if ($request.method -ne 'session/prompt') { continue }
 
-    Write-JsonLine @{jsonrpc='2.0';id=9101;method='fs/read_text_file';params=@{path='fixture-forbidden.txt'}}
-    $fsResponse = [Console]::ReadLine() | ConvertFrom-Json
-    Write-JsonLine @{jsonrpc='2.0';id=9102;method='terminal/create';params=@{cwd='.';env=@{}}}
-    $terminalResponse = [Console]::ReadLine() | ConvertFrom-Json
-    Write-JsonLine @{jsonrpc='2.0';id=9103;method='session/request_permission';params=@{toolName='fixture-tool';description='fixture permission';sessionId='fixture-acp-session'}}
-    $permissionResponse = [Console]::ReadLine() | ConvertFrom-Json
+    # Real ACP wire shapes throughout -- the host's own HostPolicy decides
+    # whether each of these is granted or denied; this fixture does not
+    # gate on the outcome (see gate4agent-shell-native's acp_fail_closed
+    # test, which asserts `granted` from the host's own broadcast instead).
+    Write-JsonLine @{jsonrpc='2.0';id=9101;method='fs/read_text_file';params=@{sessionId='fixture-acp-session';path='fixture-forbidden.txt'}}
+    $null = [Console]::ReadLine()
 
-    $callbacksDenied = ($fsResponse.id -eq 9101) -and
-        ($fsResponse.error.code -eq -32002) -and
-        ($terminalResponse.id -eq 9102) -and
-        ($terminalResponse.error.code -eq -32004) -and
-        ($permissionResponse.id -eq 9103) -and
-        ($null -eq $permissionResponse.error) -and
-        ($permissionResponse.result.allowed -eq $false)
-    if (-not $callbacksDenied) {
-        Write-JsonLine @{jsonrpc='2.0';id=$request.id;error=@{code=-32003;message='fixture observed ACP host authority'}}
-        continue
+    Write-JsonLine @{jsonrpc='2.0';id=9102;method='terminal/create';params=@{sessionId='fixture-acp-session';command='cmd';args=@('/C','exit','0')}}
+    $terminalResponse = [Console]::ReadLine() | ConvertFrom-Json
+    if ($null -eq $terminalResponse.error) {
+        Write-JsonLine @{jsonrpc='2.0';id=9103;method='terminal/release';params=@{sessionId='fixture-acp-session';terminalId=$terminalResponse.result.terminalId}}
+        $null = [Console]::ReadLine()
     }
+
+    Write-JsonLine @{jsonrpc='2.0';id=9104;method='session/request_permission';params=@{
+        sessionId='fixture-acp-session'
+        toolCall=@{toolCallId='fixture-tool-call';title='fixture permission';kind='execute';locations=@()}
+        options=@(
+            @{optionId='allow-once';name='Allow once';kind='allow_once'}
+            @{optionId='allow-always';name='Allow always';kind='allow_always'}
+            @{optionId='reject-once';name='Reject once';kind='reject_once'}
+        )
+    }}
+    $null = [Console]::ReadLine()
 
     Write-JsonLine @{jsonrpc='2.0';method='session/update';params=@{sessionId='fixture-acp-session';update=@{sessionUpdate='agent_message_chunk';content=@{type='text';text='fixture-acp-response'}}}}
     Write-JsonLine @{jsonrpc='2.0';id=$request.id;result=@{stopReason='end_turn';inputTokens=7;outputTokens=11}}
@@ -457,10 +457,8 @@ def fail(request,message,code):
  sys.exit(code)
 
 initialize=read_message()
-client=initialize.get('params',{}).get('clientCapabilities',{})
-fs=client.get('fs',{})
-if initialize.get('method')!='initialize' or fs.get('readTextFile') is not False or client.get('terminal') is not False:
- fail(initialize,'fixture expected fail-closed client capabilities',41)
+if initialize.get('method')!='initialize':
+ fail(initialize,'fixture expected initialize first',41)
 write_message({'jsonrpc':'2.0','id':initialize.get('id'),'result':{'protocolVersion':1,'agentCapabilities':{'loadSession':False},'agentInfo':{'name':'fixture','title':'Fixture ACP','version':'1'}}})
 
 new_session=read_message()
@@ -472,16 +470,32 @@ write_message({'jsonrpc':'2.0','id':new_session.get('id'),'result':{'sessionId':
 while True:
  request=read_message()
  if request.get('method')!='session/prompt': continue
- write_message({'jsonrpc':'2.0','id':9101,'method':'fs/read_text_file','params':{'path':'fixture-forbidden.txt'}})
- fs_response=read_message()
- write_message({'jsonrpc':'2.0','id':9102,'method':'terminal/create','params':{'cwd':'.','env':{}}})
+
+ # Real ACP wire shapes throughout -- the host's own HostPolicy decides
+ # whether each of these is granted or denied; this fixture does not gate
+ # on the outcome (see gate4agent-shell-native's acp_fail_closed test,
+ # which asserts `granted` from the host's own broadcast instead).
+ write_message({'jsonrpc':'2.0','id':9101,'method':'fs/read_text_file','params':{'sessionId':'fixture-acp-session','path':'fixture-forbidden.txt'}})
+ read_message()
+
+ write_message({'jsonrpc':'2.0','id':9102,'method':'terminal/create','params':{'sessionId':'fixture-acp-session','command':'true','args':[]}})
  terminal_response=read_message()
- write_message({'jsonrpc':'2.0','id':9103,'method':'session/request_permission','params':{'toolName':'fixture-tool','description':'fixture permission','sessionId':'fixture-acp-session'}})
- permission_response=read_message()
- callbacks_denied=(fs_response.get('id')==9101 and fs_response.get('error',{}).get('code')==-32002 and terminal_response.get('id')==9102 and terminal_response.get('error',{}).get('code')==-32004 and permission_response.get('id')==9103 and permission_response.get('error') is None and permission_response.get('result',{}).get('allowed') is False)
- if not callbacks_denied:
-  write_message({'jsonrpc':'2.0','id':request.get('id'),'error':{'code':-32003,'message':'fixture observed ACP host authority'}})
-  continue
+ if terminal_response.get('error') is None:
+  terminal_id=terminal_response.get('result',{}).get('terminalId')
+  write_message({'jsonrpc':'2.0','id':9103,'method':'terminal/release','params':{'sessionId':'fixture-acp-session','terminalId':terminal_id}})
+  read_message()
+
+ write_message({'jsonrpc':'2.0','id':9104,'method':'session/request_permission','params':{
+     'sessionId':'fixture-acp-session',
+     'toolCall':{'toolCallId':'fixture-tool-call','title':'fixture permission','kind':'execute','locations':[]},
+     'options':[
+         {'optionId':'allow-once','name':'Allow once','kind':'allow_once'},
+         {'optionId':'allow-always','name':'Allow always','kind':'allow_always'},
+         {'optionId':'reject-once','name':'Reject once','kind':'reject_once'},
+     ],
+ }})
+ read_message()
+
  write_message({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':'fixture-acp-session','update':{'sessionUpdate':'agent_message_chunk','content':{'type':'text','text':'fixture-acp-response'}}}})
  write_message({'jsonrpc':'2.0','id':request.get('id'),'result':{'stopReason':'end_turn','inputTokens':7,'outputTokens':11}})"#;
     #[cfg(windows)]

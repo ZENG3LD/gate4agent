@@ -193,36 +193,189 @@ pub enum SessionUpdate {
 }
 
 /// `fs/read_text_file` request params (agent → host).
+///
+/// `line` (1-based) and `limit` restrict the read to a line window, matching
+/// the ACP spec's optional partial-read fields; both default to "whole
+/// file" when absent, which is what every agent that predates this feature
+/// sends.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FsReadParams {
     pub path: String,
+    #[serde(rename = "sessionId", default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub line: Option<u32>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+/// `fs/write_text_file` request params (agent → host).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FsWriteParams {
+    pub path: String,
+    #[serde(rename = "sessionId", default)]
+    pub session_id: String,
+    pub content: String,
+}
+
+/// A `name`/`value` environment variable entry, as the ACP wire form for
+/// `terminal/create`'s `env` uses (an array of pairs, not a JSON object).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnvVariable {
+    pub name: String,
+    pub value: String,
 }
 
 /// `terminal/create` request params (agent → host).
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TerminalCreateParams {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cwd: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub env: Option<std::collections::HashMap<String, String>>,
-}
-
-/// `session/request_permission` request params (agent → host).
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PermissionRequestParams {
-    #[serde(rename = "toolName")]
-    pub tool_name: String,
-    pub description: String,
-    #[serde(rename = "sessionId")]
+    #[serde(rename = "sessionId", default)]
     pub session_id: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: Vec<EnvVariable>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(rename = "outputByteLimit", default)]
+    pub output_byte_limit: Option<u64>,
 }
 
-/// `terminal/write` request params (agent → host).
+/// Shared `{sessionId, terminalId}` params for `terminal/output`,
+/// `terminal/wait_for_exit`, `terminal/kill`, and `terminal/release`.
 #[derive(Debug, Serialize, Deserialize)]
-pub struct TerminalWriteParams {
-    #[serde(rename = "terminalId")]
+pub struct TerminalIdParams {
+    #[serde(rename = "sessionId", default)]
+    pub session_id: String,
+    #[serde(rename = "terminalId", default)]
     pub terminal_id: String,
-    pub input: String,
+}
+
+/// A terminal's exit condition — result of `terminal/wait_for_exit`, and
+/// carried inside `terminal/output`'s result once the command has finished.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TerminalExitStatus {
+    #[serde(rename = "exitCode", default)]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub signal: Option<String>,
+}
+
+/// `terminal/output` result (host → agent).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminalOutputResult {
+    pub output: String,
+    pub truncated: bool,
+    #[serde(rename = "exitStatus", default, skip_serializing_if = "Option::is_none")]
+    pub exit_status: Option<TerminalExitStatus>,
+}
+
+/// The kind of operation a tool call performs, carried on
+/// [`PermissionToolCall::kind`] so a host policy can decide by intent (e.g.
+/// "read" is safe to auto-allow, "execute" is not) without inspecting
+/// vendor-specific tool names. `Other` is both the literal wire value for
+/// "none of the above" AND the fallback for any kind string a future ACP
+/// revision adds that this build does not know yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolKind {
+    Read,
+    Edit,
+    Delete,
+    Move,
+    Search,
+    Execute,
+    Think,
+    Fetch,
+    #[serde(other)]
+    #[default]
+    Other,
+}
+
+impl ToolKind {
+    /// Whether this kind only observes state rather than changing it or
+    /// running arbitrary code — the set a `ReadOnly` host policy auto-allows.
+    pub(crate) fn is_read_only(self) -> bool {
+        matches!(self, ToolKind::Read | ToolKind::Search | ToolKind::Think | ToolKind::Fetch)
+    }
+}
+
+/// A file-system location a tool call touches, as carried on
+/// [`PermissionToolCall::locations`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallLocation {
+    pub path: String,
+    #[serde(default)]
+    pub line: Option<u32>,
+}
+
+/// The tool-call summary embedded in a `session/request_permission` request
+/// — just enough for a host policy to decide, not the full `session/update`
+/// tool-call shape. Every field defaults so an agent that omits some of
+/// them (or all of them) still parses.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PermissionToolCall {
+    #[serde(rename = "toolCallId", default)]
+    pub tool_call_id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub kind: ToolKind,
+    #[serde(default)]
+    pub locations: Vec<ToolCallLocation>,
+}
+
+/// The four option kinds the ACP spec defines for
+/// [`PermissionOption::kind`]. An agent is not required to offer all four —
+/// see [`PermissionRequestParams`] and the host policy that selects among
+/// whichever subset arrives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionOptionKind {
+    AllowOnce,
+    AllowAlways,
+    RejectOnce,
+    RejectAlways,
+}
+
+/// One option the agent is offering the host for a `session/request_
+/// permission` call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermissionOption {
+    #[serde(rename = "optionId")]
+    pub option_id: String,
+    pub name: String,
+    pub kind: PermissionOptionKind,
+}
+
+/// `session/request_permission` request params (agent → host) — the real
+/// ACP shape: a `toolCall` summary of what is being asked for, and the
+/// concrete `options` the agent is willing to accept a decision from. There
+/// is no bare `allowed: bool` on the wire; the host must pick one of
+/// `options` (or decline to pick any of them).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermissionRequestParams {
+    #[serde(rename = "sessionId", default)]
+    pub session_id: String,
+    #[serde(rename = "toolCall", default)]
+    pub tool_call: PermissionToolCall,
+    #[serde(default)]
+    pub options: Vec<PermissionOption>,
+}
+
+/// `session/request_permission` result (host → agent) — the host either
+/// selects one of the request's `options` by ID, or cancels without
+/// selecting any of them (used e.g. when none of the offered options match
+/// the host's policy).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum PermissionOutcome {
+    Selected {
+        #[serde(rename = "optionId")]
+        option_id: String,
+    },
+    Cancelled,
 }
 
 // ---------------------------------------------------------------------------
@@ -709,5 +862,151 @@ mod tests {
             }
             McpServerConfig::Sse { .. } => panic!("expected Stdio variant"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // session/request_permission — protocol-accurate shape
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn permission_request_params_parses_the_real_wire_shape() {
+        let raw = r#"{
+            "sessionId": "s1",
+            "toolCall": {
+                "toolCallId": "tc1",
+                "title": "Edit config.toml",
+                "kind": "edit",
+                "locations": [{"path": "/repo/config.toml", "line": 12}]
+            },
+            "options": [
+                {"optionId": "allow-once", "name": "Allow once", "kind": "allow_once"},
+                {"optionId": "reject-once", "name": "Reject once", "kind": "reject_once"}
+            ]
+        }"#;
+        let params: PermissionRequestParams = serde_json::from_str(raw).unwrap();
+        assert_eq!(params.session_id, "s1");
+        assert_eq!(params.tool_call.tool_call_id, "tc1");
+        assert_eq!(params.tool_call.kind, ToolKind::Edit);
+        assert_eq!(params.tool_call.locations.len(), 1);
+        assert_eq!(params.tool_call.locations[0].path, "/repo/config.toml");
+        assert_eq!(params.tool_call.locations[0].line, Some(12));
+        assert_eq!(params.options.len(), 2);
+        assert_eq!(params.options[0].kind, PermissionOptionKind::AllowOnce);
+        assert_eq!(params.options[1].kind, PermissionOptionKind::RejectOnce);
+    }
+
+    #[test]
+    fn permission_request_params_survives_an_agent_missing_reject_always() {
+        // Some agents only ever offer allow_once/allow_always/reject_once —
+        // no reject_always. The parser must not require all four kinds.
+        let raw = r#"{
+            "sessionId": "s1",
+            "toolCall": {"toolCallId": "tc1", "kind": "execute"},
+            "options": [
+                {"optionId": "a1", "name": "Allow once", "kind": "allow_once"},
+                {"optionId": "a2", "name": "Allow always", "kind": "allow_always"},
+                {"optionId": "r1", "name": "Reject once", "kind": "reject_once"}
+            ]
+        }"#;
+        let params: PermissionRequestParams = serde_json::from_str(raw).unwrap();
+        assert_eq!(params.options.len(), 3);
+        assert!(params
+            .options
+            .iter()
+            .all(|option| option.kind != PermissionOptionKind::RejectAlways));
+    }
+
+    #[test]
+    fn permission_request_params_tolerates_a_missing_tool_call_and_options() {
+        // Defensive parsing: an agent that sends only sessionId still parses,
+        // it just carries no usable tool-call detail or options.
+        let raw = r#"{"sessionId": "s1"}"#;
+        let params: PermissionRequestParams = serde_json::from_str(raw).unwrap();
+        assert_eq!(params.tool_call.kind, ToolKind::Other);
+        assert!(params.options.is_empty());
+    }
+
+    #[test]
+    fn tool_kind_unknown_string_falls_back_to_other() {
+        let raw = r#"{"toolCallId": "tc1", "kind": "not-a-real-kind"}"#;
+        let tool_call: PermissionToolCall = serde_json::from_str(raw).unwrap();
+        assert_eq!(tool_call.kind, ToolKind::Other);
+    }
+
+    #[test]
+    fn tool_kind_serializes_the_nine_canonical_wire_values() {
+        let cases = [
+            (ToolKind::Read, "\"read\""),
+            (ToolKind::Edit, "\"edit\""),
+            (ToolKind::Delete, "\"delete\""),
+            (ToolKind::Move, "\"move\""),
+            (ToolKind::Search, "\"search\""),
+            (ToolKind::Execute, "\"execute\""),
+            (ToolKind::Think, "\"think\""),
+            (ToolKind::Fetch, "\"fetch\""),
+            (ToolKind::Other, "\"other\""),
+        ];
+        for (kind, expected) in cases {
+            assert_eq!(serde_json::to_string(&kind).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn permission_outcome_selected_serializes_with_option_id() {
+        let outcome = PermissionOutcome::Selected { option_id: "allow-once".to_owned() };
+        let s = serde_json::to_string(&outcome).unwrap();
+        assert!(s.contains(r#""outcome":"selected""#));
+        assert!(s.contains(r#""optionId":"allow-once""#));
+    }
+
+    #[test]
+    fn permission_outcome_cancelled_serializes_without_an_option_id() {
+        let outcome = PermissionOutcome::Cancelled;
+        let s = serde_json::to_string(&outcome).unwrap();
+        assert_eq!(s, r#"{"outcome":"cancelled"}"#);
+    }
+
+    // -----------------------------------------------------------------------
+    // terminal/* — protocol-accurate shapes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn terminal_create_params_parses_command_args_and_env_array() {
+        let raw = r#"{
+            "sessionId": "s1",
+            "command": "pytest",
+            "args": ["-x"],
+            "env": [{"name": "CI", "value": "1"}],
+            "cwd": "/repo",
+            "outputByteLimit": 4096
+        }"#;
+        let params: TerminalCreateParams = serde_json::from_str(raw).unwrap();
+        assert_eq!(params.command, "pytest");
+        assert_eq!(params.args, vec!["-x"]);
+        assert_eq!(params.env.len(), 1);
+        assert_eq!(params.env[0].name, "CI");
+        assert_eq!(params.env[0].value, "1");
+        assert_eq!(params.cwd.as_deref(), Some("/repo"));
+        assert_eq!(params.output_byte_limit, Some(4096));
+    }
+
+    #[test]
+    fn terminal_id_params_round_trip() {
+        let params = TerminalIdParams {
+            session_id: "s1".to_owned(),
+            terminal_id: "term-1".to_owned(),
+        };
+        let s = serde_json::to_string(&params).unwrap();
+        assert!(s.contains("\"terminalId\":\"term-1\""));
+        let decoded: TerminalIdParams = serde_json::from_str(&s).unwrap();
+        assert_eq!(decoded.terminal_id, "term-1");
+    }
+
+    #[test]
+    fn fs_write_params_parses_content() {
+        let raw = r#"{"sessionId": "s1", "path": "/tmp/x.txt", "content": "hello"}"#;
+        let params: FsWriteParams = serde_json::from_str(raw).unwrap();
+        assert_eq!(params.path, "/tmp/x.txt");
+        assert_eq!(params.content, "hello");
     }
 }

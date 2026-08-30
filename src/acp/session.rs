@@ -25,11 +25,11 @@ use crate::rpc::id::IdGen;
 use crate::rpc::message::{RpcNotification, RpcRequest};
 use crate::rpc::pending::PendingRequests;
 
-use super::host::{AcpHostAdapter, DefaultAcpHandler};
+use super::host::{AcpHostAdapter, HostPolicy, PolicyHostHandler};
 use super::protocol::{
-    extract_token_usage, AgentCapabilities, ClientCapabilities, ClientInfo, ContentBlock,
-    FsCapabilities, InitializeParams, SessionCancelParams, SessionLoadParams,
-    SessionLoadResult, SessionNewParams, SessionPromptParams,
+    extract_token_usage, AgentCapabilities, ClientInfo, ContentBlock, InitializeParams,
+    SessionCancelParams, SessionLoadParams, SessionLoadResult, SessionNewParams,
+    SessionPromptParams,
 };
 use super::reader::acp_reader_loop;
 use super::spawn::AcpProcess;
@@ -104,6 +104,15 @@ pub struct AcpSessionOptions {
 
     /// Timeout for `session/prompt` calls. Default: 120 s.
     pub prompt_timeout: Duration,
+
+    /// The host authority mode for this session — governs both the
+    /// `clientCapabilities` declared at `initialize` and how `session/
+    /// request_permission` is answered. Default: [`HostPolicy::Auto`].
+    /// Set this to bound a child agent's authority (e.g. a parent agent
+    /// spawning a subordinate one under [`HostPolicy::ReadOnly`] or
+    /// [`HostPolicy::Deny`]), not to route decisions to a human operator —
+    /// every mode resolves permission requests on its own.
+    pub host_policy: HostPolicy,
 }
 
 impl Default for AcpSessionOptions {
@@ -112,6 +121,7 @@ impl Default for AcpSessionOptions {
             channel_capacity: 256,
             handshake_timeout: Duration::from_secs(30),
             prompt_timeout: Duration::from_secs(120),
+            host_policy: HostPolicy::default(),
         }
     }
 }
@@ -194,10 +204,12 @@ impl AcpSession {
 
         let process = Arc::new(Mutex::new(proc));
 
-        // ACP host authority remains fail-closed until requests flow through
-        // the canonical control-plane authority path.
-        let handler: Arc<dyn crate::rpc::handler::HostHandler> =
-            Arc::new(AcpHostAdapter(Arc::new(DefaultAcpHandler)));
+        // ACP host authority is `options.host_policy` -- it governs both the
+        // `clientCapabilities` declared below and how `session/request_
+        // permission` gets answered, so the two can never drift apart.
+        let handler: Arc<dyn crate::rpc::handler::HostHandler> = Arc::new(AcpHostAdapter(Arc::new(
+            PolicyHostHandler::new(options.host_policy, working_dir.to_path_buf()),
+        )));
 
         let pending = PendingRequests::new();
         let id_gen = Arc::new(IdGen::new());
@@ -229,13 +241,7 @@ impl AcpSession {
         // --- Handshake step 1: initialize (id=0 per ACP convention) ---
         let init_params = InitializeParams {
             protocol_version: 1,
-            client_capabilities: ClientCapabilities {
-                fs: FsCapabilities {
-                    read_text_file: false,
-                    write_text_file: false,
-                },
-                terminal: false,
-            },
+            client_capabilities: options.host_policy.client_capabilities(),
             client_info: ClientInfo {
                 name: "gate4agent",
                 title: Some("Gate4Agent"),
@@ -671,5 +677,6 @@ mod tests {
         assert_eq!(opts.channel_capacity, 256);
         assert_eq!(opts.handshake_timeout, Duration::from_secs(30));
         assert_eq!(opts.prompt_timeout, Duration::from_secs(120));
+        assert_eq!(opts.host_policy, HostPolicy::Auto);
     }
 }

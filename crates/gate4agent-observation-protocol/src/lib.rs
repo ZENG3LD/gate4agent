@@ -168,11 +168,12 @@ pub enum ObservationKindV1 {
     },
     RateLimited,
     /// The agent asked the ACP host for something (`session/request_
-    /// permission`, `fs/read_text_file`, `terminal/create`, `terminal/
-    /// write`) and the host's policy decided on it. `class` is a coarse
-    /// bucket of the ACP method requested -- the same scale as `ToolStarted
-    /// ::class` -- never the raw request parameters: what path was read or
-    /// what command ran is never carried on this wire.
+    /// permission`, `fs/read_text_file`, `fs/write_text_file`, `terminal/
+    /// create`, `terminal/output`, `terminal/wait_for_exit`, `terminal/
+    /// kill`, `terminal/release`) and the host's policy decided on it.
+    /// `class` is a coarse bucket of the ACP method requested -- the same
+    /// scale as `ToolStarted::class` -- never the raw request parameters:
+    /// what path was read or what command ran is never carried on this wire.
     HostRequestObserved {
         class: String,
         granted: bool,

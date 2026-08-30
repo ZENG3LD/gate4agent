@@ -41,7 +41,7 @@ pub mod history;
 pub mod manager;
 pub mod daemon;
 
-pub use acp::{AcpError, AcpSession, AcpSessionOptions};
+pub use acp::{AcpError, AcpSession, AcpSessionOptions, HostPolicy};
 pub use rpc::{
     HostHandler, RejectAllHandler, MethodRouter,
     RpcId, RpcRequest, RpcResponse, RpcError, RpcNotification,

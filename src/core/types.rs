@@ -233,13 +233,16 @@ pub enum AgentEvent {
     /// `granted` is the host's decision on the request, read off the same
     /// `Result<Value, RpcError>` the reader loop already computed by calling
     /// the handler -- `Err(_)` (e.g. `fs/read_text_file`'s or `terminal/
-    /// create`'s `PERMISSION_DENIED`/`UNSUPPORTED` refusal) means denied;
-    /// `Ok(value)` means granted, UNLESS `value` carries an `"allowed"` key
-    /// (the shape `session/request_permission` responds with even when
-    /// declining, since ACP models a declined permission as a normal
-    /// response, not an RPC error), in which case that key is the answer.
-    /// This does not change what the host does -- it only lets a subscriber
-    /// see the request and the decision the host already made.
+    /// create`'s `PERMISSION_DENIED` refusal) means denied; `Ok(value)`
+    /// means granted, UNLESS `method` is `session/request_permission`, in
+    /// which case granted is recovered by cross-referencing the selected
+    /// `optionId` in `value`'s `outcome` against the original request's
+    /// `options` list (a `Cancelled` outcome, or a `selected` outcome that
+    /// picked a `reject_once`/`reject_always` option, is not a grant even
+    /// though the RPC call itself succeeded -- ACP models a decline as a
+    /// normal response, not an RPC error). This does not change what the
+    /// host does -- it only lets a subscriber see the request and the
+    /// decision the host already made.
     RpcIncomingRequest {
         id: crate::rpc::message::RpcId,
         method: String,

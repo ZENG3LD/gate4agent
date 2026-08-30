@@ -25,7 +25,9 @@ use crate::rpc::handler::HostHandler;
 use crate::rpc::message::{classify_line, IncomingMessage, RpcError, RpcResponse};
 use crate::rpc::pending::PendingRequests;
 
-use super::protocol::{update_to_event, SessionUpdateParams};
+use super::protocol::{
+    update_to_event, PermissionOptionKind, PermissionRequestParams, SessionUpdateParams,
+};
 use super::spawn::AcpProcess;
 
 /// Reader loop for ACP transport — runs on a `spawn_blocking` thread.
@@ -119,7 +121,7 @@ pub(crate) fn acp_reader_loop(
                 // not block for long). Do NOT hold `process` mutex during this
                 // call to avoid deadlock with `write_line`.
                 let result = handler.handle(&method, params.clone());
-                let granted = request_granted(&result);
+                let granted = request_granted(&method, params.as_ref(), &result);
 
                 let response = match result {
                     Ok(val) => RpcResponse::success(id.clone(), val),
@@ -214,14 +216,45 @@ fn write_line_to_process(process: &Arc<Mutex<AcpProcess>>, line: &str) {
 /// Read the host's actual decision off the same `Result` the reader loop
 /// already computed by calling `HostHandler::handle` -- see
 /// `AgentEvent::RpcIncomingRequest::granted` for the full rationale.
-fn request_granted(result: &Result<Value, RpcError>) -> bool {
-    match result {
-        Err(_) => false,
-        Ok(value) => value
-            .get("allowed")
-            .and_then(Value::as_bool)
-            .unwrap_or(true),
+///
+/// For every method except `session/request_permission`, `Err` means
+/// denied and `Ok` means granted (the whole story: `fs/read_text_file` and
+/// `terminal/create` model "no" as an RPC error). `session/request_
+/// permission` is different -- ACP models a decline as a normal `outcome`
+/// response, not an RPC error, and the host may have deliberately selected
+/// a `reject_once`/`reject_always` option rather than declining to answer
+/// at all (`Cancelled`). So for that one method, `granted` is recovered by
+/// looking the chosen `optionId` back up in the ORIGINAL request's
+/// `options` list (still available here as `params`) and reading its
+/// `kind` -- an `outcome` of `selected` alone does not mean granted, since
+/// a `Deny` policy answers by selecting a reject-kind option, not by
+/// erroring.
+fn request_granted(method: &str, params: Option<&Value>, result: &Result<Value, RpcError>) -> bool {
+    let Ok(outcome) = result else { return false };
+    if method != "session/request_permission" {
+        return true;
     }
+    permission_outcome_is_granted(params, outcome)
+}
+
+/// See [`request_granted`]. Cross-references the selected `optionId` (if
+/// any) against the original request's `options` to recover whether the
+/// selection was an allow-kind or reject-kind option.
+fn permission_outcome_is_granted(params: Option<&Value>, outcome: &Value) -> bool {
+    let Some(option_id) = outcome.get("optionId").and_then(Value::as_str) else {
+        return false; // Cancelled, or a malformed outcome -- never granted.
+    };
+    let Some(params) = params else { return false };
+    let Ok(request) = serde_json::from_value::<PermissionRequestParams>(params.clone()) else {
+        return false;
+    };
+    request
+        .options
+        .iter()
+        .find(|option| option.option_id == option_id)
+        .is_some_and(|option| {
+            matches!(option.kind, PermissionOptionKind::AllowOnce | PermissionOptionKind::AllowAlways)
+        })
 }
 
 /// Collect the child process exit code. Falls back to 0 on any error.

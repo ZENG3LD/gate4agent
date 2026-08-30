@@ -1759,13 +1759,14 @@ mod tests {
         assert_eq!(label.as_deref(), Some("crash-loop"));
     }
 
-    /// `Unknown` half of the `ScreenNotReady` refusal: no label to carry
-    /// (nothing has been observed yet), but the refusal itself must still
-    /// fire -- `PtyScreenState::admits_blind_write`'s own doc comment is
-    /// explicit that `Unknown` must be treated exactly like `NotAgent` by a
-    /// blind writer, never optimistically.
+    /// `Unknown` is ADMITTED, not refused. It means the matcher recognized
+    /// nothing on this screen -- not that an obstacle is suspected -- and
+    /// every provider passes through it for the frame or two before process
+    /// identity resolves. Refusing on it would make ignorance
+    /// indistinguishable from a finding; the three states that DO carry a
+    /// finding are covered by the tests above.
     #[test]
-    fn write_pty_refuses_an_unknown_screen_with_no_label() {
+    fn write_pty_admits_an_unrecognized_screen() {
         let mut app = pty_pane_app_with_screen_state(
             true,
             Some(NodeIncarnationId::from_bytes([9; 16])),
@@ -1780,15 +1781,11 @@ mod tests {
             reply: reply_tx,
         };
         let action = apply(&mut app, &TerminalWatermarks::default(), command);
-        assert_eq!(action, AppAction::None);
-        let ControlReplyV1::Error { error } = reply_rx.try_recv().unwrap() else {
-            panic!("expected an Error reply naming why the write was refused");
-        };
-        let ControlErrorV1::ScreenNotReady { state_kind, label } = error else {
-            panic!("expected ScreenNotReady");
-        };
-        assert_eq!(state_kind, "unknown");
-        assert_eq!(label, None);
+        assert_ne!(action, AppAction::None);
+        assert!(
+            !matches!(reply_rx.try_recv().unwrap(), ControlReplyV1::Error { .. }),
+            "an unrecognized screen must not be refused",
+        );
     }
 
     /// Pins the ordering [`write_pty`]'s own doc comment promises: the

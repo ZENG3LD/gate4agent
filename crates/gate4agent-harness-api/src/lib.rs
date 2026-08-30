@@ -4005,12 +4005,15 @@ pub enum PtyScreenStateV1 {
 }
 
 impl PtyScreenStateV1 {
-    /// True only for `Ready` -- mirrors
-    /// `gate4agent_types::PtyScreenState::admits_blind_write`, so a wire
-    /// consumer has the same single predicate and no call site open-codes
-    /// `matches!(.., Ready)` and gets `Unknown` wrong.
+    /// Refuses only the three states that carry a finding -- mirrors
+    /// `gate4agent_types::PtyScreenState::admits_blind_write` exactly, so a
+    /// wire consumer gets the same answer as the node and no call site
+    /// open-codes its own reading. See that method for why `Unknown` admits.
     pub fn admits_blind_write(&self) -> bool {
-        matches!(self, Self::Ready)
+        !matches!(
+            self,
+            Self::OperatorGate { .. } | Self::NotAgent { .. } | Self::Failing { .. }
+        )
     }
 
     fn validate(&self) -> Result<(), HarnessOperatorApiError> {

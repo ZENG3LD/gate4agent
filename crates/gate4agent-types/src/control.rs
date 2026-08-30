@@ -664,11 +664,30 @@ pub enum PtyScreenState {
 }
 
 impl PtyScreenState {
-    /// True only for `Ready`. The one predicate a blind/automated writer
-    /// should consult; written as a method so no call site open-codes
-    /// `matches!(.., Ready)` and quietly gets the `Unknown` case wrong.
+    /// True unless this screen was READ as an obstacle. Refuses on the three
+    /// states that carry a finding -- a gate the operator must answer, a
+    /// foreign process, a failure -- and admits `Ready` and `Unknown` alike.
+    ///
+    /// `Unknown` admits deliberately. It does not mean "an obstacle we might
+    /// have missed", it means the matcher recognized nothing, and refusing on
+    /// it makes ignorance indistinguishable from a finding. Every provider
+    /// reaches `Ready` within a frame or two of spawn on process identity
+    /// alone, long before anything is on screen, so `Unknown` is mostly just
+    /// the moment before that -- and the screen is no longer where this
+    /// system decides what a session is doing. ACP carries that as protocol
+    /// state and never consults this predicate at all; a PTY is an operator's
+    /// surface first and a control channel second.
+    ///
+    /// What stays refused is what was actually read: writing a task into a
+    /// trust prompt or a login screen puts the text nowhere and leaves Enter
+    /// to pick a menu item blind. That is a finding, and findings still
+    /// count. Answering such a screen is not blocked and never was -- key
+    /// injection does not come through here.
     pub fn admits_blind_write(&self) -> bool {
-        matches!(self, Self::Ready)
+        !matches!(
+            self,
+            Self::OperatorGate { .. } | Self::NotAgent { .. } | Self::Failing { .. }
+        )
     }
 
     /// Bounds check matching `ForegroundProcess::is_valid_for`: the carried
@@ -2350,9 +2369,16 @@ mod tests {
         }
     }
 
+    /// Refusal follows a FINDING, not the absence of one. The three states
+    /// that carry something the matcher actually read still refuse; `Ready`
+    /// and `Unknown` both admit, because "recognized nothing" is not a
+    /// reason to treat a screen as an obstacle -- and every provider sits in
+    /// `Unknown` for the frame or two before process identity resolves,
+    /// which is not a state worth refusing.
     #[test]
-    fn admits_blind_write_is_true_only_for_ready() {
-        assert!(!PtyScreenState::Unknown.admits_blind_write());
+    fn admits_blind_write_refuses_a_finding_and_admits_the_absence_of_one() {
+        assert!(PtyScreenState::Ready.admits_blind_write());
+        assert!(PtyScreenState::Unknown.admits_blind_write());
         assert!(!PtyScreenState::NotAgent {
             observed_process: "npm".to_owned(),
         }
@@ -2362,7 +2388,6 @@ mod tests {
             reason: "startup-crash".to_owned(),
         }
         .admits_blind_write());
-        assert!(PtyScreenState::Ready.admits_blind_write());
     }
 
     #[test]

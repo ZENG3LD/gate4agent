@@ -13980,6 +13980,7 @@ fn session_mode_label(mode: SessionMode) -> &'static str {
     match mode {
         SessionMode::Pty => "pty",
         SessionMode::Inline => "inline",
+        SessionMode::Acp => "acp",
     }
 }
 

@@ -5517,6 +5517,7 @@ fn bind_harness_mcp_reservation(
             (proof.mode(), current.mode),
             (SessionMode::Pty, HarnessExecutionModeV1::Pty)
                 | (SessionMode::Inline, HarnessExecutionModeV1::Inline)
+                | (SessionMode::Acp, HarnessExecutionModeV1::Acp)
         )
         || bound_at_unix_ms < current.updated_at_unix_ms
         || bound_at_unix_ms >= current.expires_at_unix_ms
@@ -5661,6 +5662,7 @@ fn validate_accepted_spawn_proof(
     let proof_mode = match proof.mode() {
         SessionMode::Pty => HarnessExecutionModeV1::Pty,
         SessionMode::Inline => HarnessExecutionModeV1::Inline,
+        SessionMode::Acp => HarnessExecutionModeV1::Acp,
     };
     let managed_accepted = validate_managed_accepted_workspace_authority(
         issued_launches,
@@ -6225,6 +6227,9 @@ fn validate_run_dispatch_seam(
         }
         SpawnOverride::Set { value: SessionMode::Inline } => {
             context.mode == HarnessExecutionModeV1::Inline
+        }
+        SpawnOverride::Set { value: SessionMode::Acp } => {
+            context.mode == HarnessExecutionModeV1::Acp
         }
         SpawnOverride::Inherit | SpawnOverride::Clear => false,
     };

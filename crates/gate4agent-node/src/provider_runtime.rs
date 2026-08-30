@@ -19,6 +19,7 @@ pub(crate) enum ProviderRuntimeRequirement {
     RawPty,
     SemanticPrompt,
     Inline,
+    Acp,
     Resume,
     ResumeWithPrompt,
 }
@@ -195,6 +196,13 @@ pub(crate) fn require_policy(
             policy.semantic_readiness && policy.structured_prompt
         }
         ProviderRuntimeRequirement::Inline => false,
+        // ACP speaks a structured JSON-RPC protocol over stdio, not a PTY --
+        // none of this policy's fields (all PTY-terminal-text-inference
+        // verification: raw_pty_lifecycle, semantic_readiness, ...) describe
+        // it, so there is nothing here to gate on. The actual "does this
+        // provider support ACP" check is `spec.capabilities.transports.acp.
+        // is_some()`, enforced at kernel `Register` time.
+        ProviderRuntimeRequirement::Acp => true,
         // A provider-native PTY resume is still a raw PTY launch. The durable
         // session record supplies the exact provider identity and workspace;
         // the native shell separately requires a declared resume adapter before

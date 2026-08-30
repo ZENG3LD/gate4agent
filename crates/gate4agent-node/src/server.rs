@@ -4159,6 +4159,7 @@ impl NodeShared {
         let transport = match mode {
             SessionMode::Pty => TransportKind::Pty,
             SessionMode::Inline => TransportKind::Pipe,
+            SessionMode::Acp => TransportKind::Acp,
         };
         let overlay = if let Some(extra_args) = bundle_arguments {
             Some(PreparedNativeLaunchOverlay::Instance(
@@ -4459,6 +4460,7 @@ impl NodeShared {
                 let transport = match mode {
                     SessionMode::Pty => TransportKind::Pty,
                     SessionMode::Inline => TransportKind::Pipe,
+                    SessionMode::Acp => TransportKind::Acp,
                 };
                 let overlay = match bundle_arguments {
                     Some(extra_args) => PreparedNativeLaunchOverlay::Instance(
@@ -5451,6 +5453,7 @@ impl NodeShared {
             (SessionMode::Pty, false) => ProviderRuntimeRequirement::RawPty,
             (SessionMode::Pty, true) => ProviderRuntimeRequirement::SemanticPrompt,
             (SessionMode::Inline, _) => ProviderRuntimeRequirement::Inline,
+            (SessionMode::Acp, _) => ProviderRuntimeRequirement::Acp,
         };
         let runtime_policy = timeout(
             spawn_deadline_remaining(deadline)?,
@@ -7370,6 +7373,7 @@ impl NodeShared {
         let transport = match record.mode {
             SessionMode::Pty => TransportKind::Pty,
             SessionMode::Inline => TransportKind::Pipe,
+            SessionMode::Acp => TransportKind::Acp,
         };
         let agent_id = record.provider.clone();
         let dispatch_timeout = Duration::from_millis(SPAWN_DISPATCH_TIMEOUT_MS);
@@ -11055,6 +11059,7 @@ impl NodeShared {
             (SessionMode::Pty, false) => ProviderRuntimeRequirement::RawPty,
             (SessionMode::Pty, true) => ProviderRuntimeRequirement::SemanticPrompt,
             (SessionMode::Inline, _) => ProviderRuntimeRequirement::Inline,
+            (SessionMode::Acp, _) => ProviderRuntimeRequirement::Acp,
         };
         let runtime_policy = if let Some(runtime_policy) = admitted_runtime_policy {
             require_policy(runtime_policy, runtime_requirement).map_err(|_| failure(
@@ -11203,6 +11208,7 @@ impl NodeShared {
         let transport = match mode {
             SessionMode::Pty => TransportKind::Pty,
             SessionMode::Inline => TransportKind::Pipe,
+            SessionMode::Acp => TransportKind::Acp,
         };
         let agent_id = provider;
         if let Err(error) = self.dispatch_bounded(

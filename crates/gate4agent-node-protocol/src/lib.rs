@@ -423,6 +423,7 @@ pub enum ProviderRuntimeStatusError {
 pub enum SessionMode {
     Pty,
     Inline,
+    Acp,
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]

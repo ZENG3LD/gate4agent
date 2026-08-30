@@ -148,7 +148,13 @@ async fn spawn_session_inner(
         )
         .map_err(|_| LightRelayError::InvalidRequest)?])
         .map_err(|_| LightRelayError::InvalidRequest)?,
-        HarnessExecutionModeV1::Inline => SpawnRequiredCapabilities::default(),
+        // See the mirror match in `gate4agent-harness-service::c2` -- ACP has
+        // no terminal, so none of the raw-pty/semantic-readiness capabilities
+        // apply; the real transport-support gate is the kernel's
+        // `spec.capabilities.transports.acp.is_some()` check.
+        HarnessExecutionModeV1::Inline | HarnessExecutionModeV1::Acp => {
+            SpawnRequiredCapabilities::default()
+        }
     };
     let spec = SpawnSpec {
         target: SpawnTarget { node_id: route.node_id.clone(), workspace_id: workspace, worktree_id: None },
@@ -200,6 +206,7 @@ fn execution_mode(mode: HarnessExecutionModeV1) -> SessionMode {
     match mode {
         HarnessExecutionModeV1::Pty => SessionMode::Pty,
         HarnessExecutionModeV1::Inline => SessionMode::Inline,
+        HarnessExecutionModeV1::Acp => SessionMode::Acp,
     }
 }
 

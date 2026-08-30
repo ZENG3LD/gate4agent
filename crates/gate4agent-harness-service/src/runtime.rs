@@ -7506,6 +7506,7 @@ impl HarnessRuntimeInventoryCache {
         let expected_mode = match run.intent.mode {
             HarnessExecutionModeV1::Pty => HarnessRuntimeManagedModeV1::Pty,
             HarnessExecutionModeV1::Inline => HarnessRuntimeManagedModeV1::Inline,
+            HarnessExecutionModeV1::Acp => HarnessRuntimeManagedModeV1::Acp,
         };
         if record.workspace_id != binding.workspace_id.as_str()
             || record.mode != expected_mode
@@ -7857,6 +7858,7 @@ pub fn redact_runtime_inventory(
                 gate4agent_node_protocol::SessionMode::Inline => {
                     HarnessRuntimeManagedModeV1::Inline
                 }
+                gate4agent_node_protocol::SessionMode::Acp => HarnessRuntimeManagedModeV1::Acp,
             },
             state: match record.state {
                 gate4agent_node_protocol::ManagedSessionState::IdentityPending => {

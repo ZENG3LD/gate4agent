@@ -129,6 +129,12 @@ impl EnvironmentProfileBinding {
         match mode {
             SessionMode::Pty => self.pty_id.as_ref(),
             SessionMode::Inline => self.inline_id.as_ref(),
+            // Environment profiles have no ACP binding yet -- callers already
+            // treat `None` here as "this profile does not cover the
+            // requested mode" (see `EnvironmentProfileBindingMismatch`), the
+            // same outcome a profile declaring only `pty` gets for a
+            // requested `Inline` mode today.
+            SessionMode::Acp => None,
         }
     }
 

@@ -373,7 +373,10 @@ fn build_command(
             let mode = match take_flag(flags, "mode").as_deref() {
                 None | Some("pty") => HarnessExecutionModeV1::Pty,
                 Some("inline") => HarnessExecutionModeV1::Inline,
-                Some(other) => return Err(format!("--mode must be pty or inline, got {other}")),
+                Some("acp") => HarnessExecutionModeV1::Acp,
+                Some(other) => {
+                    return Err(format!("--mode must be pty, inline, or acp, got {other}"))
+                }
             };
             let rows = match take_flag(flags, "rows") {
                 Some(value) => value.parse().map_err(|_| "--rows must be a u16".to_owned())?,

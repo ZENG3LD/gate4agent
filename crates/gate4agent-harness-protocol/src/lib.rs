@@ -392,6 +392,7 @@ impl HarnessRetryTaskRequestV1 {
 pub enum HarnessExecutionModeV1 {
     Pty,
     Inline,
+    Acp,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

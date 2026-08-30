@@ -329,7 +329,16 @@ impl HarnessC2Adapter {
                 CapabilityId::new(SPAWN_RUNTIME_RAW_PTY_LIFECYCLE)
                     .map_err(|_| HarnessC2Error::InvalidSessionSpawnRequest)?,
             ]).map_err(|_| HarnessC2Error::InvalidSessionSpawnRequest)?,
-            HarnessExecutionModeV1::Inline => SpawnRequiredCapabilities::default(),
+            // ACP has no terminal at all, so none of the raw-pty/semantic-
+            // readiness `SPAWN_RUNTIME_*` capabilities (they all gate PTY-
+            // text-inference semantics) describe it -- same empty set Inline
+            // uses. The real "does this provider speak ACP" gate is
+            // `spec.capabilities.transports.acp.is_some()`, enforced at
+            // kernel `Register` time (`KernelCommandError::UnsupportedTransport`),
+            // not here.
+            HarnessExecutionModeV1::Inline | HarnessExecutionModeV1::Acp => {
+                SpawnRequiredCapabilities::default()
+            }
         };
         let spec = SpawnSpec {
             target: SpawnTarget {
@@ -3175,6 +3184,7 @@ fn project_c2_managed_session(
         mode: match record.mode {
             SessionMode::Pty => HarnessRuntimeManagedModeV1::Pty,
             SessionMode::Inline => HarnessRuntimeManagedModeV1::Inline,
+            SessionMode::Acp => HarnessRuntimeManagedModeV1::Acp,
         },
         state: match record.state {
             gate4agent_node_protocol::ManagedSessionState::IdentityPending => {

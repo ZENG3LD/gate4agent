@@ -4197,7 +4197,7 @@ impl HarnessRuntimeTerminalPageV1 {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum HarnessRuntimeManagedModeV1 { Pty, Inline }
+pub enum HarnessRuntimeManagedModeV1 { Pty, Inline, Acp }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]

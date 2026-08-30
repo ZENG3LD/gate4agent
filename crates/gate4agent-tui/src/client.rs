@@ -6706,6 +6706,7 @@ fn project_harness_inventory_managed_session(
     let mode = match record.mode {
         HarnessRuntimeManagedModeV1::Pty => SessionMode::Pty,
         HarnessRuntimeManagedModeV1::Inline => SessionMode::Inline,
+        HarnessRuntimeManagedModeV1::Acp => SessionMode::Acp,
     };
     let state = match record.state {
         HarnessRuntimeManagedStateV1::IdentityPending => ManagedSessionState::IdentityPending,

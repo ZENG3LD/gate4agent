@@ -50,7 +50,8 @@ use gate4agent_types::{
     OperatorGateKind, OperatorGateOption, OperatorGateOptionSemantics, OperatorGateState,
     OperatorGateSubject, PipeProtocol,
     PreparedInputKind, PromptPayload, ProviderEvent, ProviderInteractionKind,
-    ProviderRuntimeCapability, ProviderRuntimePolicy, ProviderSessionIdentity, ProviderSessionKey,
+    ProviderRateLimitKind, ProviderRuntimeCapability, ProviderRuntimePolicy,
+    ProviderSessionIdentity, ProviderSessionKey,
     ProviderSource, PtyScreenState, ResumeLaunchRequest, SessionGeneration, StartRequest,
     TerminalFrame, TerminalMouseProtocolEncoding, TerminalSize, TokenUsage, TransportKind,
     CONTROL_PROTOCOL_VERSION, OPERATOR_GATE_OPTIONS_MAX, WORKING_DIRECTORY_MAX_BYTES,
@@ -2313,10 +2314,25 @@ fn parsed_provider_event(message: ParsedMessage) -> Option<ProviderEvent> {
 
 fn rate_limit_event(info: gate4agent::core::types::RateLimitInfo) -> ProviderEvent {
     ProviderEvent::RateLimited {
-        limit_type: format!("{:?}", info.limit_type),
+        limit_type: provider_rate_limit_kind(info.limit_type),
         resets_at: info.resets_at.map(|value| value.to_rfc3339()),
         usage_percent: info.usage_percent.map(|value| value.to_string()),
         raw_message: info.raw_message,
+    }
+}
+
+/// Map the detector's own `RateLimitType` onto the wire-typed
+/// `ProviderRateLimitKind`. A plain match, not `format!("{:?}", ..)`: the
+/// wire carries the typed value itself, not a Debug-rendering of it.
+fn provider_rate_limit_kind(
+    limit_type: gate4agent::core::types::RateLimitType,
+) -> ProviderRateLimitKind {
+    use gate4agent::core::types::RateLimitType;
+    match limit_type {
+        RateLimitType::Session => ProviderRateLimitKind::Session,
+        RateLimitType::Daily => ProviderRateLimitKind::Daily,
+        RateLimitType::Weekly => ProviderRateLimitKind::Weekly,
+        RateLimitType::Unknown => ProviderRateLimitKind::Unknown,
     }
 }
 

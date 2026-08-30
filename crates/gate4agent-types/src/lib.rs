@@ -33,6 +33,7 @@ pub use control::{
     ProviderInteraction, ProviderInteractionId, ProviderInteractionKind,
     ProviderInteractionOutcome, ProviderInteractionResponse, ProviderInteractionResponseError,
     ProviderInteractionResponseKind, ProviderInteractionStatus, ProviderInteractionTarget,
+    ProviderRateLimitKind,
     ProviderRuntimeCapability, ProviderRuntimePolicy, ProviderRuntimePolicyError,
     ProviderSessionIdentity, ProviderSessionKey, ProviderSnapshot, ProviderSource,
     ProviderSourceCursor, ProviderSubagent, PtyScreenState, SessionGeneration, SessionSnapshot,

@@ -112,9 +112,32 @@ impl Default for SessionConfig {
 pub struct RateLimitInfo {
     /// Type of rate limit.
     pub limit_type: RateLimitType,
-    /// When the limit resets (if known).
+    /// When the limit resets, resolved to an absolute UTC instant.
+    ///
+    /// Providers print this in the LOCAL wall-clock time of the machine
+    /// running the CLI, never with an explicit zone or offset, so this is
+    /// filled by resolving that local time against `chrono::Local` (this
+    /// process's own OS zone — correct only because the harness node and
+    /// the CLI it drives run on the same machine) to the NEAREST FUTURE
+    /// occurrence: a bare `HH:MM` that has already passed today resolves
+    /// to tomorrow; a `HH:MM on D Mon` whose date has already passed this
+    /// year resolves to next year. `None` when no reset time was printed,
+    /// or when the local wall-clock time the provider printed does not
+    /// exist on this host (a spring-forward DST gap) — `resets_at_text`
+    /// carries the verbatim text in every case, including this one.
     pub resets_at: Option<DateTime<Utc>>,
-    /// Usage percentage (if known).
+    /// Verbatim reset text as printed by the provider, e.g. `"23:40"` or
+    /// `"18:40 on 6 Sep"`, independent of whether `resets_at` above could
+    /// be resolved. Populated only by parsers that locate this exact
+    /// substring (codex's `/status` quota-state line); `None` for the
+    /// generic refusal-message detectors, which have no such fragment to
+    /// extract.
+    pub resets_at_text: Option<String>,
+    /// Percentage of quota CONSUMED (0-100), i.e. usage — not remaining.
+    ///
+    /// Providers that print remaining quota instead (codex's `/status`:
+    /// `"N% left"`) are converted here as `100.0 - N`; this field never
+    /// silently holds a raw "percent left" value under the "usage" name.
     pub usage_percent: Option<f64>,
     /// Raw message from CLI.
     pub raw_message: String,

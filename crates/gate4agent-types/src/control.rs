@@ -1110,6 +1110,25 @@ pub enum ProviderInteractionKind {
     Question,
 }
 
+/// Which class of budget a `ProviderEvent::RateLimited` observation
+/// concerns. This is the wire-typed counterpart of `gate4agent`'s own
+/// (source-of-truth) `RateLimitType` -- kept as its own type here, rather
+/// than imported, because this crate's contract forbids depending on
+/// `gate4agent` (see this crate's `CLAUDE.md`); the conversion from the
+/// detector's enum lives in the shell that already depends on both.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderRateLimitKind {
+    /// Session/hourly limit (codex: the rolling 5h window).
+    Session,
+    /// Daily limit.
+    Daily,
+    /// Weekly limit.
+    Weekly,
+    /// Limit type could not be determined from the matched text.
+    Unknown,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProviderInteractionOutcome {
@@ -1312,7 +1331,7 @@ pub enum ProviderEvent {
         agent_id: String,
     },
     RateLimited {
-        limit_type: String,
+        limit_type: ProviderRateLimitKind,
         resets_at: Option<String>,
         usage_percent: Option<String>,
         raw_message: String,
@@ -1476,12 +1495,13 @@ impl ProviderEvent {
                 validate_required("subagent id", agent_id, PROVIDER_EVENT_ID_MAX_BYTES)?;
             }
             Self::RateLimited {
-                limit_type,
+                limit_type: _,
                 resets_at,
                 usage_percent,
                 raw_message,
             } => {
-                validate_required("limit type", limit_type, PROVIDER_EVENT_ID_MAX_BYTES)?;
+                // `limit_type` is a typed enum now (`ProviderRateLimitKind`),
+                // not a String -- it has no shape to validate here.
                 for (field, value) in [
                     ("reset time", resets_at.as_deref()),
                     ("usage percent", usage_percent.as_deref()),

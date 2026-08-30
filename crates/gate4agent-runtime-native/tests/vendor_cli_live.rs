@@ -209,7 +209,7 @@ fn provider_failure_kind(events: &[ControlEvent]) -> Option<String> {
         ControlEventKind::ProviderEvent {
             event: ProviderEvent::RateLimited { limit_type, .. },
             ..
-        } => Some(format!("rate-limited:{limit_type}")),
+        } => Some(format!("rate-limited:{limit_type:?}")),
         _ => None,
     })
 }

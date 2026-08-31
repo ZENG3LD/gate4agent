@@ -30,6 +30,7 @@
 //! # }
 //! ```
 
+mod gate;
 mod host;
 pub mod protocol;
 pub mod session;
@@ -37,5 +38,6 @@ pub(crate) mod reader;
 pub(crate) mod spawn;
 mod terminal;
 
+pub use gate::DangerousCommandGate;
 pub use host::HostPolicy;
 pub use session::{AcpError, AcpSession, AcpSessionOptions};

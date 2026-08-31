@@ -25,6 +25,7 @@ use crate::rpc::id::IdGen;
 use crate::rpc::message::{RpcNotification, RpcRequest};
 use crate::rpc::pending::PendingRequests;
 
+use super::gate::DangerousCommandGate;
 use super::host::{AcpHostAdapter, HostPolicy, PolicyHostHandler};
 use super::protocol::{
     extract_token_usage, AgentCapabilities, ClientInfo, ContentBlock, InitializeParams,
@@ -113,6 +114,14 @@ pub struct AcpSessionOptions {
     /// [`HostPolicy::Deny`]), not to route decisions to a human operator —
     /// every mode resolves permission requests on its own.
     pub host_policy: HostPolicy,
+
+    /// Whether the dangerous-command gate runs ahead of `host_policy` for
+    /// `terminal/create` and `execute`-kind `session/request_permission` --
+    /// a decision independent of `host_policy`, including from
+    /// [`HostPolicy::Yolo`]. Default: [`DangerousCommandGate::Enforced`].
+    /// Set to [`DangerousCommandGate::Disabled`] only as its own explicit
+    /// choice, never as a side effect of picking a permissive `host_policy`.
+    pub dangerous_command_gate: DangerousCommandGate,
 }
 
 impl Default for AcpSessionOptions {
@@ -122,6 +131,7 @@ impl Default for AcpSessionOptions {
             handshake_timeout: Duration::from_secs(30),
             prompt_timeout: Duration::from_secs(120),
             host_policy: HostPolicy::default(),
+            dangerous_command_gate: DangerousCommandGate::default(),
         }
     }
 }
@@ -208,7 +218,11 @@ impl AcpSession {
         // `clientCapabilities` declared below and how `session/request_
         // permission` gets answered, so the two can never drift apart.
         let handler: Arc<dyn crate::rpc::handler::HostHandler> = Arc::new(AcpHostAdapter(Arc::new(
-            PolicyHostHandler::new(options.host_policy, working_dir.to_path_buf()),
+            PolicyHostHandler::new(
+                options.host_policy,
+                working_dir.to_path_buf(),
+                options.dangerous_command_gate,
+            ),
         )));
 
         let pending = PendingRequests::new();

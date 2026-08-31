@@ -324,6 +324,16 @@ pub struct PermissionToolCall {
     pub kind: ToolKind,
     #[serde(default)]
     pub locations: Vec<ToolCallLocation>,
+    /// Raw tool-specific input the agent attached to this permission
+    /// request, when it chose to include one -- e.g. `{"command": "rm -rf
+    /// /"}` for an `execute`-kind tool call. The ACP spec does not mandate
+    /// this field be present on a permission request the way it is on a
+    /// `tool_call` session update; many agents omit it here. Defaults to
+    /// `Value::Null`, which the dangerous-command gate
+    /// (`super::gate::evaluate_permission_tool_call`) treats as "nothing to
+    /// inspect" rather than as an empty/safe command.
+    #[serde(rename = "rawInput", default)]
+    pub raw_input: Value,
 }
 
 /// The four option kinds the ACP spec defines for

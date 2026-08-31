@@ -19,10 +19,11 @@ use serde_json::{json, Value};
 use crate::rpc::handler::HostHandler;
 use crate::rpc::message::RpcError;
 
+use super::gate::{self, DangerousCommandGate};
 use super::protocol::{
     ClientCapabilities, FsCapabilities, FsReadParams, FsWriteParams, PermissionOption,
     PermissionOptionKind, PermissionOutcome, PermissionRequestParams, PermissionToolCall,
-    TerminalCreateParams, TerminalExitStatus, TerminalIdParams, TerminalOutputResult,
+    TerminalCreateParams, TerminalExitStatus, TerminalIdParams, TerminalOutputResult, ToolKind,
 };
 use super::terminal::TerminalStore;
 
@@ -208,11 +209,20 @@ pub(crate) struct PolicyHostHandler {
     policy: HostPolicy,
     working_dir: PathBuf,
     terminals: TerminalStore,
+    /// Whether the dangerous-command gate (`super::gate`) runs ahead of
+    /// `policy` for `terminal/create` and `execute`-kind `session/request_
+    /// permission` -- a decision independent of `policy` itself, see
+    /// [`DangerousCommandGate`].
+    dangerous_command_gate: DangerousCommandGate,
 }
 
 impl PolicyHostHandler {
-    pub(crate) fn new(policy: HostPolicy, working_dir: PathBuf) -> Self {
-        Self { policy, working_dir, terminals: TerminalStore::new() }
+    pub(crate) fn new(
+        policy: HostPolicy,
+        working_dir: PathBuf,
+        dangerous_command_gate: DangerousCommandGate,
+    ) -> Self {
+        Self { policy, working_dir, terminals: TerminalStore::new(), dangerous_command_gate }
     }
 }
 
@@ -247,6 +257,21 @@ impl AcpHostHandler for PolicyHostHandler {
     }
 
     fn terminal_create(&self, params: &TerminalCreateParams) -> Result<String, String> {
+        // The dangerous-command gate runs before `policy` gets a say, and
+        // is not skipped by any `HostPolicy` value including `Yolo` -- see
+        // `DangerousCommandGate`'s doc comment for why this is a second,
+        // separately-switched axis rather than folded into the policy.
+        if self.dangerous_command_gate == DangerousCommandGate::Enforced {
+            let cwd: PathBuf = params
+                .cwd
+                .as_deref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| self.working_dir.clone());
+            let verdict = gate::evaluate_command(&params.command, &params.args, &cwd);
+            if let Some(refusal) = verdict.refusal_message() {
+                return Err(format!("terminal/create {refusal}"));
+            }
+        }
         if !self.policy.allows_mutation() {
             return Err("terminal/create denied by host policy".to_string());
         }
@@ -273,6 +298,18 @@ impl AcpHostHandler for PolicyHostHandler {
     }
 
     fn request_permission(&self, params: &PermissionRequestParams) -> PermissionOutcome {
+        // Same gate, same "above the policy" placement as `terminal_create`.
+        // A `Block` verdict here has no wire field to carry its reason on
+        // (`PermissionOutcome` is `Selected`/`Cancelled`, not an error), so
+        // it is answered the same way `HostPolicy::Deny` answers any
+        // execute-kind request: prefer a reject-kind option the agent
+        // offered, else decline to pick any of them.
+        if self.dangerous_command_gate == DangerousCommandGate::Enforced
+            && params.tool_call.kind == ToolKind::Execute
+            && gate::evaluate_permission_tool_call(&params.tool_call, &self.working_dir).is_blocked()
+        {
+            return HostPolicy::Deny.select_permission_option(&params.tool_call, &params.options);
+        }
         self.policy.select_permission_option(&params.tool_call, &params.options)
     }
 }
@@ -432,7 +469,15 @@ mod tests {
     }
 
     fn adapter(policy: HostPolicy) -> AcpHostAdapter {
-        AcpHostAdapter(Arc::new(PolicyHostHandler::new(policy, std::env::temp_dir())))
+        AcpHostAdapter(Arc::new(PolicyHostHandler::new(
+            policy,
+            std::env::temp_dir(),
+            DangerousCommandGate::Enforced,
+        )))
+    }
+
+    fn adapter_with_gate(policy: HostPolicy, gate: DangerousCommandGate) -> AcpHostAdapter {
+        AcpHostAdapter(Arc::new(PolicyHostHandler::new(policy, std::env::temp_dir(), gate)))
     }
 
     // -----------------------------------------------------------------------
@@ -480,7 +525,8 @@ mod tests {
         let path = dir.join("gate4agent_host_test_rw.txt");
         std::fs::write(&path, "before").unwrap();
 
-        let handler = PolicyHostHandler::new(HostPolicy::Auto, dir.clone());
+        let handler =
+            PolicyHostHandler::new(HostPolicy::Auto, dir.clone(), DangerousCommandGate::Enforced);
         let read = handler
             .fs_read_text_file(&FsReadParams {
                 path: path.to_string_lossy().into_owned(),
@@ -509,7 +555,8 @@ mod tests {
         let path = dir.join("gate4agent_host_test_readonly.txt");
         std::fs::write(&path, "content").unwrap();
 
-        let handler = PolicyHostHandler::new(HostPolicy::ReadOnly, dir);
+        let handler =
+            PolicyHostHandler::new(HostPolicy::ReadOnly, dir, DangerousCommandGate::Enforced);
         assert!(handler
             .fs_read_text_file(&FsReadParams {
                 path: path.to_string_lossy().into_owned(),
@@ -532,7 +579,7 @@ mod tests {
     #[test]
     fn deny_refuses_read_and_write() {
         let dir = std::env::temp_dir();
-        let handler = PolicyHostHandler::new(HostPolicy::Deny, dir);
+        let handler = PolicyHostHandler::new(HostPolicy::Deny, dir, DangerousCommandGate::Enforced);
         assert!(handler
             .fs_read_text_file(&FsReadParams {
                 path: "/etc/passwd".to_owned(),
@@ -577,6 +624,7 @@ mod tests {
             title: "test".to_owned(),
             kind,
             locations: vec![ToolCallLocation { path: "/repo/file.txt".to_owned(), line: None }],
+            raw_input: Value::Null,
         }
     }
 
@@ -726,5 +774,112 @@ mod tests {
         let result = adapter(HostPolicy::ReadOnly)
             .handle("terminal/create", Some(json!({"command": "echo", "args": []})));
         assert_eq!(result.unwrap_err().code, RpcError::PERMISSION_DENIED);
+    }
+
+    // -----------------------------------------------------------------------
+    // Dangerous-command gate — stands above `HostPolicy`
+    //
+    // Every case here uses a command that is dangerous BY CONSTRUCTION
+    // (`rm -rf /`) but never lets it reach `TerminalStore::create` — the
+    // gate check returns `Err` before that call. Tests that need to prove
+    // the gate was NOT consulted (the `Disabled` cases) pair it with
+    // `HostPolicy::Deny`, whose OWN refusal keeps the test safe even if the
+    // gate really were skipped, while the assertion tells the two refusals
+    // apart by message.
+    // -----------------------------------------------------------------------
+
+    fn dangerous_terminal_params() -> TerminalCreateParams {
+        TerminalCreateParams {
+            session_id: String::new(),
+            command: "rm".to_owned(),
+            args: vec!["-rf".to_owned(), "/".to_owned()],
+            env: vec![],
+            cwd: None,
+            output_byte_limit: None,
+        }
+    }
+
+    fn dangerous_execute_tool_call() -> PermissionToolCall {
+        PermissionToolCall {
+            tool_call_id: "tc1".to_owned(),
+            title: "Run rm -rf /".to_owned(),
+            kind: crate::acp::protocol::ToolKind::Execute,
+            locations: vec![],
+            raw_input: json!({"command": "rm", "args": ["-rf", "/"]}),
+        }
+    }
+
+    #[test]
+    fn dangerous_command_gate_blocks_terminal_create_even_under_yolo_policy() {
+        let handler =
+            PolicyHostHandler::new(HostPolicy::Yolo, std::env::temp_dir(), DangerousCommandGate::Enforced);
+        let message = handler.terminal_create(&dangerous_terminal_params()).unwrap_err();
+        assert!(message.contains("dangerous-command gate"), "message was: {message}");
+        assert!(message.contains("filesystem-wipe"), "message was: {message}");
+        assert!(message.contains("rule="), "refusal must name the rule: {message}");
+        assert!(message.contains("argument="), "refusal must name the offending argument: {message}");
+    }
+
+    #[test]
+    fn dangerous_command_gate_disabled_skips_straight_to_policy_for_terminal_create() {
+        let handler =
+            PolicyHostHandler::new(HostPolicy::Deny, std::env::temp_dir(), DangerousCommandGate::Disabled);
+        let message = handler.terminal_create(&dangerous_terminal_params()).unwrap_err();
+        // The POLICY's refusal text, not the gate's -- proves the gate
+        // itself never ran when explicitly disabled.
+        assert_eq!(message, "terminal/create denied by host policy");
+    }
+
+    #[test]
+    fn dangerous_command_gate_blocks_execute_permission_request_even_under_yolo_policy() {
+        let handler =
+            PolicyHostHandler::new(HostPolicy::Yolo, std::env::temp_dir(), DangerousCommandGate::Enforced);
+        let params = PermissionRequestParams {
+            session_id: "s1".to_owned(),
+            tool_call: dangerous_execute_tool_call(),
+            options: options_all_four(),
+        };
+        // Yolo alone would select allow_always ("aa") -- the gate must
+        // override that and land on a reject-kind option instead.
+        let outcome = handler.request_permission(&params);
+        assert_eq!(outcome, PermissionOutcome::Selected { option_id: "ro".to_owned() });
+    }
+
+    #[test]
+    fn dangerous_command_gate_disabled_leaves_execute_permission_request_to_policy() {
+        let handler =
+            PolicyHostHandler::new(HostPolicy::Yolo, std::env::temp_dir(), DangerousCommandGate::Disabled);
+        let params = PermissionRequestParams {
+            session_id: "s1".to_owned(),
+            tool_call: dangerous_execute_tool_call(),
+            options: options_all_four(),
+        };
+        let outcome = handler.request_permission(&params);
+        assert_eq!(outcome, PermissionOutcome::Selected { option_id: "aa".to_owned() });
+    }
+
+    #[test]
+    fn dangerous_command_gate_allows_a_benign_terminal_create_under_yolo() {
+        let handler =
+            PolicyHostHandler::new(HostPolicy::Yolo, std::env::temp_dir(), DangerousCommandGate::Enforced);
+        let params = TerminalCreateParams {
+            session_id: String::new(),
+            command: "echo".to_owned(),
+            args: vec!["hello".to_owned()],
+            env: vec![],
+            cwd: None,
+            output_byte_limit: None,
+        };
+        // Reaches TerminalStore -- a real (harmless) process is fine here.
+        assert!(handler.terminal_create(&params).is_ok());
+    }
+
+    #[test]
+    fn adapter_dispatches_terminal_create_blocked_by_gate_as_permission_denied() {
+        let result = adapter_with_gate(HostPolicy::Auto, DangerousCommandGate::Enforced)
+            .handle("terminal/create", Some(json!({"command": "rm", "args": ["-rf", "/"]})));
+        let error = result.unwrap_err();
+        assert_eq!(error.code, RpcError::PERMISSION_DENIED);
+        assert!(error.message.contains("filesystem-wipe"), "message was: {}", error.message);
     }
 }

@@ -14,7 +14,7 @@ use gate4agent_types::{
     ControlEvent, ControlEventKind, ForegroundAuthority, ForegroundProcessKind, InputAction,
     PreparedInputKind, PromptFraming, PromptPayload, ProviderActivity, ProviderEvent,
     ProviderInteractionKind, ProviderInteractionOutcome, ProviderInteractionStatus,
-    ProviderRuntimePolicy, ProviderSource, SessionStatus, ShellCommand, StartRequest,
+    ProviderRuntimePolicy, ProviderSource, SessionStatus, ShellCommand, ApprovalLevel, StartRequest,
     TerminalControl, TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
 };
 
@@ -96,6 +96,7 @@ async fn pipe_one_shot_reaches_public_snapshot_with_semantic_events() {
                     },
                     initial_prompt: Some("fixture prompt".to_owned()),
                     session_options: None,
+                    approval_level: ApprovalLevel::default(),
                 },
             },
         ))
@@ -165,6 +166,7 @@ async fn acp_multi_turn_prompt_streams_and_stops_through_public_handle() {
                     },
                     initial_prompt: None,
                     session_options: None,
+                    approval_level: ApprovalLevel::default(),
                 },
             },
         ))
@@ -276,6 +278,7 @@ async fn acp_grok_registration_is_no_longer_rejected_and_reaches_spawn() {
                     },
                     initial_prompt: None,
                     session_options: None,
+                    approval_level: ApprovalLevel::default(),
                 },
             },
         ))
@@ -381,6 +384,7 @@ async fn pty_classification_uses_the_same_provider_event_contract() {
                     },
                     initial_prompt: None,
                     session_options: None,
+                    approval_level: ApprovalLevel::default(),
                 },
             },
         ))
@@ -482,6 +486,7 @@ async fn public_handle_shell_command_requires_and_uses_live_shell_route() {
                     },
                     initial_prompt: None,
                     session_options: None,
+                    approval_level: ApprovalLevel::default(),
                 },
             },
         ))
@@ -586,6 +591,7 @@ async fn external_hook_ingress_reaches_the_public_snapshot_without_shell_authori
                     },
                     initial_prompt: None,
                     session_options: None,
+                    approval_level: ApprovalLevel::default(),
                 },
             },
         ))
@@ -800,6 +806,7 @@ async fn loopback_hook_listener_injects_a_route_without_identity_authority() {
                     },
                     initial_prompt: None,
                     session_options: None,
+                    approval_level: ApprovalLevel::default(),
                 },
             },
         ))
@@ -873,6 +880,7 @@ async fn hook_listener_rejects_a_late_start_after_spawn_dispatch() {
                     },
                     initial_prompt: None,
                     session_options: None,
+                    approval_level: ApprovalLevel::default(),
                 },
             },
         ))

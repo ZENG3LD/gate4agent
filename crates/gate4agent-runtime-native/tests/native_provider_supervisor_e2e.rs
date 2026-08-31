@@ -16,7 +16,7 @@ use gate4agent_tool_engine::{
 };
 use gate4agent_types::{
     AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, ProviderRuntimePolicy,
-    SessionGeneration, SessionStatus, StartRequest, TerminalSize, TransportKind,
+    SessionGeneration, SessionStatus, ApprovalLevel, StartRequest, TerminalSize, TransportKind,
     CONTROL_PROTOCOL_VERSION,
 };
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -290,6 +290,7 @@ async fn native_provider_supervisor_reaps_cancelled_child_before_detach_and_high
                     },
                     initial_prompt: None,
                     session_options: None,
+                    approval_level: ApprovalLevel::default(),
                 },
             },
         ))
@@ -760,6 +761,7 @@ async fn coordinated_shutdown_drains_exact_cancel_beyond_one_work_quantum() {
                     },
                     initial_prompt: None,
                     session_options: None,
+                    approval_level: ApprovalLevel::default(),
                 },
             },
         ))

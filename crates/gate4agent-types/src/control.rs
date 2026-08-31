@@ -43,6 +43,45 @@ pub struct OperationId(pub u64);
 #[serde(transparent)]
 pub struct SessionGeneration(pub u64);
 
+/// How much autonomy a freshly spawned provider CLI process is granted at
+/// launch, independent of which transport (PTY, inline/pipe, ACP) execs it --
+/// these are process launch arguments, the same axis regardless of transport.
+///
+/// The mapping from a level to actual CLI flags is per-provider, verified
+/// against vendor documentation (and, for `grok`/`kimi`, against a third-party
+/// harness's observed behavior), and lives in `gate4agent_catalog` -- the
+/// crate that owns launch policy -- not here; this type only names the
+/// levels. Where a provider has no verified intermediate flag (`grok` and
+/// `kimi` do not have one for `Moderate` or `ReadOnly` as of this writing),
+/// the catalog's mapping falls back to `Unmanaged` behavior (no injected
+/// flag) rather than fabricating one -- see
+/// `gate4agent_catalog::approval_level_args`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ApprovalLevel {
+    /// No restriction: the provider CLI is launched with whatever flag
+    /// grants it full autonomy (Claude `--permission-mode bypassPermissions`,
+    /// Codex `--dangerously-bypass-approvals-and-sandbox`, Grok
+    /// `--permission-mode bypassPermissions`, Kimi `--yolo`). Default --
+    /// restricting is opt-in, not asking a human is the norm.
+    #[default]
+    FullAuto,
+    /// The provider's own middle ground, when one is verified (Claude
+    /// `--permission-mode acceptEdits`, Codex `--sandbox workspace-write
+    /// --ask-for-approval on-request`). A provider with no verified
+    /// intermediate flag falls back to `Unmanaged` -- never a fabricated
+    /// flag.
+    Moderate,
+    /// Read-only: no writes, no command execution (Claude
+    /// `--permission-mode default`, Codex `--sandbox read-only
+    /// --ask-for-approval never`). A provider with no verified read-only
+    /// flag falls back to `Unmanaged`.
+    ReadOnly,
+    /// Impose nothing: launch with no approval-related flag at all and let
+    /// the provider CLI use whatever it is configured with on its own.
+    Unmanaged,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StartRequest {
     pub working_directory: String,
@@ -51,6 +90,13 @@ pub struct StartRequest {
     pub initial_prompt: Option<String>,
     #[serde(default)]
     pub session_options: Option<SessionOptionSelection>,
+    /// Approval-level axis for this spawn; defaults to
+    /// `ApprovalLevel::FullAuto` when the caller does not set it, matching
+    /// `ApprovalLevel`'s own default. `#[serde(default)]` so a peer that
+    /// predates this field decodes it as the same default rather than
+    /// failing to deserialize.
+    #[serde(default)]
+    pub approval_level: ApprovalLevel,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]

@@ -2921,7 +2921,7 @@ mod tests {
         hook_posting_agent_spec, interactive_agent_spec, CONTROL_FIXTURE_ID,
         HOOK_POSTING_FIXTURE_ID,
     };
-    use gate4agent_types::{OperationId, StartRequest, TerminalSize};
+    use gate4agent_types::{ApprovalLevel, OperationId, StartRequest, TerminalSize};
 
     #[test]
     fn history_record_preserves_completed_turn_count() {
@@ -3630,6 +3630,7 @@ mod tests {
                     terminal_size: TerminalSize { rows: 24, columns: 80 },
                     initial_prompt: Some("must-not-run".to_owned()),
                     session_options: None,
+                    approval_level: ApprovalLevel::default(),
                 },
             },
         });
@@ -3672,6 +3673,7 @@ mod tests {
                         terminal_size: TerminalSize { rows: 24, columns: 80 },
                         initial_prompt: None,
                         session_options: None,
+                        approval_level: ApprovalLevel::default(),
                     },
                 },
             }

@@ -6,7 +6,7 @@ use gate4agent_testkit::{one_shot_agent_spec, ONE_SHOT_FIXTURE_ID};
 use gate4agent_types::{
     AdapterFamily, AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand,
     ControlEventKind, ProviderEvent, ProviderRuntimePolicy, ProviderSource, SessionStatus,
-    StartRequest, TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
+    ApprovalLevel, StartRequest, TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
 };
 
 fn command(id: u64, command: ControlCommand) -> CommandEnvelope {
@@ -57,6 +57,7 @@ async fn bounded_plain_text_one_shot_crosses_the_public_control_plane() {
                     },
                     initial_prompt: Some("fixture prompt".to_owned()),
                     session_options: None,
+                    approval_level: ApprovalLevel::default(),
                 },
             },
         ))

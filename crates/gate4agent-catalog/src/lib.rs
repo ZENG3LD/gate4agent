@@ -29,14 +29,14 @@ pub use gate4agent_adapters::{
 pub use gate4agent_types::{
     AcpTransportSpec, AdapterBinding, AdapterBindingError, AdapterFamily, AdapterId,
     AdapterIdError, AdapterVerification, AgentAdapterCapabilities, AgentCapabilities,
-    AgentCommandMode, AgentId, AgentIdError, AgentReadinessSpec, AgentSpec,
+    AgentCommandMode, AgentId, AgentIdError, AgentReadinessSpec, AgentSpec, ApprovalLevel,
     AgentTransportCapabilities, DetectionSpec, DraftReadySignal, InitialPromptMode, LaunchSpec,
     NativeDraftMode, PipePromptDelivery, PipeProtocol, PipeTransportSpec, ProcessMatcher,
     PromptSpec, RuntimePlatform, SessionOptionSelection, SessionOptionValue, SpecVerification,
 };
 pub use launch::{
-    plan_draft_launch, plan_launch, EnvMutation, LaunchPlan, LaunchPlanError, LaunchRequest,
-    MAX_LAUNCH_PROMPT_BYTES, WINDOWS_INLINE_LAUNCH_MAX_CHARS,
+    approval_level_args, plan_draft_launch, plan_launch, EnvMutation, LaunchPlan, LaunchPlanError,
+    LaunchRequest, MAX_LAUNCH_PROMPT_BYTES, WINDOWS_INLINE_LAUNCH_MAX_CHARS,
 };
 pub use registry::{AgentRegistry, RegistryError};
 pub use session_options::{

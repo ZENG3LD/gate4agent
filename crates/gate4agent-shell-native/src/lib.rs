@@ -42,7 +42,7 @@ use gate4agent_adapters::{
 use gate4agent_catalog::{AgentRegistry, AgentSpec, EnvMutation};
 use gate4agent_shell_one_shot::NativeOneShotSession;
 use gate4agent_types::{
-    AdapterFamily, AgentCommand, AgentId, AgentInstanceId, CapabilityProbeFailure,
+    AdapterFamily, AgentCommand, AgentId, AgentInstanceId, ApprovalLevel, CapabilityProbeFailure,
     ContextWindowUsage as ProviderContextWindowUsage, ControlEffect,
     ControlObservation, EffectEnvelope, ForegroundProcess, ForegroundProcessKind,
     ForegroundRequirement, InputAction, ObservationEnvelope, OperationId, OperatorGateInput,
@@ -804,6 +804,7 @@ impl NativeEffectShell {
                         platform: RuntimePlatform::current(),
                         prompt: request.initial_prompt,
                         session_options: request.session_options,
+                        approval_level: request.approval_level,
                         extra_args: launch_extra_args,
                     },
                     request.terminal_size.rows,
@@ -1233,7 +1234,13 @@ impl NativeEffectShell {
             working_directory: request.working_directory,
             terminal_size: request.terminal_size,
             initial_prompt: request.initial_prompt,
+            // A resume reattaches to a provider session that already has a
+            // process running with whatever argv it was originally spawned
+            // with -- there is no fresh CLI invocation here to apply an
+            // approval level to, the same reasoning that leaves
+            // `session_options` unset on a resume above.
             session_options: None,
+            approval_level: ApprovalLevel::default(),
         };
         self.spawn_native(
             key,

@@ -173,7 +173,8 @@ use gate4agent_node_wire::{
     AuthDirection, OwnerOnlyLocalListener,
 };
 use gate4agent_types::{
-    AdapterBinding, AdapterFamily, AgentId, AgentInstanceId, AgentSpec, CommandEnvelope, CommandId,
+    AdapterBinding, AdapterFamily, AgentId, AgentInstanceId, AgentSpec, ApprovalLevel,
+    CommandEnvelope, CommandId,
     validate_candidate_id, ControlCommand, ControlEvent, ControlEventKind,
     HistoryCandidateSummary, HistoryOperation, HistoryQuery, HistorySessionRecord, InputAction,
     PromptFraming, PromptPayload, ResumeLaunchRequest,
@@ -11314,6 +11315,14 @@ impl NodeShared {
                         terminal_size,
                         initial_prompt,
                         session_options: None,
+                        // The operator wire (`SpawnSpec`/`SpawnOverrides`)
+                        // does not yet carry a per-spawn approval-level
+                        // selection -- this applies the axis's own default,
+                        // `FullAuto`, explicitly rather than leaving it
+                        // implicit. Wiring a real per-spawn choice through
+                        // the profile/override resolution path is a
+                        // follow-up.
+                        approval_level: ApprovalLevel::default(),
                     },
                 },
                 start_timeout,

@@ -21,7 +21,7 @@ use gate4agent_testkit::{
 use gate4agent_types::{
     AdapterFamily, AgentId, AgentInstanceId, AgentSpec, CommandEnvelope, CommandId,
     ControlCommand, ControlEventKind, ProviderEvent, ProviderRuntimePolicy, ProviderSource,
-    SessionStatus, StartRequest, TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
+    SessionStatus, ApprovalLevel, StartRequest, TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
 };
 
 const PROFILE_SENTINEL: &str = "GATE4AGENT_TEST_PROFILE_SENTINEL";
@@ -239,6 +239,7 @@ fn register_and_start_agent(
                     },
                     initial_prompt: None,
                     session_options: None,
+                    approval_level: ApprovalLevel::default(),
                 },
             },
         ))
@@ -791,6 +792,7 @@ async fn selected_native_launch_profile_overlays_only_future_exact_pty_spawns() 
                     },
                     initial_prompt: Some("fixture prompt".to_owned()),
                     session_options: None,
+                    approval_level: ApprovalLevel::default(),
                 },
             },
         ))
@@ -1005,6 +1007,7 @@ async fn native_launch_profile_control_selects_before_spawn_for_exact_one_shot_p
                     },
                     initial_prompt: Some("fixture prompt".to_owned()),
                     session_options: None,
+                    approval_level: ApprovalLevel::default(),
                 },
             },
         ))
@@ -1120,6 +1123,7 @@ async fn persistent_codex_pipe_policy_reaches_the_exact_one_shot_spawn() {
                     },
                     initial_prompt: Some("must not spawn".to_owned()),
                     session_options: None,
+                    approval_level: ApprovalLevel::default(),
                 },
             },
         ))
@@ -1208,6 +1212,7 @@ async fn selected_native_launch_profile_mismatch_fails_closed_before_resolver_or
                     },
                     initial_prompt: Some("must not spawn".to_owned()),
                     session_options: None,
+                    approval_level: ApprovalLevel::default(),
                 },
             },
         ))

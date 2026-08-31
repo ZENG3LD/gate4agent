@@ -22,7 +22,8 @@ pub use capability::{
     CAPABILITY_MODELS_MAX, CAPABILITY_MODEL_ID_MAX_BYTES, CAPABILITY_MODEL_LABEL_MAX_BYTES,
 };
 pub use control::{
-    ActiveProviderTool, AgentInstanceId, CommandEnvelope, CommandId, ContextWindowUsage,
+    ActiveProviderTool, AgentInstanceId, ApprovalLevel, CommandEnvelope, CommandId,
+    ContextWindowUsage,
     ControlCommand, ControlEffect,
     ControlError, ControlEvent, ControlEventKind, ControlHealth, ControlObservation,
     ControlSnapshot, EffectEnvelope, ForegroundAuthority, ForegroundProcess, ForegroundProcessKind,

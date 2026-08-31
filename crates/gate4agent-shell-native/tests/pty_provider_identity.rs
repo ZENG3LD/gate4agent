@@ -6,7 +6,7 @@ use gate4agent_shell_native::NativeEffectShell;
 use gate4agent_testkit::{pty_provider_agent_spec, PTY_PROVIDER_FIXTURE_ID};
 use gate4agent_types::{
     AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, ControlObservation,
-    ProviderEvent, ProviderRuntimePolicy, StartRequest, TerminalSize, TransportKind,
+    ProviderEvent, ProviderRuntimePolicy, ApprovalLevel, StartRequest, TerminalSize, TransportKind,
     CONTROL_PROTOCOL_VERSION,
 };
 
@@ -57,6 +57,7 @@ async fn fresh_codex_pty_does_not_publish_a_transport_local_provider_identity() 
                     },
                     initial_prompt: None,
                     session_options: None,
+                    approval_level: ApprovalLevel::default(),
                 },
             },
         )],

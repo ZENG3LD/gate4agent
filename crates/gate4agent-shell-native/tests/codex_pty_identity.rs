@@ -9,7 +9,7 @@ use gate4agent_shell_native::{NativeEffectShell, NativeSessionKey};
 use gate4agent_testkit::interactive_agent_spec;
 use gate4agent_types::{
     AdapterFamily, AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand,
-    ControlObservation, ProviderEvent, ProviderRuntimePolicy, ProviderSessionKey, StartRequest,
+    ControlObservation, ProviderEvent, ProviderRuntimePolicy, ProviderSessionKey, ApprovalLevel, StartRequest,
     TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
 };
 
@@ -87,6 +87,7 @@ async fn codex_pty_probes_status_and_emits_only_the_authoritative_session_identi
                     },
                     initial_prompt: None,
                     session_options: None,
+                    approval_level: ApprovalLevel::default(),
                 },
             },
         )],
@@ -227,6 +228,7 @@ async fn codex_pty_identity_layout_miss_keeps_the_fresh_session_running() {
                     },
                     initial_prompt: None,
                     session_options: None,
+                    approval_level: ApprovalLevel::default(),
                 },
             },
         )],

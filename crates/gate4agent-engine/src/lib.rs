@@ -3420,7 +3420,7 @@ impl Default for Gate4AgentEngine {
 mod tests {
     use super::*;
     use gate4agent_types::{
-        AdapterBinding, AdapterFamily, AdapterId, AdapterVerification, AgentId,
+        AdapterBinding, AdapterFamily, AdapterId, AdapterVerification, AgentId, ApprovalLevel,
         CapabilityModelSummary, ForegroundAuthority, ForegroundProcess, ForegroundProcessKind,
         HistoryCandidateSummary, HistoryMessageRecord, HistoryMessageRole, HistoryQuery,
         HistorySessionRecord, InputAction, PreparedInputKind, PromptFraming, PromptPayload,
@@ -3497,6 +3497,7 @@ mod tests {
                     },
                     initial_prompt: None,
                     session_options: None,
+                    approval_level: ApprovalLevel::default(),
                 },
             },
         }
@@ -4047,6 +4048,7 @@ mod tests {
                         },
                         initial_prompt: None,
                         session_options: None,
+                        approval_level: ApprovalLevel::default(),
                     },
                 },
             })

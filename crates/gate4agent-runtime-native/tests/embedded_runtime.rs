@@ -7,7 +7,7 @@ use gate4agent_testkit::{interactive_agent_spec, CONTROL_FIXTURE_ID};
 use gate4agent_types::{
     AgentCommand, AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand,
     ControlEvent, InitialPromptMode, InputAction, ProviderRuntimePolicy, SessionStatus,
-    StartRequest, TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
+    ApprovalLevel, StartRequest, TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
 };
 
 const FIXTURE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -77,6 +77,7 @@ async fn public_handle_drives_embedded_runtime_to_real_pty_and_back() {
                     terminal_size: initial_size,
                     initial_prompt: None,
                     session_options: None,
+                    approval_level: ApprovalLevel::default(),
                 },
             },
         ))
@@ -263,6 +264,7 @@ async fn after_ready_initial_prompt_is_delivered_before_native_session_runs() {
                     },
                     initial_prompt: Some(initial_prompt.to_owned()),
                     session_options: None,
+                    approval_level: ApprovalLevel::default(),
                 },
             },
         ))
@@ -377,6 +379,7 @@ async fn two_agent_instances_progress_on_independent_effect_workers() {
                         },
                         initial_prompt: None,
                         session_options: None,
+                        approval_level: ApprovalLevel::default(),
                     },
                 },
             ))

@@ -6,7 +6,7 @@ use gate4agent_runtime_native::{NativeRuntime, NativeRuntimeConfig};
 use gate4agent_types::{
     AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, ControlEvent,
     ControlEventKind, ProviderEvent, ProviderRuntimePolicy, ResumeLaunchRequest, ResumeTarget,
-    SessionStatus, StartRequest, TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
+    SessionStatus, ApprovalLevel, StartRequest, TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
 };
 
 fn semantic_runtime_policy() -> ProviderRuntimePolicy {
@@ -421,6 +421,7 @@ async fn run_pipe_canary(agent_id: &str, instance_id: u64) {
                     },
                     initial_prompt: Some(prompt),
                     session_options: None,
+                    approval_level: ApprovalLevel::default(),
                 },
             },
         ))
@@ -683,6 +684,7 @@ async fn windows_live_parallel_codex_inline_process_isolation() {
                             markers[index]
                         )),
                         session_options: None,
+                        approval_level: ApprovalLevel::default(),
                     },
                 },
             ))
@@ -774,6 +776,7 @@ async fn windows_live_codex_inline_inflight_stop() {
                             .to_owned(),
                     ),
                     session_options: None,
+                    approval_level: ApprovalLevel::default(),
                 },
             },
         ))

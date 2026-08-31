@@ -2,7 +2,7 @@ use gate4agent_handle::bounded_port;
 use gate4agent_kernel::Gate4AgentKernel;
 use gate4agent_types::{
     AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, ControlEffect,
-    ProviderRuntimePolicy, SessionStatus, StartRequest, TerminalSize, TransportKind,
+    ProviderRuntimePolicy, SessionStatus, ApprovalLevel, StartRequest, TerminalSize, TransportKind,
     CONTROL_PROTOCOL_VERSION,
 };
 
@@ -38,6 +38,7 @@ fn handle_drives_kernel_and_publishes_one_authoritative_snapshot() {
                     },
                     initial_prompt: None,
                     session_options: None,
+                    approval_level: ApprovalLevel::default(),
                 },
             },
         })

@@ -9,7 +9,7 @@ use gate4agent_runtime_native::{NativeRuntime, NativeRuntimeConfig};
 use gate4agent_types::{
     AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, ControlEvent,
     ControlEventKind, InputAction, PreparedInputKind, PromptFraming, PromptPayload,
-    ProviderRuntimePolicy, SessionStatus, StartRequest, TerminalControl, TerminalSize,
+    ProviderRuntimePolicy, SessionStatus, ApprovalLevel, StartRequest, TerminalControl, TerminalSize,
     TerminalText, TransportKind, CONTROL_PROTOCOL_VERSION,
 };
 
@@ -842,6 +842,7 @@ async fn run_pty_canary(agent_id: &str, instance_id: u64) {
                     terminal_size: initial_size,
                     initial_prompt: Some(first.prompt.clone()),
                     session_options: None,
+                    approval_level: ApprovalLevel::default(),
                 },
             },
         ))
@@ -935,6 +936,7 @@ async fn run_codex_whole_chunk_transport_canary(instance_id: u64) {
                     },
                     initial_prompt: None,
                     session_options: None,
+                    approval_level: ApprovalLevel::default(),
                 },
             },
         ))
@@ -1069,6 +1071,7 @@ async fn run_expected_startup_block_canary(
                     },
                     initial_prompt: Some("must-not-be-sent-before-vendor-login".to_owned()),
                     session_options: None,
+                    approval_level: ApprovalLevel::default(),
                 },
             },
         ))
@@ -1208,6 +1211,7 @@ async fn windows_live_parallel_codex_kimi_pty_process_isolation() {
                         },
                         initial_prompt: Some(prompt),
                         session_options: None,
+                        approval_level: ApprovalLevel::default(),
                     },
                 },
             ))

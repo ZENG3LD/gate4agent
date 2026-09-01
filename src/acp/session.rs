@@ -29,11 +29,11 @@ use super::gate::DangerousCommandGate;
 use super::host::{AcpHostAdapter, HostPolicy, PolicyHostHandler};
 use super::protocol::{
     extract_token_usage, AgentCapabilities, AvailableCommand, ClientInfo, ContentBlock,
-    InitializeParams, SessionCancelParams, SessionCloseParams, SessionConfigOption,
-    SessionDeleteParams, SessionForkParams, SessionListParams, SessionListResult,
-    SessionLoadParams, SessionLoadResult, SessionMode, SessionModel, SessionNewParams,
-    SessionPromptParams, SessionSetConfigOptionParams, SessionSetModeParams, SessionState,
-    SessionSummary, SessionUsage,
+    InitializeParams, SessionCancelParams, SessionCloseParams, SessionCloseResult,
+    SessionConfigOption, SessionDeleteParams, SessionForkParams, SessionListParams,
+    SessionListResult, SessionLoadParams, SessionLoadResult, SessionMode, SessionModel,
+    SessionNewParams, SessionPromptParams, SessionSetConfigOptionParams, SessionSetModeParams,
+    SessionState, SessionSummary, SessionUsage,
 };
 use super::reader::acp_reader_loop;
 use super::spawn::AcpProcess;
@@ -577,37 +577,42 @@ impl AcpSession {
         self.state().models.current_model_id.clone()
     }
 
-    /// List prior sessions via `session/list`.
+    /// List prior sessions via `session/list`, optionally filtered to
+    /// those under `cwd`.
     ///
-    /// UNVERIFIED wire shape -- see [`super::protocol::SessionListParams`].
+    /// Verified live by direct invocation on claude-agent-acp 0.71.0 and
+    /// Grok CLI 1.0.13 -- see [`super::protocol::SessionListParams`] and
+    /// [`super::protocol::SessionSummary`] for exactly what was observed
+    /// on each provider. `cwd: None` sends `{}`, the exact shape both
+    /// providers were called with; `cwd: Some(_)` sends `{"cwd": "..."}`,
+    /// which Grok answered identically to the filterless call in the live
+    /// invocation.
     ///
     /// # Errors
     ///
     /// - [`AcpError::UnsupportedCapability`] — agent does not advertise `sessionCapabilities.list`
     /// - [`AcpError::Timeout`] — no response within `prompt_timeout`
     /// - [`AcpError::Agent`] — agent returned an RPC error
-    pub async fn list_sessions(&self) -> Result<Vec<SessionSummary>, AcpError> {
+    pub async fn list_sessions(&self, cwd: Option<&str>) -> Result<Vec<SessionSummary>, AcpError> {
         if !self.supports_session_list() {
             return Err(AcpError::UnsupportedCapability { capability: "list" });
         }
+        let params = SessionListParams { cwd: cwd.map(str::to_owned) };
         let result: SessionListResult = self
-            .rpc_call_typed(
-                "session/list",
-                json!(SessionListParams::default()),
-                self.prompt_timeout,
-                false,
-            )
+            .rpc_call_typed("session/list", json!(params), self.prompt_timeout, false)
             .await?;
         Ok(result.sessions)
     }
 
     /// Close the current session via `session/close`.
     ///
-    /// UNVERIFIED wire shape -- see [`super::protocol::SessionCloseParams`].
-    /// Does not kill the subprocess (use [`kill`](Self::kill) for that) and
-    /// does not clear the locally cached `acp_session_id` -- it only tells
-    /// the agent the session is done; whether the agent then rejects
-    /// further calls on this id is up to the agent.
+    /// Verified live by direct invocation on claude-agent-acp 0.71.0 and
+    /// Grok CLI 1.0.13 -- see [`super::protocol::SessionCloseParams`] and
+    /// [`super::protocol::SessionCloseResult`]. Does not kill the
+    /// subprocess (use [`kill`](Self::kill) for that) and does not clear
+    /// the locally cached `acp_session_id` -- it only tells the agent the
+    /// session is done; whether the agent then rejects further calls on
+    /// this id is up to the agent.
     ///
     /// # Errors
     ///
@@ -624,7 +629,9 @@ impl AcpSession {
             guard.clone().ok_or(AcpError::NoSession)?
         };
         let params = SessionCloseParams { session_id };
-        self.rpc_call("session/close", Some(json!(params)), self.prompt_timeout).await?;
+        let _: SessionCloseResult = self
+            .rpc_call_typed("session/close", json!(params), self.prompt_timeout, false)
+            .await?;
         Ok(())
     }
 
@@ -647,22 +654,29 @@ impl AcpSession {
         Ok(())
     }
 
-    /// Fork the current session into a new, independent one via
-    /// `session/fork`. Returns the new session's id; does NOT switch this
-    /// [`AcpSession`] to track it -- the original session stays current.
+    /// Fork the current session into a new, independent one rooted at
+    /// `cwd`, via `session/fork`. Returns the new session's id; does NOT
+    /// switch this [`AcpSession`] to track it -- the original session
+    /// stays current.
     ///
-    /// UNVERIFIED wire shape -- see [`super::protocol::SessionForkParams`].
-    /// The result is parsed with the same handshake-result shape
-    /// `session/new`/`session/load` use, since a fork's whole point is
-    /// handing back a second ready-to-use session.
+    /// `cwd` is REQUIRED, verified live by direct invocation on
+    /// claude-agent-acp 0.71.0: calling with only `{"sessionId": "<id>"}`
+    /// (this file's earlier guess) was rejected with a `-32602 Invalid
+    /// params` error naming `cwd` as the missing field -- see
+    /// [`super::protocol::SessionForkParams`] for the exact error payload.
+    /// Forking creates a new session rooted at a working directory; it
+    /// does not clone the original purely by id. The SUCCESS response
+    /// shape remains UNVERIFIED (the only live call made errored before
+    /// returning one) and is still parsed with the same handshake-result
+    /// shape `session/new`/`session/load` use.
     ///
     /// # Errors
     ///
     /// - [`AcpError::UnsupportedCapability`] — agent does not advertise `sessionCapabilities.fork`
     /// - [`AcpError::NoSession`] — handshake not complete
     /// - [`AcpError::Timeout`] — no response within `prompt_timeout`
-    /// - [`AcpError::Agent`] — agent returned an RPC error
-    pub async fn fork_session(&self) -> Result<String, AcpError> {
+    /// - [`AcpError::Agent`] — agent returned an RPC error (e.g. a missing/invalid `cwd`)
+    pub async fn fork_session(&self, cwd: &str) -> Result<String, AcpError> {
         if !self.supports_session_fork() {
             return Err(AcpError::UnsupportedCapability { capability: "fork" });
         }
@@ -670,7 +684,7 @@ impl AcpSession {
             let guard = self.acp_session_id.lock().await;
             guard.clone().ok_or(AcpError::NoSession)?
         };
-        let params = SessionForkParams { session_id };
+        let params = SessionForkParams { session_id, cwd: cwd.to_owned() };
         let result: SessionLoadResult = self
             .rpc_call_typed("session/fork", json!(params), self.prompt_timeout, false)
             .await?;

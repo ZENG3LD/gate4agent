@@ -225,32 +225,55 @@ pub struct SessionModelState {
     pub available_models: Vec<SessionModel>,
 }
 
-/// `session/list` request params (host → agent) -- UNVERIFIED wire shape.
-/// Every live capture shows `sessionCapabilities.list` as an advertised
-/// flag but none of them ever calls the method; this is sent as an empty
-/// object, matching how other no-argument ACP calls are shaped.
+/// `session/list` request params (host → agent). Verified live by direct
+/// invocation on claude-agent-acp 0.71.0 and Grok CLI 1.0.13: both an
+/// empty object and `{"cwd": "<path>"}` are accepted, and Grok answered
+/// identically either way -- `cwd` is an optional filter, not a required
+/// field. `#[serde(skip_serializing_if)]` keeps the default call shaped
+/// exactly as verified (`{}`) when no filter is requested.
 #[derive(Debug, Default, Serialize, Deserialize)]
-pub struct SessionListParams {}
+pub struct SessionListParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
 
-/// One session summary entry in a `session/list` response -- UNVERIFIED
-/// wire shape (see [`SessionListParams`]). Field names follow this file's
-/// `sessionId` convention plus the two facts a picker UI needs (`title`,
-/// `cwd`); `extra` keeps anything under a different real key name from
-/// being silently dropped.
+/// One session summary entry in a `session/list` response. Verified live
+/// by direct invocation on claude-agent-acp 0.71.0 and Grok CLI 1.0.13:
+/// both agree on `sessionId`, `cwd`, `updatedAt`; Claude additionally
+/// sends `title` (Grok does not), and Grok additionally sends `_meta`
+/// (`x.ai/session` with `kind` and `facets` -- `branch`/`cwd`/`gitRoot`/
+/// `repo`; Claude does not send `_meta` at all) -- both are therefore
+/// optional. `updatedAt` is kept as a raw string rather than parsed: the
+/// two providers use different timestamp formats on the same field
+/// (Grok `"2026-09-01T19:00:20.154340+00:00"`, six-digit microseconds
+/// and an explicit `+00:00` offset; Claude
+/// `"2026-09-01T19:02:19.365Z"`, three-digit milliseconds and a `Z`
+/// suffix) -- both are valid RFC 3339 but a single fixed-precision parser
+/// would reject one of them, so this build keeps the field opaque
+/// instead of picking a parser that only works for one provider.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionSummary {
     #[serde(rename = "sessionId", default)]
     pub session_id: String,
     #[serde(default)]
-    pub title: Option<String>,
-    #[serde(default)]
     pub cwd: Option<String>,
+    /// Claude-only.
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(rename = "updatedAt", default)]
+    pub updated_at: Option<String>,
+    /// Grok-only (`x.ai/session`: `kind`, `facets` -- `branch`, `cwd`,
+    /// `gitRoot`, `repo`). Kept as raw JSON: this build has no use for
+    /// the facet breakdown today, only for not dropping it.
+    #[serde(rename = "_meta", default)]
+    pub meta: Option<Value>,
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
 }
 
-/// `session/list` response result (agent → host) -- UNVERIFIED wire shape
-/// (see [`SessionListParams`]).
+/// `session/list` response result (agent → host). Verified live: both
+/// claude-agent-acp 0.71.0 and Grok CLI 1.0.13 wrap the summaries in a
+/// `sessions` array under this exact key.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionListResult {
     #[serde(default)]
@@ -259,31 +282,56 @@ pub struct SessionListResult {
     pub extra: HashMap<String, Value>,
 }
 
-/// `session/close` request params (host → agent) -- UNVERIFIED wire
-/// shape. Every live capture shows `sessionCapabilities.close` as an
-/// advertised flag but none of them ever calls the method; follows this
-/// file's `{sessionId}`-request convention (`session/cancel`,
-/// `session/load`, ...).
+/// `session/close` request params (host → agent). Verified live by
+/// direct invocation on claude-agent-acp 0.71.0 and Grok CLI 1.0.13:
+/// `{"sessionId": "<id>"}`, matching this file's `{sessionId}`-request
+/// convention (`session/cancel`, `session/load`, ...).
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SessionCloseParams {
     #[serde(rename = "sessionId")]
     pub session_id: String,
 }
 
+/// `session/close` response result (agent → host). Verified live: Claude
+/// returns an empty object; Grok returns `{"_meta": {"x.ai/
+/// closeOutcome": "closed"}}`. Both parse here -- `meta` is `None` for
+/// Claude's empty response.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionCloseResult {
+    #[serde(rename = "_meta", default)]
+    pub meta: Option<Value>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
 /// `session/delete` request params (host → agent) -- UNVERIFIED wire
-/// shape (see [`SessionCloseParams`]).
+/// shape (see [`SessionCloseParams`]). Not exercised by any live
+/// invocation -- only `session/list`, `session/close`, and `session/fork`
+/// were called against a real agent.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SessionDeleteParams {
     #[serde(rename = "sessionId")]
     pub session_id: String,
 }
 
-/// `session/fork` request params (host → agent) -- UNVERIFIED wire shape
-/// (see [`SessionCloseParams`]).
+/// `session/fork` request params (host → agent). Verified live by direct
+/// invocation on claude-agent-acp 0.71.0: calling with only `{"sessionId":
+/// "<id>"}` (this file's earlier guess) was REJECTED with a `-32602
+/// Invalid params` error naming the missing field explicitly:
+/// `{"_errors": [], "cwd": {"_errors": ["Invalid input: expected string,
+/// received undefined"]}}}`. `cwd` is therefore required, not optional --
+/// forking creates a new session rooted at a working directory, not a
+/// bare clone by id, mirroring `session/new`'s own required `cwd`. The
+/// success response shape remains UNVERIFIED (the only live call made
+/// errored on the missing field before returning one); this file still
+/// parses it with [`SessionLoadResult`], the same "here is a session I
+/// made ready for you" shape `session/new`/`session/load` use, since
+/// nothing contradicts that guess -- just nothing confirms it either.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SessionForkParams {
     #[serde(rename = "sessionId")]
     pub session_id: String,
+    pub cwd: String,
 }
 
 /// `session/set_mode` request params (host → agent) -- switch the agent's
@@ -2544,43 +2592,128 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // session/list, session/close, session/delete, session/fork — outbound
+    // session/list, session/close, session/delete, session/fork — outbound,
+    // verified by direct live invocation on claude-agent-acp 0.71.0 and
+    // Grok CLI 1.0.13 (`session/delete` was NOT exercised and stays
+    // UNVERIFIED, unchanged from the earlier guess).
     // -----------------------------------------------------------------------
 
     #[test]
-    fn session_list_params_serialize_as_an_empty_object() {
+    fn session_list_params_serialize_with_no_filter_matches_the_call_that_was_actually_made() {
+        // Verified: an empty object is accepted by both providers.
         let s = serde_json::to_string(&SessionListParams::default()).unwrap();
         assert_eq!(s, "{}");
     }
 
     #[test]
-    fn session_list_result_parses_sessions() {
-        let raw = r#"{"sessions":[{"sessionId":"s1","title":"Fix the parser","cwd":"/repo"}]}"#;
+    fn session_list_params_serialize_with_a_cwd_filter_matches_the_call_that_was_actually_made() {
+        // Verified: Grok accepted `{"cwd": "<path>"}` and answered
+        // identically to the filterless call.
+        let params = SessionListParams { cwd: Some("/repo".to_owned()) };
+        let s = serde_json::to_string(&params).unwrap();
+        assert_eq!(s, r#"{"cwd":"/repo"}"#);
+    }
+
+    #[test]
+    fn session_list_result_parses_the_live_claude_session_summary_shape() {
+        // Claude's `session/list` entry: sessionId, cwd, title, updatedAt
+        // -- no `_meta`. `updatedAt` uses milliseconds + `Z`.
+        let raw = r#"{"sessions":[{
+            "sessionId": "5932f0f1-b2c0-4651-8041-1e7d64be1d64",
+            "cwd": "/repo",
+            "title": "Fix the parser",
+            "updatedAt": "2026-09-01T19:02:19.365Z"
+        }]}"#;
         let result: SessionListResult = serde_json::from_str(raw).unwrap();
         assert_eq!(result.sessions.len(), 1);
-        assert_eq!(result.sessions[0].session_id, "s1");
-        assert_eq!(result.sessions[0].title.as_deref(), Some("Fix the parser"));
+        let entry = &result.sessions[0];
+        assert_eq!(entry.session_id, "5932f0f1-b2c0-4651-8041-1e7d64be1d64");
+        assert_eq!(entry.cwd.as_deref(), Some("/repo"));
+        assert_eq!(entry.title.as_deref(), Some("Fix the parser"));
+        assert_eq!(entry.updated_at.as_deref(), Some("2026-09-01T19:02:19.365Z"));
+        assert!(entry.meta.is_none());
+    }
+
+    #[test]
+    fn session_list_result_parses_the_live_grok_session_summary_shape_with_meta_facets() {
+        // Grok's `session/list` entry: sessionId, cwd, updatedAt, _meta
+        // (`x.ai/session`: kind + facets branch/cwd/gitRoot/repo) -- no
+        // `title`. `updatedAt` uses six-digit microseconds + `+00:00`.
+        // Sub-values of `kind`/`facets` were reported by key set, not
+        // literal values, so this fixture uses illustrative content for
+        // those; the key names and outer shape are as reported.
+        let raw = r#"{"sessions":[{
+            "sessionId": "01a05e41-1437-7231-9625-5fb30b8a02cd",
+            "cwd": "C:\\repo\\gate4agent",
+            "updatedAt": "2026-09-01T19:00:20.154340+00:00",
+            "_meta": {
+                "x.ai/session": {
+                    "kind": "build",
+                    "facets": {
+                        "branch": "main",
+                        "cwd": "C:\\repo\\gate4agent",
+                        "gitRoot": "C:/repo/gate4agent",
+                        "repo": "gate4agent"
+                    }
+                }
+            }
+        }]}"#;
+        let result: SessionListResult = serde_json::from_str(raw).unwrap();
+        let entry = &result.sessions[0];
+        assert_eq!(entry.session_id, "01a05e41-1437-7231-9625-5fb30b8a02cd");
+        assert_eq!(entry.updated_at.as_deref(), Some("2026-09-01T19:00:20.154340+00:00"));
+        assert!(entry.title.is_none());
+        let meta = entry.meta.as_ref().expect("grok entries carry _meta");
+        assert_eq!(meta["x.ai/session"]["kind"], "build");
+        assert_eq!(meta["x.ai/session"]["facets"]["repo"], "gate4agent");
     }
 
     #[test]
     fn session_close_params_serialize() {
+        // Verified: identical `{"sessionId": "<id>"}` shape on both
+        // claude-agent-acp 0.71.0 and Grok CLI 1.0.13.
         let params = SessionCloseParams { session_id: "s1".to_owned() };
         let s = serde_json::to_string(&params).unwrap();
         assert_eq!(s, r#"{"sessionId":"s1"}"#);
     }
 
     #[test]
+    fn session_close_result_parses_the_live_claude_empty_response() {
+        // Verbatim: Claude's `session/close` response is `{}`.
+        let result: SessionCloseResult = serde_json::from_str("{}").unwrap();
+        assert!(result.meta.is_none());
+    }
+
+    #[test]
+    fn session_close_result_parses_the_live_grok_close_outcome_response() {
+        // Verbatim: Grok's `session/close` response.
+        let raw = r#"{"_meta": {"x.ai/closeOutcome": "closed"}}"#;
+        let result: SessionCloseResult = serde_json::from_str(raw).unwrap();
+        assert_eq!(result.meta.unwrap()["x.ai/closeOutcome"], "closed");
+    }
+
+    #[test]
     fn session_delete_params_serialize() {
+        // UNVERIFIED -- not exercised by any live invocation, unchanged
+        // from the earlier `{sessionId}`-request guess.
         let params = SessionDeleteParams { session_id: "s1".to_owned() };
         let s = serde_json::to_string(&params).unwrap();
         assert_eq!(s, r#"{"sessionId":"s1"}"#);
     }
 
     #[test]
-    fn session_fork_params_serialize() {
-        let params = SessionForkParams { session_id: "s1".to_owned() };
+    fn session_fork_params_serialize_carries_both_session_id_and_the_required_cwd() {
+        // Verified: calling with only `sessionId` (this file's earlier
+        // guess) was rejected live by claude-agent-acp 0.71.0 with:
+        //   {"code": -32602, "message": "Invalid params",
+        //    "data": {"_errors": [],
+        //             "cwd": {"_errors": ["Invalid input: expected string, received undefined"]}}}
+        // `cwd` is a required field on `SessionForkParams` -- the type
+        // system itself now makes the earlier bug (a call missing `cwd`)
+        // impossible to construct.
+        let params = SessionForkParams { session_id: "s1".to_owned(), cwd: "/repo".to_owned() };
         let s = serde_json::to_string(&params).unwrap();
-        assert_eq!(s, r#"{"sessionId":"s1"}"#);
+        assert_eq!(s, r#"{"sessionId":"s1","cwd":"/repo"}"#);
     }
 
     // -----------------------------------------------------------------------

@@ -448,6 +448,25 @@ fn agent_progress_event_kind(event: &ProviderEvent) -> Option<AgentProgressEvent
             AgentProgressEventKindV1::UnrecognizedNotification
         }
         ProviderEvent::ContextWindowUsage { .. } => unreachable!("handled above"),
+        // ACP session/update coverage beyond text/tool/turn streaming
+        // (`plan`, `available_commands_update`, `current_mode_update`,
+        // `session_info_update`, `usage_update`, `config_option_update`,
+        // `user_message_chunk`). `AgentProgressEventKindV1` is a versioned
+        // wire enum without a `#[serde(other)]` fallback; minting new
+        // variants for it is a deliberate wire-contract decision for
+        // whoever owns this protocol, not a side effect of parsing more of
+        // ACP's own wire -- until that decision is made, these fold into
+        // the same "we saw something, no dedicated kind for it yet" bucket
+        // as `UnrecognizedNotification`.
+        ProviderEvent::UserMessage { .. }
+        | ProviderEvent::Plan { .. }
+        | ProviderEvent::AvailableCommandsUpdated { .. }
+        | ProviderEvent::ModeChanged { .. }
+        | ProviderEvent::SessionInfoUpdated { .. }
+        | ProviderEvent::UsageUpdated { .. }
+        | ProviderEvent::ConfigOptionsUpdated { .. } => {
+            AgentProgressEventKindV1::UnrecognizedNotification
+        }
     })
 }
 
@@ -852,7 +871,18 @@ fn provider_observations(event: &ControlEvent) -> Vec<ObservationV1> {
         | ProviderEvent::ToolCompleted { .. }
         | ProviderEvent::TurnCompleted { .. }
         | ProviderEvent::ContextWindowUsage { .. }
-        | ProviderEvent::SubagentStopped { .. } => {}
+        | ProviderEvent::SubagentStopped { .. }
+        // ACP session/update coverage beyond text/tool/turn streaming has
+        // no dedicated `ObservationKindV1` yet -- see the matching comment
+        // on `agent_progress_event_kind` above for why minting one is left
+        // to whoever owns this versioned wire contract.
+        | ProviderEvent::UserMessage { .. }
+        | ProviderEvent::Plan { .. }
+        | ProviderEvent::AvailableCommandsUpdated { .. }
+        | ProviderEvent::ModeChanged { .. }
+        | ProviderEvent::SessionInfoUpdated { .. }
+        | ProviderEvent::UsageUpdated { .. }
+        | ProviderEvent::ConfigOptionsUpdated { .. } => {}
     }
     let reports_capabilities = source_sequence == 1
         || matches!(provider_event, ProviderEvent::SessionStarted { .. });

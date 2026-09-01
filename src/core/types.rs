@@ -163,6 +163,72 @@ pub struct ContextWindowUsage {
     pub capacity_tokens: u64,
 }
 
+/// Priority of a single [`PlanStep`] (ACP transport's `plan` update).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlanStepPriority {
+    High,
+    Medium,
+    Low,
+}
+
+/// Status of a single [`PlanStep`] (ACP transport's `plan` update).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlanStepStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+/// One step of an agent's execution plan (ACP transport only). Always
+/// delivered as a full snapshot replacing any previously emitted plan,
+/// never a delta -- see `AgentEvent::Plan`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanStep {
+    pub content: String,
+    pub priority: PlanStepPriority,
+    pub status: PlanStepStatus,
+}
+
+/// A single slash-style command the agent advertises (ACP transport
+/// only).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AvailableCommandInfo {
+    pub name: String,
+    pub description: String,
+    pub input_hint: Option<String>,
+}
+
+/// The kind of a [`ConfigOptionInfo`] -- `select` (choose one of
+/// `choices`) or `boolean` (toggle `value`). `Unknown` is the fallback for
+/// a kind string this build does not recognize.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConfigOptionKind {
+    Select,
+    Boolean,
+    Unknown,
+}
+
+/// One selectable value of a `select`-kind [`ConfigOptionInfo`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConfigOptionChoiceInfo {
+    pub value: serde_json::Value,
+    pub label: Option<String>,
+}
+
+/// One session configuration setting -- the mechanism ACP uses to change
+/// model, reasoning effort, and similar settings, superseding session
+/// modes (ACP transport only).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConfigOptionInfo {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub category: Option<String>,
+    pub kind: ConfigOptionKind,
+    pub value: serde_json::Value,
+    pub choices: Vec<ConfigOptionChoiceInfo>,
+}
+
 /// Unified event type produced by both PTY and pipe transports.
 ///
 /// Consumers subscribe to a `broadcast::Receiver<AgentEvent>` and
@@ -249,4 +315,31 @@ pub enum AgentEvent {
         params: Option<serde_json::Value>,
         granted: bool,
     },
+
+    // --- ACP session/update: structured session state (ACP transport only) ---
+    /// Echo of a user message, replayed when resuming a loaded session
+    /// (`session/update`'s `user_message_chunk`).
+    UserMessage { text: String, is_delta: bool },
+    /// The agent's full execution plan, replacing any plan emitted before
+    /// it (`session/update`'s `plan`).
+    Plan { steps: Vec<PlanStep> },
+    /// The agent's slash-command catalog changed
+    /// (`available_commands_update`).
+    AvailableCommandsUpdate { commands: Vec<AvailableCommandInfo> },
+    /// The session's active mode changed (`current_mode_update`).
+    ModeChanged { mode_id: String },
+    /// Session metadata changed; only the fields that actually changed
+    /// are populated (`session_info_update`).
+    SessionInfoUpdate { title: Option<String> },
+    /// Context-window consumption and, when reported, turn cost
+    /// (`usage_update`).
+    UsageUpdate {
+        used_tokens: Option<u64>,
+        context_window: Option<u64>,
+        cost_amount: Option<f64>,
+        cost_currency: Option<String>,
+    },
+    /// The full current set of session configuration options
+    /// (`config_option_update`).
+    ConfigOptionsUpdate { options: Vec<ConfigOptionInfo> },
 }

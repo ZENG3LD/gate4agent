@@ -901,6 +901,22 @@ impl From<&gate4agent_types::ProviderEvent> for C2ProviderEventKind {
             ProviderEvent::RateLimited { .. } => Self::RateLimited,
             ProviderEvent::HostRequestObserved { .. } => Self::HostRequestObserved,
             ProviderEvent::UnrecognizedNotification { .. } => Self::UnrecognizedNotification,
+            // ACP session/update coverage beyond text/tool/turn streaming
+            // (`plan`, `available_commands_update`, `current_mode_update`,
+            // `session_info_update`, `usage_update`, `config_option_
+            // update`, `user_message_chunk`). `C2ProviderEventKind` is a
+            // wire enum without a `#[serde(other)]` fallback; minting new
+            // variants for it is a deliberate wire-contract decision for
+            // whoever owns this protocol, not a side effect of parsing
+            // more of ACP's own wire -- until that decision is made, these
+            // fold into the same bucket as `UnrecognizedNotification`.
+            ProviderEvent::UserMessage { .. }
+            | ProviderEvent::Plan { .. }
+            | ProviderEvent::AvailableCommandsUpdated { .. }
+            | ProviderEvent::ModeChanged { .. }
+            | ProviderEvent::SessionInfoUpdated { .. }
+            | ProviderEvent::UsageUpdated { .. }
+            | ProviderEvent::ConfigOptionsUpdated { .. } => Self::UnrecognizedNotification,
         }
     }
 }

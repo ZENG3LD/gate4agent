@@ -4,10 +4,16 @@
 //! in [`crate::rpc::message`]. The RPC wire types (`RpcRequest`, `RpcResponse`,
 //! `classify_line`) are reused as-is; only the ACP payload shapes live here.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::core::types::AgentEvent;
+use crate::core::types::{
+    AgentEvent, AvailableCommandInfo, ConfigOptionChoiceInfo, ConfigOptionInfo, PlanStep,
+    PlanStepPriority, PlanStepStatus,
+};
+use crate::core::types::ConfigOptionKind as CoreConfigOptionKind;
 
 // ---------------------------------------------------------------------------
 // Outbound: host → agent
@@ -117,11 +123,126 @@ pub struct SessionLoadParams {
     pub session_id: String,
 }
 
-/// `session/load` response result (agent → host).
-#[derive(Debug, Serialize, Deserialize, Default)]
+/// `session/load` response result (agent → host) -- also reused to parse
+/// `session/new`'s result, since both carry the same "here is the session
+/// I made ready for you" shape per the ACP spec: `sessionId`, and
+/// optionally `modes` (current + available session modes),
+/// `availableCommands` (the agent's slash-command catalog), and
+/// `configOptions` (current session configuration -- model, reasoning
+/// effort, ...). Every field beyond `sessionId` defaults to empty so an
+/// agent that predates any of them still parses.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SessionLoadResult {
     #[serde(rename = "sessionId", default)]
     pub session_id: String,
+    #[serde(default)]
+    pub modes: SessionModeState,
+    #[serde(rename = "availableCommands", default)]
+    pub available_commands: Vec<AvailableCommand>,
+    #[serde(rename = "configOptions", default)]
+    pub config_options: Vec<SessionConfigOption>,
+}
+
+/// `session/set_mode` request params (host → agent) -- switch the agent's
+/// current session mode. Permitted at any time per the ACP spec, including
+/// mid-generation.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SessionSetModeParams {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(rename = "modeId")]
+    pub mode_id: String,
+}
+
+/// `session/set_config_option` request params (host → agent) -- the
+/// generic mechanism that supersedes session modes for per-session
+/// settings such as model selection and reasoning effort. Field names
+/// (`optionId`, `value`) follow this file's camelCase convention and this
+/// crate's own [`SessionConfigOption`] naming; unverified against a live
+/// agent capture.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SessionSetConfigOptionParams {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(rename = "optionId")]
+    pub option_id: String,
+    pub value: Value,
+}
+
+// ---------------------------------------------------------------------------
+// SessionState — live state assembled at handshake, kept current by
+// session/update notifications
+// ---------------------------------------------------------------------------
+
+/// Context-window consumption and cost, as last reported by a
+/// `usage_update`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SessionUsage {
+    pub used_tokens: Option<u64>,
+    pub context_window: Option<u64>,
+    pub cost_amount: Option<f64>,
+    pub cost_currency: Option<String>,
+}
+
+/// Live ACP session state: modes, command catalog, config options, and
+/// context usage. Assembled from the `session/new`/`session/load`
+/// handshake result via [`SessionState::from_handshake`] and kept current
+/// by `current_mode_update`, `available_commands_update`,
+/// `config_option_update`, `session_info_update`, and `usage_update`
+/// notifications via [`apply_session_update`]. Exposed to callers through
+/// [`super::session::AcpSession`]'s accessor methods.
+#[derive(Debug, Clone, Default)]
+pub struct SessionState {
+    pub modes: SessionModeState,
+    pub available_commands: Vec<AvailableCommand>,
+    pub config_options: Vec<SessionConfigOption>,
+    pub title: Option<String>,
+    pub usage: Option<SessionUsage>,
+}
+
+impl SessionState {
+    /// Seed state from a `session/new`/`session/load` handshake result.
+    pub(crate) fn from_handshake(result: &SessionLoadResult) -> Self {
+        Self {
+            modes: result.modes.clone(),
+            available_commands: result.available_commands.clone(),
+            config_options: result.config_options.clone(),
+            title: None,
+            usage: None,
+        }
+    }
+}
+
+/// Fold a `session/update` notification into [`SessionState`], for the
+/// subset of update kinds that represent durable session state rather
+/// than a one-shot stream event. `plan`, message chunks, tool calls, and
+/// `stop` do not touch state and are ignored here.
+pub(crate) fn apply_session_update(state: &mut SessionState, update: &SessionUpdate) {
+    match update {
+        SessionUpdate::CurrentModeUpdate { current_mode_id } => {
+            state.modes.current_mode_id = Some(current_mode_id.clone());
+        }
+        SessionUpdate::AvailableCommandsUpdate { available_commands } => {
+            state.available_commands = available_commands.clone();
+        }
+        SessionUpdate::ConfigOptionUpdate { config_options } => {
+            state.config_options = config_options.clone();
+        }
+        SessionUpdate::SessionInfoUpdate { title, .. } => {
+            if let Some(title) = title {
+                state.title = Some(title.clone());
+            }
+        }
+        SessionUpdate::UsageUpdate { used_tokens, context_window, cost, .. } => {
+            state.usage = Some(SessionUsage {
+                used_tokens: *used_tokens,
+                context_window: *context_window,
+                cost_amount: cost.as_ref().and_then(|c| c.amount),
+                cost_currency: cost.as_ref().and_then(|c| c.currency.clone()),
+            });
+        }
+        _ => {}
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -188,8 +309,208 @@ pub enum SessionUpdate {
         #[serde(default)]
         usage: Option<Value>,
     },
+    /// Echo of a user message chunk -- sent when replaying a loaded
+    /// session's history, mirroring `agent_message_chunk`'s content shapes.
+    #[serde(rename = "user_message_chunk")]
+    UserMessageChunk {
+        #[serde(default)]
+        content: Value,
+    },
+    /// The agent's execution plan. Always a full snapshot replacing any
+    /// plan sent before it, never a delta.
+    #[serde(rename = "plan")]
+    Plan {
+        #[serde(default)]
+        entries: Vec<PlanEntry>,
+    },
+    /// The agent's slash-command catalog changed.
+    #[serde(rename = "available_commands_update")]
+    AvailableCommandsUpdate {
+        #[serde(rename = "availableCommands", default)]
+        available_commands: Vec<AvailableCommand>,
+    },
+    /// The session's active mode changed.
+    #[serde(rename = "current_mode_update")]
+    CurrentModeUpdate {
+        #[serde(rename = "currentModeId", default)]
+        current_mode_id: String,
+    },
+    /// Session metadata changed (e.g. title). Only the fields that
+    /// actually changed are present on the wire; anything not named below
+    /// lands in `extra` rather than being dropped.
+    #[serde(rename = "session_info_update")]
+    SessionInfoUpdate {
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(flatten)]
+        extra: HashMap<String, Value>,
+    },
+    /// Context-window consumption and, optionally, turn cost. Field names
+    /// (`usedTokens`, `contextWindow`, nested `cost`) are a best-effort
+    /// guess following this file's camelCase convention -- not verified
+    /// against a live agent capture. `extra` keeps anything that lands
+    /// under a different real key name from being silently dropped.
+    #[serde(rename = "usage_update")]
+    UsageUpdate {
+        #[serde(rename = "usedTokens", default)]
+        used_tokens: Option<u64>,
+        #[serde(rename = "contextWindow", default)]
+        context_window: Option<u64>,
+        #[serde(default)]
+        cost: Option<UsageCost>,
+        #[serde(flatten)]
+        extra: HashMap<String, Value>,
+    },
+    /// The full current set of session configuration options -- the
+    /// mechanism that supersedes session modes. Sent whole on every
+    /// update, like `plan`.
+    #[serde(rename = "config_option_update")]
+    ConfigOptionUpdate {
+        #[serde(rename = "configOptions", default)]
+        config_options: Vec<SessionConfigOption>,
+    },
     #[serde(other)]
     Unknown,
+}
+
+/// Priority of a single [`PlanEntry`] within a `plan` update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanEntryPriority {
+    High,
+    Medium,
+    Low,
+}
+
+/// Status of a single [`PlanEntry`] within a `plan` update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanEntryStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+/// One step of the agent's execution plan, as carried in
+/// [`SessionUpdate::Plan`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanEntry {
+    pub content: String,
+    pub priority: PlanEntryPriority,
+    pub status: PlanEntryStatus,
+}
+
+/// An input hint attached to an [`AvailableCommand`], e.g.
+/// `{"hint": "<file>"}`. The exact shape of this sub-object has not been
+/// captured from a live agent; `hint` is read defensively and `extra`
+/// keeps anything else intact.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AvailableCommandInput {
+    #[serde(default)]
+    pub hint: Option<String>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
+/// A single slash-style command the agent advertises, either at handshake
+/// time (`session/new`/`session/load`'s result) or via
+/// `available_commands_update`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AvailableCommand {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub input: Option<AvailableCommandInput>,
+}
+
+/// A mode the agent can operate in -- one entry of
+/// [`SessionModeState::available_modes`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionMode {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// The mode block returned by `session/new`/`session/load` and kept
+/// current by `current_mode_update`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionModeState {
+    #[serde(rename = "currentModeId", default)]
+    pub current_mode_id: Option<String>,
+    #[serde(rename = "availableModes", default)]
+    pub available_modes: Vec<SessionMode>,
+}
+
+/// The kind of a [`SessionConfigOption`] -- `select` (choose one of
+/// `options`) or `boolean` (toggle `value`). Falls back to `Unknown` for a
+/// kind string a future ACP revision adds that this build does not know
+/// yet, matching the [`ToolKind`] tolerance pattern used elsewhere in this
+/// file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigOptionKind {
+    Select,
+    Boolean,
+    #[serde(other)]
+    #[default]
+    Unknown,
+}
+
+/// One selectable value of a `select`-kind [`SessionConfigOption`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ConfigOptionChoice {
+    #[serde(default)]
+    pub value: Value,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
+/// One session configuration setting -- the mechanism that supersedes
+/// session modes for things like model selection and reasoning effort.
+/// `config_option_update` carries the FULL current set on every update,
+/// same as `plan`. Field names beyond `id`/`kind` are best-effort guesses
+/// following this file's camelCase convention -- not verified against a
+/// live agent capture; `extra` keeps anything under a different real key
+/// name from being silently dropped.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionConfigOption {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub kind: ConfigOptionKind,
+    #[serde(default)]
+    pub value: Value,
+    #[serde(default)]
+    pub options: Vec<ConfigOptionChoice>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
+/// Amount/currency pair attached to a `usage_update`, when the agent
+/// reports cost. Field names (`amount`/`currency`) are a best-effort
+/// guess; unverified against a live agent capture.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UsageCost {
+    #[serde(default)]
+    pub amount: Option<f64>,
+    #[serde(default)]
+    pub currency: Option<String>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
 }
 
 /// `fs/read_text_file` request params (agent → host).
@@ -288,6 +609,7 @@ pub enum ToolKind {
     Execute,
     Think,
     Fetch,
+    SwitchMode,
     #[serde(other)]
     #[default]
     Other,
@@ -577,6 +899,91 @@ pub(crate) fn update_to_event(params: &SessionUpdateParams) -> Vec<AgentEvent> {
                     is_error: false,
                 },
             ]
+        }
+
+        SessionUpdate::UserMessageChunk { content } => {
+            let text = extract_text_from_content(content);
+            if text.is_empty() {
+                vec![]
+            } else {
+                vec![AgentEvent::UserMessage { text, is_delta: true }]
+            }
+        }
+
+        SessionUpdate::Plan { entries } => {
+            let steps = entries
+                .iter()
+                .map(|entry| PlanStep {
+                    content: entry.content.clone(),
+                    priority: match entry.priority {
+                        PlanEntryPriority::High => PlanStepPriority::High,
+                        PlanEntryPriority::Medium => PlanStepPriority::Medium,
+                        PlanEntryPriority::Low => PlanStepPriority::Low,
+                    },
+                    status: match entry.status {
+                        PlanEntryStatus::Pending => PlanStepStatus::Pending,
+                        PlanEntryStatus::InProgress => PlanStepStatus::InProgress,
+                        PlanEntryStatus::Completed => PlanStepStatus::Completed,
+                    },
+                })
+                .collect();
+            vec![AgentEvent::Plan { steps }]
+        }
+
+        SessionUpdate::AvailableCommandsUpdate { available_commands } => {
+            let commands = available_commands
+                .iter()
+                .map(|command| AvailableCommandInfo {
+                    name: command.name.clone(),
+                    description: command.description.clone(),
+                    input_hint: command.input.as_ref().and_then(|input| input.hint.clone()),
+                })
+                .collect();
+            vec![AgentEvent::AvailableCommandsUpdate { commands }]
+        }
+
+        SessionUpdate::CurrentModeUpdate { current_mode_id } => {
+            vec![AgentEvent::ModeChanged { mode_id: current_mode_id.clone() }]
+        }
+
+        SessionUpdate::SessionInfoUpdate { title, .. } => {
+            vec![AgentEvent::SessionInfoUpdate { title: title.clone() }]
+        }
+
+        SessionUpdate::UsageUpdate { used_tokens, context_window, cost, .. } => {
+            vec![AgentEvent::UsageUpdate {
+                used_tokens: *used_tokens,
+                context_window: *context_window,
+                cost_amount: cost.as_ref().and_then(|c| c.amount),
+                cost_currency: cost.as_ref().and_then(|c| c.currency.clone()),
+            }]
+        }
+
+        SessionUpdate::ConfigOptionUpdate { config_options } => {
+            let options = config_options
+                .iter()
+                .map(|option| ConfigOptionInfo {
+                    id: option.id.clone(),
+                    name: option.name.clone(),
+                    description: option.description.clone(),
+                    category: option.category.clone(),
+                    kind: match option.kind {
+                        ConfigOptionKind::Select => CoreConfigOptionKind::Select,
+                        ConfigOptionKind::Boolean => CoreConfigOptionKind::Boolean,
+                        ConfigOptionKind::Unknown => CoreConfigOptionKind::Unknown,
+                    },
+                    value: option.value.clone(),
+                    choices: option
+                        .options
+                        .iter()
+                        .map(|choice| ConfigOptionChoiceInfo {
+                            value: choice.value.clone(),
+                            label: choice.label.clone(),
+                        })
+                        .collect(),
+                })
+                .collect();
+            vec![AgentEvent::ConfigOptionsUpdate { options }]
         }
 
         SessionUpdate::Unknown => vec![],
@@ -944,7 +1351,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_kind_serializes_the_nine_canonical_wire_values() {
+    fn tool_kind_serializes_the_ten_canonical_wire_values() {
         let cases = [
             (ToolKind::Read, "\"read\""),
             (ToolKind::Edit, "\"edit\""),
@@ -954,11 +1361,20 @@ mod tests {
             (ToolKind::Execute, "\"execute\""),
             (ToolKind::Think, "\"think\""),
             (ToolKind::Fetch, "\"fetch\""),
+            (ToolKind::SwitchMode, "\"switch_mode\""),
             (ToolKind::Other, "\"other\""),
         ];
         for (kind, expected) in cases {
             assert_eq!(serde_json::to_string(&kind).unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn tool_kind_switch_mode_round_trips() {
+        let raw = r#"{"toolCallId": "tc1", "kind": "switch_mode"}"#;
+        let tool_call: PermissionToolCall = serde_json::from_str(raw).unwrap();
+        assert_eq!(tool_call.kind, ToolKind::SwitchMode);
+        assert!(!tool_call.kind.is_read_only());
     }
 
     #[test]
@@ -1018,5 +1434,437 @@ mod tests {
         let params: FsWriteParams = serde_json::from_str(raw).unwrap();
         assert_eq!(params.path, "/tmp/x.txt");
         assert_eq!(params.content, "hello");
+    }
+
+    // -----------------------------------------------------------------------
+    // session/update — the six kinds this file previously left unparsed
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn session_update_user_message_chunk_parses_and_emits_event() {
+        let raw = r#"{"sessionId":"s1","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hi from the user"}}}"#;
+        let params: SessionUpdateParams = serde_json::from_str(raw).unwrap();
+        assert!(matches!(params.update, SessionUpdate::UserMessageChunk { .. }));
+        let events = update_to_event(&params);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            AgentEvent::UserMessage { text, is_delta: true } if text == "hi from the user"
+        ));
+    }
+
+    #[test]
+    fn session_update_plan_parses_full_snapshot() {
+        let raw = r#"{"sessionId":"s1","update":{
+            "sessionUpdate":"plan",
+            "entries":[
+                {"content":"read the file","priority":"high","status":"completed"},
+                {"content":"write the fix","priority":"medium","status":"in_progress"},
+                {"content":"run the tests","priority":"low","status":"pending"}
+            ]
+        }}"#;
+        let params: SessionUpdateParams = serde_json::from_str(raw).unwrap();
+        let SessionUpdate::Plan { entries } = &params.update else {
+            panic!("expected Plan variant");
+        };
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].priority, PlanEntryPriority::High);
+        assert_eq!(entries[0].status, PlanEntryStatus::Completed);
+        assert_eq!(entries[1].status, PlanEntryStatus::InProgress);
+
+        let events = update_to_event(&params);
+        assert_eq!(events.len(), 1);
+        let AgentEvent::Plan { steps } = &events[0] else {
+            panic!("expected AgentEvent::Plan");
+        };
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0].content, "read the file");
+        assert_eq!(steps[0].priority, PlanStepPriority::High);
+        assert_eq!(steps[2].status, PlanStepStatus::Pending);
+    }
+
+    #[test]
+    fn session_update_available_commands_update_parses() {
+        let raw = r#"{"sessionId":"s1","update":{
+            "sessionUpdate":"available_commands_update",
+            "availableCommands":[
+                {"name":"review","description":"Review the diff","input":{"hint":"<file>"}},
+                {"name":"explain","description":"Explain the code"}
+            ]
+        }}"#;
+        let params: SessionUpdateParams = serde_json::from_str(raw).unwrap();
+        let SessionUpdate::AvailableCommandsUpdate { available_commands } = &params.update else {
+            panic!("expected AvailableCommandsUpdate variant");
+        };
+        assert_eq!(available_commands.len(), 2);
+        assert_eq!(available_commands[0].name, "review");
+        assert_eq!(
+            available_commands[0].input.as_ref().and_then(|i| i.hint.clone()),
+            Some("<file>".to_owned())
+        );
+        assert!(available_commands[1].input.is_none());
+
+        let events = update_to_event(&params);
+        let AgentEvent::AvailableCommandsUpdate { commands } = &events[0] else {
+            panic!("expected AgentEvent::AvailableCommandsUpdate");
+        };
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0].input_hint.as_deref(), Some("<file>"));
+        assert_eq!(commands[1].input_hint, None);
+    }
+
+    #[test]
+    fn session_update_current_mode_update_parses() {
+        let raw = r#"{"sessionId":"s1","update":{"sessionUpdate":"current_mode_update","currentModeId":"architect"}}"#;
+        let params: SessionUpdateParams = serde_json::from_str(raw).unwrap();
+        assert!(matches!(
+            &params.update,
+            SessionUpdate::CurrentModeUpdate { current_mode_id } if current_mode_id == "architect"
+        ));
+        let events = update_to_event(&params);
+        assert!(matches!(
+            &events[0],
+            AgentEvent::ModeChanged { mode_id } if mode_id == "architect"
+        ));
+    }
+
+    #[test]
+    fn session_update_session_info_update_parses_only_changed_fields() {
+        // Only "title" changed on this update -- no other field present.
+        let raw = r#"{"sessionId":"s1","update":{"sessionUpdate":"session_info_update","title":"New title"}}"#;
+        let params: SessionUpdateParams = serde_json::from_str(raw).unwrap();
+        assert!(matches!(
+            &params.update,
+            SessionUpdate::SessionInfoUpdate { title: Some(t), .. } if t == "New title"
+        ));
+        let events = update_to_event(&params);
+        assert!(matches!(
+            &events[0],
+            AgentEvent::SessionInfoUpdate { title: Some(t) } if t == "New title"
+        ));
+    }
+
+    #[test]
+    fn session_update_session_info_update_keeps_unnamed_fields_via_extra() {
+        // A field this build doesn't have a named slot for must not be
+        // dropped silently -- it must show up in `extra`.
+        let raw = r#"{"sessionId":"s1","update":{"sessionUpdate":"session_info_update","someFutureField":"value"}}"#;
+        let params: SessionUpdateParams = serde_json::from_str(raw).unwrap();
+        let SessionUpdate::SessionInfoUpdate { title, extra } = &params.update else {
+            panic!("expected SessionInfoUpdate variant");
+        };
+        assert!(title.is_none());
+        assert_eq!(extra.get("someFutureField").and_then(Value::as_str), Some("value"));
+    }
+
+    #[test]
+    fn session_update_usage_update_parses_with_cost() {
+        let raw = r#"{"sessionId":"s1","update":{
+            "sessionUpdate":"usage_update",
+            "usedTokens":12345,
+            "contextWindow":200000,
+            "cost":{"amount":0.42,"currency":"USD"}
+        }}"#;
+        let params: SessionUpdateParams = serde_json::from_str(raw).unwrap();
+        let SessionUpdate::UsageUpdate { used_tokens, context_window, cost, .. } = &params.update
+        else {
+            panic!("expected UsageUpdate variant");
+        };
+        assert_eq!(*used_tokens, Some(12345));
+        assert_eq!(*context_window, Some(200_000));
+        assert_eq!(cost.as_ref().and_then(|c| c.amount), Some(0.42));
+        assert_eq!(cost.as_ref().and_then(|c| c.currency.clone()), Some("USD".to_owned()));
+
+        let events = update_to_event(&params);
+        assert!(matches!(
+            &events[0],
+            AgentEvent::UsageUpdate {
+                used_tokens: Some(12345),
+                context_window: Some(200_000),
+                cost_amount: Some(amount),
+                cost_currency: Some(currency),
+            } if (*amount - 0.42).abs() < f64::EPSILON && currency == "USD"
+        ));
+    }
+
+    #[test]
+    fn session_update_usage_update_parses_without_cost() {
+        let raw = r#"{"sessionId":"s1","update":{"sessionUpdate":"usage_update","usedTokens":100}}"#;
+        let params: SessionUpdateParams = serde_json::from_str(raw).unwrap();
+        let events = update_to_event(&params);
+        assert!(matches!(
+            &events[0],
+            AgentEvent::UsageUpdate {
+                used_tokens: Some(100),
+                context_window: None,
+                cost_amount: None,
+                cost_currency: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn session_update_config_option_update_parses_select_and_boolean() {
+        let raw = r#"{"sessionId":"s1","update":{
+            "sessionUpdate":"config_option_update",
+            "configOptions":[
+                {
+                    "id":"model",
+                    "name":"Model",
+                    "description":"Which model to use",
+                    "category":"generation",
+                    "kind":"select",
+                    "value":"opus",
+                    "options":[
+                        {"value":"opus","label":"Opus"},
+                        {"value":"sonnet","label":"Sonnet"}
+                    ]
+                },
+                {
+                    "id":"extended-thinking",
+                    "name":"Extended thinking",
+                    "kind":"boolean",
+                    "value":true
+                }
+            ]
+        }}"#;
+        let params: SessionUpdateParams = serde_json::from_str(raw).unwrap();
+        let SessionUpdate::ConfigOptionUpdate { config_options } = &params.update else {
+            panic!("expected ConfigOptionUpdate variant");
+        };
+        assert_eq!(config_options.len(), 2);
+        assert_eq!(config_options[0].kind, ConfigOptionKind::Select);
+        assert_eq!(config_options[0].options.len(), 2);
+        assert_eq!(config_options[1].kind, ConfigOptionKind::Boolean);
+        assert_eq!(config_options[1].value, Value::Bool(true));
+
+        let events = update_to_event(&params);
+        let AgentEvent::ConfigOptionsUpdate { options } = &events[0] else {
+            panic!("expected AgentEvent::ConfigOptionsUpdate");
+        };
+        assert_eq!(options.len(), 2);
+        assert_eq!(options[0].choices.len(), 2);
+        assert_eq!(options[0].choices[0].label.as_deref(), Some("Opus"));
+    }
+
+    #[test]
+    fn session_update_config_option_kind_unknown_string_falls_back() {
+        let raw = r#"{"id":"x","name":"X","kind":"not-a-real-kind","value":null}"#;
+        let option: SessionConfigOption = serde_json::from_str(raw).unwrap();
+        assert_eq!(option.kind, ConfigOptionKind::Unknown);
+    }
+
+    #[test]
+    fn session_update_unrecognized_future_kind_falls_back_to_unknown_and_events_are_empty() {
+        // A `sessionUpdate` tag this build has never heard of must not
+        // break parsing -- it must land in the `Unknown` variant, and
+        // `update_to_event` must return no events for it (the reader loop
+        // then passes it through as a raw `RpcNotification` rather than
+        // dropping it -- see `reader::acp_reader_loop`).
+        let raw = r#"{"sessionId":"s1","update":{"sessionUpdate":"totally_new_kind_from_the_future","someField":42}}"#;
+        let params: SessionUpdateParams = serde_json::from_str(raw).unwrap();
+        assert!(matches!(params.update, SessionUpdate::Unknown));
+        assert!(update_to_event(&params).is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // session/new & session/load handshake result — modes, commands, config
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn session_load_result_parses_modes_commands_and_config_options() {
+        let raw = r#"{
+            "sessionId":"s1",
+            "modes":{
+                "currentModeId":"code",
+                "availableModes":[
+                    {"id":"code","name":"Code"},
+                    {"id":"architect","name":"Architect","description":"Plan before editing"}
+                ]
+            },
+            "availableCommands":[
+                {"name":"review","description":"Review the diff"}
+            ],
+            "configOptions":[
+                {"id":"model","name":"Model","kind":"select","value":"opus"}
+            ]
+        }"#;
+        let result: SessionLoadResult = serde_json::from_str(raw).unwrap();
+        assert_eq!(result.session_id, "s1");
+        assert_eq!(result.modes.current_mode_id.as_deref(), Some("code"));
+        assert_eq!(result.modes.available_modes.len(), 2);
+        assert_eq!(result.modes.available_modes[1].id, "architect");
+        assert_eq!(result.available_commands.len(), 1);
+        assert_eq!(result.config_options.len(), 1);
+        assert_eq!(result.config_options[0].id, "model");
+    }
+
+    #[test]
+    fn session_load_result_defaults_when_agent_predates_modes_and_commands() {
+        let raw = r#"{"sessionId":"s1"}"#;
+        let result: SessionLoadResult = serde_json::from_str(raw).unwrap();
+        assert!(result.modes.current_mode_id.is_none());
+        assert!(result.modes.available_modes.is_empty());
+        assert!(result.available_commands.is_empty());
+        assert!(result.config_options.is_empty());
+    }
+
+    #[test]
+    fn session_state_from_handshake_seeds_modes_commands_and_config_options() {
+        let raw = r#"{
+            "sessionId":"s1",
+            "modes":{"currentModeId":"code","availableModes":[{"id":"code","name":"Code"}]},
+            "availableCommands":[{"name":"review","description":"Review the diff"}],
+            "configOptions":[{"id":"model","name":"Model","kind":"select","value":"opus"}]
+        }"#;
+        let result: SessionLoadResult = serde_json::from_str(raw).unwrap();
+        let state = SessionState::from_handshake(&result);
+        assert_eq!(state.modes.current_mode_id.as_deref(), Some("code"));
+        assert_eq!(state.available_commands.len(), 1);
+        assert_eq!(state.config_options.len(), 1);
+        assert!(state.title.is_none());
+        assert!(state.usage.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_session_update — SessionState kept current by *_update
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn apply_session_update_sets_current_mode_id() {
+        let mut state = SessionState::default();
+        apply_session_update(
+            &mut state,
+            &SessionUpdate::CurrentModeUpdate { current_mode_id: "architect".to_owned() },
+        );
+        assert_eq!(state.modes.current_mode_id.as_deref(), Some("architect"));
+    }
+
+    #[test]
+    fn apply_session_update_replaces_available_commands() {
+        let mut state = SessionState::default();
+        state.available_commands.push(AvailableCommand {
+            name: "stale".to_owned(),
+            description: String::new(),
+            input: None,
+        });
+        let fresh = vec![AvailableCommand {
+            name: "review".to_owned(),
+            description: "Review the diff".to_owned(),
+            input: None,
+        }];
+        apply_session_update(
+            &mut state,
+            &SessionUpdate::AvailableCommandsUpdate { available_commands: fresh.clone() },
+        );
+        assert_eq!(state.available_commands.len(), 1);
+        assert_eq!(state.available_commands[0].name, "review");
+    }
+
+    #[test]
+    fn apply_session_update_replaces_config_options_wholesale() {
+        let mut state = SessionState::default();
+        let options = vec![SessionConfigOption {
+            id: "model".to_owned(),
+            name: "Model".to_owned(),
+            kind: ConfigOptionKind::Select,
+            value: Value::String("opus".to_owned()),
+            ..Default::default()
+        }];
+        apply_session_update(
+            &mut state,
+            &SessionUpdate::ConfigOptionUpdate { config_options: options },
+        );
+        assert_eq!(state.config_options.len(), 1);
+        assert_eq!(state.config_options[0].id, "model");
+    }
+
+    #[test]
+    fn apply_session_update_sets_title_only_when_present() {
+        let mut state = SessionState::default();
+        apply_session_update(
+            &mut state,
+            &SessionUpdate::SessionInfoUpdate { title: None, extra: HashMap::new() },
+        );
+        assert!(state.title.is_none());
+
+        apply_session_update(
+            &mut state,
+            &SessionUpdate::SessionInfoUpdate {
+                title: Some("New title".to_owned()),
+                extra: HashMap::new(),
+            },
+        );
+        assert_eq!(state.title.as_deref(), Some("New title"));
+    }
+
+    #[test]
+    fn apply_session_update_sets_usage() {
+        let mut state = SessionState::default();
+        apply_session_update(
+            &mut state,
+            &SessionUpdate::UsageUpdate {
+                used_tokens: Some(500),
+                context_window: Some(200_000),
+                cost: Some(UsageCost {
+                    amount: Some(1.5),
+                    currency: Some("USD".to_owned()),
+                    extra: HashMap::new(),
+                }),
+                extra: HashMap::new(),
+            },
+        );
+        let usage = state.usage.expect("usage must be set");
+        assert_eq!(usage.used_tokens, Some(500));
+        assert_eq!(usage.context_window, Some(200_000));
+        assert_eq!(usage.cost_amount, Some(1.5));
+        assert_eq!(usage.cost_currency.as_deref(), Some("USD"));
+    }
+
+    #[test]
+    fn apply_session_update_ignores_stream_only_updates() {
+        let mut state = SessionState::default();
+        let before = state.clone();
+        apply_session_update(&mut state, &SessionUpdate::Plan { entries: vec![] });
+        apply_session_update(
+            &mut state,
+            &SessionUpdate::Stop {
+                stop_reason: "end_turn".to_owned(),
+                input_tokens: 0,
+                output_tokens: 0,
+                usage: None,
+            },
+        );
+        assert_eq!(before.modes.current_mode_id, state.modes.current_mode_id);
+        assert!(state.title.is_none());
+        assert!(state.usage.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // session/set_mode & session/set_config_option — new outbound methods
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn session_set_mode_params_serialize() {
+        let params = SessionSetModeParams {
+            session_id: "s1".to_owned(),
+            mode_id: "architect".to_owned(),
+        };
+        let s = serde_json::to_string(&params).unwrap();
+        assert!(s.contains("\"sessionId\":\"s1\""));
+        assert!(s.contains("\"modeId\":\"architect\""));
+    }
+
+    #[test]
+    fn session_set_config_option_params_serialize() {
+        let params = SessionSetConfigOptionParams {
+            session_id: "s1".to_owned(),
+            option_id: "model".to_owned(),
+            value: Value::String("sonnet".to_owned()),
+        };
+        let s = serde_json::to_string(&params).unwrap();
+        assert!(s.contains("\"sessionId\":\"s1\""));
+        assert!(s.contains("\"optionId\":\"model\""));
+        assert!(s.contains("\"value\":\"sonnet\""));
     }
 }

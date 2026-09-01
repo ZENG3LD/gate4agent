@@ -26,7 +26,8 @@ use crate::rpc::message::{classify_line, IncomingMessage, RpcError, RpcResponse}
 use crate::rpc::pending::PendingRequests;
 
 use super::protocol::{
-    update_to_event, PermissionOptionKind, PermissionRequestParams, SessionUpdateParams,
+    apply_session_update, update_to_event, PermissionOptionKind, PermissionRequestParams,
+    SessionState, SessionUpdateParams,
 };
 use super::spawn::AcpProcess;
 
@@ -40,6 +41,7 @@ pub(crate) fn acp_reader_loop(
     tx: broadcast::Sender<AgentEvent>,
     pending: PendingRequests,
     handler: Arc<dyn HostHandler>,
+    session_state: Arc<Mutex<SessionState>>,
 ) {
     let mut received_session_end = false;
     // Error handed to any still-pending request when the loop exits. Only
@@ -155,6 +157,12 @@ pub(crate) fn acp_reader_loop(
                     // Try to parse as typed SessionUpdateParams.
                     if let Some(ref p) = params {
                         if let Ok(sup) = serde_json::from_value::<SessionUpdateParams>(p.clone()) {
+                            {
+                                let mut state = session_state
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                apply_session_update(&mut state, &sup.update);
+                            }
                             let events = update_to_event(&sup);
                             if events.is_empty() {
                                 // Unknown update type — pass through as generic notification.

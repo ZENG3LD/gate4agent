@@ -24,6 +24,10 @@ pub const PROVIDER_INTERACTION_RESPONSE_MAX_BYTES: usize = 32_768;
 pub const PROVIDER_INTERACTION_FAILURE_MAX_BYTES: usize = 4_096;
 pub const PROVIDER_SUBAGENTS_MAX: usize = 64;
 pub const PROVIDER_SESSION_LOCATOR_MAX_BYTES: usize = 32_768;
+pub const PROVIDER_PLAN_STEPS_MAX: usize = 256;
+pub const PROVIDER_AVAILABLE_COMMANDS_MAX: usize = 256;
+pub const PROVIDER_CONFIG_OPTIONS_MAX: usize = 256;
+pub const PROVIDER_CONFIG_OPTION_CHOICES_MAX: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -1324,6 +1328,82 @@ pub struct ProviderSubagent {
     pub description: Option<String>,
 }
 
+/// Priority of a single [`ProviderPlanStep`], carried on
+/// `ProviderEvent::Plan`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderPlanPriority {
+    High,
+    Medium,
+    Low,
+}
+
+/// Status of a single [`ProviderPlanStep`], carried on
+/// `ProviderEvent::Plan`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderPlanStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+/// One step of the agent's execution plan (ACP transport's `plan`
+/// update). `ProviderEvent::Plan` always carries the FULL plan snapshot,
+/// never a delta.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderPlanStep {
+    pub content: String,
+    pub priority: ProviderPlanPriority,
+    pub status: ProviderPlanStatus,
+}
+
+/// A single slash-style command the agent advertises (ACP transport's
+/// `available_commands_update`).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderAvailableCommand {
+    pub name: String,
+    pub description: String,
+    pub input_hint: Option<String>,
+}
+
+/// The kind of a [`ProviderConfigOption`] -- `select` (choose one of
+/// `choices`) or `boolean` (toggle the option's current value). `Unknown`
+/// is the fallback for a kind string this build does not recognize.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderConfigOptionKind {
+    Select,
+    Boolean,
+    Unknown,
+}
+
+/// One selectable value of a `select`-kind [`ProviderConfigOption`].
+/// `value_json` is the choice's value pre-serialized to JSON text (this
+/// crate is a pure data contract and does not depend on `serde_json`; see
+/// `ProviderConfigOption::value_json` for the same convention applied to
+/// the option's own current value).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderConfigChoice {
+    pub value_json: String,
+    pub label: Option<String>,
+}
+
+/// One session configuration setting -- the mechanism ACP uses to change
+/// model, reasoning effort, and similar settings, superseding session
+/// modes. `ProviderEvent::ConfigOptionsUpdated` always carries the FULL
+/// current set, never a delta.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderConfigOption {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub category: Option<String>,
+    pub kind: ProviderConfigOptionKind,
+    pub value_json: String,
+    pub choices: Vec<ProviderConfigChoice>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ProviderEvent {
@@ -1429,6 +1509,47 @@ pub enum ProviderEvent {
     UnrecognizedNotification {
         method: String,
         payload_json: String,
+    },
+    /// Echo of a user message, replayed when resuming a loaded session
+    /// (ACP transport's `user_message_chunk`).
+    UserMessage {
+        text: String,
+        is_delta: bool,
+    },
+    /// The agent's full execution plan, replacing any plan reported
+    /// before it (ACP transport's `plan`).
+    Plan {
+        steps: Vec<ProviderPlanStep>,
+    },
+    /// The agent's slash-command catalog changed (ACP transport's
+    /// `available_commands_update`).
+    AvailableCommandsUpdated {
+        commands: Vec<ProviderAvailableCommand>,
+    },
+    /// The session's active mode changed (ACP transport's
+    /// `current_mode_update`).
+    ModeChanged {
+        mode_id: String,
+    },
+    /// Session metadata changed; only the fields that actually changed
+    /// are populated (ACP transport's `session_info_update`).
+    SessionInfoUpdated {
+        title: Option<String>,
+    },
+    /// Context-window consumption and, when reported, turn cost (ACP
+    /// transport's `usage_update`). `cost_amount` is a decimal string, not
+    /// `f64`, for the same reason `SessionEnded::cost_usd` is -- so this
+    /// type can keep deriving `Eq`.
+    UsageUpdated {
+        used_tokens: Option<u64>,
+        context_window: Option<u64>,
+        cost_amount: Option<String>,
+        cost_currency: Option<String>,
+    },
+    /// The full current set of session configuration options (ACP
+    /// transport's `config_option_update`).
+    ConfigOptionsUpdated {
+        options: Vec<ProviderConfigOption>,
     },
 }
 
@@ -1610,6 +1731,122 @@ impl ProviderEvent {
                     PROVIDER_EVENT_TEXT_MAX_BYTES,
                 )?;
             }
+            Self::UserMessage { text, .. } => {
+                validate_text("text", text, PROVIDER_EVENT_TEXT_MAX_BYTES)?;
+            }
+            Self::Plan { steps } => {
+                if steps.len() > PROVIDER_PLAN_STEPS_MAX {
+                    return Err(ProviderEventValidationError::TooManyPlanSteps {
+                        count: steps.len(),
+                        max: PROVIDER_PLAN_STEPS_MAX,
+                    });
+                }
+                for step in steps {
+                    validate_required_text(
+                        "plan step content",
+                        &step.content,
+                        PROVIDER_EVENT_TEXT_MAX_BYTES,
+                    )?;
+                }
+            }
+            Self::AvailableCommandsUpdated { commands } => {
+                if commands.len() > PROVIDER_AVAILABLE_COMMANDS_MAX {
+                    return Err(ProviderEventValidationError::TooManyAvailableCommands {
+                        count: commands.len(),
+                        max: PROVIDER_AVAILABLE_COMMANDS_MAX,
+                    });
+                }
+                for command in commands {
+                    validate_required("command name", &command.name, PROVIDER_EVENT_ID_MAX_BYTES)?;
+                    validate_text(
+                        "command description",
+                        &command.description,
+                        PROVIDER_EVENT_TEXT_MAX_BYTES,
+                    )?;
+                    if let Some(hint) = &command.input_hint {
+                        validate_text("command input hint", hint, PROVIDER_EVENT_TEXT_MAX_BYTES)?;
+                    }
+                }
+            }
+            Self::ModeChanged { mode_id } => {
+                validate_required("mode id", mode_id, PROVIDER_EVENT_ID_MAX_BYTES)?;
+            }
+            Self::SessionInfoUpdated { title } => {
+                if let Some(title) = title {
+                    validate_text("session title", title, PROVIDER_EVENT_TEXT_MAX_BYTES)?;
+                }
+            }
+            Self::UsageUpdated {
+                cost_amount,
+                cost_currency,
+                ..
+            } => {
+                if let Some(amount) = cost_amount {
+                    validate_identifier("usage cost amount", amount, PROVIDER_EVENT_ID_MAX_BYTES)?;
+                }
+                if let Some(currency) = cost_currency {
+                    validate_identifier(
+                        "usage cost currency",
+                        currency,
+                        PROVIDER_EVENT_ID_MAX_BYTES,
+                    )?;
+                }
+            }
+            Self::ConfigOptionsUpdated { options } => {
+                if options.len() > PROVIDER_CONFIG_OPTIONS_MAX {
+                    return Err(ProviderEventValidationError::TooManyConfigOptions {
+                        count: options.len(),
+                        max: PROVIDER_CONFIG_OPTIONS_MAX,
+                    });
+                }
+                for option in options {
+                    validate_required("config option id", &option.id, PROVIDER_EVENT_ID_MAX_BYTES)?;
+                    validate_required(
+                        "config option name",
+                        &option.name,
+                        PROVIDER_EVENT_ID_MAX_BYTES,
+                    )?;
+                    if let Some(description) = &option.description {
+                        validate_text(
+                            "config option description",
+                            description,
+                            PROVIDER_EVENT_TEXT_MAX_BYTES,
+                        )?;
+                    }
+                    if let Some(category) = &option.category {
+                        validate_identifier(
+                            "config option category",
+                            category,
+                            PROVIDER_EVENT_ID_MAX_BYTES,
+                        )?;
+                    }
+                    validate_text(
+                        "config option value",
+                        &option.value_json,
+                        PROVIDER_EVENT_TEXT_MAX_BYTES,
+                    )?;
+                    if option.choices.len() > PROVIDER_CONFIG_OPTION_CHOICES_MAX {
+                        return Err(ProviderEventValidationError::TooManyConfigOptionChoices {
+                            count: option.choices.len(),
+                            max: PROVIDER_CONFIG_OPTION_CHOICES_MAX,
+                        });
+                    }
+                    for choice in &option.choices {
+                        validate_text(
+                            "config option choice value",
+                            &choice.value_json,
+                            PROVIDER_EVENT_TEXT_MAX_BYTES,
+                        )?;
+                        if let Some(label) = &choice.label {
+                            validate_text(
+                                "config option choice label",
+                                label,
+                                PROVIDER_EVENT_TEXT_MAX_BYTES,
+                            )?;
+                        }
+                    }
+                }
+            }
             Self::WorkingObserved
             | Self::TurnCompleted { .. }
             | Self::TurnInterrupted
@@ -1692,6 +1929,14 @@ pub enum ProviderEventValidationError {
     ContextWindowSegmentsOverflow,
     #[error("context-window token segments sum to {segment_sum}, not used_tokens {used_tokens}")]
     ContextWindowSegmentsMismatch { segment_sum: u64, used_tokens: u64 },
+    #[error("provider plan step count {count} exceeds {max}")]
+    TooManyPlanSteps { count: usize, max: usize },
+    #[error("provider available command count {count} exceeds {max}")]
+    TooManyAvailableCommands { count: usize, max: usize },
+    #[error("provider config option count {count} exceeds {max}")]
+    TooManyConfigOptions { count: usize, max: usize },
+    #[error("provider config option choice count {count} exceeds {max}")]
+    TooManyConfigOptionChoices { count: usize, max: usize },
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -2161,18 +2406,21 @@ mod tests {
         AgentInstanceId, CapabilitySnapshot, ContextWindowUsage, ForegroundProcess,
         ForegroundProcessKind, ForegroundSnapshot, HistorySnapshot, OperatorGateInput,
         OperatorGateKind, OperatorGateOption, OperatorGateOptionSemantics, OperatorGateState,
-        OperatorGateSubject, ProviderEvent,
+        OperatorGateSubject, ProviderAvailableCommand, ProviderConfigChoice, ProviderConfigOption,
+        ProviderConfigOptionKind, ProviderEvent,
         ProviderEventValidationError,
         ProviderInteractionKind, ProviderInteractionOutcome, ProviderInteractionResponse,
-        ProviderInteractionResponseError, ProviderRuntimeCapability, ProviderRuntimePolicy,
+        ProviderInteractionResponseError, ProviderPlanPriority, ProviderPlanStatus,
+        ProviderPlanStep, ProviderRuntimeCapability, ProviderRuntimePolicy,
         ProviderRuntimePolicyError,
         ProviderSessionIdentity, ProviderSessionKey, ProviderSnapshot, PtyScreenState,
         ResumeSnapshot, SessionGeneration, SessionSnapshot, SessionStatus, TerminalFrame,
         TerminalMouseProtocolEncoding, TransportKind,
         FOREGROUND_PROCESS_NAME_MAX_BYTES, OPERATOR_GATE_OPTIONS_MAX,
         OPERATOR_GATE_OPTION_TEXT_MAX_BYTES, OPERATOR_GATE_PATH_MAX_BYTES,
+        PROVIDER_AVAILABLE_COMMANDS_MAX,
         PROVIDER_EVENT_ID_MAX_BYTES, PROVIDER_EVENT_TEXT_MAX_BYTES,
-        PROVIDER_INTERACTION_RESPONSE_MAX_BYTES,
+        PROVIDER_INTERACTION_RESPONSE_MAX_BYTES, PROVIDER_PLAN_STEPS_MAX,
         PTY_SCREEN_GATE_NAME_MAX_BYTES,
     };
 
@@ -2803,6 +3051,200 @@ mod tests {
                 field: "unrecognized notification payload",
                 ..
             })
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // ACP session/update coverage — Plan, AvailableCommandsUpdated,
+    // ModeChanged, SessionInfoUpdated, UsageUpdated, ConfigOptionsUpdated,
+    // UserMessage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn provider_user_message_is_bounded_at_ingress_like_text() {
+        let valid = ProviderEvent::UserMessage { text: "hi".to_owned(), is_delta: true };
+        assert_eq!(valid.validate_ingress(), Ok(()));
+
+        assert!(matches!(
+            ProviderEvent::UserMessage {
+                text: "unsafe\u{0000}text".to_owned(),
+                is_delta: true,
+            }
+            .validate_ingress(),
+            Err(ProviderEventValidationError::InvalidField { field: "text", .. })
+        ));
+    }
+
+    #[test]
+    fn provider_plan_accepts_a_valid_snapshot_and_rejects_empty_step_content() {
+        let valid = ProviderEvent::Plan {
+            steps: vec![ProviderPlanStep {
+                content: "read the file".to_owned(),
+                priority: ProviderPlanPriority::High,
+                status: ProviderPlanStatus::Completed,
+            }],
+        };
+        assert_eq!(valid.validate_ingress(), Ok(()));
+
+        assert!(matches!(
+            ProviderEvent::Plan {
+                steps: vec![ProviderPlanStep {
+                    content: String::new(),
+                    priority: ProviderPlanPriority::Low,
+                    status: ProviderPlanStatus::Pending,
+                }],
+            }
+            .validate_ingress(),
+            Err(ProviderEventValidationError::Empty { field: "plan step content" })
+        ));
+    }
+
+    #[test]
+    fn provider_plan_rejects_too_many_steps() {
+        let steps = (0..=PROVIDER_PLAN_STEPS_MAX)
+            .map(|i| ProviderPlanStep {
+                content: format!("step {i}"),
+                priority: ProviderPlanPriority::Medium,
+                status: ProviderPlanStatus::Pending,
+            })
+            .collect();
+        assert!(matches!(
+            ProviderEvent::Plan { steps }.validate_ingress(),
+            Err(ProviderEventValidationError::TooManyPlanSteps {
+                max: PROVIDER_PLAN_STEPS_MAX,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn provider_available_commands_updated_is_bounded_at_ingress() {
+        let valid = ProviderEvent::AvailableCommandsUpdated {
+            commands: vec![ProviderAvailableCommand {
+                name: "review".to_owned(),
+                description: "Review the diff".to_owned(),
+                input_hint: Some("<file>".to_owned()),
+            }],
+        };
+        assert_eq!(valid.validate_ingress(), Ok(()));
+
+        assert!(matches!(
+            ProviderEvent::AvailableCommandsUpdated {
+                commands: vec![ProviderAvailableCommand {
+                    name: String::new(),
+                    description: String::new(),
+                    input_hint: None,
+                }],
+            }
+            .validate_ingress(),
+            Err(ProviderEventValidationError::Empty { field: "command name" })
+        ));
+
+        let too_many = (0..=PROVIDER_AVAILABLE_COMMANDS_MAX)
+            .map(|i| ProviderAvailableCommand {
+                name: format!("cmd{i}"),
+                description: String::new(),
+                input_hint: None,
+            })
+            .collect();
+        assert!(matches!(
+            ProviderEvent::AvailableCommandsUpdated { commands: too_many }.validate_ingress(),
+            Err(ProviderEventValidationError::TooManyAvailableCommands {
+                max: PROVIDER_AVAILABLE_COMMANDS_MAX,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn provider_mode_changed_requires_a_mode_id() {
+        assert_eq!(
+            ProviderEvent::ModeChanged { mode_id: "architect".to_owned() }.validate_ingress(),
+            Ok(())
+        );
+        assert!(matches!(
+            ProviderEvent::ModeChanged { mode_id: String::new() }.validate_ingress(),
+            Err(ProviderEventValidationError::Empty { field: "mode id" })
+        ));
+    }
+
+    #[test]
+    fn provider_session_info_updated_allows_no_title_and_rejects_control_bytes() {
+        assert_eq!(
+            ProviderEvent::SessionInfoUpdated { title: None }.validate_ingress(),
+            Ok(())
+        );
+        assert!(matches!(
+            ProviderEvent::SessionInfoUpdated {
+                title: Some("bad\u{0000}title".to_owned()),
+            }
+            .validate_ingress(),
+            Err(ProviderEventValidationError::InvalidField { field: "session title", .. })
+        ));
+    }
+
+    #[test]
+    fn provider_usage_updated_accepts_optional_cost_and_bounds_currency() {
+        let valid = ProviderEvent::UsageUpdated {
+            used_tokens: Some(100),
+            context_window: Some(200_000),
+            cost_amount: Some("0.42".to_owned()),
+            cost_currency: Some("USD".to_owned()),
+        };
+        assert_eq!(valid.validate_ingress(), Ok(()));
+
+        let no_cost = ProviderEvent::UsageUpdated {
+            used_tokens: None,
+            context_window: None,
+            cost_amount: None,
+            cost_currency: None,
+        };
+        assert_eq!(no_cost.validate_ingress(), Ok(()));
+
+        assert!(matches!(
+            ProviderEvent::UsageUpdated {
+                used_tokens: None,
+                context_window: None,
+                cost_amount: None,
+                cost_currency: Some("bad\ncurrency".to_owned()),
+            }
+            .validate_ingress(),
+            Err(ProviderEventValidationError::InvalidField { field: "usage cost currency", .. })
+        ));
+    }
+
+    #[test]
+    fn provider_config_options_updated_is_typed_and_bounded_at_ingress() {
+        let valid = ProviderEvent::ConfigOptionsUpdated {
+            options: vec![ProviderConfigOption {
+                id: "model".to_owned(),
+                name: "Model".to_owned(),
+                description: Some("Which model to use".to_owned()),
+                category: Some("generation".to_owned()),
+                kind: ProviderConfigOptionKind::Select,
+                value_json: "\"opus\"".to_owned(),
+                choices: vec![ProviderConfigChoice {
+                    value_json: "\"opus\"".to_owned(),
+                    label: Some("Opus".to_owned()),
+                }],
+            }],
+        };
+        assert_eq!(valid.validate_ingress(), Ok(()));
+
+        assert!(matches!(
+            ProviderEvent::ConfigOptionsUpdated {
+                options: vec![ProviderConfigOption {
+                    id: String::new(),
+                    name: "Model".to_owned(),
+                    description: None,
+                    category: None,
+                    kind: ProviderConfigOptionKind::Boolean,
+                    value_json: "true".to_owned(),
+                    choices: Vec::new(),
+                }],
+            }
+            .validate_ingress(),
+            Err(ProviderEventValidationError::Empty { field: "config option id" })
         ));
     }
 }

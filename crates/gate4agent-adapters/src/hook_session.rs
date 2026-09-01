@@ -504,7 +504,16 @@ impl HookSessionReducer {
                 | ProviderEvent::SubagentStopped { .. }
                 | ProviderEvent::RateLimited { .. }
                 | ProviderEvent::HostRequestObserved { .. }
-                | ProviderEvent::UnrecognizedNotification { .. } => {}
+                | ProviderEvent::UnrecognizedNotification { .. }
+                // ACP session/update coverage beyond text/tool/turn
+                // streaming carries no tool id to correlate.
+                | ProviderEvent::UserMessage { .. }
+                | ProviderEvent::Plan { .. }
+                | ProviderEvent::AvailableCommandsUpdated { .. }
+                | ProviderEvent::ModeChanged { .. }
+                | ProviderEvent::SessionInfoUpdated { .. }
+                | ProviderEvent::UsageUpdated { .. }
+                | ProviderEvent::ConfigOptionsUpdated { .. } => {}
             }
         }
     }

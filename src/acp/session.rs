@@ -12,7 +12,7 @@
 //! 4. `session.cancel()` — sends `session/cancel` notification
 //! 5. `session.kill()` — hard-kills the subprocess
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -28,9 +28,10 @@ use crate::rpc::pending::PendingRequests;
 use super::gate::DangerousCommandGate;
 use super::host::{AcpHostAdapter, HostPolicy, PolicyHostHandler};
 use super::protocol::{
-    extract_token_usage, AgentCapabilities, ClientInfo, ContentBlock, InitializeParams,
-    SessionCancelParams, SessionLoadParams, SessionLoadResult, SessionNewParams,
-    SessionPromptParams,
+    extract_token_usage, AgentCapabilities, AvailableCommand, ClientInfo, ContentBlock,
+    InitializeParams, SessionCancelParams, SessionConfigOption, SessionLoadParams,
+    SessionLoadResult, SessionMode, SessionNewParams, SessionPromptParams,
+    SessionSetConfigOptionParams, SessionSetModeParams, SessionState, SessionUsage,
 };
 use super::reader::acp_reader_loop;
 use super::spawn::AcpProcess;
@@ -181,6 +182,14 @@ pub struct AcpSession {
     prompt_timeout: Duration,
     /// Capabilities reported by the agent during `initialize`.
     agent_caps: AgentCapabilities,
+    /// Live session state (modes, command catalog, config options, usage)
+    /// -- seeded from the `session/new`/`session/load` handshake result
+    /// and kept current by the reader loop applying `session/update`
+    /// notifications. A plain `std::sync::Mutex` because the reader loop
+    /// that writes it runs on a blocking thread, not async; every lock is
+    /// held only long enough to read or clone the state, never across an
+    /// `.await`.
+    session_state: Arc<Mutex<SessionState>>,
 }
 
 impl AcpSession {
@@ -248,14 +257,16 @@ impl AcpSession {
 
         let pending = PendingRequests::new();
         let id_gen = Arc::new(IdGen::new());
+        let session_state = Arc::new(Mutex::new(SessionState::default()));
 
         // Clones for the reader loop task.
         let reader_process = Arc::clone(&process);
         let reader_tx = tx.clone();
         let reader_pending = pending.clone();
+        let reader_session_state = Arc::clone(&session_state);
 
         let reader_task = tokio::task::spawn_blocking(move || {
-            acp_reader_loop(reader_process, reader_tx, reader_pending, handler);
+            acp_reader_loop(reader_process, reader_tx, reader_pending, handler, reader_session_state);
         });
 
         let acp_session_id = Arc::new(tokio::sync::Mutex::new(None::<String>));
@@ -271,6 +282,7 @@ impl AcpSession {
             reader_task,
             prompt_timeout: options.prompt_timeout,
             agent_caps: AgentCapabilities::default(),
+            session_state,
         };
 
         // --- Handshake step 1: initialize (id=0 per ACP convention) ---
@@ -294,20 +306,25 @@ impl AcpSession {
             cwd: working_dir.to_str().unwrap_or(".").to_string(),
             mcp_servers: vec![],
         };
-        let new_result = session
-            .rpc_call("session/new", Some(json!(new_params)), options.handshake_timeout)
+        let new_result: SessionLoadResult = session
+            .rpc_call_typed("session/new", json!(new_params), options.handshake_timeout, false)
             .await
             .map_err(|e| map_handshake_error("session/new", e))?;
 
-        let acp_sid = new_result
-            .get("sessionId")
-            .and_then(|v| v.as_str())
-            .unwrap_or(&local_session_id)
-            .to_owned();
+        let acp_sid = if new_result.session_id.is_empty() {
+            local_session_id.clone()
+        } else {
+            new_result.session_id.clone()
+        };
 
         {
             let mut guard = acp_session_id.lock().await;
             *guard = Some(acp_sid.clone());
+        }
+
+        {
+            let mut state = session.state();
+            *state = SessionState::from_handshake(&new_result);
         }
 
         let _ = tx.send(AgentEvent::SessionStart {
@@ -486,7 +503,7 @@ impl AcpSession {
         let new_sid = if result.session_id.is_empty() {
             prior_session_id.to_owned()
         } else {
-            result.session_id
+            result.session_id.clone()
         };
 
         {
@@ -494,12 +511,123 @@ impl AcpSession {
             *guard = Some(new_sid);
         }
 
+        {
+            let mut state = self.state();
+            *state = SessionState::from_handshake(&result);
+        }
+
+        Ok(())
+    }
+
+    /// Modes the agent advertised at handshake time, kept current by
+    /// `current_mode_update`.
+    pub fn available_modes(&self) -> Vec<SessionMode> {
+        self.state().modes.available_modes.clone()
+    }
+
+    /// The session's currently active mode id, if the agent supports
+    /// session modes.
+    pub fn current_mode_id(&self) -> Option<String> {
+        self.state().modes.current_mode_id.clone()
+    }
+
+    /// The agent's slash-command catalog, kept current by
+    /// `available_commands_update`.
+    pub fn available_commands(&self) -> Vec<AvailableCommand> {
+        self.state().available_commands.clone()
+    }
+
+    /// The session's current configuration options (model, reasoning
+    /// effort, ...), kept current by `config_option_update`.
+    pub fn config_options(&self) -> Vec<SessionConfigOption> {
+        self.state().config_options.clone()
+    }
+
+    /// Context-window consumption and cost, as last reported by a
+    /// `usage_update`. `None` if the agent has not sent one.
+    pub fn usage(&self) -> Option<SessionUsage> {
+        self.state().usage.clone()
+    }
+
+    /// Session title, as last reported by `session_info_update`. `None`
+    /// if the agent has not sent one.
+    pub fn session_title(&self) -> Option<String> {
+        self.state().title.clone()
+    }
+
+    /// Switch the agent's current session mode. Per the ACP spec this may
+    /// be called at any time on a live session, including mid-generation.
+    ///
+    /// On success, updates the locally cached `current_mode_id`
+    /// immediately rather than waiting for a `current_mode_update`
+    /// notification -- an agent is not required to also send one after
+    /// acking this call.
+    ///
+    /// # Errors
+    ///
+    /// - [`AcpError::NoSession`] — handshake not complete
+    /// - [`AcpError::Timeout`] — no response within `prompt_timeout`
+    /// - [`AcpError::Agent`] — agent returned an RPC error (e.g. unknown mode id)
+    pub async fn set_mode(&self, mode_id: &str) -> Result<(), AcpError> {
+        let session_id = {
+            let guard = self.acp_session_id.lock().await;
+            guard.clone().ok_or(AcpError::NoSession)?
+        };
+        let params = SessionSetModeParams { session_id, mode_id: mode_id.to_owned() };
+        self.rpc_call("session/set_mode", Some(json!(params)), self.prompt_timeout)
+            .await?;
+        self.state().modes.current_mode_id = Some(mode_id.to_owned());
+        Ok(())
+    }
+
+    /// Set a session configuration option -- the mechanism that
+    /// supersedes session modes for settings such as model selection and
+    /// reasoning effort. Callable at any time on a live session, like
+    /// [`set_mode`](Self::set_mode).
+    ///
+    /// On success, updates the locally cached option's `value`
+    /// immediately if `option_id` matches one already known from the
+    /// handshake or a prior `config_option_update`; an unknown
+    /// `option_id` is still sent to the agent (it owns validation) but
+    /// leaves no matching local entry to update.
+    ///
+    /// # Errors
+    ///
+    /// - [`AcpError::NoSession`] — handshake not complete
+    /// - [`AcpError::Timeout`] — no response within `prompt_timeout`
+    /// - [`AcpError::Agent`] — agent returned an RPC error (e.g. unknown option id)
+    pub async fn set_config_option(&self, option_id: &str, value: Value) -> Result<(), AcpError> {
+        let session_id = {
+            let guard = self.acp_session_id.lock().await;
+            guard.clone().ok_or(AcpError::NoSession)?
+        };
+        let params = SessionSetConfigOptionParams {
+            session_id,
+            option_id: option_id.to_owned(),
+            value: value.clone(),
+        };
+        self.rpc_call("session/set_config_option", Some(json!(params)), self.prompt_timeout)
+            .await?;
+        let mut state = self.state();
+        if let Some(option) = state.config_options.iter_mut().find(|o| o.id == option_id) {
+            option.value = value;
+        }
         Ok(())
     }
 
     // -----------------------------------------------------------------------
     // Private helpers
     // -----------------------------------------------------------------------
+
+    /// Lock the live [`SessionState`] -- readers just clone a field back
+    /// out; writers assign through the guard's `DerefMut`. Recovers from a
+    /// poisoned mutex rather than panicking: this state is a best-effort
+    /// cache of agent-reported facts, not a correctness-critical
+    /// invariant, so a panic on some OTHER thread while holding this lock
+    /// must not cascade into every subsequent accessor call failing too.
+    fn state(&self) -> MutexGuard<'_, SessionState> {
+        self.session_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     /// Send a JSON-RPC request and await the response, deserializing the result.
     async fn rpc_call_typed<T: serde::de::DeserializeOwned>(

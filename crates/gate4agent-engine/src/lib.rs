@@ -3123,11 +3123,25 @@ fn reduce_provider_event(
                 subagent.source != *source || subagent.provider_agent_id != *agent_id
             });
         }
+        // ACP session/update coverage beyond text/tool/turn streaming:
+        // these carry real data (still recorded verbatim on `snapshot.
+        // last_event` below), but none of them has an established snapshot
+        // field or `lead_activity` semantics yet -- adding one is a
+        // deliberate engine-schema decision, not a side effect of parsing
+        // more of the wire protocol, so it is left to a follow-up that owns
+        // that decision.
         ProviderEvent::Text { .. }
         | ProviderEvent::Thinking { .. }
         | ProviderEvent::ContextWindowUsage { .. }
         | ProviderEvent::HostRequestObserved { .. }
-        | ProviderEvent::UnrecognizedNotification { .. } => {}
+        | ProviderEvent::UnrecognizedNotification { .. }
+        | ProviderEvent::UserMessage { .. }
+        | ProviderEvent::Plan { .. }
+        | ProviderEvent::AvailableCommandsUpdated { .. }
+        | ProviderEvent::ModeChanged { .. }
+        | ProviderEvent::SessionInfoUpdated { .. }
+        | ProviderEvent::UsageUpdated { .. }
+        | ProviderEvent::ConfigOptionsUpdated { .. } => {}
     }
     refresh_provider_activity(snapshot);
     provider_source_cursor_mut(snapshot, source).sequence = source_sequence;

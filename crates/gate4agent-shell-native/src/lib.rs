@@ -48,7 +48,9 @@ use gate4agent_types::{
     ForegroundRequirement, InputAction, ObservationEnvelope, OperationId, OperatorGateInput,
     OperatorGateKind, OperatorGateOption, OperatorGateOptionSemantics, OperatorGateState,
     OperatorGateSubject, PipeProtocol,
-    PreparedInputKind, PromptPayload, ProviderEvent, ProviderInteractionKind,
+    PreparedInputKind, PromptPayload, ProviderAvailableCommand, ProviderConfigChoice,
+    ProviderConfigOption, ProviderConfigOptionKind, ProviderEvent, ProviderInteractionKind,
+    ProviderPlanPriority, ProviderPlanStatus, ProviderPlanStep,
     ProviderRateLimitKind, ProviderRuntimeCapability, ProviderRuntimePolicy,
     ProviderSessionIdentity, ProviderSessionKey,
     ProviderSource, PtyScreenState, ResumeLaunchRequest, SessionGeneration, StartRequest,
@@ -2334,6 +2336,109 @@ fn provider_event(event: AgentEvent) -> Option<ProviderEvent> {
             })
         }
         AgentEvent::Started { .. } | AgentEvent::Exited { .. } | AgentEvent::PtyRaw { .. } => None,
+        AgentEvent::UserMessage { text, is_delta } => {
+            Some(ProviderEvent::UserMessage { text, is_delta })
+        }
+        AgentEvent::Plan { steps } => Some(ProviderEvent::Plan {
+            steps: steps.into_iter().map(provider_plan_step).collect(),
+        }),
+        AgentEvent::AvailableCommandsUpdate { commands } => {
+            Some(ProviderEvent::AvailableCommandsUpdated {
+                commands: commands
+                    .into_iter()
+                    .map(|command| ProviderAvailableCommand {
+                        name: command.name,
+                        description: command.description,
+                        input_hint: command.input_hint,
+                    })
+                    .collect(),
+            })
+        }
+        AgentEvent::ModeChanged { mode_id } => Some(ProviderEvent::ModeChanged { mode_id }),
+        AgentEvent::SessionInfoUpdate { title } => {
+            Some(ProviderEvent::SessionInfoUpdated { title })
+        }
+        AgentEvent::UsageUpdate {
+            used_tokens,
+            context_window,
+            cost_amount,
+            cost_currency,
+        } => Some(ProviderEvent::UsageUpdated {
+            used_tokens,
+            context_window,
+            cost_amount: cost_amount.map(|amount| amount.to_string()),
+            cost_currency,
+        }),
+        AgentEvent::ConfigOptionsUpdate { options } => Some(ProviderEvent::ConfigOptionsUpdated {
+            options: options.into_iter().map(provider_config_option).collect(),
+        }),
+    }
+}
+
+/// Map the ACP wire priority onto the typed `ProviderPlanPriority`. A
+/// plain match, not `format!("{:?}", ..)` -- see `provider_rate_limit_kind`
+/// for why: the wire carries the typed value itself.
+fn provider_plan_priority(priority: gate4agent::core::types::PlanStepPriority) -> ProviderPlanPriority {
+    use gate4agent::core::types::PlanStepPriority;
+    match priority {
+        PlanStepPriority::High => ProviderPlanPriority::High,
+        PlanStepPriority::Medium => ProviderPlanPriority::Medium,
+        PlanStepPriority::Low => ProviderPlanPriority::Low,
+    }
+}
+
+/// Map the ACP wire status onto the typed `ProviderPlanStatus`.
+fn provider_plan_status(status: gate4agent::core::types::PlanStepStatus) -> ProviderPlanStatus {
+    use gate4agent::core::types::PlanStepStatus;
+    match status {
+        PlanStepStatus::Pending => ProviderPlanStatus::Pending,
+        PlanStepStatus::InProgress => ProviderPlanStatus::InProgress,
+        PlanStepStatus::Completed => ProviderPlanStatus::Completed,
+    }
+}
+
+fn provider_plan_step(step: gate4agent::core::types::PlanStep) -> ProviderPlanStep {
+    ProviderPlanStep {
+        content: step.content,
+        priority: provider_plan_priority(step.priority),
+        status: provider_plan_status(step.status),
+    }
+}
+
+/// Map the ACP wire config-option kind onto the typed
+/// `ProviderConfigOptionKind`.
+fn provider_config_option_kind(
+    kind: gate4agent::core::types::ConfigOptionKind,
+) -> ProviderConfigOptionKind {
+    use gate4agent::core::types::ConfigOptionKind;
+    match kind {
+        ConfigOptionKind::Select => ProviderConfigOptionKind::Select,
+        ConfigOptionKind::Boolean => ProviderConfigOptionKind::Boolean,
+        ConfigOptionKind::Unknown => ProviderConfigOptionKind::Unknown,
+    }
+}
+
+/// `gate4agent-types` is a pure data contract and does not depend on
+/// `serde_json`, so the option's current value and each choice's value --
+/// both `serde_json::Value` in `gate4agent::core::types::ConfigOptionInfo`
+/// -- cross the boundary pre-serialized to JSON text, same convention as
+/// `ToolStarted::input_json` above.
+fn provider_config_option(option: gate4agent::core::types::ConfigOptionInfo) -> ProviderConfigOption {
+    ProviderConfigOption {
+        id: option.id,
+        name: option.name,
+        description: option.description,
+        category: option.category,
+        kind: provider_config_option_kind(option.kind),
+        value_json: option.value.to_string(),
+        choices: option
+            .choices
+            .into_iter()
+            .map(|choice| ProviderConfigChoice {
+                value_json: choice.value.to_string(),
+                label: choice.label,
+            })
+            .collect(),
     }
 }
 

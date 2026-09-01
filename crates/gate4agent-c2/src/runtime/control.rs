@@ -971,6 +971,7 @@ fn c2_event_is_terminal_frame(event: &C2NodeEvent) -> bool {
         | C2NodeEvent::Control { .. }
         | C2NodeEvent::Observation { .. }
         | C2NodeEvent::ManagedObservation { .. }
+        | C2NodeEvent::AgentStream { .. }
         | C2NodeEvent::ControllerChanged { .. }
         | C2NodeEvent::WorkspaceAdded { .. }
         | C2NodeEvent::WorkspaceRemoved { .. }
@@ -1288,6 +1289,10 @@ fn node_request_contains_opaque_unix_path(request: &NodeRequest) -> bool {
         | NodeRequest::Interrupt { .. }
         | NodeRequest::Stop { .. }
         | NodeRequest::Remove { .. }
+        | NodeRequest::ResolveInteraction { .. }
+        | NodeRequest::SetSessionMode { .. }
+        | NodeRequest::SetSessionConfigOption { .. }
+        | NodeRequest::SetSessionModel { .. }
         | NodeRequest::Shutdown => false,
     }
 }
@@ -1955,6 +1960,7 @@ fn c2_event_contains_opaque_unix_path(event: &C2NodeEvent) -> bool {
         | C2NodeEvent::Observation { .. }
         | C2NodeEvent::ManagedObservation { .. }
         | C2NodeEvent::TerminalFrame { .. }
+        | C2NodeEvent::AgentStream { .. }
         | C2NodeEvent::ControllerChanged { .. }
         | C2NodeEvent::WorkspaceRemoved { .. }
         | C2NodeEvent::SessionRecordUpserted { .. }
@@ -2303,7 +2309,11 @@ fn request_targets_unavailable_provider(
         | NodeRequest::Resize { session, .. }
         | NodeRequest::Interrupt { session }
         | NodeRequest::Stop { session, .. }
-        | NodeRequest::Remove { session } => {
+        | NodeRequest::Remove { session }
+        | NodeRequest::ResolveInteraction { session, .. }
+        | NodeRequest::SetSessionMode { session, .. }
+        | NodeRequest::SetSessionConfigOption { session, .. }
+        | NodeRequest::SetSessionModel { session, .. } => {
             !status_address_is_legacy(status, node_id, session)
         }
         NodeRequest::RenameSessionRecord { record_id, .. }
@@ -2616,7 +2626,8 @@ fn project_legacy_event(
         }
         C2NodeEvent::Control { address, .. }
         | C2NodeEvent::Observation { address, .. }
-        | C2NodeEvent::TerminalFrame { address, .. } => {
+        | C2NodeEvent::TerminalFrame { address, .. }
+        | C2NodeEvent::AgentStream { address, .. } => {
             address_is_legacy(status, node_id, snapshot, address)
         }
         C2NodeEvent::ManagedObservation { .. } => false,

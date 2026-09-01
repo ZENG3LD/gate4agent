@@ -16,7 +16,8 @@ use std::path::PathBuf;
 
 use serde_json::{json, Value};
 
-use crate::rpc::handler::HostHandler;
+use crate::core::types::HostDecisionAuthority;
+use crate::rpc::handler::{HostHandler, HostOutcome};
 use crate::rpc::message::RpcError;
 
 use super::gate::{self, DangerousCommandGate};
@@ -92,6 +93,44 @@ pub(crate) trait AcpHostHandler: Send + Sync {
         let _ = params;
         PermissionOutcome::Cancelled
     }
+
+    /// Whether the dangerous-command gate (`super::gate`) would block this
+    /// `session/request_permission` call outright, independent of whatever
+    /// [`request_permission`](Self::request_permission) itself would go on
+    /// to decide.
+    ///
+    /// The default answer is `false` -- only [`PolicyHostHandler`] (the one
+    /// implementation the gate is actually wired into) overrides it.
+    /// [`AcpHostAdapter::handle_deferrable`] calls this BEFORE deciding
+    /// whether to defer a `session/request_permission` call to an operator,
+    /// so a gate block is always decided immediately and is NEVER left
+    /// waiting on one -- the dangerous-command gate outranks deferral
+    /// exactly as it already outranks [`HostPolicy`] (see the gate's own
+    /// module doc comment). `request_permission` checks the same condition
+    /// for the immediate path, so the two can never disagree about whether
+    /// a given call is gate-blocked.
+    fn permission_blocked_by_gate(&self, tool_call: &PermissionToolCall) -> bool {
+        let _ = tool_call;
+        false
+    }
+
+    /// Whether the dangerous-command gate would block this `terminal/
+    /// create` call outright, independent of whatever
+    /// [`terminal_create`](Self::terminal_create) itself would go on to
+    /// decide -- the `terminal/create` counterpart to
+    /// [`permission_blocked_by_gate`](Self::permission_blocked_by_gate).
+    ///
+    /// The default answer is `false` -- only [`PolicyHostHandler`] overrides
+    /// it. [`AcpHostAdapter::decision_authority`] calls this purely to
+    /// classify WHO decided a completed `terminal/create` call for
+    /// `AgentEvent::RpcIncomingRequest`'s audit trail; it is never consulted
+    /// to change what `terminal_create` itself decides -- that call runs the
+    /// exact same check on its own, so the two can never disagree about
+    /// whether a given call is gate-blocked.
+    fn terminal_create_blocked_by_gate(&self, params: &TerminalCreateParams) -> bool {
+        let _ = params;
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -133,6 +172,44 @@ impl Default for HostPolicy {
     }
 }
 
+// ---------------------------------------------------------------------------
+// PermissionDeferral
+// ---------------------------------------------------------------------------
+
+/// Session-level policy for [`AcpHostAdapter::handle_deferrable`]: whether
+/// `session/request_permission` may return [`HostOutcome::Deferred`] instead
+/// of being decided by the wrapped [`AcpHostHandler`] the instant it arrives.
+///
+/// This is a THIRD axis alongside [`HostPolicy`] and
+/// [`super::gate::DangerousCommandGate`] -- and, like the gate, it is
+/// switched independently of `HostPolicy` rather than folded into it: a
+/// permissive `HostPolicy` (`Yolo`, `Auto`) still answers every permission
+/// request itself when deferral is `Disabled`, and a restrictive one
+/// (`ReadOnly`, `Deny`) still gets deferred when it is `Enabled` -- "how much
+/// authority does this session have" and "should an operator get a chance to
+/// answer before that authority decides" are independent questions. Default:
+/// `Disabled`, so a caller that never sets
+/// [`crate::acp::session::AcpSessionOptions::defer_permission_requests`]
+/// gets exactly today's behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PermissionDeferral {
+    /// [`AcpHostAdapter::handle_deferrable`] is byte-for-byte
+    /// `Immediate(self.handle(...))` for every method, matching the
+    /// [`HostHandler`] trait's own default.
+    Disabled,
+    /// `session/request_permission` returns `Deferred` UNLESS the
+    /// dangerous-command gate would block it -- see
+    /// [`AcpHostHandler::permission_blocked_by_gate`]. Every other method is
+    /// still decided immediately regardless.
+    Enabled,
+}
+
+impl Default for PermissionDeferral {
+    fn default() -> Self {
+        PermissionDeferral::Disabled
+    }
+}
+
 impl HostPolicy {
     /// The `clientCapabilities` this policy declares at `initialize`.
     pub(crate) fn client_capabilities(self) -> ClientCapabilities {
@@ -170,7 +247,7 @@ impl HostPolicy {
     /// walks a preference order and returns the first offered kind that
     /// matches, so it tolerates an agent that omits some (or three) of
     /// them.
-    fn select_permission_option(
+    pub(crate) fn select_permission_option(
         self,
         tool_call: &PermissionToolCall,
         options: &[PermissionOption],
@@ -189,13 +266,31 @@ impl HostPolicy {
         } else {
             &[PermissionOptionKind::RejectOnce, PermissionOptionKind::RejectAlways]
         };
-        for kind in preference {
-            if let Some(option) = options.iter().find(|option| option.kind == *kind) {
-                return PermissionOutcome::Selected { option_id: option.option_id.clone() };
-            }
-        }
-        PermissionOutcome::Cancelled
+        select_offered_option(options, preference)
     }
+}
+
+/// Walk `preference` in order and return the first kind the agent actually
+/// offered, as a `Selected` outcome naming that option's own id; `Cancelled`
+/// if it offered none of them.
+///
+/// Shared deliberately between [`HostPolicy::select_permission_option`] and
+/// [`super::session::AcpSession::resolve_pending_request_as`]: policy and
+/// operator must pick from the same list by the same rule, or the same intent
+/// would mean two different things depending on who acted on it. Neither
+/// caller may invent an `option_id` — an id the agent never offered is not
+/// refused by the agent so much as ignored by it, which would grant nothing
+/// while reporting success.
+pub(crate) fn select_offered_option(
+    options: &[PermissionOption],
+    preference: &[PermissionOptionKind],
+) -> PermissionOutcome {
+    for kind in preference {
+        if let Some(option) = options.iter().find(|option| option.kind == *kind) {
+            return PermissionOutcome::Selected { option_id: option.option_id.clone() };
+        }
+    }
+    PermissionOutcome::Cancelled
 }
 
 // ---------------------------------------------------------------------------
@@ -223,6 +318,17 @@ impl PolicyHostHandler {
         dangerous_command_gate: DangerousCommandGate,
     ) -> Self {
         Self { policy, working_dir, terminals: TerminalStore::new(), dangerous_command_gate }
+    }
+
+    /// The directory a `terminal/create` call actually runs in: its own
+    /// `cwd` override when present, otherwise the session's working
+    /// directory -- shared by `AcpHostHandler::terminal_create` and
+    /// `AcpHostHandler::terminal_create_blocked_by_gate` so the two never
+    /// evaluate the gate against different directories.
+    fn terminal_create_cwd(&self, cwd_override: Option<&str>) -> PathBuf {
+        cwd_override
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.working_dir.clone())
     }
 }
 
@@ -261,16 +367,15 @@ impl AcpHostHandler for PolicyHostHandler {
         // is not skipped by any `HostPolicy` value including `Yolo` -- see
         // `DangerousCommandGate`'s doc comment for why this is a second,
         // separately-switched axis rather than folded into the policy.
-        if self.dangerous_command_gate == DangerousCommandGate::Enforced {
-            let cwd: PathBuf = params
-                .cwd
-                .as_deref()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| self.working_dir.clone());
+        if self.terminal_create_blocked_by_gate(params) {
+            let cwd = self.terminal_create_cwd(params.cwd.as_deref());
             let verdict = gate::evaluate_command(&params.command, &params.args, &cwd);
-            if let Some(refusal) = verdict.refusal_message() {
-                return Err(format!("terminal/create {refusal}"));
-            }
+            // `terminal_create_blocked_by_gate` already proved this is a
+            // `Block` verdict -- `refusal_message()` only returns `None`
+            // for `Allow`/`Uncertain`, neither of which `is_blocked()`
+            // reports as blocked.
+            let refusal = verdict.refusal_message().unwrap_or_default();
+            return Err(format!("terminal/create {refusal}"));
         }
         if !self.policy.allows_mutation() {
             return Err("terminal/create denied by host policy".to_string());
@@ -298,19 +403,37 @@ impl AcpHostHandler for PolicyHostHandler {
     }
 
     fn request_permission(&self, params: &PermissionRequestParams) -> PermissionOutcome {
-        // Same gate, same "above the policy" placement as `terminal_create`.
-        // A `Block` verdict here has no wire field to carry its reason on
-        // (`PermissionOutcome` is `Selected`/`Cancelled`, not an error), so
-        // it is answered the same way `HostPolicy::Deny` answers any
-        // execute-kind request: prefer a reject-kind option the agent
-        // offered, else decline to pick any of them.
-        if self.dangerous_command_gate == DangerousCommandGate::Enforced
-            && params.tool_call.kind == ToolKind::Execute
-            && gate::evaluate_permission_tool_call(&params.tool_call, &self.working_dir).is_blocked()
-        {
+        // Same gate, same "above the policy" placement as `terminal_create`
+        // -- and now the single source of truth `AcpHostAdapter::
+        // handle_deferrable` also consults (via `permission_blocked_by_gate`
+        // below) before it will even consider deferring this call to an
+        // operator, so the two paths can never disagree about whether a
+        // given call is gate-blocked. A `Block` verdict here has no wire
+        // field to carry its reason on (`PermissionOutcome` is
+        // `Selected`/`Cancelled`, not an error), so it is answered the same
+        // way `HostPolicy::Deny` answers any execute-kind request: prefer a
+        // reject-kind option the agent offered, else decline to pick any of
+        // them.
+        if self.permission_blocked_by_gate(&params.tool_call) {
             return HostPolicy::Deny.select_permission_option(&params.tool_call, &params.options);
         }
         self.policy.select_permission_option(&params.tool_call, &params.options)
+    }
+
+    fn permission_blocked_by_gate(&self, tool_call: &PermissionToolCall) -> bool {
+        self.dangerous_command_gate == DangerousCommandGate::Enforced
+            && tool_call.kind == ToolKind::Execute
+            && gate::evaluate_permission_tool_call(tool_call, &self.working_dir).is_blocked()
+    }
+
+    fn terminal_create_blocked_by_gate(&self, params: &TerminalCreateParams) -> bool {
+        self.dangerous_command_gate == DangerousCommandGate::Enforced
+            && gate::evaluate_command(
+                &params.command,
+                &params.args,
+                &self.terminal_create_cwd(params.cwd.as_deref()),
+            )
+            .is_blocked()
     }
 }
 
@@ -321,15 +444,75 @@ impl AcpHostHandler for PolicyHostHandler {
 /// Bridges [`AcpHostHandler`] → [`HostHandler`] for use in the reader loop.
 ///
 /// Wraps `Arc<dyn AcpHostHandler>` so it can be cloned cheaply without
-/// requiring `'static + Clone` bounds on the trait.
-pub(crate) struct AcpHostAdapter(pub std::sync::Arc<dyn AcpHostHandler>);
+/// requiring `'static + Clone` bounds on the trait, plus the session's
+/// [`PermissionDeferral`] policy -- the one piece `handle_deferrable` needs
+/// that a bare `Arc<dyn AcpHostHandler>` cannot answer on its own (whether
+/// THIS session is even allowed to leave a `session/request_permission`
+/// call unanswered for a while).
+pub(crate) struct AcpHostAdapter {
+    inner: std::sync::Arc<dyn AcpHostHandler>,
+    deferral: PermissionDeferral,
+}
+
+impl AcpHostAdapter {
+    pub(crate) fn new(
+        inner: std::sync::Arc<dyn AcpHostHandler>,
+        deferral: PermissionDeferral,
+    ) -> Self {
+        Self { inner, deferral }
+    }
+
+    /// Classify WHO decided (or will decide) `method`/`params`, for
+    /// [`crate::core::types::HostRequestDecision`]'s `by` field.
+    ///
+    /// Purely observational: it re-runs the exact same gate query
+    /// [`handle`](HostHandler::handle)/[`handle_deferrable`] already
+    /// consulted (`permission_blocked_by_gate`/
+    /// `terminal_create_blocked_by_gate`) so the two can never disagree
+    /// about whether a given call was gate-blocked, but it never feeds back
+    /// into what either of those methods decides.
+    ///
+    /// Only `terminal/create` and `session/request_permission` can ever
+    /// come back `Gate` -- every other method answers `Policy` here, which
+    /// is correct even for `terminal/output`/`terminal/wait_for_exit`/
+    /// `terminal/kill`/`terminal/release` (no `HostPolicy` value gates
+    /// those beyond `terminal/create` itself, so "decided immediately, not
+    /// gate-blocked, not deferred" -- `Policy`'s own definition -- is the
+    /// honest answer for them too). `Deferred`, `Operator`, and
+    /// `DeadlinePolicy` are never returned here -- a caller reaches this
+    /// only for a request that is being decided NOW, on this thread, and
+    /// those three describe request states this call never sees (see
+    /// `crate::core::types::HostDecisionAuthority`'s own doc comment for
+    /// why `Operator`/`DeadlinePolicy` only ever come from `AcpSession::
+    /// resolve_pending_request`/`expire_deadlines` instead).
+    pub(crate) fn decision_authority(
+        &self,
+        method: &str,
+        params: Option<&Value>,
+    ) -> HostDecisionAuthority {
+        let gate_blocked = match method {
+            "terminal/create" => params
+                .and_then(|v| serde_json::from_value::<TerminalCreateParams>(v.clone()).ok())
+                .is_some_and(|p| self.inner.terminal_create_blocked_by_gate(&p)),
+            "session/request_permission" => params
+                .and_then(|v| serde_json::from_value::<PermissionRequestParams>(v.clone()).ok())
+                .is_some_and(|p| self.inner.permission_blocked_by_gate(&p.tool_call)),
+            _ => false,
+        };
+        if gate_blocked {
+            HostDecisionAuthority::Gate
+        } else {
+            HostDecisionAuthority::Policy
+        }
+    }
+}
 
 impl HostHandler for AcpHostAdapter {
     fn handle(&self, method: &str, params: Option<Value>) -> Result<Value, RpcError> {
         match method {
             "fs/read_text_file" => {
                 let p: FsReadParams = parse_params(params)?;
-                self.0
+                self.inner
                     .fs_read_text_file(&p)
                     .map(|content| json!({ "content": content }))
                     .map_err(|msg| RpcError {
@@ -341,7 +524,7 @@ impl HostHandler for AcpHostAdapter {
 
             "fs/write_text_file" => {
                 let p: FsWriteParams = parse_params(params)?;
-                self.0
+                self.inner
                     .fs_write_text_file(&p)
                     .map(|()| json!({}))
                     .map_err(|msg| RpcError {
@@ -353,7 +536,7 @@ impl HostHandler for AcpHostAdapter {
 
             "terminal/create" => {
                 let p: TerminalCreateParams = parse_params(params)?;
-                self.0
+                self.inner
                     .terminal_create(&p)
                     .map(|terminal_id| json!({ "terminalId": terminal_id }))
                     .map_err(|msg| RpcError {
@@ -365,7 +548,7 @@ impl HostHandler for AcpHostAdapter {
 
             "terminal/output" => {
                 let p: TerminalIdParams = parse_params(params)?;
-                self.0
+                self.inner
                     .terminal_output(&p)
                     .map(|result| serde_json::to_value(result).unwrap_or(Value::Null))
                     .map_err(|msg| RpcError { code: RpcError::NOT_FOUND, message: msg, data: None })
@@ -373,7 +556,7 @@ impl HostHandler for AcpHostAdapter {
 
             "terminal/wait_for_exit" => {
                 let p: TerminalIdParams = parse_params(params)?;
-                self.0
+                self.inner
                     .terminal_wait_for_exit(&p)
                     .map(|result| serde_json::to_value(result).unwrap_or(Value::Null))
                     .map_err(|msg| RpcError { code: RpcError::NOT_FOUND, message: msg, data: None })
@@ -381,7 +564,7 @@ impl HostHandler for AcpHostAdapter {
 
             "terminal/kill" => {
                 let p: TerminalIdParams = parse_params(params)?;
-                self.0
+                self.inner
                     .terminal_kill(&p)
                     .map(|()| json!({}))
                     .map_err(|msg| RpcError { code: RpcError::NOT_FOUND, message: msg, data: None })
@@ -389,7 +572,7 @@ impl HostHandler for AcpHostAdapter {
 
             "terminal/release" => {
                 let p: TerminalIdParams = parse_params(params)?;
-                self.0
+                self.inner
                     .terminal_release(&p)
                     .map(|()| json!({}))
                     .map_err(|msg| RpcError { code: RpcError::NOT_FOUND, message: msg, data: None })
@@ -397,12 +580,47 @@ impl HostHandler for AcpHostAdapter {
 
             "session/request_permission" => {
                 let p: PermissionRequestParams = parse_params(params)?;
-                let outcome = self.0.request_permission(&p);
+                let outcome = self.inner.request_permission(&p);
                 Ok(serde_json::to_value(outcome).unwrap_or(Value::Null))
             }
 
             other => Err(RpcError::method_not_found(other)),
         }
+    }
+
+    /// Only `session/request_permission`, and only when this session's
+    /// [`PermissionDeferral`] is `Enabled`, can return
+    /// [`HostOutcome::Deferred`] -- every other method, and every session
+    /// with deferral `Disabled`, is `Immediate(self.handle(method, params))`
+    /// with today's behavior, byte for byte.
+    ///
+    /// A gate block is decided immediately even under `Enabled`: the
+    /// dangerous-command gate outranks the operator (see
+    /// `AcpHostHandler::permission_blocked_by_gate`'s doc comment), so
+    /// nobody is ever asked to approve what the gate has already refused.
+    fn handle_deferrable(&self, method: &str, params: Option<Value>) -> HostOutcome {
+        if method != "session/request_permission" || self.deferral == PermissionDeferral::Disabled {
+            return HostOutcome::Immediate(self.handle(method, params));
+        }
+
+        // Parse once, here, purely to run the gate check ahead of the
+        // deferral decision. A params blob that fails to parse takes the
+        // immediate path too -- `handle`'s own `session/request_permission`
+        // arm parses `params` again independently and reports the exact
+        // same `INVALID_PARAMS` either way, so a parse failure is never
+        // silently swallowed into a `Deferred` that can never be answered.
+        let Some(parsed) = params
+            .clone()
+            .and_then(|v| serde_json::from_value::<PermissionRequestParams>(v).ok())
+        else {
+            return HostOutcome::Immediate(self.handle(method, params));
+        };
+
+        if self.inner.permission_blocked_by_gate(&parsed.tool_call) {
+            return HostOutcome::Immediate(self.handle(method, params));
+        }
+
+        HostOutcome::Deferred
     }
 }
 
@@ -469,15 +687,25 @@ mod tests {
     }
 
     fn adapter(policy: HostPolicy) -> AcpHostAdapter {
-        AcpHostAdapter(Arc::new(PolicyHostHandler::new(
-            policy,
-            std::env::temp_dir(),
-            DangerousCommandGate::Enforced,
-        )))
+        AcpHostAdapter::new(
+            Arc::new(PolicyHostHandler::new(policy, std::env::temp_dir(), DangerousCommandGate::Enforced)),
+            PermissionDeferral::Disabled,
+        )
     }
 
     fn adapter_with_gate(policy: HostPolicy, gate: DangerousCommandGate) -> AcpHostAdapter {
-        AcpHostAdapter(Arc::new(PolicyHostHandler::new(policy, std::env::temp_dir(), gate)))
+        AcpHostAdapter::new(
+            Arc::new(PolicyHostHandler::new(policy, std::env::temp_dir(), gate)),
+            PermissionDeferral::Disabled,
+        )
+    }
+
+    fn adapter_with_deferral(
+        policy: HostPolicy,
+        gate: DangerousCommandGate,
+        deferral: PermissionDeferral,
+    ) -> AcpHostAdapter {
+        AcpHostAdapter::new(Arc::new(PolicyHostHandler::new(policy, std::env::temp_dir(), gate)), deferral)
     }
 
     // -----------------------------------------------------------------------
@@ -881,5 +1109,165 @@ mod tests {
         let error = result.unwrap_err();
         assert_eq!(error.code, RpcError::PERMISSION_DENIED);
         assert!(error.message.contains("filesystem-wipe"), "message was: {}", error.message);
+    }
+
+    // -----------------------------------------------------------------------
+    // handle_deferrable — PermissionDeferral
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn handle_deferrable_never_defers_when_disabled() {
+        let handler = adapter(HostPolicy::Auto);
+        let outcome = handler.handle_deferrable(
+            "session/request_permission",
+            Some(json!({
+                "sessionId": "s1",
+                "toolCall": {"toolCallId": "tc1", "kind": "read"},
+                "options": []
+            })),
+        );
+        assert!(matches!(outcome, HostOutcome::Immediate(_)));
+    }
+
+    #[test]
+    fn handle_deferrable_never_defers_methods_other_than_request_permission() {
+        let handler =
+            adapter_with_deferral(HostPolicy::Auto, DangerousCommandGate::Enforced, PermissionDeferral::Enabled);
+        let outcome = handler.handle_deferrable("fs/read_text_file", Some(json!({"path": "/etc/passwd"})));
+        assert!(matches!(outcome, HostOutcome::Immediate(_)));
+    }
+
+    #[test]
+    fn handle_deferrable_defers_a_non_blocked_permission_request_when_enabled() {
+        let handler =
+            adapter_with_deferral(HostPolicy::Auto, DangerousCommandGate::Enforced, PermissionDeferral::Enabled);
+        let outcome = handler.handle_deferrable(
+            "session/request_permission",
+            Some(json!({
+                "sessionId": "s1",
+                "toolCall": {"toolCallId": "tc1", "kind": "read"},
+                "options": [{"optionId": "ao", "name": "Allow once", "kind": "allow_once"}]
+            })),
+        );
+        assert!(matches!(outcome, HostOutcome::Deferred));
+    }
+
+    #[test]
+    fn handle_deferrable_decides_a_gate_blocked_request_immediately_even_when_enabled() {
+        let handler =
+            adapter_with_deferral(HostPolicy::Yolo, DangerousCommandGate::Enforced, PermissionDeferral::Enabled);
+        let params = PermissionRequestParams {
+            session_id: "s1".to_owned(),
+            tool_call: dangerous_execute_tool_call(),
+            options: options_all_four(),
+        };
+        let outcome = handler.handle_deferrable(
+            "session/request_permission",
+            Some(serde_json::to_value(&params).expect("PermissionRequestParams serializes")),
+        );
+        match outcome {
+            HostOutcome::Immediate(Ok(value)) => {
+                assert_eq!(value["outcome"], "selected");
+                // Yolo alone would pick "aa" (allow_always) -- the gate
+                // overrides that to a reject-kind option, exactly as
+                // `dangerous_command_gate_blocks_execute_permission_request_even_under_yolo_policy` proves for `request_permission` directly.
+                assert_eq!(value["optionId"], "ro");
+            }
+            other => panic!("expected an immediate gate-blocked decision, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_deferrable_falls_through_to_handle_on_unparsable_params() {
+        let handler =
+            adapter_with_deferral(HostPolicy::Auto, DangerousCommandGate::Enforced, PermissionDeferral::Enabled);
+        let outcome = handler.handle_deferrable("session/request_permission", Some(json!("not an object")));
+        match outcome {
+            HostOutcome::Immediate(Err(err)) => assert_eq!(err.code, RpcError::INVALID_PARAMS),
+            other => panic!("expected an immediate INVALID_PARAMS error, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // decision_authority — classifies WHO decided, for HostRequestDecision
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn decision_authority_is_gate_for_a_gate_blocked_terminal_create() {
+        let handler = adapter_with_gate(HostPolicy::Yolo, DangerousCommandGate::Enforced);
+        let params = json!({"command": "rm", "args": ["-rf", "/"]});
+        assert_eq!(
+            handler.decision_authority("terminal/create", Some(&params)),
+            HostDecisionAuthority::Gate
+        );
+    }
+
+    #[test]
+    fn decision_authority_is_policy_for_a_benign_terminal_create() {
+        let handler = adapter_with_gate(HostPolicy::Yolo, DangerousCommandGate::Enforced);
+        let params = json!({"command": "echo", "args": ["hello"]});
+        assert_eq!(
+            handler.decision_authority("terminal/create", Some(&params)),
+            HostDecisionAuthority::Policy
+        );
+    }
+
+    #[test]
+    fn decision_authority_is_policy_for_terminal_create_when_gate_disabled() {
+        let handler = adapter_with_gate(HostPolicy::Yolo, DangerousCommandGate::Disabled);
+        let params = json!({"command": "rm", "args": ["-rf", "/"]});
+        assert_eq!(
+            handler.decision_authority("terminal/create", Some(&params)),
+            HostDecisionAuthority::Policy
+        );
+    }
+
+    #[test]
+    fn decision_authority_is_gate_for_a_gate_blocked_permission_request() {
+        let handler = adapter_with_gate(HostPolicy::Yolo, DangerousCommandGate::Enforced);
+        let params = PermissionRequestParams {
+            session_id: "s1".to_owned(),
+            tool_call: dangerous_execute_tool_call(),
+            options: options_all_four(),
+        };
+        let value = serde_json::to_value(&params).expect("PermissionRequestParams serializes");
+        assert_eq!(
+            handler.decision_authority("session/request_permission", Some(&value)),
+            HostDecisionAuthority::Gate
+        );
+    }
+
+    #[test]
+    fn decision_authority_is_policy_for_a_non_blocked_permission_request() {
+        let handler = adapter_with_gate(HostPolicy::Yolo, DangerousCommandGate::Enforced);
+        let params = PermissionRequestParams {
+            session_id: "s1".to_owned(),
+            tool_call: tool_call(crate::acp::protocol::ToolKind::Read),
+            options: options_all_four(),
+        };
+        let value = serde_json::to_value(&params).expect("PermissionRequestParams serializes");
+        assert_eq!(
+            handler.decision_authority("session/request_permission", Some(&value)),
+            HostDecisionAuthority::Policy
+        );
+    }
+
+    #[test]
+    fn decision_authority_is_policy_for_every_other_method() {
+        let handler = adapter_with_gate(HostPolicy::Yolo, DangerousCommandGate::Enforced);
+        for method in [
+            "fs/read_text_file",
+            "fs/write_text_file",
+            "terminal/output",
+            "terminal/wait_for_exit",
+            "terminal/kill",
+            "terminal/release",
+        ] {
+            assert_eq!(
+                handler.decision_authority(method, None),
+                HostDecisionAuthority::Policy,
+                "method was: {method}"
+            );
+        }
     }
 }

@@ -10737,6 +10737,13 @@ fn routed_event_to_ingress(
         }
         C2NodeEvent::Control { .. }
         | C2NodeEvent::TerminalFrame { .. }
+        // Content, not an observation -- the same reason `TerminalFrame`
+        // sits here. This path feeds the observation store, whose vocabulary
+        // is semantic telemetry with correlation ids; an agent's text and
+        // thinking carry none of that and have their own subscription. The
+        // event still advances the cursor, so ignoring its payload never
+        // opens a gap in the sequence.
+        | C2NodeEvent::AgentStream { .. }
         | C2NodeEvent::ControllerChanged { .. }
         | C2NodeEvent::WorkspaceAdded { .. }
         | C2NodeEvent::WorkspaceRemoved { .. }

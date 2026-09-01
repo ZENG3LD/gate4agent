@@ -49,6 +49,53 @@ pub enum ObservationInteractionOutcomeV1 {
     Superseded,
 }
 
+/// WHO decided a host request the agent sent to the ACP host -- see
+/// [`ObservationKindV1::HostRequestObserved`]. Mirrors `gate4agent`'s own
+/// `HostDecisionAuthority` one-for-one; this crate is dependency-light and
+/// keeps its own copy rather than depending on `gate4agent`, the same
+/// convention every other `*V1` wire type here follows.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HostDecisionAuthorityV1 {
+    /// The dangerous-command gate forced this outcome ahead of the host's
+    /// policy -- `terminal/create` and `execute`-kind `session/request_
+    /// permission` only. Always a denial.
+    Gate,
+    /// The host's policy decided the request the instant it arrived -- the
+    /// default path for every request that is neither gate-blocked nor
+    /// deferred.
+    Policy,
+    /// An operator answered a `session/request_permission` call that had
+    /// been left `HostRequestDecisionV1::Deferred`.
+    Operator,
+    /// A `session/request_permission` call left `HostRequestDecisionV1::
+    /// Deferred` reached its deadline with no operator answer, so the
+    /// host's policy -- the SAME policy that would have answered it
+    /// immediately had deferral never been enabled -- decided it instead.
+    /// Deliberately its own variant rather than `Policy`: folding it in
+    /// would erase the fact that an operator was asked first and nobody
+    /// answered in time. Equally deliberately not `Operator`: no human
+    /// made this choice.
+    DeadlinePolicy,
+}
+
+/// A typed answer to "what happened to this host request" -- see
+/// [`ObservationKindV1::HostRequestObserved`]. Mirrors `gate4agent`'s own
+/// `HostRequestDecision` one-for-one; see [`HostDecisionAuthorityV1`]'s doc
+/// comment for why this crate keeps its own copy.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum HostRequestDecisionV1 {
+    /// The request was allowed. `by` is who made that call.
+    Granted { by: HostDecisionAuthorityV1 },
+    /// The request was refused. `by` is who made that call.
+    Denied { by: HostDecisionAuthorityV1 },
+    /// The request has arrived and been recorded, but nothing has decided
+    /// it yet. A later `ObservationKindV1::HostRequestObserved` reports the
+    /// eventual `Granted`/`Denied` outcome once one exists.
+    Deferred,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObservationTodoItemV1 {
@@ -170,13 +217,17 @@ pub enum ObservationKindV1 {
     /// The agent asked the ACP host for something (`session/request_
     /// permission`, `fs/read_text_file`, `fs/write_text_file`, `terminal/
     /// create`, `terminal/output`, `terminal/wait_for_exit`, `terminal/
-    /// kill`, `terminal/release`) and the host's policy decided on it.
-    /// `class` is a coarse bucket of the ACP method requested -- the same
-    /// scale as `ToolStarted::class` -- never the raw request parameters:
-    /// what path was read or what command ran is never carried on this wire.
+    /// kill`, `terminal/release`). `class` is a coarse bucket of the ACP
+    /// method requested -- the same scale as `ToolStarted::class` -- never
+    /// the raw request parameters: what path was read or what command ran
+    /// is never carried on this wire. `decision` is `HostRequestDecisionV1::
+    /// Deferred` when the request has arrived but nothing has decided it
+    /// yet (only reachable for `session/request_permission`); a later
+    /// observation for the same underlying request reports the eventual
+    /// `Granted`/`Denied` outcome once one exists.
     HostRequestObserved {
         class: String,
-        granted: bool,
+        decision: HostRequestDecisionV1,
     },
     /// A JSON-RPC notification the reader received but could not classify
     /// into any other kind here -- the protocol said something this build
@@ -623,9 +674,9 @@ impl ObservationKindV1 {
             Self::Error { detail } => {
                 len += ",\"detail\":".len() + json_string_len(detail);
             }
-            Self::HostRequestObserved { class, granted } => {
+            Self::HostRequestObserved { class, decision } => {
                 len += ",\"class\":".len() + json_string_len(class);
-                len += ",\"granted\":".len() + bool_json_len(*granted);
+                len += ",\"decision\":".len() + decision.json_encoded_len();
             }
             Self::UnrecognizedNotification { method } => {
                 len += ",\"method\":".len() + json_string_len(method);
@@ -721,6 +772,35 @@ impl ObservationInteractionOutcomeV1 {
             Self::TurnEnded => "turn-ended",
             Self::Superseded => "superseded",
         }
+    }
+}
+
+impl HostDecisionAuthorityV1 {
+    fn wire_name(self) -> &'static str {
+        match self {
+            Self::Gate => "gate",
+            Self::Policy => "policy",
+            Self::Operator => "operator",
+            Self::DeadlinePolicy => "deadline-policy",
+        }
+    }
+}
+
+impl HostRequestDecisionV1 {
+    fn wire_name(&self) -> &'static str {
+        match self {
+            Self::Granted { .. } => "granted",
+            Self::Denied { .. } => "denied",
+            Self::Deferred => "deferred",
+        }
+    }
+
+    fn json_encoded_len(&self) -> usize {
+        let mut len = "{\"kind\":".len() + json_string_len(self.wire_name());
+        if let Self::Granted { by } | Self::Denied { by } = self {
+            len += ",\"by\":".len() + json_string_len(by.wire_name());
+        }
+        len + "}".len()
     }
 }
 

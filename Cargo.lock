@@ -727,6 +727,7 @@ dependencies = [
  "gate4agent-testkit",
  "gate4agent-tool-protocol",
  "gate4agent-types",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -12,30 +12,32 @@
 //! 4. `session.cancel()` — sends `session/cancel` notification
 //! 5. `session.kill()` — hard-kills the subprocess
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
 use crate::core::error::AgentError;
-use crate::core::types::{AgentEvent, CliTool};
+use crate::core::types::{AgentEvent, CliTool, HostDecisionAuthority, HostRequestDecision};
 use crate::rpc::id::IdGen;
-use crate::rpc::message::{RpcNotification, RpcRequest};
+use crate::rpc::message::{RpcId, RpcNotification, RpcRequest, RpcResponse};
 use crate::rpc::pending::PendingRequests;
 
 use super::gate::DangerousCommandGate;
-use super::host::{AcpHostAdapter, HostPolicy, PolicyHostHandler};
+use super::host::{AcpHostAdapter, HostPolicy, PermissionDeferral, PolicyHostHandler};
 use super::protocol::{
     extract_token_usage, AgentCapabilities, AvailableCommand, ClientInfo, ContentBlock,
-    InitializeParams, SessionCancelParams, SessionCloseParams, SessionCloseResult,
+    InitializeParams, PermissionOption, PermissionOptionKind, PermissionOutcome,
+    PermissionRequestParams, SessionCancelParams, SessionCloseParams, SessionCloseResult,
     SessionConfigOption, SessionDeleteParams, SessionForkParams, SessionListParams,
     SessionListResult, SessionLoadParams, SessionLoadResult, SessionMode, SessionModel,
     SessionNewParams, SessionPromptParams, SessionPromptResult, SessionSetConfigOptionParams,
     SessionSetModeParams, SessionState, SessionSummary, SessionUsage,
 };
-use super::reader::acp_reader_loop;
+use super::reader::{acp_reader_loop, write_line_to_process};
 use super::spawn::AcpProcess;
 use gate4agent_types::LaunchSpec;
 
@@ -163,6 +165,44 @@ pub struct AcpSessionOptions {
     /// [`super::protocol::SessionNewParams`] for why the wire shape is
     /// unverified. Default: empty.
     pub additional_directories: Vec<String>,
+
+    /// Whether `session/request_permission` may be **deferred** to a later,
+    /// out-of-band answer -- an operator resolving it by id via
+    /// [`AcpSession::resolve_pending_request`] -- instead of being decided
+    /// by `host_policy` the instant the agent asks. See
+    /// [`super::host::PermissionDeferral`] for the underlying mechanism and
+    /// §4a of
+    /// `docs/gate4agent/plans/gate4agent-acp-control-plane-on-the-wire-2026-09-02.md`
+    /// for why the reader loop cannot simply await an operator inline (it is
+    /// a synchronous, single-threaded parse loop; blocking it would stall
+    /// every other `session/update` the agent sends while the question sits
+    /// unanswered).
+    ///
+    /// Default: `false`. Every existing caller that never sets this field
+    /// keeps EXACTLY today's behavior: `host_policy` decides every
+    /// `session/request_permission` call the instant it arrives, and
+    /// [`AcpSession::resolve_pending_request`] /
+    /// [`AcpSession::expire_deadlines`] simply never find anything pending
+    /// to act on. Intended to be set per session, at spawn, from the
+    /// approval level already resolved by the caller -- a session launched
+    /// to run unattended should leave this `false` and keep deciding by
+    /// policy alone, never defer.
+    pub defer_permission_requests: bool,
+
+    /// How long a deferred `session/request_permission` request may wait
+    /// for [`AcpSession::resolve_pending_request`] before
+    /// [`AcpSession::expire_deadlines`] decides it unattended -- via
+    /// `host_policy`, exactly as it would have been decided immediately had
+    /// deferral never been enabled. Only consulted when
+    /// `defer_permission_requests` is `true`.
+    ///
+    /// Default: 5 minutes -- long enough for a human to notice a prompt and
+    /// answer it, short enough that a session with nobody watching never
+    /// stalls indefinitely on an absent one. `HostPolicy` exists precisely
+    /// so an unattended session never has to wait on a human at all; a
+    /// deferred request that times out is answered exactly the way it would
+    /// have been answered on arrival, just later.
+    pub permission_request_deadline: Duration,
 }
 
 impl Default for AcpSessionOptions {
@@ -175,8 +215,125 @@ impl Default for AcpSessionOptions {
             dangerous_command_gate: DangerousCommandGate::default(),
             approval_level_args: Vec::new(),
             additional_directories: Vec::new(),
+            defer_permission_requests: false,
+            permission_request_deadline: Duration::from_secs(300),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Deferred host permission requests
+// ---------------------------------------------------------------------------
+
+/// One `session/request_permission` request the reader loop deferred
+/// instead of deciding immediately -- see
+/// [`crate::rpc::handler::HostOutcome::Deferred`], returned by
+/// `AcpHostAdapter::handle_deferrable` (`acp/host.rs`) only when
+/// [`AcpSessionOptions::defer_permission_requests`] is `true`.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingPermissionRequest {
+    /// The full original agent → host request: what is being asked, and
+    /// the concrete options the agent will accept a decision from.
+    pub(crate) params: PermissionRequestParams,
+    /// Wall-clock point past which [`AcpSession::expire_deadlines`] decides
+    /// this request unattended.
+    pub(crate) deadline: Instant,
+}
+
+/// What an operator decided about a deferred `session/request_permission`,
+/// stated as intent rather than as one of the agent's option ids.
+///
+/// The operator answers a question ("may it do this?"); translating that into
+/// whichever of the four [`PermissionOptionKind`] values a given agent
+/// happened to offer is [`AcpSession::resolve_pending_request_as`]'s job, not
+/// the operator's and not the wire's. This is why the wire verb carries a
+/// `ProviderInteractionResponse` — the same approve/deny/answer vocabulary a
+/// PTY interaction uses — instead of an ACP-specific option id: the three
+/// chains say the same thing to an operator, and only the ACP path has to
+/// know what an option id is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorPermissionChoice {
+    Approve,
+    Reject,
+}
+
+/// Shared, thread-safe registry of one [`AcpSession`]'s deferred
+/// `session/request_permission` requests, keyed by JSON-RPC request id.
+///
+/// A plain `std::sync::Mutex`, like [`SessionState`]: `acp_reader_loop`
+/// (`acp/reader.rs`) inserts into this from its blocking thread, not an
+/// async context, and every lock taken here -- on either side -- is held
+/// only long enough to touch the map, never across an `.await`.
+#[derive(Clone, Default)]
+pub(crate) struct PendingHostRequests {
+    inner: Arc<Mutex<HashMap<RpcId, PendingPermissionRequest>>>,
+}
+
+impl PendingHostRequests {
+    /// Record a newly deferred request. Called only by `acp_reader_loop`
+    /// the moment `HostHandler::handle_deferrable` returns `Deferred`.
+    pub(crate) fn insert(&self, id: RpcId, request: PendingPermissionRequest) {
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.insert(id, request);
+        }
+    }
+
+    /// Remove and return one pending request by id, if it is still pending.
+    /// `None` covers both "never deferred" and "already answered" --
+    /// [`AcpSession::resolve_pending_request`] turns that into a named
+    /// error rather than silently doing nothing.
+    fn remove(&self, id: &RpcId) -> Option<PendingPermissionRequest> {
+        self.inner.lock().ok().and_then(|mut guard| guard.remove(id))
+    }
+
+    /// Remove and return every request whose deadline is at or before
+    /// `now`. Called by [`AcpSession::expire_deadlines`].
+    fn take_expired(&self, now: Instant) -> Vec<(RpcId, PendingPermissionRequest)> {
+        let mut guard = match self.inner.lock() {
+            Ok(g) => g,
+            Err(_) => return Vec::new(),
+        };
+        let expired_ids: Vec<RpcId> = guard
+            .iter()
+            .filter(|(_, request)| request.deadline <= now)
+            .map(|(id, _)| id.clone())
+            .collect();
+        expired_ids
+            .into_iter()
+            .filter_map(|id| {
+                let request = guard.remove(&id)?;
+                Some((id, request))
+            })
+            .collect()
+    }
+}
+
+/// Distinguishes, for [`AcpSession::write_pending_response`], whether a
+/// deferred request's response came from an operator
+/// ([`AcpSession::resolve_pending_request`]) or from an unattended deadline
+/// expiry ([`AcpSession::expire_deadlines`]) -- carried straight into the
+/// broadcast `RpcIncomingRequest`'s `HostRequestDecision::{Granted,Denied}
+/// { by }` as `HostDecisionAuthority::Operator` or `::DeadlinePolicy`
+/// respectively, so an observer never mistakes an unattended timeout for a
+/// human's choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingRequestResolution {
+    Answered,
+    TimedOut,
+}
+
+/// Error returned by [`AcpSession::resolve_pending_request`].
+#[derive(Debug, thiserror::Error)]
+pub enum PendingRequestError {
+    /// `id` was never deferred (not a `session/request_permission` call, or
+    /// deferral was disabled for this session), or it already left the
+    /// pending map -- answered once already, by
+    /// [`AcpSession::resolve_pending_request`] or
+    /// [`AcpSession::expire_deadlines`]. Not a panic: a caller racing an
+    /// operator's answer against a deadline expiry is an expected outcome,
+    /// not a programming error.
+    #[error("no pending host request with id {id:?} — never deferred, or already answered")]
+    NotFound { id: RpcId },
 }
 
 // ---------------------------------------------------------------------------
@@ -201,6 +358,14 @@ pub struct AcpSession {
     id_gen: Arc<IdGen>,
     reader_task: JoinHandle<()>,
     prompt_timeout: Duration,
+    /// The host authority mode this session was constructed with -- see
+    /// [`AcpSessionOptions::host_policy`]. Kept as its own field (rather
+    /// than read back out of the handler) so
+    /// [`expire_deadlines`](Self::expire_deadlines) can answer a timed-out
+    /// deferred request with EXACTLY the policy that would have answered it
+    /// immediately; nothing here can overrule `host_policy`, only ask it
+    /// again, later.
+    host_policy: HostPolicy,
     /// Capabilities reported by the agent during `initialize`.
     agent_caps: AgentCapabilities,
     /// Live session state (modes, command catalog, config options, usage)
@@ -211,6 +376,13 @@ pub struct AcpSession {
     /// held only long enough to read or clone the state, never across an
     /// `.await`.
     session_state: Arc<Mutex<SessionState>>,
+    /// Deferred `session/request_permission` requests awaiting an
+    /// operator's answer or a deadline expiry -- see
+    /// [`resolve_pending_request`](Self::resolve_pending_request) and
+    /// [`expire_deadlines`](Self::expire_deadlines). Empty for the whole
+    /// life of a session with [`AcpSessionOptions::defer_permission_requests`]
+    /// left at its default `false`.
+    pending_host_requests: PendingHostRequests,
 }
 
 impl AcpSession {
@@ -265,29 +437,57 @@ impl AcpSession {
 
         let process = Arc::new(Mutex::new(proc));
 
+        // Deferral is a THIRD axis, independent of `host_policy` and the
+        // dangerous-command gate -- see `super::host::PermissionDeferral`.
+        let deferral = if options.defer_permission_requests {
+            PermissionDeferral::Enabled
+        } else {
+            PermissionDeferral::Disabled
+        };
+
         // ACP host authority is `options.host_policy` -- it governs both the
         // `clientCapabilities` declared below and how `session/request_
         // permission` gets answered, so the two can never drift apart.
-        let handler: Arc<dyn crate::rpc::handler::HostHandler> = Arc::new(AcpHostAdapter(Arc::new(
-            PolicyHostHandler::new(
+        //
+        // Concretely `Arc<AcpHostAdapter>`, not the generic `Arc<dyn
+        // HostHandler>` -- the reader loop calls `handle_deferrable` on it
+        // through the `HostHandler` trait exactly as before, but ALSO calls
+        // the inherent `AcpHostAdapter::decision_authority` to classify
+        // `HostRequestDecision`'s `by`, which is not part of that generic
+        // trait (see `acp::host::AcpHostAdapter::decision_authority`'s doc
+        // comment for why it stays inherent rather than joining the trait).
+        let handler: Arc<AcpHostAdapter> = Arc::new(AcpHostAdapter::new(
+            Arc::new(PolicyHostHandler::new(
                 options.host_policy,
                 working_dir.to_path_buf(),
                 options.dangerous_command_gate,
-            ),
-        )));
+            )),
+            deferral,
+        ));
 
         let pending = PendingRequests::new();
         let id_gen = Arc::new(IdGen::new());
         let session_state = Arc::new(Mutex::new(SessionState::default()));
+        let pending_host_requests = PendingHostRequests::default();
 
         // Clones for the reader loop task.
         let reader_process = Arc::clone(&process);
         let reader_tx = tx.clone();
         let reader_pending = pending.clone();
         let reader_session_state = Arc::clone(&session_state);
+        let reader_pending_host_requests = pending_host_requests.clone();
+        let permission_request_deadline = options.permission_request_deadline;
 
         let reader_task = tokio::task::spawn_blocking(move || {
-            acp_reader_loop(reader_process, reader_tx, reader_pending, handler, reader_session_state);
+            acp_reader_loop(
+                reader_process,
+                reader_tx,
+                reader_pending,
+                handler,
+                reader_session_state,
+                reader_pending_host_requests,
+                permission_request_deadline,
+            );
         });
 
         let acp_session_id = Arc::new(tokio::sync::Mutex::new(None::<String>));
@@ -302,8 +502,10 @@ impl AcpSession {
             id_gen,
             reader_task,
             prompt_timeout: options.prompt_timeout,
+            host_policy: options.host_policy,
             agent_caps: AgentCapabilities::default(),
             session_state,
+            pending_host_requests,
         };
 
         // --- Handshake step 1: initialize (id=0 per ACP convention) ---
@@ -829,9 +1031,174 @@ impl AcpSession {
         Ok(())
     }
 
+    /// Answer one deferred `session/request_permission` request by its
+    /// JSON-RPC `id`, on an operator's behalf, with either a chosen
+    /// [`PermissionOption`] (`Some`) or an explicit cancellation (`None`,
+    /// mirroring the agent's own [`PermissionOutcome::Cancelled`]). Writes
+    /// the response straight to the agent's stdin via the same
+    /// `write_line_to_process` path `acp_reader_loop` itself uses for every
+    /// other response (`acp/reader.rs`) -- safe to call from any task,
+    /// because the reader loop is documented never to hold the process
+    /// mutex across the handler call that produced this pending request in
+    /// the first place.
+    ///
+    /// Removes the entry from the pending map on success, so a second call
+    /// with the same `id` -- a slow operator UI double-submitting, or a
+    /// race against [`expire_deadlines`](Self::expire_deadlines) -- gets
+    /// [`PendingRequestError::NotFound`] rather than answering the agent
+    /// twice.
+    ///
+    /// This is a way to ASK an operator, never a way to overrule
+    /// `host_policy` or the dangerous-command gate: a request only ever
+    /// reaches the pending map after both have already had their say (see
+    /// `AcpHostAdapter::handle_deferrable`, `acp/host.rs`) and left it
+    /// undecided on purpose.
+    ///
+    /// # Errors
+    ///
+    /// - [`PendingRequestError::NotFound`] — `id` was never deferred (this
+    ///   session never called `handle_deferrable` with it, or deferral was
+    ///   disabled), or it was already answered. Never panics on an unknown
+    ///   or stale id.
+    /// Answer a deferred request the way an OPERATOR asked for, rather than
+    /// with an option the caller had to construct.
+    ///
+    /// The operator says approve or reject. Which of the agent's offered
+    /// options that becomes is not the caller's to guess: an agent offers
+    /// whatever subset of the four [`PermissionOptionKind`] values it likes,
+    /// and an `option_id` it never offered is ignored rather than refused —
+    /// so a fabricated one grants nothing while reporting success. This reads
+    /// the options off the pending request's own stored params and walks the
+    /// same preference order [`HostPolicy::select_permission_option`] walks,
+    /// through the one shared selector, so an approval means the same thing
+    /// whether policy or a human produced it.
+    ///
+    /// `Approve` prefers a once-only grant over a standing one: an operator
+    /// answering one question has consented to one thing, and silently
+    /// upgrading that to `AllowAlways` because the agent happened not to
+    /// offer `AllowOnce` would widen a decision they did not make. `Reject`
+    /// prefers the narrower refusal for the mirror-image reason. If the agent
+    /// offered nothing in the requested direction the outcome is `Cancelled`,
+    /// which every ACP agent accepts as a complete answer.
+    pub fn resolve_pending_request_as(
+        &self,
+        id: &RpcId,
+        choice: OperatorPermissionChoice,
+    ) -> Result<(), PendingRequestError> {
+        let request = self
+            .pending_host_requests
+            .remove(id)
+            .ok_or_else(|| PendingRequestError::NotFound { id: id.clone() })?;
+        let preference: &[PermissionOptionKind] = match choice {
+            OperatorPermissionChoice::Approve => {
+                &[PermissionOptionKind::AllowOnce, PermissionOptionKind::AllowAlways]
+            }
+            OperatorPermissionChoice::Reject => {
+                &[PermissionOptionKind::RejectOnce, PermissionOptionKind::RejectAlways]
+            }
+        };
+        let outcome = super::host::select_offered_option(&request.params.options, preference);
+        self.write_pending_response(id, &request.params, outcome, PendingRequestResolution::Answered);
+        Ok(())
+    }
+
+    pub fn resolve_pending_request(
+        &self,
+        id: &RpcId,
+        option: Option<PermissionOption>,
+    ) -> Result<(), PendingRequestError> {
+        let request = self
+            .pending_host_requests
+            .remove(id)
+            .ok_or_else(|| PendingRequestError::NotFound { id: id.clone() })?;
+        let outcome = match option {
+            Some(option) => PermissionOutcome::Selected { option_id: option.option_id },
+            None => PermissionOutcome::Cancelled,
+        };
+        self.write_pending_response(id, &request.params, outcome, PendingRequestResolution::Answered);
+        Ok(())
+    }
+
+    /// Answer every deferred request whose deadline has passed, exactly as
+    /// `host_policy` (the value this session was constructed with -- see
+    /// [`AcpSessionOptions::host_policy`]) would have answered it had
+    /// deferral never been enabled. The dangerous-command gate has ALREADY
+    /// had its say by the time a request is recorded here (see
+    /// `AcpHostAdapter::handle_deferrable`, `acp/host.rs`) -- a gate-blocked
+    /// call is never deferred in the first place -- so nothing left pending
+    /// is ever gate-blocked; only `host_policy` gets asked again, later,
+    /// exactly as it would have been asked immediately.
+    ///
+    /// Cheap and safe to call repeatedly, e.g. from a periodic timer in a
+    /// caller: a session with nothing pending, or nothing yet past its
+    /// deadline, does nothing.
+    ///
+    /// The fact that a request was decided by timeout rather than by an
+    /// operator rides in the SAME [`AgentEvent::RpcIncomingRequest`] audit
+    /// event as the decision itself -- its `HostRequestDecision`'s `by` is
+    /// `HostDecisionAuthority::DeadlinePolicy`, never `::Operator`, so an
+    /// observer can never mistake an unattended timeout for a human's
+    /// choice by looking at that one event alone. An unattended session
+    /// must never stall on an absent human; that is the whole reason
+    /// `HostPolicy` exists, and this is what keeps a deferred request from
+    /// becoming a hang.
+    pub fn expire_deadlines(&self) {
+        let expired = self.pending_host_requests.take_expired(Instant::now());
+        for (id, request) in expired {
+            let outcome = self
+                .host_policy
+                .select_permission_option(&request.params.tool_call, &request.params.options);
+            self.write_pending_response(&id, &request.params, outcome, PendingRequestResolution::TimedOut);
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Private helpers
     // -----------------------------------------------------------------------
+
+    /// Write a `session/request_permission` response for a request that was
+    /// deferred, then broadcast the decision. Shared by
+    /// [`resolve_pending_request`](Self::resolve_pending_request) (an
+    /// operator's choice) and [`expire_deadlines`](Self::expire_deadlines)
+    /// (a timeout); `resolution` is what tells the two apart on the wire
+    /// out to observers -- see [`PendingRequestResolution`].
+    fn write_pending_response(
+        &self,
+        id: &RpcId,
+        params: &PermissionRequestParams,
+        outcome: PermissionOutcome,
+        resolution: PendingRequestResolution,
+    ) {
+        let value = serde_json::to_value(&outcome).unwrap_or(Value::Null);
+        let response = RpcResponse::success(id.clone(), value);
+        if let Ok(json) = serde_json::to_string(&response) {
+            write_line_to_process(&self.process, &format!("{}\n", json));
+        }
+
+        // The same `RpcIncomingRequest` audit shape the reader loop would
+        // have broadcast had this call never been deferred -- now honest,
+        // because the decision now actually exists. `by` is what tells an
+        // operator's answer apart from an unattended deadline expiry (see
+        // `PendingRequestResolution`); neither resolution can ever be
+        // `Gate` -- a gate-blocked call is never deferred in the first
+        // place (see `expire_deadlines`'s doc comment).
+        let by = match resolution {
+            PendingRequestResolution::Answered => HostDecisionAuthority::Operator,
+            PendingRequestResolution::TimedOut => HostDecisionAuthority::DeadlinePolicy,
+        };
+        let granted = permission_outcome_grants(&outcome, &params.options);
+        let decision = if granted {
+            HostRequestDecision::Granted { by }
+        } else {
+            HostRequestDecision::Denied { by }
+        };
+        let _ = self.tx.send(AgentEvent::RpcIncomingRequest {
+            id: id.clone(),
+            method: "session/request_permission".to_owned(),
+            params: Some(serde_json::to_value(params).unwrap_or(Value::Null)),
+            decision,
+        });
+    }
 
     /// Lock the live [`SessionState`] -- readers just clone a field back
     /// out; writers assign through the guard's `DerefMut`. Recovers from a
@@ -953,6 +1320,26 @@ fn generate_session_id() -> String {
         .unwrap_or_default()
         .as_nanos();
     format!("acp-{:x}", t)
+}
+
+/// Whether `outcome` grants the request it answers -- mirrors
+/// `acp::reader::permission_outcome_is_granted`'s reasoning (a `Selected`
+/// outcome only grants when the chosen option's kind is allow-shaped;
+/// `Cancelled` never grants) but works directly on the typed
+/// [`PermissionOutcome`]/[`PermissionOption`] values this module already
+/// has in hand, rather than round-tripping through `Value` the way the
+/// reader loop must (it only ever sees the raw JSON-RPC response, not the
+/// typed request that produced it).
+fn permission_outcome_grants(outcome: &PermissionOutcome, options: &[PermissionOption]) -> bool {
+    let PermissionOutcome::Selected { option_id } = outcome else {
+        return false;
+    };
+    options
+        .iter()
+        .find(|option| &option.option_id == option_id)
+        .is_some_and(|option| {
+            matches!(option.kind, PermissionOptionKind::AllowOnce | PermissionOptionKind::AllowAlways)
+        })
 }
 
 /// Fold a `session/prompt` response into the two events every caller of
@@ -1086,6 +1473,76 @@ mod tests {
         assert_eq!(opts.host_policy, HostPolicy::Auto);
         assert!(opts.approval_level_args.is_empty());
         assert!(opts.additional_directories.is_empty());
+        assert!(!opts.defer_permission_requests, "deferral must default to off");
+        assert_eq!(opts.permission_request_deadline, Duration::from_secs(300));
+    }
+
+    // -----------------------------------------------------------------------
+    // PendingHostRequests — the deferred-permission-request map
+    // -----------------------------------------------------------------------
+
+    fn fake_permission_request(session_id: &str) -> PermissionRequestParams {
+        use crate::acp::protocol::PermissionToolCall;
+        PermissionRequestParams {
+            session_id: session_id.to_owned(),
+            tool_call: PermissionToolCall::default(),
+            options: vec![
+                PermissionOption { option_id: "ao".to_owned(), name: "Allow once".to_owned(), kind: PermissionOptionKind::AllowOnce },
+                PermissionOption { option_id: "ro".to_owned(), name: "Reject once".to_owned(), kind: PermissionOptionKind::RejectOnce },
+            ],
+        }
+    }
+
+    #[test]
+    fn pending_host_requests_insert_remove_roundtrip() {
+        let map = PendingHostRequests::default();
+        let id = RpcId::Number(1);
+        map.insert(
+            id.clone(),
+            PendingPermissionRequest {
+                params: fake_permission_request("s1"),
+                deadline: Instant::now() + Duration::from_secs(60),
+            },
+        );
+        let removed = map.remove(&id).expect("was inserted");
+        assert_eq!(removed.params.session_id, "s1");
+        assert!(map.remove(&id).is_none(), "removing twice must not resurrect the entry");
+    }
+
+    #[test]
+    fn pending_host_requests_take_expired_only_removes_past_deadline() {
+        let map = PendingHostRequests::default();
+        let now = Instant::now();
+        let expired_id = RpcId::Number(1);
+        let live_id = RpcId::Number(2);
+        map.insert(
+            expired_id.clone(),
+            PendingPermissionRequest { params: fake_permission_request("expired"), deadline: now },
+        );
+        map.insert(
+            live_id.clone(),
+            PendingPermissionRequest {
+                params: fake_permission_request("live"),
+                deadline: now + Duration::from_secs(600),
+            },
+        );
+
+        let expired = map.take_expired(now);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].0, expired_id);
+        assert_eq!(expired[0].1.params.session_id, "expired");
+        assert!(map.remove(&live_id).is_some(), "the non-expired entry must still be present");
+    }
+
+    #[test]
+    fn permission_outcome_grants_selected_allow_kinds_only() {
+        let options = vec![
+            PermissionOption { option_id: "ao".to_owned(), name: "Allow once".to_owned(), kind: PermissionOptionKind::AllowOnce },
+            PermissionOption { option_id: "ro".to_owned(), name: "Reject once".to_owned(), kind: PermissionOptionKind::RejectOnce },
+        ];
+        assert!(permission_outcome_grants(&PermissionOutcome::Selected { option_id: "ao".to_owned() }, &options));
+        assert!(!permission_outcome_grants(&PermissionOutcome::Selected { option_id: "ro".to_owned() }, &options));
+        assert!(!permission_outcome_grants(&PermissionOutcome::Cancelled, &options));
     }
 
     #[test]

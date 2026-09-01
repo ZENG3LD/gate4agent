@@ -31,9 +31,10 @@ use gate4agent::pty::{
     PtyReplayCursor, PtySession, PtyTerminalSnapshot, RateLimitDetector, VteParser,
 };
 use gate4agent::{
-    AcpSession, AcpSessionOptions, AgentEvent, CliTool, HostPolicy, LaunchRequest,
-    PipeProcessOptions, PipeSession, PromptFraming, ReadinessIntent, ReadinessPermit,
-    ReadinessTracker, RuntimePlatform, SessionConfig,
+    AcpSession, AcpSessionOptions, AgentEvent, CliTool, HostDecisionAuthority, HostPolicy,
+    HostRequestDecision, LaunchRequest, OperatorPermissionChoice, PipeProcessOptions,
+    PipeSession, PromptFraming,
+    ReadinessIntent, ReadinessPermit, ReadinessTracker, RpcId, RuntimePlatform, SessionConfig,
 };
 use gate4agent_adapters::{
     build_resume_plan_for_identity, builtin_adapter_registry, AdapterRuntimeRegistry,
@@ -45,12 +46,15 @@ use gate4agent_types::{
     AdapterFamily, AgentCommand, AgentId, AgentInstanceId, ApprovalLevel, CapabilityProbeFailure,
     ContextWindowUsage as ProviderContextWindowUsage, ControlEffect,
     ControlObservation, EffectEnvelope, ForegroundProcess, ForegroundProcessKind,
-    ForegroundRequirement, InputAction, ObservationEnvelope, OperationId, OperatorGateInput,
+    ForegroundRequirement, HostDecisionAuthority as ProviderHostDecisionAuthority,
+    HostRequestDecision as ProviderHostRequestDecision, InputAction, ObservationEnvelope,
+    OperationId, OperatorGateInput,
     OperatorGateKind, OperatorGateOption, OperatorGateOptionSemantics, OperatorGateState,
     OperatorGateSubject, PipeProtocol,
     PreparedInputKind, PromptPayload, ProviderAvailableCommand, ProviderConfigChoice,
     ProviderConfigOption, ProviderConfigOptionKind, ProviderEvent, ProviderInteractionKind,
-    ProviderPlanPriority, ProviderPlanStatus, ProviderPlanStep,
+    ProviderInteractionResponse, ProviderInteractionTarget, ProviderPlanPriority,
+    ProviderPlanStatus, ProviderPlanStep,
     ProviderRateLimitKind, ProviderRuntimeCapability, ProviderRuntimePolicy,
     ProviderSessionIdentity, ProviderSessionKey,
     ProviderSource, PtyScreenState, ResumeLaunchRequest, SessionGeneration, StartRequest,
@@ -623,12 +627,12 @@ impl NativeEffectShell {
                         message: "semantic interrupt requires an ACP session".to_owned(),
                     },
                 },
-                ControlEffect::ResolveInteraction { target, .. } => {
-                    ControlObservation::InteractionResolutionFailed {
-                        interaction_id: target.interaction_id,
-                        message: "native interaction resolution authority is not configured"
-                            .to_owned(),
-                    }
+                ControlEffect::ResolveInteraction { target, response } => {
+                    resolve_acp_interaction_observation(
+                        self.acp_sessions.get(&key).map(|owned| &owned.session),
+                        target,
+                        response,
+                    )
                 }
                 ControlEffect::Resize { size } if !size.is_valid() => {
                     ControlObservation::ResizeFailed {
@@ -1124,6 +1128,7 @@ impl NativeEffectShell {
                 let acp_options = AcpSessionOptions {
                     host_policy: host_policy_for_approval_level(request.approval_level),
                     approval_level_args: approval_level_args(&agent_id, request.approval_level),
+                    defer_permission_requests: defers_permission_requests(request.approval_level),
                     ..AcpSessionOptions::default()
                 };
                 let spawned = match acp_spec.launch_override.as_ref() {
@@ -1422,6 +1427,20 @@ impl NativeEffectShell {
         }
         collect_provider_map(&mut self.pipe_sessions, &mut observations);
         collect_provider_map(&mut self.one_shot_sessions, &mut observations);
+        // Retire deferred permission requests whose deadline has passed,
+        // BEFORE draining -- so the `RpcIncomingRequest` each expiry emits is
+        // picked up by the very same drain rather than waiting a whole tick
+        // to be reported.
+        //
+        // This call is what makes the deadline real. Without it a deferred
+        // request has a `deadline` field nobody ever reads, and a session
+        // whose operator never answers waits forever on a promise the code
+        // makes and never keeps -- the agent blocked on a permission it will
+        // never be told about. Deferral is only safe because this runs on
+        // every tick; nothing else in the process calls it.
+        for owned in self.acp_sessions.values() {
+            owned.session.expire_deadlines();
+        }
         collect_provider_map(&mut self.acp_sessions, &mut observations);
         observations
     }
@@ -1727,6 +1746,36 @@ fn host_policy_for_approval_level(level: ApprovalLevel) -> HostPolicy {
         ApprovalLevel::FullAuto => HostPolicy::Yolo,
         ApprovalLevel::ReadOnly => HostPolicy::ReadOnly,
         ApprovalLevel::Moderate | ApprovalLevel::Unmanaged => HostPolicy::Auto,
+    }
+}
+
+/// Whether a session at this approval level parks a `session/request_
+/// permission` for an operator instead of answering it from policy on the
+/// spot (`AcpSessionOptions::defer_permission_requests`).
+///
+/// Deliberately the same split as `host_policy_for_approval_level` above:
+/// exactly the two levels that map to `HostPolicy::Auto` defer, and for the
+/// same reason those two are `Auto` in the first place.
+///
+/// `FullAuto` never defers. Its own doc says restricting is opt-in and not
+/// asking a human is the norm; it is the level chosen precisely so nobody has
+/// to be present, and parking its requests would stall unattended work
+/// waiting for an operator who was never expected to be there.
+///
+/// `ReadOnly` never defers either, and this one is a rule rather than a
+/// convenience: the level is a restriction, not a question. Offering an
+/// operator the chance to approve a write on a read-only session would let
+/// the answer widen the level past what was asked for at launch -- the
+/// restriction has to be un-negotiable from inside the session, or it is not
+/// a restriction.
+///
+/// `Moderate` is literally the provider's own "ask for approval on request"
+/// mode, and `Unmanaged` imposes nothing and so cannot predict what the CLI
+/// will ask. Both are levels where a question is expected, so both park it.
+fn defers_permission_requests(level: ApprovalLevel) -> bool {
+    match level {
+        ApprovalLevel::FullAuto | ApprovalLevel::ReadOnly => false,
+        ApprovalLevel::Moderate | ApprovalLevel::Unmanaged => true,
     }
 }
 
@@ -2111,6 +2160,33 @@ fn rate_limit_event(info: gate4agent::core::types::RateLimitInfo) -> ProviderEve
     }
 }
 
+/// Map `gate4agent`'s `HostRequestDecision`/`HostDecisionAuthority` onto
+/// this crate's wire-typed `ProviderHostRequestDecision`/
+/// `ProviderHostDecisionAuthority` -- `gate4agent-types` cannot depend on
+/// `gate4agent` (see that crate's own `CLAUDE.md`), so the conversion lives
+/// here, the shell that already depends on both. A plain match, not
+/// `format!("{:?}", ..)`: the wire carries the typed value itself.
+fn provider_host_request_decision(decision: HostRequestDecision) -> ProviderHostRequestDecision {
+    match decision {
+        HostRequestDecision::Granted { by } => {
+            ProviderHostRequestDecision::Granted { by: provider_host_decision_authority(by) }
+        }
+        HostRequestDecision::Denied { by } => {
+            ProviderHostRequestDecision::Denied { by: provider_host_decision_authority(by) }
+        }
+        HostRequestDecision::Deferred => ProviderHostRequestDecision::Deferred,
+    }
+}
+
+fn provider_host_decision_authority(by: HostDecisionAuthority) -> ProviderHostDecisionAuthority {
+    match by {
+        HostDecisionAuthority::Gate => ProviderHostDecisionAuthority::Gate,
+        HostDecisionAuthority::Policy => ProviderHostDecisionAuthority::Policy,
+        HostDecisionAuthority::Operator => ProviderHostDecisionAuthority::Operator,
+        HostDecisionAuthority::DeadlinePolicy => ProviderHostDecisionAuthority::DeadlinePolicy,
+    }
+}
+
 /// Map the detector's own `RateLimitType` onto the wire-typed
 /// `ProviderRateLimitKind`. A plain match, not `format!("{:?}", ..)`: the
 /// wire carries the typed value itself, not a Debug-rendering of it.
@@ -2233,6 +2309,121 @@ fn collect_provider_exits<S>(
     }
 }
 
+/// Prefix tags [`encode_rpc_request_id`] / [`decode_rpc_request_id`] use to
+/// keep an `RpcId::Number` and an `RpcId::String` from colliding once both
+/// are flattened into the bare `Option<String>` that
+/// `ProviderEvent::InteractionRequested::request_id` and
+/// `ProviderInteractionTarget::provider_request_id` carry.
+const RPC_REQUEST_ID_NUMBER_PREFIX: &str = "number:";
+const RPC_REQUEST_ID_STRING_PREFIX: &str = "string:";
+
+/// Encode a JSON-RPC id as the `request_id` string carried on
+/// `ProviderEvent::InteractionRequested` -- minted once, in `provider_event`'s
+/// `AgentEvent::RpcIncomingRequest` arm, the moment a `session/request_
+/// permission` call is first reported `HostRequestDecision::Deferred`. Read
+/// back by [`decode_rpc_request_id`] when a later `ResolveInteraction`
+/// effect needs to find this exact pending request again in
+/// `AcpSession::resolve_pending_request` (`gate4agent::acp::session`).
+///
+/// Tagged rather than a bare `to_string()`: an agent-issued
+/// `RpcId::Number(42)` and `RpcId::String("42".into())` are different ids on
+/// the wire and must not collide into the same encoded string.
+fn encode_rpc_request_id(id: &RpcId) -> String {
+    match id {
+        RpcId::Number(number) => format!("{RPC_REQUEST_ID_NUMBER_PREFIX}{number}"),
+        RpcId::String(value) => format!("{RPC_REQUEST_ID_STRING_PREFIX}{value}"),
+    }
+}
+
+/// Inverse of [`encode_rpc_request_id`]. `None` covers both an unrecognized
+/// tag and a `number:` tag whose remainder does not parse as a `u64` --
+/// either way, not an id this process ever minted, so there is nothing to
+/// look up in `AcpSession`'s pending-request map.
+fn decode_rpc_request_id(raw: &str) -> Option<RpcId> {
+    if let Some(number) = raw.strip_prefix(RPC_REQUEST_ID_NUMBER_PREFIX) {
+        return number.parse::<u64>().ok().map(RpcId::Number);
+    }
+    raw.strip_prefix(RPC_REQUEST_ID_STRING_PREFIX)
+        .map(|value| RpcId::String(value.to_owned()))
+}
+
+/// Resolve a `ControlEffect::ResolveInteraction` naming exactly why it
+/// could not be routed, when it could not be -- see
+/// `docs/gate4agent/plans/gate4agent-acp-control-plane-on-the-wire-2026-09-02.md`
+/// §4a-§5, where this is called "the deferral organ, not the plumbing" that
+/// was still missing.
+///
+/// `session` is `None` for every transport this crate owns other than a
+/// live ACP session for `key` -- PTY and pipe sessions never defer a
+/// `session/request_permission` call in the first place (only
+/// `AcpSessionOptions::defer_permission_requests` does, and that field only
+/// exists on `AcpSessionOptions`), so there is never anything for them to
+/// resolve here.
+fn resolve_acp_interaction_observation(
+    session: Option<&AcpSession>,
+    target: ProviderInteractionTarget,
+    response: ProviderInteractionResponse,
+) -> ControlObservation {
+    let interaction_id = target.interaction_id;
+    let fail = |message: String| ControlObservation::InteractionResolutionFailed {
+        interaction_id,
+        message,
+    };
+    let Some(session) = session else {
+        return fail("semantic interaction resolution requires an ACP session".to_owned());
+    };
+    let Some(provider_request_id) = target.provider_request_id.as_deref() else {
+        return fail("ACP interaction resolution requires a provider request id".to_owned());
+    };
+    let Some(id) = decode_rpc_request_id(provider_request_id) else {
+        return fail(format!(
+            "ACP interaction resolution request id {provider_request_id:?} is not a valid JSON-RPC id"
+        ));
+    };
+    match resolve_acp_permission_interaction(session, &id, response) {
+        Ok(()) => ControlObservation::InteractionResolutionCompleted { interaction_id },
+        Err(message) => fail(message),
+    }
+}
+
+/// Route an operator's `ProviderInteractionResponse` for a deferred ACP
+/// `session/request_permission` call into
+/// `AcpSession::resolve_pending_request_as` (`gate4agent::acp::session`).
+///
+/// The operator states an intent, not an option id, and that is deliberate:
+/// an ACP agent offers whatever subset of the four `PermissionOptionKind`
+/// values it likes, and an `optionId` it never offered is ignored rather
+/// than refused -- so a fabricated one would grant nothing while reporting
+/// success. Selecting a REAL offered option is therefore
+/// `AcpSession`'s job, since it is the side that holds the pending request's
+/// own params; it walks the same preference order `HostPolicy` walks,
+/// through one shared selector, so an approval means the same thing whether
+/// policy or a human produced it. If the agent offered nothing in the
+/// requested direction the answer is `Cancelled`, which every ACP agent
+/// accepts as complete.
+///
+/// This is also why the wire verb carries a `ProviderInteractionResponse` --
+/// the same approve/deny vocabulary a PTY interaction uses -- rather than an
+/// ACP-specific option id: all three chains say the same thing to an
+/// operator, and only the ACP path has to know what an option id is.
+///
+/// `Answer` never applies here: ACP `session/request_permission` only ever
+/// offers allow/deny options, never a free-text one.
+fn resolve_acp_permission_interaction(
+    session: &AcpSession,
+    id: &RpcId,
+    response: ProviderInteractionResponse,
+) -> Result<(), String> {
+    let choice = match response {
+        ProviderInteractionResponse::ApproveOnce => OperatorPermissionChoice::Approve,
+        ProviderInteractionResponse::Deny => OperatorPermissionChoice::Reject,
+        ProviderInteractionResponse::Answer { .. } => {
+            return Err("ACP permission interactions do not accept free-text answers".to_owned())
+        }
+    };
+    session.resolve_pending_request_as(id, choice).map_err(|error| error.to_string())
+}
+
 fn provider_event(event: AgentEvent) -> Option<ProviderEvent> {
     match event {
         AgentEvent::SessionStart {
@@ -2319,15 +2510,60 @@ fn provider_event(event: AgentEvent) -> Option<ProviderEvent> {
             agent_id: None,
         }),
         AgentEvent::RateLimit(info) => Some(rate_limit_event(info)),
+        // A `session/request_permission` call the host left `Deferred` (see
+        // `AcpSessionOptions::defer_permission_requests`) is the one host
+        // request an operator can actually act on -- so, ONLY for that
+        // first, deferred sighting of a given id, this becomes an
+        // `InteractionRequested` carrying the id (`encode_rpc_request_id`)
+        // instead of the audit-only `HostRequestObserved` every other host
+        // request becomes. The SAME id's eventual `Granted`/`Denied`
+        // (`HostRequestDecision`'s doc comment on `Deferred`) still falls
+        // through to `HostRequestObserved` below, exactly as before -- see
+        // `docs/gate4agent/plans/gate4agent-acp-control-plane-on-the-wire-2026-09-02.md`
+        // §4a.2, which is what this replaces (`id: _`, the id silently
+        // dropped, so an ACP permission request never became an
+        // `InteractionRequested` at all).
+        AgentEvent::RpcIncomingRequest {
+            id,
+            method,
+            params,
+            decision,
+        } if method == "session/request_permission"
+            && matches!(decision, HostRequestDecision::Deferred) =>
+        {
+            let tool_call = params.as_ref().and_then(|params| params.get("toolCall"));
+            let field = |name: &str| {
+                tool_call
+                    .and_then(|tool_call| tool_call.get(name))
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+            };
+            // `kind` is the tool's CLASS (`execute`, `edit`, `read`, ...) and
+            // `title` is the human sentence describing this particular call.
+            // They are two different things and the operator needs both: the
+            // class is what the node hashes into `tool_class` for the
+            // observation, and the title is the actual question. Putting the
+            // title in `tool_name` and leaving `prompt` empty -- which is
+            // what this did -- showed the operator a correlation id and a
+            // sentence-shaped tool name, and never the question itself.
+            Some(ProviderEvent::InteractionRequested {
+                request_id: Some(encode_rpc_request_id(&id)),
+                interaction_kind: ProviderInteractionKind::Approval,
+                tool_name: field("kind").unwrap_or(method),
+                prompt: field("title").unwrap_or_default(),
+                agent_id: None,
+            })
+        }
         AgentEvent::RpcIncomingRequest {
             id: _,
             method,
             params,
-            granted,
+            decision,
         } => Some(ProviderEvent::HostRequestObserved {
             method,
             params_json: params.map(|value| value.to_string()).unwrap_or_default(),
-            granted,
+            decision: provider_host_request_decision(decision),
         }),
         AgentEvent::RpcNotification { method, params } => {
             Some(ProviderEvent::UnrecognizedNotification {
@@ -3993,16 +4229,19 @@ mod tests {
     use gate4agent_catalog::EnvMutation;
     use gate4agent::agent::ForegroundObservation;
     use gate4agent::core::types::{
-        AgentEvent, ContextWindowUsage as AgentContextWindowUsage, RateLimitType,
+        AgentEvent, ContextWindowUsage as AgentContextWindowUsage, HostDecisionAuthority,
+        HostRequestDecision, RateLimitType,
     };
     use gate4agent::pty::event::PtyMouseProtocolEncoding;
     use gate4agent::pty::{PtyForegroundObservation, PtyForegroundSource, RateLimitDetector};
     use gate4agent::CliTool;
     use gate4agent_types::{
-        AdapterFamily, AgentId, ApprovalLevel, OperatorGateInput,
+        AdapterFamily, AgentId, ApprovalLevel,
+        HostDecisionAuthority as ProviderHostDecisionAuthority,
+        HostRequestDecision as ProviderHostRequestDecision, OperatorGateInput,
         OperatorGateKind, OperatorGateOptionSemantics, OperatorGateState, OperatorGateSubject,
-        ProviderEvent, ProviderRuntimePolicy, PtyScreenState, RuntimePlatform,
-        TerminalMouseProtocolEncoding, TransportKind,
+        ProviderEvent, ProviderInteractionKind, ProviderRuntimePolicy, PtyScreenState,
+        RuntimePlatform, TerminalMouseProtocolEncoding, TransportKind,
     };
     use std::ffi::{OsStr, OsString};
 
@@ -4121,14 +4360,16 @@ mod tests {
             id: gate4agent::rpc::message::RpcId::Number(1),
             method: "fs/read_text_file".to_owned(),
             params: None,
-            granted: false,
+            decision: HostRequestDecision::Denied { by: HostDecisionAuthority::Policy },
         });
         assert_eq!(
             denied,
             Some(ProviderEvent::HostRequestObserved {
                 method: "fs/read_text_file".to_owned(),
                 params_json: String::new(),
-                granted: false,
+                decision: ProviderHostRequestDecision::Denied {
+                    by: ProviderHostDecisionAuthority::Policy
+                },
             })
         );
 
@@ -4136,14 +4377,140 @@ mod tests {
             id: gate4agent::rpc::message::RpcId::Number(2),
             method: "terminal/create".to_owned(),
             params: None,
-            granted: true,
+            decision: HostRequestDecision::Granted { by: HostDecisionAuthority::Policy },
         });
         assert_eq!(
             granted,
             Some(ProviderEvent::HostRequestObserved {
                 method: "terminal/create".to_owned(),
                 params_json: String::new(),
-                granted: true,
+                decision: ProviderHostRequestDecision::Granted {
+                    by: ProviderHostDecisionAuthority::Policy
+                },
+            })
+        );
+
+        // Every authority carries through, not just the outcome -- a gate
+        // block and an operator's answer must remain distinguishable on the
+        // wire, and a deadline expiry must never be mistaken for one.
+        let gate_denied = super::provider_event(AgentEvent::RpcIncomingRequest {
+            id: gate4agent::rpc::message::RpcId::Number(3),
+            method: "terminal/create".to_owned(),
+            params: None,
+            decision: HostRequestDecision::Denied { by: HostDecisionAuthority::Gate },
+        });
+        assert_eq!(
+            gate_denied,
+            Some(ProviderEvent::HostRequestObserved {
+                method: "terminal/create".to_owned(),
+                params_json: String::new(),
+                decision: ProviderHostRequestDecision::Denied {
+                    by: ProviderHostDecisionAuthority::Gate
+                },
+            })
+        );
+
+        let operator_granted = super::provider_event(AgentEvent::RpcIncomingRequest {
+            id: gate4agent::rpc::message::RpcId::Number(4),
+            method: "session/request_permission".to_owned(),
+            params: None,
+            decision: HostRequestDecision::Granted { by: HostDecisionAuthority::Operator },
+        });
+        assert_eq!(
+            operator_granted,
+            Some(ProviderEvent::HostRequestObserved {
+                method: "session/request_permission".to_owned(),
+                params_json: String::new(),
+                decision: ProviderHostRequestDecision::Granted {
+                    by: ProviderHostDecisionAuthority::Operator
+                },
+            })
+        );
+
+        let deadline_denied = super::provider_event(AgentEvent::RpcIncomingRequest {
+            id: gate4agent::rpc::message::RpcId::Number(5),
+            method: "session/request_permission".to_owned(),
+            params: None,
+            decision: HostRequestDecision::Denied { by: HostDecisionAuthority::DeadlinePolicy },
+        });
+        assert_eq!(
+            deadline_denied,
+            Some(ProviderEvent::HostRequestObserved {
+                method: "session/request_permission".to_owned(),
+                params_json: String::new(),
+                decision: ProviderHostRequestDecision::Denied {
+                    by: ProviderHostDecisionAuthority::DeadlinePolicy
+                },
+            })
+        );
+
+        // `session/request_permission` + `Deferred` is deliberately absent
+        // here -- that combination becomes an `InteractionRequested`, not a
+        // `HostRequestObserved`; see
+        // `deferred_acp_permission_request_becomes_an_interaction_with_its_id`
+        // below.
+    }
+
+    #[test]
+    fn deferred_acp_permission_request_becomes_an_interaction_with_its_id() {
+        let with_title = super::provider_event(AgentEvent::RpcIncomingRequest {
+            id: gate4agent::rpc::message::RpcId::Number(6),
+            method: "session/request_permission".to_owned(),
+            params: Some(serde_json::json!({
+                "sessionId": "s1",
+                "toolCall": {"toolCallId": "t1", "title": "Edit src/main.rs"},
+                "options": [],
+            })),
+            decision: HostRequestDecision::Deferred,
+        });
+        assert_eq!(
+            with_title,
+            Some(ProviderEvent::InteractionRequested {
+                request_id: Some("number:6".to_owned()),
+                interaction_kind: ProviderInteractionKind::Approval,
+                tool_name: "Edit src/main.rs".to_owned(),
+                prompt: String::new(),
+                agent_id: None,
+            })
+        );
+
+        // No title on the wire (or no params at all) -- falls back to the
+        // method name rather than an empty `tool_name`, which
+        // `ProviderEvent::validate_ingress` rejects.
+        let without_title = super::provider_event(AgentEvent::RpcIncomingRequest {
+            id: gate4agent::rpc::message::RpcId::String("agent-7".to_owned()),
+            method: "session/request_permission".to_owned(),
+            params: None,
+            decision: HostRequestDecision::Deferred,
+        });
+        assert_eq!(
+            without_title,
+            Some(ProviderEvent::InteractionRequested {
+                request_id: Some("string:agent-7".to_owned()),
+                interaction_kind: ProviderInteractionKind::Approval,
+                tool_name: "session/request_permission".to_owned(),
+                prompt: String::new(),
+                agent_id: None,
+            })
+        );
+
+        // The SAME id's eventual outcome (not itself `Deferred` anymore)
+        // still reaches the operator as the ordinary audit trail, exactly
+        // as every other host request does.
+        let resolved = super::provider_event(AgentEvent::RpcIncomingRequest {
+            id: gate4agent::rpc::message::RpcId::Number(6),
+            method: "session/request_permission".to_owned(),
+            params: None,
+            decision: HostRequestDecision::Denied { by: HostDecisionAuthority::Operator },
+        });
+        assert_eq!(
+            resolved,
+            Some(ProviderEvent::HostRequestObserved {
+                method: "session/request_permission".to_owned(),
+                params_json: String::new(),
+                decision: ProviderHostRequestDecision::Denied {
+                    by: ProviderHostDecisionAuthority::Operator
+                },
             })
         );
     }

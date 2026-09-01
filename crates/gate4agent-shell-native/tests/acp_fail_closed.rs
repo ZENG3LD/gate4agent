@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use gate4agent::acp::{AcpSession, AcpSessionOptions, HostPolicy};
-use gate4agent::{AgentEvent, CliTool};
+use gate4agent::{AgentEvent, CliTool, HostDecisionAuthority, HostRequestDecision};
 use gate4agent_testkit::acp_agent_spec;
 
 #[tokio::test]
@@ -43,8 +43,8 @@ async fn acp_session_handshake_and_host_callbacks_are_fail_closed() {
     let mut received_text = false;
     while let Ok(event) = events.try_recv() {
         match event {
-            AgentEvent::RpcIncomingRequest { method, granted, .. } => {
-                callbacks.push((method, granted));
+            AgentEvent::RpcIncomingRequest { method, decision, .. } => {
+                callbacks.push((method, decision));
             }
             AgentEvent::Text { text, .. } if text == "fixture-acp-response" => {
                 received_text = true;
@@ -61,9 +61,14 @@ async fn acp_session_handshake_and_host_callbacks_are_fail_closed() {
             "session/request_permission",
         ]
     );
+    // Every callback in this fixture is a benign call (no dangerous-command
+    // gate rule matches any of them) under `HostPolicy::Deny`, so every one
+    // must be `Denied { by: Policy }` -- not merely denied, but denied BY
+    // THE POLICY, never by the gate and never left `Deferred`.
     assert!(
-        callbacks.iter().all(|(_, granted)| !granted),
-        "every callback under HostPolicy::Deny must be denied: {callbacks:?}"
+        callbacks.iter().all(|(_, decision)| *decision
+            == HostRequestDecision::Denied { by: HostDecisionAuthority::Policy }),
+        "every callback under HostPolicy::Deny must be denied by policy: {callbacks:?}"
     );
     assert!(
         received_text,

@@ -1404,6 +1404,53 @@ pub struct ProviderConfigOption {
     pub choices: Vec<ProviderConfigChoice>,
 }
 
+/// WHO decided a host request the agent sent to the ACP host -- see
+/// [`ProviderEvent::HostRequestObserved`]. Mirrors `gate4agent`'s own
+/// `HostDecisionAuthority` one-for-one; this crate cannot depend on
+/// `gate4agent` (see this crate's `CLAUDE.md`), so the value is converted at
+/// the boundary that already depends on both (`gate4agent-shell-native`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HostDecisionAuthority {
+    /// The dangerous-command gate forced this outcome ahead of `HostPolicy`
+    /// -- `terminal/create` and `execute`-kind `session/request_permission`
+    /// only. Always a denial.
+    Gate,
+    /// `HostPolicy` (`Yolo`/`Auto`/`ReadOnly`/`Deny`) decided the request
+    /// the instant it arrived -- the default path for every request that
+    /// is neither gate-blocked nor deferred.
+    Policy,
+    /// An operator answered a `session/request_permission` call that had
+    /// been left `HostRequestDecision::Deferred`.
+    Operator,
+    /// A `session/request_permission` call left `HostRequestDecision::
+    /// Deferred` reached its deadline with no operator answer, so
+    /// `HostPolicy` -- the SAME policy that would have answered it
+    /// immediately had deferral never been enabled -- decided it instead.
+    /// Deliberately its own variant rather than `Policy`: folding it in
+    /// would erase the fact that an operator was asked first and nobody
+    /// answered in time. Equally deliberately not `Operator`: no human
+    /// made this choice.
+    DeadlinePolicy,
+}
+
+/// A typed answer to "what happened to this host request" -- see
+/// [`ProviderEvent::HostRequestObserved`]. Mirrors `gate4agent`'s own
+/// `HostRequestDecision` one-for-one; see [`HostDecisionAuthority`]'s doc
+/// comment for why this crate keeps its own copy rather than importing it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum HostRequestDecision {
+    /// The request was allowed. `by` is who made that call.
+    Granted { by: HostDecisionAuthority },
+    /// The request was refused. `by` is who made that call.
+    Denied { by: HostDecisionAuthority },
+    /// The request has arrived and been recorded, but nothing has decided
+    /// it yet. A later `ProviderEvent::HostRequestObserved` reports the
+    /// eventual `Granted`/`Denied` outcome once one exists.
+    Deferred,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ProviderEvent {
@@ -1484,20 +1531,24 @@ pub enum ProviderEvent {
     /// The agent sent a JSON-RPC request to the ACP host -- `session/
     /// request_permission`, `fs/read_text_file`, `fs/write_text_file`,
     /// `terminal/create`, `terminal/output`, `terminal/wait_for_exit`,
-    /// `terminal/kill`, `terminal/release` -- and the host's `HostPolicy`
-    /// (`Yolo`/`Auto`/`ReadOnly`/`Deny`; `Auto` unless a caller narrowed it,
-    /// e.g. to bound a child agent) has already decided on it by the time
-    /// this event exists. This event does not change what the host does; it
-    /// exists purely so an operator sees the request AND the decision
-    /// instead of the request silently disappearing into a refusal nobody
-    /// downstream ever hears about. `granted` is read off the host's own
-    /// `Result` for the call, not re-derived here -- see the source
-    /// (`gate4agent`'s `AgentEvent::RpcIncomingRequest::granted`) for
-    /// exactly how.
+    /// `terminal/kill`, `terminal/release`. `decision` is read off the
+    /// host's own answer, not re-derived here -- see the source
+    /// (`gate4agent`'s `AgentEvent::RpcIncomingRequest::decision`) for
+    /// exactly how. A `session/request_permission` call the host chose to
+    /// defer to an operator arrives here TWICE under different `method`/
+    /// `params_json` snapshots but the SAME logical request: once as
+    /// `HostRequestDecision::Deferred` when it is recorded, then again as
+    /// `Granted`/`Denied` once `HostPolicy` (`Yolo`/`Auto`/`ReadOnly`/`Deny`)
+    /// or an operator decides it -- see `HostRequestDecision` and
+    /// `HostDecisionAuthority` for what each of the four ways a request can
+    /// end up decided actually means. This event does not change what the
+    /// host does; it exists purely so an operator sees the request AND the
+    /// decision instead of the request silently disappearing into a
+    /// refusal nobody downstream ever hears about.
     HostRequestObserved {
         method: String,
         params_json: String,
-        granted: bool,
+        decision: HostRequestDecision,
     },
     /// A JSON-RPC notification the reader received but could not classify
     /// into any other `ProviderEvent` -- most commonly a `session/update`
@@ -2404,7 +2455,8 @@ mod tests {
     use crate::AgentId;
     use super::{
         AgentInstanceId, CapabilitySnapshot, ContextWindowUsage, ForegroundProcess,
-        ForegroundProcessKind, ForegroundSnapshot, HistorySnapshot, OperatorGateInput,
+        ForegroundProcessKind, ForegroundSnapshot, HistorySnapshot, HostDecisionAuthority,
+        HostRequestDecision, OperatorGateInput,
         OperatorGateKind, OperatorGateOption, OperatorGateOptionSemantics, OperatorGateState,
         OperatorGateSubject, ProviderAvailableCommand, ProviderConfigChoice, ProviderConfigOption,
         ProviderConfigOptionKind, ProviderEvent,
@@ -2974,7 +3026,7 @@ mod tests {
         let valid = ProviderEvent::HostRequestObserved {
             method: "session/request_permission".to_owned(),
             params_json: "{\"toolName\":\"bash\"}".to_owned(),
-            granted: false,
+            decision: HostRequestDecision::Denied { by: HostDecisionAuthority::Policy },
         };
         assert_eq!(valid.validate_ingress(), Ok(()));
 
@@ -2982,7 +3034,7 @@ mod tests {
             ProviderEvent::HostRequestObserved {
                 method: String::new(),
                 params_json: String::new(),
-                granted: false,
+                decision: HostRequestDecision::Denied { by: HostDecisionAuthority::Policy },
             }
             .validate_ingress(),
             Err(ProviderEventValidationError::Empty { field: "host request method" })
@@ -2993,7 +3045,7 @@ mod tests {
             ProviderEvent::HostRequestObserved {
                 method: oversized_method,
                 params_json: String::new(),
-                granted: true,
+                decision: HostRequestDecision::Granted { by: HostDecisionAuthority::Policy },
             }
             .validate_ingress(),
             Err(ProviderEventValidationError::InvalidField {
@@ -3007,7 +3059,7 @@ mod tests {
             ProviderEvent::HostRequestObserved {
                 method: "fs/read_text_file".to_owned(),
                 params_json: oversized_params,
-                granted: true,
+                decision: HostRequestDecision::Granted { by: HostDecisionAuthority::Policy },
             }
             .validate_ingress(),
             Err(ProviderEventValidationError::InvalidField {

@@ -103,6 +103,7 @@ use crate::protocol::{
     ManagedWorktreeSpawnRequestV2, SessionRecordId,
     NativeSessionCatalogRoute, NativeSessionSelection, SessionTaskBindingV1,
     SessionTaskTargetV1, TaskId,
+    HostDecisionAuthorityV1, HostRequestDecisionV1,
     ObservationCapabilitiesV1, ObservationEvidenceV1, ObservationInteractionOutcomeV1,
     ObservationKindV1, ObservationSourceFamilyV1, ObservationV1,
     StateSchemaSupport, WorkspaceEntry, WorkspaceEntryKind, WorktreeProfileId,
@@ -137,6 +138,7 @@ use crate::protocol::{
     NODE_MANAGED_WORKTREE_SPAWN_V2_CAPABILITY,
     NODE_SPAWN_PROFILE_REVISION_CAPABILITY, NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY,
     NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
+    NODE_AGENT_STREAM_EVENTS_CAPABILITY, NODE_ACP_CONTROL_CAPABILITY,
     NODE_GIT_READ_CAPABILITY, NODE_WORKSPACE_FILE_READ_CAPABILITY,
     NODE_WORKSPACE_FILE_WRITE_CAPABILITY, NODE_WORKSPACE_ENTRY_CREATE_CAPABILITY,
     NODE_WORKTREE_SELECTION_CAPABILITY,
@@ -176,7 +178,9 @@ use gate4agent_types::{
     AdapterBinding, AdapterFamily, AgentId, AgentInstanceId, AgentSpec, ApprovalLevel,
     CommandEnvelope, CommandId,
     validate_candidate_id, ControlCommand, ControlEvent, ControlEventKind,
-    HistoryCandidateSummary, HistoryOperation, HistoryQuery, HistorySessionRecord, InputAction,
+    HistoryCandidateSummary, HistoryOperation, HistoryQuery, HistorySessionRecord,
+    HostDecisionAuthority as ProviderHostDecisionAuthority,
+    HostRequestDecision as ProviderHostRequestDecision, InputAction,
     PromptFraming, PromptPayload, ResumeLaunchRequest,
     ProviderEvent, ProviderInteractionKind, ProviderInteractionStatus,
     ProviderRuntimeCapability, ProviderRuntimePolicy, ProviderSessionIdentity, ProviderSessionKey,
@@ -216,6 +220,12 @@ pub use crate::platform::DEFAULT_NODE_ENDPOINT;
 const NODE_EVENT_HISTORY_MAX: usize = 4_096;
 const NODE_BROADCAST_CAPACITY: usize = 1_024;
 const NODE_TERMINAL_BROADCAST_CAPACITY: usize = 1;
+/// Unlike `NODE_TERMINAL_BROADCAST_CAPACITY`'s single replaceable slot (a
+/// terminal frame is a full-screen snapshot; only the latest ever matters),
+/// an `AgentStreamChunkV1` is one delta in an ordered sequence -- collapsing
+/// two pending sends into one would silently drop content a subscriber can
+/// never recover. This needs headroom for a burst instead.
+const NODE_AGENT_STREAM_BROADCAST_CAPACITY: usize = 256;
 const NODE_CONNECTION_EVENT_BURST_MAX: usize = 16;
 const CONTROL_EVENT_SUBSCRIPTION_CAPACITY: usize = 1_024;
 const MAX_PREAUTH_CONNECTIONS: usize = 32;
@@ -629,6 +639,34 @@ fn observation_tool_class(name: &str) -> String {
     sanitize_progress_tool_label(name, &mut truncated).unwrap_or_else(|| "Tool".to_owned())
 }
 
+/// Map `gate4agent-types`' `ProviderHostRequestDecision`/
+/// `ProviderHostDecisionAuthority` onto this crate's observation-wire
+/// `HostRequestDecisionV1`/`HostDecisionAuthorityV1` -- `gate4agent-
+/// observation-protocol` cannot depend on `gate4agent-types` (dependency-
+/// light wire crate), so the conversion lives here, the shell that already
+/// depends on both. A plain match, not `format!("{:?}", ..)`: the wire
+/// carries the typed value itself.
+fn observation_host_request_decision(decision: &ProviderHostRequestDecision) -> HostRequestDecisionV1 {
+    match decision {
+        ProviderHostRequestDecision::Granted { by } => {
+            HostRequestDecisionV1::Granted { by: observation_host_decision_authority(*by) }
+        }
+        ProviderHostRequestDecision::Denied { by } => {
+            HostRequestDecisionV1::Denied { by: observation_host_decision_authority(*by) }
+        }
+        ProviderHostRequestDecision::Deferred => HostRequestDecisionV1::Deferred,
+    }
+}
+
+fn observation_host_decision_authority(by: ProviderHostDecisionAuthority) -> HostDecisionAuthorityV1 {
+    match by {
+        ProviderHostDecisionAuthority::Gate => HostDecisionAuthorityV1::Gate,
+        ProviderHostDecisionAuthority::Policy => HostDecisionAuthorityV1::Policy,
+        ProviderHostDecisionAuthority::Operator => HostDecisionAuthorityV1::Operator,
+        ProviderHostDecisionAuthority::DeadlinePolicy => HostDecisionAuthorityV1::DeadlinePolicy,
+    }
+}
+
 fn opaque_subagent_correlation(
     instance_id: AgentInstanceId,
     generation: SessionGeneration,
@@ -667,11 +705,24 @@ fn opaque_tool_correlation(
     opaque_correlation("tool-", &material)
 }
 
-fn opaque_interaction_correlation(event: &ControlEvent, interaction_id: u64) -> String {
+/// Mints the wire correlation `ObservationKindV1::ApprovalRequested`/
+/// `QuestionRequested` carries and `NodeRequest::ResolveInteraction`
+/// answers -- a deliberately opaque SHA256 of `(instance_id, generation,
+/// interaction_id)` rather than the provider's own request id, so the node
+/// never leaks it onto the wire. Takes the triple directly rather than a
+/// `&ControlEvent` so the reverse lookup in `process_request_inner` can
+/// replay the same digest for each interaction a session's live snapshot
+/// still remembers, without needing a `ControlEvent` of its own to borrow
+/// `instance_id`/`generation` from.
+fn opaque_interaction_correlation(
+    instance_id: AgentInstanceId,
+    generation: SessionGeneration,
+    interaction_id: u64,
+) -> String {
     let mut material = Vec::with_capacity(24);
     material.extend_from_slice(b"interaction");
-    material.extend_from_slice(&event.instance_id.0.to_le_bytes());
-    material.extend_from_slice(&event.generation.0.to_le_bytes());
+    material.extend_from_slice(&instance_id.0.to_le_bytes());
+    material.extend_from_slice(&generation.0.to_le_bytes());
     material.extend_from_slice(&interaction_id.to_le_bytes());
     opaque_correlation("int-", &material)
 }
@@ -749,7 +800,11 @@ fn provider_observations(event: &ControlEvent) -> Vec<ObservationV1> {
                 observed_at_unix_ms: Some(unix_time_ms()),
                 evidence: ObservationEvidenceV1::NodeLifecycle,
                 kind: ObservationKindV1::InteractionResolved {
-                    correlation_id: opaque_interaction_correlation(event, interaction_id.0),
+                    correlation_id: opaque_interaction_correlation(
+                        event.instance_id,
+                        event.generation,
+                        interaction_id.0,
+                    ),
                     outcome: observation_interaction_outcome(*outcome),
                 },
                 truncated: false,
@@ -820,11 +875,19 @@ fn provider_observations(event: &ControlEvent) -> Vec<ObservationV1> {
             ..
         } => kinds.push(match interaction_kind {
             ProviderInteractionKind::Approval => ObservationKindV1::ApprovalRequested {
-                correlation_id: opaque_interaction_correlation(event, provider_sequence),
+                correlation_id: opaque_interaction_correlation(
+                    event.instance_id,
+                    event.generation,
+                    provider_sequence,
+                ),
                 tool_class: observation_tool_class(tool_name),
             },
             ProviderInteractionKind::Question => ObservationKindV1::QuestionRequested {
-                correlation_id: opaque_interaction_correlation(event, provider_sequence),
+                correlation_id: opaque_interaction_correlation(
+                    event.instance_id,
+                    event.generation,
+                    provider_sequence,
+                ),
                 tool_class: observation_tool_class(tool_name),
             },
         }),
@@ -854,10 +917,10 @@ fn provider_observations(event: &ControlEvent) -> Vec<ObservationV1> {
             });
         }
         ProviderEvent::RateLimited { .. } => kinds.push(ObservationKindV1::RateLimited),
-        ProviderEvent::HostRequestObserved { method, granted, .. } => {
+        ProviderEvent::HostRequestObserved { method, decision, .. } => {
             kinds.push(ObservationKindV1::HostRequestObserved {
                 class: observation_tool_class(method),
-                granted: *granted,
+                decision: observation_host_request_decision(decision),
             });
         }
         ProviderEvent::UnrecognizedNotification { method, .. } => {
@@ -2957,6 +3020,14 @@ struct NodeShared {
     history: Mutex<NodeEventHistory>,
     event_tx: broadcast::Sender<NodeEventEnvelope>,
     terminal_event_tx: broadcast::Sender<Arc<Vec<NodeEventEnvelope>>>,
+    /// The outbound `NodeEvent::AgentStream` push channel -- its own
+    /// dedicated, capability-gated broadcast, mirroring `terminal_event_tx`
+    /// exactly rather than riding the durable `event_tx` history (see
+    /// `publish`'s own assertion): a subscriber who never negotiated
+    /// `NODE_AGENT_STREAM_EVENTS_CAPABILITY` must never receive one of
+    /// these, the same guarantee `include_terminal_frame_events` already
+    /// gives terminal frames.
+    agent_stream_event_tx: broadcast::Sender<Arc<Vec<NodeEventEnvelope>>>,
     terminal_frame_watermarks:
         Mutex<BTreeMap<AgentInstanceId, (SessionAddress, u64)>>,
     next_connection_id: AtomicU64,
@@ -3275,6 +3346,7 @@ impl NodeShared {
     ) -> Self {
         let (event_tx, _) = broadcast::channel(NODE_BROADCAST_CAPACITY);
         let (terminal_event_tx, _) = broadcast::channel(NODE_TERMINAL_BROADCAST_CAPACITY);
+        let (agent_stream_event_tx, _) = broadcast::channel(NODE_AGENT_STREAM_BROADCAST_CAPACITY);
         let record_providers = records
             .iter()
             .map(|record| (record.record_id.clone(), record.provider.clone()))
@@ -3353,6 +3425,7 @@ impl NodeShared {
             history: Mutex::new(NodeEventHistory::new(record_providers)),
             event_tx,
             terminal_event_tx,
+            agent_stream_event_tx,
             terminal_frame_watermarks: Mutex::new(BTreeMap::new()),
             next_connection_id: AtomicU64::new(1),
             next_instance_id: AtomicU64::new(1),
@@ -9808,8 +9881,11 @@ impl NodeShared {
 
     fn publish(&self, event: NodeEvent) -> NodeEventEnvelope {
         assert!(
-            !matches!(&event, NodeEvent::TerminalFrame { .. }),
-            "terminal frame events must use the replaceable live channel",
+            !matches!(
+                &event,
+                NodeEvent::TerminalFrame { .. } | NodeEvent::AgentStream { .. }
+            ),
+            "terminal frame and agent stream events must use their own dedicated live channel",
         );
         let mut history = self.history.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let sequence = history
@@ -9848,6 +9924,7 @@ impl NodeShared {
             | NodeEvent::WorkspaceAdded { .. }
             | NodeEvent::WorkspaceRemoved { .. }
             | NodeEvent::ResyncRequired { .. }
+            | NodeEvent::AgentStream { .. }
             | NodeEvent::TerminalFrame { .. } => {}
         }
         let envelope = NodeEventEnvelope { sequence, event };
@@ -10247,6 +10324,27 @@ impl NodeShared {
                     "session snapshot is unavailable",
                 )
             })
+    }
+
+    /// Confirms `address` names a live session spawned over the ACP
+    /// transport and returns its current snapshot -- the gate every
+    /// `acp-control-v1` verb shares. `require_session_runtime_policy`
+    /// cannot answer this by itself: `ProviderRuntimePolicy` carries no
+    /// transport bit for `Acp`/`Inline` (see that method's own doc), only
+    /// the session's own recorded `TransportKind` does, and that lives on
+    /// the live snapshot, not the binding.
+    fn require_acp_session(
+        &self,
+        address: &SessionAddress,
+    ) -> Result<gate4agent_types::SessionSnapshot, NodeFailure> {
+        let snapshot = self.internal_session_snapshot(address)?;
+        if snapshot.transport != TransportKind::Acp {
+            return Err(failure(
+                NodeFailureCode::UnsupportedTransport,
+                "this verb requires a session spawned over the ACP transport",
+            ));
+        }
+        Ok(snapshot)
     }
 
     async fn dispatch_history_bounded(
@@ -11955,6 +12053,9 @@ where
     let include_terminal_frame_events = selected_capabilities.iter().any(|capability| {
         capability.as_str() == NODE_TERMINAL_FRAME_EVENTS_CAPABILITY
     });
+    let include_agent_stream_events = selected_capabilities.iter().any(|capability| {
+        capability.as_str() == NODE_AGENT_STREAM_EVENTS_CAPABILITY
+    });
     let include_spawn_profiles = selected_capabilities.iter().any(|capability| {
         capability.as_str() == NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY
     });
@@ -12005,6 +12106,10 @@ where
     let mut terminal_event_rx = terminal_event_subscription(
         &shared,
         include_terminal_frame_events,
+    );
+    let mut agent_stream_event_rx = agent_stream_event_subscription(
+        &shared,
+        include_agent_stream_events,
     );
     write_json_frame(
         &mut pipe,
@@ -12075,6 +12180,20 @@ where
             }
         }
         if let Some(receiver) = terminal_event_rx.as_mut() {
+            match receiver.try_recv() {
+                Ok(events) => queue_connection_event_batch(
+                    &mut pending_events,
+                    &events,
+                    discard_events_through,
+                ),
+                Err(broadcast::error::TryRecvError::Empty) => {}
+                Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                    resync_required = true;
+                }
+                Err(broadcast::error::TryRecvError::Closed) => return Ok(()),
+            }
+        }
+        if let Some(receiver) = agent_stream_event_rx.as_mut() {
             match receiver.try_recv() {
                 Ok(events) => queue_connection_event_batch(
                     &mut pending_events,
@@ -12315,6 +12434,17 @@ where
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
+            events = receive_terminal_event_batch(&mut agent_stream_event_rx) => {
+                match events {
+                    Ok(events) => queue_connection_event_batch(
+                        &mut pending_events,
+                        &events,
+                        discard_events_through,
+                    ),
+                    Err(broadcast::error::RecvError::Lagged(_)) => resync_required = true,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
             _ = shared.shutdown_notify.notified() => break,
         }
     }
@@ -12335,6 +12465,16 @@ fn terminal_event_subscription(
     enabled: bool,
 ) -> Option<broadcast::Receiver<Arc<Vec<NodeEventEnvelope>>>> {
     enabled.then(|| shared.terminal_event_tx.subscribe())
+}
+
+/// Mirrors `terminal_event_subscription` exactly, over the agent stream's
+/// own channel -- see `NodeShared::agent_stream_event_tx`'s own doc for why
+/// this needs a dedicated channel rather than a flag on the terminal one.
+fn agent_stream_event_subscription(
+    shared: &NodeShared,
+    enabled: bool,
+) -> Option<broadcast::Receiver<Arc<Vec<NodeEventEnvelope>>>> {
+    enabled.then(|| shared.agent_stream_event_tx.subscribe())
 }
 
 fn queue_connection_event(
@@ -12468,6 +12608,8 @@ fn baseline_capabilities() -> Result<Vec<CapabilityId>, NodeServerError> {
         NODE_PROVIDER_SESSION_REFERENCE_INDEX_CAPABILITY,
         NODE_PROVIDER_RUNTIME_STATUS_CAPABILITY,
         NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
+        NODE_AGENT_STREAM_EVENTS_CAPABILITY,
+        NODE_ACP_CONTROL_CAPABILITY,
         NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY,
         NODE_SPAWN_PROFILE_REVISION_CAPABILITY,
         NODE_WORKTREE_SELECTION_CAPABILITY,
@@ -12812,6 +12954,10 @@ fn request_requires_child_environment_profile(
         | NodeRequest::Interrupt { session }
         | NodeRequest::Stop { session, .. }
         | NodeRequest::Remove { session }
+        | NodeRequest::ResolveInteraction { session, .. }
+        | NodeRequest::SetSessionMode { session, .. }
+        | NodeRequest::SetSessionConfigOption { session, .. }
+        | NodeRequest::SetSessionModel { session, .. }
         | NodeRequest::DiscoverHistory { session, .. }
         | NodeRequest::LoadHistory { session, .. }
         | NodeRequest::ExportContextPackForSessionRecord { session, .. }
@@ -12899,6 +13045,10 @@ fn request_requires_session_bundle(shared: &NodeShared, request: &NodeRequest) -
         | NodeRequest::Interrupt { session }
         | NodeRequest::Stop { session, .. }
         | NodeRequest::Remove { session }
+        | NodeRequest::ResolveInteraction { session, .. }
+        | NodeRequest::SetSessionMode { session, .. }
+        | NodeRequest::SetSessionConfigOption { session, .. }
+        | NodeRequest::SetSessionModel { session, .. }
         | NodeRequest::DiscoverHistory { session, .. }
         | NodeRequest::LoadHistory { session, .. }
         | NodeRequest::ExportContextPackForSessionRecord { session, .. }
@@ -12988,7 +13138,11 @@ fn request_requires_history_context_pack(shared: &NodeShared, request: &NodeRequ
         | NodeRequest::Resize { session, .. }
         | NodeRequest::Interrupt { session }
         | NodeRequest::Stop { session, .. }
-        | NodeRequest::Remove { session } => shared
+        | NodeRequest::Remove { session }
+        | NodeRequest::ResolveInteraction { session, .. }
+        | NodeRequest::SetSessionMode { session, .. }
+        | NodeRequest::SetSessionConfigOption { session, .. }
+        | NodeRequest::SetSessionModel { session, .. } => shared
             .session_bindings
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -13082,6 +13236,10 @@ fn request_requires_open_provider_ids_with(
         | NodeRequest::Interrupt { session }
         | NodeRequest::Stop { session, .. }
         | NodeRequest::Remove { session }
+        | NodeRequest::ResolveInteraction { session, .. }
+        | NodeRequest::SetSessionMode { session, .. }
+        | NodeRequest::SetSessionConfigOption { session, .. }
+        | NodeRequest::SetSessionModel { session, .. }
         | NodeRequest::DiscoverHistory { session, .. }
         | NodeRequest::LoadHistory { session, .. }
         | NodeRequest::ExportContextPackForSessionRecord { session, .. }
@@ -13592,6 +13750,7 @@ fn project_event_legacy_provider_ids(
         NodeEvent::HarnessMcpReadCall { .. } => true,
         NodeEvent::Control { address, .. }
         | NodeEvent::Observation { address, .. }
+        | NodeEvent::AgentStream { address, .. }
         | NodeEvent::TerminalFrame { address, .. } => shared
             .validate_address(address)
             .is_ok_and(|provider| provider_id_is_legacy(&provider)),
@@ -15141,6 +15300,74 @@ async fn process_request_inner(shared: &NodeShared, connection_id: u64, role: Cl
             controlled_session(shared, connection_id, role, &session)?;
             shared.remove_session(&session).await?;
             Ok(NodeResponse::Accepted)
+        }
+        NodeRequest::ResolveInteraction { session, correlation_id, response } => {
+            shared.require_controller(connection_id, role)?;
+            let snapshot = shared.require_acp_session(&session)?;
+            let interaction = snapshot
+                .provider
+                .interactions
+                .iter()
+                .find(|interaction| {
+                    opaque_interaction_correlation(
+                        session.session.instance_id,
+                        session.session.generation,
+                        interaction.id.0,
+                    ) == correlation_id
+                })
+                .ok_or_else(|| failure(
+                    NodeFailureCode::InvalidRequest,
+                    "unknown interaction correlation",
+                ))?;
+            if interaction.status != ProviderInteractionStatus::Pending {
+                return Err(failure(
+                    NodeFailureCode::BackendOperationFailed,
+                    "interaction has already been resolved",
+                ));
+            }
+            response
+                .validate_for(interaction.interaction_kind)
+                .map_err(|error| failure(NodeFailureCode::InvalidRequest, &error.to_string()))?;
+            shared.dispatch(ControlCommand::ResolveInteraction {
+                instance_id: session.session.instance_id,
+                generation: session.session.generation,
+                interaction_id: interaction.id,
+                response,
+            })?;
+            Ok(NodeResponse::Accepted)
+        }
+        // `SetSessionMode`/`SetSessionConfigOption`/`SetSessionModel` are
+        // fully wired on the wire (capability, request shape, transport
+        // gate below) but have no `ControlCommand`/`ControlEffect` counterpart
+        // yet in `gate4agent-types`/`gate4agent-engine` -- `AcpSession::
+        // set_mode`/`set_config_option`/the vendor model switch are reachable
+        // from `gate4agent-shell-native` (`src/acp/session.rs:191`) but
+        // nothing on the command path calls them. Refuse by name rather than
+        // pretend, once the request itself is validated as a genuine ACP
+        // verb on a live ACP session.
+        NodeRequest::SetSessionMode { session, .. } => {
+            shared.require_controller(connection_id, role)?;
+            shared.require_acp_session(&session)?;
+            Err(failure(
+                NodeFailureCode::UnsupportedCapability,
+                "this node has no session-mode control channel to its ACP backend yet",
+            ))
+        }
+        NodeRequest::SetSessionConfigOption { session, .. } => {
+            shared.require_controller(connection_id, role)?;
+            shared.require_acp_session(&session)?;
+            Err(failure(
+                NodeFailureCode::UnsupportedCapability,
+                "this node has no session config-option control channel to its ACP backend yet",
+            ))
+        }
+        NodeRequest::SetSessionModel { session, .. } => {
+            shared.require_controller(connection_id, role)?;
+            shared.require_acp_session(&session)?;
+            Err(failure(
+                NodeFailureCode::UnsupportedCapability,
+                "this node has no session model-switch control channel to its ACP backend yet",
+            ))
         }
         NodeRequest::Shutdown => {
             shared.require_controller(connection_id, role)?;

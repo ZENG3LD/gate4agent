@@ -1950,6 +1950,10 @@ fn ensure_node_request_provider_capability(
         | NodeRequest::Interrupt { .. }
         | NodeRequest::Stop { .. }
         | NodeRequest::Remove { .. }
+        | NodeRequest::ResolveInteraction { .. }
+        | NodeRequest::SetSessionMode { .. }
+        | NodeRequest::SetSessionConfigOption { .. }
+        | NodeRequest::SetSessionModel { .. }
         | NodeRequest::Shutdown => {}
     }
     Ok(())
@@ -2083,6 +2087,10 @@ fn node_request_contains_opaque_unix_path(request: &NodeRequest) -> bool {
         | NodeRequest::Interrupt { .. }
         | NodeRequest::Stop { .. }
         | NodeRequest::Remove { .. }
+        | NodeRequest::ResolveInteraction { .. }
+        | NodeRequest::SetSessionMode { .. }
+        | NodeRequest::SetSessionConfigOption { .. }
+        | NodeRequest::SetSessionModel { .. }
         | NodeRequest::Shutdown => false,
     }
 }
@@ -2229,6 +2237,7 @@ fn node_event_contains_open_provider_id(event: &NodeEvent) -> bool {
         | NodeEvent::SessionRecordRemoved { .. }
         | NodeEvent::ManagedWorktreeUpserted { .. }
         | NodeEvent::ManagedWorktreeRemoved { .. }
+        | NodeEvent::AgentStream { .. }
         | NodeEvent::ResyncRequired { .. } => false,
     }
 }
@@ -2296,6 +2305,10 @@ fn node_request_contains_tagged_repository_path(request: &NodeRequest) -> bool {
         | NodeRequest::Interrupt { .. }
         | NodeRequest::Stop { .. }
         | NodeRequest::Remove { .. }
+        | NodeRequest::ResolveInteraction { .. }
+        | NodeRequest::SetSessionMode { .. }
+        | NodeRequest::SetSessionConfigOption { .. }
+        | NodeRequest::SetSessionModel { .. }
         | NodeRequest::Shutdown => false,
     }
 }
@@ -2487,6 +2500,7 @@ fn node_event_contains_opaque_unix_path(event: &NodeEvent) -> bool {
         | NodeEvent::SessionRecordRemoved { .. }
         | NodeEvent::ManagedWorktreeUpserted { .. }
         | NodeEvent::ManagedWorktreeRemoved { .. }
+        | NodeEvent::AgentStream { .. }
         | NodeEvent::ResyncRequired { .. } => false,
     }
 }

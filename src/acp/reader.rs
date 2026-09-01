@@ -4,31 +4,54 @@
 //! stdout lines, classifies each as JSON-RPC request / response / notification,
 //! and dispatches accordingly:
 //!
-//! - **Request** (agent → host): calls `HostHandler::handle`, writes response
-//!   back via `AcpProcess::write_line`, broadcasts `RpcIncomingRequest`.
+//! - **Request** (agent → host): calls `HostHandler::handle_deferrable`. When
+//!   it answers `Immediate`, this writes the response back via
+//!   `AcpProcess::write_line` and broadcasts `RpcIncomingRequest` carrying a
+//!   decided [`crate::core::types::HostRequestDecision`] (`Granted`/
+//!   `Denied`), exactly as a plain `HostHandler::handle` call always has.
+//!   When it answers `Deferred` (today, only `session/request_permission` on
+//!   a session with deferral enabled -- see `AcpSessionOptions::
+//!   defer_permission_requests`), this writes **no** response, broadcasts
+//!   `RpcIncomingRequest` with `HostRequestDecision::Deferred` instead, and
+//!   records the request in the session's `PendingHostRequests` map
+//!   alongside a deadline, then keeps reading — the eventual response is
+//!   written later, out of band, by `AcpSession::resolve_pending_request` or
+//!   `AcpSession::expire_deadlines`, through the very same
+//!   `write_line_to_process` this loop uses, each broadcasting its own
+//!   follow-up `RpcIncomingRequest` for the SAME `id` once a decision
+//!   actually exists. See §4a of
+//!   `docs/gate4agent/plans/gate4agent-acp-control-plane-on-the-wire-2026-09-02.md`
+//!   for why this loop must never block waiting on an operator itself.
 //! - **Response** (agent → host reply): resolves in `PendingRequests`.
 //! - **Notification**: maps `session/update` subtypes to `AgentEvent` via
 //!   `protocol::update_to_event`; unknown notifications become
 //!   `AgentEvent::RpcNotification`.
 //! - **Legacy / non-JSON line**: discarded silently (ACP is pure JSON-RPC 2.0).
 //! - **Process exit**: cancels all pending requests, emits `SessionEnd` (if
-//!   not yet received via `session_complete`) + `Exited`.
+//!   not yet received via `session_complete`) + `Exited`. Deferred
+//!   `session/request_permission` requests are NOT touched here — they are
+//!   host → nothing yet on the wire (no response was ever withheld from a
+//!   waiting future the way `pending.cancel_all` wakes), so there is nothing
+//!   to cancel; they simply become unreachable once the process is gone,
+//!   the same as any other state tied to a dead session.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tokio::sync::broadcast;
 
-use crate::core::types::AgentEvent;
-use crate::rpc::handler::HostHandler;
-use crate::rpc::message::{classify_line, IncomingMessage, RpcError, RpcResponse};
+use crate::core::types::{AgentEvent, HostDecisionAuthority, HostRequestDecision};
+use crate::rpc::handler::{HostHandler, HostOutcome};
+use crate::rpc::message::{classify_line, IncomingMessage, RpcError, RpcId, RpcResponse};
 use crate::rpc::pending::PendingRequests;
 
+use super::host::AcpHostAdapter;
 use super::protocol::{
     apply_session_update, parse_vendor_notification, update_to_event, PermissionOptionKind,
-    PermissionRequestParams, SessionState, SessionUpdateParams,
+    PermissionOutcome, PermissionRequestParams, SessionState, SessionUpdateParams,
 };
+use super::session::{PendingHostRequests, PendingPermissionRequest};
 use super::spawn::AcpProcess;
 
 /// Reader loop for ACP transport — runs on a `spawn_blocking` thread.
@@ -40,8 +63,10 @@ pub(crate) fn acp_reader_loop(
     process: Arc<Mutex<AcpProcess>>,
     tx: broadcast::Sender<AgentEvent>,
     pending: PendingRequests,
-    handler: Arc<dyn HostHandler>,
+    handler: Arc<AcpHostAdapter>,
     session_state: Arc<Mutex<SessionState>>,
+    pending_host_requests: PendingHostRequests,
+    permission_request_deadline: Duration,
 ) {
     let mut received_session_end = false;
     // Error handed to any still-pending request when the loop exits. Only
@@ -122,25 +147,52 @@ pub(crate) fn acp_reader_loop(
                 // Call the host handler (synchronously on this thread — must
                 // not block for long). Do NOT hold `process` mutex during this
                 // call to avoid deadlock with `write_line`.
-                let result = handler.handle(&method, params.clone());
-                let granted = request_granted(&method, params.as_ref(), &result);
+                //
+                // `handle_deferrable`'s default implementation is
+                // `Immediate(self.handle(method, params))`, so for every
+                // handler that never overrides it (every one except
+                // `AcpHostAdapter` with deferral enabled) this is exactly
+                // the old direct `handle` call, byte for byte.
+                match handler.handle_deferrable(&method, params.clone()) {
+                    HostOutcome::Immediate(result) => {
+                        let granted = request_granted(&method, params.as_ref(), &result);
+                        let by = handler.decision_authority(&method, params.as_ref());
+                        let decision = if granted {
+                            HostRequestDecision::Granted { by }
+                        } else {
+                            HostRequestDecision::Denied { by }
+                        };
 
-                let response = match result {
-                    Ok(val) => RpcResponse::success(id.clone(), val),
-                    Err(err) => RpcResponse::error_response(id.clone(), err),
-                };
+                        let response = match result {
+                            Ok(val) => RpcResponse::success(id.clone(), val),
+                            Err(err) => RpcResponse::error_response(id.clone(), err),
+                        };
 
-                if let Ok(json) = serde_json::to_string(&response) {
-                    write_line_to_process(&process, &format!("{}\n", json));
+                        if let Ok(json) = serde_json::to_string(&response) {
+                            write_line_to_process(&process, &format!("{}\n", json));
+                        }
+
+                        // Broadcast so observers can audit agent → host calls.
+                        let _ = tx.send(AgentEvent::RpcIncomingRequest {
+                            id,
+                            method,
+                            params,
+                            decision,
+                        });
+                    }
+
+                    HostOutcome::Deferred => {
+                        defer_request(
+                            &process,
+                            &tx,
+                            &pending_host_requests,
+                            permission_request_deadline,
+                            id,
+                            method,
+                            params,
+                        );
+                    }
                 }
-
-                // Broadcast so observers can audit agent → host calls.
-                let _ = tx.send(AgentEvent::RpcIncomingRequest {
-                    id,
-                    method,
-                    params,
-                    granted,
-                });
             }
 
             IncomingMessage::Response { id, result, error } => {
@@ -232,15 +284,91 @@ pub(crate) fn acp_reader_loop(
 /// Write a pre-formatted line to the ACP process stdin.
 /// Errors are silently ignored — the process may have exited by the time a
 /// response is ready (same pattern as `rpc/session.rs::write_to_pipe`).
-fn write_line_to_process(process: &Arc<Mutex<AcpProcess>>, line: &str) {
+///
+/// `pub(crate)` rather than private: `AcpSession::resolve_pending_request`
+/// and `AcpSession::expire_deadlines` (`acp/session.rs`) write a deferred
+/// request's eventual response through this exact same path, from outside
+/// this loop entirely -- safe to do because this loop never holds `process`
+/// locked across the handler call that produced the deferral in the first
+/// place (see the module doc comment).
+pub(crate) fn write_line_to_process(process: &Arc<Mutex<AcpProcess>>, line: &str) {
     if let Ok(mut guard) = process.lock() {
         let _ = guard.write_line(line.trim_end_matches('\n'));
     }
 }
 
+/// Record a `session/request_permission` request the handler chose not to
+/// decide yet (`HostOutcome::Deferred`), and tell an observer that a request
+/// arrived without claiming a decision that has not happened.
+///
+/// `handle_deferrable` (`acp/host.rs`) already parsed `params` into
+/// [`PermissionRequestParams`] once, to run the dangerous-command gate ahead
+/// of the decision to defer -- but per [`HostOutcome`]'s own contract,
+/// `Deferred` carries no payload, so that parsed value does not travel back
+/// here. This function parses `params` again for storage. If that reparse
+/// ever fails, `handle_deferrable`'s own parse must have failed identically
+/// (it is the exact same input, the exact same type), which per its logic
+/// means it would have returned `Immediate(Err(INVALID_PARAMS))`, never
+/// `Deferred` -- so this is a defensive branch, not a path this build's own
+/// handler can reach. It fails safe: answer `Cancelled` immediately rather
+/// than leave the agent waiting on a request nobody actually recorded.
+///
+/// That fail-safe answer is reported as `Denied { by: Policy }`, not a new
+/// authority of its own: it is decided immediately, on this thread, exactly
+/// like every other `Policy`-authority decision -- the fact that it hardcodes
+/// `Cancelled` rather than consulting `HostPolicy::select_permission_option`
+/// is an implementation detail of an unreachable branch, not a distinct
+/// decision-making entity an observer needs a fifth bucket to name.
+fn defer_request(
+    process: &Arc<Mutex<AcpProcess>>,
+    tx: &broadcast::Sender<AgentEvent>,
+    pending_host_requests: &PendingHostRequests,
+    deadline: Duration,
+    id: RpcId,
+    method: String,
+    params: Option<Value>,
+) {
+    let parsed: Result<PermissionRequestParams, _> =
+        serde_json::from_value(params.clone().unwrap_or(Value::Null));
+
+    let typed_params = match parsed {
+        Ok(p) => p,
+        Err(_) => {
+            let value = serde_json::to_value(PermissionOutcome::Cancelled).unwrap_or(Value::Null);
+            let response = RpcResponse::success(id.clone(), value);
+            if let Ok(json) = serde_json::to_string(&response) {
+                write_line_to_process(process, &format!("{}\n", json));
+            }
+            let decision = HostRequestDecision::Denied { by: HostDecisionAuthority::Policy };
+            let _ = tx.send(AgentEvent::RpcIncomingRequest { id, method, params, decision });
+            return;
+        }
+    };
+
+    pending_host_requests.insert(
+        id.clone(),
+        PendingPermissionRequest { params: typed_params, deadline: Instant::now() + deadline },
+    );
+
+    // Audit that the request ARRIVED, honestly marked `Deferred` -- no
+    // decision has been made yet. The real `Granted`/`Denied` decision for
+    // THIS request (same `id`) is broadcast later, once one actually exists
+    // -- see `AcpSession::resolve_pending_request` and `AcpSession::
+    // expire_deadlines` (`acp/session.rs`).
+    let _ = tx.send(AgentEvent::RpcIncomingRequest {
+        id,
+        method,
+        params,
+        decision: HostRequestDecision::Deferred,
+    });
+}
+
 /// Read the host's actual decision off the same `Result` the reader loop
 /// already computed by calling `HostHandler::handle` -- see
-/// `AgentEvent::RpcIncomingRequest::granted` for the full rationale.
+/// `AgentEvent::RpcIncomingRequest`'s doc comment for the full rationale.
+/// The caller wraps this bool in a [`HostRequestDecision::Granted`] or
+/// [`HostRequestDecision::Denied`] alongside the `by` authority from
+/// `AcpHostAdapter::decision_authority`.
 ///
 /// For every method except `session/request_permission`, `Err` means
 /// denied and `Ok` means granted (the whole story: `fs/read_text_file` and

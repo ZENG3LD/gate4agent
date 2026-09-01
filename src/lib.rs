@@ -24,7 +24,9 @@ pub use agent::{
 };
 pub use core::capabilities::{CliCapabilities, CliFeatures, ModelInfo, PermissionModeInfo};
 pub use core::error::AgentError;
-pub use core::types::{AgentEvent, CliTool, SessionConfig};
+pub use core::types::{
+    AgentEvent, CliTool, HostDecisionAuthority, HostRequestDecision, SessionConfig,
+};
 pub use transport::{SpawnOptions, TransportSession};
 pub use pipe::{PipeSession, PipeProcessOptions, ClaudeOptions};
 
@@ -41,7 +43,10 @@ pub mod history;
 pub mod manager;
 pub mod daemon;
 
-pub use acp::{AcpError, AcpSession, AcpSessionOptions, DangerousCommandGate, HostPolicy};
+pub use acp::{
+    AcpError, AcpSession, AcpSessionOptions, DangerousCommandGate, HostPolicy,
+    OperatorPermissionChoice,
+};
 pub use rpc::{
     HostHandler, RejectAllHandler, MethodRouter,
     RpcId, RpcRequest, RpcResponse, RpcError, RpcNotification,

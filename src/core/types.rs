@@ -291,6 +291,65 @@ pub struct AnnouncementInfo {
     pub severity: Option<String>,
 }
 
+/// WHO decided a host request from the agent -- see
+/// [`AgentEvent::RpcIncomingRequest`] and [`HostRequestDecision`].
+/// `Operator` and `DeadlinePolicy` only ever apply to a `session/
+/// request_permission` call that was first left
+/// [`HostRequestDecision::Deferred`] and answered later, out of band, by
+/// `AcpSession::resolve_pending_request` or `AcpSession::expire_deadlines`
+/// (`acp/session.rs`) -- `Gate` and `Policy` both decide immediately, on
+/// the reader loop's own thread, and never see a `Deferred` request at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostDecisionAuthority {
+    /// The dangerous-command gate (`acp::gate`) forced this outcome ahead
+    /// of `HostPolicy` -- for `terminal/create` and `execute`-kind
+    /// `session/request_permission` calls only, and only when the gate is
+    /// `Enforced` (`acp::gate::DangerousCommandGate`). The gate outranks
+    /// every `HostPolicy` value including `Yolo`, so a gate-forced decision
+    /// is always a denial.
+    Gate,
+    /// `HostPolicy` (`Yolo`/`Auto`/`ReadOnly`/`Deny`) decided the request
+    /// the instant it arrived -- today's default path for every request
+    /// that is neither gate-blocked nor deferred.
+    Policy,
+    /// An operator answered a `session/request_permission` call that had
+    /// been left `Deferred`, through `AcpSession::resolve_pending_request`.
+    Operator,
+    /// A `session/request_permission` call that had been left `Deferred`
+    /// reached its deadline with no operator answer, so `HostPolicy` --
+    /// the SAME policy that would have answered it immediately had
+    /// deferral never been enabled, see `AcpSession::expire_deadlines` --
+    /// decided it instead.
+    ///
+    /// Deliberately its own variant rather than `Policy`: folding this into
+    /// `Policy` would make it indistinguishable from a request `HostPolicy`
+    /// answered on arrival, erasing the fact that an operator was asked
+    /// first and nobody answered in time -- two different operational
+    /// stories that happen to end in the same `HostPolicy` call. Equally
+    /// deliberately not `Operator`: no human made this choice.
+    DeadlinePolicy,
+}
+
+/// A typed answer to "what happened to this host request" -- replaces a
+/// plain `bool` that had no honest value for "arrived, not yet decided",
+/// see [`AgentEvent::RpcIncomingRequest`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostRequestDecision {
+    /// The request was allowed. `by` is who made that call.
+    Granted { by: HostDecisionAuthority },
+    /// The request was refused. `by` is who made that call.
+    Denied { by: HostDecisionAuthority },
+    /// The request has arrived and been recorded, but nothing has decided
+    /// it yet -- only reachable for a `session/request_permission` call on
+    /// a session with deferral enabled (see `acp::session::
+    /// AcpSessionOptions::defer_permission_requests`), and only when the
+    /// dangerous-command gate did not already force an immediate `Denied
+    /// { by: Gate }`. A later `AgentEvent::RpcIncomingRequest` for the SAME
+    /// `id`, carrying `Granted` or `Denied`, reports the eventual outcome
+    /// once one exists.
+    Deferred,
+}
+
 /// Unified event type produced by both PTY and pipe transports.
 ///
 /// Consumers subscribe to a `broadcast::Receiver<AgentEvent>` and
@@ -355,27 +414,33 @@ pub enum AgentEvent {
     /// Agent sent a JSON-RPC request to the host (for observer purposes).
     ///
     /// The `RpcSession` reader loop has already handled it via `HostHandler`
-    /// and sent the response. This variant lets subscribers audit what the
-    /// agent requested without needing their own handler.
+    /// and sent the response -- or, for a `session/request_permission` call
+    /// left [`HostRequestDecision::Deferred`], recorded it and sent nothing
+    /// yet. This variant lets subscribers audit what the agent requested
+    /// without needing their own handler.
     ///
-    /// `granted` is the host's decision on the request, read off the same
+    /// `decision` is the host's answer, read off the same
     /// `Result<Value, RpcError>` the reader loop already computed by calling
     /// the handler -- `Err(_)` (e.g. `fs/read_text_file`'s or `terminal/
-    /// create`'s `PERMISSION_DENIED` refusal) means denied; `Ok(value)`
-    /// means granted, UNLESS `method` is `session/request_permission`, in
-    /// which case granted is recovered by cross-referencing the selected
+    /// create`'s `PERMISSION_DENIED` refusal) means `Denied`; `Ok(value)`
+    /// means `Granted`, UNLESS `method` is `session/request_permission`, in
+    /// which case it is recovered by cross-referencing the selected
     /// `optionId` in `value`'s `outcome` against the original request's
     /// `options` list (a `Cancelled` outcome, or a `selected` outcome that
-    /// picked a `reject_once`/`reject_always` option, is not a grant even
+    /// picked a `reject_once`/`reject_always` option, is `Denied` even
     /// though the RPC call itself succeeded -- ACP models a decline as a
-    /// normal response, not an RPC error). This does not change what the
-    /// host does -- it only lets a subscriber see the request and the
-    /// decision the host already made.
+    /// normal response, not an RPC error). A `session/request_permission`
+    /// call left `Deferred` is broadcast twice under the SAME `id`: once
+    /// here as `Deferred` when it arrives, then again as `Granted`/`Denied`
+    /// once `AcpSession::resolve_pending_request` or `AcpSession::
+    /// expire_deadlines` decides it. This does not change what the host
+    /// does -- it only lets a subscriber see the request and the decision
+    /// the host already made, or that none exists yet.
     RpcIncomingRequest {
         id: crate::rpc::message::RpcId,
         method: String,
         params: Option<serde_json::Value>,
-        granted: bool,
+        decision: HostRequestDecision,
     },
 
     // --- ACP session/update: structured session state (ACP transport only) ---

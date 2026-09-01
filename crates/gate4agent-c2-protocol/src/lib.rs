@@ -65,8 +65,8 @@ pub use gate4agent_node_protocol::{
     ProtocolNegotiationError, ProtocolRange,
 };
 use gate4agent_node_protocol::{
-    ManagedSessionRecord, ManagedSessionState, NegotiatedNodeCompatibility, NodeSnapshot,
-    SessionAddress, SessionMode, SessionRecordId, WorkspaceId,
+    AgentStreamChunkV1, ManagedSessionRecord, ManagedSessionState, NegotiatedNodeCompatibility,
+    NodeSnapshot, SessionAddress, SessionMode, SessionRecordId, WorkspaceId,
 };
 use gate4agent_types::{
     AgentInstanceId, OperationId, PreparedInputKind, ProviderActivity, PtyScreenState,
@@ -1049,6 +1049,10 @@ pub enum C2NodeEvent {
         address: SessionAddress,
         frame: TerminalFrame,
     },
+    AgentStream {
+        address: SessionAddress,
+        chunk: AgentStreamChunkV1,
+    },
     ControllerChanged {
         controller: Option<gate4agent_node_protocol::ControllerState>,
     },
@@ -1100,6 +1104,10 @@ impl From<&NodeEvent> for C2NodeEvent {
             NodeEvent::TerminalFrame { address, frame } => Self::TerminalFrame {
                 address: address.clone(),
                 frame: frame.clone(),
+            },
+            NodeEvent::AgentStream { address, chunk } => Self::AgentStream {
+                address: address.clone(),
+                chunk: chunk.clone(),
             },
             NodeEvent::ControllerChanged { controller } => Self::ControllerChanged {
                 controller: controller.clone(),

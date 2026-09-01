@@ -57,7 +57,7 @@ async fn native_interaction_resolution_fails_closed_with_exact_correlation() {
             interaction_id: observed_interaction_id,
             ref message,
         } if observed_interaction_id == interaction_id
-            && message == "native interaction resolution authority is not configured"
+            && message == "semantic interaction resolution requires an ACP session"
     ));
     assert_eq!(shell.active_session_count(), 0);
 }

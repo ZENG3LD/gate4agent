@@ -4,6 +4,42 @@ use serde_json::Value;
 
 use super::message::RpcError;
 
+/// Outcome of [`HostHandler::handle_deferrable`] for one agent → host
+/// request.
+///
+/// Two shapes, not one, because a caller like the ACP reader loop
+/// (`acp/reader.rs`) is a synchronous, single-threaded parse loop that must
+/// never block waiting on something slow — most notably a human operator
+/// answering a `session/request_permission` prompt. `Immediate` is today's
+/// only outcome, unchanged; `Deferred` is the escape hatch a handler reaches
+/// for instead of blocking: it tells the caller "no response yet, but keep
+/// reading — I will answer this one out of band, later, through whatever
+/// side channel I use to write responses directly" (for the ACP transport,
+/// that side channel is `write_line_to_process`, already callable from
+/// outside the reader loop for exactly this reason). See
+/// `crate::acp::host::AcpHostAdapter::handle_deferrable` for the one
+/// production implementation that actually returns `Deferred`, and
+/// `crate::acp::session::AcpSession::resolve_pending_request` /
+/// `expire_deadlines` for the two ways a deferred request is eventually
+/// answered.
+#[derive(Debug)]
+pub enum HostOutcome {
+    /// The host decided now. Carries exactly what [`HostHandler::handle`]
+    /// would have returned for the same call — a caller that never
+    /// distinguishes `Immediate` from calling `handle` directly sees
+    /// byte-for-byte the same behavior either way.
+    Immediate(Result<Value, RpcError>),
+    /// The host chose not to decide yet. The caller must send **no**
+    /// JSON-RPC response for this request now, and must not treat the
+    /// absence of a response as an error — it is expected to record enough
+    /// to answer later (at minimum the request `id`) and continue
+    /// processing further input. Exactly what "later" means, and through
+    /// what path the eventual response is written, is entirely up to
+    /// whatever produced this handler; `HostHandler` itself makes no
+    /// promise about it.
+    Deferred,
+}
+
 /// Handler for agent → host JSON-RPC requests.
 ///
 /// Implement this trait to handle requests from the agent
@@ -25,6 +61,19 @@ pub trait HostHandler: Send + Sync {
     /// Return `Ok(Value)` to send a successful response.
     /// Return `Err(RpcError)` to send an error response.
     fn handle(&self, method: &str, params: Option<Value>) -> Result<Value, RpcError>;
+
+    /// Handle a JSON-RPC request from the agent, allowing the handler to
+    /// defer its decision instead of answering immediately.
+    ///
+    /// The default implementation makes this identical to [`handle`]
+    /// (`Self::handle`) for every implementor that does not override it —
+    /// `RejectAllHandler`, `MethodRouter`, and every existing caller of
+    /// `handle` are completely unaffected by this method's existence. Only
+    /// a handler that has somewhere to send a deferred answer later (see
+    /// [`HostOutcome::Deferred`]) has a reason to override it.
+    fn handle_deferrable(&self, method: &str, params: Option<Value>) -> HostOutcome {
+        HostOutcome::Immediate(self.handle(method, params))
+    }
 }
 
 /// Default handler that rejects all requests with `METHOD_NOT_FOUND` (-32601).

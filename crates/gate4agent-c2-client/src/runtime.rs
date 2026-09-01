@@ -954,6 +954,10 @@ fn node_request_has_unix_repository_path(request: &NodeRequest) -> bool {
         | NodeRequest::Interrupt { .. }
         | NodeRequest::Stop { .. }
         | NodeRequest::Remove { .. }
+        | NodeRequest::ResolveInteraction { .. }
+        | NodeRequest::SetSessionMode { .. }
+        | NodeRequest::SetSessionConfigOption { .. }
+        | NodeRequest::SetSessionModel { .. }
         | NodeRequest::Shutdown => false,
     }
 }
@@ -1025,6 +1029,10 @@ fn node_request_has_unix_bytes(request: &NodeRequest) -> bool {
         | NodeRequest::Interrupt { .. }
         | NodeRequest::Stop { .. }
         | NodeRequest::Remove { .. }
+        | NodeRequest::ResolveInteraction { .. }
+        | NodeRequest::SetSessionMode { .. }
+        | NodeRequest::SetSessionConfigOption { .. }
+        | NodeRequest::SetSessionModel { .. }
         | NodeRequest::Shutdown => false,
     }
 }
@@ -1489,6 +1497,7 @@ fn c2_node_event_is_terminal_frame(event: &C2NodeEvent) -> bool {
         | C2NodeEvent::SessionRecordRemoved { .. }
         | C2NodeEvent::ManagedWorktreeUpserted { .. }
         | C2NodeEvent::ManagedWorktreeRemoved { .. }
+        | C2NodeEvent::AgentStream { .. }
         | C2NodeEvent::ResyncRequired { .. } => false,
     }
 }
@@ -1797,6 +1806,7 @@ fn c2_node_event_has_unix_bytes(event: &C2NodeEvent) -> bool {
         | C2NodeEvent::SessionRecordRemoved { .. }
         | C2NodeEvent::ManagedWorktreeUpserted { .. }
         | C2NodeEvent::ManagedWorktreeRemoved { .. }
+        | C2NodeEvent::AgentStream { .. }
         | C2NodeEvent::ResyncRequired { .. } => false,
     }
 }
@@ -1980,6 +1990,7 @@ fn c2_event_has_open_provider_id(event: &C2NodeEvent) -> bool {
         | C2NodeEvent::SessionRecordRemoved { .. }
         | C2NodeEvent::ManagedWorktreeUpserted { .. }
         | C2NodeEvent::ManagedWorktreeRemoved { .. }
+        | C2NodeEvent::AgentStream { .. }
         | C2NodeEvent::ResyncRequired { .. } => false,
     }
 }

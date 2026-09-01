@@ -419,7 +419,7 @@ while ($true) {
     # Real ACP wire shapes throughout -- the host's own HostPolicy decides
     # whether each of these is granted or denied; this fixture does not
     # gate on the outcome (see gate4agent-shell-native's acp_fail_closed
-    # test, which asserts `granted` from the host's own broadcast instead).
+    # test, which asserts `decision` from the host's own broadcast instead).
     Write-JsonLine @{jsonrpc='2.0';id=9101;method='fs/read_text_file';params=@{sessionId='fixture-acp-session';path='fixture-forbidden.txt'}}
     $null = [Console]::ReadLine()
 
@@ -474,7 +474,7 @@ while True:
  # Real ACP wire shapes throughout -- the host's own HostPolicy decides
  # whether each of these is granted or denied; this fixture does not gate
  # on the outcome (see gate4agent-shell-native's acp_fail_closed test,
- # which asserts `granted` from the host's own broadcast instead).
+ # which asserts `decision` from the host's own broadcast instead).
  write_message({'jsonrpc':'2.0','id':9101,'method':'fs/read_text_file','params':{'sessionId':'fixture-acp-session','path':'fixture-forbidden.txt'}})
  read_message()
 

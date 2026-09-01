@@ -40,4 +40,4 @@ mod terminal;
 
 pub use gate::DangerousCommandGate;
 pub use host::HostPolicy;
-pub use session::{AcpError, AcpSession, AcpSessionOptions};
+pub use session::{AcpError, AcpSession, AcpSessionOptions, OperatorPermissionChoice};

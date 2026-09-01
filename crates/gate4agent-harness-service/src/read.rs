@@ -14,8 +14,8 @@ use gate4agent_observation_api::{
 };
 use gate4agent_observation_engine::{CorrelationProjection, CorrelationState, SessionProjection};
 use gate4agent_observation_protocol::{
-    ObservationEvidenceV1 as SourceEvidenceV1, ObservationInteractionOutcomeV1,
-    ObservationKindV1, ObservationTodoStateV1,
+    HostRequestDecisionV1, ObservationEvidenceV1 as SourceEvidenceV1,
+    ObservationInteractionOutcomeV1, ObservationKindV1, ObservationTodoStateV1,
 };
 use gate4agent_observation_service::ObservationService;
 
@@ -894,9 +894,15 @@ fn timeline_entry(
         ObservationKindV1::RateLimited => {
             (Some("rate-limit".to_owned()), TimelineStateV1::Waiting, None)
         }
-        ObservationKindV1::HostRequestObserved { class, granted } => (
+        ObservationKindV1::HostRequestObserved { class, decision } => (
             Some(class.clone()),
-            if *granted { TimelineStateV1::Completed } else { TimelineStateV1::Failed },
+            match decision {
+                // A pending approval must never render as `Failed` -- see
+                // `HostRequestDecisionV1::Deferred`'s own doc comment.
+                HostRequestDecisionV1::Granted { .. } => TimelineStateV1::Completed,
+                HostRequestDecisionV1::Denied { .. } => TimelineStateV1::Failed,
+                HostRequestDecisionV1::Deferred => TimelineStateV1::Waiting,
+            },
             None,
         ),
         ObservationKindV1::UnrecognizedNotification { method } => {

@@ -119,6 +119,95 @@ pub struct SessionPromptParams {
     pub prompt: Vec<ContentBlock>,
 }
 
+/// Turn-level token usage as reported on a `session/prompt` response,
+/// directly under the top-level `usage` key. Verified live on
+/// claude-agent-acp 0.72.0 (`turn-claude.jsonl`): camelCase field names,
+/// NOT the snake_case `input_tokens`/`output_tokens` this file's
+/// [`extract_token_usage`] previously guessed for an unconfirmed
+/// "Claude-nested" shape. `cachedReadTokens`/`cachedWriteTokens` are
+/// Anthropic prompt-cache bookkeeping (tokens read from vs. written to the
+/// cache this turn); a provider with no such concept simply omits them.
+/// codex-acp 1.8.0, Kimi Code CLI 0.39.1, and Grok CLI (build channel)
+/// send NO `usage` key at all on this response -- every field here is
+/// therefore optional, and [`SessionPromptResult::usage`] itself is
+/// `None` for those three.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PromptUsage {
+    #[serde(rename = "inputTokens", default)]
+    pub input_tokens: Option<u64>,
+    #[serde(rename = "outputTokens", default)]
+    pub output_tokens: Option<u64>,
+    #[serde(rename = "cachedReadTokens", default)]
+    pub cached_read_tokens: Option<u64>,
+    #[serde(rename = "cachedWriteTokens", default)]
+    pub cached_write_tokens: Option<u64>,
+    #[serde(rename = "totalTokens", default)]
+    pub total_tokens: Option<u64>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
+/// The `_meta` sidecar on a `session/prompt` response, when the
+/// provider's token breakdown rides there instead of a top-level `usage`
+/// key. Verified live on Grok CLI, build channel (`turn-grok.jsonl`): the
+/// breakdown sits directly on `_meta` -- `sessionId`, `requestId`,
+/// `promptId`, `modelId`, `totalTokens`, `inputTokens`, `outputTokens`,
+/// `cachedReadTokens`, `reasoningTokens` -- alongside a nested `_meta.
+/// usage` carrying the same numbers again plus a per-model breakdown; that
+/// nested object is not modeled separately here (nothing in this build
+/// needs the per-model split) and lands in `extra` instead of being
+/// dropped. claude-agent-acp additionally sends a `_meta.quota` sidecar
+/// with none of these field names -- it also lands in `extra`. codex-acp
+/// and Kimi Code CLI send no token-bearing `_meta` on this response at
+/// all.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PromptResultMeta {
+    #[serde(rename = "sessionId", default)]
+    pub session_id: Option<String>,
+    #[serde(rename = "requestId", default)]
+    pub request_id: Option<String>,
+    #[serde(rename = "promptId", default)]
+    pub prompt_id: Option<String>,
+    #[serde(rename = "modelId", default)]
+    pub model_id: Option<String>,
+    #[serde(rename = "totalTokens", default)]
+    pub total_tokens: Option<u64>,
+    #[serde(rename = "inputTokens", default)]
+    pub input_tokens: Option<u64>,
+    #[serde(rename = "outputTokens", default)]
+    pub output_tokens: Option<u64>,
+    #[serde(rename = "cachedReadTokens", default)]
+    pub cached_read_tokens: Option<u64>,
+    #[serde(rename = "reasoningTokens", default)]
+    pub reasoning_tokens: Option<u64>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
+/// `session/prompt` response result (agent → host). `stopReason` is the
+/// only field all four captured providers agree on
+/// (`turn-{claude,codex,grok,kimi}.jsonl`). Token usage rides on two
+/// mutually-exclusive-in-practice locations depending on the provider:
+/// Claude nests it under `usage` ([`PromptUsage`]); Grok flattens it onto
+/// `_meta` ([`PromptResultMeta`]); Codex and Kimi send neither -- both
+/// fields are therefore optional, and `super::session::emit_prompt_result`
+/// falls back to [`extract_token_usage`] for any shape neither one
+/// matches. Losing this breakdown on prompt-response parsing would leave
+/// Grok and Claude turns with zeroed-out token counts even though the
+/// numbers are right there on the wire -- this struct exists so neither
+/// caller has to re-derive the shape by hand.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SessionPromptResult {
+    #[serde(rename = "stopReason", default)]
+    pub stop_reason: Option<String>,
+    #[serde(default)]
+    pub usage: Option<PromptUsage>,
+    #[serde(rename = "_meta", default)]
+    pub meta: Option<PromptResultMeta>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
 /// `session/cancel` notification params (host → agent, no response expected).
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SessionCancelParams {
@@ -366,7 +455,10 @@ pub struct SessionSetConfigOptionParams {
 // ---------------------------------------------------------------------------
 
 /// Context-window consumption and cost, as last reported by a
-/// `usage_update`.
+/// `usage_update`. Field names here are this crate's own Rust
+/// identifiers, decoupled from the wire key names -- see
+/// [`SessionUpdate::UsageUpdate`] for what is actually verified live on
+/// the wire.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SessionUsage {
     pub used_tokens: Option<u64>,
@@ -458,14 +550,25 @@ pub struct SessionUpdateParams {
 pub enum SessionUpdate {
     #[serde(rename = "agent_message_chunk")]
     AgentMessageChunk {
-        /// Can be a single content block object, an array of content blocks,
-        /// or absent. Some ACP agents send a single object; Claude ACP sends an array.
+        /// A single content block object `{"type": "text", "text": "..."}`
+        /// on every real single-turn capture from all four providers,
+        /// claude-agent-acp 0.72.0 included (`turn-{claude,codex,grok,
+        /// kimi}.jsonl`) -- contradicting this field's earlier "Claude ACP
+        /// sends an array" note, which no live capture ever confirmed. The
+        /// array-of-content-blocks case is kept as an unverified fallback
+        /// (`extract_text_from_content` handles both), not removed --
+        /// nothing disproves an agent sending it under different
+        /// circumstances, only that none of these four turns did.
         #[serde(default)]
         content: Value,
     },
     #[serde(rename = "agent_thought_chunk")]
     AgentThoughtChunk {
-        /// Can be `{"thought": "..."}` (some ACP agents) or a plain string.
+        /// A single content block object `{"type": "text", "text": "..."}`
+        /// on every real thought chunk observed -- Grok CLI and Kimi Code
+        /// CLI both (`turn-grok.jsonl`, `turn-kimi.jsonl`), the SAME shape
+        /// as `agent_message_chunk`, NOT the `{"thought": "..."}` this
+        /// field previously guessed and had never confirmed live.
         #[serde(default)]
         content: Value,
     },
@@ -504,15 +607,25 @@ pub enum SessionUpdate {
         #[serde(default)]
         usage: Option<Value>,
     },
-    /// Echo of a user message chunk -- sent when replaying a loaded
-    /// session's history, mirroring `agent_message_chunk`'s content shapes.
+    /// Echo of the user's own prompt content. Verified live on Grok CLI
+    /// (`turn-grok.jsonl`): sent as the very first `session/update` of an
+    /// ordinary turn, not only when replaying a loaded session's history
+    /// as this file previously assumed -- `{"type": "text", "text":
+    /// "..."}`, the same content shape as `agent_message_chunk`, plus a
+    /// Grok-only `_meta` sidecar (`modelId`, `promptIndex`) that this
+    /// variant has no named or `extra` slot for and so drops -- nothing in
+    /// this build needs it today.
     #[serde(rename = "user_message_chunk")]
     UserMessageChunk {
         #[serde(default)]
         content: Value,
     },
     /// The agent's execution plan. Always a full snapshot replacing any
-    /// plan sent before it, never a delta.
+    /// plan sent before it, never a delta. NOT OBSERVED in any of the four
+    /// providers' single-turn captures (`turn-{claude,codex,grok,
+    /// kimi}.jsonl`) -- a plain "reply with one word" turn never produces
+    /// a plan, so this shape remains an unverified guess pending a
+    /// capture that does exercise planning.
     #[serde(rename = "plan")]
     Plan {
         #[serde(default)]
@@ -524,7 +637,11 @@ pub enum SessionUpdate {
         #[serde(rename = "availableCommands", default)]
         available_commands: Vec<AvailableCommand>,
     },
-    /// The session's active mode changed.
+    /// The session's active mode changed. NOT OBSERVED in any of the four
+    /// providers' single-turn captures (`turn-{claude,codex,grok,
+    /// kimi}.jsonl`) -- a plain "reply with one word" turn never switches
+    /// mode mid-flight, so this shape remains an unverified guess pending a
+    /// capture that does exercise a mode switch.
     #[serde(rename = "current_mode_update")]
     CurrentModeUpdate {
         #[serde(rename = "currentModeId", default)]
@@ -532,7 +649,16 @@ pub enum SessionUpdate {
     },
     /// Session metadata changed (e.g. title). Only the fields that
     /// actually changed are present on the wire; anything not named below
-    /// lands in `extra` rather than being dropped.
+    /// lands in `extra` rather than being dropped. All four providers
+    /// disagree on the exact shape, confirmed by direct comparison
+    /// (`turn-{claude,codex,grok,kimi}.jsonl`): Grok and Kimi send bare
+    /// `{"title": "..."}`; Claude additionally sends `updatedAt` (kept in
+    /// `extra`, not modeled -- see [`SessionSummary`] for why this file
+    /// does not parse ACP timestamp strings); codex-acp sends
+    /// NO `title` at all, only `{"_meta": {"codex": {"threadStatus":
+    /// {...}}}}` -- `title: Option<String>` with `#[serde(default)]`
+    /// already tolerates that (defaults to `None`), and `extra` keeps the
+    /// `_meta` sidecar intact.
     #[serde(rename = "session_info_update")]
     SessionInfoUpdate {
         #[serde(default)]
@@ -540,16 +666,25 @@ pub enum SessionUpdate {
         #[serde(flatten)]
         extra: HashMap<String, Value>,
     },
-    /// Context-window consumption and, optionally, turn cost. Field names
-    /// (`usedTokens`, `contextWindow`, nested `cost`) are a best-effort
-    /// guess following this file's camelCase convention -- not verified
-    /// against a live agent capture. `extra` keeps anything that lands
-    /// under a different real key name from being silently dropped.
+    /// Context-window consumption and, when present, turn cost. Field
+    /// names verified live on claude-agent-acp 0.72.0 and Kimi Code CLI
+    /// 0.39.1 (`turn-claude.jsonl`, `turn-kimi.jsonl`): the wire keys are
+    /// the bare `used`/`size`, NOT the previously guessed camelCase
+    /// `usedTokens`/`contextWindow` -- that guess never matched a real
+    /// payload, so the context-usage bar silently stayed empty on every
+    /// turn. `cost` is real too, but rarer: claude-agent-acp sends it only
+    /// on the last `usage_update` of a turn (two earlier ones in the same
+    /// turn had no `cost` at all), matching `{"amount", "currency"}`
+    /// exactly as this file had guessed; Kimi Code CLI never sends it;
+    /// Grok CLI and codex-acp never send a `usage_update` notification at
+    /// all -- both report usage on the `session/prompt` response instead
+    /// ([`SessionPromptResult`]). `extra` keeps anything that lands under
+    /// a different real key name from being silently dropped.
     #[serde(rename = "usage_update")]
     UsageUpdate {
-        #[serde(rename = "usedTokens", default)]
+        #[serde(rename = "used", default)]
         used_tokens: Option<u64>,
-        #[serde(rename = "contextWindow", default)]
+        #[serde(rename = "size", default)]
         context_window: Option<u64>,
         #[serde(default)]
         cost: Option<UsageCost>,
@@ -711,8 +846,11 @@ pub struct SessionConfigOption {
 }
 
 /// Amount/currency pair attached to a `usage_update`, when the agent
-/// reports cost. Field names (`amount`/`currency`) are a best-effort
-/// guess; unverified against a live agent capture.
+/// reports cost. Field names verified live on claude-agent-acp 0.72.0
+/// (`turn-claude.jsonl`, the last `usage_update` of the turn:
+/// `{"amount": 0.17858, "currency": "USD"}`). Kimi Code CLI 0.39.1 never
+/// sends this sub-object; Grok CLI and codex-acp never send `usage_update`
+/// at all.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UsageCost {
     #[serde(default)]
@@ -1011,12 +1149,24 @@ pub struct AgentInfo {
 // update_to_event
 // ---------------------------------------------------------------------------
 
-/// Extract token counts from a raw ACP response value.
+/// Extract token counts from a raw ACP response value. This is the
+/// generic fallback for shapes that predate the typed
+/// [`SessionPromptResult`]/[`PromptUsage`]/[`PromptResultMeta`] parse
+/// (`super::session::emit_prompt_result` tries those first); it is also
+/// used by the still-unverified `SessionUpdate::Stop` variant, which no
+/// live capture has ever exercised.
 ///
 /// Tries multiple known shapes:
 /// 1. ACP canonical camelCase: `{"inputTokens": N, "outputTokens": N}`
-/// 2. Claude-nested usage: `{"usage": {"input_tokens": N, "output_tokens": N}}`
-/// 3. Stats-nested: `{"stats": {"input_tokens": N, "output_tokens": N}}`
+/// 2. Nested under `usage`, camelCase -- verified live on claude-agent-acp
+///    0.72.0 (`turn-claude.jsonl`): `{"usage": {"inputTokens": N,
+///    "outputTokens": N}}`.
+/// 3. Nested under `usage`, snake_case -- UNVERIFIED, kept from this
+///    function's earlier guess; no live capture has ever sent this exact
+///    shape, only the Anthropic Messages API's own history-file format
+///    (`src/history/claude.rs`), which is a different transport entirely.
+/// 4. Stats-nested: `{"stats": {"input_tokens": N, "output_tokens": N}}`
+///    -- likewise UNVERIFIED.
 ///
 /// Returns `(0, 0)` if nothing matches.
 pub(crate) fn extract_token_usage(v: &Value) -> (u64, u64) {
@@ -1028,8 +1178,15 @@ pub(crate) fn extract_token_usage(v: &Value) -> (u64, u64) {
         return (i, o);
     }
 
-    // 2. Nested under "usage" (Claude ACP)
     if let Some(usage) = v.get("usage") {
+        // 2. Nested under "usage", camelCase (verified: claude-agent-acp)
+        if let (Some(i), Some(o)) = (
+            usage.get("inputTokens").and_then(|x| x.as_u64()),
+            usage.get("outputTokens").and_then(|x| x.as_u64()),
+        ) {
+            return (i, o);
+        }
+        // 3. Nested under "usage", snake_case (unverified)
         if let (Some(i), Some(o)) = (
             usage.get("input_tokens").and_then(|x| x.as_u64()),
             usage.get("output_tokens").and_then(|x| x.as_u64()),
@@ -1038,7 +1195,7 @@ pub(crate) fn extract_token_usage(v: &Value) -> (u64, u64) {
         }
     }
 
-    // 3. Nested under "stats"
+    // 4. Nested under "stats" (unverified)
     if let Some(stats) = v.get("stats") {
         if let (Some(i), Some(o)) = (
             stats.get("input_tokens").and_then(|x| x.as_u64()),
@@ -1093,12 +1250,19 @@ pub(crate) fn update_to_event(params: &SessionUpdateParams) -> Vec<AgentEvent> {
         }
 
         SessionUpdate::AgentThoughtChunk { content } => {
+            // `{"thought": "..."}` was this file's original guess and is
+            // checked first so it still wins if some agent sends it; real
+            // Grok CLI and Kimi Code CLI both send the SAME content shape
+            // as `agent_message_chunk` instead --
+            // `{"type": "text", "text": "..."}` (`turn-grok.jsonl`,
+            // `turn-kimi.jsonl`) -- which the `thought`-only lookup below
+            // used to miss entirely, silently emitting empty thinking text
+            // on every real thought chunk from either provider.
             let text = content
                 .get("thought")
                 .and_then(|v| v.as_str())
-                .or_else(|| content.as_str())
-                .unwrap_or("")
-                .to_owned();
+                .map(str::to_owned)
+                .unwrap_or_else(|| extract_text_from_content(content));
             vec![AgentEvent::Thinking { text }]
         }
 
@@ -1596,6 +1760,61 @@ mod tests {
     }
 
     #[test]
+    fn update_to_event_thinking_grok_verbatim_text_field_not_thought_field() {
+        // `turn-grok.jsonl` -- the REAL shape: same content object as
+        // `agent_message_chunk`, `{"type": "text", "text": "..."}`. Before
+        // this fix, the `{"thought": "..."}`-only lookup missed this
+        // entirely and every real Grok thought chunk rendered as empty
+        // text.
+        let raw = r#"{"sessionId":"01a05e6a-aa4d-7a13-9e9c-2077aa244389","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"The"}}}"#;
+        let params: SessionUpdateParams = serde_json::from_str(raw).unwrap();
+        let events = update_to_event(&params);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], AgentEvent::Thinking { text } if text == "The"));
+    }
+
+    #[test]
+    fn update_to_event_thinking_kimi_verbatim_text_field_not_thought_field() {
+        // `turn-kimi.jsonl` -- same real shape as Grok's, confirming it is
+        // not a Grok-only quirk.
+        let raw = r#"{"sessionId":"session_ff1eb29e-0ba7-40aa-b654-bbf327c39463","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"Reply"}}}"#;
+        let params: SessionUpdateParams = serde_json::from_str(raw).unwrap();
+        let events = update_to_event(&params);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], AgentEvent::Thinking { text } if text == "Reply"));
+    }
+
+    #[test]
+    fn update_to_event_user_message_chunk_grok_verbatim() {
+        // `turn-grok.jsonl` -- the user's own prompt, echoed back as the
+        // first `session/update` of the turn. Same content shape as
+        // `agent_message_chunk`; the Grok-only `_meta` sidecar
+        // (`modelId`, `promptIndex`) is dropped -- this variant has no
+        // named or `extra` slot for it, and nothing in this build needs
+        // it.
+        let raw = r#"{"sessionId":"01a05e6a-aa4d-7a13-9e9c-2077aa244389","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"Reply with the single word: ok"},"_meta":{"modelId":"grok-4.6","promptIndex":0}}}"#;
+        let params: SessionUpdateParams = serde_json::from_str(raw).unwrap();
+        let events = update_to_event(&params);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            AgentEvent::UserMessage { text, is_delta: true } if text == "Reply with the single word: ok"
+        ));
+    }
+
+    #[test]
+    fn update_to_event_agent_message_chunk_claude_verbatim_single_object() {
+        // `turn-claude.jsonl` -- single content-block object, NOT an
+        // array, contradicting this variant's earlier "Claude ACP sends
+        // an array" doc note.
+        let raw = r#"{"sessionId":"2a82e7d7-ffa6-4ebf-a424-1bd783ec3457","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"ok"},"messageId":"msg_011CedGLEtEZqvzLu9npuaJo"}}"#;
+        let params: SessionUpdateParams = serde_json::from_str(raw).unwrap();
+        let events = update_to_event(&params);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], AgentEvent::Text { text, is_delta: true } if text == "ok"));
+    }
+
+    #[test]
     fn update_to_event_tool_start() {
         let p = make_update(SessionUpdate::ToolCall {
             tool_call_id: "t1".to_string(),
@@ -1648,7 +1867,19 @@ mod tests {
     }
 
     #[test]
-    fn extract_token_usage_claude_nested() {
+    fn extract_token_usage_nested_camel_case_verified_claude_shape() {
+        // Verbatim shape from `turn-claude.jsonl` line 9 (the `session/
+        // prompt` response's `usage` object): camelCase, not the
+        // snake_case this function's "Claude-nested" case originally
+        // guessed and never matched a real payload.
+        let v = json!({"usage": {"inputTokens": 2, "outputTokens": 4, "cachedReadTokens": 15320, "cachedWriteTokens": 17081, "totalTokens": 32407}});
+        assert_eq!(extract_token_usage(&v), (2, 4));
+    }
+
+    #[test]
+    fn extract_token_usage_nested_snake_case_unverified_fallback() {
+        // No live capture has ever sent this exact shape -- see the
+        // function's own doc comment. Kept only as a defensive fallback.
         let v = json!({"usage": {"input_tokens": 10, "output_tokens": 5}});
         assert_eq!(extract_token_usage(&v), (10, 5));
     }
@@ -1663,6 +1894,79 @@ mod tests {
     fn extract_token_usage_missing() {
         let v = json!({});
         assert_eq!(extract_token_usage(&v), (0, 0));
+    }
+
+    // -----------------------------------------------------------------------
+    // SessionPromptResult -- `session/prompt` response, all four providers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn session_prompt_result_claude_verbatim_usage() {
+        // `turn-claude.jsonl` line 9 -- the id=2 result. `stopReason` plus
+        // a camelCase `usage` object; `_meta.quota` duplicates the same
+        // numbers in a different shape and is not modeled, only kept via
+        // `extra`.
+        let raw = r#"{"stopReason":"end_turn","usage":{"inputTokens":2,"outputTokens":4,"cachedReadTokens":15320,"cachedWriteTokens":17081,"totalTokens":32407},"_meta":{"quota":{"token_count":{"totalTokens":32407,"inputTokens":2,"cachedInputTokens":15320,"cachedWriteTokens":17081,"outputTokens":4,"reasoningOutputTokens":0},"model_usage":[{"model":"claude-opus-5[1m]","token_count":{"totalTokens":32407,"inputTokens":2,"cachedInputTokens":15320,"cachedWriteTokens":17081,"outputTokens":4,"reasoningOutputTokens":0}}]}}}"#;
+        let result: SessionPromptResult = serde_json::from_str(raw).unwrap();
+        assert_eq!(result.stop_reason.as_deref(), Some("end_turn"));
+        let usage = result.usage.expect("claude sends usage");
+        assert_eq!(usage.input_tokens, Some(2));
+        assert_eq!(usage.output_tokens, Some(4));
+        assert_eq!(usage.cached_read_tokens, Some(15320));
+        assert_eq!(usage.cached_write_tokens, Some(17081));
+        assert_eq!(usage.total_tokens, Some(32407));
+        // `_meta` is present on the wire (Claude's own `quota` sidecar),
+        // so it parses to `Some` -- but none of its NAMED token fields
+        // are populated by `quota` (those are Grok's field names), only
+        // `extra`.
+        let meta = result.meta.expect("claude sends _meta.quota");
+        assert!(meta.total_tokens.is_none());
+        assert!(meta.input_tokens.is_none());
+        assert!(meta.extra.contains_key("quota"));
+    }
+
+    #[test]
+    fn session_prompt_result_grok_verbatim_meta() {
+        // `turn-grok.jsonl` -- the id=2 result. No top-level `usage`; the
+        // breakdown rides directly on `_meta` instead, alongside a
+        // duplicate nested `_meta.usage` this build does not model
+        // separately (kept intact via `extra`).
+        let raw = r#"{"stopReason":"end_turn","_meta":{"sessionId":"01a05e6a-aa4d-7a13-9e9c-2077aa244389","requestId":"97238a1c-461a-4f9a-ba2f-4acc677b762b","promptId":"97238a1c-461a-4f9a-ba2f-4acc677b762b","totalTokens":19885,"modelId":"grok-4.6","inputTokens":19807,"outputTokens":78,"cachedReadTokens":1408,"reasoningTokens":73,"usage":{"inputTokens":19807,"outputTokens":78,"totalTokens":19885,"cachedReadTokens":1408,"cacheCreationTokens":0,"reasoningTokens":73,"modelCalls":1,"apiDurationMs":3284,"costUsdTicks":64549000,"numTurns":1}}}"#;
+        let result: SessionPromptResult = serde_json::from_str(raw).unwrap();
+        assert_eq!(result.stop_reason.as_deref(), Some("end_turn"));
+        assert!(result.usage.is_none());
+        let meta = result.meta.expect("grok sends _meta");
+        assert_eq!(meta.session_id.as_deref(), Some("01a05e6a-aa4d-7a13-9e9c-2077aa244389"));
+        assert_eq!(meta.request_id.as_deref(), Some("97238a1c-461a-4f9a-ba2f-4acc677b762b"));
+        assert_eq!(meta.prompt_id.as_deref(), Some("97238a1c-461a-4f9a-ba2f-4acc677b762b"));
+        assert_eq!(meta.model_id.as_deref(), Some("grok-4.6"));
+        assert_eq!(meta.total_tokens, Some(19885));
+        assert_eq!(meta.input_tokens, Some(19807));
+        assert_eq!(meta.output_tokens, Some(78));
+        assert_eq!(meta.cached_read_tokens, Some(1408));
+        assert_eq!(meta.reasoning_tokens, Some(73));
+        // The nested per-model breakdown must not be silently dropped.
+        assert!(meta.extra.contains_key("usage"));
+    }
+
+    #[test]
+    fn session_prompt_result_kimi_verbatim_bare_stop_reason() {
+        // `turn-kimi.jsonl` -- no `usage`, no `_meta` at all.
+        let raw = r#"{"stopReason":"end_turn"}"#;
+        let result: SessionPromptResult = serde_json::from_str(raw).unwrap();
+        assert_eq!(result.stop_reason.as_deref(), Some("end_turn"));
+        assert!(result.usage.is_none());
+        assert!(result.meta.is_none());
+    }
+
+    #[test]
+    fn session_prompt_result_codex_verbatim_bare_stop_reason() {
+        // `turn-codex.jsonl` -- identical bare shape to Kimi's.
+        let raw = r#"{"stopReason":"end_turn"}"#;
+        let result: SessionPromptResult = serde_json::from_str(raw).unwrap();
+        assert_eq!(result.stop_reason.as_deref(), Some("end_turn"));
+        assert!(result.usage.is_none());
+        assert!(result.meta.is_none());
     }
 
     #[test]
@@ -2075,74 +2379,121 @@ mod tests {
     }
 
     #[test]
-    fn session_update_session_info_update_parses_only_changed_fields() {
-        // Only "title" changed on this update -- no other field present.
-        let raw = r#"{"sessionId":"s1","update":{"sessionUpdate":"session_info_update","title":"New title"}}"#;
+    fn session_update_session_info_update_grok_verbatim() {
+        // `turn-grok.jsonl` -- bare title, nothing else. (The wire message
+        // is wrapped in the usual `{"jsonrpc", "method": "session/update",
+        // "params": {...}}` envelope; `params` is what
+        // `SessionUpdateParams` deserializes.)
+        let raw = r#"{"sessionId":"01a05e6a-aa4d-7a13-9e9c-2077aa244389","update":{"sessionUpdate":"session_info_update","title":"Reply with single word ok"}}"#;
         let params: SessionUpdateParams = serde_json::from_str(raw).unwrap();
         assert!(matches!(
             &params.update,
-            SessionUpdate::SessionInfoUpdate { title: Some(t), .. } if t == "New title"
-        ));
-        let events = update_to_event(&params);
-        assert!(matches!(
-            &events[0],
-            AgentEvent::SessionInfoUpdate { title: Some(t) } if t == "New title"
+            SessionUpdate::SessionInfoUpdate { title: Some(t), .. } if t == "Reply with single word ok"
         ));
     }
 
     #[test]
-    fn session_update_session_info_update_keeps_unnamed_fields_via_extra() {
-        // A field this build doesn't have a named slot for must not be
-        // dropped silently -- it must show up in `extra`.
-        let raw = r#"{"sessionId":"s1","update":{"sessionUpdate":"session_info_update","someFutureField":"value"}}"#;
+    fn session_update_session_info_update_claude_verbatim_carries_updated_at_in_extra() {
+        // `turn-claude.jsonl` -- title plus `updatedAt`, which this build
+        // does not model as a named field (see the variant's doc comment)
+        // and must therefore keep in `extra` rather than drop.
+        let raw = r#"{"sessionId":"2a82e7d7-ffa6-4ebf-a424-1bd783ec3457","update":{"sessionUpdate":"session_info_update","title":"Reply with 'ok'","updatedAt":"2026-09-01T19:23:20.355Z"}}"#;
+        let params: SessionUpdateParams = serde_json::from_str(raw).unwrap();
+        let SessionUpdate::SessionInfoUpdate { title, extra } = &params.update else {
+            panic!("expected SessionInfoUpdate variant");
+        };
+        assert_eq!(title.as_deref(), Some("Reply with 'ok'"));
+        assert_eq!(
+            extra.get("updatedAt").and_then(Value::as_str),
+            Some("2026-09-01T19:23:20.355Z")
+        );
+    }
+
+    #[test]
+    fn session_update_session_info_update_kimi_verbatim() {
+        // `turn-kimi.jsonl` -- bare title, same shape as Grok's.
+        let raw = r#"{"sessionId":"session_ff1eb29e-0ba7-40aa-b654-bbf327c39463","update":{"sessionUpdate":"session_info_update","title":"Reply with the single word: ok"}}"#;
+        let params: SessionUpdateParams = serde_json::from_str(raw).unwrap();
+        assert!(matches!(
+            &params.update,
+            SessionUpdate::SessionInfoUpdate { title: Some(t), .. } if t == "Reply with the single word: ok"
+        ));
+    }
+
+    #[test]
+    fn session_update_session_info_update_codex_verbatim_has_no_title_at_all() {
+        // `turn-codex.jsonl` -- the one provider that sends this update
+        // WITHOUT a title, only a `_meta.codex.threadStatus` sidecar.
+        // Parsing must survive it: `title` defaults to `None` and the
+        // sidecar lands in `extra`.
+        let raw = r#"{"sessionId":"01a05e70-55a1-7010-9c10-79ae25c4f531","update":{"sessionUpdate":"session_info_update","_meta":{"codex":{"threadStatus":{"type":"active","activeFlags":[]}}}}}"#;
         let params: SessionUpdateParams = serde_json::from_str(raw).unwrap();
         let SessionUpdate::SessionInfoUpdate { title, extra } = &params.update else {
             panic!("expected SessionInfoUpdate variant");
         };
         assert!(title.is_none());
-        assert_eq!(extra.get("someFutureField").and_then(Value::as_str), Some("value"));
+        assert!(extra.contains_key("_meta"));
+        let events = update_to_event(&params);
+        assert!(matches!(&events[0], AgentEvent::SessionInfoUpdate { title: None }));
     }
 
     #[test]
-    fn session_update_usage_update_parses_with_cost() {
-        let raw = r#"{"sessionId":"s1","update":{
-            "sessionUpdate":"usage_update",
-            "usedTokens":12345,
-            "contextWindow":200000,
-            "cost":{"amount":0.42,"currency":"USD"}
-        }}"#;
+    fn session_update_usage_update_claude_verbatim_bare() {
+        // `turn-claude.jsonl` line 5 -- the first of three `usage_update`s
+        // in the turn, no `_meta`, no `cost`. `used`/`size` are the real
+        // wire keys; this file previously guessed camelCase
+        // `usedTokens`/`contextWindow`, which never matched.
+        let raw = r#"{"sessionId":"2a82e7d7-ffa6-4ebf-a424-1bd783ec3457","update":{"sessionUpdate":"usage_update","used":32407,"size":1000000}}"#;
         let params: SessionUpdateParams = serde_json::from_str(raw).unwrap();
         let SessionUpdate::UsageUpdate { used_tokens, context_window, cost, .. } = &params.update
         else {
             panic!("expected UsageUpdate variant");
         };
-        assert_eq!(*used_tokens, Some(12345));
-        assert_eq!(*context_window, Some(200_000));
-        assert_eq!(cost.as_ref().and_then(|c| c.amount), Some(0.42));
+        assert_eq!(*used_tokens, Some(32407));
+        assert_eq!(*context_window, Some(1_000_000));
+        assert!(cost.is_none());
+    }
+
+    #[test]
+    fn session_update_usage_update_claude_verbatim_final_carries_cost() {
+        // `turn-claude.jsonl` line 8 -- the LAST `usage_update` of the
+        // turn, right before the `session/prompt` response: same
+        // `used`/`size`, now with `cost` attached.
+        let raw = r#"{"sessionId":"2a82e7d7-ffa6-4ebf-a424-1bd783ec3457","update":{"sessionUpdate":"usage_update","used":32407,"size":1000000,"cost":{"amount":0.17858,"currency":"USD"},"_meta":{"_claude/origin":{"kind":"human"}}}}"#;
+        let params: SessionUpdateParams = serde_json::from_str(raw).unwrap();
+        let SessionUpdate::UsageUpdate { used_tokens, context_window, cost, .. } = &params.update
+        else {
+            panic!("expected UsageUpdate variant");
+        };
+        assert_eq!(*used_tokens, Some(32407));
+        assert_eq!(*context_window, Some(1_000_000));
+        assert_eq!(cost.as_ref().and_then(|c| c.amount), Some(0.17858));
         assert_eq!(cost.as_ref().and_then(|c| c.currency.clone()), Some("USD".to_owned()));
 
         let events = update_to_event(&params);
         assert!(matches!(
             &events[0],
             AgentEvent::UsageUpdate {
-                used_tokens: Some(12345),
-                context_window: Some(200_000),
+                used_tokens: Some(32407),
+                context_window: Some(1_000_000),
                 cost_amount: Some(amount),
                 cost_currency: Some(currency),
-            } if (*amount - 0.42).abs() < f64::EPSILON && currency == "USD"
+            } if (*amount - 0.17858).abs() < f64::EPSILON && currency == "USD"
         ));
     }
 
     #[test]
-    fn session_update_usage_update_parses_without_cost() {
-        let raw = r#"{"sessionId":"s1","update":{"sessionUpdate":"usage_update","usedTokens":100}}"#;
+    fn session_update_usage_update_kimi_verbatim() {
+        // `turn-kimi.jsonl` -- same `used`/`size` shape, no `cost`, no
+        // `_meta` at all.
+        let raw = r#"{"sessionId":"session_ff1eb29e-0ba7-40aa-b654-bbf327c39463","update":{"sessionUpdate":"usage_update","used":23382,"size":1048576}}"#;
         let params: SessionUpdateParams = serde_json::from_str(raw).unwrap();
         let events = update_to_event(&params);
         assert!(matches!(
             &events[0],
             AgentEvent::UsageUpdate {
-                used_tokens: Some(100),
-                context_window: None,
+                used_tokens: Some(23382),
+                context_window: Some(1_048_576),
                 cost_amount: None,
                 cost_currency: None,
             }

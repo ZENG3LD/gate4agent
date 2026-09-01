@@ -32,8 +32,8 @@ use super::protocol::{
     InitializeParams, SessionCancelParams, SessionCloseParams, SessionCloseResult,
     SessionConfigOption, SessionDeleteParams, SessionForkParams, SessionListParams,
     SessionListResult, SessionLoadParams, SessionLoadResult, SessionMode, SessionModel,
-    SessionNewParams, SessionPromptParams, SessionSetConfigOptionParams, SessionSetModeParams,
-    SessionState, SessionSummary, SessionUsage,
+    SessionNewParams, SessionPromptParams, SessionPromptResult, SessionSetConfigOptionParams,
+    SessionSetModeParams, SessionState, SessionSummary, SessionUsage,
 };
 use super::reader::acp_reader_loop;
 use super::spawn::AcpProcess;
@@ -955,19 +955,48 @@ fn generate_session_id() -> String {
     format!("acp-{:x}", t)
 }
 
+/// Fold a `session/prompt` response into the two events every caller of
+/// `prompt()`/`start_prompt()` waits on.
+///
+/// Token usage rides in different places depending on the provider --
+/// see [`SessionPromptResult`]'s own doc comment. Claude's `usage` is
+/// tried first, then Grok's `_meta` breakdown, then the older
+/// multi-shape [`extract_token_usage`] scan as a last resort for any
+/// provider/shape neither one matches; Codex and Kimi send neither and
+/// fall all the way through to zeroed counts, which is the honest answer
+/// -- they never report per-turn usage on this response at all.
 fn emit_prompt_result(tx: &broadcast::Sender<AgentEvent>, result: &Value) {
-    let stop_reason = result
-        .get("stopReason")
-        .and_then(|value| value.as_str())
-        .unwrap_or("end_turn")
-        .to_owned();
-    let (input_tokens, output_tokens) = extract_token_usage(result);
+    let parsed: SessionPromptResult = serde_json::from_value(result.clone()).unwrap_or_default();
+    let stop_reason = parsed.stop_reason.unwrap_or_else(|| "end_turn".to_owned());
+
+    let (input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens) =
+        if let Some(usage) = parsed.usage {
+            (
+                usage.input_tokens.unwrap_or(0),
+                usage.output_tokens.unwrap_or(0),
+                usage.cached_read_tokens.unwrap_or(0),
+                usage.cached_write_tokens.unwrap_or(0),
+                0,
+            )
+        } else if let Some(meta) = parsed.meta {
+            (
+                meta.input_tokens.unwrap_or(0),
+                meta.output_tokens.unwrap_or(0),
+                meta.cached_read_tokens.unwrap_or(0),
+                0,
+                meta.reasoning_tokens.unwrap_or(0),
+            )
+        } else {
+            let (input, output) = extract_token_usage(result);
+            (input, output, 0, 0, 0)
+        };
+
     let _ = tx.send(AgentEvent::TurnComplete {
         input_tokens,
         output_tokens,
-        cache_read_tokens: 0,
-        cache_write_tokens: 0,
-        reasoning_tokens: 0,
+        cache_read_tokens,
+        cache_write_tokens,
+        reasoning_tokens,
         context_window: None,
         is_cumulative: false,
     });
@@ -1085,6 +1114,95 @@ mod tests {
         fn fake_session_supports_load(caps: &AgentCapabilities) -> bool {
             caps.agent_capabilities.load_session
                 || caps.agent_capabilities.session_capabilities.resume.is_some()
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // emit_prompt_result -- `session/prompt` response, all four providers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn emit_prompt_result_claude_verbatim_populates_cache_tokens() {
+        // `turn-claude.jsonl` line 9 -- the id=2 result, verbatim.
+        let raw: Value = serde_json::from_str(
+            r#"{"stopReason":"end_turn","usage":{"inputTokens":2,"outputTokens":4,"cachedReadTokens":15320,"cachedWriteTokens":17081,"totalTokens":32407},"_meta":{"quota":{}}}"#,
+        )
+        .expect("valid json literal");
+        let (tx, mut rx) = broadcast::channel(8);
+        emit_prompt_result(&tx, &raw);
+
+        match rx.try_recv().expect("TurnComplete event") {
+            AgentEvent::TurnComplete {
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                reasoning_tokens,
+                ..
+            } => {
+                assert_eq!(input_tokens, 2);
+                assert_eq!(output_tokens, 4);
+                assert_eq!(cache_read_tokens, 15320);
+                assert_eq!(cache_write_tokens, 17081);
+                assert_eq!(reasoning_tokens, 0);
+            }
+            other => panic!("expected TurnComplete, got {other:?}"),
+        }
+        match rx.try_recv().expect("SessionEnd event") {
+            AgentEvent::SessionEnd { result, .. } => assert_eq!(result, "end_turn"),
+            other => panic!("expected SessionEnd, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn emit_prompt_result_grok_verbatim_reads_meta_not_usage() {
+        // `turn-grok.jsonl` -- the id=2 result, verbatim: no top-level
+        // `usage`, breakdown on `_meta` instead.
+        let raw: Value = serde_json::from_str(
+            r#"{"stopReason":"end_turn","_meta":{"sessionId":"01a05e6a-aa4d-7a13-9e9c-2077aa244389","requestId":"97238a1c-461a-4f9a-ba2f-4acc677b762b","promptId":"97238a1c-461a-4f9a-ba2f-4acc677b762b","totalTokens":19885,"modelId":"grok-4.6","inputTokens":19807,"outputTokens":78,"cachedReadTokens":1408,"reasoningTokens":73}}"#,
+        )
+        .expect("valid json literal");
+        let (tx, mut rx) = broadcast::channel(8);
+        emit_prompt_result(&tx, &raw);
+
+        match rx.try_recv().expect("TurnComplete event") {
+            AgentEvent::TurnComplete {
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                reasoning_tokens,
+                ..
+            } => {
+                assert_eq!(input_tokens, 19807);
+                assert_eq!(output_tokens, 78);
+                assert_eq!(cache_read_tokens, 1408);
+                assert_eq!(cache_write_tokens, 0);
+                assert_eq!(reasoning_tokens, 73);
+            }
+            other => panic!("expected TurnComplete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn emit_prompt_result_kimi_and_codex_verbatim_bare_stop_reason_zeroes_usage() {
+        // `turn-kimi.jsonl` / `turn-codex.jsonl` -- neither sends `usage`
+        // or a token-bearing `_meta`; the honest answer is zeroed counts,
+        // not a made-up number.
+        let raw: Value = serde_json::from_str(r#"{"stopReason":"end_turn"}"#).expect("valid json literal");
+        let (tx, mut rx) = broadcast::channel(8);
+        emit_prompt_result(&tx, &raw);
+
+        match rx.try_recv().expect("TurnComplete event") {
+            AgentEvent::TurnComplete { input_tokens, output_tokens, .. } => {
+                assert_eq!(input_tokens, 0);
+                assert_eq!(output_tokens, 0);
+            }
+            other => panic!("expected TurnComplete, got {other:?}"),
+        }
+        match rx.try_recv().expect("SessionEnd event") {
+            AgentEvent::SessionEnd { result, .. } => assert_eq!(result, "end_turn"),
+            other => panic!("expected SessionEnd, got {other:?}"),
         }
     }
 }

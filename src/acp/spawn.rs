@@ -38,14 +38,21 @@ pub(crate) struct AcpSpawnSpec {
 /// Does not panic — all `CliTool` variants are handled.
 pub(crate) fn acp_command(tool: CliTool) -> Result<AcpSpawnSpec, std::io::Error> {
     let spec = match tool {
+        // Both adapters moved from the `@zed-industries` scope to
+        // `@agentclientprotocol`, and the abandoned packages are still
+        // published -- 0.16.2 against 0.71.0 for Claude, 0.16.0 against
+        // 1.8.0 for Codex -- so pointing at the old scope installs
+        // something that runs, lags badly, and never says why. Verified
+        // against the registry rather than taken from a summary: the old
+        // names carry deprecation notices naming these as replacements.
         CliTool::ClaudeCode => AcpSpawnSpec {
             program: "npx",
-            args: &["-y", "@zed-industries/claude-code-acp"],
+            args: &["-y", "@agentclientprotocol/claude-agent-acp"],
             npm_tool: true,
         },
         CliTool::Codex => AcpSpawnSpec {
             program: "npx",
-            args: &["@zed-industries/codex-acp"],
+            args: &["-y", "@agentclientprotocol/codex-acp"],
             npm_tool: true,
         },
         CliTool::Grok => AcpSpawnSpec {
@@ -71,7 +78,7 @@ pub(crate) fn acp_command(tool: CliTool) -> Result<AcpSpawnSpec, std::io::Error>
 /// injects a flag when `spec.launch.program == spec.id` for the PTY
 /// transport. `claude` and `codex` (`npm_tool: true`) instead spawn an
 /// `npx`-installed adapter-wrapper package
-/// (`@zed-industries/claude-code-acp`, `codex-acp`) that itself spawns or
+/// (`@agentclientprotocol/claude-agent-acp`, `codex-acp`) that itself spawns or
 /// embeds the real agent; whether that wrapper forwards trailing argv
 /// through to the agent it wraps is not verified anywhere this project has
 /// checked, so no flag is invented for it -- an empty slice, matching
@@ -427,7 +434,7 @@ mod tests {
         let spec = acp_command(CliTool::ClaudeCode).unwrap();
         assert_eq!(spec.program, "npx");
         assert!(spec.npm_tool);
-        assert!(spec.args.contains(&"@zed-industries/claude-code-acp"));
+        assert!(spec.args.contains(&"@agentclientprotocol/claude-agent-acp"));
     }
 
     #[test]
@@ -435,7 +442,7 @@ mod tests {
         let spec = acp_command(CliTool::Codex).unwrap();
         assert_eq!(spec.program, "npx");
         assert!(spec.npm_tool);
-        assert!(spec.args.contains(&"@zed-industries/codex-acp"));
+        assert!(spec.args.contains(&"@agentclientprotocol/codex-acp"));
     }
 
     #[test]
@@ -582,13 +589,13 @@ mod tests {
     fn windows_cmd_wrapper_for_an_npm_tool_ignores_an_empty_extra_args() {
         let cmd = windows_cmd_wrapper(
             "npx.cmd",
-            &["-y", "@zed-industries/claude-code-acp"],
+            &["-y", "@agentclientprotocol/claude-agent-acp"],
             &[],
         );
         assert_eq!(cmd.get_program(), std::ffi::OsStr::new("cmd"));
         assert_eq!(
             command_args(&cmd),
-            ["/C", "npx.cmd", "-y", "@zed-industries/claude-code-acp"]
+            ["/C", "npx.cmd", "-y", "@agentclientprotocol/claude-agent-acp"]
         );
     }
 

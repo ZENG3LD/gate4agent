@@ -229,6 +229,68 @@ pub struct ConfigOptionInfo {
     pub choices: Vec<ConfigOptionChoiceInfo>,
 }
 
+/// One reasoning-effort level offered for an [`AvailableModelInfo`] (ACP
+/// transport only) -- carried on Grok's per-model `_meta.
+/// reasoningEfforts` array, both in `session/new`'s `models` field and in
+/// the vendor `_x.ai/models/update` notification (identical shape in
+/// both, verified live on Grok CLI 1.0.13).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReasoningEffortInfo {
+    pub id: String,
+    pub label: String,
+    pub description: Option<String>,
+    pub is_default: bool,
+}
+
+/// One model the agent can select for a session (ACP transport only), as
+/// carried in `session/new`'s `models` field (verified live on codex-acp
+/// 1.8.0 and Grok CLI 1.0.13) and Grok's vendor `_x.ai/models/update`
+/// notification.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AvailableModelInfo {
+    pub model_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    /// Total context window, when the agent reports one per model
+    /// (Grok's `_meta.totalContextTokens`; Codex's model catalog entries
+    /// carry no `_meta` at all).
+    pub context_tokens: Option<u64>,
+    pub reasoning_efforts: Vec<ReasoningEffortInfo>,
+}
+
+/// Result of one hook script the provider ran for a session lifecycle
+/// event (ACP transport only) -- Grok's vendor `_x.ai/session_
+/// notification` with `sessionUpdate: "hook_execution"`, verified live on
+/// Grok CLI 1.0.13.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HookRunResult {
+    pub name: String,
+    pub status: String,
+    pub elapsed_ms: Option<u64>,
+    pub error: Option<String>,
+}
+
+/// One MCP server the provider has configured (ACP transport only) --
+/// Grok's vendor `_x.ai/mcp/servers_updated` notification, verified live
+/// on Grok CLI 1.0.13.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct McpServerSummary {
+    pub name: String,
+    pub source: String,
+    pub transport: String,
+}
+
+/// One announcement banner the provider is showing (ACP transport only)
+/// -- Grok's vendor `_x.ai/announcements/update` notification, verified
+/// live on Grok CLI 1.0.13.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AnnouncementInfo {
+    pub id: String,
+    pub title: Option<String>,
+    pub message: String,
+    pub severity: Option<String>,
+}
+
 /// Unified event type produced by both PTY and pipe transports.
 ///
 /// Consumers subscribe to a `broadcast::Receiver<AgentEvent>` and
@@ -342,4 +404,50 @@ pub enum AgentEvent {
     /// The full current set of session configuration options
     /// (`config_option_update`).
     ConfigOptionsUpdate { options: Vec<ConfigOptionInfo> },
+
+    // --- Grok vendor `_x.ai/*` extensions (ACP transport only) ---
+    /// The agent's available model catalog and/or current selection
+    /// changed (Grok's vendor `_x.ai/models/update` notification).
+    /// `session/new`'s own `models` field seeds the same data without
+    /// emitting this event -- see `AcpSession::available_models`.
+    ModelsUpdate {
+        current_model_id: Option<String>,
+        available_models: Vec<AvailableModelInfo>,
+    },
+    /// The provider switched models mid-session (Grok's vendor
+    /// `_x.ai/session_notification` with `sessionUpdate:
+    /// "model_changed"`).
+    ProviderModelChanged {
+        model_id: String,
+        reasoning_effort: Option<String>,
+    },
+    /// A provider-specific session setting changed (Grok's vendor
+    /// `_x.ai/settings/update` notification). Only `permission_mode` and
+    /// `auto_permission_mode_enabled` are pulled out by name -- the two
+    /// that affect host-visible behavior; `raw` carries the full payload
+    /// verbatim so nothing else in it is silently dropped.
+    SettingsUpdate {
+        permission_mode: Option<String>,
+        auto_permission_mode_enabled: Option<bool>,
+        raw: serde_json::Value,
+    },
+    /// Hook scripts ran for a session lifecycle event, with per-hook
+    /// success/failure (Grok's vendor `_x.ai/session_notification` with
+    /// `sessionUpdate: "hook_execution"`).
+    HookExecutionUpdate {
+        event_name: String,
+        runs: Vec<HookRunResult>,
+    },
+    /// The provider's configured MCP server list changed (Grok's vendor
+    /// `_x.ai/mcp/servers_updated` notification).
+    McpServersUpdate { servers: Vec<McpServerSummary> },
+    /// MCP server connection progress during startup (Grok's vendor
+    /// `_x.ai/mcp/init_progress` notification).
+    McpInitProgress { total: u32, connected: u32 },
+    /// MCP server initialization finished (Grok's vendor
+    /// `_x.ai/mcp_initialized` notification).
+    McpInitialized { tool_count: u32, elapsed_ms: u64 },
+    /// The provider's announcement banners changed (Grok's vendor
+    /// `_x.ai/announcements/update` notification).
+    AnnouncementsUpdate { announcements: Vec<AnnouncementInfo> },
 }

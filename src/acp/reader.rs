@@ -26,8 +26,8 @@ use crate::rpc::message::{classify_line, IncomingMessage, RpcError, RpcResponse}
 use crate::rpc::pending::PendingRequests;
 
 use super::protocol::{
-    apply_session_update, update_to_event, PermissionOptionKind, PermissionRequestParams,
-    SessionState, SessionUpdateParams,
+    apply_session_update, parse_vendor_notification, update_to_event, PermissionOptionKind,
+    PermissionRequestParams, SessionState, SessionUpdateParams,
 };
 use super::spawn::AcpProcess;
 
@@ -182,6 +182,23 @@ pub(crate) fn acp_reader_loop(
                             }
                             continue;
                         }
+                    }
+                } else if let Some(ref p) = params {
+                    // Vendor-namespaced notification (currently only
+                    // Grok's `_x.ai/*` methods) -- see
+                    // `protocol::parse_vendor_notification` for the full
+                    // set this build recognizes. Any method it does not
+                    // recognize falls through to the generic passthrough
+                    // below exactly like an unrecognized `session/update`
+                    // kind does.
+                    let event = {
+                        let mut state =
+                            session_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        parse_vendor_notification(&mut state, &method, p)
+                    };
+                    if let Some(event) = event {
+                        let _ = tx.send(event);
+                        continue;
                     }
                 }
                 // Generic passthrough for all other notifications.

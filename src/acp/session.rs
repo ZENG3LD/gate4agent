@@ -29,9 +29,11 @@ use super::gate::DangerousCommandGate;
 use super::host::{AcpHostAdapter, HostPolicy, PolicyHostHandler};
 use super::protocol::{
     extract_token_usage, AgentCapabilities, AvailableCommand, ClientInfo, ContentBlock,
-    InitializeParams, SessionCancelParams, SessionConfigOption, SessionLoadParams,
-    SessionLoadResult, SessionMode, SessionNewParams, SessionPromptParams,
-    SessionSetConfigOptionParams, SessionSetModeParams, SessionState, SessionUsage,
+    InitializeParams, SessionCancelParams, SessionCloseParams, SessionConfigOption,
+    SessionDeleteParams, SessionForkParams, SessionListParams, SessionListResult,
+    SessionLoadParams, SessionLoadResult, SessionMode, SessionModel, SessionNewParams,
+    SessionPromptParams, SessionSetConfigOptionParams, SessionSetModeParams, SessionState,
+    SessionSummary, SessionUsage,
 };
 use super::reader::acp_reader_loop;
 use super::spawn::AcpProcess;
@@ -90,6 +92,14 @@ pub enum AcpError {
 
     #[error("Session closed while awaiting response")]
     SessionClosed,
+
+    /// The agent's `initialize` response never advertised the named
+    /// `sessionCapabilities` key (see [`super::protocol::SessionCapabilities`]),
+    /// so this build refuses to send the corresponding request rather
+    /// than let it fail on the wire with a vendor-specific "unknown
+    /// method" error.
+    #[error("Agent does not advertise the '{capability}' session capability")]
+    UnsupportedCapability { capability: &'static str },
 }
 
 // ---------------------------------------------------------------------------
@@ -143,6 +153,16 @@ pub struct AcpSessionOptions {
     ///
     /// Default: empty.
     pub approval_level_args: Vec<String>,
+
+    /// Extra directories, beyond `working_dir`, to advertise on
+    /// `session/new` via `additionalDirectories` -- the outbound side of
+    /// the `sessionCapabilities.additionalDirectories` flag every
+    /// captured agent advertises. Sent regardless of whether the agent
+    /// declared support for it (same precedent as `mcpServers`, which
+    /// this file already always sends); see
+    /// [`super::protocol::SessionNewParams`] for why the wire shape is
+    /// unverified. Default: empty.
+    pub additional_directories: Vec<String>,
 }
 
 impl Default for AcpSessionOptions {
@@ -154,6 +174,7 @@ impl Default for AcpSessionOptions {
             host_policy: HostPolicy::default(),
             dangerous_command_gate: DangerousCommandGate::default(),
             approval_level_args: Vec::new(),
+            additional_directories: Vec::new(),
         }
     }
 }
@@ -305,6 +326,7 @@ impl AcpSession {
         let new_params = SessionNewParams {
             cwd: working_dir.to_str().unwrap_or(".").to_string(),
             mcp_servers: vec![],
+            additional_directories: options.additional_directories.clone(),
         };
         let new_result: SessionLoadResult = session
             .rpc_call_typed("session/new", json!(new_params), options.handshake_timeout, false)
@@ -473,8 +495,186 @@ impl AcpSession {
     }
 
     /// Whether this agent supports session resumption via `session/load`.
+    ///
+    /// Reads BOTH signals a live capture has shown so far: the original
+    /// top-level `loadSession` boolean, and the newer
+    /// `sessionCapabilities.resume` flag -- claude-agent-acp 0.71.0,
+    /// codex-acp 1.8.0, and Kimi Code CLI 0.39.1 all advertise both
+    /// simultaneously (`acp-claude.jsonl`, `acp-codex.jsonl`,
+    /// `acp-kimi.jsonl`). No live capture ever invokes a method distinct
+    /// from `session/load` for "resume", so this build treats both flags
+    /// as gating the one method it already implements rather than
+    /// inventing a separate `session/resume`.
     pub fn supports_load_session(&self) -> bool {
         self.agent_caps.agent_capabilities.load_session
+            || self.agent_caps.agent_capabilities.session_capabilities.resume.is_some()
+    }
+
+    /// Whether the agent advertises `sessionCapabilities.list`
+    /// (`session/list`).
+    pub fn supports_session_list(&self) -> bool {
+        self.agent_caps.agent_capabilities.session_capabilities.list.is_some()
+    }
+
+    /// Whether the agent advertises `sessionCapabilities.close`
+    /// (`session/close`).
+    pub fn supports_session_close(&self) -> bool {
+        self.agent_caps.agent_capabilities.session_capabilities.close.is_some()
+    }
+
+    /// Whether the agent advertises `sessionCapabilities.delete`
+    /// (`session/delete`).
+    pub fn supports_session_delete(&self) -> bool {
+        self.agent_caps.agent_capabilities.session_capabilities.delete.is_some()
+    }
+
+    /// Whether the agent advertises `sessionCapabilities.fork`
+    /// (`session/fork`).
+    pub fn supports_session_fork(&self) -> bool {
+        self.agent_caps.agent_capabilities.session_capabilities.fork.is_some()
+    }
+
+    /// Whether the agent advertises `sessionCapabilities.
+    /// additionalDirectories` -- accepting extra directories beyond `cwd`
+    /// on `session/new` (see [`AcpSessionOptions::additional_directories`]).
+    pub fn supports_additional_directories(&self) -> bool {
+        self.agent_caps
+            .agent_capabilities
+            .session_capabilities
+            .additional_directories
+            .is_some()
+    }
+
+    /// Whether the agent advertises `sessionCapabilities.subagents` --
+    /// that it may spawn subordinate agent turns during a session.
+    ///
+    /// Verified live as a capability FLAG on claude-agent-acp 0.71.0 and
+    /// codex-acp 1.8.0 (`acp-claude.jsonl`, `acp-codex.jsonl`); this is
+    /// real, machine-readable evidence that an ACP host CAN detect
+    /// up-front whether an agent may spawn subagents. What is NOT
+    /// verified is any wire event or request shape for subagent
+    /// lifecycle -- neither capture exercises a full prompt turn, so no
+    /// live capture has ever shown a subagent starting, streaming, or
+    /// stopping over the wire. This build therefore surfaces the
+    /// capability flag but implements no subagent-specific event
+    /// handling; a session started against an agent that returns `true`
+    /// here still receives only the generic `session/update` and
+    /// `RpcNotification` events this build already understands.
+    pub fn supports_subagents(&self) -> bool {
+        self.agent_caps.agent_capabilities.session_capabilities.subagents.is_some()
+    }
+
+    /// The agent's model catalog, as seeded from `session/new`/`session/
+    /// load` and kept current by Grok's vendor `_x.ai/models/update`
+    /// notification.
+    pub fn available_models(&self) -> Vec<SessionModel> {
+        self.state().models.available_models.clone()
+    }
+
+    /// The session's currently selected model id, if the agent reports
+    /// one (see [`available_models`](Self::available_models)).
+    pub fn current_model_id(&self) -> Option<String> {
+        self.state().models.current_model_id.clone()
+    }
+
+    /// List prior sessions via `session/list`.
+    ///
+    /// UNVERIFIED wire shape -- see [`super::protocol::SessionListParams`].
+    ///
+    /// # Errors
+    ///
+    /// - [`AcpError::UnsupportedCapability`] — agent does not advertise `sessionCapabilities.list`
+    /// - [`AcpError::Timeout`] — no response within `prompt_timeout`
+    /// - [`AcpError::Agent`] — agent returned an RPC error
+    pub async fn list_sessions(&self) -> Result<Vec<SessionSummary>, AcpError> {
+        if !self.supports_session_list() {
+            return Err(AcpError::UnsupportedCapability { capability: "list" });
+        }
+        let result: SessionListResult = self
+            .rpc_call_typed(
+                "session/list",
+                json!(SessionListParams::default()),
+                self.prompt_timeout,
+                false,
+            )
+            .await?;
+        Ok(result.sessions)
+    }
+
+    /// Close the current session via `session/close`.
+    ///
+    /// UNVERIFIED wire shape -- see [`super::protocol::SessionCloseParams`].
+    /// Does not kill the subprocess (use [`kill`](Self::kill) for that) and
+    /// does not clear the locally cached `acp_session_id` -- it only tells
+    /// the agent the session is done; whether the agent then rejects
+    /// further calls on this id is up to the agent.
+    ///
+    /// # Errors
+    ///
+    /// - [`AcpError::UnsupportedCapability`] — agent does not advertise `sessionCapabilities.close`
+    /// - [`AcpError::NoSession`] — handshake not complete
+    /// - [`AcpError::Timeout`] — no response within `prompt_timeout`
+    /// - [`AcpError::Agent`] — agent returned an RPC error
+    pub async fn close_session(&self) -> Result<(), AcpError> {
+        if !self.supports_session_close() {
+            return Err(AcpError::UnsupportedCapability { capability: "close" });
+        }
+        let session_id = {
+            let guard = self.acp_session_id.lock().await;
+            guard.clone().ok_or(AcpError::NoSession)?
+        };
+        let params = SessionCloseParams { session_id };
+        self.rpc_call("session/close", Some(json!(params)), self.prompt_timeout).await?;
+        Ok(())
+    }
+
+    /// Delete a (not necessarily current) session's persisted history via
+    /// `session/delete`.
+    ///
+    /// UNVERIFIED wire shape -- see [`super::protocol::SessionDeleteParams`].
+    ///
+    /// # Errors
+    ///
+    /// - [`AcpError::UnsupportedCapability`] — agent does not advertise `sessionCapabilities.delete`
+    /// - [`AcpError::Timeout`] — no response within `prompt_timeout`
+    /// - [`AcpError::Agent`] — agent returned an RPC error
+    pub async fn delete_session(&self, session_id: &str) -> Result<(), AcpError> {
+        if !self.supports_session_delete() {
+            return Err(AcpError::UnsupportedCapability { capability: "delete" });
+        }
+        let params = SessionDeleteParams { session_id: session_id.to_owned() };
+        self.rpc_call("session/delete", Some(json!(params)), self.prompt_timeout).await?;
+        Ok(())
+    }
+
+    /// Fork the current session into a new, independent one via
+    /// `session/fork`. Returns the new session's id; does NOT switch this
+    /// [`AcpSession`] to track it -- the original session stays current.
+    ///
+    /// UNVERIFIED wire shape -- see [`super::protocol::SessionForkParams`].
+    /// The result is parsed with the same handshake-result shape
+    /// `session/new`/`session/load` use, since a fork's whole point is
+    /// handing back a second ready-to-use session.
+    ///
+    /// # Errors
+    ///
+    /// - [`AcpError::UnsupportedCapability`] — agent does not advertise `sessionCapabilities.fork`
+    /// - [`AcpError::NoSession`] — handshake not complete
+    /// - [`AcpError::Timeout`] — no response within `prompt_timeout`
+    /// - [`AcpError::Agent`] — agent returned an RPC error
+    pub async fn fork_session(&self) -> Result<String, AcpError> {
+        if !self.supports_session_fork() {
+            return Err(AcpError::UnsupportedCapability { capability: "fork" });
+        }
+        let session_id = {
+            let guard = self.acp_session_id.lock().await;
+            guard.clone().ok_or(AcpError::NoSession)?
+        };
+        let params = SessionForkParams { session_id };
+        let result: SessionLoadResult = self
+            .rpc_call_typed("session/fork", json!(params), self.prompt_timeout, false)
+            .await?;
+        Ok(result.session_id)
     }
 
     /// Resume a prior ACP session by replaying its history.
@@ -842,5 +1042,35 @@ mod tests {
         assert_eq!(opts.prompt_timeout, Duration::from_secs(120));
         assert_eq!(opts.host_policy, HostPolicy::Auto);
         assert!(opts.approval_level_args.is_empty());
+        assert!(opts.additional_directories.is_empty());
+    }
+
+    #[test]
+    fn supports_load_session_reads_either_the_legacy_bool_or_the_new_capability_flag() {
+        use super::super::protocol::{AgentCapabilities, AgentCapabilityFlags, SessionCapabilities};
+
+        let mut caps = AgentCapabilities::default();
+        assert!(!fake_session_supports_load(&caps));
+
+        caps.agent_capabilities = AgentCapabilityFlags { load_session: true, ..Default::default() };
+        assert!(fake_session_supports_load(&caps));
+
+        caps.agent_capabilities = AgentCapabilityFlags {
+            load_session: false,
+            session_capabilities: SessionCapabilities {
+                resume: Some(serde_json::json!({})),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(fake_session_supports_load(&caps));
+
+        // Helper mirrors `AcpSession::supports_load_session`'s logic
+        // without constructing a whole live session for a pure capability
+        // check.
+        fn fake_session_supports_load(caps: &AgentCapabilities) -> bool {
+            caps.agent_capabilities.load_session
+                || caps.agent_capabilities.session_capabilities.resume.is_some()
+        }
     }
 }

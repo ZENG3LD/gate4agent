@@ -2372,6 +2372,20 @@ fn provider_event(event: AgentEvent) -> Option<ProviderEvent> {
         AgentEvent::ConfigOptionsUpdate { options } => Some(ProviderEvent::ConfigOptionsUpdated {
             options: options.into_iter().map(provider_config_option).collect(),
         }),
+        // Grok vendor `_x.ai/*` extensions (see `gate4agent::acp::protocol::
+        // parse_vendor_notification`) -- not yet bridged to `ProviderEvent`.
+        // No `ProviderEvent` variant exists for any of these today; adding
+        // one is a separate, larger change across this crate's validation
+        // (`ProviderEventValidationError`), the observation pipeline, and
+        // the TUI, not part of parsing the ACP wire itself.
+        AgentEvent::ModelsUpdate { .. }
+        | AgentEvent::ProviderModelChanged { .. }
+        | AgentEvent::SettingsUpdate { .. }
+        | AgentEvent::HookExecutionUpdate { .. }
+        | AgentEvent::McpServersUpdate { .. }
+        | AgentEvent::McpInitProgress { .. }
+        | AgentEvent::McpInitialized { .. }
+        | AgentEvent::AnnouncementsUpdate { .. } => None,
     }
 }
 

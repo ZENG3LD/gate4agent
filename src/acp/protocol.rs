@@ -10,8 +10,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::core::types::{
-    AgentEvent, AvailableCommandInfo, ConfigOptionChoiceInfo, ConfigOptionInfo, PlanStep,
-    PlanStepPriority, PlanStepStatus,
+    AgentEvent, AnnouncementInfo, AvailableCommandInfo, AvailableModelInfo, ConfigOptionChoiceInfo,
+    ConfigOptionInfo, HookRunResult, McpServerSummary, PlanStep, PlanStepPriority, PlanStepStatus,
+    ReasoningEffortInfo,
 };
 use crate::core::types::ConfigOptionKind as CoreConfigOptionKind;
 
@@ -85,12 +86,21 @@ pub enum McpServerConfig {
     },
 }
 
-/// `session/new` request params.
+/// `session/new` request params. `additional_directories` is the outbound
+/// side of the `sessionCapabilities.additionalDirectories` flag every
+/// captured agent advertises (`acp-claude.jsonl`, `acp-codex.jsonl`,
+/// `acp-kimi.jsonl`) -- UNVERIFIED wire shape: no live capture ever sends
+/// a non-empty request, only the capability flag, so the field name
+/// follows this file's camelCase convention and the ACP spec's own
+/// `mcpServers` precedent (a sibling array of extra paths the agent may
+/// access beyond `cwd`), not a captured request payload.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SessionNewParams {
     pub cwd: String,
     #[serde(rename = "mcpServers", default)]
     pub mcp_servers: Vec<McpServerConfig>,
+    #[serde(rename = "additionalDirectories", default)]
+    pub additional_directories: Vec<String>,
 }
 
 /// A content block in a `session/prompt` request.
@@ -127,9 +137,11 @@ pub struct SessionLoadParams {
 /// `session/new`'s result, since both carry the same "here is the session
 /// I made ready for you" shape per the ACP spec: `sessionId`, and
 /// optionally `modes` (current + available session modes),
-/// `availableCommands` (the agent's slash-command catalog), and
-/// `configOptions` (current session configuration -- model, reasoning
-/// effort, ...). Every field beyond `sessionId` defaults to empty so an
+/// `availableCommands` (the agent's slash-command catalog), `configOptions`
+/// (current session configuration -- model, reasoning effort, ...), and
+/// `models` (the agent's model catalog -- verified live on codex-acp 1.8.0
+/// and Grok CLI 1.0.13, `acp-codex.jsonl`/`acp-grok.jsonl`; previously not
+/// parsed at all). Every field beyond `sessionId` defaults to empty so an
 /// agent that predates any of them still parses.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SessionLoadResult {
@@ -141,6 +153,137 @@ pub struct SessionLoadResult {
     pub available_commands: Vec<AvailableCommand>,
     #[serde(rename = "configOptions", default)]
     pub config_options: Vec<SessionConfigOption>,
+    #[serde(default)]
+    pub models: SessionModelState,
+}
+
+/// One reasoning-effort level offered for a [`SessionModel`]. Verified
+/// live on Grok CLI 1.0.13, identical on both `session/new`'s `models`
+/// field and the vendor `_x.ai/models/update` notification
+/// (`acp-grok.jsonl`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReasoningEffortOption {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub value: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub default: bool,
+}
+
+/// A model's `_meta` sidecar, as carried per-entry in Grok's `models`
+/// field and `_x.ai/models/update` notification (`acp-grok.jsonl`).
+/// Codex's model catalog entries carry no `_meta` at all; every field
+/// here defaults to absent so that shape still parses.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionModelMeta {
+    #[serde(rename = "totalContextTokens", default)]
+    pub total_context_tokens: Option<u64>,
+    #[serde(rename = "agentType", default)]
+    pub agent_type: Option<String>,
+    #[serde(rename = "supportsReasoningEffort", default)]
+    pub supports_reasoning_effort: Option<bool>,
+    #[serde(rename = "reasoningEffort", default)]
+    pub reasoning_effort: Option<String>,
+    #[serde(rename = "reasoningEfforts", default)]
+    pub reasoning_efforts: Vec<ReasoningEffortOption>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
+/// One model the agent can select for a session. Field names verified
+/// live on codex-acp 1.8.0 (`session/new`'s `models.availableModels`) and
+/// Grok CLI 1.0.13 (`session/new`'s `models.availableModels` and the
+/// vendor `_x.ai/models/update` notification) -- `acp-codex.jsonl`,
+/// `acp-grok.jsonl`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionModel {
+    #[serde(rename = "modelId", default)]
+    pub model_id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(rename = "_meta", default)]
+    pub meta: Option<SessionModelMeta>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
+/// The model catalog block returned by `session/new`/`session/load` and
+/// kept current by the vendor `_x.ai/models/update` notification (Grok).
+/// Field names verified live on codex-acp 1.8.0 and Grok CLI 1.0.13.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionModelState {
+    #[serde(rename = "currentModelId", default)]
+    pub current_model_id: Option<String>,
+    #[serde(rename = "availableModels", default)]
+    pub available_models: Vec<SessionModel>,
+}
+
+/// `session/list` request params (host → agent) -- UNVERIFIED wire shape.
+/// Every live capture shows `sessionCapabilities.list` as an advertised
+/// flag but none of them ever calls the method; this is sent as an empty
+/// object, matching how other no-argument ACP calls are shaped.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct SessionListParams {}
+
+/// One session summary entry in a `session/list` response -- UNVERIFIED
+/// wire shape (see [`SessionListParams`]). Field names follow this file's
+/// `sessionId` convention plus the two facts a picker UI needs (`title`,
+/// `cwd`); `extra` keeps anything under a different real key name from
+/// being silently dropped.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionSummary {
+    #[serde(rename = "sessionId", default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
+/// `session/list` response result (agent → host) -- UNVERIFIED wire shape
+/// (see [`SessionListParams`]).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionListResult {
+    #[serde(default)]
+    pub sessions: Vec<SessionSummary>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
+/// `session/close` request params (host → agent) -- UNVERIFIED wire
+/// shape. Every live capture shows `sessionCapabilities.close` as an
+/// advertised flag but none of them ever calls the method; follows this
+/// file's `{sessionId}`-request convention (`session/cancel`,
+/// `session/load`, ...).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SessionCloseParams {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+}
+
+/// `session/delete` request params (host → agent) -- UNVERIFIED wire
+/// shape (see [`SessionCloseParams`]).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SessionDeleteParams {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+}
+
+/// `session/fork` request params (host → agent) -- UNVERIFIED wire shape
+/// (see [`SessionCloseParams`]).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SessionForkParams {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
 }
 
 /// `session/set_mode` request params (host → agent) -- switch the agent's
@@ -184,18 +327,21 @@ pub struct SessionUsage {
     pub cost_currency: Option<String>,
 }
 
-/// Live ACP session state: modes, command catalog, config options, and
-/// context usage. Assembled from the `session/new`/`session/load`
-/// handshake result via [`SessionState::from_handshake`] and kept current
-/// by `current_mode_update`, `available_commands_update`,
+/// Live ACP session state: modes, command catalog, config options, model
+/// catalog, and context usage. Assembled from the `session/new`/`session/
+/// load` handshake result via [`SessionState::from_handshake`] and kept
+/// current by `current_mode_update`, `available_commands_update`,
 /// `config_option_update`, `session_info_update`, and `usage_update`
-/// notifications via [`apply_session_update`]. Exposed to callers through
+/// notifications via [`apply_session_update`], plus (for `models`) Grok's
+/// vendor `_x.ai/models/update` notification via
+/// `super::reader::acp_reader_loop`. Exposed to callers through
 /// [`super::session::AcpSession`]'s accessor methods.
 #[derive(Debug, Clone, Default)]
 pub struct SessionState {
     pub modes: SessionModeState,
     pub available_commands: Vec<AvailableCommand>,
     pub config_options: Vec<SessionConfigOption>,
+    pub models: SessionModelState,
     pub title: Option<String>,
     pub usage: Option<SessionUsage>,
 }
@@ -207,6 +353,7 @@ impl SessionState {
             modes: result.modes.clone(),
             available_commands: result.available_commands.clone(),
             config_options: result.config_options.clone(),
+            models: result.models.clone(),
             title: None,
             usage: None,
         }
@@ -414,7 +561,10 @@ pub struct AvailableCommandInput {
 
 /// A single slash-style command the agent advertises, either at handshake
 /// time (`session/new`/`session/load`'s result) or via
-/// `available_commands_update`.
+/// `available_commands_update`. `extra` keeps vendor-specific sidecar
+/// data intact -- verified live shapes include Codex's `_meta.
+/// commandAction` (`/plan`'s config-option wiring) and Grok's `_meta.
+/// scope`/`path`/`bareName`/`qualifiedName` (skill-backed commands).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AvailableCommand {
     #[serde(default)]
@@ -423,6 +573,8 @@ pub struct AvailableCommand {
     pub description: String,
     #[serde(default)]
     pub input: Option<AvailableCommandInput>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
 }
 
 /// A mode the agent can operate in -- one entry of
@@ -462,12 +614,16 @@ pub enum ConfigOptionKind {
     Unknown,
 }
 
-/// One selectable value of a `select`-kind [`SessionConfigOption`].
+/// One selectable value of a `select`-kind [`SessionConfigOption`]. Field
+/// names verified live against `session/new`'s result on
+/// claude-agent-acp 0.71.0, codex-acp 1.8.0, and Kimi Code CLI 0.39.1
+/// (`acp-claude.jsonl`, `acp-codex.jsonl`, `acp-kimi.jsonl`): the choice's
+/// display label is the wire key `"name"`, not `"label"`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ConfigOptionChoice {
     #[serde(default)]
     pub value: Value,
-    #[serde(default)]
+    #[serde(rename = "name", default)]
     pub label: Option<String>,
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
@@ -476,9 +632,15 @@ pub struct ConfigOptionChoice {
 /// One session configuration setting -- the mechanism that supersedes
 /// session modes for things like model selection and reasoning effort.
 /// `config_option_update` carries the FULL current set on every update,
-/// same as `plan`. Field names beyond `id`/`kind` are best-effort guesses
-/// following this file's camelCase convention -- not verified against a
-/// live agent capture; `extra` keeps anything under a different real key
+/// same as `plan`. Field names verified live against `session/new`'s
+/// result on claude-agent-acp 0.71.0, codex-acp 1.8.0, and Kimi Code CLI
+/// 0.39.1 (`acp-claude.jsonl`, `acp-codex.jsonl`, `acp-kimi.jsonl`): the
+/// kind discriminator is the wire key `"type"` (previously guessed as
+/// `"kind"`, which never matched a real payload and silently defaulted
+/// every option to `ConfigOptionKind::Unknown`), and the current
+/// selection is the wire key `"currentValue"` (previously guessed as
+/// `"value"`, which likewise never matched and left every option's value
+/// at `Value::Null`). `extra` keeps anything under a different real key
 /// name from being silently dropped.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionConfigOption {
@@ -490,9 +652,9 @@ pub struct SessionConfigOption {
     pub description: Option<String>,
     #[serde(default)]
     pub category: Option<String>,
-    #[serde(default)]
+    #[serde(rename = "type", default)]
     pub kind: ConfigOptionKind,
-    #[serde(default)]
+    #[serde(rename = "currentValue", default)]
     pub value: Value,
     #[serde(default)]
     pub options: Vec<ConfigOptionChoice>,
@@ -740,7 +902,48 @@ pub struct AgentCapabilities {
 pub struct AgentCapabilityFlags {
     #[serde(rename = "loadSession", default)]
     pub load_session: bool,
+    /// Per-session lifecycle capabilities. Verified live on
+    /// claude-agent-acp 0.71.0, codex-acp 1.8.0, Kimi Code CLI 0.39.1, and
+    /// Grok CLI 1.0.13 (`acp-claude.jsonl`, `acp-codex.jsonl`,
+    /// `acp-kimi.jsonl`, `acp-grok.jsonl`).
+    #[serde(rename = "sessionCapabilities", default)]
+    pub session_capabilities: SessionCapabilities,
     /// Remaining capability fields (future-proofing).
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, Value>,
+}
+
+/// The `sessionCapabilities` block inside `agentCapabilities` -- each key
+/// present means the agent advertises that lifecycle operation; its value
+/// is an (currently always empty) object reserved for future per-
+/// capability configuration, so presence/absence of the key is the signal
+/// this build reads, not its contents. Verified live: claude-agent-acp
+/// 0.71.0 and codex-acp 1.8.0 advertise all seven keys including
+/// `subagents`; Kimi Code CLI 0.39.1 advertises six (no `subagents`); Grok
+/// CLI 1.0.13 advertises only `list`/`resume`/`close`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionCapabilities {
+    #[serde(default)]
+    pub list: Option<Value>,
+    #[serde(default)]
+    pub resume: Option<Value>,
+    #[serde(default)]
+    pub close: Option<Value>,
+    #[serde(default)]
+    pub delete: Option<Value>,
+    #[serde(default)]
+    pub fork: Option<Value>,
+    #[serde(rename = "additionalDirectories", default)]
+    pub additional_directories: Option<Value>,
+    /// Whether the agent may spawn subordinate agent turns ("subagents")
+    /// during a session. Verified live as an advertised capability flag on
+    /// claude-agent-acp 0.71.0 and codex-acp 1.8.0 -- but neither capture
+    /// exercises a full prompt turn, so no subagent lifecycle event or
+    /// request shape has been observed on the wire; see
+    /// `super::session::AcpSession::supports_subagents` for what this
+    /// build can and cannot do with the flag today.
+    #[serde(default)]
+    pub subagents: Option<Value>,
     #[serde(flatten)]
     pub extra: std::collections::HashMap<String, Value>,
 }
@@ -991,6 +1194,284 @@ pub(crate) fn update_to_event(params: &SessionUpdateParams) -> Vec<AgentEvent> {
 }
 
 // ---------------------------------------------------------------------------
+// Vendor extensions: Grok's `_x.ai/*` namespace
+// ---------------------------------------------------------------------------
+//
+// xAI's Grok CLI (ACP transport) sends a family of provider-specific
+// notifications outside the ACP spec's own method names, all under the
+// `_x.ai/` prefix -- captured live from a real `grok agent stdio` run
+// (`acp-grok.jsonl`). [`parse_vendor_notification`] is the single entry
+// point the reader loop calls for any notification method that is not
+// `session/update`; it returns `None` for anything it does not
+// recognize -- either a method outside `_x.ai/` entirely, or an
+// `_x.ai/*` method this build has never seen, or one whose payload
+// failed to parse -- so an unrecognized extension always falls back to
+// the generic `AgentEvent::RpcNotification` passthrough rather than
+// breaking parsing.
+
+/// `_x.ai/models/update` notification params -- the flat sibling of
+/// [`SessionModelState`] (no wrapping `models` key). Verified live on
+/// Grok CLI 1.0.13 (`acp-grok.jsonl`).
+#[derive(Debug, Clone, Deserialize)]
+struct VendorModelsUpdateParams {
+    #[serde(rename = "currentModelId", default)]
+    current_model_id: Option<String>,
+    #[serde(rename = "availableModels", default)]
+    available_models: Vec<SessionModel>,
+}
+
+/// Status of one hook run inside `_x.ai/session_notification`'s
+/// `hook_execution` update. Verified live on Grok CLI 1.0.13.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct VendorHookStatus {
+    #[serde(default)]
+    status: String,
+    #[serde(rename = "elapsed_ms", default)]
+    elapsed_ms: Option<u64>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+/// One hook run inside `_x.ai/session_notification`'s `hook_execution`
+/// update. Verified live on Grok CLI 1.0.13.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct VendorHookRun {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    status: VendorHookStatus,
+}
+
+/// `_x.ai/session_notification`'s `update` sub-object -- a discriminated
+/// union of the two kinds verified live on Grok CLI 1.0.13
+/// (`hook_execution`, `model_changed`). `Unknown` covers any other kind
+/// this build has never seen.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "sessionUpdate")]
+enum VendorSessionNotification {
+    #[serde(rename = "hook_execution")]
+    HookExecution {
+        #[serde(default)]
+        event_name: String,
+        #[serde(default)]
+        runs: Vec<VendorHookRun>,
+    },
+    #[serde(rename = "model_changed")]
+    ModelChanged {
+        #[serde(rename = "model_id", default)]
+        model_id: String,
+        #[serde(rename = "reasoning_effort", default)]
+        reasoning_effort: Option<String>,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+/// `_x.ai/session_notification` notification params. Verified live on
+/// Grok CLI 1.0.13.
+#[derive(Debug, Clone, Deserialize)]
+struct VendorSessionNotificationParams {
+    update: VendorSessionNotification,
+}
+
+/// One entry of `_x.ai/mcp/servers_updated`'s `mcpServers` array.
+/// Verified live on Grok CLI 1.0.13.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct VendorMcpServerEntry {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    source: String,
+    #[serde(rename = "type", default)]
+    transport: String,
+}
+
+/// `_x.ai/mcp/servers_updated` notification params. Verified live on
+/// Grok CLI 1.0.13.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct VendorMcpServersUpdatedParams {
+    #[serde(rename = "mcpServers", default)]
+    mcp_servers: Vec<VendorMcpServerEntry>,
+}
+
+/// `_x.ai/mcp/init_progress` notification params. Verified live on Grok
+/// CLI 1.0.13.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct VendorMcpInitProgressParams {
+    #[serde(default)]
+    total: u32,
+    #[serde(default)]
+    connected: u32,
+}
+
+/// `_x.ai/mcp_initialized` notification params. Verified live on Grok CLI
+/// 1.0.13.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct VendorMcpInitializedParams {
+    #[serde(rename = "mcpToolCount", default)]
+    mcp_tool_count: u32,
+    #[serde(rename = "elapsedMs", default)]
+    elapsed_ms: u64,
+}
+
+/// One entry of `_x.ai/announcements/update`'s `announcements` array.
+/// Verified live on Grok CLI 1.0.13.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct VendorAnnouncement {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    severity: Option<String>,
+}
+
+/// `_x.ai/announcements/update` notification params. Verified live on
+/// Grok CLI 1.0.13.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct VendorAnnouncementsUpdateParams {
+    #[serde(default)]
+    announcements: Vec<VendorAnnouncement>,
+}
+
+/// Convert a [`SessionModel`] (the `session/new`/`session/load`/vendor
+/// wire shape) into the transport-neutral [`AvailableModelInfo`] carried
+/// on [`AgentEvent::ModelsUpdate`].
+fn session_model_to_info(model: SessionModel) -> AvailableModelInfo {
+    let meta = model.meta.unwrap_or_default();
+    AvailableModelInfo {
+        model_id: model.model_id,
+        name: model.name,
+        description: model.description,
+        context_tokens: meta.total_context_tokens,
+        reasoning_efforts: meta
+            .reasoning_efforts
+            .into_iter()
+            .map(|effort| ReasoningEffortInfo {
+                id: effort.id,
+                label: effort.label,
+                description: effort.description,
+                is_default: effort.default,
+            })
+            .collect(),
+    }
+}
+
+/// Parse an `_x.ai/*` vendor notification into an [`AgentEvent`],
+/// updating `state.models` when the method is `_x.ai/models/update` so
+/// `AcpSession::available_models`/`current_model_id` stay current the
+/// same way `session/update` keeps the rest of [`SessionState`] current.
+/// Returns `None` for a method this build does not recognize -- see this
+/// section's module-level doc comment above.
+pub(crate) fn parse_vendor_notification(
+    state: &mut SessionState,
+    method: &str,
+    params: &Value,
+) -> Option<AgentEvent> {
+    match method {
+        "_x.ai/models/update" => {
+            let parsed: VendorModelsUpdateParams = serde_json::from_value(params.clone()).ok()?;
+            state.models = SessionModelState {
+                current_model_id: parsed.current_model_id.clone(),
+                available_models: parsed.available_models.clone(),
+            };
+            Some(AgentEvent::ModelsUpdate {
+                current_model_id: parsed.current_model_id,
+                available_models: parsed
+                    .available_models
+                    .into_iter()
+                    .map(session_model_to_info)
+                    .collect(),
+            })
+        }
+        "_x.ai/settings/update" => Some(AgentEvent::SettingsUpdate {
+            permission_mode: params
+                .get("permission_mode")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            auto_permission_mode_enabled: params
+                .get("auto_permission_mode_enabled")
+                .and_then(Value::as_bool),
+            raw: params.clone(),
+        }),
+        "_x.ai/session_notification" => {
+            let parsed: VendorSessionNotificationParams =
+                serde_json::from_value(params.clone()).ok()?;
+            match parsed.update {
+                VendorSessionNotification::HookExecution { event_name, runs } => {
+                    Some(AgentEvent::HookExecutionUpdate {
+                        event_name,
+                        runs: runs
+                            .into_iter()
+                            .map(|run| HookRunResult {
+                                name: run.name,
+                                status: run.status.status,
+                                elapsed_ms: run.status.elapsed_ms,
+                                error: run.status.error,
+                            })
+                            .collect(),
+                    })
+                }
+                VendorSessionNotification::ModelChanged { model_id, reasoning_effort } => {
+                    Some(AgentEvent::ProviderModelChanged { model_id, reasoning_effort })
+                }
+                VendorSessionNotification::Unknown => None,
+            }
+        }
+        "_x.ai/mcp/servers_updated" => {
+            let parsed: VendorMcpServersUpdatedParams =
+                serde_json::from_value(params.clone()).ok()?;
+            Some(AgentEvent::McpServersUpdate {
+                servers: parsed
+                    .mcp_servers
+                    .into_iter()
+                    .map(|entry| McpServerSummary {
+                        name: entry.name,
+                        source: entry.source,
+                        transport: entry.transport,
+                    })
+                    .collect(),
+            })
+        }
+        "_x.ai/mcp/init_progress" => {
+            let parsed: VendorMcpInitProgressParams =
+                serde_json::from_value(params.clone()).ok()?;
+            Some(AgentEvent::McpInitProgress {
+                total: parsed.total,
+                connected: parsed.connected,
+            })
+        }
+        "_x.ai/mcp_initialized" => {
+            let parsed: VendorMcpInitializedParams =
+                serde_json::from_value(params.clone()).ok()?;
+            Some(AgentEvent::McpInitialized {
+                tool_count: parsed.mcp_tool_count,
+                elapsed_ms: parsed.elapsed_ms,
+            })
+        }
+        "_x.ai/announcements/update" => {
+            let parsed: VendorAnnouncementsUpdateParams =
+                serde_json::from_value(params.clone()).ok()?;
+            Some(AgentEvent::AnnouncementsUpdate {
+                announcements: parsed
+                    .announcements
+                    .into_iter()
+                    .map(|a| AnnouncementInfo {
+                        id: a.id,
+                        title: a.title,
+                        message: a.message,
+                        severity: a.severity,
+                    })
+                    .collect(),
+            })
+        }
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
 
@@ -1190,10 +1671,27 @@ mod tests {
 
     #[test]
     fn session_new_params_serialize() {
-        let p = SessionNewParams { cwd: "/home/user".to_string(), mcp_servers: vec![] };
+        let p = SessionNewParams {
+            cwd: "/home/user".to_string(),
+            mcp_servers: vec![],
+            additional_directories: vec![],
+        };
         let s = serde_json::to_string(&p).unwrap();
         assert!(s.contains("\"cwd\""), "must use cwd");
         assert!(s.contains("\"mcpServers\""), "must use mcpServers");
+        assert!(s.contains("\"additionalDirectories\""), "must use additionalDirectories");
+    }
+
+    #[test]
+    fn session_new_params_carries_additional_directories() {
+        let p = SessionNewParams {
+            cwd: "/home/user".to_string(),
+            mcp_servers: vec![],
+            additional_directories: vec!["/home/user/other-repo".to_string()],
+        };
+        let s = serde_json::to_string(&p).unwrap();
+        let decoded: SessionNewParams = serde_json::from_str(&s).unwrap();
+        assert_eq!(decoded.additional_directories, vec!["/home/user/other-repo".to_string()]);
     }
 
     #[test]
@@ -1605,6 +2103,13 @@ mod tests {
 
     #[test]
     fn session_update_config_option_update_parses_select_and_boolean() {
+        // Per-option field names (`type`, `currentValue`, choice `name`)
+        // match the live wire shape verified on `session/new`'s
+        // `configOptions` (claude-agent-acp 0.71.0, codex-acp 1.8.0, Kimi
+        // Code CLI 0.39.1 -- `acp-claude.jsonl`, `acp-codex.jsonl`,
+        // `acp-kimi.jsonl`); the outer `config_option_update` notification
+        // wrapper itself is not exercised by any live capture (none of
+        // them runs a full prompt turn).
         let raw = r#"{"sessionId":"s1","update":{
             "sessionUpdate":"config_option_update",
             "configOptions":[
@@ -1613,18 +2118,18 @@ mod tests {
                     "name":"Model",
                     "description":"Which model to use",
                     "category":"generation",
-                    "kind":"select",
-                    "value":"opus",
+                    "type":"select",
+                    "currentValue":"opus",
                     "options":[
-                        {"value":"opus","label":"Opus"},
-                        {"value":"sonnet","label":"Sonnet"}
+                        {"value":"opus","name":"Opus"},
+                        {"value":"sonnet","name":"Sonnet"}
                     ]
                 },
                 {
                     "id":"extended-thinking",
                     "name":"Extended thinking",
-                    "kind":"boolean",
-                    "value":true
+                    "type":"boolean",
+                    "currentValue":true
                 }
             ]
         }}"#;
@@ -1649,9 +2154,36 @@ mod tests {
 
     #[test]
     fn session_update_config_option_kind_unknown_string_falls_back() {
-        let raw = r#"{"id":"x","name":"X","kind":"not-a-real-kind","value":null}"#;
+        let raw = r#"{"id":"x","name":"X","type":"not-a-real-kind","currentValue":null}"#;
         let option: SessionConfigOption = serde_json::from_str(raw).unwrap();
         assert_eq!(option.kind, ConfigOptionKind::Unknown);
+    }
+
+    #[test]
+    fn session_config_option_reads_the_live_wire_key_names() {
+        // Verbatim shape of one `configOptions` entry from `session/new`'s
+        // result on claude-agent-acp 0.71.0 (`acp-claude.jsonl`) -- the
+        // discriminator is `"type"`, not `"kind"`, and the current
+        // selection is `"currentValue"`, not `"value"`. Before this fix
+        // both fields silently defaulted (`kind` -> `Unknown`, `value` ->
+        // `Value::Null`) on every real agent response.
+        let raw = r#"{
+            "id": "mode",
+            "name": "Mode",
+            "description": "Session permission mode",
+            "category": "mode",
+            "type": "select",
+            "currentValue": "auto",
+            "options": [
+                {"value": "default", "name": "Manual", "description": "Always ask before making changes"},
+                {"value": "auto", "name": "Auto", "description": "Claude handles permission decisions"}
+            ]
+        }"#;
+        let option: SessionConfigOption = serde_json::from_str(raw).unwrap();
+        assert_eq!(option.kind, ConfigOptionKind::Select);
+        assert_eq!(option.value, Value::String("auto".to_owned()));
+        assert_eq!(option.options.len(), 2);
+        assert_eq!(option.options[1].label.as_deref(), Some("Auto"));
     }
 
     #[test]
@@ -1686,7 +2218,7 @@ mod tests {
                 {"name":"review","description":"Review the diff"}
             ],
             "configOptions":[
-                {"id":"model","name":"Model","kind":"select","value":"opus"}
+                {"id":"model","name":"Model","type":"select","currentValue":"opus"}
             ]
         }"#;
         let result: SessionLoadResult = serde_json::from_str(raw).unwrap();
@@ -1697,6 +2229,9 @@ mod tests {
         assert_eq!(result.available_commands.len(), 1);
         assert_eq!(result.config_options.len(), 1);
         assert_eq!(result.config_options[0].id, "model");
+        assert_eq!(result.config_options[0].kind, ConfigOptionKind::Select);
+        assert_eq!(result.config_options[0].value, Value::String("opus".to_owned()));
+        assert!(result.models.available_models.is_empty());
     }
 
     #[test]
@@ -1707,6 +2242,68 @@ mod tests {
         assert!(result.modes.available_modes.is_empty());
         assert!(result.available_commands.is_empty());
         assert!(result.config_options.is_empty());
+        assert!(result.models.current_model_id.is_none());
+        assert!(result.models.available_models.is_empty());
+    }
+
+    #[test]
+    fn session_load_result_parses_the_live_codex_models_field() {
+        // Trimmed to two entries from codex-acp 1.8.0's real `session/new`
+        // result (`acp-codex.jsonl`) -- Codex's model catalog entries
+        // carry no `_meta` at all.
+        let raw = r#"{
+            "sessionId":"01a05e3a-f474-7c53-9e8e-68b60a606d39",
+            "models":{
+                "availableModels":[
+                    {"modelId":"gpt-5.6-sol[low]","name":"GPT-5.6-Sol (low)","description":"Fast responses with lighter reasoning"},
+                    {"modelId":"gpt-5.4-mini[xhigh]","name":"GPT-5.4-Mini (xhigh)","description":"Extra high reasoning depth for complex problems"}
+                ],
+                "currentModelId":"gpt-5.6-sol[ultra]"
+            }
+        }"#;
+        let result: SessionLoadResult = serde_json::from_str(raw).unwrap();
+        assert_eq!(result.models.current_model_id.as_deref(), Some("gpt-5.6-sol[ultra]"));
+        assert_eq!(result.models.available_models.len(), 2);
+        assert_eq!(result.models.available_models[0].model_id, "gpt-5.6-sol[low]");
+        assert!(result.models.available_models[0].meta.is_none());
+    }
+
+    #[test]
+    fn session_load_result_parses_the_live_grok_models_field_with_reasoning_efforts() {
+        // Verbatim from Grok CLI 1.0.13's real `session/new` result
+        // (`acp-grok.jsonl`), trimmed to one model's `_meta` block.
+        let raw = r#"{
+            "sessionId":"01a05e41-1437-7231-9625-5fb30b8a02cd",
+            "models":{
+                "currentModelId":"grok-4.6",
+                "availableModels":[
+                    {
+                        "modelId":"grok-4.6",
+                        "name":"Grok 4.6",
+                        "description":"SpaceXAI's latest frontier model",
+                        "_meta":{
+                            "totalContextTokens":500000,
+                            "agentType":"grok-build-plan",
+                            "supportsReasoningEffort":true,
+                            "reasoningEffort":"high",
+                            "reasoningEfforts":[
+                                {"id":"xhigh","value":"xhigh","label":"Extra High Effort","description":"Highest effort and reasoning level","default":false},
+                                {"id":"high","value":"high","label":"High Effort","description":"Higher implementation quality with extensive reasoning","default":true}
+                            ]
+                        }
+                    }
+                ]
+            }
+        }"#;
+        let result: SessionLoadResult = serde_json::from_str(raw).unwrap();
+        assert_eq!(result.models.current_model_id.as_deref(), Some("grok-4.6"));
+        let model = &result.models.available_models[0];
+        assert_eq!(model.model_id, "grok-4.6");
+        let meta = model.meta.as_ref().expect("grok models carry _meta");
+        assert_eq!(meta.total_context_tokens, Some(500_000));
+        assert_eq!(meta.reasoning_efforts.len(), 2);
+        assert_eq!(meta.reasoning_efforts[1].id, "high");
+        assert!(meta.reasoning_efforts[1].default);
     }
 
     #[test]
@@ -1715,13 +2312,16 @@ mod tests {
             "sessionId":"s1",
             "modes":{"currentModeId":"code","availableModes":[{"id":"code","name":"Code"}]},
             "availableCommands":[{"name":"review","description":"Review the diff"}],
-            "configOptions":[{"id":"model","name":"Model","kind":"select","value":"opus"}]
+            "configOptions":[{"id":"model","name":"Model","type":"select","currentValue":"opus"}],
+            "models":{"currentModelId":"grok-4.6","availableModels":[{"modelId":"grok-4.6","name":"Grok 4.6"}]}
         }"#;
         let result: SessionLoadResult = serde_json::from_str(raw).unwrap();
         let state = SessionState::from_handshake(&result);
         assert_eq!(state.modes.current_mode_id.as_deref(), Some("code"));
         assert_eq!(state.available_commands.len(), 1);
         assert_eq!(state.config_options.len(), 1);
+        assert_eq!(state.models.current_model_id.as_deref(), Some("grok-4.6"));
+        assert_eq!(state.models.available_models.len(), 1);
         assert!(state.title.is_none());
         assert!(state.usage.is_none());
     }
@@ -1747,11 +2347,13 @@ mod tests {
             name: "stale".to_owned(),
             description: String::new(),
             input: None,
+            extra: HashMap::new(),
         });
         let fresh = vec![AvailableCommand {
             name: "review".to_owned(),
             description: "Review the diff".to_owned(),
             input: None,
+            extra: HashMap::new(),
         }];
         apply_session_update(
             &mut state,
@@ -1866,5 +2468,378 @@ mod tests {
         assert!(s.contains("\"sessionId\":\"s1\""));
         assert!(s.contains("\"optionId\":\"model\""));
         assert!(s.contains("\"value\":\"sonnet\""));
+    }
+
+    // -----------------------------------------------------------------------
+    // sessionCapabilities — verified live against the initialize response
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn session_capabilities_parses_the_live_claude_and_codex_shape() {
+        // Verbatim `agentCapabilities.sessionCapabilities` from
+        // claude-agent-acp 0.71.0 and codex-acp 1.8.0 (`acp-claude.jsonl`,
+        // `acp-codex.jsonl`): all seven keys present, including `subagents`.
+        let raw = r#"{
+            "additionalDirectories": {},
+            "close": {},
+            "delete": {},
+            "fork": {},
+            "list": {},
+            "resume": {},
+            "subagents": {}
+        }"#;
+        let caps: SessionCapabilities = serde_json::from_str(raw).unwrap();
+        assert!(caps.list.is_some());
+        assert!(caps.resume.is_some());
+        assert!(caps.close.is_some());
+        assert!(caps.delete.is_some());
+        assert!(caps.fork.is_some());
+        assert!(caps.additional_directories.is_some());
+        assert!(caps.subagents.is_some());
+    }
+
+    #[test]
+    fn session_capabilities_parses_the_live_kimi_shape_without_subagents() {
+        // Verbatim from Kimi Code CLI 0.39.1 (`acp-kimi.jsonl`): six keys,
+        // no `subagents`.
+        let raw = r#"{
+            "list": {},
+            "resume": {},
+            "close": {},
+            "delete": {},
+            "fork": {},
+            "additionalDirectories": {}
+        }"#;
+        let caps: SessionCapabilities = serde_json::from_str(raw).unwrap();
+        assert!(caps.fork.is_some());
+        assert!(caps.subagents.is_none());
+    }
+
+    #[test]
+    fn session_capabilities_parses_the_live_grok_shape_with_only_three_keys() {
+        // Verbatim from Grok CLI 1.0.13 (`acp-grok.jsonl`): only
+        // `list`/`resume`/`close` -- no `delete`, `fork`,
+        // `additionalDirectories`, or `subagents`.
+        let raw = r#"{"list": {}, "resume": {}, "close": {}}"#;
+        let caps: SessionCapabilities = serde_json::from_str(raw).unwrap();
+        assert!(caps.list.is_some());
+        assert!(caps.resume.is_some());
+        assert!(caps.close.is_some());
+        assert!(caps.delete.is_none());
+        assert!(caps.fork.is_none());
+        assert!(caps.additional_directories.is_none());
+        assert!(caps.subagents.is_none());
+    }
+
+    #[test]
+    fn agent_capability_flags_parses_session_capabilities_nested_under_the_live_key() {
+        let raw = r#"{
+            "loadSession": true,
+            "sessionCapabilities": {"list": {}, "resume": {}, "close": {}, "subagents": {}}
+        }"#;
+        let flags: AgentCapabilityFlags = serde_json::from_str(raw).unwrap();
+        assert!(flags.load_session);
+        assert!(flags.session_capabilities.list.is_some());
+        assert!(flags.session_capabilities.subagents.is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // session/list, session/close, session/delete, session/fork — outbound
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn session_list_params_serialize_as_an_empty_object() {
+        let s = serde_json::to_string(&SessionListParams::default()).unwrap();
+        assert_eq!(s, "{}");
+    }
+
+    #[test]
+    fn session_list_result_parses_sessions() {
+        let raw = r#"{"sessions":[{"sessionId":"s1","title":"Fix the parser","cwd":"/repo"}]}"#;
+        let result: SessionListResult = serde_json::from_str(raw).unwrap();
+        assert_eq!(result.sessions.len(), 1);
+        assert_eq!(result.sessions[0].session_id, "s1");
+        assert_eq!(result.sessions[0].title.as_deref(), Some("Fix the parser"));
+    }
+
+    #[test]
+    fn session_close_params_serialize() {
+        let params = SessionCloseParams { session_id: "s1".to_owned() };
+        let s = serde_json::to_string(&params).unwrap();
+        assert_eq!(s, r#"{"sessionId":"s1"}"#);
+    }
+
+    #[test]
+    fn session_delete_params_serialize() {
+        let params = SessionDeleteParams { session_id: "s1".to_owned() };
+        let s = serde_json::to_string(&params).unwrap();
+        assert_eq!(s, r#"{"sessionId":"s1"}"#);
+    }
+
+    #[test]
+    fn session_fork_params_serialize() {
+        let params = SessionForkParams { session_id: "s1".to_owned() };
+        let s = serde_json::to_string(&params).unwrap();
+        assert_eq!(s, r#"{"sessionId":"s1"}"#);
+    }
+
+    // -----------------------------------------------------------------------
+    // Grok vendor `_x.ai/*` extensions — parsed from verbatim capture JSON
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_vendor_notification_models_update_updates_state_and_emits_event() {
+        // Verbatim `_x.ai/models/update` params from Grok CLI 1.0.13
+        // (`acp-grok.jsonl`), trimmed to one model.
+        let raw = serde_json::from_str::<Value>(
+            r#"{
+                "currentModelId": "grok-4.6",
+                "availableModels": [
+                    {
+                        "modelId": "grok-4.6",
+                        "name": "Grok 4.6",
+                        "description": "SpaceXAI's latest frontier model",
+                        "_meta": {
+                            "totalContextTokens": 500000,
+                            "supportsReasoningEffort": true,
+                            "reasoningEffort": "high",
+                            "reasoningEfforts": [
+                                {"id": "high", "value": "high", "label": "High Effort", "description": "Higher implementation quality with extensive reasoning", "default": true}
+                            ]
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+        let mut state = SessionState::default();
+        let event = parse_vendor_notification(&mut state, "_x.ai/models/update", &raw)
+            .expect("must parse the live models/update shape");
+        assert_eq!(state.models.current_model_id.as_deref(), Some("grok-4.6"));
+        assert_eq!(state.models.available_models.len(), 1);
+        match event {
+            AgentEvent::ModelsUpdate { current_model_id, available_models } => {
+                assert_eq!(current_model_id.as_deref(), Some("grok-4.6"));
+                assert_eq!(available_models.len(), 1);
+                assert_eq!(available_models[0].model_id, "grok-4.6");
+                assert_eq!(available_models[0].context_tokens, Some(500_000));
+                assert_eq!(available_models[0].reasoning_efforts.len(), 1);
+                assert_eq!(available_models[0].reasoning_efforts[0].id, "high");
+            }
+            other => panic!("expected AgentEvent::ModelsUpdate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_vendor_notification_settings_update_pulls_permission_fields() {
+        // Trimmed from Grok CLI 1.0.13's real `_x.ai/settings/update`
+        // (`acp-grok.jsonl`) -- the live capture itself has both fields
+        // `null`; exercised here with concrete values to prove the
+        // extraction path, since `raw` still carries the full payload
+        // either way.
+        let raw = json!({
+            "show_resolved_model": false,
+            "permission_mode": "auto",
+            "auto_permission_mode_enabled": true,
+            "subscription_tier_display": "SuperGrok Plus"
+        });
+        let mut state = SessionState::default();
+        let event = parse_vendor_notification(&mut state, "_x.ai/settings/update", &raw)
+            .expect("must parse settings/update");
+        match event {
+            AgentEvent::SettingsUpdate { permission_mode, auto_permission_mode_enabled, raw: echoed } => {
+                assert_eq!(permission_mode.as_deref(), Some("auto"));
+                assert_eq!(auto_permission_mode_enabled, Some(true));
+                assert_eq!(echoed, raw, "raw must carry the full payload verbatim");
+            }
+            other => panic!("expected AgentEvent::SettingsUpdate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_vendor_notification_settings_update_tolerates_null_permission_fields() {
+        // Verbatim from `acp-grok.jsonl`: both fields are actually `null`
+        // on the wire in this capture.
+        let raw = json!({"permission_mode": null, "auto_permission_mode_enabled": null});
+        let mut state = SessionState::default();
+        let event = parse_vendor_notification(&mut state, "_x.ai/settings/update", &raw).unwrap();
+        assert!(matches!(
+            event,
+            AgentEvent::SettingsUpdate { permission_mode: None, auto_permission_mode_enabled: None, .. }
+        ));
+    }
+
+    #[test]
+    fn parse_vendor_notification_session_notification_hook_execution() {
+        // Verbatim `_x.ai/session_notification` params from Grok CLI
+        // 1.0.13 (`acp-grok.jsonl`), including the mangled-encoding error
+        // text from a failed hook exactly as captured.
+        let raw = serde_json::from_str::<Value>(
+            r#"{
+                "sessionId": "01a05e41-1437-7231-9625-5fb30b8a02cd",
+                "update": {
+                    "sessionUpdate": "hook_execution",
+                    "event_name": "session_start",
+                    "runs": [
+                        {"name": "global/gate4agent-status:session_start[0].hooks[0]", "status": {"status": "success", "elapsed_ms": 539}},
+                        {"name": "global/settings:session_start[0].hooks[0]", "status": {"status": "failed", "error": "exit code 1", "elapsed_ms": 701}},
+                        {"name": "global/settings:session_start[1].hooks[0]", "status": {"status": "success", "elapsed_ms": 548}}
+                    ]
+                }
+            }"#,
+        )
+        .unwrap();
+        let mut state = SessionState::default();
+        let event = parse_vendor_notification(&mut state, "_x.ai/session_notification", &raw)
+            .expect("must parse hook_execution");
+        match event {
+            AgentEvent::HookExecutionUpdate { event_name, runs } => {
+                assert_eq!(event_name, "session_start");
+                assert_eq!(runs.len(), 3);
+                assert_eq!(runs[0].status, "success");
+                assert_eq!(runs[0].elapsed_ms, Some(539));
+                assert_eq!(runs[1].status, "failed");
+                assert_eq!(runs[1].error.as_deref(), Some("exit code 1"));
+            }
+            other => panic!("expected AgentEvent::HookExecutionUpdate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_vendor_notification_session_notification_model_changed() {
+        // Verbatim from Grok CLI 1.0.13 (`acp-grok.jsonl`).
+        let raw = json!({
+            "sessionId": "01a05e41-1437-7231-9625-5fb30b8a02cd",
+            "update": {"sessionUpdate": "model_changed", "model_id": "grok-4.6", "reasoning_effort": "high"}
+        });
+        let mut state = SessionState::default();
+        let event = parse_vendor_notification(&mut state, "_x.ai/session_notification", &raw)
+            .expect("must parse model_changed");
+        match event {
+            AgentEvent::ProviderModelChanged { model_id, reasoning_effort } => {
+                assert_eq!(model_id, "grok-4.6");
+                assert_eq!(reasoning_effort.as_deref(), Some("high"));
+            }
+            other => panic!("expected AgentEvent::ProviderModelChanged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_vendor_notification_mcp_servers_updated() {
+        // Verbatim from Grok CLI 1.0.13 (`acp-grok.jsonl`).
+        let raw = json!({
+            "mcpServers": [
+                {"name": "Puppeteer", "source": "local", "type": "stdio", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-puppeteer"]}
+            ]
+        });
+        let mut state = SessionState::default();
+        let event = parse_vendor_notification(&mut state, "_x.ai/mcp/servers_updated", &raw)
+            .expect("must parse mcp/servers_updated");
+        match event {
+            AgentEvent::McpServersUpdate { servers } => {
+                assert_eq!(servers.len(), 1);
+                assert_eq!(servers[0].name, "Puppeteer");
+                assert_eq!(servers[0].transport, "stdio");
+            }
+            other => panic!("expected AgentEvent::McpServersUpdate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_vendor_notification_mcp_init_progress() {
+        // Verbatim from Grok CLI 1.0.13 (`acp-grok.jsonl`).
+        let raw = json!({"total": 1, "connected": 0, "sessionId": "01a05e41-1437-7231-9625-5fb30b8a02cd"});
+        let mut state = SessionState::default();
+        let event = parse_vendor_notification(&mut state, "_x.ai/mcp/init_progress", &raw).unwrap();
+        assert!(matches!(event, AgentEvent::McpInitProgress { total: 1, connected: 0 }));
+    }
+
+    #[test]
+    fn parse_vendor_notification_mcp_initialized() {
+        // Verbatim from Grok CLI 1.0.13 (`acp-grok.jsonl`).
+        let raw = json!({
+            "sessionId": "01a05e41-1437-7231-9625-5fb30b8a02cd",
+            "mcpToolCount": 7,
+            "elapsedMs": 3887
+        });
+        let mut state = SessionState::default();
+        let event = parse_vendor_notification(&mut state, "_x.ai/mcp_initialized", &raw).unwrap();
+        assert!(matches!(
+            event,
+            AgentEvent::McpInitialized { tool_count: 7, elapsed_ms: 3887 }
+        ));
+    }
+
+    #[test]
+    fn parse_vendor_notification_announcements_update() {
+        // Verbatim from Grok CLI 1.0.13 (`acp-grok.jsonl`).
+        let raw = json!({
+            "gen": 1788287666i64,
+            "announcements": [
+                {"id": "team", "message": "Select 'Grok 4.6' under /model.", "severity": "info", "title": "Grok 4.6 is here!", "cta": null, "updated_at": null, "expires_at": null, "dismissible": null, "persistent": null}
+            ]
+        });
+        let mut state = SessionState::default();
+        let event = parse_vendor_notification(&mut state, "_x.ai/announcements/update", &raw)
+            .expect("must parse announcements/update");
+        match event {
+            AgentEvent::AnnouncementsUpdate { announcements } => {
+                assert_eq!(announcements.len(), 1);
+                assert_eq!(announcements[0].id, "team");
+                assert_eq!(announcements[0].title.as_deref(), Some("Grok 4.6 is here!"));
+                assert_eq!(announcements[0].severity.as_deref(), Some("info"));
+            }
+            other => panic!("expected AgentEvent::AnnouncementsUpdate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_vendor_notification_unknown_x_ai_method_returns_none() {
+        // An `_x.ai/*` method this build has never seen must not break
+        // parsing -- the reader loop falls back to the generic
+        // `RpcNotification` passthrough for it.
+        let mut state = SessionState::default();
+        let event = parse_vendor_notification(&mut state, "_x.ai/some_future_method", &json!({}));
+        assert!(event.is_none());
+    }
+
+    #[test]
+    fn parse_vendor_notification_unrelated_namespace_returns_none() {
+        // A notification method entirely outside `_x.ai/` -- e.g. another
+        // vendor's own future extension -- must likewise fall through.
+        let mut state = SessionState::default();
+        let event = parse_vendor_notification(&mut state, "_some.other.vendor/thing", &json!({}));
+        assert!(event.is_none());
+    }
+
+    #[test]
+    fn parse_vendor_notification_malformed_x_ai_payload_returns_none() {
+        // A recognized `_x.ai/*` method with a payload that fails to
+        // parse against its known shape must fall through to the generic
+        // passthrough rather than panicking or fabricating an event.
+        let mut state = SessionState::default();
+        let event = parse_vendor_notification(&mut state, "_x.ai/mcp_initialized", &json!("not an object"));
+        assert!(event.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // available_commands_update — `_meta` sidecar data is preserved
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn available_command_keeps_meta_sidecar_data_in_extra() {
+        // Trimmed from codex-acp 1.8.0's real `available_commands_update`
+        // (`acp-codex.jsonl`) -- the `/plan` command's `_meta.
+        // commandAction` wiring.
+        let raw = r#"{
+            "name": "plan",
+            "description": "Turn plan mode on.",
+            "input": null,
+            "_meta": {"commandAction": {"kind": "setConfigOption", "configId": "collaboration_mode", "value": "plan"}}
+        }"#;
+        let command: AvailableCommand = serde_json::from_str(raw).unwrap();
+        assert_eq!(command.name, "plan");
+        assert!(command.input.is_none());
+        assert!(command.extra.contains_key("_meta"));
     }
 }

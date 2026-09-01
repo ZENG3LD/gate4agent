@@ -3,7 +3,9 @@
 pub use gate4agent_types::{
     AdapterFamily, AdapterId, AgentId, HistoryCandidateSummary, NativeSessionCatalogScope,
     NativeSessionCatalogSummary, NativeSessionCatalogWindow, NativeSessionExternalGroup,
-    NativeSessionExternalGroupKind, SessionRecordPreview, HISTORY_DISCOVERY_LIMIT_MAX,
+    NativeSessionExternalGroupKind, ProviderConfigChoice, ProviderConfigOption,
+    ProviderConfigOptionKind, ProviderInteractionKind, ProviderInteractionResponse,
+    SessionRecordPreview, HISTORY_DISCOVERY_LIMIT_MAX,
     NATIVE_SESSION_CATALOG_LIMIT_MAX,
     NATIVE_SESSION_PREVIEW_MESSAGE_LIMIT_MAX,
 };
@@ -54,6 +56,16 @@ pub const NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY: &str = "provider-contract-
 pub const NODE_PROVIDER_RUNTIME_STATUS_CAPABILITY: &str = "provider-runtime-status-v1";
 pub const NODE_PROVIDER_ID_OPEN_CAPABILITY: &str = "provider-id.open-v1";
 pub const NODE_TERMINAL_FRAME_EVENTS_CAPABILITY: &str = "terminal-frame-events-v1";
+/// The outbound content stream -- `NodeEvent::AgentStream` -- mirroring
+/// `NODE_TERMINAL_FRAME_EVENTS_CAPABILITY`'s own subscription/type split
+/// rather than folding content into `ObservationV1`
+/// (`docs/gate4agent/plans/gate4agent-acp-control-plane-on-the-wire-2026-09-02.md`
+/// §3-4).
+pub const NODE_AGENT_STREAM_EVENTS_CAPABILITY: &str = "agent-stream-events-v1";
+/// The inbound ACP control verbs -- `ResolveInteraction`, `SetSessionMode`,
+/// `SetSessionConfigOption`, `SetSessionModel` -- that answer what
+/// `NODE_AGENT_STREAM_EVENTS_CAPABILITY` reports (same plan, §5).
+pub const NODE_ACP_CONTROL_CAPABILITY: &str = "acp-control-v1";
 pub const NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY: &str =
     "spawn-spec.defaults-overrides-v1";
 pub const NODE_SPAWN_PROFILE_REVISION_CAPABILITY: &str =
@@ -166,6 +178,30 @@ pub const NODE_AUTH_PROOF_BYTES: usize = 32;
 pub const MAX_CONTROLLER_LEASE_MS: u64 = 60_000;
 pub const MIN_CONTROLLER_LEASE_MS: u64 = 1_000;
 pub const DEFAULT_CONTROLLER_LEASE_MS: u64 = 15_000;
+/// Mirrors `gate4agent_types::PROVIDER_EVENT_ID_MAX_BYTES` -- the ACP
+/// control verbs' `mode_id`/`option_id`/`model_id` and the agent stream's
+/// `tool_name`/catalog id fields round-trip provider-minted ids through
+/// the same bound the provider event stream already validates them
+/// against.
+pub const MAX_ACP_CONTROL_ID_BYTES: usize = gate4agent_types::PROVIDER_EVENT_ID_MAX_BYTES;
+/// Mirrors `gate4agent_types::PROVIDER_EVENT_TEXT_MAX_BYTES` -- free text
+/// carried on the agent content stream (`Text`, `Thinking`, interaction
+/// `prompt`/`title`, config `value_json`) and `SetSessionConfigOption`'s
+/// `value_json`.
+pub const MAX_ACP_CONTROL_TEXT_BYTES: usize = gate4agent_types::PROVIDER_EVENT_TEXT_MAX_BYTES;
+/// Mirrors `gate4agent_observation_protocol::OBSERVATION_LABEL_MAX_BYTES`
+/// -- `ResolveInteraction.correlation_id` answers the exact correlation id
+/// `ObservationKindV1::ApprovalRequested`/`QuestionRequested` mints at that
+/// bound.
+pub const MAX_ACP_CORRELATION_ID_BYTES: usize =
+    gate4agent_observation_protocol::OBSERVATION_LABEL_MAX_BYTES;
+/// Mirrors `gate4agent_types::PROVIDER_CONFIG_OPTION_CHOICES_MAX` -- the
+/// option list on one `InteractionPrompt` chunk.
+pub const MAX_ACP_INTERACTION_OPTIONS: usize =
+    gate4agent_types::PROVIDER_CONFIG_OPTION_CHOICES_MAX;
+/// Mirrors `gate4agent_types::PROVIDER_CONFIG_OPTIONS_MAX` -- the catalog
+/// list on `ModeCatalog`/`ModelCatalog`/`ConfigOptions` chunks.
+pub const MAX_ACP_CATALOG_ENTRIES: usize = gate4agent_types::PROVIDER_CONFIG_OPTIONS_MAX;
 
 pub fn provider_id_is_legacy(provider: &AgentId) -> bool {
     NODE_LEGACY_PROVIDER_IDS.contains(&provider.as_str())
@@ -3477,6 +3513,8 @@ pub fn production_node_client_compatibility_offer() -> ClientCompatibilityOffer 
             NODE_SPAWN_PROFILE_REVISION_CAPABILITY,
             NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY,
             NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
+            NODE_AGENT_STREAM_EVENTS_CAPABILITY,
+            NODE_ACP_CONTROL_CAPABILITY,
             NODE_WORKSPACE_FILE_READ_CAPABILITY,
             NODE_WORKSPACE_FILE_WRITE_CAPABILITY,
             NODE_WORKSPACE_ENTRY_CREATE_CAPABILITY,
@@ -5689,6 +5727,34 @@ pub enum NodeRequest {
     Interrupt { session: SessionAddress },
     Stop { session: SessionAddress, force: bool },
     Remove { session: SessionAddress },
+    /// Answers the `correlation_id` `ObservationKindV1::ApprovalRequested`/
+    /// `QuestionRequested` already minted onto the observation stream.
+    /// `response` must additionally match the interaction's own kind
+    /// (`ProviderInteractionResponse::validate_for`); that check needs the
+    /// live interaction and is the routing layer's job, not this wire's.
+    ResolveInteraction {
+        session: SessionAddress,
+        #[serde(deserialize_with = "deserialize_acp_correlation_id")]
+        correlation_id: String,
+        response: ProviderInteractionResponse,
+    },
+    SetSessionMode {
+        session: SessionAddress,
+        #[serde(deserialize_with = "deserialize_acp_control_id")]
+        mode_id: String,
+    },
+    SetSessionConfigOption {
+        session: SessionAddress,
+        #[serde(deserialize_with = "deserialize_acp_control_id")]
+        option_id: String,
+        #[serde(deserialize_with = "deserialize_acp_config_value_json")]
+        value_json: String,
+    },
+    SetSessionModel {
+        session: SessionAddress,
+        #[serde(deserialize_with = "deserialize_acp_control_id")]
+        model_id: String,
+    },
     Shutdown,
 }
 
@@ -5733,6 +5799,77 @@ where
         }
     }
     Ok(branch)
+}
+
+/// A control character outside the three ACP content is allowed to carry
+/// verbatim (`\n`, `\r`, `\t`) -- mirrors
+/// `gate4agent_types::control::validate_text`'s own allowance so free text
+/// round-tripped through `AgentStreamChunkV1` and `SetSessionConfigOption`
+/// validates against the same rule the provider event stream already
+/// applies to it.
+fn contains_unsafe_control_bytes(value: &str) -> bool {
+    value
+        .chars()
+        .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+}
+
+fn deserialize_acp_correlation_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.is_empty()
+        || value.len() > MAX_ACP_CORRELATION_ID_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return Err(serde::de::Error::custom(
+            "interaction correlation id must be non-empty, bounded, and free of control characters",
+        ));
+    }
+    Ok(value)
+}
+
+fn deserialize_acp_control_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.is_empty()
+        || value.len() > MAX_ACP_CONTROL_ID_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return Err(serde::de::Error::custom(
+            "acp control id must be non-empty, bounded, and free of control characters",
+        ));
+    }
+    Ok(value)
+}
+
+fn deserialize_acp_config_value_json<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.is_empty()
+        || value.len() > MAX_ACP_CONTROL_TEXT_BYTES
+        || contains_unsafe_control_bytes(&value)
+    {
+        return Err(serde::de::Error::custom(
+            "acp config option value must be non-empty, bounded, and free of unsafe control characters",
+        ));
+    }
+    // The field is named `value_json` and its only consumer parses it into a
+    // `serde_json::Value` to hand to `session/set_config_option`. A string
+    // that is merely bounded and printable would cross this wire intact and
+    // fail deep inside the node, one process and several layers away from the
+    // sender that could have said what was wrong with it. Refuse it here,
+    // where the offending input is still in hand.
+    if let Err(error) = serde_json::from_str::<serde_json::Value>(&value) {
+        return Err(serde::de::Error::custom(format!(
+            "acp config option value must be valid JSON: {error}"
+        )));
+    }
+    Ok(value)
 }
 
 impl NodeRequest {
@@ -5853,6 +5990,10 @@ impl NodeRequest {
             | Self::Interrupt { .. }
             | Self::Stop { .. }
             | Self::Remove { .. }
+            | Self::ResolveInteraction { .. }
+            | Self::SetSessionMode { .. }
+            | Self::SetSessionConfigOption { .. }
+            | Self::SetSessionModel { .. }
             | Self::Shutdown => true,
         }
     }
@@ -5914,6 +6055,10 @@ impl NodeRequest {
             | Self::ResolveDurableContextPack { .. } => {
                 Some(NODE_HISTORY_CONTEXT_PACK_CAPABILITY)
             }
+            Self::ResolveInteraction { .. }
+            | Self::SetSessionMode { .. }
+            | Self::SetSessionConfigOption { .. }
+            | Self::SetSessionModel { .. } => Some(NODE_ACP_CONTROL_CAPABILITY),
             Self::Snapshot
             | Self::Resync { .. }
             | Self::InspectWorkspace { .. }
@@ -6646,6 +6791,244 @@ pub enum NodeFailureCode {
     ShuttingDown,
 }
 
+/// One named catalog entry -- a selectable session mode or model on the
+/// `ModeCatalog`/`ModelCatalog` chunk kinds. `id` is what
+/// `SetSessionMode`/`SetSessionModel` take back.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentStreamNamedIdV1 {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+}
+
+/// One selectable answer to an `InteractionPrompt` chunk -- an ACP
+/// permission option, named by the provider rather than invented here.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentStreamInteractionOptionV1 {
+    pub option_id: String,
+    pub name: String,
+    pub kind: String,
+}
+
+/// The kind of a single `AgentStreamChunkV1` -- content the operator needs
+/// to act on a running ACP session: what the agent is saying, a pending
+/// interaction it needs answered, and the catalogs the three ACP setter
+/// verbs (`SetSessionMode`, `SetSessionConfigOption`, `SetSessionModel`)
+/// operate over. Mirrors `gate4agent_types::ProviderEvent`'s content
+/// variants deliberately, in contrast to the collapsed `ObservationKindV1`
+/// telemetry stream, which carries none of it -- see
+/// `docs/gate4agent/plans/gate4agent-acp-control-plane-on-the-wire-2026-09-02.md`
+/// §3-4.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum AgentStreamChunkKindV1 {
+    Text { text: String, is_delta: bool },
+    Thinking { text: String },
+    /// The same `correlation_id` `ObservationKindV1::ApprovalRequested`/
+    /// `QuestionRequested` already minted, plus the question and option
+    /// list `NodeRequest::ResolveInteraction` answers blind without.
+    InteractionPrompt {
+        correlation_id: String,
+        interaction_kind: ProviderInteractionKind,
+        tool_name: String,
+        title: Option<String>,
+        prompt: String,
+        options: Vec<AgentStreamInteractionOptionV1>,
+    },
+    ModeCatalog {
+        current: Option<String>,
+        available: Vec<AgentStreamNamedIdV1>,
+    },
+    /// Mirrors `gate4agent_types::ProviderConfigOption` verbatim rather
+    /// than inventing a second shape for the same content.
+    ConfigOptions { options: Vec<ProviderConfigOption> },
+    ModelCatalog {
+        current: Option<String>,
+        available: Vec<AgentStreamNamedIdV1>,
+    },
+}
+
+impl AgentStreamChunkKindV1 {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        match self {
+            Self::Text { text, .. } | Self::Thinking { text } => {
+                if text.len() > MAX_ACP_CONTROL_TEXT_BYTES || contains_unsafe_control_bytes(text) {
+                    return Err("agent stream text chunk is invalid");
+                }
+                Ok(())
+            }
+            Self::InteractionPrompt {
+                correlation_id,
+                tool_name,
+                title,
+                prompt,
+                options,
+                ..
+            } => {
+                if correlation_id.is_empty()
+                    || correlation_id.len() > MAX_ACP_CORRELATION_ID_BYTES
+                    || correlation_id.chars().any(char::is_control)
+                {
+                    return Err("agent stream interaction prompt correlation id is invalid");
+                }
+                if tool_name.is_empty()
+                    || tool_name.len() > MAX_ACP_CONTROL_ID_BYTES
+                    || tool_name.chars().any(char::is_control)
+                {
+                    return Err("agent stream interaction prompt tool name is invalid");
+                }
+                if let Some(title) = title {
+                    if title.len() > MAX_ACP_CONTROL_TEXT_BYTES
+                        || contains_unsafe_control_bytes(title)
+                    {
+                        return Err("agent stream interaction prompt title is invalid");
+                    }
+                }
+                if prompt.len() > MAX_ACP_CONTROL_TEXT_BYTES || contains_unsafe_control_bytes(prompt)
+                {
+                    return Err("agent stream interaction prompt text is invalid");
+                }
+                if options.len() > MAX_ACP_INTERACTION_OPTIONS {
+                    return Err("agent stream interaction prompt has too many options");
+                }
+                for option in options {
+                    if option.option_id.is_empty()
+                        || option.option_id.len() > MAX_ACP_CONTROL_ID_BYTES
+                        || option.option_id.chars().any(char::is_control)
+                    {
+                        return Err("agent stream interaction prompt option id is invalid");
+                    }
+                    if option.name.is_empty()
+                        || option.name.len() > MAX_ACP_CONTROL_ID_BYTES
+                        || option.name.chars().any(char::is_control)
+                    {
+                        return Err("agent stream interaction prompt option name is invalid");
+                    }
+                    if option.kind.is_empty()
+                        || option.kind.len() > MAX_ACP_CONTROL_ID_BYTES
+                        || option.kind.chars().any(char::is_control)
+                    {
+                        return Err("agent stream interaction prompt option kind is invalid");
+                    }
+                }
+                Ok(())
+            }
+            Self::ModeCatalog { current, available } | Self::ModelCatalog { current, available } => {
+                if let Some(current) = current {
+                    if current.is_empty()
+                        || current.len() > MAX_ACP_CONTROL_ID_BYTES
+                        || current.chars().any(char::is_control)
+                    {
+                        return Err("agent stream catalog current id is invalid");
+                    }
+                }
+                if available.len() > MAX_ACP_CATALOG_ENTRIES {
+                    return Err("agent stream catalog has too many entries");
+                }
+                for entry in available {
+                    if entry.id.is_empty()
+                        || entry.id.len() > MAX_ACP_CONTROL_ID_BYTES
+                        || entry.id.chars().any(char::is_control)
+                    {
+                        return Err("agent stream catalog entry id is invalid");
+                    }
+                    if entry.name.is_empty()
+                        || entry.name.len() > MAX_ACP_CONTROL_ID_BYTES
+                        || entry.name.chars().any(char::is_control)
+                    {
+                        return Err("agent stream catalog entry name is invalid");
+                    }
+                    if let Some(description) = &entry.description {
+                        if description.len() > MAX_ACP_CONTROL_TEXT_BYTES
+                            || contains_unsafe_control_bytes(description)
+                        {
+                            return Err("agent stream catalog entry description is invalid");
+                        }
+                    }
+                }
+                Ok(())
+            }
+            Self::ConfigOptions { options } => {
+                if options.len() > MAX_ACP_CATALOG_ENTRIES {
+                    return Err("agent stream config options exceed the catalog entry limit");
+                }
+                for option in options {
+                    if option.id.is_empty()
+                        || option.id.len() > MAX_ACP_CONTROL_ID_BYTES
+                        || option.id.chars().any(char::is_control)
+                    {
+                        return Err("agent stream config option id is invalid");
+                    }
+                    if option.name.is_empty()
+                        || option.name.len() > MAX_ACP_CONTROL_ID_BYTES
+                        || option.name.chars().any(char::is_control)
+                    {
+                        return Err("agent stream config option name is invalid");
+                    }
+                    if let Some(description) = &option.description {
+                        if description.len() > MAX_ACP_CONTROL_TEXT_BYTES
+                            || contains_unsafe_control_bytes(description)
+                        {
+                            return Err("agent stream config option description is invalid");
+                        }
+                    }
+                    if let Some(category) = &option.category {
+                        if category.len() > MAX_ACP_CONTROL_ID_BYTES
+                            || category.chars().any(char::is_control)
+                        {
+                            return Err("agent stream config option category is invalid");
+                        }
+                    }
+                    if option.value_json.len() > MAX_ACP_CONTROL_TEXT_BYTES
+                        || contains_unsafe_control_bytes(&option.value_json)
+                    {
+                        return Err("agent stream config option value is invalid");
+                    }
+                    if option.choices.len() > MAX_ACP_INTERACTION_OPTIONS {
+                        return Err("agent stream config option has too many choices");
+                    }
+                    for choice in &option.choices {
+                        if choice.value_json.len() > MAX_ACP_CONTROL_TEXT_BYTES
+                            || contains_unsafe_control_bytes(&choice.value_json)
+                        {
+                            return Err("agent stream config option choice value is invalid");
+                        }
+                        if let Some(label) = &choice.label {
+                            if label.len() > MAX_ACP_CONTROL_TEXT_BYTES
+                                || contains_unsafe_control_bytes(label)
+                            {
+                                return Err("agent stream config option choice label is invalid");
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// One chunk of the outbound agent content stream -- the
+/// `agent-stream-events-v1` capability's push channel, mirroring
+/// `NodeEvent::TerminalFrame` exactly: its own subscription, its own type,
+/// no `ObservationV1` resync promise (`harness-api/src/lib.rs:2897-2905`).
+/// `source_sequence` orders chunks within one provider source the way
+/// `ObservationV1::source_sequence` orders observations.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentStreamChunkV1 {
+    pub source_sequence: u64,
+    pub kind: AgentStreamChunkKindV1,
+}
+
+impl AgentStreamChunkV1 {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        self.kind.validate()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct NodeEventEnvelope {
     pub sequence: u64,
@@ -6668,6 +7051,7 @@ pub enum NodeEvent {
     Observation { address: SessionAddress, observation: ObservationV1 },
     ManagedObservation { record_id: SessionRecordId, observation: ObservationV1 },
     TerminalFrame { address: SessionAddress, frame: TerminalFrame },
+    AgentStream { address: SessionAddress, chunk: AgentStreamChunkV1 },
     ControllerChanged { controller: Option<ControllerState> },
     WorkspaceAdded { workspace: WorkspaceSnapshot },
     WorkspaceRemoved { workspace_id: WorkspaceId },

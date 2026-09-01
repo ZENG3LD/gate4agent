@@ -35,11 +35,6 @@ pub struct LaunchRequest {
     pub env: Vec<EnvMutation>,
     pub platform: RuntimePlatform,
     pub session_options: Option<SessionOptionSelection>,
-    /// Approval-level axis for this launch -- see `ApprovalLevel` and
-    /// `approval_level_args`. Defaults to `ApprovalLevel::FullAuto`, the
-    /// owner's decision: restricting is opt-in, not asking a human is the
-    /// norm.
-    pub approval_level: ApprovalLevel,
 }
 
 impl fmt::Debug for LaunchRequest {
@@ -52,7 +47,6 @@ impl fmt::Debug for LaunchRequest {
             .field("env", &self.env)
             .field("platform", &self.platform)
             .field("has_session_options", &self.session_options.is_some())
-            .field("approval_level", &self.approval_level)
             .finish()
     }
 }
@@ -66,7 +60,6 @@ impl Default for LaunchRequest {
             env: Vec::new(),
             platform: RuntimePlatform::current(),
             session_options: None,
-            approval_level: ApprovalLevel::default(),
         }
     }
 }
@@ -80,7 +73,14 @@ impl Default for LaunchRequest {
 /// `codex`) or from a third-party harness's observed invocation (`grok`,
 /// `kimi` -- see `ORCA_REFERENCE_REVISION`). Where a provider has no verified
 /// flag for a level, this returns an empty `Vec` -- the same as
-/// `ApprovalLevel::Unmanaged` -- rather than inventing one:
+/// `ApprovalLevel::Unmanaged` -- rather than inventing one.
+///
+/// `plan_launch` (the PTY launch planner in this module) never calls this: a
+/// PTY is opened by a human, who picks their own agent's permission flags,
+/// so this crate does not impose one. The one caller that does apply this
+/// table is the ACP transport (`gate4agent`'s `src/acp`), which this project
+/// opens programmatically with no human at the keyboard to make that choice
+/// instead.
 ///
 /// - `grok` and `kimi` have exactly one verified flag each, for
 ///   `ApprovalLevel::FullAuto`. `Moderate` and `ReadOnly` both fall back to
@@ -208,24 +208,6 @@ pub fn plan_launch(
     let mut args: Vec<OsString> = spec.launch.fixed_args.iter().map(OsString::from).collect();
     if let Some(resolved) = &resolved_session_options {
         args.extend(resolved.args.iter().map(OsString::from));
-    }
-    // Vendor approval flags are only meaningful when the launched program is
-    // literally the vendor's own binary -- every built-in fleet spec sets
-    // `launch.program` to its own `id` (see `builtin.rs`), so this equality
-    // is the honest signal that argv-level flags this catalog invented for
-    // that vendor's real CLI will land on a process that actually parses
-    // them. A fixture (or any other spec that substitutes a wrapper/test
-    // double while keeping the same `id` for adapter/history matching, the
-    // same pattern `launch_override` uses for the Pipe/ACP transports)
-    // fails this check and gets no injected flag -- forcing one onto an
-    // unrelated program's argv is exactly how a fixture spawn stops
-    // reaching its own proof.
-    if spec.launch.program == spec.id.as_str() {
-        args.extend(
-            approval_level_args(&spec.id, request.approval_level)
-                .into_iter()
-                .map(OsString::from),
-        );
     }
     args.extend(request.extra_args);
     let mut followup_prompt = None;
@@ -408,12 +390,6 @@ mod tests {
     fn request(prompt: &str) -> LaunchRequest {
         LaunchRequest {
             prompt: Some(prompt.to_owned()),
-            // These tests are about prompt/draft delivery, not the
-            // approval-level axis -- pin it to `Unmanaged` so a
-            // provider's own default-on `FullAuto` flags never show up in
-            // an assertion about something else. `ApprovalLevel`'s own
-            // mapping is covered by the `approval_level_*` tests below.
-            approval_level: ApprovalLevel::Unmanaged,
             ..LaunchRequest::default()
         }
     }
@@ -534,8 +510,6 @@ mod tests {
             spec,
             LaunchRequest {
                 platform: RuntimePlatform::Linux,
-                // Not what this test is about -- see `request()`.
-                approval_level: ApprovalLevel::Unmanaged,
                 ..LaunchRequest::default()
             },
             "review before submit".to_owned(),
@@ -555,7 +529,6 @@ mod tests {
             spec,
             LaunchRequest {
                 platform: RuntimePlatform::Linux,
-                approval_level: ApprovalLevel::Unmanaged,
                 ..LaunchRequest::default()
             },
             "review before submit".to_owned(),
@@ -572,8 +545,6 @@ mod tests {
             spec,
             LaunchRequest {
                 platform: RuntimePlatform::Windows,
-                // Not what this test is about -- see `request()`.
-                approval_level: ApprovalLevel::Unmanaged,
                 ..LaunchRequest::default()
             },
             "inspect & explain".to_owned(),
@@ -596,8 +567,6 @@ mod tests {
                 ),
                 extra_args: vec!["--model".into(), "haiku".into()],
                 platform: RuntimePlatform::Linux,
-                // Not what this test is about -- see `request()`.
-                approval_level: ApprovalLevel::Unmanaged,
                 ..LaunchRequest::default()
             },
         )
@@ -617,11 +586,7 @@ mod tests {
             LaunchRequest {
                 platform: RuntimePlatform::Linux,
                 // "Vanilla" here means "no session options and no
-                // operator-provided extra args" -- the approval-level axis
-                // is its own default-on policy, covered separately by the
-                // `approval_level_*` tests, so it is pinned to `Unmanaged`
-                // here to keep this test about session options alone.
-                approval_level: ApprovalLevel::Unmanaged,
+                // operator-provided extra args".
                 ..LaunchRequest::default()
             },
         )
@@ -635,7 +600,6 @@ mod tests {
             LaunchRequest {
                 session_options: Some(selected.clone()),
                 platform: RuntimePlatform::Linux,
-                approval_level: ApprovalLevel::Unmanaged,
                 ..LaunchRequest::default()
             },
         )
@@ -665,7 +629,6 @@ mod tests {
     #[test]
     fn approval_level_defaults_to_full_auto() {
         assert_eq!(ApprovalLevel::default(), ApprovalLevel::FullAuto);
-        assert_eq!(LaunchRequest::default().approval_level, ApprovalLevel::FullAuto);
     }
 
     #[test]
@@ -760,95 +723,34 @@ mod tests {
         }
     }
 
+    /// A PTY is opened by a human, who picks their own agent's permission
+    /// flags -- `plan_launch` (the PTY launch planner) must never inject one
+    /// of `approval_level_args`'s flags on its own, for any provider,
+    /// regardless of that provider's own verified `FullAuto` flag. This is
+    /// the flip side of `approval_level_args_match_the_verified_provider_flag_table`:
+    /// the table exists and is correct, but this planner is no longer one of
+    /// its callers -- see `plan_launch`'s own doc comment on
+    /// `approval_level_args` for who is (the ACP transport).
     #[test]
-    fn plan_launch_applies_full_auto_by_default_when_the_caller_does_not_set_a_level() {
-        let spec = builtin_registry().get_by_id("codex").unwrap();
-        let plan = plan_launch(
-            spec,
-            LaunchRequest {
-                platform: RuntimePlatform::Linux,
-                ..LaunchRequest::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            args_as_strings(&plan),
-            [
-                "-c",
-                "windows_wsl_setup_acknowledged=true",
-                "--dangerously-bypass-approvals-and-sandbox"
-            ]
-        );
-    }
-
-    #[test]
-    fn plan_launch_honors_an_explicit_approval_level_ahead_of_operator_extra_args() {
-        let spec = builtin_registry().get_by_id("claude").unwrap();
-        let plan = plan_launch(
-            spec,
-            LaunchRequest {
-                approval_level: ApprovalLevel::ReadOnly,
-                extra_args: vec!["--model".into(), "haiku".into()],
-                platform: RuntimePlatform::Linux,
-                ..LaunchRequest::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            args_as_strings(&plan),
-            ["--permission-mode", "default", "--model", "haiku"]
-        );
-    }
-
-    /// A spec that keeps a vendor `id` (for adapter/history matching) but
-    /// substitutes a different program -- a fixture's shell/PowerShell
-    /// wrapper, or any future `launch_override`-style test double -- must
-    /// never receive that vendor's invented flag. The wrapper does not
-    /// parse `--yolo`/`--permission-mode`/etc.; forcing one onto its argv
-    /// is exactly the shape of regression this test pins down (a fixture
-    /// spawn that silently stops reaching its own proof).
-    #[test]
-    fn a_spec_whose_program_is_not_the_vendor_binary_gets_no_approval_flag_even_at_full_auto() {
+    fn plan_launch_never_injects_an_approval_flag_pty_has_no_approval_axis() {
         for id in ["claude", "codex", "grok", "kimi"] {
-            let mut spec = builtin_registry().get_by_id(id).unwrap().clone();
-            spec.launch.program = "powershell.exe".to_owned();
+            let spec = builtin_registry().get_by_id(id).unwrap();
             let plan = plan_launch(
-                &spec,
+                spec,
                 LaunchRequest {
                     platform: RuntimePlatform::Linux,
-                    approval_level: ApprovalLevel::FullAuto,
                     ..LaunchRequest::default()
                 },
             )
             .unwrap();
-            assert_eq!(
-                args_as_strings(&plan),
-                spec.launch
-                    .fixed_args
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>(),
-                "{id}: substituted-program spec must not gain an invented vendor flag"
-            );
+            let full_auto_flag_tokens = approval_level_args(&spec.id, ApprovalLevel::FullAuto);
+            for token in &full_auto_flag_tokens {
+                assert!(
+                    !args_as_strings(&plan).contains(token),
+                    "{id}: plan_launch must never inject its own FullAuto flag token {token:?}"
+                );
+            }
         }
     }
 
-    /// The converse: a spec whose program IS the vendor's own binary keeps
-    /// getting the mapped flag -- the gate is on the program, not a
-    /// blanket suppression.
-    #[test]
-    fn a_spec_whose_program_is_the_vendor_binary_still_gets_the_mapped_flag() {
-        let spec = builtin_registry().get_by_id("kimi").unwrap();
-        assert_eq!(spec.launch.program, spec.id.as_str());
-        let plan = plan_launch(
-            spec,
-            LaunchRequest {
-                platform: RuntimePlatform::Linux,
-                approval_level: ApprovalLevel::FullAuto,
-                ..LaunchRequest::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(args_as_strings(&plan), ["--yolo"]);
-    }
 }

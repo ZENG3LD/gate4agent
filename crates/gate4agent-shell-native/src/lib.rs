@@ -31,15 +31,15 @@ use gate4agent::pty::{
     PtyReplayCursor, PtySession, PtyTerminalSnapshot, RateLimitDetector, VteParser,
 };
 use gate4agent::{
-    AcpSession, AcpSessionOptions, AgentEvent, CliTool, LaunchRequest, PipeProcessOptions,
-    PipeSession, PromptFraming, ReadinessIntent, ReadinessPermit, ReadinessTracker, RuntimePlatform,
-    SessionConfig,
+    AcpSession, AcpSessionOptions, AgentEvent, CliTool, HostPolicy, LaunchRequest,
+    PipeProcessOptions, PipeSession, PromptFraming, ReadinessIntent, ReadinessPermit,
+    ReadinessTracker, RuntimePlatform, SessionConfig,
 };
 use gate4agent_adapters::{
     build_resume_plan_for_identity, builtin_adapter_registry, AdapterRuntimeRegistry,
     CodexPtySessionIdentityExtractor, KimiPtySessionIdentityExtractor, OneShotSessionPersistence,
 };
-use gate4agent_catalog::{AgentRegistry, AgentSpec, EnvMutation};
+use gate4agent_catalog::{approval_level_args, AgentRegistry, AgentSpec, EnvMutation};
 use gate4agent_shell_one_shot::NativeOneShotSession;
 use gate4agent_types::{
     AdapterFamily, AgentCommand, AgentId, AgentInstanceId, ApprovalLevel, CapabilityProbeFailure,
@@ -804,7 +804,6 @@ impl NativeEffectShell {
                         platform: RuntimePlatform::current(),
                         prompt: request.initial_prompt,
                         session_options: request.session_options,
-                        approval_level: request.approval_level,
                         extra_args: launch_extra_args,
                     },
                     request.terminal_size.rows,
@@ -1111,19 +1110,26 @@ impl NativeEffectShell {
                     family: AdapterFamily::Acp,
                     binding: acp_spec.adapter.clone(),
                 };
+                // ACP is the transport this project opens programmatically
+                // -- unlike a PTY, there is no human at a terminal to pick
+                // permission flags, so the request's `approval_level` has to
+                // steer both the spawned process's own argv
+                // (`approval_level_args`, applied inside `AcpSession` only
+                // for a provider it spawns as its own binary rather than
+                // through an adapter wrapper -- see `src/acp/spawn.rs`) and
+                // the host side answering the session's permission requests
+                // (`host_policy_for_approval_level`).
+                let acp_options = AcpSessionOptions {
+                    host_policy: host_policy_for_approval_level(request.approval_level),
+                    approval_level_args: approval_level_args(&agent_id, request.approval_level),
+                    ..AcpSessionOptions::default()
+                };
                 let spawned = match acp_spec.launch_override.as_ref() {
                     Some(launch) => {
-                        AcpSession::spawn_with_launch(
-                            tool,
-                            &working_dir,
-                            AcpSessionOptions::default(),
-                            launch,
-                        )
-                        .await
+                        AcpSession::spawn_with_launch(tool, &working_dir, acp_options, launch)
+                            .await
                     }
-                    None => {
-                        AcpSession::spawn(tool, &working_dir, AcpSessionOptions::default()).await
-                    }
+                    None => AcpSession::spawn(tool, &working_dir, acp_options).await,
                 };
                 match spawned {
                     Ok(session) => {
@@ -1688,6 +1694,38 @@ fn missing_session_message(key: NativeSessionKey) -> String {
         "native session {:?}/{:?} does not exist",
         key.instance_id, key.generation
     )
+}
+
+/// Map the spawn request's `ApprovalLevel` to the ACP host authority mode
+/// that answers `session/request_permission` for the SAME session -- the
+/// PTY transport lets a human at the keyboard pick their own agent's
+/// permission flags (see `gate4agent_catalog::LaunchRequest`, which carries
+/// no approval axis at all), but ACP is opened by this process with nobody
+/// at a terminal, so it is the one transport where `approval_level` also has
+/// to steer the host side of the session, not just the spawned process's own
+/// argv (`approval_level_args`).
+///
+/// `FullAuto` must never land on a refusing `HostPolicy` (`ReadOnly` or
+/// `Deny`): that combination launches the process believing it holds full
+/// autonomy while every host permission request it makes gets silently
+/// refused, which is worse than either policy alone -- so `FullAuto` maps to
+/// `HostPolicy::Yolo`, the one mode that grants everything without asking.
+/// `ReadOnly` maps to `HostPolicy::ReadOnly` for the same reason in reverse.
+///
+/// `Moderate` has no dedicated `HostPolicy` variant -- ACP's four host modes
+/// are coarser than the three managed `ApprovalLevel` steps -- so it falls
+/// back to `HostPolicy::Auto`, the same mode `Unmanaged` ("impose nothing")
+/// uses. Both already mean "allow reads, writes, and execution, but decide
+/// per request rather than blanket-granting" (see `HostPolicy::Auto`'s own
+/// doc comment), which is the correct non-extreme default whether the
+/// request asked for a deliberate middle ground or asked for nothing to be
+/// imposed at all.
+fn host_policy_for_approval_level(level: ApprovalLevel) -> HostPolicy {
+    match level {
+        ApprovalLevel::FullAuto => HostPolicy::Yolo,
+        ApprovalLevel::ReadOnly => HostPolicy::ReadOnly,
+        ApprovalLevel::Moderate | ApprovalLevel::Unmanaged => HostPolicy::Auto,
+    }
 }
 
 fn validate_spawn_runtime_policy(
@@ -3820,6 +3858,7 @@ mod tests {
         classify_operator_gate_option_semantics,
         classify_pty_screen_state,
         foreground_probe_rearms_immediately, foreground_probe_schedule,
+        host_policy_for_approval_level,
         parse_operator_gate_options, prepare_fresh_pty_provider_session,
         prompt_render_probe, prompt_rendered,
         reserve_provider_gap_sequence, resolve_foreground_verdict, screen_failure,
@@ -3830,6 +3869,7 @@ mod tests {
         ForegroundProbeSchedule, ForegroundVerdict, ReadinessDiagnostics, RateLimitFeed,
         Utf8ChunkDecoder,
     };
+    use gate4agent::HostPolicy;
     use gate4agent_adapters::builtin_adapter_registry;
     use gate4agent_catalog::EnvMutation;
     use gate4agent::agent::ForegroundObservation;
@@ -3840,7 +3880,7 @@ mod tests {
     use gate4agent::pty::{PtyForegroundObservation, PtyForegroundSource, RateLimitDetector};
     use gate4agent::CliTool;
     use gate4agent_types::{
-        AdapterFamily, AgentId, OperatorGateInput,
+        AdapterFamily, AgentId, ApprovalLevel, OperatorGateInput,
         OperatorGateKind, OperatorGateOptionSemantics, OperatorGateState, OperatorGateSubject,
         ProviderEvent, ProviderRuntimePolicy, PtyScreenState, RuntimePlatform,
         TerminalMouseProtocolEncoding, TransportKind,
@@ -5055,5 +5095,52 @@ mod tests {
             .detect(CODEX_STATUS_RAW_ANSI)
             .expect("a real quota-state line must still be recognized after the noise");
         assert_eq!(info.limit_type, RateLimitType::Session);
+    }
+
+    // -----------------------------------------------------------------------
+    // host_policy_for_approval_level -- ApprovalLevel -> HostPolicy for ACP
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn full_auto_maps_to_the_permissive_host_policy() {
+        // The one combination that must never happen is `FullAuto` paired
+        // with a refusing `HostPolicy` -- the process believes it has full
+        // autonomy while the host silently refuses it.
+        assert_eq!(host_policy_for_approval_level(ApprovalLevel::FullAuto), HostPolicy::Yolo);
+    }
+
+    #[test]
+    fn read_only_maps_to_the_read_only_host_policy() {
+        assert_eq!(
+            host_policy_for_approval_level(ApprovalLevel::ReadOnly),
+            HostPolicy::ReadOnly
+        );
+    }
+
+    #[test]
+    fn moderate_and_unmanaged_both_fall_back_to_the_default_host_policy() {
+        assert_eq!(host_policy_for_approval_level(ApprovalLevel::Moderate), HostPolicy::Auto);
+        assert_eq!(host_policy_for_approval_level(ApprovalLevel::Unmanaged), HostPolicy::Auto);
+        assert_eq!(HostPolicy::default(), HostPolicy::Auto);
+    }
+
+    #[test]
+    fn no_approval_level_ever_maps_to_a_refusing_policy_except_read_only_itself() {
+        // Guards the "never full auto + refusing host" invariant generally:
+        // `Deny` must never be reachable from this mapping at all -- it is
+        // not one of the four `ApprovalLevel` outcomes, only `ReadOnly`'s
+        // own deliberate restriction is.
+        for level in [
+            ApprovalLevel::FullAuto,
+            ApprovalLevel::Moderate,
+            ApprovalLevel::ReadOnly,
+            ApprovalLevel::Unmanaged,
+        ] {
+            assert_ne!(
+                host_policy_for_approval_level(level),
+                HostPolicy::Deny,
+                "{level:?} must never map to HostPolicy::Deny"
+            );
+        }
     }
 }

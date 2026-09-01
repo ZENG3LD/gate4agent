@@ -122,6 +122,26 @@ pub struct AcpSessionOptions {
     /// Set to [`DangerousCommandGate::Disabled`] only as its own explicit
     /// choice, never as a side effect of picking a permissive `host_policy`.
     pub dangerous_command_gate: DangerousCommandGate,
+
+    /// Approval-level CLI flags to append to the spawned ACP process's own
+    /// argv -- see `gate4agent_catalog::approval_level_args`, the single
+    /// source of truth for the level -> flag mapping.
+    ///
+    /// [`AcpSession::spawn`] only applies these when the tool it spawns is
+    /// the vendor's own binary (`grok agent stdio`, `kimi acp`); a tool that
+    /// instead goes through an `npx` adapter-wrapper package (`claude`,
+    /// `codex`) never gets them, because this crate cannot verify whether
+    /// the wrapper forwards argv through to the agent it wraps -- see
+    /// `src/acp/spawn.rs`'s `applicable_approval_args`.
+    ///
+    /// [`AcpSession::spawn_with_launch`] ignores this field entirely: its
+    /// caller-supplied `LaunchSpec` may substitute a program that is not the
+    /// vendor's own binary at all (a test fixture, for one), the same
+    /// "don't invent a flag for an unverified program" reasoning
+    /// `gate4agent_catalog::plan_launch` applies to the PTY transport.
+    ///
+    /// Default: empty.
+    pub approval_level_args: Vec<String>,
 }
 
 impl Default for AcpSessionOptions {
@@ -132,6 +152,7 @@ impl Default for AcpSessionOptions {
             prompt_timeout: Duration::from_secs(120),
             host_policy: HostPolicy::default(),
             dangerous_command_gate: DangerousCommandGate::default(),
+            approval_level_args: Vec::new(),
         }
     }
 }
@@ -179,7 +200,7 @@ impl AcpSession {
         working_dir: &std::path::Path,
         options: AcpSessionOptions,
     ) -> Result<Self, AcpError> {
-        let process = AcpProcess::spawn(tool, working_dir, &[])
+        let process = AcpProcess::spawn(tool, working_dir, &[], &options.approval_level_args)
             .map_err(|source| AcpError::Spawn { source })?;
         Self::spawn_process(tool, working_dir, options, process).await
     }
@@ -692,5 +713,6 @@ mod tests {
         assert_eq!(opts.handshake_timeout, Duration::from_secs(30));
         assert_eq!(opts.prompt_timeout, Duration::from_secs(120));
         assert_eq!(opts.host_policy, HostPolicy::Auto);
+        assert!(opts.approval_level_args.is_empty());
     }
 }

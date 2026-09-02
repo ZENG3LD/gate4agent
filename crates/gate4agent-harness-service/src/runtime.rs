@@ -4592,6 +4592,21 @@ pub async fn start_harness_host_with_operator_and_catalogs(
     let agent_stream_subscriber_connections =
         Arc::new(Semaphore::new(HOST_AGENT_STREAM_SUBSCRIBER_LIMIT));
     let task = tokio::spawn(async move {
+        // The loop below has no `break`: its only exits are the early
+        // `return Ok(())`/`return Err(_)` statements inside the `select!`
+        // arms (`HostCommand::Shutdown`, `HostCommand::None` on a closed
+        // command channel, `listener.accept()` failing, and every other
+        // `?`-propagated error from live-event/dispatch processing). Every
+        // one of those return sites drops this task's `listener` --
+        // silently closing the operator wire's bound port -- while the
+        // rest of the process (this task's own caller in `main`, which
+        // only awaits `ctrl_c()` until shutdown, plus every other spawned
+        // task) keeps running unaware. Wrapping the whole body in its own
+        // `async move` here, rather than annotating every return site
+        // individually, guarantees exactly one place -- this one -- ever
+        // needs to say why the loop stopped serving, no matter which arm
+        // did it.
+        let result: Result<(), HarnessRuntimeError> = async move {
         let mut active_dispatch = None;
         let mut subscribers = SubscriberRegistry::default();
         let mut terminal_subscribers = TerminalSubscriberRegistry::default();
@@ -6983,6 +6998,20 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                 &mut observation_recovery,
             );
         }
+        }.await;
+        if let Err(ref error) = result {
+            // The one log line every silent-exit path above now shares:
+            // whichever `return Err(_)` ended the loop, this fires before
+            // the task (and with it `listener`, `command_rx`, and every
+            // subscriber registry) is dropped -- naming the failure instead
+            // of leaving the operator wire's port to vanish unexplained
+            // while the rest of the process stays up.
+            tracing::error!(
+                error = %error,
+                "harness runtime loop exiting; operator wire is stopping while the process stays up",
+            );
+        }
+        result
     });
     Ok((handle, task))
 }

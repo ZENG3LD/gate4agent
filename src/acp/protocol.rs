@@ -66,24 +66,103 @@ pub struct ClientInfo {
     pub version: &'static str,
 }
 
+/// One `{name, value}` pair on the ACP wire -- the shape ACP v1 mandates
+/// for both a stdio server's `env` and an SSE server's `headers` (a plain
+/// JSON object is not the wire shape; `{"name":...,"value":...}` array
+/// entries are).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServerEnvVar {
+    pub name: String,
+    pub value: String,
+}
+
 /// A single MCP server entry for `session/new`.
+///
+/// Matches ACP v1's `McpServer` union exactly, confirmed by reading the
+/// spec after a live capture showed the harness never receiving
+/// `tools/list`: **no `"transport"` discriminator, and stdio carries no
+/// tag at all** -- `{name, command, args, env}`. An SSE (or, if ever
+/// needed, HTTP) entry is what carries an explicit `"type"` field instead
+/// (`"sse"` / `"http"`). `#[serde(untagged)]` reproduces this: it tries
+/// each variant against the incoming JSON in declaration order, and the
+/// two variants never overlap on required fields (`command` vs. `url`), so
+/// there is no ambiguity either way.
+///
+/// `env`/`headers` are wire-mandated arrays of [`McpServerEnvVar`] pairs,
+/// not a JSON object -- a stdio entry serialized with a map there is what
+/// the harness silently dropped before this fix (nameless, wrong-shaped
+/// `env`, no `session/new` field the adapter's registration code
+/// recognized). Order is insertion order: whatever order the caller passes
+/// to [`McpServerConfig::stdio`] / [`McpServerConfig::sse`], not sorted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "transport", rename_all = "lowercase")]
+#[serde(untagged)]
 pub enum McpServerConfig {
     /// stdio-based MCP server launched as a subprocess.
     Stdio {
+        name: String,
         command: String,
         #[serde(default)]
         args: Vec<String>,
         #[serde(default)]
-        env: std::collections::HashMap<String, String>,
+        env: Vec<McpServerEnvVar>,
     },
     /// SSE-based MCP server at a URL.
     Sse {
+        #[serde(rename = "type")]
+        kind: String,
+        name: String,
         url: String,
         #[serde(default)]
-        headers: std::collections::HashMap<String, String>,
+        headers: Vec<McpServerEnvVar>,
     },
+}
+
+impl McpServerConfig {
+    /// Build a stdio entry: `{name, command, args, env: [{name,value}]}`.
+    /// `env_pairs`' order is preserved as given, not sorted.
+    pub fn stdio(
+        name: impl Into<String>,
+        command: impl Into<String>,
+        args: impl IntoIterator<Item = String>,
+        env_pairs: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
+        Self::Stdio {
+            name: name.into(),
+            command: command.into(),
+            args: args.into_iter().collect(),
+            env: env_pairs
+                .into_iter()
+                .map(|(name, value)| McpServerEnvVar { name, value })
+                .collect(),
+        }
+    }
+
+    /// Build an SSE entry: `{type:"sse", name, url, headers:
+    /// [{name,value}]}`. `header_pairs`' order is preserved as given, not
+    /// sorted.
+    pub fn sse(
+        name: impl Into<String>,
+        url: impl Into<String>,
+        header_pairs: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
+        Self::Sse {
+            kind: "sse".to_string(),
+            name: name.into(),
+            url: url.into(),
+            headers: header_pairs
+                .into_iter()
+                .map(|(name, value)| McpServerEnvVar { name, value })
+                .collect(),
+        }
+    }
+
+    /// The server's registration name -- the only field safe to log:
+    /// never `env`/`headers`, which may carry tokens.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Stdio { name, .. } | Self::Sse { name, .. } => name,
+        }
+    }
 }
 
 /// `session/new` request params. `additional_directories` is the outbound
@@ -2049,34 +2128,45 @@ mod tests {
     /// The harness-MCP door (gate4agent-arc-mailbox-and-task-layer Slice
     /// A(ii)): when a caller populates `mcp_servers` with the one stdio
     /// entry `gate4agent-shell-native` builds from a prepared harness-MCP
-    /// overlay, `session/new` carries it -- command, args, and env all
-    /// present on the wire. An empty `mcp_servers` (no overlay prepared)
-    /// still serializes to `"mcpServers":[]`, exactly as
-    /// `session_new_params_serialize` above already pins.
+    /// overlay, `session/new` carries it in ACP v1's actual wire shape --
+    /// `name`, `command`, `args`, and `env` (an array of `{name,value}`
+    /// pairs, never a map), and no `"transport"` discriminator at all.
+    /// This is the shape a live capture showed the harness silently
+    /// dropping: a nameless entry with `env` as a JSON object never
+    /// matched the adapter's own `McpServer` union, so `tools/list` never
+    /// ran. An empty `mcp_servers` (no overlay prepared) still serializes
+    /// to `"mcpServers":[]`, exactly as `session_new_params_serialize`
+    /// above already pins.
     #[test]
     fn session_new_params_serializes_mcp_server_stdio_entry() {
-        let mut env = std::collections::HashMap::new();
-        env.insert(
-            "GATE4AGENT_HARNESS_SESSION_ENDPOINT".to_string(),
-            "\\\\.\\pipe\\gate4agent-harness-mcp-s1".to_string(),
-        );
-        env.insert("GATE4AGENT_HARNESS_SESSION_TOKEN".to_string(), "tok-abc".to_string());
+        let command = "C:\\gate4agent\\gate4agent-harness-mcp.exe";
+        let endpoint = "\\\\.\\pipe\\gate4agent-harness-mcp-s1";
         let p = SessionNewParams {
             cwd: "/home/user".to_string(),
-            mcp_servers: vec![McpServerConfig::Stdio {
-                command: "C:\\gate4agent\\gate4agent-harness-mcp.exe".to_string(),
-                args: vec!["--session-proxy".to_string()],
-                env,
-            }],
+            mcp_servers: vec![McpServerConfig::stdio(
+                "gate4agent",
+                command,
+                vec!["--session-proxy".to_string()],
+                vec![
+                    ("GATE4AGENT_HARNESS_SESSION_ENDPOINT".to_string(), endpoint.to_string()),
+                    ("GATE4AGENT_HARNESS_SESSION_TOKEN".to_string(), "tok-abc".to_string()),
+                ],
+            )],
             additional_directories: vec![],
         };
         let s = serde_json::to_string(&p).unwrap();
         assert!(s.contains(r#""mcpServers":[{"#), "must carry the one stdio entry");
-        assert!(s.contains(r#""transport":"stdio""#), "must tag the entry as stdio");
-        assert!(s.contains(r#""command":"C:\\gate4agent\\gate4agent-harness-mcp.exe""#));
+        assert!(!s.contains("\"transport\""), "ACP v1 stdio has no discriminator field");
+        assert!(s.contains(r#""name":"gate4agent""#), "must carry the ACP-visible server name");
+        assert!(s.contains(&format!("\"command\":{command:?}")));
         assert!(s.contains(r#""args":["--session-proxy"]"#));
-        assert!(s.contains("GATE4AGENT_HARNESS_SESSION_ENDPOINT"));
-        assert!(s.contains("GATE4AGENT_HARNESS_SESSION_TOKEN"));
+        // env is an array of {name,value} pairs, never a map -- this is
+        // exactly the shape a bare `contains("GATE4AGENT_HARNESS_SESSION_
+        // ENDPOINT")` check (the old assertion) could not have caught,
+        // because it passes whether env is an object or an array.
+        assert!(s.contains(&format!(
+            r#""env":[{{"name":"GATE4AGENT_HARNESS_SESSION_ENDPOINT","value":{endpoint:?}}},{{"name":"GATE4AGENT_HARNESS_SESSION_TOKEN","value":"tok-abc"}}]"#
+        )));
 
         let empty = SessionNewParams {
             cwd: "/home/user".to_string(),
@@ -2128,45 +2218,51 @@ mod tests {
 
     #[test]
     fn mcp_server_config_stdio_serialize() {
-        let cfg = McpServerConfig::Stdio {
-            command: "my-mcp-server".to_string(),
-            args: vec!["--port".to_string(), "8080".to_string()],
-            env: std::collections::HashMap::new(),
-        };
+        // ACP v1's stdio `McpServer` carries no discriminator at all --
+        // `name`, `command`, `args`, `env` land directly on the object.
+        let cfg = McpServerConfig::stdio(
+            "my-server",
+            "my-mcp-server",
+            vec!["--port".to_string(), "8080".to_string()],
+            std::iter::empty(),
+        );
         let s = serde_json::to_string(&cfg).unwrap();
-        assert!(s.contains(r#""transport":"stdio""#), "must tag as stdio");
-        assert!(s.contains("my-mcp-server"), "must contain command");
+        assert!(!s.contains("\"transport\""), "ACP v1 stdio has no discriminator field");
+        assert!(s.contains(r#""name":"my-server""#), "must carry the ACP-visible name");
+        assert!(s.contains(r#""command":"my-mcp-server""#), "must contain command");
+        assert!(s.contains(r#""env":[]"#), "env is an array even when empty, never a map");
     }
 
     #[test]
     fn mcp_server_config_sse_serialize() {
-        let cfg = McpServerConfig::Sse {
-            url: "https://example.com/mcp".to_string(),
-            headers: std::collections::HashMap::new(),
-        };
+        // ACP v1's SSE `McpServer` is the variant that DOES carry a
+        // discriminator -- `"type":"sse"` -- plus `name`.
+        let cfg = McpServerConfig::sse("my-sse-server", "https://example.com/mcp", std::iter::empty());
         let s = serde_json::to_string(&cfg).unwrap();
-        assert!(s.contains(r#""transport":"sse""#), "must tag as sse");
+        assert!(s.contains(r#""type":"sse""#), "must tag as sse");
+        assert!(s.contains(r#""name":"my-sse-server""#), "must carry the ACP-visible name");
         assert!(s.contains("https://example.com/mcp"), "must contain url");
+        assert!(s.contains(r#""headers":[]"#), "headers is an array even when empty, never a map");
     }
 
     #[test]
     fn mcp_server_config_roundtrip() {
-        let original = McpServerConfig::Stdio {
-            command: "npx".to_string(),
-            args: vec!["-y".to_string(), "@modelcontextprotocol/server-filesystem".to_string()],
-            env: {
-                let mut m = std::collections::HashMap::new();
-                m.insert("HOME".to_string(), "/home/user".to_string());
-                m
-            },
-        };
+        let original = McpServerConfig::stdio(
+            "fs-server",
+            "npx",
+            vec!["-y".to_string(), "@modelcontextprotocol/server-filesystem".to_string()],
+            vec![("HOME".to_string(), "/home/user".to_string())],
+        );
         let json = serde_json::to_string(&original).unwrap();
         let decoded: McpServerConfig = serde_json::from_str(&json).unwrap();
         match decoded {
-            McpServerConfig::Stdio { command, args, env } => {
+            McpServerConfig::Stdio { name, command, args, env } => {
+                assert_eq!(name, "fs-server");
                 assert_eq!(command, "npx");
                 assert_eq!(args, vec!["-y", "@modelcontextprotocol/server-filesystem"]);
-                assert_eq!(env.get("HOME").map(String::as_str), Some("/home/user"));
+                assert_eq!(env.len(), 1);
+                assert_eq!(env[0].name, "HOME");
+                assert_eq!(env[0].value, "/home/user");
             }
             McpServerConfig::Sse { .. } => panic!("expected Stdio variant"),
         }

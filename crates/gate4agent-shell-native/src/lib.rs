@@ -93,6 +93,11 @@ const RESERVED_CLAUDE_LAUNCH_FLAGS: &[&str] = &[
 /// from, once launched as `<program> --session-proxy`
 /// (`gate4agent-harness-mcp`'s `session_proxy_client_from_env`).
 const HARNESS_MCP_SESSION_PROXY_ARG: &str = "--session-proxy";
+/// The ACP-visible name the harness-MCP stdio server registers under in
+/// `session/new.mcpServers[].name` -- required by ACP v1 (an entry with no
+/// name is not a valid `McpServer` at all) and read back by
+/// [`harness_mcp_acp_server`].
+const HARNESS_MCP_SERVER_NAME: &str = "gate4agent";
 
 /// Mirror of `gate4agent_runtime_native::launch_profiles::HARNESS_MCP_PROGRAM_ENV`.
 /// This crate cannot depend on `gate4agent-runtime-native` -- the dependency
@@ -138,14 +143,15 @@ fn harness_mcp_acp_server(pty_env: &[EnvMutation]) -> Option<McpServerConfig> {
     let command = env_value(pty_env, HARNESS_MCP_PROGRAM_ENV)?.to_owned();
     let endpoint = env_value(pty_env, HARNESS_MCP_SESSION_ENDPOINT_ENV)?.to_owned();
     let token = env_value(pty_env, HARNESS_MCP_SESSION_TOKEN_ENV)?.to_owned();
-    let mut env = std::collections::HashMap::with_capacity(2);
-    env.insert(HARNESS_MCP_SESSION_ENDPOINT_ENV.to_owned(), endpoint);
-    env.insert(HARNESS_MCP_SESSION_TOKEN_ENV.to_owned(), token);
-    Some(McpServerConfig::Stdio {
+    Some(McpServerConfig::stdio(
+        HARNESS_MCP_SERVER_NAME,
         command,
-        args: vec![HARNESS_MCP_SESSION_PROXY_ARG.to_owned()],
-        env,
-    })
+        vec![HARNESS_MCP_SESSION_PROXY_ARG.to_owned()],
+        vec![
+            (HARNESS_MCP_SESSION_ENDPOINT_ENV.to_owned(), endpoint),
+            (HARNESS_MCP_SESSION_TOKEN_ENV.to_owned(), token),
+        ],
+    ))
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1236,6 +1242,31 @@ impl NativeEffectShell {
                     Ok(mode_id) => mode_id,
                     Err(message) => return ControlObservation::SpawnFailed { message },
                 };
+                // The harness-MCP door (gate4agent-arc-mailbox-and-task-
+                // layer Slice A(ii)): `pty_env` carries the node's resolved
+                // harness-MCP overlay whenever one was prepared for this
+                // spawn, transport-agnostic same as every other
+                // launch-profile mutation -- see `harness_mcp_acp_server`'s
+                // own doc comment. Empty when the node prepared none, which
+                // keeps `mcp_servers` empty and changes nothing else.
+                let mcp_servers: Vec<McpServerConfig> =
+                    harness_mcp_acp_server(&pty_env).into_iter().collect();
+                if !mcp_servers.is_empty() {
+                    // State-change line: this is the point measured live to
+                    // be silently empty on the wire before the ACP v1 shape
+                    // fix (`McpServerConfig`, `src/acp/protocol.rs`) -- a
+                    // nameless, map-shaped entry the agent's own adapter
+                    // dropped before ever registering it, so `tools/list`
+                    // never ran. Names only, never `env` (may carry
+                    // tokens/endpoints).
+                    tracing::info!(
+                        agent_id = %agent_id,
+                        instance_id = ?key.instance_id,
+                        mcp_server_names = ?mcp_servers.iter().map(McpServerConfig::name).collect::<Vec<_>>(),
+                        "acp session/new carries {} mcp server(s)",
+                        mcp_servers.len(),
+                    );
+                }
                 let acp_options = AcpSessionOptions {
                     host_policy: host_policy_for_approval_level(request.approval_level),
                     // Never populated for ACP any more -- see this branch's
@@ -1248,15 +1279,7 @@ impl NativeEffectShell {
                         &agent_id,
                         request.approval_level,
                     ),
-                    // The harness-MCP door (gate4agent-arc-mailbox-and-task-
-                    // layer Slice A(ii)): `pty_env` carries the node's
-                    // resolved harness-MCP overlay whenever one was prepared
-                    // for this spawn, transport-agnostic same as every other
-                    // launch-profile mutation -- see
-                    // `harness_mcp_acp_server`'s own doc comment. Empty
-                    // (`None`) when the node prepared none, which keeps
-                    // `mcp_servers` empty and changes nothing else.
-                    mcp_servers: harness_mcp_acp_server(&pty_env).into_iter().collect(),
+                    mcp_servers,
                     ..AcpSessionOptions::default()
                 };
                 let spawned = match acp_spec.launch_override.as_ref() {
@@ -4737,8 +4760,8 @@ mod tests {
         terminal_frame, terminal_frame_byte_len, terminal_state_capture_should_skip,
         validate_instance_launch_arguments, validate_spawn_runtime_policy,
         ForegroundProbeSchedule, ForegroundVerdict, ReadinessDiagnostics, RateLimitFeed,
-        Utf8ChunkDecoder, HARNESS_MCP_PROGRAM_ENV, HARNESS_MCP_SESSION_ENDPOINT_ENV,
-        HARNESS_MCP_SESSION_TOKEN_ENV,
+        Utf8ChunkDecoder, HARNESS_MCP_PROGRAM_ENV, HARNESS_MCP_SERVER_NAME,
+        HARNESS_MCP_SESSION_ENDPOINT_ENV, HARNESS_MCP_SESSION_TOKEN_ENV,
     };
     use gate4agent::acp::protocol::{McpServerConfig, SessionMode};
     use gate4agent::HostPolicy;
@@ -5161,16 +5184,17 @@ mod tests {
 
         let server = harness_mcp_acp_server(&pty_env).expect("a full overlay yields one server");
         match server {
-            McpServerConfig::Stdio { command, args, env } => {
+            McpServerConfig::Stdio { name, command, args, env } => {
+                assert_eq!(name, HARNESS_MCP_SERVER_NAME, "ACP v1 requires a name; the adapter registers by it");
                 assert_eq!(command, "C:\\gate4agent\\gate4agent-harness-mcp.exe");
                 assert_eq!(args, vec!["--session-proxy".to_string()]);
                 assert_eq!(env.len(), 2, "exactly endpoint and token, nothing else");
                 assert_eq!(
-                    env.get(HARNESS_MCP_SESSION_ENDPOINT_ENV).map(String::as_str),
+                    env.iter().find(|pair| pair.name == HARNESS_MCP_SESSION_ENDPOINT_ENV).map(|pair| pair.value.as_str()),
                     Some("\\\\.\\pipe\\gate4agent-harness-mcp-s1")
                 );
                 assert_eq!(
-                    env.get(HARNESS_MCP_SESSION_TOKEN_ENV).map(String::as_str),
+                    env.iter().find(|pair| pair.name == HARNESS_MCP_SESSION_TOKEN_ENV).map(|pair| pair.value.as_str()),
                     Some("tok-abc")
                 );
             }

@@ -11668,6 +11668,18 @@ impl NodeShared {
                     NodeFailureCode::HarnessMcpUnavailable,
                     "harness MCP launch overlay could not be installed",
                 ))?;
+            // State-change line: the overlay is installed and will be read
+            // back by the PTY child's environment or, for ACP,
+            // `gate4agent-shell-native`'s `harness_mcp_acp_server` at spawn
+            // time -- no secrets here, only which instance/provider/mode
+            // now carries a harness-MCP door.
+            tracing::info!(
+                node_id = %self.node_id,
+                instance_id = ?instance_id,
+                provider = %provider,
+                mode = ?mode,
+                "harness MCP overlay installed for spawn",
+            );
             Some(NativeHarnessMcpOverlayGuard { control, instance_id })
         } else {
             None

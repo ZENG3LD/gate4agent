@@ -154,7 +154,12 @@ fn mimo_code_interaction_event(
         request_id: explicit_tool_id(payload).map(bounded_string),
         interaction_kind,
         tool_name: bounded_string(tool_name),
+        // The hook payload carries no title or structured option list the
+        // way an ACP `session/request_permission` call does -- this source
+        // has none, not a dropped one.
+        title: None,
         prompt: input_json(Some(&prompt_source)),
+        options: Vec::new(),
         agent_id: None,
     }
 }
@@ -524,7 +529,12 @@ fn interaction_event(
         request_id: explicit_tool_id(payload).map(bounded_string),
         interaction_kind,
         tool_name,
+        // The hook payload carries no title or structured option list the
+        // way an ACP `session/request_permission` call does -- this source
+        // has none, not a dropped one.
+        title: None,
         prompt,
+        options: Vec::new(),
         agent_id: provider_agent_id(payload),
     }
 }

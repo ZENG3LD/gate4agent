@@ -977,7 +977,16 @@ impl AcpSession {
     /// On success, updates the locally cached `current_mode_id`
     /// immediately rather than waiting for a `current_mode_update`
     /// notification -- an agent is not required to also send one after
-    /// acking this call.
+    /// acking this call (codex-acp, live-measured, never does: it acks
+    /// `session/set_mode` and stays silent). The ack itself is the protocol
+    /// fact that the switch happened, so this also broadcasts the SAME
+    /// [`AgentEvent::ModeChanged`] a `current_mode_update` notification
+    /// would have produced, carrying the catalogue an operator needs to see
+    /// the new current mode rather than leaving the last-announced one
+    /// looking current. A `current_mode_update` that does arrive later
+    /// simply broadcasts its own `ModeChanged` afterward, superseding this
+    /// one the same way any other repeated state update does -- same
+    /// field, newer value, no special case for who sent it.
     ///
     /// # Errors
     ///
@@ -993,6 +1002,7 @@ impl AcpSession {
         self.rpc_call("session/set_mode", Some(json!(params)), self.prompt_timeout)
             .await?;
         self.state().modes.current_mode_id = Some(mode_id.to_owned());
+        let _ = self.tx.send(AgentEvent::ModeChanged { mode_id: mode_id.to_owned() });
         Ok(())
     }
 

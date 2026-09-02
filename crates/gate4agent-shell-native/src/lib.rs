@@ -57,7 +57,8 @@ use gate4agent_types::{
     OperatorGateSubject, PipeProtocol,
     PreparedInputKind, PromptPayload, ProviderAvailableCommand, ProviderConfigChoice,
     ProviderConfigOption, ProviderConfigOptionKind, ProviderEvent, ProviderInteractionKind,
-    ProviderInteractionResponse, ProviderInteractionTarget, ProviderModeInfo, ProviderPlanPriority,
+    ProviderInteractionOption, ProviderInteractionResponse, ProviderInteractionTarget,
+    ProviderModeInfo, ProviderPlanPriority,
     ProviderPlanStatus, ProviderPlanStep,
     ProviderRateLimitKind, ProviderRuntimeCapability, ProviderRuntimePolicy,
     ProviderSessionIdentity, ProviderSessionKey,
@@ -2391,7 +2392,12 @@ fn parsed_provider_event(message: ParsedMessage) -> Option<ProviderEvent> {
                 .metadata
                 .tool_name
                 .unwrap_or_else(|| "unknown".to_owned()),
+            // A PTY screen has no structured title or option list to read
+            // off it the way ACP's `session/request_permission` does --
+            // this source has none, not a dropped one.
+            title: None,
             prompt: message.content,
+            options: Vec::new(),
             agent_id: None,
         }),
         MessageClass::InfoMessage
@@ -2891,7 +2897,12 @@ fn provider_event(event: AgentEvent, available_modes: &[SessionMode]) -> Option<
             request_id: None,
             interaction_kind: ProviderInteractionKind::Approval,
             tool_name,
+            // A PTY screen has no structured title or option list to read
+            // off it the way ACP's `session/request_permission` does --
+            // this source has none, not a dropped one.
+            title: None,
             prompt: description.unwrap_or_default(),
+            options: Vec::new(),
             agent_id: None,
         }),
         AgentEvent::RateLimit(info) => Some(rate_limit_event(info)),
@@ -2932,11 +2943,41 @@ fn provider_event(event: AgentEvent, available_modes: &[SessionMode]) -> Option<
             // title in `tool_name` and leaving `prompt` empty -- which is
             // what this did -- showed the operator a correlation id and a
             // sentence-shaped tool name, and never the question itself.
+            let title = field("title");
+            // The agent's own offered options -- read straight off the top-
+            // level `options` array `PermissionRequestParams::options`
+            // names in `src/acp/protocol.rs` (`option_id`/`name`/`kind`,
+            // each `PermissionOption` field's own verified wire name:
+            // `optionId`/`name`/`kind`), not `toolCall` -- `options` is a
+            // sibling of `toolCall` on the request, not nested under it.
+            // `kind` is carried verbatim as the ACP wire's own snake_case
+            // string (`allow_once`, `reject_always`, ...); nothing here
+            // reinterprets it. Without this the operator is choosing
+            // approve/deny from a list they cannot see -- survivable for
+            // two options, a guess for three or more.
+            let options: Vec<ProviderInteractionOption> = params
+                .as_ref()
+                .and_then(|params| params.get("options"))
+                .and_then(|options| options.as_array())
+                .map(|options| {
+                    options
+                        .iter()
+                        .filter_map(|option| {
+                            let option_id = option.get("optionId")?.as_str()?.to_owned();
+                            let name = option.get("name")?.as_str()?.to_owned();
+                            let kind = option.get("kind")?.as_str()?.to_owned();
+                            Some(ProviderInteractionOption { option_id, name, kind })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             Some(ProviderEvent::InteractionRequested {
                 request_id: Some(encode_rpc_request_id(&id)),
                 interaction_kind: ProviderInteractionKind::Approval,
                 tool_name: field("kind").unwrap_or(method),
+                title,
                 prompt: field("title").unwrap_or_default(),
+                options,
                 agent_id: None,
             })
         }
@@ -4647,8 +4688,8 @@ mod tests {
         HostDecisionAuthority as ProviderHostDecisionAuthority,
         HostRequestDecision as ProviderHostRequestDecision, OperatorGateInput,
         OperatorGateKind, OperatorGateOptionSemantics, OperatorGateState, OperatorGateSubject,
-        ProviderEvent, ProviderInteractionKind, ProviderRuntimePolicy, PtyScreenState,
-        RuntimePlatform, TerminalMouseProtocolEncoding, TransportKind,
+        ProviderEvent, ProviderInteractionKind, ProviderInteractionOption, ProviderRuntimePolicy,
+        PtyScreenState, RuntimePlatform, TerminalMouseProtocolEncoding, TransportKind,
     };
     use std::ffi::{OsStr, OsString};
 
@@ -4887,7 +4928,10 @@ mod tests {
                 params: Some(serde_json::json!({
                     "sessionId": "s1",
                     "toolCall": {"toolCallId": "t1", "kind": "edit", "title": "Edit src/main.rs"},
-                    "options": [],
+                    "options": [
+                        {"optionId": "allow", "name": "Allow", "kind": "allow_once"},
+                        {"optionId": "reject", "name": "Reject", "kind": "reject_once"},
+                    ],
                 })),
                 decision: HostRequestDecision::Deferred,
             },
@@ -4897,14 +4941,30 @@ mod tests {
         // different things and the operator needs both: putting the title in
         // `tool_name` and leaving `prompt` empty -- which this asserted
         // before -- showed a correlation id and a sentence-shaped tool name,
-        // and never the question itself.
+        // and never the question itself. `title`/`options` now carry the
+        // agent's own values instead of arriving empty -- the operator's
+        // approve/deny answer must resolve against an option list they can
+        // actually see.
         assert_eq!(
             with_title,
             Some(ProviderEvent::InteractionRequested {
                 request_id: Some("number:6".to_owned()),
                 interaction_kind: ProviderInteractionKind::Approval,
                 tool_name: "edit".to_owned(),
+                title: Some("Edit src/main.rs".to_owned()),
                 prompt: "Edit src/main.rs".to_owned(),
+                options: vec![
+                    ProviderInteractionOption {
+                        option_id: "allow".to_owned(),
+                        name: "Allow".to_owned(),
+                        kind: "allow_once".to_owned(),
+                    },
+                    ProviderInteractionOption {
+                        option_id: "reject".to_owned(),
+                        name: "Reject".to_owned(),
+                        kind: "reject_once".to_owned(),
+                    },
+                ],
                 agent_id: None,
             })
         );
@@ -4912,7 +4972,8 @@ mod tests {
         // No `kind` on the wire (or no params at all) -- falls back to the
         // method name rather than an empty `tool_name`, which
         // `ProviderEvent::validate_ingress` rejects. An absent `title`
-        // leaves `prompt` empty rather than inventing a question.
+        // leaves `prompt` empty rather than inventing a question, and no
+        // params at all means no option list to read, not a dropped one.
         let without_title = super::provider_event(
             AgentEvent::RpcIncomingRequest {
                 id: gate4agent::rpc::message::RpcId::String("agent-7".to_owned()),
@@ -4928,7 +4989,9 @@ mod tests {
                 request_id: Some("string:agent-7".to_owned()),
                 interaction_kind: ProviderInteractionKind::Approval,
                 tool_name: "session/request_permission".to_owned(),
+                title: None,
                 prompt: String::new(),
+                options: Vec::new(),
                 agent_id: None,
             })
         );

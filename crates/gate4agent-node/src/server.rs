@@ -77,7 +77,7 @@ use crate::protocol::{
     read_json_frame_limited_body_timeout, write_json_frame, write_json_frame_limited,
     validate_node_negotiated_handshake_capacity, validate_provider_contract_manifest,
     provider_id_is_legacy, AdapterContractRevision, AgentStreamChunkKindV1, AgentStreamChunkV1,
-    AgentStreamNamedIdV1,
+    AgentStreamInteractionOptionV1, AgentStreamNamedIdV1,
     CapabilityId, ClientFrame, ClientRole,
     ControllerState, DeliveryBlobChunkHexV1, DeliveryBlobDigestV1,
     DeliveryBundleManifestV2, DeliveryCommitReceiptV1, DeliveryStageId,
@@ -1126,7 +1126,9 @@ fn agent_stream_chunk(event: &ControlEvent) -> Option<AgentStreamChunkV1> {
         ProviderEvent::InteractionRequested {
             interaction_kind,
             tool_name,
+            title,
             prompt,
+            options,
             ..
         } => AgentStreamChunkKindV1::InteractionPrompt {
             correlation_id: opaque_interaction_correlation(
@@ -1136,17 +1138,24 @@ fn agent_stream_chunk(event: &ControlEvent) -> Option<AgentStreamChunkV1> {
             ),
             interaction_kind: *interaction_kind,
             tool_name: tool_name.clone(),
-            // ACP's `session/request_permission` options are not carried
-            // through `ProviderEvent::InteractionRequested` (see its shape
-            // in `gate4agent-types/src/control.rs`) -- the response space
-            // is instead fixed by `interaction_kind` itself
-            // (`ProviderInteractionResponse::validate_for`), so there is no
-            // per-request title or option catalog to report, the same way
-            // `provider_observations` above leaves unavailable breakdown
-            // fields as `None` rather than a fabricated value.
-            title: None,
+            // `title`/`options` are carried straight through from
+            // `ProviderEvent::InteractionRequested`, as the agent itself
+            // gave them on `session/request_permission`'s `PermissionTool
+            // Call.title`/`options` (see `gate4agent-shell-native`'s
+            // `provider_event`, the only ACP-transport producer). A PTY- or
+            // hook-sourced interaction carries `title: None` and
+            // `options: []` from its own producer because that source has
+            // none to offer, never because this mapping dropped one.
+            title: title.clone(),
             prompt: prompt.clone(),
-            options: Vec::new(),
+            options: options
+                .iter()
+                .map(|option| AgentStreamInteractionOptionV1 {
+                    option_id: option.option_id.clone(),
+                    name: option.name.clone(),
+                    kind: option.kind.clone(),
+                })
+                .collect(),
         },
         ProviderEvent::ConfigOptionsUpdated { options } => {
             AgentStreamChunkKindV1::ConfigOptions { options: options.clone() }
@@ -17121,7 +17130,9 @@ mod observation_projection_tests {
                 request_id: Some("private-request-id".to_owned()),
                 interaction_kind: ProviderInteractionKind::Approval,
                 tool_name: "Shell".to_owned(),
+                title: None,
                 prompt: String::new(),
+                options: Vec::new(),
                 agent_id: None,
             },
         ));
@@ -17360,7 +17371,9 @@ mod observation_projection_tests {
                 request_id: Some("private-request".to_owned()),
                 interaction_kind: ProviderInteractionKind::Approval,
                 tool_name: "PowerShell".to_owned(),
+                title: None,
                 prompt: "private approval prompt".to_owned(),
+                options: Vec::new(),
                 agent_id: None,
             },
         );

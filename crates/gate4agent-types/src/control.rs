@@ -22,6 +22,12 @@ pub const PROVIDER_EVENT_TOOLS_MAX: usize = 256;
 pub const PROVIDER_INTERACTIONS_MAX: usize = 64;
 pub const PROVIDER_INTERACTION_RESPONSE_MAX_BYTES: usize = 32_768;
 pub const PROVIDER_INTERACTION_FAILURE_MAX_BYTES: usize = 4_096;
+/// Bound on `ProviderEvent::InteractionRequested::options` -- same
+/// rationale as `OPERATOR_GATE_OPTIONS_MAX`: an ACP `session/request_
+/// permission` call offers a subset of exactly four `PermissionOptionKind`
+/// values, so this gives headroom over that domain maximum without letting
+/// a garbled or hostile agent inflate the wire payload.
+pub const PROVIDER_INTERACTION_OPTIONS_MAX: usize = 8;
 pub const PROVIDER_SUBAGENTS_MAX: usize = 64;
 pub const PROVIDER_SESSION_LOCATOR_MAX_BYTES: usize = 32_768;
 pub const PROVIDER_PLAN_STEPS_MAX: usize = 256;
@@ -1555,6 +1561,29 @@ pub enum HostRequestDecision {
     Deferred,
 }
 
+/// One option the agent offered on a `session/request_permission`-style
+/// interaction, carried on `ProviderEvent::InteractionRequested::options`
+/// exactly as the agent gave it -- see ACP's `PermissionOption` in
+/// `src/acp/protocol.rs` (`option_id`, `name`, `kind`). This crate cannot
+/// depend on `gate4agent` (see this crate's own `CLAUDE.md`), so the shape
+/// is repeated here rather than shared, the same precedent
+/// `ProviderRateLimitKind` already sets for a wire-typed mirror of a
+/// `gate4agent`-side enum.
+///
+/// `kind` is carried as the ACP wire's own snake_case string (`allow_once`,
+/// `allow_always`, `reject_once`, `reject_always`) rather than re-typed
+/// into an enum here: nothing in this crate interprets `kind`, an operator
+/// surface only ever displays it, and `gate4agent-node-protocol`'s
+/// `AgentStreamInteractionOptionV1::kind` -- the wire shape this eventually
+/// becomes -- is the same plain `String`, so a round trip through an enum
+/// here would buy no safety, only an extra conversion.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderInteractionOption {
+    pub option_id: String,
+    pub name: String,
+    pub kind: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ProviderEvent {
@@ -1611,7 +1640,21 @@ pub enum ProviderEvent {
         request_id: Option<String>,
         interaction_kind: ProviderInteractionKind,
         tool_name: String,
+        /// The ACP `PermissionToolCall.title` -- the human sentence
+        /// describing this particular call (e.g. "Edit files"), when the
+        /// source carries one. `None` means this source never carries a
+        /// title at all (a PTY- or hook-sourced interaction has no such
+        /// field to read -- see `gate4agent-shell-native`'s construction
+        /// sites), never that a title was dropped after arriving.
+        title: Option<String>,
         prompt: String,
+        /// The concrete options the agent is willing to accept a decision
+        /// from, in the agent's own order -- an ACP `PermissionOption`
+        /// list verbatim (see `ProviderInteractionOption`). Empty means
+        /// this source has no option list to offer at all (PTY- and
+        /// hook-sourced interactions), never that the agent offered zero
+        /// and one was dropped.
+        options: Vec<ProviderInteractionOption>,
         agent_id: Option<String>,
     },
     InteractionResolved {
@@ -1784,7 +1827,9 @@ impl ProviderEvent {
                 request_id,
                 interaction_kind,
                 tool_name,
+                title,
                 prompt,
+                options,
                 agent_id,
             } => {
                 if let Some(request_id) = request_id {
@@ -1795,6 +1840,9 @@ impl ProviderEvent {
                     )?;
                 }
                 validate_required("interaction tool", tool_name, PROVIDER_EVENT_ID_MAX_BYTES)?;
+                if let Some(title) = title {
+                    validate_text("interaction title", title, PROVIDER_EVENT_TEXT_MAX_BYTES)?;
+                }
                 if *interaction_kind == ProviderInteractionKind::Question {
                     validate_required_text(
                         "interaction prompt",
@@ -1803,6 +1851,29 @@ impl ProviderEvent {
                     )?;
                 } else {
                     validate_text("interaction prompt", prompt, PROVIDER_EVENT_TEXT_MAX_BYTES)?;
+                }
+                if options.len() > PROVIDER_INTERACTION_OPTIONS_MAX {
+                    return Err(ProviderEventValidationError::TooManyInteractionOptions {
+                        count: options.len(),
+                        max: PROVIDER_INTERACTION_OPTIONS_MAX,
+                    });
+                }
+                for option in options {
+                    validate_required(
+                        "interaction option id",
+                        &option.option_id,
+                        PROVIDER_EVENT_ID_MAX_BYTES,
+                    )?;
+                    validate_required(
+                        "interaction option name",
+                        &option.name,
+                        PROVIDER_EVENT_ID_MAX_BYTES,
+                    )?;
+                    validate_required(
+                        "interaction option kind",
+                        &option.kind,
+                        PROVIDER_EVENT_ID_MAX_BYTES,
+                    )?;
                 }
                 validate_optional_agent_id(agent_id)?;
             }
@@ -2160,6 +2231,8 @@ pub enum ProviderEventValidationError {
     TooManyConfigOptionChoices { count: usize, max: usize },
     #[error("provider mode catalog count {count} exceeds {max}")]
     TooManyModes { count: usize, max: usize },
+    #[error("provider interaction option count {count} exceeds {max}")]
+    TooManyInteractionOptions { count: usize, max: usize },
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -2669,7 +2742,8 @@ mod tests {
         OperatorGateSubject, ProviderAvailableCommand, ProviderConfigChoice, ProviderConfigOption,
         ProviderConfigOptionKind, ProviderEvent,
         ProviderEventValidationError,
-        ProviderInteractionKind, ProviderInteractionOutcome, ProviderInteractionResponse,
+        ProviderInteractionKind, ProviderInteractionOption, ProviderInteractionOutcome,
+        ProviderInteractionResponse,
         ProviderInteractionResponseError, ProviderModeInfo, ProviderPlanPriority,
         ProviderPlanStatus,
         ProviderPlanStep, ProviderRuntimeCapability, ProviderRuntimePolicy,
@@ -2681,7 +2755,8 @@ mod tests {
         OPERATOR_GATE_OPTION_TEXT_MAX_BYTES, OPERATOR_GATE_PATH_MAX_BYTES,
         PROVIDER_AVAILABLE_COMMANDS_MAX,
         PROVIDER_EVENT_ID_MAX_BYTES, PROVIDER_EVENT_TEXT_MAX_BYTES,
-        PROVIDER_INTERACTION_RESPONSE_MAX_BYTES, PROVIDER_MODE_CATALOG_MAX,
+        PROVIDER_INTERACTION_OPTIONS_MAX, PROVIDER_INTERACTION_RESPONSE_MAX_BYTES,
+        PROVIDER_MODE_CATALOG_MAX,
         PROVIDER_PLAN_STEPS_MAX,
         PTY_SCREEN_GATE_NAME_MAX_BYTES,
     };
@@ -3099,7 +3174,13 @@ mod tests {
             request_id: Some("question-1".to_owned()),
             interaction_kind: ProviderInteractionKind::Question,
             tool_name: "AskUserQuestion".to_owned(),
+            title: Some("Continue?".to_owned()),
             prompt: "{\"question\":\"Continue?\"}".to_owned(),
+            options: vec![ProviderInteractionOption {
+                option_id: "yes".to_owned(),
+                name: "Yes".to_owned(),
+                kind: "allow_once".to_owned(),
+            }],
             agent_id: Some("child-1".to_owned()),
         };
         assert_eq!(question.validate_ingress(), Ok(()));
@@ -3109,7 +3190,9 @@ mod tests {
                 request_id: Some("bad\nrequest".to_owned()),
                 interaction_kind: ProviderInteractionKind::Approval,
                 tool_name: "shell".to_owned(),
+                title: None,
                 prompt: String::new(),
+                options: Vec::new(),
                 agent_id: None,
             }
             .validate_ingress(),
@@ -3123,12 +3206,36 @@ mod tests {
                 request_id: None,
                 interaction_kind: ProviderInteractionKind::Question,
                 tool_name: "AskUserQuestion".to_owned(),
+                title: None,
                 prompt: String::new(),
+                options: Vec::new(),
                 agent_id: None,
             }
             .validate_ingress(),
             Err(ProviderEventValidationError::Empty {
                 field: "interaction prompt"
+            })
+        ));
+        assert!(matches!(
+            ProviderEvent::InteractionRequested {
+                request_id: None,
+                interaction_kind: ProviderInteractionKind::Approval,
+                tool_name: "shell".to_owned(),
+                title: None,
+                prompt: String::new(),
+                options: (0..PROVIDER_INTERACTION_OPTIONS_MAX + 1)
+                    .map(|index| ProviderInteractionOption {
+                        option_id: format!("option-{index}"),
+                        name: format!("Option {index}"),
+                        kind: "allow_once".to_owned(),
+                    })
+                    .collect(),
+                agent_id: None,
+            }
+            .validate_ingress(),
+            Err(ProviderEventValidationError::TooManyInteractionOptions {
+                max: PROVIDER_INTERACTION_OPTIONS_MAX,
+                ..
             })
         ));
 

@@ -30,6 +30,7 @@ use crate::protocol::{
     C2_SPAWN_PROFILE_REVISION_CAPABILITY,
     C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY,
     C2_TERMINAL_FRAME_EVENTS_CAPABILITY,
+    C2_AGENT_STREAM_EVENTS_CAPABILITY,
     C2_GIT_READ_CAPABILITY, C2_WORKSPACE_FILE_READ_CAPABILITY,
     C2_WORKSPACE_FILE_WRITE_CAPABILITY,
     C2_WORKSPACE_ENTRY_CREATE_CAPABILITY,
@@ -83,6 +84,7 @@ struct NegotiatedPathCapabilities {
     native_session_index: bool,
     native_session_preview: bool,
     terminal_frame_events: bool,
+    agent_stream_events: bool,
     agent_progress_snapshot: bool,
     session_task_correlation: bool,
     observation_events: bool,
@@ -582,6 +584,19 @@ async fn control_writer<W>(
                 TerminalFramePayload::None => {}
             }
         }
+        if !path_capabilities.agent_stream_events {
+            match server_frame_agent_stream_payload(&frame) {
+                AgentStreamPayload::DirectEvent => {
+                    budget.fetch_sub(queued.bytes, Ordering::AcqRel);
+                    continue;
+                }
+                AgentStreamPayload::NestedReply => {
+                    budget.fetch_sub(queued.bytes, Ordering::AcqRel);
+                    break;
+                }
+                AgentStreamPayload::None => {}
+            }
+        }
         if !project_server_frame_observation_events(
             &mut frame,
             path_capabilities.observation_events,
@@ -875,6 +890,7 @@ fn negotiated_path_capabilities(
         native_session_index: selected_has(C2_NATIVE_SESSION_INDEX_CAPABILITY),
         native_session_preview: selected_has(C2_NATIVE_SESSION_PREVIEW_CAPABILITY),
         terminal_frame_events: selected_has(C2_TERMINAL_FRAME_EVENTS_CAPABILITY),
+        agent_stream_events: selected_has(C2_AGENT_STREAM_EVENTS_CAPABILITY),
         agent_progress_snapshot: selected_has(C2_AGENT_PROGRESS_SNAPSHOT_CAPABILITY),
         session_task_correlation: selected_has(C2_SESSION_TASK_CORRELATION_CAPABILITY),
         observation_events: selected_has(C2_OBSERVATION_EVENTS_CAPABILITY),
@@ -972,6 +988,101 @@ fn c2_event_is_terminal_frame(event: &C2NodeEvent) -> bool {
         | C2NodeEvent::Observation { .. }
         | C2NodeEvent::ManagedObservation { .. }
         | C2NodeEvent::AgentStream { .. }
+        | C2NodeEvent::ControllerChanged { .. }
+        | C2NodeEvent::WorkspaceAdded { .. }
+        | C2NodeEvent::WorkspaceRemoved { .. }
+        | C2NodeEvent::SessionRecordUpserted { .. }
+        | C2NodeEvent::SessionRecordRemoved { .. }
+        | C2NodeEvent::ManagedWorktreeUpserted { .. }
+        | C2NodeEvent::ManagedWorktreeRemoved { .. }
+        | C2NodeEvent::ResyncRequired { .. } => false,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AgentStreamPayload {
+    None,
+    DirectEvent,
+    NestedReply,
+}
+
+fn server_frame_agent_stream_payload(frame: &C2ServerFrame) -> AgentStreamPayload {
+    match frame {
+        C2ServerFrame::Reply(reply) if reply.result.as_ref().ok().is_some_and(|routed| {
+            routed.response.as_ref().ok().is_some_and(|response| {
+                match response {
+                    C2NodeResponse::Resync { events, .. } => events.iter().any(|event| {
+                        c2_event_is_agent_stream(&event.event)
+                    }),
+                    C2NodeResponse::Snapshot { .. }
+                    | C2NodeResponse::Armed { .. }
+                    | C2NodeResponse::Spawned { .. }
+                    | C2NodeResponse::Activated { .. }
+                    | C2NodeResponse::Aborted { .. }
+                    | C2NodeResponse::ReplyChunkAccepted { .. }
+                    | C2NodeResponse::CallRejected { .. }
+                    | C2NodeResponse::DeliveryStageBegun { .. }
+                    | C2NodeResponse::DeliveryBlobChunkAccepted { .. }
+                    | C2NodeResponse::DeliveryCommitted { .. }
+                    | C2NodeResponse::DeliveryStageAborted { .. }
+                    | C2NodeResponse::WorkspaceInspected { .. }
+                    | C2NodeResponse::HostDirectoriesBrowsed { .. }
+                    | C2NodeResponse::WorkspaceFileRead { .. }
+                    | C2NodeResponse::WorkspaceFileWritten { .. }
+                    | C2NodeResponse::WorkspaceFileCreated { .. }
+                    | C2NodeResponse::WorkspaceDirectoryCreated { .. }
+                    | C2NodeResponse::GitHistoryRead { .. }
+                    | C2NodeResponse::GitDiffRead { .. }
+                    | C2NodeResponse::Controller { .. }
+                    | C2NodeResponse::SpawnAccepted { .. }
+                    | C2NodeResponse::SpawnSpecAccepted { .. }
+                    | C2NodeResponse::ManagedWorktreeSpawnAccepted { .. }
+                    | C2NodeResponse::ManagedWorktreeCleanup { .. }
+                    | C2NodeResponse::SessionRecordUpdated { .. }
+                    | C2NodeResponse::ProviderSessionIndexed { .. }
+                    | C2NodeResponse::NativeSessionIndexed { .. }
+                    | C2NodeResponse::SessionRecordResumed { .. }
+                    | C2NodeResponse::SessionRecordForgotten { .. }
+                    | C2NodeResponse::NativeSessionsCataloged { .. }
+                    | C2NodeResponse::NativeSessionsPaged { .. }
+                    | C2NodeResponse::NativeSessionPreviewed { .. }
+                    | C2NodeResponse::SessionRecordPreviewed { .. }
+                    | C2NodeResponse::HistoryDiscovered { .. }
+                    | C2NodeResponse::HistoryLoaded { .. }
+                    | C2NodeResponse::ContextPackForSessionRecordExported { .. }
+                    | C2NodeResponse::ContextPackExported { .. }
+                    | C2NodeResponse::ContextPackForgotten { .. }
+                    | C2NodeResponse::DurableContextPackResolved { .. }
+                    | C2NodeResponse::WorkspaceRegistered { .. }
+                    | C2NodeResponse::StandaloneWorkspaceCreated { .. }
+                    | C2NodeResponse::WorkspaceUnregistered { .. }
+                    | C2NodeResponse::WorktreeCreated { .. }
+                    | C2NodeResponse::WorktreeRemoved { .. }
+                    | C2NodeResponse::Accepted
+                    | C2NodeResponse::ShuttingDown => false,
+                }
+            })
+        }) => AgentStreamPayload::NestedReply,
+        C2ServerFrame::Event(event) if c2_event_is_agent_stream(&event.event) => {
+            AgentStreamPayload::DirectEvent
+        }
+        C2ServerFrame::Challenge(_)
+        | C2ServerFrame::Hello(_)
+        | C2ServerFrame::Reply(_)
+        | C2ServerFrame::Event(_)
+        | C2ServerFrame::Topology(_)
+        | C2ServerFrame::Rejected(_) => AgentStreamPayload::None,
+    }
+}
+
+fn c2_event_is_agent_stream(event: &C2NodeEvent) -> bool {
+    match event {
+        C2NodeEvent::AgentStream { .. } => true,
+        C2NodeEvent::HarnessMcpReadCall { .. }
+        | C2NodeEvent::Control { .. }
+        | C2NodeEvent::Observation { .. }
+        | C2NodeEvent::ManagedObservation { .. }
+        | C2NodeEvent::TerminalFrame { .. }
         | C2NodeEvent::ControllerChanged { .. }
         | C2NodeEvent::WorkspaceAdded { .. }
         | C2NodeEvent::WorkspaceRemoved { .. }
@@ -2179,6 +2290,8 @@ fn c2_control_compatibility_support() -> Result<C2ControlCompatibilitySupport, F
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
             CapabilityId::new(C2_TERMINAL_FRAME_EVENTS_CAPABILITY)
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
+            CapabilityId::new(C2_AGENT_STREAM_EVENTS_CAPABILITY)
+                .map_err(|error| authentication_frame_error(error.to_string()))?,
             CapabilityId::new(C2_WORKTREE_SELECTION_CAPABILITY)
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
             CapabilityId::new(C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY)
@@ -3065,6 +3178,26 @@ mod tests {
                     }],
                 }),
             }),
+        })
+    }
+
+    fn agent_stream_event_frame(instance_id: u64, sequence: u64) -> C2ServerFrame {
+        C2ServerFrame::Event(RoutedNodeEvent {
+            node_id: NodeId::new("node-a").unwrap(),
+            cursor: NodeCursor {
+                incarnation_id: NodeIncarnationId::from_bytes([9; 16]),
+                sequence,
+            },
+            event: C2NodeEvent::AgentStream {
+                address: address(instance_id),
+                chunk: gate4agent_node_protocol::AgentStreamChunkV1 {
+                    source_sequence: sequence,
+                    kind: gate4agent_node_protocol::AgentStreamChunkKindV1::Text {
+                        text: "hello".to_owned(),
+                        is_delta: false,
+                    },
+                },
+            },
         })
     }
 
@@ -5056,6 +5189,116 @@ mod tests {
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).await.unwrap();
         assert!(bytes.is_empty());
+        assert_eq!(budget.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn control_writer_drops_unnegotiated_agent_stream_event_and_stays_healthy() {
+        let (writer, mut reader) = tokio::io::duplex(4096);
+        let (sender, receiver) = mpsc::channel(2);
+        let budget = Arc::new(AtomicUsize::new(0));
+        sender
+            .send(queued(agent_stream_event_frame(1, 8), &budget).unwrap())
+            .await
+            .unwrap();
+        let healthy_frame = terminal_event_frame(1, 9);
+        sender
+            .send(queued(healthy_frame.clone(), &budget).unwrap())
+            .await
+            .unwrap();
+        drop(sender);
+        let (disconnect, _disconnected) = watch::channel(false);
+        control_writer(
+            writer,
+            receiver,
+            Arc::clone(&budget),
+            disconnect,
+            NegotiatedPathCapabilities {
+                opaque_host_paths: true,
+                repository_paths: true,
+                workspace_file_read: true,
+                host_directory_browse: true,
+                standalone_workspace_lifecycle: true,
+                provider_session_reference_index: true,
+                provider_runtime_status: true,
+                provider_ids_open: true,
+                spawn_spec_defaults_overrides: true,
+                worktree_selection: true,
+                managed_worktree_lifecycle: true,
+                child_environment_profile: true,
+                session_bundle_materialization: true,
+                history_context_pack: true,
+                native_session_catalog: true,
+                native_session_catalog_paging: true,
+                native_session_index: true,
+                native_session_preview: true,
+                terminal_frame_events: true,
+                agent_stream_events: false,
+                ..Default::default()
+            },
+            watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
+        ).await;
+        // The unnegotiated agent-stream event must be silently absent, and
+        // the peer must stay healthy enough to still receive the frame
+        // queued right behind it -- proving the drop is a `continue`, not a
+        // connection-ending `break`.
+        let delivered = read_json_frame_limited_body_timeout::<_, C2ServerFrame>(
+            &mut reader,
+            MAX_C2_SERVER_FRAME_BYTES,
+            FRAME_BODY_DEADLINE,
+        ).await.unwrap();
+        assert_eq!(delivered, healthy_frame);
+        let mut trailing = Vec::new();
+        reader.read_to_end(&mut trailing).await.unwrap();
+        assert!(trailing.is_empty());
+        assert_eq!(budget.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn control_writer_relays_agent_stream_event_to_negotiated_peer() {
+        let (writer, mut reader) = tokio::io::duplex(4096);
+        let (sender, receiver) = mpsc::channel(1);
+        let budget = Arc::new(AtomicUsize::new(0));
+        let frame = agent_stream_event_frame(1, 8);
+        sender.send(queued(frame.clone(), &budget).unwrap()).await.unwrap();
+        drop(sender);
+        let (disconnect, _disconnected) = watch::channel(false);
+        control_writer(
+            writer,
+            receiver,
+            Arc::clone(&budget),
+            disconnect,
+            NegotiatedPathCapabilities {
+                opaque_host_paths: true,
+                repository_paths: true,
+                workspace_file_read: true,
+                host_directory_browse: true,
+                standalone_workspace_lifecycle: true,
+                provider_session_reference_index: true,
+                provider_runtime_status: true,
+                provider_ids_open: true,
+                spawn_spec_defaults_overrides: true,
+                worktree_selection: true,
+                managed_worktree_lifecycle: true,
+                child_environment_profile: true,
+                session_bundle_materialization: true,
+                history_context_pack: true,
+                native_session_catalog: true,
+                native_session_catalog_paging: true,
+                native_session_index: true,
+                native_session_preview: true,
+                terminal_frame_events: true,
+                agent_stream_events: true,
+                ..Default::default()
+            },
+            watch::channel(Arc::new(status(NodeTransportState::Offline, None))).1,
+        ).await;
+        let delivered = read_json_frame_limited_body_timeout::<_, C2ServerFrame>(
+            &mut reader,
+            MAX_C2_SERVER_FRAME_BYTES,
+            FRAME_BODY_DEADLINE,
+        ).await.unwrap();
+        assert_eq!(delivered, frame);
         assert_eq!(budget.load(Ordering::Acquire), 0);
     }
 

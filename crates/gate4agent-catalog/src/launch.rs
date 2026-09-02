@@ -206,13 +206,17 @@ pub fn approval_level_resolution(agent_id: &AgentId, level: ApprovalLevel) -> Ap
             asks_for_permission: false,
         },
         ("grok", ApprovalLevel::Moderate) => Supported {
-            args: Vec::new(),
-            // No confirmed flag for vendor-documented "Auto" (classifier
-            // auto-approves safer tools, dangerous ones still prompt) --
-            // falls back to no flag rather than inventing one, same as
-            // `Unmanaged`. The vendor's own default with no flag is "Ask",
-            // which does ask -- UNCONFIRMED whether it is reachable any
-            // other way, needs live confirmation.
+            // CONFIRMED 2026-09-02 against xAI's own documentation, which
+            // spells this invocation out literally. The earlier empty argv
+            // was wrong in a way worth naming: no flag does not mean "Auto",
+            // it means the vendor's default, which is the stricter "Ask".
+            // So a Moderate session silently ran at a narrower authority
+            // than it asked for -- the mirror image of the ReadOnly defect
+            // this map was rewritten to fix, and equally a case of assuming
+            // a default rather than reading one.
+            args: vec!["--permission-mode".to_owned(), "auto".to_owned()],
+            // Auto auto-approves the safer tools by classifier and still
+            // prompts for dangerous ones, so a request can still arrive.
             asks_for_permission: true,
         },
         // No documented read-only mode exists for Grok Build at all (Ask /
@@ -823,6 +827,10 @@ mod tests {
             approval_level_args(&grok, ApprovalLevel::FullAuto),
             ["--permission-mode", "bypassPermissions"]
         );
+        assert_eq!(
+            approval_level_args(&grok, ApprovalLevel::Moderate),
+            ["--permission-mode", "auto"]
+        );
         assert!(approval_level_args(&grok, ApprovalLevel::Unmanaged).is_empty());
 
         let kimi = AgentId::new("kimi").unwrap();
@@ -840,9 +848,20 @@ mod tests {
     /// to carry that refusal.
     #[test]
     fn grok_and_kimi_moderate_never_invents_a_flag_and_matches_unmanaged() {
-        for id in ["grok", "kimi"] {
+        // grok's `Moderate` is deliberately absent from this loop: it now
+        // carries `--permission-mode auto`, confirmed against xAI's own
+        // documentation on 2026-09-02. This test guards against INVENTING a
+        // flag, not against having one -- and the empty argv it used to
+        // assert was itself the defect, since no flag reaches grok's default
+        // "Ask", not "Auto", so a Moderate session ran narrower than it
+        // asked for. `approval_level_resolution_matches_the_verified_
+        // provider_table` pins the new row.
+        for (id, levels) in [
+            ("grok", &[ApprovalLevel::ReadOnly][..]),
+            ("kimi", &[ApprovalLevel::Moderate, ApprovalLevel::ReadOnly][..]),
+        ] {
             let agent = AgentId::new(id).unwrap();
-            for level in [ApprovalLevel::Moderate, ApprovalLevel::ReadOnly] {
+            for level in levels.iter().copied() {
                 let produced = approval_level_args(&agent, level);
                 assert!(produced.is_empty(), "{id} at {level:?} must not fabricate a flag");
                 assert_eq!(
@@ -924,7 +943,7 @@ mod tests {
         );
         assert_eq!(
             approval_level_resolution(&grok, ApprovalLevel::Moderate),
-            supported(&[], true)
+            supported(&["--permission-mode", "auto"], true)
         );
         assert_eq!(
             approval_level_resolution(&grok, ApprovalLevel::ReadOnly),

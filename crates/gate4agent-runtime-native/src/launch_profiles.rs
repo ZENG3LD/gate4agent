@@ -510,8 +510,12 @@ pub enum NativeLaunchProfileError {
     OneShotSessionPersistenceBindingMismatch,
     #[error("native instance launch overlay supports PTY transport only")]
     InstanceOverlayUnsupportedTransport,
-    #[error("native harness MCP launch overlay requires PTY transport and the exact provider binding")]
-    HarnessMcpOverlayBindingMismatch,
+    #[error("native harness MCP launch overlay requires PTY or ACP transport and the exact provider binding; saw transport {transport:?}, overlay provider '{overlay_provider}', spawn provider '{spawn_provider}'")]
+    HarnessMcpOverlayBindingMismatch {
+        transport: TransportKind,
+        overlay_provider: AgentId,
+        spawn_provider: AgentId,
+    },
     #[error("native launch profile selection capacity is {max}")]
     SelectionCapacityExceeded { max: usize },
     #[error("native launch environment overlay requires an existing profile selection")]
@@ -722,8 +726,14 @@ impl NativeLaunchProfiles {
             }
         }
         if let Some(harness_mcp_overlay) = &harness_mcp_overlay {
-            if transport != TransportKind::Pty || harness_mcp_overlay.agent_id != *agent_id {
-                return Err(NativeLaunchProfileError::HarnessMcpOverlayBindingMismatch);
+            if !matches!(transport, TransportKind::Pty | TransportKind::Acp)
+                || harness_mcp_overlay.agent_id != *agent_id
+            {
+                return Err(NativeLaunchProfileError::HarnessMcpOverlayBindingMismatch {
+                    transport,
+                    overlay_provider: harness_mcp_overlay.agent_id.clone(),
+                    spawn_provider: agent_id.clone(),
+                });
             }
         }
         if profile.is_none() && overlay.is_none() && harness_mcp_overlay.is_none() {
@@ -1219,6 +1229,103 @@ mod tests {
             assert!(resolved.environment.iter().any(|mutation| {
                 mutation.key == OsString::from(key) && mutation.value.is_some()
             }));
+        }
+    }
+
+    #[test]
+    fn harness_mcp_overlay_admits_acp_transport_for_the_same_provider() {
+        let control = NativeLaunchProfileControl::new();
+        let instance_id = AgentInstanceId(42);
+        control
+            .install_native_harness_mcp_launch_overlay(
+                instance_id,
+                NativeHarnessMcpLaunchOverlay::new(
+                    AgentId::new("claude").unwrap(),
+                    OsString::from("private-endpoint"),
+                    OsString::from("private-token"),
+                    OsString::from("reviewed-program"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let resolved = control
+            .resolve_launch_overlay(
+                instance_id,
+                &AgentId::new("claude").unwrap(),
+                TransportKind::Acp,
+                true,
+            )
+            .unwrap();
+        assert_eq!(resolved.environment.len(), 5);
+    }
+
+    #[test]
+    fn harness_mcp_overlay_refuses_acp_transport_for_a_different_provider() {
+        let control = NativeLaunchProfileControl::new();
+        let instance_id = AgentInstanceId(43);
+        control
+            .install_native_harness_mcp_launch_overlay(
+                instance_id,
+                NativeHarnessMcpLaunchOverlay::new(
+                    AgentId::new("codex").unwrap(),
+                    OsString::from("private-endpoint"),
+                    OsString::from("private-token"),
+                    OsString::from("reviewed-program"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let result = control.resolve_launch_overlay(
+            instance_id,
+            &AgentId::new("claude").unwrap(),
+            TransportKind::Acp,
+            true,
+        );
+        match result {
+            Ok(_) => panic!("expected the harness MCP overlay gate to refuse a mismatched provider"),
+            Err(error) => assert_eq!(
+                error,
+                NativeLaunchProfileError::HarnessMcpOverlayBindingMismatch {
+                    transport: TransportKind::Acp,
+                    overlay_provider: AgentId::new("codex").unwrap(),
+                    spawn_provider: AgentId::new("claude").unwrap(),
+                }
+            ),
+        }
+    }
+
+    #[test]
+    fn harness_mcp_overlay_refuses_pipe_transport_by_name() {
+        let control = NativeLaunchProfileControl::new();
+        let instance_id = AgentInstanceId(44);
+        control
+            .install_native_harness_mcp_launch_overlay(
+                instance_id,
+                NativeHarnessMcpLaunchOverlay::new(
+                    AgentId::new("codex").unwrap(),
+                    OsString::from("private-endpoint"),
+                    OsString::from("private-token"),
+                    OsString::from("reviewed-program"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let result = control.resolve_launch_overlay(
+            instance_id,
+            &AgentId::new("codex").unwrap(),
+            TransportKind::Pipe,
+            true,
+        );
+        match result {
+            Ok(_) => panic!("expected the harness MCP overlay gate to refuse Pipe transport"),
+            Err(error) => assert_eq!(
+                error,
+                NativeLaunchProfileError::HarnessMcpOverlayBindingMismatch {
+                    transport: TransportKind::Pipe,
+                    overlay_provider: AgentId::new("codex").unwrap(),
+                    spawn_provider: AgentId::new("codex").unwrap(),
+                }
+            ),
         }
     }
 }

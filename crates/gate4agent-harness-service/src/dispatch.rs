@@ -205,10 +205,26 @@ pub struct HarnessLaunchPlanV1 {
 }
 
 impl HarnessLaunchPlanV1 {
+    /// A plan is ordinary -- dispatchable straight from the operator wire,
+    /// with no exact grant baked in -- when it carries no delivery bundle,
+    /// no continuation, and its harness MCP policy is either `Disabled` or
+    /// `GrantBound` paired with `HarnessGrantPolicyV1::Operator`. The
+    /// `Operator` pairing is safe because the harness itself mints the
+    /// dispatching run's default, self-only grant at dispatch time
+    /// (`runtime::resolve_harness_mcp_grant`, gate4agent-arc-mailbox-and-
+    /// task-layer Slice A(i)) through the same audited mutation path the
+    /// operator wire's own grant mutations use -- an operator never
+    /// supplies or reuses an exact grant identity for this shape. A
+    /// `GrantBound` plan naming an `Exact` grant instead stays privileged:
+    /// that exact grant belongs to a specific parent run and must be
+    /// validated against it (`HarnessService::
+    /// prepare_scheduled_specialized_authorities`) before anything reads
+    /// through it, so it is never treated as ordinary.
     pub fn is_ordinary_dispatch(&self) -> bool {
         self.delivery.is_none()
             && self.continuation == HarnessContinuationPolicyV1::None
-            && self.harness_mcp == HarnessMcpPolicyV1::Disabled
+            && (self.harness_mcp == HarnessMcpPolicyV1::Disabled
+                || matches!(self.grant, HarnessGrantPolicyV1::Operator))
     }
 
     pub fn validate(&self) -> Result<(), HarnessDispatchError> {
@@ -229,16 +245,23 @@ impl HarnessLaunchPlanV1 {
         }
         if matches!(self.grant, HarnessGrantPolicyV1::Operator)
             && (self.delivery.is_some()
-                || self.continuation != HarnessContinuationPolicyV1::None
-                || self.harness_mcp != HarnessMcpPolicyV1::Disabled)
+                || self.continuation != HarnessContinuationPolicyV1::None)
         {
             return Err(HarnessDispatchError::OperatorPrivilegedFlow);
         }
-        if self.harness_mcp == HarnessMcpPolicyV1::GrantBound
-            && !matches!(self.grant, HarnessGrantPolicyV1::Exact { .. })
-        {
-            return Err(HarnessDispatchError::HarnessMcpGrantRequired);
-        }
+        // No arm rejects `harness_mcp: GrantBound` paired with
+        // `grant: Operator` here. Before gate4agent-arc-mailbox-and-task-
+        // layer Slice A(i), a `GrantBound` plan without an `Exact` grant to
+        // bind to was rejected as `HarnessMcpGrantRequired`, because
+        // nothing ever minted a grant for it. A(i) made
+        // `runtime::resolve_harness_mcp_grant` mint the dispatching run's
+        // own default, read-only grant through `HarnessService::apply` when
+        // the policy is `Operator`, so an `Operator`-granted `GrantBound`
+        // plan now has a real grant to arm its harness MCP reservation
+        // against; there is nothing left that combination could ask for
+        // that a harness-issued default grant cannot give. See
+        // `is_ordinary_dispatch`'s doc comment for the resulting dispatch
+        // shape.
         AgentId::new(self.provider.as_str())?;
         NodeId::new(self.node_id.as_str())?;
         WorkspaceId::new(self.workspace_id.as_str())?;
@@ -664,27 +687,50 @@ const DERIVED_LAUNCH_PLAN_TERMINAL_SIZE: TerminalSize = TerminalSize { rows: 40,
 /// introduced.
 const DERIVED_LAUNCH_PLAN_DEADLINE_MS: u64 = 30_000;
 const DERIVED_LAUNCH_PLAN_ID_PREFIX: &str = "auto";
+/// Suffix appended to a derived plan id to name its harness-MCP sibling --
+/// see `derived_launch_plan`'s `harness_mcp` parameter.
+const DERIVED_LAUNCH_PLAN_HARNESS_MCP_SUFFIX: &str = "-harness-mcp";
 
-/// Synthesizes the default ordinary launch plan for one node/workspace/
-/// provider/spawn-profile combination: an existing-worktree, PTY,
-/// no-prompt-override, operator-grant dispatch with delivery, continuation,
-/// and harness MCP all disabled -- the same shape
-/// `HarnessLaunchPlanV1::is_ordinary_dispatch` requires, so a derived plan
-/// is always eligible for `HarnessLaunchCatalog::ordinary_plans` and never
-/// needs an exact grant.
+/// Synthesizes one derived launch plan for a node/workspace/provider/spawn-
+/// profile combination. `harness_mcp` selects which of the two shapes
+/// `derive_launch_plans_from_inventory` synthesizes per combination:
 ///
-/// `prompt_source` is deliberately `Clear`, not `TaskBody`: the Node's
-/// `ProviderRuntimeRequirement` derivation
-/// (`gate4agent-node::provider_runtime`) treats any resolved prompt in
-/// `Pty` mode as `SemanticPrompt`, which only admits a provider whose
-/// runtime probe verifies semantic/structured-prompt readiness -- a raw
-/// PTY-only provider (no semantic adapter) is rejected outright and the
-/// spawn never starts. The advertised runtime inventory
-/// (`HarnessRuntimeSpawnProfileSummaryV1`) carries no signal for which
-/// providers clear that bar, so a derived plan cannot tell `TaskBody`
-/// would be safe for a given combination; `Clear` maps to `RawPty`
-/// admission, which every PTY-capable provider satisfies by construction
-/// -- the only prompt source guaranteed to actually launch.
+/// - `false`: the plain PTY plan -- existing-worktree, no-prompt-override,
+///   operator-grant dispatch with delivery, continuation, and harness MCP
+///   all disabled, the same shape `HarnessLaunchPlanV1::is_ordinary_dispatch`
+///   has always required.
+/// - `true`: its harness-MCP sibling -- same node/workspace/provider/
+///   profile, id suffixed with [`DERIVED_LAUNCH_PLAN_HARNESS_MCP_SUFFIX`],
+///   `mode: Acp`, `harness_mcp: GrantBound`. `grant` stays `Operator` for
+///   both shapes: `is_ordinary_dispatch` admits `GrantBound` exactly when
+///   paired with `Operator` (gate4agent-arc-mailbox-and-task-layer Slice
+///   A(i)/A(iii)), so the sibling is ordinary too and never needs an exact
+///   grant of its own -- the harness mints one at dispatch time
+///   (`runtime::resolve_harness_mcp_grant`).
+///
+/// `prompt_source` differs between the two shapes for a runtime-admission
+/// reason, not a stylistic one:
+///
+/// - Plain (`Pty`): deliberately `Clear`, not `TaskBody`. The Node's
+///   `ProviderRuntimeRequirement` derivation
+///   (`gate4agent-node::provider_runtime`) treats any resolved prompt in
+///   `Pty` mode as `SemanticPrompt`, which only admits a provider whose
+///   runtime probe verifies semantic/structured-prompt readiness -- a raw
+///   PTY-only provider (no semantic adapter) is rejected outright and the
+///   spawn never starts. The advertised runtime inventory
+///   (`HarnessRuntimeSpawnProfileSummaryV1`) carries no signal for which
+///   providers clear that bar, so a derived plan cannot tell `TaskBody`
+///   would be safe for a given combination; `Clear` maps to `RawPty`
+///   admission, which every PTY-capable provider satisfies by construction
+///   -- the only prompt source guaranteed to actually launch.
+/// - Harness-MCP sibling (`Acp`): `TaskBody`. Under `Acp` mode the Node
+///   resolves the SAME `ProviderRuntimeRequirement::Acp` regardless of
+///   whether a prompt is present (`gate4agent-node::server::
+///   spawn_session_with_deadline`'s `(SessionMode::Acp, _)` arm), so
+///   `TaskBody` carries no equivalent admission risk here -- and it is the
+///   whole point of the sibling: an ACP session dispatched with harness MCP
+///   access and nothing to act on would be a session an operator has to
+///   prompt by hand before it can use the grant it was just issued.
 ///
 /// `include_node_id` disambiguates the synthesized id across multiple
 /// nodes advertising the same workspace/provider/profile combination (see
@@ -701,13 +747,20 @@ fn derived_launch_plan(
     provider: &str,
     profile_id: &str,
     include_node_id: bool,
+    harness_mcp: bool,
 ) -> Option<HarnessLaunchPlanV1> {
+    let suffix = harness_mcp.then_some(DERIVED_LAUNCH_PLAN_HARNESS_MCP_SUFFIX).unwrap_or("");
     let raw_plan_id = if include_node_id {
         format!(
-            "{DERIVED_LAUNCH_PLAN_ID_PREFIX}-{provider}-{node_id}-{workspace_id}-{profile_id}",
+            "{DERIVED_LAUNCH_PLAN_ID_PREFIX}-{provider}-{node_id}-{workspace_id}-{profile_id}{suffix}",
         )
     } else {
-        format!("{DERIVED_LAUNCH_PLAN_ID_PREFIX}-{provider}-{workspace_id}-{profile_id}")
+        format!("{DERIVED_LAUNCH_PLAN_ID_PREFIX}-{provider}-{workspace_id}-{profile_id}{suffix}")
+    };
+    let (mode, prompt_source, harness_mcp_policy) = if harness_mcp {
+        (HarnessExecutionModeV1::Acp, HarnessPromptSourceV1::TaskBody, HarnessMcpPolicyV1::GrantBound)
+    } else {
+        (HarnessExecutionModeV1::Pty, HarnessPromptSourceV1::Clear, HarnessMcpPolicyV1::Disabled)
     };
     Some(HarnessLaunchPlanV1 {
         plan_id: HarnessSelectorV1::new(raw_plan_id).ok()?,
@@ -717,25 +770,35 @@ fn derived_launch_plan(
         worktree: HarnessWorktreeIntentV1::Existing,
         provider_profile: HarnessSelectorV1::new(profile_id).ok()?,
         provider: AgentId::new(provider).ok()?,
-        mode: HarnessExecutionModeV1::Pty,
+        mode,
         terminal_size: DERIVED_LAUNCH_PLAN_TERMINAL_SIZE,
-        prompt_source: HarnessPromptSourceV1::Clear,
+        prompt_source,
         delivery: None,
         continuation: HarnessContinuationPolicyV1::None,
         grant: HarnessGrantPolicyV1::Operator,
-        harness_mcp: HarnessMcpPolicyV1::Disabled,
+        harness_mcp: harness_mcp_policy,
         deadline_ms: DERIVED_LAUNCH_PLAN_DEADLINE_MS,
     })
 }
 
 /// Derives the harness's default ordinary launch plan set from the live
-/// runtime inventory: one plan per node x workspace x enabled provider x
-/// advertised spawn profile combination `nodes` currently reports. This is
-/// what the harness advertises for a combination no CLI
+/// runtime inventory: two plans -- a plain PTY plan and its harness-MCP/ACP
+/// sibling (see `derived_launch_plan`) -- per node x workspace x enabled
+/// provider x advertised spawn profile combination `nodes` currently
+/// reports. This is what the harness advertises for a combination no CLI
 /// `--launch-plan-json` plan already names -- see
 /// `runtime::effective_launch_catalog`, which composes this with the CLI
 /// catalog (CLI wins on plan id collision) and enforces
 /// `HARNESS_LAUNCH_CATALOG_MAX`.
+///
+/// Both siblings are derived from the exact same enabled-provider inventory
+/// entry: the runtime inventory carries no separate "ACP-capable" provider
+/// list (see `derived_launch_plan`'s doc comment on `prompt_source`, which
+/// covers the analogous gap for `Pty`), so every enabled provider gets both
+/// shapes rather than the harness guessing which providers would actually
+/// admit under `Acp` -- a provider that cannot run under ACP fails at Node
+/// admission time (`admit_provider_runtime`) the same way a Pty-only
+/// provider already can under a `TaskBody` prompt.
 ///
 /// Pure and total: never touches storage, never fails, and reflects
 /// exactly the `nodes` slice handed to it -- callers recompute fresh from
@@ -761,14 +824,17 @@ pub(crate) fn derive_launch_plans_from_inventory(
         for workspace_id in node.inventory.workspaces.keys() {
             for provider in &node.inventory.enabled_providers {
                 for profile in spawn_profiles {
-                    if let Some(plan) = derived_launch_plan(
-                        node.node_id.as_str(),
-                        workspace_id.as_str(),
-                        provider.as_str(),
-                        profile.id.as_str(),
-                        include_node_id,
-                    ) {
-                        plans.push(plan);
+                    for harness_mcp in [false, true] {
+                        if let Some(plan) = derived_launch_plan(
+                            node.node_id.as_str(),
+                            workspace_id.as_str(),
+                            provider.as_str(),
+                            profile.id.as_str(),
+                            include_node_id,
+                            harness_mcp,
+                        ) {
+                            plans.push(plan);
+                        }
                     }
                 }
             }
@@ -826,8 +892,6 @@ pub enum HarnessDispatchError {
     ContinuationAuthorityMismatch,
     #[error("operator launch authority cannot request delivery or continuation")]
     OperatorPrivilegedFlow,
-    #[error("grant-bound harness MCP requires an exact grant policy")]
-    HarnessMcpGrantRequired,
     #[error("specialized delivery, continuation, or harness MCP dispatch is unavailable")]
     SpecializedDispatchUnavailable,
     #[error("launch plan terminal size must be nonzero")]
@@ -1622,6 +1686,47 @@ mod tests {
         }
     }
 
+    /// Slice A(i)/A(iii) (gate4agent-arc-mailbox-and-task-layer): a
+    /// `harness_mcp: GrantBound` plan paired with `grant: Operator` is now
+    /// valid and ordinary -- the harness mints the dispatching run's own
+    /// grant at dispatch time (`runtime::resolve_harness_mcp_grant`).
+    /// Delivery and continuation stay privileged under `Operator`,
+    /// unchanged; the same `harness_mcp` policy under an `Exact` grant
+    /// stays specialized, also unchanged.
+    #[test]
+    fn operator_grant_bound_harness_mcp_is_ordinary_but_delivery_and_continuation_still_arent() {
+        let mut mcp_plan = plan(HarnessPromptSourceV1::TaskBody);
+        mcp_plan.mode = HarnessExecutionModeV1::Acp;
+        mcp_plan.harness_mcp = HarnessMcpPolicyV1::GrantBound;
+        mcp_plan.validate().unwrap();
+        assert!(mcp_plan.is_ordinary_dispatch());
+
+        let mut delivery_plan = mcp_plan.clone();
+        delivery_plan.delivery = Some(HarnessDeliveryPolicyV1 {
+            selector: selector("skills"),
+            bundle_id: SpawnBundleId::new("skills-bundle").unwrap(),
+        });
+        assert!(matches!(
+            delivery_plan.validate(),
+            Err(HarnessDispatchError::OperatorPrivilegedFlow),
+        ));
+
+        let mut continuation_plan = mcp_plan.clone();
+        continuation_plan.continuation = HarnessContinuationPolicyV1::ParentRun;
+        assert!(matches!(
+            continuation_plan.validate(),
+            Err(HarnessDispatchError::OperatorPrivilegedFlow),
+        ));
+
+        let mut exact_mcp_plan = mcp_plan.clone();
+        exact_mcp_plan.grant = HarnessGrantPolicyV1::Exact {
+            grant_id: SessionGrantId::new(format!("hgrant_{}", "e".repeat(24))).unwrap(),
+            revision: HarnessRevision::new(1).unwrap(),
+        };
+        exact_mcp_plan.validate().unwrap();
+        assert!(!exact_mcp_plan.is_ordinary_dispatch());
+    }
+
     #[test]
     fn spawn_spec_uses_only_task_body_and_explicit_safe_overrides() {
         const BODY: &str = "intentional workload text";
@@ -1795,23 +1900,41 @@ mod tests {
         let node_a = node_inventory("node-a", &["workspace-a"], &["codex"], &["codex-default"]);
         let node_b = node_inventory("node-b", &["workspace-a"], &["codex"], &["codex-default"]);
         let plans = derive_launch_plans_from_inventory(&[node_a, node_b]);
-        assert_eq!(plans.len(), 2);
-        assert_ne!(plans[0].plan_id, plans[1].plan_id);
-        for (plan, node_id) in plans.iter().zip(["node-a", "node-b"]) {
+        // Each node contributes a plain plan and its harness-MCP sibling.
+        assert_eq!(plans.len(), 4);
+        let mut ids = plans.iter().map(|plan| plan.plan_id.clone()).collect::<Vec<_>>();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), plans.len());
+        for (plan, node_id) in plans.iter().zip(
+            ["node-a", "node-a", "node-b", "node-b"],
+        ) {
             assert!(plan.plan_id.as_str().contains(node_id));
             assert_eq!(plan.node_id.as_str(), node_id);
             plan.validate().unwrap();
             assert!(plan.is_ordinary_dispatch());
         }
+        assert_eq!(
+            plans.iter().filter(|plan| {
+                plan.harness_mcp == HarnessMcpPolicyV1::GrantBound
+            }).count(),
+            2,
+        );
     }
 
     #[test]
     fn derive_launch_plans_single_node_omits_node_id_from_plan_id() {
         let node = node_inventory("node-a", &["workspace-a"], &["codex"], &["codex-default"]);
         let plans = derive_launch_plans_from_inventory(&[node]);
-        assert_eq!(plans.len(), 1);
-        assert!(!plans[0].plan_id.as_str().contains("node-a"));
+        assert_eq!(plans.len(), 2);
+        for plan in &plans {
+            assert!(!plan.plan_id.as_str().contains("node-a"));
+        }
         assert_eq!(plans[0].plan_id.as_str(), "auto-codex-workspace-a-codex-default");
+        assert_eq!(
+            plans[1].plan_id.as_str(),
+            "auto-codex-workspace-a-codex-default-harness-mcp",
+        );
     }
 
     #[test]
@@ -1823,7 +1946,8 @@ mod tests {
             &["default", "review"],
         );
         let plans = derive_launch_plans_from_inventory(&[node]);
-        assert_eq!(plans.len(), 2 * 2 * 2);
+        // Every plain plan gets a harness-MCP sibling.
+        assert_eq!(plans.len(), 2 * 2 * 2 * 2);
         let mut ids = plans.iter().map(|plan| plan.plan_id.clone()).collect::<Vec<_>>();
         ids.sort();
         ids.dedup();
@@ -1832,14 +1956,45 @@ mod tests {
             plan.validate().unwrap();
             assert!(plan.is_ordinary_dispatch());
             assert_eq!(plan.worktree, HarnessWorktreeIntentV1::Existing);
-            assert_eq!(plan.mode, HarnessExecutionModeV1::Pty);
-            assert_eq!(plan.prompt_source, HarnessPromptSourceV1::Clear);
             assert_eq!(plan.grant, HarnessGrantPolicyV1::Operator);
-            assert_eq!(plan.harness_mcp, HarnessMcpPolicyV1::Disabled);
             assert_eq!(plan.deadline_ms, DERIVED_LAUNCH_PLAN_DEADLINE_MS);
             assert_eq!(plan.terminal_size, DERIVED_LAUNCH_PLAN_TERMINAL_SIZE);
             assert_eq!(plan.revision, HarnessRevision::new(1).unwrap());
+            if plan.harness_mcp == HarnessMcpPolicyV1::GrantBound {
+                assert!(plan.plan_id.as_str().ends_with("-harness-mcp"));
+                assert_eq!(plan.mode, HarnessExecutionModeV1::Acp);
+                assert_eq!(plan.prompt_source, HarnessPromptSourceV1::TaskBody);
+            } else {
+                assert_eq!(plan.mode, HarnessExecutionModeV1::Pty);
+                assert_eq!(plan.prompt_source, HarnessPromptSourceV1::Clear);
+            }
         }
+        assert_eq!(
+            plans.iter().filter(|plan| {
+                plan.harness_mcp == HarnessMcpPolicyV1::GrantBound
+            }).count(),
+            2 * 2 * 2,
+        );
+    }
+
+    #[test]
+    fn catalog_ordinary_plans_and_resolve_ordinary_scheduled_admit_the_derived_harness_mcp_sibling() {
+        let node = node_inventory("node-a", &["workspace-a"], &["codex"], &["codex-default"]);
+        let plans = derive_launch_plans_from_inventory(&[node]);
+        let catalog = HarnessLaunchCatalog::new(plans).unwrap();
+        let mcp_plan = catalog.ordinary_plans()
+            .find(|plan| plan.harness_mcp == HarnessMcpPolicyV1::GrantBound)
+            .expect("derived catalog carries a harness-MCP sibling");
+        assert_eq!(
+            mcp_plan.plan_id.as_str(),
+            "auto-codex-workspace-a-codex-default-harness-mcp",
+        );
+        assert_eq!(mcp_plan.mode, HarnessExecutionModeV1::Acp);
+        let scheduled = mcp_plan.ordinary_scheduled_ref().unwrap();
+        assert_eq!(
+            catalog.resolve_ordinary_scheduled(&scheduled).unwrap().plan_id,
+            mcp_plan.plan_id,
+        );
     }
 
     #[test]

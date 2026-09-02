@@ -540,6 +540,23 @@ pub(crate) fn allowed_tool_ids(grant: &SessionGrantV1) -> Vec<String> {
     tools.into_iter().map(str::to_owned).collect()
 }
 
+/// The tool id a served `HarnessReadRequestV1` corresponds to, using the
+/// same naming `allowed_tool_ids` advertises. For logging a served harness
+/// MCP call only -- `execute_exact_binding_read` dispatches on the request
+/// value itself, not this id.
+pub(crate) fn harness_mcp_tool_id(request: &HarnessReadRequestV1) -> &'static str {
+    match request {
+        HarnessReadRequestV1::ContextGet => "g4a_context_get",
+        HarnessReadRequestV1::MonitorGet { .. } => "g4a_monitor_get",
+        HarnessReadRequestV1::TimelineRead { .. } => "g4a_timeline_read",
+        HarnessReadRequestV1::TasksList { .. } => "g4a_tasks_list",
+        HarnessReadRequestV1::TaskGet { .. } => "g4a_tasks_get",
+        HarnessReadRequestV1::RunsList { .. } => "g4a_runs_list",
+        HarnessReadRequestV1::RunGet { .. } => "g4a_runs_get",
+        HarnessReadRequestV1::OperationGet { .. } => "g4a_operation_get",
+    }
+}
+
 fn redact_task(
     task: &gate4agent_harness_protocol::HarnessTaskV1,
     visibility: &HarnessReadVisibilityV1,

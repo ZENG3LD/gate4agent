@@ -10438,6 +10438,7 @@ fn prepare_harness_mcp_read_call(
     } = routed.event else {
         return Err(HarnessRuntimeError::InvalidHarnessMcpEvent);
     };
+    let tool_id = crate::read::harness_mcp_tool_id(&request);
     let now = unix_time_ms();
     let current_route = adapter.exact_route(&route.node_id)?;
     let authorization = if current_route != route || now >= deadline_unix_ms {
@@ -10451,6 +10452,11 @@ fn prepare_harness_mcp_read_call(
             &session,
         ).map_err(|_| HarnessReadHostErrorV1::Unauthorized)
     };
+    // Captured before `authorization` is consumed below -- this is the one
+    // piece of the served call's identity (`grant id`) that only exists on
+    // the success side, since an unauthorized call never resolved a grant
+    // at all.
+    let grant_id = authorization.as_ref().ok().map(|binding| binding.grant_id.clone());
     let response = authorization.and_then(|binding| {
         verify_observation_credential_binding(observation, support, &binding)?;
         execute_exact_binding_read(harness, observation, support, &binding, request)
@@ -10472,6 +10478,21 @@ fn prepare_harness_mcp_read_call(
         }
         Err(error) => Err(reject_reason(error)),
     };
+    // One line per served call (not per reply chunk -- chunking happens
+    // later, in `relay_harness_mcp_read_call`), naming the grant and
+    // session a live proof can cross-check against the MCP client's own
+    // `tools/call` trace.
+    tracing::info!(
+        node_id = route.node_id.as_str(),
+        workspace_id = session.workspace_id.as_str(),
+        session = ?session.session,
+        reservation_id = reservation_id.as_str(),
+        call_id = call_id.as_str(),
+        tool = tool_id,
+        grant_id = grant_id.as_ref().map(|grant_id| grant_id.as_str()).unwrap_or("unauthorized"),
+        served = outcome.is_ok(),
+        "harness MCP read call served",
+    );
     Ok(HarnessMcpRelayPlan {
         route,
         reservation_id,

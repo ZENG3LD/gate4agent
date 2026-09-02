@@ -191,9 +191,15 @@ pub enum ApprovalLevelResolution {
 ///   also name `--auto` and `--plan` flags, but only as flags rejected
 ///   together with `--prompt` -- there is no confirmation either applies to
 ///   (or has the same meaning under) the `kimi acp` subcommand this project
-///   actually spawns, so neither is wired in here; `Moderate` and `ReadOnly`
-///   both need live confirmation before either gets a flag, and `ReadOnly`
-///   is `Unsupported` in the meantime rather than guessed.
+///   actually spawns, so neither is wired into `args` here. The ACP
+///   transport does not need argv for either any more: measured live
+///   2026-09-02 (`session/new` of `kimi acp`, see
+///   `docs/gate4agent/audits/gate4agent-acp-slice1-proof-2026-09-02.md`),
+///   kimi announces `auto` and `plan` as ACP session modes, and neither
+///   raised a live permission question when set -- `Moderate` (`auto`)
+///   wrote silently, `ReadOnly` (`plan`) refused silently. `ReadOnly` is
+///   `Supported` with a sourced `acp_mode_id` now, not `Unsupported`: the
+///   ACP mechanism was confirmed even though the CLI flag was not.
 /// - `Unmanaged` always resolves `Supported` with no flag and
 ///   `asks_for_permission: true`, for every agent ID including one this
 ///   catalog does not recognize: it imposes nothing by definition, so it can
@@ -228,32 +234,35 @@ pub fn approval_level_resolution(agent_id: &AgentId, level: ApprovalLevel) -> Ap
             acp_mode_id: Some(ModeId::new("acceptEdits")), // see FullAuto's comment above.
         },
         ("claude", ApprovalLevel::ReadOnly) => Supported {
+            // `--permission-mode plan` remains the PTY-transport (CLI)
+            // vendor-documented flag for this level; it is `args`'s own
+            // mechanism and untouched by the ACP finding below.
             args: vec!["--permission-mode".to_owned(), "plan".to_owned()],
-            // Plan mode refuses edits and mutating commands outright rather
-            // than asking about them -- a restriction, not a question, which
-            // is what this level's name promises. `default` (the prior
-            // flag here) was claude's own interactive mode and asked about
-            // everything; this row is the fix for that drift.
-            asks_for_permission: false,
-            acp_mode_id: Some(ModeId::new("plan")), // see FullAuto's comment above.
+            // measured 2026-09-02, session/new of claude-agent-acp, see
+            // docs/gate4agent/audits/gate4agent-acp-slice1-proof-2026-09-02.md
+            // Measured live over `session/set_mode`, `plan` neither refuses
+            // nor asks: a write inside the working directory completed
+            // silently and the file was created -- the opposite of the
+            // vendor-doc-sourced "Plan mode refuses edits" claim this row
+            // used to carry. claude's only mode where both an in-cwd and an
+            // out-of-cwd write raised `session/request_permission` is
+            // `default`, so `ReadOnly` moves there: `may_ask: true`,
+            // boundary "any write", not just "outside the workspace".
+            asks_for_permission: true,
+            acp_mode_id: Some(ModeId::new("default")),
         },
 
         // codex -- OpenAI Codex CLI `--sandbox` / `--ask-for-approval`.
         ("codex", ApprovalLevel::FullAuto) => Supported {
             args: vec!["--dangerously-bypass-approvals-and-sandbox".to_owned()],
-            // Bypasses approvals AND the sandbox entirely. Never asks.
+            // measured 2026-09-02, session/new of codex-acp, see
+            // docs/gate4agent/audits/gate4agent-acp-slice1-proof-2026-09-02.md
+            // codex-acp announces this level's ACP mode as
+            // `agent-full-access` ("Full access"); measured live a write
+            // completed silently and reported success -- never asks, same
+            // as the PTY bypass flag above.
             asks_for_permission: false,
-            // No confirmed ACP mode id: codex-acp's own README/PR #206
-            // reference mode-adjacent capability work (`SessionForkCapabilities`,
-            // permission modes), but no `current_mode_update`/
-            // `modes.availableModes[].id` string has been confirmed in
-            // source or a live capture -- `docs/gate4agent/research/
-            // gate4agent-acp-progress-and-result-handoff-2026-09-02.md` §2:
-            // "literal `current_mode_update` discriminator UNCONFIRMED".
-            // Left `None` rather than guessed; the ACP transport refuses
-            // this level for codex until one is sourced (see `ModeId`'s own
-            // doc comment).
-            acp_mode_id: None,
+            acp_mode_id: Some(ModeId::new("agent-full-access")),
         },
         ("codex", ApprovalLevel::Moderate) => Supported {
             args: vec![
@@ -262,11 +271,15 @@ pub fn approval_level_resolution(agent_id: &AgentId, level: ApprovalLevel) -> Ap
                 "--ask-for-approval".to_owned(),
                 "on-request".to_owned(),
             ],
-            // on-request: Codex decides when to ask -- sandboxed writes
-            // proceed unasked, escalation (e.g. a command outside the
-            // sandbox) raises a permission question.
-            asks_for_permission: true,
-            acp_mode_id: None, // see FullAuto's comment above.
+            // measured 2026-09-02, session/new of codex-acp, see
+            // docs/gate4agent/audits/gate4agent-acp-slice1-proof-2026-09-02.md
+            // codex-acp announces this level's ACP mode as `agent`
+            // ("Approve for me"); measured live it wrote and reported
+            // success with no `session/request_permission` at all -- unlike
+            // the PTY `on-request` flag above (which still escalates on a
+            // command outside the sandbox), the ACP mode itself never asks.
+            asks_for_permission: false,
+            acp_mode_id: Some(ModeId::new("agent")),
         },
         ("codex", ApprovalLevel::ReadOnly) => Supported {
             args: vec![
@@ -275,11 +288,16 @@ pub fn approval_level_resolution(agent_id: &AgentId, level: ApprovalLevel) -> Ap
                 "--ask-for-approval".to_owned(),
                 "never".to_owned(),
             ],
-            // never: Codex never asks. A mutating action fails against the
-            // read-only sandbox instead of prompting -- a restriction, not
-            // a question, and this row already had that right.
-            asks_for_permission: false,
-            acp_mode_id: None, // see FullAuto's comment above.
+            // measured 2026-09-02, session/new of codex-acp, see
+            // docs/gate4agent/audits/gate4agent-acp-slice1-proof-2026-09-02.md
+            // codex-acp announces this level's ACP mode as `read-only`
+            // ("Ask for approval"); measured live a write inside the
+            // working directory completed silently, one outside it raised
+            // `session/request_permission` -- boundary "outside the
+            // workspace", `may_ask: true`. The one row (with claude's own
+            // `default`) whose vendor mode asks rather than refuses.
+            asks_for_permission: true,
+            acp_mode_id: Some(ModeId::new("read-only")),
         },
 
         // grok (xAI Grok Build) -- see this function's own doc comment for
@@ -328,33 +346,46 @@ pub fn approval_level_resolution(agent_id: &AgentId, level: ApprovalLevel) -> Ap
             // everything" semantics inferred from the universal industry
             // meaning of "yolo mode", not read directly from a Kimi
             // permissions doc -- UNCONFIRMED at the source, high confidence.
+            //
+            // measured 2026-09-02, session/new of kimi acp, see
+            // docs/gate4agent/audits/gate4agent-acp-slice1-proof-2026-09-02.md
+            // kimi announces this level's ACP mode as `yolo` ("YOLO");
+            // measured live a write completed silently and reported success
+            // -- never asks, confirming the argv-level inference above.
             asks_for_permission: false,
-            // No confirmed ACP mode id: Kimi Code's own ACP reference
-            // documents mode selection as a `session/set_mode` JSON-RPC call
-            // ("the same underlying mode switch as `set_config_option
-            // ({configId:'mode'})`") but never publishes a literal
-            // `modeId`/`availableModes[].id` string anywhere sourced
-            // (`gate4agent-vendor-approval-modes-2026-09-02.md` §4) --
-            // `--yolo`'s CLI-level "Ask When Needed" name is a human label,
-            // not a confirmed wire id. `None` until a live capture sources
-            // one.
-            acp_mode_id: None,
+            acp_mode_id: Some(ModeId::new("yolo")),
         },
         ("kimi", ApprovalLevel::Moderate) => Supported {
-            args: Vec::new(),
             // `--auto` is named in Kimi's own release notes but only as a
             // flag rejected together with `--prompt`; whether it applies to
             // (or means the same thing under) the `kimi acp` subcommand this
-            // project spawns is UNCONFIRMED, so it is not wired in here --
-            // falls back to no flag, same as `Unmanaged`, needs live
-            // confirmation.
-            asks_for_permission: true,
-            acp_mode_id: None, // see FullAuto's comment above.
+            // project spawns is UNCONFIRMED, so it is not wired into `args`
+            // here -- falls back to no flag, same as `Unmanaged`.
+            args: Vec::new(),
+            // measured 2026-09-02, session/new of kimi acp, see
+            // docs/gate4agent/audits/gate4agent-acp-slice1-proof-2026-09-02.md
+            // kimi announces this level's ACP mode as `auto` ("Auto");
+            // measured live a write completed silently and reported success
+            // -- the ACP mode itself never asks, unlike the PTY-doc
+            // assumption this row used to carry.
+            asks_for_permission: false,
+            acp_mode_id: Some(ModeId::new("auto")),
         },
-        // Symmetric to grok: `--plan` is named in Kimi's release notes but
-        // its behaviour under `kimi acp` is UNCONFIRMED -- refuse by name
-        // rather than guess that it is this project's read-only mode.
-        ("kimi", ApprovalLevel::ReadOnly) => Unsupported,
+        // measured 2026-09-02, session/new of kimi acp, see
+        // docs/gate4agent/audits/gate4agent-acp-slice1-proof-2026-09-02.md
+        // kimi announces this level's ACP mode as `plan` ("Plan"); measured
+        // live a write outside the working directory produced no question,
+        // no text and no file -- a silent refusal (`may_ask: false`),
+        // distinct from claude's own `plan`, which neither refuses nor asks
+        // (see claude's `ReadOnly` row above). `--plan`'s applicability to
+        // the PTY `kimi acp` subcommand remains UNCONFIRMED, so `args` stays
+        // empty; the ACP mechanism is confirmed regardless, so this row is
+        // `Supported`, not `Unsupported`.
+        ("kimi", ApprovalLevel::ReadOnly) => Supported {
+            args: Vec::new(),
+            asks_for_permission: false,
+            acp_mode_id: Some(ModeId::new("plan")),
+        },
 
         // Impose nothing, for every agent ID: never refused, and the
         // vendor's own default is unpredictable by definition -- assume it
@@ -953,11 +984,14 @@ mod tests {
     /// `grok` and `kimi` have exactly one verified flag each (`FullAuto`).
     /// Neither `Moderate` nor `ReadOnly` may fabricate a flag for either --
     /// at the argv-only layer both produce exactly the same empty result as
-    /// `Unmanaged`. `ReadOnly` additionally resolves `Unsupported` one layer
-    /// up (see `approval_level_resolution_matches_the_verified_provider_table`
-    /// and `unsupported_resolution_still_yields_empty_argv_not_a_fabricated_flag`)
-    /// -- this test only covers the argv-only accessor, which has no channel
-    /// to carry that refusal.
+    /// `Unmanaged`. `grok`'s `ReadOnly` additionally resolves `Unsupported`
+    /// one layer up (see
+    /// `approval_level_resolution_matches_the_verified_provider_table` and
+    /// `unsupported_resolution_still_yields_empty_argv_not_a_fabricated_flag`);
+    /// `kimi`'s `Moderate` and `ReadOnly` resolve `Supported` with a sourced
+    /// `acp_mode_id` since 2026-09-02 but still no confirmed CLI flag -- this
+    /// test only covers the argv-only accessor, which has no channel to
+    /// carry either an ACP mode id or a refusal.
     #[test]
     fn grok_and_kimi_moderate_never_invents_a_flag_and_matches_unmanaged() {
         // grok's `Moderate` is deliberately absent from this loop: it now
@@ -1027,7 +1061,7 @@ mod tests {
         );
         assert_eq!(
             approval_level_resolution(&claude, ApprovalLevel::ReadOnly),
-            supported(&["--permission-mode", "plan"], false, Some("plan"))
+            supported(&["--permission-mode", "plan"], true, Some("default"))
         );
         assert_eq!(
             approval_level_resolution(&claude, ApprovalLevel::Unmanaged),
@@ -1037,19 +1071,27 @@ mod tests {
         let codex = AgentId::new("codex").unwrap();
         assert_eq!(
             approval_level_resolution(&codex, ApprovalLevel::FullAuto),
-            supported(&["--dangerously-bypass-approvals-and-sandbox"], false, None)
+            supported(
+                &["--dangerously-bypass-approvals-and-sandbox"],
+                false,
+                Some("agent-full-access")
+            )
         );
         assert_eq!(
             approval_level_resolution(&codex, ApprovalLevel::Moderate),
             supported(
                 &["--sandbox", "workspace-write", "--ask-for-approval", "on-request"],
-                true,
-                None
+                false,
+                Some("agent")
             )
         );
         assert_eq!(
             approval_level_resolution(&codex, ApprovalLevel::ReadOnly),
-            supported(&["--sandbox", "read-only", "--ask-for-approval", "never"], false, None)
+            supported(
+                &["--sandbox", "read-only", "--ask-for-approval", "never"],
+                true,
+                Some("read-only")
+            )
         );
         assert_eq!(
             approval_level_resolution(&codex, ApprovalLevel::Unmanaged),
@@ -1077,15 +1119,15 @@ mod tests {
         let kimi = AgentId::new("kimi").unwrap();
         assert_eq!(
             approval_level_resolution(&kimi, ApprovalLevel::FullAuto),
-            supported(&["--yolo"], false, None)
+            supported(&["--yolo"], false, Some("yolo"))
         );
         assert_eq!(
             approval_level_resolution(&kimi, ApprovalLevel::Moderate),
-            supported(&[], true, None)
+            supported(&[], false, Some("auto"))
         );
         assert_eq!(
             approval_level_resolution(&kimi, ApprovalLevel::ReadOnly),
-            ApprovalLevelResolution::Unsupported
+            supported(&[], false, Some("plan"))
         );
         assert_eq!(
             approval_level_resolution(&kimi, ApprovalLevel::Unmanaged),
@@ -1122,11 +1164,19 @@ mod tests {
             for level in [ApprovalLevel::FullAuto, ApprovalLevel::Moderate, ApprovalLevel::ReadOnly] {
                 match approval_level_resolution(&agent, level) {
                     ApprovalLevelResolution::Supported { acp_mode_id: Some(mode_id), .. } => {
-                        assert_ne!(
-                            mode_id.as_str(),
-                            "auto",
-                            "{id} at {level:?} must never silently resolve the literal vendor default 'auto'"
-                        );
+                        // kimi's own `Moderate` mode is genuinely named
+                        // `auto` -- measured 2026-09-02 (session/new of
+                        // kimi acp), not the unmeasured vendor-default drift
+                        // this guard exists to catch. Every other row must
+                        // still never land on the literal string by
+                        // accident.
+                        if (id, level) != ("kimi", ApprovalLevel::Moderate) {
+                            assert_ne!(
+                                mode_id.as_str(),
+                                "auto",
+                                "{id} at {level:?} must never silently resolve the literal vendor default 'auto'"
+                            );
+                        }
                     }
                     ApprovalLevelResolution::Supported { acp_mode_id: None, .. } => {} // refused one layer up (`required_acp_mode`)
                     ApprovalLevelResolution::Unsupported => {}
@@ -1150,17 +1200,18 @@ mod tests {
     /// refusal, which is precisely why the ACP transport must call
     /// `approval_level_resolution` directly and refuse the spawn itself
     /// rather than trusting this function's empty result to mean "safe to
-    /// launch with no flag".
+    /// launch with no flag". `kimi` is no longer one of this test's
+    /// providers: since 2026-09-02 its `ReadOnly` resolves `Supported` (a
+    /// sourced `acp_mode_id` of `plan`), not `Unsupported` -- `grok` is the
+    /// one provider left with no read-only mode of any kind.
     #[test]
     fn unsupported_resolution_still_yields_empty_argv_not_a_fabricated_flag() {
-        for id in ["grok", "kimi"] {
-            let agent = AgentId::new(id).unwrap();
-            assert!(approval_level_args(&agent, ApprovalLevel::ReadOnly).is_empty(), "{id}");
-            assert!(matches!(
-                approval_level_resolution(&agent, ApprovalLevel::ReadOnly),
-                ApprovalLevelResolution::Unsupported
-            ));
-        }
+        let grok = AgentId::new("grok").unwrap();
+        assert!(approval_level_args(&grok, ApprovalLevel::ReadOnly).is_empty());
+        assert!(matches!(
+            approval_level_resolution(&grok, ApprovalLevel::ReadOnly),
+            ApprovalLevelResolution::Unsupported
+        ));
     }
 
     #[test]

@@ -31,6 +31,7 @@ use gate4agent_c2_protocol::{
     C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY,
     C2_TERMINAL_FRAME_EVENTS_CAPABILITY,
     C2_AGENT_STREAM_EVENTS_CAPABILITY,
+    C2_ACP_CONTROL_CAPABILITY,
     C2_GIT_READ_CAPABILITY, C2_WORKSPACE_FILE_READ_CAPABILITY,
     C2_WORKSPACE_FILE_WRITE_CAPABILITY,
     C2_WORKSPACE_ENTRY_CREATE_CAPABILITY,
@@ -84,6 +85,8 @@ const TERMINAL_FRAME_EVENTS_NOT_NEGOTIATED: &str =
     "terminal frame events require negotiated C2 capability";
 const AGENT_STREAM_EVENTS_NOT_NEGOTIATED: &str =
     "agent stream events require negotiated C2 capability";
+const ACP_CONTROL_NOT_NEGOTIATED: &str =
+    "ACP control verbs require negotiated C2 capability";
 const WORKTREE_SELECTION_NOT_NEGOTIATED: &str =
     "worktree selection requires negotiated C2 capability";
 const MANAGED_WORKTREE_LIFECYCLE_NOT_NEGOTIATED: &str =
@@ -143,6 +146,7 @@ struct NegotiatedPathCapabilities {
     observation_workflow_detail: bool,
     delivery_bundle_v2_stage_commit: bool,
     harness_mcp_read_proxy: bool,
+    acp_control: bool,
 }
 
 #[derive(Clone)]
@@ -567,6 +571,8 @@ pub(crate) fn client_compatibility_offer() -> Result<ClientCompatibilityOffer, C
                 .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
             CapabilityId::new(C2_HARNESS_MCP_READ_PROXY_CAPABILITY)
                 .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
+            CapabilityId::new(C2_ACP_CONTROL_CAPABILITY)
+                .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
         ],
         state_schema: None,
     })
@@ -670,6 +676,69 @@ fn negotiated_path_capabilities(
         delivery_bundle_v2_stage_commit:
             selected_has(C2_DELIVERY_BUNDLE_V2_STAGE_COMMIT_CAPABILITY),
         harness_mcp_read_proxy: selected_has(C2_HARNESS_MCP_READ_PROXY_CAPABILITY),
+        acp_control: selected_has(C2_ACP_CONTROL_CAPABILITY),
+    }
+}
+
+/// Names the capability a refused request required. Every capability with a
+/// dedicated arm here names itself by its own message; a capability that
+/// falls to the final arm is one `NodeRequest::required_capability()`
+/// returned but this build's `NegotiatedPathCapabilities` has no dedicated
+/// field for yet -- it must refuse under ITS OWN name, never borrow a
+/// sibling's. That exact misattribution once sent a live investigation into
+/// the wrong crate: a refused `acp-control-v1` request was reported as a
+/// refused workspace file read, because the fallback arm always named
+/// `C2_WORKSPACE_FILE_READ_CAPABILITY` regardless of what was actually
+/// missing.
+fn unnegotiated_capability_refusal(capability: Option<&str>) -> String {
+    match capability {
+        Some(C2_ACP_CONTROL_CAPABILITY) => ACP_CONTROL_NOT_NEGOTIATED.to_owned(),
+        Some(C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY) => {
+            SPAWN_SPEC_NOT_NEGOTIATED.to_owned()
+        }
+        Some(C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY) => {
+            MANAGED_WORKTREE_LIFECYCLE_NOT_NEGOTIATED.to_owned()
+        }
+        Some(C2_MANAGED_WORKTREE_SPAWN_V2_CAPABILITY) => {
+            MANAGED_WORKTREE_SPAWN_V2_NOT_NEGOTIATED.to_owned()
+        }
+        Some(C2_HISTORY_CONTEXT_PACK_CAPABILITY) => {
+            HISTORY_CONTEXT_PACK_NOT_NEGOTIATED.to_owned()
+        }
+        Some(C2_SESSION_RECORD_CONTEXT_EXPORT_CAPABILITY) => {
+            SESSION_RECORD_CONTEXT_EXPORT_NOT_NEGOTIATED.to_owned()
+        }
+        Some(C2_HOST_DIRECTORY_BROWSE_CAPABILITY) => {
+            HOST_DIRECTORY_BROWSE_NOT_NEGOTIATED.to_owned()
+        }
+        Some(C2_STANDALONE_WORKSPACE_LIFECYCLE_CAPABILITY) => {
+            STANDALONE_WORKSPACE_LIFECYCLE_NOT_NEGOTIATED.to_owned()
+        }
+        Some(C2_PROVIDER_SESSION_REFERENCE_INDEX_CAPABILITY) => {
+            PROVIDER_SESSION_REFERENCE_INDEX_NOT_NEGOTIATED.to_owned()
+        }
+        Some(C2_WORKSPACE_ENTRY_CREATE_CAPABILITY) => {
+            WORKSPACE_ENTRY_CREATE_NOT_NEGOTIATED.to_owned()
+        }
+        Some(C2_NATIVE_SESSION_INDEX_CAPABILITY) => {
+            "native session index capability was not negotiated".to_owned()
+        }
+        Some(C2_SESSION_TASK_CORRELATION_CAPABILITY) => {
+            SESSION_TASK_CORRELATION_NOT_NEGOTIATED.to_owned()
+        }
+        Some(C2_HARNESS_MCP_READ_PROXY_CAPABILITY) => {
+            "harness MCP read proxy capability was not negotiated".to_owned()
+        }
+        Some(C2_WORKSPACE_FILE_READ_CAPABILITY) => {
+            WORKSPACE_FILE_READ_NOT_NEGOTIATED.to_owned()
+        }
+        Some(unrecognized) => format!(
+            "C2 control capability \"{unrecognized}\" is required but was not negotiated",
+        ),
+        // `required_capability_available` is only `false` when
+        // `required_capability()` returned `Some(..)`; this arm is
+        // unreachable in practice and carries no capability to name.
+        None => "a required C2 control capability was not negotiated".to_owned(),
     }
 }
 
@@ -765,50 +834,13 @@ fn reject_unnegotiated_outbound_path(
             capabilities.delivery_bundle_v2_stage_commit
         }
         Some(C2_HARNESS_MCP_READ_PROXY_CAPABILITY) => capabilities.harness_mcp_read_proxy,
+        Some(C2_ACP_CONTROL_CAPABILITY) => capabilities.acp_control,
         Some(_) => false,
     };
     if !required_capability_available {
-        return Err(C2ControlError::Protocol(
-            match request.required_capability() {
-                Some(C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY) => {
-                    SPAWN_SPEC_NOT_NEGOTIATED.to_owned()
-                }
-                Some(C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY) => {
-                    MANAGED_WORKTREE_LIFECYCLE_NOT_NEGOTIATED.to_owned()
-                }
-                Some(C2_MANAGED_WORKTREE_SPAWN_V2_CAPABILITY) => {
-                    MANAGED_WORKTREE_SPAWN_V2_NOT_NEGOTIATED.to_owned()
-                }
-                Some(C2_HISTORY_CONTEXT_PACK_CAPABILITY) => {
-                    HISTORY_CONTEXT_PACK_NOT_NEGOTIATED.to_owned()
-                }
-                Some(C2_SESSION_RECORD_CONTEXT_EXPORT_CAPABILITY) => {
-                    SESSION_RECORD_CONTEXT_EXPORT_NOT_NEGOTIATED.to_owned()
-                }
-                Some(C2_HOST_DIRECTORY_BROWSE_CAPABILITY) => {
-                    HOST_DIRECTORY_BROWSE_NOT_NEGOTIATED.to_owned()
-                }
-                Some(C2_STANDALONE_WORKSPACE_LIFECYCLE_CAPABILITY) => {
-                    STANDALONE_WORKSPACE_LIFECYCLE_NOT_NEGOTIATED.to_owned()
-                }
-                Some(C2_PROVIDER_SESSION_REFERENCE_INDEX_CAPABILITY) => {
-                    PROVIDER_SESSION_REFERENCE_INDEX_NOT_NEGOTIATED.to_owned()
-                }
-                Some(C2_WORKSPACE_ENTRY_CREATE_CAPABILITY) => {
-                    WORKSPACE_ENTRY_CREATE_NOT_NEGOTIATED.to_owned()
-                }
-                Some(C2_NATIVE_SESSION_INDEX_CAPABILITY) => {
-                    "native session index capability was not negotiated".to_owned()
-                }
-                Some(C2_SESSION_TASK_CORRELATION_CAPABILITY) => {
-                    SESSION_TASK_CORRELATION_NOT_NEGOTIATED.to_owned()
-                }
-                Some(C2_HARNESS_MCP_READ_PROXY_CAPABILITY) => {
-                    "harness MCP read proxy capability was not negotiated".to_owned()
-                }
-                _ => WORKSPACE_FILE_READ_NOT_NEGOTIATED.to_owned(),
-            },
-        ));
+        return Err(C2ControlError::Protocol(unnegotiated_capability_refusal(
+            request.required_capability(),
+        )));
     }
     if request.requires_spawn_spec_defaults_overrides_capability()
         && !capabilities.spawn_spec_defaults_overrides
@@ -2885,6 +2917,83 @@ mod tests {
         });
         assert!(validate_harness_mcp_response(&request, &Ok(mismatch)).is_err());
     }
+
+    #[test]
+    fn acp_control_verbs_are_admitted_only_when_negotiated_and_refuse_by_own_name() {
+        let session = gate4agent_node_protocol::SessionAddress {
+            workspace_id: WorkspaceId::new("primary").unwrap(),
+            session: gate4agent_node_protocol::SessionKey {
+                instance_id: AgentInstanceId(3),
+                generation: SessionGeneration(1),
+            },
+        };
+        let requests = [
+            NodeRequest::ResolveInteraction {
+                session: session.clone(),
+                correlation_id: "acp-correlation-1".to_owned(),
+                response: ProviderInteractionResponse::ApproveOnce,
+            },
+            NodeRequest::SetSessionMode {
+                session: session.clone(),
+                mode_id: "plan".to_owned(),
+            },
+            NodeRequest::SetSessionConfigOption {
+                session: session.clone(),
+                option_id: "reasoning-effort".to_owned(),
+                value_json: "\"high\"".to_owned(),
+            },
+            NodeRequest::SetSessionModel {
+                session: session.clone(),
+                model_id: "claude-opus".to_owned(),
+            },
+        ];
+        for request in &requests {
+            assert_eq!(
+                request.required_capability(),
+                Some(C2_ACP_CONTROL_CAPABILITY),
+            );
+            let refusal = reject_unnegotiated_outbound_path(
+                request,
+                NegotiatedPathCapabilities::default(),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(
+                    &refusal,
+                    C2ControlError::Protocol(message)
+                        if message == ACP_CONTROL_NOT_NEGOTIATED
+                ),
+                "unexpected refusal for {request:?}: {refusal:?}",
+            );
+            let capabilities = NegotiatedPathCapabilities {
+                acp_control: true,
+                ..NegotiatedPathCapabilities::default()
+            };
+            assert!(reject_unnegotiated_outbound_path(request, capabilities).is_ok());
+        }
+    }
+
+    #[test]
+    fn unrecognized_required_capability_refuses_naming_itself_not_workspace_file_read() {
+        // Every capability `NodeRequest::required_capability()` can return
+        // today has a dedicated arm now, so this reaches straight for the
+        // fallback that stands in for tomorrow's capability -- exactly the
+        // shape of the defect that shipped: a capability string with no
+        // dedicated arm yet must never borrow another capability's message.
+        let message = unnegotiated_capability_refusal(Some("future-control-v9"));
+        assert_ne!(message, WORKSPACE_FILE_READ_NOT_NEGOTIATED);
+        assert!(
+            message.contains("future-control-v9"),
+            "refusal must name the unrecognised capability, got: {message}",
+        );
+
+        // The one capability the fallback must never again be mistaken for.
+        let workspace_file_read_message =
+            unnegotiated_capability_refusal(Some(C2_WORKSPACE_FILE_READ_CAPABILITY));
+        assert_eq!(workspace_file_read_message, WORKSPACE_FILE_READ_NOT_NEGOTIATED);
+        assert_ne!(workspace_file_read_message, message);
+    }
+
     use gate4agent_c2_protocol::{
         ArchitectureId, C2GitSnapshot, C2WorkspaceInspection, C2WorkspaceSnapshot,
         C2ServerChallenge, HostDescriptor, HostDirectoryEntry, HostDirectoryListing,
@@ -2901,8 +3010,8 @@ mod tests {
         WorkspaceId,
     };
     use gate4agent_types::{
-        AgentInstanceId, ProviderSessionIdentity, ProviderSessionKey, PtyScreenState,
-        SessionGeneration, TerminalFrame, TerminalSize,
+        AgentInstanceId, ProviderInteractionResponse, ProviderSessionIdentity,
+        ProviderSessionKey, PtyScreenState, SessionGeneration, TerminalFrame, TerminalSize,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -3602,6 +3711,7 @@ mod tests {
                 CapabilityId::new(C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_SPAWN_PROFILE_REVISION_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_TERMINAL_FRAME_EVENTS_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_AGENT_STREAM_EVENTS_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_WORKTREE_SELECTION_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_MANAGED_WORKTREE_SPAWN_V2_CAPABILITY).unwrap(),
@@ -3623,6 +3733,7 @@ mod tests {
                 CapabilityId::new(C2_OBSERVATION_WORKFLOW_DETAIL_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_DELIVERY_BUNDLE_V2_STAGE_COMMIT_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_HARNESS_MCP_READ_PROXY_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_ACP_CONTROL_CAPABILITY).unwrap(),
             ],
         );
         assert_eq!(offer.state_schema, None);

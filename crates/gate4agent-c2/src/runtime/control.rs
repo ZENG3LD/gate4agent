@@ -31,6 +31,7 @@ use crate::protocol::{
     C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY,
     C2_TERMINAL_FRAME_EVENTS_CAPABILITY,
     C2_AGENT_STREAM_EVENTS_CAPABILITY,
+    C2_ACP_CONTROL_CAPABILITY,
     C2_GIT_READ_CAPABILITY, C2_WORKSPACE_FILE_READ_CAPABILITY,
     C2_WORKSPACE_FILE_WRITE_CAPABILITY,
     C2_WORKSPACE_ENTRY_CREATE_CAPABILITY,
@@ -92,6 +93,7 @@ struct NegotiatedPathCapabilities {
     observation_workflow_detail: bool,
     delivery_bundle_v2_stage_commit: bool,
     harness_mcp_read_proxy: bool,
+    acp_control: bool,
 }
 
 pub(super) async fn run(
@@ -901,6 +903,7 @@ fn negotiated_path_capabilities(
         delivery_bundle_v2_stage_commit:
             selected_has(C2_DELIVERY_BUNDLE_V2_STAGE_COMMIT_CAPABILITY),
         harness_mcp_read_proxy: selected_has(C2_HARNESS_MCP_READ_PROXY_CAPABILITY),
+        acp_control: selected_has(C2_ACP_CONTROL_CAPABILITY),
     }
 }
 
@@ -1209,6 +1212,7 @@ fn unnegotiated_request_failure(
             capabilities.delivery_bundle_v2_stage_commit
         }
         Some(C2_HARNESS_MCP_READ_PROXY_CAPABILITY) => capabilities.harness_mcp_read_proxy,
+        Some(C2_ACP_CONTROL_CAPABILITY) => capabilities.acp_control,
         Some(_) => false,
     };
     if !required_capability_available {
@@ -2334,6 +2338,8 @@ fn c2_control_compatibility_support() -> Result<C2ControlCompatibilitySupport, F
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
             CapabilityId::new(C2_HARNESS_MCP_READ_PROXY_CAPABILITY)
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
+            CapabilityId::new(C2_ACP_CONTROL_CAPABILITY)
+                .map_err(|error| authentication_frame_error(error.to_string()))?,
         ],
         host: HostDescriptor {
             operating_system: OperatingSystemId::new(std::env::consts::OS)
@@ -3246,6 +3252,7 @@ mod tests {
                 CapabilityId::new(C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_SPAWN_PROFILE_REVISION_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_TERMINAL_FRAME_EVENTS_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_AGENT_STREAM_EVENTS_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_WORKTREE_SELECTION_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_MANAGED_WORKTREE_SPAWN_V2_CAPABILITY).unwrap(),
@@ -3267,6 +3274,7 @@ mod tests {
                 CapabilityId::new(C2_OBSERVATION_WORKFLOW_DETAIL_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_DELIVERY_BUNDLE_V2_STAGE_COMMIT_CAPABILITY).unwrap(),
                 CapabilityId::new(C2_HARNESS_MCP_READ_PROXY_CAPABILITY).unwrap(),
+                CapabilityId::new(C2_ACP_CONTROL_CAPABILITY).unwrap(),
             ],
         );
         assert_eq!(support.host.operating_system.as_str(), "windows");
@@ -5505,6 +5513,7 @@ mod tests {
             observation_workflow_detail: true,
             delivery_bundle_v2_stage_commit: true,
             harness_mcp_read_proxy: true,
+            acp_control: true,
         };
         assert!(matches!(
             unnegotiated_request_failure(&request, capabilities),

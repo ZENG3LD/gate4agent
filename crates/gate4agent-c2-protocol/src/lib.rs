@@ -46,6 +46,7 @@ pub use gate4agent_node_protocol::{
     NODE_SPAWN_PROFILE_REVISION_CAPABILITY, NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY,
     NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
     NODE_AGENT_STREAM_EVENTS_CAPABILITY,
+    NODE_ACP_CONTROL_CAPABILITY,
     NODE_WORKTREE_SELECTION_CAPABILITY,
     GitDiff, GitHistoryPage, RepositoryPath, WorkspaceFileContent, WorkspaceFileRead,
     HistoryCandidateSummary, NativeSessionCatalogEntry, NativeSessionCatalogPage,
@@ -108,6 +109,11 @@ pub const C2_TERMINAL_FRAME_EVENTS_CAPABILITY: &str = NODE_TERMINAL_FRAME_EVENTS
 /// `C2NodeEvent::TerminalFrame`: a peer that never negotiated it must never
 /// receive it.
 pub const C2_AGENT_STREAM_EVENTS_CAPABILITY: &str = NODE_AGENT_STREAM_EVENTS_CAPABILITY;
+/// The four ACP control verbs -- `ResolveInteraction`, `SetSessionMode`,
+/// `SetSessionConfigOption`, `SetSessionModel` -- gated the same way every
+/// other capability-scoped path is: a peer that never negotiated it must
+/// never have its requests admitted.
+pub const C2_ACP_CONTROL_CAPABILITY: &str = NODE_ACP_CONTROL_CAPABILITY;
 pub const C2_WORKTREE_SELECTION_CAPABILITY: &str = NODE_WORKTREE_SELECTION_CAPABILITY;
 pub const C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY: &str =
     NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY;
@@ -3886,6 +3892,35 @@ mod tests {
                 version = version,
             ),
         );
+    }
+
+    #[test]
+    fn c2_acp_control_capability_is_optional_and_negotiable() {
+        assert_eq!(C2_ACP_CONTROL_CAPABILITY, "acp-control-v1");
+        assert_eq!(C2_ACP_CONTROL_CAPABILITY, NODE_ACP_CONTROL_CAPABILITY);
+        let capability = CapabilityId::new(C2_ACP_CONTROL_CAPABILITY).unwrap();
+        let support = c2_compatibility_support(
+            ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
+            vec![capability.clone()],
+        );
+        assert!(support
+            .negotiate(&C2ClientHello::new([0; C2_AUTH_NONCE_BYTES]))
+            .unwrap()
+            .capabilities
+            .is_empty());
+
+        let offer = ClientCompatibilityOffer {
+            protocol_versions: ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
+            capabilities: vec![capability.clone()],
+            state_schema: None,
+        };
+        let selected = support
+            .negotiate(&C2ClientHello::negotiating(
+                [0; C2_AUTH_NONCE_BYTES],
+                offer,
+            ))
+            .unwrap();
+        assert_eq!(selected.capabilities, vec![capability]);
     }
 
     #[test]

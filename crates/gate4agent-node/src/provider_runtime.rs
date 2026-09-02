@@ -320,13 +320,20 @@ pub(crate) fn policy_for_transport(
         // itself, not an inference this build makes by parsing PTY terminal
         // text. Granting them outright is therefore correct, not a
         // downgrade of the PTY-terminal-verification story: that story does
-        // not apply to this transport at all. `provider_session_identity`/
-        // `semantic_resume`/`hook_semantics` stay unset -- ACP resume and
-        // hook wiring are out of scope for this policy shape. Both
+        // not apply to this transport at all. `provider_session_identity` is
+        // granted for the same reason: ACP's `session/new` returns a
+        // `sessionId` by specification, and `AcpSession::acp_session_id`
+        // merely reads it back -- it is a fact of the protocol, not
+        // something inferred from a terminal, exactly like
+        // `semantic_readiness`/`structured_prompt` above. `semantic_resume`/
+        // `hook_semantics` stay unset -- the ACP spec gives no equivalent
+        // guarantee for resuming a prior session, and the engine separately
+        // refuses ACP resume outright, so granting it here would assert a
+        // capability nothing downstream can act on. Both
         // `gate4agent-shell-native` and `gate4agent-runtime-native` already
         // bypass their own PTY-semantic policy check unconditionally for
         // `TransportKind::Acp`, so this shape needs no matching change there.
-        TransportKind::Acp => ProviderRuntimePolicy::new(false, true, true, false, false, false)
+        TransportKind::Acp => ProviderRuntimePolicy::new(false, true, true, true, false, false)
             .expect("ACP transport policy is internally valid"),
     }
 }
@@ -828,21 +835,30 @@ mod tests {
         assert_eq!(policy_for_transport(TransportKind::Pty, raw), raw);
     }
 
-    /// ACP grants `SemanticReadiness`/`StructuredPrompt` as facts of the
-    /// protocol with `RawPtyLifecycle` false -- regardless of what the
-    /// (irrelevant, PTY-shaped) `pty_probed_policy` argument says, since this
-    /// transport has no PTY to have probed in the first place.
+    /// ACP grants `SemanticReadiness`/`StructuredPrompt`/
+    /// `ProviderSessionIdentity` as facts of the protocol with
+    /// `RawPtyLifecycle` false -- regardless of what the (irrelevant,
+    /// PTY-shaped) `pty_probed_policy` argument says, since this transport
+    /// has no PTY to have probed in the first place. `session/new` returns a
+    /// `sessionId` by specification, the same class of protocol fact as
+    /// `session/prompt`/`session/update`, so `ProviderSessionIdentity` is
+    /// granted alongside them, not withheld the way `SemanticResume`/
+    /// `HookSemantics` (no ACP resume guarantee, no hook wiring for this
+    /// transport) still are.
     #[test]
     fn policy_for_transport_acp_grants_semantic_prompt_with_no_raw_pty() {
         let unrelated_pty_probe = ProviderRuntimePolicy::raw_pty();
         let policy = policy_for_transport(TransportKind::Acp, unrelated_pty_probe);
         assert_eq!(
             policy,
-            ProviderRuntimePolicy::new(false, true, true, false, false, false).unwrap(),
+            ProviderRuntimePolicy::new(false, true, true, true, false, false).unwrap(),
         );
         assert!(!policy.raw_pty_lifecycle);
         assert!(policy.semantic_readiness);
         assert!(policy.structured_prompt);
+        assert!(policy.provider_session_identity);
+        assert!(!policy.semantic_resume);
+        assert!(!policy.hook_semantics);
 
         // A verified PTY probe result must not change the ACP answer either
         // -- ACP's grant is unconditional on the transport alone.

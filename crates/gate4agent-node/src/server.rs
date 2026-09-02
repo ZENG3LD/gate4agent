@@ -76,7 +76,8 @@ use crate::standalone_workspace::{
 use crate::protocol::{
     read_json_frame_limited_body_timeout, write_json_frame, write_json_frame_limited,
     validate_node_negotiated_handshake_capacity, validate_provider_contract_manifest,
-    provider_id_is_legacy, AdapterContractRevision, CapabilityId, ClientFrame, ClientRole,
+    provider_id_is_legacy, AdapterContractRevision, AgentStreamChunkKindV1, AgentStreamChunkV1,
+    CapabilityId, ClientFrame, ClientRole,
     ControllerState, DeliveryBlobChunkHexV1, DeliveryBlobDigestV1,
     DeliveryBundleManifestV2, DeliveryCommitReceiptV1, DeliveryStageId,
     AgentProgressAttentionKindV1, AgentProgressAttentionV1, AgentProgressCurrentV1,
@@ -1033,6 +1034,122 @@ fn provider_observations(event: &ControlEvent) -> Vec<ObservationV1> {
         observations.insert(0, source_capabilities_observation(source, source_sequence, evidence));
     }
     observations
+}
+
+/// Builds the `AgentStreamChunkV1` `event`'s `ProviderEvent` carries onto the
+/// `agent-stream-events-v1` channel, beside (never instead of, and never
+/// changing) `provider_observations` projecting the same event onto the
+/// observation channel -- see
+/// `docs/gate4agent/plans/gate4agent-acp-control-plane-on-the-wire-2026-09-02.md`
+/// §5. Two invariants tie this to `provider_observations` by construction
+/// rather than by convention, so an operator correlating the two streams for
+/// one event sees one id and one ordering:
+///
+/// - `source_sequence` on the chunk is the identical `source_sequence`
+///   `provider_observations` puts on the sibling `ObservationV1`.
+/// - `InteractionPrompt::correlation_id` is minted by calling
+///   `opaque_interaction_correlation` with the identical
+///   `(instance_id, generation, provider_sequence)` triple
+///   `provider_observations` uses for the matching `ApprovalRequested`/
+///   `QuestionRequested` observation -- never the provider's own
+///   `request_id`, whose opacity on the wire is pinned by a dedicated test.
+///
+/// Returns `None` for every `ControlEventKind` other than `ProviderEvent`
+/// (nothing else carries stream content), for a source
+/// `observation_evidence` does not recognize (the same gate
+/// `provider_observations` applies -- a chunk whose sibling observation was
+/// never minted would carry a correlation id nobody can resolve), and for
+/// the `ProviderEvent` variants below with no declared chunk kind to carry
+/// them, or whose declared chunk kind this build has no source for yet:
+///
+/// - `ModeChanged { mode_id }` reports only the new id, never the full
+///   `ModeCatalog { current, available }` catalog the declared kind
+///   promises -- that catalog lives behind `AcpSession::available_modes()`,
+///   a query method the node never calls in production today. Minting
+///   `ModeCatalog` from a bare id change would leave `available`
+///   permanently empty, misrepresenting a real catalog announcement.
+/// - `ModelCatalog { current, available }` has no `ProviderEvent` source at
+///   all -- grok's vendor model switch is not bridged into `ProviderEvent`
+///   yet, the same gap the plan names explicitly.
+/// - `UserMessage { text, is_delta }` is an echo of the OPERATOR's own
+///   prompt, replayed on session resume -- `Text`/`Thinking` are documented
+///   as "what the agent is saying", so mapping the operator's words onto
+///   `Text` would misrepresent whose content it is. No dedicated
+///   user-message kind is declared, so this stays unproduced rather than
+///   mislabeled.
+fn agent_stream_chunk(event: &ControlEvent) -> Option<AgentStreamChunkV1> {
+    let ControlEventKind::ProviderEvent {
+        sequence: provider_sequence,
+        source,
+        source_sequence,
+        event: provider_event,
+    } = &event.event
+    else {
+        return None;
+    };
+    observation_evidence(source.family)?;
+    let kind = match provider_event {
+        ProviderEvent::Text { text, is_delta } => AgentStreamChunkKindV1::Text {
+            text: text.clone(),
+            is_delta: *is_delta,
+        },
+        ProviderEvent::Thinking { text } => {
+            AgentStreamChunkKindV1::Thinking { text: text.clone() }
+        }
+        ProviderEvent::InteractionRequested {
+            interaction_kind,
+            tool_name,
+            prompt,
+            ..
+        } => AgentStreamChunkKindV1::InteractionPrompt {
+            correlation_id: opaque_interaction_correlation(
+                event.instance_id,
+                event.generation,
+                *provider_sequence,
+            ),
+            interaction_kind: *interaction_kind,
+            tool_name: tool_name.clone(),
+            // ACP's `session/request_permission` options are not carried
+            // through `ProviderEvent::InteractionRequested` (see its shape
+            // in `gate4agent-types/src/control.rs`) -- the response space
+            // is instead fixed by `interaction_kind` itself
+            // (`ProviderInteractionResponse::validate_for`), so there is no
+            // per-request title or option catalog to report, the same way
+            // `provider_observations` above leaves unavailable breakdown
+            // fields as `None` rather than a fabricated value.
+            title: None,
+            prompt: prompt.clone(),
+            options: Vec::new(),
+        },
+        ProviderEvent::ConfigOptionsUpdated { options } => {
+            AgentStreamChunkKindV1::ConfigOptions { options: options.clone() }
+        }
+        ProviderEvent::SessionStarted { .. }
+        | ProviderEvent::SessionIdentityObserved { .. }
+        | ProviderEvent::TurnStarted { .. }
+        | ProviderEvent::WorkingObserved
+        | ProviderEvent::ToolStarted { .. }
+        | ProviderEvent::ToolCompleted { .. }
+        | ProviderEvent::TurnCompleted { .. }
+        | ProviderEvent::ContextWindowUsage { .. }
+        | ProviderEvent::TurnInterrupted
+        | ProviderEvent::SessionEnded { .. }
+        | ProviderEvent::Error { .. }
+        | ProviderEvent::Ready
+        | ProviderEvent::InteractionResolved { .. }
+        | ProviderEvent::SubagentStarted { .. }
+        | ProviderEvent::SubagentStopped { .. }
+        | ProviderEvent::RateLimited { .. }
+        | ProviderEvent::HostRequestObserved { .. }
+        | ProviderEvent::UnrecognizedNotification { .. }
+        | ProviderEvent::UserMessage { .. }
+        | ProviderEvent::Plan { .. }
+        | ProviderEvent::AvailableCommandsUpdated { .. }
+        | ProviderEvent::ModeChanged { .. }
+        | ProviderEvent::SessionInfoUpdated { .. }
+        | ProviderEvent::UsageUpdated { .. } => return None,
+    };
+    Some(AgentStreamChunkV1 { source_sequence: *source_sequence, kind })
 }
 
 fn opaque_process_correlation(
@@ -9442,10 +9559,14 @@ impl NodeShared {
             _ => {}
         }
         let observations = provider_observations(&event);
+        let stream_chunk = agent_stream_chunk(&event);
         self.publish(NodeEvent::Control {
             address: address.clone(),
             event,
         });
+        if let Some(chunk) = stream_chunk {
+            self.publish_agent_stream_chunk(address.clone(), chunk);
+        }
         for observation in observations {
             self.publish(NodeEvent::Observation {
                 address: address.clone(),
@@ -10152,6 +10273,32 @@ impl NodeShared {
         }
         let _ = self.terminal_event_tx.send(Arc::new(envelopes));
         drop(history);
+    }
+
+    /// Publishes one `AgentStreamChunkV1` onto the dedicated agent-stream
+    /// channel, mirroring `publish_terminal_frame_candidates` above: the
+    /// envelope's `sequence` is drawn from the same `history.last_sequence`
+    /// counter every other event kind shares, never a counter of its own --
+    /// `queue_connection_event`/`queue_connection_event_batch` compare
+    /// `envelope.sequence` against one `discard_events_through` watermark
+    /// regardless of which broadcast channel it arrived on, so a
+    /// per-channel counter would desynchronize that comparison.
+    fn publish_agent_stream_chunk(&self, address: SessionAddress, chunk: AgentStreamChunkV1) {
+        let mut history = self
+            .history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let sequence = history
+            .last_sequence
+            .checked_add(1)
+            .expect("node event sequence exhausted");
+        history.last_sequence = sequence;
+        drop(history);
+        let envelope = NodeEventEnvelope {
+            sequence,
+            event: NodeEvent::AgentStream { address, chunk },
+        };
+        let _ = self.agent_stream_event_tx.send(Arc::new(vec![envelope]));
     }
 
     fn current_sequence(&self) -> u64 {

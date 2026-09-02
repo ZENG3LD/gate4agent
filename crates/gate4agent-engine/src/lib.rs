@@ -925,6 +925,44 @@ impl Gate4AgentEngine {
                 );
                 return;
             }
+            if let Some(capability) = provider_event_denied_capability(runtime_policy, event) {
+                // One refused observation must never wedge every later
+                // observation on this source for the rest of the session:
+                // advance the per-source cursor to `*sequence` exactly as an
+                // admitted observation would have left it -- the sender
+                // (`gate4agent-shell-native`'s `drain_provider_stream`)
+                // advances its own counter the moment it hands an event off,
+                // independent of whether the engine goes on to admit it, so
+                // this per-source cursor stays the SOLE authority for "how
+                // far this source has been consumed" instead of growing a
+                // second, sender-side notion of it. The refusal itself must
+                // not be silent either: it mints a `ProviderEvent::Error`
+                // naming the withheld capability, the same shape `ingest_
+                // provider`'s batched (Hook) refusal handling uses, so an
+                // operator watching a live subscription sees a refusal
+                // instead of nothing.
+                let state = self
+                    .sessions
+                    .get_mut(&instance_id)
+                    .expect("validated session");
+                let canonical_sequence =
+                    reduce_provider_gap(&mut state.snapshot.provider, source, *sequence, 1);
+                self.bump_revision();
+                self.emit_event(
+                    None,
+                    instance_id,
+                    generation,
+                    ControlEventKind::ProviderEvent {
+                        sequence: canonical_sequence,
+                        source: source.clone(),
+                        source_sequence: *sequence,
+                        event: ProviderEvent::Error {
+                            message: provider_refusal_message(capability, 1),
+                        },
+                    },
+                );
+                return;
+            }
             let state = self
                 .sessions
                 .get_mut(&instance_id)
@@ -2262,6 +2300,7 @@ impl Gate4AgentEngine {
             .checked_sub(current_source_sequence)
             .and_then(|difference| difference.checked_sub(1))
             .expect("source sequence ordering was validated");
+        let mut denied_capability = None;
         if missed > 0
             || events
                 .iter()
@@ -2277,11 +2316,14 @@ impl Gate4AgentEngine {
             } else {
                 ProviderRuntimeCapability::SemanticReadiness
             };
-            require_runtime_capability(state.runtime_policy, capability)?;
+            if !state.runtime_policy.admits(capability) {
+                denied_capability = Some(capability);
+            }
         }
-        if events
-            .iter()
-            .any(provider_event_carries_session_identity)
+        if denied_capability.is_none()
+            && events
+                .iter()
+                .any(provider_event_carries_session_identity)
         {
             // `HookSemantics` authorizes the hook source entirely, session
             // identity included. Splitting a hook's authority across two
@@ -2295,7 +2337,64 @@ impl Gate4AgentEngine {
             } else {
                 ProviderRuntimeCapability::ProviderSessionIdentity
             };
-            require_runtime_capability(state.runtime_policy, capability)?;
+            if !state.runtime_policy.admits(capability) {
+                denied_capability = Some(capability);
+            }
+        }
+        if let Some(capability) = denied_capability {
+            // The command is still refused -- this call still returns `Err`
+            // below, exactly as it always has, so a caller inspecting THIS
+            // command's own outcome (and `gate4agent-kernel`'s existing
+            // `record_command_rejection`, which fires off that same `Err`)
+            // keeps seeing precisely what it always saw. What changes is
+            // what a refusal leaves behind for every LATER batch on this
+            // source: one refused batch must never wedge every later one for
+            // the rest of the session. The sender (`gate4agent-shell-
+            // native`'s `drain_provider_stream`) advances its own sequence
+            // counter the moment it hands an event off, independent of
+            // whether the engine goes on to admit it, so this per-source
+            // cursor is kept the SOLE authority for "how far this source has
+            // been consumed" rather than growing a second, sender-side
+            // notion of it: advancing the cursor here, exactly as an
+            // admitted batch would have left it, is what lets the next
+            // (capability-clean) batch land instead of reading as stale
+            // forever. The refusal itself must not be silent either: it
+            // mints a `ProviderEvent::Error` naming the withheld capability
+            // and how many events it took down with it -- the same
+            // observation shape a real provider-reported error uses -- so an
+            // operator watching a live subscription sees a refusal instead
+            // of nothing.
+            let dropped = missed.saturating_add(events.len() as u64);
+            if state.snapshot.provider.sequence.checked_add(1).is_none() {
+                return Err(ControlError::ProviderSequenceExhausted {
+                    instance_id,
+                    generation,
+                });
+            }
+            let canonical_sequence = {
+                let snapshot = &mut self
+                    .sessions
+                    .get_mut(&instance_id)
+                    .expect("validated session")
+                    .snapshot
+                    .provider;
+                reduce_provider_gap(snapshot, &source, source_sequence, dropped)
+            };
+            self.bump_revision();
+            self.emit_event(
+                Some(command_id),
+                instance_id,
+                generation,
+                ControlEventKind::ProviderEvent {
+                    sequence: canonical_sequence,
+                    source: source.clone(),
+                    source_sequence,
+                    event: ProviderEvent::Error {
+                        message: provider_refusal_message(capability, dropped),
+                    },
+                },
+            );
+            return Err(ControlError::ProviderRuntimePolicyDenied { capability });
         }
         let canonical_steps = events.len() as u64 + u64::from(missed > 0);
         if state
@@ -2973,21 +3072,15 @@ fn denied_observation_capability(
     observation: &ControlObservation,
 ) -> Option<ProviderRuntimeCapability> {
     let capability = match observation {
-        ControlObservation::ProviderEvent {
-            event: ProviderEvent::SessionIdentityObserved { .. },
-            ..
-        } => ProviderRuntimeCapability::ProviderSessionIdentity,
-        ControlObservation::ProviderEvent { event, .. } => {
-            if !runtime_policy.admits(ProviderRuntimeCapability::SemanticReadiness) {
-                ProviderRuntimeCapability::SemanticReadiness
-            } else if provider_event_carries_session_identity(event)
-                && !runtime_policy.admits(ProviderRuntimeCapability::ProviderSessionIdentity)
-            {
-                ProviderRuntimeCapability::ProviderSessionIdentity
-            } else {
-                return None;
-            }
-        }
+        // `ControlObservation::ProviderEvent` is deliberately NOT classified
+        // here -- unlike every other kind this function gates, one denied
+        // provider event must not be dropped silently: the dedicated
+        // `ControlObservation::ProviderEvent` arm in `apply_observation_in_
+        // place` runs the same capability check itself, and on denial keeps
+        // the per-source cursor advancing (so the next observation on this
+        // source is never read as stale) and mints a visible
+        // `ProviderEvent::Error` naming the withheld capability instead of
+        // vanishing into `ObservationIgnoredReason::ProviderRuntimePolicyDenied`.
         ControlObservation::ProviderGap { .. } => ProviderRuntimeCapability::SemanticReadiness,
         // Resume authority observations are correlated to an exact pending
         // operation and are not provider telemetry. Command admission already
@@ -2999,6 +3092,41 @@ fn denied_observation_capability(
         _ => return None,
     };
     (!runtime_policy.admits(capability)).then_some(capability)
+}
+
+/// The capability `event` needs but `runtime_policy` withholds, or `None`
+/// if `event` is already admitted. Shared by both provider-event ingress
+/// paths (`Gate4AgentEngine::ingest_provider`'s batched command path and
+/// `apply_observation_in_place`'s single-event observation path) so a
+/// session-identity-carrying event is gated on `ProviderSessionIdentity`
+/// alone, and every other event needs `SemanticReadiness` first and (only if
+/// it independently carries identity) `ProviderSessionIdentity` too, the
+/// same rule on both paths.
+fn provider_event_denied_capability(
+    runtime_policy: ProviderRuntimePolicy,
+    event: &ProviderEvent,
+) -> Option<ProviderRuntimeCapability> {
+    let capability = if matches!(event, ProviderEvent::SessionIdentityObserved { .. }) {
+        ProviderRuntimeCapability::ProviderSessionIdentity
+    } else if !runtime_policy.admits(ProviderRuntimeCapability::SemanticReadiness) {
+        ProviderRuntimeCapability::SemanticReadiness
+    } else if provider_event_carries_session_identity(event)
+        && !runtime_policy.admits(ProviderRuntimeCapability::ProviderSessionIdentity)
+    {
+        ProviderRuntimeCapability::ProviderSessionIdentity
+    } else {
+        return None;
+    };
+    (!runtime_policy.admits(capability)).then_some(capability)
+}
+
+/// The visible refusal text a denied provider-event batch or observation
+/// mints as a `ProviderEvent::Error` -- named after the withheld capability
+/// and how many events it took down with it, so an operator watching a live
+/// subscription sees a refusal instead of nothing.
+fn provider_refusal_message(capability: ProviderRuntimeCapability, dropped: u64) -> String {
+    let noun = if dropped == 1 { "event" } else { "events" };
+    format!("provider events rejected: capability {capability:?} not admitted ({dropped} {noun})")
 }
 
 fn provider_event_carries_session_identity(event: &ProviderEvent) -> bool {
@@ -3767,6 +3895,26 @@ mod tests {
         register_instance(command_id, instance())
     }
 
+    /// Registers `instance()` on ACP transport instead of `register`'s
+    /// hardcoded PTY -- `start()` requires `RawPtyLifecycle` only when
+    /// `session.snapshot.transport == TransportKind::Pty` (see `Gate4Agent
+    /// Engine::start`), so an ACP-shaped runtime policy (`raw_pty_lifecycle:
+    /// false`) can only be started against a session actually registered as
+    /// ACP, never against `register`'s PTY session with the transport
+    /// overridden afterward -- that ordering hits the PTY check before the
+    /// override ever runs.
+    fn register_acp(command_id: u64) -> CommandEnvelope {
+        CommandEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            id: CommandId(command_id),
+            command: ControlCommand::Register {
+                instance_id: instance(),
+                agent_id: AgentId::new("claude").unwrap(),
+                transport: TransportKind::Acp,
+            },
+        }
+    }
+
     fn verified_runtime_policy() -> ProviderRuntimePolicy {
         ProviderRuntimePolicy::new(true, true, true, true, true, true).unwrap()
     }
@@ -3836,6 +3984,31 @@ mod tests {
         (engine, effect)
     }
 
+    /// The ACP-transport counterpart to `running_engine_with_policy`:
+    /// registers `instance()` on ACP transport up front (see `register_acp`)
+    /// so an ACP-shaped `runtime_policy` (`raw_pty_lifecycle: false`) can
+    /// actually reach `Spawned` instead of failing `start()`'s PTY-only
+    /// `RawPtyLifecycle` requirement.
+    fn running_acp_engine_with_policy(
+        runtime_policy: ProviderRuntimePolicy,
+    ) -> (Gate4AgentEngine, EffectEnvelope) {
+        let mut engine = Gate4AgentEngine::new();
+        engine.apply_command(register_acp(1)).unwrap();
+        engine.drain_events();
+        engine.apply_command(start_with_policy(2, runtime_policy)).unwrap();
+        let effect = engine.drain_effects().pop().unwrap();
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: Some(effect.operation_id),
+            instance_id: effect.instance_id,
+            generation: effect.generation,
+            observation: ControlObservation::Spawned {
+                process_id: Some(42),
+            },
+        });
+        (engine, effect)
+    }
+
     #[test]
     fn runtime_policy_keeps_raw_input_and_rejects_structured_prompt() {
         let (mut engine, spawn) = running_engine_with_policy(ProviderRuntimePolicy::raw_pty());
@@ -3883,9 +4056,23 @@ mod tests {
         assert!(engine.drain_effects().is_empty());
     }
 
+    /// Both provider-event ingress paths fail closed on a policy that
+    /// withholds the capability an event needs -- but, unlike before this
+    /// fix, a refusal is no longer silence AND no longer wedges the next,
+    /// capability-clean call on the same source: each denial below still
+    /// advances the per-source cursor (`sequence` climbs by one per call,
+    /// never resets), and the observation-path refusals mint a visible
+    /// `ProviderEvent::Error` in place of the old, invisible
+    /// `ObservationIgnoredReason::ProviderRuntimePolicyDenied`. The command
+    /// path keeps returning `Err(ProviderRuntimePolicyDenied)` from
+    /// `apply_command` itself, exactly as it always has --
+    /// `acp_runtime_policy_survives_a_capability_refusal_and_surfaces_it`
+    /// is the focused regression test for the visibility/survival change
+    /// itself.
     #[test]
     fn runtime_policy_fail_closed_provider_observations_and_ingress() {
         let (mut engine, spawn) = running_engine_with_policy(ProviderRuntimePolicy::raw_pty());
+        let mut sequence = 0u64;
         for (event, expected_capability) in [
             (
                 ProviderEvent::WorkingObserved,
@@ -3902,6 +4089,7 @@ mod tests {
                 ProviderRuntimeCapability::ProviderSessionIdentity,
             ),
         ] {
+            sequence += 1;
             engine.apply_observation(ObservationEnvelope {
                 protocol_version: CONTROL_PROTOCOL_VERSION,
                 operation_id: None,
@@ -3909,19 +4097,21 @@ mod tests {
                 generation: spawn.generation,
                 observation: ControlObservation::ProviderEvent {
                     source: provider_source(),
-                    sequence: 1,
+                    sequence,
                     event,
                 },
             });
             assert!(engine.drain_events().iter().any(|event| matches!(
-                event.event,
-                ControlEventKind::ObservationIgnored {
-                    reason: ObservationIgnoredReason::ProviderRuntimePolicyDenied { capability }
-                } if capability == expected_capability
+                &event.event,
+                ControlEventKind::ProviderEvent {
+                    event: ProviderEvent::Error { message },
+                    ..
+                } if message.contains(&format!("{expected_capability:?}"))
             )));
         }
-        assert_eq!(engine.snapshot().sessions[0].provider.sequence, 0);
+        assert_eq!(engine.snapshot().sessions[0].provider.sequence, sequence);
 
+        sequence += 1;
         assert_eq!(
             engine.apply_command(CommandEnvelope {
                 protocol_version: CONTROL_PROTOCOL_VERSION,
@@ -3930,7 +4120,7 @@ mod tests {
                     instance_id: instance(),
                     generation: spawn.generation,
                     source: provider_source(),
-                    source_sequence: 1,
+                    source_sequence: sequence,
                     events: vec![ProviderEvent::WorkingObserved],
                 },
             }),
@@ -3938,6 +4128,7 @@ mod tests {
                 capability: ProviderRuntimeCapability::SemanticReadiness,
             })
         );
+        sequence += 1;
         assert_eq!(
             engine.apply_command(CommandEnvelope {
                 protocol_version: CONTROL_PROTOCOL_VERSION,
@@ -3946,7 +4137,7 @@ mod tests {
                     instance_id: instance(),
                     generation: spawn.generation,
                     source: provider_source(),
-                    source_sequence: 1,
+                    source_sequence: sequence,
                     events: vec![ProviderEvent::SessionIdentityObserved {
                         identity: ProviderSessionIdentity {
                             key: ProviderSessionKey::SessionId,
@@ -3960,6 +4151,7 @@ mod tests {
                 capability: ProviderRuntimeCapability::ProviderSessionIdentity,
             })
         );
+        assert_eq!(engine.snapshot().sessions[0].provider.sequence, sequence);
     }
 
     /// The ACP-shaped counterpart to `runtime_policy_keeps_raw_input_and_
@@ -3975,10 +4167,9 @@ mod tests {
     /// happens to be false.
     #[test]
     fn acp_runtime_policy_admits_structured_prompt_and_refuses_raw_pty_input_by_name() {
-        let acp_policy = ProviderRuntimePolicy::new(false, true, true, false, false, false)
+        let acp_policy = ProviderRuntimePolicy::new(false, true, true, true, false, false)
             .expect("ACP-shaped runtime policy is internally valid");
-        let (mut engine, _spawn) = running_engine_with_policy(acp_policy);
-        engine.session_mut(instance()).transport = TransportKind::Acp;
+        let (mut engine, _spawn) = running_acp_engine_with_policy(acp_policy);
 
         engine
             .apply_command(CommandEnvelope {
@@ -4028,10 +4219,9 @@ mod tests {
     /// frames before this fix.
     #[test]
     fn acp_runtime_policy_admits_a_non_identity_provider_event() {
-        let acp_policy = ProviderRuntimePolicy::new(false, true, true, false, false, false)
+        let acp_policy = ProviderRuntimePolicy::new(false, true, true, true, false, false)
             .expect("ACP-shaped runtime policy is internally valid");
-        let (mut engine, spawn) = running_engine_with_policy(acp_policy);
-        engine.session_mut(instance()).transport = TransportKind::Acp;
+        let (mut engine, spawn) = running_acp_engine_with_policy(acp_policy);
 
         engine.apply_observation(ObservationEnvelope {
             protocol_version: CONTROL_PROTOCOL_VERSION,
@@ -4051,6 +4241,95 @@ mod tests {
             }
         )));
         assert_eq!(engine.snapshot().sessions[0].provider.sequence, 1);
+    }
+
+    /// The observation-ingress counterpart to `ingest_provider`'s batched
+    /// (Hook) refusal handling, and the direct regression test for the
+    /// live-measured defect this fix closes: an ACP-shaped policy that still
+    /// withholds `ProviderSessionIdentity` refuses a `SessionIdentityObserved`
+    /// observation, but that ONE refusal must (a) not wedge the session's
+    /// provider stream for the rest of its life -- a later, capability-clean
+    /// observation on the SAME source must still land -- and (b) surface
+    /// itself as a visible `ProviderEvent::Error` naming the withheld
+    /// capability, never vanish into
+    /// `ObservationIgnoredReason::ProviderRuntimePolicyDenied` silence. Live,
+    /// an ACP session's `session/new` response was denied exactly this way
+    /// and the subscription observed nothing at all afterward.
+    #[test]
+    fn acp_runtime_policy_survives_a_capability_refusal_and_surfaces_it() {
+        // `SemanticReadiness`/`StructuredPrompt` granted (the ACP protocol
+        // shape); `ProviderSessionIdentity` deliberately withheld so this
+        // fixture exercises the exact refusal this test is about.
+        let acp_policy = ProviderRuntimePolicy::new(false, true, true, false, false, false)
+            .expect("ACP-shaped runtime policy with identity withheld is internally valid");
+        let (mut engine, spawn) = running_acp_engine_with_policy(acp_policy);
+
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: None,
+            instance_id: instance(),
+            generation: spawn.generation,
+            observation: ControlObservation::ProviderEvent {
+                source: provider_source(),
+                sequence: 1,
+                event: ProviderEvent::SessionIdentityObserved {
+                    identity: ProviderSessionIdentity {
+                        key: ProviderSessionKey::SessionId,
+                        id: "acp-session".to_owned(),
+                        transcript_path: None,
+                    },
+                },
+            },
+        });
+        let refusal_events = engine.drain_events();
+        assert!(
+            refusal_events.iter().any(|event| matches!(
+                &event.event,
+                ControlEventKind::ProviderEvent {
+                    event: ProviderEvent::Error { message },
+                    ..
+                } if message.contains("ProviderSessionIdentity") && message.contains("1 event")
+            )),
+            "a denied observation must mint a visible refusal, not silence: {refusal_events:?}",
+        );
+        assert!(!refusal_events.iter().any(|event| matches!(
+            event.event,
+            ControlEventKind::ObservationIgnored {
+                reason: ObservationIgnoredReason::ProviderRuntimePolicyDenied { .. }
+            }
+        )));
+        assert_eq!(
+            engine.snapshot().sessions[0].provider.sequence,
+            1,
+            "the refusal still advances the canonical provider sequence",
+        );
+
+        // The NEXT, capability-clean observation on the same source must
+        // land -- the refusal above must not have wedged the per-source
+        // cursor for the rest of the session.
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: None,
+            instance_id: instance(),
+            generation: spawn.generation,
+            observation: ControlObservation::ProviderEvent {
+                source: provider_source(),
+                sequence: 2,
+                event: ProviderEvent::WorkingObserved,
+            },
+        });
+        let follow_up_events = engine.drain_events();
+        assert!(
+            !follow_up_events.iter().any(|event| matches!(
+                event.event,
+                ControlEventKind::ObservationIgnored {
+                    reason: ObservationIgnoredReason::StaleProviderEvent
+                        | ObservationIgnoredReason::ProviderRuntimePolicyDenied { .. },
+                }
+            )),
+            "a later, capability-clean observation must not be dropped either: {follow_up_events:?}",
+        );
+        assert_eq!(engine.snapshot().sessions[0].provider.sequence, 2);
     }
 
     /// `HookSemantics` and `SemanticReadiness` do not stand in for each
@@ -4102,25 +4381,26 @@ mod tests {
     fn runtime_policy_rejects_invalid_start_contract() {
         let mut engine = Gate4AgentEngine::new();
         engine.apply_command(register(1)).unwrap();
-        // `raw_pty_lifecycle: false` with `semantic_readiness: true` and
-        // nothing else is no longer a construction defect on its own -- it
-        // is exactly the shape `provider_runtime::policy_for_transport`
-        // grants an ACP session (`session/prompt`/`session/update` are
-        // mandatory ACP protocol surface, not a PTY-terminal-text
-        // inference). `provider_session_identity: true` here keeps this
-        // fixture on the side of the invariant that IS still a defect:
-        // nothing derives provider session identity for a transport other
-        // than a verified PTY vendor contract, so granting it without
-        // `raw_pty_lifecycle` stays rejected by `ProviderRuntimePolicy::
-        // validate` itself, before `start()` even inspects this (PTY)
-        // session's transport.
+        // `raw_pty_lifecycle: false` with `semantic_readiness`/
+        // `structured_prompt`/`provider_session_identity: true` and nothing
+        // else is no longer a construction defect on its own -- it is
+        // exactly the shape `provider_runtime::policy_for_transport` grants
+        // an ACP session (`session/prompt`/`session/update` are mandatory
+        // ACP protocol surface, and `session/new` returns a `sessionId`
+        // under that same specification, neither a PTY-terminal-text
+        // inference). `hook_semantics: true` here keeps this fixture on the
+        // side of the invariant that IS still a defect: nothing derives
+        // hook-sourced semantics for a transport other than a raw PTY
+        // lifecycle, so granting it without `raw_pty_lifecycle` stays
+        // rejected by `ProviderRuntimePolicy::validate` itself, before
+        // `start()` even inspects this (PTY) session's transport.
         let invalid = ProviderRuntimePolicy {
             raw_pty_lifecycle: false,
             semantic_readiness: true,
             structured_prompt: false,
             provider_session_identity: true,
             semantic_resume: false,
-            hook_semantics: false,
+            hook_semantics: true,
         };
         assert_eq!(
             engine.apply_command(start_with_policy(2, invalid)),

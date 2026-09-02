@@ -4603,25 +4603,31 @@ mod tests {
             method: "session/request_permission".to_owned(),
             params: Some(serde_json::json!({
                 "sessionId": "s1",
-                "toolCall": {"toolCallId": "t1", "title": "Edit src/main.rs"},
+                "toolCall": {"toolCallId": "t1", "kind": "edit", "title": "Edit src/main.rs"},
                 "options": [],
             })),
             decision: HostRequestDecision::Deferred,
         });
+        // `kind` is the tool CLASS and `title` is the question. They are two
+        // different things and the operator needs both: putting the title in
+        // `tool_name` and leaving `prompt` empty -- which this asserted
+        // before -- showed a correlation id and a sentence-shaped tool name,
+        // and never the question itself.
         assert_eq!(
             with_title,
             Some(ProviderEvent::InteractionRequested {
                 request_id: Some("number:6".to_owned()),
                 interaction_kind: ProviderInteractionKind::Approval,
-                tool_name: "Edit src/main.rs".to_owned(),
-                prompt: String::new(),
+                tool_name: "edit".to_owned(),
+                prompt: "Edit src/main.rs".to_owned(),
                 agent_id: None,
             })
         );
 
-        // No title on the wire (or no params at all) -- falls back to the
+        // No `kind` on the wire (or no params at all) -- falls back to the
         // method name rather than an empty `tool_name`, which
-        // `ProviderEvent::validate_ingress` rejects.
+        // `ProviderEvent::validate_ingress` rejects. An absent `title`
+        // leaves `prompt` empty rather than inventing a question.
         let without_title = super::provider_event(AgentEvent::RpcIncomingRequest {
             id: gate4agent::rpc::message::RpcId::String("agent-7".to_owned()),
             method: "session/request_permission".to_owned(),

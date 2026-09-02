@@ -6306,20 +6306,27 @@ mod tests {
 
     #[test]
     fn defers_permission_requests_matches_the_verified_provider_table() {
+        // Source of truth: `gate4agent_catalog::launch::approval_level_resolution`
+        // at HEAD (commit 7b6a8d2) and
+        // `docs/gate4agent/audits/gate4agent-acp-slice1-proof-2026-09-02.md`
+        // (session/new modes measured live, 2026-09-02).
         let claude = AgentId::new("claude").unwrap();
         assert!(!defers_permission_requests(&claude, ApprovalLevel::FullAuto));
         assert!(defers_permission_requests(&claude, ApprovalLevel::Moderate));
-        // The load-bearing row: claude's `ReadOnly` now launches `plan`,
-        // which genuinely never asks -- unlike the retired `default` flag,
-        // which was claude's own interactive mode and asked about
-        // everything while this function claimed it never did.
-        assert!(!defers_permission_requests(&claude, ApprovalLevel::ReadOnly));
+        // claude's `ReadOnly` now launches `default` (`plan` neither refuses
+        // nor asks over ACP, measured twice) -- claude's own interactive
+        // mode, which does ask about every write.
+        assert!(defers_permission_requests(&claude, ApprovalLevel::ReadOnly));
         assert!(defers_permission_requests(&claude, ApprovalLevel::Unmanaged));
 
         let codex = AgentId::new("codex").unwrap();
         assert!(!defers_permission_requests(&codex, ApprovalLevel::FullAuto));
-        assert!(defers_permission_requests(&codex, ApprovalLevel::Moderate));
-        assert!(!defers_permission_requests(&codex, ApprovalLevel::ReadOnly));
+        // codex's `Moderate` ACP mode (`agent`, "Approve for me") wrote and
+        // reported success with no `session/request_permission` at all --
+        // measured live, unlike the PTY `on-request` flag it shares a row
+        // with.
+        assert!(!defers_permission_requests(&codex, ApprovalLevel::Moderate));
+        assert!(defers_permission_requests(&codex, ApprovalLevel::ReadOnly));
         assert!(defers_permission_requests(&codex, ApprovalLevel::Unmanaged));
 
         let grok = AgentId::new("grok").unwrap();
@@ -6333,8 +6340,13 @@ mod tests {
 
         let kimi = AgentId::new("kimi").unwrap();
         assert!(!defers_permission_requests(&kimi, ApprovalLevel::FullAuto));
-        assert!(defers_permission_requests(&kimi, ApprovalLevel::Moderate));
-        assert!(defers_permission_requests(&kimi, ApprovalLevel::ReadOnly));
+        // kimi's `Moderate` ACP mode is genuinely named `auto` and wrote
+        // silently, measured live -- it does not ask.
+        assert!(!defers_permission_requests(&kimi, ApprovalLevel::Moderate));
+        // kimi's `ReadOnly` ACP mode (`plan`) refuses silently rather than
+        // asking -- measured live, a write outside the working directory
+        // produced no question at all.
+        assert!(!defers_permission_requests(&kimi, ApprovalLevel::ReadOnly));
         assert!(defers_permission_requests(&kimi, ApprovalLevel::Unmanaged));
     }
 
@@ -6350,6 +6362,10 @@ mod tests {
 
     #[test]
     fn required_acp_mode_matches_the_sourced_table() {
+        // Source of truth: `gate4agent_catalog::launch::approval_level_resolution`
+        // at HEAD (commit 7b6a8d2) and
+        // `docs/gate4agent/audits/gate4agent-acp-slice1-proof-2026-09-02.md`
+        // (session/new modes measured live, 2026-09-02).
         let claude = AgentId::new("claude").unwrap();
         assert_eq!(
             required_acp_mode(&claude, ApprovalLevel::FullAuto),
@@ -6359,40 +6375,79 @@ mod tests {
             required_acp_mode(&claude, ApprovalLevel::Moderate),
             Ok(Some(ModeId::new("acceptEdits")))
         );
+        // measured live: `plan` neither refuses nor asks over ACP, so
+        // `ReadOnly` moved to `default`, the one claude mode where both an
+        // in-cwd and an out-of-cwd write raised `session/request_permission`.
         assert_eq!(
             required_acp_mode(&claude, ApprovalLevel::ReadOnly),
-            Ok(Some(ModeId::new("plan")))
+            Ok(Some(ModeId::new("default")))
         );
         assert_eq!(required_acp_mode(&claude, ApprovalLevel::Unmanaged), Ok(None));
 
-        // codex/grok/kimi: no ACP mode id is sourced for any managed level
-        // yet (see `gate4agent_catalog::approval_level_resolution`'s own
-        // doc comment) -- every one of them must refuse rather than spawn
-        // unconfigured, including the two (`grok`, `kimi`) that used to get
-        // an argv flag before this rewrite retired that mechanism for ACP.
-        for id in ["codex", "grok", "kimi"] {
-            let agent = AgentId::new(id).unwrap();
-            for level in [ApprovalLevel::FullAuto, ApprovalLevel::Moderate, ApprovalLevel::ReadOnly] {
-                assert!(
-                    required_acp_mode(&agent, level).is_err(),
-                    "{id} at {level:?} has no sourced ACP mode id yet and must refuse"
-                );
-            }
-            assert_eq!(required_acp_mode(&agent, ApprovalLevel::Unmanaged), Ok(None), "{id}");
+        let codex = AgentId::new("codex").unwrap();
+        assert_eq!(
+            required_acp_mode(&codex, ApprovalLevel::FullAuto),
+            Ok(Some(ModeId::new("agent-full-access")))
+        );
+        assert_eq!(
+            required_acp_mode(&codex, ApprovalLevel::Moderate),
+            Ok(Some(ModeId::new("agent")))
+        );
+        assert_eq!(
+            required_acp_mode(&codex, ApprovalLevel::ReadOnly),
+            Ok(Some(ModeId::new("read-only")))
+        );
+        assert_eq!(required_acp_mode(&codex, ApprovalLevel::Unmanaged), Ok(None));
+
+        let kimi = AgentId::new("kimi").unwrap();
+        assert_eq!(
+            required_acp_mode(&kimi, ApprovalLevel::FullAuto),
+            Ok(Some(ModeId::new("yolo")))
+        );
+        assert_eq!(
+            required_acp_mode(&kimi, ApprovalLevel::Moderate),
+            Ok(Some(ModeId::new("auto")))
+        );
+        assert_eq!(
+            required_acp_mode(&kimi, ApprovalLevel::ReadOnly),
+            Ok(Some(ModeId::new("plan")))
+        );
+        assert_eq!(required_acp_mode(&kimi, ApprovalLevel::Unmanaged), Ok(None));
+
+        // grok: `acp_mode_id` is `None` for every managed level (`FullAuto`
+        // and `Moderate` are `Supported` with no sourced ACP id yet,
+        // `ReadOnly` is outright `Unsupported`) -- every one must refuse
+        // rather than spawn unconfigured.
+        let grok = AgentId::new("grok").unwrap();
+        for level in [ApprovalLevel::FullAuto, ApprovalLevel::Moderate, ApprovalLevel::ReadOnly] {
+            assert!(
+                required_acp_mode(&grok, level).is_err(),
+                "grok at {level:?} has no sourced ACP mode id and must refuse"
+            );
         }
+        assert_eq!(required_acp_mode(&grok, ApprovalLevel::Unmanaged), Ok(None));
     }
 
     /// The regression guard for the whole change: no provider x level may
     /// silently resolve to nothing (which would leave the session running
     /// at the agent's own default, e.g. the live-measured `auto`) unless the
-    /// level itself is `Unmanaged`. Every other level is either a concrete,
-    /// non-`"auto"` mode id, or an outright refusal.
+    /// level itself is `Unmanaged`. Every other level is either a concrete
+    /// mode id or an outright refusal -- with one named, measured exception:
+    /// kimi's `Moderate` row genuinely IS the sourced ACP mode id `auto`
+    /// (`session/new` of `kimi acp`, measured live 2026-09-02, see
+    /// `docs/gate4agent/audits/gate4agent-acp-slice1-proof-2026-09-02.md`),
+    /// not a silently-inferred vendor default -- the guard still requires
+    /// every OTHER `auto` to be refused rather than sourced.
     #[test]
     fn required_acp_mode_never_silently_permits_auto_except_for_unmanaged() {
         for id in ["claude", "codex", "grok", "kimi"] {
             let agent = AgentId::new(id).unwrap();
             for level in [ApprovalLevel::FullAuto, ApprovalLevel::Moderate, ApprovalLevel::ReadOnly] {
+                let is_kimi_moderate_measured_auto = id == "kimi" && level == ApprovalLevel::Moderate;
                 match required_acp_mode(&agent, level) {
+                    Ok(Some(mode_id)) if is_kimi_moderate_measured_auto => {
+                        assert_eq!(mode_id.as_str(), "auto");
+                    }
                     Ok(Some(mode_id)) => assert_ne!(
                         mode_id.as_str(),
                         "auto",

@@ -450,6 +450,10 @@ pub enum ContextUsageSegment {
     CacheWrite,
     ProviderOutput,
     Unattributed,
+    /// The whole `used_tokens` total, undivided. Drawn instead of the five
+    /// breakdown segments when the source never reported how the total
+    /// decomposes -- see `ContextOccupancySnapshot`'s breakdown fields.
+    Occupied,
     Remaining,
 }
 
@@ -461,6 +465,7 @@ impl ContextUsageSegment {
             Self::CacheWrite => "Cache write",
             Self::ProviderOutput => "Provider output",
             Self::Unattributed => "Unattributed",
+            Self::Occupied => "Occupied",
             Self::Remaining => "Remaining",
         }
     }

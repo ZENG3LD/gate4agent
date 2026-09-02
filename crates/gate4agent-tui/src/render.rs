@@ -7455,6 +7455,24 @@ fn exact_context_window(snapshot: ContextOccupancySnapshot) -> Result<u64, &'sta
     Ok(context_window)
 }
 
+/// The five cache/segment breakdown values together, only when every one
+/// of them was actually observed. `None` means the source reported
+/// `used_tokens`/`capacity_tokens` alone (e.g. an ACP `usage_update`) and
+/// never observed how the total decomposes -- the caller must not draw or
+/// print a per-segment figure in that case, since a zero would assert an
+/// empty segment nobody measured.
+fn context_usage_breakdown(
+    snapshot: &ContextOccupancySnapshot,
+) -> Option<(u64, u64, u64, u64, u64)> {
+    Some((
+        snapshot.uncached_input_tokens?,
+        snapshot.cache_read_tokens?,
+        snapshot.cache_write_tokens?,
+        snapshot.output_tokens?,
+        snapshot.unattributed_tokens?,
+    ))
+}
+
 fn context_usage_bar_segments(
     snapshot: ContextOccupancySnapshot,
     context_window: u64,
@@ -7463,14 +7481,21 @@ fn context_usage_bar_segments(
 ) -> Vec<ContextUsageBarSegment> {
     let occupied = snapshot.occupied_tokens();
     let remaining = context_window.saturating_sub(occupied);
-    let values = [
-        (ContextUsageSegment::UncachedInput, snapshot.uncached_input_tokens, theme.accent),
-        (ContextUsageSegment::CacheRead, snapshot.cache_read_tokens, theme.teal),
-        (ContextUsageSegment::CacheWrite, snapshot.cache_write_tokens, theme.yellow),
-        (ContextUsageSegment::ProviderOutput, snapshot.output_tokens, theme.green),
-        (ContextUsageSegment::Unattributed, snapshot.unattributed_tokens, theme.red),
-        (ContextUsageSegment::Remaining, remaining, theme.border),
-    ];
+    let values: Vec<(ContextUsageSegment, u64, Color)> =
+        match context_usage_breakdown(&snapshot) {
+            Some((uncached_input, cache_read, cache_write, output, unattributed)) => vec![
+                (ContextUsageSegment::UncachedInput, uncached_input, theme.accent),
+                (ContextUsageSegment::CacheRead, cache_read, theme.teal),
+                (ContextUsageSegment::CacheWrite, cache_write, theme.yellow),
+                (ContextUsageSegment::ProviderOutput, output, theme.green),
+                (ContextUsageSegment::Unattributed, unattributed, theme.red),
+                (ContextUsageSegment::Remaining, remaining, theme.border),
+            ],
+            None => vec![
+                (ContextUsageSegment::Occupied, occupied, theme.accent),
+                (ContextUsageSegment::Remaining, remaining, theme.border),
+            ],
+        };
     let mut unassigned_width = width;
     let mut segments = values
         .into_iter()
@@ -7571,7 +7596,27 @@ fn render_context_usage_tooltip(
         "Current / Live | source {}",
         observation_evidence_label(hover.hit.evidence),
     );
-    let formula = "Formula: used = uncached input + cache read + cache write + provider output + unattributed (reasoning excluded)";
+    // The formula has to describe the segment actually under the cursor. The
+    // five breakdown segments only exist when the source reported a
+    // breakdown, so the sum is true whenever one of them is hovered.
+    // `Occupied` is drawn only when it did NOT, and stating a decomposition
+    // there would claim a division of the total that nothing measured --
+    // the same lie the wire stopped telling when these fields became
+    // optional. `Remaining` is drawn in both cases, so its line has to hold
+    // in both, and it does.
+    let formula = match hover.hit.segment {
+        ContextUsageSegment::UncachedInput
+        | ContextUsageSegment::CacheRead
+        | ContextUsageSegment::CacheWrite
+        | ContextUsageSegment::ProviderOutput
+        | ContextUsageSegment::Unattributed => {
+            "Formula: used = uncached input + cache read + cache write + provider output + unattributed (reasoning excluded)"
+        }
+        ContextUsageSegment::Occupied => {
+            "Formula: used = the total the provider reported; it reported no breakdown of that total"
+        }
+        ContextUsageSegment::Remaining => "Formula: remaining = window - used",
+    };
     let desired_width = cell_width(&detail)
         .max(cell_width(&source))
         .max(cell_width(formula))
@@ -7846,11 +7891,15 @@ fn session_monitor_lines(app: &App, monitor: &SessionMonitorView) -> Vec<String>
                     };
                     lines.push(status);
                     lines.push(String::new());
-                    lines.push(format!("Uncached input: {}", snapshot.uncached_input_tokens));
-                    lines.push(format!("Cache read: {}", snapshot.cache_read_tokens));
-                    lines.push(format!("Cache write: {}", snapshot.cache_write_tokens));
-                    lines.push(format!("Provider output: {}", snapshot.output_tokens));
-                    lines.push(format!("Unattributed: {}", snapshot.unattributed_tokens));
+                    if let Some((uncached_input, cache_read, cache_write, output, unattributed)) =
+                        context_usage_breakdown(&snapshot)
+                    {
+                        lines.push(format!("Uncached input: {uncached_input}"));
+                        lines.push(format!("Cache read: {cache_read}"));
+                        lines.push(format!("Cache write: {cache_write}"));
+                        lines.push(format!("Provider output: {output}"));
+                        lines.push(format!("Unattributed: {unattributed}"));
+                    }
                     lines.push(format!(
                         "Remaining: {}",
                         context_window.saturating_sub(occupied),
@@ -17842,12 +17891,12 @@ mod tests {
 
     fn exact_context_snapshot(context_window: Option<u64>) -> ContextOccupancySnapshot {
         ContextOccupancySnapshot {
-            uncached_input_tokens: 10,
-            output_tokens: 10,
-            cache_read_tokens: 20,
-            cache_write_tokens: 10,
+            uncached_input_tokens: Some(10),
+            output_tokens: Some(10),
+            cache_read_tokens: Some(20),
+            cache_write_tokens: Some(10),
             reasoning_tokens: None,
-            unattributed_tokens: 10,
+            unattributed_tokens: Some(10),
             used_tokens: 60,
             context_window,
             evidence: gate4agent_node_protocol::ObservationEvidenceV1::StructuredProvider,
@@ -25165,11 +25214,11 @@ mod tests {
                 2,
                 gate4agent_node_protocol::ObservationEvidenceV1::StructuredProvider,
                 gate4agent_node_protocol::ObservationKindV1::ContextWindowUsage {
-                    uncached_input_tokens: 10,
-                    cache_read_tokens: 20,
-                    cache_write_tokens: 5,
-                    output_tokens: 15,
-                    unattributed_tokens: 10,
+                    uncached_input_tokens: Some(10),
+                    cache_read_tokens: Some(20),
+                    cache_write_tokens: Some(5),
+                    output_tokens: Some(15),
+                    unattributed_tokens: Some(10),
                     used_tokens: 60,
                     capacity_tokens: 100,
                 },
@@ -25212,11 +25261,11 @@ mod tests {
                 3,
                 gate4agent_node_protocol::ObservationEvidenceV1::StructuredProvider,
                 gate4agent_node_protocol::ObservationKindV1::ContextWindowUsage {
-                    uncached_input_tokens: 50,
-                    cache_read_tokens: 30,
-                    cache_write_tokens: 20,
-                    output_tokens: 10,
-                    unattributed_tokens: 10,
+                    uncached_input_tokens: Some(50),
+                    cache_read_tokens: Some(30),
+                    cache_write_tokens: Some(20),
+                    output_tokens: Some(10),
+                    unattributed_tokens: Some(10),
                     used_tokens: 120,
                     capacity_tokens: 100,
                 },
@@ -25251,11 +25300,11 @@ mod tests {
                 1,
                 gate4agent_node_protocol::ObservationEvidenceV1::StructuredProvider,
                 gate4agent_node_protocol::ObservationKindV1::ContextWindowUsage {
-                    uncached_input_tokens: 10,
-                    cache_read_tokens: 20,
-                    cache_write_tokens: 5,
-                    output_tokens: 15,
-                    unattributed_tokens: 10,
+                    uncached_input_tokens: Some(10),
+                    cache_read_tokens: Some(20),
+                    cache_write_tokens: Some(5),
+                    output_tokens: Some(15),
+                    unattributed_tokens: Some(10),
                     used_tokens: 60,
                     capacity_tokens: 100,
                 },

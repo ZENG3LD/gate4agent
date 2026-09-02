@@ -2290,6 +2290,57 @@ impl SessionGrantV1 {
         self.state == SessionGrantStateV1::Active
             && self.allowed_delivery_bundles.binary_search(selector).is_ok()
     }
+
+    /// The default grant a dispatch mints for its own run when harness MCP
+    /// is requested and no exact grant was supplied
+    /// (`HarnessGrantPolicyV1::Operator`, gate4agent-arc-mailbox-and-task-layer
+    /// Slice A(i)). Read-only, own run's lineage only: `SelfOnly` on every
+    /// `read_permissions` axis (never `Descendants` — this grant never sees
+    /// outside the one run it was minted for) plus `Timeline` monitoring, so
+    /// every currently-shipped `g4a_*` read tool resolves (see
+    /// `allowed_tool_ids`); the task's own sibling runs still surface through
+    /// `g4a_context_get`, which derives them independently of this scope. No
+    /// task or context writes, no delivery bundles, no child runs.
+    /// `operation_timeouts` and the child limits are this crate's own
+    /// `valid_grant()` test fixture values, not invented here.
+    pub fn default_for_run(
+        grant_id: SessionGrantId,
+        actor_run_id: HarnessRunId,
+        target: HarnessGrantTargetV1,
+        now_unix_ms: u64,
+    ) -> Self {
+        Self {
+            grant_id,
+            revision: HarnessRevision::new(1)
+                .expect("literal revision 1 is always a valid harness revision"),
+            actor_run_id,
+            allowed_targets: vec![target],
+            allowed_delivery_bundles: Vec::new(),
+            maximum_child_count: 0,
+            maximum_child_depth: 0,
+            operation_timeouts: HarnessOperationTimeoutsV1 {
+                dispatch_ms: 30_000,
+                wait_ms: 60_000,
+                reconciliation_ms: 30_000,
+            },
+            task_permissions: HarnessTaskPermissionsV1 {
+                read: true,
+                create: false,
+                mutate: false,
+                request_run: false,
+            },
+            read_permissions: HarnessReadPermissionsV1 {
+                tasks: HarnessEntityReadScopeV1::SelfOnly,
+                runs: HarnessEntityReadScopeV1::SelfOnly,
+                operations: HarnessEntityReadScopeV1::SelfOnly,
+            },
+            monitoring_visibility: HarnessMonitoringVisibilityV1::Timeline,
+            context_permissions: HarnessContextPermissionsV1 { export: false, restore: false },
+            state: SessionGrantStateV1::Active,
+            created_at_unix_ms: now_unix_ms,
+            updated_at_unix_ms: now_unix_ms,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]

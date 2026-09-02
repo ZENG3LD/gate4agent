@@ -65,6 +65,12 @@ const HARNESS_RESULT_REF_RECORD_IDEMPOTENCY_REF_DOMAIN: &[u8] =
     b"gate4agent-harness-result-ref-record-idempotency-ref-v1\0";
 const HARNESS_RESULT_REF_RECORD_REQUEST_DIGEST_DOMAIN: &[u8] =
     b"gate4agent-harness-result-ref-record-request-digest-v1\0";
+const HARNESS_DEFAULT_GRANT_ID_DOMAIN: &[u8] =
+    b"gate4agent-harness-default-grant-id-v1\0";
+const HARNESS_DEFAULT_GRANT_OPERATION_ID_DOMAIN: &[u8] =
+    b"gate4agent-harness-default-grant-operation-id-v1\0";
+const HARNESS_DEFAULT_GRANT_IDEMPOTENCY_REF_DOMAIN: &[u8] =
+    b"gate4agent-harness-default-grant-idempotency-ref-v1\0";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -1165,6 +1171,45 @@ pub fn deterministic_task_result_ref_record_ids(
         operation_id,
         idempotency_ref,
         request_digest,
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HarnessDefaultGrantAuthorityIdsV1 {
+    pub grant_id: SessionGrantId,
+    pub operation_id: HarnessOperationId,
+    pub idempotency_ref: HarnessIdempotencyRef,
+}
+
+/// Deterministic identity for the default `SessionGrantV1` a dispatch mints
+/// for its own run when `HarnessGrantPolicyV1::Operator` leaves no exact
+/// grant to bind to (gate4agent-arc-mailbox-and-task-layer Slice A(i)). Keyed
+/// by the dispatch's own operation id alone, so a retried dispatch mints the
+/// identical grant rather than a second one -- the same replay posture as
+/// `derived_mcp_reservation_id` for the reservation it pairs with.
+pub fn deterministic_default_grant_ids(
+    dispatch_operation_id: &HarnessOperationId,
+) -> Result<HarnessDefaultGrantAuthorityIdsV1, HarnessDispatchError> {
+    dispatch_operation_id.validate()?;
+    Ok(HarnessDefaultGrantAuthorityIdsV1 {
+        grant_id: derived_harness_id(
+            SessionGrantId::PREFIX,
+            HARNESS_DEFAULT_GRANT_ID_DOMAIN,
+            dispatch_operation_id,
+            SessionGrantId::new,
+        )?,
+        operation_id: derived_harness_id(
+            HarnessOperationId::PREFIX,
+            HARNESS_DEFAULT_GRANT_OPERATION_ID_DOMAIN,
+            dispatch_operation_id,
+            HarnessOperationId::new,
+        )?,
+        idempotency_ref: derived_harness_id(
+            HarnessIdempotencyRef::PREFIX,
+            HARNESS_DEFAULT_GRANT_IDEMPOTENCY_REF_DOMAIN,
+            dispatch_operation_id,
+            HarnessIdempotencyRef::new,
+        )?,
     })
 }
 

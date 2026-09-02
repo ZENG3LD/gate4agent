@@ -519,7 +519,7 @@ fn observation_state(
     (availability, freshness, projection.transport_incomplete)
 }
 
-fn allowed_tool_ids(grant: &SessionGrantV1) -> Vec<String> {
+pub(crate) fn allowed_tool_ids(grant: &SessionGrantV1) -> Vec<String> {
     let mut tools = vec!["g4a_context_get"];
     if grant.monitoring_visibility != HarnessMonitoringVisibilityV1::None {
         tools.push("g4a_monitor_get");

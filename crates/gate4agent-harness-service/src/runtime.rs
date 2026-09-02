@@ -25,11 +25,12 @@ use crate::{
         execute_exact_binding_read, execute_operator_monitor, execute_operator_timeline,
         execute_read, verify_observation_credential_binding,
     },
+    mutation_request_digest,
     HarnessApplyOutcome, HarnessMutationV1, HarnessService, HarnessServiceError,
     PreparedScheduledSpawnLease,
 };
 use crate::dispatch::{
-    deterministic_dispatch_ids, deterministic_issued_dispatch_ids,
+    deterministic_default_grant_ids, deterministic_dispatch_ids, deterministic_issued_dispatch_ids,
     deterministic_lifecycle_authority_ids,
     derive_launch_plans_from_inventory,
     exact_bound_control_lifecycle,
@@ -107,6 +108,7 @@ use gate4agent_harness_protocol::{
     HarnessContextSourceSelectionV1, HarnessContextSourceAvailabilityV1, HarnessRequestDigest,
     HarnessWorktreeIntentV1, HarnessContinuationV1, HarnessDeliveryV1,
     HarnessTransferAuthorityRefV1,
+    HarnessGrantTargetV1, SessionGrantV1,
 };
 use gate4agent_node_wire::{local_hmac_sha256, proofs_match};
 use gate4agent_node_protocol::{
@@ -2054,6 +2056,83 @@ fn apply_pre_dispatch_result(
     ).map_err(HarnessRuntimeError::Harness)?;
     reconcile_task_result_refs(harness, now_unix_ms)?;
     Ok(reservation)
+}
+
+/// Resolves the `(grant_id, grant_revision)` a harness-MCP-bound dispatch
+/// arms its H3B reservation against (gate4agent-arc-mailbox-and-task-layer
+/// Slice A(i)). An `Exact` launch plan grant is used as given, unchanged.
+/// An `Operator` plan grant names no exact grant to bind to, so this mints
+/// the dispatching run's own default, read-only grant
+/// (`SessionGrantV1::default_for_run`) through `HarnessService::apply` --
+/// the identical mutation path the operator wire's own
+/// `ApplyHarnessMutation` uses, so it gets the same validation and audit
+/// trail -- and returns that grant's freshly-minted identity instead. The
+/// grant's identity is derived deterministically from `dispatch_operation_id`
+/// alone, so a retried dispatch mints (or replays) the identical grant
+/// rather than a second one.
+fn resolve_harness_mcp_grant(
+    harness: &mut HarnessService,
+    dispatch_operation_id: &HarnessOperationId,
+    grant_policy: &crate::dispatch::HarnessGrantPolicyV1,
+    actor_run_id: &gate4agent_harness_protocol::HarnessRunId,
+    target: HarnessGrantTargetV1,
+    now_unix_ms: u64,
+) -> Result<(gate4agent_harness_protocol::SessionGrantId, HarnessRevision), HarnessRuntimeError> {
+    match grant_policy {
+        crate::dispatch::HarnessGrantPolicyV1::Exact { grant_id, revision } => {
+            Ok((grant_id.clone(), *revision))
+        }
+        crate::dispatch::HarnessGrantPolicyV1::Operator => {
+            let first_revision = HarnessRevision::new(1)
+                .map_err(|_| HarnessRuntimeError::DispatchPreparation(
+                    "literal revision 1 is not a valid harness revision",
+                ))?;
+            let grant_ids = deterministic_default_grant_ids(dispatch_operation_id)
+                .map_err(|_| HarnessRuntimeError::DispatchPreparation(
+                    "dispatch operation id fails deterministic default grant id derivation",
+                ))?;
+            let minted_grant_id = grant_ids.grant_id.clone();
+            let default_grant = SessionGrantV1::default_for_run(
+                grant_ids.grant_id,
+                actor_run_id.clone(),
+                target,
+                now_unix_ms,
+            );
+            let placeholder_digest = HarnessRequestDigest::new("0".repeat(64))
+                .map_err(|_| HarnessRuntimeError::DispatchPreparation(
+                    "literal all-zero request digest is not valid hex",
+                ))?;
+            let grant_operation = HarnessOperationV1 {
+                operation_id: grant_ids.operation_id,
+                revision: first_revision,
+                actor: HarnessActorV1::ParentRun { run_id: actor_run_id.clone() },
+                kind: HarnessOperationKindV1::CreateGrant,
+                state: HarnessOperationStateV1::Succeeded,
+                task_id: None,
+                run_id: None,
+                grant_id: Some(minted_grant_id.clone()),
+                reconciles_operation_id: None,
+                expected_revision: None,
+                request_digest: placeholder_digest,
+                idempotency_ref: grant_ids.idempotency_ref,
+                failure: None,
+                outcome_unknown_reason: None,
+                reconciliation_outcome: None,
+                created_at_unix_ms: now_unix_ms,
+                updated_at_unix_ms: now_unix_ms,
+                dispatched_at_unix_ms: None,
+                finished_at_unix_ms: Some(now_unix_ms),
+            };
+            let mut mutation = HarnessMutationV1::CreateGrant {
+                operation: grant_operation,
+                grant: default_grant,
+            };
+            mutation.operation_mut().request_digest = mutation_request_digest(&mutation)
+                .map_err(HarnessRuntimeError::Harness)?;
+            harness.apply(mutation).map_err(HarnessRuntimeError::Harness)?;
+            Ok((minted_grant_id, first_revision))
+        }
+    }
 }
 
 /// The four classifiers below are the choke point where one pre-dispatch
@@ -5645,17 +5724,19 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                     .ok_or(HarnessRuntimeError::DispatchPreparation(
                                         "dispatch ids carry no harness mcp reservation id",
                                     ))?;
-                                let (grant_id, grant_revision) = match &plan.grant {
-                                    crate::dispatch::HarnessGrantPolicyV1::Exact {
-                                        grant_id,
-                                        revision,
-                                    } => (grant_id.clone(), *revision),
-                                    crate::dispatch::HarnessGrantPolicyV1::Operator => {
-                                        return Err(HarnessRuntimeError::DispatchPreparation(
-                                            "harness mcp grant policy is Operator, not an Exact grant",
-                                        ));
-                                    }
-                                };
+                                let (grant_id, grant_revision) = resolve_harness_mcp_grant(
+                                    &mut harness,
+                                    &intent.operation_id,
+                                    &plan.grant,
+                                    &run.run_id,
+                                    HarnessGrantTargetV1 {
+                                        node_id: context.node_id.clone(),
+                                        workspace_id: context.workspace_id.clone(),
+                                        provider_profile: context.provider_profile.clone(),
+                                        mode: context.mode,
+                                    },
+                                    now,
+                                )?;
                                 let expires_at_unix_ms = now.checked_add(
                                     plan.deadline_ms.min(
                                         gate4agent_node_protocol::MAX_HARNESS_MCP_RESERVATION_TTL_MS,
@@ -11570,6 +11651,137 @@ mod tests {
             accepted_spawn_transition(&legacy_exact, false, true, false),
             Err(HarnessRuntimeError::DispatchPreparation(_)),
         ));
+    }
+
+    fn resolve_grant_target() -> HarnessGrantTargetV1 {
+        HarnessGrantTargetV1 {
+            node_id: selector("node-a"),
+            workspace_id: selector("workspace-a"),
+            provider_profile: selector("claude-default"),
+            mode: HarnessExecutionModeV1::Pty,
+        }
+    }
+
+    /// Slice A(i): a harness-MCP dispatch with no exact grant to bind to
+    /// (`HarnessGrantPolicyV1::Operator`) used to refuse outright
+    /// (`begin_run_dispatch_with_harness_mcp`'s caller in
+    /// `start_harness_host_with_operator_and_catalogs` returned
+    /// `DispatchPreparation("harness mcp grant policy is Operator, not an
+    /// Exact grant")`, unreachable from any test -- see
+    /// `deterministic_default_grant_ids`'s own doc comment and the arc plan's
+    /// O1). `resolve_harness_mcp_grant` is the extracted decision point: it
+    /// now mints the run's default grant through `HarnessService::apply`
+    /// instead of refusing, and the mint is real (visible on the engine,
+    /// validated, revision 1, replay-safe) rather than a name-only stand-in.
+    #[test]
+    fn resolve_harness_mcp_grant_mints_default_grant_when_policy_is_operator() {
+        let engine = crate::credential::tests::engine(
+            1,
+            SessionGrantStateV1::Active,
+            1,
+            HarnessRunLifecycleV1::Running,
+        );
+        let mut harness = HarnessService::from_engine_for_test(engine);
+        let run_id = HarnessRunId::new(format!("hrun_{}", "a".repeat(24))).unwrap();
+        let dispatch_operation_id = HarnessOperationId::new(format!(
+            "hop_{}",
+            "b".repeat(24),
+        )).unwrap();
+
+        let (grant_id, grant_revision) = resolve_harness_mcp_grant(
+            &mut harness,
+            &dispatch_operation_id,
+            &crate::dispatch::HarnessGrantPolicyV1::Operator,
+            &run_id,
+            resolve_grant_target(),
+            20,
+        ).unwrap();
+        assert_eq!(grant_revision, HarnessRevision::new(1).unwrap());
+
+        let grant = harness.engine().grant(&grant_id)
+            .expect("resolve_harness_mcp_grant applied a CreateGrant mutation")
+            .clone();
+        assert_eq!(grant.actor_run_id, run_id);
+        assert_eq!(grant.state, SessionGrantStateV1::Active);
+        assert_eq!(
+            grant.read_permissions,
+            gate4agent_harness_protocol::HarnessReadPermissionsV1 {
+                tasks: gate4agent_harness_protocol::HarnessEntityReadScopeV1::SelfOnly,
+                runs: gate4agent_harness_protocol::HarnessEntityReadScopeV1::SelfOnly,
+                operations: gate4agent_harness_protocol::HarnessEntityReadScopeV1::SelfOnly,
+            },
+        );
+        assert_eq!(
+            grant.monitoring_visibility,
+            gate4agent_harness_protocol::HarnessMonitoringVisibilityV1::Timeline,
+        );
+        assert!(!grant.task_permissions.create);
+        assert!(!grant.task_permissions.mutate);
+        assert!(!grant.context_permissions.export);
+        assert!(!grant.context_permissions.restore);
+        assert_eq!(grant.maximum_child_count, 0);
+        assert_eq!(grant.maximum_child_depth, 0);
+        assert!(grant.allowed_delivery_bundles.is_empty());
+
+        let mut tool_ids = crate::read::allowed_tool_ids(&grant);
+        tool_ids.sort();
+        let mut expected: Vec<String> = gate4agent_harness_api::HARNESS_READ_TOOL_IDS
+            .iter().map(|id| (*id).to_owned()).collect();
+        expected.sort();
+        assert_eq!(tool_ids, expected, "no mailbox tools exist yet, so this is the full ceiling");
+
+        // Retrying the identical dispatch replays the same grant rather than
+        // minting a second one -- required for a dispatch retry not to leak
+        // an unbounded number of grants per run.
+        let (replayed_grant_id, replayed_revision) = resolve_harness_mcp_grant(
+            &mut harness,
+            &dispatch_operation_id,
+            &crate::dispatch::HarnessGrantPolicyV1::Operator,
+            &run_id,
+            resolve_grant_target(),
+            20,
+        ).unwrap();
+        assert_eq!(replayed_grant_id, grant_id);
+        assert_eq!(replayed_revision, grant_revision);
+    }
+
+    /// The `Exact` branch is the pre-existing, unchanged behaviour: a launch
+    /// plan that already names a grant is used exactly as given, and no
+    /// mutation is applied to the engine -- this is "a dispatch without
+    /// harness MCP [grant minting]" staying unchanged.
+    #[test]
+    fn resolve_harness_mcp_grant_passes_through_an_exact_grant_untouched() {
+        let engine = crate::credential::tests::engine(
+            1,
+            SessionGrantStateV1::Active,
+            1,
+            HarnessRunLifecycleV1::Running,
+        );
+        let before = engine.checkpoint();
+        let mut harness = HarnessService::from_engine_for_test(engine);
+        let run_id = HarnessRunId::new(format!("hrun_{}", "a".repeat(24))).unwrap();
+        let dispatch_operation_id = HarnessOperationId::new(format!(
+            "hop_{}",
+            "b".repeat(24),
+        )).unwrap();
+        let exact_grant_id = SessionGrantId::new(format!("hgrant_{}", "e".repeat(24))).unwrap();
+        let exact_revision = HarnessRevision::new(3).unwrap();
+
+        let (grant_id, grant_revision) = resolve_harness_mcp_grant(
+            &mut harness,
+            &dispatch_operation_id,
+            &crate::dispatch::HarnessGrantPolicyV1::Exact {
+                grant_id: exact_grant_id.clone(),
+                revision: exact_revision,
+            },
+            &run_id,
+            resolve_grant_target(),
+            20,
+        ).unwrap();
+
+        assert_eq!(grant_id, exact_grant_id);
+        assert_eq!(grant_revision, exact_revision);
+        assert_eq!(harness.engine().checkpoint(), before);
     }
 
     #[test]

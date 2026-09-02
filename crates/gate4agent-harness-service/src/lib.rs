@@ -26,7 +26,7 @@ use gate4agent_harness_protocol::{
     HarnessContinuationRef, HarnessContinuationStateV1, HarnessContinuationV1,
     HarnessDeliveryRef, HarnessDeliveryStateV1, HarnessDeliveryV1, HarnessDispatchIntentV1,
     HarnessExecutionModeV1, HarnessExecutionSpecId,
-    HarnessExpectedExecutionSpecRevisionV1, HarnessIdempotencyRef,
+    HarnessExpectedExecutionSpecRevisionV1, HarnessGrantTargetV1, HarnessIdempotencyRef,
     HarnessMoveTaskRequestV1,
     HarnessOperationId, HarnessOperationKindV1, HarnessOperationStateV1, HarnessOperationV1,
     HarnessOperatorAuthorityV1, HarnessReplaceTaskExecutionSpecRequestV1,
@@ -5377,9 +5377,23 @@ fn next_revision(revision: HarnessRevision) -> Result<HarnessRevision, HarnessSe
 /// `actor_run_id == run.run_id` for a run that has no parent). Any actor,
 /// parent, or grant combination outside those two shapes is refused by
 /// name (`HarnessMcpGrantActorRefused`, naming the actor kind, the run's
-/// parent, and the grant's own actor run) rather than folded into the
-/// generic "not authoritative" refusal below, which stays for a
-/// recognized shape whose revision, replay link, or target is wrong.
+/// parent, and the grant's own actor run).
+///
+/// Once a shape is recognized, the remaining authority proof used to be one
+/// bare `InvalidHarnessMcpReservation("H3B grant revision, actor, or
+/// target is not authoritative")` folding four independent conditions --
+/// so a refusal never said which of them actually fired, nor the two
+/// values that disagreed. Each is now its own named, `#[from]`-free
+/// `HarnessServiceError` variant carrying both sides of the mismatch:
+/// `HarnessMcpGrantOperationLinkRefused` (the dispatch operation already
+/// names a different grant), `HarnessMcpGrantRevisionRefused` (the
+/// presented revision does not match the grant's durable one),
+/// `HarnessMcpGrantLinkRefused` (the grant's own `actor_run_id` does not
+/// match the run this dispatch resolved for that shape -- for shape (a)
+/// this is the parent run named by the operation actor; for shape (b) the
+/// match guard above already forces it to hold, so it never fires there),
+/// and `HarnessMcpGrantTargetRefused` (the dispatch's node/workspace/
+/// provider-profile/mode is not among the grant's `allowed_targets`).
 fn validate_harness_mcp_grant(
     engine: &HarnessEngine,
     run: &HarnessRunV1,
@@ -5414,19 +5428,43 @@ fn validate_harness_mcp_grant(
             });
         }
     };
-    if grant.revision != grant_revision
-        || grant.actor_run_id != *actor_run_id
-        || operation.grant_id.is_some()
-        || !grant.allows_target(
-            &context.node_id,
-            &context.workspace_id,
-            &context.provider_profile,
-            context.mode,
-        )
-    {
-        return Err(HarnessServiceError::InvalidHarnessMcpReservation(
-            "H3B grant revision, actor, or target is not authoritative",
-        ));
+    if let Some(existing_grant_id) = &operation.grant_id {
+        return Err(HarnessServiceError::HarnessMcpGrantOperationLinkRefused {
+            grant_id: grant_id.clone(),
+            operation_id: operation.operation_id.clone(),
+            existing_grant_id: existing_grant_id.clone(),
+        });
+    }
+    if grant.revision != grant_revision {
+        return Err(HarnessServiceError::HarnessMcpGrantRevisionRefused {
+            grant_id: grant_id.clone(),
+            durable_revision: grant.revision,
+            presented_revision: grant_revision,
+        });
+    }
+    if grant.actor_run_id != *actor_run_id {
+        return Err(HarnessServiceError::HarnessMcpGrantLinkRefused {
+            grant_id: grant_id.clone(),
+            grant_actor_run_id: grant.actor_run_id.clone(),
+            dispatch_actor_run_id: actor_run_id.clone(),
+        });
+    }
+    if !grant.allows_target(
+        &context.node_id,
+        &context.workspace_id,
+        &context.provider_profile,
+        context.mode,
+    ) {
+        return Err(HarnessServiceError::HarnessMcpGrantTargetRefused {
+            grant_id: grant_id.clone(),
+            presented_target: HarnessGrantTargetV1 {
+                node_id: context.node_id.clone(),
+                workspace_id: context.workspace_id.clone(),
+                provider_profile: context.provider_profile.clone(),
+                mode: context.mode,
+            },
+            allowed_targets: grant.allowed_targets.clone(),
+        });
     }
     Ok(())
 }
@@ -6526,6 +6564,42 @@ pub enum HarnessServiceError {
         actor_kind: &'static str,
         parent_run_id: Option<HarnessRunId>,
         grant_actor_run_id: HarnessRunId,
+    },
+    #[error(
+        "H3B grant {grant_id} operation link refused: dispatch operation \
+         {operation_id} already names grant {existing_grant_id}"
+    )]
+    HarnessMcpGrantOperationLinkRefused {
+        grant_id: SessionGrantId,
+        operation_id: HarnessOperationId,
+        existing_grant_id: SessionGrantId,
+    },
+    #[error(
+        "H3B grant {grant_id} revision refused: durable revision \
+         {durable_revision:?} vs presented revision {presented_revision:?}"
+    )]
+    HarnessMcpGrantRevisionRefused {
+        grant_id: SessionGrantId,
+        durable_revision: HarnessRevision,
+        presented_revision: HarnessRevision,
+    },
+    #[error(
+        "H3B grant {grant_id} link refused: grant actor run \
+         {grant_actor_run_id} vs dispatch actor run {dispatch_actor_run_id}"
+    )]
+    HarnessMcpGrantLinkRefused {
+        grant_id: SessionGrantId,
+        grant_actor_run_id: HarnessRunId,
+        dispatch_actor_run_id: HarnessRunId,
+    },
+    #[error(
+        "H3B grant {grant_id} target refused: presented target \
+         {presented_target:?} vs allowed targets {allowed_targets:?}"
+    )]
+    HarnessMcpGrantTargetRefused {
+        grant_id: SessionGrantId,
+        presented_target: HarnessGrantTargetV1,
+        allowed_targets: Vec<HarnessGrantTargetV1>,
     },
     #[error("harness MCP reservation replay changed durable request identity")]
     HarnessMcpReplayMismatch,
@@ -9578,21 +9652,34 @@ mod tests {
         )).unwrap();
         let before = service.committed_snapshot();
 
-        assert!(matches!(
-            service.begin_run_dispatch_with_harness_mcp(
-                HarnessRevision::new(1).unwrap(),
-                run.clone(),
-                HarnessRevision::new(1).unwrap(),
-                operation.clone(),
-                context.clone(),
-                &spec,
-                reservation_id.clone(),
-                grant_id.clone(),
-                HarnessRevision::new(2).unwrap(),
-                1_000,
-            ),
-            Err(HarnessServiceError::InvalidHarnessMcpReservation(_)),
-        ));
+        // A presented revision (2) that does not match the grant's durable
+        // revision (1) is refused by `HarnessMcpGrantRevisionRefused`,
+        // naming the grant and both compared revisions -- not folded into
+        // a bare "not authoritative" message.
+        match service.begin_run_dispatch_with_harness_mcp(
+            HarnessRevision::new(1).unwrap(),
+            run.clone(),
+            HarnessRevision::new(1).unwrap(),
+            operation.clone(),
+            context.clone(),
+            &spec,
+            reservation_id.clone(),
+            grant_id.clone(),
+            HarnessRevision::new(2).unwrap(),
+            1_000,
+        ) {
+            Err(HarnessServiceError::HarnessMcpGrantRevisionRefused {
+                grant_id: refused_grant_id,
+                durable_revision,
+                presented_revision,
+            }) => {
+                assert_eq!(refused_grant_id, grant_id);
+                assert_eq!(durable_revision, HarnessRevision::new(1).unwrap());
+                assert_eq!(presented_revision, HarnessRevision::new(2).unwrap());
+            }
+            Err(other) => panic!("expected a named revision refusal, got {other:?}"),
+            Ok(_) => panic!("expected a named revision refusal, but dispatch succeeded"),
+        }
         assert_eq!(service.committed_snapshot(), before);
         assert_eq!(service.harness_mcp_reservation_state(&reservation_id), None);
 
@@ -9730,6 +9817,100 @@ mod tests {
         }
     }
 
+    /// A recognized shape (b) whose presented revision does not match the
+    /// grant's durable one is refused by `HarnessMcpGrantRevisionRefused`,
+    /// naming the grant and both compared revisions -- not folded into the
+    /// bare "not authoritative" message this replaces.
+    #[test]
+    fn validate_harness_mcp_grant_refuses_revision_mismatch_by_name() {
+        let engine = h3b_operator_dispatch_engine();
+        let run = engine.run(&run_id()).unwrap().clone();
+        let operation = engine.operation(&run_operation_id()).unwrap().clone();
+        let grant_id = SessionGrantId::new(format!("hgrant_{}", "c".repeat(24))).unwrap();
+        let context = dispatch_context(
+            &operation,
+            HarnessRequestDigest::new("d".repeat(64)).unwrap(),
+        );
+        match validate_harness_mcp_grant(
+            &engine, &run, &operation, &context, &grant_id, HarnessRevision::new(2).unwrap(),
+        ) {
+            Err(HarnessServiceError::HarnessMcpGrantRevisionRefused {
+                grant_id: refused_grant_id, durable_revision, presented_revision,
+            }) => {
+                assert_eq!(refused_grant_id, grant_id);
+                assert_eq!(durable_revision, HarnessRevision::new(1).unwrap());
+                assert_eq!(presented_revision, HarnessRevision::new(2).unwrap());
+            }
+            other => panic!("expected a named revision refusal, got {other:?}"),
+        }
+    }
+
+    /// A recognized shape (b) whose dispatch target is not among the
+    /// grant's `allowed_targets` is refused by `HarnessMcpGrantTargetRefused`,
+    /// naming the grant, the presented target, and the grant's own allowed
+    /// targets.
+    #[test]
+    fn validate_harness_mcp_grant_refuses_target_mismatch_by_name() {
+        let engine = h3b_operator_dispatch_engine();
+        let run = engine.run(&run_id()).unwrap().clone();
+        let operation = engine.operation(&run_operation_id()).unwrap().clone();
+        let grant_id = SessionGrantId::new(format!("hgrant_{}", "c".repeat(24))).unwrap();
+        let mut context = dispatch_context(
+            &operation,
+            HarnessRequestDigest::new("d".repeat(64)).unwrap(),
+        );
+        context.provider_profile = HarnessSelectorV1::new("other-profile").unwrap();
+        match validate_harness_mcp_grant(
+            &engine, &run, &operation, &context, &grant_id, HarnessRevision::new(1).unwrap(),
+        ) {
+            Err(HarnessServiceError::HarnessMcpGrantTargetRefused {
+                grant_id: refused_grant_id, presented_target, allowed_targets,
+            }) => {
+                assert_eq!(refused_grant_id, grant_id);
+                assert_eq!(presented_target.provider_profile.as_str(), "other-profile");
+                assert_eq!(allowed_targets.len(), 1);
+                assert_eq!(allowed_targets[0].provider_profile.as_str(), "claude-default");
+            }
+            other => panic!("expected a named target refusal, got {other:?}"),
+        }
+    }
+
+    /// H3B shape (a)'s match guard only checks that the operation actor
+    /// names the run's actual parent -- it does not itself check the
+    /// grant's own `actor_run_id`, so a grant issued to some OTHER run
+    /// (not the parent the operation actor names) still reaches the
+    /// generic authority proof, where it is refused by name
+    /// (`HarnessMcpGrantLinkRefused`) rather than silently accepted or
+    /// folded into a bare message.
+    #[test]
+    fn validate_harness_mcp_grant_refuses_actor_link_mismatch_by_name() {
+        let mut checkpoint = h3b_dispatch_engine().checkpoint();
+        let foreign_actor_run_id = run_id();
+        checkpoint.grants[0].actor_run_id = foreign_actor_run_id.clone();
+        let engine = HarnessEngine::restore(checkpoint).unwrap();
+        let run = engine.run(&run_id()).unwrap().clone();
+        let operation = engine.operation(&run_operation_id()).unwrap().clone();
+        assert!(run.parent_run_id.is_some());
+        assert!(matches!(operation.actor, HarnessActorV1::ParentRun { .. }));
+        let grant_id = SessionGrantId::new(format!("hgrant_{}", "c".repeat(24))).unwrap();
+        let context = dispatch_context(
+            &operation,
+            HarnessRequestDigest::new("d".repeat(64)).unwrap(),
+        );
+        match validate_harness_mcp_grant(
+            &engine, &run, &operation, &context, &grant_id, HarnessRevision::new(1).unwrap(),
+        ) {
+            Err(HarnessServiceError::HarnessMcpGrantLinkRefused {
+                grant_id: refused_grant_id, grant_actor_run_id, dispatch_actor_run_id,
+            }) => {
+                assert_eq!(refused_grant_id, grant_id);
+                assert_eq!(grant_actor_run_id, foreign_actor_run_id);
+                assert_eq!(dispatch_actor_run_id, run.parent_run_id.unwrap());
+            }
+            other => panic!("expected a named link refusal, got {other:?}"),
+        }
+    }
+
     /// The full `begin_run_dispatch_with_harness_mcp` seam for H3B shape
     /// (b): the resulting reservation's `actor_run_id` is the run itself
     /// (equal to the grant it was validated against), not the parent-run
@@ -9785,6 +9966,91 @@ mod tests {
         assert_eq!(prepared.reservation_id(), &reservation_id);
         let reservation = service.harness_mcp_reservation(&reservation_id).unwrap();
         assert_eq!(reservation.grant_id, grant_id);
+        assert_eq!(reservation.actor_run_id, run.run_id);
+
+        service.close().unwrap();
+        remove_database(&path);
+    }
+
+    /// The live dispatch coordinator composes `resolve_harness_mcp_grant`
+    /// (which mints the run's default grant through a real `CreateGrant`
+    /// mutation) directly into `begin_run_dispatch_with_harness_mcp` (which
+    /// validates it) -- but neither
+    /// `resolve_harness_mcp_grant_mints_default_grant_when_policy_is_operator`
+    /// (stops at the mint, in `runtime.rs`) nor
+    /// `h3b_dispatch_accepts_operator_started_top_level_run_with_default_grant`
+    /// above (validates a hand-seeded grant that was never minted) exercises
+    /// that composition. This drives it end to end, up to (not including)
+    /// `ArmHarnessMcpReservation`, the way `start_or_resume_dispatch_job`'s
+    /// `GrantBound` arm actually does.
+    #[test]
+    fn h3b_dispatch_accepts_a_grant_minted_by_resolve_harness_mcp_grant() {
+        let path = database_path("h3b-derived-default-grant");
+        let mut service = HarnessService {
+            store: Some(HarnessStore::open(&path).unwrap()),
+            engine: h3b_operator_dispatch_engine(),
+            dispatch_contexts: BTreeMap::new(),
+            harness_mcp_reservations: BTreeMap::new(),
+            operator_requests: BTreeMap::new(),
+            scheduled_launches: BTreeMap::new(),
+            issued_launches: BTreeMap::new(),
+            poisoned: false,
+        };
+        let run = service.engine().run(&run_id()).unwrap().clone();
+        let operation = service.engine().operation(&run_operation_id()).unwrap().clone();
+        assert_eq!(run.parent_run_id, None);
+        assert!(matches!(operation.actor, HarnessActorV1::User { .. }));
+
+        let spec = spawn_spec("derived default grant H3B dispatch");
+        let fingerprint = c2::spawn_spec_fingerprint(&spec).unwrap();
+        let context = dispatch_context(&operation, fingerprint);
+
+        let (grant_id, grant_revision) = crate::runtime::resolve_harness_mcp_grant(
+            &mut service,
+            &operation.operation_id,
+            &crate::dispatch::HarnessGrantPolicyV1::Operator,
+            &run.run_id,
+            HarnessGrantTargetV1 {
+                node_id: context.node_id.clone(),
+                workspace_id: context.workspace_id.clone(),
+                provider_profile: context.provider_profile.clone(),
+                mode: context.mode,
+            },
+            13,
+        ).unwrap();
+        assert_eq!(grant_revision, HarnessRevision::new(1).unwrap());
+
+        let mut run = run;
+        run.revision = HarnessRevision::new(2).unwrap();
+        run.lifecycle = HarnessRunLifecycleV1::Dispatching;
+        run.updated_at_unix_ms = 13;
+        let mut operation = operation;
+        operation.revision = HarnessRevision::new(2).unwrap();
+        operation.state = HarnessOperationStateV1::Dispatching;
+        operation.updated_at_unix_ms = 13;
+        operation.dispatched_at_unix_ms = Some(13);
+
+        let reservation_id = HarnessMcpReservationId::new(format!(
+            "hmcpres_{}",
+            "d".repeat(24),
+        )).unwrap();
+
+        let prepared = service.begin_run_dispatch_with_harness_mcp(
+            HarnessRevision::new(1).unwrap(),
+            run.clone(),
+            HarnessRevision::new(1).unwrap(),
+            operation,
+            context,
+            &spec,
+            reservation_id.clone(),
+            grant_id.clone(),
+            grant_revision,
+            1_000,
+        ).unwrap();
+        assert_eq!(prepared.reservation_id(), &reservation_id);
+        let reservation = service.harness_mcp_reservation(&reservation_id).unwrap();
+        assert_eq!(reservation.grant_id, grant_id);
+        assert_eq!(reservation.grant_revision, grant_revision);
         assert_eq!(reservation.actor_run_id, run.run_id);
 
         service.close().unwrap();

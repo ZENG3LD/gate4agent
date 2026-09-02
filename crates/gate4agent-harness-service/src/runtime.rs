@@ -2086,7 +2086,12 @@ fn apply_pre_dispatch_result(
 /// grant's identity is derived deterministically from `dispatch_operation_id`
 /// alone, so a retried dispatch mints (or replays) the identical grant
 /// rather than a second one.
-fn resolve_harness_mcp_grant(
+///
+/// `pub(crate)` rather than private: `lib.rs`'s own test module composes
+/// this with `HarnessService::begin_run_dispatch_with_harness_mcp` to
+/// exercise the full mint-then-dispatch seam end to end (see
+/// `h3b_dispatch_accepts_a_grant_minted_by_resolve_harness_mcp_grant`).
+pub(crate) fn resolve_harness_mcp_grant(
     harness: &mut HarnessService,
     dispatch_operation_id: &HarnessOperationId,
     grant_policy: &crate::dispatch::HarnessGrantPolicyV1,

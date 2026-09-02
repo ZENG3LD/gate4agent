@@ -24,7 +24,8 @@ use gate4agent_harness_client::{
     HARNESS_RUNTIME_INVENTORY_PAGE_LIMIT_MAX,
 };
 use gate4agent_harness_api::{
-    HarnessAgentStreamChunkKindV1, HarnessAgentStreamNamedIdV1, HarnessExecutionModeV1,
+    HarnessAgentStreamChunkKindV1, HarnessAgentStreamNamedIdV1, HarnessApprovalLevelV1,
+    HarnessExecutionModeV1,
     HarnessOperatorAgentEventV1, HarnessProviderInteractionResponseV1, HarnessRuntimeSessionAddressV1,
     HarnessRuntimeTerminalSizeV1,
 };
@@ -51,12 +52,13 @@ fn usage() -> &'static str {
      \x20 runtime-inventory [--after NODE_ID] [--limit N]\n\
      \x20 monitor RUN_ID\n\
      \x20 workspace inspect NODE_ID WORKSPACE_ID\n\
-     \x20 session spawn NODE_ID WORKSPACE_ID PROVIDER [--profile ID] [--mode pty|inline] [--rows N] [--cols N]\n\
+     \x20 session spawn NODE_ID WORKSPACE_ID PROVIDER [--profile ID] [--mode pty|inline|acp] [--rows N] [--cols N] [--approval moderate|full-auto|read-only|unmanaged]\n\
      \x20 session stop NODE_ID INCARNATION_ID WORKSPACE_ID INSTANCE_ID GENERATION [--force yes]\n\
      \x20 session resolve-interaction NODE_ID INCARNATION_ID WORKSPACE_ID INSTANCE_ID GENERATION CORRELATION_ID --response approve|deny|answer [--answer TEXT]\n\
      \x20 session set-mode NODE_ID INCARNATION_ID WORKSPACE_ID INSTANCE_ID GENERATION MODE_ID\n\
      \x20 session set-model NODE_ID INCARNATION_ID WORKSPACE_ID INSTANCE_ID GENERATION MODEL_ID\n\
      \x20 session set-config-option NODE_ID INCARNATION_ID WORKSPACE_ID INSTANCE_ID GENERATION OPTION_ID --value-json JSON\n\
+     \x20 session prompt NODE_ID INCARNATION_ID WORKSPACE_ID INSTANCE_ID GENERATION TEXT (ACP/inline sessions only -- refused for a PTY session)\n\
      \x20 session subscribe NODE_ID INCARNATION_ID WORKSPACE_ID INSTANCE_ID GENERATION [...more session groups] [--verbose yes]"
 }
 
@@ -109,6 +111,7 @@ enum Command {
         mode: HarnessExecutionModeV1,
         rows: u16,
         cols: u16,
+        approval_level: Option<HarnessApprovalLevelV1>,
     },
     SessionStop { session: HarnessRuntimeSessionAddressV1, force: bool },
     SessionResolveInteraction {
@@ -117,6 +120,7 @@ enum Command {
         response: HarnessProviderInteractionResponseV1,
     },
     SessionSetMode { session: HarnessRuntimeSessionAddressV1, mode_id: String },
+    SessionPrompt { session: HarnessRuntimeSessionAddressV1, text: String },
     SessionSetConfigOption {
         session: HarnessRuntimeSessionAddressV1,
         option_id: String,
@@ -146,6 +150,7 @@ enum Verb {
     SessionStop,
     SessionResolveInteraction,
     SessionSetMode,
+    SessionPrompt,
     SessionSetConfigOption,
     SessionSetModel,
     SessionSubscribe,
@@ -175,6 +180,7 @@ fn resolve_verb(args: &[String]) -> Result<(Verb, usize), String> {
             Some("stop") => Ok((Verb::SessionStop, 2)),
             Some("resolve-interaction") => Ok((Verb::SessionResolveInteraction, 2)),
             Some("set-mode") => Ok((Verb::SessionSetMode, 2)),
+            Some("prompt") => Ok((Verb::SessionPrompt, 2)),
             Some("set-config-option") => Ok((Verb::SessionSetConfigOption, 2)),
             Some("set-model") => Ok((Verb::SessionSetModel, 2)),
             Some("subscribe") => Ok((Verb::SessionSubscribe, 2)),
@@ -447,6 +453,20 @@ fn build_command(
                 Some(value) => value.parse().map_err(|_| "--cols must be a u16".to_owned())?,
                 None => 140,
             };
+            // Absent by default -- `None` on the wire is the axis default
+            // (`FullAuto`), unchanged from before this flag existed.
+            let approval_level = match take_flag(flags, "approval").as_deref() {
+                None => None,
+                Some("full-auto") => Some(HarnessApprovalLevelV1::FullAuto),
+                Some("moderate") => Some(HarnessApprovalLevelV1::Moderate),
+                Some("read-only") => Some(HarnessApprovalLevelV1::ReadOnly),
+                Some("unmanaged") => Some(HarnessApprovalLevelV1::Unmanaged),
+                Some(other) => {
+                    return Err(format!(
+                        "--approval must be moderate, full-auto, read-only, or unmanaged, got {other}"
+                    ))
+                }
+            };
             Ok(Command::SessionSpawn {
                 node_id,
                 workspace_id,
@@ -455,6 +475,7 @@ fn build_command(
                 mode,
                 rows,
                 cols,
+                approval_level,
             })
         }
         Verb::SessionStop => {
@@ -508,6 +529,11 @@ fn build_command(
             let session = take_session_address_prefix(positionals)?;
             let mode_id = expect_single_positional(positionals, "mode-id")?;
             Ok(Command::SessionSetMode { session, mode_id })
+        }
+        Verb::SessionPrompt => {
+            let session = take_session_address_prefix(positionals)?;
+            let text = expect_single_positional(positionals, "text")?;
+            Ok(Command::SessionPrompt { session, text })
         }
         Verb::SessionSetConfigOption => {
             let session = take_session_address_prefix(positionals)?;
@@ -826,6 +852,7 @@ fn execute(invocation: Invocation) -> Result<String, String> {
             mode,
             rows,
             cols,
+            approval_level,
         } => {
             let session = client
                 .spawn_session(
@@ -835,6 +862,7 @@ fn execute(invocation: Invocation) -> Result<String, String> {
                     provider_profile,
                     mode,
                     HarnessRuntimeTerminalSizeV1 { rows, columns: cols },
+                    approval_level,
                 )
                 .map_err(|error| error.to_string())?;
             render(&session)
@@ -854,6 +882,10 @@ fn execute(invocation: Invocation) -> Result<String, String> {
         Command::SessionSetMode { session, mode_id } => {
             client.set_session_mode(session, mode_id).map_err(|error| error.to_string())?;
             render(&serde_json::json!({ "mode_set": true }))
+        }
+        Command::SessionPrompt { session, text } => {
+            client.prompt_session(session, text).map_err(|error| error.to_string())?;
+            render(&serde_json::json!({ "prompted": true }))
         }
         Command::SessionSetConfigOption { session, option_id, value_json } => {
             client

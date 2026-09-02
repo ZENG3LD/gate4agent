@@ -9,6 +9,7 @@
 use std::{collections::BTreeMap, fmt};
 
 pub use gate4agent_harness_protocol::{
+    HarnessApprovalLevelV1,
     HarnessArtifactRef, HarnessEntityReadScopeV1, HarnessExecutionModeV1,
     HarnessFailureCategoryV1, HarnessIdempotencyRef, HarnessMonitoringVisibilityV1,
     HarnessOperationId,
@@ -80,7 +81,23 @@ pub const HARNESS_MCP_AUDIENCE: &str = "gate4agent-harness-mcp-read-v1";
 /// §5) change the wire shape, so all four co-built processes rebuild
 /// together -- exactly what every bump under this single-version scheme
 /// means, not a special case.
-pub const HARNESS_OPERATOR_WIRE_VERSION: u16 = 16;
+///
+/// `17` adds one more verb the same way: `PromptSession`, the semantic-
+/// prompt sibling `WriteSessionInput` was never able to be -- it relays to
+/// the node's *other* input verb, `NodeRequest::Prompt`, not
+/// `NodeRequest::Input` (see both requests' own doc comments for the
+/// distinction and for why `PromptSession` is refused by name against a
+/// PTY-transport session). One more request/reply pair on the wire, so all
+/// four co-built processes rebuild together again.
+///
+/// `18` widens `SpawnSession`'s existing shape rather than adding a verb:
+/// `approval_level: Option<HarnessApprovalLevelV1>`, `None` decoding as the
+/// axis default so a pre-`18` frame (which never set the field) still means
+/// exactly what it always meant. It moves the version anyway, same as every
+/// bump above -- this wire has no field-level compatibility story of its
+/// own beneath the single accepted `version`, so a shape change is a shape
+/// change regardless of whether the new field happens to default cleanly.
+pub const HARNESS_OPERATOR_WIRE_VERSION: u16 = 18;
 // Realistic multi-pane ceiling with headroom; bounds the harness-side
 // per-subscriber HashSet<RuntimeSessionKey> and the connect-time seed burst
 // `SubscribeTerminal`'s handler sends immediately after registering (see
@@ -134,6 +151,9 @@ pub const HARNESS_TERMINAL_FRAME_MAX_BYTES: usize = 2 * 1_024 * 1_024;
 // this crate has no dependency on that crate, so the bound is mirrored here
 // as the wire-level ceiling `WriteSessionInput` is rejected above; the node
 // re-checks the same limit authoritatively on its own side regardless.
+// `PromptSession`/`PasteSession` reuse this exact constant: the node's own
+// `validate_node_text` checks "prompt"/"paste"/"terminal input" against the
+// same single `MAX_NODE_TEXT_BYTES` ceiling, not a per-verb one.
 pub const HARNESS_SESSION_INPUT_MAX_BYTES: usize = 32 * 1_024;
 // Matches the node's own `MAX_NODE_TERMINAL_BYTES` (gate4agent-node-protocol)
 // / `gate4agent_types::TERMINAL_BYTES_MAX_BYTES`, mirrored here for the same
@@ -2258,8 +2278,61 @@ pub enum HarnessOperatorRequestV1 {
         provider_profile: String,
         mode: HarnessExecutionModeV1,
         terminal_size: HarnessRuntimeTerminalSizeV1,
+        // `None` means "the axis default" (`ApprovalLevel::FullAuto` --
+        // not asking a human is the owner's stated norm and this field does
+        // not change that default), so every caller that predates this
+        // field, and every caller that simply does not care, is unchanged.
+        // `Some(_)` is the one way `Moderate`/`ReadOnly`/`Unmanaged` becomes
+        // reachable on a session spawned through this wire at all -- see
+        // `gate4agent-node`'s `require_session_runtime_policy` doc and
+        // `HostPolicy::Yolo`'s own doc for why `FullAuto` alone left the
+        // whole permission-deferral path dead code in production.
+        #[serde(default)]
+        approval_level: Option<HarnessApprovalLevelV1>,
     },
     WriteSessionInput {
+        session: HarnessRuntimeSessionAddressV1,
+        text: String,
+    },
+    // `PromptSession` relays to `NodeRequest::Prompt`, the node's semantic-
+    // prompt verb -- a DIFFERENT node request from the one immediately
+    // above. `WriteSessionInput` relays to `NodeRequest::Input` (typed/raw
+    // PTY text) and keeps meaning exactly that; this is an additional verb,
+    // not a reinterpretation of it, the same way `PasteSession` relaying
+    // `NodeRequest::Paste` is additional to it rather than a replacement.
+    // Bounded by the same `HARNESS_SESSION_INPUT_MAX_BYTES` ceiling
+    // `WriteSessionInput`/`PasteSession` already use (see that constant's
+    // doc comment) -- the node checks all three against the same single
+    // `MAX_NODE_TEXT_BYTES`, so there is no separate per-verb bound to pick.
+    //
+    // Admissible only against an ACP- or inline-transport session, and
+    // refused BY NAME for a PTY-transport one -- unconditionally, even for
+    // the rare PTY session whose provider profile currently admits a node-
+    // level `SemanticPrompt` runtime policy (reachable today only through
+    // `ResumeSessionRecord`'s own `initial_prompt`, a narrow capability for
+    // typing exactly one prompt into a raw terminal at resume time, for a
+    // provider CLI a human is watching). This is a deliberate, permanent
+    // boundary the owner drew, not a limitation waiting to be lifted: a PTY
+    // session has a human sitting at it, choosing what runs and watching
+    // what appears, so what lands on that screen is the operator's
+    // business, never this wire's. ACP and inline are the two transports
+    // this project opens with nobody at a terminal, and prompting is their
+    // ordinary interface -- `PromptSession` and `WriteSessionInput` must
+    // never silently fall back to each other across that line.
+    //
+    // Enforced in `gate4agent-harness-service`, not here: this wire type
+    // carries only a bare routing address (`HarnessRuntimeSessionAddressV1`
+    // has no transport field of its own), and tightening the node's shared
+    // `NodeRequest::Prompt` handler itself would also narrow the
+    // `ResumeSessionRecord` capability above, which this change does not
+    // touch. `gate4agent-harness-service` checks its own cached runtime
+    // inventory before ever dispatching to C2/the node and refuses by name
+    // (`HarnessOperatorHostErrorV1::UnsupportedTransport`) when that cache
+    // already knows the target is PTY; the node's existing
+    // `require_session_runtime_policy(SemanticPrompt)` gate remains the
+    // backstop for the narrow window right after a spawn/resume where the
+    // cache cannot yet prove the transport either way.
+    PromptSession {
         session: HarnessRuntimeSessionAddressV1,
         text: String,
     },
@@ -2693,6 +2766,19 @@ impl HarnessOperatorRequestV1 {
                 Ok(())
             }
             Self::WriteSessionInput { session, text } => {
+                session.validate()?;
+                if text.len() > HARNESS_SESSION_INPUT_MAX_BYTES {
+                    return Err(HarnessOperatorApiError::InvalidSessionControl);
+                }
+                Ok(())
+            }
+            // Same bound as `WriteSessionInput` immediately above -- see
+            // `PromptSession`'s own doc comment for why this is a separate
+            // verb rather than a flag on that one, and why the PTY-transport
+            // refusal it also carries lives in `gate4agent-harness-service`
+            // rather than here: this type alone cannot see the target
+            // session's transport.
+            Self::PromptSession { session, text } => {
                 session.validate()?;
                 if text.len() > HARNESS_SESSION_INPUT_MAX_BYTES {
                     return Err(HarnessOperatorApiError::InvalidSessionControl);
@@ -3481,6 +3567,11 @@ pub enum HarnessOperatorResponseV1 {
     SessionPasted,
     SessionRemoved,
     SessionResumed,
+    // `PromptSession`'s ack -- same bare shape as `SessionInputWritten`
+    // above, because the node's own `NodeRequest::Prompt` handler acks with
+    // a bare `NodeResponse::Accepted` too. See `HarnessOperatorRequestV1::
+    // PromptSession`'s own doc comment.
+    SessionPrompted,
     // Unit acks for the four ACP control verbs above -- same bare-ack shape
     // as the eight session-control acks immediately above, because the node
     // itself acks all four with its own bare `NodeResponse::Accepted`.
@@ -3561,6 +3652,7 @@ impl HarnessOperatorResponseV1 {
             | Self::SessionPasted
             | Self::SessionRemoved
             | Self::SessionResumed
+            | Self::SessionPrompted
             | Self::InteractionResolved
             | Self::SessionModeSet
             | Self::SessionConfigOptionSet
@@ -5166,6 +5258,16 @@ pub enum HarnessOperatorHostErrorV1 {
         agent: String,
         transport: HarnessRuntimeTransportV1,
     },
+    // Distinct from the generic `Unavailable` bucket a bare `NodeFailureCode
+    // ::UnsupportedCapability` used to collapse into: the node did not say
+    // "busy" or "disconnected", it said this exact capability does not
+    // exist for the addressed session/provider. `Unavailable` reads as
+    // transient to a caller ("try again shortly"); this operation can never
+    // succeed, so folding it into `Unavailable` invited a retry that was
+    // guaranteed to fail the same way forever. Every mapper on this wire
+    // that used to fold `NodeFailureCode::UnsupportedCapability` into
+    // `Unavailable` now returns this instead.
+    UnsupportedCapability,
     Internal,
     // Added alongside `gate4agent-harness-light` (the P2.2 light-harness
     // extraction), riding the V11 era: distinct from `NotFound` (a request
@@ -8892,6 +8994,7 @@ mod tests {
                 provider_profile: "claude-default".to_owned(),
                 mode: HarnessExecutionModeV1::Pty,
                 terminal_size: HarnessRuntimeTerminalSizeV1 { rows: 40, columns: 120 },
+                approval_level: None,
             },
             HarnessOperatorRequestV1::WriteSessionInput {
                 session: session.clone(),
@@ -8936,6 +9039,38 @@ mod tests {
         }
     }
 
+    /// `PromptSession`'s own round trip, kept separate from the V10 session-
+    /// verb test above: it landed on the wire under a later version and
+    /// carries its own PTY-refusal doctrine (see its doc comment), not just
+    /// another `WriteSessionInput`-shaped verb.
+    #[test]
+    fn operator_prompt_session_is_exact_round_trip() {
+        let session = session_address(41, 3);
+        let request = HarnessOperatorRequestV1::PromptSession {
+            session: session.clone(),
+            text: "please continue".to_owned(),
+        };
+        request.validate().expect("valid prompt-session request");
+        let encoded = serde_json::to_string(&request).unwrap();
+        let decoded: HarnessOperatorRequestV1 = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, request);
+        let credential = HarnessOperatorCredential::parse(format!(
+            "g4aho_{}",
+            "a".repeat(64),
+        )).unwrap();
+        HarnessOperatorEnvelopeV1 {
+            version: HARNESS_OPERATOR_WIRE_VERSION,
+            credential,
+            request,
+        }.validate().unwrap();
+
+        let response = HarnessOperatorResponseV1::SessionPrompted;
+        response.validate().expect("valid prompt-session response");
+        let encoded = serde_json::to_string(&response).unwrap();
+        let decoded: HarnessOperatorResponseV1 = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, response);
+    }
+
     #[test]
     fn session_spawn_and_control_requests_reject_malformed_fields() {
         let session = session_address(41, 3);
@@ -8946,6 +9081,7 @@ mod tests {
             provider_profile: "claude-default".to_owned(),
             mode: HarnessExecutionModeV1::Pty,
             terminal_size: HarnessRuntimeTerminalSizeV1 { rows: 40, columns: 120 },
+            approval_level: None,
         };
         valid_spawn.validate().unwrap();
 
@@ -8989,6 +9125,20 @@ mod tests {
             text: "x".repeat(HARNESS_SESSION_INPUT_MAX_BYTES),
         };
         bounded_input.validate().unwrap();
+
+        let oversized_prompt = HarnessOperatorRequestV1::PromptSession {
+            session: session.clone(),
+            text: "x".repeat(HARNESS_SESSION_INPUT_MAX_BYTES + 1),
+        };
+        assert!(matches!(
+            oversized_prompt.validate(),
+            Err(HarnessOperatorApiError::InvalidSessionControl),
+        ));
+        let bounded_prompt = HarnessOperatorRequestV1::PromptSession {
+            session: session.clone(),
+            text: "x".repeat(HARNESS_SESSION_INPUT_MAX_BYTES),
+        };
+        bounded_prompt.validate().unwrap();
 
         let zero_resize = HarnessOperatorRequestV1::ResizeSession {
             session: session.clone(),

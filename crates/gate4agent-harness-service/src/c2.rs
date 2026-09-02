@@ -9,6 +9,7 @@ use gate4agent_c2_protocol::{
 };
 use gate4agent_harness_delivery::CompiledDeliveryBundleV2;
 use gate4agent_harness_api::{
+    HarnessApprovalLevelV1,
     HarnessGitCommitSummaryV1, HarnessGitCommitV1, HarnessGitDiffModeV1,
     HarnessGitObjectIdV1, HarnessGitSignatureStatusV1, HarnessGitStatusCodeV1,
     HarnessGitStatusEntryV1, HarnessGitSummaryV1, HarnessNodeIncarnationV1,
@@ -324,7 +325,9 @@ impl HarnessC2Adapter {
         operation_id: HarnessOperationId,
         idempotency_ref: HarnessIdempotencyRef,
     ) -> Result<SpawnDispatchOutcome, HarnessC2Error> {
-        let PreparedSessionSpawn { route, workspace_id, provider, profile_id, mode, terminal_size } = prepared;
+        let PreparedSessionSpawn {
+            route, workspace_id, provider, profile_id, mode, terminal_size, approval_level,
+        } = prepared;
         let profile = self.preflight_spawn_profile(&route, &profile_id).await?;
         let required_capabilities = match mode {
             HarnessExecutionModeV1::Pty => SpawnRequiredCapabilities::new([
@@ -358,6 +361,7 @@ impl HarnessC2Adapter {
                 bundle_id: SpawnOverride::Clear,
                 context_id: SpawnOverride::Clear,
                 environment_profile_id: SpawnOverride::Clear,
+                approval_level,
             },
             deadline_ms: SpawnDeadlineMs::new(SESSION_SPAWN_DEADLINE_MS)
                 .map_err(|_| HarnessC2Error::InvalidSessionSpawnRequest)?,
@@ -2522,6 +2526,21 @@ fn node_workspace_file_revision_from_api(
 /// node-workspace read -- there is no stored binding to seal it from, and no
 /// launch-plan catalog resolution (the plan-based spawn path stays entirely
 /// separate, see `HarnessLaunchPlanV1::spawn_spec` in `dispatch.rs`).
+/// Exact mirror of `HarnessApprovalLevelV1` -> `gate4agent_types::
+/// ApprovalLevel` -- same rationale as `map_terminal_control`/
+/// `map_provider_interaction_response`: the two enums are kept in lockstep
+/// by doc comment, not by a shared dependency (`gate4agent-harness-api` has
+/// none on `gate4agent-types`), so the boundary crate that links both is
+/// where the conversion lives.
+fn map_approval_level(level: HarnessApprovalLevelV1) -> gate4agent_types::ApprovalLevel {
+    match level {
+        HarnessApprovalLevelV1::FullAuto => gate4agent_types::ApprovalLevel::FullAuto,
+        HarnessApprovalLevelV1::Moderate => gate4agent_types::ApprovalLevel::Moderate,
+        HarnessApprovalLevelV1::ReadOnly => gate4agent_types::ApprovalLevel::ReadOnly,
+        HarnessApprovalLevelV1::Unmanaged => gate4agent_types::ApprovalLevel::Unmanaged,
+    }
+}
+
 pub(crate) struct PreparedSessionSpawn {
     route: NodeRoute,
     workspace_id: WorkspaceId,
@@ -2529,6 +2548,7 @@ pub(crate) struct PreparedSessionSpawn {
     profile_id: SpawnProfileId,
     mode: HarnessExecutionModeV1,
     terminal_size: TerminalSize,
+    approval_level: Option<gate4agent_types::ApprovalLevel>,
 }
 
 impl PreparedSessionSpawn {
@@ -2539,6 +2559,7 @@ impl PreparedSessionSpawn {
         request.validate().map_err(|_| HarnessC2Error::InvalidSessionSpawnRequest)?;
         let HarnessOperatorRequestV1::SpawnSession {
             node_id, workspace_id, provider, provider_profile, mode, terminal_size,
+            approval_level,
         } = request else {
             return Err(HarnessC2Error::InvalidSessionSpawnRequest);
         };
@@ -2558,6 +2579,7 @@ impl PreparedSessionSpawn {
             profile_id,
             mode,
             terminal_size: TerminalSize { rows: terminal_size.rows, columns: terminal_size.columns },
+            approval_level: approval_level.map(map_approval_level),
         })
     }
 
@@ -2588,9 +2610,18 @@ impl PreparedSessionSpawn {
 /// `SetSessionModel`) with no CAS/replay layer, and the node itself acks
 /// all four with the same bare `NodeResponse::Accepted` the other eight
 /// settle against (see `HarnessOperatorRequestV1::ResolveInteraction`'s doc
-/// comment in `gate4agent-harness-api`). Twelve variants, one enum.
+/// comment in `gate4agent-harness-api`).
+///
+/// `Prompt` (`PromptSession` on the wire) is the thirteenth: same relay
+/// shape, `NodeRequest::Prompt` this time -- a different node request from
+/// `Input`'s `NodeRequest::Input`, not a variant of it (see
+/// `HarnessOperatorRequestV1::PromptSession`'s doc comment in
+/// `gate4agent-harness-api` for why, and for the PTY-transport refusal this
+/// crate enforces before a `PromptSession` request ever reaches this type;
+/// see `prompt_session_pty_refusal`). Thirteen variants, one enum.
 pub(crate) enum SessionControlKind {
     Input { text: String },
+    Prompt { text: String },
     Resize { size: TerminalSize },
     Stop { force: bool },
     Control { control: TerminalControl },
@@ -2700,6 +2731,9 @@ impl PreparedSessionControl {
             HarnessOperatorRequestV1::WriteSessionInput { session, text } => {
                 (session, SessionControlKind::Input { text })
             }
+            HarnessOperatorRequestV1::PromptSession { session, text } => {
+                (session, SessionControlKind::Prompt { text })
+            }
             HarnessOperatorRequestV1::ResizeSession { session, terminal_size } => (
                 session,
                 SessionControlKind::Resize {
@@ -2770,6 +2804,10 @@ impl PreparedSessionControl {
     fn wire_request(&self) -> NodeRequest {
         match &self.kind {
             SessionControlKind::Input { text } => NodeRequest::Input {
+                session: self.session.clone(),
+                text: text.clone(),
+            },
+            SessionControlKind::Prompt { text } => NodeRequest::Prompt {
                 session: self.session.clone(),
                 text: text.clone(),
             },
@@ -2886,9 +2924,9 @@ impl PendingSessionControl {
     /// See `SessionRosterEffect`'s doc comment. A strict superset of
     /// `stop_session_address`'s `Some` cases (`Stop` is `Absent` here too),
     /// plus `Remove` (also `Absent`) and `Resume` (`Changed`). The four ACP
-    /// control verbs join the `None` bucket alongside the other ack-only
-    /// verbs: none of them can make a session appear or disappear from the
-    /// roster either.
+    /// control verbs and `Prompt` join the `None` bucket alongside the other
+    /// ack-only verbs: none of them can make a session appear or disappear
+    /// from the roster either.
     pub(crate) fn roster_effect(&self) -> SessionRosterEffect {
         match &self.prepared.kind {
             SessionControlKind::Stop { .. } | SessionControlKind::Remove => {
@@ -2896,6 +2934,7 @@ impl PendingSessionControl {
             }
             SessionControlKind::Resume { .. } => SessionRosterEffect::Changed,
             SessionControlKind::Input { .. }
+            | SessionControlKind::Prompt { .. }
             | SessionControlKind::Resize { .. }
             | SessionControlKind::Control { .. }
             | SessionControlKind::Bytes { .. }
@@ -5767,6 +5806,7 @@ fn explicit_spawn_resolution(
                 SpawnFieldProvenance::Cleared
             },
         },
+        approval_level: spec.overrides.approval_level.unwrap_or_default(),
     })
 }
 

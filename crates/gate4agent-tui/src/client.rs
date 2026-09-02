@@ -2986,6 +2986,11 @@ fn harness_operator_worker(
                     provider_profile,
                     mode,
                     HarnessRuntimeTerminalSizeV1 { rows, columns: cols },
+                    // `AppAction::HarnessSpawnSession` carries no approval-
+                    // level selector -- `None` is the axis default
+                    // (`FullAuto`), unchanged from before this parameter
+                    // existed on `spawn_session`.
+                    None,
                 );
                 match result {
                     // `require_inventory_change: true` mirrors
@@ -4314,6 +4319,10 @@ fn project_harness_read_failure(error: HarnessOperatorClientError) -> HarnessRea
             HarnessOperatorHostErrorV1::Unavailable => "unavailable",
             HarnessOperatorHostErrorV1::OutcomeUnknown => "outcome-unknown",
             HarnessOperatorHostErrorV1::UnsupportedTransport { .. } => "unsupported-transport",
+            // Added alongside the ACP-prompt-vs-PTY-flags fix: the node said
+            // this capability does not exist for the addressed session, not
+            // "try again" -- its own category, distinct from `unavailable`.
+            HarnessOperatorHostErrorV1::UnsupportedCapability => "unsupported-capability",
             HarnessOperatorHostErrorV1::Internal => "internal",
             // Added alongside `gate4agent-harness-light` (see
             // `HarnessOperatorHostErrorV1::Unsupported`'s own doc comment):

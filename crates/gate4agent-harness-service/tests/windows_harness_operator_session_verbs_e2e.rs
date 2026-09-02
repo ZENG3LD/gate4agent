@@ -315,6 +315,7 @@ async fn windows_harness_operator_session_verbs_spawn_input_resize_control_stop_
         profile_id.as_str().to_owned(),
         HarnessExecutionModeV1::Pty,
         gate4agent_harness_api::HarnessRuntimeTerminalSizeV1 { rows: 24, columns: 80 },
+        None,
     ).unwrap();
     assert_eq!(session.node_id, node_id.as_str());
     assert_eq!(session.workspace_id, workspace_id.as_str());
@@ -383,12 +384,14 @@ async fn windows_harness_operator_session_verbs_spawn_input_resize_control_stop_
     // PasteSession, negative: see the module doc comment for why this
     // fixture's plain PTY-echo `AgentSpec` never admits a semantic paste --
     // `NodeFailureCode::UnsupportedCapability` relays through
-    // `map_session_control_error`'s same catch-all every other session-
-    // control verb's capability rejection already uses.
+    // `map_session_control_error`'s dedicated, permanent-refusal arm every
+    // other session-control verb's capability rejection already uses (not
+    // `Unavailable`, which would misread a "this can never succeed" refusal
+    // as a transient one worth retrying).
     let paste_rejected = client.paste_session(session.clone(), "rejected paste".to_owned());
     assert!(matches!(
         paste_rejected,
-        Err(HarnessOperatorClientError::Host(HarnessOperatorHostErrorV1::Unavailable)),
+        Err(HarnessOperatorClientError::Host(HarnessOperatorHostErrorV1::UnsupportedCapability)),
     ));
 
     // StopSession, then the session leaves the runtime inventory roster.
@@ -437,6 +440,7 @@ async fn windows_harness_operator_session_verbs_spawn_input_resize_control_stop_
         "no-such-profile".to_owned(),
         HarnessExecutionModeV1::Pty,
         gate4agent_harness_api::HarnessRuntimeTerminalSizeV1 { rows: 24, columns: 80 },
+        None,
     );
     assert!(matches!(
         rejected,
@@ -946,6 +950,7 @@ async fn windows_harness_operator_resource_mutation_family_round_trip_and_reject
         profile_id.as_str().to_owned(),
         HarnessExecutionModeV1::Pty,
         gate4agent_harness_api::HarnessRuntimeTerminalSizeV1 { rows: 24, columns: 80 },
+        None,
     ).unwrap();
     assert!(
         client.export_context_pack(session).is_err(),

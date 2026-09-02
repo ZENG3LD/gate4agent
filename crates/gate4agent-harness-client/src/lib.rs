@@ -267,6 +267,7 @@ impl HarnessOperatorClient {
         provider_profile: String,
         mode: HarnessExecutionModeV1,
         terminal_size: HarnessRuntimeTerminalSizeV1,
+        approval_level: Option<HarnessApprovalLevelV1>,
     ) -> Result<HarnessRuntimeSessionAddressV1, HarnessOperatorClientError> {
         match self.send(HarnessOperatorRequestV1::SpawnSession {
             node_id,
@@ -275,6 +276,7 @@ impl HarnessOperatorClient {
             provider_profile,
             mode,
             terminal_size,
+            approval_level,
         })? {
             HarnessOperatorResponseV1::SessionSpawned(session) => Ok(session),
             _ => Err(HarnessOperatorClientError::UnexpectedResponse),
@@ -290,6 +292,23 @@ impl HarnessOperatorClient {
     ) -> Result<(), HarnessOperatorClientError> {
         match self.send(HarnessOperatorRequestV1::WriteSessionInput { session, text })? {
             HarnessOperatorResponseV1::SessionInputWritten => Ok(()),
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Semantic-prompt send to an already-live session -- relays to the
+    /// node's OTHER input verb, `NodeRequest::Prompt`, distinct from
+    /// `write_session_input`'s `NodeRequest::Input`. See
+    /// `HarnessOperatorRequestV1::PromptSession`'s own doc comment for why
+    /// this is refused by name against a PTY-transport session and
+    /// admissible only against ACP and inline.
+    pub fn prompt_session(
+        &self,
+        session: HarnessRuntimeSessionAddressV1,
+        text: String,
+    ) -> Result<(), HarnessOperatorClientError> {
+        match self.send(HarnessOperatorRequestV1::PromptSession { session, text })? {
+            HarnessOperatorResponseV1::SessionPrompted => Ok(()),
             _ => Err(HarnessOperatorClientError::UnexpectedResponse),
         }
     }
@@ -1457,6 +1476,7 @@ impl HarnessOperatorClient {
         } else if matches!(
             &request,
             HarnessOperatorRequestV1::WriteSessionInput { .. }
+                | HarnessOperatorRequestV1::PromptSession { .. }
                 | HarnessOperatorRequestV1::ResizeSession { .. }
                 | HarnessOperatorRequestV1::StopSession { .. }
                 | HarnessOperatorRequestV1::ControlSession { .. }

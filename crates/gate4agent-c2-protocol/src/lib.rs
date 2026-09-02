@@ -289,6 +289,7 @@ impl From<&NodeFailure> for C2NodeFailure {
             NodeFailureCode::SpawnDeadlineExceeded => "spawn deadline exceeded",
             NodeFailureCode::UnsupportedSpawnCapability => "spawn capability unavailable",
             NodeFailureCode::UnsupportedTransport => "provider does not support the requested transport",
+            NodeFailureCode::TurnInFlight => "session already has a turn in flight",
             NodeFailureCode::UnknownSession => "session unavailable",
             NodeFailureCode::UnknownSessionRecord => "managed session unavailable",
             NodeFailureCode::SessionRecordNotResumable => "managed session cannot resume",

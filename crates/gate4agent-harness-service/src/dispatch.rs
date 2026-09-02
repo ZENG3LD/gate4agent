@@ -460,6 +460,10 @@ impl HarnessLaunchPlanV1 {
                 bundle_id: SpawnOverride::Clear,
                 context_id: SpawnOverride::Clear,
                 environment_profile_id: SpawnOverride::Clear,
+                // Launch plans carry no approval-level selection of their
+                // own -- `None` is the axis default, unchanged from before
+                // this field existed.
+                approval_level: None,
             },
             deadline_ms: SpawnDeadlineMs::new(self.deadline_ms)?,
             idempotency_key: spawn_idempotency_key(&dispatch.idempotency_ref)?,

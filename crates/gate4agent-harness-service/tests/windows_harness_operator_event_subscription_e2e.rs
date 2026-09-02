@@ -360,6 +360,7 @@ async fn windows_harness_operator_event_subscription_baseline_task_and_inventory
         profile_id.as_str().to_owned(),
         HarnessExecutionModeV1::Pty,
         gate4agent_harness_api::HarnessRuntimeTerminalSizeV1 { rows: 24, columns: 80 },
+        None,
     ).unwrap();
     assert_eq!(session.node_id, node_id.as_str());
 

@@ -395,6 +395,24 @@ pub enum HarnessExecutionModeV1 {
     Acp,
 }
 
+/// Wire mirror of `gate4agent_types::ApprovalLevel` -- this crate has no
+/// dependency on `gate4agent-types` (see the module doc: a bounded,
+/// privacy-minimized domain contract, not a re-export surface), so the four
+/// levels are named again here rather than imported. Keep the variant set
+/// and the `FullAuto` default in exact lockstep with `ApprovalLevel`'s own;
+/// the two are converted between at the one boundary that links both
+/// crates (`gate4agent-harness-service`), never compared or serialized
+/// against each other directly.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessApprovalLevelV1 {
+    #[default]
+    FullAuto,
+    Moderate,
+    ReadOnly,
+    Unmanaged,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum HarnessWorktreeIntentV1 {

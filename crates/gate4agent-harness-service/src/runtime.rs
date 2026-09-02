@@ -2720,8 +2720,13 @@ fn map_run_context_source_error(error: HarnessC2Error) -> HarnessOperatorHostErr
             NodeFailureCode::ControllerBusy
             | NodeFailureCode::WorkspaceBusy
             | NodeFailureCode::BackendBusy => HarnessOperatorHostErrorV1::Busy,
-            NodeFailureCode::UnsupportedCapability
-            | NodeFailureCode::BackendDisconnected
+            // Permanent, not transient -- see `HarnessOperatorHostErrorV1::
+            // UnsupportedCapability`'s own doc for why this no longer folds
+            // into `Unavailable`.
+            NodeFailureCode::UnsupportedCapability => {
+                HarnessOperatorHostErrorV1::UnsupportedCapability
+            }
+            NodeFailureCode::BackendDisconnected
             | NodeFailureCode::BackendOperationFailed
             | NodeFailureCode::ShuttingDown => HarnessOperatorHostErrorV1::Unavailable,
             NodeFailureCode::UnknownSessionRecord => HarnessOperatorHostErrorV1::NotFound,
@@ -2785,8 +2790,13 @@ fn map_run_read_error(error: HarnessC2Error) -> HarnessOperatorHostErrorV1 {
                 HarnessOperatorHostErrorV1::Deadline
             }
             NodeFailureCode::ResponseTooLarge => HarnessOperatorHostErrorV1::TooLarge,
-            NodeFailureCode::UnsupportedCapability
-            | NodeFailureCode::RepositoryFileReadFailed
+            // Permanent, not transient -- see `HarnessOperatorHostErrorV1::
+            // UnsupportedCapability`'s own doc for why this no longer folds
+            // into `Unavailable`.
+            NodeFailureCode::UnsupportedCapability => {
+                HarnessOperatorHostErrorV1::UnsupportedCapability
+            }
+            NodeFailureCode::RepositoryFileReadFailed
             | NodeFailureCode::GitReadFailed
             | NodeFailureCode::BackendDisconnected
             | NodeFailureCode::BackendOperationFailed
@@ -2850,8 +2860,13 @@ fn map_node_workspace_read_error(error: HarnessC2Error) -> HarnessOperatorHostEr
                 HarnessOperatorHostErrorV1::Deadline
             }
             NodeFailureCode::ResponseTooLarge => HarnessOperatorHostErrorV1::TooLarge,
-            NodeFailureCode::UnsupportedCapability
-            | NodeFailureCode::RepositoryFileReadFailed
+            // Permanent, not transient -- see `HarnessOperatorHostErrorV1::
+            // UnsupportedCapability`'s own doc for why this no longer folds
+            // into `Unavailable`.
+            NodeFailureCode::UnsupportedCapability => {
+                HarnessOperatorHostErrorV1::UnsupportedCapability
+            }
+            NodeFailureCode::RepositoryFileReadFailed
             | NodeFailureCode::GitReadFailed
             | NodeFailureCode::BackendDisconnected
             | NodeFailureCode::BackendOperationFailed
@@ -2912,8 +2927,13 @@ fn map_node_workspace_write_error(error: HarnessC2Error) -> HarnessOperatorHostE
             | NodeFailureCode::RepositoryEntryCreateTimedOut
             | NodeFailureCode::SpawnDeadlineExceeded => HarnessOperatorHostErrorV1::Deadline,
             NodeFailureCode::ResponseTooLarge => HarnessOperatorHostErrorV1::TooLarge,
-            NodeFailureCode::UnsupportedCapability
-            | NodeFailureCode::RepositoryFileWriteFailed
+            // Permanent, not transient -- see `HarnessOperatorHostErrorV1::
+            // UnsupportedCapability`'s own doc for why this no longer folds
+            // into `Unavailable`.
+            NodeFailureCode::UnsupportedCapability => {
+                HarnessOperatorHostErrorV1::UnsupportedCapability
+            }
+            NodeFailureCode::RepositoryFileWriteFailed
             | NodeFailureCode::RepositoryEntryCreateFailed
             | NodeFailureCode::BackendDisconnected
             | NodeFailureCode::BackendOperationFailed
@@ -2996,8 +3016,13 @@ fn map_session_spawn_node_failure(
             agent: agent.to_owned(),
             transport: requested_transport,
         },
-        NodeFailureCode::UnsupportedCapability
-        | NodeFailureCode::BackendDisconnected
+        // Permanent, not transient -- see `HarnessOperatorHostErrorV1::
+        // UnsupportedCapability`'s own doc for why this no longer folds into
+        // `Unavailable`.
+        NodeFailureCode::UnsupportedCapability => {
+            HarnessOperatorHostErrorV1::UnsupportedCapability
+        }
+        NodeFailureCode::BackendDisconnected
         | NodeFailureCode::BackendOperationFailed
         | NodeFailureCode::ShuttingDown => HarnessOperatorHostErrorV1::Unavailable,
         _ => HarnessOperatorHostErrorV1::Internal,
@@ -3007,18 +3032,23 @@ fn map_session_spawn_node_failure(
 /// `WriteSessionInput`/`ResizeSession`/`StopSession`/`ControlSession`/
 /// `WriteSessionBytes`/`PasteSession`/`RemoveSession`/`ResumeSession`, plus
 /// the four ACP control verbs `ResolveInteraction`/`SetSessionMode`/
-/// `SetSessionConfigOption`/`SetSessionModel`, share one C2 relay shape
-/// (`PreparedSessionControl`/`PendingSessionControl::finish`), so one mapper
-/// covers all twelve -- unlike spawn, none of these carries a multi-outcome
-/// transport ambiguity worth its own host error (DECISIONS: "naturally
-/// idempotent-enough", no dedup, no `OutcomeUnknown` case here). Every
-/// `NodeFailureCode` the node can answer any of the twelve with is bucketed
-/// below by its own meaning (`NotFound`/`Conflict`/`Busy`/`Unavailable`/
-/// `InvalidRequest`), never collapsed wholesale into `Internal` -- the ACP
-/// verbs add no new failure codes of their own (the node refuses them with
-/// the same generic vocabulary the other eight already use), so they need
-/// no new arms here, only the wider set of callers now able to reach this
-/// mapper.
+/// `SetSessionConfigOption`/`SetSessionModel`, plus `PromptSession`, share
+/// one C2 relay shape (`PreparedSessionControl`/`PendingSessionControl::
+/// finish`), so one mapper covers all thirteen -- unlike spawn, none of
+/// these carries a multi-outcome transport ambiguity worth its own host
+/// error (DECISIONS: "naturally idempotent-enough", no dedup, no
+/// `OutcomeUnknown` case here). Every `NodeFailureCode` the node can answer
+/// any of the thirteen with is bucketed below by its own meaning
+/// (`NotFound`/`Conflict`/`Busy`/`Unavailable`/`InvalidRequest`), never
+/// collapsed wholesale into `Internal` -- `PromptSession`'s OWN named PTY
+/// refusal happens earlier, in `prompt_session_pty_refusal`, before a
+/// confirmed-PTY target ever reaches C2/this mapper. `PromptSession`/
+/// `PasteSession` against an ACP or inline session DOES add one code of its
+/// own that reaches here, though: `NodeFailureCode::TurnInFlight` (the
+/// node's own turn-admission gate -- see `require_session_runtime_policy`
+/// in `gate4agent-node`'s `server.rs`), bucketed as `Conflict` below like
+/// every other "current session state disallows this request" code already
+/// is, not folded into `Internal`.
 fn map_session_control_error(error: HarnessC2Error) -> HarnessOperatorHostErrorV1 {
     match error {
         HarnessC2Error::InvalidSessionControlRequest => HarnessOperatorHostErrorV1::InvalidRequest,
@@ -3048,14 +3078,23 @@ fn map_session_control_error(error: HarnessC2Error) -> HarnessOperatorHostErrorV
             NodeFailureCode::UnknownSession | NodeFailureCode::UnknownWorkspace => {
                 HarnessOperatorHostErrorV1::NotFound
             }
-            NodeFailureCode::BindingMismatch | NodeFailureCode::StaleGeneration => {
-                HarnessOperatorHostErrorV1::Conflict
-            }
+            // `TurnInFlight` -- `Prompt`/`Paste` refused against a session
+            // that already has a provider turn running -- is a state
+            // conflict, the same bucket every other "current session state
+            // disallows this request" code above already uses.
+            NodeFailureCode::BindingMismatch
+            | NodeFailureCode::StaleGeneration
+            | NodeFailureCode::TurnInFlight => HarnessOperatorHostErrorV1::Conflict,
             NodeFailureCode::ControllerBusy
             | NodeFailureCode::WorkspaceBusy
             | NodeFailureCode::BackendBusy => HarnessOperatorHostErrorV1::Busy,
-            NodeFailureCode::UnsupportedCapability
-            | NodeFailureCode::BackendDisconnected
+            // Permanent, not transient -- see `HarnessOperatorHostErrorV1::
+            // UnsupportedCapability`'s own doc for why this no longer folds
+            // into `Unavailable`.
+            NodeFailureCode::UnsupportedCapability => {
+                HarnessOperatorHostErrorV1::UnsupportedCapability
+            }
+            NodeFailureCode::BackendDisconnected
             | NodeFailureCode::BackendOperationFailed
             | NodeFailureCode::ShuttingDown => HarnessOperatorHostErrorV1::Unavailable,
             _ => HarnessOperatorHostErrorV1::Internal,
@@ -3102,8 +3141,13 @@ fn map_session_record_mutation_error(error: HarnessC2Error) -> HarnessOperatorHo
             | NodeFailureCode::ControllerBusy
             | NodeFailureCode::WorkspaceBusy
             | NodeFailureCode::BackendBusy => HarnessOperatorHostErrorV1::Busy,
-            NodeFailureCode::UnsupportedCapability
-            | NodeFailureCode::BackendDisconnected
+            // Permanent, not transient -- see `HarnessOperatorHostErrorV1::
+            // UnsupportedCapability`'s own doc for why this no longer folds
+            // into `Unavailable`.
+            NodeFailureCode::UnsupportedCapability => {
+                HarnessOperatorHostErrorV1::UnsupportedCapability
+            }
+            NodeFailureCode::BackendDisconnected
             | NodeFailureCode::BackendOperationFailed
             | NodeFailureCode::ShuttingDown => HarnessOperatorHostErrorV1::Unavailable,
             _ => HarnessOperatorHostErrorV1::Internal,
@@ -3142,8 +3186,13 @@ fn map_host_directory_browse_error(error: HarnessC2Error) -> HarnessOperatorHost
             | NodeFailureCode::WorkspaceBusy
             | NodeFailureCode::BackendBusy => HarnessOperatorHostErrorV1::Busy,
             NodeFailureCode::HostDirectoryReadTimedOut => HarnessOperatorHostErrorV1::Deadline,
-            NodeFailureCode::UnsupportedCapability
-            | NodeFailureCode::HostDirectoryReadFailed
+            // Permanent, not transient -- see `HarnessOperatorHostErrorV1::
+            // UnsupportedCapability`'s own doc for why this no longer folds
+            // into `Unavailable`.
+            NodeFailureCode::UnsupportedCapability => {
+                HarnessOperatorHostErrorV1::UnsupportedCapability
+            }
+            NodeFailureCode::HostDirectoryReadFailed
             | NodeFailureCode::BackendDisconnected
             | NodeFailureCode::BackendOperationFailed
             | NodeFailureCode::ShuttingDown => HarnessOperatorHostErrorV1::Unavailable,
@@ -3209,8 +3258,13 @@ fn map_resource_mutation_error(error: HarnessC2Error) -> HarnessOperatorHostErro
             | NodeFailureCode::BackendBusy
             | NodeFailureCode::ContextPackBusy => HarnessOperatorHostErrorV1::Busy,
             NodeFailureCode::SpawnDeadlineExceeded => HarnessOperatorHostErrorV1::Deadline,
-            NodeFailureCode::UnsupportedCapability
-            | NodeFailureCode::ContextPackMaterializationFailed
+            // Permanent, not transient -- see `HarnessOperatorHostErrorV1::
+            // UnsupportedCapability`'s own doc for why this no longer folds
+            // into `Unavailable`.
+            NodeFailureCode::UnsupportedCapability => {
+                HarnessOperatorHostErrorV1::UnsupportedCapability
+            }
+            NodeFailureCode::ContextPackMaterializationFailed
             | NodeFailureCode::BackendDisconnected
             | NodeFailureCode::BackendOperationFailed
             | NodeFailureCode::ShuttingDown => HarnessOperatorHostErrorV1::Unavailable,
@@ -3255,8 +3309,13 @@ fn map_native_history_error(error: HarnessC2Error) -> HarnessOperatorHostErrorV1
             NodeFailureCode::ControllerBusy
             | NodeFailureCode::WorkspaceBusy
             | NodeFailureCode::BackendBusy => HarnessOperatorHostErrorV1::Busy,
-            NodeFailureCode::UnsupportedCapability
-            | NodeFailureCode::UnknownWorkspace
+            // Permanent, not transient -- see `HarnessOperatorHostErrorV1::
+            // UnsupportedCapability`'s own doc for why this no longer folds
+            // into `Unavailable`.
+            NodeFailureCode::UnsupportedCapability => {
+                HarnessOperatorHostErrorV1::UnsupportedCapability
+            }
+            NodeFailureCode::UnknownWorkspace
             | NodeFailureCode::BackendDisconnected
             | NodeFailureCode::ShuttingDown => HarnessOperatorHostErrorV1::Unavailable,
             _ => HarnessOperatorHostErrorV1::Internal,
@@ -3383,6 +3442,7 @@ fn is_session_control_request(request: &HarnessOperatorRequestV1) -> bool {
     matches!(
         request,
         HarnessOperatorRequestV1::WriteSessionInput { .. }
+            | HarnessOperatorRequestV1::PromptSession { .. }
             | HarnessOperatorRequestV1::ResizeSession { .. }
             | HarnessOperatorRequestV1::StopSession { .. }
             | HarnessOperatorRequestV1::ControlSession { .. }
@@ -3449,6 +3509,7 @@ impl OperatorRequestLogIdentity {
                 (Some(node_id.clone()), Some(workspace_id.clone()), None)
             }
             HarnessOperatorRequestV1::WriteSessionInput { session, .. }
+            | HarnessOperatorRequestV1::PromptSession { session, .. }
             | HarnessOperatorRequestV1::ResizeSession { session, .. }
             | HarnessOperatorRequestV1::StopSession { session, .. }
             | HarnessOperatorRequestV1::ControlSession { session, .. }
@@ -3678,6 +3739,7 @@ fn session_address_from_receipt(
 fn session_control_response(identity: &OperatorRequestLogIdentity) -> HarnessOperatorResponseV1 {
     match identity.operation.as_str() {
         "write-session-input" => HarnessOperatorResponseV1::SessionInputWritten,
+        "prompt-session" => HarnessOperatorResponseV1::SessionPrompted,
         "resize-session" => HarnessOperatorResponseV1::SessionResized,
         "stop-session" => HarnessOperatorResponseV1::SessionStopped,
         "control-session" => HarnessOperatorResponseV1::SessionControlled,
@@ -4956,6 +5018,36 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                 continue;
                             }
                             if is_session_control_request(&request) {
+                                // `PromptSession`'s dispatch-time PTY refusal
+                                // (see `prompt_session_pty_refusal`'s doc
+                                // comment): checked here, against the
+                                // request's own `session` field, before it
+                                // is moved into `PreparedSessionControl::
+                                // from_operator_request` below -- `runtime_
+                                // inventory` is this select loop's own
+                                // cached projection, not something
+                                // `PreparedSessionControl` (synchronous, no
+                                // cache in scope) could consult itself.
+                                if let HarnessOperatorRequestV1::PromptSession { session, .. } =
+                                    &request
+                                {
+                                    if let Some(error) =
+                                        prompt_session_pty_refusal(&runtime_inventory, session)
+                                    {
+                                        tracing::warn!(
+                                            node_id = session.node_id.as_str(),
+                                            workspace_id = session.workspace_id.as_str(),
+                                            session_id = %format!(
+                                                "{}/{}", session.instance_id, session.generation,
+                                            ),
+                                            cause = ?error,
+                                            "prompt-session rejected before C2 dispatch: \
+                                             target session is PTY-transport",
+                                        );
+                                        let _ = reply.send(HarnessOperatorReplyV1::Error { error });
+                                        continue;
+                                    }
+                                }
                                 let identity = OperatorRequestLogIdentity::describe(&request);
                                 let prepared = PreparedSessionControl::from_operator_request(
                                     &adapter,
@@ -7433,6 +7525,28 @@ impl HarnessRuntimeInventoryCache {
         self.nodes.get(&key.node_id)
     }
 
+    /// Best-effort lookup of a live session's cached transport and provider
+    /// id, for `prompt_session_pty_refusal`'s dispatch-time PTY check --
+    /// see that function's doc comment for why a miss here is read as "not
+    /// provably PTY" rather than a defect. Transport is fixed for a
+    /// session's entire lifetime once spawned (a resume never changes it),
+    /// so unlike `screen_state` a HIT here is never stale in a way that
+    /// matters, even under this cache's normal resync lag. Same lookup
+    /// shape as `apply_screen_state` immediately above, read-only.
+    fn session_transport(
+        &self,
+        key: &RuntimeSessionKey,
+    ) -> Option<(HarnessRuntimeTransportV1, String)> {
+        let node = self.nodes.get(&key.node_id)?;
+        if node.incarnation_id != key.incarnation_id.to_string() {
+            return None;
+        }
+        let workspace = node.inventory.workspaces.get(key.workspace_id.as_str())?;
+        let session = workspace.sessions.iter().find(|session| {
+            session.instance_id == key.instance_id.0 && session.generation == key.generation.0
+        })?;
+        Some((session.transport, session.provider.clone()))
+    }
 
     /// Returns the freshly built node projection when it actually differs
     /// from whatever was cached for this node id before this call (or when
@@ -8627,13 +8741,14 @@ fn execute_operator_request(
             )
         }
         // Unreachable in production: the host select loop intercepts these
-        // thirteen verbs above this function (see `is_session_spawn_request`/
+        // fourteen verbs above this function (see `is_session_spawn_request`/
         // `is_session_control_request` in the `HostCommand::Operator` arm) —
         // this function is synchronous with no C2/adapter handle in scope,
         // so it cannot dispatch a spawn or session-control round trip
         // itself. The arms exist only so this match stays exhaustive.
         HarnessOperatorRequestV1::SpawnSession { .. }
         | HarnessOperatorRequestV1::WriteSessionInput { .. }
+        | HarnessOperatorRequestV1::PromptSession { .. }
         | HarnessOperatorRequestV1::ResizeSession { .. }
         | HarnessOperatorRequestV1::StopSession { .. }
         | HarnessOperatorRequestV1::ControlSession { .. }
@@ -8719,6 +8834,54 @@ fn terminal_session_key(
             .map_err(|_| HarnessOperatorHostErrorV1::InvalidRequest)?,
         instance_id: gate4agent_types::AgentInstanceId(session.instance_id),
         generation: gate4agent_types::SessionGeneration(session.generation),
+    })
+}
+
+/// Dispatch-time refusal for `PromptSession` against a session this
+/// harness's own cached runtime inventory already knows is PTY-transport --
+/// see `HarnessOperatorRequestV1::PromptSession`'s doc comment in
+/// `gate4agent-harness-api` for the rule this enforces and why it lives
+/// here rather than in the node or in that wire type itself. Called from
+/// the `HostCommand::Operator` select-loop arm before `PreparedSessionControl
+/// ::from_operator_request` ever runs, so a confirmed-PTY target never
+/// reaches C2.
+///
+/// Returns `None` (proceed to dispatch) both when the cache confirms a
+/// non-PTY transport AND when it cannot answer at all (an unparseable
+/// address, or the node/incarnation/workspace/session missing from this
+/// cache). A miss is a legitimate, expected outcome here, not a defect:
+/// `HarnessRuntimeInventoryCache` is explicitly invalidated by the very
+/// spawn or resume that creates the session `PromptSession` most wants to
+/// target (see `invalidate_runtime_inventory_for_route`'s own doc comment)
+/// and is only repopulated by that route's next resync, plus each
+/// workspace's own session list can legitimately truncate
+/// (`HarnessRuntimeWorkspaceV1::validate`). A fail-CLOSED policy on a miss
+/// would make `PromptSession` spuriously refuse exactly the "spawn, then
+/// prompt" sequence this verb exists for.
+///
+/// Failing open through a miss does not open a hole in the owner's PTY
+/// rule: every operator-wire path that hands out a live session address
+/// leaves an ordinary PTY session's node-side binding `RawPty`-only
+/// (`SpawnSession` carries no prompt field at all), so the node's own
+/// `require_session_runtime_policy(SemanticPrompt)` gate inside its
+/// `NodeRequest::Prompt` handler still refuses an ordinary PTY session
+/// that slips past this best-effort check during that window -- just with
+/// the generic, provider-and-transport-agnostic `HarnessOperatorHostErrorV1
+/// ::UnsupportedCapability` bucket (from `NodeFailureCode::
+/// UnsupportedCapability`) instead of the transport/provider-named
+/// `UnsupportedTransport` refusal a cache hit gives here. (This gate is PTY-
+/// only: an ACP or inline session's own `Prompt`/`Paste` refusal is a
+/// different fact entirely -- a turn already in flight, `NodeFailureCode::
+/// TurnInFlight` -- and reaches the operator as `Conflict` via
+/// `map_session_control_error`, never through this PTY-only pre-check.)
+fn prompt_session_pty_refusal(
+    runtime_inventory: &HarnessRuntimeInventoryCache,
+    session: &HarnessRuntimeSessionAddressV1,
+) -> Option<HarnessOperatorHostErrorV1> {
+    let key = terminal_session_key(session).ok()?;
+    let (transport, provider) = runtime_inventory.session_transport(&key)?;
+    (transport == HarnessRuntimeTransportV1::Pty).then(|| {
+        HarnessOperatorHostErrorV1::UnsupportedTransport { agent: provider, transport }
     })
 }
 
@@ -11958,6 +12121,45 @@ mod tests {
         );
     }
 
+    /// `sample_runtime_node_inventory`'s one session is `TransportKind::Pty`
+    /// (see `sample_slim_node_inventory`), so a cache hit against its exact
+    /// address must refuse by name; an address absent from the cache
+    /// (never resynced, or simply a different session) must fail OPEN --
+    /// see `prompt_session_pty_refusal`'s own doc comment for why a miss is
+    /// the one outcome this check must never treat as a refusal.
+    #[test]
+    fn prompt_session_pty_refusal_names_a_confirmed_pty_target_and_fails_open_on_a_miss() {
+        let mut cache = HarnessRuntimeInventoryCache::default();
+        let node_id = NodeId::new("node-a").unwrap();
+        cache.nodes.insert(
+            node_id.clone(),
+            sample_runtime_node_inventory(PtyScreenState::Ready),
+        );
+
+        let pty_session = HarnessRuntimeSessionAddressV1 {
+            node_id: "node-a".to_owned(),
+            // `sample_runtime_node_inventory` stamps its incarnation as the
+            // hex string "1" x 32.
+            incarnation_id: "1".repeat(32),
+            workspace_id: "workspace-a".to_owned(),
+            instance_id: 7,
+            generation: 1,
+        };
+        assert!(matches!(
+            prompt_session_pty_refusal(&cache, &pty_session),
+            Some(HarnessOperatorHostErrorV1::UnsupportedTransport {
+                transport: HarnessRuntimeTransportV1::Pty,
+                ..
+            }),
+        ));
+
+        let unknown_session = HarnessRuntimeSessionAddressV1 {
+            instance_id: 999,
+            ..pty_session
+        };
+        assert!(prompt_session_pty_refusal(&cache, &unknown_session).is_none());
+    }
+
     /// `redact_runtime_inventory` always populates `screen_state: Some(..)`,
     /// and nothing downstream strips it back out: this wire has exactly one
     /// accepted version (see `HARNESS_OPERATOR_WIRE_VERSION`), so a
@@ -14032,6 +14234,18 @@ mod tests {
         assert!(matches!(
             session_control_response(&input_identity),
             HarnessOperatorResponseV1::SessionInputWritten,
+        ));
+        let prompt_identity = OperatorRequestLogIdentity::describe(
+            &HarnessOperatorRequestV1::PromptSession {
+                session: session.clone(),
+                text: "please continue".to_owned(),
+            },
+        );
+        assert_eq!(prompt_identity.node_id(), "node-a");
+        assert_eq!(prompt_identity.session_id(), "41/3");
+        assert!(matches!(
+            session_control_response(&prompt_identity),
+            HarnessOperatorResponseV1::SessionPrompted,
         ));
         let stop_identity = OperatorRequestLogIdentity::describe(
             &HarnessOperatorRequestV1::StopSession { session, force: true },

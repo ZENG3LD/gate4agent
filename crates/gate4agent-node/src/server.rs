@@ -183,7 +183,8 @@ use gate4agent_types::{
     HostDecisionAuthority as ProviderHostDecisionAuthority,
     HostRequestDecision as ProviderHostRequestDecision, InputAction,
     PromptFraming, PromptPayload, ResumeLaunchRequest,
-    ProviderEvent, ProviderInteractionKind, ProviderInteractionStatus, ProviderPlanStatus,
+    ProviderActivity, ProviderEvent, ProviderInteractionKind, ProviderInteractionStatus,
+    ProviderPlanStatus,
     ProviderRuntimeCapability, ProviderRuntimePolicy, ProviderSessionIdentity, ProviderSessionKey,
     ProviderSnapshot,
     ResumeTarget,
@@ -5462,6 +5463,7 @@ impl NodeShared {
                 Some(deadline),
                 &required_capabilities,
                 harness_mcp,
+                resolved.approval_level,
             )
             .await
             .map(|(session, _runtime_policy)| {
@@ -5801,6 +5803,7 @@ impl NodeShared {
             Some(deadline),
             &required_capabilities,
             None,
+            resolved.approval_level,
         ).await;
         let (session, effective_runtime_policy) = match spawn {
             Ok(spawned) => spawned,
@@ -9030,36 +9033,74 @@ impl NodeShared {
         self.workspace_root(&address.workspace_id)
     }
 
+    /// `Resume`/`ResumeWithPrompt` are always a raw-PTY relaunch (see
+    /// `require_policy`'s own doc on those two requirements), so they keep
+    /// gating on `binding.runtime_policy`'s PTY-terminal-text-inference
+    /// flags exactly as before; `pipe_transport`/`acp_transport` stay
+    /// `false` on the `require_policy` call below for them because a PTY
+    /// resume never needs those facts, not because this method cannot look
+    /// them up.
+    ///
+    /// `SemanticPrompt` -- the requirement `Prompt`/`Paste` share -- no
+    /// longer takes that shortcut. Those PTY flags describe a terminal an
+    /// ACP or inline (`Pipe`) session does not have, so admitting a prompt
+    /// against one by consulting them gates the wrong fact (this is what
+    /// made an ACP `Prompt` come back `UnsupportedCapability` even though a
+    /// prompt is an ACP session's only interface). For those two
+    /// transports this method now admits the requirement on the fact that
+    /// actually describes them instead: a session takes one turn at a
+    /// time, so a `Prompt`/`Paste` is refused by name
+    /// (`NodeFailureCode::TurnInFlight`) while a turn is already running,
+    /// read off the same live `SessionSnapshot` state `require_acp_session`
+    /// already reads for the ACP control verbs -- `TurnStarted` observed
+    /// with no matching `TurnCompleted` yet is exactly `ProviderSnapshot::
+    /// lead_activity != Idle`. Sending a second prompt mid-turn would put
+    /// its fate in vendor-specific behaviour this node cannot observe (one
+    /// agent may queue it, another drop it, another interleave it), so this
+    /// refuses it outright rather than gambling on that. PTY keeps today's
+    /// flag-based behaviour, unchanged.
     fn require_session_runtime_policy(
         &self,
         address: &SessionAddress,
         requirement: ProviderRuntimeRequirement,
     ) -> Result<ProviderRuntimePolicy, NodeFailure> {
-        let bindings = self
-            .session_bindings
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let binding = bindings
-            .get(&address.session.instance_id)
-            .ok_or_else(|| failure(NodeFailureCode::UnknownSession, "session instance does not exist"))?;
-        if binding.workspace_id != address.workspace_id {
-            return Err(failure(
-                NodeFailureCode::SessionWorkspaceMismatch,
-                "session belongs to another workspace",
-            ));
+        let runtime_policy = {
+            let bindings = self
+                .session_bindings
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let binding = bindings
+                .get(&address.session.instance_id)
+                .ok_or_else(|| failure(NodeFailureCode::UnknownSession, "session instance does not exist"))?;
+            if binding.workspace_id != address.workspace_id {
+                return Err(failure(
+                    NodeFailureCode::SessionWorkspaceMismatch,
+                    "session belongs to another workspace",
+                ));
+            }
+            if binding.generation != address.session.generation {
+                return Err(failure(NodeFailureCode::StaleGeneration, "session generation is stale"));
+            }
+            binding.runtime_policy
+        };
+        if requirement == ProviderRuntimeRequirement::SemanticPrompt {
+            let snapshot = self.internal_session_snapshot(address)?;
+            match snapshot.transport {
+                TransportKind::Acp | TransportKind::Pipe => {
+                    return if snapshot.provider.lead_activity == ProviderActivity::Idle {
+                        Ok(runtime_policy)
+                    } else {
+                        Err(failure(
+                            NodeFailureCode::TurnInFlight,
+                            "session already has a turn in flight; wait for it to complete before sending another prompt",
+                        ))
+                    };
+                }
+                TransportKind::Pty => {}
+            }
         }
-        if binding.generation != address.session.generation {
-            return Err(failure(NodeFailureCode::StaleGeneration, "session generation is stale"));
-        }
-        // Every caller of this method passes `Resume`, `ResumeWithPrompt`, or
-        // `SemanticPrompt` -- never `Inline` or `Acp` (transport admission is
-        // decided once at spawn time, before a `SessionBinding` even
-        // exists). The `pipe_transport`/`acp_transport` arguments are
-        // therefore inert here; they stay `false` rather than looking up
-        // the session's provider for facts this requirement can never
-        // consult.
-        require_policy(binding.runtime_policy, false, false, requirement)
-            .map(|()| binding.runtime_policy)
+        require_policy(runtime_policy, false, false, requirement)
+            .map(|()| runtime_policy)
             .map_err(|_| failure(
                 NodeFailureCode::UnsupportedCapability,
                 "session runtime policy does not admit this semantic operation",
@@ -11251,6 +11292,12 @@ impl NodeShared {
                 None,
                 &[],
                 None,
+                // `NodeRequest::Spawn` (this method's only caller) carries no
+                // approval-level selection of its own -- see
+                // `HarnessOperatorRequestV1::SpawnSession`'s own field for
+                // the one operator-wire path that can choose something other
+                // than the axis default.
+                ApprovalLevel::default(),
             )
             .await
             .map(|(session, _runtime_policy)| session)
@@ -11272,6 +11319,7 @@ impl NodeShared {
         deadline: Option<Instant>,
         required_capabilities: &[ProviderRuntimeCapability],
         harness_mcp: Option<&PreparedHarnessMcpSpawn>,
+        approval_level: ApprovalLevel,
     ) -> Result<(SessionAddress, ProviderRuntimePolicy), NodeFailure> {
         let reserved_lease = self.managed_worktrees.lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -11510,14 +11558,7 @@ impl NodeShared {
                         terminal_size,
                         initial_prompt,
                         session_options: None,
-                        // The operator wire (`SpawnSpec`/`SpawnOverrides`)
-                        // does not yet carry a per-spawn approval-level
-                        // selection -- this applies the axis's own default,
-                        // `FullAuto`, explicitly rather than leaving it
-                        // implicit. Wiring a real per-spawn choice through
-                        // the profile/override resolution path is a
-                        // follow-up.
-                        approval_level: ApprovalLevel::default(),
+                        approval_level,
                     },
                 },
                 start_timeout,
@@ -16178,6 +16219,7 @@ fn node_failure_category(code: NodeFailureCode) -> &'static str {
         NodeFailureCode::SpawnDeadlineExceeded => "spawn-deadline-exceeded",
         NodeFailureCode::UnsupportedSpawnCapability => "unsupported-spawn-capability",
         NodeFailureCode::UnsupportedTransport => "unsupported-transport",
+        NodeFailureCode::TurnInFlight => "turn-in-flight",
         NodeFailureCode::UnknownEnvironmentProfile => "unknown-environment-profile",
         NodeFailureCode::EnvironmentProfileBindingMismatch => {
             "environment-profile-binding-mismatch"
@@ -20681,6 +20723,7 @@ mod tests {
                 Some(Instant::now()),
                 &[],
                 None,
+                ApprovalLevel::default(),
             )
             .await
             .unwrap_err();

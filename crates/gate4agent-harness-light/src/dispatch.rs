@@ -81,9 +81,19 @@ pub(crate) async fn handle_request(
             provider_profile,
             mode,
             terminal_size,
+            approval_level,
         } => {
-            relay::spawn_session(state, node_id, workspace_id, provider, provider_profile, mode, terminal_size)
-                .await
+            relay::spawn_session(
+                state,
+                node_id,
+                workspace_id,
+                provider,
+                provider_profile,
+                mode,
+                terminal_size,
+                approval_level,
+            )
+            .await
         }
         HarnessOperatorRequestV1::WriteSessionInput { session, text } => {
             relay::session_control(state, session, SessionVerb::Input { text }).await

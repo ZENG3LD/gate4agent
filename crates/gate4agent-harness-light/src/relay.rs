@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use gate4agent_c2_protocol::{C2NodeResponse, NodeRequest, NodeRoute};
 use gate4agent_harness_api::{
-    HarnessExecutionModeV1, HarnessGitDiffModeV1, HarnessGitObjectIdV1, HarnessHostPathV1,
+    HarnessApprovalLevelV1, HarnessExecutionModeV1, HarnessGitDiffModeV1, HarnessGitObjectIdV1, HarnessHostPathV1,
     HarnessNativeSessionCatalogWindowV1, HarnessNativeSessionRouteV1,
     HarnessNativeSessionSelectionV1, HarnessOperatorReplyV1, HarnessOperatorRequestV1,
     HarnessOperatorResponseV1, HarnessProviderSessionIdentityV1, HarnessRepositoryPathV1,
@@ -69,6 +69,22 @@ const SESSION_SPAWN_DEADLINE_MS: u64 = 20_000;
 /// the requested provider profile against a fresh node snapshot (the same
 /// `launch_inventory.spawn_profiles` lookup `preflight_spawn_profile` uses)
 /// so a stale/unknown profile is a typed `NotFound`, not a node-side crash.
+/// `HarnessApprovalLevelV1` -> `gate4agent_types::ApprovalLevel`, an exact
+/// mirror of the same mapping in `gate4agent-harness-service::c2` (private
+/// to that crate, like every other spawn helper this module reimplements --
+/// see the module doc). Exhaustive on purpose: a level added to the wire
+/// must fail to compile here rather than silently resolve to the default,
+/// which would let the light path launch at a different authority than the
+/// full path for the very same request.
+fn map_approval_level(level: HarnessApprovalLevelV1) -> gate4agent_types::ApprovalLevel {
+    match level {
+        HarnessApprovalLevelV1::FullAuto => gate4agent_types::ApprovalLevel::FullAuto,
+        HarnessApprovalLevelV1::Moderate => gate4agent_types::ApprovalLevel::Moderate,
+        HarnessApprovalLevelV1::ReadOnly => gate4agent_types::ApprovalLevel::ReadOnly,
+        HarnessApprovalLevelV1::Unmanaged => gate4agent_types::ApprovalLevel::Unmanaged,
+    }
+}
+
 pub(crate) async fn spawn_session(
     state: &LightState,
     node_id: String,
@@ -77,6 +93,7 @@ pub(crate) async fn spawn_session(
     provider_profile: String,
     mode: HarnessExecutionModeV1,
     terminal_size: HarnessRuntimeTerminalSizeV1,
+    approval_level: Option<HarnessApprovalLevelV1>,
 ) -> HarnessOperatorReplyV1 {
     let result = spawn_session_inner(
         state,
@@ -86,6 +103,7 @@ pub(crate) async fn spawn_session(
         &provider_profile,
         mode,
         terminal_size,
+        approval_level,
     )
     .await;
     match result {
@@ -127,6 +145,7 @@ async fn spawn_session_inner(
     provider_profile: &str,
     mode: HarnessExecutionModeV1,
     terminal_size: HarnessRuntimeTerminalSizeV1,
+    approval_level: Option<HarnessApprovalLevelV1>,
 ) -> Result<HarnessRuntimeSessionAddressV1, LightRelayError> {
     let route = exact_route(&state.control, node_id)?;
     let workspace = WorkspaceId::new(workspace_id).map_err(|_| LightRelayError::InvalidRequest)?;
@@ -171,6 +190,12 @@ async fn spawn_session_inner(
             bundle_id: SpawnOverride::Clear,
             context_id: SpawnOverride::Clear,
             environment_profile_id: SpawnOverride::Clear,
+            // The light harness carries the operator's chosen level through
+            // unchanged, exactly as the full one does. `None` means the
+            // axis default (`FullAuto`) -- the light path must not quietly
+            // impose a different level than the full path for the same
+            // request.
+            approval_level: approval_level.map(map_approval_level),
         },
         deadline_ms: SpawnDeadlineMs::new(SESSION_SPAWN_DEADLINE_MS)
             .map_err(|_| LightRelayError::InvalidRequest)?,

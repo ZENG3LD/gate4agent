@@ -18,8 +18,8 @@ pub use gate4agent_harness_api::{
     HarnessReadHostErrorV1, HarnessReadRequestV1, HarnessReadResponseV1,
 };
 use gate4agent_types::{
-    AgentInstanceId, ControlEvent, ProviderActivity, ProviderSessionIdentity, SessionGeneration,
-    SessionSnapshot, TerminalControl, TerminalFrame, TerminalSize,
+    AgentInstanceId, ApprovalLevel, ControlEvent, ProviderActivity, ProviderSessionIdentity,
+    SessionGeneration, SessionSnapshot, TerminalControl, TerminalFrame, TerminalSize,
 };
 use serde::de::{DeserializeOwned, MapAccess, SeqAccess, Visitor};
 use serde::ser::SerializeStruct;
@@ -989,6 +989,17 @@ pub struct SpawnOverrides {
     pub bundle_id: SpawnOverride<SpawnBundleId>,
     pub context_id: SpawnOverride<SpawnContextId>,
     pub environment_profile_id: SpawnOverride<SpawnEnvironmentProfileId>,
+    /// A plain `Option`, not a `SpawnOverride<ApprovalLevel>` like every
+    /// field above it: those all have a corresponding field on
+    /// `SpawnProfileDefaults` to inherit from, so `Inherit` names a real
+    /// third state distinct from "cleared" or "set". A spawn profile
+    /// declares no approval level of its own, so there is nothing to
+    /// inherit -- `None` already means exactly what `Inherit` would, "use
+    /// the axis default" (`ApprovalLevel::FullAuto`), so this stays a
+    /// two-state `Option` rather than adding a `SpawnOverride` variant that
+    /// can never resolve against a profile field that does not exist.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_level: Option<ApprovalLevel>,
 }
 
 impl Default for SpawnOverrides {
@@ -1001,6 +1012,7 @@ impl Default for SpawnOverrides {
             bundle_id: SpawnOverride::Inherit,
             context_id: SpawnOverride::Inherit,
             environment_profile_id: SpawnOverride::Inherit,
+            approval_level: None,
         }
     }
 }
@@ -1243,6 +1255,11 @@ pub struct ResolvedSpawnSpec {
     pub idempotency_key: SpawnIdempotencyKey,
     pub required_capabilities: SpawnRequiredCapabilities,
     pub provenance: SpawnResolutionProvenance,
+    /// Resolved from `overrides.approval_level` -- `None` becomes
+    /// `ApprovalLevel::default()` (`FullAuto`) here, once, so every
+    /// consumer of a `ResolvedSpawnSpec` reads a concrete launch-time value
+    /// rather than re-deriving the same default independently.
+    pub approval_level: ApprovalLevel,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -1938,6 +1955,7 @@ impl SpawnSpec {
                 context_id: context_source,
                 environment_profile_id: environment_profile_source,
             },
+            approval_level: self.overrides.approval_level.unwrap_or_default(),
         })
     }
 }
@@ -6776,6 +6794,18 @@ pub enum NodeFailureCode {
     /// arrives asynchronously and is caught only by a blind commit-deadline
     /// poll -- a `SpawnDeadlineExceeded` that names neither).
     UnsupportedTransport,
+    /// The addressed session already has a provider turn in flight --
+    /// `TurnStarted` observed with no matching `TurnCompleted` yet -- and a
+    /// `Prompt`/`Paste` against it was refused by name rather than handed to
+    /// the agent. Applies to the two transports that admit exactly one turn
+    /// at a time (ACP, and `Pipe`/inline): what a provider does with an
+    /// overlapping second prompt is vendor-specific and unobservable here
+    /// (queue it, drop it, interleave it into the running turn), so the node
+    /// authors its own refusal instead of gambling on that behaviour. PTY
+    /// sessions never produce this code -- they are still gated by
+    /// `ProviderRuntimePolicy`'s PTY-terminal-text-inference flags, which
+    /// answer `UnsupportedCapability` instead.
+    TurnInFlight,
     UnknownSession,
     UnknownSessionRecord,
     SessionRecordNotResumable,

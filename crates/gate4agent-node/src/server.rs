@@ -107,7 +107,7 @@ use crate::protocol::{
     HostDecisionAuthorityV1, HostRequestDecisionV1,
     ObservationCapabilitiesV1, ObservationEvidenceV1, ObservationInteractionOutcomeV1,
     ObservationKindV1, ObservationSourceFamilyV1, ObservationTodoItemV1, ObservationTodoStateV1,
-    ObservationV1,
+    ObservationV1, OBSERVATION_DETAIL_MAX_BYTES,
     StateSchemaSupport, WorkspaceEntry, WorkspaceEntryKind, WorktreeProfileId,
     SpawnContextId, SpawnEnvironmentProfileId, SpawnIdempotencyKey,
     SpawnProfileDefaults, SpawnRequiredCapabilities, SpawnSpec, SpawnSpecResolveError,
@@ -481,6 +481,30 @@ fn agent_progress_event_kind(event: &ProviderEvent) -> Option<AgentProgressEvent
             AgentProgressEventKindV1::UnrecognizedNotification
         }
     })
+}
+
+/// A provider error's own message, bounded to what the observation wire
+/// accepts, falling back to the old constant when the provider said nothing.
+///
+/// Truncation is on a character boundary and marks itself, so a reader can
+/// tell a cut message from a short one -- a silently clipped reason reads as
+/// a complete one and sends the reader looking for the rest of a sentence
+/// that was never there.
+fn observation_error_detail(message: &str) -> String {
+    let message = message.trim();
+    if message.is_empty() {
+        return "provider-error".to_owned();
+    }
+    if message.len() <= OBSERVATION_DETAIL_MAX_BYTES {
+        return message.to_owned();
+    }
+    const ELLIPSIS: &str = "...";
+    let budget = OBSERVATION_DETAIL_MAX_BYTES - ELLIPSIS.len();
+    let mut cut = budget;
+    while cut > 0 && !message.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}{ELLIPSIS}", &message[..cut])
 }
 
 fn observation_evidence(family: AdapterFamily) -> Option<ObservationEvidenceV1> {
@@ -934,8 +958,16 @@ fn provider_observations(event: &ControlEvent) -> Vec<ObservationV1> {
         ProviderEvent::SessionEnded { is_error, .. } => kinds.push(ObservationKindV1::Exited {
             success: Some(!is_error),
         }),
-        ProviderEvent::Error { .. } => kinds.push(ObservationKindV1::Error {
-            detail: "provider-error".to_owned(),
+        // The message travels verbatim, bounded, rather than being replaced
+        // by a constant. It was `"provider-error"` for every error alike,
+        // which is a category where a reason belongs: the engine mints a
+        // refusal here naming which capability it withheld and how many
+        // events it dropped, and flattening that to a fixed word turns a
+        // named refusal back into the silence it was written to end. An
+        // empty message keeps the old constant, because a blank detail is
+        // rejected by `ObservationKindV1::validate`.
+        ProviderEvent::Error { message } => kinds.push(ObservationKindV1::Error {
+            detail: observation_error_detail(message),
         }),
         ProviderEvent::Ready => kinds.push(ObservationKindV1::Ready),
         ProviderEvent::InteractionRequested {

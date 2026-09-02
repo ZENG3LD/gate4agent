@@ -2125,6 +2125,7 @@ mod tests {
                 },
                 context_id: crate::protocol::SpawnOverride::Clear,
                 environment_profile_id: crate::protocol::SpawnOverride::Clear,
+                approval_level: None,
             },
             deadline_ms: crate::protocol::SpawnDeadlineMs::new(30_000).unwrap(),
             idempotency_key: crate::protocol::SpawnIdempotencyKey::new(

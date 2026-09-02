@@ -13,6 +13,7 @@ pub use gate4agent_observation_protocol::{
     HostDecisionAuthorityV1, HostRequestDecisionV1, ObservationCapabilitiesV1,
     ObservationEvidenceV1, ObservationInteractionOutcomeV1, ObservationKindV1,
     ObservationSourceFamilyV1, ObservationTodoItemV1, ObservationTodoStateV1, ObservationV1,
+    OBSERVATION_DETAIL_MAX_BYTES,
 };
 pub use gate4agent_harness_api::{
     HarnessReadHostErrorV1, HarnessReadRequestV1, HarnessReadResponseV1,

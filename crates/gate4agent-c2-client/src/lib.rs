@@ -17,7 +17,8 @@ mod reconnect;
 
 #[cfg(any(windows, unix))]
 pub use runtime::{
-    connect_local, C2ControlError, C2ControlHandle, C2EventReceiver, C2PendingRequest,
+    connect_local, C2ConnectionLossReason, C2ControlError, C2ControlHandle, C2EventReceiver,
+    C2PendingRequest,
 };
 #[cfg(any(windows, unix))]
 pub use reconnect::{

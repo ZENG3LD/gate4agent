@@ -1345,7 +1345,12 @@ enum CoordinatorSpawnResult {
     Accepted(AcceptedSpawnBindingProof),
     Rejected(NodeFailureCode),
     Failed,
-    OutcomeUnknown,
+    /// Carries WHY the outcome is unknown, when the caller has it (`None`
+    /// at the handful of call sites -- stranded-dispatch recovery at
+    /// startup, an already-discarded downstream error -- that never had a
+    /// specific cause to name). `apply_spawn_result` logs it; nothing else
+    /// reads it.
+    OutcomeUnknown(Option<String>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1906,7 +1911,18 @@ fn apply_spawn_result(
                 now_unix_ms,
             )
         }
-        CoordinatorSpawnResult::OutcomeUnknown => {
+        CoordinatorSpawnResult::OutcomeUnknown(reason) => {
+            // Unlike `Rejected`/`Failed` above, this used to commit
+            // `ReplyLost` with no log line anywhere -- the operator saw a
+            // stuck run and had nothing to grep for. Name the cause here,
+            // at the transition that makes it retryable.
+            tracing::warn!(
+                operation = %operation_id,
+                run = %run_id,
+                task = %task_id,
+                reason = reason.as_deref().unwrap_or("cause not captured"),
+                "spawn outcome is unknown after a transport/protocol failure: run and task go retryable OutcomeUnknown",
+            );
             next_run.lifecycle = HarnessRunLifecycleV1::OutcomeUnknown;
             next_operation.state = HarnessOperationStateV1::OutcomeUnknown;
             next_operation.outcome_unknown_reason = Some(
@@ -2184,15 +2200,25 @@ fn dispatching_start_error_result(error: &HarnessRuntimeError) -> CoordinatorSpa
         HarnessRuntimeError::C2(error) if error.start_failure_category().is_some() => {
             CoordinatorSpawnResult::Failed
         }
-        _ => CoordinatorSpawnResult::OutcomeUnknown,
+        _ => CoordinatorSpawnResult::OutcomeUnknown(Some(error.to_string())),
     }
 }
 
+/// Classifies the error `PendingHarnessMcpArm::finish` returned once the
+/// Arm request's fate is known. A node rejection or a protocol violation
+/// (an unnegotiated capability, a route/incarnation mismatch, an invalid
+/// reply) is a certain, non-retryable outcome -- `Failed`. Everything else
+/// -- the C2 control connection was lost, or the reply simply timed out --
+/// is a genuine "the round trip's outcome was never learned", so it stays
+/// retryable `OutcomeUnknown`, carrying the underlying error's own text as
+/// its cause.
 fn harness_mcp_arm_finish_result(error: &HarnessC2Error) -> CoordinatorSpawnResult {
-    if matches!(error, HarnessC2Error::HarnessMcpRejected { .. }) {
-        CoordinatorSpawnResult::Failed
-    } else {
-        CoordinatorSpawnResult::OutcomeUnknown
+    match error {
+        HarnessC2Error::HarnessMcpRejected { .. } => CoordinatorSpawnResult::Failed,
+        HarnessC2Error::HarnessMcpTransport(gate4agent_c2_client::C2ControlError::Protocol(_)) => {
+            CoordinatorSpawnResult::Failed
+        }
+        _ => CoordinatorSpawnResult::OutcomeUnknown(Some(error.to_string())),
     }
 }
 
@@ -4507,7 +4533,7 @@ fn start_or_terminalize_dispatch_job(
                     match dispatch_start_pre_dispatch_result(&error) {
                         CoordinatorPreDispatchResult::Failed => CoordinatorSpawnResult::Failed,
                         CoordinatorPreDispatchResult::OutcomeUnknown => {
-                            CoordinatorSpawnResult::OutcomeUnknown
+                            CoordinatorSpawnResult::OutcomeUnknown(Some(error.to_string()))
                         }
                     },
                     unix_time_ms(),
@@ -4548,28 +4574,28 @@ fn start_dispatch_finish(
                 Ok(SpawnDispatchOutcome::Accepted(accepted)) => {
                     match adapter.resolve_accepted_receipt(&route, &accepted).await {
                         Ok(proof) => CoordinatorSpawnResult::Accepted(proof),
-                        Err(_) => CoordinatorSpawnResult::OutcomeUnknown,
+                        Err(_) => CoordinatorSpawnResult::OutcomeUnknown(None),
                     }
                 }
                 Ok(SpawnDispatchOutcome::Rejected { code }) => {
                     CoordinatorSpawnResult::Rejected(code)
                 }
                 Ok(SpawnDispatchOutcome::OutcomeUnknown { .. }) | Err(_) => {
-                    CoordinatorSpawnResult::OutcomeUnknown
+                    CoordinatorSpawnResult::OutcomeUnknown(None)
                 }
             },
             PendingCoordinatorSpawn::Managed(pending) => match pending.finish().await {
                 Ok(ManagedWorktreeSpawnDispatchOutcome::Accepted(accepted)) => {
                     match adapter.resolve_managed_accepted_receipt(&route, &accepted).await {
                         Ok(proof) => CoordinatorSpawnResult::Accepted(proof),
-                        Err(_) => CoordinatorSpawnResult::OutcomeUnknown,
+                        Err(_) => CoordinatorSpawnResult::OutcomeUnknown(None),
                     }
                 }
                 Ok(ManagedWorktreeSpawnDispatchOutcome::Rejected { code }) => {
                     CoordinatorSpawnResult::Rejected(code)
                 }
                 Ok(ManagedWorktreeSpawnDispatchOutcome::OutcomeUnknown { .. }) | Err(_) => {
-                    CoordinatorSpawnResult::OutcomeUnknown
+                    CoordinatorSpawnResult::OutcomeUnknown(None)
                 }
             },
         };
@@ -4725,7 +4751,9 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                 &mut harness,
                 &effective_launch_catalog(&catalogs.launch, &runtime_inventory).0,
                 &operation_id,
-                CoordinatorSpawnResult::OutcomeUnknown,
+                CoordinatorSpawnResult::OutcomeUnknown(Some(
+                    "operation was still Dispatching at harness restart; reply outcome was never learned".to_owned(),
+                )),
                 unix_time_ms(),
             )? {
                 if let Some(cleanup) = harness
@@ -14089,15 +14117,41 @@ mod tests {
             }),
             CoordinatorSpawnResult::Failed,
         ));
+        // A protocol violation (unnegotiated capability, route mismatch,
+        // ...) is certain and non-retryable, same as a node rejection --
+        // not a genuine lost reply.
+        assert!(matches!(
+            harness_mcp_arm_finish_result(&HarnessC2Error::HarnessMcpTransport(
+                gate4agent_c2_client::C2ControlError::Protocol(
+                    "harness MCP read proxy capability was not negotiated".to_owned(),
+                ),
+            )),
+            CoordinatorSpawnResult::Failed,
+        ));
         assert!(matches!(
             harness_mcp_arm_finish_result(&HarnessC2Error::HarnessMcpTransport(
                 gate4agent_c2_client::C2ControlError::Closed,
             )),
-            CoordinatorSpawnResult::OutcomeUnknown,
+            CoordinatorSpawnResult::OutcomeUnknown(_),
         ));
+        // A named connection loss stays OutcomeUnknown and its cause
+        // survives into the reason text `apply_spawn_result` logs.
+        match harness_mcp_arm_finish_result(&HarnessC2Error::HarnessMcpTransport(
+            gate4agent_c2_client::C2ControlError::ConnectionLost {
+                reason: gate4agent_c2_client::C2ConnectionLossReason::PipeClosed,
+            },
+        )) {
+            CoordinatorSpawnResult::OutcomeUnknown(Some(reason)) => {
+                assert!(reason.contains("pipe closed"), "reason: {reason}");
+            }
+            CoordinatorSpawnResult::OutcomeUnknown(None) => {
+                panic!("expected the underlying connection-loss reason to survive")
+            }
+            _ => panic!("expected OutcomeUnknown for a genuine connection loss"),
+        }
         assert!(matches!(
             harness_mcp_arm_finish_result(&HarnessC2Error::HarnessMcpCorrelationMismatch),
-            CoordinatorSpawnResult::OutcomeUnknown,
+            CoordinatorSpawnResult::OutcomeUnknown(_),
         ));
     }
 

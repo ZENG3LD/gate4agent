@@ -2255,6 +2255,8 @@ async fn control_owner<E>(
     let events = events.into();
     let mut next_request_id = 1_u64;
     let mut pending = BTreeMap::new();
+    let mut harness_mcp_receiver_gone = false;
+    let mut loss_reason = C2ConnectionLossReason::Shutdown;
     loop {
         tokio::select! {
             command = commands.recv() => {
@@ -2284,11 +2286,15 @@ async fn control_owner<E>(
                     request_id,
                     (command.route, expected_request, command.reply),
                 );
-                if writer.send(frame).await.is_err() { break; }
+                if writer.send(frame).await.is_err() {
+                    loss_reason = C2ConnectionLossReason::PipeClosed;
+                    break;
+                }
             }
             input = incoming.recv() => {
                 match input {
                     Some(OwnerInput::Frame(C2ServerFrame::Reply(reply))) => {
+                        loss_reason = C2ConnectionLossReason::Protocol;
                         let Some((expected_route, expected_request, waiter)) =
                             pending.remove(&reply.request_id)
                         else {
@@ -2687,6 +2693,7 @@ async fn control_owner<E>(
                         let _ = waiter.send(reply.result.map_err(C2ControlError::Relay));
                     }
                     Some(OwnerInput::Frame(C2ServerFrame::Event(event))) => {
+                        loss_reason = C2ConnectionLossReason::Protocol;
                         if event.event.requires_harness_mcp_proxy_capability()
                             && (!path_capabilities.harness_mcp_read_proxy
                                 || !event.event.harness_mcp_contract_is_valid_at(
@@ -2753,13 +2760,39 @@ async fn control_owner<E>(
                             break;
                         }
                         if event.event.requires_harness_mcp_proxy_capability() {
-                            if events.harness_mcp.try_send(event).is_err() {
-                                break;
+                            // A full or gone harness-MCP receiver must never
+                            // tear down the whole C2 connection -- every
+                            // other in-flight request (Arm, Activate,
+                            // Abort, ...) would otherwise be answered
+                            // `Closed` seconds later with no log line
+                            // anywhere naming why.
+                            match events.harness_mcp.try_send(event) {
+                                Ok(()) => {}
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    tracing::warn!(
+                                        event = "HarnessMcpReadCall",
+                                        reason = "harness_mcp event channel full",
+                                        "dropped harness MCP event; C2 control connection stays open",
+                                    );
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    if !harness_mcp_receiver_gone {
+                                        harness_mcp_receiver_gone = true;
+                                        tracing::warn!(
+                                            event = "HarnessMcpReadCall",
+                                            reason = "harness_mcp event receiver dropped",
+                                            "no harness MCP event subscriber; further harness MCP events on this connection are dropped silently",
+                                        );
+                                    }
+                                }
                             }
                         } else if c2_node_event_is_terminal_frame(&event.event) {
                             match events.regular.try_send(event) {
                                 Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
-                                Err(mpsc::error::TrySendError::Closed(_)) => break,
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    loss_reason = C2ConnectionLossReason::RegularEventBackpressure;
+                                    break;
+                                }
                             }
                         } else if !matches!(
                             timeout(
@@ -2768,10 +2801,12 @@ async fn control_owner<E>(
                             ).await,
                             Ok(Ok(())),
                         ) {
+                            loss_reason = C2ConnectionLossReason::RegularEventBackpressure;
                             break;
                         }
                     }
                     Some(OwnerInput::Frame(C2ServerFrame::Topology(next))) => {
+                        loss_reason = C2ConnectionLossReason::Protocol;
                         if !topology_observation_support_is_valid(&next, path_capabilities) {
                             break;
                         }
@@ -2784,14 +2819,27 @@ async fn control_owner<E>(
                             topology.send_replace(Arc::new(next));
                         }
                     }
-                    Some(OwnerInput::Frame(C2ServerFrame::Challenge(_) | C2ServerFrame::Hello(_) | C2ServerFrame::Rejected(_)))
-                        | Some(OwnerInput::Closed) | None => break,
+                    Some(OwnerInput::Frame(C2ServerFrame::Challenge(_) | C2ServerFrame::Hello(_) | C2ServerFrame::Rejected(_))) => {
+                        loss_reason = C2ConnectionLossReason::Protocol;
+                        break;
+                    }
+                    Some(OwnerInput::Closed) | None => {
+                        loss_reason = C2ConnectionLossReason::PipeClosed;
+                        break;
+                    }
                 }
             }
         }
     }
+    if !pending.is_empty() {
+        tracing::warn!(
+            reason = %loss_reason,
+            pending = pending.len(),
+            "C2 control connection lost: failing every request still pending",
+        );
+    }
     for (_, (_, _, waiter)) in pending {
-        let _ = waiter.send(Err(C2ControlError::Closed));
+        let _ = waiter.send(Err(C2ControlError::ConnectionLost { reason: loss_reason }));
     }
 }
 
@@ -2866,10 +2914,51 @@ pub enum C2ControlError {
     Relay(C2RelayFailure),
     #[error("C2 control connection closed")]
     Closed,
+    /// The `control_owner` loop tore the connection down for a NAMED
+    /// reason (as opposed to `Closed`, which also covers a local caller
+    /// dropping its own handle/queue -- never emitted by `control_owner`
+    /// itself). Every request pending at teardown gets this, once, with
+    /// the reason logged alongside the pending count.
+    #[error("C2 control connection lost: {reason}")]
+    ConnectionLost { reason: C2ConnectionLossReason },
     #[error("C2 control request queue is full")]
     QueueFull,
     #[error("C2 request ID space exhausted")]
     RequestIdExhausted,
+}
+
+/// Why `control_owner` tore its connection down, attached to every request
+/// still pending at that moment (`C2ControlError::ConnectionLost`). Logged
+/// once at the teardown point instead of being silently swallowed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum C2ConnectionLossReason {
+    /// The reader or writer half of the physical pipe ended (I/O error,
+    /// EOF, or a downstream send failure into the writer task).
+    PipeClosed,
+    /// The relay sent a frame or reply that violates the negotiated
+    /// protocol: an unmatched request id, a route/incarnation mismatch, an
+    /// unnegotiated-capability leak, an invalid topology frame, or a
+    /// repeated handshake frame after authentication.
+    Protocol,
+    /// The `regular` event consumer fell behind: its channel closed (a
+    /// terminal-frame event found no receiver) or blocking delivery of a
+    /// non-terminal event exceeded `REGULAR_EVENT_DELIVERY_DEADLINE`.
+    RegularEventBackpressure,
+    /// The local caller side shut the connection down deliberately (every
+    /// `C2ControlHandle` clone dropped) or the request id space was
+    /// exhausted.
+    Shutdown,
+}
+
+impl std::fmt::Display for C2ConnectionLossReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::PipeClosed => "pipe closed",
+            Self::Protocol => "protocol violation",
+            Self::RegularEventBackpressure => "regular event consumer fell behind",
+            Self::Shutdown => "local caller shut the connection down",
+        })
+    }
 }
 
 #[cfg(all(test, windows))]
@@ -4282,6 +4371,12 @@ mod tests {
         for call_index in 0..=HARNESS_MCP_EVENT_CAPACITY {
             incoming_tx.send(harness_mcp_event(call_index, deadline_unix_ms)).await.unwrap();
         }
+        // The overflow (129th) event must not tear the connection down --
+        // it is dropped with a warning and the connection stays open. This
+        // test ends the connection by closing the reader input instead, so
+        // the 128-capacity assertion below still exercises a genuinely
+        // full (not closed) harness-MCP receiver.
+        drop(incoming_tx);
         let owner = tokio::spawn(control_owner(
             commands_rx,
             EventDelivery { regular: events_tx, harness_mcp: harness_tx },
@@ -4302,6 +4397,127 @@ mod tests {
             event.cursor.sequence == 41
                 && matches!(event.event, C2NodeEvent::HarnessMcpReadCall { .. })
         }));
+    }
+
+    #[tokio::test]
+    async fn harness_mcp_full_channel_drops_the_event_but_a_pending_request_still_completes() {
+        let (commands_tx, commands_rx) = mpsc::channel(1);
+        let (events_tx, _events_rx) = mpsc::channel(EVENT_CAPACITY);
+        // Capacity 1, never drained: the very first harness-MCP event
+        // fills it, so the second one exercises the `Full` branch.
+        let (harness_tx, _harness_rx) = mpsc::channel(1);
+        let (writer_tx, mut writer_rx) = mpsc::channel(1);
+        let (incoming_tx, incoming_rx) = mpsc::channel(4);
+        let (topology_tx, _topology_rx) =
+            watch::channel(Arc::new(C2Topology { nodes: Vec::new() }));
+        let mut capabilities = all_path_capabilities();
+        capabilities.harness_mcp_read_proxy = true;
+        let deadline_unix_ms = current_unix_ms().unwrap() + 3_000;
+        let owner = tokio::spawn(control_owner(
+            commands_rx,
+            EventDelivery { regular: events_tx, harness_mcp: harness_tx },
+            topology_tx,
+            writer_tx,
+            incoming_rx,
+            capabilities,
+        ));
+
+        incoming_tx.send(harness_mcp_event(1, deadline_unix_ms)).await.unwrap();
+        incoming_tx.send(harness_mcp_event(2, deadline_unix_ms)).await.unwrap();
+        tokio::task::yield_now().await;
+
+        // A request enqueued (and answered) AFTER the channel-full event
+        // still gets served: the owner loop never broke.
+        let (reply_tx, reply_rx) = oneshot::channel();
+        commands_tx.send(ControlCommand {
+            route: route(),
+            request: NodeRequest::Snapshot,
+            reply: reply_tx,
+        }).await.unwrap();
+        assert!(matches!(writer_rx.recv().await, Some(C2ClientFrame::Request(_))));
+        incoming_tx.send(reply(1)).await.unwrap();
+        assert!(matches!(
+            timeout(Duration::from_secs(1), reply_rx).await.unwrap().unwrap(),
+            Ok(RoutedNodeResponse { response: Ok(C2NodeResponse::Accepted), .. })
+        ));
+
+        drop(commands_tx);
+        drop(incoming_tx);
+        timeout(Duration::from_secs(1), owner).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn harness_mcp_dropped_receiver_stops_that_class_but_a_pending_request_still_completes() {
+        let (commands_tx, commands_rx) = mpsc::channel(1);
+        let (events_tx, _events_rx) = mpsc::channel(EVENT_CAPACITY);
+        let (harness_tx, harness_rx) = mpsc::channel(HARNESS_MCP_EVENT_CAPACITY);
+        // Nobody ever subscribes to harness-MCP events on this connection.
+        drop(harness_rx);
+        let (writer_tx, mut writer_rx) = mpsc::channel(1);
+        let (incoming_tx, incoming_rx) = mpsc::channel(4);
+        let (topology_tx, _topology_rx) =
+            watch::channel(Arc::new(C2Topology { nodes: Vec::new() }));
+        let mut capabilities = all_path_capabilities();
+        capabilities.harness_mcp_read_proxy = true;
+        let deadline_unix_ms = current_unix_ms().unwrap() + 3_000;
+        let owner = tokio::spawn(control_owner(
+            commands_rx,
+            EventDelivery { regular: events_tx, harness_mcp: harness_tx },
+            topology_tx,
+            writer_tx,
+            incoming_rx,
+            capabilities,
+        ));
+
+        incoming_tx.send(harness_mcp_event(1, deadline_unix_ms)).await.unwrap();
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        commands_tx.send(ControlCommand {
+            route: route(),
+            request: NodeRequest::Snapshot,
+            reply: reply_tx,
+        }).await.unwrap();
+        assert!(matches!(writer_rx.recv().await, Some(C2ClientFrame::Request(_))));
+        incoming_tx.send(reply(1)).await.unwrap();
+        assert!(matches!(
+            timeout(Duration::from_secs(1), reply_rx).await.unwrap().unwrap(),
+            Ok(RoutedNodeResponse { response: Ok(C2NodeResponse::Accepted), .. })
+        ));
+
+        drop(commands_tx);
+        drop(incoming_tx);
+        timeout(Duration::from_secs(1), owner).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn genuine_pipe_loss_answers_every_pending_request_with_the_named_reason() {
+        let (commands_tx, commands_rx) = mpsc::channel(4);
+        let (events_tx, _events_rx) = mpsc::channel(EVENT_CAPACITY);
+        let (writer_tx, mut writer_rx) = mpsc::channel(4);
+        let (incoming_tx, incoming_rx) = mpsc::channel(4);
+        let (topology_tx, _topology_rx) =
+            watch::channel(Arc::new(C2Topology { nodes: Vec::new() }));
+        let owner = tokio::spawn(control_owner(
+            commands_rx, events_tx, topology_tx, writer_tx, incoming_rx, all_path_capabilities(),
+        ));
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        commands_tx.send(ControlCommand {
+            route: route(),
+            request: NodeRequest::Snapshot,
+            reply: reply_tx,
+        }).await.unwrap();
+        assert!(matches!(writer_rx.recv().await, Some(C2ClientFrame::Request(_))));
+
+        // The reader half signals a genuine pipe loss -- no reply for the
+        // pending Snapshot request will ever arrive.
+        incoming_tx.send(OwnerInput::Closed).await.unwrap();
+        timeout(Duration::from_secs(1), owner).await.unwrap().unwrap();
+
+        assert!(matches!(
+            reply_rx.await.unwrap(),
+            Err(C2ControlError::ConnectionLost { reason: C2ConnectionLossReason::PipeClosed }),
+        ));
     }
 
     #[tokio::test]
@@ -5396,7 +5612,9 @@ mod tests {
                 REGULAR_EVENT_DELIVERY_DEADLINE + Duration::from_secs(1),
                 reply_rx,
             ).await.unwrap().unwrap(),
-            Err(C2ControlError::Closed),
+            Err(C2ControlError::ConnectionLost {
+                reason: C2ConnectionLossReason::RegularEventBackpressure,
+            }),
         ));
         timeout(Duration::from_secs(1), owner).await.unwrap().unwrap();
         assert!(commands_tx.is_closed());

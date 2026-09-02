@@ -105,7 +105,8 @@ use crate::protocol::{
     SessionTaskTargetV1, TaskId,
     HostDecisionAuthorityV1, HostRequestDecisionV1,
     ObservationCapabilitiesV1, ObservationEvidenceV1, ObservationInteractionOutcomeV1,
-    ObservationKindV1, ObservationSourceFamilyV1, ObservationV1,
+    ObservationKindV1, ObservationSourceFamilyV1, ObservationTodoItemV1, ObservationTodoStateV1,
+    ObservationV1,
     StateSchemaSupport, WorkspaceEntry, WorkspaceEntryKind, WorktreeProfileId,
     SpawnContextId, SpawnEnvironmentProfileId, SpawnIdempotencyKey,
     SpawnProfileDefaults, SpawnRequiredCapabilities, SpawnSpec, SpawnSpecResolveError,
@@ -182,7 +183,7 @@ use gate4agent_types::{
     HostDecisionAuthority as ProviderHostDecisionAuthority,
     HostRequestDecision as ProviderHostRequestDecision, InputAction,
     PromptFraming, PromptPayload, ResumeLaunchRequest,
-    ProviderEvent, ProviderInteractionKind, ProviderInteractionStatus,
+    ProviderEvent, ProviderInteractionKind, ProviderInteractionStatus, ProviderPlanStatus,
     ProviderRuntimeCapability, ProviderRuntimePolicy, ProviderSessionIdentity, ProviderSessionKey,
     ProviderSnapshot,
     ResumeTarget,
@@ -763,6 +764,18 @@ fn observation_interaction_outcome(
     }
 }
 
+/// Maps ACP's per-step plan status onto the observation wire's own todo
+/// state -- a plain match, not `format!("{:?}", ..)`, for the same reason
+/// `observation_host_decision_authority` above is: the source carries the
+/// typed value itself, not a string to reparse.
+fn observation_todo_state(status: ProviderPlanStatus) -> ObservationTodoStateV1 {
+    match status {
+        ProviderPlanStatus::Pending => ObservationTodoStateV1::Pending,
+        ProviderPlanStatus::InProgress => ObservationTodoStateV1::InProgress,
+        ProviderPlanStatus::Completed => ObservationTodoStateV1::Completed,
+    }
+}
+
 fn provider_observations(event: &ControlEvent) -> Vec<ObservationV1> {
     let (source, source_sequence, provider_sequence, provider_event) = match &event.event {
         ControlEventKind::ProviderEvent {
@@ -852,13 +865,67 @@ fn provider_observations(event: &ControlEvent) -> Vec<ObservationV1> {
             if evidence == ObservationEvidenceV1::StructuredProvider =>
         {
             kinds.push(ObservationKindV1::ContextWindowUsage {
-                uncached_input_tokens: usage.uncached_input_tokens,
-                cache_read_tokens: usage.cache_read_tokens,
-                cache_write_tokens: usage.cache_write_tokens,
-                output_tokens: usage.output_tokens,
-                unattributed_tokens: usage.unattributed_tokens,
+                uncached_input_tokens: Some(usage.uncached_input_tokens),
+                cache_read_tokens: Some(usage.cache_read_tokens),
+                cache_write_tokens: Some(usage.cache_write_tokens),
+                output_tokens: Some(usage.output_tokens),
+                unattributed_tokens: Some(usage.unattributed_tokens),
                 used_tokens: usage.used_tokens,
                 capacity_tokens: usage.capacity_tokens,
+            });
+        }
+        // ACP's `usage_update` only ever reports `used_tokens`/
+        // `context_window`, never the cache/segment breakdown the
+        // `ProviderEvent::ContextWindowUsage` arm above maps -- the five
+        // breakdown fields go in as `None` rather than a fabricated zero.
+        // `cost_amount`/`cost_currency` have no `ObservationKindV1` of
+        // their own; carrying provider turn cost onto this wire is a
+        // separate decision this arm deliberately does not make, so both
+        // are dropped here.
+        ProviderEvent::UsageUpdated {
+            used_tokens,
+            context_window,
+            ..
+        } if evidence == ObservationEvidenceV1::StructuredProvider => {
+            if let (Some(used_tokens), Some(capacity_tokens)) = (*used_tokens, *context_window) {
+                kinds.push(ObservationKindV1::ContextWindowUsage {
+                    uncached_input_tokens: None,
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                    output_tokens: None,
+                    unattributed_tokens: None,
+                    used_tokens,
+                    capacity_tokens,
+                });
+            }
+        }
+        // ACP always sends the FULL plan on `session/update`, never a
+        // delta, so each snapshot wholesale-replaces the previous one --
+        // `source_sequence` is already strictly increasing per (instance,
+        // generation, provider source) (`Gate4AgentEngine::ingest_provider`
+        // rejects any `source_sequence` that is not, `gate4agent-engine`),
+        // so it doubles as the per-session `revision` a `TodoSnapshot`
+        // needs without this function tracking any counter of its own.
+        ProviderEvent::Plan { steps } if !is_pty_hint => {
+            kinds.push(ObservationKindV1::TodoSnapshot {
+                revision: source_sequence,
+                items: steps
+                    .iter()
+                    .map(|step| ObservationTodoItemV1 {
+                        id: None,
+                        text: step.content.clone(),
+                        state: observation_todo_state(step.status),
+                    })
+                    .collect(),
+                // An empty plan is a CLEARED plan, not a finished one. `all`
+                // is vacuously true on an empty list, and an agent that sent
+                // `plan` with no entries would therefore have its timeline
+                // entry rendered as "done" -- a completion nobody reported.
+                // Emptiness has to be excluded explicitly.
+                complete: !steps.is_empty()
+                    && steps
+                        .iter()
+                        .all(|step| step.status == ProviderPlanStatus::Completed),
             });
         }
         ProviderEvent::TurnInterrupted => kinds.push(ObservationKindV1::TurnInterrupted),
@@ -935,16 +1002,16 @@ fn provider_observations(event: &ControlEvent) -> Vec<ObservationV1> {
         | ProviderEvent::TurnCompleted { .. }
         | ProviderEvent::ContextWindowUsage { .. }
         | ProviderEvent::SubagentStopped { .. }
-        // ACP session/update coverage beyond text/tool/turn streaming has
-        // no dedicated `ObservationKindV1` yet -- see the matching comment
-        // on `agent_progress_event_kind` above for why minting one is left
-        // to whoever owns this versioned wire contract.
-        | ProviderEvent::UserMessage { .. }
+        | ProviderEvent::UsageUpdated { .. }
         | ProviderEvent::Plan { .. }
+        // ACP session/update coverage beyond text/tool/turn/plan/usage
+        // streaming has no dedicated `ObservationKindV1` yet -- see the
+        // matching comment on `agent_progress_event_kind` above for why
+        // minting one is left to whoever owns this versioned wire contract.
+        | ProviderEvent::UserMessage { .. }
         | ProviderEvent::AvailableCommandsUpdated { .. }
         | ProviderEvent::ModeChanged { .. }
         | ProviderEvent::SessionInfoUpdated { .. }
-        | ProviderEvent::UsageUpdated { .. }
         | ProviderEvent::ConfigOptionsUpdated { .. } => {}
     }
     let reports_capabilities = source_sequence == 1
@@ -15336,38 +15403,37 @@ async fn process_request_inner(shared: &NodeShared, connection_id: u64, role: Cl
             })?;
             Ok(NodeResponse::Accepted)
         }
-        // `SetSessionMode`/`SetSessionConfigOption`/`SetSessionModel` are
-        // fully wired on the wire (capability, request shape, transport
-        // gate below) but have no `ControlCommand`/`ControlEffect` counterpart
-        // yet in `gate4agent-types`/`gate4agent-engine` -- `AcpSession::
-        // set_mode`/`set_config_option`/the vendor model switch are reachable
-        // from `gate4agent-shell-native` (`src/acp/session.rs:191`) but
-        // nothing on the command path calls them. Refuse by name rather than
-        // pretend, once the request itself is validated as a genuine ACP
-        // verb on a live ACP session.
-        NodeRequest::SetSessionMode { session, .. } => {
+        NodeRequest::SetSessionMode { session, mode_id } => {
             shared.require_controller(connection_id, role)?;
             shared.require_acp_session(&session)?;
-            Err(failure(
-                NodeFailureCode::UnsupportedCapability,
-                "this node has no session-mode control channel to its ACP backend yet",
-            ))
+            shared.dispatch(ControlCommand::SetSessionMode {
+                instance_id: session.session.instance_id,
+                mode_id,
+            })?;
+            Ok(NodeResponse::Accepted)
         }
-        NodeRequest::SetSessionConfigOption { session, .. } => {
+        NodeRequest::SetSessionConfigOption {
+            session,
+            option_id,
+            value_json,
+        } => {
             shared.require_controller(connection_id, role)?;
             shared.require_acp_session(&session)?;
-            Err(failure(
-                NodeFailureCode::UnsupportedCapability,
-                "this node has no session config-option control channel to its ACP backend yet",
-            ))
+            shared.dispatch(ControlCommand::SetSessionConfigOption {
+                instance_id: session.session.instance_id,
+                option_id,
+                value_json,
+            })?;
+            Ok(NodeResponse::Accepted)
         }
-        NodeRequest::SetSessionModel { session, .. } => {
+        NodeRequest::SetSessionModel { session, model_id } => {
             shared.require_controller(connection_id, role)?;
             shared.require_acp_session(&session)?;
-            Err(failure(
-                NodeFailureCode::UnsupportedCapability,
-                "this node has no session model-switch control channel to its ACP backend yet",
-            ))
+            shared.dispatch(ControlCommand::SetSessionModel {
+                instance_id: session.session.instance_id,
+                model_id,
+            })?;
+            Ok(NodeResponse::Accepted)
         }
         NodeRequest::Shutdown => {
             shared.require_controller(connection_id, role)?;
@@ -16347,7 +16413,8 @@ pub enum NodeServerError {
 mod observation_projection_tests {
     use super::*;
     use gate4agent_types::{
-        AdapterId, AdapterVerification, ContextWindowUsage, ProviderSource, TokenUsage,
+        AdapterId, AdapterVerification, ContextWindowUsage, ProviderPlanPriority, ProviderPlanStep,
+        ProviderSource, TokenUsage,
     };
 
     fn observation_test_shared() -> NodeShared {
@@ -16734,11 +16801,11 @@ mod observation_projection_tests {
         assert_eq!(
             timeline[0].kind,
             ObservationKindV1::ContextWindowUsage {
-                uncached_input_tokens: 70,
-                cache_read_tokens: 20,
-                cache_write_tokens: 0,
-                output_tokens: 10,
-                unattributed_tokens: 5,
+                uncached_input_tokens: Some(70),
+                cache_read_tokens: Some(20),
+                cache_write_tokens: Some(0),
+                output_tokens: Some(10),
+                unattributed_tokens: Some(5),
                 used_tokens: 105,
                 capacity_tokens: 100,
             }
@@ -17199,6 +17266,150 @@ mod observation_projection_tests {
                 &timeline[0].kind,
                 ObservationKindV1::ToolStarted { .. }
             ));
+        }
+    }
+
+    #[test]
+    fn acp_plan_produces_a_todo_snapshot_carrying_source_sequence_as_revision() {
+        let event = provider_control_event(
+            AdapterFamily::Acp,
+            ProviderEvent::Plan {
+                steps: vec![
+                    ProviderPlanStep {
+                        content: "read the file".to_owned(),
+                        priority: ProviderPlanPriority::High,
+                        status: ProviderPlanStatus::Completed,
+                    },
+                    ProviderPlanStep {
+                        content: "write the fix".to_owned(),
+                        priority: ProviderPlanPriority::Medium,
+                        status: ProviderPlanStatus::InProgress,
+                    },
+                ],
+            },
+        );
+        let projected = provider_observations(&event);
+        let timeline = timeline_observations(&projected);
+        assert_eq!(timeline.len(), 1);
+        assert_eq!(
+            timeline[0].evidence,
+            ObservationEvidenceV1::StructuredProvider
+        );
+        let ObservationKindV1::TodoSnapshot {
+            revision,
+            items,
+            complete,
+        } = &timeline[0].kind
+        else {
+            panic!("expected a todo snapshot observation");
+        };
+        // `provider_control_event` fixes `source_sequence` at 9 (see its own
+        // definition); that value doubles as the snapshot's revision -- see
+        // the doc comment on the `ProviderEvent::Plan` match arm.
+        assert_eq!(*revision, 9);
+        assert_eq!(
+            items,
+            &vec![
+                ObservationTodoItemV1 {
+                    id: None,
+                    text: "read the file".to_owned(),
+                    state: ObservationTodoStateV1::Completed,
+                },
+                ObservationTodoItemV1 {
+                    id: None,
+                    text: "write the fix".to_owned(),
+                    state: ObservationTodoStateV1::InProgress,
+                },
+            ]
+        );
+        assert!(!complete, "one step is still in progress");
+
+        let all_done = provider_control_event(
+            AdapterFamily::Acp,
+            ProviderEvent::Plan {
+                steps: vec![ProviderPlanStep {
+                    content: "read the file".to_owned(),
+                    priority: ProviderPlanPriority::High,
+                    status: ProviderPlanStatus::Completed,
+                }],
+            },
+        );
+        let projected = provider_observations(&all_done);
+        let timeline = timeline_observations(&projected);
+        let ObservationKindV1::TodoSnapshot { complete, .. } = &timeline[0].kind else {
+            panic!("expected a todo snapshot observation");
+        };
+        assert!(*complete, "every step is completed");
+
+        // A pty-hint source cannot claim the authoritative plan snapshot --
+        // same rule as `ToolCompleted`/`SubagentCompleted` above.
+        let pty = provider_control_event(
+            AdapterFamily::PtySemantic,
+            ProviderEvent::Plan {
+                steps: vec![ProviderPlanStep {
+                    content: "read the file".to_owned(),
+                    priority: ProviderPlanPriority::High,
+                    status: ProviderPlanStatus::Pending,
+                }],
+            },
+        );
+        let projected = provider_observations(&pty);
+        assert!(timeline_observations(&projected).is_empty());
+    }
+
+    #[test]
+    fn acp_usage_updated_produces_context_window_usage_with_unobserved_breakdown() {
+        let event = provider_control_event(
+            AdapterFamily::Acp,
+            ProviderEvent::UsageUpdated {
+                used_tokens: Some(4_200),
+                context_window: Some(200_000),
+                cost_amount: Some("0.42".to_owned()),
+                cost_currency: Some("USD".to_owned()),
+            },
+        );
+        let projected = provider_observations(&event);
+        let timeline = timeline_observations(&projected);
+        assert_eq!(timeline.len(), 1);
+        assert_eq!(
+            timeline[0].evidence,
+            ObservationEvidenceV1::StructuredProvider
+        );
+        assert_eq!(
+            timeline[0].kind,
+            ObservationKindV1::ContextWindowUsage {
+                uncached_input_tokens: None,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                output_tokens: None,
+                unattributed_tokens: None,
+                used_tokens: 4_200,
+                capacity_tokens: 200_000,
+            }
+        );
+        let wire = serde_json::to_string(&projected).unwrap();
+        assert!(!wire.contains("0.42"));
+        assert!(!wire.contains("USD"));
+
+        // ACP requires both `used`/`size` -- a notification missing either
+        // is malformed, not a measurement, and mints nothing.
+        for incomplete in [
+            ProviderEvent::UsageUpdated {
+                used_tokens: None,
+                context_window: Some(200_000),
+                cost_amount: None,
+                cost_currency: None,
+            },
+            ProviderEvent::UsageUpdated {
+                used_tokens: Some(4_200),
+                context_window: None,
+                cost_amount: None,
+                cost_currency: None,
+            },
+        ] {
+            let event = provider_control_event(AdapterFamily::Acp, incomplete);
+            let projected = provider_observations(&event);
+            assert!(timeline_observations(&projected).is_empty());
         }
     }
 

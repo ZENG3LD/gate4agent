@@ -1229,10 +1229,10 @@ fn context_occupancy_cumulative_replaces_every_counter_and_excludes_reasoning() 
         .usage
         .context_occupancy
         .expect("context occupancy");
-    assert_eq!(occupancy.uncached_input_tokens, 5);
-    assert_eq!(occupancy.output_tokens, 6);
-    assert_eq!(occupancy.cache_read_tokens, 7);
-    assert_eq!(occupancy.cache_write_tokens, 8);
+    assert_eq!(occupancy.uncached_input_tokens, Some(5));
+    assert_eq!(occupancy.output_tokens, Some(6));
+    assert_eq!(occupancy.cache_read_tokens, Some(7));
+    assert_eq!(occupancy.cache_write_tokens, Some(8));
     assert_eq!(occupancy.reasoning_tokens, Some(999));
     assert_eq!(occupancy.context_window, Some(200));
     assert_eq!(occupancy.provenance, ContextOccupancyProvenance::CumulativeUsage);
@@ -1265,10 +1265,10 @@ fn context_occupancy_per_turn_replaces_prompt_and_reasoning_but_accumulates_outp
         .expect("projection")
         .usage;
     let occupancy = usage_projection.context_occupancy.expect("context occupancy");
-    assert_eq!(occupancy.uncached_input_tokens, 5);
-    assert_eq!(occupancy.output_tokens, 10);
-    assert_eq!(occupancy.cache_read_tokens, 7);
-    assert_eq!(occupancy.cache_write_tokens, 8);
+    assert_eq!(occupancy.uncached_input_tokens, Some(5));
+    assert_eq!(occupancy.output_tokens, Some(10));
+    assert_eq!(occupancy.cache_read_tokens, Some(7));
+    assert_eq!(occupancy.cache_write_tokens, Some(8));
     assert_eq!(occupancy.reasoning_tokens, Some(9));
     assert_eq!(occupancy.context_window, Some(100));
     assert_eq!(
@@ -1354,12 +1354,12 @@ fn exact_context_window_usage_sets_authoritative_snapshot_without_changing_obser
     let occupancy = usage_projection.context_occupancy.expect("exact occupancy");
     assert_eq!(usage_projection.observed_delta, observed_before);
     assert_eq!(occupancy.provenance, ContextOccupancyProvenance::ExactCurrentWindow);
-    assert_eq!(occupancy.uncached_input_tokens, 10);
-    assert_eq!(occupancy.cache_read_tokens, 20);
-    assert_eq!(occupancy.cache_write_tokens, 5);
-    assert_eq!(occupancy.output_tokens, 15);
+    assert_eq!(occupancy.uncached_input_tokens, Some(10));
+    assert_eq!(occupancy.cache_read_tokens, Some(20));
+    assert_eq!(occupancy.cache_write_tokens, Some(5));
+    assert_eq!(occupancy.output_tokens, Some(15));
     assert_eq!(occupancy.reasoning_tokens, None);
-    assert_eq!(occupancy.unattributed_tokens, 10);
+    assert_eq!(occupancy.unattributed_tokens, Some(10));
     assert_eq!(occupancy.occupied_tokens(), 60);
     assert_eq!(occupancy.context_window, Some(100));
 }
@@ -1457,11 +1457,11 @@ fn usage_snapshot(
 
 fn exact_context_usage() -> ObservationKindV1 {
     ObservationKindV1::ContextWindowUsage {
-        uncached_input_tokens: 10,
-        cache_read_tokens: 20,
-        cache_write_tokens: 5,
-        output_tokens: 15,
-        unattributed_tokens: 10,
+        uncached_input_tokens: Some(10),
+        cache_read_tokens: Some(20),
+        cache_write_tokens: Some(5),
+        output_tokens: Some(15),
+        unattributed_tokens: Some(10),
         used_tokens: 60,
         capacity_tokens: 100,
     }

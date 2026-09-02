@@ -2834,7 +2834,10 @@ fn validate_effect_runtime_policy(effect: &ControlEffect) -> Result<(), String> 
         | ControlEffect::DiscoverHistory { .. }
         | ControlEffect::LoadHistory { .. }
         | ControlEffect::AuthorizeResume { .. }
-        | ControlEffect::ResolveInteraction { .. } => return Ok(()),
+        | ControlEffect::ResolveInteraction { .. }
+        | ControlEffect::SetSessionMode { .. }
+        | ControlEffect::SetSessionConfigOption { .. }
+        | ControlEffect::SetSessionModel { .. } => return Ok(()),
     };
     policy
         .validate()
@@ -2892,6 +2895,11 @@ fn effect_failure(effect: EffectEnvelope, message: String) -> ObservationEnvelop
                 message,
             }
         }
+        ControlEffect::SetSessionMode { .. } => ControlObservation::SessionModeSetFailed { message },
+        ControlEffect::SetSessionConfigOption { .. } => {
+            ControlObservation::SessionConfigOptionSetFailed { message }
+        }
+        ControlEffect::SetSessionModel { .. } => ControlObservation::SessionModelSetFailed { message },
         ControlEffect::Resize { .. } => ControlObservation::ResizeFailed { message },
         ControlEffect::ObserveForeground => ControlObservation::ForegroundFailed { message },
         ControlEffect::ProbeCapabilities { .. } => ControlObservation::CapabilityProbeFailed {

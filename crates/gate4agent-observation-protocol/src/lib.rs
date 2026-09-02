@@ -205,11 +205,17 @@ pub enum ObservationKindV1 {
         is_cumulative: bool,
     },
     ContextWindowUsage {
-        uncached_input_tokens: u64,
-        cache_read_tokens: u64,
-        cache_write_tokens: u64,
-        output_tokens: u64,
-        unattributed_tokens: u64,
+        /// Cache/segment breakdown of `used_tokens`. `None` when the
+        /// source only reported `used_tokens`/`capacity_tokens` and never
+        /// observed how the total decomposes -- see `ProviderEvent::
+        /// UsageUpdated`. Never defaulted to zero: a zero would assert a
+        /// segment was observed to be empty when it was never observed at
+        /// all.
+        uncached_input_tokens: Option<u64>,
+        cache_read_tokens: Option<u64>,
+        cache_write_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        unattributed_tokens: Option<u64>,
         used_tokens: u64,
         capacity_tokens: u64,
     },
@@ -645,11 +651,12 @@ impl ObservationKindV1 {
                 used_tokens,
                 capacity_tokens,
             } => {
-                len += ",\"uncached_input_tokens\":".len() + decimal_len(*uncached_input_tokens);
-                len += ",\"cache_read_tokens\":".len() + decimal_len(*cache_read_tokens);
-                len += ",\"cache_write_tokens\":".len() + decimal_len(*cache_write_tokens);
-                len += ",\"output_tokens\":".len() + decimal_len(*output_tokens);
-                len += ",\"unattributed_tokens\":".len() + decimal_len(*unattributed_tokens);
+                len +=
+                    ",\"uncached_input_tokens\":".len() + option_u64_json_len(*uncached_input_tokens);
+                len += ",\"cache_read_tokens\":".len() + option_u64_json_len(*cache_read_tokens);
+                len += ",\"cache_write_tokens\":".len() + option_u64_json_len(*cache_write_tokens);
+                len += ",\"output_tokens\":".len() + option_u64_json_len(*output_tokens);
+                len += ",\"unattributed_tokens\":".len() + option_u64_json_len(*unattributed_tokens);
                 len += ",\"used_tokens\":".len() + decimal_len(*used_tokens);
                 len += ",\"capacity_tokens\":".len() + decimal_len(*capacity_tokens);
             }
@@ -883,29 +890,50 @@ pub enum ObservationValidationError {
     EventTooLarge { max: usize, actual: usize },
 }
 
+/// The five breakdown segments are `Option<u64>` -- a source that only
+/// observed `used_tokens`/`capacity_tokens` (see `ObservationKindV1::
+/// ContextWindowUsage`'s own doc) reports them as `None`. The segment-sum
+/// check below only runs when EVERY segment was observed: a partially
+/// unknown breakdown has nothing sound to compare against `used_tokens`,
+/// and treating a missing segment as zero would assert it was observed
+/// to be empty rather than never measured.
 fn validate_context_window_usage(
-    uncached_input_tokens: u64,
-    cache_read_tokens: u64,
-    cache_write_tokens: u64,
-    output_tokens: u64,
-    unattributed_tokens: u64,
+    uncached_input_tokens: Option<u64>,
+    cache_read_tokens: Option<u64>,
+    cache_write_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    unattributed_tokens: Option<u64>,
     used_tokens: u64,
     capacity_tokens: u64,
 ) -> Result<(), ObservationValidationError> {
     if capacity_tokens == 0 {
         return Err(ObservationValidationError::ZeroContextWindowCapacity);
     }
-    let segment_sum = uncached_input_tokens
-        .checked_add(cache_read_tokens)
-        .and_then(|sum| sum.checked_add(cache_write_tokens))
-        .and_then(|sum| sum.checked_add(output_tokens))
-        .and_then(|sum| sum.checked_add(unattributed_tokens))
-        .ok_or(ObservationValidationError::ContextWindowSegmentsOverflow)?;
-    if segment_sum != used_tokens {
-        return Err(ObservationValidationError::ContextWindowSegmentsMismatch {
-            segment_sum,
-            used_tokens,
-        });
+    if let (
+        Some(uncached_input_tokens),
+        Some(cache_read_tokens),
+        Some(cache_write_tokens),
+        Some(output_tokens),
+        Some(unattributed_tokens),
+    ) = (
+        uncached_input_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+        output_tokens,
+        unattributed_tokens,
+    ) {
+        let segment_sum = uncached_input_tokens
+            .checked_add(cache_read_tokens)
+            .and_then(|sum| sum.checked_add(cache_write_tokens))
+            .and_then(|sum| sum.checked_add(output_tokens))
+            .and_then(|sum| sum.checked_add(unattributed_tokens))
+            .ok_or(ObservationValidationError::ContextWindowSegmentsOverflow)?;
+        if segment_sum != used_tokens {
+            return Err(ObservationValidationError::ContextWindowSegmentsMismatch {
+                segment_sum,
+                used_tokens,
+            });
+        }
     }
     Ok(())
 }
@@ -1081,11 +1109,11 @@ mod tests {
         let valid = observation(
             ObservationEvidenceV1::StructuredProvider,
             ObservationKindV1::ContextWindowUsage {
-                uncached_input_tokens: 70,
-                cache_read_tokens: 20,
-                cache_write_tokens: 0,
-                output_tokens: 10,
-                unattributed_tokens: 5,
+                uncached_input_tokens: Some(70),
+                cache_read_tokens: Some(20),
+                cache_write_tokens: Some(0),
+                output_tokens: Some(10),
+                unattributed_tokens: Some(5),
                 used_tokens: 105,
                 capacity_tokens: 100,
             },
@@ -1103,11 +1131,11 @@ mod tests {
         let invalid = |kind| observation(ObservationEvidenceV1::StructuredProvider, kind);
         assert_eq!(
             invalid(ObservationKindV1::ContextWindowUsage {
-                uncached_input_tokens: 1,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
-                output_tokens: 0,
-                unattributed_tokens: 0,
+                uncached_input_tokens: Some(1),
+                cache_read_tokens: Some(0),
+                cache_write_tokens: Some(0),
+                output_tokens: Some(0),
+                unattributed_tokens: Some(0),
                 used_tokens: 1,
                 capacity_tokens: 0,
             })
@@ -1116,11 +1144,11 @@ mod tests {
         );
         assert_eq!(
             invalid(ObservationKindV1::ContextWindowUsage {
-                uncached_input_tokens: 1,
-                cache_read_tokens: 1,
-                cache_write_tokens: 1,
-                output_tokens: 1,
-                unattributed_tokens: 1,
+                uncached_input_tokens: Some(1),
+                cache_read_tokens: Some(1),
+                cache_write_tokens: Some(1),
+                output_tokens: Some(1),
+                unattributed_tokens: Some(1),
                 used_tokens: 4,
                 capacity_tokens: 1,
             })
@@ -1132,11 +1160,11 @@ mod tests {
         );
         assert_eq!(
             invalid(ObservationKindV1::ContextWindowUsage {
-                uncached_input_tokens: u64::MAX,
-                cache_read_tokens: 1,
-                cache_write_tokens: 0,
-                output_tokens: 0,
-                unattributed_tokens: 0,
+                uncached_input_tokens: Some(u64::MAX),
+                cache_read_tokens: Some(1),
+                cache_write_tokens: Some(0),
+                output_tokens: Some(0),
+                unattributed_tokens: Some(0),
                 used_tokens: u64::MAX,
                 capacity_tokens: 1,
             })
@@ -1146,13 +1174,62 @@ mod tests {
     }
 
     #[test]
+    fn context_window_usage_with_unobserved_breakdown_skips_the_segment_check() {
+        // `ProviderEvent::UsageUpdated` only ever carries `used_tokens`/
+        // `context_window` -- the five breakdown segments arrive as `None`
+        // and the segment-sum check does not run against them: there is
+        // nothing sound to compare, and defaulting a missing segment to
+        // zero would assert it was observed to be empty rather than never
+        // measured at all.
+        let unobserved = observation(
+            ObservationEvidenceV1::StructuredProvider,
+            ObservationKindV1::ContextWindowUsage {
+                uncached_input_tokens: None,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                output_tokens: None,
+                unattributed_tokens: None,
+                used_tokens: 12_345,
+                capacity_tokens: 200_000,
+            },
+        );
+        unobserved
+            .validate()
+            .expect("used/capacity alone is still a truthful fact");
+        let encoded = serde_json::to_vec(&unobserved).expect("serialize unobserved usage");
+        assert_eq!(unobserved.json_encoded_len(), encoded.len());
+        assert_eq!(
+            serde_json::from_slice::<ObservationV1>(&encoded).unwrap(),
+            unobserved
+        );
+
+        assert_eq!(
+            observation(
+                ObservationEvidenceV1::StructuredProvider,
+                ObservationKindV1::ContextWindowUsage {
+                    uncached_input_tokens: None,
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                    output_tokens: None,
+                    unattributed_tokens: None,
+                    used_tokens: 1,
+                    capacity_tokens: 0,
+                },
+            )
+            .validate(),
+            Err(ObservationValidationError::ZeroContextWindowCapacity),
+            "capacity is still required even with an unobserved breakdown"
+        );
+    }
+
+    #[test]
     fn context_window_usage_requires_structured_provider_for_validate_and_serde() {
         let kind = ObservationKindV1::ContextWindowUsage {
-            uncached_input_tokens: 70,
-            cache_read_tokens: 20,
-            cache_write_tokens: 0,
-            output_tokens: 10,
-            unattributed_tokens: 5,
+            uncached_input_tokens: Some(70),
+            cache_read_tokens: Some(20),
+            cache_write_tokens: Some(0),
+            output_tokens: Some(10),
+            unattributed_tokens: Some(5),
             used_tokens: 105,
             capacity_tokens: 100,
         };
@@ -1335,11 +1412,11 @@ mod tests {
                 // so a pty hint is turned away before evidence class is
                 // even considered as a general question.
                 ObservationKindV1::ContextWindowUsage {
-                    uncached_input_tokens: 1,
-                    cache_read_tokens: 0,
-                    cache_write_tokens: 0,
-                    output_tokens: 0,
-                    unattributed_tokens: 0,
+                    uncached_input_tokens: Some(1),
+                    cache_read_tokens: Some(0),
+                    cache_write_tokens: Some(0),
+                    output_tokens: Some(0),
+                    unattributed_tokens: Some(0),
                     used_tokens: 1,
                     capacity_tokens: 1,
                 },

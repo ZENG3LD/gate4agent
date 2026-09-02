@@ -388,6 +388,74 @@ impl HarnessOperatorClient {
         }
     }
 
+    /// Answers a pending ACP interaction (`ObservationKindV1::
+    /// ApprovalRequested`/`QuestionRequested`'s `correlation_id`, also
+    /// carried on the matching `InteractionPrompt` agent-stream chunk) --
+    /// relays to the same C2 `NodeRequest` the four ACP control verbs share.
+    /// See `HarnessOperatorRequestV1::ResolveInteraction`'s doc comment for
+    /// why this is answered blind without the live interaction's own
+    /// `HarnessProviderInteractionKindV1` on this side of the wire.
+    pub fn resolve_interaction(
+        &self,
+        session: HarnessRuntimeSessionAddressV1,
+        correlation_id: String,
+        response: HarnessProviderInteractionResponseV1,
+    ) -> Result<(), HarnessOperatorClientError> {
+        match self.send(HarnessOperatorRequestV1::ResolveInteraction {
+            session,
+            correlation_id,
+            response,
+        })? {
+            HarnessOperatorResponseV1::InteractionResolved => Ok(()),
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Switches an already-live ACP session's mode -- `mode_id` is one of
+    /// the ids the session's own `ModeCatalog` agent-stream chunk offered.
+    pub fn set_session_mode(
+        &self,
+        session: HarnessRuntimeSessionAddressV1,
+        mode_id: String,
+    ) -> Result<(), HarnessOperatorClientError> {
+        match self.send(HarnessOperatorRequestV1::SetSessionMode { session, mode_id })? {
+            HarnessOperatorResponseV1::SessionModeSet => Ok(()),
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Sets one ACP config option on an already-live session -- `option_id`
+    /// and `value_json` are one of the entries the session's own
+    /// `ConfigOptions` agent-stream chunk offered.
+    pub fn set_session_config_option(
+        &self,
+        session: HarnessRuntimeSessionAddressV1,
+        option_id: String,
+        value_json: String,
+    ) -> Result<(), HarnessOperatorClientError> {
+        match self.send(HarnessOperatorRequestV1::SetSessionConfigOption {
+            session,
+            option_id,
+            value_json,
+        })? {
+            HarnessOperatorResponseV1::SessionConfigOptionSet => Ok(()),
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Switches an already-live ACP session's model -- `model_id` is one of
+    /// the ids the session's own `ModelCatalog` agent-stream chunk offered.
+    pub fn set_session_model(
+        &self,
+        session: HarnessRuntimeSessionAddressV1,
+        model_id: String,
+    ) -> Result<(), HarnessOperatorClientError> {
+        match self.send(HarnessOperatorRequestV1::SetSessionModel { session, model_id })? {
+            HarnessOperatorResponseV1::SessionModelSet => Ok(()),
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
     pub fn tasks_list(
         &self,
         after_task_id: Option<HarnessTaskId>,
@@ -1283,6 +1351,47 @@ impl HarnessOperatorClient {
         Ok(HarnessTerminalSubscription { reader: BufReader::new(stream) })
     }
 
+    /// Content-stream counterpart to `subscribe_terminal` immediately above
+    /// -- same "opens a long-lived, server-push subscription, dropping it is
+    /// the only unsubscribe" framing, on its own connection, carrying
+    /// `HarnessOperatorAgentEventV1` instead: see that type's own doc
+    /// comment for why agent-stream chunks get their own subscription rather
+    /// than riding `subscribe_events`'s or `subscribe_terminal`'s queue.
+    /// `sessions` is declared once, at subscribe time, the same as
+    /// `subscribe_terminal`'s own `sessions` argument.
+    pub fn subscribe_agent_stream(
+        &self,
+        sessions: Vec<HarnessRuntimeSessionAddressV1>,
+    ) -> Result<HarnessAgentStreamSubscription, HarnessOperatorClientError> {
+        let request = HarnessOperatorRequestV1::SubscribeAgentStream { sessions };
+        request.validate()?;
+        let envelope = HarnessOperatorEnvelopeV1 {
+            version: HARNESS_OPERATOR_WIRE_VERSION,
+            credential: self.credential.clone(),
+            request,
+        };
+        envelope.validate()?;
+        let mut encoded = serde_json::to_vec(&envelope)
+            .map_err(|_| HarnessOperatorClientError::Encoding)?;
+        if encoded.len() >= HARNESS_OPERATOR_REQUEST_MAX_BYTES {
+            return Err(HarnessOperatorClientError::RequestTooLarge);
+        }
+        encoded.push(b'\n');
+
+        let mut stream = TcpStream::connect_timeout(&self.endpoint, self.deadline)
+            .map_err(map_operator_connect_error)?;
+        stream.set_write_timeout(Some(self.deadline))
+            .map_err(|_| HarnessOperatorClientError::Transport)?;
+        stream.write_all(&encoded).map_err(map_operator_io_error)?;
+        stream.shutdown(Shutdown::Write)
+            .map_err(|_| HarnessOperatorClientError::Transport)?;
+
+        // Deliberately no read timeout, same reasoning as `subscribe_terminal`
+        // above: `HarnessAgentStreamSubscription::next_event` blocks until
+        // the host pushes a frame or the connection ends.
+        Ok(HarnessAgentStreamSubscription { reader: BufReader::new(stream) })
+    }
+
     fn send_mutation(
         &self,
         request: HarnessOperatorRequestV1,
@@ -1355,6 +1464,14 @@ impl HarnessOperatorClient {
                 | HarnessOperatorRequestV1::PasteSession { .. }
                 | HarnessOperatorRequestV1::RemoveSession { .. }
                 | HarnessOperatorRequestV1::ResumeSession { .. }
+                // The four ACP control verbs: relayed the same direct,
+                // no-CAS way as the eight session-control verbs above (see
+                // `HarnessOperatorRequestV1::ResolveInteraction`'s doc
+                // comment), so they share this deadline too.
+                | HarnessOperatorRequestV1::ResolveInteraction { .. }
+                | HarnessOperatorRequestV1::SetSessionMode { .. }
+                | HarnessOperatorRequestV1::SetSessionConfigOption { .. }
+                | HarnessOperatorRequestV1::SetSessionModel { .. }
         ) {
             HARNESS_SESSION_CONTROL_DEADLINE
         } else {
@@ -1489,6 +1606,42 @@ impl HarnessTerminalSubscription {
     /// owns it.
     pub fn try_clone_canceler(&self) -> std::io::Result<TcpStream> {
         self.reader.get_ref().try_clone()
+    }
+}
+
+/// A live `SubscribeAgentStream` connection: see
+/// `HarnessOperatorClient::subscribe_agent_stream`.
+/// `HarnessEventSubscription`/`HarnessTerminalSubscription`'s exact sibling
+/// over `HarnessOperatorAgentEventV1` instead. Dropping this value closes
+/// the socket, which is the wire's only representable unsubscribe.
+pub struct HarnessAgentStreamSubscription {
+    reader: BufReader<TcpStream>,
+}
+
+impl HarnessAgentStreamSubscription {
+    /// Blocks until the next pushed frame arrives, or returns an error once
+    /// the connection ends -- `HarnessEventSubscription::next_event`'s own
+    /// doc comment applies verbatim here, including the "sniff for an
+    /// ordinary reply first" reasoning (an auth failure or an over-limit
+    /// subscribe both still reply with the usual single-frame
+    /// `HarnessOperatorReplyV1::Error` before closing).
+    pub fn next_event(&mut self) -> Result<HarnessOperatorAgentEventV1, HarnessOperatorClientError> {
+        let line = read_operator_bounded_line(&mut self.reader, HARNESS_OPERATOR_RESPONSE_MAX_BYTES)?;
+        let value: serde_json::Value = serde_json::from_slice(&line)
+            .map_err(HarnessOperatorClientError::MalformedResponse)?;
+        if value.get("status").is_some() {
+            let reply: HarnessOperatorReplyV1 = serde_json::from_value(value)
+                .map_err(HarnessOperatorClientError::MalformedResponse)?;
+            reply.validate()?;
+            return match reply {
+                HarnessOperatorReplyV1::Error { error } => Err(HarnessOperatorClientError::Host(error)),
+                HarnessOperatorReplyV1::Ok { .. } => Err(HarnessOperatorClientError::UnexpectedResponse),
+            };
+        }
+        let event: HarnessOperatorAgentEventV1 = serde_json::from_value(value)
+            .map_err(HarnessOperatorClientError::MalformedResponse)?;
+        event.validate()?;
+        Ok(event)
     }
 }
 

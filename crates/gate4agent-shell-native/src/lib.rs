@@ -634,6 +634,30 @@ impl NativeEffectShell {
                         response,
                     )
                 }
+                ControlEffect::SetSessionMode { mode_id } => {
+                    set_acp_session_mode_observation(
+                        self.acp_sessions.get(&key).map(|owned| &owned.session),
+                        mode_id,
+                    )
+                    .await
+                }
+                ControlEffect::SetSessionConfigOption {
+                    option_id,
+                    value_json,
+                } => {
+                    set_acp_session_config_option_observation(
+                        self.acp_sessions.get(&key).map(|owned| &owned.session),
+                        option_id,
+                        value_json,
+                    )
+                    .await
+                }
+                ControlEffect::SetSessionModel { model_id } => {
+                    set_acp_session_model_observation(
+                        self.acp_sessions.get(&key).map(|owned| &owned.session),
+                        model_id,
+                    )
+                }
                 ControlEffect::Resize { size } if !size.is_valid() => {
                     ControlObservation::ResizeFailed {
                         message: "terminal size is outside the supported range".to_owned(),
@@ -2424,6 +2448,122 @@ fn resolve_acp_permission_interaction(
     session.resolve_pending_request_as(id, choice).map_err(|error| error.to_string())
 }
 
+/// Resolve a `ControlEffect::SetSessionMode` against a live ACP session's
+/// own advertised mode catalogue, naming exactly why it could not be
+/// routed when it could not be -- same refusal-by-name discipline as
+/// [`resolve_acp_interaction_observation`].
+///
+/// There is no `supports_*` probe for session modes (unlike
+/// `AcpSession::supports_session_list` and its siblings): the ACP
+/// `sessionCapabilities` flags block carries no `modes` key at all, so the
+/// mode catalogue seeded at handshake (`AcpSession::available_modes`) IS
+/// the capability signal -- empty means the agent never advertised any
+/// modes, non-empty-but-missing-this-id means it advertised modes but not
+/// this one.
+async fn set_acp_session_mode_observation(
+    session: Option<&AcpSession>,
+    mode_id: String,
+) -> ControlObservation {
+    let Some(session) = session else {
+        return ControlObservation::SessionModeSetFailed {
+            message: "session mode switch requires an ACP session".to_owned(),
+        };
+    };
+    let catalogue = session.available_modes();
+    if catalogue.is_empty() {
+        return ControlObservation::SessionModeSetFailed {
+            message: "the provider announces no session-mode capability".to_owned(),
+        };
+    }
+    if !catalogue.iter().any(|mode| mode.id == mode_id) {
+        return ControlObservation::SessionModeSetFailed {
+            message: format!("the provider never offered mode {mode_id:?}"),
+        };
+    }
+    match session.set_mode(&mode_id).await {
+        Ok(()) => ControlObservation::SessionModeSet { mode_id },
+        Err(error) => ControlObservation::SessionModeSetFailed {
+            message: error.to_string(),
+        },
+    }
+}
+
+/// Resolve a `ControlEffect::SetSessionConfigOption` against a live ACP
+/// session's own advertised config-option catalogue -- same capability
+/// reasoning as [`set_acp_session_mode_observation`] (no dedicated
+/// `supports_*` probe; the catalogue seeded at handshake, `AcpSession::
+/// config_options`, is the capability signal).
+///
+/// `value_json` arrives already validated as parseable JSON at the wire
+/// boundary (`gate4agent-node-protocol`'s `deserialize_acp_config_value_
+/// json`) and bounds-checked again at the engine
+/// (`gate4agent_types::validate_session_config_value_json`), but is only
+/// ever carried as text up to here -- `gate4agent-types` does not depend on
+/// `serde_json`. Parsing it into the `serde_json::Value` `AcpSession::
+/// set_config_option` actually takes is this function's job; the target
+/// type is inferred from that call rather than named directly, so this
+/// crate never needs its own `serde_json` dependency.
+async fn set_acp_session_config_option_observation(
+    session: Option<&AcpSession>,
+    option_id: String,
+    value_json: String,
+) -> ControlObservation {
+    let Some(session) = session else {
+        return ControlObservation::SessionConfigOptionSetFailed {
+            message: "session config-option switch requires an ACP session".to_owned(),
+        };
+    };
+    let catalogue = session.config_options();
+    if catalogue.is_empty() {
+        return ControlObservation::SessionConfigOptionSetFailed {
+            message: "the provider announces no session config-option capability".to_owned(),
+        };
+    }
+    if !catalogue.iter().any(|option| option.id == option_id) {
+        return ControlObservation::SessionConfigOptionSetFailed {
+            message: format!("the provider never offered config option {option_id:?}"),
+        };
+    }
+    let value = match value_json.parse() {
+        Ok(value) => value,
+        Err(error) => {
+            return ControlObservation::SessionConfigOptionSetFailed {
+                message: format!("session config option value is not valid JSON: {error}"),
+            }
+        }
+    };
+    match session.set_config_option(&option_id, value).await {
+        Ok(()) => ControlObservation::SessionConfigOptionSet { option_id },
+        Err(error) => ControlObservation::SessionConfigOptionSetFailed {
+            message: error.to_string(),
+        },
+    }
+}
+
+/// Resolve a `ControlEffect::SetSessionModel`. Unlike session modes and
+/// config options, `AcpSession` exposes no setter at all for this --
+/// `available_models`/`current_model_id` observe Grok's vendor `_x.ai/
+/// models/update` catalogue, but no live capture has ever shown a
+/// host-invocable RPC to request a switch (ACP proper has no `session/
+/// set_model`, and no vendor extension for one has been verified). Refuses
+/// by name rather than fabricate a call the crate documented it would
+/// never invent -- see `ControlCommand::SetSessionModel`'s doc comment.
+fn set_acp_session_model_observation(
+    session: Option<&AcpSession>,
+    model_id: String,
+) -> ControlObservation {
+    if session.is_none() {
+        return ControlObservation::SessionModelSetFailed {
+            message: "session model switch requires an ACP session".to_owned(),
+        };
+    }
+    ControlObservation::SessionModelSetFailed {
+        message: format!(
+            "this provider offers no host-invocable model-switch method (requested model {model_id:?})"
+        ),
+    }
+}
+
 fn provider_event(event: AgentEvent) -> Option<ProviderEvent> {
     match event {
         AgentEvent::SessionStart {
@@ -2808,6 +2948,11 @@ fn effect_failure(effect: &ControlEffect, message: String) -> ControlObservation
                 message,
             }
         }
+        ControlEffect::SetSessionMode { .. } => ControlObservation::SessionModeSetFailed { message },
+        ControlEffect::SetSessionConfigOption { .. } => {
+            ControlObservation::SessionConfigOptionSetFailed { message }
+        }
+        ControlEffect::SetSessionModel { .. } => ControlObservation::SessionModelSetFailed { message },
         ControlEffect::Resize { .. } => ControlObservation::ResizeFailed { message },
         ControlEffect::ObserveForeground => ControlObservation::ForegroundFailed { message },
         ControlEffect::ProbeCapabilities { .. } => ControlObservation::CapabilityProbeFailed {

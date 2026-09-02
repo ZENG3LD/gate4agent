@@ -3,7 +3,8 @@
 use gate4agent_types::{
     normalize_semantic_prompt, prepare_agent_command, prepare_input, prepare_shell_command,
     validate_candidate_id, validate_capability_models, validate_history_error,
-    validate_resume_error, ActiveProviderTool, AdapterFamily, AgentInstanceId,
+    validate_resume_error, validate_session_config_value_json, validate_session_control_id,
+    ActiveProviderTool, AdapterFamily, AgentInstanceId,
     CapabilityProbeRequest,
     CapabilitySnapshot, CommandEnvelope, CommandId, ControlCommand, ControlEffect, ControlError,
     ControlEvent, ControlEventKind, ControlHealth, ControlObservation, ControlSnapshot,
@@ -214,6 +215,19 @@ impl Gate4AgentEngine {
                 interaction_id,
                 response,
             ),
+            ControlCommand::SetSessionMode {
+                instance_id,
+                mode_id,
+            } => self.set_session_mode(command_id, instance_id, mode_id),
+            ControlCommand::SetSessionConfigOption {
+                instance_id,
+                option_id,
+                value_json,
+            } => self.set_session_config_option(command_id, instance_id, option_id, value_json),
+            ControlCommand::SetSessionModel {
+                instance_id,
+                model_id,
+            } => self.set_session_model(command_id, instance_id, model_id),
             ControlCommand::IngestProvider {
                 instance_id,
                 generation,
@@ -391,6 +405,21 @@ impl Gate4AgentEngine {
                     SessionStatus::Running,
                     ControlObservation::InteractionResolutionCompleted { .. }
                         | ControlObservation::InteractionResolutionFailed { .. },
+                )
+                | (
+                    SessionStatus::Running,
+                    ControlObservation::SessionModeSet { .. }
+                        | ControlObservation::SessionModeSetFailed { .. },
+                )
+                | (
+                    SessionStatus::Running,
+                    ControlObservation::SessionConfigOptionSet { .. }
+                        | ControlObservation::SessionConfigOptionSetFailed { .. },
+                )
+                | (
+                    SessionStatus::Running,
+                    ControlObservation::SessionModelSet { .. }
+                        | ControlObservation::SessionModelSetFailed { .. },
                 )
                 | (
                     SessionStatus::Running | SessionStatus::Stopping,
@@ -1259,6 +1288,36 @@ impl Gate4AgentEngine {
                 session.pending_operation = None;
                 invalidate_foreground(session, message.clone());
                 ControlEventKind::ForegroundFailed { message }
+            }
+            ControlObservation::SessionModeSet { mode_id } => {
+                let session = self.session_mut(instance_id);
+                session.pending_operation = None;
+                ControlEventKind::SessionModeSet { mode_id }
+            }
+            ControlObservation::SessionModeSetFailed { message } => {
+                let session = self.session_mut(instance_id);
+                session.pending_operation = None;
+                ControlEventKind::SessionModeSetFailed { message }
+            }
+            ControlObservation::SessionConfigOptionSet { option_id } => {
+                let session = self.session_mut(instance_id);
+                session.pending_operation = None;
+                ControlEventKind::SessionConfigOptionSet { option_id }
+            }
+            ControlObservation::SessionConfigOptionSetFailed { message } => {
+                let session = self.session_mut(instance_id);
+                session.pending_operation = None;
+                ControlEventKind::SessionConfigOptionSetFailed { message }
+            }
+            ControlObservation::SessionModelSet { model_id } => {
+                let session = self.session_mut(instance_id);
+                session.pending_operation = None;
+                ControlEventKind::SessionModelSet { model_id }
+            }
+            ControlObservation::SessionModelSetFailed { message } => {
+                let session = self.session_mut(instance_id);
+                session.pending_operation = None;
+                ControlEventKind::SessionModelSetFailed { message }
             }
             ControlObservation::TerminalFrame { .. }
             | ControlObservation::TerminalStale { .. }
@@ -2419,6 +2478,229 @@ impl Gate4AgentEngine {
                 operation_id,
                 interaction_id,
                 response_kind,
+            },
+        );
+        Ok(())
+    }
+
+    /// Request a switch of the session's ACP `session/set_mode` mode.
+    /// ACP-transport only, same gating shape as [`resize`](Self::resize):
+    /// the session must be `Running`, ACP-transport, and have no other
+    /// operation already pending. Whether `mode_id` is one the agent
+    /// actually offered is the shell executor's job (`AcpSession::
+    /// available_modes`), not this engine's -- it has no live catalogue of
+    /// its own to check against.
+    fn set_session_mode(
+        &mut self,
+        command_id: CommandId,
+        instance_id: AgentInstanceId,
+        mode_id: String,
+    ) -> Result<(), ControlError> {
+        validate_session_control_id("session mode id", &mode_id).map_err(|error| {
+            ControlError::InvalidSessionModeRequest {
+                message: error.to_string(),
+            }
+        })?;
+        let state = self
+            .sessions
+            .get(&instance_id)
+            .ok_or(ControlError::UnknownInstance { instance_id })?;
+        if state.snapshot.transport != TransportKind::Acp {
+            return Err(ControlError::UnsupportedTransportOperation {
+                transport: state.snapshot.transport,
+                action: "session mode switch".to_owned(),
+            });
+        }
+        if state.snapshot.status != SessionStatus::Running {
+            return Err(ControlError::InvalidTransition {
+                instance_id,
+                action: "set session mode".to_owned(),
+                status: state.snapshot.status.clone(),
+            });
+        }
+        if let Some(operation_id) = state.snapshot.pending_operation {
+            return Err(ControlError::OperationPending {
+                instance_id,
+                operation_id,
+            });
+        }
+
+        let operation_id = self.allocate_operation();
+        let generation = {
+            let state = self
+                .sessions
+                .get_mut(&instance_id)
+                .expect("validated session");
+            state.snapshot.pending_operation = Some(operation_id);
+            state.snapshot.generation
+        };
+        self.effects.push(EffectEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id,
+            instance_id,
+            generation,
+            effect: ControlEffect::SetSessionMode {
+                mode_id: mode_id.clone(),
+            },
+        });
+        self.bump_revision();
+        self.emit_event(
+            Some(command_id),
+            instance_id,
+            generation,
+            ControlEventKind::SessionModeSetRequested {
+                operation_id,
+                mode_id,
+            },
+        );
+        Ok(())
+    }
+
+    /// Request an ACP `session/set_config_option` value change. Same
+    /// gating shape as [`set_session_mode`](Self::set_session_mode);
+    /// `value_json` is carried as pre-serialized JSON text (see
+    /// `ControlCommand::SetSessionConfigOption`'s doc comment for why) and
+    /// is only bounds-checked here, never parsed -- this crate does not
+    /// depend on `serde_json`.
+    fn set_session_config_option(
+        &mut self,
+        command_id: CommandId,
+        instance_id: AgentInstanceId,
+        option_id: String,
+        value_json: String,
+    ) -> Result<(), ControlError> {
+        validate_session_control_id("session config option id", &option_id).map_err(|error| {
+            ControlError::InvalidSessionConfigOptionRequest {
+                message: error.to_string(),
+            }
+        })?;
+        validate_session_config_value_json(&value_json).map_err(|error| {
+            ControlError::InvalidSessionConfigOptionRequest {
+                message: error.to_string(),
+            }
+        })?;
+        let state = self
+            .sessions
+            .get(&instance_id)
+            .ok_or(ControlError::UnknownInstance { instance_id })?;
+        if state.snapshot.transport != TransportKind::Acp {
+            return Err(ControlError::UnsupportedTransportOperation {
+                transport: state.snapshot.transport,
+                action: "session config option switch".to_owned(),
+            });
+        }
+        if state.snapshot.status != SessionStatus::Running {
+            return Err(ControlError::InvalidTransition {
+                instance_id,
+                action: "set session config option".to_owned(),
+                status: state.snapshot.status.clone(),
+            });
+        }
+        if let Some(operation_id) = state.snapshot.pending_operation {
+            return Err(ControlError::OperationPending {
+                instance_id,
+                operation_id,
+            });
+        }
+
+        let operation_id = self.allocate_operation();
+        let generation = {
+            let state = self
+                .sessions
+                .get_mut(&instance_id)
+                .expect("validated session");
+            state.snapshot.pending_operation = Some(operation_id);
+            state.snapshot.generation
+        };
+        self.effects.push(EffectEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id,
+            instance_id,
+            generation,
+            effect: ControlEffect::SetSessionConfigOption {
+                option_id: option_id.clone(),
+                value_json,
+            },
+        });
+        self.bump_revision();
+        self.emit_event(
+            Some(command_id),
+            instance_id,
+            generation,
+            ControlEventKind::SessionConfigOptionSetRequested {
+                operation_id,
+                option_id,
+            },
+        );
+        Ok(())
+    }
+
+    /// Request a switch of the session's active model via a provider vendor
+    /// extension. Same gating shape as [`set_session_mode`](Self::set_session_mode);
+    /// see `ControlCommand::SetSessionModel`'s doc comment for why this is
+    /// wired end to end despite no current shell executor being able to
+    /// honor it for any known provider.
+    fn set_session_model(
+        &mut self,
+        command_id: CommandId,
+        instance_id: AgentInstanceId,
+        model_id: String,
+    ) -> Result<(), ControlError> {
+        validate_session_control_id("session model id", &model_id).map_err(|error| {
+            ControlError::InvalidSessionModelRequest {
+                message: error.to_string(),
+            }
+        })?;
+        let state = self
+            .sessions
+            .get(&instance_id)
+            .ok_or(ControlError::UnknownInstance { instance_id })?;
+        if state.snapshot.transport != TransportKind::Acp {
+            return Err(ControlError::UnsupportedTransportOperation {
+                transport: state.snapshot.transport,
+                action: "session model switch".to_owned(),
+            });
+        }
+        if state.snapshot.status != SessionStatus::Running {
+            return Err(ControlError::InvalidTransition {
+                instance_id,
+                action: "set session model".to_owned(),
+                status: state.snapshot.status.clone(),
+            });
+        }
+        if let Some(operation_id) = state.snapshot.pending_operation {
+            return Err(ControlError::OperationPending {
+                instance_id,
+                operation_id,
+            });
+        }
+
+        let operation_id = self.allocate_operation();
+        let generation = {
+            let state = self
+                .sessions
+                .get_mut(&instance_id)
+                .expect("validated session");
+            state.snapshot.pending_operation = Some(operation_id);
+            state.snapshot.generation
+        };
+        self.effects.push(EffectEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id,
+            instance_id,
+            generation,
+            effect: ControlEffect::SetSessionModel {
+                model_id: model_id.clone(),
+            },
+        });
+        self.bump_revision();
+        self.emit_event(
+            Some(command_id),
+            instance_id,
+            generation,
+            ControlEventKind::SessionModelSetRequested {
+                operation_id,
+                model_id,
             },
         );
         Ok(())

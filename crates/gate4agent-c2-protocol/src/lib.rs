@@ -957,6 +957,19 @@ pub enum C2ControlEventKind {
     InteractionResolutionRequested,
     InteractionResolutionFailed,
     InteractionResolved,
+    // The nine session-control tags below are the same shape as the
+    // interaction trio above: this projection carries WHICH kind of thing
+    // happened, never the mode/option/model id it happened to. An id is
+    // the session's own vocabulary and has no business on a relay wire.
+    SessionModeSetRequested,
+    SessionModeSet,
+    SessionModeSetFailed,
+    SessionConfigOptionSetRequested,
+    SessionConfigOptionSet,
+    SessionConfigOptionSetFailed,
+    SessionModelSetRequested,
+    SessionModelSet,
+    SessionModelSetFailed,
     Exited { exit_code: Option<i32>, forced: bool },
     Failed,
     Removed,
@@ -1002,6 +1015,15 @@ impl From<&gate4agent_types::ControlEvent> for C2ControlEvent {
             ControlEventKind::InteractionResolutionRequested { .. } => C2ControlEventKind::InteractionResolutionRequested,
             ControlEventKind::InteractionResolutionFailed { .. } => C2ControlEventKind::InteractionResolutionFailed,
             ControlEventKind::InteractionResolved { .. } => C2ControlEventKind::InteractionResolved,
+            ControlEventKind::SessionModeSetRequested { .. } => C2ControlEventKind::SessionModeSetRequested,
+            ControlEventKind::SessionModeSet { .. } => C2ControlEventKind::SessionModeSet,
+            ControlEventKind::SessionModeSetFailed { .. } => C2ControlEventKind::SessionModeSetFailed,
+            ControlEventKind::SessionConfigOptionSetRequested { .. } => C2ControlEventKind::SessionConfigOptionSetRequested,
+            ControlEventKind::SessionConfigOptionSet { .. } => C2ControlEventKind::SessionConfigOptionSet,
+            ControlEventKind::SessionConfigOptionSetFailed { .. } => C2ControlEventKind::SessionConfigOptionSetFailed,
+            ControlEventKind::SessionModelSetRequested { .. } => C2ControlEventKind::SessionModelSetRequested,
+            ControlEventKind::SessionModelSet { .. } => C2ControlEventKind::SessionModelSet,
+            ControlEventKind::SessionModelSetFailed { .. } => C2ControlEventKind::SessionModelSetFailed,
             ControlEventKind::Exited { exit_code, forced } => C2ControlEventKind::Exited {
                 exit_code: *exit_code,
                 forced: *forced,

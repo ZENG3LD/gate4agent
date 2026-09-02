@@ -56,6 +56,7 @@ pub use control::{
     PROVIDER_SUBAGENTS_MAX, PTY_SCREEN_GATE_NAME_MAX_BYTES, TERMINAL_COLUMNS_MAX,
     TERMINAL_ROWS_MAX, WORKING_DIRECTORY_MAX_BYTES,
 };
+pub use control::{validate_session_config_value_json, validate_session_control_id};
 pub use executable::normalize_executable_name;
 pub use history::{
     validate_candidate_id, validate_history_error, validate_native_session_id,

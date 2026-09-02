@@ -24,7 +24,9 @@ use gate4agent_harness_client::{
     HARNESS_RUNTIME_INVENTORY_PAGE_LIMIT_MAX,
 };
 use gate4agent_harness_api::{
-    HarnessExecutionModeV1, HarnessRuntimeSessionAddressV1, HarnessRuntimeTerminalSizeV1,
+    HarnessAgentStreamChunkKindV1, HarnessAgentStreamNamedIdV1, HarnessExecutionModeV1,
+    HarnessOperatorAgentEventV1, HarnessProviderInteractionResponseV1, HarnessRuntimeSessionAddressV1,
+    HarnessRuntimeTerminalSizeV1,
 };
 
 const HARNESS_OPERATOR_TOKEN_ENV: &str = "GATE4AGENT_HARNESS_OPERATOR_TOKEN";
@@ -50,7 +52,12 @@ fn usage() -> &'static str {
      \x20 monitor RUN_ID\n\
      \x20 workspace inspect NODE_ID WORKSPACE_ID\n\
      \x20 session spawn NODE_ID WORKSPACE_ID PROVIDER [--profile ID] [--mode pty|inline] [--rows N] [--cols N]\n\
-     \x20 session stop NODE_ID INCARNATION_ID WORKSPACE_ID INSTANCE_ID GENERATION [--force yes]"
+     \x20 session stop NODE_ID INCARNATION_ID WORKSPACE_ID INSTANCE_ID GENERATION [--force yes]\n\
+     \x20 session resolve-interaction NODE_ID INCARNATION_ID WORKSPACE_ID INSTANCE_ID GENERATION CORRELATION_ID --response approve|deny|answer [--answer TEXT]\n\
+     \x20 session set-mode NODE_ID INCARNATION_ID WORKSPACE_ID INSTANCE_ID GENERATION MODE_ID\n\
+     \x20 session set-model NODE_ID INCARNATION_ID WORKSPACE_ID INSTANCE_ID GENERATION MODEL_ID\n\
+     \x20 session set-config-option NODE_ID INCARNATION_ID WORKSPACE_ID INSTANCE_ID GENERATION OPTION_ID --value-json JSON\n\
+     \x20 session subscribe NODE_ID INCARNATION_ID WORKSPACE_ID INSTANCE_ID GENERATION [...more session groups] [--verbose yes]"
 }
 
 #[derive(Debug)]
@@ -104,6 +111,19 @@ enum Command {
         cols: u16,
     },
     SessionStop { session: HarnessRuntimeSessionAddressV1, force: bool },
+    SessionResolveInteraction {
+        session: HarnessRuntimeSessionAddressV1,
+        correlation_id: String,
+        response: HarnessProviderInteractionResponseV1,
+    },
+    SessionSetMode { session: HarnessRuntimeSessionAddressV1, mode_id: String },
+    SessionSetConfigOption {
+        session: HarnessRuntimeSessionAddressV1,
+        option_id: String,
+        value_json: String,
+    },
+    SessionSetModel { session: HarnessRuntimeSessionAddressV1, model_id: String },
+    SessionSubscribe { sessions: Vec<HarnessRuntimeSessionAddressV1>, verbose: bool },
 }
 
 enum Verb {
@@ -124,6 +144,11 @@ enum Verb {
     WorkspaceInspect,
     SessionSpawn,
     SessionStop,
+    SessionResolveInteraction,
+    SessionSetMode,
+    SessionSetConfigOption,
+    SessionSetModel,
+    SessionSubscribe,
 }
 
 fn resolve_verb(args: &[String]) -> Result<(Verb, usize), String> {
@@ -148,6 +173,11 @@ fn resolve_verb(args: &[String]) -> Result<(Verb, usize), String> {
         Some("session") => match args.get(2).map(String::as_str) {
             Some("spawn") => Ok((Verb::SessionSpawn, 2)),
             Some("stop") => Ok((Verb::SessionStop, 2)),
+            Some("resolve-interaction") => Ok((Verb::SessionResolveInteraction, 2)),
+            Some("set-mode") => Ok((Verb::SessionSetMode, 2)),
+            Some("set-config-option") => Ok((Verb::SessionSetConfigOption, 2)),
+            Some("set-model") => Ok((Verb::SessionSetModel, 2)),
+            Some("subscribe") => Ok((Verb::SessionSubscribe, 2)),
             _ => Err(usage().to_owned()),
         },
         Some("workspace") if args.get(2).map(String::as_str) == Some("inspect") => {
@@ -225,6 +255,37 @@ fn expect_two_positionals(
     let second = positionals.remove(1);
     let first = positionals.remove(0);
     Ok((first, second))
+}
+
+/// Drains the leading `NODE_ID INCARNATION_ID WORKSPACE_ID INSTANCE_ID
+/// GENERATION` quintuple every session-address subcommand shares --
+/// `session spawn`/`session stop`'s own addressing, factored out so the four
+/// new session verbs and `session subscribe`'s repeatable groups address a
+/// session the same way.
+fn take_session_address_prefix(
+    positionals: &mut Vec<String>,
+) -> Result<HarnessRuntimeSessionAddressV1, String> {
+    if positionals.len() < 5 {
+        return Err(
+            "expected at least <node-id> <incarnation-id> <workspace-id> <instance-id> <generation>"
+                .to_owned(),
+        );
+    }
+    let mut drained = positionals.drain(..5);
+    let node_id = drained.next().expect("length checked above");
+    let incarnation_id = drained.next().expect("length checked above");
+    let workspace_id = drained.next().expect("length checked above");
+    let instance_id = drained
+        .next()
+        .expect("length checked above")
+        .parse()
+        .map_err(|_| "INSTANCE_ID must be a u64".to_owned())?;
+    let generation = drained
+        .next()
+        .expect("length checked above")
+        .parse()
+        .map_err(|_| "GENERATION must be a u64".to_owned())?;
+    Ok(HarnessRuntimeSessionAddressV1 { node_id, incarnation_id, workspace_id, instance_id, generation })
 }
 
 fn parse_task_id(value: String) -> Result<HarnessTaskId, String> {
@@ -425,6 +486,54 @@ fn build_command(
                 },
                 force,
             })
+        }
+        Verb::SessionResolveInteraction => {
+            let session = take_session_address_prefix(positionals)?;
+            let correlation_id = expect_single_positional(positionals, "correlation-id")?;
+            let response_kind = require_flag(flags, "response")?;
+            let response = match response_kind.as_str() {
+                "approve" => HarnessProviderInteractionResponseV1::ApproveOnce,
+                "deny" => HarnessProviderInteractionResponseV1::Deny,
+                "answer" => {
+                    let text = require_flag(flags, "answer")?;
+                    HarnessProviderInteractionResponseV1::Answer { text }
+                }
+                other => {
+                    return Err(format!("--response must be approve, deny, or answer, got {other}"))
+                }
+            };
+            Ok(Command::SessionResolveInteraction { session, correlation_id, response })
+        }
+        Verb::SessionSetMode => {
+            let session = take_session_address_prefix(positionals)?;
+            let mode_id = expect_single_positional(positionals, "mode-id")?;
+            Ok(Command::SessionSetMode { session, mode_id })
+        }
+        Verb::SessionSetConfigOption => {
+            let session = take_session_address_prefix(positionals)?;
+            let option_id = expect_single_positional(positionals, "option-id")?;
+            let value_json = require_flag(flags, "value-json")?;
+            Ok(Command::SessionSetConfigOption { session, option_id, value_json })
+        }
+        Verb::SessionSetModel => {
+            let session = take_session_address_prefix(positionals)?;
+            let model_id = expect_single_positional(positionals, "model-id")?;
+            Ok(Command::SessionSetModel { session, model_id })
+        }
+        Verb::SessionSubscribe => {
+            if positionals.is_empty() || positionals.len() % 5 != 0 {
+                return Err(
+                    "session subscribe expects one or more NODE_ID INCARNATION_ID WORKSPACE_ID \
+                     INSTANCE_ID GENERATION groups"
+                        .to_owned(),
+                );
+            }
+            let mut sessions = Vec::new();
+            while !positionals.is_empty() {
+                sessions.push(take_session_address_prefix(positionals)?);
+            }
+            let verbose = take_flag(flags, "verbose").is_some();
+            Ok(Command::SessionSubscribe { sessions, verbose })
         }
     }
 }
@@ -735,6 +844,139 @@ fn execute(invocation: Invocation) -> Result<String, String> {
                 .stop_session(session, force)
                 .map_err(|error| error.to_string())?;
             render(&serde_json::json!({ "stopped": true }))
+        }
+        Command::SessionResolveInteraction { session, correlation_id, response } => {
+            client
+                .resolve_interaction(session, correlation_id, response)
+                .map_err(|error| error.to_string())?;
+            render(&serde_json::json!({ "resolved": true }))
+        }
+        Command::SessionSetMode { session, mode_id } => {
+            client.set_session_mode(session, mode_id).map_err(|error| error.to_string())?;
+            render(&serde_json::json!({ "mode_set": true }))
+        }
+        Command::SessionSetConfigOption { session, option_id, value_json } => {
+            client
+                .set_session_config_option(session, option_id, value_json)
+                .map_err(|error| error.to_string())?;
+            render(&serde_json::json!({ "config_option_set": true }))
+        }
+        Command::SessionSetModel { session, model_id } => {
+            client.set_session_model(session, model_id).map_err(|error| error.to_string())?;
+            render(&serde_json::json!({ "model_set": true }))
+        }
+        Command::SessionSubscribe { sessions, verbose } => {
+            let mut subscription = client
+                .subscribe_agent_stream(sessions)
+                .map_err(|error| error.to_string())?;
+            loop {
+                let event = subscription.next_event().map_err(|error| error.to_string())?;
+                print_agent_stream_event(&event, verbose);
+            }
+        }
+    }
+}
+
+/// Colon-joined rendering of a session address for one-line-per-event
+/// output -- the same five fields `session spawn`/`session stop` take as
+/// positionals, in the same order.
+fn format_session_address(session: &HarnessRuntimeSessionAddressV1) -> String {
+    format!(
+        "{}:{}:{}:{}:{}",
+        session.node_id, session.incarnation_id, session.workspace_id, session.instance_id, session.generation,
+    )
+}
+
+/// Escapes the three control bytes `HarnessAgentStreamChunkKindV1::validate`
+/// still allows through free text (`\n`, `\r`, `\t`) so every printed event
+/// stays exactly one line -- greppability is the whole point of this
+/// printer, and an unescaped newline inside e.g. a `Text` chunk would split
+/// one event across two lines.
+fn sanitize_line(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('\n', "\\n").replace('\r', "\\r").replace('\t', "\\t")
+}
+
+fn render_named_id_catalog(available: &[HarnessAgentStreamNamedIdV1]) -> String {
+    available.iter().map(|entry| format!("{}:{}", entry.id, entry.name)).collect::<Vec<_>>().join(",")
+}
+
+/// One line per `SubscribeAgentStream` frame, printed as it arrives -- see
+/// the module-level usage text for the subcommand this backs
+/// (`session subscribe`). `ts` is `now_unix_ms()`'s wall-clock reading at
+/// print time, not anything the wire itself carries.
+fn print_agent_stream_event(event: &HarnessOperatorAgentEventV1, verbose: bool) {
+    let ts = now_unix_ms();
+    match event {
+        HarnessOperatorAgentEventV1::AgentChunk { sequence, session, chunk } => {
+            let session = format_session_address(session);
+            match &chunk.kind {
+                HarnessAgentStreamChunkKindV1::Text { text, is_delta } => {
+                    println!(
+                        "ts={ts} seq={sequence} session={session} kind=text is_delta={is_delta} text={}",
+                        sanitize_line(text),
+                    );
+                }
+                HarnessAgentStreamChunkKindV1::Thinking { text } => {
+                    println!(
+                        "ts={ts} seq={sequence} session={session} kind=thinking text={}",
+                        sanitize_line(text),
+                    );
+                }
+                HarnessAgentStreamChunkKindV1::InteractionPrompt {
+                    correlation_id,
+                    interaction_kind,
+                    tool_name,
+                    title,
+                    prompt,
+                    options,
+                } => {
+                    let title = title.as_deref().map(sanitize_line).unwrap_or_default();
+                    let options = options
+                        .iter()
+                        .map(|option| format!("{}:{}:{}", option.option_id, option.name, option.kind))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    println!(
+                        "ts={ts} seq={sequence} session={session} kind=interaction-prompt \
+                         correlation_id={correlation_id} interaction_kind={interaction_kind:?} \
+                         tool={tool_name} title={title} prompt={} options=[{options}]",
+                        sanitize_line(prompt),
+                    );
+                }
+                HarnessAgentStreamChunkKindV1::ModeCatalog { current, available } => {
+                    println!(
+                        "ts={ts} seq={sequence} session={session} kind=mode-catalog current={} available=[{}]",
+                        current.as_deref().unwrap_or("-"),
+                        render_named_id_catalog(available),
+                    );
+                }
+                HarnessAgentStreamChunkKindV1::ModelCatalog { current, available } => {
+                    println!(
+                        "ts={ts} seq={sequence} session={session} kind=model-catalog current={} available=[{}]",
+                        current.as_deref().unwrap_or("-"),
+                        render_named_id_catalog(available),
+                    );
+                }
+                HarnessAgentStreamChunkKindV1::ConfigOptions { options } => {
+                    let rendered = options
+                        .iter()
+                        .map(|option| format!("{}:{}={}", option.id, option.name, sanitize_line(&option.value_json)))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    println!(
+                        "ts={ts} seq={sequence} session={session} kind=config-options options=[{rendered}]"
+                    );
+                }
+            }
+        }
+        HarnessOperatorAgentEventV1::Lagged { sequence, session, dropped } => {
+            let session = format_session_address(session);
+            println!("ts={ts} seq={sequence} session={session} LAGGED dropped={dropped}");
+        }
+        HarnessOperatorAgentEventV1::Ping { sequence } => {
+            if verbose {
+                println!("ts={ts} seq={sequence} kind=ping");
+            }
         }
     }
 }

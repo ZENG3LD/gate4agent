@@ -836,6 +836,32 @@ pub enum ControlCommand {
         interaction_id: ProviderInteractionId,
         response: ProviderInteractionResponse,
     },
+    /// Switch the session's ACP `session/set_mode` mode. ACP-transport only;
+    /// `gate4agent-engine`'s `set_session_mode` refuses any other transport.
+    SetSessionMode {
+        instance_id: AgentInstanceId,
+        mode_id: String,
+    },
+    /// Set one ACP `session/set_config_option` value (model, reasoning
+    /// effort, ...) -- the mechanism that supersedes session modes.
+    /// `value_json` is pre-serialized JSON text, same convention as
+    /// [`ProviderConfigOption::value_json`]: this crate does not depend on
+    /// `serde_json`, so parsing it into a value is the shell executor's job.
+    SetSessionConfigOption {
+        instance_id: AgentInstanceId,
+        option_id: String,
+        value_json: String,
+    },
+    /// Switch the session's active model via a provider vendor extension
+    /// (there is no `session/set_model` in the ACP spec proper). Wired end
+    /// to end on the wire and through this command regardless of whether
+    /// the current build shell can honor it for a given provider -- see
+    /// `gate4agent-shell-native`'s `SetSessionModel` effect arm for what it
+    /// actually does today.
+    SetSessionModel {
+        instance_id: AgentInstanceId,
+        model_id: String,
+    },
     IngestProvider {
         instance_id: AgentInstanceId,
         generation: SessionGeneration,
@@ -862,6 +888,9 @@ impl ControlCommand {
             | Self::LoadHistory { instance_id, .. }
             | Self::Resume { instance_id, .. }
             | Self::ResolveInteraction { instance_id, .. }
+            | Self::SetSessionMode { instance_id, .. }
+            | Self::SetSessionConfigOption { instance_id, .. }
+            | Self::SetSessionModel { instance_id, .. }
             | Self::IngestProvider { instance_id, .. }
             | Self::Remove { instance_id } => *instance_id,
         }
@@ -944,6 +973,16 @@ pub enum ControlEffect {
         target: ProviderInteractionTarget,
         response: ProviderInteractionResponse,
     },
+    SetSessionMode {
+        mode_id: String,
+    },
+    SetSessionConfigOption {
+        option_id: String,
+        value_json: String,
+    },
+    SetSessionModel {
+        model_id: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1021,6 +1060,27 @@ pub enum ControlObservation {
     },
     InteractionResolutionFailed {
         interaction_id: ProviderInteractionId,
+        message: String,
+    },
+    /// `ControlEffect::SetSessionMode` succeeded; `mode_id` echoes back the
+    /// mode the shell executor actually confirmed with the agent (Resize's
+    /// `ResizeCompleted { size }` is the same convention).
+    SessionModeSet {
+        mode_id: String,
+    },
+    SessionModeSetFailed {
+        message: String,
+    },
+    SessionConfigOptionSet {
+        option_id: String,
+    },
+    SessionConfigOptionSetFailed {
+        message: String,
+    },
+    SessionModelSet {
+        model_id: String,
+    },
+    SessionModelSetFailed {
         message: String,
     },
     TerminalFrame {
@@ -1964,6 +2024,42 @@ fn validate_text(
     Ok(())
 }
 
+/// Bounds check for the `mode_id`/`option_id`/`model_id` an ACP session
+/// control command (`ControlCommand::SetSessionMode`/
+/// `SetSessionConfigOption`/`SetSessionModel`) carries -- the same bound as
+/// any other provider-scoped id (`PROVIDER_EVENT_ID_MAX_BYTES`), required
+/// and free of control characters. Mirrors what
+/// `gate4agent-node-protocol`'s wire boundary already enforces
+/// (`deserialize_acp_control_id`) before a command ever reaches
+/// `gate4agent-engine`; re-checked here because a `ControlCommand` is
+/// constructible directly (tests, other embedders), not only through that
+/// one wire.
+pub fn validate_session_control_id(
+    field: &'static str,
+    value: &str,
+) -> Result<(), ProviderEventValidationError> {
+    validate_required(field, value, PROVIDER_EVENT_ID_MAX_BYTES)
+}
+
+/// Bounds check for `ControlCommand::SetSessionConfigOption`'s
+/// `value_json`: required, bounded the same as any other provider-scoped
+/// free text (`PROVIDER_EVENT_TEXT_MAX_BYTES`), free of unsafe control
+/// bytes. Mirrors `gate4agent-node-protocol`'s
+/// `deserialize_acp_config_value_json` minus the JSON-parseability check --
+/// this crate is a pure data contract and does not depend on `serde_json`,
+/// so confirming the text actually parses is the shell executor's job
+/// (`AcpSession::set_config_option` takes an already-parsed
+/// `serde_json::Value`).
+pub fn validate_session_config_value_json(
+    value: &str,
+) -> Result<(), ProviderEventValidationError> {
+    validate_required_text(
+        "session config option value",
+        value,
+        PROVIDER_EVENT_TEXT_MAX_BYTES,
+    )
+}
+
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum ProviderEventValidationError {
     #[error("provider event field '{field}' is required")]
@@ -2239,6 +2335,36 @@ pub enum ControlEventKind {
         interaction_id: ProviderInteractionId,
         outcome: ProviderInteractionOutcome,
     },
+    SessionModeSetRequested {
+        operation_id: OperationId,
+        mode_id: String,
+    },
+    SessionModeSet {
+        mode_id: String,
+    },
+    SessionModeSetFailed {
+        message: String,
+    },
+    SessionConfigOptionSetRequested {
+        operation_id: OperationId,
+        option_id: String,
+    },
+    SessionConfigOptionSet {
+        option_id: String,
+    },
+    SessionConfigOptionSetFailed {
+        message: String,
+    },
+    SessionModelSetRequested {
+        operation_id: OperationId,
+        model_id: String,
+    },
+    SessionModelSet {
+        model_id: String,
+    },
+    SessionModelSetFailed {
+        message: String,
+    },
     Exited {
         exit_code: Option<i32>,
         forced: bool,
@@ -2399,6 +2525,12 @@ pub enum ControlError {
     },
     #[error("provider interaction response is invalid: {message}")]
     InvalidProviderInteractionResponse { message: String },
+    #[error("session mode request is invalid: {message}")]
+    InvalidSessionModeRequest { message: String },
+    #[error("session config option request is invalid: {message}")]
+    InvalidSessionConfigOptionRequest { message: String },
+    #[error("session model request is invalid: {message}")]
+    InvalidSessionModelRequest { message: String },
 }
 
 impl Default for ControlSnapshot {

@@ -36,6 +36,10 @@ use crate::dispatch::{
     HarnessLaunchCatalog, HarnessLifecycleEventKindV1, HarnessLifecycleProjectionV1,
     HARNESS_LAUNCH_CATALOG_MAX,
 };
+use crate::agent_stream::{
+    AgentStreamSubscriberRegistry, HOST_AGENT_STREAM_SUBSCRIBER_LIMIT,
+    HOST_AGENT_STREAM_SUBSCRIBER_QUEUE_CAPACITY,
+};
 use crate::terminal::{
     map_screen_state, terminal_frame_to_wire, TerminalBufferRegistry, TerminalSubscriberRegistry,
     HOST_TERMINAL_SUBSCRIBER_LIMIT, HOST_TERMINAL_SUBSCRIBER_QUEUE_CAPACITY,
@@ -55,6 +59,7 @@ use gate4agent_harness_api::{
     HarnessInlineRunSessionV1, HarnessManagedRunSessionV1,
     HarnessLaunchPlanPageV1, HarnessLaunchPlanSummaryV1,
     HarnessNodeIncarnationV1,
+    HarnessOperatorAgentEventV1,
     HarnessOperatorApiError,
     HarnessOperatorCredential, HarnessOperatorEnvelopeV1, HarnessOperatorEventV1,
     HarnessOperatorHostErrorV1, HarnessOperatorTerminalEventV1,
@@ -538,6 +543,20 @@ enum HostCommand {
     /// `handle_connection`'s `SubscribeTerminal` branch for the sender side.
     SubscribeTerminal {
         sender: mpsc::Sender<HarnessOperatorTerminalEventV1>,
+        sessions: HashSet<RuntimeSessionKey>,
+        identity: OperatorRequestLogIdentity,
+    },
+    /// Registers a new agent-stream-push subscriber -- the sibling of
+    /// `SubscribeTerminal` immediately above for `AgentStreamSubscriberRegistry`
+    /// rather than `TerminalSubscriberRegistry`. Also fire-and-forget, but
+    /// unlike `SubscribeTerminal` there is no per-session seed to push on
+    /// registration: `AgentStreamSubscriberRegistry` has no buffer to seed
+    /// from (see its own module doc comment in `agent_stream.rs`), so the
+    /// registration itself is the entire observable effect. See
+    /// `handle_connection`'s `SubscribeAgentStream` branch for the sender
+    /// side.
+    SubscribeAgentStream {
+        sender: mpsc::Sender<HarnessOperatorAgentEventV1>,
         sessions: HashSet<RuntimeSessionKey>,
         identity: OperatorRequestLogIdentity,
     },
@@ -2986,12 +3005,20 @@ fn map_session_spawn_node_failure(
 }
 
 /// `WriteSessionInput`/`ResizeSession`/`StopSession`/`ControlSession`/
-/// `WriteSessionBytes`/`PasteSession`/`RemoveSession`/`ResumeSession` share
-/// one C2 relay shape (`PreparedSessionControl`/`PendingSessionControl::
-/// finish`), so one mapper covers all eight -- unlike spawn, none of these
-/// carries a multi-outcome transport ambiguity worth its own host error
-/// (DECISIONS: "naturally idempotent-enough", no dedup, no `OutcomeUnknown`
-/// case here).
+/// `WriteSessionBytes`/`PasteSession`/`RemoveSession`/`ResumeSession`, plus
+/// the four ACP control verbs `ResolveInteraction`/`SetSessionMode`/
+/// `SetSessionConfigOption`/`SetSessionModel`, share one C2 relay shape
+/// (`PreparedSessionControl`/`PendingSessionControl::finish`), so one mapper
+/// covers all twelve -- unlike spawn, none of these carries a multi-outcome
+/// transport ambiguity worth its own host error (DECISIONS: "naturally
+/// idempotent-enough", no dedup, no `OutcomeUnknown` case here). Every
+/// `NodeFailureCode` the node can answer any of the twelve with is bucketed
+/// below by its own meaning (`NotFound`/`Conflict`/`Busy`/`Unavailable`/
+/// `InvalidRequest`), never collapsed wholesale into `Internal` -- the ACP
+/// verbs add no new failure codes of their own (the node refuses them with
+/// the same generic vocabulary the other eight already use), so they need
+/// no new arms here, only the wider set of callers now able to reach this
+/// mapper.
 fn map_session_control_error(error: HarnessC2Error) -> HarnessOperatorHostErrorV1 {
     match error {
         HarnessC2Error::InvalidSessionControlRequest => HarnessOperatorHostErrorV1::InvalidRequest,
@@ -3346,8 +3373,12 @@ fn is_session_spawn_request(request: &HarnessOperatorRequestV1) -> bool {
     matches!(request, HarnessOperatorRequestV1::SpawnSession { .. })
 }
 
-/// The eight thin session-control verbs sharing one C2 relay shape --
-/// `PreparedSessionControl`/`PendingSessionControl` in `c2.rs`.
+/// The twelve thin session-control verbs sharing one C2 relay shape --
+/// `PreparedSessionControl`/`PendingSessionControl` in `c2.rs` -- the eight
+/// original terminal/session-lifecycle verbs plus the four ACP control
+/// verbs (`ResolveInteraction`/`SetSessionMode`/`SetSessionConfigOption`/
+/// `SetSessionModel`), which joined the same family (see
+/// `SessionControlKind`'s own doc comment in `c2.rs`).
 fn is_session_control_request(request: &HarnessOperatorRequestV1) -> bool {
     matches!(
         request,
@@ -3359,6 +3390,10 @@ fn is_session_control_request(request: &HarnessOperatorRequestV1) -> bool {
             | HarnessOperatorRequestV1::PasteSession { .. }
             | HarnessOperatorRequestV1::RemoveSession { .. }
             | HarnessOperatorRequestV1::ResumeSession { .. }
+            | HarnessOperatorRequestV1::ResolveInteraction { .. }
+            | HarnessOperatorRequestV1::SetSessionMode { .. }
+            | HarnessOperatorRequestV1::SetSessionConfigOption { .. }
+            | HarnessOperatorRequestV1::SetSessionModel { .. }
     )
 }
 
@@ -3420,7 +3455,11 @@ impl OperatorRequestLogIdentity {
             | HarnessOperatorRequestV1::WriteSessionBytes { session, .. }
             | HarnessOperatorRequestV1::PasteSession { session, .. }
             | HarnessOperatorRequestV1::RemoveSession { session, .. }
-            | HarnessOperatorRequestV1::ResumeSession { session, .. } => (
+            | HarnessOperatorRequestV1::ResumeSession { session, .. }
+            | HarnessOperatorRequestV1::ResolveInteraction { session, .. }
+            | HarnessOperatorRequestV1::SetSessionMode { session, .. }
+            | HarnessOperatorRequestV1::SetSessionConfigOption { session, .. }
+            | HarnessOperatorRequestV1::SetSessionModel { session, .. } => (
                 Some(session.node_id.clone()),
                 Some(session.workspace_id.clone()),
                 Some(format!("{}/{}", session.instance_id, session.generation)),
@@ -3631,7 +3670,7 @@ fn session_address_from_receipt(
 }
 
 /// Picks the right unit response for a completed `SessionControlFinished`.
-/// The eight verbs share one C2 relay path and `PendingSessionControl`
+/// The twelve verbs share one C2 relay path and `PendingSessionControl`
 /// deliberately only returns `Result<(), _>` (see its doc comment), so the
 /// wire `kind` tag in `identity.operation` -- never hand-guessed, read the
 /// same way `OperatorRequestLogIdentity::describe` reads it -- is what picks
@@ -3646,6 +3685,10 @@ fn session_control_response(identity: &OperatorRequestLogIdentity) -> HarnessOpe
         "paste-session" => HarnessOperatorResponseV1::SessionPasted,
         "remove-session" => HarnessOperatorResponseV1::SessionRemoved,
         "resume-session" => HarnessOperatorResponseV1::SessionResumed,
+        "resolve-interaction" => HarnessOperatorResponseV1::InteractionResolved,
+        "set-session-mode" => HarnessOperatorResponseV1::SessionModeSet,
+        "set-session-config-option" => HarnessOperatorResponseV1::SessionConfigOptionSet,
+        "set-session-model" => HarnessOperatorResponseV1::SessionModelSet,
         other => {
             tracing::error!(operation = other, "unexpected session control operation label");
             HarnessOperatorResponseV1::SessionInputWritten
@@ -4482,10 +4525,13 @@ pub async fn start_harness_host_with_operator_and_catalogs(
     let connections = Arc::new(Semaphore::new(HOST_CONNECTION_LIMIT));
     let subscriber_connections = Arc::new(Semaphore::new(HOST_SUBSCRIBER_LIMIT));
     let terminal_subscriber_connections = Arc::new(Semaphore::new(HOST_TERMINAL_SUBSCRIBER_LIMIT));
+    let agent_stream_subscriber_connections =
+        Arc::new(Semaphore::new(HOST_AGENT_STREAM_SUBSCRIBER_LIMIT));
     let task = tokio::spawn(async move {
         let mut active_dispatch = None;
         let mut subscribers = SubscriberRegistry::default();
         let mut terminal_subscribers = TerminalSubscriberRegistry::default();
+        let mut agent_stream_subscribers = AgentStreamSubscriberRegistry::default();
         let mut harness_mcp_workers = HarnessMcpWorkerRegistry::default();
         let mut native_history_workers = NativeHistoryWorkerRegistry::default();
         let mut run_read_workers = RunReadWorkerRegistry::default();
@@ -6535,6 +6581,17 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                 }
                             }
                         }
+                        Some(HostCommand::SubscribeAgentStream { sender, sessions, identity }) => {
+                            tracing::info!(
+                                operation = %identity.operation,
+                                "harness agent stream subscriber registered",
+                            );
+                            // No seed loop here, unlike `SubscribeTerminal`
+                            // immediately above: `AgentStreamSubscriberRegistry`
+                            // has no buffer to seed from (see its own doc
+                            // comment in `agent_stream.rs`).
+                            agent_stream_subscribers.insert(sender, sessions, identity);
+                        }
                         Some(HostCommand::Shutdown { reply }) => {
                             let result = harness.flush().map_err(HarnessRuntimeError::Harness)
                                 .and_then(|_| observation.flush().map_err(HarnessRuntimeError::Observation));
@@ -6576,6 +6633,16 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                             }
                                         });
                                     }
+                                }
+                                C2NodeEvent::AgentStream { address, chunk } => {
+                                    let key = RuntimeSessionKey {
+                                        node_id: event.node_id.clone(),
+                                        incarnation_id: event.cursor.incarnation_id,
+                                        workspace_id: address.workspace_id.clone(),
+                                        instance_id: address.session.instance_id,
+                                        generation: address.session.generation,
+                                    };
+                                    agent_stream_subscribers.publish(&key, chunk);
                                 }
                                 C2NodeEvent::ResyncRequired { .. } => {
                                     terminal_buffers.invalidate(&NodeRoute {
@@ -6745,9 +6812,12 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                         &commands,
                     );
                 }
-                _ = subscriber_keepalive.tick(), if !subscribers.is_empty() || !terminal_subscribers.is_empty() => {
+                _ = subscriber_keepalive.tick(), if !subscribers.is_empty()
+                    || !terminal_subscribers.is_empty()
+                    || !agent_stream_subscribers.is_empty() => {
                     emit_subscriber_keepalive(&mut subscribers);
                     terminal_subscribers.keepalive();
+                    agent_stream_subscribers.keepalive();
                 }
                 accepted = listener.accept() => {
                     let (stream, peer) = accepted.map_err(|_| HarnessRuntimeError::AcceptFailed)?;
@@ -6758,6 +6828,8 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                     let request_subscriber_connections = subscriber_connections.clone();
                     let request_terminal_subscriber_connections =
                         terminal_subscriber_connections.clone();
+                    let request_agent_stream_subscriber_connections =
+                        agent_stream_subscriber_connections.clone();
                     tokio::spawn(async move {
                         let _ = handle_connection(
                             stream,
@@ -6766,12 +6838,14 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                             permit,
                             request_subscriber_connections,
                             request_terminal_subscriber_connections,
+                            request_agent_stream_subscriber_connections,
                         ).await;
                     });
                 }
             }
             subscribers.recover_lagged(&harness, &runtime_inventory);
             terminal_subscribers.flush_pending();
+            agent_stream_subscribers.flush_lagged();
             start_pending_observation_recoveries(
                 &adapter,
                 &commands,
@@ -8553,7 +8627,7 @@ fn execute_operator_request(
             )
         }
         // Unreachable in production: the host select loop intercepts these
-        // nine verbs above this function (see `is_session_spawn_request`/
+        // thirteen verbs above this function (see `is_session_spawn_request`/
         // `is_session_control_request` in the `HostCommand::Operator` arm) —
         // this function is synchronous with no C2/adapter handle in scope,
         // so it cannot dispatch a spawn or session-control round trip
@@ -8566,10 +8640,14 @@ fn execute_operator_request(
         | HarnessOperatorRequestV1::WriteSessionBytes { .. }
         | HarnessOperatorRequestV1::PasteSession { .. }
         | HarnessOperatorRequestV1::RemoveSession { .. }
-        | HarnessOperatorRequestV1::ResumeSession { .. } => {
+        | HarnessOperatorRequestV1::ResumeSession { .. }
+        | HarnessOperatorRequestV1::ResolveInteraction { .. }
+        | HarnessOperatorRequestV1::SetSessionMode { .. }
+        | HarnessOperatorRequestV1::SetSessionConfigOption { .. }
+        | HarnessOperatorRequestV1::SetSessionModel { .. } => {
             return Err(HarnessOperatorHostErrorV1::Internal);
         }
-        // Same reasoning as the nine session verbs above: the host select
+        // Same reasoning as the session verbs above: the host select
         // loop intercepts the session-record read (`is_native_history_
         // request`) and mutation (`is_session_record_mutation_request`)
         // families before this function ever sees them.
@@ -8613,6 +8691,15 @@ fn execute_operator_request(
         // `HostCommand::SubscribeTerminal` instead). This arm exists only so
         // this match stays exhaustive.
         HarnessOperatorRequestV1::SubscribeTerminal { .. } => {
+            return Err(HarnessOperatorHostErrorV1::Internal);
+        }
+        // Same reasoning as `SubscribeTerminal` immediately above, for its
+        // own separate connection: `handle_connection` intercepts
+        // `SubscribeAgentStream` before it is ever wrapped into
+        // `HostCommand::Operator` (it registers via `HostCommand::
+        // SubscribeAgentStream` instead). This arm exists only so this
+        // match stays exhaustive.
+        HarnessOperatorRequestV1::SubscribeAgentStream { .. } => {
             return Err(HarnessOperatorHostErrorV1::Internal);
         }
     };
@@ -8852,6 +8939,7 @@ async fn handle_connection(
     connection_permit: tokio::sync::OwnedSemaphorePermit,
     subscriber_connections: Arc<Semaphore>,
     terminal_subscriber_connections: Arc<Semaphore>,
+    agent_stream_subscriber_connections: Arc<Semaphore>,
 ) -> Result<(), HarnessRuntimeError> {
     let mut operator_frame = false;
     // Populated only by the `SubscribeEvents` branch below. Read after the
@@ -8865,13 +8953,22 @@ async fn handle_connection(
     )> = None;
     // Sibling to `subscription` above, populated only by the
     // `SubscribeTerminal` branch below -- kept as its own local (not folded
-    // into an enum with `subscription`) because the two are never both
-    // `Some` for the same connection (a connection is classified as one
-    // subscription kind or the other, or neither) and keeping them
-    // physically separate mirrors `TerminalSubscriberRegistry`'s own
-    // physical separation from `SubscriberRegistry`.
+    // into an enum with `subscription`) because the three are never more
+    // than one `Some` at once for the same connection (a connection is
+    // classified as one subscription kind or another, or neither) and
+    // keeping them physically separate mirrors `TerminalSubscriberRegistry`'s
+    // own physical separation from `SubscriberRegistry`.
     let mut terminal_subscription: Option<(
         mpsc::Receiver<HarnessOperatorTerminalEventV1>,
+        tokio::sync::OwnedSemaphorePermit,
+    )> = None;
+    // Sibling to `terminal_subscription` immediately above, populated only
+    // by the `SubscribeAgentStream` branch below -- same "own physical
+    // local, never both `Some`" reasoning, mirroring
+    // `AgentStreamSubscriberRegistry`'s own physical separation from both
+    // `SubscriberRegistry` and `TerminalSubscriberRegistry`.
+    let mut agent_stream_subscription: Option<(
+        mpsc::Receiver<HarnessOperatorAgentEventV1>,
         tokio::sync::OwnedSemaphorePermit,
     )> = None;
     let outcome = timeout(HOST_CONNECTION_DEADLINE, async {
@@ -9035,6 +9132,57 @@ async fn handle_connection(
                 terminal_subscription = Some((receiver, terminal_subscriber_permit));
                 return Ok(());
             }
+            // Same "opens a long-lived, server-push subscription" shape as
+            // `SubscribeTerminal` immediately above, its own connection pool
+            // (`agent_stream_subscriber_connections`), its own registration
+            // command (`HostCommand::SubscribeAgentStream`), and its own
+            // outbound-channel size (`HOST_AGENT_STREAM_SUBSCRIBER_QUEUE_CAPACITY`
+            // -- see that constant's own doc comment in `agent_stream.rs` for
+            // why it follows `HOST_SUBSCRIBER_QUEUE_CAPACITY`'s FIFO-with-
+            // `Lagged` sizing rather than `HOST_TERMINAL_SUBSCRIBER_QUEUE_
+            // CAPACITY`'s coalescing one). Each requested session address is
+            // parsed with the same `terminal_session_key` helper -- not
+            // terminal-specific despite its name, just the
+            // `HarnessRuntimeSessionAddressV1 -> RuntimeSessionKey` parse
+            // every session-address-scoped verb on this wire shares -- and
+            // the same "first malformed field fails the whole subscribe"
+            // discipline as `SubscribeTerminal`.
+            if let HarnessOperatorRequestV1::SubscribeAgentStream { sessions } = &request {
+                let Ok(agent_stream_subscriber_permit) =
+                    agent_stream_subscriber_connections.clone().try_acquire_owned()
+                else {
+                    tracing::info!(
+                        limit = HOST_AGENT_STREAM_SUBSCRIBER_LIMIT,
+                        "harness agent stream subscribe rejected: subscriber limit reached",
+                    );
+                    write_operator_reply(
+                        &mut stream,
+                        HarnessOperatorReplyV1::Error { error: HarnessOperatorHostErrorV1::Busy },
+                    ).await?;
+                    return Ok(());
+                };
+                let mut keys = HashSet::with_capacity(sessions.len());
+                for session in sessions {
+                    let Ok(key) = terminal_session_key(session) else {
+                        write_operator_reply(
+                            &mut stream,
+                            HarnessOperatorReplyV1::Error {
+                                error: HarnessOperatorHostErrorV1::InvalidRequest,
+                            },
+                        ).await?;
+                        return Ok(());
+                    };
+                    keys.insert(key);
+                }
+                let (sender, receiver) = mpsc::channel(HOST_AGENT_STREAM_SUBSCRIBER_QUEUE_CAPACITY);
+                commands.send(HostCommand::SubscribeAgentStream {
+                    sender,
+                    sessions: keys,
+                    identity,
+                }).await.map_err(|_| HarnessRuntimeError::HostStopped)?;
+                agent_stream_subscription = Some((receiver, agent_stream_subscriber_permit));
+                return Ok(());
+            }
             // A node-workspace-read, node-workspace-write, session-spawn,
             // session-control, session-record-mutation, host-directory-
             // browse, or resource-mutation request gets a cancel signal:
@@ -9129,13 +9277,14 @@ async fn handle_connection(
         }
     }).await;
     match outcome {
-        // `subscription`/`terminal_subscription` are mutually exclusive --
-        // exactly one of the two classify branches above can have set either
-        // one, never both -- so matching the pair together stays exhaustive
-        // without a reachable-but-impossible third combination to reason
+        // `subscription`/`terminal_subscription`/`agent_stream_subscription`
+        // are mutually exclusive -- exactly one of the three classify
+        // branches above can have set any of them, never more than one --
+        // so matching the triple together stays exhaustive without a
+        // reachable-but-impossible fourth-or-more combination to reason
         // about.
-        Ok(Ok(())) => match (subscription, terminal_subscription) {
-            (Some((receiver, subscriber_permit)), _) => {
+        Ok(Ok(())) => match (subscription, terminal_subscription, agent_stream_subscription) {
+            (Some((receiver, subscriber_permit)), _, _) => {
                 // The main connection permit is released here, not held for
                 // the subscription's whole (unbounded) lifetime: see
                 // `HOST_SUBSCRIBER_LIMIT`'s doc comment. `subscriber_permit`
@@ -9145,14 +9294,24 @@ async fn handle_connection(
                 run_operator_event_subscription(stream, receiver, subscriber_permit)
                     .await
             }
-            (None, Some((receiver, terminal_subscriber_permit))) => {
+            (None, Some((receiver, terminal_subscriber_permit)), _) => {
                 // Same reasoning as the task/run/node branch above, against
                 // `HOST_TERMINAL_SUBSCRIBER_LIMIT` instead.
                 drop(connection_permit);
                 run_operator_terminal_subscription(stream, receiver, terminal_subscriber_permit)
                     .await
             }
-            (None, None) => Ok(()),
+            (None, None, Some((receiver, agent_stream_subscriber_permit))) => {
+                // Same reasoning again, against
+                // `HOST_AGENT_STREAM_SUBSCRIBER_LIMIT` instead.
+                drop(connection_permit);
+                run_operator_agent_stream_subscription(
+                    stream,
+                    receiver,
+                    agent_stream_subscriber_permit,
+                ).await
+            }
+            (None, None, None) => Ok(()),
         },
         Ok(Err(error)) => Err(error),
         Err(_) => {
@@ -9300,6 +9459,69 @@ pub async fn write_operator_terminal_event(
             error = ?error,
             kind = terminal_event_kind_label(&event),
             "terminal event failed validation before write; closing the subscription",
+        );
+        HarnessRuntimeError::InvalidReply
+    })?;
+    let mut encoded = serde_json::to_vec(&event).map_err(|_| HarnessRuntimeError::InvalidReply)?;
+    if encoded.len().saturating_add(1) > HARNESS_OPERATOR_RESPONSE_MAX_BYTES {
+        return Err(HarnessRuntimeError::ResponseTooLarge);
+    }
+    encoded.push(b'\n');
+    stream.write_all(&encoded).await.map_err(|_| HarnessRuntimeError::WriteFailed)?;
+    stream.flush().await.map_err(|_| HarnessRuntimeError::WriteFailed)
+}
+
+/// Forwarding loop for a connection that just subscribed via
+/// `SubscribeAgentStream` (`handle_connection`'s own branch above) --
+/// `run_operator_terminal_subscription`'s exact sibling, over
+/// `HarnessOperatorAgentEventV1`/`agent_stream_subscriber_permit` instead:
+/// same "outside `HOST_CONNECTION_DEADLINE`, ends on the first write failure
+/// or channel close" lifetime, same reasoning for why there is no
+/// unsubscribe frame to read for (see `run_operator_event_subscription`'s
+/// own doc comment, which applies verbatim here).
+pub async fn run_operator_agent_stream_subscription(
+    mut stream: TcpStream,
+    mut events: mpsc::Receiver<HarnessOperatorAgentEventV1>,
+    _subscriber_permit: tokio::sync::OwnedSemaphorePermit,
+) -> Result<(), HarnessRuntimeError> {
+    tracing::info!("agent stream event subscription forwarding started");
+    while let Some(event) = events.recv().await {
+        tracing::debug!(
+            kind = agent_stream_event_kind_label(&event),
+            "forwarding agent stream event",
+        );
+        write_operator_agent_stream_event(&mut stream, event).await?;
+    }
+    tracing::info!("agent stream event subscription channel drained; closing");
+    Ok(())
+}
+
+fn agent_stream_event_kind_label(event: &HarnessOperatorAgentEventV1) -> &'static str {
+    match event {
+        HarnessOperatorAgentEventV1::AgentChunk { .. } => "agent-chunk",
+        HarnessOperatorAgentEventV1::Lagged { .. } => "lagged",
+        HarnessOperatorAgentEventV1::Ping { .. } => "ping",
+    }
+}
+
+/// Push-frame counterpart to `write_operator_reply` for a
+/// `SubscribeAgentStream` connection -- `write_operator_terminal_event`'s
+/// exact sibling over `HarnessOperatorAgentEventV1` instead (same
+/// validate-before-write, same size ceiling, same "never shuts the
+/// connection down afterward" contract).
+pub async fn write_operator_agent_stream_event(
+    stream: &mut TcpStream,
+    event: HarnessOperatorAgentEventV1,
+) -> Result<(), HarnessRuntimeError> {
+    event.validate().map_err(|error| {
+        // Same reasoning as `write_operator_terminal_event`'s own
+        // validate-before-write check: a push frame failing its own
+        // validation is a server-side bug, so the stream dies here rather
+        // than the cause dying silently with it.
+        tracing::warn!(
+            error = ?error,
+            kind = agent_stream_event_kind_label(&event),
+            "agent stream event failed validation before write; closing the subscription",
         );
         HarnessRuntimeError::InvalidReply
     })?;
@@ -12813,6 +13035,8 @@ mod tests {
         let subscriber_connections = Arc::new(Semaphore::new(HOST_SUBSCRIBER_LIMIT));
         let terminal_subscriber_connections =
             Arc::new(Semaphore::new(HOST_TERMINAL_SUBSCRIBER_LIMIT));
+        let agent_stream_subscriber_connections =
+            Arc::new(Semaphore::new(HOST_AGENT_STREAM_SUBSCRIBER_LIMIT));
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             assert!(matches!(
@@ -12823,6 +13047,7 @@ mod tests {
                     permit,
                     subscriber_connections,
                     terminal_subscriber_connections,
+                    agent_stream_subscriber_connections,
                 ).await,
                 Err(HarnessRuntimeError::Deadline),
             ));
@@ -12855,6 +13080,8 @@ mod tests {
         let subscriber_connections = Arc::new(Semaphore::new(HOST_SUBSCRIBER_LIMIT));
         let terminal_subscriber_connections =
             Arc::new(Semaphore::new(HOST_TERMINAL_SUBSCRIBER_LIMIT));
+        let agent_stream_subscriber_connections =
+            Arc::new(Semaphore::new(HOST_AGENT_STREAM_SUBSCRIBER_LIMIT));
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             assert!(matches!(
@@ -12865,6 +13092,7 @@ mod tests {
                     permit,
                     subscriber_connections,
                     terminal_subscriber_connections,
+                    agent_stream_subscriber_connections,
                 ).await,
                 Err(HarnessRuntimeError::Deadline),
             ));

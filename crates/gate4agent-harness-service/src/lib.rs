@@ -1,5 +1,6 @@
 //! Single-writer SQLite authority for the adjacent harness kernel.
 
+pub mod agent_stream;
 pub mod c2;
 pub mod credential;
 pub mod delivery;

@@ -22,6 +22,7 @@ use gate4agent_harness_api::{
     HarnessNativeSessionIndexedV1, HarnessNativeSessionPreviewedV1, HarnessNativeSessionRouteV1,
     HarnessNativeSessionSelectionV1, HarnessNativeSessionsCatalogedV1,
     HarnessNativeSessionsPagedV1, HarnessOperatorRequestV1, HarnessOperatorResponseV1,
+    HarnessProviderInteractionResponseV1,
     HarnessProviderSessionIdentityV1, HarnessProviderSessionKeyV1,
     HarnessRepositoryPathV1, HarnessRunGitDiffV1, HarnessRunGitHistoryPageV1,
     HarnessSessionRecordPreviewedV1,
@@ -50,6 +51,7 @@ use gate4agent_node_protocol::{
     HarnessMcpReservationId, ManagedWorktreeLeaseId, ManagedWorktreeLeaseSnapshot,
     ManagedWorktreeLeaseState,
     ManagedWorktreeSpawnRequestV2, NodeFailureCode, NodeId, NodeIncarnationId, NodeRequest,
+    ProviderInteractionResponse,
     ResolvedBundleReceipt, ResolvedContextPackReceipt, ResolvedEnvironmentProfileReceipt,
     ResolvedHarnessMcpProxyReceiptV1,
     ResolvedSpawnReceipt, ResolvedSpawnSpec,
@@ -2577,6 +2579,16 @@ impl PreparedSessionSpawn {
 /// no CAS/replay layer and no multi-outcome transport ambiguity worth
 /// surfacing separately the way a spawn's `SpawnDispatchOutcome` is (see
 /// `dispatch_session_spawn`), so one enum covers all eight shapes.
+///
+/// The four ACP control verbs (`ResolveInteraction`/`SetSessionMode`/
+/// `SetSessionConfigOption`/`SetSessionModel`) join this exact same family
+/// rather than getting their own `Prepared*`/`Pending*` pair: like the
+/// eight above, each relays straight to its own `NodeRequest` variant
+/// (`ResolveInteraction`/`SetSessionMode`/`SetSessionConfigOption`/
+/// `SetSessionModel`) with no CAS/replay layer, and the node itself acks
+/// all four with the same bare `NodeResponse::Accepted` the other eight
+/// settle against (see `HarnessOperatorRequestV1::ResolveInteraction`'s doc
+/// comment in `gate4agent-harness-api`). Twelve variants, one enum.
 pub(crate) enum SessionControlKind {
     Input { text: String },
     Resize { size: TerminalSize },
@@ -2586,6 +2598,27 @@ pub(crate) enum SessionControlKind {
     Paste { text: String },
     Remove,
     Resume { terminal_size: TerminalSize },
+    ResolveInteraction { correlation_id: String, response: ProviderInteractionResponse },
+    SetMode { mode_id: String },
+    SetConfigOption { option_id: String, value_json: String },
+    SetModel { model_id: String },
+}
+
+/// Exact mirror of `gate4agent_types::ProviderInteractionResponse` -- the
+/// wire type `HarnessProviderInteractionResponseV1` -- same rationale and
+/// same field-for-field shape as `map_terminal_control` immediately below.
+fn map_provider_interaction_response(
+    response: HarnessProviderInteractionResponseV1,
+) -> ProviderInteractionResponse {
+    match response {
+        HarnessProviderInteractionResponseV1::ApproveOnce => {
+            ProviderInteractionResponse::ApproveOnce
+        }
+        HarnessProviderInteractionResponseV1::Deny => ProviderInteractionResponse::Deny,
+        HarnessProviderInteractionResponseV1::Answer { text } => {
+            ProviderInteractionResponse::Answer { text }
+        }
+    }
 }
 
 /// Exact mirror of `gate4agent_types::TerminalControl` -> the wire type
@@ -2695,6 +2728,23 @@ impl PreparedSessionControl {
                     terminal_size: TerminalSize { rows: terminal_size.rows, columns: terminal_size.columns },
                 },
             ),
+            HarnessOperatorRequestV1::ResolveInteraction { session, correlation_id, response } => (
+                session,
+                SessionControlKind::ResolveInteraction {
+                    correlation_id,
+                    response: map_provider_interaction_response(response),
+                },
+            ),
+            HarnessOperatorRequestV1::SetSessionMode { session, mode_id } => {
+                (session, SessionControlKind::SetMode { mode_id })
+            }
+            HarnessOperatorRequestV1::SetSessionConfigOption { session, option_id, value_json } => (
+                session,
+                SessionControlKind::SetConfigOption { option_id, value_json },
+            ),
+            HarnessOperatorRequestV1::SetSessionModel { session, model_id } => {
+                (session, SessionControlKind::SetModel { model_id })
+            }
             _ => return Err(HarnessC2Error::InvalidSessionControlRequest),
         };
         let node_id = NodeId::new(session_address.node_id.as_str())
@@ -2755,6 +2805,28 @@ impl PreparedSessionControl {
                 terminal_size: *terminal_size,
                 initial_prompt: None,
             },
+            SessionControlKind::ResolveInteraction { correlation_id, response } => {
+                NodeRequest::ResolveInteraction {
+                    session: self.session.clone(),
+                    correlation_id: correlation_id.clone(),
+                    response: response.clone(),
+                }
+            }
+            SessionControlKind::SetMode { mode_id } => NodeRequest::SetSessionMode {
+                session: self.session.clone(),
+                mode_id: mode_id.clone(),
+            },
+            SessionControlKind::SetConfigOption { option_id, value_json } => {
+                NodeRequest::SetSessionConfigOption {
+                    session: self.session.clone(),
+                    option_id: option_id.clone(),
+                    value_json: value_json.clone(),
+                }
+            }
+            SessionControlKind::SetModel { model_id } => NodeRequest::SetSessionModel {
+                session: self.session.clone(),
+                model_id: model_id.clone(),
+            },
         }
     }
 }
@@ -2813,7 +2885,10 @@ impl PendingSessionControl {
 
     /// See `SessionRosterEffect`'s doc comment. A strict superset of
     /// `stop_session_address`'s `Some` cases (`Stop` is `Absent` here too),
-    /// plus `Remove` (also `Absent`) and `Resume` (`Changed`).
+    /// plus `Remove` (also `Absent`) and `Resume` (`Changed`). The four ACP
+    /// control verbs join the `None` bucket alongside the other ack-only
+    /// verbs: none of them can make a session appear or disappear from the
+    /// roster either.
     pub(crate) fn roster_effect(&self) -> SessionRosterEffect {
         match &self.prepared.kind {
             SessionControlKind::Stop { .. } | SessionControlKind::Remove => {
@@ -2824,7 +2899,11 @@ impl PendingSessionControl {
             | SessionControlKind::Resize { .. }
             | SessionControlKind::Control { .. }
             | SessionControlKind::Bytes { .. }
-            | SessionControlKind::Paste { .. } => SessionRosterEffect::None,
+            | SessionControlKind::Paste { .. }
+            | SessionControlKind::ResolveInteraction { .. }
+            | SessionControlKind::SetMode { .. }
+            | SessionControlKind::SetConfigOption { .. }
+            | SessionControlKind::SetModel { .. } => SessionRosterEffect::None,
         }
     }
 
@@ -2849,7 +2928,7 @@ impl PendingSessionControl {
 
 /// What to mutate on a managed session record, routed directly from a
 /// node/record-id pair -- the mutation-family sibling of `SessionControlKind`
-/// (eight thin ack-only verbs, one shared C2 relay) and `WorkspaceWriteKind`
+/// (twelve thin ack-only verbs, one shared C2 relay) and `WorkspaceWriteKind`
 /// (rich per-verb correlated reply, node-scoped `exact_route` resolution).
 /// This family follows `WorkspaceWriteKind`'s shape: each of the six node
 /// requests it relays to (`RenameSessionRecord`/`SetSessionTask`/

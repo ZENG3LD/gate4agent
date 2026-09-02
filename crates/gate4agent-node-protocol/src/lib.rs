@@ -34,7 +34,7 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::{timeout, Duration};
 
-pub const NODE_PROTOCOL_VERSION: u16 = 12;
+pub const NODE_PROTOCOL_VERSION: u16 = 13;
 pub const NODE_STATE_SCHEMA_V1: u16 = 1;
 pub const NODE_STATE_SCHEMA_V2: u16 = 2;
 pub const NODE_STATE_SCHEMA_V3: u16 = 3;
@@ -7413,7 +7413,7 @@ mod tests {
 
     #[test]
     fn legacy_hello_json_remains_exact_at_the_current_protocol_version() {
-        assert_eq!(NODE_PROTOCOL_VERSION, 12);
+        assert_eq!(NODE_PROTOCOL_VERSION, 13);
         let client = ClientHello::new(ClientRole::Observer, [0; NODE_AUTH_NONCE_BYTES]);
         assert_eq!(
             serde_json::to_string(&client).unwrap(),
@@ -7697,7 +7697,7 @@ mod tests {
 
     #[test]
     fn session_bundle_materialization_contract_is_bounded_exact_and_dual_gated() {
-        assert_eq!(NODE_PROTOCOL_VERSION, 12);
+        assert_eq!(NODE_PROTOCOL_VERSION, 13);
         assert_eq!(NODE_STATE_SCHEMA_V7, 7);
         assert_eq!(NODE_STATE_SCHEMA_V8, 8);
         assert_eq!(
@@ -7904,7 +7904,7 @@ mod tests {
 
     #[test]
     fn compatibility_auth_binding_has_an_exact_bounded_encoding() {
-        assert_eq!(NODE_PROTOCOL_VERSION, 12);
+        assert_eq!(NODE_PROTOCOL_VERSION, 13);
         let offer = ClientCompatibilityOffer {
             protocol_versions: ProtocolRange::new(8, NODE_PROTOCOL_VERSION).unwrap(),
             capabilities: vec![CapabilityId::new("session.spawn").unwrap()],
@@ -7926,7 +7926,7 @@ mod tests {
 
     #[test]
     fn provider_contract_manifest_is_capability_gated_and_auth_bound_exactly() {
-        assert_eq!(NODE_PROTOCOL_VERSION, 12);
+        assert_eq!(NODE_PROTOCOL_VERSION, 13);
         let manifest_capability =
             CapabilityId::new(NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY).unwrap();
         let mut support = portable_node_support();
@@ -7955,7 +7955,7 @@ mod tests {
 
     #[test]
     fn open_provider_capability_and_manifest_are_auth_bound_exactly() {
-        assert_eq!(NODE_PROTOCOL_VERSION, 12);
+        assert_eq!(NODE_PROTOCOL_VERSION, 13);
         let manifest_capability =
             CapabilityId::new(NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY).unwrap();
         let open_capability = CapabilityId::new(NODE_PROVIDER_ID_OPEN_CAPABILITY).unwrap();
@@ -8558,7 +8558,7 @@ mod tests {
 
     #[test]
     fn history_context_pack_wire_is_bounded_path_free_and_auth_bound() {
-        assert_eq!(NODE_PROTOCOL_VERSION, 12);
+        assert_eq!(NODE_PROTOCOL_VERSION, 13);
         assert_eq!(NODE_HISTORY_CONTEXT_PACK_CAPABILITY, "history-context-pack-v1");
         let capability = CapabilityId::new(NODE_HISTORY_CONTEXT_PACK_CAPABILITY).unwrap();
         assert!(production_node_client_compatibility_offer()
@@ -8978,7 +8978,7 @@ mod tests {
 
     #[test]
     fn protocol_v9_workspace_and_worktree_mutations_have_exact_bounded_wire_shapes() {
-        assert_eq!(NODE_PROTOCOL_VERSION, 12);
+        assert_eq!(NODE_PROTOCOL_VERSION, 13);
         assert_eq!(MAX_WORKSPACE_ROOT_BYTES, gate4agent_types::WORKING_DIRECTORY_MAX_BYTES);
 
         let register = NodeRequest::RegisterWorkspace {
@@ -9092,7 +9092,7 @@ mod tests {
 
     #[test]
     fn node_hello_carries_the_incarnation_sequence_domain_at_the_current_protocol_version() {
-        assert_eq!(NODE_PROTOCOL_VERSION, 12);
+        assert_eq!(NODE_PROTOCOL_VERSION, 13);
         let hello = NodeHello {
             protocol_version: NODE_PROTOCOL_VERSION,
             incarnation_id: NodeIncarnationId::from_bytes([0; NODE_INCARNATION_ID_BYTES]),
@@ -9321,7 +9321,7 @@ mod tests {
             NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY,
             "managed-worktree-lifecycle-v1",
         );
-        assert_eq!(NODE_PROTOCOL_VERSION, 12);
+        assert_eq!(NODE_PROTOCOL_VERSION, 13);
         assert_eq!(NODE_STATE_SCHEMA_V4, 4);
         assert_eq!(NODE_STATE_SCHEMA_V5, 5);
         assert_eq!(NODE_STATE_SCHEMA_V6, 6);
@@ -9598,7 +9598,7 @@ mod tests {
 
     #[test]
     fn terminal_frame_events_capability_is_optional_and_auth_bound_exactly() {
-        assert_eq!(NODE_PROTOCOL_VERSION, 12);
+        assert_eq!(NODE_PROTOCOL_VERSION, 13);
         assert_eq!(
             NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
             "terminal-frame-events-v1",
@@ -9681,7 +9681,7 @@ mod tests {
 
     #[test]
     fn worktree_selection_capability_is_optional_and_auth_bound_exactly() {
-        assert_eq!(NODE_PROTOCOL_VERSION, 12);
+        assert_eq!(NODE_PROTOCOL_VERSION, 13);
         assert_eq!(NODE_WORKTREE_SELECTION_CAPABILITY, "worktree-selection-v1");
         assert!(production_node_client_compatibility_offer()
             .capabilities

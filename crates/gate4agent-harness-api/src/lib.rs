@@ -72,13 +72,28 @@ pub const HARNESS_MCP_AUDIENCE: &str = "gate4agent-harness-mcp-read-v1";
 /// something structurally different under the old multi-version scheme; a
 /// frame that says `"version":15` can only ever be this protocol, never
 /// misread as an artifact from before the collapse.
-pub const HARNESS_OPERATOR_WIRE_VERSION: u16 = 15;
+///
+/// `16` is the first ordinary bump under that scheme: the four ACP control
+/// verbs (`ResolveInteraction`, `SetSessionMode`, `SetSessionConfigOption`,
+/// `SetSessionModel`) and the `SubscribeAgentStream` push channel
+/// (`docs/gate4agent/plans/gate4agent-acp-control-plane-on-the-wire-2026-09-02.md`
+/// §5) change the wire shape, so all four co-built processes rebuild
+/// together -- exactly what every bump under this single-version scheme
+/// means, not a special case.
+pub const HARNESS_OPERATOR_WIRE_VERSION: u16 = 16;
 // Realistic multi-pane ceiling with headroom; bounds the harness-side
 // per-subscriber HashSet<RuntimeSessionKey> and the connect-time seed burst
 // `SubscribeTerminal`'s handler sends immediately after registering (see
 // `gate4agent-harness-service::runtime`'s `HostCommand::SubscribeTerminal`
 // arm).
 pub const HARNESS_TERMINAL_SUBSCRIPTION_SESSIONS_MAX: usize = 32;
+// Same rationale as immediately above, for `SubscribeAgentStream` -- bounds
+// the harness-side per-subscriber HashSet<RuntimeSessionKey> and the
+// connect-time seed burst its handler sends immediately after registering.
+// A distinct constant from the terminal one even though the value matches:
+// the two subscription kinds track separate per-subscriber sets and could
+// diverge later without forcing a shared bound.
+pub const HARNESS_AGENT_STREAM_SUBSCRIPTION_SESSIONS_MAX: usize = 32;
 pub const HARNESS_OPERATOR_REQUEST_MAX_BYTES: usize = 64 * 1024;
 pub const HARNESS_OPERATOR_RESPONSE_MAX_BYTES: usize = 1024 * 1024;
 pub const HARNESS_OPERATOR_CREDENTIAL_MAX_BYTES: usize = 256;
@@ -137,6 +152,36 @@ pub const HARNESS_HOST_PATH_MAX_BYTES: usize = 32 * 1_024;
 // `MAX_HOST_DIRECTORY_DISPLAY_NAME_BYTES` (gate4agent-node-protocol).
 pub const HARNESS_HOST_DIRECTORY_ENTRIES_MAX: usize = 256;
 pub const HARNESS_HOST_DIRECTORY_DISPLAY_NAME_MAX_BYTES: usize = 1_024;
+// Mirrors `gate4agent-node-protocol::MAX_ACP_CONTROL_ID_BYTES`
+// (`gate4agent_types::PROVIDER_EVENT_ID_MAX_BYTES`): this crate has no
+// dependency on either (see the doc comment on `HarnessTerminalControlV1`),
+// so the ACP setter verbs' `mode_id`/`option_id`/`model_id` and the agent
+// stream's `tool_name`/catalog id fields are bounded to the same ceiling the
+// provider event stream already validates them against.
+pub const HARNESS_AGENT_STREAM_ID_MAX_BYTES: usize = 512;
+// Mirrors `gate4agent-node-protocol::MAX_ACP_CONTROL_TEXT_BYTES`
+// (`gate4agent_types::PROVIDER_EVENT_TEXT_MAX_BYTES`): free text carried on
+// the agent content stream (`Text`, `Thinking`, interaction `prompt`/
+// `title`, catalog entry descriptions) and `SetSessionConfigOption`'s
+// `value_json`.
+pub const HARNESS_AGENT_STREAM_TEXT_MAX_BYTES: usize = 262_144;
+// Mirrors `gate4agent-node-protocol::MAX_ACP_INTERACTION_OPTIONS`
+// (`gate4agent_types::PROVIDER_CONFIG_OPTION_CHOICES_MAX`): the option list
+// on one `InteractionPrompt` chunk, and (the same source constant reused for
+// the same reason on the node side) the `choices` list on one
+// `ConfigOptions` entry.
+pub const HARNESS_AGENT_STREAM_INTERACTION_OPTIONS_MAX: usize = 256;
+// Mirrors `gate4agent-node-protocol::MAX_ACP_CATALOG_ENTRIES`
+// (`gate4agent_types::PROVIDER_CONFIG_OPTIONS_MAX`): the catalog list on a
+// `ModeCatalog`/`ConfigOptions`/`ModelCatalog` chunk.
+pub const HARNESS_AGENT_STREAM_CATALOG_ENTRIES_MAX: usize = 256;
+// Mirrors `gate4agent_types::PROVIDER_INTERACTION_RESPONSE_MAX_BYTES`: the
+// bound on `ResolveInteraction`'s `Answer { text }` payload. This wire does
+// not also mirror that source type's `EmptyAnswer` rule (an `Answer` must be
+// non-empty only when the live interaction is a `Question`) -- see
+// `HarnessProviderInteractionResponseV1`'s own doc comment for why that
+// check stays the node's job.
+pub const HARNESS_ACP_INTERACTION_RESPONSE_MAX_BYTES: usize = 32_768;
 
 pub const HARNESS_READ_TOOL_IDS: [&str; 8] = [
     "g4a_context_get",
@@ -2034,6 +2079,57 @@ impl HarnessSessionTaskTargetV1 {
     }
 }
 
+/// Exact mirror of `gate4agent_types::ProviderInteractionKind`: this crate
+/// has no dependency on `gate4agent-types` (see the doc comment on
+/// `HarnessTerminalControlV1`), so the ACP interaction classification the
+/// node resolves a `correlation_id` against is duplicated here as its own
+/// closed wire enum, the same way `HarnessAgentStreamChunkKindV1::
+/// InteractionPrompt` carries it on the outbound side.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessProviderInteractionKindV1 {
+    Approval,
+    Question,
+}
+
+/// Exact mirror of `gate4agent_types::ProviderInteractionResponse`: this
+/// crate has no dependency on `gate4agent-types` (see the doc comment on
+/// `HarnessTerminalControlV1`), so `ResolveInteraction`'s answer payload is
+/// duplicated here as its own closed wire enum rather than imported.
+/// Unlike the source type's own `validate_for`, `validate()` below does not
+/// check `Answer`/`ApproveOnce`/`Deny` against the live interaction's own
+/// `HarnessProviderInteractionKindV1` (`Approval` vs `Question`) -- that
+/// check needs the interaction the node is holding under `correlation_id`
+/// and stays the node's job, not this wire's, the same way
+/// `WriteSessionInput` never checks that a PTY exists before sending. It
+/// bounds `Answer { text }` to `HARNESS_ACP_INTERACTION_RESPONSE_MAX_BYTES`
+/// and rejects unsafe control bytes, but not emptiness: the source type's
+/// `EmptyAnswer` rule applies only when the interaction turns out to be a
+/// `Question`, which this wire does not know either.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum HarnessProviderInteractionResponseV1 {
+    ApproveOnce,
+    Deny,
+    Answer { text: String },
+}
+
+impl HarnessProviderInteractionResponseV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        match self {
+            Self::ApproveOnce | Self::Deny => Ok(()),
+            Self::Answer { text } => {
+                if text.len() > HARNESS_ACP_INTERACTION_RESPONSE_MAX_BYTES
+                    || contains_unsafe_control_bytes(text)
+                {
+                    return Err(HarnessOperatorApiError::InvalidSessionControl);
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum HarnessOperatorRequestV1 {
@@ -2213,6 +2309,49 @@ pub enum HarnessOperatorRequestV1 {
     ResumeSession {
         session: HarnessRuntimeSessionAddressV1,
         terminal_size: HarnessRuntimeTerminalSizeV1,
+    },
+    // The four ACP control verbs, session-address-scoped exactly like the
+    // eight session-control verbs above and relayed the same direct,
+    // no-CAS way to C2/node -- gated node-side behind its own
+    // `acp-control-v1` capability (a peer that predates it never negotiates
+    // it and never sees these sent), so asking one of a PTY or inline
+    // session is refused by name rather than silently accepted. They answer
+    // what the outbound `SubscribeAgentStream` content stream reports (see
+    // `HarnessOperatorAgentEventV1`), not what `SubscribeEvents`'s
+    // task/run/node telemetry or `TimelineRead`'s `ObservationV1` stream
+    // can: neither carries the question text, the option list, or the
+    // mode/config/model catalogs these verbs act on
+    // (`docs/gate4agent/plans/gate4agent-acp-control-plane-on-the-wire-2026-09-02.md`
+    // §3-5). All four ack with a bare unit reply
+    // (`InteractionResolved`/`SessionModeSet`/`SessionConfigOptionSet`/
+    // `SessionModelSet`), the same shape `WriteSessionInput` acks with,
+    // because the node itself acks all four with its own bare
+    // `NodeResponse::Accepted`.
+    //
+    // `ResolveInteraction` answers the exact `correlation_id` the
+    // observation stream already minted onto `ObservationKindV1::
+    // ApprovalRequested`/`QuestionRequested`. `response` must additionally
+    // match the interaction's own kind (`Approval` vs `Question`) -- that
+    // check needs the live interaction the node holds and stays the node's
+    // job, not this wire's, the same way `WriteSessionInput` never checks
+    // that a PTY exists before sending.
+    ResolveInteraction {
+        session: HarnessRuntimeSessionAddressV1,
+        correlation_id: String,
+        response: HarnessProviderInteractionResponseV1,
+    },
+    SetSessionMode {
+        session: HarnessRuntimeSessionAddressV1,
+        mode_id: String,
+    },
+    SetSessionConfigOption {
+        session: HarnessRuntimeSessionAddressV1,
+        option_id: String,
+        value_json: String,
+    },
+    SetSessionModel {
+        session: HarnessRuntimeSessionAddressV1,
+        model_id: String,
     },
     CatalogNativeSessions {
         route: HarnessNativeSessionRouteV1,
@@ -2404,6 +2543,17 @@ pub enum HarnessOperatorRequestV1 {
     // that opens or closes a pane reconnects with the updated list rather
     // than patching an existing subscription.
     SubscribeTerminal { sessions: Vec<HarnessRuntimeSessionAddressV1> },
+    // Same "opens a long-lived, server-push subscription" framing as
+    // SubscribeTerminal immediately above, on its own connection, for the
+    // ACP agent-content stream (node-side `agent-stream-events-v1`) rather
+    // than terminal frames -- see `HarnessOperatorAgentEventV1`'s doc
+    // comment for why that push channel needs its own event type distinct
+    // from both `HarnessOperatorEventV1` and `HarnessOperatorTerminalEventV1`.
+    // `sessions` is declared once, at subscribe time, for the same reason
+    // SubscribeTerminal's is (see the module doc): a client that opens or
+    // closes a pane reconnects with the updated list rather than patching
+    // an existing subscription.
+    SubscribeAgentStream { sessions: Vec<HarnessRuntimeSessionAddressV1> },
 }
 
 impl HarnessOperatorRequestV1 {
@@ -2576,6 +2726,38 @@ impl HarnessOperatorRequestV1 {
             Self::ResumeSession { session, terminal_size } => {
                 session.validate()?;
                 if terminal_size.rows == 0 || terminal_size.columns == 0 {
+                    return Err(HarnessOperatorApiError::InvalidSessionControl);
+                }
+                Ok(())
+            }
+            Self::ResolveInteraction { session, correlation_id, response } => {
+                session.validate()?;
+                if !valid_agent_stream_correlation_id(correlation_id) {
+                    return Err(HarnessOperatorApiError::InvalidSessionControl);
+                }
+                response.validate()
+            }
+            Self::SetSessionMode { session, mode_id } => {
+                session.validate()?;
+                if !valid_agent_stream_id(mode_id) {
+                    return Err(HarnessOperatorApiError::InvalidSessionControl);
+                }
+                Ok(())
+            }
+            Self::SetSessionConfigOption { session, option_id, value_json } => {
+                session.validate()?;
+                if !valid_agent_stream_id(option_id)
+                    || value_json.is_empty()
+                    || value_json.len() > HARNESS_AGENT_STREAM_TEXT_MAX_BYTES
+                    || contains_unsafe_control_bytes(value_json)
+                {
+                    return Err(HarnessOperatorApiError::InvalidSessionControl);
+                }
+                Ok(())
+            }
+            Self::SetSessionModel { session, model_id } => {
+                session.validate()?;
+                if !valid_agent_stream_id(model_id) {
                     return Err(HarnessOperatorApiError::InvalidSessionControl);
                 }
                 Ok(())
@@ -2784,6 +2966,19 @@ impl HarnessOperatorRequestV1 {
                 }
                 Ok(())
             }
+            Self::SubscribeAgentStream { sessions } => {
+                if sessions.is_empty()
+                    || sessions.len() > HARNESS_AGENT_STREAM_SUBSCRIPTION_SESSIONS_MAX
+                {
+                    return Err(HarnessOperatorApiError::InvalidAgentStream);
+                }
+                for session in sessions { session.validate()?; }
+                let mut seen = std::collections::HashSet::with_capacity(sessions.len());
+                if !sessions.iter().all(|session| seen.insert(session)) {
+                    return Err(HarnessOperatorApiError::InvalidAgentStream);
+                }
+                Ok(())
+            }
         }
     }
 
@@ -2941,6 +3136,309 @@ impl HarnessOperatorTerminalEventV1 {
     }
 }
 
+/// One named catalog entry -- a selectable session mode or model on the
+/// `ModeCatalog`/`ModelCatalog` chunk kinds. Exact mirror of
+/// `gate4agent-node-protocol`'s own `AgentStreamNamedIdV1` (not a
+/// `gate4agent_types` type -- it is minted on the node's own wire contract,
+/// same duplication rationale as `HarnessTerminalControlV1`). `id` is what
+/// `SetSessionMode`/`SetSessionModel` take back.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessAgentStreamNamedIdV1 {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+}
+
+/// One selectable answer to an `InteractionPrompt` chunk -- an ACP
+/// permission option, named by the provider rather than invented here.
+/// Exact mirror of `gate4agent-node-protocol`'s own
+/// `AgentStreamInteractionOptionV1`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessAgentStreamInteractionOptionV1 {
+    pub option_id: String,
+    pub name: String,
+    pub kind: String,
+}
+
+/// Exact mirror of `gate4agent_types::ProviderConfigOptionKind`.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessProviderConfigOptionKindV1 {
+    Select,
+    Boolean,
+    Unknown,
+}
+
+/// Exact mirror of `gate4agent_types::ProviderConfigChoice`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessProviderConfigChoiceV1 {
+    pub value_json: String,
+    pub label: Option<String>,
+}
+
+/// Exact mirror of `gate4agent_types::ProviderConfigOption`: the mechanism
+/// ACP uses to change model, reasoning effort, and similar settings.
+/// `ConfigOptions` always carries the FULL current set, never a delta --
+/// same contract as the source type's own doc comment states for
+/// `ProviderEvent::ConfigOptionsUpdated`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessProviderConfigOptionV1 {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub category: Option<String>,
+    pub kind: HarnessProviderConfigOptionKindV1,
+    pub value_json: String,
+    pub choices: Vec<HarnessProviderConfigChoiceV1>,
+}
+
+/// The kind of a single `HarnessAgentStreamChunkV1` -- content the operator
+/// needs to act on a running ACP session: what the agent is saying, a
+/// pending interaction it needs answered, and the catalogs the three ACP
+/// setter verbs (`SetSessionMode`, `SetSessionConfigOption`,
+/// `SetSessionModel`) operate over. Exact mirror of
+/// `gate4agent-node-protocol`'s own `AgentStreamChunkKindV1`, which itself
+/// mirrors `gate4agent_types::ProviderEvent`'s content variants
+/// deliberately, in contrast to the collapsed `ObservationKindV1` telemetry
+/// stream, which carries none of it
+/// (`docs/gate4agent/plans/gate4agent-acp-control-plane-on-the-wire-2026-09-02.md`
+/// §3-4).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum HarnessAgentStreamChunkKindV1 {
+    Text { text: String, is_delta: bool },
+    Thinking { text: String },
+    /// The same `correlation_id` `ObservationKindV1::ApprovalRequested`/
+    /// `QuestionRequested` already minted, plus the question and option
+    /// list `ResolveInteraction` answers blind without.
+    InteractionPrompt {
+        correlation_id: String,
+        interaction_kind: HarnessProviderInteractionKindV1,
+        tool_name: String,
+        title: Option<String>,
+        prompt: String,
+        options: Vec<HarnessAgentStreamInteractionOptionV1>,
+    },
+    ModeCatalog {
+        current: Option<String>,
+        available: Vec<HarnessAgentStreamNamedIdV1>,
+    },
+    ConfigOptions { options: Vec<HarnessProviderConfigOptionV1> },
+    ModelCatalog {
+        current: Option<String>,
+        available: Vec<HarnessAgentStreamNamedIdV1>,
+    },
+}
+
+impl HarnessAgentStreamChunkKindV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        match self {
+            Self::Text { text, .. } | Self::Thinking { text } => {
+                if text.len() > HARNESS_AGENT_STREAM_TEXT_MAX_BYTES
+                    || contains_unsafe_control_bytes(text)
+                {
+                    return Err(HarnessOperatorApiError::InvalidAgentStream);
+                }
+                Ok(())
+            }
+            Self::InteractionPrompt { correlation_id, tool_name, title, prompt, options, .. } => {
+                if !valid_agent_stream_correlation_id(correlation_id) {
+                    return Err(HarnessOperatorApiError::InvalidAgentStream);
+                }
+                if !valid_agent_stream_id(tool_name) {
+                    return Err(HarnessOperatorApiError::InvalidAgentStream);
+                }
+                if let Some(title) = title {
+                    if title.len() > HARNESS_AGENT_STREAM_TEXT_MAX_BYTES
+                        || contains_unsafe_control_bytes(title)
+                    {
+                        return Err(HarnessOperatorApiError::InvalidAgentStream);
+                    }
+                }
+                if prompt.len() > HARNESS_AGENT_STREAM_TEXT_MAX_BYTES
+                    || contains_unsafe_control_bytes(prompt)
+                {
+                    return Err(HarnessOperatorApiError::InvalidAgentStream);
+                }
+                if options.len() > HARNESS_AGENT_STREAM_INTERACTION_OPTIONS_MAX {
+                    return Err(HarnessOperatorApiError::InvalidAgentStream);
+                }
+                for option in options {
+                    if !valid_agent_stream_id(&option.option_id)
+                        || !valid_agent_stream_id(&option.name)
+                        || !valid_agent_stream_id(&option.kind)
+                    {
+                        return Err(HarnessOperatorApiError::InvalidAgentStream);
+                    }
+                }
+                Ok(())
+            }
+            Self::ModeCatalog { current, available } | Self::ModelCatalog { current, available } => {
+                if let Some(current) = current {
+                    if !valid_agent_stream_id(current) {
+                        return Err(HarnessOperatorApiError::InvalidAgentStream);
+                    }
+                }
+                validate_agent_stream_catalog_entries(available)
+            }
+            Self::ConfigOptions { options } => {
+                if options.len() > HARNESS_AGENT_STREAM_CATALOG_ENTRIES_MAX {
+                    return Err(HarnessOperatorApiError::InvalidAgentStream);
+                }
+                for option in options {
+                    if !valid_agent_stream_id(&option.id) || !valid_agent_stream_id(&option.name) {
+                        return Err(HarnessOperatorApiError::InvalidAgentStream);
+                    }
+                    if let Some(description) = &option.description {
+                        if description.len() > HARNESS_AGENT_STREAM_TEXT_MAX_BYTES
+                            || contains_unsafe_control_bytes(description)
+                        {
+                            return Err(HarnessOperatorApiError::InvalidAgentStream);
+                        }
+                    }
+                    if let Some(category) = &option.category {
+                        if !valid_agent_stream_id(category) {
+                            return Err(HarnessOperatorApiError::InvalidAgentStream);
+                        }
+                    }
+                    if option.value_json.len() > HARNESS_AGENT_STREAM_TEXT_MAX_BYTES
+                        || contains_unsafe_control_bytes(&option.value_json)
+                    {
+                        return Err(HarnessOperatorApiError::InvalidAgentStream);
+                    }
+                    if option.choices.len() > HARNESS_AGENT_STREAM_INTERACTION_OPTIONS_MAX {
+                        return Err(HarnessOperatorApiError::InvalidAgentStream);
+                    }
+                    for choice in &option.choices {
+                        if choice.value_json.len() > HARNESS_AGENT_STREAM_TEXT_MAX_BYTES
+                            || contains_unsafe_control_bytes(&choice.value_json)
+                        {
+                            return Err(HarnessOperatorApiError::InvalidAgentStream);
+                        }
+                        if let Some(label) = &choice.label {
+                            if label.len() > HARNESS_AGENT_STREAM_TEXT_MAX_BYTES
+                                || contains_unsafe_control_bytes(label)
+                            {
+                                return Err(HarnessOperatorApiError::InvalidAgentStream);
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+fn validate_agent_stream_catalog_entries(
+    entries: &[HarnessAgentStreamNamedIdV1],
+) -> Result<(), HarnessOperatorApiError> {
+    if entries.len() > HARNESS_AGENT_STREAM_CATALOG_ENTRIES_MAX {
+        return Err(HarnessOperatorApiError::InvalidAgentStream);
+    }
+    for entry in entries {
+        if !valid_agent_stream_id(&entry.id) || !valid_agent_stream_id(&entry.name) {
+            return Err(HarnessOperatorApiError::InvalidAgentStream);
+        }
+        if let Some(description) = &entry.description {
+            if description.len() > HARNESS_AGENT_STREAM_TEXT_MAX_BYTES
+                || contains_unsafe_control_bytes(description)
+            {
+                return Err(HarnessOperatorApiError::InvalidAgentStream);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One chunk of the outbound agent content stream -- the operator-wire
+/// counterpart of `gate4agent-node-protocol`'s `AgentStreamChunkV1`, itself
+/// mirroring `NodeEvent::TerminalFrame`'s own precedent: its own
+/// subscription, its own type, no `ObservationV1` resync promise (see
+/// `HarnessOperatorAgentEventV1`'s doc comment below). `source_sequence`
+/// orders chunks within one provider source the way
+/// `ObservationV1::source_sequence` orders observations.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessAgentStreamChunkV1 {
+    pub source_sequence: u64,
+    pub kind: HarnessAgentStreamChunkKindV1,
+}
+
+impl HarnessAgentStreamChunkV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        self.kind.validate()
+    }
+}
+
+/// Long-lived, server-push counterpart to a `SubscribeAgentStream`
+/// connection -- see `HarnessOperatorEventV1`'s own doc comment for the
+/// shared framing this also uses. Deliberately its own type, not a variant
+/// of `HarnessOperatorEventV1` and not a variant of
+/// `HarnessOperatorTerminalEventV1` either, for two separate reasons this
+/// stream's overflow story below has to hold at once:
+///
+/// - Like `HarnessOperatorTerminalEventV1`, `HarnessOperatorEventV1`'s
+///   `Lagged`/`SnapshotBaseline` pair is wrong here: there is no
+///   task/run/node to resync, only content that is already self-contained.
+/// - Unlike `HarnessOperatorTerminalEventV1`, a dropped chunk here cannot be
+///   waved off with a diagnostic counter either. A terminal frame is always
+///   a full screen, so `TerminalFrame`'s own `coalesced_since_last` can
+///   silently supersede a stale frame with a fresher one and lose nothing
+///   real. An agent-stream chunk has no such property: a `Text`/`Thinking`
+///   delta or an `InteractionPrompt` is a fact about one instant, not a
+///   snapshot of the whole session, so a chunk this stream drops is gone --
+///   there is no later chunk that already contains it, and dropping an
+///   `InteractionPrompt` in particular would strand the operator unable to
+///   ever answer a correlation id they never saw.
+///
+/// So overflow here gets its own honest shape: `Lagged` reports a real,
+/// unrecoverable loss for one subscribed session -- no snapshot follows it,
+/// because none could repair what was lost -- and the client's only correct
+/// response is to surface that loss to the operator, not to wait for a
+/// recovery frame that is never coming.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum HarnessOperatorAgentEventV1 {
+    AgentChunk {
+        sequence: u64,
+        session: HarnessRuntimeSessionAddressV1,
+        chunk: HarnessAgentStreamChunkV1,
+    },
+    /// This subscriber's outbound queue overflowed for the named session and
+    /// `dropped` chunks were lost for it specifically -- other subscribers,
+    /// and this subscriber's other subscribed sessions, are unaffected. See
+    /// this type's own doc comment for why there is no recovery frame to
+    /// follow it.
+    Lagged {
+        sequence: u64,
+        session: HarnessRuntimeSessionAddressV1,
+        dropped: u64,
+    },
+    /// Same keep-alive rationale as `HarnessOperatorTerminalEventV1::Ping`:
+    /// this is a physically separate connection with its own dead-peer-
+    /// detection problem, independent of the terminal and task/run/node
+    /// subscriptions' own.
+    Ping { sequence: u64 },
+}
+
+impl HarnessOperatorAgentEventV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        match self {
+            Self::AgentChunk { session, chunk, .. } => {
+                session.validate()?;
+                chunk.validate()
+            }
+            Self::Lagged { session, .. } => session.validate(),
+            Self::Ping { .. } => Ok(()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", content = "value", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum HarnessOperatorResponseV1 {
@@ -2983,6 +3481,13 @@ pub enum HarnessOperatorResponseV1 {
     SessionPasted,
     SessionRemoved,
     SessionResumed,
+    // Unit acks for the four ACP control verbs above -- same bare-ack shape
+    // as the eight session-control acks immediately above, because the node
+    // itself acks all four with its own bare `NodeResponse::Accepted`.
+    InteractionResolved,
+    SessionModeSet,
+    SessionConfigOptionSet,
+    SessionModelSet,
     NativeSessionsCataloged(HarnessNativeSessionsCatalogedV1),
     NativeSessionsPaged(HarnessNativeSessionsPagedV1),
     NativeSessionPreviewed(HarnessNativeSessionPreviewedV1),
@@ -3055,7 +3560,11 @@ impl HarnessOperatorResponseV1 {
             | Self::SessionBytesWritten
             | Self::SessionPasted
             | Self::SessionRemoved
-            | Self::SessionResumed => Ok(()),
+            | Self::SessionResumed
+            | Self::InteractionResolved
+            | Self::SessionModeSet
+            | Self::SessionConfigOptionSet
+            | Self::SessionModelSet => Ok(()),
             Self::NativeSessionsCataloged(value) => value.validate(),
             Self::NativeSessionsPaged(value) => value.validate(),
             Self::NativeSessionPreviewed(value) => value.validate(),
@@ -5629,6 +6138,8 @@ pub enum HarnessOperatorApiError {
     InvalidSessionSpawn,
     #[error("harness session control request is invalid")]
     InvalidSessionControl,
+    #[error("harness agent stream content is invalid")]
+    InvalidAgentStream,
     #[error("harness session record request is invalid")]
     InvalidSessionRecordRequest,
     #[error("harness host path is invalid")]
@@ -5781,6 +6292,47 @@ fn valid_native_group_id(value: &str) -> bool {
 fn valid_native_single_line(value: &str, maximum: usize, required: bool) -> bool {
     (!required || !value.trim().is_empty())
         && value.len() <= maximum
+        && !value.chars().any(char::is_control)
+}
+
+/// Mirrors `gate4agent-node-protocol`'s own `contains_unsafe_control_bytes`:
+/// every control character is unsafe except the three ACP content is allowed
+/// to carry verbatim (`\n`, `\r`, `\t`), itself mirroring
+/// `gate4agent_types::control::validate_text`'s own allowance, so
+/// agent-stream free text (`Text`, `Thinking`, `title`, `prompt`,
+/// `description`, `value_json`, `label`) and `SetSessionConfigOption`'s
+/// `value_json` validate against the same rule the provider event stream
+/// already applies to it.
+fn contains_unsafe_control_bytes(value: &str) -> bool {
+    value.chars().any(|character| {
+        character.is_control() && !matches!(character, '\n' | '\r' | '\t')
+    })
+}
+
+/// Structural bound for an ACP-minted identifier (`mode_id`/`option_id`/
+/// `model_id`/`tool_name`/catalog entry `id`/`name`/interaction option
+/// `option_id`/`name`/`kind`) -- mirrors `gate4agent-node-protocol`'s own
+/// `deserialize_acp_control_id`: non-empty, bounded by
+/// `HARNESS_AGENT_STREAM_ID_MAX_BYTES`, free of every control character
+/// (never just the unsafe subset `contains_unsafe_control_bytes` allows --
+/// an id is not free text).
+fn valid_agent_stream_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= HARNESS_AGENT_STREAM_ID_MAX_BYTES
+        && !value.chars().any(char::is_control)
+}
+
+/// Structural bound for `ResolveInteraction`'s `correlation_id` and
+/// `InteractionPrompt`'s own copy of it -- mirrors `gate4agent-node-
+/// protocol`'s own `deserialize_acp_correlation_id`, bounded by
+/// `HARNESS_OBSERVATION_LABEL_MAX_BYTES` (the same source constant,
+/// `gate4agent_observation_protocol::OBSERVATION_LABEL_MAX_BYTES`, that
+/// bound already mirrors) since a correlation id is exactly what
+/// `ObservationKindV1::ApprovalRequested`/`QuestionRequested` minted onto
+/// the timeline at that bound.
+fn valid_agent_stream_correlation_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= HARNESS_OBSERVATION_LABEL_MAX_BYTES
         && !value.chars().any(char::is_control)
 }
 
@@ -8128,6 +8680,16 @@ mod tests {
         }
     }
 
+    fn sample_agent_stream_chunk(source_sequence: u64) -> HarnessAgentStreamChunkV1 {
+        HarnessAgentStreamChunkV1 {
+            source_sequence,
+            kind: HarnessAgentStreamChunkKindV1::Text {
+                text: format!("chunk-{source_sequence}"),
+                is_delta: true,
+            },
+        }
+    }
+
     fn sample_terminal_frame(sequence: u64) -> HarnessRuntimeTerminalFrameV1 {
         HarnessRuntimeTerminalFrameV1 {
             sequence,
@@ -9411,5 +9973,328 @@ mod tests {
         let encoded_reply = serde_json::to_vec(&reply).unwrap();
         let decoded_reply: HarnessOperatorReplyV1 = serde_json::from_slice(&encoded_reply).unwrap();
         assert_eq!(decoded_reply, reply);
+    }
+
+    #[test]
+    fn operator_acp_control_verbs_are_exact_round_trips() {
+        let session = session_address(7, 2);
+        let requests = vec![
+            HarnessOperatorRequestV1::ResolveInteraction {
+                session: session.clone(),
+                correlation_id: "a".repeat(HARNESS_OBSERVATION_LABEL_MAX_BYTES),
+                response: HarnessProviderInteractionResponseV1::ApproveOnce,
+            },
+            HarnessOperatorRequestV1::ResolveInteraction {
+                session: session.clone(),
+                correlation_id: "correlation-1".to_owned(),
+                response: HarnessProviderInteractionResponseV1::Deny,
+            },
+            HarnessOperatorRequestV1::ResolveInteraction {
+                session: session.clone(),
+                correlation_id: "correlation-2".to_owned(),
+                response: HarnessProviderInteractionResponseV1::Answer {
+                    text: "yes, proceed".to_owned(),
+                },
+            },
+            HarnessOperatorRequestV1::SetSessionMode {
+                session: session.clone(),
+                mode_id: "plan".to_owned(),
+            },
+            HarnessOperatorRequestV1::SetSessionConfigOption {
+                session: session.clone(),
+                option_id: "reasoning-effort".to_owned(),
+                value_json: "\"high\"".to_owned(),
+            },
+            HarnessOperatorRequestV1::SetSessionModel {
+                session: session.clone(),
+                model_id: "grok-4".to_owned(),
+            },
+        ];
+        let credential = HarnessOperatorCredential::parse(format!(
+            "g4aho_{}",
+            "a".repeat(64),
+        )).unwrap();
+        for request in requests {
+            request.validate().expect("valid ACP control verb request");
+            let encoded = serde_json::to_string(&request).unwrap();
+            let decoded: HarnessOperatorRequestV1 = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, request);
+            HarnessOperatorEnvelopeV1 {
+                version: HARNESS_OPERATOR_WIRE_VERSION,
+                credential: credential.clone(),
+                request,
+            }.validate().unwrap();
+        }
+
+        let responses = vec![
+            HarnessOperatorResponseV1::InteractionResolved,
+            HarnessOperatorResponseV1::SessionModeSet,
+            HarnessOperatorResponseV1::SessionConfigOptionSet,
+            HarnessOperatorResponseV1::SessionModelSet,
+        ];
+        for response in responses {
+            response.validate().expect("valid ACP control verb response");
+            let encoded = serde_json::to_string(&response).unwrap();
+            let decoded: HarnessOperatorResponseV1 = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, response);
+        }
+    }
+
+    #[test]
+    fn acp_control_requests_reject_malformed_fields() {
+        let session = session_address(7, 2);
+
+        let empty_correlation = HarnessOperatorRequestV1::ResolveInteraction {
+            session: session.clone(),
+            correlation_id: String::new(),
+            response: HarnessProviderInteractionResponseV1::ApproveOnce,
+        };
+        assert!(matches!(
+            empty_correlation.validate(),
+            Err(HarnessOperatorApiError::InvalidSessionControl),
+        ));
+
+        let oversized_correlation = HarnessOperatorRequestV1::ResolveInteraction {
+            session: session.clone(),
+            correlation_id: "a".repeat(HARNESS_OBSERVATION_LABEL_MAX_BYTES + 1),
+            response: HarnessProviderInteractionResponseV1::Deny,
+        };
+        assert!(matches!(
+            oversized_correlation.validate(),
+            Err(HarnessOperatorApiError::InvalidSessionControl),
+        ));
+
+        let oversized_answer = HarnessOperatorRequestV1::ResolveInteraction {
+            session: session.clone(),
+            correlation_id: "correlation-1".to_owned(),
+            response: HarnessProviderInteractionResponseV1::Answer {
+                text: "x".repeat(HARNESS_ACP_INTERACTION_RESPONSE_MAX_BYTES + 1),
+            },
+        };
+        assert!(matches!(
+            oversized_answer.validate(),
+            Err(HarnessOperatorApiError::InvalidSessionControl),
+        ));
+
+        let empty_mode_id = HarnessOperatorRequestV1::SetSessionMode {
+            session: session.clone(),
+            mode_id: String::new(),
+        };
+        assert!(matches!(
+            empty_mode_id.validate(),
+            Err(HarnessOperatorApiError::InvalidSessionControl),
+        ));
+
+        let control_char_option_id = HarnessOperatorRequestV1::SetSessionConfigOption {
+            session: session.clone(),
+            option_id: "bad\u{0007}id".to_owned(),
+            value_json: "true".to_owned(),
+        };
+        assert!(matches!(
+            control_char_option_id.validate(),
+            Err(HarnessOperatorApiError::InvalidSessionControl),
+        ));
+
+        let empty_value_json = HarnessOperatorRequestV1::SetSessionConfigOption {
+            session: session.clone(),
+            option_id: "reasoning-effort".to_owned(),
+            value_json: String::new(),
+        };
+        assert!(matches!(
+            empty_value_json.validate(),
+            Err(HarnessOperatorApiError::InvalidSessionControl),
+        ));
+
+        let oversized_model_id = HarnessOperatorRequestV1::SetSessionModel {
+            session: session.clone(),
+            model_id: "x".repeat(HARNESS_AGENT_STREAM_ID_MAX_BYTES + 1),
+        };
+        assert!(matches!(
+            oversized_model_id.validate(),
+            Err(HarnessOperatorApiError::InvalidSessionControl),
+        ));
+
+        let mut malformed_session = session.clone();
+        malformed_session.instance_id = 0;
+        let bad_session = HarnessOperatorRequestV1::SetSessionModel {
+            session: malformed_session,
+            model_id: "grok-4".to_owned(),
+        };
+        assert!(bad_session.validate().is_err());
+    }
+
+    #[test]
+    fn operator_subscribe_agent_stream_is_exact_round_trip() {
+        let request = HarnessOperatorRequestV1::SubscribeAgentStream {
+            sessions: vec![session_address(1, 1), session_address(2, 1)],
+        };
+        request.validate().expect("valid subscribe-agent-stream request");
+        let encoded = serde_json::to_string(&request).unwrap();
+        let decoded: HarnessOperatorRequestV1 = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, request);
+
+        let credential = HarnessOperatorCredential::parse(format!(
+            "g4aho_{}",
+            "a".repeat(64),
+        )).unwrap();
+        HarnessOperatorEnvelopeV1 {
+            version: HARNESS_OPERATOR_WIRE_VERSION,
+            credential,
+            request,
+        }.validate().unwrap();
+    }
+
+    #[test]
+    fn subscribe_agent_stream_rejects_empty_oversized_and_duplicate_session_lists() {
+        assert!(matches!(
+            HarnessOperatorRequestV1::SubscribeAgentStream { sessions: Vec::new() }.validate(),
+            Err(HarnessOperatorApiError::InvalidAgentStream),
+        ));
+
+        let oversized = (0..=HARNESS_AGENT_STREAM_SUBSCRIPTION_SESSIONS_MAX as u64)
+            .map(|instance_id| session_address(instance_id + 1, 1))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            HarnessOperatorRequestV1::SubscribeAgentStream { sessions: oversized }.validate(),
+            Err(HarnessOperatorApiError::InvalidAgentStream),
+        ));
+
+        let duplicated = vec![session_address(1, 1), session_address(1, 1)];
+        assert!(matches!(
+            HarnessOperatorRequestV1::SubscribeAgentStream { sessions: duplicated }.validate(),
+            Err(HarnessOperatorApiError::InvalidAgentStream),
+        ));
+
+        let mut malformed = session_address(1, 1);
+        malformed.node_id = String::new();
+        assert!(HarnessOperatorRequestV1::SubscribeAgentStream { sessions: vec![malformed] }
+            .validate()
+            .is_err());
+    }
+
+    #[test]
+    fn operator_agent_event_variants_are_exact_round_trips() {
+        let session = session_address(1, 1);
+        let chunks = vec![
+            HarnessAgentStreamChunkKindV1::Text { text: "hello".to_owned(), is_delta: false },
+            HarnessAgentStreamChunkKindV1::Thinking { text: "considering options".to_owned() },
+            HarnessAgentStreamChunkKindV1::InteractionPrompt {
+                correlation_id: "correlation-1".to_owned(),
+                interaction_kind: HarnessProviderInteractionKindV1::Approval,
+                tool_name: "execute".to_owned(),
+                title: Some("Run command?".to_owned()),
+                prompt: "rm -rf /tmp/scratch".to_owned(),
+                options: vec![HarnessAgentStreamInteractionOptionV1 {
+                    option_id: "allow".to_owned(),
+                    name: "Allow".to_owned(),
+                    kind: "allow_once".to_owned(),
+                }],
+            },
+            HarnessAgentStreamChunkKindV1::ModeCatalog {
+                current: Some("plan".to_owned()),
+                available: vec![HarnessAgentStreamNamedIdV1 {
+                    id: "plan".to_owned(),
+                    name: "Plan".to_owned(),
+                    description: None,
+                }],
+            },
+            HarnessAgentStreamChunkKindV1::ConfigOptions {
+                options: vec![HarnessProviderConfigOptionV1 {
+                    id: "reasoning-effort".to_owned(),
+                    name: "Reasoning effort".to_owned(),
+                    description: Some("How hard to think".to_owned()),
+                    category: Some("model".to_owned()),
+                    kind: HarnessProviderConfigOptionKindV1::Select,
+                    value_json: "\"high\"".to_owned(),
+                    choices: vec![HarnessProviderConfigChoiceV1 {
+                        value_json: "\"high\"".to_owned(),
+                        label: Some("High".to_owned()),
+                    }],
+                }],
+            },
+            HarnessAgentStreamChunkKindV1::ModelCatalog {
+                current: Some("grok-4".to_owned()),
+                available: vec![HarnessAgentStreamNamedIdV1 {
+                    id: "grok-4".to_owned(),
+                    name: "Grok 4".to_owned(),
+                    description: None,
+                }],
+            },
+        ];
+
+        let mut events: Vec<HarnessOperatorAgentEventV1> = chunks
+            .into_iter()
+            .enumerate()
+            .map(|(index, kind)| HarnessOperatorAgentEventV1::AgentChunk {
+                sequence: index as u64,
+                session: session.clone(),
+                chunk: HarnessAgentStreamChunkV1 { source_sequence: index as u64, kind },
+            })
+            .collect();
+        events.push(HarnessOperatorAgentEventV1::Lagged {
+            sequence: 100,
+            session: session.clone(),
+            dropped: 3,
+        });
+        events.push(HarnessOperatorAgentEventV1::Ping { sequence: 101 });
+
+        for event in events {
+            event.validate().expect("valid operator agent event");
+            let encoded = serde_json::to_string(&event).unwrap();
+            let decoded: HarnessOperatorAgentEventV1 = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, event);
+        }
+    }
+
+    #[test]
+    fn operator_agent_event_validate_rejects_malformed_chunks_or_sessions() {
+        let session = session_address(1, 1);
+
+        let mut bad_session = session.clone();
+        bad_session.node_id = String::new();
+        let bad_session_event = HarnessOperatorAgentEventV1::AgentChunk {
+            sequence: 0,
+            session: bad_session,
+            chunk: sample_agent_stream_chunk(0),
+        };
+        assert!(bad_session_event.validate().is_err());
+
+        let oversized_text_chunk = HarnessAgentStreamChunkV1 {
+            source_sequence: 0,
+            kind: HarnessAgentStreamChunkKindV1::Text {
+                text: "x".repeat(HARNESS_AGENT_STREAM_TEXT_MAX_BYTES + 1),
+                is_delta: false,
+            },
+        };
+        let bad_chunk_event = HarnessOperatorAgentEventV1::AgentChunk {
+            sequence: 0,
+            session: session.clone(),
+            chunk: oversized_text_chunk,
+        };
+        assert!(matches!(
+            bad_chunk_event.validate(),
+            Err(HarnessOperatorApiError::InvalidAgentStream),
+        ));
+
+        let empty_correlation_prompt = HarnessAgentStreamChunkV1 {
+            source_sequence: 0,
+            kind: HarnessAgentStreamChunkKindV1::InteractionPrompt {
+                correlation_id: String::new(),
+                interaction_kind: HarnessProviderInteractionKindV1::Question,
+                tool_name: "ask".to_owned(),
+                title: None,
+                prompt: "What next?".to_owned(),
+                options: Vec::new(),
+            },
+        };
+        let bad_prompt_event = HarnessOperatorAgentEventV1::AgentChunk {
+            sequence: 0,
+            session: session.clone(),
+            chunk: empty_correlation_prompt,
+        };
+        assert!(matches!(
+            bad_prompt_event.validate(),
+            Err(HarnessOperatorApiError::InvalidAgentStream),
+        ));
     }
 }

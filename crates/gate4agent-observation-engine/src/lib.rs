@@ -95,12 +95,17 @@ pub enum ContextOccupancyProvenance {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ContextOccupancySnapshot {
-    pub uncached_input_tokens: u64,
-    pub output_tokens: u64,
-    pub cache_read_tokens: u64,
-    pub cache_write_tokens: u64,
+    /// `None` when the source reported `used_tokens`/`context_window`
+    /// alone and never observed how the total decomposes -- same
+    /// not-observed-not-zero convention `reasoning_tokens` already
+    /// follows here, now shared by every segment `ProviderEvent::
+    /// UsageUpdated` cannot supply.
+    pub uncached_input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
-    pub unattributed_tokens: u64,
+    pub unattributed_tokens: Option<u64>,
     pub used_tokens: u64,
     pub context_window: Option<u64>,
     pub evidence: ObservationEvidenceV1,
@@ -1564,7 +1569,7 @@ fn apply_usage(
         UsageTotals {
             input_tokens: incoming.input_tokens,
             output_tokens: previous
-                .map(|snapshot| snapshot.output_tokens)
+                .and_then(|snapshot| snapshot.output_tokens)
                 .unwrap_or(0)
                 .saturating_add(incoming.output_tokens),
             cache_read_tokens: incoming.cache_read_tokens,
@@ -1573,12 +1578,12 @@ fn apply_usage(
         }
     };
     projection.context_occupancy = Some(ContextOccupancySnapshot {
-        uncached_input_tokens: occupancy_totals.input_tokens,
-        output_tokens: occupancy_totals.output_tokens,
-        cache_read_tokens: occupancy_totals.cache_read_tokens,
-        cache_write_tokens: occupancy_totals.cache_write_tokens,
+        uncached_input_tokens: Some(occupancy_totals.input_tokens),
+        output_tokens: Some(occupancy_totals.output_tokens),
+        cache_read_tokens: Some(occupancy_totals.cache_read_tokens),
+        cache_write_tokens: Some(occupancy_totals.cache_write_tokens),
         reasoning_tokens: Some(occupancy_totals.reasoning_tokens),
-        unattributed_tokens: 0,
+        unattributed_tokens: Some(0),
         used_tokens: occupancy_totals
             .input_tokens
             .saturating_add(occupancy_totals.cache_read_tokens)
@@ -1609,11 +1614,11 @@ fn apply_usage(
 
 fn apply_context_window_usage(
     projection: &mut UsageProjection,
-    uncached_input_tokens: u64,
-    cache_read_tokens: u64,
-    cache_write_tokens: u64,
-    output_tokens: u64,
-    unattributed_tokens: u64,
+    uncached_input_tokens: Option<u64>,
+    cache_read_tokens: Option<u64>,
+    cache_write_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    unattributed_tokens: Option<u64>,
     used_tokens: u64,
     capacity_tokens: u64,
     evidence: ObservationEvidenceV1,
@@ -1645,11 +1650,11 @@ mod context_occupancy_internal_tests {
     fn apply_exact(projection: &mut UsageProjection, evidence: ObservationEvidenceV1) {
         apply_context_window_usage(
             projection,
-            10,
-            20,
-            5,
-            15,
-            10,
+            Some(10),
+            Some(20),
+            Some(5),
+            Some(15),
+            Some(10),
             60,
             100,
             evidence,
@@ -1684,6 +1689,42 @@ mod context_occupancy_internal_tests {
             assert!(projection.context_occupancy.is_none(), "{evidence:?}");
             assert_eq!(projection.observed_delta, observed_delta, "{evidence:?}");
         }
+    }
+
+    /// `ProviderEvent::UsageUpdated` only ever carries `used_tokens`/
+    /// `context_window` -- the five breakdown segments arrive as `None`
+    /// and must stay `None` through the reducer rather than being
+    /// defaulted to zero, which would assert a segment was measured
+    /// empty when it was never observed. `used_tokens`/`capacity_tokens`
+    /// are still an exact current-window reading either way, so the
+    /// provenance is the same `ExactCurrentWindow` the fully-observed
+    /// breakdown gets.
+    #[test]
+    fn unobserved_breakdown_propagates_as_none_not_zero() {
+        let mut projection = UsageProjection::default();
+        apply_context_window_usage(
+            &mut projection,
+            None,
+            None,
+            None,
+            None,
+            None,
+            4_200,
+            200_000,
+            ObservationEvidenceV1::StructuredProvider,
+        );
+        let snapshot = projection
+            .context_occupancy
+            .expect("structured provider activates exact-window occupancy");
+        assert_eq!(snapshot.uncached_input_tokens, None);
+        assert_eq!(snapshot.cache_read_tokens, None);
+        assert_eq!(snapshot.cache_write_tokens, None);
+        assert_eq!(snapshot.output_tokens, None);
+        assert_eq!(snapshot.unattributed_tokens, None);
+        assert_eq!(snapshot.reasoning_tokens, None);
+        assert_eq!(snapshot.used_tokens, 4_200);
+        assert_eq!(snapshot.context_window, Some(200_000));
+        assert_eq!(snapshot.provenance, ContextOccupancyProvenance::ExactCurrentWindow);
     }
 }
 

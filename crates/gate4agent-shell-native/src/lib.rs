@@ -1222,17 +1222,47 @@ impl NativeEffectShell {
                                 };
                             }
                         }
+                        // Read before `session` moves into the map below.
+                        let announced_mode = session.current_mode_id();
                         self.acp_sessions.insert(
                             key,
                             OwnedProviderSession {
                                 source,
                                 session,
                                 events,
-                                pending_events: VecDeque::from([AgentEvent::SessionStart {
-                                    session_id,
-                                    model: String::new(),
-                                    tools: Vec::new(),
-                                }]),
+                                pending_events: {
+                                    let mut seeded = VecDeque::from([AgentEvent::SessionStart {
+                                        session_id,
+                                        model: String::new(),
+                                        tools: Vec::new(),
+                                    }]);
+                                    // Announce the mode catalogue once, at
+                                    // session start.
+                                    //
+                                    // `ModeCatalog` reaches the operator only
+                                    // from a `ModeChanged`, so without this it
+                                    // is emitted solely when a mode CHANGES --
+                                    // and an operator cannot change a mode
+                                    // without knowing an id, which is what the
+                                    // catalogue carries. That is a closed
+                                    // loop: the one thing needed to ask is
+                                    // only published in reply to asking.
+                                    //
+                                    // Both halves are handshake facts, not
+                                    // inventions: `available_modes` is the
+                                    // list the agent returned from
+                                    // `session/new`, and `current_mode_id` is
+                                    // what it said it is in right now. Seeding
+                                    // them as a `ModeChanged` is a small
+                                    // misnomer -- nothing changed -- but the
+                                    // payload is the state, and the operator
+                                    // needs the state before it can ever
+                                    // change.
+                                    if let Some(mode_id) = announced_mode {
+                                        seeded.push_back(AgentEvent::ModeChanged { mode_id });
+                                    }
+                                    seeded
+                                },
                                 next_provider_sequence: 1,
                                 observed_exit_code: None,
                                 runtime_policy,

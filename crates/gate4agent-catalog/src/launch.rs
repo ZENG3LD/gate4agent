@@ -64,6 +64,40 @@ impl Default for LaunchRequest {
     }
 }
 
+/// A vendor ACP session-mode id -- the `id` a provider's `session/new`/
+/// `session/load` handshake result names under `modes.availableModes`
+/// (`gate4agent`'s `src/acp/protocol.rs::SessionMode`), and the exact value
+/// `session/set_mode`'s own `modeId` parameter takes to select it
+/// (`SessionSetModeParams`). A newtype over the raw wire string, kept
+/// distinct from [`ApprovalLevelResolution::Supported`]'s own `args` field
+/// even on the one row (`claude`) where the two happen to share a spelling
+/// (`bypassPermissions`/`acceptEdits`/`plan`): argv and an ACP mode id are
+/// two different mechanisms applied by two different transports (PTY vs.
+/// ACP), and this type exists so a caller that only checked the string can
+/// never silently substitute one for the other.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModeId(String);
+
+impl ModeId {
+    /// Construct a mode id from its raw wire string.
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    /// The raw wire string, e.g. as sent in `session/set_mode`'s `modeId`
+    /// field or compared against an agent's own announced
+    /// `modes.availableModes[].id`.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ModeId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
 /// The result of resolving a provider + [`ApprovalLevel`] to concrete launch
 /// behaviour.
 ///
@@ -81,12 +115,28 @@ pub enum ApprovalLevelResolution {
     /// This provider has a verified vendor mode for this level.
     Supported {
         /// The CLI flag(s) that select the vendor mode, lifted verbatim from
-        /// vendor documentation where one exists.
+        /// vendor documentation where one exists. Applied only to the PTY
+        /// transport (via [`approval_level_args`]) -- the ACP transport has
+        /// its own, separate mechanism: `acp_mode_id`, below.
         args: Vec<String>,
         /// Whether that vendor mode's own documented behaviour has the CLI
         /// raise a permission question on the wire at all -- never inferred
         /// from the level's name.
         asks_for_permission: bool,
+        /// The ACP `session/set_mode` mode id that applies this row's level
+        /// over the ACP transport, when one is sourced from vendor
+        /// documentation or a live capture -- never guessed from `args`.
+        /// `None` means this catalog has no confirmed ACP mode id for this
+        /// provider x level yet: an honest gap, not an invented one, exactly
+        /// like an empty `args` row (see this function's own doc comment for
+        /// which rows are `None` and why). The ACP transport (`gate4agent`'s
+        /// `src/acp`, `gate4agent-shell-native`) must treat `None` here the
+        /// same as `Unsupported` below for any level but
+        /// [`ApprovalLevel::Unmanaged`]: with no known id, `session/
+        /// set_mode` has nothing to call, so no ACP mechanism exists to
+        /// enforce the request at all -- see `Unmanaged`'s own row for the
+        /// one case where `None` means something else.
+        acp_mode_id: Option<ModeId>,
     },
     /// This provider has no verified mode for the requested level. The ACP
     /// transport (the only caller that applies this table -- see
@@ -104,6 +154,20 @@ pub enum ApprovalLevelResolution {
 /// carries a confidence note; several are marked UNCONFIRMED deliberately,
 /// per the "an honest unconfirmed beats a guessed bool" rule this table
 /// exists to enforce.
+///
+/// Since 2026-09-02 each `Supported` row also carries `acp_mode_id:
+/// Option<ModeId>` -- the `session/set_mode` mode id that applies this SAME
+/// level over the ACP transport, sourced independently of `args`. This
+/// exists because `args` turned out to be fiction for ACP: measured live,
+/// both running ACP adapters (`claude`, `codex`) spawn with no `--permission-
+/// mode` flag reaching them at all, because `npx`-wrapped specs never
+/// receive one (`applicable_approval_args`, `gate4agent`'s
+/// `src/acp/spawn.rs`) -- the adapter simply starts in its own default,
+/// confirmed on the wire as `mode:Mode="auto"`, which approves itself. `args`
+/// keeps meaning exactly what it always meant for the PTY transport; for ACP
+/// the level lives in `acp_mode_id` instead, and only where one is actually
+/// sourced -- `None` is left rather than guessed, the same honesty bar
+/// `args` already holds itself to.
 ///
 /// - `claude` and `codex` have a verified flag and verified `asks_for_permission`
 ///   for all three non-`Unmanaged` levels.
@@ -147,12 +211,21 @@ pub fn approval_level_resolution(agent_id: &AgentId, level: ApprovalLevel) -> Ap
             args: vec!["--permission-mode".to_owned(), "bypassPermissions".to_owned()],
             // bypassPermissions: every tool call is auto-approved. Never asks.
             asks_for_permission: false,
+            // claude-agent-acp exposes the CLI's own permission modes as ACP
+            // session modes under the identical spelling (CHANGELOG 0.71.0
+            // "align Claude modes...", 0.67.0 "expose permission mode
+            // kinds", 0.25.0 "Add auto permission mode support"); measured
+            // live, the handshake's default `currentModeId` is the bare
+            // string `"auto"` (`mode:Mode="auto"`), confirming the id space
+            // is the raw mode string, not a separate ACP-only vocabulary.
+            acp_mode_id: Some(ModeId::new("bypassPermissions")),
         },
         ("claude", ApprovalLevel::Moderate) => Supported {
             args: vec!["--permission-mode".to_owned(), "acceptEdits".to_owned()],
             // acceptEdits: file edits are auto-approved, everything else
             // (Bash, other tools) still raises a permission question.
             asks_for_permission: true,
+            acp_mode_id: Some(ModeId::new("acceptEdits")), // see FullAuto's comment above.
         },
         ("claude", ApprovalLevel::ReadOnly) => Supported {
             args: vec!["--permission-mode".to_owned(), "plan".to_owned()],
@@ -162,6 +235,7 @@ pub fn approval_level_resolution(agent_id: &AgentId, level: ApprovalLevel) -> Ap
             // flag here) was claude's own interactive mode and asked about
             // everything; this row is the fix for that drift.
             asks_for_permission: false,
+            acp_mode_id: Some(ModeId::new("plan")), // see FullAuto's comment above.
         },
 
         // codex -- OpenAI Codex CLI `--sandbox` / `--ask-for-approval`.
@@ -169,6 +243,17 @@ pub fn approval_level_resolution(agent_id: &AgentId, level: ApprovalLevel) -> Ap
             args: vec!["--dangerously-bypass-approvals-and-sandbox".to_owned()],
             // Bypasses approvals AND the sandbox entirely. Never asks.
             asks_for_permission: false,
+            // No confirmed ACP mode id: codex-acp's own README/PR #206
+            // reference mode-adjacent capability work (`SessionForkCapabilities`,
+            // permission modes), but no `current_mode_update`/
+            // `modes.availableModes[].id` string has been confirmed in
+            // source or a live capture -- `docs/gate4agent/research/
+            // gate4agent-acp-progress-and-result-handoff-2026-09-02.md` §2:
+            // "literal `current_mode_update` discriminator UNCONFIRMED".
+            // Left `None` rather than guessed; the ACP transport refuses
+            // this level for codex until one is sourced (see `ModeId`'s own
+            // doc comment).
+            acp_mode_id: None,
         },
         ("codex", ApprovalLevel::Moderate) => Supported {
             args: vec![
@@ -181,6 +266,7 @@ pub fn approval_level_resolution(agent_id: &AgentId, level: ApprovalLevel) -> Ap
             // proceed unasked, escalation (e.g. a command outside the
             // sandbox) raises a permission question.
             asks_for_permission: true,
+            acp_mode_id: None, // see FullAuto's comment above.
         },
         ("codex", ApprovalLevel::ReadOnly) => Supported {
             args: vec![
@@ -193,6 +279,7 @@ pub fn approval_level_resolution(agent_id: &AgentId, level: ApprovalLevel) -> Ap
             // read-only sandbox instead of prompting -- a restriction, not
             // a question, and this row already had that right.
             asks_for_permission: false,
+            acp_mode_id: None, // see FullAuto's comment above.
         },
 
         // grok (xAI Grok Build) -- see this function's own doc comment for
@@ -204,6 +291,14 @@ pub fn approval_level_resolution(agent_id: &AgentId, level: ApprovalLevel) -> Ap
             // semantics confirmed; this exact flag spelling is not --
             // UNCONFIRMED, needs live confirmation.
             asks_for_permission: false,
+            // No confirmed ACP mode id: `current_mode_update` emission by
+            // Grok Build is itself UNCONFIRMED (`gate4agent-acp-progress-
+            // and-result-handoff-2026-09-02.md` §2), and no source names a
+            // `modes.availableModes[].id` string for it -- sharing the argv
+            // spelling with claude does not confirm it is also the ACP mode
+            // id space grok announces over `grok agent stdio`. `None` until
+            // a live capture sources one.
+            acp_mode_id: None,
         },
         ("grok", ApprovalLevel::Moderate) => Supported {
             // CONFIRMED 2026-09-02 against xAI's own documentation, which
@@ -218,6 +313,7 @@ pub fn approval_level_resolution(agent_id: &AgentId, level: ApprovalLevel) -> Ap
             // Auto auto-approves the safer tools by classifier and still
             // prompts for dangerous ones, so a request can still arrive.
             asks_for_permission: true,
+            acp_mode_id: None, // see FullAuto's comment above.
         },
         // No documented read-only mode exists for Grok Build at all (Ask /
         // Auto / Always-approve, none of them a restriction) -- refuse by
@@ -233,6 +329,16 @@ pub fn approval_level_resolution(agent_id: &AgentId, level: ApprovalLevel) -> Ap
             // meaning of "yolo mode", not read directly from a Kimi
             // permissions doc -- UNCONFIRMED at the source, high confidence.
             asks_for_permission: false,
+            // No confirmed ACP mode id: Kimi Code's own ACP reference
+            // documents mode selection as a `session/set_mode` JSON-RPC call
+            // ("the same underlying mode switch as `set_config_option
+            // ({configId:'mode'})`") but never publishes a literal
+            // `modeId`/`availableModes[].id` string anywhere sourced
+            // (`gate4agent-vendor-approval-modes-2026-09-02.md` §4) --
+            // `--yolo`'s CLI-level "Ask When Needed" name is a human label,
+            // not a confirmed wire id. `None` until a live capture sources
+            // one.
+            acp_mode_id: None,
         },
         ("kimi", ApprovalLevel::Moderate) => Supported {
             args: Vec::new(),
@@ -243,6 +349,7 @@ pub fn approval_level_resolution(agent_id: &AgentId, level: ApprovalLevel) -> Ap
             // falls back to no flag, same as `Unmanaged`, needs live
             // confirmation.
             asks_for_permission: true,
+            acp_mode_id: None, // see FullAuto's comment above.
         },
         // Symmetric to grok: `--plan` is named in Kimi's release notes but
         // its behaviour under `kimi acp` is UNCONFIRMED -- refuse by name
@@ -251,10 +358,15 @@ pub fn approval_level_resolution(agent_id: &AgentId, level: ApprovalLevel) -> Ap
 
         // Impose nothing, for every agent ID: never refused, and the
         // vendor's own default is unpredictable by definition -- assume it
-        // can ask.
+        // can ask. No ACP mode id either: imposing nothing means there is
+        // nothing for `session/set_mode` to apply, so the ACP transport
+        // (`required_acp_mode`, `gate4agent-shell-native/src/lib.rs`) must
+        // read `acp_mode_id: None` here as "apply nothing", never as "no
+        // mechanism exists" -- the one row where those two readings differ.
         (_, ApprovalLevel::Unmanaged) => Supported {
             args: Vec::new(),
             asks_for_permission: true,
+            acp_mode_id: None,
         },
         // An agent ID this mapping does not carry verified data for at all.
         _ => Unsupported,
@@ -266,24 +378,24 @@ pub fn approval_level_resolution(agent_id: &AgentId, level: ApprovalLevel) -> Ap
 ///
 /// This is the single source of truth for the level -> argv mapping; nothing
 /// else in this codebase should hardcode one of these flags. A thin
-/// argv-only accessor over [`approval_level_resolution`], kept because
-/// `gate4agent`'s `src/acp/spawn.rs` forwards this `Vec<String>` straight
-/// into a provider's own argv and only needs the flags, not the rest of the
-/// resolution. Where a provider has no verified flag for a level --
+/// argv-only accessor over [`approval_level_resolution`], reading only its
+/// `args` field -- never its `acp_mode_id`, which has no argv shape at all.
+/// Where a provider has no verified flag for a level --
 /// including a level `approval_level_resolution` refuses outright -- this
 /// returns an empty `Vec`, the same as `ApprovalLevel::Unmanaged`, rather
 /// than inventing one.
 ///
 /// `plan_launch` (the PTY launch planner in this module) never calls this: a
 /// PTY is opened by a human, who picks their own agent's permission flags,
-/// so this crate does not impose one. The one caller that does apply this
-/// table is the ACP transport (`gate4agent`'s `src/acp`, and
-/// `gate4agent-shell-native`'s own native ACP spawn path), which this
-/// project opens programmatically with no human at the keyboard to make
-/// that choice instead -- and which must consult
-/// `approval_level_resolution` directly (not this function) before spawning,
-/// to refuse a level `approval_level_resolution` marks `Unsupported` instead
-/// of silently launching it with no flag.
+/// so this crate does not impose one. Nothing in this crate calls it for ACP
+/// either any more: that transport used to be this function's one real
+/// caller, but argv turned out to be fiction for it (see
+/// `approval_level_resolution`'s own doc comment) -- it now applies a level
+/// exclusively through `session/set_mode`, reading `acp_mode_id` off
+/// `approval_level_resolution` directly instead of calling this function at
+/// all. This function is kept for whatever future PTY-adjacent caller wants
+/// the plain argv table without the rest of the resolution -- today, nothing
+/// in this workspace calls it.
 pub fn approval_level_args(agent_id: &AgentId, level: ApprovalLevel) -> Vec<String> {
     match approval_level_resolution(agent_id, level) {
         ApprovalLevelResolution::Supported { args, .. } => args,
@@ -884,66 +996,74 @@ mod tests {
         }
     }
 
-    /// Item 3's table: one row per provider x level, asserting both the
-    /// expected flag(s) and the expected `asks_for_permission`, so a wrong
-    /// claim about vendor behaviour fails loudly here instead of surfacing
-    /// live as a missing `host-request-observed`.
+    /// Item 3's table: one row per provider x level, asserting the expected
+    /// flag(s), the expected `asks_for_permission`, AND (since 2026-09-02)
+    /// the expected `acp_mode_id`, so a wrong claim about vendor behaviour
+    /// fails loudly here instead of surfacing live as a missing
+    /// `host-request-observed` or a session silently parked in the vendor's
+    /// own default mode.
     #[test]
     fn approval_level_resolution_matches_the_verified_provider_table() {
-        fn supported(args: &[&str], asks_for_permission: bool) -> ApprovalLevelResolution {
+        fn supported(
+            args: &[&str],
+            asks_for_permission: bool,
+            acp_mode_id: Option<&str>,
+        ) -> ApprovalLevelResolution {
             ApprovalLevelResolution::Supported {
                 args: args.iter().map(|value| (*value).to_owned()).collect(),
                 asks_for_permission,
+                acp_mode_id: acp_mode_id.map(ModeId::new),
             }
         }
 
         let claude = AgentId::new("claude").unwrap();
         assert_eq!(
             approval_level_resolution(&claude, ApprovalLevel::FullAuto),
-            supported(&["--permission-mode", "bypassPermissions"], false)
+            supported(&["--permission-mode", "bypassPermissions"], false, Some("bypassPermissions"))
         );
         assert_eq!(
             approval_level_resolution(&claude, ApprovalLevel::Moderate),
-            supported(&["--permission-mode", "acceptEdits"], true)
+            supported(&["--permission-mode", "acceptEdits"], true, Some("acceptEdits"))
         );
         assert_eq!(
             approval_level_resolution(&claude, ApprovalLevel::ReadOnly),
-            supported(&["--permission-mode", "plan"], false)
+            supported(&["--permission-mode", "plan"], false, Some("plan"))
         );
         assert_eq!(
             approval_level_resolution(&claude, ApprovalLevel::Unmanaged),
-            supported(&[], true)
+            supported(&[], true, None)
         );
 
         let codex = AgentId::new("codex").unwrap();
         assert_eq!(
             approval_level_resolution(&codex, ApprovalLevel::FullAuto),
-            supported(&["--dangerously-bypass-approvals-and-sandbox"], false)
+            supported(&["--dangerously-bypass-approvals-and-sandbox"], false, None)
         );
         assert_eq!(
             approval_level_resolution(&codex, ApprovalLevel::Moderate),
             supported(
                 &["--sandbox", "workspace-write", "--ask-for-approval", "on-request"],
-                true
+                true,
+                None
             )
         );
         assert_eq!(
             approval_level_resolution(&codex, ApprovalLevel::ReadOnly),
-            supported(&["--sandbox", "read-only", "--ask-for-approval", "never"], false)
+            supported(&["--sandbox", "read-only", "--ask-for-approval", "never"], false, None)
         );
         assert_eq!(
             approval_level_resolution(&codex, ApprovalLevel::Unmanaged),
-            supported(&[], true)
+            supported(&[], true, None)
         );
 
         let grok = AgentId::new("grok").unwrap();
         assert_eq!(
             approval_level_resolution(&grok, ApprovalLevel::FullAuto),
-            supported(&["--permission-mode", "bypassPermissions"], false)
+            supported(&["--permission-mode", "bypassPermissions"], false, None)
         );
         assert_eq!(
             approval_level_resolution(&grok, ApprovalLevel::Moderate),
-            supported(&["--permission-mode", "auto"], true)
+            supported(&["--permission-mode", "auto"], true, None)
         );
         assert_eq!(
             approval_level_resolution(&grok, ApprovalLevel::ReadOnly),
@@ -951,17 +1071,17 @@ mod tests {
         );
         assert_eq!(
             approval_level_resolution(&grok, ApprovalLevel::Unmanaged),
-            supported(&[], true)
+            supported(&[], true, None)
         );
 
         let kimi = AgentId::new("kimi").unwrap();
         assert_eq!(
             approval_level_resolution(&kimi, ApprovalLevel::FullAuto),
-            supported(&["--yolo"], false)
+            supported(&["--yolo"], false, None)
         );
         assert_eq!(
             approval_level_resolution(&kimi, ApprovalLevel::Moderate),
-            supported(&[], true)
+            supported(&[], true, None)
         );
         assert_eq!(
             approval_level_resolution(&kimi, ApprovalLevel::ReadOnly),
@@ -969,7 +1089,7 @@ mod tests {
         );
         assert_eq!(
             approval_level_resolution(&kimi, ApprovalLevel::Unmanaged),
-            supported(&[], true)
+            supported(&[], true, None)
         );
 
         let unknown = AgentId::new("some-future-provider").unwrap();
@@ -982,8 +1102,46 @@ mod tests {
         }
         assert_eq!(
             approval_level_resolution(&unknown, ApprovalLevel::Unmanaged),
-            supported(&[], true)
+            supported(&[], true, None)
         );
+    }
+
+    /// The regression guard named in Item 3: every level but `Unmanaged`
+    /// must either resolve a concrete, non-`"auto"` ACP mode id or refuse
+    /// outright -- never silently `None`, which is how a session ends up
+    /// parked in whatever mode the agent announces on its own (measured
+    /// live as `mode:Mode="auto"`, which approves itself). This is the
+    /// catalog-layer half of the guard; `gate4agent-shell-native`'s own
+    /// `required_acp_mode_never_silently_permits_auto_except_for_unmanaged`
+    /// asserts the same property at the ACP spawn-site layer that actually
+    /// consumes this table.
+    #[test]
+    fn acp_mode_id_is_never_silently_absent_for_a_managed_level() {
+        for id in ["claude", "codex", "grok", "kimi", "some-future-provider"] {
+            let agent = AgentId::new(id).unwrap();
+            for level in [ApprovalLevel::FullAuto, ApprovalLevel::Moderate, ApprovalLevel::ReadOnly] {
+                match approval_level_resolution(&agent, level) {
+                    ApprovalLevelResolution::Supported { acp_mode_id: Some(mode_id), .. } => {
+                        assert_ne!(
+                            mode_id.as_str(),
+                            "auto",
+                            "{id} at {level:?} must never silently resolve the literal vendor default 'auto'"
+                        );
+                    }
+                    ApprovalLevelResolution::Supported { acp_mode_id: None, .. } => {} // refused one layer up (`required_acp_mode`)
+                    ApprovalLevelResolution::Unsupported => {}
+                }
+            }
+            assert_eq!(
+                approval_level_resolution(&agent, ApprovalLevel::Unmanaged),
+                ApprovalLevelResolution::Supported {
+                    args: Vec::new(),
+                    asks_for_permission: true,
+                    acp_mode_id: None,
+                },
+                "{id}: Unmanaged is the one level allowed to carry no ACP mode id"
+            );
+        }
     }
 
     /// A level `approval_level_resolution` refuses (`Unsupported`) must

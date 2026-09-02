@@ -69,30 +69,39 @@ pub(crate) fn acp_command(tool: CliTool) -> Result<AcpSpawnSpec, std::io::Error>
     Ok(spec)
 }
 
-/// The subset of `approval_args` this spec's spawn command actually forwards
-/// to the process that will parse them.
+/// Argv approval flags reaching an ACP-spawned process, for ANY spec --
+/// always empty, unconditionally.
 ///
-/// `grok` and `kimi` (`npm_tool: false`) spawn the vendor's own binary
-/// directly -- `spec.args` (`["agent", "stdio"]`, `["acp"]`) IS that
-/// binary's own argv, the same way `gate4agent_catalog::plan_launch` only
-/// injects a flag when `spec.launch.program == spec.id` for the PTY
-/// transport. `claude` and `codex` (`npm_tool: true`) instead spawn an
-/// `npx`-installed adapter-wrapper package
-/// (`@agentclientprotocol/claude-agent-acp`, `codex-acp`) that itself spawns or
-/// embeds the real agent; whether that wrapper forwards trailing argv
-/// through to the agent it wraps is not verified anywhere this project has
-/// checked, so no flag is invented for it -- an empty slice, matching
-/// `gate4agent_catalog::approval_level_args`'s own "don't invent one" rule
-/// for a level it has no verified mapping for.
+/// This used to depend on `spec.npm_tool`: `grok` and `kimi` (`npm_tool:
+/// false`) spawn the vendor's own binary directly, so `approval_args` reached
+/// their real argv, while `claude` and `codex` (`npm_tool: true`) spawn an
+/// `npx`-installed adapter-wrapper package whose trailing-argv forwarding was
+/// never verified, so they got an empty slice instead. That split is retired
+/// now that ACP has exactly one mechanism for applying an approval level,
+/// full stop: `session/set_mode`, driven from
+/// `gate4agent_catalog::approval_level_resolution`'s own `acp_mode_id`
+/// column (`ModeId`) by the caller that spawns a session
+/// (`gate4agent-shell-native`'s `apply_acp_approval_mode`), never by argv.
+/// Measured live, the wrapper-fronted providers (`claude`, `codex`) never
+/// received a flag either way and came up in the agent's own default mode
+/// regardless (`mode:Mode="auto"`) -- proof that the argv mechanism was
+/// fiction for ACP even where a spec's `npm_tool` check let it through, not
+/// just where it blocked it. `grok` and `kimi` spawning their own binary
+/// changes nothing about that: "the binary is the vendor's own" was never
+/// the reason argv reached a session mode over ACP, only the reason it
+/// reached that binary's OWN argv parser, which is a different question
+/// from whether the resulting session actually landed in the requested
+/// mode.
+///
+/// Kept as a real function (not simply inlined at the one call site,
+/// `AcpProcess::spawn`) so the intent -- and the reason it changed -- has
+/// somewhere to live, and so a caller that later has a real, argv-shaped use
+/// for `AcpSpawnSpec`/`approval_args` again finds the seam already there.
 pub(crate) fn applicable_approval_args<'a>(
-    spec: &AcpSpawnSpec,
-    approval_args: &'a [String],
+    _spec: &AcpSpawnSpec,
+    _approval_args: &'a [String],
 ) -> &'a [String] {
-    if spec.npm_tool {
-        &[]
-    } else {
-        approval_args
-    }
+    &[]
 }
 
 // ---------------------------------------------------------------------------
@@ -126,9 +135,12 @@ impl AcpProcess {
     /// npm-installed tools), sets `stdin`/`stdout` to piped, and starts a
     /// background reader thread on stdout.
     ///
-    /// `approval_args` are the flags `gate4agent_catalog::approval_level_args`
-    /// mapped for the request's `ApprovalLevel`; see `applicable_approval_args`
-    /// for which specs actually receive them.
+    /// `approval_args` is accepted for signature compatibility with
+    /// callers that still resolve `gate4agent_catalog::approval_level_args`
+    /// for other purposes, but `applicable_approval_args` now discards it
+    /// unconditionally: ACP applies an approval level exclusively through
+    /// `session/set_mode`, never argv (see `applicable_approval_args`'s own
+    /// doc comment).
     pub(crate) fn spawn(
         tool: CliTool,
         working_dir: &std::path::Path,
@@ -478,16 +490,24 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // applicable_approval_args -- the npm_tool gate
+    // applicable_approval_args -- always empty, for every spec, over ACP
     // -----------------------------------------------------------------------
 
     #[test]
-    fn direct_binary_specs_receive_approval_args_unchanged() {
+    fn direct_binary_specs_no_longer_receive_approval_args_over_acp_argv() {
+        // `grok`/`kimi` spawn the vendor's own binary directly -- this used
+        // to mean `approval_args` reached its real argv unchanged. That
+        // mechanism is retired: ACP applies a level exclusively through
+        // `session/set_mode` now, for every provider, so even a
+        // non-adapter-wrapped spec gets nothing here any more.
         for tool in [CliTool::Grok, CliTool::KimiCode] {
             let spec = acp_command(tool).unwrap();
             assert!(!spec.npm_tool, "{tool}");
             let args = vec!["--some-flag".to_owned(), "value".to_owned()];
-            assert_eq!(applicable_approval_args(&spec, &args), args.as_slice(), "{tool}");
+            assert!(
+                applicable_approval_args(&spec, &args).is_empty(),
+                "{tool}: a direct-binary spec must not receive an approval flag over ACP argv any more"
+            );
         }
     }
 
@@ -507,12 +527,15 @@ mod tests {
     /// End-to-end table: `gate4agent_catalog::approval_level_args`'s own
     /// verified flag table, filtered through `applicable_approval_args`, for
     /// every provider at every `ApprovalLevel` -- exactly the composition
-    /// `AcpProcess::spawn` performs. `claude`/`codex` never see a flag
-    /// (adapter-wrapped); `grok`/`kimi` see the catalog's table verbatim,
-    /// which is empty for every level except `FullAuto` -- proving the
-    /// intermediate levels never fabricate one either.
+    /// `AcpProcess::spawn` performs. The catalog's table itself still has
+    /// real, non-empty entries (e.g. claude `FullAuto` ->
+    /// `["--permission-mode", "bypassPermissions"]`); this proves none of
+    /// them ever reach ACP argv regardless, for any provider or level --
+    /// the level is applied through `session/set_mode` instead
+    /// (`gate4agent-shell-native`'s `apply_acp_approval_mode`), one
+    /// mechanism per transport.
     #[test]
-    fn approval_flags_reach_argv_only_for_direct_binary_specs_at_every_level() {
+    fn approval_flags_never_reach_acp_argv_for_any_provider_at_any_level() {
         use gate4agent_catalog::{approval_level_args, AgentId};
         use gate4agent_types::ApprovalLevel;
 
@@ -534,18 +557,11 @@ mod tests {
             for level in levels {
                 let table_args = approval_level_args(&agent, level);
                 let applied = applicable_approval_args(&spec, &table_args);
-                if spec.npm_tool {
-                    assert!(
-                        applied.is_empty(),
-                        "{provider_id} at {level:?} is adapter-wrapped and must never get a flag"
-                    );
-                } else {
-                    assert_eq!(
-                        applied,
-                        table_args.as_slice(),
-                        "{provider_id} at {level:?} must get exactly the catalog's own table"
-                    );
-                }
+                assert!(
+                    applied.is_empty(),
+                    "{provider_id} at {level:?} must never see an ACP argv approval flag, \
+                     even though the catalog's own table has one: {table_args:?}"
+                );
             }
         }
     }

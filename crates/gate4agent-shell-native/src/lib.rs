@@ -42,8 +42,8 @@ use gate4agent_adapters::{
     CodexPtySessionIdentityExtractor, KimiPtySessionIdentityExtractor, OneShotSessionPersistence,
 };
 use gate4agent_catalog::{
-    approval_level_args, approval_level_resolution, ApprovalLevelResolution, AgentRegistry,
-    AgentSpec, EnvMutation,
+    approval_level_resolution, ApprovalLevelResolution, AgentRegistry, AgentSpec, EnvMutation,
+    ModeId,
 };
 use gate4agent_shell_one_shot::NativeOneShotSession;
 use gate4agent_types::{
@@ -1144,39 +1144,46 @@ impl NativeEffectShell {
                     family: AdapterFamily::Acp,
                     binding: acp_spec.adapter.clone(),
                 };
-                // ACP is the transport this project opens programmatically
-                // -- unlike a PTY, there is no human at a terminal to pick
-                // permission flags, so the request's `approval_level` has to
-                // steer both the spawned process's own argv
-                // (`approval_level_args`, applied inside `AcpSession` only
-                // for a provider it spawns as its own binary rather than
-                // through an adapter wrapper -- see `src/acp/spawn.rs`) and
-                // the host side answering the session's permission requests
-                // (`host_policy_for_approval_level`).
+                // ACP is the transport this project opens programmatically --
+                // unlike a PTY, there is no human at a terminal to pick
+                // permission flags. Measured live: both running ACP adapters
+                // (claude, codex) came up with no `--permission-mode` flag
+                // reaching them at all and no permission request ever
+                // appearing, because `npx`-wrapped specs never receive one
+                // (`applicable_approval_args`, `src/acp/spawn.rs`) -- the
+                // adapter simply started in its own default, confirmed on
+                // the wire as `mode:Mode="auto"`, which approves itself.
+                // Argv was fiction for ACP; the level lives in `session/
+                // set_mode` instead now, for every provider, npx-wrapped or
+                // the vendor's own binary alike -- one mechanism per
+                // transport (`applicable_approval_args` never forwards an
+                // approval flag to an ACP-spawned process any more).
                 //
-                // A provider with no verified mode for this level
-                // (`ApprovalLevelResolution::Unsupported` -- today, `grok`
-                // and `kimi` at `ReadOnly`) must be refused by name here.
-                // Silently falling through to `approval_level_args`'s empty
-                // `Vec` would spawn the vendor's own default "ask" mode
-                // instead -- a wider authority than what was requested, the
-                // exact class of bug this whole approval-level axis exists
-                // to prevent.
-                if matches!(
-                    approval_level_resolution(&agent_id, request.approval_level),
-                    ApprovalLevelResolution::Unsupported
-                ) {
-                    return ControlObservation::SpawnFailed {
-                        message: format!(
-                            "agent '{agent_id}' has no verified {:?} mode; refusing rather than \
-                             launching at the vendor's own (wider-authority) default",
-                            request.approval_level
-                        ),
-                    };
-                }
+                // `required_acp_mode` resolves the concrete ACP mode id this
+                // level needs from `gate4agent_catalog::approval_level_
+                // resolution`'s own `acp_mode_id` column, and refuses BEFORE
+                // a process is even spawned whenever no mechanism exists to
+                // enforce the request: `ApprovalLevelResolution::Unsupported`
+                // (today, `grok`/`kimi` at `ReadOnly`), or a `Supported` row
+                // this catalog has no sourced ACP mode id for yet (today,
+                // every level on `codex`/`grok`/`kimi` except `Unmanaged`).
+                // Silently proceeding either way would spawn the vendor's
+                // own default instead -- a wider authority than requested,
+                // the exact defect this rewrite closes. `Unmanaged` is the
+                // one level that legitimately resolves to "apply nothing" --
+                // it imposes nothing by definition.
+                let acp_mode_id = match required_acp_mode(&agent_id, request.approval_level) {
+                    Ok(mode_id) => mode_id,
+                    Err(message) => return ControlObservation::SpawnFailed { message },
+                };
                 let acp_options = AcpSessionOptions {
                     host_policy: host_policy_for_approval_level(request.approval_level),
-                    approval_level_args: approval_level_args(&agent_id, request.approval_level),
+                    // Never populated for ACP any more -- see this branch's
+                    // own comment above and `applicable_approval_args`
+                    // (`src/acp/spawn.rs`): the level is applied exclusively
+                    // through `session/set_mode`, below, once the handshake
+                    // is up.
+                    approval_level_args: Vec::new(),
                     defer_permission_requests: defers_permission_requests(
                         &agent_id,
                         request.approval_level,
@@ -1192,6 +1199,15 @@ impl NativeEffectShell {
                 };
                 match spawned {
                     Ok(session) => {
+                        if let Some(mode_id) = acp_mode_id.as_ref() {
+                            if let Err(message) =
+                                apply_acp_approval_mode(&session, mode_id, request.approval_level)
+                                    .await
+                            {
+                                let _ = session.kill().await;
+                                return ControlObservation::SpawnFailed { message };
+                            }
+                        }
                         let process_id = session.process_id();
                         let events = session.subscribe();
                         let session_id = session
@@ -1837,6 +1853,151 @@ fn defers_permission_requests(agent_id: &AgentId, level: ApprovalLevel) -> bool 
         } => asks_for_permission,
         ApprovalLevelResolution::Unsupported => true,
     }
+}
+
+/// How long [`apply_acp_approval_mode`] waits, after a successful
+/// `session/set_mode` RPC ack, for the agent's own `current_mode_update`
+/// notification to corroborate it. Bounded because the notification is
+/// documented as optional -- `AcpSession::set_mode`'s own doc comment: "an
+/// agent is not required to also send one after acking this call" -- so an
+/// agent that never sends it must never stall a spawn indefinitely. The RPC
+/// ack itself (checked before this wait starts) is the authoritative
+/// confirmation; this wait is corroboration only, and a timeout here does
+/// not undo it.
+const ACP_MODE_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Resolve the concrete ACP mode id [`apply_acp_approval_mode`] must confirm
+/// and apply for `agent_id` at `level`, or the exact refusal message when no
+/// mechanism exists to enforce it at all.
+///
+/// `Ok(Some(id))` is the only outcome that lets a non-[`ApprovalLevel::
+/// Unmanaged`] spawn proceed: `gate4agent_catalog::approval_level_
+/// resolution`'s own `acp_mode_id` column named a real, catalog-sourced
+/// vendor mode id. `Ok(None)` is returned ONLY for `Unmanaged`, whose own
+/// row is `Supported` with `acp_mode_id: None` by design -- it imposes
+/// nothing, so there is nothing to apply. Every other case is `Err`:
+/// [`ApprovalLevelResolution::Unsupported`] (no verified vendor mode exists
+/// at all for this level) and a `Supported` row this catalog has no sourced
+/// ACP mode id for yet (today, every level on `codex`/`grok`/`kimi` except
+/// `Unmanaged` -- see `approval_level_resolution`'s own doc comment for why)
+/// are refused identically: ACP now applies a level exclusively through
+/// `session/set_mode`, with no argv fallback left to fall through to (see
+/// `applicable_approval_args`, `src/acp/spawn.rs`), so "no known mode id"
+/// and "no verified mode at all" are the same defect from this transport's
+/// point of view -- letting either through would spawn the vendor's own
+/// default instead, measured live as `mode:Mode="auto"`, which approves
+/// itself.
+fn required_acp_mode(agent_id: &AgentId, level: ApprovalLevel) -> Result<Option<ModeId>, String> {
+    let acp_mode_id = match approval_level_resolution(agent_id, level) {
+        ApprovalLevelResolution::Unsupported => None,
+        ApprovalLevelResolution::Supported { acp_mode_id, .. } => acp_mode_id,
+    };
+    match (acp_mode_id, level) {
+        (Some(mode_id), _) => Ok(Some(mode_id)),
+        (None, ApprovalLevel::Unmanaged) => Ok(None),
+        (None, _) => Err(format!(
+            "agent '{agent_id}' has no verified ACP mode for {level:?}; refusing rather than \
+             launching at the vendor's own (wider-authority) default"
+        )),
+    }
+}
+
+/// Named refusal for [`apply_acp_approval_mode`]: `level` resolved a real
+/// catalog `acp_mode_id`, but this agent's own `session/new` handshake never
+/// announced a mode with that id -- so the mechanism that would apply it
+/// (`session/set_mode`) has nothing to call. Refusing by name, carrying
+/// exactly what the agent DID offer, is the alternative to the defect this
+/// whole rewrite exists to close: silently leaving the session running at
+/// whichever mode the agent came up in on its own.
+#[derive(Debug)]
+struct ApprovalLevelNotOfferedByAgent {
+    level: ApprovalLevel,
+    offered: Vec<String>,
+}
+
+impl std::fmt::Display for ApprovalLevelNotOfferedByAgent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "ApprovalLevelNotOfferedByAgent {{ level: {:?}, offered: {:?} }}",
+            self.level, self.offered
+        )
+    }
+}
+
+/// `None` when `offered` (the agent's own `session/new` mode catalog) names
+/// `mode_id`; `Some(message)` -- an [`ApprovalLevelNotOfferedByAgent`],
+/// stringified -- when it does not. A free function, independent of a live
+/// [`AcpSession`], so the refusal can be exercised directly against a
+/// fixture mode list rather than only through a real spawn.
+fn approval_level_not_offered_message(
+    level: ApprovalLevel,
+    mode_id: &ModeId,
+    offered: &[SessionMode],
+) -> Option<String> {
+    if offered.iter().any(|mode| mode.id == mode_id.as_str()) {
+        None
+    } else {
+        Some(
+            ApprovalLevelNotOfferedByAgent {
+                level,
+                offered: offered.iter().map(|mode| mode.id.clone()).collect(),
+            }
+            .to_string(),
+        )
+    }
+}
+
+/// Apply `mode_id` to a freshly handshaken ACP session (Item 2 of the
+/// `session/set_mode` approval-level rewrite): refuse by name
+/// (`approval_level_not_offered_message`) when the agent's own `session/new`
+/// mode catalog never named this id, otherwise call `session/set_mode` and
+/// wait, bounded by [`ACP_MODE_CONFIRMATION_TIMEOUT`], for the agent's own
+/// `current_mode_update` to corroborate it -- only then is the session
+/// considered up at the requested level.
+///
+/// The RPC ack from `AcpSession::set_mode` is the authoritative
+/// confirmation (it already updates the session's own cached
+/// `current_mode_id` synchronously on success, and an agent rejecting an
+/// unknown mode id returns an RPC error there, not a silent no-op); the wait
+/// on this function's own subscription is corroboration only. A provider
+/// that never sends `current_mode_update` at all -- permitted by the ACP
+/// spec -- times out here and the spawn still proceeds, because the RPC ack
+/// that already succeeded is not undone by a notification that was never
+/// guaranteed in the first place.
+async fn apply_acp_approval_mode(
+    session: &AcpSession,
+    mode_id: &ModeId,
+    level: ApprovalLevel,
+) -> Result<(), String> {
+    if let Some(message) =
+        approval_level_not_offered_message(level, mode_id, &session.available_modes())
+    {
+        return Err(message);
+    }
+
+    // Subscribed BEFORE `set_mode` is sent, so a fast `current_mode_update`
+    // cannot race ahead of this receiver's creation and be missed.
+    let mut confirmation = session.subscribe();
+    session
+        .set_mode(mode_id.as_str())
+        .await
+        .map_err(|error| format!("session/set_mode to '{mode_id}' failed: {error}"))?;
+
+    let _ = tokio::time::timeout(ACP_MODE_CONFIRMATION_TIMEOUT, async {
+        loop {
+            match confirmation.recv().await {
+                Ok(AgentEvent::ModeChanged { mode_id: changed }) if changed == mode_id.as_str() => {
+                    return;
+                }
+                Ok(_) => continue,
+                Err(_) => return,
+            }
+        }
+    })
+    .await;
+
+    Ok(())
 }
 
 fn validate_spawn_runtime_policy(
@@ -4423,13 +4584,14 @@ fn elapsed_ms(started: Instant) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
+        approval_level_not_offered_message,
         classify_operator_gate_option_semantics,
         classify_pty_screen_state,
         defers_permission_requests,
         foreground_probe_rearms_immediately, foreground_probe_schedule,
         host_policy_for_approval_level,
         parse_operator_gate_options, prepare_fresh_pty_provider_session,
-        prompt_render_probe, prompt_rendered,
+        prompt_render_probe, prompt_rendered, required_acp_mode,
         reserve_provider_gap_sequence, resolve_foreground_verdict, screen_failure,
         screen_failure_for_generation, with_pty_terminal_capability_defaults,
         should_attach_pty_provider_stream, should_probe_pty_identity, startup_operator_gate,
@@ -4438,9 +4600,10 @@ mod tests {
         ForegroundProbeSchedule, ForegroundVerdict, ReadinessDiagnostics, RateLimitFeed,
         Utf8ChunkDecoder,
     };
+    use gate4agent::acp::protocol::SessionMode;
     use gate4agent::HostPolicy;
     use gate4agent_adapters::builtin_adapter_registry;
-    use gate4agent_catalog::EnvMutation;
+    use gate4agent_catalog::{EnvMutation, ModeId};
     use gate4agent::agent::ForegroundObservation;
     use gate4agent::core::types::{
         AgentEvent, ContextWindowUsage as AgentContextWindowUsage, HostDecisionAuthority,
@@ -5921,5 +6084,110 @@ mod tests {
         assert!(defers_permission_requests(&kimi, ApprovalLevel::Moderate));
         assert!(defers_permission_requests(&kimi, ApprovalLevel::ReadOnly));
         assert!(defers_permission_requests(&kimi, ApprovalLevel::Unmanaged));
+    }
+
+    // -----------------------------------------------------------------------
+    // required_acp_mode / approval_level_not_offered_message -- Item 3's
+    // table: one row per provider x level, plus the regression guard that
+    // `auto` is unreachable without an explicit choice.
+    // -----------------------------------------------------------------------
+
+    fn session_mode(id: &str) -> SessionMode {
+        SessionMode { id: id.to_owned(), name: id.to_owned(), description: None }
+    }
+
+    #[test]
+    fn required_acp_mode_matches_the_sourced_table() {
+        let claude = AgentId::new("claude").unwrap();
+        assert_eq!(
+            required_acp_mode(&claude, ApprovalLevel::FullAuto),
+            Ok(Some(ModeId::new("bypassPermissions")))
+        );
+        assert_eq!(
+            required_acp_mode(&claude, ApprovalLevel::Moderate),
+            Ok(Some(ModeId::new("acceptEdits")))
+        );
+        assert_eq!(
+            required_acp_mode(&claude, ApprovalLevel::ReadOnly),
+            Ok(Some(ModeId::new("plan")))
+        );
+        assert_eq!(required_acp_mode(&claude, ApprovalLevel::Unmanaged), Ok(None));
+
+        // codex/grok/kimi: no ACP mode id is sourced for any managed level
+        // yet (see `gate4agent_catalog::approval_level_resolution`'s own
+        // doc comment) -- every one of them must refuse rather than spawn
+        // unconfigured, including the two (`grok`, `kimi`) that used to get
+        // an argv flag before this rewrite retired that mechanism for ACP.
+        for id in ["codex", "grok", "kimi"] {
+            let agent = AgentId::new(id).unwrap();
+            for level in [ApprovalLevel::FullAuto, ApprovalLevel::Moderate, ApprovalLevel::ReadOnly] {
+                assert!(
+                    required_acp_mode(&agent, level).is_err(),
+                    "{id} at {level:?} has no sourced ACP mode id yet and must refuse"
+                );
+            }
+            assert_eq!(required_acp_mode(&agent, ApprovalLevel::Unmanaged), Ok(None), "{id}");
+        }
+    }
+
+    /// The regression guard for the whole change: no provider x level may
+    /// silently resolve to nothing (which would leave the session running
+    /// at the agent's own default, e.g. the live-measured `auto`) unless the
+    /// level itself is `Unmanaged`. Every other level is either a concrete,
+    /// non-`"auto"` mode id, or an outright refusal.
+    #[test]
+    fn required_acp_mode_never_silently_permits_auto_except_for_unmanaged() {
+        for id in ["claude", "codex", "grok", "kimi"] {
+            let agent = AgentId::new(id).unwrap();
+            for level in [ApprovalLevel::FullAuto, ApprovalLevel::Moderate, ApprovalLevel::ReadOnly] {
+                match required_acp_mode(&agent, level) {
+                    Ok(Some(mode_id)) => assert_ne!(
+                        mode_id.as_str(),
+                        "auto",
+                        "{id} at {level:?} must never silently resolve the vendor's own default 'auto'"
+                    ),
+                    Ok(None) => panic!(
+                        "{id} at {level:?} resolved Ok(None) -- only Unmanaged may silently apply nothing"
+                    ),
+                    Err(_) => {} // refused outright -- also never reaches `auto`
+                }
+            }
+            assert_eq!(
+                required_acp_mode(&agent, ApprovalLevel::Unmanaged),
+                Ok(None),
+                "{id}: Unmanaged is the one level allowed to apply nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn approval_level_not_offered_message_refuses_by_name_and_lists_what_was_offered() {
+        let offered = vec![session_mode("bypassPermissions"), session_mode("default")];
+        let mode_id = ModeId::new("plan");
+        let message = approval_level_not_offered_message(ApprovalLevel::ReadOnly, &mode_id, &offered)
+            .expect("'plan' was not among the offered modes");
+        assert!(message.contains("ApprovalLevelNotOfferedByAgent"));
+        assert!(message.contains("bypassPermissions"));
+        assert!(message.contains("default"));
+        assert!(message.contains("ReadOnly"));
+    }
+
+    #[test]
+    fn approval_level_not_offered_message_is_none_when_the_agent_announced_it() {
+        let offered = vec![session_mode("plan")];
+        let mode_id = ModeId::new("plan");
+        assert_eq!(
+            approval_level_not_offered_message(ApprovalLevel::ReadOnly, &mode_id, &offered),
+            None
+        );
+    }
+
+    #[test]
+    fn approval_level_not_offered_message_handles_an_agent_that_announces_no_modes_at_all() {
+        let mode_id = ModeId::new("bypassPermissions");
+        let message = approval_level_not_offered_message(ApprovalLevel::FullAuto, &mode_id, &[])
+            .expect("an empty mode catalog never offers anything");
+        assert!(message.contains("ApprovalLevelNotOfferedByAgent"));
+        assert!(message.contains("offered: []"));
     }
 }

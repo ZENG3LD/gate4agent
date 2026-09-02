@@ -216,6 +216,7 @@ fn spawn_request(node_id: &NodeId, workspace_id: &WorkspaceId) -> ManagedWorktre
                 bundle_id: SpawnOverride::Clear,
                 context_id: SpawnOverride::Clear,
                 environment_profile_id: SpawnOverride::Clear,
+                approval_level: None,
             },
             deadline_ms: SpawnDeadlineMs::new(20_000).unwrap(),
             idempotency_key: SpawnIdempotencyKey::new("managed-worktree-once").unwrap(),

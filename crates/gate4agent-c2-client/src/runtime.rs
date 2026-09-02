@@ -30,6 +30,7 @@ use gate4agent_c2_protocol::{
     C2_SPAWN_PROFILE_REVISION_CAPABILITY,
     C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY,
     C2_TERMINAL_FRAME_EVENTS_CAPABILITY,
+    C2_AGENT_STREAM_EVENTS_CAPABILITY,
     C2_GIT_READ_CAPABILITY, C2_WORKSPACE_FILE_READ_CAPABILITY,
     C2_WORKSPACE_FILE_WRITE_CAPABILITY,
     C2_WORKSPACE_ENTRY_CREATE_CAPABILITY,
@@ -81,6 +82,8 @@ const SPAWN_PROFILE_REVISION_NOT_NEGOTIATED: &str =
     "spawn profile revisions require negotiated C2 capability";
 const TERMINAL_FRAME_EVENTS_NOT_NEGOTIATED: &str =
     "terminal frame events require negotiated C2 capability";
+const AGENT_STREAM_EVENTS_NOT_NEGOTIATED: &str =
+    "agent stream events require negotiated C2 capability";
 const WORKTREE_SELECTION_NOT_NEGOTIATED: &str =
     "worktree selection requires negotiated C2 capability";
 const MANAGED_WORKTREE_LIFECYCLE_NOT_NEGOTIATED: &str =
@@ -132,6 +135,7 @@ struct NegotiatedPathCapabilities {
     native_session_index: bool,
     native_session_preview: bool,
     terminal_frame_events: bool,
+    agent_stream_events: bool,
     agent_progress_snapshot: bool,
     session_task_correlation: bool,
     observation_events: bool,
@@ -519,6 +523,8 @@ pub(crate) fn client_compatibility_offer() -> Result<ClientCompatibilityOffer, C
                 .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
             CapabilityId::new(C2_TERMINAL_FRAME_EVENTS_CAPABILITY)
                 .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
+            CapabilityId::new(C2_AGENT_STREAM_EVENTS_CAPABILITY)
+                .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
             CapabilityId::new(C2_WORKTREE_SELECTION_CAPABILITY)
                 .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
             CapabilityId::new(C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY)
@@ -653,6 +659,7 @@ fn negotiated_path_capabilities(
         native_session_index: selected_has(C2_NATIVE_SESSION_INDEX_CAPABILITY),
         native_session_preview: selected_has(C2_NATIVE_SESSION_PREVIEW_CAPABILITY),
         terminal_frame_events: selected_has(C2_TERMINAL_FRAME_EVENTS_CAPABILITY),
+        agent_stream_events: selected_has(C2_AGENT_STREAM_EVENTS_CAPABILITY),
         agent_progress_snapshot: selected_has(C2_AGENT_PROGRESS_SNAPSHOT_CAPABILITY),
         session_task_correlation: selected_has(C2_SESSION_TASK_CORRELATION_CAPABILITY),
         observation_events: selected_has(C2_OBSERVATION_EVENTS_CAPABILITY),
@@ -1049,6 +1056,13 @@ fn routed_response_has_terminal_frame_event(response: &RoutedNodeResponse) -> bo
         .response
         .as_ref()
         .is_ok_and(c2_node_response_has_terminal_frame_event)
+}
+
+fn routed_response_has_agent_stream_event(response: &RoutedNodeResponse) -> bool {
+    response
+        .response
+        .as_ref()
+        .is_ok_and(c2_node_response_has_agent_stream_event)
 }
 
 fn routed_response_has_agent_progress(response: &RoutedNodeResponse) -> bool {
@@ -1498,6 +1512,79 @@ fn c2_node_event_is_terminal_frame(event: &C2NodeEvent) -> bool {
         | C2NodeEvent::ManagedWorktreeUpserted { .. }
         | C2NodeEvent::ManagedWorktreeRemoved { .. }
         | C2NodeEvent::AgentStream { .. }
+        | C2NodeEvent::ResyncRequired { .. } => false,
+    }
+}
+
+fn c2_node_response_has_agent_stream_event(response: &C2NodeResponse) -> bool {
+    match response {
+        C2NodeResponse::Resync { events, .. } => events
+            .iter()
+            .any(|event| c2_node_event_is_agent_stream(&event.event)),
+        C2NodeResponse::Snapshot { .. }
+        | C2NodeResponse::Armed { .. }
+        | C2NodeResponse::Spawned { .. }
+        | C2NodeResponse::Activated { .. }
+        | C2NodeResponse::Aborted { .. }
+        | C2NodeResponse::ReplyChunkAccepted { .. }
+        | C2NodeResponse::CallRejected { .. }
+        | C2NodeResponse::DeliveryStageBegun { .. }
+        | C2NodeResponse::DeliveryBlobChunkAccepted { .. }
+        | C2NodeResponse::DeliveryCommitted { .. }
+        | C2NodeResponse::DeliveryStageAborted { .. }
+        | C2NodeResponse::WorkspaceInspected { .. }
+        | C2NodeResponse::HostDirectoriesBrowsed { .. }
+        | C2NodeResponse::WorkspaceFileRead { .. }
+        | C2NodeResponse::WorkspaceFileWritten { .. }
+        | C2NodeResponse::WorkspaceFileCreated { .. }
+        | C2NodeResponse::WorkspaceDirectoryCreated { .. }
+        | C2NodeResponse::GitHistoryRead { .. }
+        | C2NodeResponse::GitDiffRead { .. }
+        | C2NodeResponse::Controller { .. }
+        | C2NodeResponse::SpawnAccepted { .. }
+        | C2NodeResponse::SpawnSpecAccepted { .. }
+        | C2NodeResponse::ManagedWorktreeSpawnAccepted { .. }
+        | C2NodeResponse::ManagedWorktreeCleanup { .. }
+        | C2NodeResponse::SessionRecordUpdated { .. }
+        | C2NodeResponse::ProviderSessionIndexed { .. }
+        | C2NodeResponse::NativeSessionIndexed { .. }
+        | C2NodeResponse::SessionRecordResumed { .. }
+        | C2NodeResponse::SessionRecordForgotten { .. }
+        | C2NodeResponse::NativeSessionsCataloged { .. }
+        | C2NodeResponse::NativeSessionsPaged { .. }
+        | C2NodeResponse::NativeSessionPreviewed { .. }
+        | C2NodeResponse::SessionRecordPreviewed { .. }
+        | C2NodeResponse::HistoryDiscovered { .. }
+        | C2NodeResponse::HistoryLoaded { .. }
+        | C2NodeResponse::ContextPackForSessionRecordExported { .. }
+        | C2NodeResponse::ContextPackExported { .. }
+        | C2NodeResponse::ContextPackForgotten { .. }
+        | C2NodeResponse::DurableContextPackResolved { .. }
+        | C2NodeResponse::WorkspaceRegistered { .. }
+        | C2NodeResponse::StandaloneWorkspaceCreated { .. }
+        | C2NodeResponse::WorkspaceUnregistered { .. }
+        | C2NodeResponse::WorktreeCreated { .. }
+        | C2NodeResponse::WorktreeRemoved { .. }
+        | C2NodeResponse::Accepted
+        | C2NodeResponse::ShuttingDown => false,
+    }
+}
+
+fn c2_node_event_is_agent_stream(event: &C2NodeEvent) -> bool {
+    match event {
+        C2NodeEvent::AgentStream { .. } => true,
+        C2NodeEvent::HarnessMcpReadCall { .. }
+        | C2NodeEvent::Control { .. }
+        | C2NodeEvent::Observation { .. }
+        | C2NodeEvent::ManagedObservation { .. }
+        | C2NodeEvent::ControllerChanged { .. }
+        | C2NodeEvent::WorkspaceAdded { .. }
+        | C2NodeEvent::WorkspaceRemoved { .. }
+        | C2NodeEvent::SessionRecordUpserted { .. }
+        | C2NodeEvent::SessionRecordRemoved { .. }
+        | C2NodeEvent::ManagedWorktreeUpserted { .. }
+        | C2NodeEvent::ManagedWorktreeRemoved { .. }
+        | C2NodeEvent::TerminalFrame { .. }
         | C2NodeEvent::ResyncRequired { .. } => false,
     }
 }
@@ -2272,6 +2359,17 @@ async fn control_owner<E>(
                             )));
                             break;
                         }
+                        if !path_capabilities.agent_stream_events
+                            && reply
+                                .result
+                                .as_ref()
+                                .is_ok_and(routed_response_has_agent_stream_event)
+                        {
+                            let _ = waiter.send(Err(C2ControlError::Protocol(
+                                AGENT_STREAM_EVENTS_NOT_NEGOTIATED.to_owned(),
+                            )));
+                            break;
+                        }
                         if !path_capabilities.agent_progress_snapshot
                             && reply
                                 .result
@@ -2570,6 +2668,11 @@ async fn control_owner<E>(
                         }
                         if !path_capabilities.terminal_frame_events
                             && c2_node_event_is_terminal_frame(&event.event)
+                        {
+                            break;
+                        }
+                        if !path_capabilities.agent_stream_events
+                            && c2_node_event_is_agent_stream(&event.event)
                         {
                             break;
                         }

@@ -534,6 +534,7 @@ async fn schedule_next_observation_and_outcome_unknown_inventory_are_exact() {
             bundle_id: SpawnOverride::Clear,
             context_id: SpawnOverride::Clear,
             environment_profile_id: SpawnOverride::Clear,
+            approval_level: None,
         },
         deadline_ms: SpawnDeadlineMs::new(20_000).unwrap(),
         idempotency_key: SpawnIdempotencyKey::new("frozen-outcome-unknown").unwrap(),

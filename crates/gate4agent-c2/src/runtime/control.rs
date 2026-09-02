@@ -5497,6 +5497,7 @@ mod tests {
             native_session_index: true,
             native_session_preview: true,
             terminal_frame_events: true,
+            agent_stream_events: true,
             agent_progress_snapshot: true,
             session_task_correlation: true,
             observation_events: true,

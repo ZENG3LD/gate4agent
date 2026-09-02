@@ -14100,6 +14100,7 @@ mod tests {
             provider_profile: "claude-default".to_owned(),
             mode: HarnessExecutionModeV1::Pty,
             terminal_size: HarnessRuntimeTerminalSizeV1 { rows: 40, columns: 120 },
+            approval_level: None,
         };
         assert_eq!(operator_response_deadline(&request), HOST_SESSION_SPAWN_RESPONSE_DEADLINE);
 

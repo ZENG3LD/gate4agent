@@ -311,6 +311,7 @@ fn spawn_request(
                 },
                 context_id: SpawnOverride::Inherit,
                 environment_profile_id: SpawnOverride::Inherit,
+                approval_level: None,
             },
             deadline_ms: SpawnDeadlineMs::new(20_000).unwrap(),
             idempotency_key: SpawnIdempotencyKey::new(idempotency_key).unwrap(),

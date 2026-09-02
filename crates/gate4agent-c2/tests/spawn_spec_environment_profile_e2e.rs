@@ -414,6 +414,7 @@ async fn windows_fixture_spawn_spec_environment_profile_runs_exact_pty_end_to_en
             bundle_id: SpawnOverride::Inherit,
             context_id: SpawnOverride::Inherit,
             environment_profile_id: SpawnOverride::Inherit,
+            approval_level: None,
         },
         deadline_ms: SpawnDeadlineMs::new(20_000).unwrap(),
         idempotency_key: SpawnIdempotencyKey::new("environment-profile-once").unwrap(),

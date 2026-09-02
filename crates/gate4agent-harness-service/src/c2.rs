@@ -6350,6 +6350,7 @@ mod tests {
                 bundle_id: SpawnOverride::Clear,
                 context_id: SpawnOverride::Clear,
                 environment_profile_id: SpawnOverride::Clear,
+                approval_level: None,
             },
             deadline_ms: SpawnDeadlineMs::new(5_000).unwrap(),
             idempotency_key: SpawnIdempotencyKey::new("h1-proof").unwrap(),

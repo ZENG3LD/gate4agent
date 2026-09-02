@@ -549,12 +549,14 @@ enum HostCommand {
     /// Registers a new agent-stream-push subscriber -- the sibling of
     /// `SubscribeTerminal` immediately above for `AgentStreamSubscriberRegistry`
     /// rather than `TerminalSubscriberRegistry`. Also fire-and-forget, but
-    /// unlike `SubscribeTerminal` there is no per-session seed to push on
-    /// registration: `AgentStreamSubscriberRegistry` has no buffer to seed
-    /// from (see its own module doc comment in `agent_stream.rs`), so the
-    /// registration itself is the entire observable effect. See
-    /// `handle_connection`'s `SubscribeAgentStream` branch for the sender
-    /// side.
+    /// unlike `SubscribeTerminal`'s explicit per-session `send_to` call, the
+    /// seed here is folded into `AgentStreamSubscriberRegistry::insert`
+    /// itself: it hands the new subscriber whatever `ModeCatalog`/
+    /// `ConfigOptions`/`ModelCatalog`/unresolved `InteractionPrompt` it
+    /// already holds for the requested sessions, before any live chunk (see
+    /// `agent_stream.rs`'s own module doc comment for the three-way seeding
+    /// split this follows). See `handle_connection`'s `SubscribeAgentStream`
+    /// branch for the sender side.
     SubscribeAgentStream {
         sender: mpsc::Sender<HarnessOperatorAgentEventV1>,
         sessions: HashSet<RuntimeSessionKey>,
@@ -6679,9 +6681,11 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                 sessions = ?sessions,
                                 "harness agent stream subscriber registered",
                             );
-                            // No seed loop here, unlike `SubscribeTerminal`
-                            // immediately above: `AgentStreamSubscriberRegistry`
-                            // has no buffer to seed from (see its own doc
+                            // Unlike `SubscribeTerminal` immediately above,
+                            // there is no explicit seed call here to make --
+                            // `AgentStreamSubscriberRegistry::insert` itself
+                            // seeds the new subscriber with whatever state it
+                            // already holds for `sessions` (see its own doc
                             // comment in `agent_stream.rs`).
                             agent_stream_subscribers.insert(sender, sessions, identity);
                         }
@@ -6736,6 +6740,39 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                         generation: address.session.generation,
                                     };
                                     agent_stream_subscribers.publish(&key, chunk);
+                                }
+                                // The generic sink for every way an
+                                // interaction can settle -- an operator's own
+                                // `ResolveInteraction` (via its C2 round
+                                // trip and the node's own report back) or
+                                // `HostPolicy` deciding it on a deadline both
+                                // land here the same way, since both produce
+                                // the same observation kind. See
+                                // `AgentStreamSubscriberRegistry::
+                                // resolve_interaction`'s own doc comment
+                                // (`agent_stream.rs`) for why a resolved
+                                // prompt must leave the agent-stream seed set
+                                // regardless of which of the two caused it.
+                                C2NodeEvent::Observation { address, observation } => {
+                                    if let gate4agent_observation_protocol::ObservationKindV1::ApprovalResolved {
+                                        correlation_id, ..
+                                    }
+                                    | gate4agent_observation_protocol::ObservationKindV1::QuestionResolved {
+                                        correlation_id, ..
+                                    }
+                                    | gate4agent_observation_protocol::ObservationKindV1::InteractionResolved {
+                                        correlation_id, ..
+                                    } = &observation.kind
+                                    {
+                                        let key = RuntimeSessionKey {
+                                            node_id: event.node_id.clone(),
+                                            incarnation_id: event.cursor.incarnation_id,
+                                            workspace_id: address.workspace_id.clone(),
+                                            instance_id: address.session.instance_id,
+                                            generation: address.session.generation,
+                                        };
+                                        agent_stream_subscribers.resolve_interaction(&key, correlation_id);
+                                    }
                                 }
                                 C2NodeEvent::ResyncRequired { .. } => {
                                     terminal_buffers.invalidate(&NodeRoute {

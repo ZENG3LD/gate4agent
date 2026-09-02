@@ -108,7 +108,7 @@ use crate::protocol::{
     HostDecisionAuthorityV1, HostRequestDecisionV1,
     ObservationCapabilitiesV1, ObservationEvidenceV1, ObservationInteractionOutcomeV1,
     ObservationKindV1, ObservationSourceFamilyV1, ObservationTodoItemV1, ObservationTodoStateV1,
-    ObservationV1, OBSERVATION_DETAIL_MAX_BYTES,
+    ObservationV1,
     StateSchemaSupport, WorkspaceEntry, WorkspaceEntryKind, WorktreeProfileId,
     SpawnContextId, SpawnEnvironmentProfileId, SpawnIdempotencyKey,
     SpawnProfileDefaults, SpawnRequiredCapabilities, SpawnSpec, SpawnSpecResolveError,
@@ -492,20 +492,22 @@ fn agent_progress_event_kind(event: &ProviderEvent) -> Option<AgentProgressEvent
 /// a complete one and sends the reader looking for the rest of a sentence
 /// that was never there.
 fn observation_error_detail(message: &str) -> String {
-    let message = message.trim();
-    if message.is_empty() {
-        return "provider-error".to_owned();
+    // `detail` is a CATEGORY, not a message: `validate_error_category`
+    // (`gate4agent-observation-api`) accepts only hyphen-separated segments of
+    // lowercase letters and digits, and rejects anything else -- and that
+    // rejection propagates out of the harness runtime loop, taking the
+    // operator wire down with it. Passing a provider's sentence through here
+    // did exactly that, live.
+    //
+    // So a refusal still names itself, in this field's own vocabulary: a
+    // distinct slug rather than a distinct sentence. The engine's own message
+    // stays intact where free text is allowed; only the categorical view of it
+    // is derived here.
+    let message = message.trim().to_ascii_lowercase();
+    if message.starts_with("provider events rejected") {
+        return "provider-events-rejected".to_owned();
     }
-    if message.len() <= OBSERVATION_DETAIL_MAX_BYTES {
-        return message.to_owned();
-    }
-    const ELLIPSIS: &str = "...";
-    let budget = OBSERVATION_DETAIL_MAX_BYTES - ELLIPSIS.len();
-    let mut cut = budget;
-    while cut > 0 && !message.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    format!("{}{ELLIPSIS}", &message[..cut])
+    "provider-error".to_owned()
 }
 
 fn observation_evidence(family: AdapterFamily) -> Option<ObservationEvidenceV1> {

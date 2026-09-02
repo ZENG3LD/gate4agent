@@ -18,6 +18,12 @@ use std::{
 
 const C2_TOKEN_ENV: &str = "GATE4AGENT_C2_TOKEN";
 const OPERATOR_TOKEN_ENV: &str = "GATE4AGENT_HARNESS_OPERATOR_TOKEN";
+/// Process exit code used when the runtime task ends on its own -- with or
+/// without an error -- while nothing asked it to shut down. Distinct from the
+/// implicit 0 of a clean Ctrl-C shutdown and from the 2 that `fail()` uses for
+/// setup/argument errors, so a supervisor reading only the exit code can tell
+/// "the operator wire died and needs a restart" apart from both.
+const OPERATOR_WIRE_DOWN_EXIT_CODE: i32 = 3;
 const USAGE: &str = "usage: gate4agent-harness --harness-db ABSOLUTE_PATH --observation-db ABSOLUTE_PATH --c2-endpoint LOCAL_ENDPOINT --read-bind 127.0.0.1:PORT [--launch-plan-json JSON]... [--delivery-bundle-json JSON]...\n\
      --launch-plan-json is an explicit override, not a requirement: the harness always derives\n\
      a default ordinary launch plan per node/workspace/enabled-provider/spawn-profile combination\n\
@@ -68,7 +74,7 @@ async fn run(arguments: Vec<String>) -> Result<(), String> {
     let (adapter, events) = HarnessC2Adapter::connect(config.c2_endpoint, c2_token)
         .await
         .map_err(|error| format!("--c2-endpoint connect failed: {error}"))?;
-    let (host, task) = start_harness_host_with_operator_and_catalogs(
+    let (host, mut task) = start_harness_host_with_operator_and_catalogs(
         harness,
         observation,
         adapter,
@@ -82,15 +88,39 @@ async fn run(arguments: Vec<String>) -> Result<(), String> {
     let endpoint = host.endpoint().socket_addr();
     println!("HARNESS_READ_ENDPOINT={endpoint}");
     println!("GATE4AGENT_HARNESS_OPERATOR_ENDPOINT={endpoint}");
-    tokio::signal::ctrl_c()
-        .await
-        .map_err(|error| format!("Ctrl-C signal wait failed: {error}"))?;
-    host.shutdown()
-        .await
-        .map_err(|error| format!("harness host shutdown failed: {error}"))?;
-    task.await
-        .map_err(|error| format!("harness host task panicked: {error}"))?
-        .map_err(|error| format!("harness host stopped with an error: {error}"))
+    // Race the shutdown signal against the runtime task itself. If the task
+    // ends first -- with or without an error, since a bare `Ok(())` here
+    // still means it stopped serving without being asked to -- nobody is
+    // left holding the operator listener, and this process must not keep
+    // reporting itself alive while that is true. Only when `ctrl_c` wins
+    // does the process follow the previous clean-shutdown path unchanged.
+    tokio::select! {
+        ctrl_c_result = tokio::signal::ctrl_c() => {
+            ctrl_c_result
+                .map_err(|error| format!("Ctrl-C signal wait failed: {error}"))?;
+            host.shutdown()
+                .await
+                .map_err(|error| format!("harness host shutdown failed: {error}"))?;
+            task.await
+                .map_err(|error| format!("harness host task panicked: {error}"))?
+                .map_err(|error| format!("harness host stopped with an error: {error}"))
+        }
+        task_result = &mut task => {
+            let reason = match task_result {
+                Ok(Ok(())) => {
+                    "harness runtime task returned without a shutdown request".to_owned()
+                }
+                Ok(Err(error)) => format!("harness runtime task exited with an error: {error}"),
+                Err(error) => format!("harness runtime task panicked: {error}"),
+            };
+            tracing::error!(
+                reason = %reason,
+                exit_code = OPERATOR_WIRE_DOWN_EXIT_CODE,
+                "operator wire is gone; process is exiting so a supervisor can restart it",
+            );
+            std::process::exit(OPERATOR_WIRE_DOWN_EXIT_CODE);
+        }
+    }
 }
 
 fn fail(message: &str) -> ! {

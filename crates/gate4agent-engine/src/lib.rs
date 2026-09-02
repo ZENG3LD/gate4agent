@@ -3962,6 +3962,97 @@ mod tests {
         );
     }
 
+    /// The ACP-shaped counterpart to `runtime_policy_keeps_raw_input_and_
+    /// rejects_structured_prompt` above -- the two together pin the boundary
+    /// from both sides. An ACP session's `runtime_policy` grants
+    /// `SemanticReadiness`/`StructuredPrompt` as facts of the ACP protocol
+    /// itself (no PTY to verify: `raw_pty_lifecycle` is false), so
+    /// `SubmitPrompt` is admitted here where it used to come back
+    /// `ProviderRuntimePolicyDenied` for every ACP session (the live-measured
+    /// defect this fix closes). A PTY-only action landing on the same
+    /// session is still refused -- by the transport `match` itself
+    /// (`UnsupportedTransportOperation`), never by a policy flag that
+    /// happens to be false.
+    #[test]
+    fn acp_runtime_policy_admits_structured_prompt_and_refuses_raw_pty_input_by_name() {
+        let acp_policy = ProviderRuntimePolicy::new(false, true, true, false, false, false)
+            .expect("ACP-shaped runtime policy is internally valid");
+        let (mut engine, _spawn) = running_engine_with_policy(acp_policy);
+        engine.session_mut(instance()).transport = TransportKind::Acp;
+
+        engine
+            .apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(3),
+                command: ControlCommand::SendInput {
+                    instance_id: instance(),
+                    action: InputAction::SubmitPrompt(PromptPayload {
+                        text: "acp prompt".to_owned(),
+                        framing: PromptFraming::Literal,
+                    }),
+                },
+            })
+            .expect("ACP structured prompt must be admitted by an ACP-shaped runtime policy");
+        let submit = engine.drain_effects().pop().unwrap();
+        assert!(matches!(submit.effect, ControlEffect::SubmitPrompt { .. }));
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: Some(submit.operation_id),
+            instance_id: instance(),
+            generation: submit.generation,
+            observation: ControlObservation::InputCompleted,
+        });
+
+        assert_eq!(
+            engine.apply_command(CommandEnvelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                id: CommandId(4),
+                command: ControlCommand::SendInput {
+                    instance_id: instance(),
+                    action: InputAction::TerminalBytes(vec![0x1b, b'[', b'A']),
+                },
+            }),
+            Err(ControlError::UnsupportedTransportOperation {
+                transport: TransportKind::Acp,
+                action: "this input action".to_owned(),
+            }),
+        );
+        assert!(engine.drain_effects().is_empty());
+    }
+
+    /// The observation-ingress counterpart: an ACP session's
+    /// `SemanticReadiness` grant lets a non-identity `ProviderEvent` reach
+    /// the session's provider sequence instead of being dropped as
+    /// `ObservationIgnoredReason::ProviderRuntimePolicyDenied` -- the exact
+    /// defect that left a live ACP agent-stream subscription observing zero
+    /// frames before this fix.
+    #[test]
+    fn acp_runtime_policy_admits_a_non_identity_provider_event() {
+        let acp_policy = ProviderRuntimePolicy::new(false, true, true, false, false, false)
+            .expect("ACP-shaped runtime policy is internally valid");
+        let (mut engine, spawn) = running_engine_with_policy(acp_policy);
+        engine.session_mut(instance()).transport = TransportKind::Acp;
+
+        engine.apply_observation(ObservationEnvelope {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            operation_id: None,
+            instance_id: instance(),
+            generation: spawn.generation,
+            observation: ControlObservation::ProviderEvent {
+                source: provider_source(),
+                sequence: 1,
+                event: ProviderEvent::WorkingObserved,
+            },
+        });
+        assert!(!engine.drain_events().iter().any(|event| matches!(
+            event.event,
+            ControlEventKind::ObservationIgnored {
+                reason: ObservationIgnoredReason::ProviderRuntimePolicyDenied { .. }
+            }
+        )));
+        assert_eq!(engine.snapshot().sessions[0].provider.sequence, 1);
+    }
+
     /// `HookSemantics` and `SemanticReadiness` do not stand in for each
     /// other: a policy that admits the former but not the latter accepts a
     /// hook-sourced ingress batch and still refuses one sourced from a
@@ -4011,11 +4102,23 @@ mod tests {
     fn runtime_policy_rejects_invalid_start_contract() {
         let mut engine = Gate4AgentEngine::new();
         engine.apply_command(register(1)).unwrap();
+        // `raw_pty_lifecycle: false` with `semantic_readiness: true` and
+        // nothing else is no longer a construction defect on its own -- it
+        // is exactly the shape `provider_runtime::policy_for_transport`
+        // grants an ACP session (`session/prompt`/`session/update` are
+        // mandatory ACP protocol surface, not a PTY-terminal-text
+        // inference). `provider_session_identity: true` here keeps this
+        // fixture on the side of the invariant that IS still a defect:
+        // nothing derives provider session identity for a transport other
+        // than a verified PTY vendor contract, so granting it without
+        // `raw_pty_lifecycle` stays rejected by `ProviderRuntimePolicy::
+        // validate` itself, before `start()` even inspects this (PTY)
+        // session's transport.
         let invalid = ProviderRuntimePolicy {
             raw_pty_lifecycle: false,
             semantic_readiness: true,
             structured_prompt: false,
-            provider_session_identity: false,
+            provider_session_identity: true,
             semantic_resume: false,
             hook_semantics: false,
         };

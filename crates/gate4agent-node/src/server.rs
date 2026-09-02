@@ -9041,15 +9041,22 @@ impl NodeShared {
     /// resume never needs those facts, not because this method cannot look
     /// them up.
     ///
-    /// `SemanticPrompt` -- the requirement `Prompt`/`Paste` share -- no
-    /// longer takes that shortcut. Those PTY flags describe a terminal an
-    /// ACP or inline (`Pipe`) session does not have, so admitting a prompt
-    /// against one by consulting them gates the wrong fact (this is what
-    /// made an ACP `Prompt` come back `UnsupportedCapability` even though a
-    /// prompt is an ACP session's only interface). For those two
-    /// transports this method now admits the requirement on the fact that
-    /// actually describes them instead: a session takes one turn at a
-    /// time, so a `Prompt`/`Paste` is refused by name
+    /// `SemanticPrompt` -- the requirement `Prompt`/`Paste` share -- reads
+    /// the SAME `binding.runtime_policy` every other requirement reads here
+    /// (one computed policy, read by every gate). That policy is no longer
+    /// PTY-terminal-verification-shaped for an ACP session --
+    /// `spawn_session_with_deadline` computes it BY TRANSPORT now, through
+    /// `provider_runtime::policy_for_transport` -- so consulting it for
+    /// `Prompt`/`Paste` on ACP is sound where it used to gate the wrong fact
+    /// (this is what made an ACP `Prompt` come back `UnsupportedCapability`
+    /// even though a prompt is an ACP session's only interface). Pipe keeps
+    /// reading the same PTY-probe-derived value it always has --
+    /// `policy_for_transport` passes Pipe through unchanged this pass (see
+    /// its own doc for why).
+    ///
+    /// What this method still adds on top, for ACP/Pipe only, is a
+    /// turn-in-flight PRECONDITION ahead of that policy check: a session
+    /// takes one turn at a time, so a `Prompt`/`Paste` is refused by name
     /// (`NodeFailureCode::TurnInFlight`) while a turn is already running,
     /// read off the same live `SessionSnapshot` state `require_acp_session`
     /// already reads for the ACP control verbs -- `TurnStarted` observed
@@ -9057,8 +9064,8 @@ impl NodeShared {
     /// lead_activity != Idle`. Sending a second prompt mid-turn would put
     /// its fate in vendor-specific behaviour this node cannot observe (one
     /// agent may queue it, another drop it, another interleave it), so this
-    /// refuses it outright rather than gambling on that. PTY keeps today's
-    /// flag-based behaviour, unchanged.
+    /// refuses it outright rather than gambling on that -- a rule with no
+    /// PTY analogue, which is why PTY does not take this extra precondition.
     fn require_session_runtime_policy(
         &self,
         address: &SessionAddress,
@@ -9085,18 +9092,13 @@ impl NodeShared {
         };
         if requirement == ProviderRuntimeRequirement::SemanticPrompt {
             let snapshot = self.internal_session_snapshot(address)?;
-            match snapshot.transport {
-                TransportKind::Acp | TransportKind::Pipe => {
-                    return if snapshot.provider.lead_activity == ProviderActivity::Idle {
-                        Ok(runtime_policy)
-                    } else {
-                        Err(failure(
-                            NodeFailureCode::TurnInFlight,
-                            "session already has a turn in flight; wait for it to complete before sending another prompt",
-                        ))
-                    };
-                }
-                TransportKind::Pty => {}
+            if matches!(snapshot.transport, TransportKind::Acp | TransportKind::Pipe)
+                && snapshot.provider.lead_activity != ProviderActivity::Idle
+            {
+                return Err(failure(
+                    NodeFailureCode::TurnInFlight,
+                    "session already has a turn in flight; wait for it to complete before sending another prompt",
+                ));
             }
         }
         require_policy(runtime_policy, false, false, requirement)
@@ -11340,9 +11342,19 @@ impl NodeShared {
             (SessionMode::Inline, _) => ProviderRuntimeRequirement::Inline,
             (SessionMode::Acp, _) => ProviderRuntimeRequirement::Acp,
         };
+        // This session's own transport -- computed once, here, from `mode`,
+        // and reused both to admit spawn (below) and, further down, to
+        // compute the final `runtime_policy` this session actually operates
+        // under (`provider_runtime::policy_for_transport`). Registration
+        // reuses this exact value rather than recomputing it a second time.
+        let transport = match mode {
+            SessionMode::Pty => TransportKind::Pty,
+            SessionMode::Inline => TransportKind::Pipe,
+            SessionMode::Acp => TransportKind::Acp,
+        };
+        let pipe_transport = self.provider_supports_pipe_transport(&provider);
+        let acp_transport = self.provider_supports_acp_transport(&provider);
         let runtime_policy = if let Some(runtime_policy) = admitted_runtime_policy {
-            let pipe_transport = self.provider_supports_pipe_transport(&provider);
-            let acp_transport = self.provider_supports_acp_transport(&provider);
             require_policy(runtime_policy, pipe_transport, acp_transport, runtime_requirement).map_err(|_| failure(
                 NodeFailureCode::UnsupportedSpawnCapability,
                 "pre-admitted provider runtime no longer satisfies spawn requirements",
@@ -11365,6 +11377,19 @@ impl NodeShared {
             self.admit_provider_runtime(&provider, runtime_requirement).await?
         };
         let runtime_policy = self.effective_spawn_runtime_policy(runtime_policy);
+        // The single point where this session's `runtime_policy` becomes
+        // transport-correct: `admit_provider_runtime` (and the pre-admitted
+        // branch above) only ever compute a PTY-terminal-verification-shaped
+        // value, sound outright only for `TransportKind::Pty` (Pipe still
+        // relies on that same value downstream -- see `policy_for_transport`'s
+        // own doc for why). `policy_for_transport` is the explicit,
+        // exhaustive match Item 1 asks for -- this is the ONE place its
+        // output becomes the session's `runtime_policy`, so every later
+        // reader (`ControlCommand::Start`, `session_bindings`, and every
+        // engine gate that reads `state.runtime_policy`) sees the same,
+        // correctly-computed value.
+        let runtime_policy =
+            crate::provider_runtime::policy_for_transport(transport, runtime_policy);
         if required_capabilities
             .iter()
             .any(|capability| !runtime_policy.admits(*capability))
@@ -11482,11 +11507,9 @@ impl NodeShared {
         if let Some(guard) = materialization_guard.take() {
             guard.retain();
         }
-        let transport = match mode {
-            SessionMode::Pty => TransportKind::Pty,
-            SessionMode::Inline => TransportKind::Pipe,
-            SessionMode::Acp => TransportKind::Acp,
-        };
+        // `transport` was already computed above, alongside this session's
+        // `runtime_policy`; reused here for `Register` rather than derived a
+        // second time.
         let agent_id = provider;
         let register_command_id = match self.dispatch_bounded(
             ControlCommand::Register {

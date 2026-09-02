@@ -170,12 +170,41 @@ impl ProviderRuntimePolicy {
         }
     }
 
+    /// The all-false policy: no capability admitted at all. This is the
+    /// correct shape for a transport that has no PTY and whose catalog entry
+    /// declares no contract this build can grant a semantic capability from
+    /// -- e.g. a Pipe-transport provider with no declared Pipe contract.
+    /// Unlike `raw_pty()`, this does NOT claim a PTY lifecycle exists.
+    pub const fn none() -> Self {
+        Self {
+            raw_pty_lifecycle: false,
+            semantic_readiness: false,
+            structured_prompt: false,
+            provider_session_identity: false,
+            semantic_resume: false,
+            hook_semantics: false,
+        }
+    }
+
+    /// Only `provider_session_identity`, `semantic_resume`, and
+    /// `hook_semantics` require the raw PTY lifecycle. `semantic_readiness`
+    /// and `structured_prompt` do NOT, on their own -- an ACP transport has
+    /// no PTY at all, yet `session/prompt` and `session/update` are
+    /// MANDATORY surface of the ACP protocol itself, not an inference this
+    /// build makes by parsing PTY terminal text the way it does for a
+    /// verified PTY vendor contract. Granting `semantic_readiness`/
+    /// `structured_prompt` with `raw_pty_lifecycle: false` is therefore a
+    /// legitimate policy shape (see `gate4agent_node::provider_runtime::
+    /// policy_for_transport`'s `TransportKind::Acp` arm), not a defect this
+    /// validation should catch.
+    ///
+    /// `provider_session_identity`/`semantic_resume`/`hook_semantics` keep
+    /// the old, stricter rule: today nothing derives any of the three for a
+    /// transport other than a verified PTY vendor contract, so granting one
+    /// without `raw_pty_lifecycle` remains a construction defect rather than
+    /// a legitimate non-PTY policy shape.
     pub fn validate(self) -> Result<(), ProviderRuntimePolicyError> {
-        if (self.semantic_readiness
-            || self.structured_prompt
-            || self.provider_session_identity
-            || self.semantic_resume
-            || self.hook_semantics)
+        if (self.provider_session_identity || self.semantic_resume || self.hook_semantics)
             && !self.raw_pty_lifecycle
         {
             return Err(ProviderRuntimePolicyError::SemanticCapabilityRequiresRawPty);
@@ -234,7 +263,7 @@ impl<'de> Deserialize<'de> for ProviderRuntimePolicy {
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProviderRuntimePolicyError {
-    #[error("semantic provider capabilities require the raw PTY lifecycle")]
+    #[error("provider session identity, semantic resume, and hook semantics require the raw PTY lifecycle")]
     SemanticCapabilityRequiresRawPty,
     #[error("structured prompts require semantic readiness")]
     StructuredPromptRequiresReadiness,
@@ -2681,9 +2710,33 @@ mod tests {
         assert!(!raw.admits(ProviderRuntimeCapability::HookSemantics));
         assert_eq!(raw.validate(), Ok(()));
 
+        let none = ProviderRuntimePolicy::none();
+        assert!(!none.admits(ProviderRuntimeCapability::RawPtyLifecycle));
+        assert!(!none.admits(ProviderRuntimeCapability::SemanticReadiness));
+        assert_eq!(none.validate(), Ok(()));
+
+        // The ACP shape: `session/prompt`/`session/update` are mandatory ACP
+        // protocol surface, not a PTY-terminal-text inference, so this
+        // transport grants `semantic_readiness`/`structured_prompt` with no
+        // raw PTY lifecycle at all -- and that is now a VALID policy, not the
+        // `SemanticCapabilityRequiresRawPty` defect it used to be.
         assert_eq!(
-            ProviderRuntimePolicy::new(false, true, false, false, false, false),
-            Err(ProviderRuntimePolicyError::SemanticCapabilityRequiresRawPty),
+            ProviderRuntimePolicy::new(false, true, true, false, false, false),
+            Ok(ProviderRuntimePolicy {
+                raw_pty_lifecycle: false,
+                semantic_readiness: true,
+                structured_prompt: true,
+                provider_session_identity: false,
+                semantic_resume: false,
+                hook_semantics: false,
+            }),
+        );
+        // `structured_prompt` still requires `semantic_readiness`, and that
+        // rule holds independent of `raw_pty_lifecycle` -- it is not the rule
+        // the ACP shape above loosened.
+        assert_eq!(
+            ProviderRuntimePolicy::new(false, false, true, false, false, false),
+            Err(ProviderRuntimePolicyError::StructuredPromptRequiresReadiness),
         );
         assert_eq!(
             ProviderRuntimePolicy::new(true, false, true, false, false, false),
@@ -2695,6 +2748,14 @@ mod tests {
         );
         assert_eq!(
             ProviderRuntimePolicy::new(false, false, false, false, false, true),
+            Err(ProviderRuntimePolicyError::SemanticCapabilityRequiresRawPty),
+        );
+        // Granting `semantic_readiness`/`structured_prompt` without a raw PTY
+        // lifecycle (the ACP shape) must NOT silently unlock
+        // `provider_session_identity`/`semantic_resume`/`hook_semantics` --
+        // those three keep the old, stricter rule.
+        assert_eq!(
+            ProviderRuntimePolicy::new(false, true, true, true, false, false),
             Err(ProviderRuntimePolicyError::SemanticCapabilityRequiresRawPty),
         );
         assert!(ProviderRuntimePolicy::new(true, true, true, true, true, true).is_ok());

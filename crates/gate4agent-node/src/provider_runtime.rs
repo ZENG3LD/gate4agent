@@ -6,7 +6,7 @@ use gate4agent_catalog::AgentRegistry;
 use gate4agent_runtime_native::{
     VendorContractResolution, VendorRuntimeMode, VendorVersionProbeCache,
 };
-use gate4agent_types::{AgentId, ProviderRuntimePolicy};
+use gate4agent_types::{AgentId, ProviderRuntimePolicy, TransportKind};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -277,6 +277,57 @@ pub(crate) fn require_policy(
         Ok(())
     } else {
         Err(ProviderRuntimeAdmissionError::SemanticCapabilityUnverified)
+    }
+}
+
+/// Computes the `ProviderRuntimePolicy` a session may actually operate
+/// under, keyed on ITS OWN transport -- an explicit, exhaustive `match` with
+/// no catch-all arm, so a `TransportKind` variant added later fails this
+/// build instead of silently inheriting whichever arm happens to sit last.
+///
+/// `pty_probed_policy` is whatever `ProviderRuntimeMonitor::evaluate` (or the
+/// no-monitor `admit_status` fallback) derived from the vendor terminal
+/// contract table (`VERIFIED_PROFILES`) -- sound only for a session that is
+/// actually going to run over a PTY, because that table encodes verified PTY
+/// terminal BEHAVIOUR, not a fact about any other transport.
+///
+/// Pipe (NDJSON/JSONL over stdio) genuinely has no PTY either, and in
+/// principle its `structured_prompt` grant should come from the Pipe
+/// transport contract the catalog declares, not from this provider's
+/// unrelated PTY verification status -- the same shape of fix ACP gets
+/// below. It does NOT get that fix in this pass: `gate4agent-shell-native`'s
+/// `validate_spawn_runtime_policy` and `gate4agent-runtime-native`'s
+/// `validate_effect_runtime_policy` both still require `RawPtyLifecycle`
+/// (and, since Pipe is not `Pty`, `SemanticReadiness`) before a Pipe spawn
+/// effect is allowed to execute at all -- neither was changed to a
+/// transport-aware equivalent this pass, so handing Pipe a `raw_pty_
+/// lifecycle: false` policy here would make every currently-working Pipe
+/// spawn fail at one of those two layers instead. Pipe therefore stays a
+/// pass-through of the PTY probe, unchanged, exactly like Pty.
+pub(crate) fn policy_for_transport(
+    transport: TransportKind,
+    pty_probed_policy: ProviderRuntimePolicy,
+) -> ProviderRuntimePolicy {
+    match transport {
+        // The transport `pty_probed_policy`'s fields actually describe, and
+        // (see the function doc above) Pipe, which still relies on the same
+        // PTY-verification-derived value downstream -- both passed through
+        // unchanged, byte for byte.
+        TransportKind::Pty | TransportKind::Pipe => pty_probed_policy,
+        // ACP speaks structured JSON-RPC (`session/prompt`, `session/update`)
+        // as MANDATORY protocol surface -- there is genuinely no PTY, and
+        // session readiness / prompt delivery are facts of the ACP protocol
+        // itself, not an inference this build makes by parsing PTY terminal
+        // text. Granting them outright is therefore correct, not a
+        // downgrade of the PTY-terminal-verification story: that story does
+        // not apply to this transport at all. `provider_session_identity`/
+        // `semantic_resume`/`hook_semantics` stay unset -- ACP resume and
+        // hook wiring are out of scope for this policy shape. Both
+        // `gate4agent-shell-native` and `gate4agent-runtime-native` already
+        // bypass their own PTY-semantic policy check unconditionally for
+        // `TransportKind::Acp`, so this shape needs no matching change there.
+        TransportKind::Acp => ProviderRuntimePolicy::new(false, true, true, false, false, false)
+            .expect("ACP transport policy is internally valid"),
     }
 }
 
@@ -762,6 +813,60 @@ mod tests {
             ),
             ProviderRuntimePolicy::raw_pty(),
         );
+    }
+
+    /// `policy_for_transport` is the fix for the live-measured defect: a PTY
+    /// transport must come back byte-for-byte identical to whatever the PTY
+    /// probe computed -- no row in `VERIFIED_PROFILES` and no PTY behaviour
+    /// changes because a session for a DIFFERENT transport exists.
+    #[test]
+    fn policy_for_transport_pty_passes_the_probed_policy_through_unchanged() {
+        let probed = ProviderRuntimePolicy::new(true, true, true, true, true, true).unwrap();
+        assert_eq!(policy_for_transport(TransportKind::Pty, probed), probed);
+
+        let raw = ProviderRuntimePolicy::raw_pty();
+        assert_eq!(policy_for_transport(TransportKind::Pty, raw), raw);
+    }
+
+    /// ACP grants `SemanticReadiness`/`StructuredPrompt` as facts of the
+    /// protocol with `RawPtyLifecycle` false -- regardless of what the
+    /// (irrelevant, PTY-shaped) `pty_probed_policy` argument says, since this
+    /// transport has no PTY to have probed in the first place.
+    #[test]
+    fn policy_for_transport_acp_grants_semantic_prompt_with_no_raw_pty() {
+        let unrelated_pty_probe = ProviderRuntimePolicy::raw_pty();
+        let policy = policy_for_transport(TransportKind::Acp, unrelated_pty_probe);
+        assert_eq!(
+            policy,
+            ProviderRuntimePolicy::new(false, true, true, false, false, false).unwrap(),
+        );
+        assert!(!policy.raw_pty_lifecycle);
+        assert!(policy.semantic_readiness);
+        assert!(policy.structured_prompt);
+
+        // A verified PTY probe result must not change the ACP answer either
+        // -- ACP's grant is unconditional on the transport alone.
+        let verified_pty_probe = ProviderRuntimePolicy::new(true, true, true, true, true, true)
+            .unwrap();
+        assert_eq!(
+            policy_for_transport(TransportKind::Acp, verified_pty_probe),
+            policy,
+        );
+    }
+
+    /// Pipe is NOT ACP: `gate4agent-shell-native`/`gate4agent-runtime-native`
+    /// still require `RawPtyLifecycle` (and `SemanticReadiness`, since Pipe
+    /// is not Pty) before a Pipe spawn effect is allowed to execute at all,
+    /// so this stays an exact pass-through of the PTY-probed policy, just
+    /// like Pty -- forcing it to the ACP shape here would make every Pipe
+    /// spawn admitted by THIS crate fail one layer down instead.
+    #[test]
+    fn policy_for_transport_pipe_passes_the_probed_policy_through_unchanged() {
+        let probed = ProviderRuntimePolicy::new(true, true, true, true, true, true).unwrap();
+        assert_eq!(policy_for_transport(TransportKind::Pipe, probed), probed);
+
+        let raw = ProviderRuntimePolicy::raw_pty();
+        assert_eq!(policy_for_transport(TransportKind::Pipe, raw), raw);
     }
 
     #[test]

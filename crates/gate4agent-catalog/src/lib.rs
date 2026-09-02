@@ -35,8 +35,9 @@ pub use gate4agent_types::{
     PromptSpec, RuntimePlatform, SessionOptionSelection, SessionOptionValue, SpecVerification,
 };
 pub use launch::{
-    approval_level_args, plan_draft_launch, plan_launch, EnvMutation, LaunchPlan, LaunchPlanError,
-    LaunchRequest, MAX_LAUNCH_PROMPT_BYTES, WINDOWS_INLINE_LAUNCH_MAX_CHARS,
+    approval_level_args, approval_level_resolution, plan_draft_launch, plan_launch,
+    ApprovalLevelResolution, EnvMutation, LaunchPlan, LaunchPlanError, LaunchRequest,
+    MAX_LAUNCH_PROMPT_BYTES, WINDOWS_INLINE_LAUNCH_MAX_CHARS,
 };
 pub use registry::{AgentRegistry, RegistryError};
 pub use session_options::{

@@ -6676,6 +6676,7 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                         Some(HostCommand::SubscribeAgentStream { sender, sessions, identity }) => {
                             tracing::info!(
                                 operation = %identity.operation,
+                                sessions = ?sessions,
                                 "harness agent stream subscriber registered",
                             );
                             // No seed loop here, unlike `SubscribeTerminal`

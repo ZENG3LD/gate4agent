@@ -41,7 +41,10 @@ use gate4agent_adapters::{
     build_resume_plan_for_identity, builtin_adapter_registry, AdapterRuntimeRegistry,
     CodexPtySessionIdentityExtractor, KimiPtySessionIdentityExtractor, OneShotSessionPersistence,
 };
-use gate4agent_catalog::{approval_level_args, AgentRegistry, AgentSpec, EnvMutation};
+use gate4agent_catalog::{
+    approval_level_args, approval_level_resolution, ApprovalLevelResolution, AgentRegistry,
+    AgentSpec, EnvMutation,
+};
 use gate4agent_shell_one_shot::NativeOneShotSession;
 use gate4agent_types::{
     AdapterFamily, AgentCommand, AgentId, AgentInstanceId, ApprovalLevel, CapabilityProbeFailure,
@@ -1150,10 +1153,34 @@ impl NativeEffectShell {
                 // through an adapter wrapper -- see `src/acp/spawn.rs`) and
                 // the host side answering the session's permission requests
                 // (`host_policy_for_approval_level`).
+                //
+                // A provider with no verified mode for this level
+                // (`ApprovalLevelResolution::Unsupported` -- today, `grok`
+                // and `kimi` at `ReadOnly`) must be refused by name here.
+                // Silently falling through to `approval_level_args`'s empty
+                // `Vec` would spawn the vendor's own default "ask" mode
+                // instead -- a wider authority than what was requested, the
+                // exact class of bug this whole approval-level axis exists
+                // to prevent.
+                if matches!(
+                    approval_level_resolution(&agent_id, request.approval_level),
+                    ApprovalLevelResolution::Unsupported
+                ) {
+                    return ControlObservation::SpawnFailed {
+                        message: format!(
+                            "agent '{agent_id}' has no verified {:?} mode; refusing rather than \
+                             launching at the vendor's own (wider-authority) default",
+                            request.approval_level
+                        ),
+                    };
+                }
                 let acp_options = AcpSessionOptions {
                     host_policy: host_policy_for_approval_level(request.approval_level),
                     approval_level_args: approval_level_args(&agent_id, request.approval_level),
-                    defer_permission_requests: defers_permission_requests(request.approval_level),
+                    defer_permission_requests: defers_permission_requests(
+                        &agent_id,
+                        request.approval_level,
+                    ),
                     ..AcpSessionOptions::default()
                 };
                 let spawned = match acp_spec.launch_override.as_ref() {
@@ -1778,29 +1805,37 @@ fn host_policy_for_approval_level(level: ApprovalLevel) -> HostPolicy {
 /// permission` for an operator instead of answering it from policy on the
 /// spot (`AcpSessionOptions::defer_permission_requests`).
 ///
-/// Deliberately the same split as `host_policy_for_approval_level` above:
-/// exactly the two levels that map to `HostPolicy::Auto` defer, and for the
-/// same reason those two are `Auto` in the first place.
+/// Reads `asks_for_permission` straight off
+/// `gate4agent_catalog::approval_level_resolution` -- the provider's own
+/// vendor mode, declared beside its flag -- rather than matching on the
+/// `ApprovalLevel`'s name. That distinction used to matter in practice: this
+/// function previously matched on the level alone and assumed `ReadOnly`
+/// never asks, but claude's `ReadOnly` launched `--permission-mode default`,
+/// claude's own **interactive** mode, which asks about everything. A live
+/// run under that flag produced a completed tool call and zero
+/// `host-request-observed` because deferral was off for the one level that
+/// was actually asking. `approval_level_resolution`'s `ReadOnly` row for
+/// claude now launches `plan` (which genuinely never asks) instead, so the
+/// caller (this transport's own ACP spawn branch) must already have refused
+/// the spawn outright for any provider `approval_level_resolution` marks
+/// `Unsupported` for this level -- see that call site -- before this
+/// function is reached; `Unsupported` here is defensive-only and defers,
+/// the conservative choice, rather than assuming silence.
 ///
-/// `FullAuto` never defers. Its own doc says restricting is opt-in and not
-/// asking a human is the norm; it is the level chosen precisely so nobody has
-/// to be present, and parking its requests would stall unattended work
-/// waiting for an operator who was never expected to be there.
-///
-/// `ReadOnly` never defers either, and this one is a rule rather than a
-/// convenience: the level is a restriction, not a question. Offering an
-/// operator the chance to approve a write on a read-only session would let
-/// the answer widen the level past what was asked for at launch -- the
-/// restriction has to be un-negotiable from inside the session, or it is not
-/// a restriction.
-///
-/// `Moderate` is literally the provider's own "ask for approval on request"
-/// mode, and `Unmanaged` imposes nothing and so cannot predict what the CLI
-/// will ask. Both are levels where a question is expected, so both park it.
-fn defers_permission_requests(level: ApprovalLevel) -> bool {
-    match level {
-        ApprovalLevel::FullAuto | ApprovalLevel::ReadOnly => false,
-        ApprovalLevel::Moderate | ApprovalLevel::Unmanaged => true,
+/// The vendor facts happen to still split along the same two groups
+/// `host_policy_for_approval_level` above uses (`FullAuto`/`ReadOnly` never
+/// ask, `Moderate`/`Unmanaged` do) for every provider currently in the
+/// catalog -- but that is a fact about today's four providers' vendor modes,
+/// not a rule this function encodes; a fifth provider or a vendor mode
+/// change could break that grouping without this function's logic changing
+/// at all, which is the point of reading the catalog instead of the level.
+fn defers_permission_requests(agent_id: &AgentId, level: ApprovalLevel) -> bool {
+    match approval_level_resolution(agent_id, level) {
+        ApprovalLevelResolution::Supported {
+            asks_for_permission,
+            ..
+        } => asks_for_permission,
+        ApprovalLevelResolution::Unsupported => true,
     }
 }
 
@@ -4390,6 +4425,7 @@ mod tests {
     use super::{
         classify_operator_gate_option_semantics,
         classify_pty_screen_state,
+        defers_permission_requests,
         foreground_probe_rearms_immediately, foreground_probe_schedule,
         host_policy_for_approval_level,
         parse_operator_gate_options, prepare_fresh_pty_provider_session,
@@ -5844,5 +5880,46 @@ mod tests {
                 "{level:?} must never map to HostPolicy::Deny"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // defers_permission_requests -- reads `asks_for_permission` off the
+    // catalog's per-(provider, level) vendor-mode table instead of matching
+    // on the ApprovalLevel's own name (the bug this whole axis exists to
+    // remove -- see the function's own doc comment).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn defers_permission_requests_matches_the_verified_provider_table() {
+        let claude = AgentId::new("claude").unwrap();
+        assert!(!defers_permission_requests(&claude, ApprovalLevel::FullAuto));
+        assert!(defers_permission_requests(&claude, ApprovalLevel::Moderate));
+        // The load-bearing row: claude's `ReadOnly` now launches `plan`,
+        // which genuinely never asks -- unlike the retired `default` flag,
+        // which was claude's own interactive mode and asked about
+        // everything while this function claimed it never did.
+        assert!(!defers_permission_requests(&claude, ApprovalLevel::ReadOnly));
+        assert!(defers_permission_requests(&claude, ApprovalLevel::Unmanaged));
+
+        let codex = AgentId::new("codex").unwrap();
+        assert!(!defers_permission_requests(&codex, ApprovalLevel::FullAuto));
+        assert!(defers_permission_requests(&codex, ApprovalLevel::Moderate));
+        assert!(!defers_permission_requests(&codex, ApprovalLevel::ReadOnly));
+        assert!(defers_permission_requests(&codex, ApprovalLevel::Unmanaged));
+
+        let grok = AgentId::new("grok").unwrap();
+        assert!(!defers_permission_requests(&grok, ApprovalLevel::FullAuto));
+        assert!(defers_permission_requests(&grok, ApprovalLevel::Moderate));
+        // `ReadOnly` is `Unsupported` for grok -- the ACP spawn branch must
+        // already have refused the session before this function would ever
+        // see it live; the conservative fallback here still defers.
+        assert!(defers_permission_requests(&grok, ApprovalLevel::ReadOnly));
+        assert!(defers_permission_requests(&grok, ApprovalLevel::Unmanaged));
+
+        let kimi = AgentId::new("kimi").unwrap();
+        assert!(!defers_permission_requests(&kimi, ApprovalLevel::FullAuto));
+        assert!(defers_permission_requests(&kimi, ApprovalLevel::Moderate));
+        assert!(defers_permission_requests(&kimi, ApprovalLevel::ReadOnly));
+        assert!(defers_permission_requests(&kimi, ApprovalLevel::Unmanaged));
     }
 }

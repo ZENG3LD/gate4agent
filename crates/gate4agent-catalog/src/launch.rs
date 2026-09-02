@@ -64,76 +64,226 @@ impl Default for LaunchRequest {
     }
 }
 
+/// The result of resolving a provider + [`ApprovalLevel`] to concrete launch
+/// behaviour.
+///
+/// This exists because a level's *name* and the vendor mode it launches can
+/// drift apart: `claude`'s `ReadOnly` used to launch `--permission-mode
+/// default`, which is claude's own **interactive** mode -- it asks about
+/// everything, exactly the opposite of what the name promises. Deferral
+/// logic that matched on the level's name rather than on this fact got that
+/// backwards: the one level whose vendor mode actually asks was the level
+/// where asking was assumed impossible. `asks_for_permission` is the fix --
+/// declared beside each row's flag, from that vendor mode's own documented
+/// behaviour, so nothing downstream has to (mis)infer it from a name again.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ApprovalLevelResolution {
+    /// This provider has a verified vendor mode for this level.
+    Supported {
+        /// The CLI flag(s) that select the vendor mode, lifted verbatim from
+        /// vendor documentation where one exists.
+        args: Vec<String>,
+        /// Whether that vendor mode's own documented behaviour has the CLI
+        /// raise a permission question on the wire at all -- never inferred
+        /// from the level's name.
+        asks_for_permission: bool,
+    },
+    /// This provider has no verified mode for the requested level. The ACP
+    /// transport (the only caller that applies this table -- see
+    /// `approval_level_args`'s doc comment) must refuse the spawn by name
+    /// here rather than silently falling back to the vendor's own default:
+    /// an unrequested default is a wider authority than what was asked for,
+    /// most acute for `ReadOnly` on a provider with no read-only mode at
+    /// all -- substituting an "ask" mode for it would be exactly the
+    /// name-vs-behaviour drift this type exists to remove.
+    Unsupported,
+}
+
+/// Resolve a provider + [`ApprovalLevel`] to its vendor mode, using only
+/// vendor-documented behaviour -- never the level's own name. Each row below
+/// carries a confidence note; several are marked UNCONFIRMED deliberately,
+/// per the "an honest unconfirmed beats a guessed bool" rule this table
+/// exists to enforce.
+///
+/// - `claude` and `codex` have a verified flag and verified `asks_for_permission`
+///   for all three non-`Unmanaged` levels.
+/// - `grok` (xAI Grok Build) has three documented modes -- Ask (default,
+///   prompts for anything not pre-allowed), Auto (classifier auto-approves
+///   safer tools, dangerous ones still prompt), Always-approve (skips
+///   prompts; deny rules and hooks still apply) -- but no documented
+///   read-only mode. `FullAuto`'s flag string is inherited, UNCONFIRMED
+///   against Grok Build's own CLI surface (its *mode semantics* --
+///   "skips prompts" -- are confirmed from the vendor user guide, only the
+///   exact flag spelling is not); `Moderate` has no confirmed flag for
+///   "Auto" and falls back to the vendor's own interactive default rather
+///   than inventing one; `ReadOnly` is `Unsupported` -- refused, not
+///   silently downgraded to "Ask".
+/// - `kimi` (Kimi Code) confirms `--yolo` as a real flag (from its own
+///   release notes: rejected only when combined with `--prompt`, i.e. it is
+///   otherwise accepted); its "skip everything" semantics are inferred from
+///   the universal industry meaning of "yolo mode" rather than read directly
+///   from a Kimi Code permissions doc, so treat that inference as
+///   HIGH-CONFIDENCE but UNCONFIRMED-at-the-source. Kimi's release notes
+///   also name `--auto` and `--plan` flags, but only as flags rejected
+///   together with `--prompt` -- there is no confirmation either applies to
+///   (or has the same meaning under) the `kimi acp` subcommand this project
+///   actually spawns, so neither is wired in here; `Moderate` and `ReadOnly`
+///   both need live confirmation before either gets a flag, and `ReadOnly`
+///   is `Unsupported` in the meantime rather than guessed.
+/// - `Unmanaged` always resolves `Supported` with no flag and
+///   `asks_for_permission: true`, for every agent ID including one this
+///   catalog does not recognize: it imposes nothing by definition, so it can
+///   never be refused, and "impose nothing" means the vendor's own default
+///   is in control and cannot be predicted -- assume it can ask.
+/// - An agent ID this catalog does not recognize resolves `Unsupported` at
+///   every other level: this function never guesses at an unknown
+///   provider's flag surface, and refusing is honest where the old
+///   behaviour (silently launching with no flag at all) was not.
+pub fn approval_level_resolution(agent_id: &AgentId, level: ApprovalLevel) -> ApprovalLevelResolution {
+    use ApprovalLevelResolution::{Supported, Unsupported};
+    match (agent_id.as_str(), level) {
+        // claude -- code.claude.com/docs/en/cli-reference `--permission-mode`.
+        ("claude", ApprovalLevel::FullAuto) => Supported {
+            args: vec!["--permission-mode".to_owned(), "bypassPermissions".to_owned()],
+            // bypassPermissions: every tool call is auto-approved. Never asks.
+            asks_for_permission: false,
+        },
+        ("claude", ApprovalLevel::Moderate) => Supported {
+            args: vec!["--permission-mode".to_owned(), "acceptEdits".to_owned()],
+            // acceptEdits: file edits are auto-approved, everything else
+            // (Bash, other tools) still raises a permission question.
+            asks_for_permission: true,
+        },
+        ("claude", ApprovalLevel::ReadOnly) => Supported {
+            args: vec!["--permission-mode".to_owned(), "plan".to_owned()],
+            // Plan mode refuses edits and mutating commands outright rather
+            // than asking about them -- a restriction, not a question, which
+            // is what this level's name promises. `default` (the prior
+            // flag here) was claude's own interactive mode and asked about
+            // everything; this row is the fix for that drift.
+            asks_for_permission: false,
+        },
+
+        // codex -- OpenAI Codex CLI `--sandbox` / `--ask-for-approval`.
+        ("codex", ApprovalLevel::FullAuto) => Supported {
+            args: vec!["--dangerously-bypass-approvals-and-sandbox".to_owned()],
+            // Bypasses approvals AND the sandbox entirely. Never asks.
+            asks_for_permission: false,
+        },
+        ("codex", ApprovalLevel::Moderate) => Supported {
+            args: vec![
+                "--sandbox".to_owned(),
+                "workspace-write".to_owned(),
+                "--ask-for-approval".to_owned(),
+                "on-request".to_owned(),
+            ],
+            // on-request: Codex decides when to ask -- sandboxed writes
+            // proceed unasked, escalation (e.g. a command outside the
+            // sandbox) raises a permission question.
+            asks_for_permission: true,
+        },
+        ("codex", ApprovalLevel::ReadOnly) => Supported {
+            args: vec![
+                "--sandbox".to_owned(),
+                "read-only".to_owned(),
+                "--ask-for-approval".to_owned(),
+                "never".to_owned(),
+            ],
+            // never: Codex never asks. A mutating action fails against the
+            // read-only sandbox instead of prompting -- a restriction, not
+            // a question, and this row already had that right.
+            asks_for_permission: false,
+        },
+
+        // grok (xAI Grok Build) -- see this function's own doc comment for
+        // the three documented modes and per-row confidence.
+        ("grok", ApprovalLevel::FullAuto) => Supported {
+            args: vec!["--permission-mode".to_owned(), "bypassPermissions".to_owned()],
+            // Mapped to vendor-documented "Always-approve": "skips prompts;
+            // explicit deny rules and PreToolUse hooks still apply." Mode
+            // semantics confirmed; this exact flag spelling is not --
+            // UNCONFIRMED, needs live confirmation.
+            asks_for_permission: false,
+        },
+        ("grok", ApprovalLevel::Moderate) => Supported {
+            args: Vec::new(),
+            // No confirmed flag for vendor-documented "Auto" (classifier
+            // auto-approves safer tools, dangerous ones still prompt) --
+            // falls back to no flag rather than inventing one, same as
+            // `Unmanaged`. The vendor's own default with no flag is "Ask",
+            // which does ask -- UNCONFIRMED whether it is reachable any
+            // other way, needs live confirmation.
+            asks_for_permission: true,
+        },
+        // No documented read-only mode exists for Grok Build at all (Ask /
+        // Auto / Always-approve, none of them a restriction) -- refuse by
+        // name rather than silently substitute "Ask", which would launch at
+        // a wider authority than requested.
+        ("grok", ApprovalLevel::ReadOnly) => Unsupported,
+
+        // kimi (Kimi Code) -- see this function's own doc comment.
+        ("kimi", ApprovalLevel::FullAuto) => Supported {
+            args: vec!["--yolo".to_owned()],
+            // Flag confirmed to exist (Kimi Code release notes). "Skips
+            // everything" semantics inferred from the universal industry
+            // meaning of "yolo mode", not read directly from a Kimi
+            // permissions doc -- UNCONFIRMED at the source, high confidence.
+            asks_for_permission: false,
+        },
+        ("kimi", ApprovalLevel::Moderate) => Supported {
+            args: Vec::new(),
+            // `--auto` is named in Kimi's own release notes but only as a
+            // flag rejected together with `--prompt`; whether it applies to
+            // (or means the same thing under) the `kimi acp` subcommand this
+            // project spawns is UNCONFIRMED, so it is not wired in here --
+            // falls back to no flag, same as `Unmanaged`, needs live
+            // confirmation.
+            asks_for_permission: true,
+        },
+        // Symmetric to grok: `--plan` is named in Kimi's release notes but
+        // its behaviour under `kimi acp` is UNCONFIRMED -- refuse by name
+        // rather than guess that it is this project's read-only mode.
+        ("kimi", ApprovalLevel::ReadOnly) => Unsupported,
+
+        // Impose nothing, for every agent ID: never refused, and the
+        // vendor's own default is unpredictable by definition -- assume it
+        // can ask.
+        (_, ApprovalLevel::Unmanaged) => Supported {
+            args: Vec::new(),
+            asks_for_permission: true,
+        },
+        // An agent ID this mapping does not carry verified data for at all.
+        _ => Unsupported,
+    }
+}
+
 /// Map an approval level to the provider CLI flags that implement it, for
 /// the given agent.
 ///
 /// This is the single source of truth for the level -> argv mapping; nothing
-/// else in this codebase should hardcode one of these flags. Every mapping
-/// below is either lifted verbatim from vendor CLI documentation (`claude`,
-/// `codex`) or from a third-party harness's observed invocation (`grok`,
-/// `kimi` -- see `ORCA_REFERENCE_REVISION`). Where a provider has no verified
-/// flag for a level, this returns an empty `Vec` -- the same as
-/// `ApprovalLevel::Unmanaged` -- rather than inventing one.
+/// else in this codebase should hardcode one of these flags. A thin
+/// argv-only accessor over [`approval_level_resolution`], kept because
+/// `gate4agent`'s `src/acp/spawn.rs` forwards this `Vec<String>` straight
+/// into a provider's own argv and only needs the flags, not the rest of the
+/// resolution. Where a provider has no verified flag for a level --
+/// including a level `approval_level_resolution` refuses outright -- this
+/// returns an empty `Vec`, the same as `ApprovalLevel::Unmanaged`, rather
+/// than inventing one.
 ///
 /// `plan_launch` (the PTY launch planner in this module) never calls this: a
 /// PTY is opened by a human, who picks their own agent's permission flags,
 /// so this crate does not impose one. The one caller that does apply this
-/// table is the ACP transport (`gate4agent`'s `src/acp`), which this project
-/// opens programmatically with no human at the keyboard to make that choice
-/// instead.
-///
-/// - `grok` and `kimi` have exactly one verified flag each, for
-///   `ApprovalLevel::FullAuto`. `Moderate` and `ReadOnly` both fall back to
-///   no flag for these two providers -- there is no confirmed intermediate
-///   or read-only mode to reach for either CLI.
-/// - `claude` and `codex` have a verified flag for all three non-`Unmanaged`
-///   levels.
-///
-/// An agent ID this catalog does not recognize also returns an empty `Vec`:
-/// this function never guesses at an unknown provider's flag surface.
+/// table is the ACP transport (`gate4agent`'s `src/acp`, and
+/// `gate4agent-shell-native`'s own native ACP spawn path), which this
+/// project opens programmatically with no human at the keyboard to make
+/// that choice instead -- and which must consult
+/// `approval_level_resolution` directly (not this function) before spawning,
+/// to refuse a level `approval_level_resolution` marks `Unsupported` instead
+/// of silently launching it with no flag.
 pub fn approval_level_args(agent_id: &AgentId, level: ApprovalLevel) -> Vec<String> {
-    match (agent_id.as_str(), level) {
-        ("claude", ApprovalLevel::FullAuto) => {
-            vec!["--permission-mode".to_owned(), "bypassPermissions".to_owned()]
-        }
-        ("claude", ApprovalLevel::Moderate) => {
-            vec!["--permission-mode".to_owned(), "acceptEdits".to_owned()]
-        }
-        ("claude", ApprovalLevel::ReadOnly) => {
-            vec!["--permission-mode".to_owned(), "default".to_owned()]
-        }
-
-        ("codex", ApprovalLevel::FullAuto) => {
-            vec!["--dangerously-bypass-approvals-and-sandbox".to_owned()]
-        }
-        ("codex", ApprovalLevel::Moderate) => vec![
-            "--sandbox".to_owned(),
-            "workspace-write".to_owned(),
-            "--ask-for-approval".to_owned(),
-            "on-request".to_owned(),
-        ],
-        ("codex", ApprovalLevel::ReadOnly) => vec![
-            "--sandbox".to_owned(),
-            "read-only".to_owned(),
-            "--ask-for-approval".to_owned(),
-            "never".to_owned(),
-        ],
-
-        ("grok", ApprovalLevel::FullAuto) => {
-            vec!["--permission-mode".to_owned(), "bypassPermissions".to_owned()]
-        }
-        // No verified intermediate or read-only flag for grok -- do not
-        // invent one.
-        ("grok", ApprovalLevel::Moderate | ApprovalLevel::ReadOnly) => Vec::new(),
-
-        ("kimi", ApprovalLevel::FullAuto) => vec!["--yolo".to_owned()],
-        // No verified intermediate or read-only flag for kimi -- do not
-        // invent one.
-        ("kimi", ApprovalLevel::Moderate | ApprovalLevel::ReadOnly) => Vec::new(),
-
-        (_, ApprovalLevel::Unmanaged) => Vec::new(),
-        // An agent ID this mapping does not carry a verified flag for at all.
-        _ => Vec::new(),
+    match approval_level_resolution(agent_id, level) {
+        ApprovalLevelResolution::Supported { args, .. } => args,
+        ApprovalLevelResolution::Unsupported => Vec::new(),
     }
 }
 
@@ -644,7 +794,7 @@ mod tests {
         );
         assert_eq!(
             approval_level_args(&claude, ApprovalLevel::ReadOnly),
-            ["--permission-mode", "default"]
+            ["--permission-mode", "plan"]
         );
         assert!(approval_level_args(&claude, ApprovalLevel::Unmanaged).is_empty());
 
@@ -681,8 +831,13 @@ mod tests {
     }
 
     /// `grok` and `kimi` have exactly one verified flag each (`FullAuto`).
-    /// `Moderate` must never fabricate a flag for either -- it has to fall
-    /// back to exactly the same (empty) result as `Unmanaged`.
+    /// Neither `Moderate` nor `ReadOnly` may fabricate a flag for either --
+    /// at the argv-only layer both produce exactly the same empty result as
+    /// `Unmanaged`. `ReadOnly` additionally resolves `Unsupported` one layer
+    /// up (see `approval_level_resolution_matches_the_verified_provider_table`
+    /// and `unsupported_resolution_still_yields_empty_argv_not_a_fabricated_flag`)
+    /// -- this test only covers the argv-only accessor, which has no channel
+    /// to carry that refusal.
     #[test]
     fn grok_and_kimi_moderate_never_invents_a_flag_and_matches_unmanaged() {
         for id in ["grok", "kimi"] {
@@ -707,6 +862,127 @@ mod tests {
                 approval_level_args(&agent, ApprovalLevel::Unmanaged).is_empty(),
                 "{id}"
             );
+        }
+    }
+
+    /// Item 3's table: one row per provider x level, asserting both the
+    /// expected flag(s) and the expected `asks_for_permission`, so a wrong
+    /// claim about vendor behaviour fails loudly here instead of surfacing
+    /// live as a missing `host-request-observed`.
+    #[test]
+    fn approval_level_resolution_matches_the_verified_provider_table() {
+        fn supported(args: &[&str], asks_for_permission: bool) -> ApprovalLevelResolution {
+            ApprovalLevelResolution::Supported {
+                args: args.iter().map(|value| (*value).to_owned()).collect(),
+                asks_for_permission,
+            }
+        }
+
+        let claude = AgentId::new("claude").unwrap();
+        assert_eq!(
+            approval_level_resolution(&claude, ApprovalLevel::FullAuto),
+            supported(&["--permission-mode", "bypassPermissions"], false)
+        );
+        assert_eq!(
+            approval_level_resolution(&claude, ApprovalLevel::Moderate),
+            supported(&["--permission-mode", "acceptEdits"], true)
+        );
+        assert_eq!(
+            approval_level_resolution(&claude, ApprovalLevel::ReadOnly),
+            supported(&["--permission-mode", "plan"], false)
+        );
+        assert_eq!(
+            approval_level_resolution(&claude, ApprovalLevel::Unmanaged),
+            supported(&[], true)
+        );
+
+        let codex = AgentId::new("codex").unwrap();
+        assert_eq!(
+            approval_level_resolution(&codex, ApprovalLevel::FullAuto),
+            supported(&["--dangerously-bypass-approvals-and-sandbox"], false)
+        );
+        assert_eq!(
+            approval_level_resolution(&codex, ApprovalLevel::Moderate),
+            supported(
+                &["--sandbox", "workspace-write", "--ask-for-approval", "on-request"],
+                true
+            )
+        );
+        assert_eq!(
+            approval_level_resolution(&codex, ApprovalLevel::ReadOnly),
+            supported(&["--sandbox", "read-only", "--ask-for-approval", "never"], false)
+        );
+        assert_eq!(
+            approval_level_resolution(&codex, ApprovalLevel::Unmanaged),
+            supported(&[], true)
+        );
+
+        let grok = AgentId::new("grok").unwrap();
+        assert_eq!(
+            approval_level_resolution(&grok, ApprovalLevel::FullAuto),
+            supported(&["--permission-mode", "bypassPermissions"], false)
+        );
+        assert_eq!(
+            approval_level_resolution(&grok, ApprovalLevel::Moderate),
+            supported(&[], true)
+        );
+        assert_eq!(
+            approval_level_resolution(&grok, ApprovalLevel::ReadOnly),
+            ApprovalLevelResolution::Unsupported
+        );
+        assert_eq!(
+            approval_level_resolution(&grok, ApprovalLevel::Unmanaged),
+            supported(&[], true)
+        );
+
+        let kimi = AgentId::new("kimi").unwrap();
+        assert_eq!(
+            approval_level_resolution(&kimi, ApprovalLevel::FullAuto),
+            supported(&["--yolo"], false)
+        );
+        assert_eq!(
+            approval_level_resolution(&kimi, ApprovalLevel::Moderate),
+            supported(&[], true)
+        );
+        assert_eq!(
+            approval_level_resolution(&kimi, ApprovalLevel::ReadOnly),
+            ApprovalLevelResolution::Unsupported
+        );
+        assert_eq!(
+            approval_level_resolution(&kimi, ApprovalLevel::Unmanaged),
+            supported(&[], true)
+        );
+
+        let unknown = AgentId::new("some-future-provider").unwrap();
+        for level in [ApprovalLevel::FullAuto, ApprovalLevel::Moderate, ApprovalLevel::ReadOnly] {
+            assert_eq!(
+                approval_level_resolution(&unknown, level),
+                ApprovalLevelResolution::Unsupported,
+                "{level:?}"
+            );
+        }
+        assert_eq!(
+            approval_level_resolution(&unknown, ApprovalLevel::Unmanaged),
+            supported(&[], true)
+        );
+    }
+
+    /// A level `approval_level_resolution` refuses (`Unsupported`) must
+    /// still surface as an empty `Vec` from the argv-only accessor, exactly
+    /// like `Unmanaged` -- `approval_level_args` has no channel to carry a
+    /// refusal, which is precisely why the ACP transport must call
+    /// `approval_level_resolution` directly and refuse the spawn itself
+    /// rather than trusting this function's empty result to mean "safe to
+    /// launch with no flag".
+    #[test]
+    fn unsupported_resolution_still_yields_empty_argv_not_a_fabricated_flag() {
+        for id in ["grok", "kimi"] {
+            let agent = AgentId::new(id).unwrap();
+            assert!(approval_level_args(&agent, ApprovalLevel::ReadOnly).is_empty(), "{id}");
+            assert!(matches!(
+                approval_level_resolution(&agent, ApprovalLevel::ReadOnly),
+                ApprovalLevelResolution::Unsupported
+            ));
         }
     }
 

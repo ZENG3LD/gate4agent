@@ -4034,7 +4034,11 @@ impl HarnessService {
         self.ensure_healthy()?;
         let current = self.harness_mcp_reservations
             .get(proof.reservation_id())
-            .ok_or(HarnessServiceError::HarnessMcpProofMismatch)?;
+            .ok_or(HarnessServiceError::HarnessMcpArmDurableLookupMissing {
+                missing: "reservation",
+                operation_id: None,
+                reservation_id: Some(proof.reservation_id().clone()),
+            })?;
         proof.validate_record(current)?;
         if current.state == HarnessMcpReservationStateV1::Armed {
             return Ok(());
@@ -4043,7 +4047,13 @@ impl HarnessService {
             || armed_at_unix_ms < current.updated_at_unix_ms
             || armed_at_unix_ms >= current.expires_at_unix_ms
         {
-            return Err(HarnessServiceError::HarnessMcpProofMismatch);
+            return Err(HarnessServiceError::HarnessMcpArmReservationNotReadyRefused {
+                reservation_id: current.reservation_id.clone(),
+                state: current.state,
+                armed_at_unix_ms,
+                updated_at_unix_ms: current.updated_at_unix_ms,
+                expires_at_unix_ms: current.expires_at_unix_ms,
+            });
         }
         let mut next = current.clone();
         next.revision = next_revision(next.revision)?;
@@ -4062,28 +4072,51 @@ impl HarnessService {
         self.ensure_healthy()?;
         let current = self.harness_mcp_reservations
             .get(proof.reservation_id())
-            .ok_or(HarnessServiceError::HarnessMcpProofMismatch)?;
+            .ok_or(HarnessServiceError::HarnessMcpArmDurableLookupMissing {
+                missing: "reservation",
+                operation_id: None,
+                reservation_id: Some(proof.reservation_id().clone()),
+            })?;
         proof.validate_record(current)?;
         if current.state != HarnessMcpReservationStateV1::Prepared
             || armed_at_unix_ms < current.updated_at_unix_ms
             || armed_at_unix_ms >= current.expires_at_unix_ms
         {
-            return Err(HarnessServiceError::HarnessMcpProofMismatch);
+            return Err(HarnessServiceError::HarnessMcpArmReservationNotReadyRefused {
+                reservation_id: current.reservation_id.clone(),
+                state: current.state,
+                armed_at_unix_ms,
+                updated_at_unix_ms: current.updated_at_unix_ms,
+                expires_at_unix_ms: current.expires_at_unix_ms,
+            });
         }
         let operation = self.engine.operation(&current.operation_id)
-            .ok_or(HarnessServiceError::HarnessMcpProofMismatch)?;
+            .ok_or(HarnessServiceError::HarnessMcpArmDurableLookupMissing {
+                missing: "operation",
+                operation_id: Some(current.operation_id.clone()),
+                reservation_id: Some(current.reservation_id.clone()),
+            })?;
         let run = operation.run_id.as_ref()
             .and_then(|run_id| self.engine.run(run_id))
-            .ok_or(HarnessServiceError::HarnessMcpProofMismatch)?;
+            .ok_or(HarnessServiceError::HarnessMcpArmDurableLookupMissing {
+                missing: "run",
+                operation_id: Some(current.operation_id.clone()),
+                reservation_id: Some(current.reservation_id.clone()),
+            })?;
         let scheduled = self.scheduled_launches.get(&current.operation_id)
-            .ok_or(HarnessServiceError::HarnessMcpProofMismatch)?;
+            .ok_or(HarnessServiceError::HarnessMcpArmDurableLookupMissing {
+                missing: "scheduled-launch",
+                operation_id: Some(current.operation_id.clone()),
+                reservation_id: Some(current.reservation_id.clone()),
+            })?;
         let plan = catalog.resolve_scheduled(scheduled)?;
-        if plan.harness_mcp != dispatch::HarnessMcpPolicyV1::GrantBound {
-            return Err(HarnessServiceError::HarnessMcpProofMismatch);
-        }
         plan.validate_intent(&run.intent)?;
         let context = self.dispatch_contexts.get(&current.operation_id)
-            .ok_or(HarnessServiceError::HarnessMcpProofMismatch)?;
+            .ok_or(HarnessServiceError::HarnessMcpArmDurableLookupMissing {
+                missing: "dispatch-context",
+                operation_id: Some(current.operation_id.clone()),
+                reservation_id: Some(current.reservation_id.clone()),
+            })?;
         let fingerprint = c2::spawn_spec_fingerprint(&spec)
             .map_err(|_| HarnessServiceError::DispatchFingerprint)?;
         validate_run_dispatch_seam(
@@ -4096,9 +4129,17 @@ impl HarnessService {
         )?;
         let route = gate4agent_c2_protocol::NodeRoute {
             node_id: gate4agent_node_protocol::NodeId::new(context.node_id.as_str())
-                .map_err(|_| HarnessServiceError::HarnessMcpProofMismatch)?,
+                .map_err(|_| HarnessServiceError::HarnessMcpArmRouteInvalid {
+                    operation_id: current.operation_id.clone(),
+                    field: "node_id",
+                    value: context.node_id.as_str().to_owned(),
+                })?,
             expected_incarnation_id: context.node_incarnation_id.as_str().parse()
-                .map_err(|_| HarnessServiceError::HarnessMcpProofMismatch)?,
+                .map_err(|_| HarnessServiceError::HarnessMcpArmRouteInvalid {
+                    operation_id: current.operation_id.clone(),
+                    field: "node_incarnation_id",
+                    value: context.node_incarnation_id.as_str().to_owned(),
+                })?,
         };
         let mut armed = current.clone();
         armed.revision = next_revision(armed.revision)?;
@@ -4409,20 +4450,62 @@ fn prepared_scheduled_spawn_dispatch(
 
     match (plan.harness_mcp, harness_mcp) {
         (dispatch::HarnessMcpPolicyV1::Disabled, None) => {}
-        (dispatch::HarnessMcpPolicyV1::GrantBound, Some(reservation))
-            if reservation.state == HarnessMcpReservationStateV1::Armed
-                && reservation.operation_id == operation.operation_id
-                && grant_authority == Some(HarnessTransferAuthorityRefV1::ParentGrant {
-                    grant_id: reservation.grant_id.clone(),
-                    revision: reservation.grant_revision,
-                }) =>
-        {
+        // `plan.grant` names the exact grant an armed H3B reservation must
+        // carry only when the plan pins one (`Exact`, shape (a)'s
+        // continuation/delivery flows). An `Operator`-policy plan
+        // (`grant_authority` is `None` above) mints its grant per dispatch
+        // through `runtime::resolve_harness_mcp_grant` instead of naming
+        // one ahead of time -- `HarnessLaunchPlanV1::is_ordinary_dispatch`
+        // documents this pairing as intentional since gate4agent-arc-
+        // mailbox-and-task-layer Slice A(i) -- so there is no exact
+        // `(grant_id, revision)` here to compare the reservation against;
+        // `begin_run_dispatch_with_harness_mcp`'s own `validate_harness_mcp_
+        // grant` already proved that minted grant authoritative for this
+        // run and operation before the reservation was ever created, and
+        // that identity is immutable for the reservation's lifetime. This
+        // match used to require `grant_authority == Some(ParentGrant {..})`
+        // unconditionally, which an `Operator`-policy plan can never
+        // produce -- so every H3B shape (b) dispatch (an operator-started
+        // top-level run) fell to the catch-all refusal below even after the
+        // Node armed the reservation ("harness MCP authority proof does not
+        // match current durable state", measured live on claude and codex).
+        (dispatch::HarnessMcpPolicyV1::GrantBound, Some(reservation)) => {
+            if reservation.state != HarnessMcpReservationStateV1::Armed {
+                return Err(HarnessServiceError::HarnessMcpLaunchReservationNotArmedRefused {
+                    reservation_id: reservation.reservation_id.clone(),
+                    state: reservation.state,
+                });
+            }
+            if reservation.operation_id != operation.operation_id {
+                return Err(HarnessServiceError::HarnessMcpLaunchOperationRefused {
+                    reservation_operation_id: reservation.operation_id.clone(),
+                    dispatch_operation_id: operation.operation_id.clone(),
+                });
+            }
+            if let HarnessGrantPolicyV1::Exact { grant_id, revision } = &plan.grant {
+                if &reservation.grant_id != grant_id || reservation.grant_revision != *revision {
+                    return Err(HarnessServiceError::HarnessMcpLaunchGrantRefused {
+                        plan_grant_id: grant_id.clone(),
+                        plan_grant_revision: *revision,
+                        reservation_grant_id: reservation.grant_id.clone(),
+                        reservation_grant_revision: reservation.grant_revision,
+                    });
+                }
+            }
             prepared = prepared.with_harness_mcp(
                 reservation,
                 reservation.expires_at_unix_ms,
             );
         }
-        _ => return Err(HarnessServiceError::HarnessMcpProofMismatch),
+        (plan_policy, reservation) => {
+            return Err(HarnessServiceError::HarnessMcpLaunchPolicyRefused {
+                plan_policy: match plan_policy {
+                    dispatch::HarnessMcpPolicyV1::Disabled => "disabled",
+                    dispatch::HarnessMcpPolicyV1::GrantBound => "grant-bound",
+                },
+                reservation_present: reservation.is_some(),
+            });
+        }
     }
     Ok(prepared)
 }
@@ -6605,6 +6688,99 @@ pub enum HarnessServiceError {
     HarnessMcpReplayMismatch,
     #[error("harness MCP authority proof does not match current durable state")]
     HarnessMcpProofMismatch,
+    #[error(
+        "H3B arm proof reservation field {field} refused: durable is \
+         {durable} vs proof is {proof}"
+    )]
+    HarnessMcpArmProofReservationFieldRefused {
+        field: &'static str,
+        durable: String,
+        proof: String,
+    },
+    #[error(
+        "H3B arm proof route {field} refused: durable is {durable} vs \
+         route is {route}"
+    )]
+    HarnessMcpArmProofRouteRefused {
+        field: &'static str,
+        durable: String,
+        route: String,
+    },
+    #[error(
+        "H3B arm proof binding {field} refused: reservation is {expected} \
+         vs proof is {actual}"
+    )]
+    HarnessMcpArmProofBindingRefused {
+        field: &'static str,
+        expected: String,
+        actual: String,
+    },
+    #[error(
+        "H3B arm lookup refused: {missing} is missing for operation \
+         {operation_id:?} reservation {reservation_id:?}"
+    )]
+    HarnessMcpArmDurableLookupMissing {
+        missing: &'static str,
+        operation_id: Option<HarnessOperationId>,
+        reservation_id: Option<HarnessMcpReservationId>,
+    },
+    #[error(
+        "H3B arm reservation {reservation_id:?} refused: state is {state:?}, \
+         armed_at is {armed_at_unix_ms}, durable updated_at is \
+         {updated_at_unix_ms}, expires_at is {expires_at_unix_ms}"
+    )]
+    HarnessMcpArmReservationNotReadyRefused {
+        reservation_id: HarnessMcpReservationId,
+        state: HarnessMcpReservationStateV1,
+        armed_at_unix_ms: u64,
+        updated_at_unix_ms: u64,
+        expires_at_unix_ms: u64,
+    },
+    #[error(
+        "H3B arm route refused: operation {operation_id} context {field} \
+         {value} does not parse as a Node route field"
+    )]
+    HarnessMcpArmRouteInvalid {
+        operation_id: HarnessOperationId,
+        field: &'static str,
+        value: String,
+    },
+    #[error(
+        "H3B launch authority refused: plan harness MCP policy is \
+         {plan_policy}, armed reservation present is {reservation_present}"
+    )]
+    HarnessMcpLaunchPolicyRefused {
+        plan_policy: &'static str,
+        reservation_present: bool,
+    },
+    #[error(
+        "H3B launch reservation {reservation_id:?} refused: state is \
+         {state:?}, must be armed"
+    )]
+    HarnessMcpLaunchReservationNotArmedRefused {
+        reservation_id: HarnessMcpReservationId,
+        state: HarnessMcpReservationStateV1,
+    },
+    #[error(
+        "H3B launch operation refused: reservation names operation \
+         {reservation_operation_id}, dispatch is for operation \
+         {dispatch_operation_id}"
+    )]
+    HarnessMcpLaunchOperationRefused {
+        reservation_operation_id: HarnessOperationId,
+        dispatch_operation_id: HarnessOperationId,
+    },
+    #[error(
+        "H3B launch grant refused: plan names grant {plan_grant_id} \
+         revision {plan_grant_revision:?}, reservation carries grant \
+         {reservation_grant_id} revision {reservation_grant_revision:?}"
+    )]
+    HarnessMcpLaunchGrantRefused {
+        plan_grant_id: SessionGrantId,
+        plan_grant_revision: HarnessRevision,
+        reservation_grant_id: SessionGrantId,
+        reservation_grant_revision: HarnessRevision,
+    },
     #[error("H3B accepted spawn requires the specialized atomic reservation transition")]
     HarnessMcpSpecializedTransitionRequired,
     #[error("operator request operation id {operation_id} was reused with different typed intent")]
@@ -10052,6 +10228,115 @@ mod tests {
         assert_eq!(reservation.grant_id, grant_id);
         assert_eq!(reservation.grant_revision, grant_revision);
         assert_eq!(reservation.actor_run_id, run.run_id);
+
+        service.close().unwrap();
+        remove_database(&path);
+    }
+
+    /// H3B shape (b) end to end past the point
+    /// `h3b_dispatch_accepts_a_grant_minted_by_resolve_harness_mcp_grant`
+    /// above stops at: the Node's `Armed` reply is recorded and the spawn
+    /// lease is issued from it. Measured live on claude and codex, this
+    /// exact composition -- `resolve_harness_mcp_grant`'s minted `Operator`
+    /// grant, armed and recorded through `record_harness_mcp_armed_and_
+    /// issue_spawn_lease` -- went `OutcomeUnknown` with `HarnessMcpProofMismatch`
+    /// even though the Node had already armed the reservation: the launch
+    /// plan's own `grant: Operator` carries no exact `(grant_id, revision)`
+    /// to compare against, so `prepared_scheduled_spawn_dispatch`'s harness-
+    /// MCP guard -- built only for shape (a)'s `grant: Exact` plans -- could
+    /// never match an `Operator`-policy plan's armed reservation at all.
+    #[test]
+    fn h3b_operator_started_top_level_run_arms_and_issues_spawn_lease() {
+        let path = database_path("h3b-operator-arm-and-lease");
+        let mut plan = exact_launch_plan(false, false, true);
+        plan.grant = crate::dispatch::HarnessGrantPolicyV1::Operator;
+        let catalog = dispatch::HarnessLaunchCatalog::new([plan.clone()]).unwrap();
+        let scheduled = plan.scheduled_ref().unwrap();
+        let mut service = HarnessService {
+            store: Some(HarnessStore::open(&path).unwrap()),
+            engine: h3b_operator_dispatch_engine(),
+            dispatch_contexts: BTreeMap::new(),
+            harness_mcp_reservations: BTreeMap::new(),
+            operator_requests: BTreeMap::new(),
+            scheduled_launches: BTreeMap::from([(run_operation_id(), scheduled)]),
+            issued_launches: BTreeMap::new(),
+            poisoned: false,
+        };
+        let run = service.engine().run(&run_id()).unwrap().clone();
+        let operation = service.engine().operation(&run_operation_id()).unwrap().clone();
+        assert_eq!(run.parent_run_id, None);
+        assert!(matches!(operation.actor, HarnessActorV1::User { .. }));
+
+        let mut spec = spawn_spec("operator top-level H3B arm and lease");
+        spec.overrides.terminal_size = SpawnOverride::Set {
+            value: TerminalSize { rows: 40, columns: 120 },
+        };
+        let fingerprint = c2::spawn_spec_fingerprint(&spec).unwrap();
+        let mut context = dispatch_context(&operation, fingerprint);
+        let incarnation = "07".repeat(16);
+        context.node_incarnation_id = HarnessSelectorV1::new(&incarnation).unwrap();
+
+        let (grant_id, grant_revision) = crate::runtime::resolve_harness_mcp_grant(
+            &mut service,
+            &operation.operation_id,
+            &crate::dispatch::HarnessGrantPolicyV1::Operator,
+            &run.run_id,
+            HarnessGrantTargetV1 {
+                node_id: context.node_id.clone(),
+                workspace_id: context.workspace_id.clone(),
+                provider_profile: context.provider_profile.clone(),
+                mode: context.mode,
+            },
+            13,
+        ).unwrap();
+
+        let mut run = run;
+        run.revision = HarnessRevision::new(2).unwrap();
+        run.lifecycle = HarnessRunLifecycleV1::Dispatching;
+        run.updated_at_unix_ms = 13;
+        let mut operation = operation;
+        operation.revision = HarnessRevision::new(2).unwrap();
+        operation.state = HarnessOperationStateV1::Dispatching;
+        operation.updated_at_unix_ms = 13;
+        operation.dispatched_at_unix_ms = Some(13);
+
+        let reservation_id = HarnessMcpReservationId::new(format!(
+            "hmcpres_{}",
+            "d".repeat(24),
+        )).unwrap();
+
+        service.begin_run_dispatch_with_harness_mcp(
+            HarnessRevision::new(1).unwrap(),
+            run.clone(),
+            HarnessRevision::new(1).unwrap(),
+            operation,
+            context,
+            &spec,
+            reservation_id.clone(),
+            grant_id.clone(),
+            grant_revision,
+            1_000,
+        ).unwrap();
+
+        let route = gate4agent_c2_protocol::NodeRoute {
+            node_id: NodeId::new("node-a").unwrap(),
+            expected_incarnation_id: NodeIncarnationId::from_bytes([7; 16]),
+        };
+        let prepared_record = service.harness_mcp_reservation(&reservation_id).unwrap().clone();
+        assert_eq!(prepared_record.grant_id, grant_id);
+        assert_eq!(prepared_record.actor_run_id, run.run_id);
+        let proof = c2::armed_harness_mcp_reservation_proof_for_test(route, prepared_record);
+
+        let _lease = service.record_harness_mcp_armed_and_issue_spawn_lease(
+            &catalog,
+            proof,
+            14,
+            spec,
+        ).unwrap();
+        assert_eq!(
+            service.harness_mcp_reservation_state(&reservation_id),
+            Some(HarnessMcpReservationStateV1::Armed),
+        );
 
         service.close().unwrap();
         remove_database(&path);

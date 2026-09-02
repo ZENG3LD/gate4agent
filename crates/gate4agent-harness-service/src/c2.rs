@@ -1463,6 +1463,50 @@ pub struct ActivatedHarnessMcpReservationProof {
     session: SessionAddress,
 }
 
+/// Field-by-field diff between the reservation an H3B proof carries (fetched
+/// at the point the request to the Node was started) and the durable
+/// reservation it is now being validated against (fetched fresh when the
+/// reply came back), skipping `revision`, `state`, and `updated_at_unix_ms`
+/// -- the three fields every reservation transition is expected to advance
+/// between those two fetches. Returns the first field that still differs,
+/// named, with both sides formatted for a refusal that says which one.
+fn reservation_identity_mismatch(
+    proof_side: &crate::HarnessMcpReservationV1,
+    durable_side: &crate::HarnessMcpReservationV1,
+) -> Option<(&'static str, String, String)> {
+    macro_rules! check {
+        ($field:ident) => {
+            if proof_side.$field != durable_side.$field {
+                return Some((
+                    stringify!($field),
+                    format!("{:?}", durable_side.$field),
+                    format!("{:?}", proof_side.$field),
+                ));
+            }
+        };
+    }
+    check!(reservation_id);
+    check!(activation_digest);
+    check!(grant_id);
+    check!(grant_revision);
+    check!(actor_run_id);
+    check!(operation_id);
+    check!(node_id);
+    check!(node_incarnation_id);
+    check!(workspace_id);
+    check!(provider_profile);
+    check!(expected_provider);
+    check!(mode);
+    check!(spawn_spec_fingerprint);
+    check!(idempotency_ref);
+    check!(expires_at_unix_ms);
+    check!(record_id);
+    check!(instance_id);
+    check!(generation);
+    check!(created_at_unix_ms);
+    None
+}
+
 impl ActivatedHarnessMcpReservationProof {
     pub fn reservation_id(&self) -> &HarnessMcpReservationId {
         &self.reservation.reservation_id
@@ -1472,21 +1516,49 @@ impl ActivatedHarnessMcpReservationProof {
         &self,
         record: &crate::HarnessMcpReservationV1,
     ) -> Result<(), crate::HarnessServiceError> {
-        let mut normalized = record.clone();
-        normalized.revision = self.reservation.revision;
-        normalized.state = self.reservation.state;
-        normalized.updated_at_unix_ms = self.reservation.updated_at_unix_ms;
-        if self.reservation != normalized
-            || self.route.node_id.as_str() != record.node_id.as_str()
-            || self.route.expected_incarnation_id.to_string()
-                != record.node_incarnation_id.as_str()
-            || record.record_id.as_ref().is_none_or(|value| {
-                value.as_str() != self.record_id.as_str()
-            })
-            || record.instance_id != Some(self.session.session.instance_id.0)
-            || record.generation != Some(self.session.session.generation.0)
+        if let Some((field, durable, proof)) =
+            reservation_identity_mismatch(&self.reservation, record)
         {
-            return Err(crate::HarnessServiceError::HarnessMcpProofMismatch);
+            return Err(crate::HarnessServiceError::HarnessMcpArmProofReservationFieldRefused {
+                field, durable, proof,
+            });
+        }
+        if self.route.node_id.as_str() != record.node_id.as_str() {
+            return Err(crate::HarnessServiceError::HarnessMcpArmProofRouteRefused {
+                field: "node_id",
+                durable: record.node_id.as_str().to_owned(),
+                route: self.route.node_id.as_str().to_owned(),
+            });
+        }
+        if self.route.expected_incarnation_id.to_string() != record.node_incarnation_id.as_str() {
+            return Err(crate::HarnessServiceError::HarnessMcpArmProofRouteRefused {
+                field: "node_incarnation_id",
+                durable: record.node_incarnation_id.as_str().to_owned(),
+                route: self.route.expected_incarnation_id.to_string(),
+            });
+        }
+        if record.record_id.as_ref().is_none_or(|value| {
+            value.as_str() != self.record_id.as_str()
+        }) {
+            return Err(crate::HarnessServiceError::HarnessMcpArmProofBindingRefused {
+                field: "record_id",
+                expected: format!("{:?}", record.record_id),
+                actual: self.record_id.as_str().to_owned(),
+            });
+        }
+        if record.instance_id != Some(self.session.session.instance_id.0) {
+            return Err(crate::HarnessServiceError::HarnessMcpArmProofBindingRefused {
+                field: "instance_id",
+                expected: format!("{:?}", record.instance_id),
+                actual: format!("{:?}", self.session.session.instance_id.0),
+            });
+        }
+        if record.generation != Some(self.session.session.generation.0) {
+            return Err(crate::HarnessServiceError::HarnessMcpArmProofBindingRefused {
+                field: "generation",
+                expected: format!("{:?}", record.generation),
+                actual: format!("{:?}", self.session.session.generation.0),
+            });
         }
         Ok(())
     }
@@ -1505,16 +1577,26 @@ impl ArmedHarnessMcpReservationProof {
         &self,
         record: &crate::HarnessMcpReservationV1,
     ) -> Result<(), crate::HarnessServiceError> {
-        let mut normalized = record.clone();
-        normalized.revision = self.reservation.revision;
-        normalized.state = self.reservation.state;
-        normalized.updated_at_unix_ms = self.reservation.updated_at_unix_ms;
-        if self.reservation != normalized
-            || self.route.node_id.as_str() != record.node_id.as_str()
-            || self.route.expected_incarnation_id.to_string()
-                != record.node_incarnation_id.as_str()
+        if let Some((field, durable, proof)) =
+            reservation_identity_mismatch(&self.reservation, record)
         {
-            return Err(crate::HarnessServiceError::HarnessMcpProofMismatch);
+            return Err(crate::HarnessServiceError::HarnessMcpArmProofReservationFieldRefused {
+                field, durable, proof,
+            });
+        }
+        if self.route.node_id.as_str() != record.node_id.as_str() {
+            return Err(crate::HarnessServiceError::HarnessMcpArmProofRouteRefused {
+                field: "node_id",
+                durable: record.node_id.as_str().to_owned(),
+                route: self.route.node_id.as_str().to_owned(),
+            });
+        }
+        if self.route.expected_incarnation_id.to_string() != record.node_incarnation_id.as_str() {
+            return Err(crate::HarnessServiceError::HarnessMcpArmProofRouteRefused {
+                field: "node_incarnation_id",
+                durable: record.node_incarnation_id.as_str().to_owned(),
+                route: self.route.expected_incarnation_id.to_string(),
+            });
         }
         Ok(())
     }

@@ -11634,10 +11634,19 @@ impl NodeShared {
             "session spawn request accepted",
         );
         let mut harness_mcp_overlay = if let Some(prepared) = harness_mcp {
-            if mode != SessionMode::Pty || prepared.provider != provider {
+            // Slice A(ii) of gate4agent-arc-mailbox-and-task-layer: the door
+            // exists for PTY (env vars) and ACP (`session/new.mcpServers`,
+            // `gate4agent-shell-native`'s `harness_mcp_acp_server`) alike --
+            // both read the identical overlay resolved below, one as child
+            // environment, the other translated into one stdio MCP server
+            // entry. `Inline`/`Pipe` stays refused: this arc's proof is ACP
+            // only, and nothing downstream reads a harness-MCP overlay for
+            // that transport yet.
+            if !matches!(mode, SessionMode::Pty | SessionMode::Acp) || prepared.provider != provider
+            {
                 return Err(failure(
                     NodeFailureCode::BindingMismatch,
-                    "harness MCP reservation does not match the exact PTY provider",
+                    "harness MCP reservation does not match the exact PTY/ACP provider",
                 ));
             }
             prepared.verify_helper_program().map_err(harness_mcp_failure)?;

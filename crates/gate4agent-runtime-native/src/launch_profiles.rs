@@ -223,7 +223,18 @@ pub struct NativeInstanceLaunchOverlay {
     profile_selection_required: bool,
 }
 
-/// Dedicated host-only H3B child environment for one exact PTY instance.
+/// Dedicated host-only H3B child environment for one exact instance,
+/// PTY or ACP.
+///
+/// The resolved mutations are the same regardless of which transport reads
+/// them: `NativeSpawnOverlay::resolve_environment`, below, does not gate this
+/// overlay by transport. A PTY child consumes them as OS environment; an ACP
+/// child never sees an environment variable this way at all --
+/// `gate4agent-shell-native`'s ACP branch instead reads the resolved
+/// `GATE4AGENT_HARNESS_MCP_PROGRAM`/`_SESSION_ENDPOINT`/`_SESSION_TOKEN`
+/// entries back out of the same resolved list and translates them into one
+/// `session/new.mcpServers` stdio entry
+/// (gate4agent-arc-mailbox-and-task-layer Slice A(ii)).
 ///
 /// Endpoint, token, and reviewed helper path never enter generic launch-profile
 /// ownership, wire state, or diagnostics.

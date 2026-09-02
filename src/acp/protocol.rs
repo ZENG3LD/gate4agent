@@ -2046,6 +2046,47 @@ mod tests {
         assert_eq!(decoded.additional_directories, vec!["/home/user/other-repo".to_string()]);
     }
 
+    /// The harness-MCP door (gate4agent-arc-mailbox-and-task-layer Slice
+    /// A(ii)): when a caller populates `mcp_servers` with the one stdio
+    /// entry `gate4agent-shell-native` builds from a prepared harness-MCP
+    /// overlay, `session/new` carries it -- command, args, and env all
+    /// present on the wire. An empty `mcp_servers` (no overlay prepared)
+    /// still serializes to `"mcpServers":[]`, exactly as
+    /// `session_new_params_serialize` above already pins.
+    #[test]
+    fn session_new_params_serializes_mcp_server_stdio_entry() {
+        let mut env = std::collections::HashMap::new();
+        env.insert(
+            "GATE4AGENT_HARNESS_SESSION_ENDPOINT".to_string(),
+            "\\\\.\\pipe\\gate4agent-harness-mcp-s1".to_string(),
+        );
+        env.insert("GATE4AGENT_HARNESS_SESSION_TOKEN".to_string(), "tok-abc".to_string());
+        let p = SessionNewParams {
+            cwd: "/home/user".to_string(),
+            mcp_servers: vec![McpServerConfig::Stdio {
+                command: "C:\\gate4agent\\gate4agent-harness-mcp.exe".to_string(),
+                args: vec!["--session-proxy".to_string()],
+                env,
+            }],
+            additional_directories: vec![],
+        };
+        let s = serde_json::to_string(&p).unwrap();
+        assert!(s.contains(r#""mcpServers":[{"#), "must carry the one stdio entry");
+        assert!(s.contains(r#""transport":"stdio""#), "must tag the entry as stdio");
+        assert!(s.contains(r#""command":"C:\\gate4agent\\gate4agent-harness-mcp.exe""#));
+        assert!(s.contains(r#""args":["--session-proxy"]"#));
+        assert!(s.contains("GATE4AGENT_HARNESS_SESSION_ENDPOINT"));
+        assert!(s.contains("GATE4AGENT_HARNESS_SESSION_TOKEN"));
+
+        let empty = SessionNewParams {
+            cwd: "/home/user".to_string(),
+            mcp_servers: vec![],
+            additional_directories: vec![],
+        };
+        let empty_s = serde_json::to_string(&empty).unwrap();
+        assert!(empty_s.contains(r#""mcpServers":[]"#), "no overlay means an empty array, not absence");
+    }
+
     #[test]
     fn session_prompt_params_wraps_content_blocks() {
         let p = SessionPromptParams {

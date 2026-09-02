@@ -30,7 +30,7 @@ use super::gate::DangerousCommandGate;
 use super::host::{AcpHostAdapter, HostPolicy, PermissionDeferral, PolicyHostHandler};
 use super::protocol::{
     extract_token_usage, AgentCapabilities, AvailableCommand, ClientInfo, ContentBlock,
-    InitializeParams, PermissionOption, PermissionOptionKind, PermissionOutcome,
+    InitializeParams, McpServerConfig, PermissionOption, PermissionOptionKind, PermissionOutcome,
     PermissionRequestParams, SessionCancelParams, SessionCloseParams, SessionCloseResult,
     SessionConfigOption, SessionDeleteParams, SessionForkParams, SessionListParams,
     SessionListResult, SessionLoadParams, SessionLoadResult, SessionMode, SessionModel,
@@ -166,6 +166,18 @@ pub struct AcpSessionOptions {
     /// unverified. Default: empty.
     pub additional_directories: Vec<String>,
 
+    /// MCP servers to advertise on `session/new` via `mcpServers` -- the
+    /// spec-sanctioned door a spawned agent uses to reach tools the host
+    /// exposes, most notably the harness MCP proxy
+    /// (`gate4agent-harness-mcp --session-proxy`) when the caller prepared
+    /// one for this spawn. This crate only forwards whatever the caller
+    /// already assembled; it never constructs an entry itself (that is
+    /// `gate4agent-shell-native`'s job, reusing the exact program/endpoint/
+    /// token the PTY transport's environment overlay already carries).
+    /// Default: empty, which sends `"mcpServers":[]` exactly as before this
+    /// field existed.
+    pub mcp_servers: Vec<McpServerConfig>,
+
     /// Whether `session/request_permission` may be **deferred** to a later,
     /// out-of-band answer -- an operator resolving it by id via
     /// [`AcpSession::resolve_pending_request`] -- instead of being decided
@@ -215,6 +227,7 @@ impl Default for AcpSessionOptions {
             dangerous_command_gate: DangerousCommandGate::default(),
             approval_level_args: Vec::new(),
             additional_directories: Vec::new(),
+            mcp_servers: Vec::new(),
             defer_permission_requests: false,
             permission_request_deadline: Duration::from_secs(300),
         }
@@ -527,7 +540,7 @@ impl AcpSession {
         // --- Handshake step 2: session/new ---
         let new_params = SessionNewParams {
             cwd: working_dir.to_str().unwrap_or(".").to_string(),
-            mcp_servers: vec![],
+            mcp_servers: options.mcp_servers.clone(),
             additional_directories: options.additional_directories.clone(),
         };
         let new_result: SessionLoadResult = session
@@ -1483,6 +1496,7 @@ mod tests {
         assert_eq!(opts.host_policy, HostPolicy::Auto);
         assert!(opts.approval_level_args.is_empty());
         assert!(opts.additional_directories.is_empty());
+        assert!(opts.mcp_servers.is_empty());
         assert!(!opts.defer_permission_requests, "deferral must default to off");
         assert_eq!(opts.permission_request_deadline, Duration::from_secs(300));
     }

@@ -28,6 +28,7 @@ pub const PROVIDER_PLAN_STEPS_MAX: usize = 256;
 pub const PROVIDER_AVAILABLE_COMMANDS_MAX: usize = 256;
 pub const PROVIDER_CONFIG_OPTIONS_MAX: usize = 256;
 pub const PROVIDER_CONFIG_OPTION_CHOICES_MAX: usize = 256;
+pub const PROVIDER_MODE_CATALOG_MAX: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -1457,6 +1458,19 @@ pub struct ProviderAvailableCommand {
     pub input_hint: Option<String>,
 }
 
+/// One mode the agent advertised as selectable, read from ACP's
+/// `session/new` handshake result (`AcpSession::available_modes()`) and
+/// carried on [`ProviderEvent::ModeChanged`] alongside the id that changed.
+/// Mirrors `gate4agent-node-protocol`'s `AgentStreamNamedIdV1`
+/// field-for-field; this crate does not depend on that one (see this
+/// crate's own `CLAUDE.md`), so the shape is repeated rather than shared.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderModeInfo {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+}
+
 /// The kind of a [`ProviderConfigOption`] -- `select` (choose one of
 /// `choices`) or `boolean` (toggle the option's current value). `Unknown`
 /// is the fallback for a kind string this build does not recognize.
@@ -1668,9 +1682,18 @@ pub enum ProviderEvent {
         commands: Vec<ProviderAvailableCommand>,
     },
     /// The session's active mode changed (ACP transport's
-    /// `current_mode_update`).
+    /// `current_mode_update`). `available` is the mode catalogue the agent
+    /// returned at `session/new` (`AcpSession::available_modes()`), read
+    /// back at the moment this event is minted -- `current_mode_update`
+    /// itself carries only the new id, never the catalogue. ACP orders
+    /// `session/new` strictly before any `session/update`, and the
+    /// catalogue never changes after handshake, so by the time a
+    /// `ModeChanged` can exist the same session object's catalogue is
+    /// already the real one: an empty `available` here always means the
+    /// agent announced zero modes, never "not read yet".
     ModeChanged {
         mode_id: String,
+        available: Vec<ProviderModeInfo>,
     },
     /// Session metadata changed; only the fields that actually changed
     /// are populated (ACP transport's `session_info_update`).
@@ -1909,8 +1932,29 @@ impl ProviderEvent {
                     }
                 }
             }
-            Self::ModeChanged { mode_id } => {
+            Self::ModeChanged { mode_id, available } => {
                 validate_required("mode id", mode_id, PROVIDER_EVENT_ID_MAX_BYTES)?;
+                if available.len() > PROVIDER_MODE_CATALOG_MAX {
+                    return Err(ProviderEventValidationError::TooManyModes {
+                        count: available.len(),
+                        max: PROVIDER_MODE_CATALOG_MAX,
+                    });
+                }
+                for mode in available {
+                    validate_required("available mode id", &mode.id, PROVIDER_EVENT_ID_MAX_BYTES)?;
+                    validate_required(
+                        "available mode name",
+                        &mode.name,
+                        PROVIDER_EVENT_ID_MAX_BYTES,
+                    )?;
+                    if let Some(description) = &mode.description {
+                        validate_text(
+                            "available mode description",
+                            description,
+                            PROVIDER_EVENT_TEXT_MAX_BYTES,
+                        )?;
+                    }
+                }
             }
             Self::SessionInfoUpdated { title } => {
                 if let Some(title) = title {
@@ -2114,6 +2158,8 @@ pub enum ProviderEventValidationError {
     TooManyConfigOptions { count: usize, max: usize },
     #[error("provider config option choice count {count} exceeds {max}")]
     TooManyConfigOptionChoices { count: usize, max: usize },
+    #[error("provider mode catalog count {count} exceeds {max}")]
+    TooManyModes { count: usize, max: usize },
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -2624,7 +2670,8 @@ mod tests {
         ProviderConfigOptionKind, ProviderEvent,
         ProviderEventValidationError,
         ProviderInteractionKind, ProviderInteractionOutcome, ProviderInteractionResponse,
-        ProviderInteractionResponseError, ProviderPlanPriority, ProviderPlanStatus,
+        ProviderInteractionResponseError, ProviderModeInfo, ProviderPlanPriority,
+        ProviderPlanStatus,
         ProviderPlanStep, ProviderRuntimeCapability, ProviderRuntimePolicy,
         ProviderRuntimePolicyError,
         ProviderSessionIdentity, ProviderSessionKey, ProviderSnapshot, PtyScreenState,
@@ -2634,7 +2681,8 @@ mod tests {
         OPERATOR_GATE_OPTION_TEXT_MAX_BYTES, OPERATOR_GATE_PATH_MAX_BYTES,
         PROVIDER_AVAILABLE_COMMANDS_MAX,
         PROVIDER_EVENT_ID_MAX_BYTES, PROVIDER_EVENT_TEXT_MAX_BYTES,
-        PROVIDER_INTERACTION_RESPONSE_MAX_BYTES, PROVIDER_PLAN_STEPS_MAX,
+        PROVIDER_INTERACTION_RESPONSE_MAX_BYTES, PROVIDER_MODE_CATALOG_MAX,
+        PROVIDER_PLAN_STEPS_MAX,
         PTY_SCREEN_GATE_NAME_MAX_BYTES,
     };
 
@@ -3412,12 +3460,62 @@ mod tests {
     #[test]
     fn provider_mode_changed_requires_a_mode_id() {
         assert_eq!(
-            ProviderEvent::ModeChanged { mode_id: "architect".to_owned() }.validate_ingress(),
+            ProviderEvent::ModeChanged {
+                mode_id: "architect".to_owned(),
+                available: Vec::new(),
+            }
+            .validate_ingress(),
             Ok(())
         );
         assert!(matches!(
-            ProviderEvent::ModeChanged { mode_id: String::new() }.validate_ingress(),
+            ProviderEvent::ModeChanged { mode_id: String::new(), available: Vec::new() }
+                .validate_ingress(),
             Err(ProviderEventValidationError::Empty { field: "mode id" })
+        ));
+    }
+
+    #[test]
+    fn provider_mode_changed_available_catalog_is_bounded_at_ingress() {
+        let valid = ProviderEvent::ModeChanged {
+            mode_id: "architect".to_owned(),
+            available: vec![ProviderModeInfo {
+                id: "architect".to_owned(),
+                name: "Architect".to_owned(),
+                description: Some("Plans before it edits".to_owned()),
+            }],
+        };
+        assert_eq!(valid.validate_ingress(), Ok(()));
+
+        assert!(matches!(
+            ProviderEvent::ModeChanged {
+                mode_id: "architect".to_owned(),
+                available: vec![ProviderModeInfo {
+                    id: String::new(),
+                    name: "Architect".to_owned(),
+                    description: None,
+                }],
+            }
+            .validate_ingress(),
+            Err(ProviderEventValidationError::Empty { field: "available mode id" })
+        ));
+
+        let too_many = (0..=PROVIDER_MODE_CATALOG_MAX)
+            .map(|i| ProviderModeInfo {
+                id: format!("mode{i}"),
+                name: format!("Mode {i}"),
+                description: None,
+            })
+            .collect();
+        assert!(matches!(
+            ProviderEvent::ModeChanged {
+                mode_id: "architect".to_owned(),
+                available: too_many,
+            }
+            .validate_ingress(),
+            Err(ProviderEventValidationError::TooManyModes {
+                max: PROVIDER_MODE_CATALOG_MAX,
+                ..
+            })
         ));
     }
 

@@ -22,6 +22,7 @@ pub use provider_supervisor::{
     MAX_PROVIDER_SUPERVISOR_WORK_PER_TICK,
 };
 
+use gate4agent::acp::protocol::SessionMode;
 use gate4agent::agent::{is_agent_foreground_wrapper, is_expected_agent_process, ReadinessStatus};
 use gate4agent::pty::cli::codex::strip_ansi_codes;
 use gate4agent::pty::cli::{create_pipeline, ClassificationPipeline, MessageClass, ParsedMessage};
@@ -53,7 +54,7 @@ use gate4agent_types::{
     OperatorGateSubject, PipeProtocol,
     PreparedInputKind, PromptPayload, ProviderAvailableCommand, ProviderConfigChoice,
     ProviderConfigOption, ProviderConfigOptionKind, ProviderEvent, ProviderInteractionKind,
-    ProviderInteractionResponse, ProviderInteractionTarget, ProviderPlanPriority,
+    ProviderInteractionResponse, ProviderInteractionTarget, ProviderModeInfo, ProviderPlanPriority,
     ProviderPlanStatus, ProviderPlanStep,
     ProviderRateLimitKind, ProviderRuntimeCapability, ProviderRuntimePolicy,
     ProviderSessionIdentity, ProviderSessionKey,
@@ -1449,8 +1450,8 @@ impl NativeEffectShell {
                 drain_pty_provider(*key, provider, &mut observations);
             }
         }
-        collect_provider_map(&mut self.pipe_sessions, &mut observations);
-        collect_provider_map(&mut self.one_shot_sessions, &mut observations);
+        collect_provider_map(&mut self.pipe_sessions, &mut observations, |_| Vec::new());
+        collect_provider_map(&mut self.one_shot_sessions, &mut observations, |_| Vec::new());
         // Retire deferred permission requests whose deadline has passed,
         // BEFORE draining -- so the `RpcIncomingRequest` each expiry emits is
         // picked up by the very same drain rather than waiting a whole tick
@@ -1465,7 +1466,7 @@ impl NativeEffectShell {
         for owned in self.acp_sessions.values() {
             owned.session.expire_deadlines();
         }
-        collect_provider_map(&mut self.acp_sessions, &mut observations);
+        collect_provider_map(&mut self.acp_sessions, &mut observations, AcpSession::available_modes);
         observations
     }
 
@@ -2226,11 +2227,18 @@ fn provider_rate_limit_kind(
     }
 }
 
+/// `mode_catalogue` reads the mode catalogue off `owned.session` for
+/// transports that have one -- only `AcpSession::available_modes()` does
+/// (see `provider_event`'s doc comment); `collect_provider_map`'s two
+/// non-ACP call sites pass `|_| Vec::new()` since their `AgentEvent` stream
+/// never carries `ModeChanged` in the first place.
 fn collect_provider_map<S>(
     sessions: &mut BTreeMap<NativeSessionKey, OwnedProviderSession<S>>,
     observations: &mut Vec<ObservationEnvelope>,
+    mode_catalogue: impl Fn(&S) -> Vec<SessionMode>,
 ) {
     for (key, owned) in sessions {
+        let available_modes = mode_catalogue(&owned.session);
         drain_provider_stream(
             *key,
             &owned.source,
@@ -2239,6 +2247,7 @@ fn collect_provider_map<S>(
             &mut owned.next_provider_sequence,
             Some(&mut owned.observed_exit_code),
             observations,
+            &available_modes,
         );
     }
 }
@@ -2251,6 +2260,7 @@ fn drain_provider_stream(
     next_provider_sequence: &mut u64,
     mut observed_exit_code: Option<&mut Option<i32>>,
     observations: &mut Vec<ObservationEnvelope>,
+    available_modes: &[SessionMode],
 ) {
     loop {
         let next = match pending_events.pop_front() {
@@ -2264,7 +2274,7 @@ fn drain_provider_stream(
                 }
             }
             Ok(event) => {
-                let Some(event) = provider_event(event) else {
+                let Some(event) = provider_event(event, available_modes) else {
                     continue;
                 };
                 let sequence = *next_provider_sequence;
@@ -2564,7 +2574,16 @@ fn set_acp_session_model_observation(
     }
 }
 
-fn provider_event(event: AgentEvent) -> Option<ProviderEvent> {
+/// Maps one `AgentEvent` onto the wire-typed `ProviderEvent`. `available_
+/// modes` is used ONLY by the `AgentEvent::ModeChanged` arm -- it carries
+/// the mode catalogue `AcpSession::available_modes()` read at handshake
+/// (`session/new`), so a mode change reports the SAME catalogue the agent
+/// actually offered, not just the id that changed. Every other arm ignores
+/// it; passing `&[]` from a non-ACP transport (which never emits
+/// `ModeChanged` in the first place -- see `update_to_event`'s
+/// `CurrentModeUpdate` arm, `gate4agent`'s `src/acp/protocol.rs`) changes
+/// nothing observable.
+fn provider_event(event: AgentEvent, available_modes: &[SessionMode]) -> Option<ProviderEvent> {
     match event {
         AgentEvent::SessionStart {
             session_id,
@@ -2730,7 +2749,10 @@ fn provider_event(event: AgentEvent) -> Option<ProviderEvent> {
                     .collect(),
             })
         }
-        AgentEvent::ModeChanged { mode_id } => Some(ProviderEvent::ModeChanged { mode_id }),
+        AgentEvent::ModeChanged { mode_id } => Some(ProviderEvent::ModeChanged {
+            mode_id,
+            available: available_modes.iter().cloned().map(provider_mode_info).collect(),
+        }),
         AgentEvent::SessionInfoUpdate { title } => {
             Some(ProviderEvent::SessionInfoUpdated { title })
         }
@@ -2792,6 +2814,17 @@ fn provider_plan_step(step: gate4agent::core::types::PlanStep) -> ProviderPlanSt
         content: step.content,
         priority: provider_plan_priority(step.priority),
         status: provider_plan_status(step.status),
+    }
+}
+
+/// Maps one ACP `SessionMode` (`gate4agent::acp::protocol::SessionMode`,
+/// `session/new`'s `modes.availableModes`) onto the wire-typed
+/// `ProviderModeInfo` carried on `ProviderEvent::ModeChanged::available`.
+fn provider_mode_info(mode: SessionMode) -> ProviderModeInfo {
+    ProviderModeInfo {
+        id: mode.id,
+        name: mode.name,
+        description: mode.description,
     }
 }
 
@@ -4453,17 +4486,20 @@ mod tests {
 
     #[test]
     fn structured_context_usage_maps_without_pty_inference() {
-        let mapped = super::provider_event(AgentEvent::ContextWindowUsage {
-            usage: AgentContextWindowUsage {
-                uncached_input_tokens: 70,
-                cache_read_tokens: 20,
-                cache_write_tokens: 0,
-                output_tokens: 10,
-                unattributed_tokens: 5,
-                used_tokens: 105,
-                capacity_tokens: 100,
+        let mapped = super::provider_event(
+            AgentEvent::ContextWindowUsage {
+                usage: AgentContextWindowUsage {
+                    uncached_input_tokens: 70,
+                    cache_read_tokens: 20,
+                    cache_write_tokens: 0,
+                    output_tokens: 10,
+                    unattributed_tokens: 5,
+                    used_tokens: 105,
+                    capacity_tokens: 100,
+                },
             },
-        });
+            &[],
+        );
         assert_eq!(
             mapped,
             Some(ProviderEvent::ContextWindowUsage {
@@ -4496,17 +4532,22 @@ mod tests {
                 used_tokens: 104,
             })
         );
-        assert!(super::provider_event(AgentEvent::PtyRaw { data: b"105/100".to_vec() }).is_none());
+        assert!(
+            super::provider_event(AgentEvent::PtyRaw { data: b"105/100".to_vec() }, &[]).is_none()
+        );
     }
 
     #[test]
     fn host_request_reaches_the_operator_with_method_and_host_decision() {
-        let denied = super::provider_event(AgentEvent::RpcIncomingRequest {
-            id: gate4agent::rpc::message::RpcId::Number(1),
-            method: "fs/read_text_file".to_owned(),
-            params: None,
-            decision: HostRequestDecision::Denied { by: HostDecisionAuthority::Policy },
-        });
+        let denied = super::provider_event(
+            AgentEvent::RpcIncomingRequest {
+                id: gate4agent::rpc::message::RpcId::Number(1),
+                method: "fs/read_text_file".to_owned(),
+                params: None,
+                decision: HostRequestDecision::Denied { by: HostDecisionAuthority::Policy },
+            },
+            &[],
+        );
         assert_eq!(
             denied,
             Some(ProviderEvent::HostRequestObserved {
@@ -4518,12 +4559,15 @@ mod tests {
             })
         );
 
-        let granted = super::provider_event(AgentEvent::RpcIncomingRequest {
-            id: gate4agent::rpc::message::RpcId::Number(2),
-            method: "terminal/create".to_owned(),
-            params: None,
-            decision: HostRequestDecision::Granted { by: HostDecisionAuthority::Policy },
-        });
+        let granted = super::provider_event(
+            AgentEvent::RpcIncomingRequest {
+                id: gate4agent::rpc::message::RpcId::Number(2),
+                method: "terminal/create".to_owned(),
+                params: None,
+                decision: HostRequestDecision::Granted { by: HostDecisionAuthority::Policy },
+            },
+            &[],
+        );
         assert_eq!(
             granted,
             Some(ProviderEvent::HostRequestObserved {
@@ -4538,12 +4582,15 @@ mod tests {
         // Every authority carries through, not just the outcome -- a gate
         // block and an operator's answer must remain distinguishable on the
         // wire, and a deadline expiry must never be mistaken for one.
-        let gate_denied = super::provider_event(AgentEvent::RpcIncomingRequest {
-            id: gate4agent::rpc::message::RpcId::Number(3),
-            method: "terminal/create".to_owned(),
-            params: None,
-            decision: HostRequestDecision::Denied { by: HostDecisionAuthority::Gate },
-        });
+        let gate_denied = super::provider_event(
+            AgentEvent::RpcIncomingRequest {
+                id: gate4agent::rpc::message::RpcId::Number(3),
+                method: "terminal/create".to_owned(),
+                params: None,
+                decision: HostRequestDecision::Denied { by: HostDecisionAuthority::Gate },
+            },
+            &[],
+        );
         assert_eq!(
             gate_denied,
             Some(ProviderEvent::HostRequestObserved {
@@ -4555,12 +4602,15 @@ mod tests {
             })
         );
 
-        let operator_granted = super::provider_event(AgentEvent::RpcIncomingRequest {
-            id: gate4agent::rpc::message::RpcId::Number(4),
-            method: "session/request_permission".to_owned(),
-            params: None,
-            decision: HostRequestDecision::Granted { by: HostDecisionAuthority::Operator },
-        });
+        let operator_granted = super::provider_event(
+            AgentEvent::RpcIncomingRequest {
+                id: gate4agent::rpc::message::RpcId::Number(4),
+                method: "session/request_permission".to_owned(),
+                params: None,
+                decision: HostRequestDecision::Granted { by: HostDecisionAuthority::Operator },
+            },
+            &[],
+        );
         assert_eq!(
             operator_granted,
             Some(ProviderEvent::HostRequestObserved {
@@ -4572,12 +4622,15 @@ mod tests {
             })
         );
 
-        let deadline_denied = super::provider_event(AgentEvent::RpcIncomingRequest {
-            id: gate4agent::rpc::message::RpcId::Number(5),
-            method: "session/request_permission".to_owned(),
-            params: None,
-            decision: HostRequestDecision::Denied { by: HostDecisionAuthority::DeadlinePolicy },
-        });
+        let deadline_denied = super::provider_event(
+            AgentEvent::RpcIncomingRequest {
+                id: gate4agent::rpc::message::RpcId::Number(5),
+                method: "session/request_permission".to_owned(),
+                params: None,
+                decision: HostRequestDecision::Denied { by: HostDecisionAuthority::DeadlinePolicy },
+            },
+            &[],
+        );
         assert_eq!(
             deadline_denied,
             Some(ProviderEvent::HostRequestObserved {
@@ -4598,16 +4651,19 @@ mod tests {
 
     #[test]
     fn deferred_acp_permission_request_becomes_an_interaction_with_its_id() {
-        let with_title = super::provider_event(AgentEvent::RpcIncomingRequest {
-            id: gate4agent::rpc::message::RpcId::Number(6),
-            method: "session/request_permission".to_owned(),
-            params: Some(serde_json::json!({
-                "sessionId": "s1",
-                "toolCall": {"toolCallId": "t1", "kind": "edit", "title": "Edit src/main.rs"},
-                "options": [],
-            })),
-            decision: HostRequestDecision::Deferred,
-        });
+        let with_title = super::provider_event(
+            AgentEvent::RpcIncomingRequest {
+                id: gate4agent::rpc::message::RpcId::Number(6),
+                method: "session/request_permission".to_owned(),
+                params: Some(serde_json::json!({
+                    "sessionId": "s1",
+                    "toolCall": {"toolCallId": "t1", "kind": "edit", "title": "Edit src/main.rs"},
+                    "options": [],
+                })),
+                decision: HostRequestDecision::Deferred,
+            },
+            &[],
+        );
         // `kind` is the tool CLASS and `title` is the question. They are two
         // different things and the operator needs both: putting the title in
         // `tool_name` and leaving `prompt` empty -- which this asserted
@@ -4628,12 +4684,15 @@ mod tests {
         // method name rather than an empty `tool_name`, which
         // `ProviderEvent::validate_ingress` rejects. An absent `title`
         // leaves `prompt` empty rather than inventing a question.
-        let without_title = super::provider_event(AgentEvent::RpcIncomingRequest {
-            id: gate4agent::rpc::message::RpcId::String("agent-7".to_owned()),
-            method: "session/request_permission".to_owned(),
-            params: None,
-            decision: HostRequestDecision::Deferred,
-        });
+        let without_title = super::provider_event(
+            AgentEvent::RpcIncomingRequest {
+                id: gate4agent::rpc::message::RpcId::String("agent-7".to_owned()),
+                method: "session/request_permission".to_owned(),
+                params: None,
+                decision: HostRequestDecision::Deferred,
+            },
+            &[],
+        );
         assert_eq!(
             without_title,
             Some(ProviderEvent::InteractionRequested {
@@ -4648,12 +4707,15 @@ mod tests {
         // The SAME id's eventual outcome (not itself `Deferred` anymore)
         // still reaches the operator as the ordinary audit trail, exactly
         // as every other host request does.
-        let resolved = super::provider_event(AgentEvent::RpcIncomingRequest {
-            id: gate4agent::rpc::message::RpcId::Number(6),
-            method: "session/request_permission".to_owned(),
-            params: None,
-            decision: HostRequestDecision::Denied { by: HostDecisionAuthority::Operator },
-        });
+        let resolved = super::provider_event(
+            AgentEvent::RpcIncomingRequest {
+                id: gate4agent::rpc::message::RpcId::Number(6),
+                method: "session/request_permission".to_owned(),
+                params: None,
+                decision: HostRequestDecision::Denied { by: HostDecisionAuthority::Operator },
+            },
+            &[],
+        );
         assert_eq!(
             resolved,
             Some(ProviderEvent::HostRequestObserved {
@@ -4668,10 +4730,13 @@ mod tests {
 
     #[test]
     fn unrecognized_notification_reaches_the_operator_as_a_raw_event_instead_of_vanishing() {
-        let mapped = super::provider_event(AgentEvent::RpcNotification {
-            method: "session/update".to_owned(),
-            params: Default::default(),
-        });
+        let mapped = super::provider_event(
+            AgentEvent::RpcNotification {
+                method: "session/update".to_owned(),
+                params: Default::default(),
+            },
+            &[],
+        );
         assert_eq!(
             mapped,
             Some(ProviderEvent::UnrecognizedNotification {

@@ -77,6 +77,7 @@ use crate::protocol::{
     read_json_frame_limited_body_timeout, write_json_frame, write_json_frame_limited,
     validate_node_negotiated_handshake_capacity, validate_provider_contract_manifest,
     provider_id_is_legacy, AdapterContractRevision, AgentStreamChunkKindV1, AgentStreamChunkV1,
+    AgentStreamNamedIdV1,
     CapabilityId, ClientFrame, ClientRole,
     ControllerState, DeliveryBlobChunkHexV1, DeliveryBlobDigestV1,
     DeliveryBundleManifestV2, DeliveryCommitReceiptV1, DeliveryStageId,
@@ -1094,12 +1095,6 @@ fn provider_observations(event: &ControlEvent) -> Vec<ObservationV1> {
 /// the `ProviderEvent` variants below with no declared chunk kind to carry
 /// them, or whose declared chunk kind this build has no source for yet:
 ///
-/// - `ModeChanged { mode_id }` reports only the new id, never the full
-///   `ModeCatalog { current, available }` catalog the declared kind
-///   promises -- that catalog lives behind `AcpSession::available_modes()`,
-///   a query method the node never calls in production today. Minting
-///   `ModeCatalog` from a bare id change would leave `available`
-///   permanently empty, misrepresenting a real catalog announcement.
 /// - `ModelCatalog { current, available }` has no `ProviderEvent` source at
 ///   all -- grok's vendor model switch is not bridged into `ProviderEvent`
 ///   yet, the same gap the plan names explicitly.
@@ -1156,6 +1151,27 @@ fn agent_stream_chunk(event: &ControlEvent) -> Option<AgentStreamChunkV1> {
         ProviderEvent::ConfigOptionsUpdated { options } => {
             AgentStreamChunkKindV1::ConfigOptions { options: options.clone() }
         }
+        // `available` is the mode catalogue `AcpSession::available_modes()`
+        // read back at `session/new` and threaded through by
+        // `gate4agent-shell-native`'s `provider_event` (see that crate's
+        // `ProviderEvent::ModeChanged` arm) -- an empty list here is the
+        // agent's own honest "no modes announced", never "not read": ACP
+        // orders `session/new` before any `session/update`, and the
+        // catalogue is fixed at handshake, so a `ModeChanged` event cannot
+        // exist before the same session object's catalogue is already
+        // populated (see `gate4agent_types::ProviderEvent::ModeChanged`'s
+        // own doc comment for the ordering argument in full).
+        ProviderEvent::ModeChanged { mode_id, available } => AgentStreamChunkKindV1::ModeCatalog {
+            current: Some(mode_id.clone()),
+            available: available
+                .iter()
+                .map(|mode| AgentStreamNamedIdV1 {
+                    id: mode.id.clone(),
+                    name: mode.name.clone(),
+                    description: mode.description.clone(),
+                })
+                .collect(),
+        },
         ProviderEvent::SessionStarted { .. }
         | ProviderEvent::SessionIdentityObserved { .. }
         | ProviderEvent::TurnStarted { .. }
@@ -1177,7 +1193,6 @@ fn agent_stream_chunk(event: &ControlEvent) -> Option<AgentStreamChunkV1> {
         | ProviderEvent::UserMessage { .. }
         | ProviderEvent::Plan { .. }
         | ProviderEvent::AvailableCommandsUpdated { .. }
-        | ProviderEvent::ModeChanged { .. }
         | ProviderEvent::SessionInfoUpdated { .. }
         | ProviderEvent::UsageUpdated { .. } => return None,
     };

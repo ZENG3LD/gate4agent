@@ -6880,6 +6880,27 @@ pub enum AgentStreamChunkKindV1 {
         current: Option<String>,
         available: Vec<AgentStreamNamedIdV1>,
     },
+    /// The SAME fact `ObservationKindV1::ActionBlocked` records -- minted at
+    /// the same site, with the same `correlation_id`/`tool_class`/
+    /// `authority`/`reason_kind`/`reason`/`help` -- delivered on the agent
+    /// content stream instead of (never in place of) the observation
+    /// channel, so the operator connection already subscribed to
+    /// `NODE_AGENT_STREAM_EVENTS_CAPABILITY` sees it the instant the node
+    /// mints it rather than waiting on the next observation poll. Reuses
+    /// `BlockAuthorityV1` directly rather than a second copy of the same
+    /// vocabulary; see that type's own doc comment for why authority is
+    /// never guessed. An EVENT, not state: a session that reconnects
+    /// mid-block does not get this replayed to it -- the same seeded-state-
+    /// vs-unreplayed-event split the agent stream already draws for `Text`/
+    /// `Thinking`/`InteractionPrompt`.
+    Blocked {
+        correlation_id: Option<String>,
+        tool_class: String,
+        authority: BlockAuthorityV1,
+        reason_kind: Option<String>,
+        reason: String,
+        help: Option<String>,
+    },
 }
 
 impl AgentStreamChunkKindV1 {
@@ -7034,6 +7055,52 @@ impl AgentStreamChunkKindV1 {
                                 return Err("agent stream config option choice label is invalid");
                             }
                         }
+                    }
+                }
+                Ok(())
+            }
+            Self::Blocked {
+                correlation_id,
+                tool_class,
+                reason_kind,
+                reason,
+                help,
+                ..
+            } => {
+                if let Some(correlation_id) = correlation_id {
+                    if correlation_id.is_empty()
+                        || correlation_id.len() > MAX_ACP_CORRELATION_ID_BYTES
+                        || correlation_id.chars().any(char::is_control)
+                    {
+                        return Err("agent stream blocked chunk correlation id is invalid");
+                    }
+                }
+                if tool_class.is_empty()
+                    || tool_class.len() > MAX_ACP_CORRELATION_ID_BYTES
+                    || tool_class.chars().any(char::is_control)
+                {
+                    return Err("agent stream blocked chunk tool class is invalid");
+                }
+                if let Some(reason_kind) = reason_kind {
+                    if reason_kind.is_empty()
+                        || reason_kind.len() > MAX_ACP_CORRELATION_ID_BYTES
+                        || reason_kind.chars().any(char::is_control)
+                    {
+                        return Err("agent stream blocked chunk reason kind is invalid");
+                    }
+                }
+                if reason.is_empty()
+                    || reason.len() > OBSERVATION_ACTION_BLOCKED_REASON_MAX_BYTES
+                    || contains_unsafe_control_bytes(reason)
+                {
+                    return Err("agent stream blocked chunk reason is invalid");
+                }
+                if let Some(help) = help {
+                    if help.is_empty()
+                        || help.len() > OBSERVATION_ACTION_BLOCKED_HELP_MAX_BYTES
+                        || contains_unsafe_control_bytes(help)
+                    {
+                        return Err("agent stream blocked chunk help is invalid");
                     }
                 }
                 Ok(())
@@ -7299,6 +7366,60 @@ pub enum FrameError {
 mod tests {
     use super::*;
 
+    /// `AgentStreamChunkKindV1::Blocked` -- the chunk twin of
+    /// `ObservationKindV1::ActionBlocked` -- carries all six fields and
+    /// serialises additively (`"kind":"blocked"` alongside `Text`/
+    /// `Thinking`/`InteractionPrompt`/`ModeCatalog`/`ConfigOptions`/
+    /// `ModelCatalog`, never replacing any of them), and round-trips exactly.
+    #[test]
+    fn agent_stream_blocked_chunk_serialises_additively_with_all_six_fields() {
+        let chunk = AgentStreamChunkV1 {
+            source_sequence: 7,
+            kind: AgentStreamChunkKindV1::Blocked {
+                correlation_id: Some("tool-deadbeefcafebabe".to_owned()),
+                tool_class: "Shell".to_owned(),
+                authority: BlockAuthorityV1::HarnessGate,
+                reason_kind: Some("gate-rule".to_owned()),
+                reason: "blocked by dangerous-command gate: rule=filesystem-wipe".to_owned(),
+                help: Some("add a Bash permission rule".to_owned()),
+            },
+        };
+        chunk.validate().unwrap();
+        let json = serde_json::to_string(&chunk).unwrap();
+        assert_eq!(
+            json,
+            r#"{"source_sequence":7,"kind":{"kind":"blocked","correlation_id":"tool-deadbeefcafebabe","tool_class":"Shell","authority":"harness-gate","reason_kind":"gate-rule","reason":"blocked by dangerous-command gate: rule=filesystem-wipe","help":"add a Bash permission rule"}}"#,
+        );
+        assert_eq!(serde_json::from_str::<AgentStreamChunkV1>(&json).unwrap(), chunk);
+
+        // `correlation_id`/`reason_kind`/`help` are `None` for the harness's
+        // own denials today (see `gate4agent-node`'s `host_request_denied_
+        // block`) -- confirm the wire keeps them as explicit JSON `null`,
+        // not an omitted field, matching every other `Option` field this
+        // enum already carries (`ModeCatalog::current`, `title`).
+        let minimal = AgentStreamChunkV1 {
+            source_sequence: 8,
+            kind: AgentStreamChunkKindV1::Blocked {
+                correlation_id: None,
+                tool_class: "Write".to_owned(),
+                authority: BlockAuthorityV1::Unknown,
+                reason_kind: None,
+                reason: "blocked; no reason was reported".to_owned(),
+                help: None,
+            },
+        };
+        minimal.validate().unwrap();
+        let minimal_json = serde_json::to_string(&minimal).unwrap();
+        assert_eq!(
+            minimal_json,
+            r#"{"source_sequence":8,"kind":{"kind":"blocked","correlation_id":null,"tool_class":"Write","authority":"unknown","reason_kind":null,"reason":"blocked; no reason was reported","help":null}}"#,
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentStreamChunkV1>(&minimal_json).unwrap(),
+            minimal,
+        );
+    }
+
     #[test]
     fn harness_mcp_protocol_serde_bounds_and_privacy() {
         let reservation_id = HarnessMcpReservationId::new(format!(
@@ -7449,7 +7570,9 @@ mod tests {
         let client = ClientHello::new(ClientRole::Observer, [0; NODE_AUTH_NONCE_BYTES]);
         assert_eq!(
             serde_json::to_string(&client).unwrap(),
-            r#"{"protocol_version":11,"role":"observer","client_nonce":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}"#,
+            format!(
+                r#"{{"protocol_version":{NODE_PROTOCOL_VERSION},"role":"observer","client_nonce":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}}"#,
+            ),
         );
 
         let challenge = ServerChallenge {
@@ -7953,7 +8076,9 @@ mod tests {
         let encoded = encode_node_compatibility_auth_binding(&offer, &selected).unwrap();
         assert_eq!(
             String::from_utf8(encoded).unwrap(),
-            r#"{"offer":{"protocol_versions":{"minimum":8,"maximum":11},"capabilities":["session.spawn"],"state_schema":{"versions":{"minimum":4,"maximum":6}}},"selected":{"protocol_version":11,"capabilities":["session.spawn"],"host":{"operating_system":"windows","architecture":"x86_64"},"path_semantics":{"style":"windows","encoding":"utf8"},"local_transport":"windows-named-pipe","state_schema_version":5,"provider_contracts":[]}}"#,
+            format!(
+                r#"{{"offer":{{"protocol_versions":{{"minimum":8,"maximum":{NODE_PROTOCOL_VERSION}}},"capabilities":["session.spawn"],"state_schema":{{"versions":{{"minimum":4,"maximum":6}}}}}},"selected":{{"protocol_version":{NODE_PROTOCOL_VERSION},"capabilities":["session.spawn"],"host":{{"operating_system":"windows","architecture":"x86_64"}},"path_semantics":{{"style":"windows","encoding":"utf8"}},"local_transport":"windows-named-pipe","state_schema_version":5,"provider_contracts":[]}}}}"#,
+            ),
         );
     }
 
@@ -7982,7 +8107,9 @@ mod tests {
         let encoded = encode_node_compatibility_auth_binding(&offer, &selected).unwrap();
         assert_eq!(
             String::from_utf8(encoded).unwrap(),
-            r#"{"offer":{"protocol_versions":{"minimum":11,"maximum":11},"capabilities":["provider-contract-manifest-v1"]},"selected":{"protocol_version":11,"capabilities":["provider-contract-manifest-v1"],"host":{"operating_system":"windows","architecture":"x86_64"},"path_semantics":{"style":"windows","encoding":"utf8"},"local_transport":"windows-named-pipe","provider_contracts":[{"provider":"codex","revision":"codex.2026-08"}],"provider_adapter_contracts":[{"provider":"codex","family":"pty-semantic","adapter_id":"codex-cli","revision":"pty-semantic-v1"}]}}"#,
+            format!(
+                r#"{{"offer":{{"protocol_versions":{{"minimum":{NODE_PROTOCOL_VERSION},"maximum":{NODE_PROTOCOL_VERSION}}},"capabilities":["provider-contract-manifest-v1"]}},"selected":{{"protocol_version":{NODE_PROTOCOL_VERSION},"capabilities":["provider-contract-manifest-v1"],"host":{{"operating_system":"windows","architecture":"x86_64"}},"path_semantics":{{"style":"windows","encoding":"utf8"}},"local_transport":"windows-named-pipe","provider_contracts":[{{"provider":"codex","revision":"codex.2026-08"}}],"provider_adapter_contracts":[{{"provider":"codex","family":"pty-semantic","adapter_id":"codex-cli","revision":"pty-semantic-v1"}}]}}}}"#,
+            ),
         );
     }
 
@@ -8011,7 +8138,9 @@ mod tests {
         let encoded = encode_node_compatibility_auth_binding(&offer, &selected).unwrap();
         assert_eq!(
             String::from_utf8(encoded).unwrap(),
-            r#"{"offer":{"protocol_versions":{"minimum":11,"maximum":11},"capabilities":["provider-contract-manifest-v1","provider-id.open-v1"]},"selected":{"protocol_version":11,"capabilities":["provider-contract-manifest-v1","provider-id.open-v1"],"host":{"operating_system":"windows","architecture":"x86_64"},"path_semantics":{"style":"windows","encoding":"utf8"},"local_transport":"windows-named-pipe","provider_contracts":[{"provider":"third-party-agent","revision":"third-party.2026-08"}]}}"#,
+            format!(
+                r#"{{"offer":{{"protocol_versions":{{"minimum":{NODE_PROTOCOL_VERSION},"maximum":{NODE_PROTOCOL_VERSION}}},"capabilities":["provider-contract-manifest-v1","provider-id.open-v1"]}},"selected":{{"protocol_version":{NODE_PROTOCOL_VERSION},"capabilities":["provider-contract-manifest-v1","provider-id.open-v1"],"host":{{"operating_system":"windows","architecture":"x86_64"}},"path_semantics":{{"style":"windows","encoding":"utf8"}},"local_transport":"windows-named-pipe","provider_contracts":[{{"provider":"third-party-agent","revision":"third-party.2026-08"}}]}}}}"#,
+            ),
         );
     }
 
@@ -9148,7 +9277,9 @@ mod tests {
         let json = serde_json::to_string(&hello).unwrap();
         assert_eq!(
             json,
-            r#"{"protocol_version":11,"incarnation_id":"00000000000000000000000000000000","connection_id":42,"role":"observer","event_sequence":9,"controller":null,"snapshot":{"node_id":"fixture-node","enabled_providers":[],"workspaces":[],"session_records":[]}}"#,
+            format!(
+                r#"{{"protocol_version":{NODE_PROTOCOL_VERSION},"incarnation_id":"00000000000000000000000000000000","connection_id":42,"role":"observer","event_sequence":9,"controller":null,"snapshot":{{"node_id":"fixture-node","enabled_providers":[],"workspaces":[],"session_records":[]}}}}"#,
+            ),
         );
         assert_eq!(serde_json::from_str::<NodeHello>(&json).unwrap(), hello);
     }
@@ -9666,7 +9797,9 @@ mod tests {
                 encode_node_compatibility_auth_binding(&offer, &selected).unwrap(),
             )
             .unwrap(),
-            r#"{"offer":{"protocol_versions":{"minimum":11,"maximum":11},"capabilities":["terminal-frame-events-v1"]},"selected":{"protocol_version":11,"capabilities":["terminal-frame-events-v1"],"host":{"operating_system":"windows","architecture":"x86_64"},"path_semantics":{"style":"windows","encoding":"utf8"},"local_transport":"windows-named-pipe","provider_contracts":[]}}"#,
+            format!(
+                r#"{{"offer":{{"protocol_versions":{{"minimum":{NODE_PROTOCOL_VERSION},"maximum":{NODE_PROTOCOL_VERSION}}},"capabilities":["terminal-frame-events-v1"]}},"selected":{{"protocol_version":{NODE_PROTOCOL_VERSION},"capabilities":["terminal-frame-events-v1"],"host":{{"operating_system":"windows","architecture":"x86_64"}},"path_semantics":{{"style":"windows","encoding":"utf8"}},"local_transport":"windows-named-pipe","provider_contracts":[]}}}}"#,
+            ),
         );
     }
 
@@ -9744,7 +9877,9 @@ mod tests {
                 encode_node_compatibility_auth_binding(&offer, &selected).unwrap(),
             )
             .unwrap(),
-            r#"{"offer":{"protocol_versions":{"minimum":11,"maximum":11},"capabilities":["worktree-selection-v1"]},"selected":{"protocol_version":11,"capabilities":["worktree-selection-v1"],"host":{"operating_system":"windows","architecture":"x86_64"},"path_semantics":{"style":"windows","encoding":"utf8"},"local_transport":"windows-named-pipe","provider_contracts":[]}}"#,
+            format!(
+                r#"{{"offer":{{"protocol_versions":{{"minimum":{NODE_PROTOCOL_VERSION},"maximum":{NODE_PROTOCOL_VERSION}}},"capabilities":["worktree-selection-v1"]}},"selected":{{"protocol_version":{NODE_PROTOCOL_VERSION},"capabilities":["worktree-selection-v1"],"host":{{"operating_system":"windows","architecture":"x86_64"}},"path_semantics":{{"style":"windows","encoding":"utf8"}},"local_transport":"windows-named-pipe","provider_contracts":[]}}}}"#,
+            ),
         );
     }
 

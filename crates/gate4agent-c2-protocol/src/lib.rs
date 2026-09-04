@@ -3659,6 +3659,42 @@ mod tests {
         assert_eq!(serde_json::from_str::<C2NodeEvent>(&json).unwrap(), event);
     }
 
+    /// `C2NodeEvent::AgentStream` passes `gate4agent_node_protocol::
+    /// AgentStreamChunkV1` straight through -- no re-typed mirror of
+    /// `AgentStreamChunkKindV1` in this crate -- so the new `Blocked`
+    /// variant round-trips across the c2 wire unchanged, the same way
+    /// `Text`/`InteractionPrompt`/every other chunk kind already does.
+    #[test]
+    fn c2_agent_stream_projection_passes_the_blocked_chunk_through_unchanged() {
+        let address = SessionAddress {
+            workspace_id: WorkspaceId::new("primary").unwrap(),
+            session: gate4agent_node_protocol::SessionKey {
+                instance_id: AgentInstanceId(7),
+                generation: SessionGeneration(3),
+            },
+        };
+        let chunk = AgentStreamChunkV1 {
+            source_sequence: 11,
+            kind: gate4agent_node_protocol::AgentStreamChunkKindV1::Blocked {
+                correlation_id: None,
+                tool_class: "Write".to_owned(),
+                authority: gate4agent_node_protocol::BlockAuthorityV1::HarnessGate,
+                reason_kind: None,
+                reason: "blocked by dangerous-command gate: rule=filesystem-wipe".to_owned(),
+                help: None,
+            },
+        };
+        let source = NodeEvent::AgentStream { address: address.clone(), chunk: chunk.clone() };
+        let projected = C2NodeEvent::from(&source);
+        assert_eq!(projected, C2NodeEvent::AgentStream { address, chunk: chunk.clone() });
+        let json = serde_json::to_string(&projected).unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"agent-stream","address":{"workspace_id":"primary","session":{"instance_id":7,"generation":3}},"chunk":{"source_sequence":11,"kind":{"kind":"blocked","correlation_id":null,"tool_class":"Write","authority":"harness-gate","reason_kind":null,"reason":"blocked by dangerous-command gate: rule=filesystem-wipe","help":null}}}"#,
+        );
+        assert_eq!(serde_json::from_str::<C2NodeEvent>(&json).unwrap(), projected);
+    }
+
     #[test]
     fn c2_observation_projection_roundtrips_exactly() {
         let address = SessionAddress {

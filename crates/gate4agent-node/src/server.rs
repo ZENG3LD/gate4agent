@@ -747,6 +747,28 @@ fn action_blocked_fallback_reason(authority: BlockAuthorityV1) -> &'static str {
     }
 }
 
+/// Computes `ObservationKindV1::ActionBlocked`'s and `AgentStreamChunkKindV1::
+/// Blocked`'s shared `tool_class`/`authority`/`reason` for a `HostRequest
+/// Observed` `Denied` decision -- called once from `provider_observations`
+/// and once from `agent_stream_chunk` so the observation and the chunk that
+/// one event mints carry byte-identical values, never two independent
+/// computations of the same fact that could quietly drift apart.
+fn host_request_denied_block(
+    method: &str,
+    by: ProviderHostDecisionAuthority,
+    reason: Option<&str>,
+) -> (String, BlockAuthorityV1, String) {
+    let authority = block_authority(by);
+    let reason_source = reason.unwrap_or_else(|| action_blocked_fallback_reason(authority));
+    // `validate_required_text` REJECTS an over-long value outright rather
+    // than truncating (see `ObservationKindV1::ActionBlocked`'s own
+    // validation) -- this cut happens here, at the producer, before either
+    // validator ever sees the text.
+    let (reason_text, _) =
+        truncate_observation_text(reason_source, OBSERVATION_ACTION_BLOCKED_REASON_MAX_BYTES);
+    (observation_tool_class(method), authority, reason_text)
+}
+
 fn opaque_subagent_correlation(
     instance_id: AgentInstanceId,
     generation: SessionGeneration,
@@ -1086,27 +1108,11 @@ fn provider_observations(event: &ControlEvent) -> Vec<ObservationV1> {
             // `provider_event` discards the raw RPC id at this mapping on
             // purpose -- see that match arm's own comment).
             if let ProviderHostRequestDecision::Denied { by } = decision {
-                let authority = block_authority(*by);
-                let reason_source = reason
-                    .as_deref()
-                    .unwrap_or_else(|| action_blocked_fallback_reason(authority));
-                // `validate_required_text` REJECTS an over-long value
-                // outright rather than truncating (see `ObservationKindV1::
-                // ActionBlocked`'s own validation) -- this cut happens here,
-                // at the producer, before that validator ever sees the
-                // text, the same convention `observation_tool_class` above
-                // already follows for `class`/`tool_class` labels (that
-                // helper's own truncation flag is discarded the same way
-                // this one is: this crate does not yet thread a per-`kind`
-                // `truncated` bit through the shared `kinds` pipeline
-                // below, which always writes `truncated: false`).
-                let (reason_text, _) = truncate_observation_text(
-                    reason_source,
-                    OBSERVATION_ACTION_BLOCKED_REASON_MAX_BYTES,
-                );
+                let (tool_class, authority, reason_text) =
+                    host_request_denied_block(method, *by, reason.as_deref());
                 kinds.push(ObservationKindV1::ActionBlocked {
                     correlation_id: None,
-                    tool_class: observation_tool_class(method),
+                    tool_class,
                     authority,
                     reason_kind: None,
                     reason: reason_text,
@@ -1175,6 +1181,10 @@ fn provider_observations(event: &ControlEvent) -> Vec<ObservationV1> {
 ///   `provider_observations` uses for the matching `ApprovalRequested`/
 ///   `QuestionRequested` observation -- never the provider's own
 ///   `request_id`, whose opacity on the wire is pinned by a dedicated test.
+/// - `Blocked`'s `tool_class`/`authority`/`reason` are computed by calling
+///   `host_request_denied_block` with the identical `(method, by, reason)`
+///   `provider_observations` uses for the sibling `ActionBlocked`
+///   observation -- one computation, not two that could drift.
 ///
 /// Returns `None` for every `ControlEventKind` other than `ProviderEvent`
 /// (nothing else carries stream content), for a source
@@ -1193,6 +1203,12 @@ fn provider_observations(event: &ControlEvent) -> Vec<ObservationV1> {
 ///   `Text` would misrepresent whose content it is. No dedicated
 ///   user-message kind is declared, so this stays unproduced rather than
 ///   mislabeled.
+///
+/// `HostRequestObserved { .. }` is its own arm below, not in this exclusion
+/// list: a `Granted`/`Deferred` decision still returns `None` here (nothing
+/// for the operator to react to), but a `Denied` decision returns
+/// `Some(Blocked { .. })`, mirroring exactly the `Denied`-only condition
+/// `provider_observations` applies before pushing `ActionBlocked`.
 fn agent_stream_chunk(event: &ControlEvent) -> Option<AgentStreamChunkV1> {
     let ControlEventKind::ProviderEvent {
         sequence: provider_sequence,
@@ -1270,6 +1286,24 @@ fn agent_stream_chunk(event: &ControlEvent) -> Option<AgentStreamChunkV1> {
                 })
                 .collect(),
         },
+        // Alongside, never instead of, `provider_observations`'s
+        // `ActionBlocked` -- see this function's own doc comment for why
+        // `HostRequestObserved` is not in the exclusion list below.
+        ProviderEvent::HostRequestObserved { method, decision, reason, .. } => {
+            let ProviderHostRequestDecision::Denied { by } = decision else {
+                return None;
+            };
+            let (tool_class, authority, reason_text) =
+                host_request_denied_block(method, *by, reason.as_deref());
+            AgentStreamChunkKindV1::Blocked {
+                correlation_id: None,
+                tool_class,
+                authority,
+                reason_kind: None,
+                reason: reason_text,
+                help: None,
+            }
+        }
         ProviderEvent::SessionStarted { .. }
         | ProviderEvent::SessionIdentityObserved { .. }
         | ProviderEvent::TurnStarted { .. }
@@ -1286,7 +1320,6 @@ fn agent_stream_chunk(event: &ControlEvent) -> Option<AgentStreamChunkV1> {
         | ProviderEvent::SubagentStarted { .. }
         | ProviderEvent::SubagentStopped { .. }
         | ProviderEvent::RateLimited { .. }
-        | ProviderEvent::HostRequestObserved { .. }
         | ProviderEvent::UnrecognizedNotification { .. }
         | ProviderEvent::UserMessage { .. }
         | ProviderEvent::Plan { .. }
@@ -17214,6 +17247,62 @@ mod observation_projection_tests {
         }
     }
 
+    /// The SAME event also mints a `Blocked` chunk on the agent-stream
+    /// channel, carrying the identical `authority`/`reason` the sibling
+    /// `ActionBlocked` observation does -- one computation
+    /// (`host_request_denied_block`), not two that could drift.
+    #[test]
+    fn gate_denied_host_request_mints_a_blocked_chunk_matching_the_action_blocked_observation() {
+        let gate_text =
+            "blocked by dangerous-command gate: rule=filesystem-wipe, argument=rm -rf /";
+        let event = provider_control_event_at(
+            AdapterFamily::Acp,
+            "claude-code",
+            2,
+            ProviderEvent::HostRequestObserved {
+                method: "terminal/create".to_owned(),
+                params_json: String::new(),
+                decision: ProviderHostRequestDecision::Denied {
+                    by: ProviderHostDecisionAuthority::Gate,
+                },
+                reason: Some(gate_text.to_owned()),
+            },
+        );
+        let (observed_authority, observed_reason) =
+            timeline_observations(&provider_observations(&event))
+                .iter()
+                .find_map(|observation| match &observation.kind {
+                    ObservationKindV1::ActionBlocked { authority, reason, .. } => {
+                        Some((*authority, reason.clone()))
+                    }
+                    _ => None,
+                })
+                .expect("expected an ActionBlocked observation");
+
+        let chunk = agent_stream_chunk(&event).expect("expected a Blocked chunk");
+        assert_eq!(chunk.source_sequence, 2);
+        let AgentStreamChunkKindV1::Blocked {
+            correlation_id,
+            tool_class,
+            authority,
+            reason_kind,
+            reason,
+            help,
+        } = chunk.kind.clone()
+        else {
+            panic!("expected AgentStreamChunkKindV1::Blocked, got {:?}", chunk.kind);
+        };
+        assert_eq!(authority, observed_authority);
+        assert_eq!(reason, observed_reason);
+        assert_eq!(authority, BlockAuthorityV1::HarnessGate);
+        assert_eq!(reason, gate_text);
+        assert_eq!(correlation_id, None);
+        assert_eq!(reason_kind, None);
+        assert_eq!(help, None);
+        assert_eq!(tool_class, "Write");
+        chunk.validate().expect("minted chunk must validate");
+    }
+
     /// `Granted`/`Deferred` decisions never mint `ActionBlocked` -- there is
     /// nothing blocked to report.
     #[test]
@@ -17238,6 +17327,33 @@ mod observation_projection_tests {
                     .iter()
                     .any(|observation| matches!(observation.kind, ObservationKindV1::ActionBlocked { .. })),
                 "{decision:?} must not mint ActionBlocked"
+            );
+        }
+    }
+
+    /// The same `Granted`/`Deferred` decisions never mint a `Blocked` chunk
+    /// either -- the chunk side of `agent_stream_chunk` applies the
+    /// identical `Denied`-only gate `provider_observations` does.
+    #[test]
+    fn granted_and_deferred_host_requests_never_mint_a_blocked_chunk() {
+        for decision in [
+            ProviderHostRequestDecision::Granted { by: ProviderHostDecisionAuthority::Policy },
+            ProviderHostRequestDecision::Deferred,
+        ] {
+            let event = provider_control_event_at(
+                AdapterFamily::Acp,
+                "claude-code",
+                3,
+                ProviderEvent::HostRequestObserved {
+                    method: "fs/read_text_file".to_owned(),
+                    params_json: String::new(),
+                    decision,
+                    reason: None,
+                },
+            );
+            assert!(
+                agent_stream_chunk(&event).is_none(),
+                "{decision:?} must not mint a Blocked chunk"
             );
         }
     }

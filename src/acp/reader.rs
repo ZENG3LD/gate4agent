@@ -162,6 +162,27 @@ pub(crate) fn acp_reader_loop(
                         } else {
                             HostRequestDecision::Denied { by }
                         };
+                        // The refusal text a `Denied` decision has to show
+                        // for -- read BEFORE `result` is moved into
+                        // `response` below. `session/request_permission`
+                        // never carries its reason on `result` at all (ACP
+                        // models a decline as `Ok`, see
+                        // `AcpHostAdapter::permission_refusal_reason`'s own
+                        // doc comment), so it takes the dedicated path;
+                        // every other method's denial IS an `Err`, and
+                        // `err.message` already carries exactly the text
+                        // `acp::host::PolicyHostHandler` computed for it
+                        // (the gate's rule-and-argument sentence, or the
+                        // fixed "denied by host policy" one) -- this stops
+                        // discarding it. `Granted`/`Deferred` never had a
+                        // reason to explain, so this stays `None` for both.
+                        let reason = if granted {
+                            None
+                        } else if method == "session/request_permission" {
+                            handler.permission_refusal_reason(params.as_ref())
+                        } else {
+                            result.as_ref().err().map(|err| err.message.clone())
+                        };
 
                         let response = match result {
                             Ok(val) => RpcResponse::success(id.clone(), val),
@@ -178,6 +199,7 @@ pub(crate) fn acp_reader_loop(
                             method,
                             params,
                             decision,
+                            reason,
                         });
                     }
 
@@ -340,7 +362,16 @@ fn defer_request(
                 write_line_to_process(process, &format!("{}\n", json));
             }
             let decision = HostRequestDecision::Denied { by: HostDecisionAuthority::Policy };
-            let _ = tx.send(AgentEvent::RpcIncomingRequest { id, method, params, decision });
+            let _ = tx.send(AgentEvent::RpcIncomingRequest {
+                id,
+                method,
+                params,
+                decision,
+                reason: Some(
+                    "session/request_permission request could not be re-parsed for deferral"
+                        .to_string(),
+                ),
+            });
             return;
         }
     };
@@ -360,6 +391,10 @@ fn defer_request(
         method,
         params,
         decision: HostRequestDecision::Deferred,
+        // Nothing has decided this request yet -- there is no reason to
+        // report until a later `RpcIncomingRequest` for the same `id`
+        // carries the eventual `Granted`/`Denied`.
+        reason: None,
     });
 }
 

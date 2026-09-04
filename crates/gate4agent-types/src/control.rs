@@ -1696,6 +1696,18 @@ pub enum ProviderEvent {
         method: String,
         params_json: String,
         decision: HostRequestDecision,
+        /// The refusal text behind a `Denied` decision, when this session
+        /// actually computed one -- the dangerous-command gate's own
+        /// "blocked by dangerous-command gate: rule=…, argument=…", or
+        /// `HostPolicy`'s fixed "denied by host policy" sentence. `None` for
+        /// every `Granted`/`Deferred` decision (there is nothing to explain),
+        /// and for a `Denied` decision this session's host handler did not
+        /// attach text to -- never a placeholder standing in for a reason
+        /// nobody computed. Bounded and verbatim, the same
+        /// `PROVIDER_EVENT_TEXT_MAX_BYTES` bound `ToolCompleted::output`
+        /// uses -- never summarised or rewritten at the point this is
+        /// minted (`gate4agent-shell-native`'s `provider_event`).
+        reason: Option<String>,
     },
     /// A JSON-RPC notification the reader received but could not classify
     /// into any other `ProviderEvent` -- most commonly a `session/update`
@@ -1942,6 +1954,7 @@ impl ProviderEvent {
             Self::HostRequestObserved {
                 method,
                 params_json,
+                reason,
                 ..
             } => {
                 validate_required("host request method", method, PROVIDER_EVENT_ID_MAX_BYTES)?;
@@ -1950,6 +1963,9 @@ impl ProviderEvent {
                     params_json,
                     PROVIDER_EVENT_TEXT_MAX_BYTES,
                 )?;
+                if let Some(reason) = reason {
+                    validate_text("host request reason", reason, PROVIDER_EVENT_TEXT_MAX_BYTES)?;
+                }
             }
             Self::UnrecognizedNotification {
                 method,
@@ -3383,6 +3399,7 @@ mod tests {
             method: "session/request_permission".to_owned(),
             params_json: "{\"toolName\":\"bash\"}".to_owned(),
             decision: HostRequestDecision::Denied { by: HostDecisionAuthority::Policy },
+            reason: Some("session/request_permission denied by host policy".to_owned()),
         };
         assert_eq!(valid.validate_ingress(), Ok(()));
 
@@ -3391,6 +3408,7 @@ mod tests {
                 method: String::new(),
                 params_json: String::new(),
                 decision: HostRequestDecision::Denied { by: HostDecisionAuthority::Policy },
+                reason: None,
             }
             .validate_ingress(),
             Err(ProviderEventValidationError::Empty { field: "host request method" })
@@ -3402,6 +3420,7 @@ mod tests {
                 method: oversized_method,
                 params_json: String::new(),
                 decision: HostRequestDecision::Granted { by: HostDecisionAuthority::Policy },
+                reason: None,
             }
             .validate_ingress(),
             Err(ProviderEventValidationError::InvalidField {
@@ -3416,6 +3435,7 @@ mod tests {
                 method: "fs/read_text_file".to_owned(),
                 params_json: oversized_params,
                 decision: HostRequestDecision::Granted { by: HostDecisionAuthority::Policy },
+                reason: None,
             }
             .validate_ingress(),
             Err(ProviderEventValidationError::InvalidField {
@@ -3423,6 +3443,48 @@ mod tests {
                 ..
             })
         ));
+
+        let oversized_reason = "r".repeat(PROVIDER_EVENT_TEXT_MAX_BYTES + 1);
+        assert!(matches!(
+            ProviderEvent::HostRequestObserved {
+                method: "terminal/create".to_owned(),
+                params_json: String::new(),
+                decision: HostRequestDecision::Denied { by: HostDecisionAuthority::Gate },
+                reason: Some(oversized_reason),
+            }
+            .validate_ingress(),
+            Err(ProviderEventValidationError::InvalidField {
+                field: "host request reason",
+                ..
+            })
+        ));
+    }
+
+    /// The refusal text a `Denied` decision carries is bounded, verbatim
+    /// free text -- never the categorical `Error::detail` slug (see this
+    /// module's own doc comment for the incident that rule fixes). `None`
+    /// for a `Granted`/`Deferred` decision, or a `Denied` one nobody
+    /// attached text to, is equally valid: this is the honest absence of a
+    /// reason, not a value to reject.
+    #[test]
+    fn host_request_observed_reason_is_bounded_free_text_and_optional() {
+        let gate_text =
+            "blocked by dangerous-command gate: rule=filesystem-wipe, argument=rm -rf /";
+        let with_reason = ProviderEvent::HostRequestObserved {
+            method: "terminal/create".to_owned(),
+            params_json: String::new(),
+            decision: HostRequestDecision::Denied { by: HostDecisionAuthority::Gate },
+            reason: Some(gate_text.to_owned()),
+        };
+        assert_eq!(with_reason.validate_ingress(), Ok(()));
+
+        let without_reason = ProviderEvent::HostRequestObserved {
+            method: "terminal/create".to_owned(),
+            params_json: String::new(),
+            decision: HostRequestDecision::Granted { by: HostDecisionAuthority::Policy },
+            reason: None,
+        };
+        assert_eq!(without_reason.validate_ingress(), Ok(()));
     }
 
     /// The catch-all "protocol said something we don't parse" event must

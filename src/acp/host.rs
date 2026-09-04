@@ -94,6 +94,21 @@ pub(crate) trait AcpHostHandler: Send + Sync {
         PermissionOutcome::Cancelled
     }
 
+    /// The refusal text behind a `session/request_permission` call this
+    /// session's [`request_permission`](Self::request_permission) would
+    /// decline -- ACP models a decline as a normal `outcome` response, never
+    /// an RPC error, so unlike every other method here (`fs/read_text_file`,
+    /// `terminal/create`, ...) there is no `Err(String)` this reason can ride
+    /// on; this is the dedicated path instead. Only meaningful for a call the
+    /// caller already knows was NOT granted -- the caller (`acp::reader`)
+    /// only ever asks this after computing that fact from the actual
+    /// `PermissionOutcome`, never before. The default is `None`: only
+    /// [`PolicyHostHandler`] has a reason to compute here at all.
+    fn permission_refusal_reason(&self, params: &PermissionRequestParams) -> Option<String> {
+        let _ = params;
+        None
+    }
+
     /// Whether the dangerous-command gate (`super::gate`) would block this
     /// `session/request_permission` call outright, independent of whatever
     /// [`request_permission`](Self::request_permission) itself would go on
@@ -420,6 +435,27 @@ impl AcpHostHandler for PolicyHostHandler {
         self.policy.select_permission_option(&params.tool_call, &params.options)
     }
 
+    /// Mirrors [`request_permission`](Self::request_permission)'s own two
+    /// branches exactly, so the reason always describes whichever one
+    /// actually decided: the gate's own rule-and-argument text
+    /// (`GateVerdict::refusal_message`, the SAME verdict `terminal/create`'s
+    /// `Err(String)` already carries this text from) when gate-blocked, else
+    /// a fixed sentence naming host policy as the authority -- `terminal/
+    /// create`'s own denial has an equally fixed "denied by host policy"
+    /// text for the non-gate case, this is that sentence's `session/
+    /// request_permission` counterpart. The caller only invokes this after
+    /// already establishing the call was NOT granted (see the trait method's
+    /// own doc comment), so a non-gate-blocked call reaching here is a
+    /// policy denial by construction, never a grant this text would
+    /// mischaracterize.
+    fn permission_refusal_reason(&self, params: &PermissionRequestParams) -> Option<String> {
+        if self.permission_blocked_by_gate(&params.tool_call) {
+            return gate::evaluate_permission_tool_call(&params.tool_call, &self.working_dir)
+                .refusal_message();
+        }
+        Some("session/request_permission denied by host policy".to_string())
+    }
+
     fn permission_blocked_by_gate(&self, tool_call: &PermissionToolCall) -> bool {
         self.dangerous_command_gate == DangerousCommandGate::Enforced
             && tool_call.kind == ToolKind::Execute
@@ -504,6 +540,20 @@ impl AcpHostAdapter {
         } else {
             HostDecisionAuthority::Policy
         }
+    }
+
+    /// The refusal text for a `session/request_permission` call the caller
+    /// already knows was NOT granted -- reparses `params` into
+    /// [`PermissionRequestParams`] the same way [`decision_authority`]
+    /// (Self::decision_authority) does, then delegates to the wrapped
+    /// handler's own [`AcpHostHandler::permission_refusal_reason`]. `None`
+    /// when `params` fails to parse (the same defensive, practically
+    /// unreachable branch `decision_authority` falls back on for the same
+    /// reason) or when the wrapped handler has no reason to report.
+    pub(crate) fn permission_refusal_reason(&self, params: Option<&Value>) -> Option<String> {
+        let parsed = params
+            .and_then(|v| serde_json::from_value::<PermissionRequestParams>(v.clone()).ok())?;
+        self.inner.permission_refusal_reason(&parsed)
     }
 }
 
@@ -1109,6 +1159,106 @@ mod tests {
         let error = result.unwrap_err();
         assert_eq!(error.code, RpcError::PERMISSION_DENIED);
         assert!(error.message.contains("filesystem-wipe"), "message was: {}", error.message);
+    }
+
+    // -----------------------------------------------------------------------
+    // permission_refusal_reason — carries the gate/policy refusal text that
+    // `session/request_permission` has no `Err(String)` to ride on (unlike
+    // `terminal/create`'s denial, which already had one) -- see the trait
+    // method's own doc comment.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn permission_refusal_reason_is_the_gate_verdict_text_when_gate_blocked() {
+        let handler =
+            PolicyHostHandler::new(HostPolicy::Yolo, std::env::temp_dir(), DangerousCommandGate::Enforced);
+        let params = PermissionRequestParams {
+            session_id: "s1".to_owned(),
+            tool_call: dangerous_execute_tool_call(),
+            options: options_all_four(),
+        };
+        let reason = handler
+            .permission_refusal_reason(&params)
+            .expect("a gate-blocked call must explain why");
+        assert!(reason.contains("dangerous-command gate"), "reason was: {reason}");
+        assert!(reason.contains("rule="), "reason must name the rule: {reason}");
+        assert!(reason.contains("argument="), "reason must name the offending argument: {reason}");
+    }
+
+    #[test]
+    fn permission_refusal_reason_is_the_fixed_policy_sentence_when_not_gate_blocked() {
+        let handler =
+            PolicyHostHandler::new(HostPolicy::Deny, std::env::temp_dir(), DangerousCommandGate::Enforced);
+        let params = PermissionRequestParams {
+            session_id: "s1".to_owned(),
+            tool_call: PermissionToolCall {
+                tool_call_id: "tc1".to_owned(),
+                title: "Read a file".to_owned(),
+                kind: crate::acp::protocol::ToolKind::Read,
+                locations: vec![],
+                raw_input: json!({}),
+            },
+            options: options_all_four(),
+        };
+        assert_eq!(
+            handler.permission_refusal_reason(&params),
+            Some("session/request_permission denied by host policy".to_string())
+        );
+    }
+
+    #[test]
+    fn adapter_permission_refusal_reason_reparses_raw_params_and_carries_the_gate_text() {
+        let handler = adapter_with_gate(HostPolicy::Yolo, DangerousCommandGate::Enforced);
+        let params = PermissionRequestParams {
+            session_id: "s1".to_owned(),
+            tool_call: dangerous_execute_tool_call(),
+            options: options_all_four(),
+        };
+        let raw = serde_json::to_value(&params).expect("PermissionRequestParams serializes");
+        let reason = handler
+            .permission_refusal_reason(Some(&raw))
+            .expect("gate-blocked call must carry a reason through the adapter");
+        assert!(reason.contains("dangerous-command gate"), "reason was: {reason}");
+    }
+
+    #[test]
+    fn adapter_permission_refusal_reason_is_none_for_unparsable_params() {
+        let handler = adapter_with_gate(HostPolicy::Yolo, DangerousCommandGate::Enforced);
+        assert_eq!(handler.permission_refusal_reason(Some(&json!("not an object"))), None);
+    }
+
+    /// The fact this whole change exists to fix: BEFORE this, a gate-blocked
+    /// `terminal/create` had a refusal `Err(String)` an observer could read,
+    /// while the SAME gate blocking a `session/request_permission` call on
+    /// the SAME command shape produced a `Selected`/`Cancelled` outcome with
+    /// no text anywhere -- "no wire field to carry its reason on". Proves
+    /// both paths now surface the SAME rule-and-argument text (both fixtures
+    /// hit the identical `filesystem-wipe` rule on `rm -rf /`), so an
+    /// observer reading either one learns the same fact.
+    #[test]
+    fn gate_refusal_text_reaches_both_terminal_create_and_permission_request_paths() {
+        let handler =
+            PolicyHostHandler::new(HostPolicy::Yolo, std::env::temp_dir(), DangerousCommandGate::Enforced);
+
+        let terminal_reason = handler.terminal_create(&dangerous_terminal_params()).unwrap_err();
+
+        let permission_params = PermissionRequestParams {
+            session_id: "s1".to_owned(),
+            tool_call: dangerous_execute_tool_call(),
+            options: options_all_four(),
+        };
+        let permission_reason = handler
+            .permission_refusal_reason(&permission_params)
+            .expect("gate-blocked permission request must carry a reason");
+
+        assert!(
+            terminal_reason.contains("rule=filesystem-wipe"),
+            "terminal reason was: {terminal_reason}"
+        );
+        assert!(
+            permission_reason.contains("rule=filesystem-wipe"),
+            "permission reason was: {permission_reason}"
+        );
     }
 
     // -----------------------------------------------------------------------

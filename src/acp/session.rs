@@ -1220,6 +1220,12 @@ impl AcpSession {
             method: "session/request_permission".to_owned(),
             params: Some(serde_json::to_value(params).unwrap_or(Value::Null)),
             decision,
+            // Neither `OperatorPermissionChoice` nor an unattended deadline
+            // expiry carries any free text -- an operator answers
+            // approve/reject, never a comment, and `expire_deadlines` never
+            // asks anyone anything. There is genuinely no reason to report
+            // here, so this stays `None` rather than inventing one.
+            reason: None,
         });
     }
 

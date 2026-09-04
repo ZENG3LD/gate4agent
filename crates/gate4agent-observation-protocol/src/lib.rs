@@ -17,6 +17,17 @@ pub const OBSERVATION_TODO_ITEMS_MAX: usize = 64;
 pub const OBSERVATION_TODO_TEXT_MAX_BYTES: usize = 256;
 pub const OBSERVATION_PATH_MAX_BYTES: usize = 1_024;
 pub const OBSERVATION_COLLECTION_MAX: usize = 128;
+/// Max bytes for `ObservationKindV1::ActionBlocked::reason` -- the
+/// authority's own refusal sentence (e.g. "blocked by dangerous-command
+/// gate: rule=…, argument=…", or a provider's "Reason: Blocked by
+/// classifier."). Verbatim and bounded, never summarised -- see
+/// [`truncate_observation_text`] for the producer-side cut this bound backs.
+pub const OBSERVATION_ACTION_BLOCKED_REASON_MAX_BYTES: usize = 1_024;
+/// Max bytes for `ObservationKindV1::ActionBlocked::help` -- the guidance
+/// tail a CLI attaches after naming the block (e.g. "add a Bash permission
+/// rule"). Larger than `reason` because guidance text runs longer than a
+/// one-line refusal.
+pub const OBSERVATION_ACTION_BLOCKED_HELP_MAX_BYTES: usize = 2_048;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -77,6 +88,60 @@ pub enum HostDecisionAuthorityV1 {
     /// answered in time. Equally deliberately not `Operator`: no human
     /// made this choice.
     DeadlinePolicy,
+}
+
+/// WHO or WHAT blocked an action -- see [`ObservationKindV1::ActionBlocked`].
+/// A strictly wider vocabulary than [`HostDecisionAuthorityV1`]: the harness
+/// itself only ever produces `HarnessGate`/`HarnessPolicy`/`HarnessDeadline`/
+/// `Operator` (see that type's own variants, which this one mirrors
+/// one-for-one for the harness's own four), but a block can also come from
+/// the PROVIDER side of the wire -- a classifier, a permission rule, a
+/// sandbox, a plain refusal, a hook, or the user declining inside the
+/// provider's own UI -- none of which `HostDecisionAuthorityV1` has any
+/// vocabulary for at all. `Unknown` is the evidence-gated fallback: see
+/// `ObservationV1::validate`'s pty-hint rule, the only evidence class this
+/// crate lets claim it.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BlockAuthorityV1 {
+    /// The dangerous-command gate -- mirrors [`HostDecisionAuthorityV1::
+    /// Gate`].
+    HarnessGate,
+    /// The harness's own host policy -- mirrors [`HostDecisionAuthorityV1::
+    /// Policy`].
+    HarnessPolicy,
+    /// A deferred request the harness's policy decided after no operator
+    /// answered in time -- mirrors [`HostDecisionAuthorityV1::
+    /// DeadlinePolicy`].
+    HarnessDeadline,
+    /// An operator explicitly declined -- mirrors [`HostDecisionAuthorityV1::
+    /// Operator`]. The one variant this type shares by name, not just by
+    /// meaning, with `HostDecisionAuthorityV1`.
+    Operator,
+    /// The provider's own auto-mode classifier (e.g. Claude Code's auto
+    /// mode).
+    ProviderClassifier,
+    /// A provider-side permission rule (an allow/deny list entry) refused
+    /// the call, distinct from a classifier's runtime judgement.
+    ProviderPermissionRule,
+    /// The provider's sandbox refused the call (a filesystem or network
+    /// boundary the sandbox itself enforces, not a policy decision).
+    ProviderSandbox,
+    /// The provider declined with a `stopReason: "refusal"` or equivalent,
+    /// carrying no more specific typed reason than "the provider itself said
+    /// no".
+    ProviderRefusal,
+    /// A provider-managed hook (e.g. Claude Code's `PermissionDenied` hook)
+    /// reported the block.
+    ProviderHook,
+    /// A human declined inside the provider's OWN UI/CLI (not this
+    /// harness's operator surface) -- the provider's own `user-rejected`-
+    /// shaped outcome.
+    UserRejected,
+    /// No typed field named who blocked it -- text matching may still have
+    /// filled `reason`/`help`, but never this field; see the module doc
+    /// comment's rule that authority is never guessed.
+    Unknown,
 }
 
 /// A typed answer to "what happened to this host request" -- see
@@ -235,6 +300,33 @@ pub enum ObservationKindV1 {
         class: String,
         decision: HostRequestDecisionV1,
     },
+    /// Something the agent tried was blocked mid-turn -- by this harness's
+    /// own gate/policy/deadline, by an operator, or by the provider itself
+    /// (a classifier, a permission rule, a sandbox, a plain refusal, a hook,
+    /// or the provider's own user-rejected outcome). `correlation_id` is the
+    /// tool call this block belongs to, when there is one, using the SAME
+    /// opaque id scheme `ToolStarted::correlation_id` does -- `None` when the
+    /// block has no tool call to correlate against yet (an operator/policy
+    /// denial today never does; a provider-side block wired up later may).
+    /// `tool_class` is the same coarse bucket `ToolStarted::class`/
+    /// `HostRequestObserved::class` use, never the raw command. `authority`
+    /// is read off a typed field or this harness's own decision, NEVER
+    /// guessed from text -- see [`BlockAuthorityV1`]'s doc comment.
+    /// `reason_kind` is the source's own machine code for why (ACP's
+    /// `nonExecutionKind`, a provider's `decision_reason_type`, a
+    /// `stopReason`), when one exists. `reason` and `help` are bounded,
+    /// verbatim free text -- never summarised or rewritten -- and are a
+    /// SEPARATE contract from `Error::detail`, which stays a categorical
+    /// slug; see this crate's module doc comment for why a sentence must
+    /// never travel through that field.
+    ActionBlocked {
+        correlation_id: Option<String>,
+        tool_class: String,
+        authority: BlockAuthorityV1,
+        reason_kind: Option<String>,
+        reason: String,
+        help: Option<String>,
+    },
     /// A JSON-RPC notification the reader received but could not classify
     /// into any other kind here -- the protocol said something this build
     /// does not parse. `method` is the bare JSON-RPC method string (a
@@ -324,6 +416,15 @@ impl ObservationV1 {
             return Err(
                 ObservationValidationError::ContextWindowUsageRequiresStructuredProvider,
             );
+        }
+        if let ObservationKindV1::ActionBlocked { authority, .. } = &self.kind {
+            if self.evidence == ObservationEvidenceV1::PtyHint
+                && *authority != BlockAuthorityV1::Unknown
+            {
+                return Err(
+                    ObservationValidationError::PtyHintActionBlockedRequiresUnknownAuthority,
+                );
+            }
         }
         if self.evidence == ObservationEvidenceV1::PtyHint
             && self.kind.requires_authoritative_semantic_evidence()
@@ -485,6 +586,47 @@ impl ObservationKindV1 {
             }
             Self::HostRequestObserved { class, .. } => {
                 validate_required_text("host request class", class, OBSERVATION_LABEL_MAX_BYTES)
+            }
+            Self::ActionBlocked {
+                correlation_id,
+                tool_class,
+                reason_kind,
+                reason,
+                help,
+                ..
+            } => {
+                if let Some(correlation_id) = correlation_id {
+                    validate_required_text(
+                        "action blocked correlation id",
+                        correlation_id,
+                        OBSERVATION_LABEL_MAX_BYTES,
+                    )?;
+                }
+                validate_required_text(
+                    "action blocked tool class",
+                    tool_class,
+                    OBSERVATION_LABEL_MAX_BYTES,
+                )?;
+                if let Some(reason_kind) = reason_kind {
+                    validate_required_text(
+                        "action blocked reason kind",
+                        reason_kind,
+                        OBSERVATION_LABEL_MAX_BYTES,
+                    )?;
+                }
+                validate_required_text(
+                    "action blocked reason",
+                    reason,
+                    OBSERVATION_ACTION_BLOCKED_REASON_MAX_BYTES,
+                )?;
+                if let Some(help) = help {
+                    validate_required_text(
+                        "action blocked help",
+                        help,
+                        OBSERVATION_ACTION_BLOCKED_HELP_MAX_BYTES,
+                    )?;
+                }
+                Ok(())
             }
             Self::UnrecognizedNotification { method } => validate_required_text(
                 "unrecognized notification method",
@@ -685,6 +827,21 @@ impl ObservationKindV1 {
                 len += ",\"class\":".len() + json_string_len(class);
                 len += ",\"decision\":".len() + decision.json_encoded_len();
             }
+            Self::ActionBlocked {
+                correlation_id,
+                tool_class,
+                authority,
+                reason_kind,
+                reason,
+                help,
+            } => {
+                len += ",\"correlation_id\":".len() + option_string_json_len(correlation_id.as_deref());
+                len += ",\"tool_class\":".len() + json_string_len(tool_class);
+                len += ",\"authority\":".len() + json_string_len(authority.wire_name());
+                len += ",\"reason_kind\":".len() + option_string_json_len(reason_kind.as_deref());
+                len += ",\"reason\":".len() + json_string_len(reason);
+                len += ",\"help\":".len() + option_string_json_len(help.as_deref());
+            }
             Self::UnrecognizedNotification { method } => {
                 len += ",\"method\":".len() + json_string_len(method);
             }
@@ -719,6 +876,7 @@ impl ObservationKindV1 {
             Self::ContextWindowUsage { .. } => "context-window-usage",
             Self::RateLimited => "rate-limited",
             Self::HostRequestObserved { .. } => "host-request-observed",
+            Self::ActionBlocked { .. } => "action-blocked",
             Self::UnrecognizedNotification { .. } => "unrecognized-notification",
             Self::OwnedProcessStarted { .. } => "owned-process-started",
             Self::OwnedProcessExited { .. } => "owned-process-exited",
@@ -789,6 +947,24 @@ impl HostDecisionAuthorityV1 {
             Self::Policy => "policy",
             Self::Operator => "operator",
             Self::DeadlinePolicy => "deadline-policy",
+        }
+    }
+}
+
+impl BlockAuthorityV1 {
+    fn wire_name(self) -> &'static str {
+        match self {
+            Self::HarnessGate => "harness-gate",
+            Self::HarnessPolicy => "harness-policy",
+            Self::HarnessDeadline => "harness-deadline",
+            Self::Operator => "operator",
+            Self::ProviderClassifier => "provider-classifier",
+            Self::ProviderPermissionRule => "provider-permission-rule",
+            Self::ProviderSandbox => "provider-sandbox",
+            Self::ProviderRefusal => "provider-refusal",
+            Self::ProviderHook => "provider-hook",
+            Self::UserRejected => "user-rejected",
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -876,6 +1052,8 @@ pub enum ObservationValidationError {
     InvalidPath,
     #[error("PTY evidence cannot claim authoritative semantic workflow facts")]
     PtyHintClaimsAuthoritativeFact,
+    #[error("PTY-hint action-blocked observations may only assert authority 'unknown'")]
+    PtyHintActionBlockedRequiresUnknownAuthority,
     #[error("history snapshots require history projection evidence")]
     HistorySnapshotRequiresHistoryProjection,
     #[error("context-window usage requires structured provider evidence")]
@@ -963,6 +1141,28 @@ fn validate_relative_path(path: &str) -> Result<(), ObservationValidationError> 
         return Err(ObservationValidationError::InvalidPath);
     }
     Ok(())
+}
+
+/// Cuts `value` to at most `max_bytes`, backing off to the nearest UTF-8
+/// character boundary at or before that limit -- never inside a multi-byte
+/// sequence. Returns `(text, true)` when a cut was made, `(text, false)`
+/// when `value` already fit. This is the one honest way to bound
+/// `ActionBlocked::reason`/`help` without rewriting them: the byte limit is
+/// enforced here, at the producer, BEFORE `ObservationV1::validate` ever
+/// sees the text -- that validator rejects an oversize value outright (see
+/// `validate_required_text`), it does not truncate. A caller that cuts text
+/// with this function is responsible for setting the sibling
+/// `ObservationV1::truncated` from the returned bool; this function only
+/// makes the cut safe, it does not know how to report having made it.
+pub fn truncate_observation_text(value: &str, max_bytes: usize) -> (String, bool) {
+    if value.len() <= max_bytes {
+        return (value.to_owned(), false);
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    (value[..end].to_owned(), true)
 }
 
 fn decimal_len(value: u64) -> usize {
@@ -1521,5 +1721,137 @@ mod tests {
             unsafe_path.validate(),
             Err(ObservationValidationError::InvalidPath)
         );
+    }
+
+    fn action_blocked(authority: BlockAuthorityV1, reason: &str) -> ObservationKindV1 {
+        ObservationKindV1::ActionBlocked {
+            correlation_id: Some("tool-0123456789abcdef".to_string()),
+            tool_class: "Bash".to_string(),
+            authority,
+            reason_kind: Some("nonExecutionKind".to_string()),
+            reason: reason.to_string(),
+            help: Some("add a Bash permission rule".to_string()),
+        }
+    }
+
+    /// A `StructuredProvider` block may assert ANY authority, including the
+    /// provider-side ones `HostDecisionAuthorityV1` has no vocabulary for at
+    /// all -- the fixture from the owner's sample: a classifier block naming
+    /// its own reason and help text.
+    #[test]
+    fn action_blocked_structured_provider_accepts_any_authority() {
+        for authority in [
+            BlockAuthorityV1::HarnessGate,
+            BlockAuthorityV1::HarnessPolicy,
+            BlockAuthorityV1::HarnessDeadline,
+            BlockAuthorityV1::Operator,
+            BlockAuthorityV1::ProviderClassifier,
+            BlockAuthorityV1::ProviderPermissionRule,
+            BlockAuthorityV1::ProviderSandbox,
+            BlockAuthorityV1::ProviderRefusal,
+            BlockAuthorityV1::ProviderHook,
+            BlockAuthorityV1::UserRejected,
+            BlockAuthorityV1::Unknown,
+        ] {
+            let value = observation(
+                ObservationEvidenceV1::StructuredProvider,
+                action_blocked(authority, "denied by the Claude Code auto mode classifier"),
+            );
+            value
+                .validate()
+                .unwrap_or_else(|error| panic!("{authority:?} must be accepted: {error}"));
+            let encoded = serde_json::to_vec(&value).expect("serialize action-blocked");
+            assert_eq!(value.json_encoded_len(), encoded.len());
+            assert!(encoded.len() <= OBSERVATION_EVENT_MAX_BYTES);
+            assert_eq!(serde_json::from_slice::<ObservationV1>(&encoded).unwrap(), value);
+        }
+    }
+
+    /// A `PtyHint` block may only ever assert `authority: Unknown` -- every
+    /// other authority is refused, by the SAME rule the module doc comment
+    /// describes: text matching may fill `reason`/`help`, never `authority`.
+    #[test]
+    fn action_blocked_pty_hint_requires_unknown_authority() {
+        let refused = [
+            BlockAuthorityV1::HarnessGate,
+            BlockAuthorityV1::HarnessPolicy,
+            BlockAuthorityV1::HarnessDeadline,
+            BlockAuthorityV1::Operator,
+            BlockAuthorityV1::ProviderClassifier,
+            BlockAuthorityV1::ProviderPermissionRule,
+            BlockAuthorityV1::ProviderSandbox,
+            BlockAuthorityV1::ProviderRefusal,
+            BlockAuthorityV1::ProviderHook,
+            BlockAuthorityV1::UserRejected,
+        ];
+        for authority in refused {
+            let rejected = observation(
+                ObservationEvidenceV1::PtyHint,
+                action_blocked(authority, "bash denied by auto mode"),
+            );
+            assert_eq!(
+                rejected.validate(),
+                Err(ObservationValidationError::PtyHintActionBlockedRequiresUnknownAuthority),
+                "{authority:?} must be refused under pty-hint evidence"
+            );
+        }
+
+        let accepted = observation(
+            ObservationEvidenceV1::PtyHint,
+            action_blocked(BlockAuthorityV1::Unknown, "bash denied by auto mode"),
+        );
+        accepted
+            .validate()
+            .expect("pty-hint may assert Unknown authority");
+    }
+
+    /// `reason`/`help` are bounded and verbatim -- `validate` REJECTS an
+    /// over-long value outright rather than silently cutting it (the same
+    /// convention every other bounded text field in this crate follows), so
+    /// the producer must cut with `truncate_observation_text` before
+    /// minting. That helper cuts at a safe UTF-8 boundary and reports the
+    /// cut so the producer can mark `ObservationV1::truncated`.
+    #[test]
+    fn action_blocked_reason_is_bounded_and_truncation_is_producer_side() {
+        let oversized_reason = "r".repeat(OBSERVATION_ACTION_BLOCKED_REASON_MAX_BYTES + 1);
+        let rejected = observation(
+            ObservationEvidenceV1::StructuredProvider,
+            action_blocked(BlockAuthorityV1::ProviderClassifier, &oversized_reason),
+        );
+        assert!(matches!(
+            rejected.validate(),
+            Err(ObservationValidationError::InvalidText {
+                field: "action blocked reason",
+                ..
+            })
+        ));
+
+        // A multi-byte character sits exactly on the cut boundary -- the
+        // truncation must back off to the last whole character, never split
+        // it, and must still report that a cut happened.
+        let mut boundary_straddling =
+            "a".repeat(OBSERVATION_ACTION_BLOCKED_REASON_MAX_BYTES - 1);
+        boundary_straddling.push('€'); // 3 bytes: straddles the 1024-byte cut
+        boundary_straddling.push_str(" trailing text past the limit");
+        let (truncated, was_truncated) = truncate_observation_text(
+            &boundary_straddling,
+            OBSERVATION_ACTION_BLOCKED_REASON_MAX_BYTES,
+        );
+        assert!(was_truncated);
+        assert!(truncated.len() <= OBSERVATION_ACTION_BLOCKED_REASON_MAX_BYTES);
+        assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
+
+        let fits_after_cut = observation(
+            ObservationEvidenceV1::StructuredProvider,
+            action_blocked(BlockAuthorityV1::ProviderClassifier, &truncated),
+        );
+        fits_after_cut
+            .validate()
+            .expect("truncated reason fits the bound");
+
+        let (untouched, was_truncated) =
+            truncate_observation_text("short reason", OBSERVATION_ACTION_BLOCKED_REASON_MAX_BYTES);
+        assert!(!was_truncated);
+        assert_eq!(untouched, "short reason");
     }
 }

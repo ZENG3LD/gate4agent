@@ -3015,6 +3015,10 @@ fn provider_event(event: AgentEvent, available_modes: &[SessionMode]) -> Option<
             method,
             params,
             decision,
+            // A `Deferred` sighting never carries a reason -- nothing has
+            // decided this request yet (see `AgentEvent::
+            // RpcIncomingRequest`'s own doc comment).
+            reason: _,
         } if method == "session/request_permission"
             && matches!(decision, HostRequestDecision::Deferred) =>
         {
@@ -3077,10 +3081,12 @@ fn provider_event(event: AgentEvent, available_modes: &[SessionMode]) -> Option<
             method,
             params,
             decision,
+            reason,
         } => Some(ProviderEvent::HostRequestObserved {
             method,
             params_json: params.map(|value| value.to_string()).unwrap_or_default(),
             decision: provider_host_request_decision(decision),
+            reason,
         }),
         AgentEvent::RpcNotification { method, params } => {
             Some(ProviderEvent::UnrecognizedNotification {
@@ -4907,6 +4913,7 @@ mod tests {
                 method: "fs/read_text_file".to_owned(),
                 params: None,
                 decision: HostRequestDecision::Denied { by: HostDecisionAuthority::Policy },
+                reason: None,
             },
             &[],
         );
@@ -4918,6 +4925,7 @@ mod tests {
                 decision: ProviderHostRequestDecision::Denied {
                     by: ProviderHostDecisionAuthority::Policy
                 },
+                reason: None,
             })
         );
 
@@ -4927,6 +4935,7 @@ mod tests {
                 method: "terminal/create".to_owned(),
                 params: None,
                 decision: HostRequestDecision::Granted { by: HostDecisionAuthority::Policy },
+                reason: None,
             },
             &[],
         );
@@ -4938,6 +4947,7 @@ mod tests {
                 decision: ProviderHostRequestDecision::Granted {
                     by: ProviderHostDecisionAuthority::Policy
                 },
+                reason: None,
             })
         );
 
@@ -4950,6 +4960,7 @@ mod tests {
                 method: "terminal/create".to_owned(),
                 params: None,
                 decision: HostRequestDecision::Denied { by: HostDecisionAuthority::Gate },
+                reason: None,
             },
             &[],
         );
@@ -4961,6 +4972,7 @@ mod tests {
                 decision: ProviderHostRequestDecision::Denied {
                     by: ProviderHostDecisionAuthority::Gate
                 },
+                reason: None,
             })
         );
 
@@ -4970,6 +4982,7 @@ mod tests {
                 method: "session/request_permission".to_owned(),
                 params: None,
                 decision: HostRequestDecision::Granted { by: HostDecisionAuthority::Operator },
+                reason: None,
             },
             &[],
         );
@@ -4981,6 +4994,7 @@ mod tests {
                 decision: ProviderHostRequestDecision::Granted {
                     by: ProviderHostDecisionAuthority::Operator
                 },
+                reason: None,
             })
         );
 
@@ -4990,6 +5004,7 @@ mod tests {
                 method: "session/request_permission".to_owned(),
                 params: None,
                 decision: HostRequestDecision::Denied { by: HostDecisionAuthority::DeadlinePolicy },
+                reason: None,
             },
             &[],
         );
@@ -5001,6 +5016,7 @@ mod tests {
                 decision: ProviderHostRequestDecision::Denied {
                     by: ProviderHostDecisionAuthority::DeadlinePolicy
                 },
+                reason: None,
             })
         );
 
@@ -5009,6 +5025,45 @@ mod tests {
         // `HostRequestObserved`; see
         // `deferred_acp_permission_request_becomes_an_interaction_with_its_id`
         // below.
+    }
+
+    /// The bug this change fixes: the gate's own refusal text used to be
+    /// computed, then thrown away -- an observer got the categorical
+    /// `Denied { by: Gate }` and nothing naming WHY. `reason` now rides the
+    /// SAME `AgentEvent::RpcIncomingRequest` → `ProviderEvent::
+    /// HostRequestObserved` mapping every other field already used,
+    /// verbatim, bounded by `validate_ingress`.
+    #[test]
+    fn host_request_reason_carries_through_to_the_operator() {
+        let gate_text =
+            "blocked by dangerous-command gate: rule=filesystem-wipe, argument=rm -rf /";
+        let denied = super::provider_event(
+            AgentEvent::RpcIncomingRequest {
+                id: gate4agent::rpc::message::RpcId::Number(9),
+                method: "terminal/create".to_owned(),
+                params: None,
+                decision: HostRequestDecision::Denied { by: HostDecisionAuthority::Gate },
+                reason: Some(gate_text.to_owned()),
+            },
+            &[],
+        );
+        assert_eq!(
+            denied,
+            Some(ProviderEvent::HostRequestObserved {
+                method: "terminal/create".to_owned(),
+                params_json: String::new(),
+                decision: ProviderHostRequestDecision::Denied {
+                    by: ProviderHostDecisionAuthority::Gate
+                },
+                reason: Some(gate_text.to_owned()),
+            })
+        );
+
+        // `validate_ingress` accepts the reason as ordinary bounded free
+        // text -- the same bound `ToolCompleted::output` uses, proving this
+        // is not smuggled through the categorical `Error::detail` field the
+        // owner's incident named (that validator only accepts `a-z0-9-`).
+        denied.expect("mapped").validate_ingress().expect("bounded free-text reason validates");
     }
 
     #[test]
@@ -5026,6 +5081,7 @@ mod tests {
                     ],
                 })),
                 decision: HostRequestDecision::Deferred,
+                reason: None,
             },
             &[],
         );
@@ -5072,6 +5128,7 @@ mod tests {
                 method: "session/request_permission".to_owned(),
                 params: None,
                 decision: HostRequestDecision::Deferred,
+                reason: None,
             },
             &[],
         );
@@ -5097,6 +5154,7 @@ mod tests {
                 method: "session/request_permission".to_owned(),
                 params: None,
                 decision: HostRequestDecision::Denied { by: HostDecisionAuthority::Operator },
+                reason: None,
             },
             &[],
         );
@@ -5108,6 +5166,7 @@ mod tests {
                 decision: ProviderHostRequestDecision::Denied {
                     by: ProviderHostDecisionAuthority::Operator
                 },
+                reason: None,
             })
         );
     }

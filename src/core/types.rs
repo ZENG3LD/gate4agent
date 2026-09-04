@@ -441,6 +441,20 @@ pub enum AgentEvent {
         method: String,
         params: Option<serde_json::Value>,
         decision: HostRequestDecision,
+        /// The refusal text behind a `Denied` decision, when this build
+        /// actually computed one -- read off the SAME `Result<Value,
+        /// RpcError>` `decision` itself was derived from
+        /// (`acp::reader::request_granted`): `Err(err).message` for every
+        /// method that models a denial as an RPC error (`fs/read_text_file`,
+        /// `fs/write_text_file`, `terminal/create`, `terminal/output`,
+        /// `terminal/wait_for_exit`, `terminal/kill`, `terminal/release`),
+        /// or `AcpHostAdapter::permission_refusal_reason` for `session/
+        /// request_permission`, the one method that answers a decline with
+        /// an `Ok` outcome instead (see that method's own doc comment).
+        /// `None` for every `Granted`/`Deferred` decision, and for a
+        /// `Denied` decision no reason text exists for -- never a
+        /// placeholder standing in for a reason nobody computed.
+        reason: Option<String>,
     },
 
     // --- ACP session/update: structured session state (ACP transport only) ---

@@ -105,10 +105,10 @@ use crate::protocol::{
     ManagedWorktreeSpawnRequestV2, SessionRecordId,
     NativeSessionCatalogRoute, NativeSessionSelection, SessionTaskBindingV1,
     SessionTaskTargetV1, TaskId,
-    HostDecisionAuthorityV1, HostRequestDecisionV1,
+    truncate_observation_text, BlockAuthorityV1, HostDecisionAuthorityV1, HostRequestDecisionV1,
     ObservationCapabilitiesV1, ObservationEvidenceV1, ObservationInteractionOutcomeV1,
     ObservationKindV1, ObservationSourceFamilyV1, ObservationTodoItemV1, ObservationTodoStateV1,
-    ObservationV1,
+    ObservationV1, OBSERVATION_ACTION_BLOCKED_REASON_MAX_BYTES,
     StateSchemaSupport, WorkspaceEntry, WorkspaceEntryKind, WorktreeProfileId,
     SpawnContextId, SpawnEnvironmentProfileId, SpawnIdempotencyKey,
     SpawnProfileDefaults, SpawnRequiredCapabilities, SpawnSpec, SpawnSpecResolveError,
@@ -697,6 +697,56 @@ fn observation_host_decision_authority(by: ProviderHostDecisionAuthority) -> Hos
     }
 }
 
+/// Maps this harness's own `HostDecisionAuthority` onto the wider
+/// `BlockAuthorityV1` an `ActionBlocked` observation carries -- the four
+/// authorities the harness itself ever produces a `Denied` decision under,
+/// one-for-one, exactly as
+/// `docs/gate4agent/plans/gate4agent-blocked-action-event-2026-09-02.md`
+/// §2's mapping table names them. The remaining `BlockAuthorityV1`
+/// variants (`ProviderClassifier`, `ProviderPermissionRule`,
+/// `ProviderSandbox`, `ProviderRefusal`, `ProviderHook`, `UserRejected`,
+/// `Unknown`) describe a block the PROVIDER side of the wire reported --
+/// this function never produces one, because `ProviderHostDecisionAuthority`
+/// has no vocabulary for them; a later slice that reads a provider's own
+/// typed block field mints those directly, not through this map.
+fn block_authority(by: ProviderHostDecisionAuthority) -> BlockAuthorityV1 {
+    match by {
+        ProviderHostDecisionAuthority::Gate => BlockAuthorityV1::HarnessGate,
+        ProviderHostDecisionAuthority::Policy => BlockAuthorityV1::HarnessPolicy,
+        ProviderHostDecisionAuthority::Operator => BlockAuthorityV1::Operator,
+        ProviderHostDecisionAuthority::DeadlinePolicy => BlockAuthorityV1::HarnessDeadline,
+    }
+}
+
+/// The `ActionBlocked::reason` for a `Denied` decision this build's own
+/// `AgentEvent::RpcIncomingRequest::reason` did not attach text to --
+/// reachable today for `Operator`/`HarnessDeadline`: a deferred `session/
+/// request_permission` request resolved by `AcpSession::
+/// resolve_pending_request`/`expire_deadlines` (`src/acp/session.rs`),
+/// neither of which computes free text (an operator answers approve/reject,
+/// never a comment; an unattended deadline asks nobody anything). `reason`
+/// is a REQUIRED field on the wire (see `ObservationKindV1::ActionBlocked`'s
+/// own doc comment) -- a categorical fallback naming the authority is the
+/// honest minimum, never a placeholder standing in for detail nobody
+/// reported.
+fn action_blocked_fallback_reason(authority: BlockAuthorityV1) -> &'static str {
+    match authority {
+        BlockAuthorityV1::HarnessGate => "denied by the dangerous-command gate",
+        BlockAuthorityV1::HarnessPolicy => "denied by host policy",
+        BlockAuthorityV1::HarnessDeadline => {
+            "denied by host policy after the operator deadline expired"
+        }
+        BlockAuthorityV1::Operator => "declined by the operator",
+        BlockAuthorityV1::ProviderClassifier => "denied by the provider's classifier",
+        BlockAuthorityV1::ProviderPermissionRule => "denied by a provider permission rule",
+        BlockAuthorityV1::ProviderSandbox => "denied by the provider's sandbox",
+        BlockAuthorityV1::ProviderRefusal => "refused by the provider",
+        BlockAuthorityV1::ProviderHook => "denied by a provider hook",
+        BlockAuthorityV1::UserRejected => "rejected by the user",
+        BlockAuthorityV1::Unknown => "blocked; no reason was reported",
+    }
+}
+
 fn opaque_subagent_correlation(
     instance_id: AgentInstanceId,
     generation: SessionGeneration,
@@ -1021,11 +1071,48 @@ fn provider_observations(event: &ControlEvent) -> Vec<ObservationV1> {
             });
         }
         ProviderEvent::RateLimited { .. } => kinds.push(ObservationKindV1::RateLimited),
-        ProviderEvent::HostRequestObserved { method, decision, .. } => {
+        ProviderEvent::HostRequestObserved { method, decision, reason, .. } => {
             kinds.push(ObservationKindV1::HostRequestObserved {
                 class: observation_tool_class(method),
                 decision: observation_host_request_decision(decision),
             });
+            // Alongside, never instead of, the audit-only observation
+            // above: a `Denied` decision is ALSO a typed block event an
+            // operator needs to see fast -- see
+            // `docs/gate4agent/plans/gate4agent-blocked-action-event-2026-09-02.md`.
+            // `correlation_id: None` is honest here, not a dropped id:
+            // `ProviderEvent::HostRequestObserved` carries no tool
+            // correlation id to read one off (`gate4agent-shell-native`'s
+            // `provider_event` discards the raw RPC id at this mapping on
+            // purpose -- see that match arm's own comment).
+            if let ProviderHostRequestDecision::Denied { by } = decision {
+                let authority = block_authority(*by);
+                let reason_source = reason
+                    .as_deref()
+                    .unwrap_or_else(|| action_blocked_fallback_reason(authority));
+                // `validate_required_text` REJECTS an over-long value
+                // outright rather than truncating (see `ObservationKindV1::
+                // ActionBlocked`'s own validation) -- this cut happens here,
+                // at the producer, before that validator ever sees the
+                // text, the same convention `observation_tool_class` above
+                // already follows for `class`/`tool_class` labels (that
+                // helper's own truncation flag is discarded the same way
+                // this one is: this crate does not yet thread a per-`kind`
+                // `truncated` bit through the shared `kinds` pipeline
+                // below, which always writes `truncated: false`).
+                let (reason_text, _) = truncate_observation_text(
+                    reason_source,
+                    OBSERVATION_ACTION_BLOCKED_REASON_MAX_BYTES,
+                );
+                kinds.push(ObservationKindV1::ActionBlocked {
+                    correlation_id: None,
+                    tool_class: observation_tool_class(method),
+                    authority,
+                    reason_kind: None,
+                    reason: reason_text,
+                    help: None,
+                });
+            }
         }
         ProviderEvent::UnrecognizedNotification { method, .. } => {
             kinds.push(ObservationKindV1::UnrecognizedNotification {
@@ -17067,6 +17154,171 @@ mod observation_projection_tests {
                 ..
             }
         ));
+    }
+
+    /// The proof slice K1 asks for: a gate-blocked `Denied` decision, WITH
+    /// its reason text carried all the way from `src/acp/host.rs` through
+    /// `AgentEvent::RpcIncomingRequest` and `gate4agent-shell-native`'s
+    /// `provider_event`, mints BOTH the existing audit-only
+    /// `HostRequestObserved` AND the new `ActionBlocked` -- never one
+    /// instead of the other.
+    #[test]
+    fn gate_denied_host_request_mints_both_host_request_observed_and_action_blocked() {
+        let gate_text =
+            "blocked by dangerous-command gate: rule=filesystem-wipe, argument=rm -rf /";
+        let projected = provider_observations(&provider_control_event_at(
+            AdapterFamily::Acp,
+            "claude-code",
+            2,
+            ProviderEvent::HostRequestObserved {
+                method: "terminal/create".to_owned(),
+                params_json: String::new(),
+                decision: ProviderHostRequestDecision::Denied {
+                    by: ProviderHostDecisionAuthority::Gate,
+                },
+                reason: Some(gate_text.to_owned()),
+            },
+        ));
+        let timeline = timeline_observations(&projected);
+        assert!(
+            timeline.iter().any(|observation| matches!(
+                &observation.kind,
+                ObservationKindV1::HostRequestObserved {
+                    decision: HostRequestDecisionV1::Denied { by: HostDecisionAuthorityV1::Gate },
+                    ..
+                }
+            )),
+            "expected the existing audit observation to still be minted: {timeline:?}"
+        );
+        let blocked = timeline
+            .iter()
+            .find_map(|observation| match &observation.kind {
+                ObservationKindV1::ActionBlocked {
+                    authority,
+                    reason,
+                    correlation_id,
+                    reason_kind,
+                    help,
+                    ..
+                } => Some((*authority, reason.clone(), correlation_id.clone(), reason_kind.clone(), help.clone())),
+                _ => None,
+            })
+            .expect("expected an ActionBlocked observation alongside HostRequestObserved");
+        assert_eq!(blocked.0, BlockAuthorityV1::HarnessGate);
+        assert_eq!(blocked.1, gate_text);
+        assert_eq!(blocked.2, None);
+        assert_eq!(blocked.3, None);
+        assert_eq!(blocked.4, None);
+        for observation in &projected {
+            observation.validate().expect("minted observation must validate");
+        }
+    }
+
+    /// `Granted`/`Deferred` decisions never mint `ActionBlocked` -- there is
+    /// nothing blocked to report.
+    #[test]
+    fn granted_and_deferred_host_requests_never_mint_action_blocked() {
+        for decision in [
+            ProviderHostRequestDecision::Granted { by: ProviderHostDecisionAuthority::Policy },
+            ProviderHostRequestDecision::Deferred,
+        ] {
+            let projected = provider_observations(&provider_control_event_at(
+                AdapterFamily::Acp,
+                "claude-code",
+                3,
+                ProviderEvent::HostRequestObserved {
+                    method: "fs/read_text_file".to_owned(),
+                    params_json: String::new(),
+                    decision,
+                    reason: None,
+                },
+            ));
+            assert!(
+                !timeline_observations(&projected)
+                    .iter()
+                    .any(|observation| matches!(observation.kind, ObservationKindV1::ActionBlocked { .. })),
+                "{decision:?} must not mint ActionBlocked"
+            );
+        }
+    }
+
+    /// A deferred `session/request_permission` resolved by an operator or
+    /// an expired deadline (`src/acp/session.rs::write_pending_response`)
+    /// carries no reason text at all -- `ActionBlocked::reason` is a
+    /// REQUIRED field, so the mint falls back to a categorical sentence
+    /// naming the authority rather than dropping the observation or
+    /// inventing detail nobody reported.
+    #[test]
+    fn denied_host_request_with_no_reason_falls_back_to_a_categorical_sentence() {
+        for (authority, expected_authority, expected_reason) in [
+            (
+                ProviderHostDecisionAuthority::Operator,
+                BlockAuthorityV1::Operator,
+                "declined by the operator",
+            ),
+            (
+                ProviderHostDecisionAuthority::DeadlinePolicy,
+                BlockAuthorityV1::HarnessDeadline,
+                "denied by host policy after the operator deadline expired",
+            ),
+        ] {
+            let projected = provider_observations(&provider_control_event_at(
+                AdapterFamily::Acp,
+                "claude-code",
+                4,
+                ProviderEvent::HostRequestObserved {
+                    method: "session/request_permission".to_owned(),
+                    params_json: String::new(),
+                    decision: ProviderHostRequestDecision::Denied { by: authority },
+                    reason: None,
+                },
+            ));
+            let (found_authority, found_reason) = timeline_observations(&projected)
+                .iter()
+                .find_map(|observation| match &observation.kind {
+                    ObservationKindV1::ActionBlocked { authority, reason, .. } => {
+                        Some((*authority, reason.clone()))
+                    }
+                    _ => None,
+                })
+                .expect("expected a fallback ActionBlocked observation");
+            assert_eq!(found_authority, expected_authority);
+            assert_eq!(found_reason, expected_reason);
+        }
+    }
+
+    /// An over-long reason is cut to the wire bound BEFORE the observation
+    /// is constructed, at a safe UTF-8 boundary -- `ObservationKindV1::
+    /// validate` rejects an over-long value outright rather than
+    /// truncating, so this is the producer's own responsibility (see
+    /// `truncate_observation_text`'s doc comment).
+    #[test]
+    fn overlong_action_blocked_reason_is_truncated_to_the_wire_bound() {
+        let oversized = "x".repeat(OBSERVATION_ACTION_BLOCKED_REASON_MAX_BYTES + 500);
+        let projected = provider_observations(&provider_control_event_at(
+            AdapterFamily::Acp,
+            "claude-code",
+            5,
+            ProviderEvent::HostRequestObserved {
+                method: "terminal/create".to_owned(),
+                params_json: String::new(),
+                decision: ProviderHostRequestDecision::Denied {
+                    by: ProviderHostDecisionAuthority::Policy,
+                },
+                reason: Some(oversized),
+            },
+        ));
+        let reason = timeline_observations(&projected)
+            .iter()
+            .find_map(|observation| match &observation.kind {
+                ObservationKindV1::ActionBlocked { reason, .. } => Some(reason.clone()),
+                _ => None,
+            })
+            .expect("expected an ActionBlocked observation");
+        assert!(reason.len() <= OBSERVATION_ACTION_BLOCKED_REASON_MAX_BYTES);
+        for observation in &projected {
+            observation.validate().expect("truncated reason must validate");
+        }
     }
 
     #[test]

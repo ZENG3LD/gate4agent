@@ -292,8 +292,32 @@ impl AcpProcess {
 // Build the OS-appropriate Command
 // ---------------------------------------------------------------------------
 
-/// Build a `Command` using the same Windows `cmd /C` wrapping logic as
-/// `PipeProcess::build_command_with_options`.
+/// Build a `Command` for the spec's target platform.
+///
+/// No ACP spawn goes through a POSIX shell on either platform. npm-installed
+/// tools (`claude`, `codex`) run through their vendor `.cmd` wrapper, which
+/// on Windows needs `cmd /C` (Windows `CreateProcess` never resolves a `.cmd`
+/// extension on its own — that association is `cmd.exe`'s, not the OS
+/// loader's) and on Unix is a POSIX shell script that the kernel already
+/// runs as `sh <script>` via its own `#!` line, so a bare `Command::new`
+/// invocation is enough. Every other tool (`grok`, `kimi`) is a real native
+/// binary and is spawned directly by program name on every platform: POSIX
+/// `execvp` and Windows `CreateProcess` (via `Command::new`) both resolve a
+/// bare name against PATH themselves, and Windows appends `.exe` when the
+/// name carries no extension of its own -- which is exactly how `grok`
+/// (`~/.grok/bin/grok.exe`) and `kimi` (`~/.kimi-code/bin/kimi.exe`, the
+/// native binary, not the older npm JS shim of the same bare name earlier in
+/// PATH) are already found by `gate4agent-shell-native`'s PTY launch path,
+/// whose `LaunchSpec.program` is this same bare `"kimi"`/`"grok"` with no
+/// wrapping at all (`AcpProcess::spawn_with_launch` does the identical
+/// `Command::new(&launch.program)`). Routing either of them through `bash`
+/// (the previous fallback) hands them to whatever `bash.exe` happens to be
+/// first on PATH -- on this fleet that is the WSL launcher stub, which
+/// either can't find a WSL distro at all (`execvpe(/bin/bash) failed`) or
+/// runs the tool inside the WSL guest's own Linux filesystem, where a
+/// Windows-only binary like `grok` was never installed (`command not
+/// found`, exit 127). There is no POSIX shell in the loop on Windows for
+/// this project's tools any more, full stop.
 ///
 /// `extra_args` are appended after `spec.args` -- callers are expected to
 /// have already applied `applicable_approval_args` (an empty slice is a
@@ -307,38 +331,31 @@ fn build_command(spec: &AcpSpawnSpec, extra_args: &[String]) -> Command {
 }
 
 fn build_command_unix(spec: &AcpSpawnSpec, extra_args: &[String]) -> Command {
-    let mut cmd = Command::new(spec.program);
-    for arg in spec.args {
+    direct_command(spec.program, spec.args, extra_args)
+}
+
+fn build_command_windows(spec: &AcpSpawnSpec, extra_args: &[String]) -> Command {
+    // npm-installed tools always have a `.cmd` wrapper on Windows.
+    if spec.npm_tool {
+        windows_cmd_wrapper(&format!("{}.cmd", spec.program), spec.args, extra_args)
+    } else {
+        direct_command(spec.program, spec.args, extra_args)
+    }
+}
+
+/// Spawn `program` directly, with `args`/`extra_args` as separate argv
+/// entries -- no shell, no `.cmd` detection, no wrapping. See
+/// [`build_command`]'s doc comment for why this is correct on every
+/// platform for every non-npm tool.
+fn direct_command(program: &str, args: &[&str], extra_args: &[String]) -> Command {
+    let mut cmd = Command::new(program);
+    for arg in args {
         cmd.arg(arg);
     }
     for arg in extra_args {
         cmd.arg(arg);
     }
     cmd
-}
-
-fn build_command_windows(spec: &AcpSpawnSpec, extra_args: &[String]) -> Command {
-    // npm-installed tools always have a `.cmd` wrapper on Windows.
-    if spec.npm_tool {
-        return windows_cmd_wrapper(&format!("{}.cmd", spec.program), spec.args, extra_args);
-    }
-
-    let program = spec.program;
-
-    // Check if a `.cmd` wrapper exists on PATH for non-npm tools.
-    let cmd_name = format!("{}.cmd", program);
-    let has_cmd = std::env::var_os("PATH")
-        .map(|path| {
-            std::env::split_paths(&path).any(|dir| dir.join(&cmd_name).is_file())
-        })
-        .unwrap_or(false);
-
-    if has_cmd {
-        windows_cmd_wrapper(&cmd_name, spec.args, extra_args)
-    } else {
-        // No `.cmd` wrapper — invoke via `bash -c "program arg1 arg2 ..."`.
-        windows_bash_fallback(program, spec.args, extra_args)
-    }
 }
 
 /// `cmd /C <cmd_name> <args...> <extra_args...>` -- each argument is its own
@@ -353,41 +370,6 @@ fn windows_cmd_wrapper(cmd_name: &str, args: &[&str], extra_args: &[String]) -> 
         cmd.arg(arg);
     }
     cmd
-}
-
-/// `bash -c "program arg1 arg2 ... extra1 extra2 ..."` -- unlike
-/// `windows_cmd_wrapper`, every argument (including `extra_args`) has to be
-/// folded into the SAME single shell-quoted string, because that string is
-/// itself the only argument `bash -c` receives; appending `extra_args` as
-/// further `Command::arg` calls after this one would hand them to `bash` as
-/// its own positional parameters (`$0`, `$1`, ...) rather than to `program`.
-fn windows_bash_fallback(program: &str, args: &[&str], extra_args: &[String]) -> Command {
-    let mut cmd = Command::new("bash");
-    cmd.arg("-c");
-    let mut shell_str = shell_quote(program);
-    for arg in args {
-        shell_str.push(' ');
-        shell_str.push_str(&shell_quote(arg));
-    }
-    for arg in extra_args {
-        shell_str.push(' ');
-        shell_str.push_str(&shell_quote(arg));
-    }
-    cmd.arg(&shell_str);
-    cmd
-}
-
-/// Single-quote a token for POSIX shell (`bash -c`).
-fn shell_quote(s: &str) -> String {
-    if s.is_empty() {
-        return "''".to_string();
-    }
-    if s.chars()
-        .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '/')
-    {
-        return s.to_string();
-    }
-    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 // ---------------------------------------------------------------------------
@@ -471,22 +453,6 @@ mod tests {
         assert_eq!(spec.program, "kimi");
         assert_eq!(spec.args, &["acp"]);
         assert!(!spec.npm_tool);
-    }
-
-    #[test]
-    fn shell_quote_empty() {
-        assert_eq!(shell_quote(""), "''");
-    }
-
-    #[test]
-    fn shell_quote_simple() {
-        assert_eq!(shell_quote("cursor-agent"), "cursor-agent");
-    }
-
-    #[test]
-    fn shell_quote_with_spaces() {
-        let q = shell_quote("hello world");
-        assert_eq!(q, "'hello world'");
     }
 
     // -----------------------------------------------------------------------
@@ -615,28 +581,58 @@ mod tests {
         );
     }
 
-    /// The fallback path folds every argument -- including `extra_args` --
-    /// into the SAME single shell string, because that string is the only
-    /// argument `bash -c` itself receives. This is the regression the
-    /// `windows_bash_fallback` split guards: appending `extra_args` as
-    /// further `Command::arg` calls after building this string (instead of
-    /// folding them in) would hand them to `bash` as `$0`/`$1`/... rather
-    /// than to `program`.
+    /// `grok` (`npm_tool: false`) is a real native binary
+    /// (`~/.grok/bin/grok.exe`) -- on Windows it is spawned directly by bare
+    /// program name, exactly like the Unix path, with no `.cmd` detection
+    /// and no shell in between. This is the regression guard for the
+    /// WSL-`bash` fallback this project used to fall back to: that fallback
+    /// either failed to launch a WSL distro at all
+    /// (`execvpe(/bin/bash) failed`) or ran `grok` inside the WSL guest's
+    /// own Linux filesystem, where the Windows-only binary was never
+    /// installed (`grok: command not found`, exit 127) -- measured live on
+    /// this fleet.
     #[test]
-    fn windows_bash_fallback_folds_extra_args_into_the_single_shell_string() {
+    fn build_command_windows_grok_spawns_the_native_binary_directly_no_shell() {
+        let spec = acp_command(CliTool::Grok).unwrap();
+        let cmd = build_command_windows(&spec, &[]);
+        assert_eq!(cmd.get_program(), std::ffi::OsStr::new("grok"));
+        assert_eq!(command_args(&cmd), ["agent", "stdio"]);
+    }
+
+    /// `kimi` (`npm_tool: false`) resolves the same way: bare `Command::new
+    /// ("kimi")` on Windows appends `.exe` (never `.cmd`) when searching
+    /// PATH, which lands on the native `~/.kimi-code/bin/kimi.exe` binary --
+    /// the same target `gate4agent-shell-native`'s PTY launch path already
+    /// spawns via the catalog's own bare `LaunchSpec.program = "kimi"`, with
+    /// no `.cmd` wrapper and no shell.
+    #[test]
+    fn build_command_windows_kimi_spawns_the_native_binary_directly_no_shell() {
+        let spec = acp_command(CliTool::KimiCode).unwrap();
+        let cmd = build_command_windows(&spec, &[]);
+        assert_eq!(cmd.get_program(), std::ffi::OsStr::new("kimi"));
+        assert_eq!(command_args(&cmd), ["acp"]);
+    }
+
+    #[test]
+    fn build_command_windows_appends_extra_args_for_a_direct_non_npm_tool() {
+        let spec = acp_command(CliTool::Grok).unwrap();
         let extra = vec!["--permission-mode".to_owned(), "bypassPermissions".to_owned()];
-        let cmd = windows_bash_fallback("grok", &["agent", "stdio"], &extra);
-        assert_eq!(cmd.get_program(), std::ffi::OsStr::new("bash"));
+        let cmd = build_command_windows(&spec, &extra);
+        assert_eq!(cmd.get_program(), std::ffi::OsStr::new("grok"));
         assert_eq!(
             command_args(&cmd),
-            ["-c", "grok agent stdio --permission-mode bypassPermissions"]
+            ["agent", "stdio", "--permission-mode", "bypassPermissions"]
         );
     }
 
     #[test]
-    fn windows_bash_fallback_quotes_an_extra_arg_that_needs_it() {
-        let extra = vec!["hello world".to_owned()];
-        let cmd = windows_bash_fallback("kimi", &["acp"], &extra);
-        assert_eq!(command_args(&cmd), ["-c", "kimi acp 'hello world'"]);
+    fn build_command_windows_npm_tool_still_wraps_through_cmd() {
+        let spec = acp_command(CliTool::ClaudeCode).unwrap();
+        let cmd = build_command_windows(&spec, &[]);
+        assert_eq!(cmd.get_program(), std::ffi::OsStr::new("cmd"));
+        assert_eq!(
+            command_args(&cmd),
+            ["/C", "npx.cmd", "-y", "@agentclientprotocol/claude-agent-acp"]
+        );
     }
 }

@@ -794,7 +794,8 @@ fn timeline_category(kind: &ObservationKindV1) -> TimelineCategoryV1 {
         | ObservationKindV1::ApprovalResolved { .. }
         | ObservationKindV1::QuestionResolved { .. }
         | ObservationKindV1::InteractionResolved { .. }
-        | ObservationKindV1::HostRequestObserved { .. } => TimelineCategoryV1::Interaction,
+        | ObservationKindV1::HostRequestObserved { .. }
+        | ObservationKindV1::ActionBlocked { .. } => TimelineCategoryV1::Interaction,
         ObservationKindV1::SubagentStarted { .. }
         | ObservationKindV1::SubagentProgress { .. }
         | ObservationKindV1::SubagentCompleted { .. } => TimelineCategoryV1::Subagent,
@@ -921,6 +922,17 @@ fn timeline_entry(
                 HostRequestDecisionV1::Deferred => TimelineStateV1::Waiting,
             },
             None,
+        ),
+        // `reason` is verbatim, already-bounded free text (see
+        // `ObservationKindV1::ActionBlocked`'s own doc comment) -- it is the
+        // label outright, not a class bucket. `help` has no categorical
+        // field to land in on this projection today (`TimelineEntryV1` carries
+        // no free-text detail), so it is dropped here rather than smuggled
+        // into `label`/`state`/`correlation`.
+        ObservationKindV1::ActionBlocked { correlation_id, reason, .. } => (
+            Some(reason.clone()),
+            TimelineStateV1::Failed,
+            correlation_id.as_deref().and_then(|id| correlation_ordinal(&projection.tools, id)),
         ),
         ObservationKindV1::UnrecognizedNotification { method } => {
             (Some(method.clone()), TimelineStateV1::Unknown, None)

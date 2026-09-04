@@ -10472,6 +10472,19 @@ impl NodeShared {
             .expect("node event sequence exhausted");
         history.last_sequence = sequence;
         drop(history);
+        // Debug, not info/warn -- this fires on every single chunk, but it
+        // is exactly the counter the next drop-measurement pass needs: what
+        // the node actually emitted (`source_sequence`, `kind`) versus what
+        // a harness subscriber's own forwarder later logs having received
+        // (`gate4agent-harness-service::runtime`'s "forwarding agent stream
+        // event"), so a gap between the two logs names itself instead of
+        // needing a new counter added ad hoc.
+        tracing::debug!(
+            source_sequence = chunk.source_sequence,
+            kind = agent_stream_chunk_kind_label(&chunk.kind),
+            envelope_sequence = sequence,
+            "publishing agent stream chunk",
+        );
         let envelope = NodeEventEnvelope {
             sequence,
             event: NodeEvent::AgentStream { address, chunk },
@@ -12249,6 +12262,22 @@ impl NodeShared {
     }
 }
 
+/// Coarse label for one `AgentStreamChunkKindV1`, used only by
+/// `NodeShared::publish_agent_stream_chunk`'s own debug log -- mirrors
+/// `gate4agent-harness-service`'s `agent_stream_event_kind_label` (same
+/// "name what crossed this boundary" reasoning, one layer upstream of it).
+fn agent_stream_chunk_kind_label(kind: &AgentStreamChunkKindV1) -> &'static str {
+    match kind {
+        AgentStreamChunkKindV1::Text { .. } => "text",
+        AgentStreamChunkKindV1::Thinking { .. } => "thinking",
+        AgentStreamChunkKindV1::InteractionPrompt { .. } => "interaction-prompt",
+        AgentStreamChunkKindV1::ModeCatalog { .. } => "mode-catalog",
+        AgentStreamChunkKindV1::ConfigOptions { .. } => "config-options",
+        AgentStreamChunkKindV1::ModelCatalog { .. } => "model-catalog",
+        AgentStreamChunkKindV1::Blocked { .. } => "blocked",
+    }
+}
+
 /// Serves this wire on the local endpoint, and -- when `call_home` names a
 /// relay -- over an outbound connection to it as well.
 ///
@@ -12671,17 +12700,36 @@ where
             }
         }
         if let Some(receiver) = agent_stream_event_rx.as_mut() {
-            match receiver.try_recv() {
-                Ok(events) => queue_connection_event_batch(
-                    &mut pending_events,
-                    &events,
-                    discard_events_through,
-                ),
-                Err(broadcast::error::TryRecvError::Empty) => {}
-                Err(broadcast::error::TryRecvError::Lagged(_)) => {
-                    resync_required = true;
+            // Loops up to the same remaining-room budget the durable
+            // `event_rx` drain above uses, rather than one `try_recv` per
+            // tick: each successful receive here is itself only ONE
+            // `NodeEventEnvelope` batch (`publish_agent_stream_chunk` always
+            // sends `vec![envelope]`, never more), so a single-shot drain
+            // caps this connection's agent-stream throughput at one chunk
+            // per outer-loop tick regardless of how many are already queued
+            // -- exactly the kind of self-inflicted stall this crate's own
+            // durable-event budget exists to avoid.
+            let agent_stream_drain_budget = NODE_CONNECTION_EVENT_BURST_MAX
+                .saturating_sub(pending_events.len().min(NODE_CONNECTION_EVENT_BURST_MAX));
+            for _ in 0..agent_stream_drain_budget {
+                match receiver.try_recv() {
+                    Ok(events) => queue_connection_event_batch(
+                        &mut pending_events,
+                        &events,
+                        discard_events_through,
+                    ),
+                    Err(broadcast::error::TryRecvError::Empty) => break,
+                    Err(broadcast::error::TryRecvError::Lagged(dropped)) => {
+                        tracing::warn!(
+                            connection_id,
+                            dropped,
+                            "agent stream event subscription lagged; forcing a resync",
+                        );
+                        resync_required = true;
+                        break;
+                    }
+                    Err(broadcast::error::TryRecvError::Closed) => return Ok(()),
                 }
-                Err(broadcast::error::TryRecvError::Closed) => return Ok(()),
             }
         }
         if resync_required {

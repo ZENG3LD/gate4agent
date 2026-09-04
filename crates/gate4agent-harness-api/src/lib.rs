@@ -3282,6 +3282,29 @@ pub struct HarnessProviderConfigOptionV1 {
     pub choices: Vec<HarnessProviderConfigChoiceV1>,
 }
 
+/// Exact mirror of `gate4agent_observation_protocol::BlockAuthorityV1`: this
+/// crate has no dependency on `gate4agent-observation-protocol` (see the
+/// doc comment on `HarnessTerminalControlV1`), so the WHO/WHAT-blocked-it
+/// vocabulary `HarnessAgentStreamChunkKindV1::Blocked` carries is duplicated
+/// here as its own closed wire enum rather than imported, the same way
+/// `HarnessProviderInteractionKindV1` mirrors `gate4agent_types::
+/// ProviderInteractionKind`.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessBlockAuthorityV1 {
+    HarnessGate,
+    HarnessPolicy,
+    HarnessDeadline,
+    Operator,
+    ProviderClassifier,
+    ProviderPermissionRule,
+    ProviderSandbox,
+    ProviderRefusal,
+    ProviderHook,
+    UserRejected,
+    Unknown,
+}
+
 /// The kind of a single `HarnessAgentStreamChunkV1` -- content the operator
 /// needs to act on a running ACP session: what the agent is saying, a
 /// pending interaction it needs answered, and the catalogs the three ACP
@@ -3317,6 +3340,20 @@ pub enum HarnessAgentStreamChunkKindV1 {
     ModelCatalog {
         current: Option<String>,
         available: Vec<HarnessAgentStreamNamedIdV1>,
+    },
+    /// The chunk twin of `ObservationKindV1::ActionBlocked`, delivered on
+    /// the agent content stream instead of (never in place of) the
+    /// observation channel -- see `gate4agent-node-protocol`'s own
+    /// `AgentStreamChunkKindV1::Blocked` doc comment for why. An EVENT, not
+    /// state: never seeded to a fresh subscriber, exactly like `Text`/
+    /// `Thinking`.
+    Blocked {
+        correlation_id: Option<String>,
+        tool_class: String,
+        authority: HarnessBlockAuthorityV1,
+        reason_kind: Option<String>,
+        reason: String,
+        help: Option<String>,
     },
 }
 
@@ -3412,6 +3449,36 @@ impl HarnessAgentStreamChunkKindV1 {
                                 return Err(HarnessOperatorApiError::InvalidAgentStream);
                             }
                         }
+                    }
+                }
+                Ok(())
+            }
+            Self::Blocked { correlation_id, tool_class, reason_kind, reason, help, .. } => {
+                if let Some(correlation_id) = correlation_id {
+                    if !valid_agent_stream_correlation_id(correlation_id) {
+                        return Err(HarnessOperatorApiError::InvalidAgentStream);
+                    }
+                }
+                if !valid_agent_stream_id(tool_class) {
+                    return Err(HarnessOperatorApiError::InvalidAgentStream);
+                }
+                if let Some(reason_kind) = reason_kind {
+                    if !valid_agent_stream_id(reason_kind) {
+                        return Err(HarnessOperatorApiError::InvalidAgentStream);
+                    }
+                }
+                if reason.is_empty()
+                    || reason.len() > HARNESS_AGENT_STREAM_TEXT_MAX_BYTES
+                    || contains_unsafe_control_bytes(reason)
+                {
+                    return Err(HarnessOperatorApiError::InvalidAgentStream);
+                }
+                if let Some(help) = help {
+                    if help.is_empty()
+                        || help.len() > HARNESS_AGENT_STREAM_TEXT_MAX_BYTES
+                        || contains_unsafe_control_bytes(help)
+                    {
+                        return Err(HarnessOperatorApiError::InvalidAgentStream);
                     }
                 }
                 Ok(())

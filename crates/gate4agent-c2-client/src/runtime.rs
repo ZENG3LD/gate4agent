@@ -1621,6 +1621,53 @@ fn c2_node_event_is_agent_stream(event: &C2NodeEvent) -> bool {
     }
 }
 
+/// Coarse label for a dropped/tearing-down `C2NodeEvent` -- used only by
+/// `control_owner`'s event-delivery warns, mirroring `gate4agent-harness-
+/// service`'s own `agent_stream_event_kind_label` (same "name every drop"
+/// reasoning): a log line that fires once per backpressure episode still
+/// needs to say WHAT kind of event was in flight when it fired.
+fn c2_node_event_kind_label(event: &C2NodeEvent) -> &'static str {
+    match event {
+        C2NodeEvent::HarnessMcpReadCall { .. } => "harness-mcp-read-call",
+        C2NodeEvent::Control { .. } => "control",
+        C2NodeEvent::Observation { .. } => "observation",
+        C2NodeEvent::ManagedObservation { .. } => "managed-observation",
+        C2NodeEvent::TerminalFrame { .. } => "terminal-frame",
+        C2NodeEvent::AgentStream { .. } => "agent-stream",
+        C2NodeEvent::ControllerChanged { .. } => "controller-changed",
+        C2NodeEvent::WorkspaceAdded { .. } => "workspace-added",
+        C2NodeEvent::WorkspaceRemoved { .. } => "workspace-removed",
+        C2NodeEvent::SessionRecordUpserted { .. } => "session-record-upserted",
+        C2NodeEvent::SessionRecordRemoved { .. } => "session-record-removed",
+        C2NodeEvent::ManagedWorktreeUpserted { .. } => "managed-worktree-upserted",
+        C2NodeEvent::ManagedWorktreeRemoved { .. } => "managed-worktree-removed",
+        C2NodeEvent::ResyncRequired { .. } => "resync-required",
+    }
+}
+
+/// Whether THIS full-channel drop should be logged: `true` exactly once per
+/// contiguous backlog episode (the first drop since `logged` was last
+/// reset), flipping `*logged` so every later drop in the same episode
+/// returns `false` -- see `reset_channel_full_drop_episode` for the
+/// counterpart that ends an episode. Split out as a pure function, used by
+/// both `control_owner`'s `harness_mcp` and terminal-frame delivery arms, so
+/// the "once per episode, not per event" contract is directly testable
+/// without needing a tracing subscriber to observe log call counts.
+fn should_log_channel_full_drop(logged: &mut bool) -> bool {
+    if *logged {
+        return false;
+    }
+    *logged = true;
+    true
+}
+
+/// Ends a full-channel drop episode: a send that succeeds again means the
+/// backlog cleared, so the next drop (if any) is a fresh episode and earns
+/// its own log line.
+fn reset_channel_full_drop_episode(logged: &mut bool) {
+    *logged = false;
+}
+
 fn c2_node_response_has_unix_bytes(response: &C2NodeResponse) -> bool {
     match response {
         C2NodeResponse::Snapshot { snapshot, .. } => node_snapshot_has_unix_bytes(snapshot),
@@ -2256,6 +2303,15 @@ async fn control_owner<E>(
     let mut next_request_id = 1_u64;
     let mut pending = BTreeMap::new();
     let mut harness_mcp_receiver_gone = false;
+    // Set the moment a `harness_mcp`/`regular` (terminal-frame) delivery
+    // first drops an event for a full channel, cleared the moment a send
+    // succeeds again -- so a sustained burst of drops during one backlog
+    // episode logs exactly once (at the episode's start) instead of once
+    // per dropped event, mirroring `harness_mcp_receiver_gone`'s own
+    // one-shot-per-episode discipline for the channel-closed case right
+    // next to it.
+    let mut harness_mcp_channel_full_logged = false;
+    let mut terminal_frame_channel_full_logged = false;
     let mut loss_reason = C2ConnectionLossReason::Shutdown;
     loop {
         tokio::select! {
@@ -2708,11 +2764,25 @@ async fn control_owner<E>(
                         if !path_capabilities.terminal_frame_events
                             && c2_node_event_is_terminal_frame(&event.event)
                         {
+                            tracing::warn!(
+                                kind = c2_node_event_kind_label(&event.event),
+                                sequence = event.cursor.sequence,
+                                cursor = ?event.cursor,
+                                reason = "terminal frame events capability not negotiated",
+                                "dropping event and tearing down the C2 control connection",
+                            );
                             break;
                         }
                         if !path_capabilities.agent_stream_events
                             && c2_node_event_is_agent_stream(&event.event)
                         {
+                            tracing::warn!(
+                                kind = c2_node_event_kind_label(&event.event),
+                                sequence = event.cursor.sequence,
+                                cursor = ?event.cursor,
+                                reason = "agent stream events capability not negotiated",
+                                "dropping event and tearing down the C2 control connection",
+                            );
                             break;
                         }
                         if !path_capabilities.provider_ids_open
@@ -2766,20 +2836,30 @@ async fn control_owner<E>(
                             // Abort, ...) would otherwise be answered
                             // `Closed` seconds later with no log line
                             // anywhere naming why.
+                            let sequence = event.cursor.sequence;
+                            let cursor = event.cursor;
                             match events.harness_mcp.try_send(event) {
-                                Ok(()) => {}
+                                Ok(()) => {
+                                    reset_channel_full_drop_episode(&mut harness_mcp_channel_full_logged);
+                                }
                                 Err(mpsc::error::TrySendError::Full(_)) => {
-                                    tracing::warn!(
-                                        event = "HarnessMcpReadCall",
-                                        reason = "harness_mcp event channel full",
-                                        "dropped harness MCP event; C2 control connection stays open",
-                                    );
+                                    if should_log_channel_full_drop(&mut harness_mcp_channel_full_logged) {
+                                        tracing::warn!(
+                                            kind = "harness-mcp-read-call",
+                                            sequence,
+                                            cursor = ?cursor,
+                                            reason = "harness_mcp event channel full",
+                                            "dropped harness MCP event; C2 control connection stays open",
+                                        );
+                                    }
                                 }
                                 Err(mpsc::error::TrySendError::Closed(_)) => {
                                     if !harness_mcp_receiver_gone {
                                         harness_mcp_receiver_gone = true;
                                         tracing::warn!(
-                                            event = "HarnessMcpReadCall",
+                                            kind = "harness-mcp-read-call",
+                                            sequence,
+                                            cursor = ?cursor,
                                             reason = "harness_mcp event receiver dropped",
                                             "no harness MCP event subscriber; further harness MCP events on this connection are dropped silently",
                                         );
@@ -2787,22 +2867,57 @@ async fn control_owner<E>(
                                 }
                             }
                         } else if c2_node_event_is_terminal_frame(&event.event) {
+                            let kind = c2_node_event_kind_label(&event.event);
+                            let sequence = event.cursor.sequence;
+                            let cursor = event.cursor;
                             match events.regular.try_send(event) {
-                                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                                Ok(()) => {
+                                    reset_channel_full_drop_episode(&mut terminal_frame_channel_full_logged);
+                                }
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    if should_log_channel_full_drop(&mut terminal_frame_channel_full_logged) {
+                                        tracing::warn!(
+                                            kind,
+                                            sequence,
+                                            cursor = ?cursor,
+                                            reason = "regular event channel full",
+                                            "dropped terminal frame event; C2 control connection stays open",
+                                        );
+                                    }
+                                }
                                 Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    tracing::warn!(
+                                        kind,
+                                        sequence,
+                                        cursor = ?cursor,
+                                        reason = "regular event receiver dropped",
+                                        "dropping event and tearing down the C2 control connection",
+                                    );
                                     loss_reason = C2ConnectionLossReason::RegularEventBackpressure;
                                     break;
                                 }
                             }
-                        } else if !matches!(
-                            timeout(
-                                REGULAR_EVENT_DELIVERY_DEADLINE,
-                                events.regular.send(event),
-                            ).await,
-                            Ok(Ok(())),
-                        ) {
-                            loss_reason = C2ConnectionLossReason::RegularEventBackpressure;
-                            break;
+                        } else {
+                            let kind = c2_node_event_kind_label(&event.event);
+                            let sequence = event.cursor.sequence;
+                            let cursor = event.cursor;
+                            if !matches!(
+                                timeout(
+                                    REGULAR_EVENT_DELIVERY_DEADLINE,
+                                    events.regular.send(event),
+                                ).await,
+                                Ok(Ok(())),
+                            ) {
+                                tracing::warn!(
+                                    kind,
+                                    sequence,
+                                    cursor = ?cursor,
+                                    reason = "regular event channel backpressure exceeded delivery deadline",
+                                    "dropping event and tearing down the C2 control connection",
+                                );
+                                loss_reason = C2ConnectionLossReason::RegularEventBackpressure;
+                                break;
+                            }
                         }
                     }
                     Some(OwnerInput::Frame(C2ServerFrame::Topology(next))) => {
@@ -4397,6 +4512,35 @@ mod tests {
             event.cursor.sequence == 41
                 && matches!(event.event, C2NodeEvent::HarnessMcpReadCall { .. })
         }));
+    }
+
+    /// Item 3's direct proof: a sustained full-channel backlog -- a "gap
+    /// episode" of dropped events -- logs exactly once at its start, not
+    /// once per dropped event, and a fresh episode after recovery earns its
+    /// own log line again. `control_owner`'s `harness_mcp`/terminal-frame
+    /// arms both gate their warn through this exact function.
+    #[test]
+    fn channel_full_drop_logs_once_per_gap_episode_then_resets() {
+        let mut logged = false;
+        assert!(
+            should_log_channel_full_drop(&mut logged),
+            "the first drop of a new episode must log",
+        );
+        assert!(
+            !should_log_channel_full_drop(&mut logged),
+            "a second drop in the same still-unreported episode must not log again",
+        );
+        assert!(
+            !should_log_channel_full_drop(&mut logged),
+            "nor a third, no matter how long the episode runs",
+        );
+
+        reset_channel_full_drop_episode(&mut logged);
+
+        assert!(
+            should_log_channel_full_drop(&mut logged),
+            "a drop in a NEW episode, after the channel recovered, logs again",
+        );
     }
 
     #[tokio::test]

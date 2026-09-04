@@ -15,8 +15,8 @@
 //! `HarnessOperatorAgentEventV1`'s own doc comment in `gate4agent-harness-api`
 //! for the full inventory) -- three different disciplines, not two:
 //!
-//! - **`Text`, `Thinking`: instants, never seeded.** A fact about one
-//!   moment; a subscriber that was not listening when it happened has no
+//! - **`Text`, `Thinking`, `Blocked`: instants, never seeded.** A fact about
+//!   one moment; a subscriber that was not listening when it happened has no
 //!   use for it after the fact, and replaying it stale would mislead.
 //! - **`ModeCatalog`, `ConfigOptions`, `ModelCatalog`: current state, always
 //!   seeded, latest replaces prior.** The latest one IS the truth about the
@@ -46,14 +46,14 @@
 use crate::runtime::OperatorRequestLogIdentity;
 use gate4agent_harness_api::{
     HarnessAgentStreamChunkKindV1, HarnessAgentStreamChunkV1, HarnessAgentStreamInteractionOptionV1,
-    HarnessAgentStreamNamedIdV1, HarnessOperatorAgentEventV1, HarnessProviderConfigChoiceV1,
-    HarnessProviderConfigOptionKindV1, HarnessProviderConfigOptionV1, HarnessProviderInteractionKindV1,
-    HarnessRuntimeSessionAddressV1,
+    HarnessAgentStreamNamedIdV1, HarnessBlockAuthorityV1, HarnessOperatorAgentEventV1,
+    HarnessProviderConfigChoiceV1, HarnessProviderConfigOptionKindV1, HarnessProviderConfigOptionV1,
+    HarnessProviderInteractionKindV1, HarnessRuntimeSessionAddressV1,
 };
 use gate4agent_node_protocol::{
     AgentStreamChunkKindV1, AgentStreamChunkV1, AgentStreamInteractionOptionV1,
-    AgentStreamNamedIdV1, ProviderConfigChoice, ProviderConfigOption, ProviderConfigOptionKind,
-    ProviderInteractionKind,
+    AgentStreamNamedIdV1, BlockAuthorityV1, ProviderConfigChoice, ProviderConfigOption,
+    ProviderConfigOptionKind, ProviderInteractionKind,
 };
 use gate4agent_observation_api::RuntimeSessionKey;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -103,6 +103,22 @@ fn map_provider_interaction_kind(kind: ProviderInteractionKind) -> HarnessProvid
     match kind {
         ProviderInteractionKind::Approval => HarnessProviderInteractionKindV1::Approval,
         ProviderInteractionKind::Question => HarnessProviderInteractionKindV1::Question,
+    }
+}
+
+fn map_block_authority(authority: BlockAuthorityV1) -> HarnessBlockAuthorityV1 {
+    match authority {
+        BlockAuthorityV1::HarnessGate => HarnessBlockAuthorityV1::HarnessGate,
+        BlockAuthorityV1::HarnessPolicy => HarnessBlockAuthorityV1::HarnessPolicy,
+        BlockAuthorityV1::HarnessDeadline => HarnessBlockAuthorityV1::HarnessDeadline,
+        BlockAuthorityV1::Operator => HarnessBlockAuthorityV1::Operator,
+        BlockAuthorityV1::ProviderClassifier => HarnessBlockAuthorityV1::ProviderClassifier,
+        BlockAuthorityV1::ProviderPermissionRule => HarnessBlockAuthorityV1::ProviderPermissionRule,
+        BlockAuthorityV1::ProviderSandbox => HarnessBlockAuthorityV1::ProviderSandbox,
+        BlockAuthorityV1::ProviderRefusal => HarnessBlockAuthorityV1::ProviderRefusal,
+        BlockAuthorityV1::ProviderHook => HarnessBlockAuthorityV1::ProviderHook,
+        BlockAuthorityV1::UserRejected => HarnessBlockAuthorityV1::UserRejected,
+        BlockAuthorityV1::Unknown => HarnessBlockAuthorityV1::Unknown,
     }
 }
 
@@ -184,6 +200,21 @@ fn map_agent_stream_chunk_kind(kind: AgentStreamChunkKindV1) -> HarnessAgentStre
                 available: available.into_iter().map(map_named_id).collect(),
             }
         }
+        AgentStreamChunkKindV1::Blocked {
+            correlation_id,
+            tool_class,
+            authority,
+            reason_kind,
+            reason,
+            help,
+        } => HarnessAgentStreamChunkKindV1::Blocked {
+            correlation_id,
+            tool_class,
+            authority: map_block_authority(authority),
+            reason_kind,
+            reason,
+            help,
+        },
     }
 }
 
@@ -238,12 +269,15 @@ struct AgentStreamSubscriber {
     sessions: HashSet<RuntimeSessionKey>,
     /// Unreported-loss count per session. Unlike `TerminalSubscriber::
     /// pending`, this never holds content to retry -- once a chunk does not
-    /// fit, it is gone -- only the tally that `flush_lagged` opportunistically
-    /// reports as its own `Lagged` event. A session with a nonzero entry
-    /// here is "owed a loss report": `deliver` refuses to send it anything
-    /// new (including a fresher chunk) until that report actually goes out,
+    /// fit, it is gone -- only the tally that `flush_lagged`/`deliver`
+    /// opportunistically report as a `Lagged` event. A session with a
+    /// nonzero entry here is "owed a loss report": `deliver` always tries to
+    /// flush that report FIRST (never skipping the attempt, never leaving it
+    /// to languish until the next standalone `flush_lagged` pass), and only
+    /// once it lands does it go on to attempt the incoming chunk itself --
     /// so the operator is never shown content that arrived after a gap it
-    /// was never told about.
+    /// was never told about, but a channel that has drained is never left
+    /// muted either.
     dropped: HashMap<RuntimeSessionKey, u64>,
     /// Per-subscription monotonic; never resets. No `Lagged`/`SnapshotBaseline`
     /// resync pair the way `HarnessEventSubscriber::next_sequence` has one --
@@ -256,16 +290,30 @@ struct AgentStreamSubscriber {
 impl AgentStreamSubscriber {
     /// Attempts an immediate delivery of `chunk` for `key`. See this
     /// module's own doc comment and `dropped`'s doc comment above for why a
-    /// chunk that does not fit is dropped outright rather than stashed, and
-    /// why a session already owed a loss report skips straight to counting
-    /// this chunk against that same report instead of attempting to send it.
-    /// Returns `true` if the subscriber's channel is discovered closed, so
-    /// the caller can prune it exactly the way `TerminalSubscriber::deliver`
-    /// does for its own registry.
+    /// chunk that does not fit is dropped outright rather than stashed. A
+    /// session already owed a loss report gets that report flushed first
+    /// (`try_send_lagged_report`, attempted fresh on every call -- NEVER a
+    /// one-way gate that stops trying): if it lands, this chunk is then
+    /// attempted right behind it in the same call; if the channel is still
+    /// full, this chunk is counted onto the same still-unreported loss
+    /// (no second warning -- the first drop of the episode already named
+    /// it). Returns `true` if the subscriber's channel is discovered closed,
+    /// so the caller can prune it exactly the way `TerminalSubscriber::
+    /// deliver` does for its own registry.
     fn deliver(&mut self, key: &RuntimeSessionKey, chunk: AgentStreamChunkV1) -> bool {
-        if let Some(dropped) = self.dropped.get_mut(key) {
-            *dropped = dropped.saturating_add(1);
-            return false;
+        if let Some(&dropped) = self.dropped.get(key) {
+            match self.try_send_lagged_report(key, dropped) {
+                Ok(true) => {
+                    self.dropped.remove(key);
+                }
+                Ok(false) => {
+                    if let Some(count) = self.dropped.get_mut(key) {
+                        *count = count.saturating_add(1);
+                    }
+                    return false;
+                }
+                Err(()) => return true,
+            }
         }
         let sequence = self.next_sequence;
         let event = HarnessOperatorAgentEventV1::AgentChunk {
@@ -279,6 +327,12 @@ impl AgentStreamSubscriber {
                 false
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!(
+                    subscriber_id = self.id,
+                    node_id = key.node_id.as_str(),
+                    workspace_id = key.workspace_id.as_str(),
+                    "harness agent stream subscriber queue full, dropping a chunk",
+                );
                 self.dropped.insert(key.clone(), 1);
                 false
             }
@@ -332,6 +386,42 @@ impl AgentStreamSubscriber {
         }
     }
 
+    /// Attempts to flush a still-unreported `Lagged { dropped }` notice for
+    /// `key` -- the one send path shared by `deliver` above (opportunistic,
+    /// tried again on every incoming chunk for a session that already owes
+    /// one) and `flush_lagged` below (the per-select-loop-pass backstop for
+    /// a session with no further incoming chunks to trigger the
+    /// opportunistic path, so a report is not left stranded just because
+    /// nothing else arrived to ask for it). `Ok(true)` means the notice went
+    /// out (the caller clears `dropped[key]`, and logs once that the loss
+    /// was reported); `Ok(false)` means the channel is still full (the
+    /// caller counts this as one more unreported loss, no new warning -- the
+    /// first drop of the episode already named it); `Err(())` means the
+    /// channel is discovered closed, same pruning contract as `deliver`.
+    fn try_send_lagged_report(&mut self, key: &RuntimeSessionKey, dropped: u64) -> Result<bool, ()> {
+        let sequence = self.next_sequence;
+        let event = HarnessOperatorAgentEventV1::Lagged {
+            sequence,
+            session: session_key_to_address(key),
+            dropped,
+        };
+        match self.sender.try_send(event) {
+            Ok(()) => {
+                self.next_sequence = self.next_sequence.wrapping_add(1);
+                tracing::warn!(
+                    subscriber_id = self.id,
+                    node_id = key.node_id.as_str(),
+                    workspace_id = key.workspace_id.as_str(),
+                    dropped,
+                    "harness agent stream subscriber flushed a lag report",
+                );
+                Ok(true)
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => Ok(false),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(()),
+        }
+    }
+
     /// Opportunistically reports every session's unreported drop count as
     /// its own `Lagged` event -- called once per select-loop pass
     /// (`AgentStreamSubscriberRegistry::flush_lagged`, mirroring
@@ -344,19 +434,12 @@ impl AgentStreamSubscriber {
         let keys: Vec<RuntimeSessionKey> = self.dropped.keys().cloned().collect();
         for key in keys {
             let Some(&dropped) = self.dropped.get(&key) else { continue; };
-            let sequence = self.next_sequence;
-            let event = HarnessOperatorAgentEventV1::Lagged {
-                sequence,
-                session: session_key_to_address(&key),
-                dropped,
-            };
-            match self.sender.try_send(event) {
-                Ok(()) => {
-                    self.next_sequence = self.next_sequence.wrapping_add(1);
+            match self.try_send_lagged_report(&key, dropped) {
+                Ok(true) => {
                     self.dropped.remove(&key);
                 }
-                Err(mpsc::error::TrySendError::Full(_)) => {}
-                Err(mpsc::error::TrySendError::Closed(_)) => return true,
+                Ok(false) => {}
+                Err(()) => return true,
             }
         }
         false
@@ -491,7 +574,9 @@ impl AgentStreamSubscriberRegistry {
             AgentStreamChunkKindV1::InteractionPrompt { correlation_id, .. } => {
                 self.state_slot(key).interaction_prompts.insert(correlation_id.clone(), chunk.clone());
             }
-            AgentStreamChunkKindV1::Text { .. } | AgentStreamChunkKindV1::Thinking { .. } => {}
+            AgentStreamChunkKindV1::Text { .. }
+            | AgentStreamChunkKindV1::Thinking { .. }
+            | AgentStreamChunkKindV1::Blocked { .. } => {}
         }
     }
 
@@ -731,6 +816,54 @@ mod tests {
         registry.publish(&key, &sample_chunk(4));
         let event = receiver.try_recv().unwrap();
         assert!(matches!(event, HarnessOperatorAgentEventV1::AgentChunk { sequence: 2, .. }));
+    }
+
+    /// Item 1's direct proof: `deliver` itself -- NOT a separate
+    /// `flush_lagged` call -- opportunistically flushes a pending `Lagged`
+    /// report the moment the channel has room, then goes straight on to
+    /// attempt the very chunk that triggered it, all from one `publish`.
+    /// This is the fix for the old permanent-mute-on-first-overflow design:
+    /// a session that owes a loss report is never left stuck waiting on a
+    /// separate pass to notice the channel drained.
+    #[test]
+    fn deliver_recovers_a_pending_lag_report_and_the_next_chunk_in_one_call() {
+        let mut registry = AgentStreamSubscriberRegistry::default();
+        let key = sample_key("node-a", 'a');
+        let (sender, mut receiver) = mpsc::channel(2);
+        let mut sessions = HashSet::new();
+        sessions.insert(key.clone());
+        registry.insert(sender, sessions, subscribe_agent_stream_identity());
+
+        registry.publish(&key, &sample_chunk(1)); // sent directly, 1/2 slots used
+        registry.publish(&key, &sample_chunk(2)); // sent directly, 2/2 slots used (now full)
+        registry.publish(&key, &sample_chunk(3)); // full -- dropped, dropped[key] = 1
+        assert_eq!(*registry.subscribers[0].dropped.get(&key).unwrap(), 1);
+
+        // Drain both already-sent chunks the forwarder task would have
+        // taken, freeing the whole channel back up. No call to
+        // `flush_lagged` anywhere in this test.
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            HarnessOperatorAgentEventV1::AgentChunk { sequence: 0, .. },
+        ));
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            HarnessOperatorAgentEventV1::AgentChunk { sequence: 1, .. },
+        ));
+
+        // The very next publish for this session recovers on its own:
+        // `deliver` flushes the pending `Lagged { dropped: 1 }` report
+        // first, then this chunk right behind it, in the same call.
+        registry.publish(&key, &sample_chunk(4));
+        assert!(registry.subscribers[0].dropped.is_empty());
+
+        let event = receiver.try_recv().unwrap();
+        assert!(matches!(
+            event,
+            HarnessOperatorAgentEventV1::Lagged { sequence: 2, dropped: 1, .. },
+        ));
+        let event = receiver.try_recv().unwrap();
+        assert!(matches!(event, HarnessOperatorAgentEventV1::AgentChunk { sequence: 3, .. }));
     }
 
     #[test]

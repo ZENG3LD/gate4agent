@@ -9815,6 +9815,15 @@ pub async fn write_operator_terminal_event(
     stream.flush().await.map_err(|_| HarnessRuntimeError::WriteFailed)
 }
 
+/// Upper bound on how many already-queued agent-stream events one forwarder
+/// write batches together -- see `run_operator_agent_stream_subscription`'s
+/// own doc comment for why. Mirrors `NODE_CONNECTION_EVENT_BURST_MAX`'s own
+/// per-tick burst-cap reasoning (`server.rs`): sized well under
+/// `HOST_AGENT_STREAM_SUBSCRIBER_QUEUE_CAPACITY` so one write never tries to
+/// drain the entire queue in a single shot, which would let one slow batch
+/// hold up every other subscriber's turn on this same task's event loop.
+const AGENT_STREAM_FORWARD_BATCH_MAX: usize = 32;
+
 /// Forwarding loop for a connection that just subscribed via
 /// `SubscribeAgentStream` (`handle_connection`'s own branch above) --
 /// `run_operator_terminal_subscription`'s exact sibling, over
@@ -9823,18 +9832,34 @@ pub async fn write_operator_terminal_event(
 /// or channel close" lifetime, same reasoning for why there is no
 /// unsubscribe frame to read for (see `run_operator_event_subscription`'s
 /// own doc comment, which applies verbatim here).
+///
+/// Drains `events` in bounded batches (`AGENT_STREAM_FORWARD_BATCH_MAX`)
+/// rather than one `write_all`+`flush` per event: a burst of small `Text`
+/// deltas otherwise pays one write-syscall round trip per delta, and if the
+/// operator socket is even briefly slow to accept writes, `events.recv()` is
+/// not called again while that single write blocks -- the producer-side
+/// queue (`HOST_AGENT_STREAM_SUBSCRIBER_QUEUE_CAPACITY`) backs up purely
+/// from this task's own per-event write overhead, not from the client
+/// actually falling behind. One write per already-queued batch removes that
+/// self-inflicted stall without changing anything about backpressure once
+/// the queue is genuinely empty (falls straight back to `events.recv().await`
+/// blocking, exactly as before).
 pub async fn run_operator_agent_stream_subscription(
     mut stream: TcpStream,
     mut events: mpsc::Receiver<HarnessOperatorAgentEventV1>,
     _subscriber_permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<(), HarnessRuntimeError> {
     tracing::info!("agent stream event subscription forwarding started");
-    while let Some(event) = events.recv().await {
-        tracing::debug!(
-            kind = agent_stream_event_kind_label(&event),
-            "forwarding agent stream event",
-        );
-        write_operator_agent_stream_event(&mut stream, event).await?;
+    while let Some(first) = events.recv().await {
+        let mut batch = Vec::with_capacity(1);
+        batch.push(first);
+        while batch.len() < AGENT_STREAM_FORWARD_BATCH_MAX {
+            match events.try_recv() {
+                Ok(event) => batch.push(event),
+                Err(_) => break,
+            }
+        }
+        write_operator_agent_stream_events(&mut stream, batch).await?;
     }
     tracing::info!("agent stream event subscription channel drained; closing");
     Ok(())
@@ -9848,15 +9873,14 @@ fn agent_stream_event_kind_label(event: &HarnessOperatorAgentEventV1) -> &'stati
     }
 }
 
-/// Push-frame counterpart to `write_operator_reply` for a
-/// `SubscribeAgentStream` connection -- `write_operator_terminal_event`'s
-/// exact sibling over `HarnessOperatorAgentEventV1` instead (same
-/// validate-before-write, same size ceiling, same "never shuts the
-/// connection down afterward" contract).
-pub async fn write_operator_agent_stream_event(
-    stream: &mut TcpStream,
+/// Validates and newline-frames one `HarnessOperatorAgentEventV1`, shared by
+/// `write_operator_agent_stream_event` (one event, one write) and
+/// `write_operator_agent_stream_events` (a batch, one write for all of
+/// them) below -- same validate-before-write, same size ceiling, same
+/// warn-and-close-on-failure either way.
+fn encode_operator_agent_stream_event(
     event: HarnessOperatorAgentEventV1,
-) -> Result<(), HarnessRuntimeError> {
+) -> Result<Vec<u8>, HarnessRuntimeError> {
     event.validate().map_err(|error| {
         // Same reasoning as `write_operator_terminal_event`'s own
         // validate-before-write check: a push frame failing its own
@@ -9874,6 +9898,55 @@ pub async fn write_operator_agent_stream_event(
         return Err(HarnessRuntimeError::ResponseTooLarge);
     }
     encoded.push(b'\n');
+    Ok(encoded)
+}
+
+/// Push-frame counterpart to `write_operator_reply` for a
+/// `SubscribeAgentStream` connection -- `write_operator_terminal_event`'s
+/// exact sibling over `HarnessOperatorAgentEventV1` instead (same
+/// validate-before-write, same size ceiling, same "never shuts the
+/// connection down afterward" contract).
+pub async fn write_operator_agent_stream_event(
+    stream: &mut TcpStream,
+    event: HarnessOperatorAgentEventV1,
+) -> Result<(), HarnessRuntimeError> {
+    let encoded = encode_operator_agent_stream_event(event)?;
+    stream.write_all(&encoded).await.map_err(|_| HarnessRuntimeError::WriteFailed)?;
+    stream.flush().await.map_err(|_| HarnessRuntimeError::WriteFailed)
+}
+
+/// Validates and encodes every event in `events` exactly the way the
+/// single-event path does (same per-event `validate()` call, same
+/// warn-and-close-on-failure, same per-event `"forwarding agent stream
+/// event"` debug log), concatenating every encoded frame into ONE buffer --
+/// the pure half of `write_operator_agent_stream_events` below, split out
+/// so the batching contract itself (N queued events collapse into one
+/// buffer, in order) is directly testable without needing a real socket's
+/// write-syscall count to observe it.
+fn encode_operator_agent_stream_event_batch(
+    events: Vec<HarnessOperatorAgentEventV1>,
+) -> Result<Vec<u8>, HarnessRuntimeError> {
+    let mut encoded = Vec::new();
+    for event in events {
+        tracing::debug!(
+            kind = agent_stream_event_kind_label(&event),
+            "forwarding agent stream event",
+        );
+        encoded.append(&mut encode_operator_agent_stream_event(event)?);
+    }
+    Ok(encoded)
+}
+
+/// Batch counterpart used by `run_operator_agent_stream_subscription`'s
+/// forwarding loop: issues ONE `write_all`+`flush` for the whole buffer
+/// `encode_operator_agent_stream_event_batch` returns -- see that
+/// function's own doc comment, and `run_operator_agent_stream_subscription`'s,
+/// for why.
+async fn write_operator_agent_stream_events(
+    stream: &mut TcpStream,
+    events: Vec<HarnessOperatorAgentEventV1>,
+) -> Result<(), HarnessRuntimeError> {
+    let encoded = encode_operator_agent_stream_event_batch(events)?;
     stream.write_all(&encoded).await.map_err(|_| HarnessRuntimeError::WriteFailed)?;
     stream.flush().await.map_err(|_| HarnessRuntimeError::WriteFailed)
 }
@@ -13649,6 +13722,70 @@ mod tests {
             },
         );
         server.await.unwrap();
+    }
+
+    /// Item 2's direct proof, part one: the pure batching contract itself --
+    /// N queued events collapse into ONE buffer, still framed as N separate
+    /// newline-delimited JSON lines in order, exactly the concatenation of
+    /// encoding each one individually. This is the buffer
+    /// `write_operator_agent_stream_events` issues exactly one
+    /// `write_all`+`flush` for, so this test locks in "one write" at the
+    /// type level rather than by racing a real socket's syscall count.
+    #[test]
+    fn encode_operator_agent_stream_event_batch_concatenates_every_frame_in_order() {
+        let events: Vec<HarnessOperatorAgentEventV1> = (0..3u64)
+            .map(|sequence| HarnessOperatorAgentEventV1::Ping { sequence })
+            .collect();
+        let mut expected = Vec::new();
+        for sequence in 0..3u64 {
+            expected.append(
+                &mut encode_operator_agent_stream_event(HarnessOperatorAgentEventV1::Ping {
+                    sequence,
+                }).unwrap(),
+            );
+        }
+        let batched = encode_operator_agent_stream_event_batch(events).unwrap();
+        assert_eq!(batched, expected);
+        assert_eq!(batched.iter().filter(|byte| **byte == b'\n').count(), 3);
+    }
+
+    /// Item 2's direct proof, part two: a burst well past one batch's worth
+    /// (`AGENT_STREAM_FORWARD_BATCH_MAX`), all queued before the forwarder
+    /// task ever runs, still drains completely and in order across however
+    /// many batch iterations it takes, then closes cleanly once the sender
+    /// side is gone -- the forwarder never gets stuck handling only the
+    /// first batch.
+    #[tokio::test]
+    async fn forwarder_drains_a_pre_queued_burst_spanning_multiple_batches() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, receiver) = mpsc::channel(HOST_AGENT_STREAM_SUBSCRIBER_QUEUE_CAPACITY);
+        let total = AGENT_STREAM_FORWARD_BATCH_MAX * 2 + 5;
+        for sequence in 0..total as u64 {
+            sender.try_send(HarnessOperatorAgentEventV1::Ping { sequence }).unwrap();
+        }
+        drop(sender);
+        let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            run_operator_agent_stream_subscription(stream, receiver, permit).await
+        });
+        let mut client = TcpStream::connect(address).await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        let lines: Vec<&[u8]> = response
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert_eq!(lines.len(), total);
+        for (index, line) in lines.iter().enumerate() {
+            let event: HarnessOperatorAgentEventV1 = serde_json::from_slice(line).unwrap();
+            assert!(matches!(
+                event,
+                HarnessOperatorAgentEventV1::Ping { sequence } if sequence == index as u64,
+            ));
+        }
+        assert!(server.await.unwrap().is_ok());
     }
 
     #[test]

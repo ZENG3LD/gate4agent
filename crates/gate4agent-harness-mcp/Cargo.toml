@@ -12,6 +12,10 @@ name = "gate4agent_harness_mcp"
 name = "gate4agent-harness-mcp"
 path = "src/main.rs"
 
+[[bin]]
+name = "acp_fixture_agent"
+path = "src/bin/acp_fixture_agent.rs"
+
 [dependencies]
 gate4agent-harness-client = { path = "../gate4agent-harness-client" }
 gate4agent-node-protocol = { path = "../gate4agent-node-protocol" }
@@ -31,3 +35,4 @@ gate4agent-observation-service = { path = "../gate4agent-observation-service" }
 gate4agent-testkit = { path = "../gate4agent-testkit" }
 gate4agent-types = { path = "../gate4agent-types" }
 tokio = { version = "1", features = ["full"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -2382,13 +2382,20 @@ try { $contextHash = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadA
         Self::new_fixture_with_spec(config, spec)
     }
 
+    /// Shared H3B validation and spec construction for
+    /// `new_harness_mcp_proxy_fixture` and
+    /// `new_harness_mcp_acp_launcher_fixture`: an absolute, exact-regular-
+    /// file provider launcher plus at most 32 Unicode, NUL-free fixed
+    /// arguments (65,536 bytes total), replacing `spec.launch` on a clone of
+    /// the named builtin catalog entry -- detection command and expected
+    /// process matcher rebased on the launcher's own basename, exactly the
+    /// same shape `new_harness_mcp_proxy_fixture` always built.
     #[cfg(feature = "fixture")]
-    pub fn new_harness_mcp_proxy_fixture(
-        config: NodeServerConfig,
+    fn h3b_provider_spec_with_program_and_args(
+        agent_id: AgentId,
         provider_program: PathBuf,
         fixed_args: Vec<OsString>,
-        harness_mcp_program: PathBuf,
-    ) -> Result<Self, NodeServerError> {
+    ) -> Result<AgentSpec, NodeServerError> {
         if !provider_program.is_absolute() || fixed_args.len() > 32 {
             return Err(NodeServerError::Registry(
                 "H3B fixture requires an absolute provider and at most 32 arguments".to_owned(),
@@ -2420,13 +2427,9 @@ try { $contextHash = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadA
                 "H3B fixture provider or arguments are invalid".to_owned(),
             ));
         }
-        let mut config = config.with_harness_mcp_helper(harness_mcp_program)?;
-        let agent_id = AgentId::new("codex")
-            .map_err(|error| NodeServerError::Registry(error.to_string()))?;
         let mut spec = builtin_registry().get(&agent_id).ok_or_else(|| {
             NodeServerError::Registry("H3B fixture provider is unavailable".to_owned())
         })?.clone();
-        spec.display_name = "Controlled H3B MCP proxy fixture".to_owned();
         let process_name = Path::new(&program).file_name().and_then(|name| name.to_str())
             .ok_or_else(|| NodeServerError::Registry(
                 "H3B fixture provider basename is unavailable".to_owned(),
@@ -2437,7 +2440,80 @@ try { $contextHash = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadA
         }];
         spec.launch.program = program;
         spec.launch.fixed_args = fixed_args;
+        Ok(spec)
+    }
+
+    #[cfg(feature = "fixture")]
+    pub fn new_harness_mcp_proxy_fixture(
+        config: NodeServerConfig,
+        provider_program: PathBuf,
+        fixed_args: Vec<OsString>,
+        harness_mcp_program: PathBuf,
+    ) -> Result<Self, NodeServerError> {
+        let mut config = config.with_harness_mcp_helper(harness_mcp_program)?;
+        let agent_id = AgentId::new("codex")
+            .map_err(|error| NodeServerError::Registry(error.to_string()))?;
+        let mut spec =
+            Self::h3b_provider_spec_with_program_and_args(agent_id, provider_program, fixed_args)?;
+        spec.display_name = "Controlled H3B MCP proxy fixture".to_owned();
         config.fixture_raw_pty_runtime = true;
+        Self::new_fixture_with_spec(config, spec)
+    }
+
+    /// The ACP-mode sibling of `new_harness_mcp_proxy_fixture`: the same
+    /// `--harness-mcp-helper` wiring and the same absolute-program-plus-
+    /// fixed-args launcher replacement as `new_exact_launcher_fixture`, but
+    /// admitting `ProviderRuntimeRequirement::Acp` the honest way instead of
+    /// hardcoding it. `new_harness_mcp_proxy_fixture` forces `config.
+    /// fixture_raw_pty_runtime = true`, which tears out the live
+    /// `ProviderRuntimeMonitor` entirely (`NodeServer::new_with_registry`)
+    /// and makes `NodeShared::admit_provider_runtime`'s no-monitor branch
+    /// hardcode `acp_transport = false` for every provider, refusing
+    /// `ProviderRuntimeRequirement::Acp` unconditionally regardless of what
+    /// the catalog declares. This constructor leaves `fixture_raw_pty_
+    /// runtime` at its default `false`, so a real `ProviderRuntimeMonitor`
+    /// is built from the (cloned, launcher-replaced) catalog spec, and
+    /// `ProviderRuntimeMonitor::supports_acp_transport` reads the honest,
+    /// unmodified catalog fact: every builtin provider this accepts
+    /// (`claude`, `codex`, `grok`, `kimi`) already declares `capabilities.
+    /// transports.acp` in `gate4agent-catalog::builtin`, so no capability is
+    /// invented here -- this constructor only removes the fixture-only
+    /// bypass standing in its way. `provider_runtime::policy_for_transport`'s
+    /// `TransportKind::Acp` arm (applied unconditionally at spawn-prep time
+    /// for every ACP session, fixture or not) is what actually grants the
+    /// ACP-shaped `ProviderRuntimePolicy` downstream of that admission --
+    /// this constructor never calls it directly, and does not need to.
+    #[cfg(feature = "fixture")]
+    pub fn new_harness_mcp_acp_launcher_fixture(
+        config: NodeServerConfig,
+        helper_program: PathBuf,
+        provider: AgentId,
+        program: PathBuf,
+        args: Vec<OsString>,
+    ) -> Result<Self, NodeServerError> {
+        if !matches!(provider.as_str(), "claude" | "codex" | "grok" | "kimi") {
+            return Err(NodeServerError::Registry(
+                "ACP harness-MCP launcher fixture requires a supported provider".to_owned(),
+            ));
+        }
+        let config = config.with_harness_mcp_helper(helper_program)?;
+        let mut spec = Self::h3b_provider_spec_with_program_and_args(provider, program, args)?;
+        let launch = spec.launch.clone();
+        let acp = spec.capabilities.transports.acp.as_mut().ok_or_else(|| {
+            NodeServerError::Registry(
+                "ACP harness-MCP launcher fixture provider does not declare an ACP transport"
+                    .to_owned(),
+            )
+        })?;
+        // Routes the ACP spawn itself through the exact replaced launcher
+        // (`AcpSession::spawn_with_launch` -> a bare `Command::new(&launch.
+        // program)`, `gate4agent`'s `src/acp/spawn.rs`) instead of the
+        // catalog's own vendor-npm resolution (`acp_command`, same file) --
+        // without this the ACP transport ignores `spec.launch` entirely and
+        // tries to spawn the real vendor CLI (e.g. `npx -y @agentclientprotocol/
+        // codex-acp@1.10.0`), which this fixture must never reach.
+        acp.launch_override = Some(launch);
+        spec.display_name = "Controlled ACP harness-MCP launcher fixture".to_owned();
         Self::new_fixture_with_spec(config, spec)
     }
 

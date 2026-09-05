@@ -350,6 +350,15 @@ struct OwnedProviderSession<S> {
     session: S,
     events: broadcast::Receiver<AgentEvent>,
     pending_events: VecDeque<AgentEvent>,
+    /// Already wire-typed `ProviderEvent`s seeded at the spawn site with no
+    /// `AgentEvent` counterpart to carry them through `pending_events` --
+    /// today, only `ProviderEvent::SessionIdentityObserved` for a freshly
+    /// spawned ACP session (see the `TransportKind::Acp` arm of
+    /// `spawn_native`). Drained by `drain_provider_stream` immediately after
+    /// `pending_events` empties and before the live broadcast stream, so an
+    /// event seeded here lands right after whatever `pending_events` seeded
+    /// (`AgentEvent::SessionStart`, chiefly) rather than racing it.
+    pending_provider_events: VecDeque<ProviderEvent>,
     next_provider_sequence: u64,
     observed_exit_code: Option<i32>,
     runtime_policy: ProviderRuntimePolicy,
@@ -1093,6 +1102,7 @@ impl NativeEffectShell {
                                     session,
                                     events,
                                     pending_events: VecDeque::new(),
+                                    pending_provider_events: VecDeque::new(),
                                     next_provider_sequence: 1,
                                     observed_exit_code: None,
                                     runtime_policy,
@@ -1171,6 +1181,7 @@ impl NativeEffectShell {
                                 session,
                                 events,
                                 pending_events,
+                                pending_provider_events: VecDeque::new(),
                                 next_provider_sequence: 1,
                                 observed_exit_code: None,
                                 runtime_policy,
@@ -1300,6 +1311,57 @@ impl NativeEffectShell {
                             .acp_session_id()
                             .await
                             .unwrap_or_else(|| session.session_id().to_owned());
+                        // Binds a freshly created record from `IdentityPending`
+                        // to `Live` (`gate4agent-node`'s `reconcile_managed_
+                        // record` on `ProviderEvent::SessionIdentityObserved`)
+                        // as soon as the session exists, mirroring the PTY
+                        // path's own identity seeding
+                        // (`prepare_fresh_pty_provider_session`/
+                        // `probe_fresh_*_session_identity`) for the transport
+                        // ACP's own spec makes this a protocol MUST for:
+                        // `session/new` MUST return a `sessionId`, and both
+                        // shipped adapters map it onto the provider's own
+                        // durable session id (`AcpSession::
+                        // provider_reported_session_id`'s own doc comment).
+                        //
+                        // Gated on `runtime_policy.provider_session_identity`
+                        // -- the same capability the PTY path checks before
+                        // treating any identity as authoritative -- so a
+                        // spawn that never asked for identity tracking stays
+                        // silent rather than warning on every ACP session
+                        // whose caller has no interest in one.
+                        //
+                        // `provider_reported_session_id` (NOT `session_id`
+                        // above) is the signal here: `session_id` already
+                        // falls back to the host-local id the moment the
+                        // agent's `session/new` response carries no
+                        // `sessionId`, so it can never itself distinguish "the
+                        // agent reported one" from "the agent violated ACP's
+                        // MUST and this build filled in its own" -- exactly
+                        // the distinction the `IdentityPending` refusal
+                        // downstream depends on.
+                        let identity_observed = if runtime_policy.provider_session_identity {
+                            match session.provider_reported_session_id().await {
+                                Some(id) => Some(ProviderEvent::SessionIdentityObserved {
+                                    identity: ProviderSessionIdentity {
+                                        key: ProviderSessionKey::SessionId,
+                                        id,
+                                        transcript_path: None,
+                                    },
+                                }),
+                                None => {
+                                    tracing::warn!(
+                                        agent_id = %agent_id,
+                                        adapter = %acp_spec.adapter.id,
+                                        "ACP session/new returned no sessionId; provider \
+                                         session identity stays IdentityPending",
+                                    );
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
                         if let Some(prompt) = request.initial_prompt {
                             if let Err(error) = session.start_prompt(&prompt).await {
                                 let _ = session.kill().await;
@@ -1349,6 +1411,7 @@ impl NativeEffectShell {
                                     }
                                     seeded
                                 },
+                                pending_provider_events: VecDeque::from_iter(identity_observed),
                                 next_provider_sequence: 1,
                                 observed_exit_code: None,
                                 runtime_policy,
@@ -2587,6 +2650,7 @@ fn collect_provider_map<S>(
             &owned.source,
             &mut owned.events,
             &mut owned.pending_events,
+            &mut owned.pending_provider_events,
             &mut owned.next_provider_sequence,
             Some(&mut owned.observed_exit_code),
             observations,
@@ -2595,43 +2659,95 @@ fn collect_provider_map<S>(
     }
 }
 
+/// Pushes one already-sequenced `ProviderEvent` onto `observations`, sharing
+/// the same per-session `next_provider_sequence` counter regardless of which
+/// of `drain_provider_stream`'s three sources (`pending_events` mapped
+/// through `provider_event`, raw `pending_provider_events`, or the live
+/// broadcast stream) produced it -- so sequence numbers stay contiguous
+/// across all three.
+fn push_sequenced_provider_event(
+    key: NativeSessionKey,
+    source: &ProviderSource,
+    next_provider_sequence: &mut u64,
+    observations: &mut Vec<ObservationEnvelope>,
+    event: ProviderEvent,
+) {
+    let sequence = *next_provider_sequence;
+    *next_provider_sequence = next_provider_sequence.saturating_add(1);
+    observations.push(ObservationEnvelope {
+        operation_id: None,
+        instance_id: key.instance_id,
+        generation: key.generation,
+        observation: ControlObservation::ProviderEvent {
+            source: source.clone(),
+            sequence,
+            event,
+        },
+    });
+}
+
 fn drain_provider_stream(
     key: NativeSessionKey,
     source: &ProviderSource,
     events: &mut broadcast::Receiver<AgentEvent>,
     pending_events: &mut VecDeque<AgentEvent>,
+    pending_provider_events: &mut VecDeque<ProviderEvent>,
     next_provider_sequence: &mut u64,
     mut observed_exit_code: Option<&mut Option<i32>>,
     observations: &mut Vec<ObservationEnvelope>,
     available_modes: &[SessionMode],
 ) {
     loop {
-        let next = match pending_events.pop_front() {
-            Some(event) => Ok(event),
-            None => events.try_recv(),
-        };
-        match next {
+        // `pending_events` (seeded `AgentEvent`s, e.g. `SessionStart`) drains
+        // first and fully, in order; only once it is empty does
+        // `pending_provider_events` (seeded raw `ProviderEvent`s, e.g.
+        // `SessionIdentityObserved`, with no `AgentEvent` counterpart to
+        // carry them) get a turn, and only once THAT is empty does this fall
+        // through to the live broadcast stream -- so anything seeded at the
+        // spawn site always reaches `observations` ahead of anything the
+        // provider itself emits afterwards, and in the exact relative order
+        // the spawn site seeded it in.
+        if let Some(event) = pending_events.pop_front() {
+            match event {
+                AgentEvent::Exited { code } => {
+                    if let Some(exit_code) = observed_exit_code.as_deref_mut() {
+                        *exit_code = Some(code);
+                    }
+                }
+                event => {
+                    if let Some(event) = provider_event(event, available_modes) {
+                        push_sequenced_provider_event(
+                            key,
+                            source,
+                            next_provider_sequence,
+                            observations,
+                            event,
+                        );
+                    }
+                }
+            }
+            continue;
+        }
+        if let Some(event) = pending_provider_events.pop_front() {
+            push_sequenced_provider_event(key, source, next_provider_sequence, observations, event);
+            continue;
+        }
+        match events.try_recv() {
             Ok(AgentEvent::Exited { code }) => {
                 if let Some(exit_code) = observed_exit_code.as_deref_mut() {
                     *exit_code = Some(code);
                 }
             }
             Ok(event) => {
-                let Some(event) = provider_event(event, available_modes) else {
-                    continue;
-                };
-                let sequence = *next_provider_sequence;
-                *next_provider_sequence = next_provider_sequence.saturating_add(1);
-                observations.push(ObservationEnvelope {
-                    operation_id: None,
-                    instance_id: key.instance_id,
-                    generation: key.generation,
-                    observation: ControlObservation::ProviderEvent {
-                        source: source.clone(),
-                        sequence,
+                if let Some(event) = provider_event(event, available_modes) {
+                    push_sequenced_provider_event(
+                        key,
+                        source,
+                        next_provider_sequence,
+                        observations,
                         event,
-                    },
-                });
+                    );
+                }
             }
             Err(broadcast::error::TryRecvError::Lagged(missed)) => {
                 if let Some(source_sequence) =
@@ -6838,6 +6954,7 @@ mod tests {
                 session,
                 events,
                 pending_events: VecDeque::new(),
+                pending_provider_events: VecDeque::new(),
                 next_provider_sequence: 1,
                 observed_exit_code: None,
                 runtime_policy: gate4agent_types::ProviderRuntimePolicy::none(),
@@ -6988,6 +7105,7 @@ while True:
                 session,
                 events,
                 pending_events: VecDeque::new(),
+                pending_provider_events: VecDeque::new(),
                 next_provider_sequence: 1,
                 observed_exit_code: None,
                 runtime_policy: gate4agent_types::ProviderRuntimePolicy::none(),
@@ -7009,5 +7127,224 @@ while True:
             }
             other => panic!("expected StopCompleted, got {other:?}"),
         }
+    }
+
+    // -------------------------------------------------------------------
+    // spawn_native -- ACP branch: `ProviderEvent::SessionIdentityObserved`.
+    //
+    // Regression coverage for the defect this carries fixed: nothing on the
+    // ACP path ever emitted `SessionIdentityObserved`, so a managed session
+    // record for an ACP-spawned agent could never leave
+    // `ManagedSessionState::IdentityPending` (`gate4agent-node`'s
+    // `reconcile_managed_record` binds the identity ONLY on that event).
+    // Built through the full `execute()`/`EffectEnvelope` path (unlike
+    // `spawn_fixture_acp_shell` above, which inserts an already-spawned
+    // session directly into `acp_sessions`) so these tests exercise the
+    // ACTUAL `TransportKind::Acp` arm of `spawn_native`, not a stand-in for
+    // it -- the same synthetic stdio handshake fixture, extended with a
+    // second script that omits `sessionId` to name the ACP-MUST violation
+    // this whole feature exists to survive.
+    // -------------------------------------------------------------------
+
+    #[cfg(windows)]
+    fn acp_fixture_launch_no_session_id() -> gate4agent_types::LaunchSpec {
+        gate4agent_types::LaunchSpec {
+            program: "powershell.exe".to_owned(),
+            fixed_args: vec![
+                "-NoLogo".to_owned(),
+                "-NoProfile".to_owned(),
+                "-NonInteractive".to_owned(),
+                "-ExecutionPolicy".to_owned(),
+                "Bypass".to_owned(),
+                "-Command".to_owned(),
+                ACP_HANDSHAKE_SCRIPT_NO_SESSION_ID.to_owned(),
+            ],
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn acp_fixture_launch_no_session_id() -> gate4agent_types::LaunchSpec {
+        gate4agent_types::LaunchSpec {
+            program: "python3".to_owned(),
+            fixed_args: vec![
+                "-u".to_owned(),
+                "-c".to_owned(),
+                ACP_HANDSHAKE_SCRIPT_NO_SESSION_ID.to_owned(),
+            ],
+        }
+    }
+
+    #[cfg(windows)]
+    const ACP_HANDSHAKE_SCRIPT_NO_SESSION_ID: &str = r#"[Console]::OutputEncoding=[Text.Encoding]::UTF8
+function Write-JsonLine($value) { [Console]::WriteLine(($value | ConvertTo-Json -Compress -Depth 12)) }
+$initialize = [Console]::ReadLine() | ConvertFrom-Json
+Write-JsonLine @{jsonrpc='2.0';id=$initialize.id;result=@{}}
+$newSession = [Console]::ReadLine() | ConvertFrom-Json
+Write-JsonLine @{jsonrpc='2.0';id=$newSession.id;result=@{}}
+while ($true) {
+    $line = [Console]::ReadLine()
+    if ($null -eq $line) { exit 0 }
+}"#;
+    #[cfg(not(windows))]
+    const ACP_HANDSHAKE_SCRIPT_NO_SESSION_ID: &str = r#"import json,sys
+def read_message():
+ line=sys.stdin.readline()
+ if not line: return None
+ return json.loads(line)
+def write_message(message):
+ print(json.dumps(message),flush=True)
+
+initialize=read_message()
+write_message({'jsonrpc':'2.0','id':initialize.get('id'),'result':{}})
+new_session=read_message()
+write_message({'jsonrpc':'2.0','id':new_session.get('id'),'result':{}})
+while True:
+ msg=read_message()
+ if msg is None:
+  sys.exit(0)"#;
+
+    fn fixture_acp_spawn_agent_id() -> AgentId {
+        AgentId::new("claude").expect("builtin catalog names 'claude'")
+    }
+
+    /// Clones the REAL built-in `claude` spec (so `capabilities.transports.acp`
+    /// carries the same `AdapterBinding` the default `legacy_adapters`
+    /// registry (`NativeEffectShell::new`) already resolves) and overrides
+    /// only `launch_override`, so `spawn_native` execs the synthetic stdio
+    /// fixture above instead of a real `claude` binary.
+    fn fixture_acp_spawn_agent_spec(launch: gate4agent_types::LaunchSpec) -> FixtureAgentSpec {
+        let mut spec = gate4agent_catalog::builtin_registry()
+            .get(&fixture_acp_spawn_agent_id())
+            .cloned()
+            .expect("builtin catalog must declare claude");
+        spec.capabilities
+            .transports
+            .acp
+            .as_mut()
+            .expect("claude must declare ACP capability")
+            .launch_override = Some(launch);
+        spec
+    }
+
+    fn fixture_acp_spawn_key() -> NativeSessionKey {
+        NativeSessionKey {
+            instance_id: gate4agent_types::AgentInstanceId(9_101),
+            generation: gate4agent_types::SessionGeneration(1),
+        }
+    }
+
+    /// Spawns through the full `execute()`/`EffectEnvelope` path with
+    /// `ApprovalLevel::Unmanaged` -- the one level `required_acp_mode`
+    /// resolves to `Ok(None)` for every agent, so the spawn never calls
+    /// `session/set_mode` against a fixture that only answers `initialize`/
+    /// `session/new`.
+    async fn spawn_native_acp_fixture(
+        launch: gate4agent_types::LaunchSpec,
+        provider_session_identity: bool,
+    ) -> (NativeEffectShell, NativeSessionKey, ControlObservation) {
+        let mut policy = ProviderRuntimePolicy::none();
+        policy.provider_session_identity = provider_session_identity;
+        let key = fixture_acp_spawn_key();
+        let mut shell = NativeEffectShell::new(
+            FixtureAgentRegistry::new([fixture_acp_spawn_agent_spec(launch)])
+                .expect("single-agent fixture catalog"),
+        );
+        let envelope = gate4agent_types::EffectEnvelope {
+            operation_id: gate4agent_types::OperationId(1),
+            instance_id: key.instance_id,
+            generation: key.generation,
+            effect: gate4agent_types::ControlEffect::Spawn {
+                agent_id: fixture_acp_spawn_agent_id(),
+                transport: TransportKind::Acp,
+                runtime_policy: policy,
+                request: gate4agent_types::StartRequest {
+                    working_directory: std::env::current_dir()
+                        .expect("cwd")
+                        .to_string_lossy()
+                        .into_owned(),
+                    terminal_size: gate4agent_types::TerminalSize {
+                        rows: 24,
+                        columns: 80,
+                    },
+                    initial_prompt: None,
+                    session_options: None,
+                    approval_level: ApprovalLevel::Unmanaged,
+                },
+            },
+        };
+        let observation = shell.execute(envelope).await.observation;
+        (shell, key, observation)
+    }
+
+    #[tokio::test]
+    async fn acp_spawn_with_a_real_sessionid_emits_session_identity_observed_after_session_start() {
+        let (mut shell, key, spawned) =
+            spawn_native_acp_fixture(acp_fixture_launch(), true).await;
+        match spawned {
+            ControlObservation::Spawned { .. } => {}
+            other => panic!("expected Spawned, got {other:?}"),
+        }
+
+        let mut provider_events = shell
+            .collect_provider_events()
+            .into_iter()
+            .filter_map(|envelope| match envelope.observation {
+                ControlObservation::ProviderEvent { event, .. } => Some(event),
+                _ => None,
+            });
+
+        match provider_events.next() {
+            Some(ProviderEvent::SessionStarted { .. }) => {}
+            other => panic!("expected SessionStarted first, got {other:?}"),
+        }
+        match provider_events.next() {
+            Some(ProviderEvent::SessionIdentityObserved { identity }) => {
+                assert_eq!(identity.key, gate4agent_types::ProviderSessionKey::SessionId);
+                assert_eq!(identity.id, "fixture-acp-session");
+                assert!(identity.transcript_path.is_none());
+            }
+            other => panic!("expected SessionIdentityObserved second, got {other:?}"),
+        }
+        assert!(
+            provider_events.next().is_none(),
+            "expected exactly one SessionIdentityObserved and nothing after it"
+        );
+
+        let _ = shell.stop_native(key, true).await;
+    }
+
+    #[tokio::test]
+    async fn acp_spawn_with_no_sessionid_emits_no_session_identity_observed() {
+        let (mut shell, key, spawned) =
+            spawn_native_acp_fixture(acp_fixture_launch_no_session_id(), true).await;
+        match spawned {
+            ControlObservation::Spawned { .. } => {}
+            other => panic!("expected Spawned, got {other:?}"),
+        }
+
+        let provider_events: Vec<_> = shell
+            .collect_provider_events()
+            .into_iter()
+            .filter_map(|envelope| match envelope.observation {
+                ControlObservation::ProviderEvent { event, .. } => Some(event),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            provider_events
+                .iter()
+                .any(|event| matches!(event, ProviderEvent::SessionStarted { .. })),
+            "expected SessionStarted even when the agent reported no sessionId, got {provider_events:?}"
+        );
+        assert!(
+            !provider_events
+                .iter()
+                .any(|event| matches!(event, ProviderEvent::SessionIdentityObserved { .. })),
+            "an agent that violates ACP's sessionId MUST must not be granted an identity: \
+             got {provider_events:?}"
+        );
+
+        let _ = shell.stop_native(key, true).await;
     }
 }

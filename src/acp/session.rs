@@ -401,6 +401,18 @@ pub struct AcpSession {
     local_session_id: String,
     /// ACP sessionId returned by `session/new` (required for subsequent requests).
     acp_session_id: Arc<tokio::sync::Mutex<Option<String>>>,
+    /// The `sessionId` LITERALLY carried by `session/new`'s wire response --
+    /// `None` when the agent's response carried none at all (an absent or
+    /// empty `sessionId`, the shape `SessionLoadResult::session_id`'s
+    /// `#[serde(default)]` collapses an omitted field to). Distinct from
+    /// `acp_session_id` above, which is the EFFECTIVE id this session uses
+    /// for every subsequent ACP call and falls back to `local_session_id`
+    /// precisely in the case this field is `None` -- that fallback is what
+    /// makes `acp_session_id` alone unable to answer "did the agent actually
+    /// report one", which is exactly what
+    /// [`provider_reported_session_id`](Self::provider_reported_session_id)
+    /// exists to answer instead.
+    provider_reported_session_id: Arc<tokio::sync::Mutex<Option<String>>>,
     tool: CliTool,
     tx: broadcast::Sender<AgentEvent>,
     /// Shared write handle to the process stdin (also used by reader loop for responses).
@@ -542,10 +554,12 @@ impl AcpSession {
         });
 
         let acp_session_id = Arc::new(tokio::sync::Mutex::new(None::<String>));
+        let provider_reported_session_id = Arc::new(tokio::sync::Mutex::new(None::<String>));
 
         let mut session = Self {
             local_session_id: local_session_id.clone(),
             acp_session_id: Arc::clone(&acp_session_id),
+            provider_reported_session_id: Arc::clone(&provider_reported_session_id),
             tool,
             tx: tx.clone(),
             process,
@@ -595,6 +609,11 @@ impl AcpSession {
         {
             let mut guard = acp_session_id.lock().await;
             *guard = Some(acp_sid.clone());
+        }
+
+        {
+            let mut guard = provider_reported_session_id.lock().await;
+            *guard = (!new_result.session_id.is_empty()).then(|| new_result.session_id.clone());
         }
 
         {
@@ -731,6 +750,29 @@ impl AcpSession {
     /// with the current API).
     pub async fn acp_session_id(&self) -> Option<String> {
         self.acp_session_id.lock().await.clone()
+    }
+
+    /// The `sessionId` LITERALLY reported by `session/new`'s wire response,
+    /// or `None` when the agent's response carried none at all.
+    ///
+    /// ACP's `session/new` MUST return a `sessionId` per the protocol
+    /// specification, and both shipped adapters map that id onto the
+    /// provider's own durable session identity (claude-agent-acp's is the
+    /// Claude Code session id and on-disk transcript filename; codex-acp's is
+    /// the Codex thread id) -- `None` here names an agent that violated that
+    /// MUST, distinctly from [`acp_session_id`](Self::acp_session_id), which
+    /// is the id this session actually uses for every subsequent ACP call
+    /// and is never `None` once the handshake completes: it silently falls
+    /// back to the host-local session id in exactly the case this method
+    /// reports `None` for. A caller that needs to know whether a REAL
+    /// provider-issued identity exists (e.g. to decide whether to publish a
+    /// `ProviderEvent::SessionIdentityObserved`) must read this method, not
+    /// `acp_session_id`, which cannot make that distinction on its own.
+    ///
+    /// Returns `None` if called before the handshake has completed, the same
+    /// constraint documented on `acp_session_id`.
+    pub async fn provider_reported_session_id(&self) -> Option<String> {
+        self.provider_reported_session_id.lock().await.clone()
     }
 
     /// Kill the subprocess immediately -- no grace period, no chance for the

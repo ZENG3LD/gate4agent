@@ -196,10 +196,22 @@ impl ProviderRuntimePolicy {
     /// lifecycle. `semantic_readiness`, `structured_prompt`, and
     /// `provider_session_identity` do NOT, on their own -- an ACP transport
     /// has no PTY at all, yet `session/prompt` and `session/update` are
-    /// MANDATORY surface of the ACP protocol itself, and `session/new`
-    /// returns a `sessionId` under that same specification, none of it an
+    /// MANDATORY surface of the ACP protocol itself, and `session/new` MUST
+    /// return a `sessionId` under that same specification, none of it an
     /// inference this build makes by parsing PTY terminal text the way it
-    /// does for a verified PTY vendor contract. Granting `semantic_readiness`/
+    /// does for a verified PTY vendor contract. `provider_session_identity`
+    /// in particular is not a bare protocol formality here: both shipped ACP
+    /// adapters map that mandatory `sessionId` to the provider's own durable
+    /// session id (claude-agent-acp's is the Claude Code session id and
+    /// on-disk transcript filename; codex-acp's is the Codex thread id), and
+    /// the ACP spawn path publishes it as a `SessionId`-keyed
+    /// `ProviderEvent::SessionIdentityObserved`, which is what carries a
+    /// newly-created record from `IdentityPending` to `Live`. An agent whose
+    /// adapter never emits that event -- because it returns no `sessionId`,
+    /// violating the ACP contract this grant relies on -- correctly stays
+    /// `IdentityPending` rather than being treated as identity-less; that is
+    /// the refusal-by-name this policy is meant to produce for such an
+    /// agent, not a defect in the grant. Granting `semantic_readiness`/
     /// `structured_prompt`/`provider_session_identity` with
     /// `raw_pty_lifecycle: false` is therefore a legitimate policy shape (see
     /// `gate4agent_node::provider_runtime::policy_for_transport`'s

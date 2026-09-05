@@ -321,15 +321,24 @@ pub(crate) fn policy_for_transport(
         // text. Granting them outright is therefore correct, not a
         // downgrade of the PTY-terminal-verification story: that story does
         // not apply to this transport at all. `provider_session_identity` is
-        // granted for the same reason: ACP's `session/new` returns a
-        // `sessionId` by specification, and `AcpSession::acp_session_id`
-        // merely reads it back -- it is a fact of the protocol, not
-        // something inferred from a terminal, exactly like
-        // `semantic_readiness`/`structured_prompt` above. `semantic_resume`/
-        // `hook_semantics` stay unset -- the ACP spec gives no equivalent
-        // guarantee for resuming a prior session, and the engine separately
-        // refuses ACP resume outright, so granting it here would assert a
-        // capability nothing downstream can act on. Both
+        // granted for the same reason, not merely by analogy: ACP's
+        // `session/new` MUST return a `sessionId` by specification, and both
+        // shipped ACP adapters map that id to the provider's OWN durable
+        // session id -- claude-agent-acp's is the Claude Code session id and
+        // on-disk transcript filename, codex-acp's is the Codex thread id --
+        // so it is exactly the kind of identity `ProviderSessionKey::SessionId`
+        // exists to carry. The ACP spawn path publishes that id as a
+        // `SessionId`-keyed `ProviderEvent::SessionIdentityObserved`, which is
+        // what moves a newly-created record from `ManagedSessionState::
+        // IdentityPending` to `Live` (`reconcile_managed_record` in
+        // `server.rs`) -- an agent whose adapter returns no `sessionId` at
+        // all violates the ACP contract this policy relies on, and correctly
+        // stays `IdentityPending` (refused by name at context-pack export)
+        // rather than being silently treated as identity-less. `semantic_
+        // resume`/`hook_semantics` stay unset -- the ACP spec gives no
+        // equivalent guarantee for resuming a prior session, and the engine
+        // separately refuses ACP resume outright, so granting it here would
+        // assert a capability nothing downstream can act on. Both
         // `gate4agent-shell-native` and `gate4agent-runtime-native` already
         // bypass their own PTY-semantic policy check unconditionally for
         // `TransportKind::Acp`, so this shape needs no matching change there.

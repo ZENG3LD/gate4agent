@@ -24188,6 +24188,7 @@ mod tests {
             active_tools: 0,
             active_subagents: 0,
             active_interactions: 0,
+            active_blocks: 0,
             active_processes: 0,
             input_tokens: 0,
             output_tokens: 0,

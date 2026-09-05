@@ -16030,6 +16030,7 @@ mod tests {
             active_tools: 2,
             active_subagents: 1,
             active_interactions: 1,
+            active_blocks: 0,
             active_processes: 1,
             input_tokens: 21,
             output_tokens: 8,
@@ -16073,6 +16074,7 @@ mod tests {
                     correlation: Some(1),
                     evidence: HarnessObservationEvidenceV1::StructuredProvider,
                 }],
+                block_facts: Vec::new(),
                 interaction_facts: vec![InteractionFactV1 {
                     class: InteractionClassV1::Approval,
                     state: InteractionStateV1::Required,

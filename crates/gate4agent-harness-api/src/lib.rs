@@ -60,6 +60,15 @@ pub const HARNESS_MONITOR_FACTS_MAX: usize = 128;
 pub const HARNESS_OBSERVATION_LABEL_MAX_BYTES: usize = 64;
 pub const HARNESS_OBSERVATION_TODO_TEXT_MAX_BYTES: usize = 256;
 pub const HARNESS_OBSERVATION_PATH_MAX_BYTES: usize = 1_024;
+/// Max bytes for `BlockFactV1::label` (`<authority slug>: <reason>`,
+/// producer-truncated to fit) -- sized like
+/// `HARNESS_OBSERVATION_TODO_TEXT_MAX_BYTES` rather than
+/// `HARNESS_OBSERVATION_LABEL_MAX_BYTES`: a block's `reason` is verbatim
+/// provider/gate prose, bounded at 1024 bytes where it is minted (see
+/// `gate4agent_observation_protocol::OBSERVATION_ACTION_BLOCKED_REASON_MAX_BYTES`),
+/// not a short class slug like "bash"/"editor" the 64-byte activity-label
+/// bound was sized for.
+pub const HARNESS_OBSERVATION_BLOCK_LABEL_MAX_BYTES: usize = 256;
 pub const HARNESS_READ_CREDENTIAL_MAX_BYTES: usize = 8 * 1024;
 pub const HARNESS_MCP_AUDIENCE: &str = "gate4agent-harness-mcp-read-v1";
 /// The harness operator wire is a loopback protocol between processes built
@@ -6113,6 +6122,18 @@ pub struct SessionMonitorV1 {
     pub active_tools: u16,
     pub active_subagents: u16,
     pub active_interactions: u16,
+    /// Count of `ObservationKindV1::ActionBlocked` observations recorded
+    /// against this session so far (`SessionProjection::blocked_count`,
+    /// saturated to `u16`) -- NOT a "currently pending" count like its
+    /// `active_*` siblings: unlike a tool call or an interaction, a block
+    /// has no resolution step to wait on (see that observation kind's own
+    /// doc comment), so there is no pending/resolved split to count
+    /// separately. Mirrors the fleet-wide `HarnessRuntimeManagedSessionV1::
+    /// blocked_count` this same tally already backs, just for this one run.
+    /// `#[serde(default)]`: additive field on a read-wire response that is
+    /// never persisted, only built fresh per read.
+    #[serde(default)]
+    pub active_blocks: u16,
     pub active_processes: u16,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -6185,6 +6206,23 @@ pub struct SessionMonitorDetailV1 {
     pub tool_facts: Vec<ActivityFactV1>,
     pub subagent_facts: Vec<ActivityFactV1>,
     pub interaction_facts: Vec<InteractionFactV1>,
+    /// One fact per `ObservationKindV1::ActionBlocked` observation recorded
+    /// against this session. `gate4agent-harness-service::read::monitor_detail`
+    /// derives these from the session's own bounded `timeline`
+    /// (`gate4agent_observation_engine::SessionProjection::timeline`), not
+    /// from a dedicated correlation-tracked list: a block has no
+    /// request/response pairing for that engine's projection to track, only
+    /// a running `blocked_count` tally (see `SessionMonitorV1::active_blocks`).
+    /// Its own list rather than folded into `interaction_facts`:
+    /// `interaction_facts` is built strictly off `SessionProjection::
+    /// interactions`, which `ActionBlocked` never populates, so folding it
+    /// in would need widening that engine-side projection, out of this
+    /// field's own scope. `#[serde(default)]` reads a monitor response
+    /// captured before this field existed as empty rather than failing to
+    /// deserialize -- this type is never persisted, only built fresh per
+    /// read and sent over the operator/grant-bound wire.
+    #[serde(default)]
+    pub block_facts: Vec<BlockFactV1>,
     pub process_facts: Vec<ActivityFactV1>,
     pub file_facts: Vec<FileFactV1>,
 }
@@ -6195,12 +6233,14 @@ impl SessionMonitorDetailV1 {
         validate_monitor_facts(&self.tool_facts)?;
         validate_monitor_facts(&self.subagent_facts)?;
         validate_monitor_facts(&self.interaction_facts)?;
+        validate_monitor_facts(&self.block_facts)?;
         validate_monitor_facts(&self.process_facts)?;
         validate_monitor_facts(&self.file_facts)?;
         for fact in &self.todo_facts { fact.validate()?; }
         for fact in &self.tool_facts { fact.validate()?; }
         for fact in &self.subagent_facts { fact.validate()?; }
         for fact in &self.interaction_facts { fact.validate()?; }
+        for fact in &self.block_facts { fact.validate()?; }
         for fact in &self.process_facts { fact.validate()?; }
         for fact in &self.file_facts { fact.validate()?; }
         if self.tool_facts.iter().any(|fact| fact.class != ActivityClassV1::Tool)
@@ -6332,6 +6372,42 @@ impl FileFactV1 {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum FileActionV1 { Changed }
+
+/// One `ObservationKindV1::ActionBlocked` observation surfaced on the
+/// monitor wire -- see `SessionMonitorDetailV1::block_facts`'s own doc
+/// comment for why this is its own list rather than folded into
+/// `interaction_facts`/`process_facts`. `label` is `<authority slug>:
+/// <reason>`, truncated to `HARNESS_OBSERVATION_BLOCK_LABEL_MAX_BYTES` by
+/// the producer -- never the raw, up-to-1024-byte `reason` verbatim.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlockFactV1 {
+    pub state: BlockStateV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation: Option<u16>,
+    pub evidence: ObservationEvidenceV1,
+}
+
+impl BlockFactV1 {
+    fn validate(&self) -> Result<(), HarnessReadApiError> {
+        validate_optional_observation_text(
+            "block label",
+            self.label.as_deref(),
+            HARNESS_OBSERVATION_BLOCK_LABEL_MAX_BYTES,
+        )?;
+        validate_observation_correlation(self.correlation)
+    }
+}
+
+/// A single, always-terminal variant today (paralleling `FileActionV1::
+/// Changed`) -- kept as its own enum rather than a bare unit field so a
+/// future, more granular block state has somewhere to land without another
+/// wire shape change.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BlockStateV1 { Blocked }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -8539,6 +8615,7 @@ mod tests {
             active_tools: 0,
             active_subagents: 0,
             active_interactions: 0,
+            active_blocks: 0,
             active_processes: 0,
             input_tokens: 0,
             output_tokens: 0,
@@ -8557,6 +8634,7 @@ mod tests {
                 tool_facts: Vec::new(),
                 subagent_facts: Vec::new(),
                 interaction_facts: Vec::new(),
+                block_facts: Vec::new(),
                 process_facts: vec![ActivityFactV1 {
                     class: ActivityClassV1::OwnedProcess,
                     state: ActivityStateV1::UnknownAfterGap,

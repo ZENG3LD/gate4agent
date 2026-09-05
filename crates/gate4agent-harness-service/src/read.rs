@@ -14,8 +14,9 @@ use gate4agent_observation_api::{
 };
 use gate4agent_observation_engine::{CorrelationProjection, CorrelationState, SessionProjection};
 use gate4agent_observation_protocol::{
-    HostRequestDecisionV1, HostRequestOutcomeV1, ObservationEvidenceV1 as SourceEvidenceV1,
-    ObservationInteractionOutcomeV1, ObservationKindV1, ObservationTodoStateV1,
+    BlockAuthorityV1, HostRequestDecisionV1, HostRequestOutcomeV1,
+    ObservationEvidenceV1 as SourceEvidenceV1, ObservationInteractionOutcomeV1, ObservationKindV1,
+    ObservationTodoStateV1, truncate_observation_text,
 };
 use gate4agent_observation_service::ObservationService;
 
@@ -564,6 +565,9 @@ fn monitor(
         active_tools: projection.map_or(0, |projection| active_count(&projection.tools)),
         active_subagents: projection.map_or(0, |projection| active_count(&projection.subagents)),
         active_interactions: projection.map_or(0, |projection| active_count(&projection.interactions)),
+        active_blocks: projection.map_or(0, |projection| {
+            u16::try_from(projection.blocked_count).unwrap_or(u16::MAX)
+        }),
         active_processes: projection.map_or(0, |projection| active_count(&projection.owned_processes)),
         input_tokens: projection.map_or(0, |projection| projection.usage.observed_delta.input_tokens),
         output_tokens: projection.map_or(0, |projection| projection.usage.observed_delta.output_tokens),
@@ -1018,6 +1022,9 @@ fn monitor_detail(
         interaction_facts: projection.interactions.iter().enumerate()
             .map(|(index, value)| interaction_fact(value, index, structured))
             .take(HARNESS_MONITOR_FACTS_MAX).collect(),
+        block_facts: projection.timeline.iter()
+            .filter_map(|entry| block_fact(projection, entry, structured))
+            .take(HARNESS_MONITOR_FACTS_MAX).collect(),
         process_facts: projection.owned_processes.iter().enumerate()
             .map(|(index, value)| {
                 activity_fact(value, ActivityClassV1::OwnedProcess, index, structured)
@@ -1081,6 +1088,68 @@ fn interaction_fact(
         label: structured.then(|| value.class.clone()).flatten(),
         correlation: structured.then(|| u16::try_from(index + 1).ok()).flatten(),
         evidence: observation_evidence(value.evidence),
+    }
+}
+
+/// A `BlockFactV1` for one `ObservationKindV1::ActionBlocked` timeline
+/// entry, `None` for every other kind -- see `SessionMonitorDetailV1::
+/// block_facts`'s own doc comment for why this reads the session's bounded
+/// `timeline` (`SessionProjection::timeline`, the same list `timeline_entry`
+/// below renders the `g4a_timeline_read` page from) rather than a
+/// correlation-tracked list like `tools`/`interactions`. `correlation`
+/// resolves `ActionBlocked::correlation_id` against `projection.tools` --
+/// the SAME lookup, and the same meaning ("the tool call this block belongs
+/// to"), `timeline_entry`'s own `ActionBlocked` arm already uses.
+fn block_fact(
+    projection: &SessionProjection,
+    entry: &gate4agent_observation_engine::TimelineEntry,
+    structured: bool,
+) -> Option<BlockFactV1> {
+    let ObservationKindV1::ActionBlocked { correlation_id, authority, reason, .. } = &entry.kind
+    else {
+        return None;
+    };
+    Some(BlockFactV1 {
+        state: BlockStateV1::Blocked,
+        label: structured.then(|| block_fact_label(*authority, reason)),
+        correlation: structured.then(|| {
+            correlation_id.as_deref().and_then(|id| correlation_ordinal(&projection.tools, id))
+        }).flatten(),
+        evidence: observation_evidence(entry.evidence),
+    })
+}
+
+/// `<authority slug>: <reason>`, truncated on a UTF-8 boundary to
+/// `HARNESS_OBSERVATION_BLOCK_LABEL_MAX_BYTES` -- see that constant's own
+/// doc comment for why it is wider than the 64-byte activity-label bound.
+/// `reason` is already bounded verbatim at the observation layer
+/// (`OBSERVATION_ACTION_BLOCKED_REASON_MAX_BYTES`, 1024 bytes); this
+/// re-bounds the COMBINED string to the monitor wire's own, smaller label,
+/// using the same producer-side cut (`truncate_observation_text`) that
+/// mints `reason` itself.
+fn block_fact_label(authority: BlockAuthorityV1, reason: &str) -> String {
+    let combined = format!("{}: {reason}", block_authority_slug(authority));
+    truncate_observation_text(&combined, HARNESS_OBSERVATION_BLOCK_LABEL_MAX_BYTES).0
+}
+
+/// The wire's own kebab-case name for a `BlockAuthorityV1` variant --
+/// written out rather than round-tripped through `serde_json` so the label
+/// never depends on that crate's own encoding of what is, on this type, a
+/// plain string enum.
+fn block_authority_slug(authority: BlockAuthorityV1) -> &'static str {
+    match authority {
+        BlockAuthorityV1::HarnessGate => "harness-gate",
+        BlockAuthorityV1::HarnessPolicy => "harness-policy",
+        BlockAuthorityV1::HarnessDeadline => "harness-deadline",
+        BlockAuthorityV1::Operator => "operator",
+        BlockAuthorityV1::ProviderClassifier => "provider-classifier",
+        BlockAuthorityV1::ProviderPermissionRule => "provider-permission-rule",
+        BlockAuthorityV1::ProviderSandbox => "provider-sandbox",
+        BlockAuthorityV1::ProviderRefusal => "provider-refusal",
+        BlockAuthorityV1::ProviderHook => "provider-hook",
+        BlockAuthorityV1::UserRejected => "user-rejected",
+        BlockAuthorityV1::ProviderQuota => "provider-quota",
+        BlockAuthorityV1::Unknown => "unknown",
     }
 }
 
@@ -1448,8 +1517,8 @@ mod tests {
         ObservationIngressPayload, ObservationTransport, SessionRecordId,
     };
     use gate4agent_observation_protocol::{
-        ObservationCapabilitiesV1, ObservationSourceFamilyV1, ObservationTodoItemV1,
-        ObservationV1,
+        HostDecisionAuthorityV1, ObservationCapabilitiesV1, ObservationSourceFamilyV1,
+        ObservationTodoItemV1, ObservationV1,
     };
     use std::{fs, path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
 
@@ -2182,6 +2251,91 @@ mod tests {
 
         monitor.validate_for(&run_id).unwrap();
         timeline.validate_for(&run_id).unwrap();
+        close_observation(observation, &path);
+    }
+
+    /// Measured live 2026-09-05: a provider quota block (`ActionBlocked {
+    /// authority: ProviderQuota, reason_kind: Some("usageLimitExceeded"), .. }`)
+    /// reached the operator stream and the runtime inventory's `blocked_count`,
+    /// but `harnessctl monitor <run>` showed no trace of it at all. Proof this
+    /// gap is closed: two `ActionBlocked` observations with different
+    /// authorities become two `block_facts` with the right `<authority
+    /// slug>: <reason>` labels and bump `active_blocks` to 2, while a sibling
+    /// `HostRequestObserved { outcome: Failed }` -- "authorized but failed
+    /// running", never a refusal, see `HostRequestOutcomeV1`'s own doc
+    /// comment -- contributes no block fact at all.
+    #[test]
+    fn action_blocked_observations_surface_as_monitor_block_facts_not_host_request_failures() {
+        let path = observation_path("action-blocked-monitor");
+        let harness = HarnessService::from_engine_for_test(
+            crate::credential::tests::engine(
+                1,
+                SessionGrantStateV1::Active,
+                1,
+                HarnessRunLifecycleV1::Running,
+            ),
+        );
+        let mut observation = ObservationService::open(&path).unwrap();
+        apply_observation(
+            &mut observation,
+            "record-a",
+            1,
+            SourceEvidenceV1::ManagedHook,
+            ObservationKindV1::ActionBlocked {
+                correlation_id: None,
+                tool_class: "bash".to_owned(),
+                authority: BlockAuthorityV1::HarnessGate,
+                reason_kind: None,
+                reason: "rule=deny-write".to_owned(),
+                help: None,
+            },
+        );
+        apply_observation(
+            &mut observation,
+            "record-a",
+            2,
+            SourceEvidenceV1::StructuredProvider,
+            ObservationKindV1::ActionBlocked {
+                correlation_id: None,
+                tool_class: "session/prompt".to_owned(),
+                authority: BlockAuthorityV1::ProviderQuota,
+                reason_kind: Some("usageLimitExceeded".to_owned()),
+                reason: "usage limit exceeded".to_owned(),
+                help: None,
+            },
+        );
+        apply_observation(
+            &mut observation,
+            "record-a",
+            3,
+            SourceEvidenceV1::StructuredProvider,
+            ObservationKindV1::HostRequestObserved {
+                class: "Terminal".to_owned(),
+                decision: HostRequestDecisionV1::Granted { by: HostDecisionAuthorityV1::Policy },
+                outcome: HostRequestOutcomeV1::Failed {
+                    error: "terminal/create spawn failed: os error 3".to_owned(),
+                },
+            },
+        );
+
+        let run_id = HarnessRunId::new(format!("hrun_{}", "a".repeat(24))).unwrap();
+        let support = ObservationSupportRegistry::default();
+        let monitor = execute_operator_monitor(&harness, &observation, &support, &run_id)
+            .unwrap();
+        let detail = monitor.detail.as_ref().unwrap();
+        assert_eq!(detail.block_facts.len(), 2);
+        assert_eq!(detail.block_facts[0].state, BlockStateV1::Blocked);
+        assert_eq!(
+            detail.block_facts[0].label.as_deref(),
+            Some("harness-gate: rule=deny-write"),
+        );
+        assert_eq!(
+            detail.block_facts[1].label.as_deref(),
+            Some("provider-quota: usage limit exceeded"),
+        );
+        assert_eq!(monitor.active_blocks, 2);
+
+        monitor.validate_for(&run_id).unwrap();
         close_observation(observation, &path);
     }
 

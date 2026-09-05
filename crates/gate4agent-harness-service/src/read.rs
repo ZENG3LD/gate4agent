@@ -165,13 +165,13 @@ pub(crate) fn execute_exact_binding_read(
     // arm -- so the immutable borrow of `harness` those two hold ends before
     // the mutable one `HarnessService::send_mail`/`ack_mail` needs begins.
     match request {
-        HarnessReadRequestV1::MailSend { to, subject, body, reply_to } => {
+        HarnessReadRequestV1::MailSend { to, subject, body, reply_to, refs } => {
             let grant_id = grant.grant_id.clone();
             let actor_run_id = binding.actor_run_id.clone();
             let now_unix_ms = unix_time_ms();
             let from = resolve_caller_record_ref(binding, runtime_inventory);
             let result = harness.send_mail(
-                grant_id, actor_run_id, from, to, subject, body, reply_to, now_unix_ms,
+                grant_id, actor_run_id, from, to, subject, body, reply_to, refs, now_unix_ms,
             ).map_err(|_| HarnessReadHostErrorV1::Internal)?;
             Ok(HarnessReadResponseV1::MailSend(result))
         }
@@ -294,6 +294,9 @@ fn execute_exact_binding_read_only(
                 .ok_or(HarnessReadHostErrorV1::NotFoundOrDenied)?;
             Ok(HarnessReadResponseV1::Operation(redact_operation(operation, visibility)))
         }
+        HarnessReadRequestV1::MailFetch { message_id, ref_index } => {
+            mail_fetch(engine, observation, support, grant, binding, message_id, ref_index)
+        }
         // `MailSend`/`MailInbox`/`MailAck` never reach this function --
         // `execute_exact_binding_read` dispatches all three itself, before
         // ever delegating here. Never reached in practice; refused rather
@@ -302,6 +305,98 @@ fn execute_exact_binding_read_only(
         | HarnessReadRequestV1::MailInbox { .. }
         | HarnessReadRequestV1::MailAck { .. } => Err(HarnessReadHostErrorV1::InvalidRequest),
     }
+}
+
+/// D3/Slice C's `g4a_mail_fetch`: first verifies the message is in
+/// `binding.record_id`'s inbox (`HarnessEngine::mail_fetch`'s own membership
+/// predicate -- the same one `mail_inbox` uses), then resolves the ref.
+/// `Run`/`Result` refusals from the engine (not addressed to this reader, an
+/// out-of-range index, `ContextPack`/`WorkspacePath` not yet fetchable)
+/// travel back as `HarnessMailFetchResultV1::Refused` with the engine's own
+/// `Display` text -- a named domain refusal, never a host error, same
+/// pattern as `MailSend`. Deliberately does NOT call `authorized_monitor_run`
+/// -- that enforces the caller's own lineage (`visibility.run_visible`),
+/// which a mailed `Run` ref is explicitly allowed to cross; the ONLY gate
+/// here is `HarnessEngine::mail_fetch`'s own inbox-membership check.
+fn mail_fetch(
+    engine: &gate4agent_harness_engine::HarnessEngine,
+    observation: &ObservationService,
+    support: &ObservationSupportRegistry,
+    grant: &SessionGrantV1,
+    binding: &CredentialBindingV1,
+    message_id: HarnessMailMessageId,
+    ref_index: u16,
+) -> Result<HarnessReadResponseV1, HarnessReadHostErrorV1> {
+    let resolved = match engine.mail_fetch(
+        &grant.grant_id,
+        &binding.record_id,
+        &message_id,
+        usize::from(ref_index),
+    ) {
+        Ok(reference) => reference,
+        Err(error) => {
+            return Ok(HarnessReadResponseV1::MailFetch(HarnessMailFetchResultV1::Refused {
+                reason: error.to_string(),
+            }));
+        }
+    };
+    let result = match resolved {
+        gate4agent_harness_protocol::HarnessMailRefV1::Run { run_id } => {
+            if engine.run(&run_id).is_none() {
+                return Ok(HarnessReadResponseV1::MailFetch(HarnessMailFetchResultV1::Refused {
+                    reason: format!("mailed run {run_id} no longer exists"),
+                }));
+            }
+            let HarnessReadResponseV1::Monitor(monitor_value) = monitor(
+                engine,
+                observation,
+                support,
+                HarnessMonitoringVisibilityV1::Timeline,
+                &run_id,
+                ObservationAudience::GrantBound,
+            )? else {
+                return Err(HarnessReadHostErrorV1::Internal);
+            };
+            let HarnessReadResponseV1::Timeline(timeline_value) = timeline(
+                engine,
+                observation,
+                support,
+                &run_id,
+                None,
+                HARNESS_TIMELINE_PAGE_LIMIT_MAX,
+                ObservationAudience::GrantBound,
+            )? else {
+                return Err(HarnessReadHostErrorV1::Internal);
+            };
+            HarnessMailFetchResultV1::Run { monitor: monitor_value, timeline: timeline_value }
+        }
+        gate4agent_harness_protocol::HarnessMailRefV1::Result { result_ref } => {
+            let Ok(run_id) = result_ref.run_id() else {
+                return Ok(HarnessReadResponseV1::MailFetch(HarnessMailFetchResultV1::Refused {
+                    reason: format!("mailed result reference {result_ref} is malformed"),
+                }));
+            };
+            let Some(run) = engine.run(&run_id) else {
+                return Ok(HarnessReadResponseV1::MailFetch(HarnessMailFetchResultV1::Refused {
+                    reason: format!("mailed result reference names a run that no longer exists: {run_id}"),
+                }));
+            };
+            // The lineage fence stays closed for cross-references reachable
+            // FROM this run (its own parent/task/operation) -- only the run
+            // the ref names was authorized by the mail, not its lineage.
+            HarnessMailFetchResultV1::Result {
+                run: redact_run(run, &HarnessReadVisibilityV1::default()),
+            }
+        }
+        // `HarnessEngine::mail_fetch` already refuses `ContextPack`/
+        // `WorkspacePath` with `MailRefKindNotYetFetchable` before ever
+        // returning `Ok` -- unreachable in practice.
+        gate4agent_harness_protocol::HarnessMailRefV1::ContextPack { .. }
+        | gate4agent_harness_protocol::HarnessMailRefV1::WorkspacePath { .. } => {
+            return Err(HarnessReadHostErrorV1::Internal);
+        }
+    };
+    Ok(HarnessReadResponseV1::MailFetch(result))
 }
 
 fn authorize_request(
@@ -326,7 +421,8 @@ fn authorize_request(
         }
         HarnessReadRequestV1::MailSend { .. }
         | HarnessReadRequestV1::MailInbox { .. }
-        | HarnessReadRequestV1::MailAck { .. } if !grant.mail =>
+        | HarnessReadRequestV1::MailAck { .. }
+        | HarnessReadRequestV1::MailFetch { .. } if !grant.mail =>
         {
             return Err(HarnessReadHostErrorV1::NotFoundOrDenied);
         }
@@ -602,7 +698,7 @@ pub(crate) fn allowed_tool_ids(grant: &SessionGrantV1) -> Vec<String> {
         tools.push("g4a_operation_get");
     }
     if grant.mail {
-        tools.extend(["g4a_mail_send", "g4a_mail_inbox", "g4a_mail_ack"]);
+        tools.extend(["g4a_mail_send", "g4a_mail_inbox", "g4a_mail_ack", "g4a_mail_fetch"]);
     }
     tools.sort_unstable();
     tools.into_iter().map(str::to_owned).collect()
@@ -625,6 +721,7 @@ pub(crate) fn harness_mcp_tool_id(request: &HarnessReadRequestV1) -> &'static st
         HarnessReadRequestV1::MailSend { .. } => "g4a_mail_send",
         HarnessReadRequestV1::MailInbox { .. } => "g4a_mail_inbox",
         HarnessReadRequestV1::MailAck { .. } => "g4a_mail_ack",
+        HarnessReadRequestV1::MailFetch { .. } => "g4a_mail_fetch",
     }
 }
 
@@ -690,6 +787,7 @@ fn mail_inbox_page(
         body: entry.message.body,
         reply_to: entry.message.reply_to,
         task_id: entry.message.task_id,
+        refs: entry.message.refs,
         created_at_unix_ms: entry.message.created_at_unix_ms,
         acked: entry.acked,
         thread: entry.thread.into_iter()
@@ -748,6 +846,7 @@ pub(crate) fn operator_mail_inbox(
             body: message.body,
             reply_to: message.reply_to,
             task_id: message.task_id,
+            refs: message.refs,
             created_at_unix_ms: message.created_at_unix_ms,
             acked,
             thread: Vec::new(),
@@ -2247,6 +2346,241 @@ mod tests {
         ] {
             assert!(!encoded.contains(forbidden), "grant-bound serialized {forbidden}");
         }
+        close_observation(observation, &path);
+    }
+
+    /// D3/Slice C, end to end through `execute_exact_binding_read`: A mails
+    /// B a `Run` ref naming A's own run plus a `ContextPack` ref. B's own
+    /// grant (`HarnessReadPermissionsV1::default()`, same fixture default
+    /// every grant in this file uses) has empty `read_visibility` -- B
+    /// cannot see A's run by lineage at all -- yet `g4a_mail_fetch` resolves
+    /// the `Run` ref because the message was addressed to B, never
+    /// consulting that empty visibility. A third record, C, never addressed
+    /// by the message, gets the named membership refusal
+    /// (`MailNotForReader`) on the identical fetch; B's second ref
+    /// (`ContextPack`) is refused by kind (`MailRefKindNotYetFetchable`).
+    #[test]
+    fn mail_fetch_crosses_lineage_for_the_addressed_reader_and_refuses_everyone_and_everything_else() {
+        let path = observation_path("mail-fetch");
+        let mut checkpoint = crate::credential::tests::engine(
+            1,
+            SessionGrantStateV1::Active,
+            1,
+            HarnessRunLifecycleV1::Running,
+        ).checkpoint();
+        // Sender A already exists in the base fixture (task/run/grant
+        // 'a'*24, bound to "record-a"); flip on the mail permission it
+        // starts without.
+        checkpoint.grants[0].mail = true;
+
+        let node_incarnation = HarnessSelectorV1::new(
+            gate4agent_node_protocol::NodeIncarnationId::from_bytes([4; 16]).to_string(),
+        ).unwrap();
+
+        let recipient_task_id = HarnessTaskId::new(format!("htask_{}", "b".repeat(24))).unwrap();
+        let recipient_run_id = HarnessRunId::new(format!("hrun_{}", "b".repeat(24))).unwrap();
+        let recipient_grant_id = SessionGrantId::new(format!("hgrant_{}", "b".repeat(24))).unwrap();
+        let recipient_operation_id = HarnessOperationId::new(format!("hop_{}", "b".repeat(24))).unwrap();
+
+        let stranger_task_id = HarnessTaskId::new(format!("htask_{}", "c".repeat(24))).unwrap();
+        let stranger_run_id = HarnessRunId::new(format!("hrun_{}", "c".repeat(24))).unwrap();
+        let stranger_grant_id = SessionGrantId::new(format!("hgrant_{}", "c".repeat(24))).unwrap();
+        let stranger_operation_id = HarnessOperationId::new(format!("hop_{}", "c".repeat(24))).unwrap();
+
+        for (task_id, run_id, grant_id, operation_id, record_id, digest_hex) in [
+            (recipient_task_id, recipient_run_id.clone(), recipient_grant_id.clone(), recipient_operation_id, "record-b", 'b'),
+            (stranger_task_id, stranger_run_id.clone(), stranger_grant_id.clone(), stranger_operation_id, "record-c", 'c'),
+        ] {
+            checkpoint.tasks.push(HarnessTaskV1 {
+                task_id: task_id.clone(),
+                revision: HarnessRevision::new(1).unwrap(),
+                title: "recipient fixture".to_owned(),
+                body: String::new(),
+                creator: HarnessActorV1::User { actor_id: selector("operator") },
+                parent_task_id: None,
+                dependencies: Vec::new(),
+                state: HarnessTaskStateV1::Running,
+                run_ids: vec![run_id.clone()],
+                result_refs: Vec::new(),
+                artifact_refs: Vec::new(),
+                created_at_unix_ms: 10,
+                updated_at_unix_ms: 10,
+            });
+            checkpoint.runs.push(HarnessRunV1 {
+                run_id: run_id.clone(),
+                revision: HarnessRevision::new(1).unwrap(),
+                parent_run_id: None,
+                task_id: task_id.clone(),
+                operation_id: operation_id.clone(),
+                intent: HarnessRunIntentV1 {
+                    node_id: selector("node-a"),
+                    workspace_id: selector("workspace-a"),
+                    worktree: HarnessWorktreeIntentV1::Existing,
+                    provider_profile: selector("claude-default"),
+                    mode: HarnessExecutionModeV1::Pty,
+                    delivery_bundle: None,
+                    continuation: None,
+                },
+                delivery_receipt: None,
+                continuation_receipt: None,
+                context_pack: None,
+                git_facts: None,
+                binding: Some(HarnessSessionBindingV1 {
+                    node_id: selector("node-a"),
+                    node_incarnation: node_incarnation.clone(),
+                    workspace_id: selector("workspace-a"),
+                    session: HarnessSessionIdentityV1::Managed {
+                        record_id: selector(record_id),
+                        active_session: Some(HarnessRuntimeIdentityV1 { instance_id: 7, generation: 1 }),
+                    },
+                }),
+                lifecycle: HarnessRunLifecycleV1::Running,
+                result_disposition: None,
+                failure: None,
+                created_at_unix_ms: 10,
+                updated_at_unix_ms: 10,
+            });
+            checkpoint.grants.push(SessionGrantV1 {
+                grant_id: grant_id.clone(),
+                revision: HarnessRevision::new(1).unwrap(),
+                actor_run_id: run_id.clone(),
+                allowed_targets: vec![HarnessGrantTargetV1 {
+                    node_id: selector("node-a"),
+                    workspace_id: selector("workspace-a"),
+                    provider_profile: selector("claude-default"),
+                    mode: HarnessExecutionModeV1::Pty,
+                }],
+                allowed_delivery_bundles: Vec::new(),
+                maximum_child_count: 0,
+                maximum_child_depth: 0,
+                operation_timeouts: HarnessOperationTimeoutsV1 {
+                    dispatch_ms: 1_000,
+                    wait_ms: 1_000,
+                    reconciliation_ms: 1_000,
+                },
+                task_permissions: HarnessTaskPermissionsV1 {
+                    read: true,
+                    create: false,
+                    mutate: false,
+                    request_run: false,
+                },
+                read_permissions: HarnessReadPermissionsV1::default(),
+                monitoring_visibility: HarnessMonitoringVisibilityV1::Timeline,
+                context_permissions: HarnessContextPermissionsV1 { export: false, restore: false },
+                mail: true,
+                state: SessionGrantStateV1::Active,
+                created_at_unix_ms: 10,
+                updated_at_unix_ms: 11,
+            });
+            checkpoint.operations.push(HarnessOperationV1 {
+                operation_id: operation_id.clone(),
+                revision: HarnessRevision::new(1).unwrap(),
+                actor: HarnessActorV1::User { actor_id: selector("operator") },
+                kind: HarnessOperationKindV1::CreateRun,
+                state: HarnessOperationStateV1::Succeeded,
+                task_id: Some(task_id),
+                run_id: Some(run_id),
+                grant_id: None,
+                reconciles_operation_id: None,
+                expected_revision: Some(HarnessRevision::new(1).unwrap()),
+                request_digest: HarnessRequestDigest::new(digest_hex.to_string().repeat(64)).unwrap(),
+                idempotency_ref: HarnessIdempotencyRef::new(format!(
+                    "hidem_{}", digest_hex.to_string().repeat(24),
+                )).unwrap(),
+                failure: None,
+                outcome_unknown_reason: None,
+                reconciliation_outcome: None,
+                created_at_unix_ms: 10,
+                updated_at_unix_ms: 10,
+                dispatched_at_unix_ms: Some(10),
+                finished_at_unix_ms: Some(10),
+            });
+        }
+
+        let mut harness = HarnessService::from_engine_for_test(
+            gate4agent_harness_engine::HarnessEngine::restore(checkpoint).unwrap(),
+        );
+        let observation = ObservationService::open(&path).unwrap();
+        let support = ObservationSupportRegistry::default();
+        let inventory = crate::runtime::HarnessRuntimeInventoryCache::default();
+
+        let sender_binding = crate::credential::tests::binding(1, 1);
+        let sender_run_id = HarnessRunId::new(format!("hrun_{}", "a".repeat(24))).unwrap();
+        let recipient_binding = CredentialBindingV1 {
+            grant_id: recipient_grant_id.clone(),
+            grant_revision: HarnessRevision::new(1).unwrap(),
+            actor_run_id: recipient_run_id,
+            node_id: selector("node-a"),
+            workspace_id: selector("workspace-a"),
+            node_incarnation: node_incarnation.clone(),
+            record_id: selector("record-b"),
+            instance_id: 7,
+            generation: 1,
+        };
+        let stranger_binding = CredentialBindingV1 {
+            grant_id: stranger_grant_id,
+            grant_revision: HarnessRevision::new(1).unwrap(),
+            actor_run_id: stranger_run_id,
+            node_id: selector("node-a"),
+            workspace_id: selector("workspace-a"),
+            node_incarnation,
+            record_id: selector("record-c"),
+            instance_id: 7,
+            generation: 1,
+        };
+
+        let send_result = execute_exact_binding_read(
+            &mut harness, &observation, &support, &sender_binding,
+            HarnessReadRequestV1::MailSend {
+                to: HarnessMailAddressV1::Session { record_id: selector("record-b") },
+                subject: "handoff".to_owned(),
+                body: "see the attached run".to_owned(),
+                reply_to: None,
+                refs: vec![
+                    HarnessMailRefV1::Run { run_id: sender_run_id.clone() },
+                    HarnessMailRefV1::ContextPack { digest: format!("sha256:{}", "a".repeat(64)) },
+                ],
+            },
+            &inventory,
+        ).unwrap();
+        let HarnessReadResponseV1::MailSend(HarnessMailSendResultV1::Accepted { message_id }) = send_result else {
+            panic!("expected an accepted send, got {send_result:?}");
+        };
+
+        // Proof this is a real lineage boundary, not a fixture accident: B's
+        // own grant sees nothing at all.
+        assert!(harness.engine().read_visibility(&recipient_grant_id).unwrap().is_empty());
+
+        let fetched_run = execute_exact_binding_read(
+            &mut harness, &observation, &support, &recipient_binding,
+            HarnessReadRequestV1::MailFetch { message_id: message_id.clone(), ref_index: 0 },
+            &inventory,
+        ).unwrap();
+        let HarnessReadResponseV1::MailFetch(HarnessMailFetchResultV1::Run { monitor, .. }) = fetched_run else {
+            panic!("expected B to fetch the mailed run, got {fetched_run:?}");
+        };
+        assert_eq!(monitor.run_id, sender_run_id);
+
+        let fetched_context_pack = execute_exact_binding_read(
+            &mut harness, &observation, &support, &recipient_binding,
+            HarnessReadRequestV1::MailFetch { message_id: message_id.clone(), ref_index: 1 },
+            &inventory,
+        ).unwrap();
+        let HarnessReadResponseV1::MailFetch(HarnessMailFetchResultV1::Refused { reason }) = fetched_context_pack else {
+            panic!("expected the ContextPack ref to be refused, got {fetched_context_pack:?}");
+        };
+        assert!(reason.contains("not yet fetchable"), "{reason}");
+
+        let fetched_by_stranger = execute_exact_binding_read(
+            &mut harness, &observation, &support, &stranger_binding,
+            HarnessReadRequestV1::MailFetch { message_id, ref_index: 0 },
+            &inventory,
+        ).unwrap();
+        let HarnessReadResponseV1::MailFetch(HarnessMailFetchResultV1::Refused { reason }) = fetched_by_stranger else {
+            panic!("expected the stranger's fetch to be refused, got {fetched_by_stranger:?}");
+        };
+        assert!(reason.contains("not addressed to this reader"), "{reason}");
+
         close_observation(observation, &path);
     }
 

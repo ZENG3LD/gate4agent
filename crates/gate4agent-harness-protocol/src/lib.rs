@@ -34,6 +34,10 @@ pub const HARNESS_CONTEXT_PACK_RETAINED_MESSAGES_MAX: u64 = 256;
 pub const HARNESS_SCHEDULER_SCAN_MAX: usize = 8_192;
 pub const HARNESS_DELIVERY_COMPONENT_KINDS_MAX: usize = 9;
 pub const HARNESS_DELIVERY_COMPONENTS_MAX: u32 = 4_096;
+/// Bound on `HarnessMailMessageV1.refs` (D3, C1): a message names a handful
+/// of dereferenceable results, never a manifest -- the mailbox stays S9's
+/// "bounded text, or an artifact reference plus hash", plural but small.
+pub const HARNESS_MAIL_REFS_MAX: usize = 8;
 
 macro_rules! opaque_id {
     ($name:ident, $prefix:literal, $label:literal) => {
@@ -2557,12 +2561,57 @@ impl HarnessMailAddressV1 {
     }
 }
 
+/// D3/C1: what one mailed reference names. All four variants are defined now
+/// so the wire is stable even though only `Run`/`Result` are fetchable today
+/// (`HarnessEngine::mail_fetch` refuses `ContextPack`/`WorkspacePath` by name,
+/// `MailRefKindNotYetFetchable` -- C2/C3 wire them). `WorkspacePath.sha256` is
+/// a bare lowercase hex digest of the file's bytes (no `sha256:` prefix,
+/// unlike `ContextPack.digest`, which reuses the context-pack digest scheme
+/// verbatim since it names the same kind of object).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum HarnessMailRefV1 {
+    Run { run_id: HarnessRunId },
+    ContextPack { digest: String },
+    Result { result_ref: HarnessResultRef },
+    WorkspacePath {
+        workspace: HarnessSelectorV1,
+        path: String,
+        sha256: String,
+    },
+}
+
+impl HarnessMailRefV1 {
+    pub fn validate(&self) -> Result<(), HarnessValidationError> {
+        match self {
+            Self::Run { run_id } => run_id.validate(),
+            Self::ContextPack { digest } => validate_context_digest(digest),
+            Self::Result { result_ref } => result_ref.validate(),
+            Self::WorkspacePath { workspace, path, sha256 } => {
+                workspace.validate()?;
+                if path.is_empty()
+                    || path.len() > HARNESS_RUN_GIT_PATH_MAX_BYTES
+                    || path.chars().any(char::is_control)
+                {
+                    return Err(HarnessValidationError::InvalidMailRef { field: "workspace path" });
+                }
+                validate_lower_hex("workspace path sha256", sha256, 64)
+                    .map_err(|_| HarnessValidationError::InvalidMailRef { field: "workspace path sha256" })
+            }
+        }
+    }
+}
+
 /// S9's envelope, unchanged: sender, recipient, `reply_to`, bounded text.
 /// `subject` reuses the task title bound (`HARNESS_TITLE_MAX_BYTES` via
 /// `validate_title`) and `body` reuses the task body bound
 /// (`HARNESS_BODY_MAX_BYTES` via `validate_body`) -- no new size constant.
 /// `task_id` is correlation only: the harness never reads it to decide
 /// anything (D5); it exists so a panel can group mail by task.
+/// `refs` is C1's addition to an already-persisted, already-shipped shape --
+/// `#[serde(default)]` so a message written before this change (SQLite
+/// `payload` blob, or an in-flight `g4a_mail_send` caller) still deserializes
+/// with an empty ref list, never a decode failure.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HarnessMailMessageV1 {
@@ -2573,6 +2622,8 @@ pub struct HarnessMailMessageV1 {
     pub body: String,
     pub reply_to: Option<HarnessMailMessageId>,
     pub task_id: Option<HarnessTaskId>,
+    #[serde(default)]
+    pub refs: Vec<HarnessMailRefV1>,
     pub created_at_unix_ms: u64,
 }
 
@@ -2591,6 +2642,15 @@ impl HarnessMailMessageV1 {
         }
         if let Some(task_id) = &self.task_id {
             task_id.validate()?;
+        }
+        if self.refs.len() > HARNESS_MAIL_REFS_MAX {
+            return Err(HarnessValidationError::CollectionTooLarge {
+                field: "refs",
+                maximum: HARNESS_MAIL_REFS_MAX,
+            });
+        }
+        for reference in &self.refs {
+            reference.validate()?;
         }
         if self.created_at_unix_ms == 0 {
             return Err(HarnessValidationError::InvalidTimestamps);
@@ -2798,6 +2858,8 @@ pub enum HarnessValidationError {
     InvalidContinuationLink,
     #[error("harness run git summary is empty, unbounded, unsorted, or contains a control character")]
     InvalidGitSummary,
+    #[error("mail {field} is empty, unbounded, malformed, or contains a control character")]
+    InvalidMailRef { field: &'static str },
 }
 
 #[cfg(test)]
@@ -3099,6 +3161,7 @@ mod tests {
             body: "handing off the result".to_owned(),
             reply_to: None,
             task_id: None,
+            refs: Vec::new(),
             created_at_unix_ms: 1_000,
         }
     }
@@ -3128,6 +3191,91 @@ mod tests {
             ..message
         };
         task_addressed.validate().unwrap();
+    }
+
+    /// C1: a message persisted before `refs` existed (SQLite `payload` blob,
+    /// or a checkpoint written by an older binary) deserializes with an empty
+    /// ref list rather than failing -- the JSON below is exactly the old
+    /// shape, missing the `refs` key entirely.
+    #[test]
+    fn harness_mail_message_old_shape_without_refs_deserializes() {
+        let old_shape = serde_json::json!({
+            "message_id": format!("hmail_{}", "1".repeat(24)),
+            "from": { "record_id": "record-a", "provider": "claude" },
+            "to": { "kind": "session", "record_id": "record-b" },
+            "subject": "status",
+            "body": "handing off the result",
+            "reply_to": null,
+            "task_id": null,
+            "created_at_unix_ms": 1_000,
+        });
+        let decoded: HarnessMailMessageV1 = serde_json::from_value(old_shape).unwrap();
+        assert!(decoded.refs.is_empty());
+        decoded.validate().unwrap();
+    }
+
+    #[test]
+    fn harness_mail_message_refs_are_bounded_and_each_kind_validates() {
+        let mut message = valid_mail_message();
+        message.refs = vec![HarnessMailRefV1::Run { run_id: run_id('2') }];
+        message.validate().unwrap();
+
+        // Bound: HARNESS_MAIL_REFS_MAX + 1 refs is rejected by name.
+        let mut over_bound = message.clone();
+        over_bound.refs = (0..HARNESS_MAIL_REFS_MAX + 1)
+            .map(|_| HarnessMailRefV1::Run { run_id: run_id('2') })
+            .collect();
+        assert_eq!(
+            over_bound.validate(),
+            Err(HarnessValidationError::CollectionTooLarge {
+                field: "refs",
+                maximum: HARNESS_MAIL_REFS_MAX,
+            }),
+        );
+
+        // Run: an invalid opaque id is rejected.
+        let bad_run_json = serde_json::json!({ "kind": "run", "run_id": "not-a-run-id" });
+        assert!(serde_json::from_value::<HarnessMailRefV1>(bad_run_json).is_err());
+
+        // ContextPack: reuses the context-pack digest scheme.
+        let context_pack = HarnessMailRefV1::ContextPack {
+            digest: format!("sha256:{}", "a".repeat(64)),
+        };
+        context_pack.validate().unwrap();
+        let bad_context_pack = HarnessMailRefV1::ContextPack { digest: "not-a-digest".to_owned() };
+        assert_eq!(bad_context_pack.validate(), Err(HarnessValidationError::InvalidContextPackDigest));
+
+        // Result: reuses HarnessResultRef's own opaque-id validation.
+        let result_ref = HarnessMailRefV1::Result { result_ref: HarnessResultRef::for_run(&run_id('3')) };
+        result_ref.validate().unwrap();
+
+        // WorkspacePath: bare 64-hex sha256, bounded non-empty path.
+        let workspace_path = HarnessMailRefV1::WorkspacePath {
+            workspace: selector("workspace-a"),
+            path: "reports/handoff.md".to_owned(),
+            sha256: "b".repeat(64),
+        };
+        workspace_path.validate().unwrap();
+
+        let empty_path = HarnessMailRefV1::WorkspacePath {
+            workspace: selector("workspace-a"),
+            path: String::new(),
+            sha256: "b".repeat(64),
+        };
+        assert_eq!(
+            empty_path.validate(),
+            Err(HarnessValidationError::InvalidMailRef { field: "workspace path" }),
+        );
+
+        let bad_sha = HarnessMailRefV1::WorkspacePath {
+            workspace: selector("workspace-a"),
+            path: "reports/handoff.md".to_owned(),
+            sha256: "sha256:".to_owned() + &"b".repeat(64),
+        };
+        assert_eq!(
+            bad_sha.validate(),
+            Err(HarnessValidationError::InvalidMailRef { field: "workspace path sha256" }),
+        );
     }
 
     #[test]

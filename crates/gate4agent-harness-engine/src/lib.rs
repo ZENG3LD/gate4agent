@@ -5,6 +5,7 @@ use gate4agent_harness_protocol::{
     HarnessContinuationV1, HarnessDeliveryRef, HarnessDeliveryStateV1, HarnessDeliveryV1,
     HarnessEntityReadScopeV1, HarnessExpectedExecutionSpecRevisionV1,
     HarnessMailAckV1, HarnessMailAddressV1, HarnessMailMessageId, HarnessMailMessageV1,
+    HarnessMailRefV1,
     HarnessOperationId, HarnessOperationKindV1,
     HarnessOperationStateV1, HarnessOperationV1, HarnessResultRef, HarnessRevision,
     HarnessRunId, HarnessRunLifecycleV1, HarnessRunV1, HarnessSelectorV1,
@@ -710,6 +711,53 @@ impl HarnessEngine {
             .collect();
         thread.sort_by_key(|message| message.created_at_unix_ms);
         thread
+    }
+
+    /// D3/C1's dereference gate: "it was mailed to me", never lineage. Checks
+    /// membership FIRST -- exactly `mail_inbox`'s own predicate (addressed to
+    /// `reader_record_id` directly, or to a task visible under `grant_id`'s
+    /// own `read_visibility`) -- and only then resolves `ref_index`. A message
+    /// not in the reader's inbox is `MailNotForReader` by name, never
+    /// `NotFound` (that would leak whether the id exists at all to a caller it
+    /// was never mailed to). `ContextPack`/`WorkspacePath` refs are refused by
+    /// name, `MailRefKindNotYetFetchable` (C2/C3 wire their bytes); `Run`/
+    /// `Result` are returned for the caller (`gate4agent-harness-service`) to
+    /// dereference the rest of the way -- that caller has the observation data
+    /// this crate deliberately does not depend on, and it must NOT re-consult
+    /// `read_visibility` for the resolved run: membership above is the only
+    /// gate a mailed ref crosses.
+    pub fn mail_fetch(
+        &self,
+        grant_id: &SessionGrantId,
+        reader_record_id: &HarnessSelectorV1,
+        message_id: &HarnessMailMessageId,
+        ref_index: usize,
+    ) -> Result<HarnessMailRefV1, HarnessEngineError> {
+        let message = self.mail_messages.get(message_id)
+            .ok_or_else(|| HarnessEngineError::NotFound(message_id.to_string()))?;
+        let for_reader = match &message.to {
+            HarnessMailAddressV1::Session { record_id } => record_id == reader_record_id,
+            HarnessMailAddressV1::Task { task_id } => {
+                self.read_visibility(grant_id)?.task_visible(task_id)
+            }
+        };
+        if !for_reader {
+            return Err(HarnessEngineError::MailNotForReader { message_id: message_id.clone() });
+        }
+        let reference = message.refs.get(ref_index)
+            .ok_or_else(|| HarnessEngineError::MailRefIndexOutOfRange {
+                message_id: message_id.clone(),
+                ref_index,
+            })?;
+        match reference {
+            HarnessMailRefV1::ContextPack { .. } => {
+                Err(HarnessEngineError::MailRefKindNotYetFetchable { kind: "context-pack" })
+            }
+            HarnessMailRefV1::WorkspacePath { .. } => {
+                Err(HarnessEngineError::MailRefKindNotYetFetchable { kind: "workspace-path" })
+            }
+            HarnessMailRefV1::Run { .. } | HarnessMailRefV1::Result { .. } => Ok(reference.clone()),
+        }
     }
 
     /// Retention: mail addressed to `task_id` stays readable exactly as long
@@ -4207,6 +4255,12 @@ pub enum HarnessEngineError {
     MailRecipientEnded { to: String },
     #[error("grant {grant_id} does not hold the mail permission")]
     MailPermissionDenied { grant_id: SessionGrantId },
+    #[error("mail message {message_id} is not addressed to this reader")]
+    MailNotForReader { message_id: HarnessMailMessageId },
+    #[error("mail message {message_id} has no ref at index {ref_index}")]
+    MailRefIndexOutOfRange { message_id: HarnessMailMessageId, ref_index: usize },
+    #[error("mail ref kind {kind} is not yet fetchable")]
+    MailRefKindNotYetFetchable { kind: &'static str },
 }
 
 #[cfg(test)]
@@ -7589,6 +7643,7 @@ mod tests {
             body: "handing off the result".to_owned(),
             reply_to: None,
             task_id: None,
+            refs: Vec::new(),
             created_at_unix_ms: 20,
         };
         let send_operation = mail_operation(
@@ -7653,6 +7708,199 @@ mod tests {
         assert!(engine.mail_ack(&message.message_id, &reader_record_id).is_some());
     }
 
+    /// D3/C1: A mails B a `Run` ref naming A's OWN run. `reader_grant`'s
+    /// `read_permissions` are the fixture default (`None` on every scope,
+    /// `mail_grant` never sets them), so B's own lineage fence
+    /// (`read_visibility`) is provably empty -- B's grant could not see
+    /// `sender_run_id` by any of the eight read tools. `mail_fetch` resolves
+    /// the ref anyway because membership ("addressed to me") is the only gate
+    /// it consults, exactly as D3 mandates. A third record never addressed by
+    /// the message gets `MailNotForReader` on the identical call, proving the
+    /// gate is message-scoped, not "any active grant".
+    #[test]
+    fn harness_mail_fetch_run_ref_crosses_a_lineage_the_readers_own_grant_cannot_see() {
+        let mut engine = HarnessEngine::new();
+        let sender_run_id = numbered_run_id(111);
+        let recipient_run_id = numbered_run_id(112);
+        let sender_task_id = numbered_task_id(111);
+        let recipient_task_id = numbered_task_id(112);
+
+        let mut sender_task = task(sender_task_id.clone(), 1, "sender task");
+        sender_task.run_ids = vec![sender_run_id.clone()];
+        engine.tasks.insert(sender_task_id.clone(), sender_task);
+        insert_managed_run(
+            &mut engine,
+            sender_run_id.clone(),
+            sender_task_id,
+            numbered_operation_id(111),
+            HarnessRunLifecycleV1::Running,
+            1,
+            "record-sender-2",
+        );
+
+        let mut recipient_task = task(recipient_task_id.clone(), 1, "recipient task");
+        recipient_task.run_ids = vec![recipient_run_id.clone()];
+        engine.tasks.insert(recipient_task_id.clone(), recipient_task);
+        insert_managed_run(
+            &mut engine,
+            recipient_run_id.clone(),
+            recipient_task_id,
+            numbered_operation_id(112),
+            HarnessRunLifecycleV1::Running,
+            1,
+            "record-recipient-2",
+        );
+
+        let mut sender_grant = mail_grant(SessionGrantStateV1::Active, 1);
+        sender_grant.grant_id = numbered_grant_id(111);
+        sender_grant.actor_run_id = sender_run_id.clone();
+        engine.grants.insert(sender_grant.grant_id.clone(), sender_grant.clone());
+
+        let mut reader_grant = mail_grant(SessionGrantStateV1::Active, 1);
+        reader_grant.grant_id = numbered_grant_id(112);
+        reader_grant.actor_run_id = recipient_run_id.clone();
+        engine.grants.insert(reader_grant.grant_id.clone(), reader_grant.clone());
+
+        // Proof that this is a real lineage boundary, not a fixture accident:
+        // the reader's own grant sees nothing at all.
+        assert!(engine.read_visibility(&reader_grant.grant_id).unwrap().is_empty());
+
+        let message = HarnessMailMessageV1 {
+            message_id: mail_message_id('a'),
+            from: mail_record_ref("record-sender-2", "codex"),
+            to: HarnessMailAddressV1::Session { record_id: HarnessSelectorV1::new("record-recipient-2").unwrap() },
+            subject: "handoff".to_owned(),
+            body: "see the attached run".to_owned(),
+            reply_to: None,
+            task_id: None,
+            refs: vec![HarnessMailRefV1::Run { run_id: sender_run_id.clone() }],
+            created_at_unix_ms: 80,
+        };
+        let send_operation = mail_operation(
+            operation_id('b'),
+            sender_grant.grant_id.clone(),
+            HarnessOperationKindV1::SendMail,
+            'b',
+            sender_run_id.clone(),
+        );
+        engine.accept(engine.prepare(HarnessMutationV1::SendMail {
+            operation: send_operation,
+            message: message.clone(),
+        }).unwrap());
+
+        let reader_record_id = HarnessSelectorV1::new("record-recipient-2").unwrap();
+        let resolved = engine.mail_fetch(&reader_grant.grant_id, &reader_record_id, &message.message_id, 0).unwrap();
+        assert_eq!(resolved, HarnessMailRefV1::Run { run_id: sender_run_id });
+
+        // A third record, never addressed, gets the named membership refusal
+        // -- never `NotFound` (that would leak that the message id exists).
+        let stranger_record_id = HarnessSelectorV1::new("record-stranger").unwrap();
+        let mut stranger_grant = mail_grant(SessionGrantStateV1::Active, 1);
+        stranger_grant.grant_id = numbered_grant_id(113);
+        stranger_grant.actor_run_id = recipient_run_id;
+        engine.grants.insert(stranger_grant.grant_id.clone(), stranger_grant.clone());
+        match engine.mail_fetch(&stranger_grant.grant_id, &stranger_record_id, &message.message_id, 0) {
+            Err(HarnessEngineError::MailNotForReader { message_id }) => {
+                assert_eq!(message_id, message.message_id);
+            }
+            other => panic!("expected MailNotForReader, got {other:?}"),
+        }
+
+        // Out-of-range index is refused by name too, distinct from a missing
+        // recipient.
+        match engine.mail_fetch(&reader_grant.grant_id, &reader_record_id, &message.message_id, 1) {
+            Err(HarnessEngineError::MailRefIndexOutOfRange { ref_index, .. }) => assert_eq!(ref_index, 1),
+            other => panic!("expected MailRefIndexOutOfRange, got {other:?}"),
+        }
+    }
+
+    /// D3/C1: `ContextPack`/`WorkspacePath` refs are refused by name --
+    /// `mail_fetch` never returns their bytes (C2/C3 wire them later).
+    #[test]
+    fn harness_mail_fetch_refuses_context_pack_and_workspace_path_refs_by_name() {
+        let mut engine = HarnessEngine::new();
+        let sender_run_id = numbered_run_id(121);
+        let sender_task_id = numbered_task_id(121);
+        let mut sender_task = task(sender_task_id.clone(), 1, "sender task");
+        sender_task.run_ids = vec![sender_run_id.clone()];
+        engine.tasks.insert(sender_task_id.clone(), sender_task);
+        insert_managed_run(
+            &mut engine,
+            sender_run_id.clone(),
+            sender_task_id,
+            numbered_operation_id(121),
+            HarnessRunLifecycleV1::Running,
+            1,
+            "record-sender-3",
+        );
+
+        let mut sender_grant = mail_grant(SessionGrantStateV1::Active, 1);
+        sender_grant.grant_id = numbered_grant_id(121);
+        sender_grant.actor_run_id = sender_run_id.clone();
+        engine.grants.insert(sender_grant.grant_id.clone(), sender_grant.clone());
+
+        // A run must be bound to "record-recipient-3" or `validate_mail_recipient`
+        // refuses the send as `MailRecipientUnknown` before this test ever
+        // reaches `mail_fetch`.
+        let recipient_run_id = numbered_run_id(122);
+        let recipient_task_id = numbered_task_id(122);
+        let mut recipient_task = task(recipient_task_id.clone(), 1, "recipient task");
+        recipient_task.run_ids = vec![recipient_run_id.clone()];
+        engine.tasks.insert(recipient_task_id.clone(), recipient_task);
+        insert_managed_run(
+            &mut engine,
+            recipient_run_id,
+            recipient_task_id,
+            numbered_operation_id(122),
+            HarnessRunLifecycleV1::Running,
+            1,
+            "record-recipient-3",
+        );
+
+        let recipient_record_id = HarnessSelectorV1::new("record-recipient-3").unwrap();
+        let message = HarnessMailMessageV1 {
+            message_id: mail_message_id('c'),
+            from: mail_record_ref("record-sender-3", "claude"),
+            to: HarnessMailAddressV1::Session { record_id: recipient_record_id.clone() },
+            subject: "handoff".to_owned(),
+            body: "see the attached pack and file".to_owned(),
+            reply_to: None,
+            task_id: None,
+            refs: vec![
+                HarnessMailRefV1::ContextPack { digest: format!("sha256:{}", "a".repeat(64)) },
+                HarnessMailRefV1::WorkspacePath {
+                    workspace: HarnessSelectorV1::new("workspace-a").unwrap(),
+                    path: "reports/handoff.md".to_owned(),
+                    sha256: "b".repeat(64),
+                },
+            ],
+            created_at_unix_ms: 90,
+        };
+        engine.accept(engine.prepare(HarnessMutationV1::SendMail {
+            operation: mail_operation(operation_id('d'), sender_grant.grant_id.clone(), HarnessOperationKindV1::SendMail, 'd', sender_run_id),
+            message: message.clone(),
+        }).unwrap());
+
+        // The recipient's own grant does not matter for this refusal -- it is
+        // decided purely by ref kind, once `Session`-addressed membership
+        // already passed (a `Session`-addressed check never touches
+        // `read_visibility`, so the grant's own `actor_run_id` need not name
+        // a real run for this test).
+        let mut reader_grant = mail_grant(SessionGrantStateV1::Active, 1);
+        reader_grant.grant_id = numbered_grant_id(122);
+        reader_grant.actor_run_id = numbered_run_id(998);
+        engine.grants.insert(reader_grant.grant_id.clone(), reader_grant.clone());
+
+        match engine.mail_fetch(&reader_grant.grant_id, &recipient_record_id, &message.message_id, 0) {
+            Err(HarnessEngineError::MailRefKindNotYetFetchable { kind }) => assert_eq!(kind, "context-pack"),
+            other => panic!("expected MailRefKindNotYetFetchable(context-pack), got {other:?}"),
+        }
+        match engine.mail_fetch(&reader_grant.grant_id, &recipient_record_id, &message.message_id, 1) {
+            Err(HarnessEngineError::MailRefKindNotYetFetchable { kind }) => assert_eq!(kind, "workspace-path"),
+            other => panic!("expected MailRefKindNotYetFetchable(workspace-path), got {other:?}"),
+        }
+    }
+
     #[test]
     fn harness_mail_send_to_task_visibility_gates_readers() {
         let mut engine = HarnessEngine::new();
@@ -7711,6 +7959,7 @@ mod tests {
             body: "posting the result to the shared task".to_owned(),
             reply_to: None,
             task_id: None,
+            refs: Vec::new(),
             created_at_unix_ms: 30,
         };
         let send_operation = mail_operation(
@@ -7770,6 +8019,7 @@ mod tests {
             body: "can you check this?".to_owned(),
             reply_to: None,
             task_id: None,
+            refs: Vec::new(),
             created_at_unix_ms: 40,
         };
         engine.accept(engine.prepare(HarnessMutationV1::SendMail {
@@ -7785,6 +8035,7 @@ mod tests {
             body: "checked, looks correct".to_owned(),
             reply_to: Some(original.message_id.clone()),
             task_id: None,
+            refs: Vec::new(),
             created_at_unix_ms: 45,
         };
         engine.accept(engine.prepare(HarnessMutationV1::SendMail {
@@ -7814,6 +8065,7 @@ mod tests {
             body: "session ending".to_owned(),
             reply_to: None,
             task_id: None,
+            refs: Vec::new(),
             created_at_unix_ms: 50,
         });
         engine.mail_acks.insert(
@@ -7828,6 +8080,7 @@ mod tests {
             body: "task wrapping up".to_owned(),
             reply_to: None,
             task_id: None,
+            refs: Vec::new(),
             created_at_unix_ms: 52,
         });
         engine.tasks.insert(task_for_record.clone(), task(task_for_record.clone(), 1, "closing task"));
@@ -7882,6 +8135,7 @@ mod tests {
             body: "is anyone there".to_owned(),
             reply_to: None,
             task_id: None,
+            refs: Vec::new(),
             created_at_unix_ms: 60,
         };
 
@@ -8000,6 +8254,7 @@ mod tests {
         let mut sender_grant = mail_grant(SessionGrantStateV1::Active, 1);
         sender_grant.grant_id = numbered_grant_id(601);
         sender_grant.actor_run_id = sender_run_id.clone();
+        sender_grant.read_permissions.tasks = HarnessEntityReadScopeV1::SelfOnly;
         engine.grants.insert(sender_grant.grant_id.clone(), sender_grant.clone());
 
         let message = HarnessMailMessageV1 {
@@ -8010,9 +8265,10 @@ mod tests {
             body: "please approve my last tool call so I can continue".to_owned(),
             reply_to: None,
             task_id: None,
+            refs: vec![HarnessMailRefV1::Run { run_id: sender_run_id.clone() }],
             created_at_unix_ms: 70,
         };
-        let operation = mail_operation(operation_id('a'), sender_grant.grant_id.clone(), HarnessOperationKindV1::SendMail, 'a', sender_run_id);
+        let operation = mail_operation(operation_id('a'), sender_grant.grant_id.clone(), HarnessOperationKindV1::SendMail, 'a', sender_run_id.clone());
         let prepared = engine.prepare(HarnessMutationV1::SendMail {
             operation: operation.clone(),
             message: message.clone(),
@@ -8023,5 +8279,16 @@ mod tests {
         );
         engine.accept(prepared);
         assert_eq!(engine.mail_message(&message.message_id), Some(&message));
+
+        // D3/C1 closes the same loophole for the dereference path: fetching
+        // this approval-shaped message's `Run` ref returns only a plain
+        // `HarnessMailRefV1::Run` -- the type has no interaction-shaped
+        // variant and `mail_fetch`'s match is exhaustive over exactly
+        // {Run, ContextPack, Result, WorkspacePath}, so there is structurally
+        // no path from an approval-shaped mail body to `ResolveInteraction`,
+        // not merely an unexercised one.
+        let reader_record_id = HarnessSelectorV1::new("record-sender").unwrap();
+        let resolved = engine.mail_fetch(&sender_grant.grant_id, &reader_record_id, &message.message_id, 0).unwrap();
+        assert_eq!(resolved, HarnessMailRefV1::Run { run_id: sender_run_id });
     }
 }

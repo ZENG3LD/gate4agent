@@ -11929,11 +11929,12 @@ mod tests {
             "g4a_mail_send".to_owned(),
             "g4a_mail_inbox".to_owned(),
             "g4a_mail_ack".to_owned(),
+            "g4a_mail_fetch".to_owned(),
         ]);
         expected.sort();
         assert_eq!(
             tool_ids, expected,
-            "the eight reads plus the three mailbox writes are the full ceiling now that the default grant carries mail",
+            "the eight reads plus the four mailbox tools are the full ceiling now that the default grant carries mail",
         );
 
         // Retrying the identical dispatch replays the same grant rather than

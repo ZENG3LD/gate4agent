@@ -40,11 +40,12 @@ pub use gate4agent_harness_protocol::{
     HarnessRuntimeIdentityV1, HarnessSelectorV1, HarnessTaskId, HarnessTaskStateV1,
     HarnessValidationError, HarnessWorktreeIntentV1, SessionGrantId,
     HarnessMailAckV1, HarnessMailAddressV1, HarnessMailMessageId, HarnessMailMessageV1,
+    HarnessMailRefV1,
     HarnessRecordRef,
     HARNESS_ARTIFACTS_MAX, HARNESS_BODY_MAX_BYTES,
     HARNESS_CHILD_COUNT_MAX, HARNESS_CHILD_DEPTH_MAX, HARNESS_DEPENDENCIES_MAX,
     HARNESS_CONTEXT_PACK_MAX_BYTES, HARNESS_CONTEXT_PACK_RETAINED_MESSAGES_MAX,
-    HARNESS_LINKS_MAX, HARNESS_RESULTS_MAX, HARNESS_TITLE_MAX_BYTES,
+    HARNESS_LINKS_MAX, HARNESS_MAIL_REFS_MAX, HARNESS_RESULTS_MAX, HARNESS_TITLE_MAX_BYTES,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
@@ -136,7 +137,16 @@ pub const HARNESS_MCP_AUDIENCE: &str = "gate4agent-harness-mcp-read-v1";
 /// every bump above: two new verbs and a widened struct move the version
 /// even though a pre-`21` reader would have silently read zero for the new
 /// field and never sent either new request.
-pub const HARNESS_OPERATOR_WIRE_VERSION: u16 = 21;
+///
+/// `22` adds the mailbox arc's Slice C hand-off (same plan, §3 Slice C):
+/// `HarnessMailInboxEntryV1` widens with `refs: Vec<HarnessMailRefV1>`, read
+/// by both `g4a_mail_inbox` (unversioned) and the operator's `MailInbox`
+/// reply (versioned, embeds the same struct) -- the operator envelope checks
+/// `version` for exact equality, never semver compatibility, so even this
+/// additive-with-default field moves the pin. Same rule as every bump above:
+/// a pre-`22` reader would have silently read an empty `refs` list and never
+/// seen an attached reference at all.
+pub const HARNESS_OPERATOR_WIRE_VERSION: u16 = 22;
 // Realistic multi-pane ceiling with headroom; bounds the harness-side
 // per-subscriber HashSet<RuntimeSessionKey> and the connect-time seed burst
 // `SubscribeTerminal`'s handler sends immediately after registering (see
@@ -253,19 +263,24 @@ pub const HARNESS_READ_TOOL_IDS: [&str; 8] = [
     "g4a_operation_get",
 ];
 
-/// The mailbox arc's Slice B write allow-list (D1 + D7): the harness MCP
-/// server's first writes. Kept separate from `HARNESS_READ_TOOL_IDS` rather
-/// than folded into it -- that array's own test
+/// The mailbox arc's Slice B write allow-list (D1 + D7), joined by Slice C's
+/// `g4a_mail_fetch`. Kept separate from `HARNESS_READ_TOOL_IDS` rather than
+/// folded into it -- that array's own test
 /// (`all_eight_tool_schemas_are_stable_and_closed`) pins it as exactly the
 /// eight read-only tools zipped in `tool_definitions()`'s declared order, and
-/// `g4a_mail_inbox` is a read in effect but gated by `grant.mail`, not by any
-/// of the three `read_permissions`/`monitoring_visibility` scopes the eight
-/// reads use -- it belongs with its two write siblings, not with them. D7:
-/// this array, and `HARNESS_READ_TOOL_IDS`, are the only two names
-/// `tools/call` ever admits; `ResolveInteraction` (or any other name) is
-/// refused by name regardless of what a grant's `allowed_tool_ids` claims.
-pub const HARNESS_WRITE_TOOL_IDS: [&str; 3] = [
+/// every mail tool here is gated by `grant.mail`, not by any of the three
+/// `read_permissions`/`monitoring_visibility` scopes the eight reads use.
+/// `g4a_mail_inbox` and `g4a_mail_fetch` perform no mutation -- they are
+/// reads in effect, `g4a_mail_fetch`'s the C1 read whose authorization is
+/// message-membership ("it was mailed to me") rather than lineage scope --
+/// but both belong here with their mutating siblings because the gate they
+/// share is the same one, not the eight reads' gate. D7: this array, and
+/// `HARNESS_READ_TOOL_IDS`, are the only two names `tools/call` ever admits;
+/// `ResolveInteraction` (or any other name) is refused by name regardless of
+/// what a grant's `allowed_tool_ids` claims.
+pub const HARNESS_WRITE_TOOL_IDS: [&str; 4] = [
     "g4a_mail_ack",
+    "g4a_mail_fetch",
     "g4a_mail_inbox",
     "g4a_mail_send",
 ];
@@ -5587,12 +5602,16 @@ pub enum HarnessReadRequestV1 {
     /// `body` reuse the task title/body bounds (S9, unchanged). The named
     /// refusal (unknown/ended recipient, no `mail` permission) travels back
     /// as `HarnessMailSendResultV1::Refused`, never as a host error -- see
-    /// that type's own doc comment.
+    /// that type's own doc comment. `refs` is Slice C's addition (D3): at
+    /// most `HARNESS_MAIL_REFS_MAX` dereferenceable references, defaulted so
+    /// a caller built before Slice C still sends a valid request.
     MailSend {
         to: HarnessMailAddressV1,
         subject: String,
         body: String,
         reply_to: Option<HarnessMailMessageId>,
+        #[serde(default)]
+        refs: Vec<HarnessMailRefV1>,
     },
     /// D8's forum read: mail addressed to the caller's own session record
     /// plus every message addressed to a task currently visible to the
@@ -5604,26 +5623,47 @@ pub enum HarnessReadRequestV1 {
     /// Idempotent: acking an already-acked message is a no-op success (S9's
     /// at-least-once delivery termination).
     MailAck { message_id: HarnessMailMessageId },
+    /// D3/Slice C: dereference one ref on a message already in the caller's
+    /// inbox ("it was mailed to me" -- `HarnessEngine::mail_fetch`'s own doc
+    /// comment). Authorization here is message membership, never the
+    /// caller's own lineage (`read_visibility`) -- see
+    /// `HARNESS_WRITE_TOOL_IDS`'s doc comment for why this otherwise-read
+    /// tool lives there rather than in `HARNESS_READ_TOOL_IDS`. A refusal
+    /// (not addressed to the caller, an out-of-range index, or a ref kind
+    /// C1 does not yet fetch) travels back as
+    /// `HarnessMailFetchResultV1::Refused`, never as a host error -- same
+    /// pattern as `MailSend`'s own named refusal.
+    MailFetch {
+        message_id: HarnessMailMessageId,
+        ref_index: u16,
+    },
 }
 
 impl HarnessReadRequestV1 {
     pub fn validate(&self) -> Result<(), HarnessReadApiError> {
         match self {
-            Self::MailSend { to, subject, body, reply_to } => {
+            Self::MailSend { to, subject, body, reply_to, refs } => {
                 to.validate().map_err(HarnessReadApiError::Protocol)?;
                 if subject.is_empty()
                     || subject.len() > HARNESS_TITLE_MAX_BYTES
                     || body.len() > HARNESS_BODY_MAX_BYTES
+                    || refs.len() > HARNESS_MAIL_REFS_MAX
                 {
                     return Err(HarnessReadApiError::InvalidMailMessage);
                 }
                 if let Some(reply_to) = reply_to {
                     reply_to.validate().map_err(HarnessReadApiError::Protocol)?;
                 }
+                for reference in refs {
+                    reference.validate().map_err(HarnessReadApiError::Protocol)?;
+                }
                 Ok(())
             }
             Self::MailInbox { limit, .. } => validate_limit(*limit, HARNESS_ENTITY_PAGE_LIMIT_MAX),
             Self::MailAck { message_id } => {
+                message_id.validate().map_err(HarnessReadApiError::Protocol)
+            }
+            Self::MailFetch { message_id, .. } => {
                 message_id.validate().map_err(HarnessReadApiError::Protocol)
             }
             Self::TimelineRead { run_id, after_sequence, limit } => {
@@ -5696,6 +5736,7 @@ pub enum HarnessReadResponseV1 {
     MailSend(HarnessMailSendResultV1),
     MailInbox(HarnessMailInboxPageV1),
     MailAck(HarnessMailAckResultV1),
+    MailFetch(HarnessMailFetchResultV1),
 }
 
 impl HarnessReadResponseV1 {
@@ -5712,6 +5753,7 @@ impl HarnessReadResponseV1 {
             Self::MailSend(value) => value.validate(),
             Self::MailInbox(value) => value.validate(),
             Self::MailAck(value) => value.validate(),
+            Self::MailFetch(value) => value.validate(),
         }
     }
 }
@@ -5762,6 +5804,11 @@ pub struct HarnessMailInboxEntryV1 {
     pub body: String,
     pub reply_to: Option<HarnessMailMessageId>,
     pub task_id: Option<HarnessTaskId>,
+    /// Slice C's addition: what this message carries, so a reader sees what
+    /// is attached without dereferencing it -- bounded the same way the
+    /// message itself is, `HARNESS_MAIL_REFS_MAX`.
+    #[serde(default)]
+    pub refs: Vec<HarnessMailRefV1>,
     pub created_at_unix_ms: u64,
     pub acked: bool,
     pub thread: Vec<HarnessMailMessageId>,
@@ -5775,6 +5822,7 @@ impl HarnessMailInboxEntryV1 {
         if self.subject.is_empty()
             || self.subject.len() > HARNESS_TITLE_MAX_BYTES
             || self.body.len() > HARNESS_BODY_MAX_BYTES
+            || self.refs.len() > HARNESS_MAIL_REFS_MAX
         {
             return Err(HarnessReadApiError::InvalidMailMessage);
         }
@@ -5783,6 +5831,9 @@ impl HarnessMailInboxEntryV1 {
         }
         if let Some(task_id) = &self.task_id {
             task_id.validate().map_err(HarnessReadApiError::Protocol)?;
+        }
+        for reference in &self.refs {
+            reference.validate().map_err(HarnessReadApiError::Protocol)?;
         }
         if self.created_at_unix_ms == 0 || self.thread.len() > usize::from(HARNESS_MAIL_THREAD_IDS_MAX) {
             return Err(HarnessReadApiError::InvalidMailInbox);
@@ -5826,6 +5877,45 @@ pub struct HarnessMailAckResultV1 {
 
 impl HarnessMailAckResultV1 {
     pub fn validate(&self) -> Result<(), HarnessReadApiError> { Ok(()) }
+}
+
+/// The outcome of one `g4a_mail_fetch` call (D3, Slice C). `Run` and
+/// `Result` are the two kinds C1 dereferences: `Run` returns the named run's
+/// redacted monitor projection plus a bounded timeline page -- the same
+/// shapes `g4a_monitor_get`/`g4a_timeline_read` already return, just reached
+/// through the mailed ref instead of the caller's own lineage; `Result`
+/// returns the redacted run record the result reference names. `Refused`
+/// carries `HarnessEngineError`'s own `Display` text verbatim for
+/// `MailNotForReader`/`MailRefIndexOutOfRange`/`MailRefKindNotYetFetchable`
+/// -- a named refusal, never a host error, same pattern as
+/// `HarnessMailSendResultV1`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "outcome", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum HarnessMailFetchResultV1 {
+    Run { monitor: SessionMonitorV1, timeline: TimelinePageV1 },
+    Result { run: RedactedRunV1 },
+    Refused { reason: String },
+}
+
+impl HarnessMailFetchResultV1 {
+    pub fn validate(&self) -> Result<(), HarnessReadApiError> {
+        match self {
+            Self::Run { monitor, timeline } => {
+                monitor.validate()?;
+                timeline.validate()
+            }
+            Self::Result { run } => run.validate(),
+            Self::Refused { reason } => {
+                if reason.is_empty()
+                    || reason.len() > HARNESS_MAIL_REFUSAL_REASON_MAX_BYTES
+                    || reason.chars().any(char::is_control)
+                {
+                    return Err(HarnessReadApiError::InvalidMailFetch);
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -6589,6 +6679,8 @@ pub enum HarnessReadApiError {
     InvalidMailMessage,
     #[error("harness mail inbox page is invalid")]
     InvalidMailInbox,
+    #[error("harness mail fetch result is invalid")]
+    InvalidMailFetch,
     #[error("harness protocol value is invalid: {0}")]
     Protocol(#[from] gate4agent_harness_protocol::HarnessValidationError),
 }
@@ -10848,11 +10940,104 @@ mod tests {
 
     /// The mailbox arc's Slice B operator surface (`MailInbox`/`AckMail`,
     /// `unread_mail` on `HarnessRuntimeManagedSessionV1`) moved
-    /// `HARNESS_OPERATOR_WIRE_VERSION` from `20` to `21` -- see the
-    /// constant's own doc comment for the shape.
+    /// `HARNESS_OPERATOR_WIRE_VERSION` from `20` to `21`; Slice C's `refs` on
+    /// `HarnessMailInboxEntryV1` then moved it `21` -> `22` -- see the
+    /// constant's own doc comment for both shapes.
     #[test]
-    fn mailbox_operator_surface_moved_the_wire_pin_to_21() {
-        assert_eq!(HARNESS_OPERATOR_WIRE_VERSION, 21);
+    fn mailbox_operator_surface_moved_the_wire_pin_to_22() {
+        assert_eq!(HARNESS_OPERATOR_WIRE_VERSION, 22);
+    }
+
+    /// D3/Slice C: `HarnessMailFetchResultV1` round-trips for all three
+    /// outcomes, and `Refused`'s reason string is bounded the same way
+    /// `HarnessMailSendResultV1::Refused`'s already is.
+    #[test]
+    fn mail_fetch_result_round_trips_for_run_result_and_refused() {
+        let run_result = HarnessMailFetchResultV1::Run {
+            monitor: monitor_with_mixed_capabilities(),
+            timeline: TimelinePageV1 {
+                run_id: HarnessRunId::new("hrun_000000000000000000000001").unwrap(),
+                availability: ProjectionAvailabilityV1::Current,
+                freshness: ProjectionFreshnessV1::Live,
+                transport_incomplete: false,
+                entries: Vec::new(),
+                next_cursor: None,
+            },
+        };
+        run_result.validate().unwrap();
+        let encoded = serde_json::to_string(&run_result).unwrap();
+        assert_eq!(serde_json::from_str::<HarnessMailFetchResultV1>(&encoded).unwrap(), run_result);
+
+        let result_outcome = HarnessMailFetchResultV1::Result { run: sample_redacted_run('2') };
+        result_outcome.validate().unwrap();
+        let encoded = serde_json::to_string(&result_outcome).unwrap();
+        assert_eq!(serde_json::from_str::<HarnessMailFetchResultV1>(&encoded).unwrap(), result_outcome);
+
+        let refused = HarnessMailFetchResultV1::Refused {
+            reason: "mail message hmail_000000000000000000000001 is not addressed to this reader".to_owned(),
+        };
+        refused.validate().unwrap();
+        let encoded = serde_json::to_string(&refused).unwrap();
+        assert_eq!(serde_json::from_str::<HarnessMailFetchResultV1>(&encoded).unwrap(), refused);
+
+        let empty_reason = HarnessMailFetchResultV1::Refused { reason: String::new() };
+        assert!(matches!(empty_reason.validate(), Err(HarnessReadApiError::InvalidMailFetch)));
+
+        let oversized_reason = HarnessMailFetchResultV1::Refused {
+            reason: "x".repeat(HARNESS_MAIL_REFUSAL_REASON_MAX_BYTES + 1),
+        };
+        assert!(matches!(oversized_reason.validate(), Err(HarnessReadApiError::InvalidMailFetch)));
+    }
+
+    /// C1: `HarnessMailInboxEntryV1` written before `refs` existed
+    /// deserializes with an empty ref list.
+    #[test]
+    fn mail_inbox_entry_old_shape_without_refs_deserializes() {
+        let old_shape = serde_json::json!({
+            "message_id": format!("hmail_{}", "1".repeat(24)),
+            "from": { "record_id": "record-a", "provider": "claude" },
+            "to": { "kind": "session", "record_id": "record-b" },
+            "subject": "status",
+            "body": "handing off the result",
+            "reply_to": null,
+            "task_id": null,
+            "created_at_unix_ms": 1_000,
+            "acked": false,
+            "thread": [],
+        });
+        let decoded: HarnessMailInboxEntryV1 = serde_json::from_value(old_shape).unwrap();
+        assert!(decoded.refs.is_empty());
+        decoded.validate().unwrap();
+    }
+
+    /// D3/Slice C: `MailSend` accepts `refs`, bounded by
+    /// `HARNESS_MAIL_REFS_MAX`, and an old-shape request (no `refs` key)
+    /// still validates.
+    #[test]
+    fn mail_send_request_accepts_bounded_refs_and_old_shape_defaults_empty() {
+        let run_id = HarnessRunId::new("hrun_000000000000000000000001").unwrap();
+        let request = HarnessReadRequestV1::MailSend {
+            to: HarnessMailAddressV1::Session { record_id: HarnessSelectorV1::new("record-b").unwrap() },
+            subject: "status".to_owned(),
+            body: "handing off the result".to_owned(),
+            reply_to: None,
+            refs: vec![HarnessMailRefV1::Run { run_id }],
+        };
+        request.validate().unwrap();
+
+        let old_shape = serde_json::json!({
+            "kind": "mail-send",
+            "to": { "kind": "session", "record_id": "record-b" },
+            "subject": "status",
+            "body": "handing off the result",
+            "reply_to": null,
+        });
+        let decoded: HarnessReadRequestV1 = serde_json::from_value(old_shape).unwrap();
+        match &decoded {
+            HarnessReadRequestV1::MailSend { refs, .. } => assert!(refs.is_empty()),
+            other => panic!("expected MailSend, got {other:?}"),
+        }
+        decoded.validate().unwrap();
     }
 
     #[test]

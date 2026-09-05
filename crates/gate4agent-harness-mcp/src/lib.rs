@@ -3,10 +3,12 @@
 use std::{io::{BufRead, Write}, net::SocketAddr};
 
 use gate4agent_harness_client::{
-    HarnessMailAddressV1, HarnessMailMessageId, HarnessOperationId, HarnessReadClient,
+    HarnessMailAddressV1, HarnessMailMessageId, HarnessMailRefV1, HarnessOperationId,
+    HarnessReadClient,
     HarnessReadClientError, HarnessReadCredential, HarnessReadHostErrorV1, HarnessReadResponseV1,
     HarnessRunId, HarnessRunLifecycleV1, HarnessSelectorV1, HarnessTaskId, HarnessTaskStateV1,
-    SessionContextV1, HARNESS_READ_REQUEST_MAX_BYTES, HARNESS_READ_RESPONSE_MAX_BYTES,
+    SessionContextV1, HARNESS_MAIL_REFS_MAX, HARNESS_READ_REQUEST_MAX_BYTES,
+    HARNESS_READ_RESPONSE_MAX_BYTES,
     HARNESS_READ_TOOL_IDS, HARNESS_WRITE_TOOL_IDS,
 };
 use gate4agent_node_protocol::HarnessReadRequestV1;
@@ -59,9 +61,9 @@ impl HarnessMcpBackend for HarnessReadClient {
             HarnessMcpToolCall::OperationGet { operation_id } => {
                 HarnessReadResponseV1::Operation(self.operation_get(operation_id).map_err(HarnessMcpBackendError::from)?)
             }
-            HarnessMcpToolCall::MailSend { to, subject, body, reply_to } => {
+            HarnessMcpToolCall::MailSend { to, subject, body, reply_to, refs } => {
                 HarnessReadResponseV1::MailSend(
-                    self.mail_send(to, subject, body, reply_to).map_err(HarnessMcpBackendError::from)?,
+                    self.mail_send(to, subject, body, reply_to, refs).map_err(HarnessMcpBackendError::from)?,
                 )
             }
             HarnessMcpToolCall::MailInbox { since_unix_ms, limit } => {
@@ -71,6 +73,11 @@ impl HarnessMcpBackend for HarnessReadClient {
             }
             HarnessMcpToolCall::MailAck { message_id } => {
                 HarnessReadResponseV1::MailAck(self.mail_ack(message_id).map_err(HarnessMcpBackendError::from)?)
+            }
+            HarnessMcpToolCall::MailFetch { message_id, ref_index } => {
+                HarnessReadResponseV1::MailFetch(
+                    self.mail_fetch(message_id, ref_index).map_err(HarnessMcpBackendError::from)?,
+                )
             }
         };
         Ok(response)
@@ -110,13 +117,16 @@ fn tool_call_request(call: HarnessMcpToolCall) -> HarnessReadRequestV1 {
         HarnessMcpToolCall::OperationGet { operation_id } => {
             HarnessReadRequestV1::OperationGet { operation_id }
         }
-        HarnessMcpToolCall::MailSend { to, subject, body, reply_to } => {
-            HarnessReadRequestV1::MailSend { to, subject, body, reply_to }
+        HarnessMcpToolCall::MailSend { to, subject, body, reply_to, refs } => {
+            HarnessReadRequestV1::MailSend { to, subject, body, reply_to, refs }
         }
         HarnessMcpToolCall::MailInbox { since_unix_ms, limit } => {
             HarnessReadRequestV1::MailInbox { since_unix_ms, limit }
         }
         HarnessMcpToolCall::MailAck { message_id } => HarnessReadRequestV1::MailAck { message_id },
+        HarnessMcpToolCall::MailFetch { message_id, ref_index } => {
+            HarnessReadRequestV1::MailFetch { message_id, ref_index }
+        }
     }
 }
 
@@ -140,9 +150,11 @@ pub enum HarnessMcpToolCall {
         subject: String,
         body: String,
         reply_to: Option<HarnessMailMessageId>,
+        refs: Vec<HarnessMailRefV1>,
     },
     MailInbox { since_unix_ms: Option<u64>, limit: u16 },
     MailAck { message_id: HarnessMailMessageId },
+    MailFetch { message_id: HarnessMailMessageId, ref_index: u16 },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -513,7 +525,14 @@ struct MailAddressArgs { session: Option<String>, task: Option<String> }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct MailSendArgs { to: MailAddressArgs, subject: String, body: String, reply_to: Option<String> }
+struct MailSendArgs {
+    to: MailAddressArgs,
+    subject: String,
+    body: String,
+    reply_to: Option<String>,
+    #[serde(default)]
+    refs: Vec<HarnessMailRefV1>,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -522,6 +541,10 @@ struct MailInboxArgs { since_unix_ms: Option<u64>, #[serde(default = "default_li
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MailAckArgs { message_id: String }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MailFetchArgs { message_id: String, ref_index: u16 }
 
 fn parse_mail_address(args: MailAddressArgs) -> Result<HarnessMailAddressV1, ()> {
     match (args.session, args.task) {
@@ -587,11 +610,13 @@ fn parse_tool_call(name: &str, arguments: Value) -> Result<HarnessMcpToolCall, (
         }
         "g4a_mail_send" => {
             let args: MailSendArgs = serde_json::from_value(arguments).map_err(|_| ())?;
+            if args.refs.len() > HARNESS_MAIL_REFS_MAX { return Err(()); }
             Ok(HarnessMcpToolCall::MailSend {
                 to: parse_mail_address(args.to)?,
                 subject: args.subject,
                 body: args.body,
                 reply_to: parse_optional(args.reply_to, HarnessMailMessageId::new)?,
+                refs: args.refs,
             })
         }
         "g4a_mail_inbox" => {
@@ -602,6 +627,14 @@ fn parse_tool_call(name: &str, arguments: Value) -> Result<HarnessMcpToolCall, (
         "g4a_mail_ack" => {
             let args: MailAckArgs = serde_json::from_value(arguments).map_err(|_| ())?;
             Ok(HarnessMcpToolCall::MailAck { message_id: HarnessMailMessageId::new(args.message_id).map_err(|_| ())? })
+        }
+        "g4a_mail_fetch" => {
+            let args: MailFetchArgs = serde_json::from_value(arguments).map_err(|_| ())?;
+            if usize::from(args.ref_index) >= HARNESS_MAIL_REFS_MAX { return Err(()); }
+            Ok(HarnessMcpToolCall::MailFetch {
+                message_id: HarnessMailMessageId::new(args.message_id).map_err(|_| ())?,
+                ref_index: args.ref_index,
+            })
         }
         _ => Err(()),
     }
@@ -632,6 +665,16 @@ fn tool_definitions() -> Vec<Value> {
             true,
         ),
         tool_with_hints(
+            "g4a_mail_fetch",
+            "Dereference one ref attached to a mail message already in this session's inbox. Authorized by message membership, not by this grant's own lineage.",
+            object_schema(vec![
+                ("message_id", string_schema()),
+                ("ref_index", integer_schema(0, HARNESS_MAIL_REFS_MAX as u64 - 1)),
+            ], vec!["message_id", "ref_index"]),
+            true,
+            true,
+        ),
+        tool_with_hints(
             "g4a_mail_inbox",
             "Read waiting mail addressed to this session or to a task it can see.",
             object_schema(vec![
@@ -649,6 +692,7 @@ fn tool_definitions() -> Vec<Value> {
                 ("subject", title_schema()),
                 ("body", body_schema()),
                 ("reply_to", string_schema()),
+                ("refs", mail_refs_schema()),
             ], vec!["to", "subject", "body"]),
             false,
             false,
@@ -696,6 +740,53 @@ fn mail_address_schema() -> Value {
         "properties": { "session": string_schema(), "task": string_schema() },
         "additionalProperties": false
     })
+}
+/// A ref field's own text can run longer than `string_schema`'s 128-byte
+/// tool-argument convention (a workspace-relative `path`, in particular).
+/// This is advisory only -- `HarnessMailRefV1::validate()` (harness-protocol)
+/// is the authoritative bound each field is actually checked against; this
+/// schema only needs to not reject something that would otherwise validate.
+fn mail_ref_text_schema() -> Value { json!({ "type": "string", "minLength": 1, "maxLength": 2_048 }) }
+
+/// One `HarnessMailRefV1`, deserialized straight off the protocol's own
+/// `#[serde(tag = "kind")]` shape (D3): four fixed kinds, so a `oneOf` over
+/// their exact shapes is closed and stable, unlike `mail_address_schema`'s
+/// deliberately simplified two-key surface (that address has only two
+/// shapes and no internal tag to begin with).
+fn mail_ref_schema() -> Value {
+    json!({
+        "type": "object",
+        "oneOf": [
+            {
+                "properties": { "kind": { "const": "run" }, "run_id": mail_ref_text_schema() },
+                "required": ["kind", "run_id"],
+                "additionalProperties": false,
+            },
+            {
+                "properties": { "kind": { "const": "context-pack" }, "digest": mail_ref_text_schema() },
+                "required": ["kind", "digest"],
+                "additionalProperties": false,
+            },
+            {
+                "properties": { "kind": { "const": "result" }, "result_ref": mail_ref_text_schema() },
+                "required": ["kind", "result_ref"],
+                "additionalProperties": false,
+            },
+            {
+                "properties": {
+                    "kind": { "const": "workspace-path" },
+                    "workspace": mail_ref_text_schema(),
+                    "path": mail_ref_text_schema(),
+                    "sha256": mail_ref_text_schema(),
+                },
+                "required": ["kind", "workspace", "path", "sha256"],
+                "additionalProperties": false,
+            },
+        ],
+    })
+}
+fn mail_refs_schema() -> Value {
+    json!({ "type": "array", "items": mail_ref_schema(), "maxItems": HARNESS_MAIL_REFS_MAX })
 }
 fn empty_object() -> Value { json!({}) }
 fn default_limit() -> u16 { DEFAULT_LIMIT }
@@ -1034,6 +1125,58 @@ mod tests {
         }
     }
 
+    /// D3/Slice C: `g4a_mail_fetch` parses a valid call, refuses an
+    /// out-of-range `ref_index` before ever reaching the backend, and
+    /// `g4a_mail_send` carries `refs` end to end (parse -> tool call ->
+    /// wire request), all bounded by `HARNESS_MAIL_REFS_MAX`.
+    #[test]
+    fn mail_fetch_parses_and_rejects_out_of_range_index_before_the_backend() {
+        let message_id = format!("hmail_{}", "1".repeat(24));
+        let call = parse_tool_call(
+            "g4a_mail_fetch",
+            json!({ "message_id": message_id, "ref_index": 0 }),
+        ).unwrap();
+        assert_eq!(
+            call,
+            HarnessMcpToolCall::MailFetch {
+                message_id: HarnessMailMessageId::new(format!("hmail_{}", "1".repeat(24))).unwrap(),
+                ref_index: 0,
+            },
+        );
+        assert!(parse_tool_call(
+            "g4a_mail_fetch",
+            json!({ "message_id": format!("hmail_{}", "1".repeat(24)), "ref_index": HARNESS_MAIL_REFS_MAX as u64 }),
+        ).is_err());
+
+        let run_id = format!("hrun_{}", "2".repeat(24));
+        let send_call = parse_tool_call(
+            "g4a_mail_send",
+            json!({
+                "to": { "session": "record-b" },
+                "subject": "status",
+                "body": "handing off",
+                "refs": [{ "kind": "run", "run_id": run_id }],
+            }),
+        ).unwrap();
+        match send_call {
+            HarnessMcpToolCall::MailSend { refs, .. } => assert_eq!(refs.len(), 1),
+            other => panic!("expected MailSend, got {other:?}"),
+        }
+
+        let too_many_refs = (0..HARNESS_MAIL_REFS_MAX + 1)
+            .map(|_| json!({ "kind": "run", "run_id": format!("hrun_{}", "2".repeat(24)) }))
+            .collect::<Vec<_>>();
+        assert!(parse_tool_call(
+            "g4a_mail_send",
+            json!({
+                "to": { "session": "record-b" },
+                "subject": "status",
+                "body": "handing off",
+                "refs": too_many_refs,
+            }),
+        ).is_err());
+    }
+
     /// D7: "not an authority channel, by construction and by test." No
     /// catalog id resembles `ResolveInteraction` (the sole approval-answering
     /// verb, operator-wire only) and `tools/call` refuses that exact name by
@@ -1042,7 +1185,7 @@ mod tests {
     /// legitimate-but-ungranted tool id.
     #[test]
     fn d7_no_tool_reaches_resolve_interaction_and_write_tool_ids_are_exactly_mail() {
-        assert_eq!(HARNESS_WRITE_TOOL_IDS, ["g4a_mail_ack", "g4a_mail_inbox", "g4a_mail_send"]);
+        assert_eq!(HARNESS_WRITE_TOOL_IDS, ["g4a_mail_ack", "g4a_mail_fetch", "g4a_mail_inbox", "g4a_mail_send"]);
         assert!(HARNESS_READ_TOOL_IDS.iter().chain(HARNESS_WRITE_TOOL_IDS.iter()).all(|id| {
             !id.contains("resolve_interaction") && !id.contains("resolve-interaction")
         }));

@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use gate4agent_harness_client::{
     HarnessCreateTaskRequestV1, HarnessDeliveryBundleIdV1, HarnessDeliveryBundleSelectionV1,
     HarnessExpectedExecutionSpecRevisionV1, HarnessIdempotencyRef, HarnessMailAckOperatorRequestV1,
-    HarnessMailMessageId, HarnessMoveTaskRequestV1,
+    HarnessMailMessageId, HarnessMailRefV1, HarnessMoveTaskRequestV1,
     HarnessOperationId, HarnessOperatorAuthorityV1, HarnessOperatorClient, HarnessOperatorCredential,
     HarnessOperatorMutationOutcomeV1, HarnessOrdinaryLaunchPlanOptionV1,
     HarnessReplaceTaskExecutionSpecRequestV2, HarnessReviewedTaskLaunchSelectionV1,
@@ -320,6 +320,18 @@ fn parse_record_id(value: String) -> Result<HarnessSelectorV1, String> {
 
 fn parse_mail_message_id(value: String) -> Result<HarnessMailMessageId, String> {
     HarnessMailMessageId::new(value).map_err(|_| "invalid mail message id".to_owned())
+}
+
+/// D3/Slice C: names one attached ref's kind for `mail inbox`'s one-line
+/// summary -- never the ref's own content (a run id, a digest, a path), just
+/// which of the four fixed kinds it is.
+fn mail_ref_kind_name(reference: &HarnessMailRefV1) -> &'static str {
+    match reference {
+        HarnessMailRefV1::Run { .. } => "run",
+        HarnessMailRefV1::ContextPack { .. } => "context-pack",
+        HarnessMailRefV1::Result { .. } => "result",
+        HarnessMailRefV1::WorkspacePath { .. } => "workspace-path",
+    }
 }
 
 fn parse_kebab<T: serde::de::DeserializeOwned>(value: &str, flag: &str) -> Result<T, String> {
@@ -877,9 +889,14 @@ fn execute(invocation: Invocation) -> Result<String, String> {
             let page = client
                 .mail_inbox(record_id, since_unix_ms, limit)
                 .map_err(|error| error.to_string())?;
-            let mut lines = page.messages.iter()
-                .map(|message| serde_json::to_string(message).map_err(|error| error.to_string()))
-                .collect::<Result<Vec<_>, String>>()?;
+            let mut lines = Vec::with_capacity(page.messages.len() * 2 + 1);
+            for message in &page.messages {
+                lines.push(serde_json::to_string(message).map_err(|error| error.to_string())?);
+                if !message.refs.is_empty() {
+                    let kinds = message.refs.iter().map(mail_ref_kind_name).collect::<Vec<_>>().join(",");
+                    lines.push(format!("  refs[{}]: {kinds}", message.refs.len()));
+                }
+            }
             lines.push(format!("{{\"unacked\":{}}}", page.unacked));
             Ok(lines.join("\n"))
         }

@@ -155,8 +155,9 @@ impl HarnessReadClient {
         subject: String,
         body: String,
         reply_to: Option<HarnessMailMessageId>,
+        refs: Vec<HarnessMailRefV1>,
     ) -> Result<HarnessMailSendResultV1, HarnessReadClientError> {
-        match self.send(HarnessReadRequestV1::MailSend { to, subject, body, reply_to })? {
+        match self.send(HarnessReadRequestV1::MailSend { to, subject, body, reply_to, refs })? {
             HarnessReadResponseV1::MailSend(value) => Ok(value),
             _ => Err(HarnessReadClientError::UnexpectedResponse),
         }
@@ -179,6 +180,20 @@ impl HarnessReadClient {
     ) -> Result<HarnessMailAckResultV1, HarnessReadClientError> {
         match self.send(HarnessReadRequestV1::MailAck { message_id })? {
             HarnessReadResponseV1::MailAck(value) => Ok(value),
+            _ => Err(HarnessReadClientError::UnexpectedResponse),
+        }
+    }
+
+    /// D3/Slice C: dereference one ref on a message already in the caller's
+    /// inbox. See `HarnessReadRequestV1::MailFetch`'s own doc comment for the
+    /// authorization rule (message membership, not lineage).
+    pub fn mail_fetch(
+        &self,
+        message_id: HarnessMailMessageId,
+        ref_index: u16,
+    ) -> Result<HarnessMailFetchResultV1, HarnessReadClientError> {
+        match self.send(HarnessReadRequestV1::MailFetch { message_id, ref_index })? {
+            HarnessReadResponseV1::MailFetch(value) => Ok(value),
             _ => Err(HarnessReadClientError::UnexpectedResponse),
         }
     }

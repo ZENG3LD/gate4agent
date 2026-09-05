@@ -2714,6 +2714,7 @@ impl HarnessService {
         subject: String,
         body: String,
         reply_to: Option<gate4agent_harness_protocol::HarnessMailMessageId>,
+        refs: Vec<gate4agent_harness_protocol::HarnessMailRefV1>,
         now_unix_ms: u64,
     ) -> Result<HarnessMailSendResultV1, HarnessServiceError> {
         self.ensure_healthy()?;
@@ -2737,6 +2738,7 @@ impl HarnessService {
             body,
             reply_to,
             task_id: None,
+            refs,
             created_at_unix_ms: now_unix_ms,
         };
         let mut mutation = HarnessMutationV1::SendMail { operation, message };

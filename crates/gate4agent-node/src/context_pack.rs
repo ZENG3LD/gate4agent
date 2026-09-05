@@ -1,9 +1,8 @@
 use crate::protocol::{
-    ContextPackLineageReceipt, GitSnapshot, ResolvedContextPackReceipt,
+    context_pack_digest, ContextPackLineageReceipt, GitSnapshot, ResolvedContextPackReceipt,
     SpawnContextDigest, SpawnContextId, MAX_CONTEXT_PACK_BYTES,
 };
 use gate4agent_types::{AgentId, HistoryMessageRecord, HistorySessionRecord};
-use ring::digest::{Context, SHA256};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -18,7 +17,6 @@ pub(crate) const CONTEXT_PACK_SELECTED_FILES: [&str; 4] = [
 ];
 pub(crate) const MAX_CONTEXT_PACK_SELECTED_FILE_BYTES: usize = 16 * 1_024;
 const CONTEXT_PACK_SCHEMA: &str = "g4a-context-pack-v1";
-const CONTEXT_PACK_DIGEST_DOMAIN: &[u8] = b"g4a-context-pack-v1\0";
 const CONTEXT_PACK_STATUS_MAX_ENTRIES: usize = 64;
 const CONTEXT_PACK_COMMIT_MAX_ENTRIES: usize = 12;
 const CONTEXT_PACK_BRANCH_MAX_BYTES: usize = 256;
@@ -371,7 +369,7 @@ impl NodeContextPack {
             truncated = true;
         };
 
-        let digest = context_digest(&lineage, &bytes)?;
+        let digest = context_pack_digest(&lineage, &bytes);
         let context_id = context_id(&digest)?;
         let receipt = ResolvedContextPackReceipt {
             id: context_id,
@@ -393,7 +391,7 @@ impl NodeContextPack {
         if bytes.len() != receipt.byte_len as usize
             || bytes.is_empty()
             || bytes.len() > MAX_CONTEXT_PACK_BYTES as usize
-            || context_digest(&receipt.lineage, &bytes)? != receipt.digest
+            || context_pack_digest(&receipt.lineage, &bytes) != receipt.digest
             || context_id(&receipt.digest)? != receipt.id
         {
             return Err(ContextPackError::ReceiptMismatch);
@@ -851,26 +849,6 @@ impl ContextPackCatalog {
     }
 }
 
-fn context_digest(
-    lineage: &ContextPackLineageReceipt,
-    bytes: &[u8],
-) -> Result<SpawnContextDigest, ContextPackError> {
-    let lineage = serde_json::to_vec(lineage).map_err(|_| ContextPackError::Serialization)?;
-    let mut context = Context::new(&SHA256);
-    context.update(CONTEXT_PACK_DIGEST_DOMAIN);
-    context.update(&lineage);
-    context.update(&[0]);
-    context.update(bytes);
-    let hex = context
-        .finish()
-        .as_ref()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    SpawnContextDigest::new(format!("sha256:{hex}"))
-        .map_err(|_| ContextPackError::Serialization)
-}
-
 fn context_id(digest: &SpawnContextDigest) -> Result<SpawnContextId, ContextPackError> {
     let hex = digest
         .as_str()
@@ -1105,7 +1083,7 @@ mod tests {
         };
         let bytes = serde_json::to_vec(&document).unwrap();
         assert!(!String::from_utf8_lossy(&bytes).contains("repository"));
-        let digest = context_digest(&lineage, &bytes).unwrap();
+        let digest = context_pack_digest(&lineage, &bytes);
         let receipt = ResolvedContextPackReceipt {
             id: context_id(&digest).unwrap(),
             digest,

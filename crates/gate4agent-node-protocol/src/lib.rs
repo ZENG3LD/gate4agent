@@ -25,6 +25,7 @@ use gate4agent_types::{
     AgentInstanceId, ApprovalLevel, ControlEvent, ProviderActivity, ProviderSessionIdentity,
     SessionGeneration, SessionSnapshot, TerminalControl, TerminalFrame, TerminalSize,
 };
+use ring::digest::{Context, SHA256};
 use serde::de::{DeserializeOwned, MapAccess, SeqAccess, Visitor};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -1593,6 +1594,35 @@ impl ResolvedContextPackReceipt {
             && self.truncated
                 == (self.source_message_count > self.retained_message_count)
     }
+}
+
+/// Domain-separates the context pack digest from every other SHA256 use in
+/// the wire so a collision elsewhere can never be replayed as a valid
+/// context pack digest.
+const CONTEXT_PACK_DIGEST_DOMAIN: &[u8] = b"g4a-context-pack-v1\0";
+
+/// The one definition of the context pack digest formula: `SHA256(domain ||
+/// JSON(lineage) || 0x00 || bytes)`, rendered `sha256:<hex>`. Both the node
+/// (computing a pack's digest when it exports one) and the harness
+/// (recomputing a fetched pack's digest to check it against a mailed
+/// receipt) call this instead of keeping their own copy, so the formula can
+/// only drift in one place.
+pub fn context_pack_digest(lineage: &ContextPackLineageReceipt, bytes: &[u8]) -> SpawnContextDigest {
+    let lineage_bytes = serde_json::to_vec(lineage)
+        .expect("ContextPackLineageReceipt has no map keys and always serializes to JSON");
+    let mut context = Context::new(&SHA256);
+    context.update(CONTEXT_PACK_DIGEST_DOMAIN);
+    context.update(&lineage_bytes);
+    context.update(&[0]);
+    context.update(bytes);
+    let hex = context
+        .finish()
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    SpawnContextDigest::new(format!("sha256:{hex}"))
+        .expect("a freshly rendered sha256:<64 lowercase hex> string always satisfies SpawnContextDigest::new")
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -10327,6 +10357,26 @@ mod tests {
         };
         let encoded = serde_json::to_string(&oversized).unwrap();
         assert!(serde_json::from_str::<ContextPackBytesRead>(&encoded).is_err());
+    }
+
+    /// Pins `context_pack_digest`'s formula (`SHA256(domain || JSON(lineage)
+    /// || 0x00 || bytes)`, rendered `sha256:<hex>`) to a literal so a future
+    /// edit to the hashing, the domain tag, the separator byte, or the
+    /// lineage's own JSON shape shows up here as a changed digest rather than
+    /// drifting silently between the node (which computes it on export) and
+    /// the harness (which recomputes it to check a fetched pack).
+    #[test]
+    fn context_pack_digest_formula_is_pinned() {
+        let lineage = ContextPackLineageReceipt {
+            source_node_id: NodeId::new("node-pin").unwrap(),
+            source_session: session_address("pin-workspace", 42),
+            source_provider: agent("claude"),
+        };
+        let digest = context_pack_digest(&lineage, b"pinned-context-pack-bytes");
+        assert_eq!(
+            digest.as_str(),
+            "sha256:d35f4bd15866f03ca3621129bd661862a307a46002fd90e1ff2ca988c72a7035",
+        );
     }
 
     #[test]

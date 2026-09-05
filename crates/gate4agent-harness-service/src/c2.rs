@@ -46,7 +46,7 @@ use gate4agent_harness_api::{
     HARNESS_WORKSPACE_FILE_MAX_BYTES, HARNESS_WORKSPACE_TREE_ENTRIES_MAX,
 };
 use gate4agent_node_protocol::{
-    CapabilityId, ContextPackBytesRead, DeliveryBlobChunkHexV1,
+    context_pack_digest, CapabilityId, ContextPackBytesRead, DeliveryBlobChunkHexV1,
     DeliveryBlobDigestV1, DeliveryBundleManifestV2,
     DeliveryCommitReceiptV1, DeliveryStageId, HarnessMcpActivationDigest,
     HarnessMcpCallId, HarnessMcpRejectReasonV1, HarnessMcpReplyChunkHexV1,
@@ -5324,37 +5324,22 @@ fn correlate_context_pack_fetch_response(
     }
 }
 
-/// Recomputes `gate4agent-node`'s own context-pack digest
-/// (`context_pack.rs::context_digest`, private to that crate/module) over
-/// the lineage this run's own receipt carries plus the bytes the Node just
-/// returned -- so bytes that don't hash to the digest a mailed ref actually
-/// named (a corrupted store, a stale pack) are caught here rather than
-/// trusted on the wire's say-so alone. The formula is replicated verbatim
-/// (SHA256 over a fixed domain tag, the lineage receipt's own JSON encoding,
-/// one zero byte, then the bytes) since `gate4agent-node` cannot be depended
-/// on directly (PTY/process/workspace runtime) and the function itself is
-/// private to its module; `harness_context_to_node` already reconstructs the
-/// exact `ContextPackLineageReceipt` value node serialized when it first
-/// computed this digest, so the JSON bytes hashed here are byte-identical to
-/// node's own.
-const CONTEXT_PACK_DIGEST_DOMAIN: &[u8] = b"g4a-context-pack-v1\0";
-
+/// Recomputes a fetched context pack's digest over the lineage this run's
+/// own receipt carries plus the bytes the Node just returned -- so bytes
+/// that don't hash to the digest a mailed ref actually named (a corrupted
+/// store, a stale pack) are caught here rather than trusted on the wire's
+/// say-so alone. The formula itself lives once in
+/// `gate4agent_node_protocol::context_pack_digest`, shared with
+/// `gate4agent-node`'s own export path; `harness_context_to_node` already
+/// reconstructs the exact `ContextPackLineageReceipt` value node serialized
+/// when it first computed this digest, so the JSON bytes hashed here are
+/// byte-identical to node's own.
 pub(crate) fn recompute_context_pack_digest(
     receipt: &HarnessResolvedContextPackReceiptV1,
     bytes: &[u8],
 ) -> Result<String, HarnessC2Error> {
     let node_receipt = harness_context_to_node(receipt)?;
-    let lineage_bytes: Vec<u8> = serde_json::to_vec(&node_receipt.lineage)
-        .map_err(|_| HarnessC2Error::ContextPackFetchDigestReconstruction)?;
-    let mut hasher = ring::digest::Context::new(&ring::digest::SHA256);
-    hasher.update(CONTEXT_PACK_DIGEST_DOMAIN);
-    hasher.update(&lineage_bytes);
-    hasher.update(&[0]);
-    hasher.update(bytes);
-    let hex = hasher.finish().as_ref().iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    Ok(format!("sha256:{hex}"))
+    Ok(context_pack_digest(&node_receipt.lineage, bytes).to_string())
 }
 
 #[derive(Debug)]
@@ -6370,8 +6355,6 @@ pub enum HarnessC2Error {
     ContextPackFetchCorrelationMismatch,
     #[error("Node rejected mailed context pack fetch with {code:?}")]
     ContextPackFetchRejected { code: NodeFailureCode },
-    #[error("mailed context pack lineage could not be reconstructed into the Node's own receipt shape")]
-    ContextPackFetchDigestReconstruction,
     #[error("node workspace write request is invalid")]
     InvalidNodeWorkspaceWriteRequest,
     #[error("node workspace write was not enqueued: {0}")]

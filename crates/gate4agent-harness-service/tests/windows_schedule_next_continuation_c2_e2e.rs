@@ -214,6 +214,7 @@ fn apply(service: &mut HarnessService, mut mutation: HarnessMutationV1) {
 
 fn source_plan(node_id: &NodeId, workspace_id: &WorkspaceId) -> HarnessLaunchPlanV1 {
     HarnessLaunchPlanV1 {
+        approval_level: Default::default(),
         plan_id: selector("source-codex"),
         revision: revision(1),
         node_id: selector(node_id.as_str()),
@@ -234,6 +235,7 @@ fn source_plan(node_id: &NodeId, workspace_id: &WorkspaceId) -> HarnessLaunchPla
 
 fn target_plan(node_id: &NodeId, workspace_id: &WorkspaceId) -> HarnessLaunchPlanV1 {
     HarnessLaunchPlanV1 {
+        approval_level: Default::default(),
         plan_id: selector("target-kimi-continuation"),
         revision: revision(1),
         node_id: selector(node_id.as_str()),

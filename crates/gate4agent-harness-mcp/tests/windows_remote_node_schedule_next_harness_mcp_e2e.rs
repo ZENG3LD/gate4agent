@@ -49,6 +49,7 @@ fn parent_run_task() -> HarnessTaskV1 {
 
 fn h3b_schedule_next_plan() -> HarnessLaunchPlanV1 {
     HarnessLaunchPlanV1 {
+        approval_level: Default::default(),
         plan_id: selector("remote-harness-mcp"),
         revision: HarnessRevision::new(1).unwrap(),
         node_id: selector("remote-h3b-node"),

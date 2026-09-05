@@ -324,6 +324,7 @@ async fn windows_harness_light_operator_session_verbs_and_typed_rejections() {
         profile_id.as_str().to_owned(),
         HarnessExecutionModeV1::Pty,
         HarnessRuntimeTerminalSizeV1 { rows: 24, columns: 80 },
+        None,
     ).unwrap();
     assert_eq!(session.node_id, node_id.as_str());
     assert_eq!(session.workspace_id, workspace_id.as_str());
@@ -572,6 +573,7 @@ async fn windows_harness_light_operator_workspace_history_management_and_termina
         profile_id.as_str().to_owned(),
         HarnessExecutionModeV1::Pty,
         HarnessRuntimeTerminalSizeV1 { rows: 24, columns: 80 },
+        None,
     ).unwrap();
 
     let first_page = timeout(Duration::from_secs(15), async {
@@ -753,6 +755,7 @@ async fn windows_harness_light_operator_event_subscription_baseline_and_inventor
         profile_id.as_str().to_owned(),
         HarnessExecutionModeV1::Pty,
         HarnessRuntimeTerminalSizeV1 { rows: 24, columns: 80 },
+        None,
     ).unwrap();
     assert_eq!(session.node_id, node_id.as_str());
 

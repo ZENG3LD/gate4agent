@@ -221,6 +221,7 @@ fn ordinary_plan(
     plan_revision: HarnessRevision,
 ) -> HarnessLaunchPlanV1 {
     HarnessLaunchPlanV1 {
+        approval_level: Default::default(),
         plan_id: selector(plan_id),
         revision: plan_revision,
         node_id: selector(node_id.as_str()),

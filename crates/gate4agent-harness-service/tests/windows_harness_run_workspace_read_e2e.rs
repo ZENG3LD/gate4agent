@@ -270,6 +270,7 @@ fn prepare_repository(
 
 fn launch_catalog(node_id: &NodeId, workspace_id: &WorkspaceId) -> HarnessLaunchCatalog {
     HarnessLaunchCatalog::new([HarnessLaunchPlanV1 {
+        approval_level: Default::default(),
         plan_id: selector("default"),
         revision: HarnessRevision::new(1).unwrap(),
         node_id: selector(node_id.as_str()),

@@ -322,6 +322,7 @@ fn launch_catalog(
     grant_revision: HarnessRevision,
 ) -> HarnessLaunchCatalog {
     HarnessLaunchCatalog::new([HarnessLaunchPlanV1 {
+        approval_level: Default::default(),
         plan_id: selector("reviewed-delivery"),
         revision: revision(1),
         node_id: selector(node_id.as_str()),

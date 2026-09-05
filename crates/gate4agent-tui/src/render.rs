@@ -8985,7 +8985,7 @@ fn harness_feature_state_label(state: FeatureObservationStateV1) -> &'static str
 
 fn harness_monitor_progress_line(monitor: &HarnessSessionMonitorV1) -> String {
     format!(
-        "Observation: availability={:?} freshness={:?}{} | progress TODO {}/{} tools {} subagents {} | usage in {} out {}",
+        "Observation: availability={:?} freshness={:?}{} | progress TODO {}/{} tools {} subagents {} blocks {} | usage in {} out {}",
         monitor.availability,
         monitor.freshness,
         if monitor.transport_incomplete { " transport=incomplete" } else { "" },
@@ -8993,6 +8993,7 @@ fn harness_monitor_progress_line(monitor: &HarnessSessionMonitorV1) -> String {
         monitor.todo_total,
         monitor.active_tools,
         monitor.active_subagents,
+        monitor.active_blocks,
         monitor.input_tokens,
         monitor.output_tokens,
     )
@@ -9184,6 +9185,23 @@ fn harness_monitor_section_lines(
                     .unwrap_or_else(|| "unavailable".to_owned()),
                 fact.state,
                 fact.label.as_deref().unwrap_or("label unavailable"),
+                fact.evidence,
+            ),
+            theme.dim,
+            None,
+        )));
+        lines.push((
+            format!("blocks {}", detail.block_facts.len()),
+            theme.text,
+            None,
+        ));
+        lines.extend(detail.block_facts.iter().map(|fact| (
+            format!(
+                "blocked {}{} | via {:?}",
+                fact.label.as_deref().unwrap_or("label unavailable"),
+                fact.correlation
+                    .map(|value| format!(" #{value}"))
+                    .unwrap_or_default(),
                 fact.evidence,
             ),
             theme.dim,
@@ -15750,7 +15768,8 @@ mod tests {
         HarnessTaskId, HarnessTaskStateV1, RedactedBindingStateV1,
         RedactedRunIntentV1, RedactedRunV1, RedactedTaskV1,
         RedactedWorktreeIntentV1, TaskCreatorCategoryV1,
-        ActivityClassV1, ActivityFactV1, ActivityStateV1, FeatureObservationStateV1,
+        ActivityClassV1, ActivityFactV1, ActivityStateV1, BlockFactV1, BlockStateV1,
+        FeatureObservationStateV1,
         FileActionV1, FileFactV1, HarnessMonitoringVisibilityV1, InteractionClassV1,
         InteractionFactV1, InteractionStateV1, MonitorFeatureStatesV1,
         ObservationEvidenceV1 as HarnessObservationEvidenceV1, ProjectionAvailabilityV1,
@@ -16931,6 +16950,69 @@ mod tests {
         let activity_text = buffer_text(&activity_buf);
         assert!(activity_text.contains("Tools: unsupported by observed sources"), "{activity_text}");
         assert!(activity_text.contains("Subagents: supported, not observed"), "{activity_text}");
+    }
+
+    #[test]
+    fn harness_monitor_renders_block_fact_with_label_and_correlation() {
+        let mut monitor = rich_harness_monitor(
+            HarnessRunId::new("hrun_888888888888888888888888").unwrap(),
+        );
+        monitor.active_blocks = 1;
+        let detail = monitor.detail.as_mut().unwrap();
+        detail.block_facts.push(BlockFactV1 {
+            state: BlockStateV1::Blocked,
+            label: Some("policy: no unattended writes".to_owned()),
+            correlation: Some(9),
+            evidence: HarnessObservationEvidenceV1::ManagedHook,
+        });
+        let run = RedactedRunV1 {
+            run_id: monitor.run_id.clone(),
+            revision: HarnessRevision::new(1).unwrap(),
+            parent_run_id: None,
+            task_id: None,
+            operation_id: None,
+            intent: RedactedRunIntentV1 {
+                mode: HarnessExecutionModeV1::Pty,
+                worktree: RedactedWorktreeIntentV1::Existing,
+                has_delivery_bundle: false,
+                has_continuation: false,
+            },
+            lifecycle: HarnessRunLifecycleV1::Running,
+            binding: RedactedBindingStateV1::ManagedActive,
+            result_disposition: None,
+            failure_category: None,
+            context_pack: None,
+            git_facts: None,
+            references_redacted: false,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+        };
+        let mut app = App::default();
+        app.agent_board_mode = crate::app::AgentBoardMode::HarnessKanban;
+        app.harness_kanban.monitor = Some(crate::app::HarnessRunMonitorView {
+            run,
+            monitor: Some(monitor),
+            timeline: Vec::new(),
+            section: crate::app::HarnessRunMonitorSection::Activity,
+            scroll: 0,
+            loading: false,
+            stale_reason: None,
+        });
+        let mut activity_buf = TerminalBuffer::new(180, 36);
+        let mut layout = LayoutRects::default();
+        render_harness_kanban(
+            &app,
+            Rect::new(0, 0, 180, 36),
+            &mut activity_buf,
+            &mut layout,
+            Theme::for_mode(PtyColorMode::Inherited),
+        );
+        let activity_text = buffer_text(&activity_buf);
+        assert!(activity_text.contains("blocks 1"), "{activity_text}");
+        assert!(
+            activity_text.contains("blocked policy: no unattended writes #9"),
+            "{activity_text}"
+        );
     }
 
     #[test]

@@ -45,14 +45,28 @@ pub(crate) fn acp_command(tool: CliTool) -> Result<AcpSpawnSpec, std::io::Error>
         // something that runs, lags badly, and never says why. Verified
         // against the registry rather than taken from a summary: the old
         // names carry deprecation notices naming these as replacements.
+        //
+        // Pinned to an exact version, not a bare package name: `npx -y
+        // <pkg>` with no version resolves and fetches whatever is
+        // currently published, and a COLD fetch of a freshly published
+        // version measured 19s today -- eating most of the 30s ACP
+        // handshake budget. The last live run timed claude out at
+        // `initialize` on the first spawn after the adapter's own 0.74.0
+        // release (2026-09-04): the unpinned `npx -y` picked that release
+        // up mid-handshake-budget with no warning. Pinned here 2026-09-05
+        // against the registry's own `npm view <pkg> version`: `claude-
+        // agent-acp@0.74.0` (current latest at pin time) and `codex-
+        // acp@1.10.0` (current latest at pin time). A version bump is a
+        // deliberate edit to this literal, never an automatic `npx`
+        // resolution.
         CliTool::ClaudeCode => AcpSpawnSpec {
             program: "npx",
-            args: &["-y", "@agentclientprotocol/claude-agent-acp"],
+            args: &["-y", "@agentclientprotocol/claude-agent-acp@0.74.0"],
             npm_tool: true,
         },
         CliTool::Codex => AcpSpawnSpec {
             program: "npx",
-            args: &["-y", "@agentclientprotocol/codex-acp"],
+            args: &["-y", "@agentclientprotocol/codex-acp@1.10.0"],
             npm_tool: true,
         },
         CliTool::Grok => AcpSpawnSpec {
@@ -428,7 +442,7 @@ mod tests {
         let spec = acp_command(CliTool::ClaudeCode).unwrap();
         assert_eq!(spec.program, "npx");
         assert!(spec.npm_tool);
-        assert!(spec.args.contains(&"@agentclientprotocol/claude-agent-acp"));
+        assert!(spec.args.contains(&"@agentclientprotocol/claude-agent-acp@0.74.0"));
     }
 
     #[test]
@@ -436,7 +450,7 @@ mod tests {
         let spec = acp_command(CliTool::Codex).unwrap();
         assert_eq!(spec.program, "npx");
         assert!(spec.npm_tool);
-        assert!(spec.args.contains(&"@agentclientprotocol/codex-acp"));
+        assert!(spec.args.contains(&"@agentclientprotocol/codex-acp@1.10.0"));
     }
 
     #[test]
@@ -571,13 +585,13 @@ mod tests {
     fn windows_cmd_wrapper_for_an_npm_tool_ignores_an_empty_extra_args() {
         let cmd = windows_cmd_wrapper(
             "npx.cmd",
-            &["-y", "@agentclientprotocol/claude-agent-acp"],
+            &["-y", "@agentclientprotocol/claude-agent-acp@0.74.0"],
             &[],
         );
         assert_eq!(cmd.get_program(), std::ffi::OsStr::new("cmd"));
         assert_eq!(
             command_args(&cmd),
-            ["/C", "npx.cmd", "-y", "@agentclientprotocol/claude-agent-acp"]
+            ["/C", "npx.cmd", "-y", "@agentclientprotocol/claude-agent-acp@0.74.0"]
         );
     }
 
@@ -632,7 +646,7 @@ mod tests {
         assert_eq!(cmd.get_program(), std::ffi::OsStr::new("cmd"));
         assert_eq!(
             command_args(&cmd),
-            ["/C", "npx.cmd", "-y", "@agentclientprotocol/claude-agent-acp"]
+            ["/C", "npx.cmd", "-y", "@agentclientprotocol/claude-agent-acp@0.74.0"]
         );
     }
 }

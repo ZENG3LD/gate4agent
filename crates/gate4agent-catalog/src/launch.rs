@@ -191,15 +191,15 @@ pub enum ApprovalLevelResolution {
 ///   also name `--auto` and `--plan` flags, but only as flags rejected
 ///   together with `--prompt` -- there is no confirmation either applies to
 ///   (or has the same meaning under) the `kimi acp` subcommand this project
-///   actually spawns, so neither is wired into `args` here. The ACP
-///   transport does not need argv for either any more: measured live
-///   2026-09-02 (`session/new` of `kimi acp`, see
-///   `docs/gate4agent/audits/gate4agent-acp-slice1-proof-2026-09-02.md`),
-///   kimi announces `auto` and `plan` as ACP session modes, and neither
-///   raised a live permission question when set -- `Moderate` (`auto`)
-///   wrote silently, `ReadOnly` (`plan`) refused silently. `ReadOnly` is
-///   `Supported` with a sourced `acp_mode_id` now, not `Unsupported`: the
-///   ACP mechanism was confirmed even though the CLI flag was not.
+///   actually spawns, so neither is wired into `args` here. All three
+///   managed levels carry `acp_mode_id: None` now: measured 2026-09-05,
+///   `kimi.exe 0.29.0`'s `session/new` result (the native binary at
+///   `%USERPROFILE%\.kimi-code\bin\kimi.exe`, spawned directly by `kimi acp`
+///   since `1fb14ca`) carries `configOptions` (a `model` select) and no
+///   `modes` field at all -- there is no ACP mode mechanism to source an id
+///   from any more. The 2026-09-02 measurement that put `yolo`/`auto`/`plan`
+///   here was a different build: the npm shell shim running under WSL
+///   interop, not this native binary.
 /// - `Unmanaged` always resolves `Supported` with no flag and
 ///   `asks_for_permission: true`, for every agent ID including one this
 ///   catalog does not recognize: it imposes nothing by definition, so it can
@@ -346,14 +346,11 @@ pub fn approval_level_resolution(agent_id: &AgentId, level: ApprovalLevel) -> Ap
             // everything" semantics inferred from the universal industry
             // meaning of "yolo mode", not read directly from a Kimi
             // permissions doc -- UNCONFIRMED at the source, high confidence.
-            //
-            // measured 2026-09-02, session/new of kimi acp, see
-            // docs/gate4agent/audits/gate4agent-acp-slice1-proof-2026-09-02.md
-            // kimi announces this level's ACP mode as `yolo` ("YOLO");
-            // measured live a write completed silently and reported success
-            // -- never asks, confirming the argv-level inference above.
             asks_for_permission: false,
-            acp_mode_id: Some(ModeId::new("yolo")),
+            // measured 2026-09-05: kimi.exe 0.29.0 session/new offers no
+            // modes; the 2026-09-02 yolo/auto/plan measurement was the npm
+            // shim under WSL interop
+            acp_mode_id: None,
         },
         ("kimi", ApprovalLevel::Moderate) => Supported {
             // `--auto` is named in Kimi's own release notes but only as a
@@ -362,29 +359,21 @@ pub fn approval_level_resolution(agent_id: &AgentId, level: ApprovalLevel) -> Ap
             // project spawns is UNCONFIRMED, so it is not wired into `args`
             // here -- falls back to no flag, same as `Unmanaged`.
             args: Vec::new(),
-            // measured 2026-09-02, session/new of kimi acp, see
-            // docs/gate4agent/audits/gate4agent-acp-slice1-proof-2026-09-02.md
-            // kimi announces this level's ACP mode as `auto` ("Auto");
-            // measured live a write completed silently and reported success
-            // -- the ACP mode itself never asks, unlike the PTY-doc
-            // assumption this row used to carry.
             asks_for_permission: false,
-            acp_mode_id: Some(ModeId::new("auto")),
+            // measured 2026-09-05: kimi.exe 0.29.0 session/new offers no
+            // modes; the 2026-09-02 yolo/auto/plan measurement was the npm
+            // shim under WSL interop
+            acp_mode_id: None,
         },
-        // measured 2026-09-02, session/new of kimi acp, see
-        // docs/gate4agent/audits/gate4agent-acp-slice1-proof-2026-09-02.md
-        // kimi announces this level's ACP mode as `plan` ("Plan"); measured
-        // live a write outside the working directory produced no question,
-        // no text and no file -- a silent refusal (`may_ask: false`),
-        // distinct from claude's own `plan`, which neither refuses nor asks
-        // (see claude's `ReadOnly` row above). `--plan`'s applicability to
-        // the PTY `kimi acp` subcommand remains UNCONFIRMED, so `args` stays
-        // empty; the ACP mechanism is confirmed regardless, so this row is
-        // `Supported`, not `Unsupported`.
+        // `--plan`'s applicability to the PTY `kimi acp` subcommand remains
+        // UNCONFIRMED, so `args` stays empty here, same as `Moderate` above.
         ("kimi", ApprovalLevel::ReadOnly) => Supported {
             args: Vec::new(),
             asks_for_permission: false,
-            acp_mode_id: Some(ModeId::new("plan")),
+            // measured 2026-09-05: kimi.exe 0.29.0 session/new offers no
+            // modes; the 2026-09-02 yolo/auto/plan measurement was the npm
+            // shim under WSL interop
+            acp_mode_id: None,
         },
 
         // Impose nothing, for every agent ID: never refused, and the
@@ -988,10 +977,11 @@ mod tests {
     /// one layer up (see
     /// `approval_level_resolution_matches_the_verified_provider_table` and
     /// `unsupported_resolution_still_yields_empty_argv_not_a_fabricated_flag`);
-    /// `kimi`'s `Moderate` and `ReadOnly` resolve `Supported` with a sourced
-    /// `acp_mode_id` since 2026-09-02 but still no confirmed CLI flag -- this
-    /// test only covers the argv-only accessor, which has no channel to
-    /// carry either an ACP mode id or a refusal.
+    /// `kimi`'s `Moderate` and `ReadOnly` resolve `Supported` with no
+    /// `acp_mode_id` (measured 2026-09-05: `kimi.exe` 0.29.0 offers no ACP
+    /// modes at all) and still no confirmed CLI flag -- this test only
+    /// covers the argv-only accessor, which has no channel to carry either
+    /// an ACP mode id or a refusal.
     #[test]
     fn grok_and_kimi_moderate_never_invents_a_flag_and_matches_unmanaged() {
         // grok's `Moderate` is deliberately absent from this loop: it now
@@ -1116,18 +1106,21 @@ mod tests {
             supported(&[], true, None)
         );
 
+        // measured 2026-09-05: kimi.exe 0.29.0 session/new offers no modes;
+        // the 2026-09-02 yolo/auto/plan measurement was the npm shim under
+        // WSL interop.
         let kimi = AgentId::new("kimi").unwrap();
         assert_eq!(
             approval_level_resolution(&kimi, ApprovalLevel::FullAuto),
-            supported(&["--yolo"], false, Some("yolo"))
+            supported(&["--yolo"], false, None)
         );
         assert_eq!(
             approval_level_resolution(&kimi, ApprovalLevel::Moderate),
-            supported(&[], false, Some("auto"))
+            supported(&[], false, None)
         );
         assert_eq!(
             approval_level_resolution(&kimi, ApprovalLevel::ReadOnly),
-            supported(&[], false, Some("plan"))
+            supported(&[], false, None)
         );
         assert_eq!(
             approval_level_resolution(&kimi, ApprovalLevel::Unmanaged),
@@ -1163,20 +1156,17 @@ mod tests {
             let agent = AgentId::new(id).unwrap();
             for level in [ApprovalLevel::FullAuto, ApprovalLevel::Moderate, ApprovalLevel::ReadOnly] {
                 match approval_level_resolution(&agent, level) {
+                    // Every sourced mode id must be a concrete, non-`"auto"`
+                    // string -- kimi no longer has a row that qualifies for
+                    // an exception here: measured 2026-09-05, `kimi.exe`
+                    // 0.29.0 offers no ACP modes at all, so every one of its
+                    // managed levels now falls into the `None` arm below.
                     ApprovalLevelResolution::Supported { acp_mode_id: Some(mode_id), .. } => {
-                        // kimi's own `Moderate` mode is genuinely named
-                        // `auto` -- measured 2026-09-02 (session/new of
-                        // kimi acp), not the unmeasured vendor-default drift
-                        // this guard exists to catch. Every other row must
-                        // still never land on the literal string by
-                        // accident.
-                        if (id, level) != ("kimi", ApprovalLevel::Moderate) {
-                            assert_ne!(
-                                mode_id.as_str(),
-                                "auto",
-                                "{id} at {level:?} must never silently resolve the literal vendor default 'auto'"
-                            );
-                        }
+                        assert_ne!(
+                            mode_id.as_str(),
+                            "auto",
+                            "{id} at {level:?} must never silently resolve the literal vendor default 'auto'"
+                        );
                     }
                     ApprovalLevelResolution::Supported { acp_mode_id: None, .. } => {} // refused one layer up (`required_acp_mode`)
                     ApprovalLevelResolution::Unsupported => {}
@@ -1200,10 +1190,11 @@ mod tests {
     /// refusal, which is precisely why the ACP transport must call
     /// `approval_level_resolution` directly and refuse the spawn itself
     /// rather than trusting this function's empty result to mean "safe to
-    /// launch with no flag". `kimi` is no longer one of this test's
-    /// providers: since 2026-09-02 its `ReadOnly` resolves `Supported` (a
-    /// sourced `acp_mode_id` of `plan`), not `Unsupported` -- `grok` is the
-    /// one provider left with no read-only mode of any kind.
+    /// launch with no flag". `kimi` is not one of this test's providers:
+    /// its `ReadOnly` still resolves `Supported` (with `acp_mode_id: None`
+    /// since 2026-09-05, see `approval_level_resolution`'s own doc comment),
+    /// not `Unsupported` -- `grok` is the one provider left with no
+    /// read-only mode of any kind.
     #[test]
     fn unsupported_resolution_still_yields_empty_argv_not_a_fabricated_flag() {
         let grok = AgentId::new("grok").unwrap();

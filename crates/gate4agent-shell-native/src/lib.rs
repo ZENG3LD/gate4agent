@@ -6458,19 +6458,19 @@ mod tests {
         );
         assert_eq!(required_acp_mode(&codex, ApprovalLevel::Unmanaged), Ok(None));
 
+        // kimi: `acp_mode_id` is `None` for every managed level -- measured
+        // 2026-09-05, `kimi.exe` 0.29.0's `session/new` result carries
+        // `configOptions` (a `model` select) and no `modes` field at all.
+        // The 2026-09-02 `yolo`/`auto`/`plan` measurement this table used to
+        // pin was a different build: the npm shell shim running under WSL
+        // interop, not this native binary.
         let kimi = AgentId::new("kimi").unwrap();
-        assert_eq!(
-            required_acp_mode(&kimi, ApprovalLevel::FullAuto),
-            Ok(Some(ModeId::new("yolo")))
-        );
-        assert_eq!(
-            required_acp_mode(&kimi, ApprovalLevel::Moderate),
-            Ok(Some(ModeId::new("auto")))
-        );
-        assert_eq!(
-            required_acp_mode(&kimi, ApprovalLevel::ReadOnly),
-            Ok(Some(ModeId::new("plan")))
-        );
+        for level in [ApprovalLevel::FullAuto, ApprovalLevel::Moderate, ApprovalLevel::ReadOnly] {
+            assert!(
+                required_acp_mode(&kimi, level).is_err(),
+                "kimi at {level:?} has no sourced ACP mode id and must refuse"
+            );
+        }
         assert_eq!(required_acp_mode(&kimi, ApprovalLevel::Unmanaged), Ok(None));
 
         // grok: `acp_mode_id` is `None` for every managed level (`FullAuto`
@@ -6491,22 +6491,18 @@ mod tests {
     /// silently resolve to nothing (which would leave the session running
     /// at the agent's own default, e.g. the live-measured `auto`) unless the
     /// level itself is `Unmanaged`. Every other level is either a concrete
-    /// mode id or an outright refusal -- with one named, measured exception:
-    /// kimi's `Moderate` row genuinely IS the sourced ACP mode id `auto`
-    /// (`session/new` of `kimi acp`, measured live 2026-09-02, see
-    /// `docs/gate4agent/audits/gate4agent-acp-slice1-proof-2026-09-02.md`),
-    /// not a silently-inferred vendor default -- the guard still requires
-    /// every OTHER `auto` to be refused rather than sourced.
+    /// mode id or an outright refusal. kimi no longer has an exception here:
+    /// measured 2026-09-05, `kimi.exe` 0.29.0 offers no ACP modes at all, so
+    /// every one of its managed levels now refuses (`Err`) rather than
+    /// sourcing a mode id -- the `Moderate` row's `auto` exception this
+    /// guard used to carry was the 2026-09-02 npm-shim-under-WSL-interop
+    /// measurement, a different build.
     #[test]
     fn required_acp_mode_never_silently_permits_auto_except_for_unmanaged() {
         for id in ["claude", "codex", "grok", "kimi"] {
             let agent = AgentId::new(id).unwrap();
             for level in [ApprovalLevel::FullAuto, ApprovalLevel::Moderate, ApprovalLevel::ReadOnly] {
-                let is_kimi_moderate_measured_auto = id == "kimi" && level == ApprovalLevel::Moderate;
                 match required_acp_mode(&agent, level) {
-                    Ok(Some(mode_id)) if is_kimi_moderate_measured_auto => {
-                        assert_eq!(mode_id.as_str(), "auto");
-                    }
                     Ok(Some(mode_id)) => assert_ne!(
                         mode_id.as_str(),
                         "auto",

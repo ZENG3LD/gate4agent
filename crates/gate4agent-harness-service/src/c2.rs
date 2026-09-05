@@ -3367,8 +3367,8 @@ pub fn correlate_session_record_mutation_response(
     Ok(response)
 }
 
-/// Thins a node-side managed-session record down to the same 10-field shape
-/// the runtime-inventory roster already uses (`HarnessRuntimeManagedSessionV1`,
+/// Thins a node-side managed-session record down to the same shape the
+/// runtime-inventory roster already uses (`HarnessRuntimeManagedSessionV1`,
 /// see `redact_runtime_inventory` in `runtime.rs` for the roster's own
 /// twin of this projection) -- no receipts, no raw provider session
 /// identity, just enough to keep the operator's session-record surfaces in
@@ -3376,6 +3376,13 @@ pub fn correlate_session_record_mutation_response(
 /// mirror of the node's `ManagedSessionRecord` (drops `canonical_root`/
 /// `provider_session`/`last_error`), the type every session-record `C2NodeResponse`
 /// carries.
+///
+/// `blocked_count`/`last_blocked_at_ms` are always `0`/`None` here, same as
+/// in `redact_runtime_inventory`: this function has no `ObservationService`
+/// in scope (it runs off a C2 mutation-completion reply, not an operator
+/// read), and only `fill_managed_session_blocked_stats` in `runtime.rs`
+/// (the `RuntimeInventoryList` reply path) fills them from the harness's own
+/// observation projection.
 fn project_c2_managed_session(
     record: C2ManagedSessionRecord,
 ) -> Result<HarnessRuntimeManagedSessionV1, HarnessC2Error> {
@@ -3415,6 +3422,8 @@ fn project_c2_managed_session(
         }),
         provider_identity_present: record.provider_identity_present,
         updated_at_unix_ms: record.updated_at_unix_ms,
+        blocked_count: 0,
+        last_blocked_at_ms: None,
     })
 }
 

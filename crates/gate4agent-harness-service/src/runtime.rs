@@ -8303,6 +8303,13 @@ pub fn redact_runtime_inventory(
             }),
             provider_identity_present: record.provider_identity_present,
             updated_at_unix_ms: record.updated_at_unix_ms,
+            // Filled in by `fill_managed_session_blocked_stats` against the
+            // harness's own observation projection, never by this node-side
+            // mapping -- the node's `C2ManagedSessionRecord` carries no such
+            // field at all, and this function stays a pure, side-effect-free
+            // projection of it (see this function's own doc comment).
+            blocked_count: 0,
+            last_blocked_at_ms: None,
         }
     }).collect();
     HarnessRuntimeInventoryV1 {
@@ -8316,6 +8323,45 @@ pub fn redact_runtime_inventory(
         managed_session_count: inventory.managed_session_count,
         managed_sessions_truncated: inventory.managed_sessions_truncated,
         launch_inventory: inventory.launch_inventory.map(redact_launch_inventory),
+    }
+}
+
+/// Overlays `blocked_count`/`last_blocked_at_ms` onto every managed session
+/// in a `RuntimeInventoryList` reply from the harness's own observation
+/// projection -- the `runtime-inventory` counterpart of `observation_state`
+/// (`read.rs`), which does the same lookup-by-`ManagedSessionKey` for a
+/// single run's freshness/availability. `redact_runtime_inventory` cannot
+/// fill these itself: it is a pure mapping of the node's own
+/// `SlimNodeInventory`, which carries nothing about the harness's own
+/// `ActionBlocked` observations (see that function's own doc comment).
+///
+/// A node id, incarnation id, or record id that fails to parse back into
+/// its typed form is left at the zero/`None` `redact_runtime_inventory`
+/// already set -- every value here round-tripped through validated wire
+/// types on the way in, so a parse failure is unreachable in practice, not
+/// a case worth surfacing as an error to an operator asking a read-only
+/// question.
+fn fill_managed_session_blocked_stats(
+    page: &mut HarnessRuntimeInventoryPageV1,
+    observation: &ObservationService,
+) {
+    for node in &mut page.nodes {
+        let Ok(node_id) = NodeId::new(node.node_id.as_str()) else { continue; };
+        let Ok(incarnation_id) = node.incarnation_id.parse::<NodeIncarnationId>() else {
+            continue;
+        };
+        for record in &mut node.inventory.managed_sessions {
+            let Ok(record_id) = SessionRecordId::new(record.record_id.as_str()) else {
+                continue;
+            };
+            let key = ManagedSessionKey { node_id: node_id.clone(), incarnation_id, record_id };
+            let Some(projection) = observation.projection(&ObservationTarget::Managed { key })
+            else {
+                continue;
+            };
+            record.blocked_count = projection.blocked_count;
+            record.last_blocked_at_ms = projection.last_blocked_at_ms;
+        }
     }
 }
 
@@ -8798,7 +8844,8 @@ fn execute_operator_request(
             )?)
         }
         HarnessOperatorRequestV1::RuntimeInventoryList { after_node_id, limit } => {
-            let page = runtime_inventory.page(after_node_id.as_deref(), limit);
+            let mut page = runtime_inventory.page(after_node_id.as_deref(), limit);
+            fill_managed_session_blocked_stats(&mut page, observation);
             HarnessOperatorResponseV1::RuntimeInventory(page)
         }
         HarnessOperatorRequestV1::TerminalRead { session, after_sequence, limit } => {
@@ -11491,7 +11538,7 @@ mod tests {
         SpawnContextDigest,
     };
     use gate4agent_observation_protocol::{
-        ObservationEvidenceV1, ObservationKindV1, ObservationV1,
+        BlockAuthorityV1, ObservationEvidenceV1, ObservationKindV1, ObservationV1,
     };
     use std::{fs, path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
     use gate4agent_harness_protocol::{
@@ -14040,6 +14087,88 @@ mod tests {
         assert_eq!(page.nodes[0].event_sequence, 6);
         assert_eq!(page.nodes[0].inventory.managed_sessions.len(), 1);
         assert_eq!(page.nodes[0].inventory.session_count, 1);
+    }
+
+    /// Two `ActionBlocked` observations against the same managed session
+    /// tally into `blocked_count: 2` with `last_blocked_at_ms` reading the
+    /// LATER of the two `received_at_ms` values, in the actual
+    /// `RuntimeInventoryList` reply shape (`fill_managed_session_blocked_stats`)
+    /// -- not just in the observation engine's own projection. Proof for
+    /// plan item 4 (`gate4agent-blocked-action-event-2026-09-02.md` §2).
+    #[test]
+    fn action_blocked_observations_tally_into_the_runtime_inventory_blocked_stats() {
+        let route = NodeRoute {
+            node_id: NodeId::new("node-a").unwrap(),
+            expected_incarnation_id: NodeIncarnationId::from_bytes([7; 16]),
+        };
+        let active_session = SessionAddress {
+            workspace_id: gate4agent_node_protocol::WorkspaceId::new("workspace-a").unwrap(),
+            session: gate4agent_node_protocol::SessionKey {
+                instance_id: AgentInstanceId(7),
+                generation: SessionGeneration(3),
+            },
+        };
+        let snapshot = bound_snapshot(
+            &route.node_id,
+            ManagedSessionState::Live,
+            Some(active_session),
+            C2SessionStatus::Running,
+        );
+        let resync = HarnessObservationResync::test_fixture(route.clone(), 5, snapshot);
+        let mut cache = HarnessRuntimeInventoryCache::default();
+        cache.refresh(&resync, 10);
+
+        let observation_path = database_path();
+        let mut observation = ObservationService::open(&observation_path).unwrap();
+        let record_id = SessionRecordId::new("record-a").unwrap();
+        for (sequence, received_at_ms) in [(1, 1_000), (2, 2_000)] {
+            apply_routed_observation_event(
+                &mut observation,
+                RoutedNodeEvent {
+                    node_id: route.node_id.clone(),
+                    cursor: NodeCursor {
+                        incarnation_id: route.expected_incarnation_id,
+                        sequence,
+                    },
+                    event: C2NodeEvent::ManagedObservation {
+                        record_id: record_id.clone(),
+                        observation: ObservationV1 {
+                            source_sequence: sequence,
+                            observed_at_unix_ms: Some(received_at_ms),
+                            evidence: ObservationEvidenceV1::ManagedHook,
+                            kind: ObservationKindV1::ActionBlocked {
+                                correlation_id: None,
+                                tool_class: "bash".to_owned(),
+                                authority: BlockAuthorityV1::HarnessGate,
+                                reason_kind: None,
+                                reason: "rule=deny-write".to_owned(),
+                                help: None,
+                            },
+                            truncated: false,
+                        },
+                    },
+                },
+                received_at_ms,
+            ).unwrap();
+        }
+
+        let mut page = cache.page(None, 1);
+        fill_managed_session_blocked_stats(&mut page, &observation);
+        page.validate().unwrap();
+        assert_eq!(page.nodes[0].inventory.managed_sessions.len(), 1);
+        let record = &page.nodes[0].inventory.managed_sessions[0];
+        assert_eq!(record.record_id, "record-a");
+        assert_eq!(record.blocked_count, 2);
+        assert_eq!(record.last_blocked_at_ms, Some(2_000));
+
+        observation.close().unwrap();
+        for candidate in [
+            observation_path.clone(),
+            PathBuf::from(format!("{}-wal", observation_path.display())),
+            PathBuf::from(format!("{}-shm", observation_path.display())),
+        ] {
+            let _ = fs::remove_file(candidate);
+        }
     }
 
     #[test]

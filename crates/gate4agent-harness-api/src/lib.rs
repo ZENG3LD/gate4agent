@@ -97,7 +97,16 @@ pub const HARNESS_MCP_AUDIENCE: &str = "gate4agent-harness-mcp-read-v1";
 /// bump above -- this wire has no field-level compatibility story of its
 /// own beneath the single accepted `version`, so a shape change is a shape
 /// change regardless of whether the new field happens to default cleanly.
-pub const HARNESS_OPERATOR_WIRE_VERSION: u16 = 18;
+///
+/// `19` widens `HarnessRuntimeManagedSessionV1` the same way: `blocked_count`
+/// and `last_blocked_at_ms`, the fleet-wide instrument for
+/// `ObservationKindV1::ActionBlocked`
+/// (`docs/gate4agent/plans/gate4agent-blocked-action-event-2026-09-02.md`
+/// §2 item 4) -- one `runtime-inventory` read answers "how many sessions are
+/// stuck behind a gate right now" across every node. Same rule as `18`: a
+/// shape change moves the version even though a pre-`19` reader would have
+/// silently read zero/`None` for both new fields.
+pub const HARNESS_OPERATOR_WIRE_VERSION: u16 = 19;
 // Realistic multi-pane ceiling with headroom; bounds the harness-side
 // per-subscriber HashSet<RuntimeSessionKey> and the connect-time seed burst
 // `SubscribeTerminal`'s handler sends immediately after registering (see
@@ -4895,6 +4904,17 @@ pub struct HarnessRuntimeManagedSessionV1 {
     pub active_binding: Option<HarnessRuntimeSessionBindingV1>,
     pub provider_identity_present: bool,
     pub updated_at_unix_ms: u64,
+    /// Count of `ObservationKindV1::ActionBlocked` observations recorded
+    /// against this managed session, from the harness's own per-session
+    /// observation projection -- see
+    /// `gate4agent_observation_engine::SessionProjection::blocked_count`.
+    /// The fleet-wide instrument this exists for: one `runtime-inventory`
+    /// read answers "how many sessions are stuck behind a gate right now"
+    /// across every node at once.
+    pub blocked_count: u64,
+    /// `received_at_ms` of the most recent such observation, or `None` when
+    /// `blocked_count` is zero.
+    pub last_blocked_at_ms: Option<u64>,
 }
 
 impl HarnessRuntimeManagedSessionV1 {
@@ -4911,6 +4931,7 @@ impl HarnessRuntimeManagedSessionV1 {
                     || binding.instance_id == 0
                     || binding.generation == 0
             })
+            || (self.blocked_count == 0) != self.last_blocked_at_ms.is_none()
         {
             return Err(HarnessOperatorApiError::InvalidRuntimeInventory);
         }
@@ -7547,6 +7568,33 @@ mod tests {
         }.validate().is_ok());
     }
 
+    /// Plan item 4 (`gate4agent-blocked-action-event-2026-09-02.md` §2): the
+    /// fleet-wide `blocked_count`/`last_blocked_at_ms` instrument moved
+    /// `HARNESS_OPERATOR_WIRE_VERSION` from `18` to `19`, round-trips
+    /// through JSON intact, and its own invariant (a count of zero implies
+    /// no timestamp, and vice versa) is enforced the same way every other
+    /// paired count/timestamp field in this crate is.
+    #[test]
+    fn managed_session_blocked_stats_round_trip_and_the_wire_pin_moved() {
+        assert_eq!(HARNESS_OPERATOR_WIRE_VERSION, 19);
+
+        let mut session = sample_managed_session("record-a");
+        session.blocked_count = 2;
+        session.last_blocked_at_ms = Some(2_000);
+        session.validate().expect("blocked_count with a timestamp is valid");
+        let encoded = serde_json::to_string(&session).unwrap();
+        let decoded: HarnessRuntimeManagedSessionV1 = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, session);
+
+        let mut zero_with_timestamp = sample_managed_session("record-a");
+        zero_with_timestamp.last_blocked_at_ms = Some(1);
+        assert!(zero_with_timestamp.validate().is_err());
+
+        let mut counted_without_timestamp = sample_managed_session("record-a");
+        counted_without_timestamp.blocked_count = 1;
+        assert!(counted_without_timestamp.validate().is_err());
+    }
+
     #[test]
     fn runtime_inventory_launch_inventory_round_trips_and_fails_closed() {
         let node = HarnessRuntimeNodeInventoryV1 {
@@ -9369,6 +9417,8 @@ mod tests {
             active_binding: None,
             provider_identity_present: true,
             updated_at_unix_ms: 10,
+            blocked_count: 0,
+            last_blocked_at_ms: None,
         }
     }
 

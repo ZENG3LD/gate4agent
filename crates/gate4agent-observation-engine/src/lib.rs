@@ -186,6 +186,19 @@ pub struct SessionProjection {
     pub files: VecDeque<FileProjection>,
     pub usage: UsageProjection,
     pub timeline: VecDeque<TimelineEntry>,
+    /// Running tally of every `ObservationKindV1::ActionBlocked` this
+    /// session has ever received. Unlike `timeline` (a
+    /// `TIMELINE_PER_SESSION_MAX`-bounded ring buffer), this never shrinks,
+    /// so a long-lived session's total survives past whatever churned out
+    /// of the ring. `#[serde(default)]` reads a checkpoint written before
+    /// this field existed as zero instead of failing to deserialize it.
+    #[serde(default)]
+    pub blocked_count: u64,
+    /// `received_at_ms` of the most recent `ActionBlocked` observation, or
+    /// `None` if this session has never been blocked. Same
+    /// backward-compatibility rule as `blocked_count`.
+    #[serde(default)]
+    pub last_blocked_at_ms: Option<u64>,
 }
 
 impl SessionProjection {
@@ -207,6 +220,8 @@ impl SessionProjection {
             files: VecDeque::new(),
             usage: UsageProjection::default(),
             timeline: VecDeque::new(),
+            blocked_count: 0,
+            last_blocked_at_ms: None,
         }
     }
 
@@ -1405,6 +1420,13 @@ fn apply_observation(
         }
         ObservationKindV1::Gap { .. } => projection.mark_source_incomplete(evidence, true),
         ObservationKindV1::SourceReset => projection.source_reset(evidence),
+        ObservationKindV1::ActionBlocked { .. } => {
+            projection.blocked_count = projection.blocked_count.saturating_add(1);
+            projection.last_blocked_at_ms = Some(match projection.last_blocked_at_ms {
+                Some(previous) => previous.max(received_at_ms),
+                None => received_at_ms,
+            });
+        }
         _ => {}
     }
     if observation.truncated {

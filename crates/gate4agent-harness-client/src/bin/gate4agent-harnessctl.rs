@@ -25,7 +25,7 @@ use gate4agent_harness_client::{
 };
 use gate4agent_harness_api::{
     HarnessAgentStreamChunkKindV1, HarnessAgentStreamNamedIdV1, HarnessApprovalLevelV1,
-    HarnessExecutionModeV1,
+    HarnessBlockAuthorityV1, HarnessExecutionModeV1,
     HarnessOperatorAgentEventV1, HarnessProviderInteractionResponseV1, HarnessRuntimeSessionAddressV1,
     HarnessRuntimeTerminalSizeV1,
 };
@@ -932,27 +932,62 @@ fn render_named_id_catalog(available: &[HarnessAgentStreamNamedIdV1]) -> String 
     available.iter().map(|entry| format!("{}:{}", entry.id, entry.name)).collect::<Vec<_>>().join(",")
 }
 
+/// The kebab-case slug `HarnessBlockAuthorityV1` already carries on the wire
+/// (`#[serde(rename_all = "kebab-case")]`) -- spelled out here rather than
+/// routed through a JSON round trip because this printer's whole contract is
+/// one grep-friendly plain-text line, not JSON.
+fn block_authority_slug(authority: &HarnessBlockAuthorityV1) -> &'static str {
+    match authority {
+        HarnessBlockAuthorityV1::HarnessGate => "harness-gate",
+        HarnessBlockAuthorityV1::HarnessPolicy => "harness-policy",
+        HarnessBlockAuthorityV1::HarnessDeadline => "harness-deadline",
+        HarnessBlockAuthorityV1::Operator => "operator",
+        HarnessBlockAuthorityV1::ProviderClassifier => "provider-classifier",
+        HarnessBlockAuthorityV1::ProviderPermissionRule => "provider-permission-rule",
+        HarnessBlockAuthorityV1::ProviderSandbox => "provider-sandbox",
+        HarnessBlockAuthorityV1::ProviderRefusal => "provider-refusal",
+        HarnessBlockAuthorityV1::ProviderHook => "provider-hook",
+        HarnessBlockAuthorityV1::UserRejected => "user-rejected",
+        HarnessBlockAuthorityV1::Unknown => "unknown",
+    }
+}
+
 /// One line per `SubscribeAgentStream` frame, printed as it arrives -- see
 /// the module-level usage text for the subcommand this backs
 /// (`session subscribe`). `ts` is `now_unix_ms()`'s wall-clock reading at
 /// print time, not anything the wire itself carries.
 fn print_agent_stream_event(event: &HarnessOperatorAgentEventV1, verbose: bool) {
-    let ts = now_unix_ms();
+    if let Some(line) = format_agent_stream_event(event, now_unix_ms(), verbose) {
+        println!("{line}");
+    }
+}
+
+/// The formatting half of `print_agent_stream_event`, split out so the exact
+/// line text is unit-testable without capturing process stdout -- `ts` is
+/// passed in rather than read from the wall clock so a test gets a
+/// deterministic line. `None` means nothing prints for this event (a
+/// `Ping` outside `verbose`), matching the caller's previous `if verbose`
+/// guard exactly.
+fn format_agent_stream_event(
+    event: &HarnessOperatorAgentEventV1,
+    ts: u64,
+    verbose: bool,
+) -> Option<String> {
     match event {
         HarnessOperatorAgentEventV1::AgentChunk { sequence, session, chunk } => {
             let session = format_session_address(session);
-            match &chunk.kind {
+            Some(match &chunk.kind {
                 HarnessAgentStreamChunkKindV1::Text { text, is_delta } => {
-                    println!(
+                    format!(
                         "ts={ts} seq={sequence} session={session} kind=text is_delta={is_delta} text={}",
                         sanitize_line(text),
-                    );
+                    )
                 }
                 HarnessAgentStreamChunkKindV1::Thinking { text } => {
-                    println!(
+                    format!(
                         "ts={ts} seq={sequence} session={session} kind=thinking text={}",
                         sanitize_line(text),
-                    );
+                    )
                 }
                 HarnessAgentStreamChunkKindV1::InteractionPrompt {
                     correlation_id,
@@ -968,26 +1003,26 @@ fn print_agent_stream_event(event: &HarnessOperatorAgentEventV1, verbose: bool) 
                         .map(|option| format!("{}:{}:{}", option.option_id, option.name, option.kind))
                         .collect::<Vec<_>>()
                         .join(",");
-                    println!(
+                    format!(
                         "ts={ts} seq={sequence} session={session} kind=interaction-prompt \
                          correlation_id={correlation_id} interaction_kind={interaction_kind:?} \
                          tool={tool_name} title={title} prompt={} options=[{options}]",
                         sanitize_line(prompt),
-                    );
+                    )
                 }
                 HarnessAgentStreamChunkKindV1::ModeCatalog { current, available } => {
-                    println!(
+                    format!(
                         "ts={ts} seq={sequence} session={session} kind=mode-catalog current={} available=[{}]",
                         current.as_deref().unwrap_or("-"),
                         render_named_id_catalog(available),
-                    );
+                    )
                 }
                 HarnessAgentStreamChunkKindV1::ModelCatalog { current, available } => {
-                    println!(
+                    format!(
                         "ts={ts} seq={sequence} session={session} kind=model-catalog current={} available=[{}]",
                         current.as_deref().unwrap_or("-"),
                         render_named_id_catalog(available),
-                    );
+                    )
                 }
                 HarnessAgentStreamChunkKindV1::ConfigOptions { options } => {
                     let rendered = options
@@ -995,20 +1030,37 @@ fn print_agent_stream_event(event: &HarnessOperatorAgentEventV1, verbose: bool) 
                         .map(|option| format!("{}:{}={}", option.id, option.name, sanitize_line(&option.value_json)))
                         .collect::<Vec<_>>()
                         .join(",");
-                    println!(
+                    format!(
                         "ts={ts} seq={sequence} session={session} kind=config-options options=[{rendered}]"
-                    );
+                    )
                 }
-            }
+                HarnessAgentStreamChunkKindV1::Blocked {
+                    correlation_id,
+                    tool_class,
+                    authority,
+                    reason_kind,
+                    reason,
+                    help,
+                } => {
+                    format!(
+                        "ts={ts} seq={sequence} session={session} kind=blocked \
+                         authority={} tool={tool_class} reason={} reason_kind={} help={} \
+                         correlation_id={}",
+                        block_authority_slug(authority),
+                        sanitize_line(reason),
+                        reason_kind.as_deref().unwrap_or("-"),
+                        help.as_deref().map(sanitize_line).unwrap_or_else(|| "-".to_owned()),
+                        correlation_id.as_deref().unwrap_or("-"),
+                    )
+                }
+            })
         }
         HarnessOperatorAgentEventV1::Lagged { sequence, session, dropped } => {
             let session = format_session_address(session);
-            println!("ts={ts} seq={sequence} session={session} LAGGED dropped={dropped}");
+            Some(format!("ts={ts} seq={sequence} session={session} LAGGED dropped={dropped}"))
         }
         HarnessOperatorAgentEventV1::Ping { sequence } => {
-            if verbose {
-                println!("ts={ts} seq={sequence} kind=ping");
-            }
+            verbose.then(|| format!("ts={ts} seq={sequence} kind=ping"))
         }
     }
 }
@@ -1037,6 +1089,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gate4agent_harness_api::HarnessAgentStreamChunkV1;
     use gate4agent_harness_client::{
         HarnessContextSourceAvailabilityV1, HarnessContextSourceSelectionV1,
         HarnessDeliveryBundleDigestV1, HarnessDeliveryBundleRevisionV1, HarnessDeliveryBundleV1,
@@ -1062,6 +1115,73 @@ mod tests {
 
     fn token() -> String {
         format!("g4aho_{}", "0".repeat(64))
+    }
+
+    fn sample_session_address() -> HarnessRuntimeSessionAddressV1 {
+        HarnessRuntimeSessionAddressV1 {
+            node_id: "node-a".to_owned(),
+            incarnation_id: "1".repeat(32),
+            workspace_id: "workspace-a".to_owned(),
+            instance_id: 7,
+            generation: 3,
+        }
+    }
+
+    #[test]
+    fn blocked_chunk_prints_one_greppable_line_with_every_field() {
+        let event = HarnessOperatorAgentEventV1::AgentChunk {
+            sequence: 42,
+            session: sample_session_address(),
+            chunk: HarnessAgentStreamChunkV1 {
+                source_sequence: 7,
+                kind: HarnessAgentStreamChunkKindV1::Blocked {
+                    correlation_id: Some("corr-1".to_owned()),
+                    tool_class: "bash".to_owned(),
+                    authority: HarnessBlockAuthorityV1::ProviderClassifier,
+                    reason_kind: Some("permission-rule".to_owned()),
+                    reason: "Blocked by classifier".to_owned(),
+                    help: Some("add a Bash permission rule".to_owned()),
+                },
+            },
+        };
+        let line = format_agent_stream_event(&event, 1_000, false).unwrap();
+        let session = format_session_address(&sample_session_address());
+        assert_eq!(
+            line,
+            format!(
+                "ts=1000 seq=42 session={session} kind=blocked authority=provider-classifier \
+                 tool=bash reason=Blocked by classifier reason_kind=permission-rule \
+                 help=add a Bash permission rule correlation_id=corr-1",
+            ),
+        );
+    }
+
+    #[test]
+    fn blocked_chunk_renders_absent_optionals_as_a_dash() {
+        let event = HarnessOperatorAgentEventV1::AgentChunk {
+            sequence: 1,
+            session: sample_session_address(),
+            chunk: HarnessAgentStreamChunkV1 {
+                source_sequence: 1,
+                kind: HarnessAgentStreamChunkKindV1::Blocked {
+                    correlation_id: None,
+                    tool_class: "write".to_owned(),
+                    authority: HarnessBlockAuthorityV1::HarnessGate,
+                    reason_kind: None,
+                    reason: "rule=deny-write".to_owned(),
+                    help: None,
+                },
+            },
+        };
+        let line = format_agent_stream_event(&event, 1_000, false).unwrap();
+        let session = format_session_address(&sample_session_address());
+        assert_eq!(
+            line,
+            format!(
+                "ts=1000 seq=1 session={session} kind=blocked authority=harness-gate \
+                 tool=write reason=rule=deny-write reason_kind=- help=- correlation_id=-",
+            ),
+        );
     }
 
     #[test]

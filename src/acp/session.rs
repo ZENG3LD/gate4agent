@@ -633,19 +633,19 @@ impl AcpSession {
             match tokio::time::timeout(timeout, receiver).await {
                 Ok(Ok(Ok(result))) => emit_prompt_result(&tx, &result),
                 Ok(Ok(Err(error))) => {
-                    let _ = tx.send(AgentEvent::Error {
-                        message: error.to_string(),
-                    });
+                    interrupt_turn(&tx, error.to_string());
                 }
                 Ok(Err(_)) => {
-                    let _ = tx.send(AgentEvent::Error {
-                        message: "ACP session closed while awaiting prompt response".to_owned(),
-                    });
+                    interrupt_turn(
+                        &tx,
+                        "ACP session closed while awaiting prompt response".to_owned(),
+                    );
                 }
                 Err(_) => {
-                    let _ = tx.send(AgentEvent::Error {
-                        message: "ACP session/prompt timed out".to_owned(),
-                    });
+                    interrupt_turn(
+                        &tx,
+                        format!("session/prompt timed out after {timeout:?} with no response from the agent"),
+                    );
                 }
             }
         });
@@ -1378,6 +1378,22 @@ fn permission_outcome_grants(outcome: &PermissionOutcome, options: &[PermissionO
         })
 }
 
+/// Report a `session/prompt` call started by [`AcpSession::start_prompt`]
+/// that ended WITHOUT a `session/prompt` success response -- an agent RPC
+/// error, the session closing mid-call, or `prompt_timeout` elapsing (see
+/// that method's three failure branches). Sends both `Error` (the failure
+/// text, for anything that only wants to display it) and `TurnInterrupted`
+/// (the signal that the turn itself is over) so a caller that only reads
+/// `Error` sees no change in behavior, while `TurnInterrupted` gives
+/// downstream turn-state tracking (`gate4agent-engine`'s snapshot reducer)
+/// something to reset `ProviderActivity` away from `Blocked` with -- see
+/// `AgentEvent::TurnInterrupted`'s own doc comment for the stuck-forever bug
+/// this closes.
+fn interrupt_turn(tx: &broadcast::Sender<AgentEvent>, reason: String) {
+    let _ = tx.send(AgentEvent::Error { message: reason.clone() });
+    let _ = tx.send(AgentEvent::TurnInterrupted { reason });
+}
+
 /// Fold a `session/prompt` response into the two events every caller of
 /// `prompt()`/`start_prompt()` waits on.
 ///
@@ -1698,5 +1714,36 @@ mod tests {
             AgentEvent::SessionEnd { result, .. } => assert_eq!(result, "end_turn"),
             other => panic!("expected SessionEnd, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // interrupt_turn -- the fix for a `session/prompt` failure (agent RPC
+    // error, session closed mid-call, or `prompt_timeout` elapsing) leaving
+    // the turn stuck rather than ended. Measured live against codex-acp
+    // 1.10.0 on 2026-09-05: an RPC error response landed within seconds, but
+    // because `start_prompt`'s failure branches used to emit only `Error`
+    // (which `gate4agent-engine`'s snapshot reducer maps to
+    // `ProviderActivity::Blocked`, not `Idle`), every subsequent prompt was
+    // refused as "turn in flight" for the rest of the session's life.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn interrupt_turn_emits_both_error_and_turn_interrupted_with_the_same_reason() {
+        let (tx, mut rx) = broadcast::channel(8);
+        interrupt_turn(&tx, "session/prompt timed out after 120s".to_owned());
+
+        match rx.try_recv().expect("Error event") {
+            AgentEvent::Error { message } => {
+                assert_eq!(message, "session/prompt timed out after 120s");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        match rx.try_recv().expect("TurnInterrupted event") {
+            AgentEvent::TurnInterrupted { reason } => {
+                assert_eq!(reason, "session/prompt timed out after 120s");
+            }
+            other => panic!("expected TurnInterrupted, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "no third event should follow");
     }
 }

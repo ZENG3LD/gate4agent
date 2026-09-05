@@ -15952,12 +15952,29 @@ async fn process_request_inner(shared: &NodeShared, connection_id: u64, role: Cl
             response
                 .validate_for(interaction.interaction_kind)
                 .map_err(|error| failure(NodeFailureCode::InvalidRequest, &error.to_string()))?;
+            let interaction_id = interaction.id;
+            let response_kind = response.kind();
+            let response_outcome = response.outcome();
             shared.dispatch(ControlCommand::ResolveInteraction {
                 instance_id: session.session.instance_id,
                 generation: session.session.generation,
-                interaction_id: interaction.id,
+                interaction_id,
                 response,
             })?;
+            // The one line that lets an operator compare what THIS node
+            // recorded against what the provider itself reports doing --
+            // measured live on a kimi run where our side resolved `true`
+            // while the agent reported "rejected" and neither layer had a
+            // line to line up against the other.
+            tracing::info!(
+                node_id = %shared.node_id,
+                session = ?session.session,
+                correlation_id = %correlation_id,
+                interaction_id = interaction_id.0,
+                response_kind = ?response_kind,
+                outcome = ?response_outcome,
+                "interaction resolved",
+            );
             Ok(NodeResponse::Accepted)
         }
         NodeRequest::SetSessionMode { session, mode_id } => {

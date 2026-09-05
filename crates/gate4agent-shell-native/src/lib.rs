@@ -2994,6 +2994,19 @@ fn provider_event(event: AgentEvent, available_modes: &[SessionMode]) -> Option<
             is_error,
         }),
         AgentEvent::Error { message } => Some(ProviderEvent::Error { message }),
+        // ACP-only: `acp::session::AcpSession::start_prompt` synthesizes
+        // this locally when a `session/prompt` call ends without a success
+        // response (an agent RPC error, the session closing mid-call, or
+        // `prompt_timeout` elapsing) -- see that event's own doc comment.
+        // `ProviderEvent::TurnInterrupted` carries no `reason` field (it
+        // predates this source and is also used by a PTY-side interrupt
+        // with no text of its own to attach), so the reason is logged here
+        // rather than silently dropped -- this is the one place downstream
+        // of the ACP session that ever sees it.
+        AgentEvent::TurnInterrupted { reason } => {
+            tracing::warn!(reason = %reason, "acp turn interrupted");
+            Some(ProviderEvent::TurnInterrupted)
+        }
         AgentEvent::PtyParsed(message) => parsed_provider_event(message),
         AgentEvent::PtyReady => Some(ProviderEvent::Ready),
         AgentEvent::PtyToolApproval {
@@ -4933,6 +4946,25 @@ mod tests {
         assert!(
             super::provider_event(AgentEvent::PtyRaw { data: b"105/100".to_vec() }, &[]).is_none()
         );
+    }
+
+    /// `AgentEvent::TurnInterrupted` (synthesized by `acp::session::
+    /// AcpSession::start_prompt` when a `session/prompt` call ends without a
+    /// success response) must reach `ProviderEvent::TurnInterrupted` --
+    /// `gate4agent-engine`'s snapshot reducer is the one place that resets
+    /// `ProviderActivity` away from `Blocked` back to `Idle` for it, closing
+    /// the stuck-forever "turn in flight" bug measured live against
+    /// codex-acp 1.10.0 (a `session/prompt` RPC error left every subsequent
+    /// prompt refused for the rest of the session).
+    #[test]
+    fn turn_interrupted_maps_to_the_provider_event_that_unblocks_the_next_prompt() {
+        let mapped = super::provider_event(
+            AgentEvent::TurnInterrupted {
+                reason: "session/prompt timed out after 120s".to_owned(),
+            },
+            &[],
+        );
+        assert_eq!(mapped, Some(ProviderEvent::TurnInterrupted));
     }
 
     #[test]

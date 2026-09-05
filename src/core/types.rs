@@ -428,6 +428,32 @@ pub enum AgentEvent {
     ContextWindowUsage { usage: ContextWindowUsage },
     /// Session ended with final result.
     SessionEnd { result: String, cost_usd: Option<f64>, is_error: bool },
+    /// The current turn ended abnormally, without a matching `TurnComplete`/
+    /// `SessionEnd` -- ACP transport only, synthesized locally by
+    /// `acp::session::AcpSession::start_prompt` (never sent by an agent on
+    /// the wire) for the three ways a `session/prompt` call can fail to
+    /// produce one: the agent answered with a JSON-RPC error (e.g. codex-acp
+    /// 1.10.0's `-32603 usageLimitExceeded` when the account's quota is
+    /// exhausted, measured live), the pending call was cancelled because the
+    /// session closed mid-turn, or `AcpSessionOptions::prompt_timeout`
+    /// elapsed with no response at all. `reason` is the bounded, human-
+    /// readable text explaining which of those three happened.
+    ///
+    /// This is a DISTINCT signal from `Error`, not a replacement for it:
+    /// `Error` still carries the same failure text for anything that only
+    /// wants to display it (e.g. `manager.rs`'s chat transcript). This event
+    /// exists because `Error` alone left the turn's own state stuck --
+    /// downstream (`gate4agent-shell-native`'s `provider_event`,
+    /// `gate4agent-engine`'s snapshot reducer) had no event here that reset
+    /// `ProviderActivity` away from `Blocked`, so `gate4agent-node`'s
+    /// turn-in-flight precondition
+    /// (`NodeShared::require_session_runtime_policy`) refused every
+    /// subsequent `session/prompt` as `TurnInFlight` forever, even though no
+    /// turn was actually still running -- measured live against codex-acp
+    /// 1.10.0 on 2026-09-05: a `session/prompt` RPC error landed within
+    /// seconds, but the session then refused every further prompt for the
+    /// rest of its life.
+    TurnInterrupted { reason: String },
 
     // --- Both modes ---
     /// Rate limit detected (from text pattern matching).

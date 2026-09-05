@@ -955,7 +955,10 @@ fn block_authority_slug(authority: &HarnessBlockAuthorityV1) -> &'static str {
 /// One line per `SubscribeAgentStream` frame, printed as it arrives -- see
 /// the module-level usage text for the subcommand this backs
 /// (`session subscribe`). `ts` is `now_unix_ms()`'s wall-clock reading at
-/// print time, not anything the wire itself carries.
+/// print time for every kind except `AgentChunk`, which instead prints its
+/// own `published_at_ms` off the wire -- see `format_agent_stream_event`'s
+/// own doc comment for why: a replayed chunk must print the moment it was
+/// originally published, not the moment `harnessctl` happened to receive it.
 fn print_agent_stream_event(event: &HarnessOperatorAgentEventV1, verbose: bool) {
     if let Some(line) = format_agent_stream_event(event, now_unix_ms(), verbose) {
         println!("{line}");
@@ -965,17 +968,22 @@ fn print_agent_stream_event(event: &HarnessOperatorAgentEventV1, verbose: bool) 
 /// The formatting half of `print_agent_stream_event`, split out so the exact
 /// line text is unit-testable without capturing process stdout -- `ts` is
 /// passed in rather than read from the wall clock so a test gets a
-/// deterministic line. `None` means nothing prints for this event (a
-/// `Ping` outside `verbose`), matching the caller's previous `if verbose`
-/// guard exactly.
+/// deterministic line, and is used for every kind EXCEPT `AgentChunk`: that
+/// one instead prints its own `published_at_ms` field, so a chunk replayed
+/// long after it was first published (`ReplayBoundary`'s own doc comment)
+/// prints the moment it actually happened, identically whether it arrived
+/// live or was replayed -- there is no separate "replay" print path.
+/// `None` means nothing prints for this event (a `Ping` outside `verbose`),
+/// matching the caller's previous `if verbose` guard exactly.
 fn format_agent_stream_event(
     event: &HarnessOperatorAgentEventV1,
     ts: u64,
     verbose: bool,
 ) -> Option<String> {
     match event {
-        HarnessOperatorAgentEventV1::AgentChunk { sequence, session, chunk } => {
+        HarnessOperatorAgentEventV1::AgentChunk { sequence, session, chunk, published_at_ms } => {
             let session = format_session_address(session);
+            let ts = published_at_ms;
             Some(match &chunk.kind {
                 HarnessAgentStreamChunkKindV1::Text { text, is_delta } => {
                     format!(
@@ -1058,6 +1066,17 @@ fn format_agent_stream_event(
         HarnessOperatorAgentEventV1::Lagged { sequence, session, dropped } => {
             let session = format_session_address(session);
             Some(format!("ts={ts} seq={sequence} session={session} LAGGED dropped={dropped}"))
+        }
+        // No `ts=`/`seq=`: `ReplayBoundary` carries neither (see that
+        // variant's own doc comment in `gate4agent-harness-api`) -- it is a
+        // marker between two bursts of chunks that already carry their own
+        // timestamps, not an instant of its own.
+        HarnessOperatorAgentEventV1::ReplayBoundary { session, replayed, dropped_before_replay } => {
+            let session = format_session_address(session);
+            Some(format!(
+                "session={session} kind=replay-boundary replayed={replayed} \
+                 dropped_before_replay={dropped_before_replay}",
+            ))
         }
         HarnessOperatorAgentEventV1::Ping { sequence } => {
             verbose.then(|| format!("ts={ts} seq={sequence} kind=ping"))
@@ -1143,6 +1162,7 @@ mod tests {
                     help: Some("add a Bash permission rule".to_owned()),
                 },
             },
+            published_at_ms: 1_000,
         };
         let line = format_agent_stream_event(&event, 1_000, false).unwrap();
         let session = format_session_address(&sample_session_address());
@@ -1172,6 +1192,7 @@ mod tests {
                     help: None,
                 },
             },
+            published_at_ms: 1_000,
         };
         let line = format_agent_stream_event(&event, 1_000, false).unwrap();
         let session = format_session_address(&sample_session_address());
@@ -1181,6 +1202,49 @@ mod tests {
                 "ts=1000 seq=1 session={session} kind=blocked authority=harness-gate \
                  tool=write reason=rule=deny-write reason_kind=- help=- correlation_id=-",
             ),
+        );
+    }
+
+    /// A replayed chunk prints exactly like a live one -- through the same
+    /// match arm, the same fields -- except its `ts` is the wire's own
+    /// `published_at_ms`, never the print-time `ts` `format_agent_stream_event`
+    /// was called with (`5_000_000` here, deliberately far from
+    /// `published_at_ms`, so the two could never be confused for one
+    /// another by coincidence).
+    #[test]
+    fn agent_chunk_prints_its_own_published_at_ms_not_the_print_time_ts() {
+        let event = HarnessOperatorAgentEventV1::AgentChunk {
+            sequence: 9,
+            session: sample_session_address(),
+            chunk: HarnessAgentStreamChunkV1 {
+                source_sequence: 9,
+                kind: HarnessAgentStreamChunkKindV1::Text { text: "hello".to_owned(), is_delta: false },
+            },
+            published_at_ms: 42,
+        };
+        let line = format_agent_stream_event(&event, 5_000_000, false).unwrap();
+        let session = format_session_address(&sample_session_address());
+        assert_eq!(line, format!("ts=42 seq=9 session={session} kind=text is_delta=false text=hello"));
+    }
+
+    /// `kind=replay-boundary` names its own two fields, session-scoped like
+    /// every other line -- and, unlike every other line, carries no `ts=`/
+    /// `seq=` at all: `ReplayBoundary` is a marker between two bursts of
+    /// chunks that already carry their own timestamps, not an instant of
+    /// its own (see that variant's own doc comment in
+    /// `gate4agent-harness-api`).
+    #[test]
+    fn replay_boundary_prints_replayed_and_dropped_before_replay_with_no_ts_or_seq() {
+        let event = HarnessOperatorAgentEventV1::ReplayBoundary {
+            session: sample_session_address(),
+            replayed: 256,
+            dropped_before_replay: 44,
+        };
+        let line = format_agent_stream_event(&event, 1_000, false).unwrap();
+        let session = format_session_address(&sample_session_address());
+        assert_eq!(
+            line,
+            format!("session={session} kind=replay-boundary replayed=256 dropped_before_replay=44"),
         );
     }
 

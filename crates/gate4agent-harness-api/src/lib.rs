@@ -106,7 +106,23 @@ pub const HARNESS_MCP_AUDIENCE: &str = "gate4agent-harness-mcp-read-v1";
 /// stuck behind a gate right now" across every node. Same rule as `18`: a
 /// shape change moves the version even though a pre-`19` reader would have
 /// silently read zero/`None` for both new fields.
-pub const HARNESS_OPERATOR_WIRE_VERSION: u16 = 19;
+///
+/// `20` closes the gap between when a `SubscribeAgentStream` connection
+/// registers and when the session it asked for actually started emitting:
+/// measured live, that gap runs 2-25 s, and every instant chunk (`Text`/
+/// `Thinking`/`Blocked`) published into it before registration used to be
+/// gone for good (`gate4agent-harness-service::agent_stream`'s own doc
+/// comment covers why those three are never part of the SEEDED state, and
+/// still are not). `HarnessOperatorAgentEventV1::AgentChunk` widens with
+/// `published_at_ms` (the harness's own publish-time reading, carried
+/// unchanged through a replay so a replayed line never prints as if it just
+/// happened), and a new variant, `ReplayBoundary`, marks the point in one
+/// session's delivery where a bounded backward-looking replay ends and live
+/// delivery begins. Same rule as every bump above: a widened variant and a
+/// new one both move the version even though a pre-`20` reader would have
+/// silently read zero for the new field and never received the new variant
+/// at all.
+pub const HARNESS_OPERATOR_WIRE_VERSION: u16 = 20;
 // Realistic multi-pane ceiling with headroom; bounds the harness-side
 // per-subscriber HashSet<RuntimeSessionKey> and the connect-time seed burst
 // `SubscribeTerminal`'s handler sends immediately after registering (see
@@ -3563,6 +3579,17 @@ impl HarnessAgentStreamChunkV1 {
 /// because none could repair what was lost -- and the client's only correct
 /// response is to surface that loss to the operator, not to wait for a
 /// recovery frame that is never coming.
+///
+/// `ReplayBoundary` is a separate, narrower concession to the same
+/// "instants are gone once missed" rule: a subscriber routinely registers
+/// seconds after a session's first turn already started (an operator can
+/// only address a session that has been spawned), and every `Text`/
+/// `Thinking`/`Blocked` chunk published into that gap used to be gone for
+/// good. The harness now keeps a small bounded ring of the most recent ones
+/// per session and replays it once at subscribe time, immediately marked by
+/// this event so it is never mistaken for live content -- see this field's
+/// own doc comment on `AgentChunk::published_at_ms` for how a replayed
+/// chunk keeps proving it is history, not now.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum HarnessOperatorAgentEventV1 {
@@ -3570,6 +3597,14 @@ pub enum HarnessOperatorAgentEventV1 {
         sequence: u64,
         session: HarnessRuntimeSessionAddressV1,
         chunk: HarnessAgentStreamChunkV1,
+        /// The harness's own wall-clock reading of the moment this chunk
+        /// was first published to `AgentStreamSubscriberRegistry`
+        /// (`gate4agent-harness-service::agent_stream`), carried unchanged
+        /// through every delivery path -- live, state seed, and the bounded
+        /// replay `ReplayBoundary` marks the end of. A replayed chunk keeps
+        /// the timestamp it was born with here; nothing ever restamps it to
+        /// the moment it happened to be replayed.
+        published_at_ms: u64,
     },
     /// This subscriber's outbound queue overflowed for the named session and
     /// `dropped` chunks were lost for it specifically -- other subscribers,
@@ -3580,6 +3615,27 @@ pub enum HarnessOperatorAgentEventV1 {
         sequence: u64,
         session: HarnessRuntimeSessionAddressV1,
         dropped: u64,
+    },
+    /// Sent at most once per `SubscribeAgentStream` subscription per
+    /// session, right after that session's replayed instant chunks
+    /// (`Text`/`Thinking`/`Blocked` pulled from the harness's own bounded
+    /// replay ring -- see `gate4agent-harness-service::agent_stream`'s own
+    /// doc comment) and before any live chunk for that session: the marker
+    /// that lets the operator tell "recent history it missed" apart from
+    /// "happening right now". Sent for every session the harness has
+    /// recorded ANYTHING for at all (state, replay, or both), even if the
+    /// ring itself turned out empty for it (`replayed: 0`) -- but never for
+    /// a session the harness has not seen even once, since there is nothing
+    /// to mark a boundary against there and the first thing that subscriber
+    /// sees for it will just be live content, unambiguously so.
+    /// `dropped_before_replay` is the ring's own running eviction count --
+    /// nonzero here means the replay itself is truncated, and it names that
+    /// gap rather than silently handing back a partial history as if it
+    /// were the whole one.
+    ReplayBoundary {
+        session: HarnessRuntimeSessionAddressV1,
+        replayed: u32,
+        dropped_before_replay: u64,
     },
     /// Same keep-alive rationale as `HarnessOperatorTerminalEventV1::Ping`:
     /// this is a physically separate connection with its own dead-peer-
@@ -3596,6 +3652,7 @@ impl HarnessOperatorAgentEventV1 {
                 chunk.validate()
             }
             Self::Lagged { session, .. } => session.validate(),
+            Self::ReplayBoundary { session, .. } => session.validate(),
             Self::Ping { .. } => Ok(()),
         }
     }
@@ -7569,15 +7626,15 @@ mod tests {
     }
 
     /// Plan item 4 (`gate4agent-blocked-action-event-2026-09-02.md` §2): the
-    /// fleet-wide `blocked_count`/`last_blocked_at_ms` instrument moved
-    /// `HARNESS_OPERATOR_WIRE_VERSION` from `18` to `19`, round-trips
-    /// through JSON intact, and its own invariant (a count of zero implies
-    /// no timestamp, and vice versa) is enforced the same way every other
-    /// paired count/timestamp field in this crate is.
+    /// fleet-wide `blocked_count`/`last_blocked_at_ms` instrument (added when
+    /// `HARNESS_OPERATOR_WIRE_VERSION` moved `18` -> `19`; the version pin
+    /// itself has since moved again and is asserted where it currently
+    /// lives, not here) round-trips through JSON intact, and its own
+    /// invariant (a count of zero implies no timestamp, and vice versa) is
+    /// enforced the same way every other paired count/timestamp field in
+    /// this crate is.
     #[test]
-    fn managed_session_blocked_stats_round_trip_and_the_wire_pin_moved() {
-        assert_eq!(HARNESS_OPERATOR_WIRE_VERSION, 19);
-
+    fn managed_session_blocked_stats_round_trip() {
         let mut session = sample_managed_session("record-a");
         session.blocked_count = 2;
         session.last_blocked_at_ms = Some(2_000);
@@ -10496,12 +10553,18 @@ mod tests {
                 sequence: index as u64,
                 session: session.clone(),
                 chunk: HarnessAgentStreamChunkV1 { source_sequence: index as u64, kind },
+                published_at_ms: 1_000 + index as u64,
             })
             .collect();
         events.push(HarnessOperatorAgentEventV1::Lagged {
             sequence: 100,
             session: session.clone(),
             dropped: 3,
+        });
+        events.push(HarnessOperatorAgentEventV1::ReplayBoundary {
+            session: session.clone(),
+            replayed: 6,
+            dropped_before_replay: 44,
         });
         events.push(HarnessOperatorAgentEventV1::Ping { sequence: 101 });
 
@@ -10511,6 +10574,19 @@ mod tests {
             let decoded: HarnessOperatorAgentEventV1 = serde_json::from_str(&encoded).unwrap();
             assert_eq!(decoded, event);
         }
+    }
+
+    /// The bounded agent-stream replay (a subscriber missed a session's
+    /// first turn, so the harness hands back its recent instant chunks
+    /// once, marked, instead of nothing at all) moved
+    /// `HARNESS_OPERATOR_WIRE_VERSION` from `19` to `20`: `AgentChunk` widens
+    /// with `published_at_ms` and the new `ReplayBoundary` variant round-
+    /// trips through JSON intact, both already exercised for content by
+    /// `operator_agent_event_variants_are_exact_round_trips` above -- this
+    /// test is the version pin itself.
+    #[test]
+    fn agent_stream_replay_moved_the_wire_pin_to_20() {
+        assert_eq!(HARNESS_OPERATOR_WIRE_VERSION, 20);
     }
 
     #[test]
@@ -10523,6 +10599,7 @@ mod tests {
             sequence: 0,
             session: bad_session,
             chunk: sample_agent_stream_chunk(0),
+            published_at_ms: 1_000,
         };
         assert!(bad_session_event.validate().is_err());
 
@@ -10537,6 +10614,7 @@ mod tests {
             sequence: 0,
             session: session.clone(),
             chunk: oversized_text_chunk,
+            published_at_ms: 1_000,
         };
         assert!(matches!(
             bad_chunk_event.validate(),
@@ -10558,6 +10636,7 @@ mod tests {
             sequence: 0,
             session: session.clone(),
             chunk: empty_correlation_prompt,
+            published_at_ms: 1_000,
         };
         assert!(matches!(
             bad_prompt_event.validate(),

@@ -39,6 +39,24 @@
 //!   history, and seeding a closed question to a fresh operator would
 //!   invite an answer to something already decided.
 //!
+//! "Never seeded" for `Text`/`Thinking`/`Blocked` is still exactly true --
+//! neither is ever part of `AgentStreamSessionState`'s replace-latest set --
+//! but it used to also mean "gone for good the moment a subscriber missed
+//! it", and measured live that gap is real: `SubscribeAgentStream` routinely
+//! registers 2-25 s after a session's first turn already started, because a
+//! session address exists only after the node has spawned it. Every one of
+//! those three kinds published into that gap is now kept in a small, bounded
+//! FIFO per session (`AgentStreamReplayRing`, recorded by every `publish`
+//! the same unconditional way `record_state` already is), and
+//! `AgentStreamSubscriberRegistry::insert` hands a fresh subscriber that
+//! ring's held chunks, in publish order, immediately after the state seed
+//! above and before anything live -- then exactly one `ReplayBoundary` event
+//! per session, so the operator can always tell replayed history from
+//! something happening right now. This is deliberately NOT a fourth seeded
+//! kind: the ring is read once, at `insert` time, never consulted again for
+//! that subscriber, and never restamps a chunk's `published_at_ms` to the
+//! moment it happened to be replayed.
+//!
 //! Kernel-free by construction, like `terminal.rs`: no `HarnessService`/
 //! SQLite/`HarnessC2Adapter` dependency, only the plain `RuntimeSessionKey`
 //! and wire types.
@@ -46,9 +64,9 @@
 use crate::runtime::OperatorRequestLogIdentity;
 use gate4agent_harness_api::{
     HarnessAgentStreamChunkKindV1, HarnessAgentStreamChunkV1, HarnessAgentStreamInteractionOptionV1,
-    HarnessAgentStreamNamedIdV1, HarnessBlockAuthorityV1, HarnessOperatorAgentEventV1,
-    HarnessProviderConfigChoiceV1, HarnessProviderConfigOptionKindV1, HarnessProviderConfigOptionV1,
-    HarnessProviderInteractionKindV1, HarnessRuntimeSessionAddressV1,
+    HarnessAgentStreamNamedIdV1, HARNESS_AGENT_STREAM_TEXT_MAX_BYTES, HarnessBlockAuthorityV1,
+    HarnessOperatorAgentEventV1, HarnessProviderConfigChoiceV1, HarnessProviderConfigOptionKindV1,
+    HarnessProviderConfigOptionV1, HarnessProviderInteractionKindV1, HarnessRuntimeSessionAddressV1,
 };
 use gate4agent_node_protocol::{
     AgentStreamChunkKindV1, AgentStreamChunkV1, AgentStreamInteractionOptionV1,
@@ -57,6 +75,7 @@ use gate4agent_node_protocol::{
 };
 use gate4agent_observation_api::RuntimeSessionKey;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
 /// Own dedicated pool, same isolation rationale as `HOST_SUBSCRIBER_LIMIT`/
@@ -80,9 +99,52 @@ pub const HOST_AGENT_STREAM_SUBSCRIBER_QUEUE_CAPACITY: usize = 256;
 /// ever sees, whether or not a subscriber exists yet to receive it live, so
 /// nothing else bounds how many sessions accumulate there except this cap
 /// plus each session's own tiny, fixed-by-construction footprint (three
-/// `Option<AgentStreamChunkV1>` slots and a handful of pending interaction
-/// prompts -- see `AgentStreamSessionState`'s own doc comment).
+/// `Option<StampedAgentStreamChunk>` slots, a handful of pending interaction
+/// prompts, and one bounded `AgentStreamReplayRing` -- see
+/// `AgentStreamSessionState`'s own doc comment).
 const AGENT_STREAM_STATE_SESSIONS_MAX: usize = 64;
+/// Chunk-count ceiling for `AgentStreamReplayRing`, one of the two bounds
+/// (`AGENT_STREAM_REPLAY_RING_BYTES_MAX` below is the other; both apply at
+/// once, whichever is hit first) that keep a bounded replay bounded. Matches
+/// `HOST_AGENT_STREAM_SUBSCRIBER_QUEUE_CAPACITY` on purpose, not by
+/// coincidence: retaining more instants per session than a single
+/// subscriber's own outbound queue could ever hold in one seed burst buys
+/// nothing -- that queue's own overflow discipline (`AgentStreamSubscriber::
+/// deliver`) would drop the excess anyway the instant it tried to go out
+/// live, so there is no point keeping it around unreplayed for longer than
+/// that.
+const AGENT_STREAM_REPLAY_RING_CHUNKS_MAX: usize = HOST_AGENT_STREAM_SUBSCRIBER_QUEUE_CAPACITY;
+/// Byte ceiling on `AgentStreamReplayRing`'s ENTIRE retained free-text
+/// footprint (the `text` on `Text`/`Thinking`, `reason`+`help` on `Blocked`
+/// -- see `instant_chunk_text_bytes`), the second of the two bounds above.
+/// Matches `HARNESS_AGENT_STREAM_TEXT_MAX_BYTES`
+/// (`gate4agent-harness-api`), the wire's own ceiling on ONE free-text
+/// field, reused here as the ceiling on the ring's WHOLE retained text
+/// across every chunk it holds: without this second bound, a run of
+/// near-maximum-size `Text`/`Thinking` chunks well under
+/// `AGENT_STREAM_REPLAY_RING_CHUNKS_MAX` in count could still balloon one
+/// session's held memory far past what a single such field is already
+/// trusted to cost.
+const AGENT_STREAM_REPLAY_RING_BYTES_MAX: usize = HARNESS_AGENT_STREAM_TEXT_MAX_BYTES;
+
+/// Wall-clock milliseconds since the Unix epoch, floored at `1` so a zero
+/// reading (a clock that somehow reports before the epoch) is never mistaken
+/// for "never published" -- mirrors `runtime.rs`'s own private helper of the
+/// same name exactly; duplicated rather than shared across the two sibling
+/// modules for the same reason `terminal.rs`'s ring buffer and this
+/// module's subscriber registry already are not shared (see this module's
+/// own doc comment). The only reading `AgentStreamSubscriberRegistry::
+/// publish` takes for `HarnessOperatorAgentEventV1::AgentChunk::
+/// published_at_ms` -- taken once per publish and carried unchanged through
+/// every delivery path afterward (live, state seed, replay), never
+/// recomputed at delivery time.
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(1)
+        .max(1)
+}
 
 // Not a `From` impl for the same orphan-rule reason `terminal::
 // terminal_frame_to_wire`/`session_key_to_address` aren't ones: both sides
@@ -227,16 +289,93 @@ fn agent_stream_chunk_to_wire(chunk: AgentStreamChunkV1) -> HarnessAgentStreamCh
     }
 }
 
+/// One `AgentStreamChunkV1` plus the harness's own wall-clock reading of the
+/// moment `AgentStreamSubscriberRegistry::publish` first recorded it (see
+/// `unix_time_ms`'s own doc comment) -- carried through every delivery path
+/// alike (live, state seed, replay-ring seed) as
+/// `HarnessOperatorAgentEventV1::AgentChunk::published_at_ms`, so a replayed
+/// chunk's printed `ts` (`harnessctl`'s `format_agent_stream_event`) is
+/// always the moment it was born, never the moment it happened to be
+/// replayed.
+#[derive(Clone)]
+struct StampedAgentStreamChunk {
+    chunk: AgentStreamChunkV1,
+    published_at_ms: u64,
+}
+
+/// Free-text bytes `chunk` contributes to `AgentStreamReplayRing`'s own
+/// `AGENT_STREAM_REPLAY_RING_BYTES_MAX` bound. Exhaustive over the full
+/// source enum even though only `Text`/`Thinking`/`Blocked` are ever pushed
+/// to the ring (`AgentStreamSubscriberRegistry::record_replay`'s own match)
+/// -- every other kind costs nothing here rather than silently
+/// miscompiling if that match is ever edited without checking this one too.
+fn instant_chunk_text_bytes(kind: &AgentStreamChunkKindV1) -> usize {
+    match kind {
+        AgentStreamChunkKindV1::Text { text, .. } => text.len(),
+        AgentStreamChunkKindV1::Thinking { text } => text.len(),
+        AgentStreamChunkKindV1::Blocked { reason, help, .. } => {
+            reason.len() + help.as_deref().map(str::len).unwrap_or(0)
+        }
+        AgentStreamChunkKindV1::InteractionPrompt { .. }
+        | AgentStreamChunkKindV1::ModeCatalog { .. }
+        | AgentStreamChunkKindV1::ConfigOptions { .. }
+        | AgentStreamChunkKindV1::ModelCatalog { .. } => 0,
+    }
+}
+
+/// Bounded FIFO of the most recent instant chunks (`Text`/`Thinking`/
+/// `Blocked`) for one session -- see this module's own doc comment for why
+/// a bounded, explicitly marked replay exists. Two eviction bounds apply at
+/// once, whichever is hit first on a `push` (`AGENT_STREAM_REPLAY_RING_CHUNKS_MAX`/
+/// `AGENT_STREAM_REPLAY_RING_BYTES_MAX`, see both constants' own doc
+/// comments for why these particular values). `dropped` is the running,
+/// never-reset count of chunks this ring has had to evict to stay within
+/// either bound -- read once per subscription at `insert` time as
+/// `HarnessOperatorAgentEventV1::ReplayBoundary::dropped_before_replay`, so
+/// a truncated replay always names its own gap rather than silently handing
+/// back a partial history as if it were the whole one.
+#[derive(Default)]
+struct AgentStreamReplayRing {
+    entries: VecDeque<StampedAgentStreamChunk>,
+    text_bytes: usize,
+    dropped: u64,
+}
+
+impl AgentStreamReplayRing {
+    /// Pushes `chunk` onto the back of the ring, then evicts from the front
+    /// until both bounds are satisfied again -- including evicting the
+    /// just-pushed entry itself if its own text alone already exceeds
+    /// `AGENT_STREAM_REPLAY_RING_BYTES_MAX`, so the byte bound is never
+    /// silently allowed to slip past for a single oversized chunk.
+    fn push(&mut self, stamped: StampedAgentStreamChunk) {
+        let bytes = instant_chunk_text_bytes(&stamped.chunk.kind);
+        self.entries.push_back(stamped);
+        self.text_bytes = self.text_bytes.saturating_add(bytes);
+        while self.entries.len() > AGENT_STREAM_REPLAY_RING_CHUNKS_MAX
+            || self.text_bytes > AGENT_STREAM_REPLAY_RING_BYTES_MAX
+        {
+            let Some(evicted) = self.entries.pop_front() else { break; };
+            self.text_bytes =
+                self.text_bytes.saturating_sub(instant_chunk_text_bytes(&evicted.chunk.kind));
+            self.dropped = self.dropped.saturating_add(1);
+        }
+    }
+}
+
 /// The current-state chunks held for one session -- see this module's own
 /// doc comment for why these, and only these, earn a seed. Three fixed
 /// slots (`ModeCatalog`/`ConfigOptions`/`ModelCatalog`), each replaced --
-/// never accumulated -- by the newest chunk of its kind, plus a map of
-/// still-unresolved `InteractionPrompt`s.
+/// never accumulated -- by the newest chunk of its kind, a map of
+/// still-unresolved `InteractionPrompt`s, and a bounded `AgentStreamReplayRing`
+/// of recent instants -- a materially different discipline (bounded FIFO,
+/// never replaced, read once per subscription rather than held as current
+/// truth) from the three seeded slots above it, hence its own type rather
+/// than a fourth `Option`.
 #[derive(Default)]
 struct AgentStreamSessionState {
-    mode_catalog: Option<AgentStreamChunkV1>,
-    config_options: Option<AgentStreamChunkV1>,
-    model_catalog: Option<AgentStreamChunkV1>,
+    mode_catalog: Option<StampedAgentStreamChunk>,
+    config_options: Option<StampedAgentStreamChunk>,
+    model_catalog: Option<StampedAgentStreamChunk>,
     /// Keyed by `InteractionPrompt::correlation_id` -- the same id both a
     /// `ResolveInteraction` names and `AgentStreamSubscriberRegistry::
     /// resolve_interaction` is called with, so more than one interaction
@@ -244,7 +383,8 @@ struct AgentStreamSessionState {
     /// than one clobbering another's slot. `BTreeMap` only for a
     /// deterministic seed order across runs, not because the protocol
     /// itself orders interactions by correlation id.
-    interaction_prompts: BTreeMap<String, AgentStreamChunkV1>,
+    interaction_prompts: BTreeMap<String, StampedAgentStreamChunk>,
+    replay: AgentStreamReplayRing,
 }
 
 impl AgentStreamSessionState {
@@ -252,7 +392,10 @@ impl AgentStreamSessionState {
     /// fixed order (mode catalogue, config options, model catalogue, then
     /// every still-unresolved interaction prompt in correlation-id order)
     /// -- the order `AgentStreamSubscriberRegistry::seed` delivers in.
-    fn seed_chunks(&self) -> impl Iterator<Item = &AgentStreamChunkV1> {
+    /// Deliberately NOT including `replay`'s own entries: those are seeded
+    /// by `seed` too, but as their own explicitly bounded, explicitly
+    /// marked burst, never folded into this "current state" list.
+    fn seed_chunks(&self) -> impl Iterator<Item = &StampedAgentStreamChunk> {
         [self.mode_catalog.as_ref(), self.config_options.as_ref(), self.model_catalog.as_ref()]
             .into_iter()
             .flatten()
@@ -299,8 +442,11 @@ impl AgentStreamSubscriber {
     /// (no second warning -- the first drop of the episode already named
     /// it). Returns `true` if the subscriber's channel is discovered closed,
     /// so the caller can prune it exactly the way `TerminalSubscriber::
-    /// deliver` does for its own registry.
-    fn deliver(&mut self, key: &RuntimeSessionKey, chunk: AgentStreamChunkV1) -> bool {
+    /// deliver` does for its own registry. `published_at_ms` is
+    /// `AgentStreamSubscriberRegistry::publish`'s own single reading for
+    /// this chunk (`unix_time_ms`'s own doc comment), carried straight onto
+    /// the wire unchanged.
+    fn deliver(&mut self, key: &RuntimeSessionKey, chunk: AgentStreamChunkV1, published_at_ms: u64) -> bool {
         if let Some(&dropped) = self.dropped.get(key) {
             match self.try_send_lagged_report(key, dropped) {
                 Ok(true) => {
@@ -320,6 +466,7 @@ impl AgentStreamSubscriber {
             sequence,
             session: session_key_to_address(key),
             chunk: agent_stream_chunk_to_wire(chunk),
+            published_at_ms,
         };
         match self.sender.try_send(event) {
             Ok(()) => {
@@ -365,7 +512,17 @@ impl AgentStreamSubscriber {
     ///
     /// Returns `true` only when the channel is discovered closed, so the
     /// caller can prune it the same way every other send path here does.
-    fn deliver_seed(&mut self, key: &RuntimeSessionKey, chunk: AgentStreamChunkV1) -> bool {
+    /// Shared verbatim by `AgentStreamSubscriberRegistry::seed` for BOTH the
+    /// state seed and the replay-ring burst that follows it: both are seeded
+    /// content sent before the subscriber can have observed anything, so
+    /// the same non-loss-counted `Full` handling applies to each --
+    /// see this module's own doc comment for why a bounded replay's own
+    /// `dropped_before_replay` (ring EVICTION, tracked separately by
+    /// `AgentStreamReplayRing`) is the loss signal for the replay half, not
+    /// this method's silent-drop-on-full. `published_at_ms` is the reading
+    /// `AgentStreamSubscriberRegistry::publish` took when this chunk was
+    /// first recorded, never recomputed here.
+    fn deliver_seed(&mut self, key: &RuntimeSessionKey, chunk: AgentStreamChunkV1, published_at_ms: u64) -> bool {
         debug_assert!(
             !self.dropped.contains_key(key),
             "a subscriber being seeded has not yet observed anything to lose",
@@ -375,12 +532,49 @@ impl AgentStreamSubscriber {
             sequence,
             session: session_key_to_address(key),
             chunk: agent_stream_chunk_to_wire(chunk),
+            published_at_ms,
         };
         match self.sender.try_send(event) {
             Ok(()) => {
                 self.next_sequence = self.next_sequence.wrapping_add(1);
                 false
             }
+            Err(mpsc::error::TrySendError::Full(_)) => false,
+            Err(mpsc::error::TrySendError::Closed(_)) => true,
+        }
+    }
+
+    /// Delivers exactly one `ReplayBoundary` event for `key` to a
+    /// subscriber still being registered -- the marker
+    /// `AgentStreamSubscriberRegistry::seed` sends immediately after this
+    /// session's replayed ring chunks (see this module's own doc comment),
+    /// separating replay from live. Same non-loss-counted `Full` handling as
+    /// `deliver_seed` and for the same reason (this only ever runs before
+    /// the subscriber has observed anything, so `self.dropped` is always
+    /// empty here); a boundary that does not fit is a seeding-burst sizing
+    /// problem, not live content to report through `Lagged`. Unlike every
+    /// other send path here, it never touches `next_sequence` --
+    /// `ReplayBoundary` carries no `sequence` field (see that variant's own
+    /// doc comment in `gate4agent-harness-api`). Returns `true` only when
+    /// the channel is discovered closed, same pruning contract as
+    /// `deliver_seed`.
+    fn deliver_replay_boundary(
+        &mut self,
+        key: &RuntimeSessionKey,
+        replayed: u32,
+        dropped_before_replay: u64,
+    ) -> bool {
+        debug_assert!(
+            !self.dropped.contains_key(key),
+            "a subscriber being seeded has not yet observed anything to lose",
+        );
+        let event = HarnessOperatorAgentEventV1::ReplayBoundary {
+            session: session_key_to_address(key),
+            replayed,
+            dropped_before_replay,
+        };
+        match self.sender.try_send(event) {
+            Ok(()) => false,
             Err(mpsc::error::TrySendError::Full(_)) => false,
             Err(mpsc::error::TrySendError::Closed(_)) => true,
         }
@@ -496,24 +690,62 @@ impl AgentStreamSubscriberRegistry {
     }
 
     /// Sends every STATE chunk this registry currently holds for each of
-    /// `sessions` to subscriber `id`, before it can observe anything live --
-    /// the fan-out half of `insert`'s seeding. Split out from `insert` only
-    /// to keep the borrow of `self.state` (read) and `self.subscribers`
-    /// (written via `deliver_seed`) from overlapping.
+    /// `sessions` to subscriber `id`, then that session's bounded replay
+    /// (`AgentStreamReplayRing`'s held chunks, in order), then exactly one
+    /// `ReplayBoundary` for it -- all before the subscriber can observe
+    /// anything live. Sent per session, in that fixed order, for every
+    /// session in `sessions` this registry has recorded ANYTHING for at all
+    /// (`self.state` holds an entry for it -- state, replay, or both). A
+    /// session this registry has never seen even once is skipped entirely,
+    /// same as before this method grew a replay half: there is nothing to
+    /// mark a boundary against, and the first thing that subscriber ever
+    /// sees for it will just be live content, unambiguously so. See this
+    /// module's own doc comment for the three-way seeding split plus the
+    /// replay ring layered on top of it. Split out from `insert` only to
+    /// keep the borrow of `self.state` (read) and `self.subscribers`
+    /// (written via `deliver_seed`/`deliver_replay_boundary`) from
+    /// overlapping: every chunk this session owes is cloned out into
+    /// `plans` first, so the two borrows never need to be alive at once.
     fn seed(&mut self, id: u64, sessions: &HashSet<RuntimeSessionKey>) {
         let Some(index) = self.subscribers.iter().position(|subscriber| subscriber.id == id)
         else {
             return;
         };
-        let mut seed_chunks: Vec<(RuntimeSessionKey, AgentStreamChunkV1)> = Vec::new();
+        struct SessionSeedPlan {
+            key: RuntimeSessionKey,
+            seed_chunks: Vec<StampedAgentStreamChunk>,
+            replay_chunks: Vec<StampedAgentStreamChunk>,
+            dropped_before_replay: u64,
+        }
+        let mut plans: Vec<SessionSeedPlan> = Vec::new();
         for key in sessions {
             let Some(state) = self.state.get(key) else { continue; };
-            for chunk in state.seed_chunks() {
-                seed_chunks.push((key.clone(), chunk.clone()));
-            }
+            plans.push(SessionSeedPlan {
+                key: key.clone(),
+                seed_chunks: state.seed_chunks().cloned().collect(),
+                replay_chunks: state.replay.entries.iter().cloned().collect(),
+                dropped_before_replay: state.replay.dropped,
+            });
         }
-        for (key, chunk) in seed_chunks {
-            if self.subscribers[index].deliver_seed(&key, chunk) {
+        for plan in plans {
+            for stamped in plan.seed_chunks {
+                if self.subscribers[index].deliver_seed(&plan.key, stamped.chunk, stamped.published_at_ms) {
+                    self.remove_at(index);
+                    return;
+                }
+            }
+            let replayed = u32::try_from(plan.replay_chunks.len()).unwrap_or(u32::MAX);
+            for stamped in plan.replay_chunks {
+                if self.subscribers[index].deliver_seed(&plan.key, stamped.chunk, stamped.published_at_ms) {
+                    self.remove_at(index);
+                    return;
+                }
+            }
+            if self.subscribers[index].deliver_replay_boundary(
+                &plan.key,
+                replayed,
+                plan.dropped_before_replay,
+            ) {
                 self.remove_at(index);
                 return;
             }
@@ -554,29 +786,59 @@ impl AgentStreamSubscriberRegistry {
     }
 
     /// Records `chunk` into `state` if it is one of the seeded kinds (see
-    /// this module's own doc comment); every other kind (`Text`, `Thinking`)
-    /// is an instant and is never held. Called unconditionally from
-    /// `publish` below, even with zero subscribers -- this is the fix for
-    /// the fan-out this module's own doc comment describes: without it, a
-    /// state chunk published before any subscriber exists would never be
-    /// recorded anywhere for `insert` to seed a later one from.
-    fn record_state(&mut self, key: &RuntimeSessionKey, chunk: &AgentStreamChunkV1) {
+    /// this module's own doc comment); every other kind (`Text`, `Thinking`,
+    /// `Blocked`) is an instant and is never held here -- `record_replay`
+    /// below is its own separate discipline for those three. Called
+    /// unconditionally from `publish` below, even with zero subscribers --
+    /// this is the fix for the fan-out this module's own doc comment
+    /// describes: without it, a state chunk published before any subscriber
+    /// exists would never be recorded anywhere for `insert` to seed a later
+    /// one from. `published_at_ms` is `publish`'s own single reading for
+    /// this chunk, stamped once onto the `StampedAgentStreamChunk` stored
+    /// here.
+    fn record_state(&mut self, key: &RuntimeSessionKey, chunk: &AgentStreamChunkV1, published_at_ms: u64) {
+        let stamped = || StampedAgentStreamChunk { chunk: chunk.clone(), published_at_ms };
         match &chunk.kind {
             AgentStreamChunkKindV1::ModeCatalog { .. } => {
-                self.state_slot(key).mode_catalog = Some(chunk.clone());
+                self.state_slot(key).mode_catalog = Some(stamped());
             }
             AgentStreamChunkKindV1::ConfigOptions { .. } => {
-                self.state_slot(key).config_options = Some(chunk.clone());
+                self.state_slot(key).config_options = Some(stamped());
             }
             AgentStreamChunkKindV1::ModelCatalog { .. } => {
-                self.state_slot(key).model_catalog = Some(chunk.clone());
+                self.state_slot(key).model_catalog = Some(stamped());
             }
             AgentStreamChunkKindV1::InteractionPrompt { correlation_id, .. } => {
-                self.state_slot(key).interaction_prompts.insert(correlation_id.clone(), chunk.clone());
+                self.state_slot(key).interaction_prompts.insert(correlation_id.clone(), stamped());
             }
             AgentStreamChunkKindV1::Text { .. }
             | AgentStreamChunkKindV1::Thinking { .. }
             | AgentStreamChunkKindV1::Blocked { .. } => {}
+        }
+    }
+
+    /// Pushes `chunk` onto this session's bounded replay ring
+    /// (`AgentStreamReplayRing`) if it is one of the three instant kinds the
+    /// ring exists for (`Text`/`Thinking`/`Blocked` -- see this module's own
+    /// doc comment); every other kind is already handled by `record_state`
+    /// above and is never duplicated into the ring. Called unconditionally
+    /// from `publish`, mirroring `record_state`'s own unconditional call: a
+    /// chunk published before any subscriber exists must still be in the
+    /// ring for the next subscriber's replay.
+    fn record_replay(&mut self, key: &RuntimeSessionKey, chunk: &AgentStreamChunkV1, published_at_ms: u64) {
+        match &chunk.kind {
+            AgentStreamChunkKindV1::Text { .. }
+            | AgentStreamChunkKindV1::Thinking { .. }
+            | AgentStreamChunkKindV1::Blocked { .. } => {
+                self.state_slot(key).replay.push(StampedAgentStreamChunk {
+                    chunk: chunk.clone(),
+                    published_at_ms,
+                });
+            }
+            AgentStreamChunkKindV1::InteractionPrompt { .. }
+            | AgentStreamChunkKindV1::ModeCatalog { .. }
+            | AgentStreamChunkKindV1::ConfigOptions { .. }
+            | AgentStreamChunkKindV1::ModelCatalog { .. } => {}
         }
     }
 
@@ -598,14 +860,21 @@ impl AgentStreamSubscriberRegistry {
 
     /// Called from the ingest call site for every incoming chunk. Unlike
     /// the cheap no-op-when-empty convention this used to share verbatim
-    /// with `TerminalSubscriberRegistry::publish`, `record_state` now runs
-    /// unconditionally -- even with zero subscribers -- because that is
-    /// exactly the situation `insert`'s seed exists to fix: a state chunk
-    /// observed before anyone was listening must still be there for the
-    /// next subscriber to be seeded with. The fan-out to `subscribers`
-    /// immediately below remains the cheap no-op it always was.
+    /// with `TerminalSubscriberRegistry::publish`, `record_state`/
+    /// `record_replay` now run unconditionally -- even with zero
+    /// subscribers -- because that is exactly the situation `insert`'s seed
+    /// exists to fix: a state chunk or an instant observed before anyone was
+    /// listening must still be there (as state, or in the replay ring) for
+    /// the next subscriber to be seeded with. The fan-out to `subscribers`
+    /// immediately below remains the cheap no-op it always was. Takes
+    /// exactly one `unix_time_ms()` reading for this chunk here, before
+    /// either record call or the live fan-out, so every path this one
+    /// `publish` call touches -- state, replay ring, and every live
+    /// subscriber -- carries the identical `published_at_ms`.
     pub fn publish(&mut self, key: &RuntimeSessionKey, chunk: &AgentStreamChunkV1) {
-        self.record_state(key, chunk);
+        let published_at_ms = unix_time_ms();
+        self.record_state(key, chunk, published_at_ms);
+        self.record_replay(key, chunk, published_at_ms);
         if self.subscribers.is_empty() { return; }
         let mut index = 0;
         while index < self.subscribers.len() {
@@ -614,7 +883,7 @@ impl AgentStreamSubscriberRegistry {
                 index += 1;
                 continue;
             }
-            if subscriber.deliver(key, chunk.clone()) {
+            if subscriber.deliver(key, chunk.clone(), published_at_ms) {
                 self.remove_at(index);
             } else {
                 index += 1;
@@ -937,14 +1206,24 @@ mod tests {
             HarnessAgentStreamChunkKindV1::ModeCatalog { current: Some(current), .. }
                 if current == "default"
         ));
-        assert!(receiver.try_recv().is_err(), "exactly one seeded chunk, nothing live yet");
+        // The session has state but nothing in its replay ring, so the
+        // boundary right behind it reports an empty replay -- and nothing
+        // follows that, since nothing has gone live yet.
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            HarnessOperatorAgentEventV1::ReplayBoundary { replayed: 0, dropped_before_replay: 0, .. },
+        ));
+        assert!(receiver.try_recv().is_err(), "exactly one seeded chunk plus its boundary, nothing live yet");
     }
 
-    /// Item 2's direct proof: `Text` (and, by the same code path, `Thinking`)
-    /// is an instant, never held in `state`, so a subscriber that registers
-    /// after one was published sees nothing from it.
+    /// Item 2's direct proof, now that the fix lands: `Text` (and, by the
+    /// same code path, `Thinking`/`Blocked`) is still never part of
+    /// `state`'s seeded, replace-latest set -- but it is no longer simply
+    /// gone either. A subscriber that registers after one was published
+    /// gets it back once, through the bounded replay ring, immediately
+    /// followed by the boundary that marks it as history rather than live.
     #[test]
-    fn insert_does_not_seed_an_instant_chunk_published_before_registration() {
+    fn insert_replays_an_instant_chunk_published_before_registration_but_never_as_seeded_state() {
         let mut registry = AgentStreamSubscriberRegistry::default();
         let key = sample_key("node-a", 'a');
         registry.publish(&key, &sample_chunk(1));
@@ -954,7 +1233,19 @@ mod tests {
         sessions.insert(key.clone());
         registry.insert(sender, sessions, subscribe_agent_stream_identity());
 
-        assert!(receiver.try_recv().is_err(), "a Text instant must never be seeded");
+        let event = receiver.try_recv().unwrap();
+        let HarnessOperatorAgentEventV1::AgentChunk { chunk, .. } = event else {
+            panic!("expected a replayed agent chunk");
+        };
+        assert!(matches!(
+            chunk.kind,
+            HarnessAgentStreamChunkKindV1::Text { text, .. } if text == "chunk-1",
+        ));
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            HarnessOperatorAgentEventV1::ReplayBoundary { replayed: 1, dropped_before_replay: 0, .. },
+        ));
+        assert!(receiver.try_recv().is_err(), "exactly one replayed chunk plus its boundary");
     }
 
     /// A second `ModeCatalog` replaces the first in `state` rather than
@@ -980,6 +1271,10 @@ mod tests {
             chunk.kind,
             HarnessAgentStreamChunkKindV1::ModeCatalog { current: Some(current), .. }
                 if current == "careful"
+        ));
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            HarnessOperatorAgentEventV1::ReplayBoundary { replayed: 0, dropped_before_replay: 0, .. },
         ));
         assert!(receiver.try_recv().is_err(), "exactly one seeded ModeCatalog, the latest only");
     }
@@ -1019,9 +1314,150 @@ mod tests {
         sessions_resolved.insert(key.clone());
         registry.insert(sender_resolved, sessions_resolved, subscribe_agent_stream_identity());
 
+        // The session still has state (the resolved prompt just left it),
+        // so this subscriber still gets a boundary marking an empty replay
+        // -- but never the resolved prompt itself.
+        assert!(matches!(
+            receiver_resolved.try_recv().unwrap(),
+            HarnessOperatorAgentEventV1::ReplayBoundary { replayed: 0, dropped_before_replay: 0, .. },
+        ));
         assert!(
             receiver_resolved.try_recv().is_err(),
             "a resolved interaction prompt must not be seeded",
         );
+    }
+
+    /// Item 1's large-scale proof: a session's replay ring is bounded, not
+    /// unbounded -- 300 published `Text` instants, none seen live by
+    /// anyone, still hand back only the most recent
+    /// `AGENT_STREAM_REPLAY_RING_CHUNKS_MAX`, in publish order, and the
+    /// boundary right behind them names exactly how many older ones the
+    /// ring had to evict to stay bounded. A live chunk published after the
+    /// subscriber registers arrives cleanly behind the boundary, proving the
+    /// replay-to-live handoff has no gap and no overlap: nothing from the
+    /// replay burst is ever seen twice.
+    #[test]
+    fn replay_ring_hands_back_only_the_most_recent_capacity_then_a_boundary_then_goes_live() {
+        const TOTAL_PUBLISHED: u64 = 300;
+        let mut registry = AgentStreamSubscriberRegistry::default();
+        let key = sample_key("node-a", 'a');
+        for sequence in 1..=TOTAL_PUBLISHED {
+            registry.publish(&key, &sample_chunk(sequence));
+        }
+
+        let capacity = u64::try_from(AGENT_STREAM_REPLAY_RING_CHUNKS_MAX)
+            .expect("the ring's own chunk cap fits in a u64");
+        let expected_dropped = TOTAL_PUBLISHED - capacity;
+
+        let (sender, mut receiver) = mpsc::channel(AGENT_STREAM_REPLAY_RING_CHUNKS_MAX + 8);
+        let mut sessions = HashSet::new();
+        sessions.insert(key.clone());
+        registry.insert(sender, sessions, subscribe_agent_stream_identity());
+
+        // The last `capacity` chunks, in the order they were originally
+        // published -- never the earliest ones the ring had to evict.
+        let first_kept_sequence = TOTAL_PUBLISHED - capacity + 1;
+        for sequence in first_kept_sequence..=TOTAL_PUBLISHED {
+            let event = receiver.try_recv().unwrap();
+            let HarnessOperatorAgentEventV1::AgentChunk { chunk, .. } = event else {
+                panic!("expected a replayed agent chunk for sequence {sequence}");
+            };
+            assert!(matches!(
+                chunk.kind,
+                HarnessAgentStreamChunkKindV1::Text { text, .. }
+                    if text == format!("chunk-{sequence}"),
+            ));
+        }
+
+        let replayed = u32::try_from(capacity).expect("the ring's own chunk cap fits in a u32");
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            HarnessOperatorAgentEventV1::ReplayBoundary {
+                replayed: got_replayed,
+                dropped_before_replay: got_dropped,
+                ..
+            } if got_replayed == replayed && got_dropped == expected_dropped,
+        ));
+
+        assert!(receiver.try_recv().is_err(), "nothing live yet after the boundary");
+
+        // A chunk published right after the subscriber is live arrives
+        // exactly once, never folded into (or duplicated out of) the burst
+        // that preceded it.
+        registry.publish(&key, &sample_chunk(TOTAL_PUBLISHED + 1));
+        let event = receiver.try_recv().unwrap();
+        let HarnessOperatorAgentEventV1::AgentChunk { chunk, .. } = event else {
+            panic!("expected the live chunk");
+        };
+        assert!(matches!(
+            chunk.kind,
+            HarnessAgentStreamChunkKindV1::Text { text, .. }
+                if text == format!("chunk-{}", TOTAL_PUBLISHED + 1),
+        ));
+        assert!(receiver.try_recv().is_err(), "exactly one live chunk, no duplicate of the replay");
+    }
+
+    /// Item 1's second subscriber proof: the ring is read, never drained, at
+    /// `insert` time -- a second subscriber that registers later gets its
+    /// own independent replay reflecting the ring's contents as of ITS OWN
+    /// registration, not whatever the first subscriber already consumed.
+    #[test]
+    fn a_second_subscriber_registered_later_gets_its_own_independent_replay() {
+        let mut registry = AgentStreamSubscriberRegistry::default();
+        let key = sample_key("node-a", 'a');
+        registry.publish(&key, &sample_chunk(1));
+        registry.publish(&key, &sample_chunk(2));
+
+        let (sender_a, mut receiver_a) = mpsc::channel(HOST_AGENT_STREAM_SUBSCRIBER_QUEUE_CAPACITY);
+        let mut sessions_a = HashSet::new();
+        sessions_a.insert(key.clone());
+        registry.insert(sender_a, sessions_a, subscribe_agent_stream_identity());
+
+        // Subscriber A's own replay: chunk-1, chunk-2, then its boundary.
+        for sequence in 1..=2u64 {
+            let event = receiver_a.try_recv().unwrap();
+            let HarnessOperatorAgentEventV1::AgentChunk { chunk, .. } = event else {
+                panic!("expected a replayed agent chunk");
+            };
+            assert!(matches!(
+                chunk.kind,
+                HarnessAgentStreamChunkKindV1::Text { text, .. }
+                    if text == format!("chunk-{sequence}"),
+            ));
+        }
+        assert!(matches!(
+            receiver_a.try_recv().unwrap(),
+            HarnessOperatorAgentEventV1::ReplayBoundary { replayed: 2, dropped_before_replay: 0, .. },
+        ));
+
+        // More instants land -- some delivered live to subscriber A, all of
+        // them still recorded into the ring for whoever subscribes next.
+        registry.publish(&key, &sample_chunk(3));
+        registry.publish(&key, &sample_chunk(4));
+        assert_eq!(receiver_a.len(), 2, "both new chunks went live to subscriber A");
+
+        let (sender_b, mut receiver_b) = mpsc::channel(HOST_AGENT_STREAM_SUBSCRIBER_QUEUE_CAPACITY);
+        let mut sessions_b = HashSet::new();
+        sessions_b.insert(key.clone());
+        registry.insert(sender_b, sessions_b, subscribe_agent_stream_identity());
+
+        // Subscriber B's own replay reflects all four chunks published so
+        // far, independent of what subscriber A already consumed live.
+        for sequence in 1..=4u64 {
+            let event = receiver_b.try_recv().unwrap();
+            let HarnessOperatorAgentEventV1::AgentChunk { chunk, .. } = event else {
+                panic!("expected a replayed agent chunk");
+            };
+            assert!(matches!(
+                chunk.kind,
+                HarnessAgentStreamChunkKindV1::Text { text, .. }
+                    if text == format!("chunk-{sequence}"),
+            ));
+        }
+        assert!(matches!(
+            receiver_b.try_recv().unwrap(),
+            HarnessOperatorAgentEventV1::ReplayBoundary { replayed: 4, dropped_before_replay: 0, .. },
+        ));
+        assert!(receiver_b.try_recv().is_err(), "exactly subscriber B's own replay, nothing more");
     }
 }

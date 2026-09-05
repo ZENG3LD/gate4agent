@@ -9918,6 +9918,7 @@ fn agent_stream_event_kind_label(event: &HarnessOperatorAgentEventV1) -> &'stati
     match event {
         HarnessOperatorAgentEventV1::AgentChunk { .. } => "agent-chunk",
         HarnessOperatorAgentEventV1::Lagged { .. } => "lagged",
+        HarnessOperatorAgentEventV1::ReplayBoundary { .. } => "replay-boundary",
         HarnessOperatorAgentEventV1::Ping { .. } => "ping",
     }
 }

@@ -71,7 +71,7 @@ use gate4agent_types::{
     NativeSessionPreviewMessage, ObservationEnvelope, ProviderSessionIdentity,
     ProviderRuntimeCapability, ProviderRuntimePolicy,
     PipeProtocol, ResumeAuthorityTarget, ResumeLaunchRequest, SessionGeneration, SessionStatus,
-    TransportKind, CONTROL_PROTOCOL_VERSION,
+    TransportKind,
 };
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::convert::Infallible;
@@ -2286,41 +2286,27 @@ impl NativeAuthorityWorkerState {
 
     fn execute(&mut self, envelope: EffectEnvelope) -> ObservationEnvelope {
         let EffectEnvelope {
-            protocol_version,
             operation_id,
             instance_id,
             generation,
             effect,
         } = envelope;
-        let is_resume = matches!(effect, ControlEffect::AuthorizeResume { .. });
-        let observation = if protocol_version != CONTROL_PROTOCOL_VERSION {
-            authority_failure(
-                is_resume,
-                format!(
-                    "authority effect protocol version {protocol_version} is unsupported; expected {CONTROL_PROTOCOL_VERSION}"
-                ),
-            )
-        } else {
-            match effect {
-                ControlEffect::DiscoverHistory { agent_id, query } => {
-                    self.discover(instance_id, generation, agent_id, query)
-                }
-                ControlEffect::LoadHistory {
-                    agent_id,
-                    candidate_id,
-                } => self.load(instance_id, generation, agent_id, candidate_id),
-                ControlEffect::AuthorizeResume {
-                    agent_id,
-                    target,
-                    request,
-                } => self.authorize_resume(instance_id, generation, agent_id, target, request),
-                _ => {
-                    history_failure("native authority worker received an invalid effect".to_owned())
-                }
+        let observation = match effect {
+            ControlEffect::DiscoverHistory { agent_id, query } => {
+                self.discover(instance_id, generation, agent_id, query)
             }
+            ControlEffect::LoadHistory {
+                agent_id,
+                candidate_id,
+            } => self.load(instance_id, generation, agent_id, candidate_id),
+            ControlEffect::AuthorizeResume {
+                agent_id,
+                target,
+                request,
+            } => self.authorize_resume(instance_id, generation, agent_id, target, request),
+            _ => history_failure("native authority worker received an invalid effect".to_owned()),
         };
         ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: Some(operation_id),
             instance_id,
             generation,
@@ -2540,17 +2526,12 @@ async fn run_capability_worker(
     let mut authority = NativeCapabilityProbeAuthority::default();
     while let Some(request) = effects.recv().await {
         let EffectEnvelope {
-            protocol_version,
             operation_id,
             instance_id,
             generation,
             effect,
         } = request.effect;
-        let observation = if protocol_version != CONTROL_PROTOCOL_VERSION {
-            ControlObservation::CapabilityProbeFailed {
-                failure: CapabilityProbeFailure::AuthorityRejected,
-            }
-        } else if let ControlEffect::ProbeCapabilities { agent_id, request } = effect {
+        let observation = if let ControlEffect::ProbeCapabilities { agent_id, request } = effect {
             if request.validate().is_err() {
                 ControlObservation::CapabilityProbeFailed {
                     failure: CapabilityProbeFailure::AuthorityRejected,
@@ -2574,7 +2555,6 @@ async fn run_capability_worker(
         };
         if control_tx
             .send(ObservationEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 operation_id: Some(operation_id),
                 instance_id,
                 generation,
@@ -2594,14 +2574,6 @@ fn history_failure(message: String) -> ControlObservation {
 
 fn resume_failure(message: String) -> ControlObservation {
     ControlObservation::ResumeFailed { message }
-}
-
-fn authority_failure(is_resume: bool, message: String) -> ControlObservation {
-    if is_resume {
-        resume_failure(message)
-    } else {
-        history_failure(message)
-    }
 }
 
 struct ExplicitResumeAuthority;
@@ -2911,7 +2883,6 @@ fn effect_failure(effect: EffectEnvelope, message: String) -> ObservationEnvelop
         ControlEffect::AuthorizeResume { .. } => ControlObservation::ResumeFailed { message },
     };
     ObservationEnvelope {
-        protocol_version: CONTROL_PROTOCOL_VERSION,
         operation_id: Some(effect.operation_id),
         instance_id: effect.instance_id,
         generation: effect.generation,
@@ -3625,7 +3596,6 @@ mod tests {
             None,
         );
         dispatcher.dispatch(EffectEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: OperationId(1),
             instance_id: AgentInstanceId(1),
             generation: SessionGeneration(1),
@@ -3668,7 +3638,6 @@ mod tests {
         assert!(!hook_monitoring_policy.provider_session_identity);
         let spawn = |operation_id, instance_id, agent_id, transport, runtime_policy| {
             EffectEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 operation_id: OperationId(operation_id),
                 instance_id: AgentInstanceId(instance_id),
                 generation: SessionGeneration(1),

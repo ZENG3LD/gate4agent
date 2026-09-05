@@ -6,7 +6,7 @@ use gate4agent_tool_protocol::{
     CapabilityObservationEnvelope, CapabilityRequestKey, CapabilityResult, InvocationCancelReason,
     ObservationIgnoredReason, ProviderBindingId, ProviderBoundCapabilityEffectEnvelope,
     ProviderRuntimeCommand, ProviderRuntimeEnvelope, ProviderRuntimeSnapshot, ResourceScopeId,
-    ToolCapabilityId, ToolFailure, ToolOperationId, ToolProviderId, CAPABILITY_PROTOCOL_VERSION,
+    ToolCapabilityId, ToolFailure, ToolOperationId, ToolProviderId,
 };
 use gate4agent_types::{AgentInstanceId, SessionGeneration};
 use std::collections::BTreeMap;
@@ -268,7 +268,6 @@ impl ProviderRuntimeAuthorityHandle {
             cancelled: AtomicBool::new(false),
         });
         let envelope = ProviderRuntimeEnvelope {
-            protocol_version: CAPABILITY_PROTOCOL_VERSION,
             sequence,
             command: ProviderRuntimeCommand::Attach {
                 binding_id,
@@ -1002,7 +1001,6 @@ fn submit_observation(
         request_key: effect.request_key.clone(),
     };
     let raw = CapabilityObservationEnvelope {
-        protocol_version: CAPABILITY_PROTOCOL_VERSION,
         operation_id: effect.operation_id,
         request_key: effect.request_key,
         instance_id: effect.instance_id,
@@ -1011,7 +1009,6 @@ fn submit_observation(
         observation,
     };
     let envelope = ProviderRuntimeEnvelope {
-        protocol_version: CAPABILITY_PROTOCOL_VERSION,
         sequence,
         command: ProviderRuntimeCommand::Observe {
             binding_id: state.binding_id,
@@ -1084,7 +1081,6 @@ fn request_close(state: &Arc<ProviderBindingState>) -> Result<u64, ProviderRunti
     }
     let sequence = inner.next_sequence;
     let envelope = ProviderRuntimeEnvelope {
-        protocol_version: CAPABILITY_PROTOCOL_VERSION,
         sequence,
         command: ProviderRuntimeCommand::Detach {
             binding_id: state.binding_id,
@@ -1267,7 +1263,6 @@ mod tests {
         ProviderBoundCapabilityEffectEnvelope {
             binding_id,
             effect: CapabilityEffectEnvelope {
-                protocol_version: CAPABILITY_PROTOCOL_VERSION,
                 sequence: operation,
                 operation_id: ToolOperationId(operation),
                 request_key: CapabilityRequestKey {

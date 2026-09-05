@@ -10,7 +10,7 @@ use gate4agent_types::{
     AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, ControlEvent,
     ControlEventKind, InputAction, PreparedInputKind, PromptFraming, PromptPayload,
     ProviderRuntimePolicy, SessionStatus, ApprovalLevel, StartRequest, TerminalControl, TerminalSize,
-    TerminalText, TransportKind, CONTROL_PROTOCOL_VERSION,
+    TerminalText, TransportKind,
 };
 
 fn semantic_runtime_policy() -> ProviderRuntimePolicy {
@@ -228,7 +228,6 @@ fn sanitized_diagnostics(
 
 fn command(id: u64, command: ControlCommand) -> CommandEnvelope {
     CommandEnvelope {
-        protocol_version: CONTROL_PROTOCOL_VERSION,
         id: CommandId(id),
         command,
     }

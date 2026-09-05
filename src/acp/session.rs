@@ -10,7 +10,10 @@
 //! 2. `session.prompt("...")` — sends `session/prompt`, returns on ack
 //! 3. `session.subscribe()` — receives `AgentEvent` broadcast stream
 //! 4. `session.cancel()` — sends `session/cancel` notification
-//! 5. `session.kill()` — hard-kills the subprocess
+//! 5. `session.stop(force)` — `force = false` closes stdin and waits for the
+//!    adapter to exit on its own (see `AcpSession::stop`); `force = true` is the
+//!    same hard kill as `session.kill()`
+//! 6. `session.kill()` — hard-kills the subprocess immediately, no grace period
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -104,6 +107,39 @@ pub enum AcpError {
     /// method" error.
     #[error("Agent does not advertise the '{capability}' session capability")]
     UnsupportedCapability { capability: &'static str },
+}
+
+// ---------------------------------------------------------------------------
+// AcpSession::stop -- bound and outcome
+// ---------------------------------------------------------------------------
+
+/// How long `stop(force = false)` waits for the ACP-spawned process to exit
+/// on its own, after its stdin is closed, before falling back to a kill.
+///
+/// Measured live 2026-09-05 by spawning each pinned ACP adapter
+/// (`acp_command`/`AcpSpawnSpec`, `acp/spawn.rs`), completing the
+/// `initialize` handshake, closing stdin, and timing the exit:
+/// `claude-agent-acp@0.74.0` exited 0.05s after stdin close,
+/// `codex-acp@1.10.0` (over its usage quota, but `initialize` still ran)
+/// 4.81s, `grok agent stdio` 3.22s -- all exit code 0. Mirrors
+/// `crate::pipe::PIPE_GRACEFUL_STOP_BOUND_SECS`'s value and reasoning (the
+/// same better-than-2x margin over the slowest process measured); kept as
+/// its own constant rather than a shared one because the two bounds cover
+/// different transports and are free to diverge if either measurement
+/// ever does.
+pub const ACP_GRACEFUL_STOP_BOUND_SECS: u64 = 10;
+
+/// Outcome of [`AcpSession::stop`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcpStopOutcome {
+    /// The process's real exit code -- known only when it exited on its own
+    /// within the graceful bound. `None` when the stop performed (or fell
+    /// back to) a hard kill.
+    pub exit_code: Option<i32>,
+    /// `true` when the process was killed rather than left to exit on its
+    /// own -- either because the caller asked for `force = true`, or the
+    /// graceful bound elapsed while the process was still running.
+    pub forced: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -697,7 +733,11 @@ impl AcpSession {
         self.acp_session_id.lock().await.clone()
     }
 
-    /// Kill the subprocess immediately.
+    /// Kill the subprocess immediately -- no grace period, no chance for the
+    /// adapter to exit on its own. This is the `force = true` path
+    /// [`AcpSession::stop`] calls straight through to; `stop(false)` is the
+    /// graceful alternative that closes stdin and waits before falling back
+    /// to this.
     pub async fn kill(&self) -> Result<(), AgentError> {
         self.reader_task.abort();
         let process = Arc::clone(&self.process);
@@ -709,6 +749,53 @@ impl AcpSession {
         })
         .await
         .map_err(|_| AgentError::Pty("spawn_blocking panicked".into()))?
+    }
+
+    /// Stop the subprocess.
+    ///
+    /// `force = true` kills immediately -- identical to [`AcpSession::kill`].
+    /// `force = false` closes the write half of the process's stdin (the
+    /// adapter observes EOF on its own input and can choose to exit cleanly)
+    /// and waits up to [`ACP_GRACEFUL_STOP_BOUND_SECS`] for it to exit on its
+    /// own, reporting the real exit code when it does. The reader loop keeps
+    /// draining stdout/stderr the whole time -- it is only ever stopped by
+    /// `kill()`'s `reader_task.abort()` -- so nothing the process still
+    /// writes while shutting down is lost. Only falls back to a kill if the
+    /// bound elapses with the process still running.
+    ///
+    /// If the process has already exited on its own by the time this is
+    /// called, `reader_finished()` is already `true` and this returns
+    /// immediately with `forced: false`.
+    pub async fn stop(&self, force: bool) -> Result<AcpStopOutcome, AgentError> {
+        if !force {
+            {
+                let process = Arc::clone(&self.process);
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Ok(mut guard) = process.lock() {
+                        guard.close_stdin();
+                    }
+                })
+                .await;
+            }
+            let deadline = Instant::now() + Duration::from_secs(ACP_GRACEFUL_STOP_BOUND_SECS);
+            loop {
+                if self.reader_finished() {
+                    return Ok(AcpStopOutcome {
+                        exit_code: Some(acp_exit_code(&self.process)),
+                        forced: false,
+                    });
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        self.kill().await?;
+        Ok(AcpStopOutcome {
+            exit_code: None,
+            forced: true,
+        })
     }
 
     /// Whether this agent supports session resumption via `session/load`.
@@ -1358,6 +1445,17 @@ fn generate_session_id() -> String {
     format!("acp-{:x}", t)
 }
 
+/// Best-effort exit code for a still-tracked ACP process. Falls back to
+/// `0` if the lock is poisoned -- same convention as
+/// `pipe::session::get_exit_code`.
+fn acp_exit_code(process: &Arc<Mutex<AcpProcess>>) -> i32 {
+    process
+        .lock()
+        .ok()
+        .map(|mut guard| guard.exit_code())
+        .unwrap_or(0)
+}
+
 /// Whether `outcome` grants the request it answers -- mirrors
 /// `acp::reader::permission_outcome_is_granted`'s reasoning (a `Selected`
 /// outcome only grants when the chosen option's kind is allow-shaped;
@@ -1853,5 +1951,166 @@ mod tests {
             }
             other => panic!("expected SessionEnd, got {other:?}"),
         }
+    }
+
+    // -------------------------------------------------------------------
+    // AcpSession::stop -- graceful (stdin close) vs. forced.
+    //
+    // Fixture mirrors `gate4agent_testkit::acp_fixture_launch`'s verified
+    // handshake responder (PowerShell on Windows, `python3` on Unix): it
+    // answers `initialize` and `session/new` with the minimal
+    // all-`#[serde(default)]` result shape both `AgentCapabilities` and
+    // `SessionLoadResult` accept, then either exits 0 on stdin EOF
+    // (graceful fixture) or spins ignoring EOF (ignore-EOF fixture) --
+    // exactly the two outcomes measured live against the real pinned ACP
+    // adapters (see `ACP_GRACEFUL_STOP_BOUND_SECS`'s doc comment).
+    // -------------------------------------------------------------------
+
+    #[cfg(windows)]
+    const WINDOWS_GRACEFUL_SCRIPT: &str = r#"[Console]::OutputEncoding=[Text.Encoding]::UTF8
+function Write-JsonLine($value) { [Console]::WriteLine(($value | ConvertTo-Json -Compress -Depth 12)) }
+$initialize = [Console]::ReadLine() | ConvertFrom-Json
+Write-JsonLine @{jsonrpc='2.0';id=$initialize.id;result=@{}}
+$newSession = [Console]::ReadLine() | ConvertFrom-Json
+Write-JsonLine @{jsonrpc='2.0';id=$newSession.id;result=@{sessionId='fixture-acp-session'}}
+while ($true) {
+    $line = [Console]::ReadLine()
+    if ($null -eq $line) { exit 0 }
+}"#;
+    #[cfg(windows)]
+    const WINDOWS_IGNORE_EOF_SCRIPT: &str = r#"[Console]::OutputEncoding=[Text.Encoding]::UTF8
+function Write-JsonLine($value) { [Console]::WriteLine(($value | ConvertTo-Json -Compress -Depth 12)) }
+$initialize = [Console]::ReadLine() | ConvertFrom-Json
+Write-JsonLine @{jsonrpc='2.0';id=$initialize.id;result=@{}}
+$newSession = [Console]::ReadLine() | ConvertFrom-Json
+Write-JsonLine @{jsonrpc='2.0';id=$newSession.id;result=@{sessionId='fixture-acp-session'}}
+while ($true) {
+    $line = [Console]::ReadLine()
+    if ($null -eq $line) { Start-Sleep -Milliseconds 200 }
+}"#;
+    #[cfg(not(windows))]
+    const UNIX_GRACEFUL_SCRIPT: &str = r#"import json,sys
+def read_message():
+ line=sys.stdin.readline()
+ if not line: return None
+ return json.loads(line)
+def write_message(message):
+ print(json.dumps(message),flush=True)
+
+initialize=read_message()
+write_message({'jsonrpc':'2.0','id':initialize.get('id'),'result':{}})
+new_session=read_message()
+write_message({'jsonrpc':'2.0','id':new_session.get('id'),'result':{'sessionId':'fixture-acp-session'}})
+while True:
+ msg=read_message()
+ if msg is None:
+  sys.exit(0)"#;
+    #[cfg(not(windows))]
+    const UNIX_IGNORE_EOF_SCRIPT: &str = r#"import json,sys,time
+def read_message():
+ line=sys.stdin.readline()
+ if not line: return None
+ return json.loads(line)
+def write_message(message):
+ print(json.dumps(message),flush=True)
+
+initialize=read_message()
+write_message({'jsonrpc':'2.0','id':initialize.get('id'),'result':{}})
+new_session=read_message()
+write_message({'jsonrpc':'2.0','id':new_session.get('id'),'result':{'sessionId':'fixture-acp-session'}})
+while True:
+ msg=read_message()
+ if msg is None:
+  time.sleep(0.2)"#;
+
+    #[cfg(windows)]
+    fn acp_graceful_exit_launch() -> LaunchSpec {
+        LaunchSpec {
+            program: "powershell.exe".to_owned(),
+            fixed_args: vec![
+                "-NoLogo".to_owned(),
+                "-NoProfile".to_owned(),
+                "-NonInteractive".to_owned(),
+                "-ExecutionPolicy".to_owned(),
+                "Bypass".to_owned(),
+                "-Command".to_owned(),
+                WINDOWS_GRACEFUL_SCRIPT.to_owned(),
+            ],
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn acp_graceful_exit_launch() -> LaunchSpec {
+        LaunchSpec {
+            program: "python3".to_owned(),
+            fixed_args: vec!["-u".to_owned(), "-c".to_owned(), UNIX_GRACEFUL_SCRIPT.to_owned()],
+        }
+    }
+
+    #[cfg(windows)]
+    fn acp_ignore_eof_launch() -> LaunchSpec {
+        LaunchSpec {
+            program: "powershell.exe".to_owned(),
+            fixed_args: vec![
+                "-NoLogo".to_owned(),
+                "-NoProfile".to_owned(),
+                "-NonInteractive".to_owned(),
+                "-ExecutionPolicy".to_owned(),
+                "Bypass".to_owned(),
+                "-Command".to_owned(),
+                WINDOWS_IGNORE_EOF_SCRIPT.to_owned(),
+            ],
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn acp_ignore_eof_launch() -> LaunchSpec {
+        LaunchSpec {
+            program: "python3".to_owned(),
+            fixed_args: vec!["-u".to_owned(), "-c".to_owned(), UNIX_IGNORE_EOF_SCRIPT.to_owned()],
+        }
+    }
+
+    async fn spawn_fixture_acp_session(launch: LaunchSpec) -> AcpSession {
+        AcpSession::spawn_with_launch(
+            CliTool::ClaudeCode,
+            &std::env::current_dir().expect("cwd"),
+            AcpSessionOptions::default(),
+            &launch,
+        )
+        .await
+        .expect("fixture ACP handshake must succeed")
+    }
+
+    #[tokio::test]
+    async fn acp_stop_graceful_reports_the_real_exit_code_for_a_process_that_ends_itself() {
+        let session = spawn_fixture_acp_session(acp_graceful_exit_launch()).await;
+
+        let outcome = session
+            .stop(false)
+            .await
+            .expect("stop(force=false) must succeed for a process that exits on its own");
+
+        assert_eq!(outcome.exit_code, Some(0), "outcome: {outcome:?}");
+        assert!(
+            !outcome.forced,
+            "a process that already exited on its own must not be reported as forced"
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_stop_graceful_falls_back_to_a_kill_once_the_bound_elapses() {
+        let session = spawn_fixture_acp_session(acp_ignore_eof_launch()).await;
+
+        let outcome = session
+            .stop(false)
+            .await
+            .expect("stop(force=false) must still succeed by falling back to a kill");
+
+        assert!(
+            outcome.forced,
+            "a process that ignores stdin EOF must be force-killed once the graceful bound elapses"
+        );
+        assert!(outcome.exit_code.is_none(), "outcome: {outcome:?}");
     }
 }

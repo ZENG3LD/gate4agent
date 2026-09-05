@@ -66,7 +66,7 @@ use gate4agent_types::{
     ProviderSessionIdentity, ProviderSessionKey, ProviderStopReason,
     ProviderSource, PtyScreenState, ResumeLaunchRequest, SessionGeneration, StartRequest,
     TerminalFrame, TerminalMouseProtocolEncoding, TerminalSize, TokenUsage, TransportKind,
-    CONTROL_PROTOCOL_VERSION, OPERATOR_GATE_OPTIONS_MAX, WORKING_DIRECTORY_MAX_BYTES,
+    OPERATOR_GATE_OPTIONS_MAX, WORKING_DIRECTORY_MAX_BYTES,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{OsStr, OsString};
@@ -498,7 +498,6 @@ impl NativeEffectShell {
         one_shot_session_persistence: OneShotSessionPersistence,
     ) -> ObservationEnvelope {
         let EffectEnvelope {
-            protocol_version,
             operation_id,
             instance_id,
             generation,
@@ -509,14 +508,7 @@ impl NativeEffectShell {
             generation,
         };
 
-        let observation = if protocol_version != CONTROL_PROTOCOL_VERSION {
-            effect_failure(
-                &effect,
-                format!(
-                    "effect protocol version {protocol_version} is unsupported; expected {CONTROL_PROTOCOL_VERSION}"
-                ),
-            )
-        } else {
+        let observation = {
             match effect {
                 ControlEffect::Spawn {
                     agent_id,
@@ -1492,10 +1484,22 @@ impl NativeEffectShell {
             };
         }
         if let Some(owned) = self.pipe_sessions.remove(&key) {
-            return match owned.session.kill().await {
-                Ok(()) => ControlObservation::StopCompleted {
-                    forced: true,
-                    exit_code: owned.observed_exit_code,
+            // `PipeSession::stop` reads `force`: `false` waits up to
+            // `PIPE_GRACEFUL_STOP_BOUND_SECS` for the process to exit on its
+            // own (stdin is already closed by spawn time for every
+            // supported CLI, so this is "let the run finish" rather than a
+            // new signal) before falling back to a kill; `true` kills
+            // immediately, same as the old unconditional `kill()` call this
+            // replaces. `Err(_) if reader_finished()` below is the race
+            // where a `force = true` kill loses to the process already
+            // having exited on its own between the map lookup and the kill
+            // attempt -- `stop`'s own graceful path already reports that
+            // case as `Ok` with `forced: false`, so this arm is only ever
+            // reached on the `force = true` side of `stop`.
+            return match owned.session.stop(force).await {
+                Ok(outcome) => ControlObservation::StopCompleted {
+                    forced: outcome.forced,
+                    exit_code: outcome.exit_code.or(owned.observed_exit_code),
                     final_terminal: None,
                 },
                 Err(_) if owned.session.reader_finished() => ControlObservation::StopCompleted {
@@ -1526,13 +1530,20 @@ impl NativeEffectShell {
             };
         }
         if let Some(owned) = self.acp_sessions.remove(&key) {
-            if !force {
-                let _ = owned.session.cancel().await;
-            }
-            return match owned.session.kill().await {
-                Ok(()) => ControlObservation::StopCompleted {
-                    forced: true,
-                    exit_code: owned.observed_exit_code,
+            // `AcpSession::stop` reads `force`: `false` closes stdin and
+            // waits up to `ACP_GRACEFUL_STOP_BOUND_SECS` for the adapter to
+            // exit on its own before falling back to a kill; `true` kills
+            // immediately, same as the old unconditional `kill()` call this
+            // replaces. `Err(_) if reader_finished()` below is the race
+            // where a `force = true` kill loses to the process already
+            // having exited on its own between the map lookup and the kill
+            // attempt -- `stop`'s own graceful path already reports that
+            // case as `Ok` with `forced: false`, so this arm is only ever
+            // reached on the `force = true` side of `stop`.
+            return match owned.session.stop(force).await {
+                Ok(outcome) => ControlObservation::StopCompleted {
+                    forced: outcome.forced,
+                    exit_code: outcome.exit_code.or(owned.observed_exit_code),
                     final_terminal: None,
                 },
                 Err(_) if owned.session.reader_finished() => ControlObservation::StopCompleted {
@@ -1586,7 +1597,6 @@ impl NativeEffectShell {
                 Err(_) => (None, None),
             };
             observations.push(ObservationEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 operation_id: None,
                 instance_id: key.instance_id,
                 generation: key.generation,
@@ -1718,7 +1728,6 @@ impl NativeEffectShell {
                         }
                         owned.last_screen_state = merged.clone();
                         observations.push(ObservationEnvelope {
-                            protocol_version: CONTROL_PROTOCOL_VERSION,
                             operation_id: None,
                             instance_id: key.instance_id,
                             generation: key.generation,
@@ -1731,7 +1740,6 @@ impl NativeEffectShell {
                     let frame = terminal_frame(snapshot, merged);
                     efficiency_facts.record_terminal_frame_published(terminal_frame_byte_len(&frame));
                     observations.push(ObservationEnvelope {
-                        protocol_version: CONTROL_PROTOCOL_VERSION,
                         operation_id: None,
                         instance_id: key.instance_id,
                         generation: key.generation,
@@ -1742,7 +1750,6 @@ impl NativeEffectShell {
                 Err(error) if !owned.terminal_stale_published => {
                     owned.terminal_stale_published = true;
                     observations.push(ObservationEnvelope {
-                        protocol_version: CONTROL_PROTOCOL_VERSION,
                         operation_id: None,
                         instance_id: key.instance_id,
                         generation: key.generation,
@@ -1836,7 +1843,6 @@ impl NativeEffectShell {
                     if merged != owned.last_screen_state {
                         owned.last_screen_state = merged.clone();
                         observations.push(ObservationEnvelope {
-                            protocol_version: CONTROL_PROTOCOL_VERSION,
                             operation_id: None,
                             instance_id: key.instance_id,
                             generation: key.generation,
@@ -2396,7 +2402,6 @@ fn drain_pty_provider(
                         .map(|source_sequence| (source_sequence, missed))
                 }) {
                     observations.push(ObservationEnvelope {
-                        protocol_version: CONTROL_PROTOCOL_VERSION,
                         operation_id: None,
                         instance_id: key.instance_id,
                         generation: key.generation,
@@ -2434,7 +2439,6 @@ fn push_provider_observation(
     let sequence = provider.next_provider_sequence;
     provider.next_provider_sequence = provider.next_provider_sequence.saturating_add(1);
     observations.push(ObservationEnvelope {
-        protocol_version: CONTROL_PROTOCOL_VERSION,
         operation_id: None,
         instance_id: key.instance_id,
         generation: key.generation,
@@ -2619,7 +2623,6 @@ fn drain_provider_stream(
                 let sequence = *next_provider_sequence;
                 *next_provider_sequence = next_provider_sequence.saturating_add(1);
                 observations.push(ObservationEnvelope {
-                    protocol_version: CONTROL_PROTOCOL_VERSION,
                     operation_id: None,
                     instance_id: key.instance_id,
                     generation: key.generation,
@@ -2635,7 +2638,6 @@ fn drain_provider_stream(
                     reserve_provider_gap_sequence(next_provider_sequence, missed)
                 {
                     observations.push(ObservationEnvelope {
-                        protocol_version: CONTROL_PROTOCOL_VERSION,
                         operation_id: None,
                         instance_id: key.instance_id,
                         generation: key.generation,
@@ -2670,7 +2672,6 @@ fn collect_provider_exits<S>(
             .remove(&key)
             .expect("completed provider key came from the owned session map");
         observations.push(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: None,
             instance_id: key.instance_id,
             generation: key.generation,
@@ -3395,38 +3396,6 @@ fn canonical_foreground(
     }
 }
 
-fn effect_failure(effect: &ControlEffect, message: String) -> ControlObservation {
-    match effect {
-        ControlEffect::Spawn { .. } => ControlObservation::SpawnFailed { message },
-        ControlEffect::Stop { .. } => ControlObservation::StopFailed { message },
-        ControlEffect::WriteInput { .. } => ControlObservation::InputFailed { message },
-        ControlEffect::SubmitPrompt { .. } | ControlEffect::Interrupt => {
-            ControlObservation::InputFailed { message }
-        }
-        ControlEffect::ResolveInteraction { target, .. } => {
-            ControlObservation::InteractionResolutionFailed {
-                interaction_id: target.interaction_id,
-                message,
-            }
-        }
-        ControlEffect::SetSessionMode { .. } => ControlObservation::SessionModeSetFailed { message },
-        ControlEffect::SetSessionConfigOption { .. } => {
-            ControlObservation::SessionConfigOptionSetFailed { message }
-        }
-        ControlEffect::SetSessionModel { .. } => ControlObservation::SessionModelSetFailed { message },
-        ControlEffect::Resize { .. } => ControlObservation::ResizeFailed { message },
-        ControlEffect::ObserveForeground => ControlObservation::ForegroundFailed { message },
-        ControlEffect::ProbeCapabilities { .. } => ControlObservation::CapabilityProbeFailed {
-            failure: CapabilityProbeFailure::ExecutorUnavailable,
-        },
-        ControlEffect::DiscoverHistory { .. } | ControlEffect::LoadHistory { .. } => {
-            ControlObservation::HistoryFailed { message }
-        }
-        ControlEffect::AuthorizeResume { .. } => ControlObservation::ResumeFailed { message },
-        ControlEffect::SpawnResume { .. } => ControlObservation::SpawnFailed { message },
-    }
-}
-
 fn completion_observation(
     operation_id: OperationId,
     instance_id: AgentInstanceId,
@@ -3434,7 +3403,6 @@ fn completion_observation(
     observation: ControlObservation,
 ) -> ObservationEnvelope {
     ObservationEnvelope {
-        protocol_version: CONTROL_PROTOCOL_VERSION,
         operation_id: Some(operation_id),
         instance_id,
         generation,
@@ -6762,5 +6730,284 @@ mod tests {
             .expect("an empty mode catalog never offers anything");
         assert!(message.contains("ApprovalLevelNotOfferedByAgent"));
         assert!(message.contains("offered: []"));
+    }
+
+    // -----------------------------------------------------------------------
+    // stop_native — pipe_sessions branch reads `force`.
+    //
+    // Regression coverage: this branch used to call
+    // `owned.session.kill().await` unconditionally, so no headless Pipe run
+    // could ever end any way other than a forced kill regardless of what the
+    // caller asked for. `PipeSession::stop`'s own unit tests (`gate4agent`'s
+    // `pipe::session::tests`) cover the graceful-wait/bound-elapse timing in
+    // depth; these two only prove the NEW wiring in `stop_native` itself:
+    // `force` reaches `PipeSession::stop`, and its `PipeStopOutcome` maps
+    // onto `ControlObservation::StopCompleted` correctly. Built by inserting
+    // directly into `pipe_sessions` (private field, visible to this child
+    // module) rather than through `execute()`/`EffectEnvelope`, so this does
+    // not depend on the catalog/spawn-plan machinery at all.
+    // -----------------------------------------------------------------------
+
+    use super::{NativeEffectShell, NativeSessionKey, OwnedProviderSession};
+    use gate4agent_catalog::{AgentRegistry as FixtureAgentRegistry, AgentSpec as FixtureAgentSpec};
+    use gate4agent_types::ControlObservation;
+    use std::collections::VecDeque;
+
+    fn fixture_pipe_key() -> NativeSessionKey {
+        NativeSessionKey {
+            instance_id: gate4agent_types::AgentInstanceId(9_001),
+            generation: gate4agent_types::SessionGeneration(1),
+        }
+    }
+
+    fn fixture_pipe_source() -> gate4agent_types::ProviderSource {
+        gate4agent_types::ProviderSource {
+            family: AdapterFamily::Pipe,
+            binding: gate4agent_types::AdapterBinding::new(
+                gate4agent_types::AdapterId::new("fixture").unwrap(),
+                "1",
+                gate4agent_types::AdapterVerification::SyntheticFixture,
+            )
+            .unwrap(),
+        }
+    }
+
+    #[cfg(windows)]
+    fn fixture_graceful_exit_launch() -> gate4agent_types::LaunchSpec {
+        gate4agent_types::LaunchSpec {
+            program: "powershell.exe".to_owned(),
+            fixed_args: vec![
+                "-NoProfile".to_owned(),
+                "-NonInteractive".to_owned(),
+                "-Command".to_owned(),
+                "[Console]::In.ReadToEnd() | Out-Null; exit 0".to_owned(),
+            ],
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn fixture_graceful_exit_launch() -> gate4agent_types::LaunchSpec {
+        gate4agent_types::LaunchSpec {
+            program: "sh".to_owned(),
+            fixed_args: vec!["-c".to_owned(), "cat >/dev/null; exit 0".to_owned()],
+        }
+    }
+
+    #[cfg(windows)]
+    fn fixture_ignore_stdin_launch() -> gate4agent_types::LaunchSpec {
+        gate4agent_types::LaunchSpec {
+            program: "powershell.exe".to_owned(),
+            fixed_args: vec![
+                "-NoProfile".to_owned(),
+                "-NonInteractive".to_owned(),
+                "-Command".to_owned(),
+                "Start-Sleep -Seconds 30".to_owned(),
+            ],
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn fixture_ignore_stdin_launch() -> gate4agent_types::LaunchSpec {
+        gate4agent_types::LaunchSpec {
+            program: "sh".to_owned(),
+            fixed_args: vec!["-c".to_owned(), "sleep 30".to_owned()],
+        }
+    }
+
+    async fn spawn_fixture_pipe_shell(
+        launch: gate4agent_types::LaunchSpec,
+    ) -> (NativeEffectShell, NativeSessionKey) {
+        let session = gate4agent::PipeSession::spawn_with_launch(
+            gate4agent::core::types::SessionConfig::default(),
+            "prompt",
+            &launch,
+            gate4agent_types::PipePromptDelivery::StdinClose,
+        )
+        .await
+        .expect("fixture pipe process must spawn");
+        let events = session.subscribe();
+        let key = fixture_pipe_key();
+        let mut shell = NativeEffectShell::new(
+            FixtureAgentRegistry::new(std::iter::empty::<FixtureAgentSpec>())
+                .expect("empty fixture catalog"),
+        );
+        shell.pipe_sessions.insert(
+            key,
+            OwnedProviderSession {
+                source: fixture_pipe_source(),
+                session,
+                events,
+                pending_events: VecDeque::new(),
+                next_provider_sequence: 1,
+                observed_exit_code: None,
+                runtime_policy: gate4agent_types::ProviderRuntimePolicy::none(),
+            },
+        );
+        (shell, key)
+    }
+
+    #[tokio::test]
+    async fn stop_native_pipe_session_reports_the_real_exit_code_when_not_forced() {
+        let (mut shell, key) = spawn_fixture_pipe_shell(fixture_graceful_exit_launch()).await;
+
+        match shell.stop_native(key, false).await {
+            ControlObservation::StopCompleted {
+                forced, exit_code, ..
+            } => {
+                assert!(!forced, "a process that exits on its own must not be forced");
+                assert_eq!(exit_code, Some(0));
+            }
+            other => panic!("expected StopCompleted, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_native_pipe_session_force_true_kills_immediately_without_waiting() {
+        let (mut shell, key) = spawn_fixture_pipe_shell(fixture_ignore_stdin_launch()).await;
+
+        let start = std::time::Instant::now();
+        match shell.stop_native(key, true).await {
+            ControlObservation::StopCompleted { forced, .. } => {
+                assert!(forced, "force=true must always report forced");
+            }
+            other => panic!("expected StopCompleted, got {other:?}"),
+        }
+        assert!(
+            start.elapsed()
+                < std::time::Duration::from_secs(gate4agent::pipe::PIPE_GRACEFUL_STOP_BOUND_SECS),
+            "force=true must not wait out the graceful bound"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // stop_native -- acp_sessions branch reads `force`.
+    //
+    // Regression coverage: this branch used to call
+    // `owned.session.kill().await` unconditionally after an optional
+    // `session/cancel`, so `forced` was always `true` regardless of what
+    // the caller asked for. Fixture mirrors `gate4agent::acp::session`'s
+    // own `AcpSession::stop` unit tests (which cover the graceful-wait/
+    // bound-elapse timing in depth): a minimal handshake responder that
+    // answers `initialize`/`session/new` and exits 0 on stdin EOF. This
+    // test only proves the NEW wiring in `stop_native` itself: `force`
+    // reaches `AcpSession::stop`, and its `AcpStopOutcome` maps onto
+    // `ControlObservation::StopCompleted` correctly.
+    // -------------------------------------------------------------------
+
+    #[cfg(windows)]
+    fn acp_fixture_launch() -> gate4agent_types::LaunchSpec {
+        gate4agent_types::LaunchSpec {
+            program: "powershell.exe".to_owned(),
+            fixed_args: vec![
+                "-NoLogo".to_owned(),
+                "-NoProfile".to_owned(),
+                "-NonInteractive".to_owned(),
+                "-ExecutionPolicy".to_owned(),
+                "Bypass".to_owned(),
+                "-Command".to_owned(),
+                ACP_HANDSHAKE_SCRIPT.to_owned(),
+            ],
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn acp_fixture_launch() -> gate4agent_types::LaunchSpec {
+        gate4agent_types::LaunchSpec {
+            program: "python3".to_owned(),
+            fixed_args: vec!["-u".to_owned(), "-c".to_owned(), ACP_HANDSHAKE_SCRIPT.to_owned()],
+        }
+    }
+
+    #[cfg(windows)]
+    const ACP_HANDSHAKE_SCRIPT: &str = r#"[Console]::OutputEncoding=[Text.Encoding]::UTF8
+function Write-JsonLine($value) { [Console]::WriteLine(($value | ConvertTo-Json -Compress -Depth 12)) }
+$initialize = [Console]::ReadLine() | ConvertFrom-Json
+Write-JsonLine @{jsonrpc='2.0';id=$initialize.id;result=@{}}
+$newSession = [Console]::ReadLine() | ConvertFrom-Json
+Write-JsonLine @{jsonrpc='2.0';id=$newSession.id;result=@{sessionId='fixture-acp-session'}}
+while ($true) {
+    $line = [Console]::ReadLine()
+    if ($null -eq $line) { exit 0 }
+}"#;
+    #[cfg(not(windows))]
+    const ACP_HANDSHAKE_SCRIPT: &str = r#"import json,sys
+def read_message():
+ line=sys.stdin.readline()
+ if not line: return None
+ return json.loads(line)
+def write_message(message):
+ print(json.dumps(message),flush=True)
+
+initialize=read_message()
+write_message({'jsonrpc':'2.0','id':initialize.get('id'),'result':{}})
+new_session=read_message()
+write_message({'jsonrpc':'2.0','id':new_session.get('id'),'result':{'sessionId':'fixture-acp-session'}})
+while True:
+ msg=read_message()
+ if msg is None:
+  sys.exit(0)"#;
+
+    fn fixture_acp_key() -> NativeSessionKey {
+        NativeSessionKey {
+            instance_id: gate4agent_types::AgentInstanceId(9_002),
+            generation: gate4agent_types::SessionGeneration(1),
+        }
+    }
+
+    fn fixture_acp_source() -> gate4agent_types::ProviderSource {
+        gate4agent_types::ProviderSource {
+            family: AdapterFamily::Acp,
+            binding: gate4agent_types::AdapterBinding::new(
+                gate4agent_types::AdapterId::new("fixture").unwrap(),
+                "1",
+                gate4agent_types::AdapterVerification::SyntheticFixture,
+            )
+            .unwrap(),
+        }
+    }
+
+    async fn spawn_fixture_acp_shell() -> (NativeEffectShell, NativeSessionKey) {
+        let session = gate4agent::acp::AcpSession::spawn_with_launch(
+            gate4agent::CliTool::ClaudeCode,
+            &std::env::current_dir().expect("cwd"),
+            gate4agent::acp::AcpSessionOptions::default(),
+            &acp_fixture_launch(),
+        )
+        .await
+        .expect("fixture ACP handshake must succeed");
+        let events = session.subscribe();
+        let key = fixture_acp_key();
+        let mut shell = NativeEffectShell::new(
+            FixtureAgentRegistry::new(std::iter::empty::<FixtureAgentSpec>())
+                .expect("empty fixture catalog"),
+        );
+        shell.acp_sessions.insert(
+            key,
+            OwnedProviderSession {
+                source: fixture_acp_source(),
+                session,
+                events,
+                pending_events: VecDeque::new(),
+                next_provider_sequence: 1,
+                observed_exit_code: None,
+                runtime_policy: gate4agent_types::ProviderRuntimePolicy::none(),
+            },
+        );
+        (shell, key)
+    }
+
+    #[tokio::test]
+    async fn stop_native_acp_session_reports_the_real_exit_code_when_not_forced() {
+        let (mut shell, key) = spawn_fixture_acp_shell().await;
+
+        match shell.stop_native(key, false).await {
+            ControlObservation::StopCompleted {
+                forced, exit_code, ..
+            } => {
+                assert!(!forced, "a process that exits on its own must not be forced");
+                assert_eq!(exit_code, Some(0));
+            }
+            other => panic!("expected StopCompleted, got {other:?}"),
+        }
     }
 }

@@ -20,7 +20,7 @@ use gate4agent_types::{
     ResumeAuthorityTarget, ResumeLaunchRequest, ResumePhase, ResumeSessionSummary, ResumeSnapshot,
     ResumeTarget, SessionGeneration, SessionSnapshot, SessionStatus, StartRequest, TerminalControl,
     TerminalSize, TokenUsage, TransportKind, CONTROL_INSTANCE_IDENTITIES_CAPACITY,
-    CONTROL_INSTANCE_IDENTITIES_MAX, CONTROL_PROTOCOL_VERSION, CONTROL_SESSIONS_MAX,
+    CONTROL_INSTANCE_IDENTITIES_MAX, CONTROL_SESSIONS_MAX,
     PROVIDER_INGRESS_EVENTS_MAX, PROVIDER_INTERACTIONS_MAX, PROVIDER_INTERACTION_FAILURE_MAX_BYTES,
     PROVIDER_SUBAGENTS_MAX, WORKING_DIRECTORY_MAX_BYTES,
 };
@@ -89,12 +89,6 @@ impl Gate4AgentEngine {
     }
 
     fn apply_command_in_place(&mut self, envelope: CommandEnvelope) -> Result<(), ControlError> {
-        if envelope.protocol_version != CONTROL_PROTOCOL_VERSION {
-            return Err(ControlError::UnsupportedProtocolVersion {
-                expected: CONTROL_PROTOCOL_VERSION,
-                actual: envelope.protocol_version,
-            });
-        }
         let command_id = envelope.id;
         match envelope.command {
             ControlCommand::Register {
@@ -275,14 +269,6 @@ impl Gate4AgentEngine {
     fn apply_observation_in_place(&mut self, envelope: ObservationEnvelope) {
         let instance_id = envelope.instance_id;
         let generation = envelope.generation;
-        if envelope.protocol_version != CONTROL_PROTOCOL_VERSION {
-            self.emit_ignored(
-                instance_id,
-                generation,
-                ObservationIgnoredReason::UnsupportedProtocolVersion,
-            );
-            return;
-        }
         let Some(current_state) = self.sessions.get(&instance_id) else {
             self.emit_ignored(
                 instance_id,
@@ -667,7 +653,6 @@ impl Gate4AgentEngine {
                     self.generation_watermarks
                         .insert(instance_id, next_generation);
                     self.effects.push(EffectEnvelope {
-                        protocol_version: CONTROL_PROTOCOL_VERSION,
                         operation_id,
                         instance_id,
                         generation: next_generation,
@@ -1382,7 +1367,6 @@ impl Gate4AgentEngine {
 
     pub fn snapshot(&self) -> ControlSnapshot {
         ControlSnapshot {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             revision: self.revision,
             health: self.health(),
             sessions: self
@@ -1559,7 +1543,6 @@ impl Gate4AgentEngine {
         };
         self.generation_watermarks.insert(instance_id, generation);
         self.effects.push(EffectEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id,
             instance_id,
             generation,
@@ -1627,7 +1610,6 @@ impl Gate4AgentEngine {
             });
         }
         self.effects.push(EffectEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id,
             instance_id,
             generation,
@@ -1768,7 +1750,6 @@ impl Gate4AgentEngine {
             session.generation
         };
         self.effects.push(EffectEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id,
             instance_id,
             generation,
@@ -1831,7 +1812,6 @@ impl Gate4AgentEngine {
             state.snapshot.generation
         };
         self.effects.push(EffectEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id,
             instance_id,
             generation,
@@ -1884,7 +1864,6 @@ impl Gate4AgentEngine {
             session.generation
         };
         self.effects.push(EffectEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id,
             instance_id,
             generation,
@@ -1937,7 +1916,6 @@ impl Gate4AgentEngine {
             (session.generation, session.agent_id.clone(), operation)
         };
         self.effects.push(EffectEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id,
             instance_id,
             generation,
@@ -1994,7 +1972,6 @@ impl Gate4AgentEngine {
             (generation, session.agent_id.clone())
         };
         self.effects.push(EffectEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id,
             instance_id,
             generation,
@@ -2049,7 +2026,6 @@ impl Gate4AgentEngine {
             (session.generation, session.agent_id.clone(), operation)
         };
         self.effects.push(EffectEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id,
             instance_id,
             generation,
@@ -2213,7 +2189,6 @@ impl Gate4AgentEngine {
             (session.generation, session.agent_id.clone())
         };
         self.effects.push(EffectEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id,
             instance_id,
             generation,
@@ -2562,7 +2537,6 @@ impl Gate4AgentEngine {
             response_kind,
         };
         self.effects.push(EffectEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id,
             instance_id,
             generation,
@@ -2634,7 +2608,6 @@ impl Gate4AgentEngine {
             state.snapshot.generation
         };
         self.effects.push(EffectEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id,
             instance_id,
             generation,
@@ -2712,7 +2685,6 @@ impl Gate4AgentEngine {
             state.snapshot.generation
         };
         self.effects.push(EffectEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id,
             instance_id,
             generation,
@@ -2784,7 +2756,6 @@ impl Gate4AgentEngine {
             state.snapshot.generation
         };
         self.effects.push(EffectEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id,
             instance_id,
             generation,
@@ -3001,7 +2972,6 @@ impl Gate4AgentEngine {
         };
         self.next_event_sequence = sequence.checked_add(1);
         self.events.push(ControlEvent {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             sequence,
             command_id,
             instance_id,
@@ -3882,7 +3852,6 @@ mod tests {
 
     fn register_instance(command_id: u64, instance_id: AgentInstanceId) -> CommandEnvelope {
         CommandEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             id: CommandId(command_id),
             command: ControlCommand::Register {
                 instance_id,
@@ -3906,7 +3875,6 @@ mod tests {
     /// override ever runs.
     fn register_acp(command_id: u64) -> CommandEnvelope {
         CommandEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             id: CommandId(command_id),
             command: ControlCommand::Register {
                 instance_id: instance(),
@@ -3929,7 +3897,6 @@ mod tests {
         runtime_policy: ProviderRuntimePolicy,
     ) -> CommandEnvelope {
         CommandEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             id: CommandId(command_id),
             command: ControlCommand::Start {
                 instance_id: instance(),
@@ -3950,7 +3917,6 @@ mod tests {
 
     fn terminal_text(command_id: u64, text: &str) -> CommandEnvelope {
         CommandEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             id: CommandId(command_id),
             command: ControlCommand::SendInput {
                 instance_id: instance(),
@@ -3974,7 +3940,6 @@ mod tests {
         engine.apply_command(start_with_policy(2, runtime_policy)).unwrap();
         let effect = engine.drain_effects().pop().unwrap();
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: Some(effect.operation_id),
             instance_id: effect.instance_id,
             generation: effect.generation,
@@ -3999,7 +3964,6 @@ mod tests {
         engine.apply_command(start_with_policy(2, runtime_policy)).unwrap();
         let effect = engine.drain_effects().pop().unwrap();
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: Some(effect.operation_id),
             instance_id: effect.instance_id,
             generation: effect.generation,
@@ -4020,7 +3984,6 @@ mod tests {
         ));
         engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(3),
                 command: ControlCommand::SendInput {
                     instance_id: instance(),
@@ -4031,7 +3994,6 @@ mod tests {
         let raw_input = engine.drain_effects().pop().unwrap();
         assert!(matches!(raw_input.effect, ControlEffect::WriteInput { .. }));
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: Some(raw_input.operation_id),
             instance_id: instance(),
             generation: spawn.generation,
@@ -4040,7 +4002,6 @@ mod tests {
 
         assert_eq!(
             engine.apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(4),
                 command: ControlCommand::SendInput {
                     instance_id: instance(),
@@ -4092,7 +4053,6 @@ mod tests {
         ] {
             sequence += 1;
             engine.apply_observation(ObservationEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 operation_id: None,
                 instance_id: instance(),
                 generation: spawn.generation,
@@ -4115,7 +4075,6 @@ mod tests {
         sequence += 1;
         assert_eq!(
             engine.apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(5),
                 command: ControlCommand::IngestProvider {
                     instance_id: instance(),
@@ -4132,7 +4091,6 @@ mod tests {
         sequence += 1;
         assert_eq!(
             engine.apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(6),
                 command: ControlCommand::IngestProvider {
                     instance_id: instance(),
@@ -4174,7 +4132,6 @@ mod tests {
 
         engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(3),
                 command: ControlCommand::SendInput {
                     instance_id: instance(),
@@ -4188,7 +4145,6 @@ mod tests {
         let submit = engine.drain_effects().pop().unwrap();
         assert!(matches!(submit.effect, ControlEffect::SubmitPrompt { .. }));
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: Some(submit.operation_id),
             instance_id: instance(),
             generation: submit.generation,
@@ -4197,7 +4153,6 @@ mod tests {
 
         assert_eq!(
             engine.apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(4),
                 command: ControlCommand::SendInput {
                     instance_id: instance(),
@@ -4225,7 +4180,6 @@ mod tests {
         let (mut engine, spawn) = running_acp_engine_with_policy(acp_policy);
 
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: None,
             instance_id: instance(),
             generation: spawn.generation,
@@ -4266,7 +4220,6 @@ mod tests {
         let (mut engine, spawn) = running_acp_engine_with_policy(acp_policy);
 
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: None,
             instance_id: instance(),
             generation: spawn.generation,
@@ -4309,7 +4262,6 @@ mod tests {
         // land -- the refusal above must not have wedged the per-source
         // cursor for the rest of the session.
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: None,
             instance_id: instance(),
             generation: spawn.generation,
@@ -4345,7 +4297,6 @@ mod tests {
 
         engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(5),
                 command: ControlCommand::IngestProvider {
                     instance_id: instance(),
@@ -4361,7 +4312,6 @@ mod tests {
 
         assert_eq!(
             engine.apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(6),
                 command: ControlCommand::IngestProvider {
                     instance_id: instance(),
@@ -4432,7 +4382,6 @@ mod tests {
         };
         engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(2),
                 command: ControlCommand::Resume {
                     instance_id: instance(),
@@ -4453,7 +4402,6 @@ mod tests {
             } if requested == &identity
         ));
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: Some(authorize.operation_id),
             instance_id: instance(),
             generation: authorize.generation,
@@ -4476,7 +4424,6 @@ mod tests {
         prompted.apply_command(register(1)).unwrap();
         assert_eq!(
             prompted.apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(2),
                 command: ControlCommand::Resume {
                     instance_id: instance(),
@@ -4511,7 +4458,6 @@ mod tests {
         let (mut engine, spawn) = running_engine();
         let interaction_id = ProviderInteractionId(1);
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: None,
             instance_id: spawn.instance_id,
             generation: spawn.generation,
@@ -4531,7 +4477,6 @@ mod tests {
         });
         engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(90),
                 command: ControlCommand::ResolveInteraction {
                     instance_id: instance(),
@@ -4556,7 +4501,6 @@ mod tests {
     ) {
         engine.drain_events();
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: Some(operation_id),
             instance_id: spawn.instance_id,
             generation: spawn.generation,
@@ -4587,7 +4531,6 @@ mod tests {
             transcript_path: None,
         };
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: None,
             instance_id: instance(),
             generation: spawn.generation,
@@ -4600,7 +4543,6 @@ mod tests {
             },
         });
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: None,
             instance_id: instance(),
             generation: spawn.generation,
@@ -4631,7 +4573,6 @@ mod tests {
         engine.apply_command(register(1)).unwrap();
         engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(2),
                 command: ControlCommand::ProbeCapabilities {
                     instance_id: instance(),
@@ -4652,7 +4593,6 @@ mod tests {
         );
 
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: Some(probe.operation_id),
             instance_id: probe.instance_id,
             generation: probe.generation,
@@ -4672,7 +4612,6 @@ mod tests {
         assert!(engine.snapshot().sessions[0].capabilities.pending.is_some());
 
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: Some(probe.operation_id),
             instance_id: probe.instance_id,
             generation: probe.generation,
@@ -4697,7 +4636,6 @@ mod tests {
         assert_eq!(
             engine
                 .apply_command(CommandEnvelope {
-                    protocol_version: CONTROL_PROTOCOL_VERSION,
                     id: CommandId(4),
                     command: ControlCommand::ProbeCapabilities {
                         instance_id: instance(),
@@ -4717,7 +4655,6 @@ mod tests {
         engine.apply_command(register(1)).unwrap();
         let error = engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(2),
                 command: ControlCommand::Start {
                     instance_id: instance(),
@@ -4750,7 +4687,6 @@ mod tests {
         request.session_options = Some(SessionOptionSelection::new("bad\nmodel"));
         let error = engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(2),
                 command: ControlCommand::Start {
                     instance_id: instance(),
@@ -4767,7 +4703,6 @@ mod tests {
     fn direct_provider_gap_advances_source_cursor_and_accepts_next_event() {
         let (mut engine, spawn) = running_engine();
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: None,
             instance_id: spawn.instance_id,
             generation: spawn.generation,
@@ -4786,7 +4721,6 @@ mod tests {
             },
         });
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: None,
             instance_id: spawn.instance_id,
             generation: spawn.generation,
@@ -4797,7 +4731,6 @@ mod tests {
             },
         });
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: None,
             instance_id: spawn.instance_id,
             generation: spawn.generation,
@@ -4808,7 +4741,6 @@ mod tests {
             },
         });
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: None,
             instance_id: spawn.instance_id,
             generation: spawn.generation,
@@ -4892,7 +4824,6 @@ mod tests {
 
         for (index, event) in events.into_iter().enumerate() {
             engine.apply_observation(ObservationEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 operation_id: None,
                 instance_id: spawn.instance_id,
                 generation: spawn.generation,
@@ -4932,7 +4863,6 @@ mod tests {
         engine.drain_events();
         let source = provider_source();
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: None,
             instance_id: spawn.instance_id,
             generation: spawn.generation,
@@ -4962,7 +4892,6 @@ mod tests {
         )));
 
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: None,
             instance_id: spawn.instance_id,
             generation: spawn.generation,
@@ -5003,7 +4932,6 @@ mod tests {
             let (mut engine, spawn) = running_engine();
             let source = provider_source();
             engine.apply_observation(ObservationEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 operation_id: None,
                 instance_id: spawn.instance_id,
                 generation: spawn.generation,
@@ -5023,7 +4951,6 @@ mod tests {
             });
             engine.drain_events();
             engine.apply_observation(ObservationEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 operation_id: None,
                 instance_id: spawn.instance_id,
                 generation: spawn.generation,
@@ -5067,7 +4994,6 @@ mod tests {
         let (mut engine, spawn) = running_engine();
         let source = provider_source();
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: None,
             instance_id: spawn.instance_id,
             generation: spawn.generation,
@@ -5087,7 +5013,6 @@ mod tests {
         )));
 
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: None,
             instance_id: spawn.instance_id,
             generation: spawn.generation,
@@ -5108,7 +5033,6 @@ mod tests {
         engine.drain_events();
         for sequence in [3, 4] {
             engine.apply_observation(ObservationEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 operation_id: None,
                 instance_id: spawn.instance_id,
                 generation: spawn.generation,
@@ -5138,7 +5062,6 @@ mod tests {
         );
 
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: None,
             instance_id: spawn.instance_id,
             generation: spawn.generation,
@@ -5167,7 +5090,6 @@ mod tests {
     fn interrupt_resolves_pending_interactions_only_after_effect_completion() {
         let (mut engine, spawn) = running_engine();
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: None,
             instance_id: spawn.instance_id,
             generation: spawn.generation,
@@ -5188,7 +5110,6 @@ mod tests {
         engine.drain_events();
 
         let send_interrupt = |id| CommandEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             id: CommandId(id),
             command: ControlCommand::SendInput {
                 instance_id: instance(),
@@ -5198,7 +5119,6 @@ mod tests {
         engine.apply_command(send_interrupt(80)).unwrap();
         let failed = engine.drain_effects().pop().unwrap();
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: Some(failed.operation_id),
             instance_id: failed.instance_id,
             generation: failed.generation,
@@ -5214,7 +5134,6 @@ mod tests {
         engine.apply_command(send_interrupt(81)).unwrap();
         let completed = engine.drain_effects().pop().unwrap();
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: Some(completed.operation_id),
             instance_id: completed.instance_id,
             generation: completed.generation,
@@ -5239,7 +5158,6 @@ mod tests {
     fn canonical_interaction_resolution_is_generation_checked_and_fail_closed() {
         let (mut engine, spawn) = running_engine();
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: None,
             instance_id: spawn.instance_id,
             generation: spawn.generation,
@@ -5260,7 +5178,6 @@ mod tests {
         engine.drain_events();
         let interaction_id = ProviderInteractionId(1);
         let resolve = |id, generation, response| CommandEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             id: CommandId(id),
             command: ControlCommand::ResolveInteraction {
                 instance_id: instance(),
@@ -5333,7 +5250,6 @@ mod tests {
         )));
 
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: Some(effect.operation_id),
             instance_id: effect.instance_id,
             generation: effect.generation,
@@ -5353,7 +5269,6 @@ mod tests {
         )));
 
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: Some(effect.operation_id),
             instance_id: effect.instance_id,
             generation: effect.generation,
@@ -5379,7 +5294,6 @@ mod tests {
             .unwrap();
         let effect = engine.drain_effects().pop().unwrap();
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: Some(effect.operation_id),
             instance_id: effect.instance_id,
             generation: effect.generation,
@@ -5401,7 +5315,6 @@ mod tests {
         );
 
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: None,
             instance_id: spawn.instance_id,
             generation: spawn.generation,
@@ -5452,7 +5365,6 @@ mod tests {
                 ProviderInteractionResponse::ApproveOnce,
             );
             engine.apply_observation(ObservationEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 operation_id: None,
                 instance_id: spawn.instance_id,
                 generation: spawn.generation,
@@ -5486,7 +5398,6 @@ mod tests {
         for terminate_with_process_exit in [false, true] {
             let (mut engine, spawn) = running_engine();
             engine.apply_observation(ObservationEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 operation_id: None,
                 instance_id: spawn.instance_id,
                 generation: spawn.generation,
@@ -5506,7 +5417,6 @@ mod tests {
             });
             engine
                 .apply_command(CommandEnvelope {
-                    protocol_version: CONTROL_PROTOCOL_VERSION,
                     id: CommandId(94),
                     command: ControlCommand::ResolveInteraction {
                         instance_id: instance(),
@@ -5520,7 +5430,6 @@ mod tests {
 
             if terminate_with_process_exit {
                 engine.apply_observation(ObservationEnvelope {
-                    protocol_version: CONTROL_PROTOCOL_VERSION,
                     operation_id: None,
                     instance_id: spawn.instance_id,
                     generation: spawn.generation,
@@ -5531,7 +5440,6 @@ mod tests {
                 });
             } else {
                 engine.apply_observation(ObservationEnvelope {
-                    protocol_version: CONTROL_PROTOCOL_VERSION,
                     operation_id: None,
                     instance_id: spawn.instance_id,
                     generation: spawn.generation,
@@ -5557,7 +5465,6 @@ mod tests {
 
             engine.drain_events();
             engine.apply_observation(ObservationEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 operation_id: Some(operation_id),
                 instance_id: spawn.instance_id,
                 generation: spawn.generation,
@@ -5575,7 +5482,6 @@ mod tests {
 
         let (mut engine, spawn) = running_engine();
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: None,
             instance_id: spawn.instance_id,
             generation: spawn.generation,
@@ -5595,7 +5501,6 @@ mod tests {
         });
         engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(95),
                 command: ControlCommand::ResolveInteraction {
                     instance_id: instance(),
@@ -5607,7 +5512,6 @@ mod tests {
             .unwrap();
         engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(96),
                 command: ControlCommand::Stop {
                     instance_id: instance(),
@@ -5622,7 +5526,6 @@ mod tests {
             ControlEffect::Stop { force: false }
         ));
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: Some(effects[0].operation_id),
             instance_id: effects[0].instance_id,
             generation: effects[0].generation,
@@ -5676,7 +5579,6 @@ mod tests {
         .enumerate()
         {
             engine.apply_observation(ObservationEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 operation_id: None,
                 instance_id: spawn.instance_id,
                 generation: spawn.generation,
@@ -5688,7 +5590,6 @@ mod tests {
             });
         }
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: None,
             instance_id: spawn.instance_id,
             generation: spawn.generation,
@@ -5705,7 +5606,6 @@ mod tests {
 
         engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(82),
                 command: ControlCommand::SendInput {
                     instance_id: instance(),
@@ -5715,7 +5615,6 @@ mod tests {
             .unwrap();
         let effect = engine.drain_effects().pop().unwrap();
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: Some(effect.operation_id),
             instance_id: effect.instance_id,
             generation: effect.generation,
@@ -5724,7 +5623,6 @@ mod tests {
 
         engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(83),
                 command: ControlCommand::SendInput {
                     instance_id: instance(),
@@ -5737,7 +5635,6 @@ mod tests {
             .unwrap();
         let effect = engine.drain_effects().pop().unwrap();
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: Some(effect.operation_id),
             instance_id: effect.instance_id,
             generation: effect.generation,
@@ -5781,7 +5678,6 @@ mod tests {
         ];
         for (index, event) in events.into_iter().enumerate() {
             engine.apply_observation(ObservationEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 operation_id: None,
                 instance_id: spawn.instance_id,
                 generation: spawn.generation,
@@ -5800,7 +5696,6 @@ mod tests {
         );
 
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: None,
             instance_id: spawn.instance_id,
             generation: spawn.generation,
@@ -5831,7 +5726,6 @@ mod tests {
         );
 
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: None,
             instance_id: spawn.instance_id,
             generation: spawn.generation,
@@ -5858,7 +5752,6 @@ mod tests {
         );
 
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: None,
             instance_id: spawn.instance_id,
             generation: spawn.generation,
@@ -5878,7 +5771,6 @@ mod tests {
         });
 
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: None,
             instance_id: spawn.instance_id,
             generation: spawn.generation,
@@ -5898,7 +5790,6 @@ mod tests {
         });
 
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: None,
             instance_id: spawn.instance_id,
             generation: spawn.generation,
@@ -5958,7 +5849,6 @@ mod tests {
         .enumerate()
         {
             engine.apply_observation(ObservationEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 operation_id: None,
                 instance_id: spawn.instance_id,
                 generation: spawn.generation,
@@ -6024,7 +5914,6 @@ mod tests {
         .enumerate()
         {
             engine.apply_observation(ObservationEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 operation_id: None,
                 instance_id: spawn.instance_id,
                 generation: spawn.generation,
@@ -6076,7 +5965,6 @@ mod tests {
         .enumerate()
         {
             engine.apply_observation(ObservationEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 operation_id: None,
                 instance_id: spawn.instance_id,
                 generation: spawn.generation,
@@ -6117,7 +6005,6 @@ mod tests {
         .enumerate()
         {
             engine.apply_observation(ObservationEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 operation_id: None,
                 instance_id: spawn.instance_id,
                 generation: spawn.generation,
@@ -6134,7 +6021,6 @@ mod tests {
         assert_eq!(provider.subagents.len(), 1);
 
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: None,
             instance_id: spawn.instance_id,
             generation: spawn.generation,
@@ -6157,7 +6043,6 @@ mod tests {
         engine.drain_events();
         for index in 0..=PROVIDER_INTERACTIONS_MAX {
             engine.apply_observation(ObservationEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 operation_id: None,
                 instance_id: spawn.instance_id,
                 generation: spawn.generation,
@@ -6199,7 +6084,6 @@ mod tests {
     fn ingest_provider_jump_emits_exact_gap_and_accepts_next_sequence() {
         let (mut engine, spawn) = running_engine();
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: None,
             instance_id: spawn.instance_id,
             generation: spawn.generation,
@@ -6212,7 +6096,6 @@ mod tests {
 
         engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(30),
                 command: ControlCommand::IngestProvider {
                     instance_id: spawn.instance_id,
@@ -6235,7 +6118,6 @@ mod tests {
             .unwrap();
         engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(31),
                 command: ControlCommand::IngestProvider {
                     instance_id: spawn.instance_id,
@@ -6269,7 +6151,6 @@ mod tests {
 
         engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(32),
                 command: ControlCommand::IngestProvider {
                     instance_id: spawn.instance_id,
@@ -6290,7 +6171,6 @@ mod tests {
 
         let stale = engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(33),
                 command: ControlCommand::IngestProvider {
                     instance_id: spawn.instance_id,
@@ -6308,7 +6188,6 @@ mod tests {
     fn external_ingress_rejects_stale_generation_empty_batches_and_oversized_events() {
         let (mut engine, spawn) = running_engine();
         let command = |id, generation, events| CommandEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             id: CommandId(id),
             command: ControlCommand::IngestProvider {
                 instance_id: spawn.instance_id,
@@ -6366,7 +6245,6 @@ mod tests {
         engine.apply_command(request).unwrap();
         let spawn = engine.drain_effects().pop().unwrap();
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: Some(spawn.operation_id),
             instance_id: spawn.instance_id,
             generation: spawn.generation,
@@ -6376,7 +6254,6 @@ mod tests {
         });
         let error = engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(4),
                 command: ControlCommand::SendInput {
                     instance_id: instance(),
@@ -6394,21 +6271,6 @@ mod tests {
                 ..
             }
         ));
-    }
-
-    #[test]
-    fn unsupported_command_protocol_is_rejected_without_state_change() {
-        let mut engine = Gate4AgentEngine::new();
-        let mut command = register(1);
-        command.protocol_version = CONTROL_PROTOCOL_VERSION + 1;
-
-        assert!(matches!(
-            engine.apply_command(command),
-            Err(ControlError::UnsupportedProtocolVersion { .. })
-        ));
-        assert_eq!(engine.snapshot(), ControlSnapshot::default());
-        assert!(engine.drain_effects().is_empty());
-        assert!(engine.drain_events().is_empty());
     }
 
     #[test]
@@ -6436,7 +6298,6 @@ mod tests {
         };
         engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(9),
                 command: ControlCommand::Resize {
                     instance_id: instance(),
@@ -6454,7 +6315,6 @@ mod tests {
         );
 
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: Some(effect.operation_id),
             instance_id: effect.instance_id,
             generation: effect.generation,
@@ -6469,7 +6329,6 @@ mod tests {
         engine.drain_events();
         engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(10),
                 command: ControlCommand::RefreshForeground {
                     instance_id: instance(),
@@ -6492,7 +6351,6 @@ mod tests {
             },
         };
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: Some(effect.operation_id),
             instance_id: effect.instance_id,
             generation: effect.generation,
@@ -6518,7 +6376,6 @@ mod tests {
         engine.drain_events();
         engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(11),
                 command: ControlCommand::RefreshForeground {
                     instance_id: instance(),
@@ -6527,7 +6384,6 @@ mod tests {
             .unwrap();
         let effect = engine.drain_effects().pop().unwrap();
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: Some(effect.operation_id),
             instance_id: effect.instance_id,
             generation: effect.generation,
@@ -6578,7 +6434,6 @@ mod tests {
             bracketed_paste: None,
         };
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: None,
             instance_id: instance(),
             generation: spawn.generation,
@@ -6590,7 +6445,6 @@ mod tests {
         assert!(engine.drain_events().is_empty());
 
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: None,
             instance_id: instance(),
             generation: spawn.generation,
@@ -6637,7 +6491,6 @@ mod tests {
         engine.drain_events();
         engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(3),
                 command: ControlCommand::Stop {
                     instance_id: instance(),
@@ -6652,7 +6505,6 @@ mod tests {
         );
 
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: Some(effect.operation_id),
             instance_id: effect.instance_id,
             generation: effect.generation,
@@ -6674,7 +6526,6 @@ mod tests {
         engine.drain_events();
         engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(7),
                 command: ControlCommand::SendInput {
                     instance_id: instance(),
@@ -6703,7 +6554,6 @@ mod tests {
         );
 
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: Some(effect.operation_id),
             instance_id: effect.instance_id,
             generation: effect.generation,
@@ -6726,7 +6576,6 @@ mod tests {
         let (mut engine, _) = running_engine();
         engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(70),
                 command: ControlCommand::SendInput {
                     instance_id: instance(),
@@ -6756,7 +6605,6 @@ mod tests {
         let (mut engine, _) = running_engine();
         engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(71),
                 command: ControlCommand::SendInput {
                     instance_id: instance(),
@@ -6784,7 +6632,6 @@ mod tests {
         let (mut engine, _) = running_engine();
         let error = engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(8),
                 command: ControlCommand::SendInput {
                     instance_id: instance(),
@@ -6806,7 +6653,6 @@ mod tests {
     fn remove_and_reregister_strictly_advance_the_generation_watermark() {
         let (mut engine, first_spawn) = running_engine();
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: None,
             instance_id: instance(),
             generation: first_spawn.generation,
@@ -6817,7 +6663,6 @@ mod tests {
         });
         engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(3),
                 command: ControlCommand::Remove {
                     instance_id: instance(),
@@ -6931,7 +6776,6 @@ mod tests {
         engine.drain_events();
 
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: None,
             instance_id: known_instance,
             generation: SessionGeneration::default(),
@@ -6960,7 +6804,6 @@ mod tests {
         assert_eq!(effect.operation_id, OperationId(u64::MAX));
         engine
             .try_apply_observation(ObservationEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 operation_id: Some(effect.operation_id),
                 instance_id: instance(),
                 generation: spawn.generation,
@@ -6989,7 +6832,6 @@ mod tests {
 
         let error = engine
             .try_apply_observation(ObservationEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 operation_id: Some(effect.operation_id),
                 instance_id: instance(),
                 generation: spawn.generation,
@@ -7017,7 +6859,6 @@ mod tests {
 
         let error = engine
             .try_apply_observation(ObservationEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 operation_id: Some(effect.operation_id),
                 instance_id: instance(),
                 generation: spawn.generation,
@@ -7038,7 +6879,6 @@ mod tests {
 
         let error = engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(3),
                 command: ControlCommand::IngestProvider {
                     instance_id: instance(),
@@ -7078,7 +6918,6 @@ mod tests {
 
         let error = engine
             .try_apply_observation(ObservationEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 operation_id: None,
                 instance_id: instance(),
                 generation: spawn.generation,
@@ -7118,7 +6957,6 @@ mod tests {
 
         let error = engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(3),
                 command: ControlCommand::IngestProvider {
                     instance_id: instance(),
@@ -7158,7 +6996,6 @@ mod tests {
         let before = engine.clone();
         let error = engine
             .try_apply_observation(ObservationEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 operation_id: None,
                 instance_id: instance(),
                 generation: spawn.generation,
@@ -7184,7 +7021,6 @@ mod tests {
     fn direct_provider_gap_rejects_non_exact_source_sequence() {
         let (mut engine, spawn) = running_engine();
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: None,
             instance_id: instance(),
             generation: spawn.generation,
@@ -7209,7 +7045,6 @@ mod tests {
     fn removed_lifecycle_observations_cannot_mutate_a_reregistered_instance() {
         let (mut engine, first_spawn) = running_engine();
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: None,
             instance_id: instance(),
             generation: first_spawn.generation,
@@ -7220,7 +7055,6 @@ mod tests {
         });
         engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(3),
                 command: ControlCommand::Remove {
                     instance_id: instance(),
@@ -7231,7 +7065,6 @@ mod tests {
         engine.apply_command(start(5)).unwrap();
         let second_spawn = engine.drain_effects().pop().unwrap();
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: Some(second_spawn.operation_id),
             instance_id: instance(),
             generation: second_spawn.generation,
@@ -7243,7 +7076,6 @@ mod tests {
         engine.drain_events();
 
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: None,
             instance_id: instance(),
             generation: first_spawn.generation,
@@ -7253,7 +7085,6 @@ mod tests {
             },
         });
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: None,
             instance_id: instance(),
             generation: first_spawn.generation,
@@ -7313,7 +7144,6 @@ mod tests {
         engine.apply_command(register(1)).unwrap();
         engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(2),
                 command: ControlCommand::DiscoverHistory {
                     instance_id: instance(),
@@ -7352,7 +7182,6 @@ mod tests {
     fn multi_event_rollback_retires_the_event_sequence_terminally() {
         let (mut engine, spawn) = running_engine();
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: None,
             instance_id: instance(),
             generation: spawn.generation,
@@ -7372,7 +7201,6 @@ mod tests {
         });
         engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(3),
                 command: ControlCommand::SendInput {
                     instance_id: instance(),
@@ -7387,7 +7215,6 @@ mod tests {
 
         let error = engine
             .try_apply_observation(ObservationEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 operation_id: Some(interrupt.operation_id),
                 instance_id: instance(),
                 generation: spawn.generation,
@@ -7408,7 +7235,6 @@ mod tests {
     fn stale_generation_cannot_mutate_restarted_session() {
         let (mut engine, first_spawn) = running_engine();
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: None,
             instance_id: instance(),
             generation: first_spawn.generation,
@@ -7422,7 +7248,6 @@ mod tests {
         assert!(second_spawn.generation.0 > first_spawn.generation.0);
 
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: Some(first_spawn.operation_id),
             instance_id: instance(),
             generation: first_spawn.generation,
@@ -7447,7 +7272,6 @@ mod tests {
         let (mut engine, _) = running_engine();
         let error = engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(5),
                 command: ControlCommand::Remove {
                     instance_id: instance(),
@@ -7465,7 +7289,6 @@ mod tests {
         engine.drain_events();
         engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(2),
                 command: ControlCommand::DiscoverHistory {
                     instance_id: instance(),
@@ -7494,7 +7317,6 @@ mod tests {
             modified_at_unix_ms: Some(42),
         };
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: Some(discovery.operation_id),
             instance_id: instance(),
             generation: discovery.generation,
@@ -7509,7 +7331,6 @@ mod tests {
 
         engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(3),
                 command: ControlCommand::LoadHistory {
                     instance_id: instance(),
@@ -7519,7 +7340,6 @@ mod tests {
             .unwrap();
         let load = engine.drain_effects().pop().unwrap();
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: Some(load.operation_id),
             instance_id: instance(),
             generation: load.generation,
@@ -7554,7 +7374,6 @@ mod tests {
         engine.apply_command(register(1)).unwrap();
         engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(2),
                 command: ControlCommand::DiscoverHistory {
                     instance_id: instance(),
@@ -7581,7 +7400,6 @@ mod tests {
         assert!(snapshot.sessions[0].history.candidates.is_empty());
 
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: Some(history_operation_id),
             instance_id: instance(),
             generation: before_start.generation,
@@ -7603,7 +7421,6 @@ mod tests {
         engine.apply_command(register(1)).unwrap();
         engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(2),
                 command: ControlCommand::ProbeCapabilities {
                     instance_id: instance(),
@@ -7623,7 +7440,6 @@ mod tests {
 
         let error = engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(3),
                 command: ControlCommand::Remove {
                     instance_id: instance(),
@@ -7653,7 +7469,6 @@ mod tests {
         engine.apply_command(register(1)).unwrap();
         engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(2),
                 command: ControlCommand::DiscoverHistory {
                     instance_id: instance(),
@@ -7674,7 +7489,6 @@ mod tests {
 
         let error = engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(3),
                 command: ControlCommand::Remove {
                     instance_id: instance(),
@@ -7704,7 +7518,6 @@ mod tests {
         engine.apply_command(register(1)).unwrap();
         engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(2),
                 command: ControlCommand::DiscoverHistory {
                     instance_id: instance(),
@@ -7718,7 +7531,6 @@ mod tests {
         let discovery = engine.drain_effects().pop().unwrap();
 
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: Some(discovery.operation_id),
             instance_id: instance(),
             generation: discovery.generation,
@@ -7758,7 +7570,6 @@ mod tests {
         let previous_generation = engine.snapshot().sessions[0].generation;
         engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(10),
                 command: ControlCommand::Resume {
                     instance_id: instance(),
@@ -7794,7 +7605,6 @@ mod tests {
         );
 
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: Some(authorize.operation_id),
             instance_id: instance(),
             generation: authorize.generation,
@@ -7821,7 +7631,6 @@ mod tests {
         );
 
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: Some(spawn.operation_id),
             instance_id: instance(),
             generation: spawn.generation,
@@ -7856,7 +7665,6 @@ mod tests {
         };
         engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(2),
                 command: ControlCommand::Resume {
                     instance_id: instance(),
@@ -7890,7 +7698,6 @@ mod tests {
         );
 
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: Some(authorize.operation_id),
             instance_id: instance(),
             generation: authorize.generation,
@@ -7909,7 +7716,6 @@ mod tests {
         );
 
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: Some(authorize.operation_id),
             instance_id: instance(),
             generation: authorize.generation,
@@ -7934,7 +7740,6 @@ mod tests {
         engine.session_mut(instance()).transport = TransportKind::Pipe;
 
         let missing_prompt = engine.apply_command(CommandEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             id: CommandId(20),
             command: ControlCommand::Resume {
                 instance_id: instance(),
@@ -7956,7 +7761,6 @@ mod tests {
         engine.session_mut(instance()).transport = TransportKind::Acp;
         assert!(matches!(
             engine.apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(21),
                 command: ControlCommand::Resume {
                     instance_id: instance(),
@@ -7981,7 +7785,6 @@ mod tests {
 
         engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(22),
                 command: ControlCommand::Resume {
                     instance_id: instance(),
@@ -8006,7 +7809,6 @@ mod tests {
         ));
 
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: Some(authorize.operation_id),
             instance_id: instance(),
             generation: authorize.generation,
@@ -8032,7 +7834,6 @@ mod tests {
         engine.generation_watermarks.insert(instance(), exhausted);
         engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(10),
                 command: ControlCommand::Resume {
                     instance_id: instance(),
@@ -8054,7 +7855,6 @@ mod tests {
         let before = engine.snapshot().sessions[0].clone();
 
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: Some(authorize.operation_id),
             instance_id: instance(),
             generation: authorize.generation,
@@ -8082,7 +7882,6 @@ mod tests {
         let (mut engine, identity) = inactive_engine_with_provider_session();
         engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(12),
                 command: ControlCommand::Resume {
                     instance_id: instance(),
@@ -8101,7 +7900,6 @@ mod tests {
             .unwrap();
         let authorize = engine.drain_effects().pop().unwrap();
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: Some(authorize.operation_id),
             instance_id: instance(),
             generation: authorize.generation,
@@ -8111,7 +7909,6 @@ mod tests {
         });
         let spawn = engine.drain_effects().pop().unwrap();
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: Some(spawn.operation_id),
             instance_id: instance(),
             generation: spawn.generation,
@@ -8129,7 +7926,6 @@ mod tests {
         assert!(session.resume.last_session.is_none());
         engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(13),
                 command: ControlCommand::Resume {
                     instance_id: instance(),
@@ -8158,7 +7954,6 @@ mod tests {
         let before = engine.snapshot().sessions[0].clone();
         engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(11),
                 command: ControlCommand::Resume {
                     instance_id: instance(),
@@ -8177,7 +7972,6 @@ mod tests {
             .unwrap();
         let authorize = engine.drain_effects().pop().unwrap();
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: Some(authorize.operation_id),
             instance_id: instance(),
             generation: authorize.generation,
@@ -8203,7 +7997,6 @@ mod tests {
         engine.apply_command(register(1)).unwrap();
         engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(2),
                 command: ControlCommand::DiscoverHistory {
                     instance_id: instance(),
@@ -8216,7 +8009,6 @@ mod tests {
             .unwrap();
         let discover = engine.drain_effects().pop().unwrap();
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: Some(discover.operation_id),
             instance_id: instance(),
             generation: discover.generation,
@@ -8238,7 +8030,6 @@ mod tests {
         };
         assert_eq!(
             engine.apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(3),
                 command: ControlCommand::Resume {
                     instance_id: instance(),
@@ -8254,7 +8045,6 @@ mod tests {
 
         engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(4),
                 command: ControlCommand::LoadHistory {
                     instance_id: instance(),
@@ -8264,7 +8054,6 @@ mod tests {
             .unwrap();
         let load = engine.drain_effects().pop().unwrap();
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: Some(load.operation_id),
             instance_id: instance(),
             generation: load.generation,
@@ -8283,7 +8072,6 @@ mod tests {
         });
         engine
             .apply_command(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(5),
                 command: ControlCommand::Resume {
                     instance_id: instance(),
@@ -8297,7 +8085,6 @@ mod tests {
             .unwrap();
         let authorize = engine.drain_effects().pop().unwrap();
         engine.apply_observation(ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: Some(authorize.operation_id),
             instance_id: instance(),
             generation: authorize.generation,
@@ -8334,7 +8121,6 @@ mod tests {
             engine.apply_command(start(2)).unwrap();
             let effect = engine.drain_effects().pop().unwrap();
             engine.apply_observation(ObservationEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 operation_id: Some(effect.operation_id),
                 instance_id: effect.instance_id,
                 generation: effect.generation,

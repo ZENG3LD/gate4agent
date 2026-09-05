@@ -802,7 +802,6 @@ impl ToolEngine {
         &mut self,
         envelope: CapabilityObservationEnvelope,
     ) -> Result<CapabilityObservationDisposition, ToolEngineError> {
-        validate_protocol_version(envelope.protocol_version)?;
         if envelope.operation_id.0 == 0 {
             return Err(ToolValidationError::ZeroIdentifier {
                 field: "tool operation id",
@@ -962,7 +961,6 @@ impl ToolEngine {
 
     pub fn snapshot(&self) -> ToolEngineSnapshot {
         ToolEngineSnapshot {
-            protocol_version: CAPABILITY_PROTOCOL_VERSION,
             revision: self.revision,
             current_tick: self.current_tick,
             generations: self
@@ -1451,7 +1449,6 @@ impl ToolEngine {
             self.next_effect_sequence += 1;
         }
         self.effects.push(CapabilityEffectEnvelope {
-            protocol_version: CAPABILITY_PROTOCOL_VERSION,
             sequence,
             operation_id,
             request_key: request.key.clone(),
@@ -1487,7 +1484,6 @@ impl ToolEngine {
             self.next_completion_sequence += 1;
         }
         let completion = CapabilityCompletionEnvelope {
-            protocol_version: CAPABILITY_PROTOCOL_VERSION,
             sequence,
             accepted_sequence,
             operation_id,
@@ -1841,7 +1837,6 @@ mod tests {
 
     fn dummy_effect() -> CapabilityEffectEnvelope {
         CapabilityEffectEnvelope {
-            protocol_version: CAPABILITY_PROTOCOL_VERSION,
             sequence: 9_999,
             operation_id: ToolOperationId(9_999),
             request_key: request_key(9_999),
@@ -1876,7 +1871,6 @@ mod tests {
         fn succeed(effect: &CapabilityEffectEnvelope) -> CapabilityObservationEnvelope {
             assert!(matches!(effect.effect, CapabilityEffect::Invoke { .. }));
             CapabilityObservationEnvelope {
-                protocol_version: CAPABILITY_PROTOCOL_VERSION,
                 operation_id: effect.operation_id,
                 request_key: effect.request_key.clone(),
                 instance_id: effect.instance_id,
@@ -2572,7 +2566,6 @@ mod tests {
         };
         assert!(!format!("{raw_effect:?}").contains(&secret_payload_debug));
         let raw_effect_envelope = CapabilityEffectEnvelope {
-            protocol_version: CAPABILITY_PROTOCOL_VERSION,
             sequence: 1,
             operation_id: ToolOperationId(1),
             request_key: request_key(1),
@@ -2599,7 +2592,6 @@ mod tests {
             delivery: inline_delivery.clone(),
         };
         let inline_completion = CapabilityCompletionEnvelope {
-            protocol_version: CAPABILITY_PROTOCOL_VERSION,
             sequence: 1,
             accepted_sequence: 1,
             operation_id: Some(ToolOperationId(1)),
@@ -2615,7 +2607,6 @@ mod tests {
             result: inline_result.clone(),
         };
         let inline_observation_envelope = CapabilityObservationEnvelope {
-            protocol_version: CAPABILITY_PROTOCOL_VERSION,
             operation_id: ToolOperationId(1),
             request_key: request_key(1),
             instance_id: instance(),
@@ -2647,7 +2638,6 @@ mod tests {
             delivery: reference_delivery.clone(),
         };
         let reference_completion = CapabilityCompletionEnvelope {
-            protocol_version: CAPABILITY_PROTOCOL_VERSION,
             sequence: 2,
             accepted_sequence: 2,
             operation_id: Some(ToolOperationId(2)),
@@ -2663,7 +2653,6 @@ mod tests {
             result: reference_result.clone(),
         };
         let reference_observation_envelope = CapabilityObservationEnvelope {
-            protocol_version: CAPABILITY_PROTOCOL_VERSION,
             operation_id: ToolOperationId(2),
             request_key: request_key(2),
             instance_id: instance(),
@@ -2778,7 +2767,6 @@ mod tests {
         let effect = failed.drain_effects().pop().unwrap();
         failed
             .apply_observation(CapabilityObservationEnvelope {
-                protocol_version: CAPABILITY_PROTOCOL_VERSION,
                 operation_id: effect.operation_id,
                 request_key: effect.request_key,
                 instance_id: effect.instance_id,
@@ -3011,46 +2999,11 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_versions_are_rejected_before_mutation() {
+    fn zero_operation_observation_is_rejected_before_mutation() {
         let mut engine = configured(Some(GrantMode::Allow));
-        let before_request = engine.snapshot();
-        let mut unsupported_request = request(1, 1, 100);
-        unsupported_request.protocol_version = CAPABILITY_PROTOCOL_VERSION + 1;
-        assert!(matches!(
-            engine.request(unsupported_request),
-            Err(ToolEngineError::Validation(
-                ToolValidationError::UnsupportedProtocolVersion { .. }
-            ))
-        ));
-        assert_eq!(engine.snapshot(), before_request);
-
-        let before_authority = engine.snapshot();
-        assert!(matches!(
-            engine.apply_authority(ToolAuthorityEnvelope {
-                protocol_version: CAPABILITY_PROTOCOL_VERSION + 1,
-                sequence: 1,
-                command: ToolAuthorityCommand::RevokeGrant {
-                    key: grant(GrantMode::Allow).key,
-                },
-            }),
-            Err(ToolEngineError::Validation(
-                ToolValidationError::UnsupportedProtocolVersion { .. }
-            ))
-        ));
-        assert_eq!(engine.snapshot(), before_authority);
-
         engine.request(request(1, 1, 100)).unwrap();
         let effect = engine.drain_effects().pop().unwrap();
         let before_observation = engine.snapshot();
-        let mut observation = FakeProvider::succeed(&effect);
-        observation.protocol_version = CAPABILITY_PROTOCOL_VERSION + 1;
-        assert!(matches!(
-            engine.apply_observation(observation),
-            Err(ToolEngineError::Validation(
-                ToolValidationError::UnsupportedProtocolVersion { .. }
-            ))
-        ));
-        assert_eq!(engine.snapshot(), before_observation);
 
         let mut zero_operation = FakeProvider::succeed(&effect);
         zero_operation.operation_id = ToolOperationId(0);
@@ -3078,7 +3031,6 @@ mod tests {
 
         let outcome = engine
             .apply_authority(ToolAuthorityEnvelope {
-                protocol_version: CAPABILITY_PROTOCOL_VERSION,
                 sequence: 1,
                 command: ToolAuthorityCommand::ResolveApproval {
                     resolution: ApprovalResolution {
@@ -3100,7 +3052,6 @@ mod tests {
         );
         assert!(matches!(
             engine.apply_authority(ToolAuthorityEnvelope {
-                protocol_version: CAPABILITY_PROTOCOL_VERSION,
                 sequence: 1,
                 command: ToolAuthorityCommand::RevokeGrant {
                     key: grant(GrantMode::RequireApproval).key,

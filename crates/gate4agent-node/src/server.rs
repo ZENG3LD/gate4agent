@@ -194,7 +194,7 @@ use gate4agent_types::{
     ResumeTarget,
     SessionGeneration, StartRequest,
     TerminalControl, TerminalText,
-    SessionStatus, TerminalFrame, TransportKind, CONTROL_PROTOCOL_VERSION, CONTROL_SESSIONS_MAX,
+    SessionStatus, TerminalFrame, TransportKind, CONTROL_SESSIONS_MAX,
     HISTORY_DISCOVERY_LIMIT_MAX, WORKING_DIRECTORY_MAX_BYTES,
 };
 use std::collections::{BTreeMap, VecDeque};
@@ -10968,7 +10968,6 @@ impl NodeShared {
     fn prepare_command(&self, command: ControlCommand) -> CommandEnvelope {
         let id = self.next_command_id.fetch_add(1, Ordering::AcqRel);
         CommandEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             id: CommandId(id),
             command,
         }
@@ -17268,7 +17267,6 @@ mod observation_projection_tests {
         provider_event: ProviderEvent,
     ) -> ControlEvent {
         ControlEvent {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             sequence: 41,
             command_id: None,
             instance_id: AgentInstanceId(7),
@@ -18227,7 +18225,6 @@ mod observation_projection_tests {
         ));
         assert!(raw_resolution.is_empty());
         let resolved = provider_observations(&ControlEvent {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             sequence: 42,
             command_id: None,
             instance_id: AgentInstanceId(7),
@@ -18458,7 +18455,6 @@ mod observation_projection_tests {
         };
         let interaction_correlation = correlation_id.clone();
         let resolved = ControlEvent {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             sequence: 42,
             command_id: None,
             instance_id: AgentInstanceId(7),
@@ -18830,7 +18826,6 @@ mod observation_projection_tests {
     #[test]
     fn provider_gap_receives_capabilities_and_preserves_source_sequence() {
         let control = ControlEvent {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             sequence: 99,
             command_id: None,
             instance_id: AgentInstanceId(7),
@@ -21113,7 +21108,6 @@ mod tests {
             &record_id,
             &address,
             &ControlEvent {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 sequence: 1,
                 command_id: None,
                 instance_id: address.session.instance_id,
@@ -21266,7 +21260,6 @@ mod tests {
             transcript_path: None,
         };
         shared.publish_control(ControlEvent {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             sequence: 1,
             command_id: None,
             instance_id: address.session.instance_id,
@@ -24402,7 +24395,6 @@ mod tests {
             &record_id,
             &address,
             &ControlEvent {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 sequence: 1,
                 command_id: None,
                 instance_id: address.session.instance_id,
@@ -24421,7 +24413,6 @@ mod tests {
             &record_id,
             &address,
             &ControlEvent {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 sequence: 2,
                 command_id: None,
                 instance_id: address.session.instance_id,
@@ -25268,7 +25259,6 @@ mod tests {
             })
             .unwrap();
         let event = ControlEvent {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             sequence: 1,
             command_id: None,
             instance_id: address.session.instance_id,
@@ -25391,7 +25381,6 @@ mod tests {
             None,
         );
         let event = ControlEvent {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             sequence: 1,
             command_id: None,
             instance_id: address.session.instance_id,
@@ -25539,7 +25528,6 @@ mod tests {
             ..persisted_identity
         };
         let event = ControlEvent {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             sequence: 1,
             command_id: None,
             instance_id: address.session.instance_id,
@@ -25853,7 +25841,6 @@ mod tests {
             .unwrap();
 
         shared.publish_control(ControlEvent {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             sequence: 1,
             command_id: None,
             instance_id,
@@ -25867,7 +25854,6 @@ mod tests {
         assert!(shared.address_for(instance_id, SessionGeneration(4)).is_none());
 
         shared.publish_control(ControlEvent {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             sequence: 2,
             command_id: Some(CommandId(42)),
             instance_id,
@@ -25878,7 +25864,6 @@ mod tests {
         });
 
         shared.publish_control(ControlEvent {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             sequence: 3,
             command_id: None,
             instance_id,

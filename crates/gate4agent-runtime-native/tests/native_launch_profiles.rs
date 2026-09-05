@@ -21,7 +21,7 @@ use gate4agent_testkit::{
 use gate4agent_types::{
     AdapterFamily, AgentId, AgentInstanceId, AgentSpec, CommandEnvelope, CommandId,
     ControlCommand, ControlEventKind, ProviderEvent, ProviderRuntimePolicy, ProviderSource,
-    SessionStatus, ApprovalLevel, StartRequest, TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
+    SessionStatus, ApprovalLevel, StartRequest, TerminalSize, TransportKind,
 };
 
 const PROFILE_SENTINEL: &str = "GATE4AGENT_TEST_PROFILE_SENTINEL";
@@ -192,7 +192,6 @@ fn zai_glm_fixture_spec(report_environment: bool) -> AgentSpec {
 
 fn command(id: u64, command: ControlCommand) -> CommandEnvelope {
     CommandEnvelope {
-        protocol_version: CONTROL_PROTOCOL_VERSION,
         id: CommandId(id),
         command,
     }

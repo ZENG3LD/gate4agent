@@ -4,7 +4,7 @@ use gate4agent_testkit::acp_agent_spec;
 use gate4agent_types::{
     AdapterFamily, AgentInstanceId, ControlEffect, ControlObservation, EffectEnvelope, OperationId,
     ProviderInteractionId, ProviderInteractionKind, ProviderInteractionResponse,
-    ProviderInteractionTarget, ProviderSource, SessionGeneration, CONTROL_PROTOCOL_VERSION,
+    ProviderInteractionTarget, ProviderSource, SessionGeneration,
 };
 
 #[tokio::test]
@@ -30,7 +30,6 @@ async fn native_interaction_resolution_fails_closed_with_exact_correlation() {
 
     let observation = shell
         .execute(EffectEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id,
             instance_id,
             generation,

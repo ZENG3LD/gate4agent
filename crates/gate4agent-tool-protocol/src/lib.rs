@@ -29,8 +29,6 @@ pub const TOOL_ACTIVE_REQUESTS_PER_CLIENT_MAX: usize = 32;
 pub const TOOL_EFFECTS_MAX: usize = TOOL_REQUESTS_MAX * 2;
 pub const TOOL_COMPLETIONS_MAX: usize = 128;
 pub const TOOL_AUDIT_EVENTS_MAX: usize = 4_096;
-pub const CAPABILITY_PROTOCOL_VERSION: u16 = 2;
-
 macro_rules! bounded_id {
     ($name:ident, $field:literal, $max:expr) => {
         #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -303,7 +301,6 @@ impl CapabilityRequestInput {
 
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ConsumerBoundCapabilityRequest {
-    pub protocol_version: u16,
     pub consumer_id: ConsumerId,
     pub actor_id: ToolActorId,
     pub request: CapabilityRequestInput,
@@ -316,7 +313,6 @@ impl ConsumerBoundCapabilityRequest {
         request: CapabilityRequestInput,
     ) -> Self {
         Self {
-            protocol_version: CAPABILITY_PROTOCOL_VERSION,
             consumer_id,
             actor_id,
             request,
@@ -332,7 +328,6 @@ impl ConsumerBoundCapabilityRequest {
     }
 
     pub fn validate(&self, current_tick: u64) -> Result<(), ToolValidationError> {
-        validate_protocol_version(self.protocol_version)?;
         self.request.validate(current_tick)
     }
 }
@@ -341,7 +336,6 @@ impl fmt::Debug for ConsumerBoundCapabilityRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ConsumerBoundCapabilityRequest")
-            .field("protocol_version", &self.protocol_version)
             .field("key", &self.key())
             .field("request", &self.request)
             .finish()
@@ -437,14 +431,12 @@ pub struct ApprovalResolution {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ToolAuthorityEnvelope {
-    pub protocol_version: u16,
     pub sequence: u64,
     pub command: ToolAuthorityCommand,
 }
 
 impl ToolAuthorityEnvelope {
     pub fn validate(&self) -> Result<(), ToolValidationError> {
-        validate_protocol_version(self.protocol_version)?;
         if self.sequence == 0 {
             return Err(ToolValidationError::ZeroIdentifier {
                 field: "tool authority sequence",
@@ -549,7 +541,6 @@ impl fmt::Debug for CapabilityEffect {
 
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CapabilityEffectEnvelope {
-    pub protocol_version: u16,
     pub sequence: u64,
     pub operation_id: ToolOperationId,
     pub request_key: CapabilityRequestKey,
@@ -564,7 +555,6 @@ impl fmt::Debug for CapabilityEffectEnvelope {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("CapabilityEffectEnvelope")
-            .field("protocol_version", &self.protocol_version)
             .field("sequence", &self.sequence)
             .field("operation_id", &self.operation_id)
             .field("request_key", &self.request_key)
@@ -762,7 +752,6 @@ impl fmt::Debug for CapabilityTerminalOutcome {
 
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CapabilityCompletionEnvelope {
-    pub protocol_version: u16,
     pub sequence: u64,
     pub accepted_sequence: u64,
     pub operation_id: Option<ToolOperationId>,
@@ -777,7 +766,6 @@ impl fmt::Debug for CapabilityCompletionEnvelope {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("CapabilityCompletionEnvelope")
-            .field("protocol_version", &self.protocol_version)
             .field("sequence", &self.sequence)
             .field("accepted_sequence", &self.accepted_sequence)
             .field("operation_id", &self.operation_id)
@@ -866,7 +854,6 @@ impl CapabilityObservation {
 
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CapabilityObservationEnvelope {
-    pub protocol_version: u16,
     pub operation_id: ToolOperationId,
     pub request_key: CapabilityRequestKey,
     pub instance_id: AgentInstanceId,
@@ -879,7 +866,6 @@ impl fmt::Debug for CapabilityObservationEnvelope {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("CapabilityObservationEnvelope")
-            .field("protocol_version", &self.protocol_version)
             .field("operation_id", &self.operation_id)
             .field("request_key", &self.request_key)
             .field("instance_id", &self.instance_id)
@@ -892,7 +878,6 @@ impl fmt::Debug for CapabilityObservationEnvelope {
 
 impl CapabilityObservationEnvelope {
     pub fn validate(&self) -> Result<(), ToolValidationError> {
-        validate_protocol_version(self.protocol_version)?;
         if self.operation_id.0 == 0 {
             return Err(ToolValidationError::ZeroIdentifier {
                 field: "tool operation id",
@@ -904,14 +889,12 @@ impl CapabilityObservationEnvelope {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProviderRuntimeEnvelope {
-    pub protocol_version: u16,
     pub sequence: u64,
     pub command: ProviderRuntimeCommand,
 }
 
 impl ProviderRuntimeEnvelope {
     pub fn validate(&self) -> Result<(), ToolValidationError> {
-        validate_protocol_version(self.protocol_version)?;
         if self.sequence == 0 {
             return Err(ToolValidationError::ZeroIdentifier {
                 field: "provider runtime sequence",
@@ -1019,7 +1002,6 @@ impl ProviderBoundCapabilityEffectEnvelope {
                 field: "provider binding id",
             });
         }
-        validate_protocol_version(self.effect.protocol_version)?;
         if self.effect.sequence == 0 {
             return Err(ToolValidationError::ZeroIdentifier {
                 field: "tool effect sequence",
@@ -1261,7 +1243,6 @@ pub struct ToolAuditEvent {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ToolEngineSnapshot {
-    pub protocol_version: u16,
     pub revision: u64,
     pub current_tick: u64,
     pub generations: Vec<(AgentInstanceId, SessionGeneration)>,
@@ -1288,10 +1269,6 @@ pub enum CompletionDropReason {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ToolValidationError {
-    UnsupportedProtocolVersion {
-        expected: u16,
-        actual: u16,
-    },
     Required {
         field: &'static str,
     },
@@ -1400,17 +1377,6 @@ fn has_forbidden_capability_namespace(value: &str) -> bool {
     })
 }
 
-pub fn validate_protocol_version(actual: u16) -> Result<(), ToolValidationError> {
-    if actual == CAPABILITY_PROTOCOL_VERSION {
-        Ok(())
-    } else {
-        Err(ToolValidationError::UnsupportedProtocolVersion {
-            expected: CAPABILITY_PROTOCOL_VERSION,
-            actual,
-        })
-    }
-}
-
 fn validate_required_text(
     field: &'static str,
     value: &str,
@@ -1487,13 +1453,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_wire_version_and_unbounded_id_fail_validation() {
-        let mut request = request();
-        request.protocol_version = CAPABILITY_PROTOCOL_VERSION + 1;
-        assert!(matches!(
-            request.validate(1),
-            Err(ToolValidationError::UnsupportedProtocolVersion { .. })
-        ));
+    fn unbounded_id_fails_validation() {
         let invalid = serde_json::to_string(
             &String::from_utf8(vec![b'x'; TOOL_ACTOR_ID_MAX_BYTES + 1]).unwrap(),
         )
@@ -1523,7 +1483,6 @@ mod tests {
             },
         ] {
             let lifecycle = ProviderRuntimeEnvelope {
-                protocol_version: CAPABILITY_PROTOCOL_VERSION,
                 sequence: 4,
                 command,
             };
@@ -1536,7 +1495,6 @@ mod tests {
             assert!(!format!("{lifecycle:?}").is_empty());
         }
         let observation = CapabilityObservationEnvelope {
-            protocol_version: CAPABILITY_PROTOCOL_VERSION,
             operation_id: ToolOperationId(9),
             request_key: request().key(),
             instance_id: AgentInstanceId(11),
@@ -1557,7 +1515,6 @@ mod tests {
             },
         };
         let envelope = ProviderRuntimeEnvelope {
-            protocol_version: CAPABILITY_PROTOCOL_VERSION,
             sequence: 4,
             command: ProviderRuntimeCommand::Observe {
                 binding_id: ProviderBindingId(4),
@@ -1583,12 +1540,6 @@ mod tests {
             Err(ToolValidationError::ZeroIdentifier {
                 field: "provider runtime sequence"
             })
-        ));
-        let mut unsupported = envelope.clone();
-        unsupported.protocol_version = CAPABILITY_PROTOCOL_VERSION + 1;
-        assert!(matches!(
-            unsupported.validate(),
-            Err(ToolValidationError::UnsupportedProtocolVersion { .. })
         ));
         let mut zero_binding = envelope.clone();
         if let ProviderRuntimeCommand::Observe { binding_id, .. } = &mut zero_binding.command {
@@ -1628,7 +1579,6 @@ mod tests {
         let bound = ProviderBoundCapabilityEffectEnvelope {
             binding_id: ProviderBindingId(4),
             effect: CapabilityEffectEnvelope {
-                protocol_version: CAPABILITY_PROTOCOL_VERSION,
                 sequence: 1,
                 operation_id: ToolOperationId(9),
                 request_key: request().key(),
@@ -1729,7 +1679,6 @@ mod tests {
         );
 
         let snapshot = ToolEngineSnapshot {
-            protocol_version: CAPABILITY_PROTOCOL_VERSION,
             revision: 4,
             current_tick: 9,
             generations: vec![(AgentInstanceId(11), SessionGeneration(3))],
@@ -1758,7 +1707,6 @@ mod tests {
         };
         let encoded = serde_json::to_string(&snapshot).unwrap();
         let decoded = serde_json::from_str::<ToolEngineSnapshot>(&encoded).unwrap();
-        assert_eq!(decoded.protocol_version, CAPABILITY_PROTOCOL_VERSION);
         assert_eq!(decoded, snapshot);
     }
 }

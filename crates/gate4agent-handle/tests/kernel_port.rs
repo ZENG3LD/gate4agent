@@ -3,7 +3,6 @@ use gate4agent_kernel::Gate4AgentKernel;
 use gate4agent_types::{
     AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, ControlEffect,
     ProviderRuntimePolicy, SessionStatus, ApprovalLevel, StartRequest, TerminalSize, TransportKind,
-    CONTROL_PROTOCOL_VERSION,
 };
 
 #[test]
@@ -13,7 +12,6 @@ fn handle_drives_kernel_and_publishes_one_authoritative_snapshot() {
     let instance_id = AgentInstanceId(41);
     handle
         .dispatch(CommandEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             id: CommandId(1),
             command: ControlCommand::Register {
                 instance_id,
@@ -24,7 +22,6 @@ fn handle_drives_kernel_and_publishes_one_authoritative_snapshot() {
         .unwrap();
     handle
         .dispatch(CommandEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             id: CommandId(2),
             command: ControlCommand::Start {
                 instance_id,

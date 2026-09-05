@@ -9,7 +9,7 @@ use gate4agent_adapters::{HookEventEnvelope, HookSessionReducer, HookSubagentSee
 use gate4agent_handle::{Gate4AgentHandle, PortDispatchError};
 use gate4agent_types::{
     AdapterBinding, AdapterFamily, AdapterId, AgentInstanceId, CommandEnvelope, CommandId,
-    ControlCommand, ProviderSource, SessionGeneration, CONTROL_PROTOCOL_VERSION,
+    ControlCommand, ProviderSource, SessionGeneration,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -875,7 +875,6 @@ fn handle_request(shared: &HookIngressShared, request: HttpRequest) -> HttpStatu
         .max(1);
     let command_counter = shared.next_command_id.fetch_add(1, Ordering::AcqRel);
     let command = CommandEnvelope {
-        protocol_version: CONTROL_PROTOCOL_VERSION,
         id: CommandId(HOOK_COMMAND_ID_PREFIX | command_counter),
         command: ControlCommand::IngestProvider {
             instance_id: route.key.instance_id,
@@ -1380,7 +1379,6 @@ mod tests {
         let (handle, port) = bounded_port(1);
         handle
             .dispatch(CommandEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 id: CommandId(1),
                 command: ControlCommand::Register {
                     instance_id: AgentInstanceId(99),

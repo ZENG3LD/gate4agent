@@ -21,7 +21,7 @@ use gate4agent_runtime_native::{NativeRuntime, NativeRuntimeConfig};
 use gate4agent_types::{
     AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, ControlEvent,
     ControlEventKind, InputAction, PreparedInputKind, ProviderRuntimePolicy, SessionStatus,
-    ApprovalLevel, StartRequest, TerminalControl, TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
+    ApprovalLevel, StartRequest, TerminalControl, TerminalSize, TransportKind,
 };
 
 #[cfg(unix)]
@@ -238,7 +238,6 @@ fn live_config(expected_agent: &str) -> Result<LiveConfig, &'static str> {
 #[cfg(unix)]
 fn command(id: u64, command: ControlCommand) -> CommandEnvelope {
     CommandEnvelope {
-        protocol_version: CONTROL_PROTOCOL_VERSION,
         id: CommandId(id),
         command,
     }

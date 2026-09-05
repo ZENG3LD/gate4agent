@@ -129,7 +129,10 @@ pub(crate) fn applicable_approval_args<'a>(
 /// multiple JSON-RPC requests without respawning.
 pub(crate) struct AcpProcess {
     child: Child,
-    stdin: std::process::ChildStdin,
+    /// `None` once `close_stdin` has run -- the graceful side of a stop
+    /// (see `AcpSession::stop`, `acp/session.rs`) drops this to let the
+    /// spawned adapter observe EOF on its own stdin.
+    stdin: Option<std::process::ChildStdin>,
     output_rx: Receiver<String>,
     /// Bounded ring buffer of the most recent stderr lines. Populated by a
     /// background reader thread; read out via [`stderr_tail`](Self::stderr_tail)
@@ -199,7 +202,7 @@ impl AcpProcess {
 
         Ok(Self {
             child,
-            stdin,
+            stdin: Some(stdin),
             output_rx: rx,
             stderr_tail,
         })
@@ -241,7 +244,7 @@ impl AcpProcess {
 
         Ok(Self {
             child,
-            stdin,
+            stdin: Some(stdin),
             output_rx: rx,
             stderr_tail,
         })
@@ -252,10 +255,30 @@ impl AcpProcess {
     /// Returns `BrokenPipe` if the process has already exited and stdin is
     /// closed. The caller maps this to `AcpError::Write`.
     pub(crate) fn write_line(&mut self, line: &str) -> Result<(), std::io::Error> {
-        self.stdin.write_all(line.as_bytes())?;
-        self.stdin.write_all(b"\n")?;
-        self.stdin.flush()?;
+        let Some(stdin) = self.stdin.as_mut() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "stdin is closed -- the graceful stop path already ran",
+            ));
+        };
+        stdin.write_all(line.as_bytes())?;
+        stdin.write_all(b"\n")?;
+        stdin.flush()?;
         Ok(())
+    }
+
+    /// Close the write half of stdin by dropping the underlying handle.
+    ///
+    /// This is the ACP side of a graceful stop: closing stdin lets the
+    /// spawned adapter observe EOF on its own input and choose to exit on
+    /// its own -- exactly the behaviour measured live against every pinned
+    /// ACP adapter this project spawns (`claude-agent-acp@0.74.0` exited
+    /// 0.05s after stdin close, `codex-acp@1.10.0` 4.81s, `grok agent
+    /// stdio` 3.22s, all exit code 0). See `AcpSession::stop`'s doc
+    /// comment (`acp/session.rs`) for the full measurement. Idempotent:
+    /// closing an already-closed stdin is a no-op.
+    pub(crate) fn close_stdin(&mut self) {
+        self.stdin = None;
     }
 
     /// Non-blocking stdout poll. Returns `None` when no line is available.

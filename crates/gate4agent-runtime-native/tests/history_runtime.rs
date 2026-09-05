@@ -7,7 +7,6 @@ use gate4agent_types::{
     AdapterId, AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, ControlEvent,
     ControlEventKind, HistoryQuery, LaunchSpec, ProcessMatcher, ProviderRuntimePolicy,
     ResumeLaunchRequest, ResumeTarget, SessionStatus, TerminalSize, TransportKind,
-    CONTROL_PROTOCOL_VERSION,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -38,7 +37,6 @@ impl Drop for FixtureDir {
 
 fn command(id: u64, command: ControlCommand) -> CommandEnvelope {
     CommandEnvelope {
-        protocol_version: CONTROL_PROTOCOL_VERSION,
         id: CommandId(id),
         command,
     }

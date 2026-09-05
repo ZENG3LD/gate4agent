@@ -855,7 +855,6 @@ impl From<&gate4agent_node_protocol::NodeEventEnvelope> for C2NodeEventEnvelope 
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct C2ControlEvent {
-    pub protocol_version: u16,
     pub sequence: u64,
     pub command_id: Option<gate4agent_types::CommandId>,
     pub instance_id: AgentInstanceId,
@@ -1046,7 +1045,6 @@ impl From<&gate4agent_types::ControlEvent> for C2ControlEvent {
             ControlEventKind::ObservationIgnored { .. } => C2ControlEventKind::ObservationIgnored,
         };
         Self {
-            protocol_version: event.protocol_version,
             sequence: event.sequence,
             command_id: event.command_id,
             instance_id: event.instance_id,
@@ -3465,7 +3463,6 @@ mod tests {
             event: C2NodeEvent::from(&NodeEvent::Control {
                 address,
                 event: ControlEvent {
-                    protocol_version: gate4agent_types::CONTROL_PROTOCOL_VERSION,
                     sequence: 12,
                     command_id: None,
                     instance_id: AgentInstanceId(41),

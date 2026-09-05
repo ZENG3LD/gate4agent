@@ -15,7 +15,7 @@ use gate4agent_types::{
     PreparedInputKind, PromptFraming, PromptPayload, ProviderActivity, ProviderEvent,
     ProviderInteractionKind, ProviderInteractionOutcome, ProviderInteractionStatus,
     ProviderRuntimePolicy, ProviderSource, SessionStatus, ShellCommand, ApprovalLevel, StartRequest,
-    TerminalControl, TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
+    TerminalControl, TerminalSize, TransportKind,
 };
 
 fn semantic_runtime_policy() -> ProviderRuntimePolicy {
@@ -24,7 +24,6 @@ fn semantic_runtime_policy() -> ProviderRuntimePolicy {
 
 fn command(id: u64, command: ControlCommand) -> CommandEnvelope {
     CommandEnvelope {
-        protocol_version: CONTROL_PROTOCOL_VERSION,
         id: CommandId(id),
         command,
     }

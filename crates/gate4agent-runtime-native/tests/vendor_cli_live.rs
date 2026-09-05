@@ -6,7 +6,7 @@ use gate4agent_runtime_native::{NativeRuntime, NativeRuntimeConfig};
 use gate4agent_types::{
     AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, ControlEvent,
     ControlEventKind, ProviderEvent, ProviderRuntimePolicy, ResumeLaunchRequest, ResumeTarget,
-    SessionStatus, ApprovalLevel, StartRequest, TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
+    SessionStatus, ApprovalLevel, StartRequest, TerminalSize, TransportKind,
 };
 
 fn semantic_runtime_policy() -> ProviderRuntimePolicy {
@@ -35,7 +35,6 @@ impl Drop for CanaryDirectory {
 
 fn command(id: u64, command: ControlCommand) -> CommandEnvelope {
     CommandEnvelope {
-        protocol_version: CONTROL_PROTOCOL_VERSION,
         id: CommandId(id),
         command,
     }

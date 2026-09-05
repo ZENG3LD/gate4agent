@@ -20,7 +20,6 @@ use gate4agent_tool_protocol::{
     ConsumerBoundCapabilityRequest, ConsumerId, PolicyGrant, ProviderBindingId,
     ProviderBoundCapabilityRequest, ToolActorId, ToolAuditEvent, ToolAuthorityCommand,
     ToolAuthorityEnvelope, ToolAuthorityOutcome, ToolInstanceState, ToolProviderId,
-    CAPABILITY_PROTOCOL_VERSION,
 };
 use gate4agent_types::{
     AgentInstanceId, CommandEnvelope, ControlEvent, ControlSnapshot, SessionGeneration,
@@ -104,7 +103,6 @@ pub struct ToolCompletionSourceGap {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ToolClientSnapshot {
-    pub protocol_version: u16,
     pub backend_revision: u64,
     pub logical_tick: u64,
     pub tool_revision: u64,
@@ -622,7 +620,6 @@ impl ToolAuthorityHandle {
                 counter: "authority-sequence",
             })?;
         let envelope = ToolAuthorityEnvelope {
-            protocol_version: CAPABILITY_PROTOCOL_VERSION,
             sequence,
             command,
         };
@@ -693,7 +690,6 @@ impl ToolAuthorityHandle {
                     counter: "authority-sequence",
                 })?;
         let envelope = ToolAuthorityEnvelope {
-            protocol_version: CAPABILITY_PROTOCOL_VERSION,
             sequence,
             command: ToolAuthorityCommand::CloseClient {
                 consumer_id: client.state.consumer_id.clone(),
@@ -828,7 +824,6 @@ impl ToolClientHandle {
             .chain(requests.iter().map(|request| request.instance_id))
             .collect::<BTreeSet<_>>();
         Arc::new(ToolClientSnapshot {
-            protocol_version: tools.protocol_version,
             backend_revision: snapshot.revision,
             logical_tick: snapshot.logical_tick,
             tool_revision: tools.revision,
@@ -1081,14 +1076,10 @@ fn publish_one_locked<T: Clone>(subscribers: &mut Vec<SyncSender<T>>, item: T) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gate4agent_types::{
-        AgentId, CommandId, ControlCommand, ControlEventKind, TransportKind,
-        CONTROL_PROTOCOL_VERSION,
-    };
+    use gate4agent_types::{AgentId, CommandId, ControlCommand, ControlEventKind, TransportKind};
 
     fn command(id: u64) -> CommandEnvelope {
         CommandEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             id: CommandId(id),
             command: ControlCommand::Register {
                 instance_id: AgentInstanceId(id),
@@ -1100,7 +1091,6 @@ mod tests {
 
     fn event(sequence: u64) -> ControlEvent {
         ControlEvent {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             sequence,
             command_id: None,
             instance_id: AgentInstanceId(1),

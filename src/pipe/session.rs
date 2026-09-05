@@ -20,12 +20,45 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
+use tokio::time::sleep;
 
 use crate::core::error::AgentError;
 use crate::core::types::{AgentEvent, CliTool, SessionConfig};
 use crate::pipe::cli::{create_ndjson_parser, CliEvent};
 use crate::pipe::process::{PipeOutput, PipeProcess, PipeProcessOptions, PIPE_TIMEOUT_SECONDS};
 use gate4agent_types::{LaunchSpec, PipePromptDelivery};
+
+/// How long [`PipeSession::stop`] with `force = false` waits for the process
+/// to exit on its own before falling back to a hard kill.
+///
+/// Measured live 2026-09-05 against the piped ACP adapters this project
+/// spawns (`AcpProcess`/`acp_command`) as a proxy for "does closing stdin let
+/// a provider process end itself, and how long does that take": spawn,
+/// complete the `initialize` handshake, close stdin, time the exit.
+/// `claude-agent-acp@0.74.0` exited 0.05s after stdin close, `codex-
+/// acp@1.10.0` (over quota, but `initialize` still ran) 4.81s, `grok agent
+/// stdio` 3.22s — all exit code 0. `PipeSession`'s own children (`claude -p`,
+/// `codex exec --json`, ...) already have stdin closed by the time a session
+/// exists (`PipeProcess::spawn_command` writes the prompt and drops the
+/// write half immediately), so a graceful stop here means "let the run
+/// already under way finish" rather than sending a fresh signal — 10s leaves
+/// better than 2x margin over the slowest process measured.
+pub const PIPE_GRACEFUL_STOP_BOUND_SECS: u64 = 10;
+
+/// Outcome of [`PipeSession::stop`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PipeStopOutcome {
+    /// The process's real exit code — known only when it exited on its own
+    /// within the graceful bound. `None` when the stop performed (or fell
+    /// back to) a hard kill: `kill_tree` does not itself observe an exit
+    /// code, and the caller already has its own authoritative source for one
+    /// (the broadcast `AgentEvent::Exited`).
+    pub exit_code: Option<i32>,
+    /// `true` when the process was killed rather than left to exit on its
+    /// own — either because the caller asked for `force = true`, or the
+    /// graceful bound elapsed while the process was still running.
+    pub forced: bool,
+}
 
 /// Async pipe session. Spawns a CLI tool in headless pipe mode and broadcasts
 /// NDJSON events as `AgentEvent` to all subscribers via a tokio broadcast channel.
@@ -182,6 +215,42 @@ impl PipeSession {
         })
         .await
         .map_err(|_| AgentError::Pty("spawn_blocking panicked".into()))?
+    }
+
+    /// Stop the pipe process.
+    ///
+    /// `force = true` kills the process tree immediately — identical to
+    /// [`PipeSession::kill`]. `force = false` waits up to
+    /// [`PIPE_GRACEFUL_STOP_BOUND_SECS`] for the process to exit on its own
+    /// (stdin is already closed by spawn time for every supported CLI, so
+    /// this is "let the run finish" rather than a new signal), reporting the
+    /// real exit code when it does, and only kills if the bound elapses.
+    ///
+    /// If the process has already exited on its own by the time this is
+    /// called — including the case where the reader loop's own timeout or
+    /// output-limit guard already terminated it — `reader_finished()` is
+    /// already `true` and this returns immediately with `forced: false`.
+    pub async fn stop(&self, force: bool) -> Result<PipeStopOutcome, AgentError> {
+        if !force {
+            let deadline = Instant::now() + Duration::from_secs(PIPE_GRACEFUL_STOP_BOUND_SECS);
+            loop {
+                if self.reader_finished() {
+                    return Ok(PipeStopOutcome {
+                        exit_code: Some(get_exit_code(&self.stdin)),
+                        forced: false,
+                    });
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        }
+        self.kill().await?;
+        Ok(PipeStopOutcome {
+            exit_code: None,
+            forced: true,
+        })
     }
 }
 
@@ -590,6 +659,132 @@ mod tests {
         assert!(
             session_end_pos < exited_pos,
             "SessionEnd must precede Exited"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PipeSession::stop — graceful vs. forced, against real fixture children.
+    //
+    // Both fixtures are spawned through `spawn_with_launch`/`StdinClose`:
+    // `PipeProcess::spawn_command` writes the prompt then drops the write
+    // half immediately, so by the time `PipeSession::stop` runs, stdin is
+    // already closed for both — the only variable is whether the child
+    // itself waits on stdin (graceful fixture) or ignores it entirely
+    // (ignore-stdin fixture), matching the real ACP adapters measured live
+    // (see `PIPE_GRACEFUL_STOP_BOUND_SECS`'s doc comment).
+    // -----------------------------------------------------------------------
+
+    #[cfg(windows)]
+    fn graceful_exit_launch() -> LaunchSpec {
+        LaunchSpec {
+            program: "powershell.exe".to_owned(),
+            fixed_args: vec![
+                "-NoProfile".to_owned(),
+                "-NonInteractive".to_owned(),
+                "-Command".to_owned(),
+                "[Console]::In.ReadToEnd() | Out-Null; exit 0".to_owned(),
+            ],
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn graceful_exit_launch() -> LaunchSpec {
+        LaunchSpec {
+            program: "sh".to_owned(),
+            fixed_args: vec!["-c".to_owned(), "cat >/dev/null; exit 0".to_owned()],
+        }
+    }
+
+    #[cfg(windows)]
+    fn ignore_stdin_launch() -> LaunchSpec {
+        LaunchSpec {
+            program: "powershell.exe".to_owned(),
+            fixed_args: vec![
+                "-NoProfile".to_owned(),
+                "-NonInteractive".to_owned(),
+                "-Command".to_owned(),
+                "Start-Sleep -Seconds 30".to_owned(),
+            ],
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn ignore_stdin_launch() -> LaunchSpec {
+        LaunchSpec {
+            program: "sh".to_owned(),
+            fixed_args: vec!["-c".to_owned(), "sleep 30".to_owned()],
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_graceful_reports_the_real_exit_code_for_a_process_that_ends_itself() {
+        let launch = graceful_exit_launch();
+        let session = PipeSession::spawn_with_launch(
+            SessionConfig::default(),
+            "prompt",
+            &launch,
+            PipePromptDelivery::StdinClose,
+        )
+        .await
+        .expect("graceful-exit fixture must spawn");
+
+        let outcome = session
+            .stop(false)
+            .await
+            .expect("stop(force=false) must succeed for a process that exits on its own");
+
+        assert_eq!(outcome.exit_code, Some(0), "outcome: {outcome:?}");
+        assert!(
+            !outcome.forced,
+            "a process that already exited on its own must not be reported as forced"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_graceful_falls_back_to_a_kill_once_the_bound_elapses() {
+        let launch = ignore_stdin_launch();
+        let session = PipeSession::spawn_with_launch(
+            SessionConfig::default(),
+            "prompt",
+            &launch,
+            PipePromptDelivery::StdinClose,
+        )
+        .await
+        .expect("ignore-stdin fixture must spawn");
+
+        let outcome = session
+            .stop(false)
+            .await
+            .expect("stop(force=false) must still succeed by falling back to a kill");
+
+        assert!(
+            outcome.forced,
+            "a process that ignores stdin must be force-killed once the graceful bound elapses"
+        );
+        assert!(outcome.exit_code.is_none(), "outcome: {outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn stop_force_true_kills_immediately_without_waiting() {
+        let launch = ignore_stdin_launch();
+        let session = PipeSession::spawn_with_launch(
+            SessionConfig::default(),
+            "prompt",
+            &launch,
+            PipePromptDelivery::StdinClose,
+        )
+        .await
+        .expect("ignore-stdin fixture must spawn");
+
+        let start = Instant::now();
+        let outcome = session
+            .stop(true)
+            .await
+            .expect("stop(force=true) must succeed");
+        assert!(outcome.forced);
+        assert!(
+            start.elapsed() < Duration::from_secs(PIPE_GRACEFUL_STOP_BOUND_SECS),
+            "force=true must not wait out the graceful bound"
         );
     }
 }

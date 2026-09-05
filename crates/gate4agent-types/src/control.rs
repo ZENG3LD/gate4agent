@@ -8,7 +8,6 @@ use crate::{
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
-pub const CONTROL_PROTOCOL_VERSION: u16 = 28;
 pub const CONTROL_SESSIONS_MAX: usize = 512;
 pub const CONTROL_INSTANCE_IDENTITIES_CAPACITY: u32 = 4_096;
 pub const CONTROL_INSTANCE_IDENTITIES_MAX: usize = CONTROL_INSTANCE_IDENTITIES_CAPACITY as usize;
@@ -816,7 +815,6 @@ pub enum TransportKind {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CommandEnvelope {
-    pub protocol_version: u16,
     pub id: CommandId,
     pub command: ControlCommand,
 }
@@ -936,7 +934,6 @@ impl ControlCommand {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EffectEnvelope {
-    pub protocol_version: u16,
     pub operation_id: OperationId,
     pub instance_id: AgentInstanceId,
     pub generation: SessionGeneration,
@@ -1024,7 +1021,6 @@ pub enum ControlEffect {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ObservationEnvelope {
-    pub protocol_version: u16,
     pub operation_id: Option<OperationId>,
     pub instance_id: AgentInstanceId,
     pub generation: SessionGeneration,
@@ -2467,7 +2463,6 @@ pub struct ProviderSnapshot {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ControlSnapshot {
-    pub protocol_version: u16,
     pub revision: u64,
     pub health: ControlHealth,
     pub sessions: Vec<SessionSnapshot>,
@@ -2498,7 +2493,6 @@ impl Default for ControlHealth {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ControlEvent {
-    pub protocol_version: u16,
     pub sequence: u64,
     pub command_id: Option<CommandId>,
     pub instance_id: AgentInstanceId,
@@ -2669,7 +2663,6 @@ pub enum ControlEventKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ObservationIgnoredReason {
-    UnsupportedProtocolVersion,
     UnknownInstance,
     StaleGeneration,
     GenerationExhausted,
@@ -2691,8 +2684,6 @@ pub enum ObservationIgnoredReason {
 #[derive(Clone, Debug, Eq, Error, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ControlError {
-    #[error("control protocol version {actual} is unsupported; expected {expected}")]
-    UnsupportedProtocolVersion { expected: u16, actual: u16 },
     #[error("agent instance {instance_id:?} is already registered")]
     DuplicateInstance { instance_id: AgentInstanceId },
     #[error(
@@ -2824,7 +2815,6 @@ pub enum ControlError {
 impl Default for ControlSnapshot {
     fn default() -> Self {
         Self {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             revision: 0,
             health: ControlHealth::default(),
             sessions: Vec::new(),

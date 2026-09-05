@@ -7,7 +7,6 @@ use gate4agent_testkit::{pty_provider_agent_spec, PTY_PROVIDER_FIXTURE_ID};
 use gate4agent_types::{
     AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, ControlObservation,
     ProviderEvent, ProviderRuntimePolicy, ApprovalLevel, StartRequest, TerminalSize, TransportKind,
-    CONTROL_PROTOCOL_VERSION,
 };
 
 fn semantic_runtime_policy() -> ProviderRuntimePolicy {
@@ -16,7 +15,6 @@ fn semantic_runtime_policy() -> ProviderRuntimePolicy {
 
 fn command(id: u64, command: ControlCommand) -> CommandEnvelope {
     CommandEnvelope {
-        protocol_version: CONTROL_PROTOCOL_VERSION,
         id: CommandId(id),
         command,
     }

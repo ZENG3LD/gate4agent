@@ -18,7 +18,6 @@ use gate4agent_types::{
     AdapterBinding, AdapterFamily, AgentId, AgentInstanceId, CommandEnvelope, CommandId,
     ControlCommand, ControlError, ControlEvent, ControlHealth, ControlSnapshot, EffectEnvelope,
     InputAction, ObservationEnvelope, PipeProtocol, ProviderSource, SessionStatus, TransportKind,
-    CONTROL_PROTOCOL_VERSION,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -187,7 +186,6 @@ impl Default for BackendSnapshot {
             revision: 0,
             logical_tick: 0,
             control: Arc::new(ControlSnapshot {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 revision: 0,
                 health: ControlHealth::default(),
                 sessions: Vec::new(),
@@ -894,13 +892,6 @@ impl Gate4AgentKernel {
         &mut self,
         mut command: CommandEnvelope,
     ) -> Result<(), KernelCommandError> {
-        if command.protocol_version != CONTROL_PROTOCOL_VERSION {
-            return Err(ControlError::UnsupportedProtocolVersion {
-                expected: CONTROL_PROTOCOL_VERSION,
-                actual: command.protocol_version,
-            }
-            .into());
-        }
         if let ControlCommand::Register {
             agent_id,
             transport,
@@ -1172,14 +1163,13 @@ mod tests {
         CapabilityRequestInput, CapabilityResult, CapabilityResultDelivery,
         CapabilityResultMetadata, CapabilityTerminalOutcome, ConsumerBoundCapabilityRequest,
         ConsumerId, GrantMode, PolicyDenial, PolicyGrant, PolicyKey, ResourceScopeId, ToolActorId,
-        ToolAuthorityCommand, ToolCapabilityId, ToolProviderId, CAPABILITY_PROTOCOL_VERSION,
+        ToolAuthorityCommand, ToolCapabilityId, ToolProviderId,
     };
     use gate4agent_types::{
         AgentInstanceId, ApprovalLevel, CapabilityProbeRequest, ControlObservation, HistoryQuery,
         ObservationEnvelope, ProviderActivity, ProviderEvent, ProviderRuntimePolicy,
         ProviderSource, ResumeLaunchRequest, ResumeTarget, SessionGeneration,
         SessionOptionSelection, SessionStatus, StartRequest, TerminalSize, TransportKind,
-        CONTROL_PROTOCOL_VERSION,
     };
 
     fn instance() -> AgentInstanceId {
@@ -1192,7 +1182,6 @@ mod tests {
 
     fn command(id: u64, command: ControlCommand) -> CommandEnvelope {
         CommandEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             id: CommandId(id),
             command,
         }
@@ -1388,7 +1377,6 @@ mod tests {
 
     fn tool_grant(generation: SessionGeneration, sequence: u64) -> ToolAuthorityEnvelope {
         ToolAuthorityEnvelope {
-            protocol_version: CAPABILITY_PROTOCOL_VERSION,
             sequence,
             command: ToolAuthorityCommand::SetGrant {
                 grant: tool_policy_grant(generation),
@@ -1398,7 +1386,6 @@ mod tests {
 
     fn provider_runtime(sequence: u64, command: ProviderRuntimeCommand) -> BackendIngress {
         BackendIngress::ToolProvider(ProviderRuntimeEnvelope {
-            protocol_version: CAPABILITY_PROTOCOL_VERSION,
             sequence,
             command,
         })
@@ -1430,7 +1417,6 @@ mod tests {
         effect: &ProviderBoundCapabilityEffectEnvelope,
     ) -> CapabilityObservationEnvelope {
         CapabilityObservationEnvelope {
-            protocol_version: CAPABILITY_PROTOCOL_VERSION,
             operation_id: effect.effect.operation_id,
             request_key: effect.effect.request_key.clone(),
             instance_id: effect.effect.instance_id,
@@ -1480,7 +1466,6 @@ mod tests {
         let running = kernel.step(
             [],
             [ObservationEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 operation_id: Some(spawn.operation_id),
                 instance_id: spawn.instance_id,
                 generation: spawn.generation,
@@ -2237,7 +2222,6 @@ mod tests {
         kernel.step(
             [],
             [ObservationEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 operation_id: Some(spawn.operation_id),
                 instance_id: spawn.instance_id,
                 generation: spawn.generation,
@@ -2301,7 +2285,6 @@ mod tests {
         let running = kernel.step(
             [],
             [ObservationEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 operation_id: Some(spawn.operation_id),
                 instance_id: spawn.instance_id,
                 generation: spawn.generation,
@@ -2321,7 +2304,6 @@ mod tests {
                 },
             )],
             [ObservationEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 operation_id: None,
                 instance_id: instance(),
                 generation: spawn.generation,
@@ -2445,7 +2427,6 @@ mod tests {
                 tool_request(1, spawn.generation),
             ))],
             [ObservationEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 operation_id: Some(spawn.operation_id),
                 instance_id: spawn.instance_id,
                 generation: spawn.generation,
@@ -2574,7 +2555,6 @@ mod tests {
         let exited = kernel.step(
             [],
             [ObservationEnvelope {
-                protocol_version: CONTROL_PROTOCOL_VERSION,
                 operation_id: None,
                 instance_id: instance(),
                 generation,
@@ -3073,7 +3053,6 @@ mod tests {
         let reduced = kernel.step_control_plane(
             [
                 BackendIngress::ToolAuthority(ToolAuthorityEnvelope {
-                    protocol_version: CAPABILITY_PROTOCOL_VERSION,
                     sequence: 2,
                     command: ToolAuthorityCommand::RevokeGrant {
                         key: tool_policy_grant(generation).key,

@@ -6,12 +6,11 @@ use gate4agent_testkit::{one_shot_agent_spec, ONE_SHOT_FIXTURE_ID};
 use gate4agent_types::{
     AdapterFamily, AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand,
     ControlEventKind, ProviderEvent, ProviderRuntimePolicy, ProviderSource, SessionStatus,
-    ApprovalLevel, StartRequest, TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
+    ApprovalLevel, StartRequest, TerminalSize, TransportKind,
 };
 
 fn command(id: u64, command: ControlCommand) -> CommandEnvelope {
     CommandEnvelope {
-        protocol_version: CONTROL_PROTOCOL_VERSION,
         id: CommandId(id),
         command,
     }

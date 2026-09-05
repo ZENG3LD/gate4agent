@@ -8,7 +8,6 @@ use std::{cmp::Ordering, fmt};
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
-pub const HARNESS_PROTOCOL_VERSION_V1: u16 = 1;
 pub const HARNESS_TITLE_MAX_BYTES: usize = 256;
 pub const HARNESS_BODY_MAX_BYTES: usize = 8 * 1024;
 pub const HARNESS_SELECTOR_MAX_BYTES: usize = 128;

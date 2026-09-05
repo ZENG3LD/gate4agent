@@ -9,7 +9,6 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
-pub const OBSERVATION_PROTOCOL_VERSION_V1: u16 = 1;
 pub const OBSERVATION_EVENT_MAX_BYTES: usize = 4_096;
 pub const OBSERVATION_LABEL_MAX_BYTES: usize = 64;
 pub const OBSERVATION_DETAIL_MAX_BYTES: usize = 1_024;
@@ -1308,7 +1307,6 @@ mod tests {
 
     #[test]
     fn observation_v1_is_bounded_private_and_versioned() {
-        assert_eq!(OBSERVATION_PROTOCOL_VERSION_V1, 1);
         let value = observation(
             ObservationEvidenceV1::StructuredProvider,
             ObservationKindV1::Error {

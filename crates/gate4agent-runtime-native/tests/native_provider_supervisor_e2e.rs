@@ -17,7 +17,6 @@ use gate4agent_tool_engine::{
 use gate4agent_types::{
     AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, ProviderRuntimePolicy,
     SessionGeneration, SessionStatus, ApprovalLevel, StartRequest, TerminalSize, TransportKind,
-    CONTROL_PROTOCOL_VERSION,
 };
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -967,7 +966,6 @@ fn request(
 
 fn command(id: u64, command: ControlCommand) -> CommandEnvelope {
     CommandEnvelope {
-        protocol_version: CONTROL_PROTOCOL_VERSION,
         id: CommandId(id),
         command,
     }

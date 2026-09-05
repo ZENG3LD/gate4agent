@@ -9,12 +9,11 @@ use gate4agent_tool_protocol::{
     CapabilityResultDelivery, CapabilityResultMetadata, CapabilityTerminalOutcome, GrantMode,
     InvocationCancelReason, ObservationIgnoredReason, PolicyGrant, PolicyKey, ResourceScopeId,
     ToolActorId, ToolAuthorityCommand, ToolCapabilityId, ToolProviderId,
-    CAPABILITY_PROTOCOL_VERSION,
 };
 use gate4agent_types::{
     AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand, ControlObservation,
     ObservationEnvelope, ProviderRuntimePolicy, SessionGeneration, ApprovalLevel, StartRequest, TerminalSize,
-    TransportKind, CONTROL_PROTOCOL_VERSION,
+    TransportKind,
 };
 use std::sync::mpsc::TryRecvError;
 
@@ -75,7 +74,6 @@ fn result() -> CapabilityResult {
 
 fn command(id: u64, command: ControlCommand) -> CommandEnvelope {
     CommandEnvelope {
-        protocol_version: CONTROL_PROTOCOL_VERSION,
         id: CommandId(id),
         command,
     }
@@ -154,7 +152,6 @@ fn start_running(
     let running = kernel.step_control_plane(
         [],
         [ObservationEnvelope {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
             operation_id: Some(spawn.operation_id),
             instance_id: spawn.instance_id,
             generation: spawn.generation,
@@ -234,10 +231,6 @@ fn control_plane_e2e_routes_bound_provider_result_only_to_exact_client() {
     assert_eq!(
         published_snapshot.backend_revision,
         dispatched.backend_snapshot.revision
-    );
-    assert_eq!(
-        published_snapshot.protocol_version,
-        CAPABILITY_PROTOCOL_VERSION
     );
     let accepted = request_outcomes.try_recv().unwrap();
     assert_eq!(accepted.request_key, request_key);

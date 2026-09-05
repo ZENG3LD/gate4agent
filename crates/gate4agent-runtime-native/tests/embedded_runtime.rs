@@ -7,7 +7,7 @@ use gate4agent_testkit::{interactive_agent_spec, CONTROL_FIXTURE_ID};
 use gate4agent_types::{
     AgentCommand, AgentId, AgentInstanceId, CommandEnvelope, CommandId, ControlCommand,
     ControlEvent, InitialPromptMode, InputAction, ProviderRuntimePolicy, SessionStatus,
-    ApprovalLevel, StartRequest, TerminalSize, TransportKind, CONTROL_PROTOCOL_VERSION,
+    ApprovalLevel, StartRequest, TerminalSize, TransportKind,
 };
 
 const FIXTURE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -18,7 +18,6 @@ fn semantic_runtime_policy() -> ProviderRuntimePolicy {
 
 fn command(id: u64, command: ControlCommand) -> CommandEnvelope {
     CommandEnvelope {
-        protocol_version: CONTROL_PROTOCOL_VERSION,
         id: CommandId(id),
         command,
     }

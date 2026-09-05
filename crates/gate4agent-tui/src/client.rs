@@ -4340,6 +4340,120 @@ fn project_harness_read_failure(error: HarnessOperatorClientError) -> HarnessRea
             // `HarnessOperatorClientError::Host`'s `{0:?}` Debug rendering
             // of this variant's fields -- this arm only needs the category.
             HarnessOperatorHostErrorV1::BuildStampMismatch { .. } => "build-stamp-mismatch",
+            // Added when `map_operator_service_error`'s catch-all `_ =>
+            // Conflict` in `gate4agent-harness-service` was replaced with one
+            // typed wire variant per `HarnessServiceError` -- every arm below
+            // mirrors `BuildStampMismatch`'s pattern: a bare tag for a
+            // fieldless variant, a tag plus the fields folded into the status
+            // text for one that carries them.
+            HarnessOperatorHostErrorV1::EngineRefused { .. } => "engine-refused",
+            HarnessOperatorHostErrorV1::InvalidLaunchSelection { .. } => "invalid-launch-selection",
+            HarnessOperatorHostErrorV1::UnsupportedCheckpointVersion { .. } => {
+                "unsupported-checkpoint-version"
+            }
+            HarnessOperatorHostErrorV1::InvalidDispatchContext { .. } => "invalid-dispatch-context",
+            HarnessOperatorHostErrorV1::MutationDigestMismatch => "mutation-digest-mismatch",
+            HarnessOperatorHostErrorV1::DispatchFingerprintUnavailable => {
+                "dispatch-fingerprint-unavailable"
+            }
+            HarnessOperatorHostErrorV1::NonAtomicRunOperation => "non-atomic-run-operation",
+            HarnessOperatorHostErrorV1::AcceptedSpawnProofRequired => "accepted-spawn-proof-required",
+            HarnessOperatorHostErrorV1::InvalidAcceptedSpawnProof { .. } => {
+                "invalid-accepted-spawn-proof"
+            }
+            HarnessOperatorHostErrorV1::DeliveryAuthorityWindowClosed => {
+                "delivery-authority-window-closed"
+            }
+            HarnessOperatorHostErrorV1::DeliveryCompilationInvalid => "delivery-compilation-invalid",
+            HarnessOperatorHostErrorV1::InvalidStagedDeliveryProof { .. } => {
+                "invalid-staged-delivery-proof"
+            }
+            HarnessOperatorHostErrorV1::AtomicDeliveryCommitRequired => {
+                "atomic-delivery-commit-required"
+            }
+            HarnessOperatorHostErrorV1::ContinuationAuthorityWindowClosed => {
+                "continuation-authority-window-closed"
+            }
+            HarnessOperatorHostErrorV1::InvalidContinuationProof { .. } => {
+                "invalid-continuation-proof"
+            }
+            HarnessOperatorHostErrorV1::AtomicContinuationBindRequired => {
+                "atomic-continuation-bind-required"
+            }
+            HarnessOperatorHostErrorV1::InvalidHarnessMcpReservation { .. } => {
+                "invalid-harness-mcp-reservation"
+            }
+            HarnessOperatorHostErrorV1::HarnessMcpGrantActorRefused { .. } => {
+                "harness-mcp-grant-actor-refused"
+            }
+            HarnessOperatorHostErrorV1::HarnessMcpGrantOperationLinkRefused { .. } => {
+                "harness-mcp-grant-operation-link-refused"
+            }
+            HarnessOperatorHostErrorV1::HarnessMcpGrantRevisionRefused { .. } => {
+                "harness-mcp-grant-revision-refused"
+            }
+            HarnessOperatorHostErrorV1::HarnessMcpGrantLinkRefused { .. } => {
+                "harness-mcp-grant-link-refused"
+            }
+            HarnessOperatorHostErrorV1::HarnessMcpGrantTargetRefused { .. } => {
+                "harness-mcp-grant-target-refused"
+            }
+            HarnessOperatorHostErrorV1::HarnessMcpReplayMismatch => "harness-mcp-replay-mismatch",
+            HarnessOperatorHostErrorV1::HarnessMcpProofMismatch => "harness-mcp-proof-mismatch",
+            HarnessOperatorHostErrorV1::HarnessMcpArmProofReservationFieldRefused { .. } => {
+                "harness-mcp-arm-proof-reservation-field-refused"
+            }
+            HarnessOperatorHostErrorV1::HarnessMcpArmProofRouteRefused { .. } => {
+                "harness-mcp-arm-proof-route-refused"
+            }
+            HarnessOperatorHostErrorV1::HarnessMcpArmProofBindingRefused { .. } => {
+                "harness-mcp-arm-proof-binding-refused"
+            }
+            HarnessOperatorHostErrorV1::HarnessMcpArmDurableLookupMissing { .. } => {
+                "harness-mcp-arm-durable-lookup-missing"
+            }
+            HarnessOperatorHostErrorV1::HarnessMcpArmReservationNotReadyRefused { .. } => {
+                "harness-mcp-arm-reservation-not-ready-refused"
+            }
+            HarnessOperatorHostErrorV1::HarnessMcpArmRouteInvalid { .. } => {
+                "harness-mcp-arm-route-invalid"
+            }
+            HarnessOperatorHostErrorV1::HarnessMcpLaunchPolicyRefused { .. } => {
+                "harness-mcp-launch-policy-refused"
+            }
+            HarnessOperatorHostErrorV1::HarnessMcpLaunchReservationNotArmedRefused { .. } => {
+                "harness-mcp-launch-reservation-not-armed-refused"
+            }
+            HarnessOperatorHostErrorV1::HarnessMcpLaunchOperationRefused { .. } => {
+                "harness-mcp-launch-operation-refused"
+            }
+            HarnessOperatorHostErrorV1::HarnessMcpLaunchGrantRefused { .. } => {
+                "harness-mcp-launch-grant-refused"
+            }
+            HarnessOperatorHostErrorV1::HarnessMcpSpecializedTransitionRequired => {
+                "harness-mcp-specialized-transition-required"
+            }
+            HarnessOperatorHostErrorV1::OperatorRequestConflict { .. } => {
+                "operator-request-conflict"
+            }
+            HarnessOperatorHostErrorV1::InvalidOperatorTaskTransition { .. } => {
+                "invalid-operator-task-transition"
+            }
+            HarnessOperatorHostErrorV1::TaskHasActiveRun => "task-has-active-run",
+            HarnessOperatorHostErrorV1::ExecutionSpecRevisionMismatch { .. } => {
+                "execution-spec-revision-mismatch"
+            }
+            HarnessOperatorHostErrorV1::ExecutionSpecLaunchMismatch => {
+                "execution-spec-launch-mismatch"
+            }
+            HarnessOperatorHostErrorV1::IssuedExecutionCasMismatch { .. } => {
+                "issued-execution-cas-mismatch"
+            }
+            HarnessOperatorHostErrorV1::TaskNotReady => "task-not-ready",
+            HarnessOperatorHostErrorV1::SchedulerResourceExhausted => {
+                "scheduler-resource-exhausted"
+            }
+            HarnessOperatorHostErrorV1::SchedulerInvalidGraph { .. } => "scheduler-invalid-graph",
         },
         HarnessOperatorClientError::Api(_) => "validation",
         HarnessOperatorClientError::Deadline => "deadline",

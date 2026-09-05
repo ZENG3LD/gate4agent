@@ -24230,6 +24230,7 @@ mod tests {
             task_revision: task.revision,
             policy_digest: gate4agent_harness_client::HarnessRequestDigest::new("3".repeat(64)).unwrap(),
             plans: vec![plan],
+            next_after: None,
             managed_worktree_profiles: vec![HarnessManagedWorktreeProfileOptionV1 {
                 node_id: HarnessSelectorV1::new("node-a").unwrap(),
                 node_incarnation: HarnessSelectorV1::new("07".repeat(16)).unwrap(),

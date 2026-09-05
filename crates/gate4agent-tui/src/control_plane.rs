@@ -19,7 +19,7 @@
 //! of the connect side.
 //!
 //! **Wire idiom.** One newline-terminated JSON [`ControlEnvelopeV1`] per
-//! TCP connection (`{"version", "credential", "request"}`), the caller
+//! TCP connection (`{"build_stamp", "credential", "request"}`), the caller
 //! then half-closes its write side (EOF is the request boundary, exactly
 //! `gate4agent-harness-api`'s own `HarnessOperatorEnvelopeV1` framing --
 //! see [`read_request`]), and exactly one newline-terminated
@@ -84,6 +84,7 @@ use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use gate4agent_build_stamp::BUILD_STAMP;
 use gate4agent_types::{PtyScreenState, TERMINAL_INPUT_MAX_BYTES};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -101,7 +102,6 @@ const CONTROL_IO_DEADLINE: Duration = Duration::from_secs(3);
 /// caller gets an honest `busy` reply instead of hanging forever behind a
 /// main loop that, for whatever reason, stopped ticking.
 const CONTROL_REPLY_DEADLINE: Duration = Duration::from_secs(3);
-const CONTROL_WIRE_VERSION_V1: u16 = 1;
 const CONTROL_TOKEN_PREFIX: &str = "g4atc_";
 /// Mirrors `HARNESS_OPERATOR_CREDENTIAL_MAX_BYTES` (`gate4agent-harness-
 /// api`): the prefix plus 64 hex bytes is nowhere near this, so the bound
@@ -230,7 +230,7 @@ pub(crate) struct ControlCommand {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ControlEnvelopeV1 {
-    version: u16,
+    build_stamp: String,
     credential: String,
     request: ControlRequestV1,
 }
@@ -419,7 +419,12 @@ enum ControlErrorV1 {
     MalformedRequest,
     RequestTooLarge,
     ResponseTooLarge,
-    UnsupportedVersion,
+    /// The caller's declared `build_stamp` did not match this side's own
+    /// [`BUILD_STAMP`] -- a content hash of the working tree computed at
+    /// compile time (see `gate4agent-build-stamp`). Names both stamps so
+    /// the caller can tell which tree state it built against, rather than
+    /// a bare "unsupported version" that named neither.
+    BuildStampMismatch { expected: String, received: String },
     Unauthorized,
     /// `client::run`'s own loop did not drain this command within
     /// [`CONTROL_REPLY_DEADLINE`].
@@ -688,8 +693,13 @@ fn serve_connection(
             return;
         }
     };
-    if envelope.version != CONTROL_WIRE_VERSION_V1 {
-        write_reply(&mut stream, &ControlReplyV1::Error { error: ControlErrorV1::UnsupportedVersion });
+    if envelope.build_stamp != BUILD_STAMP {
+        write_reply(&mut stream, &ControlReplyV1::Error {
+            error: ControlErrorV1::BuildStampMismatch {
+                expected: BUILD_STAMP.to_owned(),
+                received: envelope.build_stamp,
+            },
+        });
         return;
     }
     if !authority.verify(&envelope.credential) {
@@ -1267,7 +1277,8 @@ mod tests {
         };
         let bound = spawn(endpoint, tx).unwrap();
         let body = format!(
-            r#"{{"version":1,"credential":"g4atc_{}","request":{{"kind":"query_state"}}}}"#,
+            r#"{{"build_stamp":"{}","credential":"g4atc_{}","request":{{"kind":"query_state"}}}}"#,
+            BUILD_STAMP,
             "b".repeat(64),
         );
         let line = round_trip(bound, &body);
@@ -1277,7 +1288,7 @@ mod tests {
     }
 
     #[test]
-    fn wire_rejects_an_unsupported_version() {
+    fn wire_rejects_a_mismatched_build_stamp() {
         let (tx, _rx) = mpsc::channel(CONTROL_COMMAND_QUEUE_TEST);
         let endpoint = ControlPlaneEndpoint {
             bind: "127.0.0.1:0".parse().unwrap(),
@@ -1285,11 +1296,14 @@ mod tests {
         };
         let bound = spawn(endpoint, tx).unwrap();
         let body = format!(
-            r#"{{"version":99,"credential":"g4atc_{}","request":{{"kind":"query_state"}}}}"#,
+            r#"{{"build_stamp":"{}","credential":"g4atc_{}","request":{{"kind":"query_state"}}}}"#,
+            "0".repeat(40),
             "a".repeat(64),
         );
         let line = round_trip(bound, &body);
-        assert!(line.contains("unsupported_version"), "unexpected reply: {line}");
+        assert!(line.contains("build_stamp_mismatch"), "unexpected reply: {line}");
+        assert!(line.contains(BUILD_STAMP), "unexpected reply: {line}");
+        assert!(line.contains(&"0".repeat(40)), "unexpected reply: {line}");
     }
 
     const CONTROL_COMMAND_QUEUE_TEST: usize = 8;
@@ -2081,7 +2095,8 @@ mod tests {
 
         let session = test_session_address();
         let body = format!(
-            r#"{{"version":1,"credential":"g4atc_{}","request":{{"kind":"wait_for_output","session":{{"node_id":"{}","workspace_id":"{}","instance_id":{},"generation":{}}},"after_frame":5,"timeout_ms":4000}}}}"#,
+            r#"{{"build_stamp":"{}","credential":"g4atc_{}","request":{{"kind":"wait_for_output","session":{{"node_id":"{}","workspace_id":"{}","instance_id":{},"generation":{}}},"after_frame":5,"timeout_ms":4000}}}}"#,
+            BUILD_STAMP,
             "a".repeat(64), session.node_id, session.workspace_id, session.instance_id, session.generation,
         );
         let line = round_trip(bound, &body);

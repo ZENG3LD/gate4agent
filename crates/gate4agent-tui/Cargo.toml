@@ -14,6 +14,7 @@ crossterm = "0.28"
 gate4agent-arcade-engine = { path = "../../../gate4agent-arcade/engine", default-features = false, features = ["render"] }
 gate4agent-arcade-pet-bastion = { path = "../../../gate4agent-arcade/games/pet-bastion" }
 gate4agent-arcade-pet-bastion-render = { path = "../../../gate4agent-arcade/games/pet-bastion-render" }
+gate4agent-build-stamp = { path = "../gate4agent-build-stamp" }
 gate4agent-c2-client = { path = "../gate4agent-c2-client" }
 gate4agent-c2-protocol = { path = "../gate4agent-c2-protocol" }
 gate4agent-harness-client = { path = "../gate4agent-harness-client" }

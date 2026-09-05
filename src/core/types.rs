@@ -350,6 +350,33 @@ pub enum HostRequestDecision {
     Deferred,
 }
 
+/// Whether a host request's underlying operation actually ran without an
+/// I/O or execution problem -- orthogonal to [`HostRequestDecision`], which
+/// answers "was this allowed", not "did doing it succeed". Introduced
+/// because an `Err` a method like `terminal/create` or `fs/read_text_file`
+/// returns AFTER the gate/policy already authorized it (a spawn failure, a
+/// missing file) is not a refusal -- collapsing it into `HostRequestDecision
+/// ::Denied` mints a policy block that never happened (see
+/// `acp::host::HostCallOutcome`, where the two are first told apart, and
+/// `acp::reader`'s dispatch loop, which reads this off the SAME call that
+/// decided [`HostRequestDecision::Granted`], never a second one).
+///
+/// Only meaningful paired with `Granted`: a `Denied` or `Deferred` request
+/// never attempted its underlying operation, so it is always `Executed`
+/// here for lack of anything to have failed running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostRequestOutcome {
+    /// No execution problem -- either the request ran cleanly, or (for
+    /// `Denied`/`Deferred`) no execution was ever attempted to fail.
+    Executed,
+    /// The request was authorized but failed while running it. `error` is
+    /// the bounded underlying I/O/execution failure text (e.g. an OS error
+    /// from a spawn call) -- never a policy/gate refusal message, which
+    /// stays on `AgentEvent::RpcIncomingRequest`'s own `reason` field
+    /// instead, exactly as it did before this type existed.
+    Failed { error: String },
+}
+
 /// Unified event type produced by both PTY and pipe transports.
 ///
 /// Consumers subscribe to a `broadcast::Receiver<AgentEvent>` and
@@ -419,20 +446,22 @@ pub enum AgentEvent {
     /// yet. This variant lets subscribers audit what the agent requested
     /// without needing their own handler.
     ///
-    /// `decision` is the host's answer, read off the same
-    /// `Result<Value, RpcError>` the reader loop already computed by calling
-    /// the handler -- `Err(_)` (e.g. `fs/read_text_file`'s or `terminal/
-    /// create`'s `PERMISSION_DENIED` refusal) means `Denied`; `Ok(value)`
-    /// means `Granted`, UNLESS `method` is `session/request_permission`, in
-    /// which case it is recovered by cross-referencing the selected
-    /// `optionId` in `value`'s `outcome` against the original request's
-    /// `options` list (a `Cancelled` outcome, or a `selected` outcome that
-    /// picked a `reject_once`/`reject_always` option, is `Denied` even
-    /// though the RPC call itself succeeded -- ACP models a decline as a
-    /// normal response, not an RPC error). A `session/request_permission`
-    /// call left `Deferred` is broadcast twice under the SAME `id`: once
-    /// here as `Deferred` when it arrives, then again as `Granted`/`Denied`
-    /// once `AcpSession::resolve_pending_request` or `AcpSession::
+    /// `decision` is the host's answer: for `terminal/create`,
+    /// `fs/read_text_file`, `fs/write_text_file`, and the other `terminal/*`
+    /// methods, `acp::host::AcpHostAdapter::dispatch` tells apart a gate/
+    /// policy refusal decided BEFORE any operation ran (`Denied`) from an
+    /// operation that WAS authorized (`Granted`, regardless of whether it
+    /// then succeeded or failed -- see `outcome` below for that). For
+    /// `session/request_permission`, there is no execution step to fail --
+    /// `Granted`/`Denied` is recovered by cross-referencing the selected
+    /// `optionId` in the outcome against the original request's `options`
+    /// list (a `Cancelled` outcome, or a `selected` outcome that picked a
+    /// `reject_once`/`reject_always` option, is `Denied` even though the RPC
+    /// call itself succeeded -- ACP models a decline as a normal response,
+    /// not an RPC error). A `session/request_permission` call left
+    /// `Deferred` is broadcast twice under the SAME `id`: once here as
+    /// `Deferred` when it arrives, then again as `Granted`/`Denied` once
+    /// `AcpSession::resolve_pending_request` or `AcpSession::
     /// expire_deadlines` decides it. This does not change what the host
     /// does -- it only lets a subscriber see the request and the decision
     /// the host already made, or that none exists yet.
@@ -441,19 +470,27 @@ pub enum AgentEvent {
         method: String,
         params: Option<serde_json::Value>,
         decision: HostRequestDecision,
+        /// Whether an authorized (`Granted`) request actually ran cleanly
+        /// or failed doing so -- see [`HostRequestOutcome`]'s own doc
+        /// comment for why this is a separate field from `decision` rather
+        /// than a third flavor of `Denied`. Always `Executed` for `Denied`/
+        /// `Deferred` (nothing ran to fail).
+        outcome: HostRequestOutcome,
         /// The refusal text behind a `Denied` decision, when this build
-        /// actually computed one -- read off the SAME `Result<Value,
-        /// RpcError>` `decision` itself was derived from
-        /// (`acp::reader::request_granted`): `Err(err).message` for every
-        /// method that models a denial as an RPC error (`fs/read_text_file`,
+        /// actually computed one -- for `fs/read_text_file`,
         /// `fs/write_text_file`, `terminal/create`, `terminal/output`,
-        /// `terminal/wait_for_exit`, `terminal/kill`, `terminal/release`),
-        /// or `AcpHostAdapter::permission_refusal_reason` for `session/
-        /// request_permission`, the one method that answers a decline with
-        /// an `Ok` outcome instead (see that method's own doc comment).
-        /// `None` for every `Granted`/`Deferred` decision, and for a
-        /// `Denied` decision no reason text exists for -- never a
-        /// placeholder standing in for a reason nobody computed.
+        /// `terminal/wait_for_exit`, `terminal/kill`, `terminal/release`,
+        /// read off `acp::host::HostCallOutcome::Denied`'s own message
+        /// (the gate's or `HostPolicy`'s refusal text, computed BEFORE any
+        /// operation ran); for `session/request_permission`, read off
+        /// `AcpHostAdapter::permission_refusal_reason` instead, the one
+        /// method that answers a decline with an `Ok` outcome (see that
+        /// method's own doc comment). `None` for every `Granted`/`Deferred`
+        /// decision -- an execution failure on a `Granted` request explains
+        /// itself through `outcome` above, never through this field, so a
+        /// `Denied` decision's refusal text and a `Granted` request's I/O
+        /// failure text can never be confused for one another by a
+        /// consumer that only reads `reason`.
         reason: Option<String>,
     },
 

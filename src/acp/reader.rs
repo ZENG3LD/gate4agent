@@ -4,12 +4,15 @@
 //! stdout lines, classifies each as JSON-RPC request / response / notification,
 //! and dispatches accordingly:
 //!
-//! - **Request** (agent → host): calls `HostHandler::handle_deferrable`. When
-//!   it answers `Immediate`, this writes the response back via
+//! - **Request** (agent → host): calls `AcpHostAdapter::dispatch_deferrable`.
+//!   When it answers `Immediate`, this writes the response back via
 //!   `AcpProcess::write_line` and broadcasts `RpcIncomingRequest` carrying a
 //!   decided [`crate::core::types::HostRequestDecision`] (`Granted`/
-//!   `Denied`), exactly as a plain `HostHandler::handle` call always has.
-//!   When it answers `Deferred` (today, only `session/request_permission` on
+//!   `Denied`) and [`crate::core::types::HostRequestOutcome`] (whether a
+//!   `Granted` call actually ran cleanly or failed doing so -- an execution
+//!   failure on an authorized call is never reported as `Denied`), exactly
+//!   as a plain `HostHandler::handle` call always has for the wire response
+//!   itself. When it answers `Deferred` (today, only `session/request_permission` on
 //!   a session with deferral enabled -- see `AcpSessionOptions::
 //!   defer_permission_requests`), this writes **no** response, broadcasts
 //!   `RpcIncomingRequest` with `HostRequestDecision::Deferred` instead, and
@@ -41,12 +44,11 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tokio::sync::broadcast;
 
-use crate::core::types::{AgentEvent, HostDecisionAuthority, HostRequestDecision};
-use crate::rpc::handler::{HostHandler, HostOutcome};
+use crate::core::types::{AgentEvent, HostDecisionAuthority, HostRequestDecision, HostRequestOutcome};
 use crate::rpc::message::{classify_line, IncomingMessage, RpcError, RpcId, RpcResponse};
 use crate::rpc::pending::PendingRequests;
 
-use super::host::AcpHostAdapter;
+use super::host::{AcpHostAdapter, HostCallOutcome, HostDispatchOutcome};
 use super::protocol::{
     apply_session_update, parse_vendor_notification, update_to_event, PermissionOptionKind,
     PermissionOutcome, PermissionRequestParams, SessionState, SessionUpdateParams,
@@ -148,48 +150,29 @@ pub(crate) fn acp_reader_loop(
                 // not block for long). Do NOT hold `process` mutex during this
                 // call to avoid deadlock with `write_line`.
                 //
-                // `handle_deferrable`'s default implementation is
-                // `Immediate(self.handle(method, params))`, so for every
-                // handler that never overrides it (every one except
-                // `AcpHostAdapter` with deferral enabled) this is exactly
-                // the old direct `handle` call, byte for byte.
-                match handler.handle_deferrable(&method, params.clone()) {
-                    HostOutcome::Immediate(result) => {
-                        let granted = request_granted(&method, params.as_ref(), &result);
+                // `dispatch_deferrable`'s default path for every method
+                // except `session/request_permission` under deferral is
+                // exactly the old direct `handle` call for the wire
+                // response, plus a `HostCallOutcome` computed from the SAME
+                // call -- see `acp::host::AcpHostAdapter::dispatch_deferrable`.
+                match handler.dispatch_deferrable(&method, params.clone()) {
+                    HostDispatchOutcome::Immediate { response: result, outcome: call_outcome } => {
                         let by = handler.decision_authority(&method, params.as_ref());
-                        let decision = if granted {
-                            HostRequestDecision::Granted { by }
-                        } else {
-                            HostRequestDecision::Denied { by }
-                        };
-                        // The refusal text a `Denied` decision has to show
-                        // for -- read BEFORE `result` is moved into
-                        // `response` below. `session/request_permission`
-                        // never carries its reason on `result` at all (ACP
-                        // models a decline as `Ok`, see
-                        // `AcpHostAdapter::permission_refusal_reason`'s own
-                        // doc comment), so it takes the dedicated path;
-                        // every other method's denial IS an `Err`, and
-                        // `err.message` already carries exactly the text
-                        // `acp::host::PolicyHostHandler` computed for it
-                        // (the gate's rule-and-argument sentence, or the
-                        // fixed "denied by host policy" one) -- this stops
-                        // discarding it. `Granted`/`Deferred` never had a
-                        // reason to explain, so this stays `None` for both.
-                        let reason = if granted {
-                            None
-                        } else if method == "session/request_permission" {
-                            handler.permission_refusal_reason(params.as_ref())
-                        } else {
-                            result.as_ref().err().map(|err| err.message.clone())
-                        };
+                        let (decision, host_outcome, reason) = classify_immediate_request(
+                            &handler,
+                            &method,
+                            by,
+                            &result,
+                            call_outcome,
+                            params.as_ref(),
+                        );
 
-                        let response = match result {
+                        let wire_response = match result {
                             Ok(val) => RpcResponse::success(id.clone(), val),
                             Err(err) => RpcResponse::error_response(id.clone(), err),
                         };
 
-                        if let Ok(json) = serde_json::to_string(&response) {
+                        if let Ok(json) = serde_json::to_string(&wire_response) {
                             write_line_to_process(&process, &format!("{}\n", json));
                         }
 
@@ -199,11 +182,12 @@ pub(crate) fn acp_reader_loop(
                             method,
                             params,
                             decision,
+                            outcome: host_outcome,
                             reason,
                         });
                     }
 
-                    HostOutcome::Deferred => {
+                    HostDispatchOutcome::Deferred => {
                         defer_request(
                             &process,
                             &tx,
@@ -320,20 +304,21 @@ pub(crate) fn write_line_to_process(process: &Arc<Mutex<AcpProcess>>, line: &str
 }
 
 /// Record a `session/request_permission` request the handler chose not to
-/// decide yet (`HostOutcome::Deferred`), and tell an observer that a request
-/// arrived without claiming a decision that has not happened.
+/// decide yet (`HostDispatchOutcome::Deferred`), and tell an observer that a
+/// request arrived without claiming a decision that has not happened.
 ///
-/// `handle_deferrable` (`acp/host.rs`) already parsed `params` into
+/// `dispatch_deferrable` (`acp/host.rs`) already parsed `params` into
 /// [`PermissionRequestParams`] once, to run the dangerous-command gate ahead
-/// of the decision to defer -- but per [`HostOutcome`]'s own contract,
-/// `Deferred` carries no payload, so that parsed value does not travel back
-/// here. This function parses `params` again for storage. If that reparse
-/// ever fails, `handle_deferrable`'s own parse must have failed identically
-/// (it is the exact same input, the exact same type), which per its logic
-/// means it would have returned `Immediate(Err(INVALID_PARAMS))`, never
-/// `Deferred` -- so this is a defensive branch, not a path this build's own
-/// handler can reach. It fails safe: answer `Cancelled` immediately rather
-/// than leave the agent waiting on a request nobody actually recorded.
+/// of the decision to defer -- but per [`HostDispatchOutcome`]'s own
+/// contract, `Deferred` carries no payload, so that parsed value does not
+/// travel back here. This function parses `params` again for storage. If
+/// that reparse ever fails, `dispatch_deferrable`'s own parse must have
+/// failed identically (it is the exact same input, the exact same type),
+/// which per its logic means it would have returned
+/// `Immediate { response: Err(INVALID_PARAMS), .. }`, never `Deferred` -- so
+/// this is a defensive branch, not a path this build's own handler can
+/// reach. It fails safe: answer `Cancelled` immediately rather than leave
+/// the agent waiting on a request nobody actually recorded.
 ///
 /// That fail-safe answer is reported as `Denied { by: Policy }`, not a new
 /// authority of its own: it is decided immediately, on this thread, exactly
@@ -367,6 +352,9 @@ fn defer_request(
                 method,
                 params,
                 decision,
+                // Nothing ever ran -- this is decided before any execution
+                // step, same as every other `Denied`.
+                outcome: HostRequestOutcome::Executed,
                 reason: Some(
                     "session/request_permission request could not be re-parsed for deferral"
                         .to_string(),
@@ -391,6 +379,9 @@ fn defer_request(
         method,
         params,
         decision: HostRequestDecision::Deferred,
+        // Nothing has run yet either -- deferral means no decision exists
+        // to authorize an execution step in the first place.
+        outcome: HostRequestOutcome::Executed,
         // Nothing has decided this request yet -- there is no reason to
         // report until a later `RpcIncomingRequest` for the same `id`
         // carries the eventual `Granted`/`Denied`.
@@ -398,30 +389,80 @@ fn defer_request(
     });
 }
 
-/// Read the host's actual decision off the same `Result` the reader loop
-/// already computed by calling `HostHandler::handle` -- see
+/// Classify one `HostDispatchOutcome::Immediate` result into the
+/// `(decision, outcome, reason)` triple `AgentEvent::RpcIncomingRequest`
+/// broadcasts -- the one place that reads `HostCallOutcome::{Denied,
+/// Granted, GrantedButFailed}` off the SAME dispatch that already produced
+/// the wire `result`, so a `terminal/create` (or `fs/read_text_file`,
+/// `fs/write_text_file`, or the other `terminal/*` methods) call that was
+/// AUTHORIZED and then failed EXECUTING (a spawn error, a missing file)
+/// reads back as `Granted` with `HostRequestOutcome::Failed`, never as
+/// `Denied` -- the bug this function exists to close: an `Err` used to mean
+/// "refused" unconditionally, minting a policy/gate block for a call the
+/// gate and `HostPolicy` never even saw.
+///
+/// `session/request_permission` is the one exception: it has no execution
+/// step to fail (selecting or cancelling an offered option is not I/O), so
+/// its `Granted`/`Denied` classification is recovered from the selected
+/// `optionId` via [`request_granted`] exactly as before this function
+/// existed, ignoring `call_outcome` entirely (`dispatch` answers `Granted`
+/// for it unconditionally -- see [`HostCallOutcome`]'s own doc comment,
+/// not a claim about what was actually decided).
+fn classify_immediate_request(
+    handler: &AcpHostAdapter,
+    method: &str,
+    by: HostDecisionAuthority,
+    result: &Result<Value, RpcError>,
+    call_outcome: HostCallOutcome,
+    params: Option<&Value>,
+) -> (HostRequestDecision, HostRequestOutcome, Option<String>) {
+    if method == "session/request_permission" {
+        let granted = request_granted(method, params, result);
+        let decision =
+            if granted { HostRequestDecision::Granted { by } } else { HostRequestDecision::Denied { by } };
+        let reason = if granted { None } else { handler.permission_refusal_reason(params) };
+        return (decision, HostRequestOutcome::Executed, reason);
+    }
+
+    match call_outcome {
+        HostCallOutcome::Denied => {
+            let reason = result.as_ref().err().map(|err| err.message.clone());
+            (HostRequestDecision::Denied { by }, HostRequestOutcome::Executed, reason)
+        }
+        HostCallOutcome::Granted => {
+            (HostRequestDecision::Granted { by }, HostRequestOutcome::Executed, None)
+        }
+        HostCallOutcome::GrantedButFailed { error } => {
+            (HostRequestDecision::Granted { by }, HostRequestOutcome::Failed { error }, None)
+        }
+    }
+}
+
+/// Read a `session/request_permission` call's actual decision off the same
+/// `Result` the reader loop already computed by dispatching it -- see
 /// `AgentEvent::RpcIncomingRequest`'s doc comment for the full rationale.
 /// The caller wraps this bool in a [`HostRequestDecision::Granted`] or
 /// [`HostRequestDecision::Denied`] alongside the `by` authority from
 /// `AcpHostAdapter::decision_authority`.
 ///
-/// For every method except `session/request_permission`, `Err` means
-/// denied and `Ok` means granted (the whole story: `fs/read_text_file` and
-/// `terminal/create` model "no" as an RPC error). `session/request_
-/// permission` is different -- ACP models a decline as a normal `outcome`
-/// response, not an RPC error, and the host may have deliberately selected
-/// a `reject_once`/`reject_always` option rather than declining to answer
-/// at all (`Cancelled`). So for that one method, `granted` is recovered by
-/// looking the chosen `optionId` back up in the ORIGINAL request's
-/// `options` list (still available here as `params`) and reading its
-/// `kind` -- an `outcome` of `selected` alone does not mean granted, since
-/// a `Deny` policy answers by selecting a reject-kind option, not by
-/// erroring.
+/// Only ever called for `session/request_permission` -- every other method
+/// models its refusal as `HostCallOutcome::Denied`/`GrantedButFailed`
+/// instead (`acp::host::AcpHostAdapter::dispatch`), read directly by this
+/// function's one caller without going through here at all. ACP models a
+/// `session/request_permission` decline as a normal `outcome` response, not
+/// an RPC error, and the host may have deliberately selected a
+/// `reject_once`/`reject_always` option rather than declining to answer at
+/// all (`Cancelled`) -- so `granted` is recovered by looking the chosen
+/// `optionId` back up in the ORIGINAL request's `options` list (still
+/// available here as `params`) and reading its `kind`; an `outcome` of
+/// `selected` alone does not mean granted, since a `Deny` policy answers by
+/// selecting a reject-kind option, not by erroring. An `Err` here (e.g. a
+/// params parse failure) is the one case this method still has no
+/// execution-failure concept for -- it stays `false`/not-granted, exactly
+/// as before this change.
 fn request_granted(method: &str, params: Option<&Value>, result: &Result<Value, RpcError>) -> bool {
+    assert_eq!(method, "session/request_permission", "request_granted is only valid for session/request_permission");
     let Ok(outcome) = result else { return false };
-    if method != "session/request_permission" {
-        return true;
-    }
     permission_outcome_is_granted(params, outcome)
 }
 
@@ -526,5 +567,117 @@ mod tests {
         // a combination, not a single word, decides the match.
         let tail = vec!["a value is required here".to_owned()];
         assert_eq!(detect_authentication_required(&tail), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // classify_immediate_request -- Denied (gate/policy) vs Granted-then-
+    // Failed (an authorized call that failed EXECUTING). The measured bug
+    // this whole change fixes: an ACP `terminal/create` I/O error (a spawn
+    // failure) used to read back as `Denied { by: Gate | Policy }`, minting
+    // a policy block that never happened.
+    // -----------------------------------------------------------------------
+
+    use crate::acp::gate::DangerousCommandGate;
+    use crate::acp::host::{HostPolicy, PermissionDeferral, PolicyHostHandler};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    fn test_adapter(policy: HostPolicy, gate: DangerousCommandGate) -> AcpHostAdapter {
+        AcpHostAdapter::new(
+            Arc::new(PolicyHostHandler::new(policy, std::env::temp_dir(), gate)),
+            PermissionDeferral::Disabled,
+        )
+    }
+
+    /// Dispatches `method`/`params` through the exact same path
+    /// `acp_reader_loop` uses (`dispatch_deferrable` then
+    /// `classify_immediate_request`), for methods that never defer.
+    fn classify(
+        handler: &AcpHostAdapter,
+        method: &str,
+        params: Value,
+    ) -> (HostRequestDecision, HostRequestOutcome, Option<String>) {
+        let (result, call_outcome) = match handler.dispatch_deferrable(method, Some(params.clone())) {
+            HostDispatchOutcome::Immediate { response, outcome } => (response, outcome),
+            HostDispatchOutcome::Deferred => panic!("{method} is not expected to defer in this test"),
+        };
+        let by = handler.decision_authority(method, Some(&params));
+        classify_immediate_request(handler, method, by, &result, call_outcome, Some(&params))
+    }
+
+    /// A `terminal/create` call the gate/policy AUTHORIZED, but whose
+    /// `Command::spawn` then failed (the command does not exist) -- must be
+    /// `Granted`, with the OS-level failure text on `outcome`, never on
+    /// `reason` and never as `Denied`.
+    #[test]
+    fn terminal_create_spawn_failure_is_granted_and_failed_never_denied() {
+        let handler = test_adapter(HostPolicy::Auto, DangerousCommandGate::Enforced);
+        let params = json!({
+            "command": "g4a-gate-probe-nonexistent-command-zzz",
+            "args": [],
+        });
+
+        let (decision, outcome, reason) = classify(&handler, "terminal/create", params);
+
+        assert_eq!(decision, HostRequestDecision::Granted { by: HostDecisionAuthority::Policy });
+        match outcome {
+            HostRequestOutcome::Failed { error } => {
+                assert!(!error.is_empty(), "failure text must not be empty");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert_eq!(reason, None, "a Granted decision must never carry a reason");
+    }
+
+    /// The dangerous-command gate stands above `HostPolicy` -- a gate-
+    /// blocked `terminal/create` is decided BEFORE anything executes, so it
+    /// stays `Denied { by: Gate }`, carrying the gate's own rule-and-
+    /// argument text on `reason` -- and that text is never an I/O error,
+    /// because nothing ever ran to produce one.
+    #[test]
+    fn terminal_create_gate_block_is_denied_with_the_gate_text() {
+        let handler = test_adapter(HostPolicy::Yolo, DangerousCommandGate::Enforced);
+        let params = json!({"command": "rm", "args": ["-rf", "/"]});
+
+        let (decision, outcome, reason) = classify(&handler, "terminal/create", params);
+
+        assert_eq!(decision, HostRequestDecision::Denied { by: HostDecisionAuthority::Gate });
+        assert_eq!(outcome, HostRequestOutcome::Executed, "a Denied request never executed anything");
+        let reason = reason.expect("a gate block must carry its refusal text");
+        assert!(reason.contains("dangerous-command gate"), "reason was: {reason}");
+        assert!(reason.contains("filesystem-wipe"), "reason was: {reason}");
+        assert!(!reason.to_lowercase().contains("os error"), "reason was: {reason}");
+    }
+
+    /// A `terminal/create` call `HostPolicy` refused outright (no gate
+    /// involved) -- `Denied { by: Policy }`, same non-I/O refusal text as
+    /// today, never `Failed`.
+    #[test]
+    fn terminal_create_policy_denial_is_denied_never_failed() {
+        let handler = test_adapter(HostPolicy::ReadOnly, DangerousCommandGate::Enforced);
+        let params = json!({"command": "echo", "args": ["hello"]});
+
+        let (decision, outcome, reason) = classify(&handler, "terminal/create", params);
+
+        assert_eq!(decision, HostRequestDecision::Denied { by: HostDecisionAuthority::Policy });
+        assert_eq!(outcome, HostRequestOutcome::Executed);
+        assert_eq!(reason, Some("terminal/create denied by host policy".to_owned()));
+    }
+
+    /// A `terminal/create` call that is fully authorized and actually runs
+    /// -- `Granted`, `Executed`, no reason. The ordinary, unremarkable case.
+    #[test]
+    fn terminal_create_success_is_granted_and_executed() {
+        let handler = test_adapter(HostPolicy::Auto, DangerousCommandGate::Enforced);
+        #[cfg(windows)]
+        let params = json!({"command": "cmd", "args": ["/C", "echo hi"]});
+        #[cfg(not(windows))]
+        let params = json!({"command": "sh", "args": ["-c", "echo hi"]});
+
+        let (decision, outcome, reason) = classify(&handler, "terminal/create", params);
+
+        assert_eq!(decision, HostRequestDecision::Granted { by: HostDecisionAuthority::Policy });
+        assert_eq!(outcome, HostRequestOutcome::Executed);
+        assert_eq!(reason, None);
     }
 }

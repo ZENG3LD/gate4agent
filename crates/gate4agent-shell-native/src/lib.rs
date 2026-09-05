@@ -3019,6 +3019,10 @@ fn provider_event(event: AgentEvent, available_modes: &[SessionMode]) -> Option<
             // decided this request yet (see `AgentEvent::
             // RpcIncomingRequest`'s own doc comment).
             reason: _,
+            // Nothing has run yet either -- always `Executed` for a
+            // `Deferred` sighting (see `HostRequestOutcome`'s own doc
+            // comment).
+            outcome: _,
         } if method == "session/request_permission"
             && matches!(decision, HostRequestDecision::Deferred) =>
         {
@@ -3082,6 +3086,22 @@ fn provider_event(event: AgentEvent, available_modes: &[SessionMode]) -> Option<
             params,
             decision,
             reason,
+            // `outcome` distinguishes a `Granted` request that ran cleanly
+            // from one that was authorized and then failed WHILE
+            // EXECUTING (`HostRequestOutcome::Failed` -- e.g. a
+            // `terminal/create` spawn error; see that type's own doc
+            // comment). `gate4agent_types::ProviderEvent::
+            // HostRequestObserved` has no field for it yet -- it mirrors
+            // `gate4agent`'s own `AgentEvent::RpcIncomingRequest` one field
+            // at a time, and this one has not been added there (follow-up:
+            // `gate4agent-types`/`gate4agent-node` need their own
+            // `HostRequestOutcome` mirror plus an `outcome` field on
+            // `HostRequestObserved`). Until that lands, an execution
+            // failure still reaches the operator as an undifferentiated
+            // `Granted` -- not `Denied`, so a block is never claimed where
+            // none happened; just not yet the distinct "tool/host failure"
+            // observation it deserves.
+            outcome: _,
         } => Some(ProviderEvent::HostRequestObserved {
             method,
             params_json: params.map(|value| value.to_string()).unwrap_or_default(),
@@ -4776,7 +4796,7 @@ mod tests {
     use gate4agent::agent::ForegroundObservation;
     use gate4agent::core::types::{
         AgentEvent, ContextWindowUsage as AgentContextWindowUsage, HostDecisionAuthority,
-        HostRequestDecision, RateLimitType,
+        HostRequestDecision, HostRequestOutcome, RateLimitType,
     };
     use gate4agent::pty::event::PtyMouseProtocolEncoding;
     use gate4agent::pty::{PtyForegroundObservation, PtyForegroundSource, RateLimitDetector};
@@ -4913,6 +4933,7 @@ mod tests {
                 method: "fs/read_text_file".to_owned(),
                 params: None,
                 decision: HostRequestDecision::Denied { by: HostDecisionAuthority::Policy },
+                outcome: HostRequestOutcome::Executed,
                 reason: None,
             },
             &[],
@@ -4935,6 +4956,7 @@ mod tests {
                 method: "terminal/create".to_owned(),
                 params: None,
                 decision: HostRequestDecision::Granted { by: HostDecisionAuthority::Policy },
+                outcome: HostRequestOutcome::Executed,
                 reason: None,
             },
             &[],
@@ -4960,6 +4982,7 @@ mod tests {
                 method: "terminal/create".to_owned(),
                 params: None,
                 decision: HostRequestDecision::Denied { by: HostDecisionAuthority::Gate },
+                outcome: HostRequestOutcome::Executed,
                 reason: None,
             },
             &[],
@@ -4982,6 +5005,7 @@ mod tests {
                 method: "session/request_permission".to_owned(),
                 params: None,
                 decision: HostRequestDecision::Granted { by: HostDecisionAuthority::Operator },
+                outcome: HostRequestOutcome::Executed,
                 reason: None,
             },
             &[],
@@ -5004,6 +5028,7 @@ mod tests {
                 method: "session/request_permission".to_owned(),
                 params: None,
                 decision: HostRequestDecision::Denied { by: HostDecisionAuthority::DeadlinePolicy },
+                outcome: HostRequestOutcome::Executed,
                 reason: None,
             },
             &[],
@@ -5043,6 +5068,7 @@ mod tests {
                 method: "terminal/create".to_owned(),
                 params: None,
                 decision: HostRequestDecision::Denied { by: HostDecisionAuthority::Gate },
+                outcome: HostRequestOutcome::Executed,
                 reason: Some(gate_text.to_owned()),
             },
             &[],
@@ -5081,6 +5107,7 @@ mod tests {
                     ],
                 })),
                 decision: HostRequestDecision::Deferred,
+                outcome: HostRequestOutcome::Executed,
                 reason: None,
             },
             &[],
@@ -5128,6 +5155,7 @@ mod tests {
                 method: "session/request_permission".to_owned(),
                 params: None,
                 decision: HostRequestDecision::Deferred,
+                outcome: HostRequestOutcome::Executed,
                 reason: None,
             },
             &[],
@@ -5154,6 +5182,7 @@ mod tests {
                 method: "session/request_permission".to_owned(),
                 params: None,
                 decision: HostRequestDecision::Denied { by: HostDecisionAuthority::Operator },
+                outcome: HostRequestOutcome::Executed,
                 reason: None,
             },
             &[],

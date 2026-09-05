@@ -29,6 +29,46 @@ use super::protocol::{
 use super::terminal::TerminalStore;
 
 // ---------------------------------------------------------------------------
+// HostRequestError — Denied vs Failed
+// ---------------------------------------------------------------------------
+
+/// One [`AcpHostHandler`] method's refusal, distinguishing a decision made
+/// BEFORE any operation ran (`Denied` -- the dangerous-command gate or
+/// `HostPolicy` refused it outright) from a failure encountered WHILE
+/// running an operation that gate/policy had already authorized (`Failed`
+/// -- a spawn error, a missing file, any I/O problem). Collapsing the two
+/// into a single `Err(String)` is exactly the bug this type exists to rule
+/// out: an execution failure on an ALLOWED `terminal/create` call used to
+/// read back as `HostRequestDecision::Denied`, minting a policy block that
+/// never happened (see `HostCallOutcome`, where a `Result<T,
+/// HostRequestError>` becomes the audit-facing classification, and
+/// `crate::core::types::HostRequestOutcome`, what `Failed` maps onto there).
+///
+/// [`AcpHostAdapter::handle`]'s JSON-RPC mapping reads only
+/// [`message`](Self::message) from either variant -- the wire `RpcError` an
+/// agent sees is byte-for-byte unchanged by this type existing; it exists
+/// so the reader loop's audit trail can read the honest classification off
+/// the SAME call, instead of guessing it back out of the refusal prose.
+#[derive(Debug, Clone)]
+pub(crate) enum HostRequestError {
+    /// The gate or `HostPolicy` refused this call before anything executed.
+    Denied(String),
+    /// The call was authorized, but failed while executing it.
+    Failed(String),
+}
+
+impl HostRequestError {
+    /// The refusal/failure text, whichever variant this is -- what
+    /// [`AcpHostAdapter::handle`] puts on the wire `RpcError`, unchanged
+    /// either way.
+    pub(crate) fn message(&self) -> &str {
+        match self {
+            HostRequestError::Denied(m) | HostRequestError::Failed(m) => m,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // AcpHostHandler — typed trait
 // ---------------------------------------------------------------------------
 
@@ -41,46 +81,55 @@ use super::terminal::TerminalStore;
 /// the reader loop's blocking thread.
 pub(crate) trait AcpHostHandler: Send + Sync {
     /// Agent wants to read a file from the host filesystem.
-    fn fs_read_text_file(&self, params: &FsReadParams) -> Result<String, String> {
-        Err(format!("fs/read_text_file not supported: {}", params.path))
+    fn fs_read_text_file(&self, params: &FsReadParams) -> Result<String, HostRequestError> {
+        Err(HostRequestError::Denied(format!(
+            "fs/read_text_file not supported: {}",
+            params.path
+        )))
     }
 
     /// Agent wants to write (fully replace) a file on the host filesystem.
-    fn fs_write_text_file(&self, params: &FsWriteParams) -> Result<(), String> {
-        Err(format!("fs/write_text_file not supported: {}", params.path))
+    fn fs_write_text_file(&self, params: &FsWriteParams) -> Result<(), HostRequestError> {
+        Err(HostRequestError::Denied(format!(
+            "fs/write_text_file not supported: {}",
+            params.path
+        )))
     }
 
     /// Agent wants to run a command on the host and get a terminal id back.
-    fn terminal_create(&self, params: &TerminalCreateParams) -> Result<String, String> {
+    fn terminal_create(&self, params: &TerminalCreateParams) -> Result<String, HostRequestError> {
         let _ = params;
-        Err("terminal/create not supported".to_string())
+        Err(HostRequestError::Denied("terminal/create not supported".to_string()))
     }
 
     /// Agent wants the accumulated output of a terminal it created earlier.
-    fn terminal_output(&self, params: &TerminalIdParams) -> Result<TerminalOutputResult, String> {
+    fn terminal_output(
+        &self,
+        params: &TerminalIdParams,
+    ) -> Result<TerminalOutputResult, HostRequestError> {
         let _ = params;
-        Err("terminal/output not supported".to_string())
+        Err(HostRequestError::Denied("terminal/output not supported".to_string()))
     }
 
     /// Agent wants to block until a terminal's command exits.
     fn terminal_wait_for_exit(
         &self,
         params: &TerminalIdParams,
-    ) -> Result<TerminalExitStatus, String> {
+    ) -> Result<TerminalExitStatus, HostRequestError> {
         let _ = params;
-        Err("terminal/wait_for_exit not supported".to_string())
+        Err(HostRequestError::Denied("terminal/wait_for_exit not supported".to_string()))
     }
 
     /// Agent wants to kill a terminal's command without releasing the id.
-    fn terminal_kill(&self, params: &TerminalIdParams) -> Result<(), String> {
+    fn terminal_kill(&self, params: &TerminalIdParams) -> Result<(), HostRequestError> {
         let _ = params;
-        Err("terminal/kill not supported".to_string())
+        Err(HostRequestError::Denied("terminal/kill not supported".to_string()))
     }
 
     /// Agent is done with a terminal — kill it if still running and forget it.
-    fn terminal_release(&self, params: &TerminalIdParams) -> Result<(), String> {
+    fn terminal_release(&self, params: &TerminalIdParams) -> Result<(), HostRequestError> {
         let _ = params;
-        Err("terminal/release not supported".to_string())
+        Err(HostRequestError::Denied("terminal/release not supported".to_string()))
     }
 
     /// Agent is requesting permission to perform a tool call.
@@ -362,22 +411,33 @@ fn windowed_read(content: &str, line: Option<u32>, limit: Option<u32>) -> String
 }
 
 impl AcpHostHandler for PolicyHostHandler {
-    fn fs_read_text_file(&self, params: &FsReadParams) -> Result<String, String> {
+    fn fs_read_text_file(&self, params: &FsReadParams) -> Result<String, HostRequestError> {
         if !self.policy.allows_read() {
-            return Err(format!("fs/read_text_file denied by host policy: {}", params.path));
+            return Err(HostRequestError::Denied(format!(
+                "fs/read_text_file denied by host policy: {}",
+                params.path
+            )));
         }
-        let content = std::fs::read_to_string(&params.path).map_err(|e| e.to_string())?;
+        // Authorized -- anything past this point is an I/O problem, not a
+        // refusal: the file may not exist, be unreadable, or not be valid
+        // UTF-8. `Failed`, never `Denied`.
+        let content = std::fs::read_to_string(&params.path)
+            .map_err(|e| HostRequestError::Failed(e.to_string()))?;
         Ok(windowed_read(&content, params.line, params.limit))
     }
 
-    fn fs_write_text_file(&self, params: &FsWriteParams) -> Result<(), String> {
+    fn fs_write_text_file(&self, params: &FsWriteParams) -> Result<(), HostRequestError> {
         if !self.policy.allows_mutation() {
-            return Err(format!("fs/write_text_file denied by host policy: {}", params.path));
+            return Err(HostRequestError::Denied(format!(
+                "fs/write_text_file denied by host policy: {}",
+                params.path
+            )));
         }
-        std::fs::write(&params.path, &params.content).map_err(|e| e.to_string())
+        std::fs::write(&params.path, &params.content)
+            .map_err(|e| HostRequestError::Failed(e.to_string()))
     }
 
-    fn terminal_create(&self, params: &TerminalCreateParams) -> Result<String, String> {
+    fn terminal_create(&self, params: &TerminalCreateParams) -> Result<String, HostRequestError> {
         // The dangerous-command gate runs before `policy` gets a say, and
         // is not skipped by any `HostPolicy` value including `Yolo` -- see
         // `DangerousCommandGate`'s doc comment for why this is a second,
@@ -390,31 +450,44 @@ impl AcpHostHandler for PolicyHostHandler {
             // for `Allow`/`Uncertain`, neither of which `is_blocked()`
             // reports as blocked.
             let refusal = verdict.refusal_message().unwrap_or_default();
-            return Err(format!("terminal/create {refusal}"));
+            return Err(HostRequestError::Denied(format!("terminal/create {refusal}")));
         }
         if !self.policy.allows_mutation() {
-            return Err("terminal/create denied by host policy".to_string());
+            return Err(HostRequestError::Denied("terminal/create denied by host policy".to_string()));
         }
-        self.terminals.create(&self.working_dir, params)
+        // Authorized -- `TerminalStore::create`'s own `Err` is always a
+        // spawn/I/O problem from here (empty-command validation, the
+        // `Command::spawn` call itself, a missing stdout/stderr pipe, a
+        // poisoned terminal-table mutex), never a second refusal: this is
+        // the exact call whose OS-level spawn failure used to be reported
+        // as `Denied { by: Gate | Policy }` (a block that never happened)
+        // instead of an authorized call that failed running. `Failed`.
+        self.terminals.create(&self.working_dir, params).map_err(HostRequestError::Failed)
     }
 
-    fn terminal_output(&self, params: &TerminalIdParams) -> Result<TerminalOutputResult, String> {
-        self.terminals.output(&params.terminal_id)
+    fn terminal_output(
+        &self,
+        params: &TerminalIdParams,
+    ) -> Result<TerminalOutputResult, HostRequestError> {
+        // No gate/policy check precedes this call -- every error path here
+        // (unknown terminal id, a poisoned mutex) is an execution problem,
+        // never a refusal decided ahead of time.
+        self.terminals.output(&params.terminal_id).map_err(HostRequestError::Failed)
     }
 
     fn terminal_wait_for_exit(
         &self,
         params: &TerminalIdParams,
-    ) -> Result<TerminalExitStatus, String> {
-        self.terminals.wait_for_exit(&params.terminal_id)
+    ) -> Result<TerminalExitStatus, HostRequestError> {
+        self.terminals.wait_for_exit(&params.terminal_id).map_err(HostRequestError::Failed)
     }
 
-    fn terminal_kill(&self, params: &TerminalIdParams) -> Result<(), String> {
-        self.terminals.kill(&params.terminal_id)
+    fn terminal_kill(&self, params: &TerminalIdParams) -> Result<(), HostRequestError> {
+        self.terminals.kill(&params.terminal_id).map_err(HostRequestError::Failed)
     }
 
-    fn terminal_release(&self, params: &TerminalIdParams) -> Result<(), String> {
-        self.terminals.release(&params.terminal_id)
+    fn terminal_release(&self, params: &TerminalIdParams) -> Result<(), HostRequestError> {
+        self.terminals.release(&params.terminal_id).map_err(HostRequestError::Failed)
     }
 
     fn request_permission(&self, params: &PermissionRequestParams) -> PermissionOutcome {
@@ -557,105 +630,220 @@ impl AcpHostAdapter {
     }
 }
 
-impl HostHandler for AcpHostAdapter {
-    fn handle(&self, method: &str, params: Option<Value>) -> Result<Value, RpcError> {
+// ---------------------------------------------------------------------------
+// HostCallOutcome / dispatch — the single place Denied vs Granted(-but-
+// Failed) is decided, for every method whose refusal is modeled as an `Err`
+// ---------------------------------------------------------------------------
+
+/// How one dispatched call classifies, for the reader loop's audit trail
+/// (`crate::core::types::AgentEvent::RpcIncomingRequest`) -- computed
+/// together with the wire response in [`AcpHostAdapter::dispatch`] so the
+/// two can never disagree about the SAME call.
+///
+/// Not meaningful for `session/request_permission`: that method has no
+/// execution step to fail (selecting or cancelling an offered option is not
+/// I/O), so its `Granted`/`Denied` classification is recovered entirely
+/// from the `PermissionOutcome` it returns, by `acp::reader::
+/// request_granted` -- unchanged by this type's existence. `dispatch`
+/// answers `Granted` for it unconditionally; callers must not read that as
+/// a claim about what was actually decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HostCallOutcome {
+    /// The gate or `HostPolicy` refused this call before anything executed.
+    Denied,
+    /// The call was authorized and ran without error.
+    Granted,
+    /// The call was authorized but failed while running it. `error` is the
+    /// same bounded text the wire `RpcError.message` already carries for
+    /// this call.
+    GrantedButFailed { error: String },
+}
+
+/// The wire response `handle` would have returned for this call, paired
+/// with its [`HostCallOutcome`] -- both computed from the SAME single
+/// dispatch, never from two separate calls (a `terminal/create` call must
+/// spawn its command exactly once).
+pub(crate) struct HostCallResult {
+    pub(crate) response: Result<Value, RpcError>,
+    pub(crate) outcome: HostCallOutcome,
+}
+
+/// Build a [`HostCallResult`] from one [`AcpHostHandler`] method's `Err`,
+/// reading the wire `code` this method has always used (`PERMISSION_DENIED`
+/// for `fs/*` and `terminal/create`, `NOT_FOUND` for the other `terminal/*`
+/// methods) and classifying `Denied`/`GrantedButFailed` off the SAME
+/// [`HostRequestError`] variant the message came from.
+fn host_call_result_from_error(code: i32, err: HostRequestError) -> HostCallResult {
+    let message = err.message().to_string();
+    let outcome = match err {
+        HostRequestError::Denied(_) => HostCallOutcome::Denied,
+        HostRequestError::Failed(_) => HostCallOutcome::GrantedButFailed { error: message.clone() },
+    };
+    HostCallResult { response: Err(RpcError { code, message, data: None }), outcome }
+}
+
+/// Outcome of [`AcpHostAdapter::dispatch_deferrable`] -- the
+/// `HostCallOutcome`-carrying counterpart to [`HostOutcome`] the reader
+/// loop calls directly on the concrete `AcpHostAdapter` (not through the
+/// `HostHandler` trait), because `HostOutcome::Immediate` has no room for
+/// the outcome classification `Denied`/`Granted`/`GrantedButFailed` reads
+/// need.
+pub(crate) enum HostDispatchOutcome {
+    /// Decided now. `response` is byte-for-byte what
+    /// [`HostHandler::handle`] would have returned for the same call.
+    Immediate { response: Result<Value, RpcError>, outcome: HostCallOutcome },
+    /// See [`HostOutcome::Deferred`] -- identical meaning.
+    Deferred,
+}
+
+impl AcpHostAdapter {
+    /// Dispatches one agent → host request, computing the wire response and
+    /// its [`HostCallOutcome`] together from a single call to the wrapped
+    /// [`AcpHostHandler`] method -- the one place both
+    /// [`HostHandler::handle`] and [`Self::dispatch_deferrable`] (and, through
+    /// it, the reader loop's audit trail) read from, so a `terminal/create`
+    /// spawn or an `fs/write_text_file` write happens exactly once no matter
+    /// which of those two callers is asking.
+    fn dispatch(&self, method: &str, params: Option<Value>) -> HostCallResult {
         match method {
             "fs/read_text_file" => {
-                let p: FsReadParams = parse_params(params)?;
-                self.inner
-                    .fs_read_text_file(&p)
-                    .map(|content| json!({ "content": content }))
-                    .map_err(|msg| RpcError {
-                        code: RpcError::PERMISSION_DENIED,
-                        message: msg,
-                        data: None,
-                    })
+                let p: FsReadParams = match parse_params(params) {
+                    Ok(p) => p,
+                    Err(e) => return HostCallResult { response: Err(e), outcome: HostCallOutcome::Denied },
+                };
+                match self.inner.fs_read_text_file(&p) {
+                    Ok(content) => HostCallResult {
+                        response: Ok(json!({ "content": content })),
+                        outcome: HostCallOutcome::Granted,
+                    },
+                    Err(err) => host_call_result_from_error(RpcError::PERMISSION_DENIED, err),
+                }
             }
 
             "fs/write_text_file" => {
-                let p: FsWriteParams = parse_params(params)?;
-                self.inner
-                    .fs_write_text_file(&p)
-                    .map(|()| json!({}))
-                    .map_err(|msg| RpcError {
-                        code: RpcError::PERMISSION_DENIED,
-                        message: msg,
-                        data: None,
-                    })
+                let p: FsWriteParams = match parse_params(params) {
+                    Ok(p) => p,
+                    Err(e) => return HostCallResult { response: Err(e), outcome: HostCallOutcome::Denied },
+                };
+                match self.inner.fs_write_text_file(&p) {
+                    Ok(()) => {
+                        HostCallResult { response: Ok(json!({})), outcome: HostCallOutcome::Granted }
+                    }
+                    Err(err) => host_call_result_from_error(RpcError::PERMISSION_DENIED, err),
+                }
             }
 
             "terminal/create" => {
-                let p: TerminalCreateParams = parse_params(params)?;
-                self.inner
-                    .terminal_create(&p)
-                    .map(|terminal_id| json!({ "terminalId": terminal_id }))
-                    .map_err(|msg| RpcError {
-                        code: RpcError::PERMISSION_DENIED,
-                        message: msg,
-                        data: None,
-                    })
+                let p: TerminalCreateParams = match parse_params(params) {
+                    Ok(p) => p,
+                    Err(e) => return HostCallResult { response: Err(e), outcome: HostCallOutcome::Denied },
+                };
+                match self.inner.terminal_create(&p) {
+                    Ok(terminal_id) => HostCallResult {
+                        response: Ok(json!({ "terminalId": terminal_id })),
+                        outcome: HostCallOutcome::Granted,
+                    },
+                    Err(err) => host_call_result_from_error(RpcError::PERMISSION_DENIED, err),
+                }
             }
 
             "terminal/output" => {
-                let p: TerminalIdParams = parse_params(params)?;
-                self.inner
-                    .terminal_output(&p)
-                    .map(|result| serde_json::to_value(result).unwrap_or(Value::Null))
-                    .map_err(|msg| RpcError { code: RpcError::NOT_FOUND, message: msg, data: None })
+                let p: TerminalIdParams = match parse_params(params) {
+                    Ok(p) => p,
+                    Err(e) => return HostCallResult { response: Err(e), outcome: HostCallOutcome::Denied },
+                };
+                match self.inner.terminal_output(&p) {
+                    Ok(result) => HostCallResult {
+                        response: Ok(serde_json::to_value(result).unwrap_or(Value::Null)),
+                        outcome: HostCallOutcome::Granted,
+                    },
+                    Err(err) => host_call_result_from_error(RpcError::NOT_FOUND, err),
+                }
             }
 
             "terminal/wait_for_exit" => {
-                let p: TerminalIdParams = parse_params(params)?;
-                self.inner
-                    .terminal_wait_for_exit(&p)
-                    .map(|result| serde_json::to_value(result).unwrap_or(Value::Null))
-                    .map_err(|msg| RpcError { code: RpcError::NOT_FOUND, message: msg, data: None })
+                let p: TerminalIdParams = match parse_params(params) {
+                    Ok(p) => p,
+                    Err(e) => return HostCallResult { response: Err(e), outcome: HostCallOutcome::Denied },
+                };
+                match self.inner.terminal_wait_for_exit(&p) {
+                    Ok(result) => HostCallResult {
+                        response: Ok(serde_json::to_value(result).unwrap_or(Value::Null)),
+                        outcome: HostCallOutcome::Granted,
+                    },
+                    Err(err) => host_call_result_from_error(RpcError::NOT_FOUND, err),
+                }
             }
 
             "terminal/kill" => {
-                let p: TerminalIdParams = parse_params(params)?;
-                self.inner
-                    .terminal_kill(&p)
-                    .map(|()| json!({}))
-                    .map_err(|msg| RpcError { code: RpcError::NOT_FOUND, message: msg, data: None })
+                let p: TerminalIdParams = match parse_params(params) {
+                    Ok(p) => p,
+                    Err(e) => return HostCallResult { response: Err(e), outcome: HostCallOutcome::Denied },
+                };
+                match self.inner.terminal_kill(&p) {
+                    Ok(()) => {
+                        HostCallResult { response: Ok(json!({})), outcome: HostCallOutcome::Granted }
+                    }
+                    Err(err) => host_call_result_from_error(RpcError::NOT_FOUND, err),
+                }
             }
 
             "terminal/release" => {
-                let p: TerminalIdParams = parse_params(params)?;
-                self.inner
-                    .terminal_release(&p)
-                    .map(|()| json!({}))
-                    .map_err(|msg| RpcError { code: RpcError::NOT_FOUND, message: msg, data: None })
+                let p: TerminalIdParams = match parse_params(params) {
+                    Ok(p) => p,
+                    Err(e) => return HostCallResult { response: Err(e), outcome: HostCallOutcome::Denied },
+                };
+                match self.inner.terminal_release(&p) {
+                    Ok(()) => {
+                        HostCallResult { response: Ok(json!({})), outcome: HostCallOutcome::Granted }
+                    }
+                    Err(err) => host_call_result_from_error(RpcError::NOT_FOUND, err),
+                }
             }
 
             "session/request_permission" => {
-                let p: PermissionRequestParams = parse_params(params)?;
+                let p: PermissionRequestParams = match parse_params(params) {
+                    Ok(p) => p,
+                    Err(e) => return HostCallResult { response: Err(e), outcome: HostCallOutcome::Denied },
+                };
                 let outcome = self.inner.request_permission(&p);
-                Ok(serde_json::to_value(outcome).unwrap_or(Value::Null))
+                HostCallResult {
+                    response: Ok(serde_json::to_value(outcome).unwrap_or(Value::Null)),
+                    // See `HostCallOutcome`'s own doc comment -- never read
+                    // by the reader loop for this method.
+                    outcome: HostCallOutcome::Granted,
+                }
             }
 
-            other => Err(RpcError::method_not_found(other)),
+            other => HostCallResult {
+                response: Err(RpcError::method_not_found(other)),
+                outcome: HostCallOutcome::Denied,
+            },
         }
     }
 
-    /// Only `session/request_permission`, and only when this session's
-    /// [`PermissionDeferral`] is `Enabled`, can return
-    /// [`HostOutcome::Deferred`] -- every other method, and every session
-    /// with deferral `Disabled`, is `Immediate(self.handle(method, params))`
-    /// with today's behavior, byte for byte.
+    /// [`Self::dispatch`], but returning [`HostDispatchOutcome`] instead of
+    /// a bare wire response, and able to answer `Deferred` for
+    /// `session/request_permission` exactly as [`HostHandler::
+    /// handle_deferrable`] does -- indeed `handle_deferrable` is now a thin
+    /// wrapper around this. The reader loop (`acp::reader`) calls this
+    /// directly on the concrete `AcpHostAdapter`, not through the
+    /// `HostHandler` trait, because it needs the `HostCallOutcome`
+    /// `HostOutcome::Immediate` has no field for.
     ///
-    /// A gate block is decided immediately even under `Enabled`: the
-    /// dangerous-command gate outranks the operator (see
+    /// A gate block is decided immediately even when deferral is `Enabled`:
+    /// the dangerous-command gate outranks the operator (see
     /// `AcpHostHandler::permission_blocked_by_gate`'s doc comment), so
     /// nobody is ever asked to approve what the gate has already refused.
-    fn handle_deferrable(&self, method: &str, params: Option<Value>) -> HostOutcome {
+    pub(crate) fn dispatch_deferrable(&self, method: &str, params: Option<Value>) -> HostDispatchOutcome {
         if method != "session/request_permission" || self.deferral == PermissionDeferral::Disabled {
-            return HostOutcome::Immediate(self.handle(method, params));
+            let result = self.dispatch(method, params);
+            return HostDispatchOutcome::Immediate { response: result.response, outcome: result.outcome };
         }
 
         // Parse once, here, purely to run the gate check ahead of the
         // deferral decision. A params blob that fails to parse takes the
-        // immediate path too -- `handle`'s own `session/request_permission`
+        // immediate path too -- `dispatch`'s own `session/request_permission`
         // arm parses `params` again independently and reports the exact
         // same `INVALID_PARAMS` either way, so a parse failure is never
         // silently swallowed into a `Deferred` that can never be answered.
@@ -663,14 +851,38 @@ impl HostHandler for AcpHostAdapter {
             .clone()
             .and_then(|v| serde_json::from_value::<PermissionRequestParams>(v).ok())
         else {
-            return HostOutcome::Immediate(self.handle(method, params));
+            let result = self.dispatch(method, params);
+            return HostDispatchOutcome::Immediate { response: result.response, outcome: result.outcome };
         };
 
         if self.inner.permission_blocked_by_gate(&parsed.tool_call) {
-            return HostOutcome::Immediate(self.handle(method, params));
+            let result = self.dispatch(method, params);
+            return HostDispatchOutcome::Immediate { response: result.response, outcome: result.outcome };
         }
 
-        HostOutcome::Deferred
+        HostDispatchOutcome::Deferred
+    }
+}
+
+impl HostHandler for AcpHostAdapter {
+    fn handle(&self, method: &str, params: Option<Value>) -> Result<Value, RpcError> {
+        self.dispatch(method, params).response
+    }
+
+    /// Only `session/request_permission`, and only when this session's
+    /// [`PermissionDeferral`] is `Enabled`, can return
+    /// [`HostOutcome::Deferred`] -- every other method, and every session
+    /// with deferral `Disabled`, is `Immediate(self.handle(method, params))`
+    /// with today's behavior, byte for byte. A thin wrapper around
+    /// [`AcpHostAdapter::dispatch_deferrable`], discarding the
+    /// `HostCallOutcome` that method's other caller (`acp::reader`) reads
+    /// directly -- callers going through the `HostHandler` trait never
+    /// needed it.
+    fn handle_deferrable(&self, method: &str, params: Option<Value>) -> HostOutcome {
+        match self.dispatch_deferrable(method, params) {
+            HostDispatchOutcome::Immediate { response, .. } => HostOutcome::Immediate(response),
+            HostDispatchOutcome::Deferred => HostOutcome::Deferred,
+        }
     }
 }
 
@@ -1091,7 +1303,11 @@ mod tests {
     fn dangerous_command_gate_blocks_terminal_create_even_under_yolo_policy() {
         let handler =
             PolicyHostHandler::new(HostPolicy::Yolo, std::env::temp_dir(), DangerousCommandGate::Enforced);
-        let message = handler.terminal_create(&dangerous_terminal_params()).unwrap_err();
+        let err = handler.terminal_create(&dangerous_terminal_params()).unwrap_err();
+        // A gate block is decided BEFORE anything executes -- `Denied`,
+        // never `Failed` (this call never reached `TerminalStore::create`).
+        assert!(matches!(err, HostRequestError::Denied(_)), "gate block must be Denied, was: {err:?}");
+        let message = err.message();
         assert!(message.contains("dangerous-command gate"), "message was: {message}");
         assert!(message.contains("filesystem-wipe"), "message was: {message}");
         assert!(message.contains("rule="), "refusal must name the rule: {message}");
@@ -1102,10 +1318,11 @@ mod tests {
     fn dangerous_command_gate_disabled_skips_straight_to_policy_for_terminal_create() {
         let handler =
             PolicyHostHandler::new(HostPolicy::Deny, std::env::temp_dir(), DangerousCommandGate::Disabled);
-        let message = handler.terminal_create(&dangerous_terminal_params()).unwrap_err();
+        let err = handler.terminal_create(&dangerous_terminal_params()).unwrap_err();
+        assert!(matches!(err, HostRequestError::Denied(_)), "policy refusal must be Denied, was: {err:?}");
         // The POLICY's refusal text, not the gate's -- proves the gate
         // itself never ran when explicitly disabled.
-        assert_eq!(message, "terminal/create denied by host policy");
+        assert_eq!(err.message(), "terminal/create denied by host policy");
     }
 
     #[test]
@@ -1241,6 +1458,7 @@ mod tests {
             PolicyHostHandler::new(HostPolicy::Yolo, std::env::temp_dir(), DangerousCommandGate::Enforced);
 
         let terminal_reason = handler.terminal_create(&dangerous_terminal_params()).unwrap_err();
+        let terminal_reason = terminal_reason.message();
 
         let permission_params = PermissionRequestParams {
             session_id: "s1".to_owned(),

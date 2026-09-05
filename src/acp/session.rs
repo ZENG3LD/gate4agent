@@ -21,7 +21,9 @@ use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
 use crate::core::error::AgentError;
-use crate::core::types::{AgentEvent, CliTool, HostDecisionAuthority, HostRequestDecision};
+use crate::core::types::{
+    AgentEvent, CliTool, HostDecisionAuthority, HostRequestDecision, HostRequestOutcome,
+};
 use crate::rpc::id::IdGen;
 use crate::rpc::message::{RpcId, RpcNotification, RpcRequest, RpcResponse};
 use crate::rpc::pending::PendingRequests;
@@ -1220,6 +1222,11 @@ impl AcpSession {
             method: "session/request_permission".to_owned(),
             params: Some(serde_json::to_value(params).unwrap_or(Value::Null)),
             decision,
+            // Selecting/cancelling a `session/request_permission` option is
+            // not I/O -- there is no execution step here that can fail the
+            // way a `terminal/create` spawn can (see
+            // `crate::core::types::HostRequestOutcome`'s own doc comment).
+            outcome: HostRequestOutcome::Executed,
             // Neither `OperatorPermissionChoice` nor an unattended deadline
             // expiry carries any free text -- an operator answers
             // approve/reject, never a comment, and `expire_deadlines` never

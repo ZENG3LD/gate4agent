@@ -7,7 +7,7 @@ use gate4agent_node_protocol::{
     NodeRequest, NodeResponse, NodeSnapshot, OperatingSystemId, PathEncoding, PathSemantics,
     PathStyle, ProtocolRange, ResponseEnvelope, ServerChallenge, ServerFrame, StateSchemaSupport,
     MAX_NODE_CLIENT_FRAME_BYTES, MAX_NODE_FRAME_BYTES, MAX_NODE_HELLO_FRAME_BYTES,
-    NODE_AUTH_NONCE_BYTES, NODE_COMPATIBILITY_METADATA_CAPABILITY, NODE_PROTOCOL_VERSION,
+    NODE_AUTH_NONCE_BYTES, NODE_COMPATIBILITY_METADATA_CAPABILITY, BUILD_STAMP,
     NODE_STATE_SCHEMA_V2,
 };
 use gate4agent_node_wire::{
@@ -106,10 +106,8 @@ fn negotiated_compatibility(hello: &ClientHello) -> NegotiatedNodeCompatibility 
         .compatibility
         .as_ref()
         .expect("production client must negotiate compatibility");
-    let exact_protocol = ProtocolRange::exact(NODE_PROTOCOL_VERSION)
-        .expect("active protocol range is valid");
     NodeCompatibilitySupport {
-        protocol_versions: exact_protocol,
+        build_stamp: BUILD_STAMP.to_owned(),
         capabilities: vec![
             CapabilityId::new(NODE_COMPATIBILITY_METADATA_CAPABILITY)
                 .expect("fixed capability is valid"),
@@ -132,7 +130,7 @@ fn negotiated_compatibility(hello: &ClientHello) -> NegotiatedNodeCompatibility 
         provider_contracts: Vec::new(),
         provider_adapter_contracts: Vec::new(),
     }
-    .negotiate(NODE_PROTOCOL_VERSION, offer)
+    .negotiate(offer)
     .expect("fake node compatibility must match the production client offer")
 }
 
@@ -166,7 +164,7 @@ async fn challenge_client(
     let ClientFrame::Hello(hello) = read_client_frame(stream).await else {
         panic!("first client frame must be hello");
     };
-    assert_eq!(hello.protocol_version, NODE_PROTOCOL_VERSION);
+    assert_eq!(hello.build_stamp, BUILD_STAMP);
     assert_eq!(hello.role, ClientRole::Observer);
 
     let selected = negotiated_compatibility(&hello);
@@ -190,7 +188,7 @@ async fn challenge_client(
     write_server_frame(
         stream,
         &ServerFrame::Challenge(ServerChallenge {
-            protocol_version: NODE_PROTOCOL_VERSION,
+            build_stamp: BUILD_STAMP.to_owned(),
             server_nonce,
             server_proof,
             compatibility: Some(selected.clone()),
@@ -249,7 +247,7 @@ async fn local_node_client_authenticates_and_correlates_snapshot_over_real_uds()
         write_server_frame(
             &mut stream,
             &ServerFrame::Hello(NodeHello {
-                protocol_version: NODE_PROTOCOL_VERSION,
+                build_stamp: BUILD_STAMP.to_owned(),
                 incarnation_id: NodeIncarnationId::from_bytes([0x24; 16]),
                 connection_id: 41,
                 role: hello.role,

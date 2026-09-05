@@ -186,9 +186,9 @@ pub fn terminal_frame_to_wire(frame: &TerminalFrame) -> HarnessRuntimeTerminalFr
         // `TerminalFrame::produced_at_unix_ms`'s own doc for why no hop,
         // including this one, may recompute it.
         produced_at_unix_ms: frame.produced_at_unix_ms,
-        // Unconditional: this wire has exactly one accepted version (see
-        // `HARNESS_OPERATOR_WIRE_VERSION`), so there is no older peer shape
-        // to withhold either field from.
+        // Unconditional: this wire has exactly one accepted build stamp
+        // (see `BUILD_STAMP`), so there is no older peer shape to withhold
+        // either field from.
         screen_state: Some(map_screen_state(&frame.screen_state)),
         bracketed_paste: frame.bracketed_paste,
     }
@@ -594,10 +594,10 @@ mod tests {
     }
 
     /// `screen_state` is unconditional: every frame carries the caller's
-    /// real classification, never `None` for a version reason (see
-    /// `HARNESS_OPERATOR_WIRE_VERSION`'s doc comment -- there is exactly one
-    /// accepted version on this wire, so there is no older shape to
-    /// withhold the field from).
+    /// real classification, never `None` for a build-stamp reason (see
+    /// `BUILD_STAMP`'s doc comment -- there is exactly one accepted build
+    /// stamp on this wire, so there is no older shape to withhold the
+    /// field from).
     #[test]
     fn terminal_frame_to_wire_always_carries_screen_state() {
         let mut frame = sample_frame(1);

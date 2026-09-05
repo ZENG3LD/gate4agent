@@ -2,7 +2,7 @@
 
 use gate4agent_c2::protocol::{
     C2NodeEvent, C2NodeResponse, C2RelayFailureCode, NodeId, NodeRoute, NodeTransportState,
-    PathStyle, C2_COMPATIBILITY_METADATA_CAPABILITY, C2_CONTROL_PROTOCOL_VERSION,
+    PathStyle, BUILD_STAMP, C2_COMPATIBILITY_METADATA_CAPABILITY,
     C2_OPAQUE_UNIX_PATH_CAPABILITY, C2_REPOSITORY_PATH_CAPABILITY,
     C2_PROVIDER_CONTRACT_MANIFEST_CAPABILITY, C2_WORKSPACE_FILE_READ_CAPABILITY,
     RepositoryPath, WorkspaceFileContent,
@@ -207,7 +207,7 @@ async fn windows_real_two_node_c2_control_relay_routes_commands_events_and_prese
     assert_eq!(control.hello().status.nodes.len(), 2);
     let compatibility = control.hello().compatibility.as_ref()
         .expect("negotiated C2 compatibility metadata");
-    assert_eq!(compatibility.protocol_version, C2_CONTROL_PROTOCOL_VERSION);
+    assert_eq!(compatibility.build_stamp, BUILD_STAMP);
     assert_eq!(compatibility.capabilities.len(), 5);
     assert_eq!(
         compatibility.capabilities[0].as_str(),

@@ -6,7 +6,7 @@ use gate4agent_node_protocol::{
     ProtocolRange, ProviderRuntimeStatuses, ResponseEnvelope, ServerChallenge, ServerFrame,
     StateSchemaSupport, MAX_NODE_CLIENT_FRAME_BYTES, MAX_NODE_FRAME_BYTES,
     MAX_NODE_HELLO_FRAME_BYTES, NODE_COMPATIBILITY_METADATA_CAPABILITY,
-    NODE_PROTOCOL_VERSION, NODE_STATE_SCHEMA_V2,
+    BUILD_STAMP, NODE_STATE_SCHEMA_V2,
 };
 use gate4agent_node_wire::{
     negotiated_auth_proof, proofs_match, AuthDirection, LocalNodeClient, NodeClientError,
@@ -71,11 +71,11 @@ async fn loopback_node_client_uses_exact_node_v8_handshake_and_snapshot() {
         let ClientFrame::Hello(hello) = read_client_frame(&mut stream).await else {
             panic!("first frame must be client hello");
         };
-        assert_eq!(hello.protocol_version, NODE_PROTOCOL_VERSION);
+        assert_eq!(hello.build_stamp, BUILD_STAMP);
         assert_eq!(hello.role, ClientRole::Operator);
         let offer = hello.compatibility.as_ref().expect("compatibility offer");
         let compatibility = NodeCompatibilitySupport {
-            protocol_versions: ProtocolRange::exact(NODE_PROTOCOL_VERSION).unwrap(),
+            build_stamp: BUILD_STAMP.to_owned(),
             capabilities: vec![CapabilityId::new(NODE_COMPATIBILITY_METADATA_CAPABILITY).unwrap()],
             host: HostDescriptor {
                 operating_system: OperatingSystemId::new(std::env::consts::OS).unwrap(),
@@ -89,7 +89,7 @@ async fn loopback_node_client_uses_exact_node_v8_handshake_and_snapshot() {
             provider_contracts: Vec::new(),
             provider_adapter_contracts: Vec::new(),
         }
-        .negotiate(NODE_PROTOCOL_VERSION, offer)
+        .negotiate(offer)
         .expect("compatible Node v8 selection");
         let server_nonce = [0x42; 32];
         let server_proof = negotiated_auth_proof(
@@ -105,7 +105,7 @@ async fn loopback_node_client_uses_exact_node_v8_handshake_and_snapshot() {
         write_server_frame(
             &mut stream,
             &ServerFrame::Challenge(ServerChallenge {
-                protocol_version: NODE_PROTOCOL_VERSION,
+                build_stamp: BUILD_STAMP.to_owned(),
                 server_nonce,
                 server_proof,
                 compatibility: Some(compatibility.clone()),
@@ -130,7 +130,7 @@ async fn loopback_node_client_uses_exact_node_v8_handshake_and_snapshot() {
         write_server_frame(
             &mut stream,
             &ServerFrame::Hello(NodeHello {
-                protocol_version: NODE_PROTOCOL_VERSION,
+                build_stamp: BUILD_STAMP.to_owned(),
                 incarnation_id: NodeIncarnationId::from_bytes([0x24; 16]),
                 connection_id: 9,
                 role: hello.role,

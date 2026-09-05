@@ -4,8 +4,8 @@ use crate::protocol::{
     C2ClientFrame, C2ControlCompatibilitySupport, C2Hello, C2ReplyEnvelope,
     C2ServerChallenge, C2ServerFrame, C2Topology, CapabilityId, ClientCompatibilityOffer,
     HostDescriptor, NegotiatedC2ControlCompatibility,
-    OperatingSystemId, PathEncoding, PathSemantics, PathStyle, ProtocolRange,
-    C2_COMPATIBILITY_METADATA_CAPABILITY, C2_CONTROL_PROTOCOL_VERSION,
+    OperatingSystemId, PathEncoding, PathSemantics, PathStyle,
+    BUILD_STAMP, C2_COMPATIBILITY_METADATA_CAPABILITY,
     C2_OPAQUE_UNIX_PATH_CAPABILITY, C2_REPOSITORY_PATH_CAPABILITY,
     C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
     C2_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY,
@@ -160,11 +160,11 @@ async fn serve_connection(
         tracing::warn!("control connection rejected: expected a hello frame first");
         return Ok(());
     };
-    if hello.protocol_version != C2_CONTROL_PROTOCOL_VERSION {
+    if hello.build_stamp != BUILD_STAMP {
         tracing::warn!(
-            protocol_version = hello.protocol_version,
-            expected_protocol_version = C2_CONTROL_PROTOCOL_VERSION,
-            "control connection rejected: unsupported protocol version",
+            local = %BUILD_STAMP,
+            remote = %hello.build_stamp,
+            "control connection rejected: build stamp mismatch",
         );
         return Ok(());
     }
@@ -189,7 +189,7 @@ async fn serve_connection(
     timeout(AUTH_DEADLINE, write_json_frame_limited(
         &mut pipe,
         &C2ServerFrame::Challenge(C2ServerChallenge {
-            protocol_version: C2_CONTROL_PROTOCOL_VERSION,
+            build_stamp: BUILD_STAMP.to_owned(),
             server_nonce,
             server_proof,
             compatibility: compatibility.clone(),
@@ -286,7 +286,7 @@ async fn serve_connection(
     if timeout(AUTH_DEADLINE, write_json_frame_limited(
         &mut pipe,
         &C2ServerFrame::Hello(C2Hello {
-            protocol_version: C2_CONTROL_PROTOCOL_VERSION,
+            build_stamp: BUILD_STAMP.to_owned(),
             connection_id,
             status: hello_status,
             compatibility,
@@ -2265,8 +2265,7 @@ fn authentication_frame_error(message: String) -> FrameError {
 
 fn c2_control_compatibility_support() -> Result<C2ControlCompatibilitySupport, FrameError> {
     Ok(C2ControlCompatibilitySupport {
-        protocol_versions: ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION)
-            .map_err(|error| authentication_frame_error(error.to_string()))?,
+        build_stamp: BUILD_STAMP.to_owned(),
         capabilities: vec![
             CapabilityId::new(C2_COMPATIBILITY_METADATA_CAPABILITY)
                 .map_err(|error| authentication_frame_error(error.to_string()))?,
@@ -3232,10 +3231,7 @@ mod tests {
     fn c2_control_server_selects_authenticated_path_opt_ins() {
         let support = c2_control_compatibility_support().unwrap();
 
-        assert_eq!(
-            support.protocol_versions,
-            ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
-        );
+        assert_eq!(support.build_stamp, BUILD_STAMP);
         assert_eq!(
             support.capabilities,
             vec![
@@ -3283,7 +3279,7 @@ mod tests {
         assert_eq!(support.path_semantics.encoding, PathEncoding::Utf8);
 
         let offer = ClientCompatibilityOffer {
-            protocol_versions: ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
+            build_stamp: BUILD_STAMP.to_owned(),
             capabilities: support.capabilities.clone(),
             state_schema: None,
         };
@@ -3544,7 +3540,7 @@ mod tests {
             (true, true, true, Some(full)),
         ] {
             let mut hello = C2ServerFrame::Hello(C2Hello {
-                protocol_version: C2_CONTROL_PROTOCOL_VERSION,
+                build_stamp: BUILD_STAMP.to_owned(),
                 connection_id: 1,
                 status: source_status.clone(),
                 compatibility: None,
@@ -4957,7 +4953,7 @@ mod tests {
     fn n_minus_one_control_hello_keeps_exact_legacy_empty_manifest_shape() {
         #[derive(serde::Serialize)]
         struct LegacyHello<'a> {
-            protocol_version: u16,
+            build_stamp: String,
             connection_id: u64,
             status: &'a StatusResponse,
         }
@@ -4970,13 +4966,13 @@ mod tests {
         assert!(inventory.provider_contracts.is_empty());
         assert!(inventory.provider_adapter_contracts.is_empty());
         let hello = C2Hello {
-            protocol_version: C2_CONTROL_PROTOCOL_VERSION,
+            build_stamp: BUILD_STAMP.to_owned(),
             connection_id: 9,
             status: status.clone(),
             compatibility: None,
         };
         let legacy = LegacyHello {
-            protocol_version: C2_CONTROL_PROTOCOL_VERSION,
+            build_stamp: BUILD_STAMP.to_owned(),
             connection_id: 9,
             status: &status,
         };

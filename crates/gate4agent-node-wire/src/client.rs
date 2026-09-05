@@ -40,7 +40,7 @@ use gate4agent_node_protocol::{
     NODE_WORKSPACE_FILE_WRITE_CAPABILITY,
     NODE_WORKSPACE_ENTRY_CREATE_CAPABILITY,
     NODE_WORKTREE_SELECTION_CAPABILITY,
-    NODE_PROTOCOL_VERSION,
+    BUILD_STAMP,
 };
 use crate::{
     connect_local_stream, negotiated_auth_proof, proofs_match, random_nonce, AuthDirection,
@@ -378,10 +378,11 @@ impl LocalNodeClient {
                 "server did not return an authentication challenge".to_owned(),
             ));
         };
-        if challenge.protocol_version != NODE_PROTOCOL_VERSION {
-            return Err(NodeClientError::Protocol(
-                "node protocol version mismatch".to_owned(),
-            ));
+        if challenge.build_stamp != BUILD_STAMP {
+            return Err(NodeClientError::BuildStampMismatch {
+                local: BUILD_STAMP.to_owned(),
+                remote: challenge.build_stamp.clone(),
+            });
         }
         let authentication = prepare_negotiated_authentication(
             &challenge,
@@ -411,10 +412,11 @@ impl LocalNodeClient {
                 "server did not return hello".to_owned(),
             ));
         };
-        if hello.protocol_version != NODE_PROTOCOL_VERSION {
-            return Err(NodeClientError::Protocol(
-                "node protocol version mismatch".to_owned(),
-            ));
+        if hello.build_stamp != BUILD_STAMP {
+            return Err(NodeClientError::BuildStampMismatch {
+                local: BUILD_STAMP.to_owned(),
+                remote: hello.build_stamp.clone(),
+            });
         }
         validate_authenticated_hello_compatibility(
             &compatibility_offer,
@@ -2587,17 +2589,11 @@ fn validate_selected_compatibility(
     offer: &ClientCompatibilityOffer,
     selected: &NegotiatedNodeCompatibility,
 ) -> Result<(), NodeClientError> {
-    if selected.protocol_version != NODE_PROTOCOL_VERSION {
+    if selected.build_stamp != BUILD_STAMP {
         return Err(NodeClientError::Protocol(format!(
-            "node selected protocol version {} for active wire protocol {}",
-            selected.protocol_version,
-            NODE_PROTOCOL_VERSION,
-        )));
-    }
-    if !offer.protocol_versions.contains(selected.protocol_version) {
-        return Err(NodeClientError::Protocol(format!(
-            "node selected protocol version {} outside the client offer",
-            selected.protocol_version,
+            "node selected build stamp {} for active wire build {}",
+            selected.build_stamp,
+            BUILD_STAMP,
         )));
     }
     if selected
@@ -2674,6 +2670,8 @@ pub enum NodeClientError {
     Node(NodeFailure),
     #[error("node protocol failed: {0}")]
     Protocol(String),
+    #[error("build stamp mismatch: local={local} remote={remote}")]
+    BuildStampMismatch { local: String, remote: String },
     #[error("node capability was not negotiated: {0}")]
     UnsupportedCapability(String),
     #[error("node authentication frame was not received before the bounded deadline")]
@@ -2770,14 +2768,14 @@ mod tests {
 
     fn negotiated_fixture() -> (ClientCompatibilityOffer, NegotiatedNodeCompatibility) {
         let offer = ClientCompatibilityOffer {
-            protocol_versions: ProtocolRange::exact(NODE_PROTOCOL_VERSION).unwrap(),
+            build_stamp: BUILD_STAMP.to_owned(),
             capabilities: vec![CapabilityId::new(NODE_COMPATIBILITY_METADATA_CAPABILITY).unwrap()],
             state_schema: Some(StateSchemaSupport {
                 versions: ProtocolRange::exact(1).unwrap(),
             }),
         };
         let support = NodeCompatibilitySupport {
-            protocol_versions: ProtocolRange::exact(NODE_PROTOCOL_VERSION).unwrap(),
+            build_stamp: BUILD_STAMP.to_owned(),
             capabilities: vec![CapabilityId::new(NODE_COMPATIBILITY_METADATA_CAPABILITY).unwrap()],
             host: HostDescriptor {
                 operating_system: OperatingSystemId::new("windows").unwrap(),
@@ -2794,7 +2792,7 @@ mod tests {
             provider_contracts: Vec::new(),
             provider_adapter_contracts: Vec::new(),
         };
-        let selected = support.negotiate(NODE_PROTOCOL_VERSION, &offer).unwrap();
+        let selected = support.negotiate(&offer).unwrap();
         (offer, selected)
     }
 
@@ -2973,7 +2971,7 @@ mod tests {
 
     fn hello_with_snapshot(snapshot: NodeSnapshot) -> NodeHello {
         NodeHello {
-            protocol_version: NODE_PROTOCOL_VERSION,
+            build_stamp: BUILD_STAMP.to_owned(),
             incarnation_id: NodeIncarnationId::from_bytes([3; NODE_INCARNATION_ID_BYTES]),
             connection_id: 7,
             role: ClientRole::Operator,
@@ -3430,10 +3428,7 @@ mod tests {
     /// crate family defines.
     fn the_client_offer_carries_the_open_provider_capabilities_and_the_whole_schema_range() {
         let offer = client_compatibility_offer().unwrap();
-        assert_eq!(
-            offer.protocol_versions,
-            ProtocolRange::exact(NODE_PROTOCOL_VERSION).unwrap(),
-        );
+        assert_eq!(offer.build_stamp, BUILD_STAMP);
         assert!(offer.capabilities.contains(
             &CapabilityId::new(NODE_OPAQUE_UNIX_PATH_CAPABILITY).unwrap(),
         ));
@@ -3495,7 +3490,7 @@ mod tests {
         )
         .unwrap();
         let challenge = ServerChallenge {
-            protocol_version: NODE_PROTOCOL_VERSION,
+            build_stamp: BUILD_STAMP.to_owned(),
             server_nonce,
             server_proof,
             compatibility: None,
@@ -3533,7 +3528,7 @@ mod tests {
         )
         .unwrap();
         let challenge = ServerChallenge {
-            protocol_version: NODE_PROTOCOL_VERSION,
+            build_stamp: BUILD_STAMP.to_owned(),
             server_nonce,
             server_proof,
             compatibility: Some(selected),
@@ -3617,7 +3612,7 @@ mod tests {
         selected.provider_adapter_contracts[0].revision =
             AdapterContractRevision::new("pty-semantic-v2").unwrap();
         let challenge = ServerChallenge {
-            protocol_version: NODE_PROTOCOL_VERSION,
+            build_stamp: BUILD_STAMP.to_owned(),
             server_nonce,
             server_proof,
             compatibility: Some(selected),
@@ -3659,7 +3654,7 @@ mod tests {
             candidate.as_str() != NODE_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY
         });
         let challenge = ServerChallenge {
-            protocol_version: NODE_PROTOCOL_VERSION,
+            build_stamp: BUILD_STAMP.to_owned(),
             server_nonce,
             server_proof,
             compatibility: Some(selected),
@@ -3700,7 +3695,7 @@ mod tests {
             candidate.as_str() != NODE_HISTORY_CONTEXT_PACK_CAPABILITY
         });
         let challenge = ServerChallenge {
-            protocol_version: NODE_PROTOCOL_VERSION,
+            build_stamp: BUILD_STAMP.to_owned(),
             server_nonce,
             server_proof,
             compatibility: Some(selected),

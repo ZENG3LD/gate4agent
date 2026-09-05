@@ -470,17 +470,17 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<LightState>) {
         let envelope: HarnessOperatorEnvelopeV1 = serde_json::from_slice(&frame)
             .map_err(|_| HarnessRuntimeError::InvalidFrame)?;
         if let Err(error) = envelope.validate() {
-            if let HarnessOperatorApiError::WireVersionMismatch { expected, received } = error {
+            if let HarnessOperatorApiError::BuildStampMismatch { expected, received } = error {
                 tracing::warn!(
-                    expected,
-                    received,
-                    "harness-light: operator wire version mismatch: rebuild and restart \
+                    expected = %expected,
+                    received = %received,
+                    "harness-light: operator build stamp mismatch: rebuild and restart \
                      the out-of-date side",
                 );
                 write_operator_reply(
                     &mut stream,
                     HarnessOperatorReplyV1::Error {
-                        error: HarnessOperatorHostErrorV1::WireVersionMismatch { expected, received },
+                        error: HarnessOperatorHostErrorV1::BuildStampMismatch { expected, received },
                     },
                 ).await?;
             }

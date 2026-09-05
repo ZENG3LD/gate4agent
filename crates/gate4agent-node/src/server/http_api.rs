@@ -1,5 +1,5 @@
 use super::{clear_snapshot_context_packs, project_snapshot_history_for_wire, NodeShared};
-use crate::protocol::{MAX_NODE_FRAME_BYTES, NODE_PROTOCOL_VERSION};
+use crate::protocol::{BUILD_STAMP, MAX_NODE_FRAME_BYTES};
 use gate4agent_runtime_native::tick_profile::Distribution;
 use serde_json::{json, Value};
 use std::io;
@@ -122,7 +122,7 @@ fn health_body(shared: &NodeShared) -> Value {
         "incarnation_id": shared.incarnation_id,
         "pid": std::process::id(),
         "version": env!("CARGO_PKG_VERSION"),
-        "protocol_version": NODE_PROTOCOL_VERSION,
+        "build_stamp": BUILD_STAMP,
         "started_at_unix_ms": shared.started_at_unix_ms,
     })
 }
@@ -596,7 +596,7 @@ mod tests {
         let health = request(address, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
         assert!(health.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(health.contains("\"service\":\"gate4agent-node\""));
-        assert!(health.contains("\"protocol_version\":"));
+        assert!(health.contains(&format!("\"build_stamp\":\"{BUILD_STAMP}\"")));
         assert!(health.contains(&format!("\"incarnation_id\":\"{incarnation_id}\"")));
         assert!(!health.contains("test-token"));
 

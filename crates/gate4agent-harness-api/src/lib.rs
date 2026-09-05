@@ -75,87 +75,18 @@ pub const HARNESS_MCP_AUDIENCE: &str = "gate4agent-harness-mcp-read-v1";
 /// from the same tree and rolled together (`gate4agent-harness` and its two
 /// clients, `gate4agent-tui` / `gate4agent-tui-light`, via
 /// `gate4agent-harness-client`). There is exactly one peer shape at a time --
-/// no peer that cannot be rebuilt exists -- so there is exactly one accepted
-/// version, not a negotiated range.
-///
-/// Value `15` deliberately continues the counter past the last real version
-/// this protocol carried (`14`, retired together with V1..V13 in the same
-/// change that introduced this single constant) rather than resetting to
-/// `1`. A stray old log line or captured frame that says `"version":1` meant
-/// something structurally different under the old multi-version scheme; a
-/// frame that says `"version":15` can only ever be this protocol, never
-/// misread as an artifact from before the collapse.
-///
-/// `16` is the first ordinary bump under that scheme: the four ACP control
-/// verbs (`ResolveInteraction`, `SetSessionMode`, `SetSessionConfigOption`,
-/// `SetSessionModel`) and the `SubscribeAgentStream` push channel
-/// (`docs/gate4agent/plans/gate4agent-acp-control-plane-on-the-wire-2026-09-02.md`
-/// §5) change the wire shape, so all four co-built processes rebuild
-/// together -- exactly what every bump under this single-version scheme
-/// means, not a special case.
-///
-/// `17` adds one more verb the same way: `PromptSession`, the semantic-
-/// prompt sibling `WriteSessionInput` was never able to be -- it relays to
-/// the node's *other* input verb, `NodeRequest::Prompt`, not
-/// `NodeRequest::Input` (see both requests' own doc comments for the
-/// distinction and for why `PromptSession` is refused by name against a
-/// PTY-transport session). One more request/reply pair on the wire, so all
-/// four co-built processes rebuild together again.
-///
-/// `18` widens `SpawnSession`'s existing shape rather than adding a verb:
-/// `approval_level: Option<HarnessApprovalLevelV1>`, `None` decoding as the
-/// axis default so a pre-`18` frame (which never set the field) still means
-/// exactly what it always meant. It moves the version anyway, same as every
-/// bump above -- this wire has no field-level compatibility story of its
-/// own beneath the single accepted `version`, so a shape change is a shape
-/// change regardless of whether the new field happens to default cleanly.
-///
-/// `19` widens `HarnessRuntimeManagedSessionV1` the same way: `blocked_count`
-/// and `last_blocked_at_ms`, the fleet-wide instrument for
-/// `ObservationKindV1::ActionBlocked`
-/// (`docs/gate4agent/plans/gate4agent-blocked-action-event-2026-09-02.md`
-/// §2 item 4) -- one `runtime-inventory` read answers "how many sessions are
-/// stuck behind a gate right now" across every node. Same rule as `18`: a
-/// shape change moves the version even though a pre-`19` reader would have
-/// silently read zero/`None` for both new fields.
-///
-/// `20` closes the gap between when a `SubscribeAgentStream` connection
-/// registers and when the session it asked for actually started emitting:
-/// measured live, that gap runs 2-25 s, and every instant chunk (`Text`/
-/// `Thinking`/`Blocked`) published into it before registration used to be
-/// gone for good (`gate4agent-harness-service::agent_stream`'s own doc
-/// comment covers why those three are never part of the SEEDED state, and
-/// still are not). `HarnessOperatorAgentEventV1::AgentChunk` widens with
-/// `published_at_ms` (the harness's own publish-time reading, carried
-/// unchanged through a replay so a replayed line never prints as if it just
-/// happened), and a new variant, `ReplayBoundary`, marks the point in one
-/// session's delivery where a bounded backward-looking replay ends and live
-/// delivery begins. Same rule as every bump above: a widened variant and a
-/// new one both move the version even though a pre-`20` reader would have
-/// silently read zero for the new field and never received the new variant
-/// at all.
-///
-/// `21` adds the mailbox arc's Slice B operator surface
-/// (`docs/gate4agent/plans/gate4agent-arc-mailbox-and-task-layer-2026-09-02.md`
-/// §3 Slice B): `HarnessOperatorRequestV1::MailInbox` (a bounded, redacted
-/// mailbox page for one session record) and `::AckMail` (the operator's own
-/// ack, applied through the same `HarnessMutationV1::AckMail` mutation an
-/// agent's own `g4a_mail_ack` uses, under the operator's authority), plus
-/// `unread_mail: u64` on `HarnessRuntimeManagedSessionV1` -- the mailbox
-/// counterpart of `19`'s `blocked_count`, filled the same way. Same rule as
-/// every bump above: two new verbs and a widened struct move the version
-/// even though a pre-`21` reader would have silently read zero for the new
-/// field and never sent either new request.
-///
-/// `22` adds the mailbox arc's Slice C hand-off (same plan, §3 Slice C):
-/// `HarnessMailInboxEntryV1` widens with `refs: Vec<HarnessMailRefV1>`, read
-/// by both `g4a_mail_inbox` (unversioned) and the operator's `MailInbox`
-/// reply (versioned, embeds the same struct) -- the operator envelope checks
-/// `version` for exact equality, never semver compatibility, so even this
-/// additive-with-default field moves the pin. Same rule as every bump above:
-/// a pre-`22` reader would have silently read an empty `refs` list and never
-/// seen an attached reference at all.
-pub const HARNESS_OPERATOR_WIRE_VERSION: u16 = 22;
+/// no peer that cannot be rebuilt exists -- so the envelope now checks
+/// [`BUILD_STAMP`] for exact equality instead of a hand-typed version
+/// counter: `BUILD_STAMP` is a content hash of the working tree computed at
+/// compile time (see `gate4agent-build-stamp`), so any wire-shape change
+/// anywhere in the co-built tree moves it automatically, and a peer built
+/// from a byte-identical checkout always matches. An additive read-wire
+/// field still just needs `#[serde(default)]`, same as before -- nothing
+/// about that discipline changes. A persisted format version (a checkpoint,
+/// database schema, or any other record that must survive forward migration
+/// across releases) is a different thing entirely and keeps its own
+/// explicit, hand-bumped integer.
+pub use gate4agent_build_stamp::BUILD_STAMP;
 // Realistic multi-pane ceiling with headroom; bounds the harness-side
 // per-subscriber HashSet<RuntimeSessionKey> and the connect-time seed burst
 // `SubscribeTerminal`'s handler sends immediately after registering (see
@@ -379,17 +310,29 @@ impl<'de> Deserialize<'de> for HarnessOperatorCredential {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HarnessOperatorEnvelopeV1 {
-    pub version: u16,
+    pub build_stamp: String,
     pub credential: HarnessOperatorCredential,
     pub request: HarnessOperatorRequestV1,
 }
 
 impl HarnessOperatorEnvelopeV1 {
+    /// Builds an envelope carrying this binary's own [`BUILD_STAMP`] -- the
+    /// one place every caller in this tree (this crate's own tests,
+    /// `gate4agent-harness-service`, `gate4agent-harness-client`) should
+    /// build one from, rather than hand-filling `build_stamp` at each site.
+    pub fn new(credential: HarnessOperatorCredential, request: HarnessOperatorRequestV1) -> Self {
+        Self {
+            build_stamp: BUILD_STAMP.to_string(),
+            credential,
+            request,
+        }
+    }
+
     pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
-        if self.version != HARNESS_OPERATOR_WIRE_VERSION {
-            return Err(HarnessOperatorApiError::WireVersionMismatch {
-                expected: HARNESS_OPERATOR_WIRE_VERSION,
-                received: self.version,
+        if self.build_stamp != BUILD_STAMP {
+            return Err(HarnessOperatorApiError::BuildStampMismatch {
+                expected: BUILD_STAMP.to_string(),
+                received: self.build_stamp.clone(),
             });
         }
         validate_operator_credential(self.credential.expose())?;
@@ -5556,15 +5499,15 @@ pub enum HarnessOperatorHostErrorV1 {
     // skew risk in practice: `gate4agent-harness-light` pairs this crate
     // in-process (same build, same binary), never across a version boundary.
     Unsupported,
-    // The host decoded the envelope but its declared `version` was not
-    // `HARNESS_OPERATOR_WIRE_VERSION` (see `HarnessOperatorApiError::
-    // WireVersionMismatch`, which this carries verbatim onto the wire so the
-    // caller sees both numbers instead of the generic `InvalidRequest` every
+    // The host decoded the envelope but its declared `build_stamp` did not
+    // match this side's own `BUILD_STAMP` (see `HarnessOperatorApiError::
+    // BuildStampMismatch`, which this carries verbatim onto the wire so the
+    // caller sees both stamps instead of the generic `InvalidRequest` every
     // other malformed-envelope shape collapses to). Reaching this variant
-    // itself proves a build/version skew between the two loopback sides --
-    // this protocol has exactly one accepted version, so a well-formed peer
+    // itself proves a build skew between the two loopback sides -- this
+    // protocol has exactly one accepted build stamp, so a well-formed peer
     // never triggers it against a matching one.
-    WireVersionMismatch { expected: u16, received: u16 },
+    BuildStampMismatch { expected: String, received: String },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -6764,12 +6707,12 @@ pub enum HarnessReadApiError {
 #[derive(Debug, Error)]
 pub enum HarnessOperatorApiError {
     #[error(
-        "harness operator wire version mismatch: this side speaks version {expected}, the \
-         peer sent version {received} -- rebuild and restart the out-of-date side \
+        "build stamp mismatch: this side was built from tree {expected}, the peer from \
+         tree {received} -- rebuild and restart the out-of-date side \
          (gate4agent-harness and its gate4agent-tui / gate4agent-tui-light client are built \
          from the same tree and must be rolled together)"
     )]
-    WireVersionMismatch { expected: u16, received: u16 },
+    BuildStampMismatch { expected: String, received: String },
     #[error("harness operator credential is malformed")]
     MalformedCredential,
     #[error("harness operator limit is outside the supported range")]
@@ -7467,7 +7410,7 @@ mod tests {
         assert!(!encoded_request.contains("idempotency_ref"));
         assert!(!encoded_request.contains("\"task_id\":"));
         let envelope = HarnessOperatorEnvelopeV1 {
-            version: HARNESS_OPERATOR_WIRE_VERSION,
+            build_stamp: BUILD_STAMP.to_string(),
             credential,
             request,
         };
@@ -7488,7 +7431,7 @@ mod tests {
             run_id: HarnessRunId::new(format!("hrun_{}", "c".repeat(24))).unwrap(),
         };
         let envelope = HarnessOperatorEnvelopeV1 {
-            version: HARNESS_OPERATOR_WIRE_VERSION,
+            build_stamp: BUILD_STAMP.to_string(),
             credential,
             request,
         };
@@ -7511,7 +7454,7 @@ mod tests {
             run_id: summary.run_id.clone(),
         };
         HarnessOperatorEnvelopeV1 {
-            version: HARNESS_OPERATOR_WIRE_VERSION,
+            build_stamp: BUILD_STAMP.to_string(),
             credential,
             request,
         }.validate().unwrap();
@@ -7726,7 +7669,7 @@ mod tests {
             request.validate().unwrap();
         }
         HarnessOperatorEnvelopeV1 {
-            version: HARNESS_OPERATOR_WIRE_VERSION,
+            build_stamp: BUILD_STAMP.to_string(),
             credential,
             request: replace.clone(),
         }.validate().unwrap();
@@ -7875,7 +7818,7 @@ mod tests {
         for request in requests {
             assert!(request.validate().is_ok());
             assert!(HarnessOperatorEnvelopeV1 {
-                version: HARNESS_OPERATOR_WIRE_VERSION,
+                build_stamp: BUILD_STAMP.to_string(),
                 credential: credential.clone(),
                 request,
             }.validate().is_ok());
@@ -8056,20 +7999,20 @@ mod tests {
             limit: HARNESS_RUNTIME_INVENTORY_PAGE_LIMIT_MAX,
         };
         assert!(HarnessOperatorEnvelopeV1 {
-            version: HARNESS_OPERATOR_WIRE_VERSION,
+            build_stamp: BUILD_STAMP.to_string(),
             credential,
             request,
         }.validate().is_ok());
     }
 
     /// Plan item 4 (`gate4agent-blocked-action-event-2026-09-02.md` §2): the
-    /// fleet-wide `blocked_count`/`last_blocked_at_ms` instrument (added when
-    /// `HARNESS_OPERATOR_WIRE_VERSION` moved `18` -> `19`; the version pin
-    /// itself has since moved again and is asserted where it currently
-    /// lives, not here) round-trips through JSON intact, and its own
-    /// invariant (a count of zero implies no timestamp, and vice versa) is
-    /// enforced the same way every other paired count/timestamp field in
-    /// this crate is.
+    /// fleet-wide `blocked_count`/`last_blocked_at_ms` instrument (added
+    /// under the old hand-bumped wire-pin scheme; the envelope now checks
+    /// `BUILD_STAMP` for exact equality instead, so this field's own arrival
+    /// is no longer asserted by a version number here) round-trips through
+    /// JSON intact, and its own invariant (a count of zero implies no
+    /// timestamp, and vice versa) is enforced the same way every other
+    /// paired count/timestamp field in this crate is.
     #[test]
     fn managed_session_blocked_stats_round_trip() {
         let mut session = sample_managed_session("record-a");
@@ -8190,7 +8133,7 @@ mod tests {
             },
         ] {
             HarnessOperatorEnvelopeV1 {
-                version: HARNESS_OPERATOR_WIRE_VERSION,
+                build_stamp: BUILD_STAMP.to_string(),
                 credential: credential.clone(),
                 request,
             }.validate().unwrap();
@@ -8784,7 +8727,7 @@ mod tests {
             "a".repeat(64),
         )).unwrap();
         HarnessOperatorEnvelopeV1 {
-            version: HARNESS_OPERATOR_WIRE_VERSION,
+            build_stamp: BUILD_STAMP.to_string(),
             credential,
             request,
         }.validate().unwrap();
@@ -9008,7 +8951,7 @@ mod tests {
             let decoded: HarnessOperatorRequestV1 = serde_json::from_str(&encoded).unwrap();
             assert_eq!(decoded, request);
             HarnessOperatorEnvelopeV1 {
-                version: HARNESS_OPERATOR_WIRE_VERSION,
+                build_stamp: BUILD_STAMP.to_string(),
                 credential: credential.clone(),
                 request,
             }.validate().unwrap();
@@ -9144,7 +9087,7 @@ mod tests {
             let decoded: HarnessOperatorRequestV1 = serde_json::from_str(&encoded).unwrap();
             assert_eq!(decoded, request);
             HarnessOperatorEnvelopeV1 {
-                version: HARNESS_OPERATOR_WIRE_VERSION,
+                build_stamp: BUILD_STAMP.to_string(),
                 credential: credential.clone(),
                 request,
             }.validate().unwrap();
@@ -9283,7 +9226,7 @@ mod tests {
             "a".repeat(64),
         )).unwrap();
         HarnessOperatorEnvelopeV1 {
-            version: HARNESS_OPERATOR_WIRE_VERSION,
+            build_stamp: BUILD_STAMP.to_string(),
             credential,
             request,
         }.validate().unwrap();
@@ -9630,7 +9573,7 @@ mod tests {
             let decoded: HarnessOperatorRequestV1 = serde_json::from_str(&encoded).unwrap();
             assert_eq!(decoded, request);
             HarnessOperatorEnvelopeV1 {
-                version: HARNESS_OPERATOR_WIRE_VERSION,
+                build_stamp: BUILD_STAMP.to_string(),
                 credential: credential.clone(),
                 request,
             }.validate().unwrap();
@@ -9670,7 +9613,7 @@ mod tests {
             "a".repeat(64),
         )).unwrap();
         HarnessOperatorEnvelopeV1 {
-            version: HARNESS_OPERATOR_WIRE_VERSION,
+            build_stamp: BUILD_STAMP.to_string(),
             credential,
             request,
         }.validate().unwrap();
@@ -9803,7 +9746,7 @@ mod tests {
             let decoded: HarnessOperatorRequestV1 = serde_json::from_str(&encoded).unwrap();
             assert_eq!(decoded, request);
             HarnessOperatorEnvelopeV1 {
-                version: HARNESS_OPERATOR_WIRE_VERSION,
+                build_stamp: BUILD_STAMP.to_string(),
                 credential: credential.clone(),
                 request,
             }.validate().unwrap();
@@ -9976,7 +9919,7 @@ mod tests {
             let decoded: HarnessOperatorRequestV1 = serde_json::from_str(&encoded).unwrap();
             assert_eq!(decoded, request);
             HarnessOperatorEnvelopeV1 {
-                version: HARNESS_OPERATOR_WIRE_VERSION,
+                build_stamp: BUILD_STAMP.to_string(),
                 credential: credential.clone(),
                 request,
             }.validate().unwrap();
@@ -10264,7 +10207,7 @@ mod tests {
             let decoded: HarnessOperatorRequestV1 = serde_json::from_str(&encoded).unwrap();
             assert_eq!(decoded, request);
             HarnessOperatorEnvelopeV1 {
-                version: HARNESS_OPERATOR_WIRE_VERSION,
+                build_stamp: BUILD_STAMP.to_string(),
                 credential: credential.clone(),
                 request,
             }.validate().unwrap();
@@ -10525,7 +10468,7 @@ mod tests {
             "a".repeat(64),
         )).unwrap();
         HarnessOperatorEnvelopeV1 {
-            version: HARNESS_OPERATOR_WIRE_VERSION,
+            build_stamp: BUILD_STAMP.to_string(),
             credential,
             request,
         }.validate().unwrap();
@@ -10546,40 +10489,38 @@ mod tests {
             "a".repeat(64),
         )).unwrap();
         HarnessOperatorEnvelopeV1 {
-            version: HARNESS_OPERATOR_WIRE_VERSION,
+            build_stamp: BUILD_STAMP.to_string(),
             credential,
             request,
         }.validate().unwrap();
     }
 
-    /// The single accepted version, both directions: a lower AND a higher
-    /// declared version are both rejected, and the error names both the
-    /// expected and the received number -- the diagnostic a silent
-    /// binary-skew incident previously had neither of.
+    /// The single accepted build stamp: a foreign stamp is rejected, and the
+    /// error names both the expected and the received stamp -- the
+    /// diagnostic a silent binary-skew incident previously had neither of.
     #[test]
-    fn envelope_with_a_different_version_is_rejected_naming_both_versions() {
+    fn envelope_with_a_foreign_build_stamp_is_rejected_naming_both_values() {
         let credential = HarnessOperatorCredential::parse(format!(
             "g4aho_{}",
             "a".repeat(64),
         )).unwrap();
-        for alien_version in [HARNESS_OPERATOR_WIRE_VERSION - 1, HARNESS_OPERATOR_WIRE_VERSION + 1] {
-            let envelope = HarnessOperatorEnvelopeV1 {
-                version: alien_version,
-                credential: credential.clone(),
-                request: HarnessOperatorRequestV1::SubscribeEvents {},
-            };
-            let error = envelope.validate().expect_err("alien version must be rejected");
-            assert!(matches!(
-                error,
-                HarnessOperatorApiError::WireVersionMismatch {
-                    expected: HARNESS_OPERATOR_WIRE_VERSION,
-                    received,
-                } if received == alien_version,
-            ));
-            let message = error.to_string();
-            assert!(message.contains(&HARNESS_OPERATOR_WIRE_VERSION.to_string()));
-            assert!(message.contains(&alien_version.to_string()));
-        }
+        let foreign_stamp = "f".repeat(40);
+        let envelope = HarnessOperatorEnvelopeV1 {
+            build_stamp: foreign_stamp.clone(),
+            credential,
+            request: HarnessOperatorRequestV1::SubscribeEvents {},
+        };
+        let error = envelope
+            .validate()
+            .expect_err("a foreign build stamp must be rejected");
+        assert!(matches!(
+            &error,
+            HarnessOperatorApiError::BuildStampMismatch { expected, received }
+                if expected == BUILD_STAMP && received == &foreign_stamp,
+        ));
+        let message = error.to_string();
+        assert!(message.contains(BUILD_STAMP));
+        assert!(message.contains(&foreign_stamp));
     }
 
     #[test]
@@ -10784,7 +10725,7 @@ mod tests {
             let decoded: HarnessOperatorRequestV1 = serde_json::from_str(&encoded).unwrap();
             assert_eq!(decoded, request);
             HarnessOperatorEnvelopeV1 {
-                version: HARNESS_OPERATOR_WIRE_VERSION,
+                build_stamp: BUILD_STAMP.to_string(),
                 credential: credential.clone(),
                 request,
             }.validate().unwrap();
@@ -10902,7 +10843,7 @@ mod tests {
             "a".repeat(64),
         )).unwrap();
         HarnessOperatorEnvelopeV1 {
-            version: HARNESS_OPERATOR_WIRE_VERSION,
+            build_stamp: BUILD_STAMP.to_string(),
             credential,
             request,
         }.validate().unwrap();
@@ -11014,16 +10955,6 @@ mod tests {
             let decoded: HarnessOperatorAgentEventV1 = serde_json::from_str(&encoded).unwrap();
             assert_eq!(decoded, event);
         }
-    }
-
-    /// The mailbox arc's Slice B operator surface (`MailInbox`/`AckMail`,
-    /// `unread_mail` on `HarnessRuntimeManagedSessionV1`) moved
-    /// `HARNESS_OPERATOR_WIRE_VERSION` from `20` to `21`; Slice C's `refs` on
-    /// `HarnessMailInboxEntryV1` then moved it `21` -> `22` -- see the
-    /// constant's own doc comment for both shapes.
-    #[test]
-    fn mailbox_operator_surface_moved_the_wire_pin_to_22() {
-        assert_eq!(HARNESS_OPERATOR_WIRE_VERSION, 22);
     }
 
     /// D3/Slice C: `HarnessMailFetchResultV1` round-trips for all three

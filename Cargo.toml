@@ -61,6 +61,7 @@ tokio = { version = "1", features = ["full", "test-util"] }
 [workspace]
 members = [
     "crates/g4a",
+    "crates/gate4agent-build-stamp",
     "crates/gate4agent-types",
     "crates/gate4agent-adapters",
     "crates/gate4agent-provider-ports",

@@ -9,6 +9,7 @@ publish = false
 name = "gate4agent_harness_api"
 
 [dependencies]
+gate4agent-build-stamp = { path = "../gate4agent-build-stamp" }
 gate4agent-harness-protocol = { path = "../gate4agent-harness-protocol" }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"

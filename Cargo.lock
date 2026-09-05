@@ -304,6 +304,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "gate4agent-build-stamp"
+version = "0.1.0"
+
+[[package]]
 name = "gate4agent-c2"
 version = "0.2.37"
 dependencies = [
@@ -347,6 +351,7 @@ dependencies = [
 name = "gate4agent-c2-protocol"
 version = "0.2.37"
 dependencies = [
+ "gate4agent-build-stamp",
  "gate4agent-node-protocol",
  "gate4agent-types",
  "serde",
@@ -384,6 +389,7 @@ dependencies = [
 name = "gate4agent-harness-api"
 version = "0.2.37"
 dependencies = [
+ "gate4agent-build-stamp",
  "gate4agent-harness-protocol",
  "serde",
  "serde_json",
@@ -547,6 +553,7 @@ dependencies = [
 name = "gate4agent-node-protocol"
 version = "0.2.37"
 dependencies = [
+ "gate4agent-build-stamp",
  "gate4agent-harness-api",
  "gate4agent-observation-protocol",
  "gate4agent-types",

@@ -385,7 +385,7 @@ mod tests {
         C2ServerChallenge, C2ServerFrame, C2TopologyNode, HostDescriptor,
         NegotiatedC2ControlCompatibility, NodeCursor, NodeId, NodeTransportState,
         OperatingSystemId, PathEncoding, PathSemantics, PathStyle, StatusResponse,
-        C2_AUTH_NONCE_BYTES, C2_CONTROL_PROTOCOL_VERSION, MAX_C2_AUTH_FRAME_BYTES,
+        BUILD_STAMP, C2_AUTH_NONCE_BYTES, MAX_C2_AUTH_FRAME_BYTES,
         MAX_C2_CLIENT_FRAME_BYTES, MAX_C2_HELLO_FRAME_BYTES, MAX_C2_SERVER_FRAME_BYTES,
     };
     use gate4agent_node_protocol::{
@@ -504,7 +504,7 @@ mod tests {
         let C2ClientFrame::Hello(hello) = frame else { panic!("client did not send hello") };
         let offer = client_compatibility_offer().unwrap();
         let selected = NegotiatedC2ControlCompatibility {
-            protocol_version: C2_CONTROL_PROTOCOL_VERSION,
+            build_stamp: offer.build_stamp.clone(),
             capabilities: offer.capabilities.clone(),
             host: HostDescriptor {
                 operating_system: OperatingSystemId::new("windows").unwrap(),
@@ -527,7 +527,7 @@ mod tests {
         write_json_frame_limited(
             pipe,
             &C2ServerFrame::Challenge(C2ServerChallenge {
-                protocol_version: C2_CONTROL_PROTOCOL_VERSION,
+                build_stamp: BUILD_STAMP.to_owned(),
                 server_nonce,
                 server_proof,
                 compatibility: Some(selected.clone()),
@@ -592,7 +592,7 @@ mod tests {
             write_json_frame_limited(
                 &mut pipe,
                 &C2ServerFrame::Hello(C2Hello {
-                    protocol_version: C2_CONTROL_PROTOCOL_VERSION,
+                    build_stamp: BUILD_STAMP.to_owned(),
                     connection_id: 1,
                     status,
                     compatibility: Some(selected),

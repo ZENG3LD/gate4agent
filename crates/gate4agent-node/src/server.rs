@@ -146,7 +146,7 @@ use crate::protocol::{
     NODE_GIT_READ_CAPABILITY, NODE_WORKSPACE_FILE_READ_CAPABILITY,
     NODE_WORKSPACE_FILE_WRITE_CAPABILITY, NODE_WORKSPACE_ENTRY_CREATE_CAPABILITY,
     NODE_WORKTREE_SELECTION_CAPABILITY,
-    NODE_PROTOCOL_VERSION, MAX_NODE_CLIENT_FRAME_BYTES, MAX_NODE_HELLO_FRAME_BYTES,
+    BUILD_STAMP, MAX_NODE_CLIENT_FRAME_BYTES, MAX_NODE_HELLO_FRAME_BYTES,
     MAX_AGENT_PROGRESS_ACTIVE_TOOL_LABELS, MAX_AGENT_PROGRESS_ENTRY_BYTES,
     MAX_NODE_TERMINAL_BYTES, MAX_NODE_TEXT_BYTES,
     MAX_REPOSITORY_PATH_BYTES,
@@ -2826,11 +2826,8 @@ try { $contextHash = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadA
             &provider_contracts,
             &provider_adapter_contracts,
         )?;
-        validate_node_negotiated_handshake_capacity(
-            &compatibility_support,
-            NODE_PROTOCOL_VERSION,
-        )
-        .map_err(|error| NodeServerError::ProviderContractManifest(error.to_string()))?;
+        validate_node_negotiated_handshake_capacity(&compatibility_support)
+            .map_err(|error| NodeServerError::ProviderContractManifest(error.to_string()))?;
         let enabled_providers = provider_contracts
             .iter()
             .map(|contract| contract.provider.clone())
@@ -12767,13 +12764,16 @@ where
     let ClientFrame::Hello(hello) = hello_frame else {
         return Err(NodeServerError::Handshake("first frame must be hello".to_owned()));
     };
-    if hello.protocol_version != NODE_PROTOCOL_VERSION {
-        return Err(NodeServerError::Handshake("node protocol version mismatch".to_owned()));
+    if hello.build_stamp != BUILD_STAMP {
+        return Err(NodeServerError::Handshake(format!(
+            "build stamp mismatch: local={BUILD_STAMP} remote={}",
+            hello.build_stamp,
+        )));
     }
     let compatibility = match hello.compatibility.as_ref() {
         Some(offer) => {
             let mut selected = node_compatibility_support(&shared)?
-                .negotiate(NODE_PROTOCOL_VERSION, offer)
+                .negotiate(offer)
                 .map_err(|error| NodeServerError::Handshake(error.to_string()))?;
             project_negotiated_provider_ids(&mut selected);
             Some(selected)
@@ -12804,7 +12804,7 @@ where
     write_json_frame_limited(
         &mut pipe,
         &ServerFrame::Challenge(ServerChallenge {
-            protocol_version: NODE_PROTOCOL_VERSION,
+            build_stamp: BUILD_STAMP.to_owned(),
             server_nonce,
             server_proof,
             compatibility: compatibility.clone(),
@@ -12922,7 +12922,7 @@ where
     write_json_frame(
         &mut pipe,
         &ServerFrame::Hello(NodeHello {
-            protocol_version: NODE_PROTOCOL_VERSION,
+            build_stamp: BUILD_STAMP.to_owned(),
             incarnation_id: shared.incarnation_id,
             connection_id,
             role: hello.role,
@@ -13406,8 +13406,7 @@ fn node_compatibility_support_for_manifest(
     provider_adapter_contracts: &[ProviderAdapterContractSupport],
 ) -> Result<NodeCompatibilitySupport, NodeServerError> {
     Ok(NodeCompatibilitySupport {
-        protocol_versions: ProtocolRange::exact(NODE_PROTOCOL_VERSION)
-            .map_err(|error| NodeServerError::Handshake(error.to_string()))?,
+        build_stamp: BUILD_STAMP.to_owned(),
         capabilities: baseline_capabilities()?,
         host: platform::host_descriptor().map_err(NodeServerError::Handshake)?,
         path_semantics: platform::path_semantics(),

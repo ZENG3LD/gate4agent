@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use gate4agent_node_protocol::{
     read_json_frame_limited_body_timeout, write_json_frame_limited, FrameError,
-    NodeCallHomeAnnounce, NodeId, MAX_NODE_HELLO_FRAME_BYTES, NODE_PROTOCOL_VERSION,
+    NodeCallHomeAnnounce, NodeId, BUILD_STAMP, MAX_NODE_HELLO_FRAME_BYTES,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -36,11 +36,11 @@ pub enum CallHomeAnnounceError {
     TimedOut,
     /// The bytes were not a well-formed preface.
     Frame(FrameError),
-    /// A preface arrived, from a peer speaking a different version of this
-    /// wire. Reported separately from `Frame` because it is the one
+    /// A preface arrived, from a peer built from a different tree than
+    /// this binary. Reported separately from `Frame` because it is the one
     /// failure here that is a deployment mistake rather than a hostile or
     /// broken peer, and it should read as one in a log.
-    ProtocolVersion { announced: u16 },
+    BuildStamp { announced: String },
     /// The name is not a syntactically valid node id. Checked here rather
     /// than left to the lookup so a malformed name is refused at the door
     /// with a reason, instead of becoming an indistinguishable "no such
@@ -53,9 +53,9 @@ impl std::fmt::Display for CallHomeAnnounceError {
         match self {
             Self::TimedOut => write!(formatter, "call-home peer did not announce itself in time"),
             Self::Frame(error) => write!(formatter, "call-home announce frame is invalid: {error}"),
-            Self::ProtocolVersion { announced } => write!(
+            Self::BuildStamp { announced } => write!(
                 formatter,
-                "call-home peer speaks node protocol {announced}, this relay speaks {NODE_PROTOCOL_VERSION}",
+                "build stamp mismatch: local={BUILD_STAMP} remote={announced}",
             ),
             Self::InvalidNodeId => write!(formatter, "call-home announce carried an invalid node id"),
         }
@@ -100,9 +100,9 @@ where
     .await
     .map_err(|_| CallHomeAnnounceError::TimedOut)?
     .map_err(CallHomeAnnounceError::Frame)?;
-    if announce.protocol_version != NODE_PROTOCOL_VERSION {
-        return Err(CallHomeAnnounceError::ProtocolVersion {
-            announced: announce.protocol_version,
+    if announce.build_stamp != BUILD_STAMP {
+        return Err(CallHomeAnnounceError::BuildStamp {
+            announced: announce.build_stamp,
         });
     }
     NodeId::new(announce.node_id).map_err(|_| CallHomeAnnounceError::InvalidNodeId)
@@ -124,16 +124,17 @@ mod tests {
         assert_eq!(read, node_id);
     }
 
-    /// A peer on a different node protocol is told which mismatch it is,
+    /// A peer built from a different tree is told which mismatch it is,
     /// not handed a generic parse failure -- this is the one error here
     /// that means "your deployment is mixed", and it has to read that way.
     #[tokio::test]
-    async fn a_version_mismatch_names_itself_rather_than_looking_like_garbage() {
+    async fn a_build_stamp_mismatch_names_itself_rather_than_looking_like_garbage() {
+        let foreign_stamp = "f".repeat(BUILD_STAMP.len());
         let mut wire = Vec::new();
         write_json_frame_limited(
             &mut wire,
             &NodeCallHomeAnnounce {
-                protocol_version: NODE_PROTOCOL_VERSION.wrapping_add(1),
+                build_stamp: foreign_stamp.clone(),
                 node_id: "opbox-windows-x86-64-1d67e837f8fa".to_owned(),
             },
             MAX_NODE_HELLO_FRAME_BYTES,
@@ -142,8 +143,12 @@ mod tests {
         .unwrap();
         let error = read_call_home_announce(&mut wire.as_slice()).await.unwrap_err();
         assert!(
-            matches!(error, CallHomeAnnounceError::ProtocolVersion { .. }),
-            "expected a named version mismatch, got {error:?}",
+            matches!(&error, CallHomeAnnounceError::BuildStamp { announced } if *announced == foreign_stamp),
+            "expected a named build stamp mismatch, got {error:?}",
+        );
+        assert_eq!(
+            error.to_string(),
+            format!("build stamp mismatch: local={BUILD_STAMP} remote={foreign_stamp}"),
         );
     }
 

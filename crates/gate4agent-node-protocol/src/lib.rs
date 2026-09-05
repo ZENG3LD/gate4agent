@@ -20,6 +20,7 @@ pub use gate4agent_observation_protocol::{
 pub use gate4agent_harness_api::{
     HarnessReadHostErrorV1, HarnessReadRequestV1, HarnessReadResponseV1,
 };
+pub use gate4agent_build_stamp::BUILD_STAMP;
 use gate4agent_types::{
     AgentInstanceId, ApprovalLevel, ControlEvent, ProviderActivity, ProviderSessionIdentity,
     SessionGeneration, SessionSnapshot, TerminalControl, TerminalFrame, TerminalSize,
@@ -37,7 +38,6 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::{timeout, Duration};
 
-pub const NODE_PROTOCOL_VERSION: u16 = 16;
 pub const NODE_STATE_SCHEMA_V1: u16 = 1;
 pub const NODE_STATE_SCHEMA_V2: u16 = 2;
 pub const NODE_STATE_SCHEMA_V3: u16 = 3;
@@ -2570,12 +2570,8 @@ pub enum ProtocolNegotiationError {
         local: ProtocolRange,
         remote: ProtocolRange,
     },
-    #[error("active wire protocol {active} is not contained in both ranges {local:?} and {remote:?}")]
-    ActiveVersionUnsupported {
-        active: u16,
-        local: ProtocolRange,
-        remote: ProtocolRange,
-    },
+    #[error("build stamp mismatch: local={local} remote={remote}")]
+    BuildStampMismatch { local: String, remote: String },
     #[error("provider contract manifest is invalid: {0}")]
     InvalidProviderContractManifest(ProviderContractManifestError),
 }
@@ -3481,7 +3477,7 @@ pub fn validate_provider_contract_manifest(
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ClientCompatibilityOffer {
-    pub protocol_versions: ProtocolRange,
+    pub build_stamp: String,
     #[serde(default)]
     pub capabilities: Vec<CapabilityId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3489,21 +3485,21 @@ pub struct ClientCompatibilityOffer {
 }
 
 impl ClientCompatibilityOffer {
-    pub fn exact(protocol_version: u16) -> Result<Self, ProtocolNegotiationError> {
-        Ok(Self {
-            protocol_versions: ProtocolRange::exact(protocol_version)?,
+    /// An offer carrying this binary's own [`BUILD_STAMP`], no capabilities
+    /// and no state-schema support -- the minimal offer a client makes when
+    /// it wants nothing beyond a build-stamp check.
+    pub fn local() -> Self {
+        Self {
+            build_stamp: BUILD_STAMP.to_owned(),
             capabilities: Vec::new(),
             state_schema: None,
-        })
+        }
     }
 }
 
 pub fn production_node_client_compatibility_offer() -> ClientCompatibilityOffer {
     ClientCompatibilityOffer {
-        protocol_versions: ProtocolRange {
-            minimum: NODE_PROTOCOL_VERSION,
-            maximum: NODE_PROTOCOL_VERSION,
-        },
+        build_stamp: BUILD_STAMP.to_owned(),
         capabilities: [
             NODE_COMPATIBILITY_METADATA_CAPABILITY,
             NODE_DELIVERY_BUNDLE_V2_STAGE_COMMIT_CAPABILITY,
@@ -3556,7 +3552,7 @@ pub fn production_node_client_compatibility_offer() -> ClientCompatibilityOffer 
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct NodeCompatibilitySupport {
-    pub protocol_versions: ProtocolRange,
+    pub build_stamp: String,
     #[serde(default)]
     pub capabilities: Vec<CapabilityId>,
     pub host: HostDescriptor,
@@ -3571,7 +3567,7 @@ pub struct NodeCompatibilitySupport {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct NegotiatedNodeCompatibility {
-    pub protocol_version: u16,
+    pub build_stamp: String,
     #[serde(default)]
     pub capabilities: Vec<CapabilityId>,
     pub host: HostDescriptor,
@@ -3588,16 +3584,12 @@ pub struct NegotiatedNodeCompatibility {
 impl NodeCompatibilitySupport {
     pub fn negotiate(
         &self,
-        active_protocol_version: u16,
         client: &ClientCompatibilityOffer,
     ) -> Result<NegotiatedNodeCompatibility, ProtocolNegotiationError> {
-        if !self.protocol_versions.contains(active_protocol_version)
-            || !client.protocol_versions.contains(active_protocol_version)
-        {
-            return Err(ProtocolNegotiationError::ActiveVersionUnsupported {
-                active: active_protocol_version,
-                local: self.protocol_versions,
-                remote: client.protocol_versions,
+        if self.build_stamp != client.build_stamp {
+            return Err(ProtocolNegotiationError::BuildStampMismatch {
+                local: self.build_stamp.clone(),
+                remote: client.build_stamp.clone(),
             });
         }
         let capabilities: Vec<CapabilityId> = self
@@ -3625,7 +3617,7 @@ impl NodeCompatibilitySupport {
             .map_err(ProtocolNegotiationError::InvalidProviderContractManifest)?;
         }
         Ok(NegotiatedNodeCompatibility {
-            protocol_version: active_protocol_version,
+            build_stamp: self.build_stamp.clone(),
             capabilities,
             host: self.host.clone(),
             path_semantics: self.path_semantics.clone(),
@@ -3671,15 +3663,14 @@ pub enum NodeCompatibilityAuthBindingError {
 
 pub fn validate_node_negotiated_handshake_capacity(
     support: &NodeCompatibilitySupport,
-    active_protocol_version: u16,
 ) -> Result<(), NodeNegotiatedHandshakeCapacityError> {
     let offer = production_node_client_compatibility_offer();
-    let selected = support.negotiate(active_protocol_version, &offer)?;
+    let selected = support.negotiate(&offer)?;
     encode_node_compatibility_auth_binding(&offer, &selected)?;
     validate_node_handshake_frame_capacity(
         "negotiated client hello",
         &ClientFrame::Hello(ClientHello {
-            protocol_version: active_protocol_version,
+            build_stamp: BUILD_STAMP.to_owned(),
             role: ClientRole::Observer,
             client_nonce: [u8::MAX; NODE_AUTH_NONCE_BYTES],
             compatibility: Some(offer),
@@ -3688,7 +3679,7 @@ pub fn validate_node_negotiated_handshake_capacity(
     validate_node_handshake_frame_capacity(
         "negotiated server challenge",
         &ServerFrame::Challenge(ServerChallenge {
-            protocol_version: active_protocol_version,
+            build_stamp: BUILD_STAMP.to_owned(),
             server_nonce: [u8::MAX; NODE_AUTH_NONCE_BYTES],
             server_proof: [u8::MAX; NODE_AUTH_PROOF_BYTES],
             compatibility: Some(selected),
@@ -4942,7 +4933,7 @@ where
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ClientHello {
-    pub protocol_version: u16,
+    pub build_stamp: String,
     pub role: ClientRole,
     pub client_nonce: [u8; NODE_AUTH_NONCE_BYTES],
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4952,7 +4943,7 @@ pub struct ClientHello {
 impl ClientHello {
     pub fn new(role: ClientRole, client_nonce: [u8; NODE_AUTH_NONCE_BYTES]) -> Self {
         Self {
-            protocol_version: NODE_PROTOCOL_VERSION,
+            build_stamp: BUILD_STAMP.to_owned(),
             role,
             client_nonce,
             compatibility: None,
@@ -4965,7 +4956,7 @@ impl ClientHello {
         compatibility: ClientCompatibilityOffer,
     ) -> Self {
         Self {
-            protocol_version: NODE_PROTOCOL_VERSION,
+            build_stamp: BUILD_STAMP.to_owned(),
             role,
             client_nonce,
             compatibility: Some(compatibility),
@@ -4975,7 +4966,7 @@ impl ClientHello {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ServerChallenge {
-    pub protocol_version: u16,
+    pub build_stamp: String,
     pub server_nonce: [u8; NODE_AUTH_NONCE_BYTES],
     pub server_proof: [u8; NODE_AUTH_PROOF_BYTES],
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5501,7 +5492,7 @@ pub struct NodeCursor {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct NodeHello {
-    pub protocol_version: u16,
+    pub build_stamp: String,
     pub incarnation_id: NodeIncarnationId,
     pub connection_id: u64,
     pub role: ClientRole,
@@ -7239,13 +7230,13 @@ impl NodeEvent {
 /// any point in a session. It is a preface, not a frame of the protocol.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct NodeCallHomeAnnounce {
-    pub protocol_version: u16,
+    pub build_stamp: String,
     pub node_id: String,
 }
 
 impl NodeCallHomeAnnounce {
     pub fn new(node_id: impl Into<String>) -> Self {
-        Self { protocol_version: NODE_PROTOCOL_VERSION, node_id: node_id.into() }
+        Self { build_stamp: BUILD_STAMP.to_owned(), node_id: node_id.into() }
     }
 }
 
@@ -7535,7 +7526,7 @@ mod tests {
 
     fn portable_node_support() -> NodeCompatibilitySupport {
         NodeCompatibilitySupport {
-            protocol_versions: ProtocolRange::new(7, 9).unwrap(),
+            build_stamp: BUILD_STAMP.to_owned(),
             capabilities: vec![
                 CapabilityId::new("workspace.inspect").unwrap(),
                 CapabilityId::new("session.spawn").unwrap(),
@@ -7566,18 +7557,17 @@ mod tests {
     }
 
     #[test]
-    fn legacy_hello_json_remains_exact_at_the_current_protocol_version() {
-        assert_eq!(NODE_PROTOCOL_VERSION, 16);
+    fn legacy_hello_json_carries_the_build_stamp() {
         let client = ClientHello::new(ClientRole::Observer, [0; NODE_AUTH_NONCE_BYTES]);
         assert_eq!(
             serde_json::to_string(&client).unwrap(),
             format!(
-                r#"{{"protocol_version":{NODE_PROTOCOL_VERSION},"role":"observer","client_nonce":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}}"#,
+                r#"{{"build_stamp":"{BUILD_STAMP}","role":"observer","client_nonce":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}}"#,
             ),
         );
 
         let challenge = ServerChallenge {
-            protocol_version: NODE_PROTOCOL_VERSION,
+            build_stamp: BUILD_STAMP.to_owned(),
             server_nonce: [0; NODE_AUTH_NONCE_BYTES],
             server_proof: [0; NODE_AUTH_PROOF_BYTES],
             compatibility: None,
@@ -7854,7 +7844,6 @@ mod tests {
 
     #[test]
     fn session_bundle_materialization_contract_is_bounded_exact_and_dual_gated() {
-        assert_eq!(NODE_PROTOCOL_VERSION, 16);
         assert_eq!(NODE_STATE_SCHEMA_V7, 7);
         assert_eq!(NODE_STATE_SCHEMA_V8, 8);
         assert_eq!(
@@ -7867,15 +7856,14 @@ mod tests {
             .capabilities
             .contains(&capability));
         let mut support = portable_node_support();
-        support.protocol_versions = ProtocolRange::new(7, NODE_PROTOCOL_VERSION).unwrap();
         support.capabilities = vec![capability.clone()];
         let offer = ClientCompatibilityOffer {
-            protocol_versions: ProtocolRange::exact(NODE_PROTOCOL_VERSION).unwrap(),
+            build_stamp: BUILD_STAMP.to_owned(),
             capabilities: vec![capability.clone()],
             state_schema: None,
         };
         let selected = support
-            .negotiate(NODE_PROTOCOL_VERSION, &offer)
+            .negotiate(&offer)
             .unwrap();
         assert_eq!(selected.capabilities, vec![capability]);
         let bound = encode_node_compatibility_auth_binding(&offer, &selected).unwrap();
@@ -8009,9 +7997,9 @@ mod tests {
     }
 
     #[test]
-    fn compatibility_negotiation_keeps_the_active_wire_and_selects_highest_state_schema() {
+    fn compatibility_negotiation_keeps_the_build_stamp_and_selects_highest_state_schema() {
         let offer = ClientCompatibilityOffer {
-            protocol_versions: ProtocolRange::new(8, NODE_PROTOCOL_VERSION).unwrap(),
+            build_stamp: BUILD_STAMP.to_owned(),
             capabilities: vec![
                 CapabilityId::new("session.spawn").unwrap(),
                 CapabilityId::new("unknown.future").unwrap(),
@@ -8027,10 +8015,9 @@ mod tests {
         );
         assert_eq!(hello.compatibility, Some(offer.clone()));
 
-        let mut support = portable_node_support();
-        support.protocol_versions = ProtocolRange::new(7, NODE_PROTOCOL_VERSION).unwrap();
-        let negotiated = support.negotiate(NODE_PROTOCOL_VERSION, &offer).unwrap();
-        assert_eq!(negotiated.protocol_version, NODE_PROTOCOL_VERSION);
+        let support = portable_node_support();
+        let negotiated = support.negotiate(&offer).unwrap();
+        assert_eq!(negotiated.build_stamp, BUILD_STAMP);
         assert_eq!(negotiated.state_schema_version, Some(5));
         assert_eq!(
             negotiated.capabilities,
@@ -8041,63 +8028,60 @@ mod tests {
     }
 
     #[test]
-    fn compatibility_negotiation_rejects_an_active_wire_outside_either_range() {
+    fn negotiate_rejects_a_foreign_build_stamp_naming_both_values() {
+        let foreign_stamp = "f".repeat(40);
         let offer = ClientCompatibilityOffer {
-            protocol_versions: ProtocolRange::new(10, 11).unwrap(),
+            build_stamp: foreign_stamp.clone(),
             capabilities: Vec::new(),
             state_schema: None,
         };
-        let error = portable_node_support()
-            .negotiate(NODE_PROTOCOL_VERSION, &offer)
-            .unwrap_err();
+        let error = portable_node_support().negotiate(&offer).unwrap_err();
         assert!(matches!(
-            error,
-            ProtocolNegotiationError::ActiveVersionUnsupported {
-                active: NODE_PROTOCOL_VERSION,
-                ..
-            },
+            &error,
+            ProtocolNegotiationError::BuildStampMismatch { local, remote }
+                if local == BUILD_STAMP && remote == &foreign_stamp,
         ));
+        assert_eq!(
+            error.to_string(),
+            format!("build stamp mismatch: local={BUILD_STAMP} remote={foreign_stamp}"),
+        );
     }
 
     #[test]
     fn compatibility_auth_binding_has_an_exact_bounded_encoding() {
-        assert_eq!(NODE_PROTOCOL_VERSION, 16);
         let offer = ClientCompatibilityOffer {
-            protocol_versions: ProtocolRange::new(8, NODE_PROTOCOL_VERSION).unwrap(),
+            build_stamp: BUILD_STAMP.to_owned(),
             capabilities: vec![CapabilityId::new("session.spawn").unwrap()],
             state_schema: Some(StateSchemaSupport {
                 versions: ProtocolRange::new(4, 6).unwrap(),
             }),
         };
-        let mut support = portable_node_support();
-        support.protocol_versions = ProtocolRange::new(7, NODE_PROTOCOL_VERSION).unwrap();
+        let support = portable_node_support();
         let selected = support
-            .negotiate(NODE_PROTOCOL_VERSION, &offer)
+            .negotiate(&offer)
             .unwrap();
         let encoded = encode_node_compatibility_auth_binding(&offer, &selected).unwrap();
         assert_eq!(
             String::from_utf8(encoded).unwrap(),
             format!(
-                r#"{{"offer":{{"protocol_versions":{{"minimum":8,"maximum":{NODE_PROTOCOL_VERSION}}},"capabilities":["session.spawn"],"state_schema":{{"versions":{{"minimum":4,"maximum":6}}}}}},"selected":{{"protocol_version":{NODE_PROTOCOL_VERSION},"capabilities":["session.spawn"],"host":{{"operating_system":"windows","architecture":"x86_64"}},"path_semantics":{{"style":"windows","encoding":"utf8"}},"local_transport":"windows-named-pipe","state_schema_version":5,"provider_contracts":[]}}}}"#,
+                r#"{{"offer":{{"build_stamp":"{BUILD_STAMP}","capabilities":["session.spawn"],"state_schema":{{"versions":{{"minimum":4,"maximum":6}}}}}},"selected":{{"build_stamp":"{BUILD_STAMP}","capabilities":["session.spawn"],"host":{{"operating_system":"windows","architecture":"x86_64"}},"path_semantics":{{"style":"windows","encoding":"utf8"}},"local_transport":"windows-named-pipe","state_schema_version":5,"provider_contracts":[]}}}}"#,
             ),
         );
     }
 
     #[test]
     fn provider_contract_manifest_is_capability_gated_and_auth_bound_exactly() {
-        assert_eq!(NODE_PROTOCOL_VERSION, 16);
         let manifest_capability =
             CapabilityId::new(NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY).unwrap();
         let mut support = portable_node_support();
-        support.protocol_versions = ProtocolRange::new(7, NODE_PROTOCOL_VERSION).unwrap();
         support.capabilities.push(manifest_capability.clone());
         let offer = ClientCompatibilityOffer {
-            protocol_versions: ProtocolRange::exact(NODE_PROTOCOL_VERSION).unwrap(),
+            build_stamp: BUILD_STAMP.to_owned(),
             capabilities: vec![manifest_capability.clone()],
             state_schema: None,
         };
         let selected = support
-            .negotiate(NODE_PROTOCOL_VERSION, &offer)
+            .negotiate(&offer)
             .unwrap();
         assert_eq!(selected.capabilities, vec![manifest_capability]);
         assert_eq!(selected.provider_contracts, support.provider_contracts);
@@ -8109,19 +8093,17 @@ mod tests {
         assert_eq!(
             String::from_utf8(encoded).unwrap(),
             format!(
-                r#"{{"offer":{{"protocol_versions":{{"minimum":{NODE_PROTOCOL_VERSION},"maximum":{NODE_PROTOCOL_VERSION}}},"capabilities":["provider-contract-manifest-v1"]}},"selected":{{"protocol_version":{NODE_PROTOCOL_VERSION},"capabilities":["provider-contract-manifest-v1"],"host":{{"operating_system":"windows","architecture":"x86_64"}},"path_semantics":{{"style":"windows","encoding":"utf8"}},"local_transport":"windows-named-pipe","provider_contracts":[{{"provider":"codex","revision":"codex.2026-08"}}],"provider_adapter_contracts":[{{"provider":"codex","family":"pty-semantic","adapter_id":"codex-cli","revision":"pty-semantic-v1"}}]}}}}"#,
+                r#"{{"offer":{{"build_stamp":"{BUILD_STAMP}","capabilities":["provider-contract-manifest-v1"]}},"selected":{{"build_stamp":"{BUILD_STAMP}","capabilities":["provider-contract-manifest-v1"],"host":{{"operating_system":"windows","architecture":"x86_64"}},"path_semantics":{{"style":"windows","encoding":"utf8"}},"local_transport":"windows-named-pipe","provider_contracts":[{{"provider":"codex","revision":"codex.2026-08"}}],"provider_adapter_contracts":[{{"provider":"codex","family":"pty-semantic","adapter_id":"codex-cli","revision":"pty-semantic-v1"}}]}}}}"#,
             ),
         );
     }
 
     #[test]
     fn open_provider_capability_and_manifest_are_auth_bound_exactly() {
-        assert_eq!(NODE_PROTOCOL_VERSION, 16);
         let manifest_capability =
             CapabilityId::new(NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY).unwrap();
         let open_capability = CapabilityId::new(NODE_PROVIDER_ID_OPEN_CAPABILITY).unwrap();
         let mut support = portable_node_support();
-        support.protocol_versions = ProtocolRange::new(7, NODE_PROTOCOL_VERSION).unwrap();
         support.capabilities = vec![manifest_capability.clone(), open_capability.clone()];
         support.provider_contracts = vec![ProviderContractSupport {
             provider: agent("third-party-agent"),
@@ -8129,25 +8111,25 @@ mod tests {
         }];
         support.provider_adapter_contracts.clear();
         let offer = ClientCompatibilityOffer {
-            protocol_versions: ProtocolRange::exact(NODE_PROTOCOL_VERSION).unwrap(),
+            build_stamp: BUILD_STAMP.to_owned(),
             capabilities: vec![manifest_capability, open_capability],
             state_schema: None,
         };
         let selected = support
-            .negotiate(NODE_PROTOCOL_VERSION, &offer)
+            .negotiate(&offer)
             .unwrap();
         let encoded = encode_node_compatibility_auth_binding(&offer, &selected).unwrap();
         assert_eq!(
             String::from_utf8(encoded).unwrap(),
             format!(
-                r#"{{"offer":{{"protocol_versions":{{"minimum":{NODE_PROTOCOL_VERSION},"maximum":{NODE_PROTOCOL_VERSION}}},"capabilities":["provider-contract-manifest-v1","provider-id.open-v1"]}},"selected":{{"protocol_version":{NODE_PROTOCOL_VERSION},"capabilities":["provider-contract-manifest-v1","provider-id.open-v1"],"host":{{"operating_system":"windows","architecture":"x86_64"}},"path_semantics":{{"style":"windows","encoding":"utf8"}},"local_transport":"windows-named-pipe","provider_contracts":[{{"provider":"third-party-agent","revision":"third-party.2026-08"}}]}}}}"#,
+                r#"{{"offer":{{"build_stamp":"{BUILD_STAMP}","capabilities":["provider-contract-manifest-v1","provider-id.open-v1"]}},"selected":{{"build_stamp":"{BUILD_STAMP}","capabilities":["provider-contract-manifest-v1","provider-id.open-v1"],"host":{{"operating_system":"windows","architecture":"x86_64"}},"path_semantics":{{"style":"windows","encoding":"utf8"}},"local_transport":"windows-named-pipe","provider_contracts":[{{"provider":"third-party-agent","revision":"third-party.2026-08"}}]}}}}"#,
             ),
         );
     }
 
     #[test]
     fn n_minus_one_selected_json_round_trips_without_manifest_fields() {
-        let json = r#"{"protocol_version":8,"capabilities":["compatibility.metadata"],"host":{"operating_system":"windows","architecture":"x86_64"},"path_semantics":{"style":"windows","encoding":"utf8"},"local_transport":"windows-named-pipe","state_schema_version":1,"provider_contracts":[]}"#;
+        let json = r#"{"build_stamp":"n-minus-one-stamp","capabilities":["compatibility.metadata"],"host":{"operating_system":"windows","architecture":"x86_64"},"path_semantics":{"style":"windows","encoding":"utf8"},"local_transport":"windows-named-pipe","state_schema_version":1,"provider_contracts":[]}"#;
         let selected: NegotiatedNodeCompatibility = serde_json::from_str(json).unwrap();
         assert!(selected.provider_contracts.is_empty());
         assert!(selected.provider_adapter_contracts.is_empty());
@@ -8266,19 +8248,15 @@ mod tests {
         let manifest_capability =
             CapabilityId::new(NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY).unwrap();
         let mut support = portable_node_support();
-        support.protocol_versions = ProtocolRange::new(7, NODE_PROTOCOL_VERSION).unwrap();
         support.capabilities.push(manifest_capability.clone());
         support.provider_contracts = provider_contracts;
         support.provider_adapter_contracts = provider_adapter_contracts;
         let selected = support
-            .negotiate(
-                NODE_PROTOCOL_VERSION,
-                &ClientCompatibilityOffer {
-                    protocol_versions: ProtocolRange::exact(NODE_PROTOCOL_VERSION).unwrap(),
-                    capabilities: vec![manifest_capability],
-                    state_schema: None,
-                },
-            )
+            .negotiate(&ClientCompatibilityOffer {
+                build_stamp: BUILD_STAMP.to_owned(),
+                capabilities: vec![manifest_capability],
+                state_schema: None,
+            })
             .unwrap();
         assert_eq!(selected.provider_contracts.len(), 3);
         assert_eq!(selected.provider_adapter_contracts.len(), 30);
@@ -8291,7 +8269,6 @@ mod tests {
             .map(|index| agent(&format!("provider-{index}")))
             .collect::<Vec<_>>();
         let mut support = portable_node_support();
-        support.protocol_versions = ProtocolRange::new(7, NODE_PROTOCOL_VERSION).unwrap();
         support.capabilities.extend([
             CapabilityId::new(NODE_PROVIDER_CONTRACT_MANIFEST_CAPABILITY).unwrap(),
             CapabilityId::new(NODE_PROVIDER_ID_OPEN_CAPABILITY).unwrap(),
@@ -8317,7 +8294,7 @@ mod tests {
             })
             .collect();
 
-        validate_node_negotiated_handshake_capacity(&support, NODE_PROTOCOL_VERSION).unwrap();
+        validate_node_negotiated_handshake_capacity(&support).unwrap();
     }
 
     #[test]
@@ -8721,21 +8698,19 @@ mod tests {
 
     #[test]
     fn history_context_pack_wire_is_bounded_path_free_and_auth_bound() {
-        assert_eq!(NODE_PROTOCOL_VERSION, 16);
         assert_eq!(NODE_HISTORY_CONTEXT_PACK_CAPABILITY, "history-context-pack-v1");
         let capability = CapabilityId::new(NODE_HISTORY_CONTEXT_PACK_CAPABILITY).unwrap();
         assert!(production_node_client_compatibility_offer()
             .capabilities
             .contains(&capability));
         let mut support = portable_node_support();
-        support.protocol_versions = ProtocolRange::new(7, NODE_PROTOCOL_VERSION).unwrap();
         support.capabilities = vec![capability.clone()];
         let offer = ClientCompatibilityOffer {
-            protocol_versions: ProtocolRange::exact(NODE_PROTOCOL_VERSION).unwrap(),
+            build_stamp: BUILD_STAMP.to_owned(),
             capabilities: vec![capability.clone()],
             state_schema: None,
         };
-        let selected = support.negotiate(NODE_PROTOCOL_VERSION, &offer).unwrap();
+        let selected = support.negotiate(&offer).unwrap();
         assert_eq!(selected.capabilities, vec![capability]);
         let binding = encode_node_compatibility_auth_binding(&offer, &selected).unwrap();
         assert!(binding
@@ -9141,7 +9116,6 @@ mod tests {
 
     #[test]
     fn protocol_v9_workspace_and_worktree_mutations_have_exact_bounded_wire_shapes() {
-        assert_eq!(NODE_PROTOCOL_VERSION, 16);
         assert_eq!(MAX_WORKSPACE_ROOT_BYTES, gate4agent_types::WORKING_DIRECTORY_MAX_BYTES);
 
         let register = NodeRequest::RegisterWorkspace {
@@ -9254,10 +9228,9 @@ mod tests {
     }
 
     #[test]
-    fn node_hello_carries_the_incarnation_sequence_domain_at_the_current_protocol_version() {
-        assert_eq!(NODE_PROTOCOL_VERSION, 16);
+    fn node_hello_carries_the_incarnation_sequence_domain_with_the_build_stamp() {
         let hello = NodeHello {
-            protocol_version: NODE_PROTOCOL_VERSION,
+            build_stamp: BUILD_STAMP.to_owned(),
             incarnation_id: NodeIncarnationId::from_bytes([0; NODE_INCARNATION_ID_BYTES]),
             connection_id: 42,
             role: ClientRole::Observer,
@@ -9279,7 +9252,7 @@ mod tests {
         assert_eq!(
             json,
             format!(
-                r#"{{"protocol_version":{NODE_PROTOCOL_VERSION},"incarnation_id":"00000000000000000000000000000000","connection_id":42,"role":"observer","event_sequence":9,"controller":null,"snapshot":{{"node_id":"fixture-node","enabled_providers":[],"workspaces":[],"session_records":[]}}}}"#,
+                r#"{{"build_stamp":"{BUILD_STAMP}","incarnation_id":"00000000000000000000000000000000","connection_id":42,"role":"observer","event_sequence":9,"controller":null,"snapshot":{{"node_id":"fixture-node","enabled_providers":[],"workspaces":[],"session_records":[]}}}}"#,
             ),
         );
         assert_eq!(serde_json::from_str::<NodeHello>(&json).unwrap(), hello);
@@ -9486,7 +9459,6 @@ mod tests {
             NODE_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY,
             "managed-worktree-lifecycle-v1",
         );
-        assert_eq!(NODE_PROTOCOL_VERSION, 16);
         assert_eq!(NODE_STATE_SCHEMA_V4, 4);
         assert_eq!(NODE_STATE_SCHEMA_V5, 5);
         assert_eq!(NODE_STATE_SCHEMA_V6, 6);
@@ -9763,7 +9735,6 @@ mod tests {
 
     #[test]
     fn terminal_frame_events_capability_is_optional_and_auth_bound_exactly() {
-        assert_eq!(NODE_PROTOCOL_VERSION, 16);
         assert_eq!(
             NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
             "terminal-frame-events-v1",
@@ -9775,22 +9746,21 @@ mod tests {
 
         let capability = CapabilityId::new(NODE_TERMINAL_FRAME_EVENTS_CAPABILITY).unwrap();
         let mut support = portable_node_support();
-        support.protocol_versions = ProtocolRange::new(7, NODE_PROTOCOL_VERSION).unwrap();
         support.capabilities = vec![capability.clone()];
-        let legacy = ClientCompatibilityOffer::exact(NODE_PROTOCOL_VERSION).unwrap();
+        let legacy = ClientCompatibilityOffer::local();
         assert!(support
-            .negotiate(NODE_PROTOCOL_VERSION, &legacy)
+            .negotiate(&legacy)
             .unwrap()
             .capabilities
             .is_empty());
 
         let offer = ClientCompatibilityOffer {
-            protocol_versions: ProtocolRange::exact(NODE_PROTOCOL_VERSION).unwrap(),
+            build_stamp: BUILD_STAMP.to_owned(),
             capabilities: vec![capability.clone()],
             state_schema: None,
         };
         let selected = support
-            .negotiate(NODE_PROTOCOL_VERSION, &offer)
+            .negotiate(&offer)
             .unwrap();
         assert_eq!(selected.capabilities, vec![capability]);
         assert_eq!(
@@ -9799,7 +9769,7 @@ mod tests {
             )
             .unwrap(),
             format!(
-                r#"{{"offer":{{"protocol_versions":{{"minimum":{NODE_PROTOCOL_VERSION},"maximum":{NODE_PROTOCOL_VERSION}}},"capabilities":["terminal-frame-events-v1"]}},"selected":{{"protocol_version":{NODE_PROTOCOL_VERSION},"capabilities":["terminal-frame-events-v1"],"host":{{"operating_system":"windows","architecture":"x86_64"}},"path_semantics":{{"style":"windows","encoding":"utf8"}},"local_transport":"windows-named-pipe","provider_contracts":[]}}}}"#,
+                r#"{{"offer":{{"build_stamp":"{BUILD_STAMP}","capabilities":["terminal-frame-events-v1"]}},"selected":{{"build_stamp":"{BUILD_STAMP}","capabilities":["terminal-frame-events-v1"],"host":{{"operating_system":"windows","architecture":"x86_64"}},"path_semantics":{{"style":"windows","encoding":"utf8"}},"local_transport":"windows-named-pipe","provider_contracts":[]}}}}"#,
             ),
         );
     }
@@ -9820,22 +9790,21 @@ mod tests {
         let capability =
             CapabilityId::new(NODE_CHILD_ENVIRONMENT_PROFILE_CAPABILITY).unwrap();
         let mut support = portable_node_support();
-        support.protocol_versions = ProtocolRange::new(7, NODE_PROTOCOL_VERSION).unwrap();
         support.capabilities = vec![capability.clone()];
-        let legacy = ClientCompatibilityOffer::exact(NODE_PROTOCOL_VERSION).unwrap();
+        let legacy = ClientCompatibilityOffer::local();
         assert!(support
-            .negotiate(NODE_PROTOCOL_VERSION, &legacy)
+            .negotiate(&legacy)
             .unwrap()
             .capabilities
             .is_empty());
 
         let offer = ClientCompatibilityOffer {
-            protocol_versions: ProtocolRange::exact(NODE_PROTOCOL_VERSION).unwrap(),
+            build_stamp: BUILD_STAMP.to_owned(),
             capabilities: vec![capability.clone()],
             state_schema: None,
         };
         let selected = support
-            .negotiate(NODE_PROTOCOL_VERSION, &offer)
+            .negotiate(&offer)
             .unwrap();
         assert_eq!(selected.capabilities, vec![capability]);
         let bound = encode_node_compatibility_auth_binding(&offer, &selected).unwrap();
@@ -9848,7 +9817,6 @@ mod tests {
 
     #[test]
     fn worktree_selection_capability_is_optional_and_auth_bound_exactly() {
-        assert_eq!(NODE_PROTOCOL_VERSION, 16);
         assert_eq!(NODE_WORKTREE_SELECTION_CAPABILITY, "worktree-selection-v1");
         assert!(production_node_client_compatibility_offer()
             .capabilities
@@ -9857,21 +9825,20 @@ mod tests {
 
         let capability = CapabilityId::new(NODE_WORKTREE_SELECTION_CAPABILITY).unwrap();
         let mut support = portable_node_support();
-        support.protocol_versions = ProtocolRange::new(7, NODE_PROTOCOL_VERSION).unwrap();
         support.capabilities = vec![capability.clone()];
-        let legacy = ClientCompatibilityOffer::exact(NODE_PROTOCOL_VERSION).unwrap();
+        let legacy = ClientCompatibilityOffer::local();
         assert!(support
-            .negotiate(NODE_PROTOCOL_VERSION, &legacy)
+            .negotiate(&legacy)
             .unwrap()
             .capabilities
             .is_empty());
 
         let offer = ClientCompatibilityOffer {
-            protocol_versions: ProtocolRange::exact(NODE_PROTOCOL_VERSION).unwrap(),
+            build_stamp: BUILD_STAMP.to_owned(),
             capabilities: vec![capability.clone()],
             state_schema: None,
         };
-        let selected = support.negotiate(NODE_PROTOCOL_VERSION, &offer).unwrap();
+        let selected = support.negotiate(&offer).unwrap();
         assert_eq!(selected.capabilities, vec![capability]);
         assert_eq!(
             String::from_utf8(
@@ -9879,7 +9846,7 @@ mod tests {
             )
             .unwrap(),
             format!(
-                r#"{{"offer":{{"protocol_versions":{{"minimum":{NODE_PROTOCOL_VERSION},"maximum":{NODE_PROTOCOL_VERSION}}},"capabilities":["worktree-selection-v1"]}},"selected":{{"protocol_version":{NODE_PROTOCOL_VERSION},"capabilities":["worktree-selection-v1"],"host":{{"operating_system":"windows","architecture":"x86_64"}},"path_semantics":{{"style":"windows","encoding":"utf8"}},"local_transport":"windows-named-pipe","provider_contracts":[]}}}}"#,
+                r#"{{"offer":{{"build_stamp":"{BUILD_STAMP}","capabilities":["worktree-selection-v1"]}},"selected":{{"build_stamp":"{BUILD_STAMP}","capabilities":["worktree-selection-v1"],"host":{{"operating_system":"windows","architecture":"x86_64"}},"path_semantics":{{"style":"windows","encoding":"utf8"}},"local_transport":"windows-named-pipe","provider_contracts":[]}}}}"#,
             ),
         );
     }

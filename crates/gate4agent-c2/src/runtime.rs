@@ -1761,6 +1761,7 @@ fn relay_node_failure(error: &NodeClientError) -> Option<C2NodeFailure> {
         NodeClientError::Io(_)
         | NodeClientError::Frame(_)
         | NodeClientError::Protocol(_)
+        | NodeClientError::BuildStampMismatch { .. }
         | NodeClientError::AuthenticationTimedOut
         | NodeClientError::Authentication(_)
         | NodeClientError::RequestIdExhausted => None,
@@ -2212,6 +2213,8 @@ fn sanitize_node_error(error: &NodeClientError) -> (SanitizedError, bool) {
             (C2ErrorCategory::Authentication, "node authentication failed", true),
         NodeClientError::Protocol(_) | NodeClientError::Frame(FrameError::Json(_) | FrameError::InvalidLength { .. }) =>
             (C2ErrorCategory::Protocol, "node protocol failed", true),
+        NodeClientError::BuildStampMismatch { .. } =>
+            (C2ErrorCategory::Protocol, "node build stamp mismatch", true),
         NodeClientError::UnsupportedCapability(_) =>
             (C2ErrorCategory::Protocol, "node capability unavailable", true),
         NodeClientError::Node(failure) if failure.code == NodeFailureCode::Unauthorized =>

@@ -330,8 +330,8 @@ pub(crate) async fn handle_event(state: &LightState, event: &RoutedNodeEvent) {
 ///
 /// Every entry in `inventory` was built by `redact_runtime_inventory`, which
 /// always populates `screen_state: Some(..)` -- this wire has exactly one
-/// accepted version (see `HARNESS_OPERATOR_WIRE_VERSION`), so that value is
-/// served unconditionally, with no per-connection projection.
+/// accepted build stamp (see `BUILD_STAMP`), so that value is served
+/// unconditionally, with no per-connection projection.
 pub(crate) async fn list(
     inventory: &SharedInventory,
     after_node_id: Option<String>,

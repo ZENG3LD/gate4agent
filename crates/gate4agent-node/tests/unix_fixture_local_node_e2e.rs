@@ -3,7 +3,7 @@
 use gate4agent_node::protocol::{
     AgentId, ClientRole, LocalTransportKind, NodeFailureCode, NodeId, NodeRequest,
     NodeResponse, NodeSnapshot, PathEncoding, PathStyle, SessionAddress, SessionMode, WorkspaceId,
-    NODE_PROTOCOL_VERSION,
+    BUILD_STAMP,
 };
 use gate4agent_node::{NodeServer, NodeServerConfig, WorkspaceConfig};
 use gate4agent_node_wire::{LocalNodeClient, NodeClientError};
@@ -150,7 +150,7 @@ async fn unix_production_socket_node_preserves_auth_controller_pty_reconnect_and
     )
     .await
     .unwrap();
-    assert_eq!(first.hello().protocol_version, NODE_PROTOCOL_VERSION);
+    assert_eq!(first.hello().build_stamp, BUILD_STAMP);
     assert_eq!(first.hello().snapshot.workspaces.len(), 2);
     let compatibility = first.hello().compatibility.as_ref().unwrap();
     assert_eq!(compatibility.local_transport, LocalTransportKind::UnixDomainSocket);

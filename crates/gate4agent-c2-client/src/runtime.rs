@@ -3,8 +3,8 @@ use gate4agent_c2_protocol::{
     C2ClientHello, C2Hello, C2NodeEvent, C2NodeResponse, C2ObservationSupport, C2RelayFailure,
     C2RequestEnvelope, C2RequestId, C2ServerFrame, C2Topology, CapabilityId,
     ClientCompatibilityOffer, NegotiatedC2ControlCompatibility, NodeRequest, NodeRoute,
-    ProtocolRange, RoutedNodeEvent, RoutedNodeRequest, RoutedNodeResponse,
-    C2_COMPATIBILITY_METADATA_CAPABILITY, C2_CONTROL_PROTOCOL_VERSION,
+    RoutedNodeEvent, RoutedNodeRequest, RoutedNodeResponse,
+    BUILD_STAMP, C2_COMPATIBILITY_METADATA_CAPABILITY,
     C2_OPAQUE_UNIX_PATH_CAPABILITY, C2_REPOSITORY_PATH_CAPABILITY,
     C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY,
     C2_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY,
@@ -367,8 +367,11 @@ pub async fn connect_local(
     let C2ServerFrame::Challenge(challenge) = challenge else {
         return Err(C2ControlError::Protocol("C2 did not return an authentication challenge".to_owned()));
     };
-    if challenge.protocol_version != C2_CONTROL_PROTOCOL_VERSION {
-        return Err(C2ControlError::Protocol("C2 control protocol version mismatch".to_owned()));
+    if challenge.build_stamp != BUILD_STAMP {
+        return Err(C2ControlError::BuildStampMismatch {
+            local: BUILD_STAMP.to_owned(),
+            remote: challenge.build_stamp.clone(),
+        });
     }
     let selected = challenge.compatibility.as_ref().ok_or_else(|| {
         C2ControlError::Protocol(
@@ -404,11 +407,14 @@ pub async fn connect_local(
     let hello = timeout(HELLO_DEADLINE, read_server_frame(&mut pipe, MAX_C2_HELLO_FRAME_BYTES))
         .await.map_err(|_| C2ControlError::AuthenticationTimedOut)??;
     let hello = match hello {
-        C2ServerFrame::Hello(hello) if hello.protocol_version == C2_CONTROL_PROTOCOL_VERSION => hello,
+        C2ServerFrame::Hello(hello) if hello.build_stamp == BUILD_STAMP => hello,
         C2ServerFrame::Rejected(failure) =>
             return Err(C2ControlError::Relay(failure)),
-        C2ServerFrame::Hello(_) =>
-            return Err(C2ControlError::Protocol("C2 control protocol version mismatch".to_owned())),
+        C2ServerFrame::Hello(hello) =>
+            return Err(C2ControlError::BuildStampMismatch {
+                local: BUILD_STAMP.to_owned(),
+                remote: hello.build_stamp.clone(),
+            }),
         _ => return Err(C2ControlError::Protocol("C2 did not return hello".to_owned())),
     };
     if hello.compatibility.is_none() {
@@ -498,8 +504,7 @@ pub async fn connect_local(
 
 pub(crate) fn client_compatibility_offer() -> Result<ClientCompatibilityOffer, C2ControlError> {
     Ok(ClientCompatibilityOffer {
-        protocol_versions: ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION)
-            .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
+        build_stamp: BUILD_STAMP.to_owned(),
         capabilities: vec![
             CapabilityId::new(C2_COMPATIBILITY_METADATA_CAPABILITY)
                 .map_err(|error| C2ControlError::Protocol(error.to_string()))?,
@@ -582,22 +587,16 @@ fn validate_selected_compatibility(
     offer: &ClientCompatibilityOffer,
     selected: Option<&NegotiatedC2ControlCompatibility>,
 ) -> Result<(), C2ControlError> {
-    if !offer.protocol_versions.contains(C2_CONTROL_PROTOCOL_VERSION) {
-        return Err(C2ControlError::Protocol(
-            "C2 compatibility offer excludes control protocol v2".to_owned(),
-        ));
-    }
     let Some(selected) = selected else {
         return Err(C2ControlError::Protocol(
             "C2 omitted the required authenticated compatibility selection".to_owned(),
         ));
     };
-    if selected.protocol_version != C2_CONTROL_PROTOCOL_VERSION
-        || !offer.protocol_versions.contains(selected.protocol_version)
-    {
-        return Err(C2ControlError::Protocol(
-            "C2 selected a protocol version outside the client offer".to_owned(),
-        ));
+    if selected.build_stamp != offer.build_stamp {
+        return Err(C2ControlError::BuildStampMismatch {
+            local: offer.build_stamp.clone(),
+            remote: selected.build_stamp.clone(),
+        });
     }
     if selected
         .capabilities
@@ -3025,6 +3024,8 @@ pub enum C2ControlError {
     Authentication(String),
     #[error("C2 control protocol failed: {0}")]
     Protocol(String),
+    #[error("build stamp mismatch: local={local} remote={remote}")]
+    BuildStampMismatch { local: String, remote: String },
     #[error("C2 relay rejected request: {0:?}")]
     Relay(C2RelayFailure),
     #[error("C2 control connection closed")]
@@ -3895,10 +3896,7 @@ mod tests {
     fn c2_control_client_offer_is_exact_v2_with_authenticated_opt_ins() {
         let offer = client_compatibility_offer().unwrap();
 
-        assert_eq!(
-            offer.protocol_versions,
-            ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
-        );
+        assert_eq!(offer.build_stamp, BUILD_STAMP);
         assert_eq!(
             offer.capabilities,
             vec![
@@ -4740,7 +4738,7 @@ mod tests {
     fn c2_control_client_rejects_selection_outside_offer() {
         let offer = client_compatibility_offer().unwrap();
         let selected = NegotiatedC2ControlCompatibility {
-            protocol_version: C2_CONTROL_PROTOCOL_VERSION + 1,
+            build_stamp: format!("{}-tampered", offer.build_stamp),
             capabilities: offer.capabilities.clone(),
             host: HostDescriptor {
                 operating_system: OperatingSystemId::new("windows").unwrap(),
@@ -4754,7 +4752,7 @@ mod tests {
 
         assert!(matches!(
             validate_selected_compatibility(&offer, Some(&selected)),
-            Err(C2ControlError::Protocol(_)),
+            Err(C2ControlError::BuildStampMismatch { .. }),
         ));
     }
 
@@ -4762,7 +4760,7 @@ mod tests {
     fn c2_control_client_requires_authenticated_compatibility_metadata() {
         let offer = client_compatibility_offer().unwrap();
         let selected = NegotiatedC2ControlCompatibility {
-            protocol_version: C2_CONTROL_PROTOCOL_VERSION,
+            build_stamp: offer.build_stamp.clone(),
             capabilities: vec![
                 CapabilityId::new(C2_WORKSPACE_FILE_READ_CAPABILITY).unwrap(),
             ],
@@ -4817,7 +4815,7 @@ mod tests {
                 write_json_frame_limited(
                     &mut server,
                     &C2ServerFrame::Challenge(C2ServerChallenge {
-                        protocol_version: C2_CONTROL_PROTOCOL_VERSION,
+                        build_stamp: BUILD_STAMP.to_owned(),
                         server_nonce,
                         server_proof,
                         compatibility: None,
@@ -4857,7 +4855,7 @@ mod tests {
     fn c2_control_bound_proof_rejects_tampered_selection() {
         let offer = client_compatibility_offer().unwrap();
         let selected = NegotiatedC2ControlCompatibility {
-            protocol_version: C2_CONTROL_PROTOCOL_VERSION,
+            build_stamp: offer.build_stamp.clone(),
             capabilities: offer.capabilities.clone(),
             host: HostDescriptor {
                 operating_system: OperatingSystemId::new("windows").unwrap(),

@@ -66,6 +66,7 @@ pub use gate4agent_node_protocol::{
     NODE_HARNESS_MCP_READ_PROXY_CAPABILITY,
     ProtocolNegotiationError, ProtocolRange,
 };
+pub use gate4agent_build_stamp::BUILD_STAMP;
 use gate4agent_node_protocol::{
     AgentStreamChunkV1, ManagedSessionRecord, ManagedSessionState, NegotiatedNodeCompatibility,
     NodeSnapshot, SessionAddress, SessionMode, SessionRecordId, WorkspaceId,
@@ -81,7 +82,6 @@ use std::fmt;
 
 pub const C2_API_VERSION: u16 = 2;
 pub const DEFAULT_C2_API_LISTEN: &str = "127.0.0.1:18320";
-pub const C2_CONTROL_PROTOCOL_VERSION: u16 = 4;
 pub const C2_COMPATIBILITY_METADATA_CAPABILITY: &str = "compatibility.metadata";
 pub const C2_OPAQUE_UNIX_PATH_CAPABILITY: &str =
     gate4agent_node_protocol::NODE_OPAQUE_UNIX_PATH_CAPABILITY;
@@ -2285,7 +2285,7 @@ pub struct C2RelayFailure {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct C2ClientHello {
-    pub protocol_version: u16,
+    pub build_stamp: String,
     pub client_nonce: [u8; C2_AUTH_NONCE_BYTES],
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compatibility: Option<ClientCompatibilityOffer>,
@@ -2294,7 +2294,7 @@ pub struct C2ClientHello {
 impl C2ClientHello {
     pub fn new(client_nonce: [u8; C2_AUTH_NONCE_BYTES]) -> Self {
         Self {
-            protocol_version: C2_CONTROL_PROTOCOL_VERSION,
+            build_stamp: BUILD_STAMP.to_owned(),
             client_nonce,
             compatibility: None,
         }
@@ -2305,7 +2305,7 @@ impl C2ClientHello {
         compatibility: ClientCompatibilityOffer,
     ) -> Self {
         Self {
-            protocol_version: C2_CONTROL_PROTOCOL_VERSION,
+            build_stamp: BUILD_STAMP.to_owned(),
             client_nonce,
             compatibility: Some(compatibility),
         }
@@ -2314,7 +2314,7 @@ impl C2ClientHello {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct C2ControlCompatibilitySupport {
-    pub protocol_versions: ProtocolRange,
+    pub build_stamp: String,
     #[serde(default)]
     pub capabilities: Vec<CapabilityId>,
     pub host: HostDescriptor,
@@ -2323,7 +2323,7 @@ pub struct C2ControlCompatibilitySupport {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct NegotiatedC2ControlCompatibility {
-    pub protocol_version: u16,
+    pub build_stamp: String,
     #[serde(default)]
     pub capabilities: Vec<CapabilityId>,
     pub host: HostDescriptor,
@@ -2335,19 +2335,20 @@ impl C2ControlCompatibilitySupport {
         &self,
         hello: &C2ClientHello,
     ) -> Result<NegotiatedC2ControlCompatibility, ProtocolNegotiationError> {
-        ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION)?
-            .highest_common(ProtocolRange::exact(hello.protocol_version)?)?;
+        if self.build_stamp != hello.build_stamp {
+            return Err(ProtocolNegotiationError::BuildStampMismatch {
+                local: self.build_stamp.clone(),
+                remote: hello.build_stamp.clone(),
+            });
+        }
         let legacy;
         let offer = match hello.compatibility.as_ref() {
             Some(offer) => offer,
             None => {
-                legacy = ClientCompatibilityOffer::exact(C2_CONTROL_PROTOCOL_VERSION)?;
+                legacy = ClientCompatibilityOffer::local();
                 &legacy
             }
         };
-        let active_protocol = ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION)?;
-        active_protocol.highest_common(self.protocol_versions)?;
-        active_protocol.highest_common(offer.protocol_versions)?;
         let capabilities = self
             .capabilities
             .iter()
@@ -2355,7 +2356,7 @@ impl C2ControlCompatibilitySupport {
             .cloned()
             .collect();
         Ok(NegotiatedC2ControlCompatibility {
-            protocol_version: C2_CONTROL_PROTOCOL_VERSION,
+            build_stamp: self.build_stamp.clone(),
             capabilities,
             host: self.host.clone(),
             path_semantics: self.path_semantics.clone(),
@@ -2365,7 +2366,7 @@ impl C2ControlCompatibilitySupport {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct C2ServerChallenge {
-    pub protocol_version: u16,
+    pub build_stamp: String,
     pub server_nonce: [u8; C2_AUTH_NONCE_BYTES],
     pub server_proof: [u8; C2_AUTH_PROOF_BYTES],
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2379,7 +2380,7 @@ pub struct C2ClientAuthentication {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct C2Hello {
-    pub protocol_version: u16,
+    pub build_stamp: String,
     pub connection_id: u64,
     pub status: StatusResponse,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2554,7 +2555,7 @@ pub fn c2_auth_transcript(
 ) -> Vec<u8> {
     let mut message = Vec::with_capacity(32 + (C2_AUTH_NONCE_BYTES * 2));
     message.extend_from_slice(b"gate4agent-c2-control-auth-v2\0");
-    message.extend_from_slice(&C2_CONTROL_PROTOCOL_VERSION.to_le_bytes());
+    encode_bounded_str(&mut message, BUILD_STAMP);
     message.push(match direction { C2AuthDirection::Server => 1, C2AuthDirection::Client => 2 });
     message.extend_from_slice(client_nonce);
     message.extend_from_slice(server_nonce);
@@ -2603,13 +2604,13 @@ pub fn c2_bound_auth_transcript(
 
     let mut message = Vec::with_capacity(512);
     message.extend_from_slice(b"gate4agent-c2-control-auth-v2-compatibility\0");
-    message.extend_from_slice(&C2_CONTROL_PROTOCOL_VERSION.to_le_bytes());
+    encode_bounded_str(&mut message, BUILD_STAMP);
     message.push(match direction { C2AuthDirection::Server => 1, C2AuthDirection::Client => 2 });
     message.extend_from_slice(client_nonce);
     message.extend_from_slice(server_nonce);
 
     message.extend_from_slice(b"offer\0");
-    encode_protocol_range(&mut message, offer.protocol_versions);
+    encode_bounded_str(&mut message, &offer.build_stamp);
     encode_capabilities(&mut message, &offer.capabilities);
     match offer.state_schema {
         Some(state_schema) => {
@@ -2620,7 +2621,7 @@ pub fn c2_bound_auth_transcript(
     }
 
     message.extend_from_slice(b"selected\0");
-    message.extend_from_slice(&selected.protocol_version.to_le_bytes());
+    encode_bounded_str(&mut message, &selected.build_stamp);
     encode_capabilities(&mut message, &selected.capabilities);
     encode_bounded_str(&mut message, selected.host.operating_system.as_str());
     encode_bounded_str(&mut message, selected.host.architecture.as_str());
@@ -3494,11 +3495,10 @@ mod tests {
     }
 
     fn c2_compatibility_support(
-        protocol_versions: ProtocolRange,
         capabilities: Vec<CapabilityId>,
     ) -> C2ControlCompatibilitySupport {
         C2ControlCompatibilitySupport {
-            protocol_versions,
+            build_stamp: BUILD_STAMP.to_owned(),
             capabilities,
             host: HostDescriptor {
                 operating_system: OperatingSystemId::new("darwin").unwrap(),
@@ -3516,13 +3516,12 @@ mod tests {
     /// `null` -- against a decoder that predates negotiation and would
     /// reject an unknown key.
     ///
-    /// The version is interpolated from `C2_CONTROL_PROTOCOL_VERSION`
-    /// rather than frozen, because freezing it could not survive its own
-    /// design: `C2ClientHello::new` fills that field FROM the constant, so
-    /// the frozen form asserted the constant still equalled a copy of
-    /// itself taken when the test was written. It went red on the first
-    /// bump and stayed red across the next two, which is how a test stops
-    /// being read at all. The key set and their order are what must not
+    /// The stamp is interpolated from `BUILD_STAMP` rather than frozen,
+    /// because freezing it could not survive its own design:
+    /// `C2ClientHello::new` fills that field FROM the constant, and the
+    /// constant is recomputed from the working tree on every build, so a
+    /// frozen copy would go red on the very next unrelated source edit
+    /// anywhere in the tree. The key set and their order are what must not
     /// drift, and those are still pinned literally.
     #[test]
     fn the_legacy_client_hello_json_carries_exactly_these_keys_in_this_order() {
@@ -3530,11 +3529,11 @@ mod tests {
         let json = serde_json::to_string(&hello).unwrap();
         let owned = format!(
             concat!(
-                r#"{{"protocol_version":{},"client_nonce":["#,
+                r#"{{"build_stamp":"{}","client_nonce":["#,
                 "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,",
                 "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}}"
             ),
-            C2_CONTROL_PROTOCOL_VERSION,
+            BUILD_STAMP,
         );
         let expected = owned.as_str();
 
@@ -3549,49 +3548,50 @@ mod tests {
         );
     }
 
-    /// `C2_CONTROL_PROTOCOL_VERSION` as the two little-endian hex bytes a
-    /// bound-auth transcript encodes it as.
+    /// `BUILD_STAMP` as the bound-auth transcript encodes it: a
+    /// little-endian u16 byte-length prefix followed by its ASCII bytes,
+    /// rendered as hex.
     ///
     /// The transcript tests below still pin their entire byte layout
     /// literally -- domain tag, direction byte, both nonces, the offer and
     /// selection blocks with their length prefixes, the host descriptor --
     /// and interpolate only this. That split is deliberate: reorder a
     /// field, drop a length prefix, or change an encoding and they still
-    /// fail; bump the protocol and they do not, because the transcript
-    /// derives its version from the same constant the expectation does.
-    /// Freezing the version alongside the layout is what left these red.
-    fn protocol_version_hex() -> String {
-        C2_CONTROL_PROTOCOL_VERSION
-            .to_le_bytes()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect()
+    /// fail; edit any file in the tree and they do not, because the
+    /// transcript derives its stamp from the same constant the expectation
+    /// does. Freezing the stamp alongside the layout is what would leave
+    /// these permanently red.
+    fn build_stamp_hex() -> String {
+        let mut bytes = Vec::with_capacity(2 + BUILD_STAMP.len());
+        bytes.extend_from_slice(&(BUILD_STAMP.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(BUILD_STAMP.as_bytes());
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
     #[test]
     fn c2_compatibility_legacy_server_json_is_byte_equivalent() {
         #[derive(Serialize)]
         struct LegacyChallenge {
-            protocol_version: u16,
+            build_stamp: String,
             server_nonce: [u8; C2_AUTH_NONCE_BYTES],
             server_proof: [u8; C2_AUTH_PROOF_BYTES],
         }
 
         #[derive(Serialize)]
         struct LegacyHello<'a> {
-            protocol_version: u16,
+            build_stamp: String,
             connection_id: u64,
             status: &'a StatusResponse,
         }
 
         let challenge = C2ServerChallenge {
-            protocol_version: C2_CONTROL_PROTOCOL_VERSION,
+            build_stamp: BUILD_STAMP.to_owned(),
             server_nonce: [1; C2_AUTH_NONCE_BYTES],
             server_proof: [2; C2_AUTH_PROOF_BYTES],
             compatibility: None,
         };
         let legacy_challenge = LegacyChallenge {
-            protocol_version: C2_CONTROL_PROTOCOL_VERSION,
+            build_stamp: BUILD_STAMP.to_owned(),
             server_nonce: [1; C2_AUTH_NONCE_BYTES],
             server_proof: [2; C2_AUTH_PROOF_BYTES],
         };
@@ -3607,13 +3607,13 @@ mod tests {
             nodes: BTreeMap::new(),
         };
         let hello = C2Hello {
-            protocol_version: C2_CONTROL_PROTOCOL_VERSION,
+            build_stamp: BUILD_STAMP.to_owned(),
             connection_id: 11,
             status: status.clone(),
             compatibility: None,
         };
         let legacy_hello = LegacyHello {
-            protocol_version: C2_CONTROL_PROTOCOL_VERSION,
+            build_stamp: BUILD_STAMP.to_owned(),
             connection_id: 11,
             status: &status,
         };
@@ -3871,9 +3871,7 @@ mod tests {
             NODE_TERMINAL_FRAME_EVENTS_CAPABILITY,
         );
         let capability = CapabilityId::new(C2_TERMINAL_FRAME_EVENTS_CAPABILITY).unwrap();
-        let support = c2_compatibility_support(
-            ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
-            vec![capability.clone()],
+        let support = c2_compatibility_support(vec![capability.clone()],
         );
         assert!(support
             .negotiate(&C2ClientHello::new([0; C2_AUTH_NONCE_BYTES]))
@@ -3882,7 +3880,7 @@ mod tests {
             .is_empty());
 
         let offer = ClientCompatibilityOffer {
-            protocol_versions: ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
+            build_stamp: BUILD_STAMP.to_owned(),
             capabilities: vec![capability.clone()],
             state_schema: None,
         };
@@ -3905,27 +3903,27 @@ mod tests {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
-        let version = protocol_version_hex();
+        let stamp = build_stamp_hex();
         assert_eq!(
             hex,
             format!(
                 concat!(
                     "67617465346167656e742d63322d636f6e74726f6c2d617574682d76322d636f6d7061746962696c69747900",
-                    "{version}",
+                    "{stamp}",
                     "01",
                     "1111111111111111111111111111111111111111111111111111111111111111",
                     "2222222222222222222222222222222222222222222222222222222222222222",
                     "6f6666657200",
-                    "{version}{version}",
+                    "{stamp}",
                     "0100",
                     "18007465726d696e616c2d6672616d652d6576656e74732d763100",
                     "73656c656374656400",
-                    "{version}",
+                    "{stamp}",
                     "0100",
                     "18007465726d696e616c2d6672616d652d6576656e74732d7631",
                     "060064617277696e0700616172636836340201",
                 ),
-                version = version,
+                stamp = stamp,
             ),
         );
     }
@@ -3935,9 +3933,7 @@ mod tests {
         assert_eq!(C2_ACP_CONTROL_CAPABILITY, "acp-control-v1");
         assert_eq!(C2_ACP_CONTROL_CAPABILITY, NODE_ACP_CONTROL_CAPABILITY);
         let capability = CapabilityId::new(C2_ACP_CONTROL_CAPABILITY).unwrap();
-        let support = c2_compatibility_support(
-            ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
-            vec![capability.clone()],
+        let support = c2_compatibility_support(vec![capability.clone()],
         );
         assert!(support
             .negotiate(&C2ClientHello::new([0; C2_AUTH_NONCE_BYTES]))
@@ -3946,7 +3942,7 @@ mod tests {
             .is_empty());
 
         let offer = ClientCompatibilityOffer {
-            protocol_versions: ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
+            build_stamp: BUILD_STAMP.to_owned(),
             capabilities: vec![capability.clone()],
             state_schema: None,
         };
@@ -3971,9 +3967,7 @@ mod tests {
         );
         let capability =
             CapabilityId::new(C2_SPAWN_SPEC_DEFAULTS_OVERRIDES_CAPABILITY).unwrap();
-        let support = c2_compatibility_support(
-            ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
-            vec![capability.clone()],
+        let support = c2_compatibility_support(vec![capability.clone()],
         );
         assert!(support
             .negotiate(&C2ClientHello::new([0; C2_AUTH_NONCE_BYTES]))
@@ -3982,7 +3976,7 @@ mod tests {
             .is_empty());
 
         let offer = ClientCompatibilityOffer {
-            protocol_versions: ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
+            build_stamp: BUILD_STAMP.to_owned(),
             capabilities: vec![capability.clone()],
             state_schema: None,
         };
@@ -4006,12 +4000,12 @@ mod tests {
             &[0x11; C2_AUTH_NONCE_BYTES],
             &[0x22; C2_AUTH_NONCE_BYTES],
             &ClientCompatibilityOffer {
-                protocol_versions: offer.protocol_versions,
+                build_stamp: offer.build_stamp.clone(),
                 capabilities: Vec::new(),
                 state_schema: None,
             },
             &NegotiatedC2ControlCompatibility {
-                protocol_version: selected.protocol_version,
+                build_stamp: selected.build_stamp.clone(),
                 capabilities: Vec::new(),
                 host: selected.host.clone(),
                 path_semantics: selected.path_semantics.clone(),
@@ -4036,9 +4030,7 @@ mod tests {
         );
         let capability =
             CapabilityId::new(C2_SPAWN_PROFILE_REVISION_CAPABILITY).unwrap();
-        let support = c2_compatibility_support(
-            ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
-            vec![capability.clone()],
+        let support = c2_compatibility_support(vec![capability.clone()],
         );
         assert!(support
             .negotiate(&C2ClientHello::new([0; C2_AUTH_NONCE_BYTES]))
@@ -4047,7 +4039,7 @@ mod tests {
             .is_empty());
 
         let offer = ClientCompatibilityOffer {
-            protocol_versions: ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
+            build_stamp: BUILD_STAMP.to_owned(),
             capabilities: vec![capability.clone()],
             state_schema: None,
         };
@@ -4079,9 +4071,7 @@ mod tests {
             NODE_WORKTREE_SELECTION_CAPABILITY,
         );
         let capability = CapabilityId::new(C2_WORKTREE_SELECTION_CAPABILITY).unwrap();
-        let support = c2_compatibility_support(
-            ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
-            vec![capability.clone()],
+        let support = c2_compatibility_support(vec![capability.clone()],
         );
         assert!(support
             .negotiate(&C2ClientHello::new([0; C2_AUTH_NONCE_BYTES]))
@@ -4090,7 +4080,7 @@ mod tests {
             .is_empty());
 
         let offer = ClientCompatibilityOffer {
-            protocol_versions: ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
+            build_stamp: BUILD_STAMP.to_owned(),
             capabilities: vec![capability.clone()],
             state_schema: None,
         };
@@ -4114,12 +4104,12 @@ mod tests {
             &[0x11; C2_AUTH_NONCE_BYTES],
             &[0x22; C2_AUTH_NONCE_BYTES],
             &ClientCompatibilityOffer {
-                protocol_versions: offer.protocol_versions,
+                build_stamp: offer.build_stamp.clone(),
                 capabilities: Vec::new(),
                 state_schema: None,
             },
             &NegotiatedC2ControlCompatibility {
-                protocol_version: selected.protocol_version,
+                build_stamp: selected.build_stamp.clone(),
                 capabilities: Vec::new(),
                 host: selected.host.clone(),
                 path_semantics: selected.path_semantics.clone(),
@@ -4152,12 +4142,10 @@ mod tests {
         );
         let capability =
             CapabilityId::new(C2_MANAGED_WORKTREE_LIFECYCLE_CAPABILITY).unwrap();
-        let support = c2_compatibility_support(
-            ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
-            vec![capability.clone()],
+        let support = c2_compatibility_support(vec![capability.clone()],
         );
         let offer = ClientCompatibilityOffer {
-            protocol_versions: ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
+            build_stamp: BUILD_STAMP.to_owned(),
             capabilities: vec![capability],
             state_schema: None,
         };
@@ -4195,12 +4183,10 @@ mod tests {
         );
         let capability =
             CapabilityId::new(C2_CHILD_ENVIRONMENT_PROFILE_CAPABILITY).unwrap();
-        let support = c2_compatibility_support(
-            ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
-            vec![capability.clone()],
+        let support = c2_compatibility_support(vec![capability.clone()],
         );
         let offer = ClientCompatibilityOffer {
-            protocol_versions: ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
+            build_stamp: BUILD_STAMP.to_owned(),
             capabilities: vec![capability],
             state_schema: None,
         };
@@ -4242,12 +4228,10 @@ mod tests {
         );
         let capability =
             CapabilityId::new(C2_SESSION_BUNDLE_MATERIALIZATION_CAPABILITY).unwrap();
-        let support = c2_compatibility_support(
-            ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
-            vec![capability.clone()],
+        let support = c2_compatibility_support(vec![capability.clone()],
         );
         let offer = ClientCompatibilityOffer {
-            protocol_versions: ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
+            build_stamp: BUILD_STAMP.to_owned(),
             capabilities: vec![capability.clone()],
             state_schema: None,
         };
@@ -4297,9 +4281,7 @@ mod tests {
             NODE_HISTORY_CONTEXT_PACK_CAPABILITY,
         );
         let capability = CapabilityId::new(C2_HISTORY_CONTEXT_PACK_CAPABILITY).unwrap();
-        let support = c2_compatibility_support(
-            ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
-            vec![capability.clone()],
+        let support = c2_compatibility_support(vec![capability.clone()],
         );
         assert!(support
             .negotiate(&C2ClientHello::new([0; C2_AUTH_NONCE_BYTES]))
@@ -4308,7 +4290,7 @@ mod tests {
             .is_empty());
 
         let offer = ClientCompatibilityOffer {
-            protocol_versions: ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
+            build_stamp: BUILD_STAMP.to_owned(),
             capabilities: vec![capability.clone()],
             state_schema: None,
         };
@@ -4710,33 +4692,27 @@ mod tests {
     }
 
     #[test]
-    fn c2_compatibility_missing_offer_negotiates_exact_v2() {
-        let support = c2_compatibility_support(
-            ProtocolRange::new(1, 4).unwrap(),
-            Vec::new(),
-        );
+    fn c2_compatibility_missing_offer_negotiates_local_build_stamp() {
+        let support = c2_compatibility_support(Vec::new());
 
         let negotiated = support
             .negotiate(&C2ClientHello::new([1; C2_AUTH_NONCE_BYTES]))
             .unwrap();
 
-        assert_eq!(negotiated.protocol_version, C2_CONTROL_PROTOCOL_VERSION);
+        assert_eq!(negotiated.build_stamp, BUILD_STAMP);
         assert!(negotiated.capabilities.is_empty());
     }
 
     #[test]
-    fn c2_compatibility_selects_active_v2_and_capability_intersection() {
+    fn c2_compatibility_selects_local_build_stamp_and_capability_intersection() {
         let shared = CapabilityId::new("terminal-stream").unwrap();
         let server_only = CapabilityId::new("server-only").unwrap();
         let client_only = CapabilityId::new("client-only").unwrap();
-        let support = c2_compatibility_support(
-            ProtocolRange::new(1, 5).unwrap(),
-            vec![shared.clone(), server_only],
-        );
+        let support = c2_compatibility_support(vec![shared.clone(), server_only]);
         let hello = C2ClientHello::negotiating(
             [2; C2_AUTH_NONCE_BYTES],
             ClientCompatibilityOffer {
-                protocol_versions: ProtocolRange::new(2, 4).unwrap(),
+                build_stamp: BUILD_STAMP.to_owned(),
                 capabilities: vec![client_only, shared.clone()],
                 state_schema: None,
             },
@@ -4744,41 +4720,42 @@ mod tests {
 
         let negotiated = support.negotiate(&hello).unwrap();
 
-        assert_eq!(negotiated.protocol_version, C2_CONTROL_PROTOCOL_VERSION);
+        assert_eq!(negotiated.build_stamp, BUILD_STAMP);
         assert_eq!(negotiated.capabilities, vec![shared]);
     }
 
     #[test]
-    fn c2_compatibility_disjoint_ranges_fail() {
-        let support = c2_compatibility_support(
-            ProtocolRange::new(2, 3).unwrap(),
-            Vec::new(),
-        );
-        let hello = C2ClientHello::negotiating(
-            [3; C2_AUTH_NONCE_BYTES],
-            ClientCompatibilityOffer {
-                protocol_versions: ProtocolRange::new(4, 5).unwrap(),
-                capabilities: Vec::new(),
-                state_schema: None,
-            },
-        );
+    fn c2_compatibility_negotiate_rejects_a_foreign_build_stamp_naming_both_values() {
+        let support = c2_compatibility_support(Vec::new());
+        let foreign_stamp = "f".repeat(40);
+        let hello = C2ClientHello {
+            build_stamp: foreign_stamp.clone(),
+            client_nonce: [3; C2_AUTH_NONCE_BYTES],
+            compatibility: None,
+        };
 
+        let error = support.negotiate(&hello).unwrap_err();
         assert!(matches!(
-            support.negotiate(&hello),
-            Err(ProtocolNegotiationError::Disjoint { .. }),
+            &error,
+            ProtocolNegotiationError::BuildStampMismatch { local, remote }
+                if local == BUILD_STAMP && remote == &foreign_stamp,
         ));
+        assert_eq!(
+            error.to_string(),
+            format!("build stamp mismatch: local={BUILD_STAMP} remote={foreign_stamp}"),
+        );
     }
 
     #[test]
     fn c2_compatibility_bound_auth_transcript_is_exact_and_selection_sensitive() {
         let capability = CapabilityId::new(C2_COMPATIBILITY_METADATA_CAPABILITY).unwrap();
         let offer = ClientCompatibilityOffer {
-            protocol_versions: ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
+            build_stamp: BUILD_STAMP.to_owned(),
             capabilities: vec![capability.clone()],
             state_schema: None,
         };
         let selected = NegotiatedC2ControlCompatibility {
-            protocol_version: C2_CONTROL_PROTOCOL_VERSION,
+            build_stamp: BUILD_STAMP.to_owned(),
             capabilities: vec![capability],
             host: HostDescriptor {
                 operating_system: OperatingSystemId::new("windows").unwrap(),
@@ -4798,27 +4775,27 @@ mod tests {
         ).unwrap();
         let hex = transcript.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
 
-        let version = protocol_version_hex();
+        let stamp = build_stamp_hex();
         assert_eq!(
             hex,
             format!(
                 concat!(
                     "67617465346167656e742d63322d636f6e74726f6c2d617574682d76322d636f6d7061746962696c69747900",
-                    "{version}",
+                    "{stamp}",
                     "01",
                     "1111111111111111111111111111111111111111111111111111111111111111",
                     "2222222222222222222222222222222222222222222222222222222222222222",
                     "6f6666657200",
-                    "{version}{version}",
+                    "{stamp}",
                     "0100",
                     "1600636f6d7061746962696c6974792e6d6574616461746100",
                     "73656c656374656400",
-                    "{version}",
+                    "{stamp}",
                     "0100",
                     "1600636f6d7061746962696c6974792e6d65746164617461",
                     "070077696e646f777306007838365f36340101",
                 ),
-                version = version,
+                stamp = stamp,
             ),
         );
 
@@ -4838,9 +4815,7 @@ mod tests {
 
     #[test]
     fn c2_compatibility_preserves_foreign_host_and_opaque_path() {
-        let support = c2_compatibility_support(
-            ProtocolRange::exact(C2_CONTROL_PROTOCOL_VERSION).unwrap(),
-            Vec::new(),
+        let support = c2_compatibility_support(Vec::new(),
         );
         let negotiated = support
             .negotiate(&C2ClientHello::new([4; C2_AUTH_NONCE_BYTES]))
@@ -5286,7 +5261,6 @@ mod tests {
     #[test]
     fn control_auth_transcript_is_direction_and_protocol_domain_separated() {
         assert_eq!(C2_API_VERSION, 2);
-        assert_eq!(C2_CONTROL_PROTOCOL_VERSION, 4);
         let client_nonce = [3; C2_AUTH_NONCE_BYTES];
         let server_nonce = [7; C2_AUTH_NONCE_BYTES];
         let server = c2_auth_transcript(C2AuthDirection::Server, &client_nonce, &server_nonce);

@@ -1,7 +1,7 @@
 use gate4agent_node_protocol::{
     encode_node_compatibility_auth_binding, ClientCompatibilityOffer, ClientRole,
-    NegotiatedNodeCompatibility, NodeIncarnationId, NODE_AUTH_NONCE_BYTES,
-    NODE_AUTH_PROOF_BYTES, NODE_INCARNATION_ID_BYTES, NODE_PROTOCOL_VERSION,
+    NegotiatedNodeCompatibility, NodeIncarnationId, BUILD_STAMP, NODE_AUTH_NONCE_BYTES,
+    NODE_AUTH_PROOF_BYTES, NODE_INCARNATION_ID_BYTES,
 };
 
 #[cfg(windows)]
@@ -57,9 +57,10 @@ pub fn auth_proof(
     client_nonce: &[u8; NODE_AUTH_NONCE_BYTES],
     server_nonce: &[u8; NODE_AUTH_NONCE_BYTES],
 ) -> Result<[u8; NODE_AUTH_PROOF_BYTES], String> {
-    let mut message = Vec::with_capacity(32 + (NODE_AUTH_NONCE_BYTES * 2));
+    let mut message = Vec::with_capacity(32 + (NODE_AUTH_NONCE_BYTES * 2) + BUILD_STAMP.len());
     message.extend_from_slice(b"gate4agent-node-auth-v3\0");
-    message.extend_from_slice(&NODE_PROTOCOL_VERSION.to_le_bytes());
+    message.extend_from_slice(&(BUILD_STAMP.len() as u16).to_le_bytes());
+    message.extend_from_slice(BUILD_STAMP.as_bytes());
     message.push(match direction {
         AuthDirection::Server => 1,
         AuthDirection::Client => 2,
@@ -86,9 +87,12 @@ pub fn negotiated_auth_proof(
         .map_err(|error| error.to_string())?;
     let binding_length = u32::try_from(binding.len())
         .map_err(|_| "node compatibility authentication binding is too large".to_owned())?;
-    let mut message = Vec::with_capacity(48 + (NODE_AUTH_NONCE_BYTES * 2) + binding.len());
+    let mut message = Vec::with_capacity(
+        48 + (NODE_AUTH_NONCE_BYTES * 2) + BUILD_STAMP.len() + binding.len(),
+    );
     message.extend_from_slice(b"gate4agent-node-auth-negotiated-v1\0");
-    message.extend_from_slice(&NODE_PROTOCOL_VERSION.to_le_bytes());
+    message.extend_from_slice(&(BUILD_STAMP.len() as u16).to_le_bytes());
+    message.extend_from_slice(BUILD_STAMP.as_bytes());
     message.push(match direction {
         AuthDirection::Server => 1,
         AuthDirection::Client => 2,
@@ -295,7 +299,7 @@ mod tests {
 
     fn negotiated_fixture() -> (ClientCompatibilityOffer, NegotiatedNodeCompatibility) {
         let offer = ClientCompatibilityOffer {
-            protocol_versions: ProtocolRange::exact(NODE_PROTOCOL_VERSION).unwrap(),
+            build_stamp: BUILD_STAMP.to_owned(),
             capabilities: vec![CapabilityId::new(
                 NODE_COMPATIBILITY_METADATA_CAPABILITY,
             )
@@ -305,7 +309,7 @@ mod tests {
             }),
         };
         let support = NodeCompatibilitySupport {
-            protocol_versions: ProtocolRange::exact(NODE_PROTOCOL_VERSION).unwrap(),
+            build_stamp: BUILD_STAMP.to_owned(),
             capabilities: offer.capabilities.clone(),
             host: HostDescriptor {
                 operating_system: OperatingSystemId::new("windows").unwrap(),
@@ -322,7 +326,7 @@ mod tests {
             provider_contracts: Vec::new(),
             provider_adapter_contracts: Vec::new(),
         };
-        let selected = support.negotiate(NODE_PROTOCOL_VERSION, &offer).unwrap();
+        let selected = support.negotiate(&offer).unwrap();
         (offer, selected)
     }
 
@@ -348,24 +352,25 @@ mod tests {
     /// pinning the proof itself.
     ///
     /// It used to pin the proof, and could not have worked: `auth_proof`
-    /// mixes `NODE_PROTOCOL_VERSION` into that message on purpose, so a
-    /// peer on another version cannot authenticate. A frozen output is
-    /// therefore only valid for one version, and this one froze at a
-    /// version long gone -- red for every bump since, which is exactly how
-    /// a test stops being read.
+    /// mixes `BUILD_STAMP` into that message on purpose, so a peer built
+    /// from another tree cannot authenticate. A frozen output is therefore
+    /// only valid for one build, and every rebuild moves the stamp -- red on
+    /// every build, which is exactly how a test stops being read.
     ///
-    /// What must not drift is the layout: the domain tag, the version, the
-    /// direction and role bytes, and the two nonces in that order. Reorder
-    /// any of it, drop the version, or collide the direction/role encoding
-    /// and this fails; bump the protocol and it still passes, because the
-    /// expectation is built from the same version the code uses.
+    /// What must not drift is the layout: the domain tag, the build stamp
+    /// length prefix and its ASCII bytes, the direction and role bytes, and
+    /// the two nonces in that order. Reorder any of it, drop the stamp, or
+    /// collide the direction/role encoding and this fails; rebuild the tree
+    /// and it still passes, because the expectation is built from the same
+    /// stamp the code uses.
     #[test]
     fn the_legacy_auth_proof_is_an_hmac_over_exactly_this_message() {
         let client_nonce = [3; NODE_AUTH_NONCE_BYTES];
         let server_nonce = [7; NODE_AUTH_NONCE_BYTES];
         let mut expected_message = Vec::new();
         expected_message.extend_from_slice(b"gate4agent-node-auth-v3\0");
-        expected_message.extend_from_slice(&NODE_PROTOCOL_VERSION.to_le_bytes());
+        expected_message.extend_from_slice(&(BUILD_STAMP.len() as u16).to_le_bytes());
+        expected_message.extend_from_slice(BUILD_STAMP.as_bytes());
         expected_message.push(1); // AuthDirection::Server
         expected_message.push(1); // ClientRole::Operator
         expected_message.extend_from_slice(&client_nonce);
@@ -425,8 +430,8 @@ mod tests {
     /// length prefix ahead of the compatibility binding -- and that prefix
     /// is what stops a crafted offer/selection pair from shifting bytes
     /// across the boundary into the nonces. Pinning the layout keeps it
-    /// checked; pinning the output never did, because the version inside
-    /// it moves by design.
+    /// checked; pinning the output never did, because the build stamp
+    /// inside it moves on every rebuild by design.
     #[test]
     fn the_negotiated_auth_proof_is_an_hmac_over_exactly_this_message_and_is_bound() {
         let (offer, selected) = negotiated_fixture();
@@ -446,7 +451,8 @@ mod tests {
         let binding = encode_node_compatibility_auth_binding(&offer, &selected).unwrap();
         let mut expected_message = Vec::new();
         expected_message.extend_from_slice(b"gate4agent-node-auth-negotiated-v1\0");
-        expected_message.extend_from_slice(&NODE_PROTOCOL_VERSION.to_le_bytes());
+        expected_message.extend_from_slice(&(BUILD_STAMP.len() as u16).to_le_bytes());
+        expected_message.extend_from_slice(BUILD_STAMP.as_bytes());
         expected_message.push(1); // AuthDirection::Server
         expected_message.push(1); // ClientRole::Operator
         expected_message.extend_from_slice(&client_nonce);

@@ -4,10 +4,10 @@ use gate4agent_node::protocol::{
     read_json_frame_limited_body_timeout, write_json_frame_limited, AgentId, CapabilityId,
     ClientAuthentication, ClientCompatibilityOffer, ClientFrame, ClientHello, ClientRole,
     FrameError, LocalTransportKind, NodeEvent, NodeFailureCode, NodeId, NodeRequest, NodeResponse,
-    NodeSnapshot, OpaqueHostPath, PathEncoding, PathStyle, ProtocolRange, ServerFrame,
+    NodeSnapshot, OpaqueHostPath, PathEncoding, PathStyle, ServerFrame,
     SessionAddress, SessionMode, WorkspaceId,
     MAX_NODE_FRAME_BYTES, MAX_NODE_HELLO_FRAME_BYTES, MAX_NODE_TEXT_BYTES,
-    NODE_COMPATIBILITY_METADATA_CAPABILITY, NODE_PROTOCOL_VERSION,
+    NODE_COMPATIBILITY_METADATA_CAPABILITY, BUILD_STAMP,
 };
 use gate4agent_node::{NodeServer, NodeServerConfig, NodeServerError, WorkspaceConfig};
 use gate4agent_node_wire::{
@@ -203,7 +203,7 @@ async fn windows_fixture_negotiating_client_receives_exact_v8_node_compatibility
         .compatibility
         .as_ref()
         .expect("new node omitted negotiated compatibility");
-    assert_eq!(compatibility.protocol_version, NODE_PROTOCOL_VERSION);
+    assert_eq!(compatibility.build_stamp, BUILD_STAMP);
     assert_eq!(
         compatibility
             .capabilities
@@ -348,7 +348,7 @@ async fn windows_fixture_raw_legacy_v8_hello_negotiates_without_optional_capabil
     else {
         panic!("legacy client did not receive a challenge");
     };
-    assert_eq!(challenge.protocol_version, NODE_PROTOCOL_VERSION);
+    assert_eq!(challenge.build_stamp, BUILD_STAMP);
     assert_eq!(challenge.compatibility, None);
     let expected_server_proof = auth_proof(
         token.as_bytes(),
@@ -384,7 +384,7 @@ async fn windows_fixture_raw_legacy_v8_hello_negotiates_without_optional_capabil
     else {
         panic!("legacy client did not receive node hello");
     };
-    assert_eq!(hello.protocol_version, NODE_PROTOCOL_VERSION);
+    assert_eq!(hello.build_stamp, BUILD_STAMP);
     assert_eq!(hello.snapshot.node_id, expected_node_id());
     assert_eq!(hello.compatibility, None);
 
@@ -407,7 +407,7 @@ async fn windows_fixture_negotiation_without_manifest_capability_returns_empty_m
     let mut pipe = raw_pipe_client(&endpoint).await;
     let client_nonce = random_nonce().unwrap();
     let offer = ClientCompatibilityOffer {
-        protocol_versions: ProtocolRange::exact(NODE_PROTOCOL_VERSION).unwrap(),
+        build_stamp: BUILD_STAMP.to_owned(),
         capabilities: vec![CapabilityId::new(NODE_COMPATIBILITY_METADATA_CAPABILITY).unwrap()],
         state_schema: None,
     };
@@ -598,7 +598,7 @@ async fn windows_fixture_extracted_named_pipe_client_preserves_auth_snapshot_eve
     let mut first = NamedPipeNodeClient::connect(&endpoint, &expected_node_id(), ClientRole::Operator, token)
         .await
         .unwrap();
-    assert_eq!(first.hello().protocol_version, NODE_PROTOCOL_VERSION);
+    assert_eq!(first.hello().build_stamp, BUILD_STAMP);
     assert_eq!(first.hello().snapshot.node_id, NodeId::new("fixture-node").unwrap());
     assert_eq!(first.hello().snapshot.workspaces.len(), 2);
     assert!(all_sessions(&first.hello().snapshot).is_empty());

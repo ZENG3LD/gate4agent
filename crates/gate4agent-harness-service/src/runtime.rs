@@ -8209,9 +8209,9 @@ fn project_run_correlation(
 /// construction, with no duplicated field-mapping logic to drift.
 ///
 /// Always populates `screen_state: Some(..)` from the source `SlimSession`,
-/// unconditionally -- this wire has exactly one accepted version (see
-/// `HARNESS_OPERATOR_WIRE_VERSION`), so every peer sees the same
-/// projection, cached once and fanned out to every currently
+/// unconditionally -- this wire has exactly one accepted build stamp (see
+/// `BUILD_STAMP`), so every peer sees the same projection, cached once and
+/// fanned out to every currently
 /// polling/subscribed peer with no per-recipient variation.
 pub fn redact_runtime_inventory(
     inventory: gate4agent_c2_protocol::SlimNodeInventory,
@@ -9427,14 +9427,14 @@ async fn handle_connection(
             };
             if let Err(error) = envelope.validate() {
                 let host_error = match error {
-                    HarnessOperatorApiError::WireVersionMismatch { expected, received } => {
+                    HarnessOperatorApiError::BuildStampMismatch { expected, received } => {
                         tracing::warn!(
-                            expected,
-                            received,
-                            "harness operator wire version mismatch: rebuild and restart \
+                            expected = %expected,
+                            received = %received,
+                            "harness operator build stamp mismatch: rebuild and restart \
                              the out-of-date side",
                         );
-                        HarnessOperatorHostErrorV1::WireVersionMismatch { expected, received }
+                        HarnessOperatorHostErrorV1::BuildStampMismatch { expected, received }
                     }
                     _ => HarnessOperatorHostErrorV1::InvalidRequest,
                 };
@@ -12650,7 +12650,7 @@ mod tests {
 
     /// `redact_runtime_inventory` always populates `screen_state: Some(..)`,
     /// and nothing downstream strips it back out: this wire has exactly one
-    /// accepted version (see `HARNESS_OPERATOR_WIRE_VERSION`), so a
+    /// accepted build stamp (see `BUILD_STAMP`), so a
     /// `RuntimeInventoryChanged` event carries the real classification key
     /// on every serialized session unconditionally.
     #[test]

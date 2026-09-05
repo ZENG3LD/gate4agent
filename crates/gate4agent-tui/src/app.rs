@@ -8094,7 +8094,7 @@ fn append_event_to_diagnostics_file(event: &AppEvent) {
             .flat_map(|node| node.session_records.iter())
             .filter_map(|record| record.active_session.clone())
             .collect::<BTreeSet<_>>();
-        let mut rows = self
+        let rows = self
             .nodes
             .iter()
             .flat_map(|node| {

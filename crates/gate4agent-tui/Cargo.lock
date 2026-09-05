@@ -373,6 +373,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6d5a32815ae3f33302d95fdcb2ce17862f8c65363dcfd29360480ba1001fc9c"
 
 [[package]]
+name = "gate4agent-adapters"
+version = "0.3.0"
+dependencies = [
+ "gate4agent-types",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "gate4agent-arcade-engine"
 version = "0.1.0"
 dependencies = [
@@ -423,6 +432,15 @@ dependencies = [
  "gate4agent-node-protocol",
  "gate4agent-types",
  "serde",
+]
+
+[[package]]
+name = "gate4agent-catalog"
+version = "0.3.0"
+dependencies = [
+ "gate4agent-adapters",
+ "gate4agent-types",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -496,6 +514,7 @@ version = "0.2.37"
 dependencies = [
  "gate4agent-c2-client",
  "gate4agent-c2-protocol",
+ "gate4agent-catalog",
  "gate4agent-harness-api",
  "gate4agent-harness-delivery",
  "gate4agent-harness-engine",

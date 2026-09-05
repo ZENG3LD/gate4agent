@@ -4878,6 +4878,7 @@ mod tests {
                 is_error: false,
                 duration_ms: None,
                 agent_id: None,
+                non_execution_kind: None,
             },
             ProviderEvent::TurnCompleted {
                 usage: TokenUsage::default(),
@@ -5443,6 +5444,7 @@ mod tests {
                 is_error: false,
                 duration_ms: Some(1),
                 agent_id: None,
+                non_execution_kind: None,
             },
         ] {
             let (mut engine, spawn, operation_id, interaction_id) = resolving_interaction(

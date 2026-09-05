@@ -409,6 +409,7 @@ fn publish_outcome(outcome: OneShotOutcome, events: &broadcast::Sender<AgentEven
                 result: "one-shot completed".to_owned(),
                 cost_usd: None,
                 is_error: false,
+                stop_reason: None,
             });
             let _ = events.send(AgentEvent::Exited {
                 code: exit_code.unwrap_or(0),
@@ -423,6 +424,7 @@ fn publish_outcome(outcome: OneShotOutcome, events: &broadcast::Sender<AgentEven
                 result: message,
                 cost_usd: None,
                 is_error: true,
+                stop_reason: None,
             });
             let _ = events.send(AgentEvent::Exited {
                 code: exit_code.unwrap_or_else(|| failure.synthetic_exit_code()),

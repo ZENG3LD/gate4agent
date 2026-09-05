@@ -109,7 +109,7 @@ use crate::protocol::{
     HostRequestOutcomeV1, ObservationCapabilitiesV1, ObservationEvidenceV1,
     ObservationInteractionOutcomeV1, ObservationKindV1, ObservationSourceFamilyV1,
     ObservationTodoItemV1, ObservationTodoStateV1,
-    ObservationV1, OBSERVATION_ACTION_BLOCKED_REASON_MAX_BYTES,
+    ObservationV1, OBSERVATION_ACTION_BLOCKED_HELP_MAX_BYTES, OBSERVATION_ACTION_BLOCKED_REASON_MAX_BYTES,
     StateSchemaSupport, WorkspaceEntry, WorkspaceEntryKind, WorktreeProfileId,
     SpawnContextId, SpawnEnvironmentProfileId, SpawnIdempotencyKey,
     SpawnProfileDefaults, SpawnRequiredCapabilities, SpawnSpec, SpawnSpecResolveError,
@@ -190,7 +190,7 @@ use gate4agent_types::{
     ProviderActivity, ProviderEvent, ProviderInteractionKind, ProviderInteractionStatus,
     ProviderPlanStatus,
     ProviderRuntimeCapability, ProviderRuntimePolicy, ProviderSessionIdentity, ProviderSessionKey,
-    ProviderSnapshot,
+    ProviderSnapshot, ProviderStopReason,
     ResumeTarget,
     SessionGeneration, StartRequest,
     TerminalControl, TerminalText,
@@ -765,6 +765,7 @@ fn action_blocked_fallback_reason(authority: BlockAuthorityV1) -> &'static str {
         BlockAuthorityV1::ProviderRefusal => "refused by the provider",
         BlockAuthorityV1::ProviderHook => "denied by a provider hook",
         BlockAuthorityV1::UserRejected => "rejected by the user",
+        BlockAuthorityV1::ProviderQuota => "the provider's quota or rate limit was exhausted",
         BlockAuthorityV1::Unknown => "blocked; no reason was reported",
     }
 }
@@ -789,6 +790,130 @@ fn host_request_denied_block(
     let (reason_text, _) =
         truncate_observation_text(reason_source, OBSERVATION_ACTION_BLOCKED_REASON_MAX_BYTES);
     (observation_tool_class(method), authority, reason_text)
+}
+
+// ---------------------------------------------------------------------------
+// K2 -- provider-side blocks read off ACP `tool_call_update._meta.
+// nonExecutionKind` (`ProviderEvent::ToolCompleted::non_execution_kind`) and
+// `SessionEnded::stop_reason` (`stopReason: "refusal"`, or a `session/
+// prompt` RPC error whose vendor code names a quota/limit/rate
+// exhaustion). See
+// `docs/gate4agent/plans/gate4agent-blocked-action-event-2026-09-02.md`
+// §3 slice K2.
+// ---------------------------------------------------------------------------
+
+/// Classifies ACP's `nonExecutionKind` into the typed authority a block
+/// this build mints under, or `None` when the tool truly did not run for a
+/// reason that is NOT a block -- `"interrupted"`/`"cancelled"` mean the
+/// TURN stopped (session closed, the operator cancelled), not that a
+/// policy/classifier/rule refused the call, so those (and any unrecognized
+/// future value) stay a plain `ToolCompleted { success: false }` only, per
+/// this plan's own rule that a tool failure is never inflated into a block
+/// this build cannot actually attribute.
+fn provider_tool_block_authority(kind: Option<&str>) -> Option<(BlockAuthorityV1, &'static str)> {
+    match kind? {
+        "user-rejected" => Some((BlockAuthorityV1::UserRejected, "user-rejected")),
+        "permission-rule" => Some((BlockAuthorityV1::ProviderPermissionRule, "permission-rule")),
+        _ => None,
+    }
+}
+
+/// Splits a provider's own denial sentence into `reason`/`help`, when it
+/// matches the fixed shape Claude Code's classifier/permission-rule denial
+/// uses -- verified live, the owner's sample fixture
+/// (`docs/gate4agent/research/gate4agent-blocked-action-signals-2026-09-02.md`
+/// appendix): "...denied by <authority>. Reason: <reason>. <help...>".
+/// `authority` is NEVER derived from this text (see this module's own rule
+/// that authority comes only from a typed field) -- only `reason`/`help`
+/// are. Falls back to the full text as `reason` with no `help` when the
+/// shape does not match (a provider whose text does not carry this exact
+/// wording) -- the honest minimum: the tool truly did not run, so SOME
+/// reason is always reported, never fabricated detail beyond what arrived.
+fn split_provider_denial_text(text: &str) -> (String, Option<String>) {
+    let trimmed = text.trim();
+    let Some((_, after_reason)) = trimmed.split_once("Reason:") else {
+        return (trimmed.to_owned(), None);
+    };
+    let tail = after_reason.trim_start();
+    let Some((reason, help)) = tail.split_once(". ") else {
+        // "Reason:" present but no ". " to split help off -- the whole
+        // tail is the reason, e.g. "Reason: Blocked by classifier." with
+        // no help text following on some providers/versions.
+        let reason = tail.strip_suffix('.').unwrap_or(tail).trim();
+        return (reason.to_owned(), None);
+    };
+    let help = help.trim();
+    if help.is_empty() {
+        (reason.trim().to_owned(), None)
+    } else {
+        (reason.trim().to_owned(), Some(help.to_owned()))
+    }
+}
+
+/// `tool_class` for a provider-side `ActionBlocked` this build has no typed
+/// tool name for -- `ProviderEvent::ToolCompleted` carries only `id`, never
+/// `name` (see `ProviderEvent::ToolStarted`, which does, but a tool's own
+/// name is never threaded through to its completion). Reads the class off
+/// the guidance tail's own "add a <Class> permission rule" sentence when
+/// present (the shape the owner's sample fixture uses) -- text matching
+/// fills `tool_class` here, same as `reason`/`help`, NEVER `authority` (see
+/// this module's own rule). Falls back to the same generic `"Tool"` class
+/// `ToolCompleted`'s own observation already uses when nothing names one.
+fn tool_class_from_denial_help(help: Option<&str>) -> String {
+    help.and_then(|text| text.split("add a ").nth(1))
+        .and_then(|tail| tail.split(' ').next())
+        .filter(|word| !word.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| "Tool".to_owned())
+}
+
+/// Whether a `session/prompt` RPC error's vendor code (or, absent one, its
+/// message) names a quota/rate-limit exhaustion -- Codex's
+/// `data.codexErrorInfo: "usageLimitExceeded"` (measured live 2026-09-05)
+/// contains "limit", the word this build actually keys on; "quota"/"rate"
+/// are kept for whichever OTHER vendor's own code names one of those
+/// instead, never confirmed live, but the honest generalization of the
+/// one confirmed sample.
+fn provider_error_is_quota(vendor_code: Option<&str>, message: &str) -> bool {
+    fn names_quota(s: &str) -> bool {
+        let lower = s.to_ascii_lowercase();
+        lower.contains("limit") || lower.contains("quota") || lower.contains("rate")
+    }
+    vendor_code.is_some_and(names_quota) || names_quota(message)
+}
+
+/// The `ActionBlocked`/`Blocked` this build mints when a turn stopped via a
+/// typed provider fact rather than a tool call -- `stopReason: "refusal"`
+/// (`authority: ProviderRefusal`) or a `session/prompt` RPC error whose
+/// vendor code (or message) names a quota/limit/rate exhaustion
+/// (`authority: ProviderQuota`, `reason` = the error message verbatim,
+/// `reason_kind` = the vendor code). `None` for every other stop --
+/// `end_turn`, `max_tokens`, `max_turn_requests`, `cancelled`, an untagged
+/// `Other`, or an RPC error whose vendor code/message names none of the
+/// three words: `SessionEnded` stays a plain `Exited`/turn-end fact for
+/// those, never inflated into a block this build cannot actually
+/// attribute. `ProviderRefusal`'s `reason` has no source text to read on
+/// `SessionEnded` itself (ACP's `refusal` stopReason carries none) -- the
+/// honest minimum names the fact that happened, never invented detail; a
+/// later slice that threads the turn's last agent text chunk through can
+/// replace it without changing this function's contract.
+fn provider_session_end_block(
+    stop_reason: &ProviderStopReason,
+) -> Option<(BlockAuthorityV1, String, String)> {
+    match stop_reason {
+        ProviderStopReason::Refusal => Some((
+            BlockAuthorityV1::ProviderRefusal,
+            "refusal".to_owned(),
+            "the provider ended the turn with stopReason: refusal".to_owned(),
+        )),
+        ProviderStopReason::ProviderError { message, vendor_code, .. }
+            if provider_error_is_quota(vendor_code.as_deref(), message) =>
+        {
+            let reason_kind = vendor_code.clone().unwrap_or_else(|| "provider-error".to_owned());
+            Some((BlockAuthorityV1::ProviderQuota, reason_kind, message.clone()))
+        }
+        _ => None,
+    }
 }
 
 fn opaque_subagent_correlation(
@@ -962,13 +1087,33 @@ fn provider_observations(event: &ControlEvent) -> Vec<ObservationV1> {
             correlation_id: opaque_tool_correlation(event, source, id),
             class: observation_tool_class(name),
         }),
-        ProviderEvent::ToolCompleted { id, is_error, duration_ms, .. } if !is_pty_hint => {
+        ProviderEvent::ToolCompleted { id, is_error, duration_ms, output, non_execution_kind, .. }
+            if !is_pty_hint =>
+        {
             kinds.push(ObservationKindV1::ToolCompleted {
                 correlation_id: opaque_tool_correlation(event, source, id),
                 class: "Tool".to_owned(),
                 success: !is_error,
                 duration_ms: *duration_ms,
             });
+            if let Some((authority, reason_kind)) =
+                provider_tool_block_authority(non_execution_kind.as_deref())
+            {
+                let (reason, help) = split_provider_denial_text(output);
+                let (reason, _) =
+                    truncate_observation_text(&reason, OBSERVATION_ACTION_BLOCKED_REASON_MAX_BYTES);
+                let help = help.map(|help| {
+                    truncate_observation_text(&help, OBSERVATION_ACTION_BLOCKED_HELP_MAX_BYTES).0
+                });
+                kinds.push(ObservationKindV1::ActionBlocked {
+                    correlation_id: Some(opaque_tool_correlation(event, source, id)),
+                    tool_class: tool_class_from_denial_help(help.as_deref()),
+                    authority,
+                    reason_kind: Some(reason_kind.to_owned()),
+                    reason,
+                    help,
+                });
+            }
         }
         ProviderEvent::TurnCompleted { usage, is_cumulative } if !is_pty_hint => {
             kinds.push(ObservationKindV1::TurnCompleted);
@@ -1052,9 +1197,23 @@ fn provider_observations(event: &ControlEvent) -> Vec<ObservationV1> {
             });
         }
         ProviderEvent::TurnInterrupted => kinds.push(ObservationKindV1::TurnInterrupted),
-        ProviderEvent::SessionEnded { is_error, .. } => kinds.push(ObservationKindV1::Exited {
-            success: Some(!is_error),
-        }),
+        ProviderEvent::SessionEnded { is_error, stop_reason, .. } => {
+            kinds.push(ObservationKindV1::Exited { success: Some(!is_error) });
+            if let Some((authority, reason_kind, reason)) =
+                stop_reason.as_ref().and_then(provider_session_end_block)
+            {
+                let (reason, _) =
+                    truncate_observation_text(&reason, OBSERVATION_ACTION_BLOCKED_REASON_MAX_BYTES);
+                kinds.push(ObservationKindV1::ActionBlocked {
+                    correlation_id: None,
+                    tool_class: "Session".to_owned(),
+                    authority,
+                    reason_kind: Some(reason_kind),
+                    reason,
+                    help: None,
+                });
+            }
+        }
         // The message travels verbatim, bounded, rather than being replaced
         // by a constant. It was `"provider-error"` for every error alike,
         // which is a category where a reason belongs: the engine mints a
@@ -1232,6 +1391,13 @@ fn provider_observations(event: &ControlEvent) -> Vec<ObservationV1> {
 /// for the operator to react to), but a `Denied` decision returns
 /// `Some(Blocked { .. })`, mirroring exactly the `Denied`-only condition
 /// `provider_observations` applies before pushing `ActionBlocked`.
+///
+/// `ToolCompleted { .. }`/`SessionEnded { .. }` are likewise their own arms
+/// below (K2), not in the exclusion list: each returns `None` unless
+/// `provider_tool_block_authority`/`provider_session_end_block` classifies
+/// the event as an actual block (ACP's `_meta.nonExecutionKind`, or
+/// `stopReason`/an RPC error naming a quota), mirroring the same
+/// `provider_observations` computation byte-for-byte.
 fn agent_stream_chunk(event: &ControlEvent) -> Option<AgentStreamChunkV1> {
     let ControlEventKind::ProviderEvent {
         sequence: provider_sequence,
@@ -1327,16 +1493,53 @@ fn agent_stream_chunk(event: &ControlEvent) -> Option<AgentStreamChunkV1> {
                 help: None,
             }
         }
+        // Alongside, never instead of, `provider_observations`'s
+        // `ActionBlocked` -- same relationship as `HostRequestObserved`
+        // above, driven by ACP's own `_meta.nonExecutionKind` instead of
+        // this harness's `HostRequestDecision`.
+        ProviderEvent::ToolCompleted { id, output, non_execution_kind, .. } => {
+            let (authority, reason_kind) =
+                provider_tool_block_authority(non_execution_kind.as_deref())?;
+            let (reason, help) = split_provider_denial_text(output);
+            let (reason, _) =
+                truncate_observation_text(&reason, OBSERVATION_ACTION_BLOCKED_REASON_MAX_BYTES);
+            let help = help.map(|help| {
+                truncate_observation_text(&help, OBSERVATION_ACTION_BLOCKED_HELP_MAX_BYTES).0
+            });
+            AgentStreamChunkKindV1::Blocked {
+                correlation_id: Some(opaque_tool_correlation(event, source, id)),
+                tool_class: tool_class_from_denial_help(help.as_deref()),
+                authority,
+                reason_kind: Some(reason_kind.to_owned()),
+                reason,
+                help,
+            }
+        }
+        // Same relationship, driven by `stopReason: "refusal"` or a
+        // `session/prompt` RPC error naming a quota/limit/rate exhaustion
+        // instead of a tool-level fact.
+        ProviderEvent::SessionEnded { stop_reason, .. } => {
+            let (authority, reason_kind, reason) =
+                stop_reason.as_ref().and_then(provider_session_end_block)?;
+            let (reason, _) =
+                truncate_observation_text(&reason, OBSERVATION_ACTION_BLOCKED_REASON_MAX_BYTES);
+            AgentStreamChunkKindV1::Blocked {
+                correlation_id: None,
+                tool_class: "Session".to_owned(),
+                authority,
+                reason_kind: Some(reason_kind),
+                reason,
+                help: None,
+            }
+        }
         ProviderEvent::SessionStarted { .. }
         | ProviderEvent::SessionIdentityObserved { .. }
         | ProviderEvent::TurnStarted { .. }
         | ProviderEvent::WorkingObserved
         | ProviderEvent::ToolStarted { .. }
-        | ProviderEvent::ToolCompleted { .. }
         | ProviderEvent::TurnCompleted { .. }
         | ProviderEvent::ContextWindowUsage { .. }
         | ProviderEvent::TurnInterrupted
-        | ProviderEvent::SessionEnded { .. }
         | ProviderEvent::Error { .. }
         | ProviderEvent::Ready
         | ProviderEvent::InteractionResolved { .. }
@@ -17469,6 +17672,211 @@ mod observation_projection_tests {
         chunk.validate().expect("minted chunk must validate");
     }
 
+    // -----------------------------------------------------------------------
+    // K2 -- provider-side blocks: ACP `_meta.nonExecutionKind` on
+    // `ProviderEvent::ToolCompleted`, and `stopReason`/an RPC error's vendor
+    // code on `ProviderEvent::SessionEnded`. Fixtures verbatim from
+    // `docs/gate4agent/research/gate4agent-blocked-action-signals-2026-09-02.md`
+    // (the owner's classifier sample, appendix) and the live codex-acp
+    // quota transcript measured 2026-09-05.
+    // -----------------------------------------------------------------------
+
+    const CLASSIFIER_SAMPLE: &str = "Permission for this action was denied by the Claude Code auto mode classifier. Reason: Blocked by classifier. If you have other tasks that don't depend on this action, continue working on those. IMPORTANT: You *may* attempt to accomplish this action using other tools that might naturally be used to accomplish this goal, e.g. using head instead of cat. But you *should not* attempt to work around this denial in malicious ways, e.g. do not use your ability to run tests to execute non-test actions. You should only try to work around this restriction in reasonable ways that do not attempt to bypass the intent behind this denial. If you believe this capability is essential to complete the user's request, STOP and explain to the user what you were trying to do and why you need this permission. Let the user decide how to proceed. To allow this type of action in the future, the user can add a Bash permission rule to their settings.";
+
+    /// The owner's classifier sample, verbatim, arriving as a
+    /// `tool_call_update`-derived `ProviderEvent::ToolCompleted` with
+    /// `non_execution_kind: "permission-rule"` (claude-agent-acp's
+    /// `_meta.nonExecutionKind`) -- mints `ActionBlocked { authority:
+    /// ProviderPermissionRule, reason: "Blocked by classifier", reason_kind:
+    /// Some("permission-rule"), help: <the tail> }`, extracting `Reason:`
+    /// and the guidance tail exactly as this plan's extractor describes.
+    #[test]
+    fn classifier_sample_permission_rule_mints_action_blocked_provider_permission_rule() {
+        let event = provider_control_event(
+            AdapterFamily::Acp,
+            ProviderEvent::ToolCompleted {
+                id: "toolu_9".to_owned(),
+                output: CLASSIFIER_SAMPLE.to_owned(),
+                is_error: true,
+                duration_ms: None,
+                agent_id: None,
+                non_execution_kind: Some("permission-rule".to_owned()),
+            },
+        );
+        let projected = provider_observations(&event);
+        let blocked = timeline_observations(&projected)
+            .iter()
+            .find_map(|observation| match &observation.kind {
+                ObservationKindV1::ActionBlocked {
+                    authority,
+                    reason,
+                    reason_kind,
+                    help,
+                    correlation_id,
+                    ..
+                } => Some((*authority, reason.clone(), reason_kind.clone(), help.clone(), correlation_id.clone())),
+                _ => None,
+            })
+            .expect("expected an ActionBlocked observation");
+        assert_eq!(blocked.0, BlockAuthorityV1::ProviderPermissionRule);
+        assert_eq!(blocked.1, "Blocked by classifier");
+        assert_eq!(blocked.2, Some("permission-rule".to_owned()));
+        assert!(blocked.3.as_deref().is_some_and(|help| help.starts_with("If you have other tasks")));
+        assert!(blocked.4.is_some(), "a tool-correlated block must carry a correlation id");
+        for observation in &projected {
+            observation.validate().expect("minted observation must validate");
+        }
+
+        // The chunk side mints the identical fact.
+        let chunk = agent_stream_chunk(&event).expect("expected a Blocked chunk");
+        let AgentStreamChunkKindV1::Blocked { authority, reason, reason_kind, .. } = chunk.kind.clone()
+        else {
+            panic!("expected AgentStreamChunkKindV1::Blocked, got {:?}", chunk.kind);
+        };
+        assert_eq!(authority, BlockAuthorityV1::ProviderPermissionRule);
+        assert_eq!(reason, "Blocked by classifier");
+        assert_eq!(reason_kind, Some("permission-rule".to_owned()));
+        chunk.validate().expect("minted chunk must validate");
+    }
+
+    /// The live codex-acp quota transcript (measured 2026-09-05): a
+    /// `session/prompt` RPC error with `data.codexErrorInfo:
+    /// "usageLimitExceeded"` becomes `AgentEvent::SessionEnd`'s
+    /// `StopReason::ProviderError`, which `gate4agent-shell-native` maps
+    /// onto `ProviderEvent::SessionEnded::stop_reason` -- mints
+    /// `ActionBlocked { authority: ProviderQuota, reason: <message
+    /// verbatim>, reason_kind: Some("usageLimitExceeded") }`.
+    #[test]
+    fn codex_quota_rpc_error_mints_action_blocked_provider_quota() {
+        let message = "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 7th, 2026 6:19 PM.";
+        let event = provider_control_event(
+            AdapterFamily::Acp,
+            ProviderEvent::SessionEnded {
+                result: "JSON-RPC error -32603: Internal error".to_owned(),
+                cost_usd: None,
+                is_error: true,
+                stop_reason: Some(ProviderStopReason::ProviderError {
+                    code: -32603,
+                    message: message.to_owned(),
+                    vendor_code: Some("usageLimitExceeded".to_owned()),
+                }),
+            },
+        );
+        let projected = provider_observations(&event);
+        let blocked = timeline_observations(&projected)
+            .iter()
+            .find_map(|observation| match &observation.kind {
+                ObservationKindV1::ActionBlocked { authority, reason, reason_kind, .. } => {
+                    Some((*authority, reason.clone(), reason_kind.clone()))
+                }
+                _ => None,
+            })
+            .expect("expected an ActionBlocked observation");
+        assert_eq!(blocked.0, BlockAuthorityV1::ProviderQuota);
+        assert_eq!(blocked.1, message);
+        assert_eq!(blocked.2, Some("usageLimitExceeded".to_owned()));
+        for observation in &projected {
+            observation.validate().expect("minted observation must validate");
+        }
+
+        let chunk = agent_stream_chunk(&event).expect("expected a Blocked chunk");
+        let AgentStreamChunkKindV1::Blocked { authority, reason_kind, .. } = chunk.kind.clone() else {
+            panic!("expected AgentStreamChunkKindV1::Blocked, got {:?}", chunk.kind);
+        };
+        assert_eq!(authority, BlockAuthorityV1::ProviderQuota);
+        assert_eq!(reason_kind, Some("usageLimitExceeded".to_owned()));
+        chunk.validate().expect("minted chunk must validate");
+    }
+
+    /// ACP's `stopReason: "refusal"` mints `ActionBlocked { authority:
+    /// ProviderRefusal }`.
+    #[test]
+    fn session_end_stop_reason_refusal_mints_action_blocked_provider_refusal() {
+        let event = provider_control_event(
+            AdapterFamily::Acp,
+            ProviderEvent::SessionEnded {
+                result: "refusal".to_owned(),
+                cost_usd: None,
+                is_error: true,
+                stop_reason: Some(ProviderStopReason::Refusal),
+            },
+        );
+        let projected = provider_observations(&event);
+        let blocked = timeline_observations(&projected)
+            .iter()
+            .find_map(|observation| match &observation.kind {
+                ObservationKindV1::ActionBlocked { authority, .. } => Some(*authority),
+                _ => None,
+            })
+            .expect("expected an ActionBlocked observation");
+        assert_eq!(blocked, BlockAuthorityV1::ProviderRefusal);
+        for observation in &projected {
+            observation.validate().expect("minted observation must validate");
+        }
+    }
+
+    /// A `failed` tool completion with NO `_meta` (no `non_execution_kind`)
+    /// is a plain execution failure, never a block -- `ToolCompleted {
+    /// success: false }` only, exactly the plan's rule that `interrupted`/
+    /// `cancelled`/absent typed field never becomes `ActionBlocked`.
+    #[test]
+    fn failed_tool_without_non_execution_kind_mints_no_action_blocked() {
+        for non_execution_kind in [None, Some("interrupted".to_owned()), Some("cancelled".to_owned())] {
+            let projected = provider_observations(&provider_control_event(
+                AdapterFamily::Acp,
+                ProviderEvent::ToolCompleted {
+                    id: "toolu_1".to_owned(),
+                    output: "command exited with status 1".to_owned(),
+                    is_error: true,
+                    duration_ms: Some(12),
+                    agent_id: None,
+                    non_execution_kind,
+                },
+            ));
+            assert!(
+                !timeline_observations(&projected)
+                    .iter()
+                    .any(|observation| matches!(observation.kind, ObservationKindV1::ActionBlocked { .. })),
+                "a failed tool with no permission-rule/user-rejected kind must not mint ActionBlocked"
+            );
+            assert!(
+                timeline_observations(&projected)
+                    .iter()
+                    .any(|observation| matches!(
+                        observation.kind,
+                        ObservationKindV1::ToolCompleted { success: false, .. }
+                    )),
+                "the tool failure itself must still be recorded"
+            );
+        }
+    }
+
+    /// Negative fixture (`audits/gate4agent-acp-slice1-proof-2026-09-02.md`,
+    /// commit `8397ab5`): the agent's own narrative claims a block ("the
+    /// harness blocked the write, approval needed") while the tool actually
+    /// completed successfully (`is_error: false`, no typed
+    /// `non_execution_kind`). An agent's narrative is never a block.
+    #[test]
+    fn agent_narrative_claiming_a_block_on_a_completed_tool_mints_no_action_blocked() {
+        let projected = provider_observations(&provider_control_event(
+            AdapterFamily::Acp,
+            ProviderEvent::ToolCompleted {
+                id: "toolu_2".to_owned(),
+                output: "the harness blocked the write, approval needed".to_owned(),
+                is_error: false,
+                duration_ms: Some(3),
+                agent_id: None,
+                non_execution_kind: None,
+            },
+        ));
+        assert!(
+            !timeline_observations(&projected)
+                .iter()
+                .any(|observation| matches!(observation.kind, ObservationKindV1::ActionBlocked { .. })),
+            "an agent's own narrative text must never mint ActionBlocked"
+        );
+    }
+
     /// `Granted`/`Deferred` decisions never mint `ActionBlocked` -- there is
     /// nothing blocked to report.
     #[test]
@@ -17865,6 +18273,7 @@ mod observation_projection_tests {
                 is_error: false,
                 duration_ms: Some(7),
                 agent_id: None,
+                non_execution_kind: None,
             },
         );
         let completed = provider_observations(&completed);
@@ -18056,6 +18465,7 @@ mod observation_projection_tests {
                 is_error: false,
                 duration_ms: Some(5),
                 agent_id: None,
+                non_execution_kind: None,
             },
         );
         let projected = provider_observations(&tool_completed);

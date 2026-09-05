@@ -36,6 +36,7 @@ use gate4agent::{
     HostRequestDecision, HostRequestOutcome, LaunchRequest, OperatorPermissionChoice,
     PipeProcessOptions, PipeSession, PromptFraming,
     ReadinessIntent, ReadinessPermit, ReadinessTracker, RpcId, RuntimePlatform, SessionConfig,
+    StopReason,
 };
 use gate4agent_adapters::{
     build_resume_plan_for_identity, builtin_adapter_registry, AdapterRuntimeRegistry,
@@ -62,7 +63,7 @@ use gate4agent_types::{
     ProviderModeInfo, ProviderPlanPriority,
     ProviderPlanStatus, ProviderPlanStep,
     ProviderRateLimitKind, ProviderRuntimeCapability, ProviderRuntimePolicy,
-    ProviderSessionIdentity, ProviderSessionKey,
+    ProviderSessionIdentity, ProviderSessionKey, ProviderStopReason,
     ProviderSource, PtyScreenState, ResumeLaunchRequest, SessionGeneration, StartRequest,
     TerminalFrame, TerminalMouseProtocolEncoding, TerminalSize, TokenUsage, TransportKind,
     CONTROL_PROTOCOL_VERSION, OPERATOR_GATE_OPTIONS_MAX, WORKING_DIRECTORY_MAX_BYTES,
@@ -2921,6 +2922,23 @@ fn set_acp_session_model_observation(
 /// `ModeChanged` in the first place -- see `update_to_event`'s
 /// `CurrentModeUpdate` arm, `gate4agent`'s `src/acp/protocol.rs`) changes
 /// nothing observable.
+/// Maps `gate4agent`'s own `StopReason` onto the wire-typed
+/// `ProviderStopReason` mirror -- see that type's own doc comment for why
+/// this crate keeps a second copy rather than sharing one.
+fn map_provider_stop_reason(reason: StopReason) -> ProviderStopReason {
+    match reason {
+        StopReason::EndTurn => ProviderStopReason::EndTurn,
+        StopReason::MaxTokens => ProviderStopReason::MaxTokens,
+        StopReason::MaxTurnRequests => ProviderStopReason::MaxTurnRequests,
+        StopReason::Refusal => ProviderStopReason::Refusal,
+        StopReason::Cancelled => ProviderStopReason::Cancelled,
+        StopReason::Other(value) => ProviderStopReason::Other { value },
+        StopReason::ProviderError { code, message, vendor_code } => {
+            ProviderStopReason::ProviderError { code, message, vendor_code }
+        }
+    }
+}
+
 fn provider_event(event: AgentEvent, available_modes: &[SessionMode]) -> Option<ProviderEvent> {
     match event {
         AgentEvent::SessionStart {
@@ -2945,12 +2963,14 @@ fn provider_event(event: AgentEvent, available_modes: &[SessionMode]) -> Option<
             output,
             is_error,
             duration_ms,
+            non_execution_kind,
         } => Some(ProviderEvent::ToolCompleted {
             id,
             output,
             is_error,
             duration_ms,
             agent_id: None,
+            non_execution_kind,
         }),
         AgentEvent::TurnComplete {
             input_tokens,
@@ -2988,10 +3008,12 @@ fn provider_event(event: AgentEvent, available_modes: &[SessionMode]) -> Option<
             result,
             cost_usd,
             is_error,
+            stop_reason,
         } => Some(ProviderEvent::SessionEnded {
             result,
             cost_usd: cost_usd.map(|cost| cost.to_string()),
             is_error,
+            stop_reason: stop_reason.map(map_provider_stop_reason),
         }),
         AgentEvent::Error { message } => Some(ProviderEvent::Error { message }),
         // ACP-only: `acp::session::AcpSession::start_prompt` synthesizes
@@ -4965,6 +4987,82 @@ mod tests {
             &[],
         );
         assert_eq!(mapped, Some(ProviderEvent::TurnInterrupted));
+    }
+
+    #[test]
+    fn tool_result_non_execution_kind_carries_through_to_tool_completed() {
+        let mapped = super::provider_event(
+            AgentEvent::ToolResult {
+                id: "t1".to_owned(),
+                output: "denied".to_owned(),
+                is_error: true,
+                duration_ms: None,
+                non_execution_kind: Some("permission-rule".to_owned()),
+            },
+            &[],
+        );
+        assert_eq!(
+            mapped,
+            Some(ProviderEvent::ToolCompleted {
+                id: "t1".to_owned(),
+                output: "denied".to_owned(),
+                is_error: true,
+                duration_ms: None,
+                agent_id: None,
+                non_execution_kind: Some("permission-rule".to_owned()),
+            })
+        );
+    }
+
+    #[test]
+    fn session_end_stop_reason_carries_through_to_session_ended() {
+        use gate4agent::StopReason;
+
+        let refusal = super::provider_event(
+            AgentEvent::SessionEnd {
+                result: "refusal".to_owned(),
+                cost_usd: None,
+                is_error: true,
+                stop_reason: Some(StopReason::Refusal),
+            },
+            &[],
+        );
+        assert_eq!(
+            refusal,
+            Some(ProviderEvent::SessionEnded {
+                result: "refusal".to_owned(),
+                cost_usd: None,
+                is_error: true,
+                stop_reason: Some(gate4agent_types::ProviderStopReason::Refusal),
+            })
+        );
+
+        let quota = super::provider_event(
+            AgentEvent::SessionEnd {
+                result: "JSON-RPC error -32603: Internal error".to_owned(),
+                cost_usd: None,
+                is_error: true,
+                stop_reason: Some(StopReason::ProviderError {
+                    code: -32603,
+                    message: "You've hit your usage limit.".to_owned(),
+                    vendor_code: Some("usageLimitExceeded".to_owned()),
+                }),
+            },
+            &[],
+        );
+        assert_eq!(
+            quota,
+            Some(ProviderEvent::SessionEnded {
+                result: "JSON-RPC error -32603: Internal error".to_owned(),
+                cost_usd: None,
+                is_error: true,
+                stop_reason: Some(gate4agent_types::ProviderStopReason::ProviderError {
+                    code: -32603,
+                    message: "You've hit your usage limit.".to_owned(),
+                    vendor_code: Some("usageLimitExceeded".to_owned()),
+                }),
+            })
+        );
     }
 
     #[test]

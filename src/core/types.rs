@@ -377,6 +377,116 @@ pub enum HostRequestOutcome {
     Failed { error: String },
 }
 
+/// ACP's `stopReason` vocabulary (`agentclientprotocol.com/protocol/
+/// prompt-turn`): `end_turn`, `max_tokens`, `max_turn_requests`, `refusal`,
+/// `cancelled`. An unrecognized wire string is kept verbatim as `Other`,
+/// never dropped -- a future ACP revision or a vendor extension stays
+/// visible to a consumer that only wants the five canonical values.
+///
+/// `ProviderError` is NOT part of ACP's own vocabulary -- it is synthesized
+/// locally (`acp::session`) for the one case ACP has no `stopReason` for at
+/// all: the `session/prompt` call itself answered with a JSON-RPC error
+/// instead of a normal response (e.g. codex-acp's `-32603` "usage limit
+/// exceeded", measured live 2026-09-05, `data: {"message": "...",
+/// "codexErrorInfo": "usageLimitExceeded"}}`). `message` is the error text
+/// verbatim -- the RPC error's own `data.message` when the error carries
+/// one (Codex's shape: `error.message` itself is only the generic
+/// "Internal error", the real text rides on `data.message`), else the bare
+/// `error.message`. `vendor_code` is the provider's own machine code for
+/// the error when `data` names one (Codex's `data.codexErrorInfo`), or any
+/// OTHER string-valued field found directly on `data` when `codexErrorInfo`
+/// itself is absent -- never guessed beyond what the wire actually named.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StopReason {
+    EndTurn,
+    MaxTokens,
+    MaxTurnRequests,
+    Refusal,
+    Cancelled,
+    Other(String),
+    ProviderError {
+        code: i32,
+        message: String,
+        vendor_code: Option<String>,
+    },
+}
+
+impl StopReason {
+    /// Parse ACP's raw `stopReason` wire string. Never fails: an
+    /// unrecognized value becomes `Other`, exactly as a future ACP revision
+    /// or a vendor's own extension should be treated -- visible, never
+    /// rejected.
+    pub fn from_wire_str(s: &str) -> Self {
+        match s {
+            "end_turn" => Self::EndTurn,
+            "max_tokens" => Self::MaxTokens,
+            "max_turn_requests" => Self::MaxTurnRequests,
+            "refusal" => Self::Refusal,
+            "cancelled" => Self::Cancelled,
+            other => Self::Other(other.to_owned()),
+        }
+    }
+
+    /// The wire string this value round-trips to -- `Other`'s own inner
+    /// string for an unrecognized value, and a fixed descriptive slug for
+    /// `ProviderError`, which never arrived as a `stopReason` string in the
+    /// first place (see this type's own doc comment).
+    pub fn as_wire_str(&self) -> &str {
+        match self {
+            Self::EndTurn => "end_turn",
+            Self::MaxTokens => "max_tokens",
+            Self::MaxTurnRequests => "max_turn_requests",
+            Self::Refusal => "refusal",
+            Self::Cancelled => "cancelled",
+            Self::Other(s) => s,
+            Self::ProviderError { .. } => "provider_error",
+        }
+    }
+
+    /// Whether this stop reason is itself a block an operator needs to see
+    /// -- true only for ACP's own `refusal`. `ProviderError` is NOT
+    /// unconditionally a block here (a quota/limit exhaustion is, a random
+    /// transient RPC error is not) -- that finer classification belongs to
+    /// the mint site that reads `vendor_code`/`message`, not this type.
+    pub fn is_refusal(&self) -> bool {
+        matches!(self, Self::Refusal)
+    }
+}
+
+impl Serialize for StopReason {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::ProviderError { code, message, vendor_code } => {
+                use serde::ser::SerializeStruct;
+                let mut state = serializer.serialize_struct("StopReason", 4)?;
+                state.serialize_field("kind", "provider_error")?;
+                state.serialize_field("code", code)?;
+                state.serialize_field("message", message)?;
+                state.serialize_field("vendor_code", vendor_code)?;
+                state.end()
+            }
+            other => serializer.serialize_str(other.as_wire_str()),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for StopReason {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Only the plain wire-string shape round-trips here -- this build
+        // never receives a `ProviderError` back off the wire (it is
+        // synthesized locally, never parsed), so a bare string is the only
+        // inbound shape that needs to deserialize.
+        let s = String::deserialize(deserializer)?;
+        Ok(Self::from_wire_str(&s))
+    }
+}
+
 /// Unified event type produced by both PTY and pipe transports.
 ///
 /// Consumers subscribe to a `broadcast::Receiver<AgentEvent>` and
@@ -411,7 +521,21 @@ pub enum AgentEvent {
     /// Tool call started by assistant.
     ToolStart { id: String, name: String, input: serde_json::Value },
     /// Tool call completed.
-    ToolResult { id: String, output: String, is_error: bool, duration_ms: Option<u64> },
+    ToolResult {
+        id: String,
+        output: String,
+        is_error: bool,
+        duration_ms: Option<u64>,
+        /// ACP `tool_call_update._meta.nonExecutionKind` -- Claude's own
+        /// vocabulary for WHY the tool never actually ran:
+        /// `"user-rejected"`, `"permission-rule"`, `"interrupted"`,
+        /// `"cancelled"`. `None` for a provider that sends no such field
+        /// (every provider except Claude, and Claude itself for a call
+        /// that genuinely ran and either succeeded or failed for real).
+        /// Never guessed from `output` text -- read off the typed `_meta`
+        /// field only, or absent.
+        non_execution_kind: Option<String>,
+    },
     /// Assistant thinking/reasoning block.
     Thinking { text: String },
     /// Turn complete with token usage.
@@ -427,7 +551,19 @@ pub enum AgentEvent {
     /// Exact current context-window usage from a structured provider event.
     ContextWindowUsage { usage: ContextWindowUsage },
     /// Session ended with final result.
-    SessionEnd { result: String, cost_usd: Option<f64>, is_error: bool },
+    SessionEnd {
+        result: String,
+        cost_usd: Option<f64>,
+        is_error: bool,
+        /// The typed reason the turn stopped, when the transport is ACP
+        /// and one exists -- `Some(StopReason::Refusal)` and
+        /// `Some(StopReason::ProviderError { .. })` are both `is_error:
+        /// true` (see [`StopReason`]'s own doc comment). `None` for a
+        /// non-ACP transport (pipe, one-shot), which has no such concept
+        /// on the wire at all, and for the ACP process-exit path, which
+        /// has no `stopReason` to report either.
+        stop_reason: Option<StopReason>,
+    },
     /// The current turn ended abnormally, without a matching `TurnComplete`/
     /// `SessionEnd` -- ACP transport only, synthesized locally by
     /// `acp::session::AcpSession::start_prompt` (never sent by an agent on

@@ -1618,6 +1618,49 @@ pub struct ProviderInteractionOption {
     pub kind: String,
 }
 
+/// Why an ACP turn stopped -- mirrors `gate4agent`'s own `StopReason`
+/// (`src/core/types.rs`) one-for-one; this crate cannot depend on
+/// `gate4agent` (see this crate's own `CLAUDE.md`), the same reason every
+/// other wire-typed mirror here exists (`ProviderRateLimitKind`,
+/// `ProviderInteractionOption`, ...). `ProviderError` is synthesized
+/// locally by `gate4agent`'s ACP session when `session/prompt` itself
+/// answers with a JSON-RPC error instead of a normal response -- see that
+/// type's own doc comment for the live Codex fixture this shape was
+/// measured against.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ProviderStopReason {
+    EndTurn,
+    MaxTokens,
+    MaxTurnRequests,
+    Refusal,
+    Cancelled,
+    Other { value: String },
+    ProviderError {
+        code: i32,
+        message: String,
+        vendor_code: Option<String>,
+    },
+}
+
+impl ProviderStopReason {
+    fn validate_ingress(&self) -> Result<(), ProviderEventValidationError> {
+        match self {
+            Self::EndTurn | Self::MaxTokens | Self::MaxTurnRequests | Self::Refusal | Self::Cancelled => {
+                Ok(())
+            }
+            Self::Other { value } => validate_text("stop reason", value, PROVIDER_EVENT_ID_MAX_BYTES),
+            Self::ProviderError { message, vendor_code, .. } => {
+                validate_text("provider error message", message, PROVIDER_EVENT_TEXT_MAX_BYTES)?;
+                if let Some(code) = vendor_code {
+                    validate_text("provider error vendor code", code, PROVIDER_EVENT_ID_MAX_BYTES)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ProviderEvent {
@@ -1652,6 +1695,16 @@ pub enum ProviderEvent {
         is_error: bool,
         duration_ms: Option<u64>,
         agent_id: Option<String>,
+        /// ACP `tool_call_update._meta.nonExecutionKind` -- Claude's own
+        /// vocabulary for WHY the tool never actually ran:
+        /// `"user-rejected"`, `"permission-rule"`, `"interrupted"`,
+        /// `"cancelled"`. `None` for a provider that sends no such field,
+        /// or a call that genuinely ran and either succeeded or failed for
+        /// real. `#[serde(default)]` reads a durable record written
+        /// before this field existed as `None` -- honest, since that
+        /// record could not have carried it either way.
+        #[serde(default)]
+        non_execution_kind: Option<String>,
     },
     TurnCompleted {
         usage: TokenUsage,
@@ -1665,6 +1718,15 @@ pub enum ProviderEvent {
         result: String,
         cost_usd: Option<String>,
         is_error: bool,
+        /// Why the turn stopped, when the transport is ACP and one exists
+        /// -- mirrors `gate4agent`'s own `StopReason` (`src/core/
+        /// types.rs`) one-for-one; this crate cannot depend on
+        /// `gate4agent` (see this crate's own `CLAUDE.md`), the same
+        /// reason every other wire-typed mirror here exists. `None` for a
+        /// non-ACP transport, and for a durable record written before
+        /// this field existed (`#[serde(default)]`).
+        #[serde(default)]
+        stop_reason: Option<ProviderStopReason>,
     },
     Error {
         message: String,
@@ -1861,18 +1923,28 @@ impl ProviderEvent {
                 id,
                 output,
                 agent_id,
+                non_execution_kind,
                 ..
             } => {
                 validate_required("tool id", id, PROVIDER_EVENT_ID_MAX_BYTES)?;
                 validate_text("tool output", output, PROVIDER_EVENT_TEXT_MAX_BYTES)?;
                 validate_optional_agent_id(agent_id)?;
+                if let Some(kind) = non_execution_kind {
+                    validate_text("tool non-execution kind", kind, PROVIDER_EVENT_ID_MAX_BYTES)?;
+                }
             }
             Self::SessionEnded {
-                result, cost_usd, ..
+                result,
+                cost_usd,
+                stop_reason,
+                ..
             } => {
                 validate_text("session result", result, PROVIDER_EVENT_TEXT_MAX_BYTES)?;
                 if let Some(cost) = cost_usd {
                     validate_identifier("cost", cost, PROVIDER_EVENT_ID_MAX_BYTES)?;
+                }
+                if let Some(stop_reason) = stop_reason {
+                    stop_reason.validate_ingress()?;
                 }
             }
             Self::Error { message } => {
@@ -3890,6 +3962,118 @@ mod tests {
             }
             .validate_ingress(),
             Err(ProviderEventValidationError::Empty { field: "config option id" })
+        ));
+    }
+
+    #[test]
+    fn tool_completed_non_execution_kind_is_optional_and_bounded() {
+        let none = ProviderEvent::ToolCompleted {
+            id: "t1".to_owned(),
+            output: "denied".to_owned(),
+            is_error: true,
+            duration_ms: None,
+            agent_id: None,
+            non_execution_kind: None,
+        };
+        assert_eq!(none.validate_ingress(), Ok(()));
+
+        let typed = ProviderEvent::ToolCompleted {
+            id: "t1".to_owned(),
+            output: "denied".to_owned(),
+            is_error: true,
+            duration_ms: None,
+            agent_id: None,
+            non_execution_kind: Some("permission-rule".to_owned()),
+        };
+        assert_eq!(typed.validate_ingress(), Ok(()));
+
+        let oversized = "k".repeat(PROVIDER_EVENT_ID_MAX_BYTES + 1);
+        assert!(matches!(
+            ProviderEvent::ToolCompleted {
+                id: "t1".to_owned(),
+                output: "denied".to_owned(),
+                is_error: true,
+                duration_ms: None,
+                agent_id: None,
+                non_execution_kind: Some(oversized),
+            }
+            .validate_ingress(),
+            Err(ProviderEventValidationError::InvalidField {
+                field: "tool non-execution kind",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn session_ended_stop_reason_is_optional_and_each_variant_validates() {
+        use super::ProviderStopReason;
+        for stop_reason in [
+            None,
+            Some(ProviderStopReason::EndTurn),
+            Some(ProviderStopReason::MaxTokens),
+            Some(ProviderStopReason::MaxTurnRequests),
+            Some(ProviderStopReason::Refusal),
+            Some(ProviderStopReason::Cancelled),
+            Some(ProviderStopReason::Other { value: "some-vendor-code".to_owned() }),
+            Some(ProviderStopReason::ProviderError {
+                code: -32603,
+                message: "You've hit your usage limit.".to_owned(),
+                vendor_code: Some("usageLimitExceeded".to_owned()),
+            }),
+        ] {
+            let event = ProviderEvent::SessionEnded {
+                result: "end_turn".to_owned(),
+                cost_usd: None,
+                is_error: false,
+                stop_reason,
+            };
+            assert_eq!(event.validate_ingress(), Ok(()));
+            let encoded = serde_json::to_vec(&event).expect("serialize");
+            let decoded: ProviderEvent = serde_json::from_slice(&encoded).expect("deserialize");
+            assert_eq!(decoded, event);
+        }
+    }
+
+    #[test]
+    fn session_ended_provider_error_message_and_vendor_code_are_bounded() {
+        use super::ProviderStopReason;
+        let oversized_message = "m".repeat(PROVIDER_EVENT_TEXT_MAX_BYTES + 1);
+        assert!(matches!(
+            ProviderEvent::SessionEnded {
+                result: "provider_error".to_owned(),
+                cost_usd: None,
+                is_error: true,
+                stop_reason: Some(ProviderStopReason::ProviderError {
+                    code: -32603,
+                    message: oversized_message,
+                    vendor_code: None,
+                }),
+            }
+            .validate_ingress(),
+            Err(ProviderEventValidationError::InvalidField {
+                field: "provider error message",
+                ..
+            })
+        ));
+
+        let oversized_code = "c".repeat(PROVIDER_EVENT_ID_MAX_BYTES + 1);
+        assert!(matches!(
+            ProviderEvent::SessionEnded {
+                result: "provider_error".to_owned(),
+                cost_usd: None,
+                is_error: true,
+                stop_reason: Some(ProviderStopReason::ProviderError {
+                    code: -32603,
+                    message: "usage limit exceeded".to_owned(),
+                    vendor_code: Some(oversized_code),
+                }),
+            }
+            .validate_ingress(),
+            Err(ProviderEventValidationError::InvalidField {
+                field: "provider error vendor code",
+                ..
+            })
         ));
     }
 }

@@ -180,6 +180,7 @@ fn map_block_authority(authority: BlockAuthorityV1) -> HarnessBlockAuthorityV1 {
         BlockAuthorityV1::ProviderRefusal => HarnessBlockAuthorityV1::ProviderRefusal,
         BlockAuthorityV1::ProviderHook => HarnessBlockAuthorityV1::ProviderHook,
         BlockAuthorityV1::UserRejected => HarnessBlockAuthorityV1::UserRejected,
+        BlockAuthorityV1::ProviderQuota => HarnessBlockAuthorityV1::ProviderQuota,
         BlockAuthorityV1::Unknown => HarnessBlockAuthorityV1::Unknown,
     }
 }

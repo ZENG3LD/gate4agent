@@ -948,6 +948,7 @@ fn block_authority_slug(authority: &HarnessBlockAuthorityV1) -> &'static str {
         HarnessBlockAuthorityV1::ProviderRefusal => "provider-refusal",
         HarnessBlockAuthorityV1::ProviderHook => "provider-hook",
         HarnessBlockAuthorityV1::UserRejected => "user-rejected",
+        HarnessBlockAuthorityV1::ProviderQuota => "provider-quota",
         HarnessBlockAuthorityV1::Unknown => "unknown",
     }
 }

@@ -266,6 +266,7 @@ fn reader_loop(
                         result: format!("exit_code={}", exit_code),
                         cost_usd: None,
                         is_error: exit_code != 0,
+                        stop_reason: None,
                     });
                 }
                 let _ = tx.send(AgentEvent::Exited { code: exit_code });
@@ -304,6 +305,7 @@ fn terminate_pipe(
             result: message.to_owned(),
             cost_usd: None,
             is_error: true,
+            stop_reason: None,
         });
         *parser_emitted_session_end = true;
     }
@@ -353,6 +355,7 @@ pub(crate) fn map_cli_event(event: CliEvent) -> AgentEvent {
             output,
             is_error,
             duration_ms,
+            non_execution_kind: None,
         },
         CliEvent::Thinking { text } => AgentEvent::Thinking { text },
         CliEvent::TurnComplete {
@@ -381,6 +384,7 @@ pub(crate) fn map_cli_event(event: CliEvent) -> AgentEvent {
             result,
             cost_usd,
             is_error,
+            stop_reason: None,
         },
         CliEvent::Error { message } => AgentEvent::Error { message },
     }
@@ -488,6 +492,7 @@ mod tests {
                 result: format!("exit_code={}", exit_code),
                 cost_usd: None,
                 is_error: exit_code != 0,
+                stop_reason: None,
             });
         }
         events.push(AgentEvent::Exited { code: exit_code });
@@ -516,6 +521,7 @@ mod tests {
             result,
             is_error,
             cost_usd,
+            ..
         } = session_end
         {
             assert_eq!(result, "exit_code=0");

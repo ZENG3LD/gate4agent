@@ -12,7 +12,7 @@ use serde_json::Value;
 use crate::core::types::{
     AgentEvent, AnnouncementInfo, AvailableCommandInfo, AvailableModelInfo, ConfigOptionChoiceInfo,
     ConfigOptionInfo, HookRunResult, McpServerSummary, PlanStep, PlanStepPriority, PlanStepStatus,
-    ReasoningEffortInfo,
+    ReasoningEffortInfo, StopReason,
 };
 use crate::core::types::ConfigOptionKind as CoreConfigOptionKind;
 
@@ -278,7 +278,7 @@ pub struct PromptResultMeta {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionPromptResult {
     #[serde(rename = "stopReason", default)]
-    pub stop_reason: Option<String>,
+    pub stop_reason: Option<StopReason>,
     #[serde(default)]
     pub usage: Option<PromptUsage>,
     #[serde(rename = "_meta", default)]
@@ -674,6 +674,10 @@ pub enum SessionUpdate {
         status: String,
         #[serde(default)]
         content: Vec<Value>,
+        /// Claude's own sidecar naming WHY the tool never actually ran --
+        /// see [`ToolCallUpdateMeta`]'s own doc comment.
+        #[serde(rename = "_meta", default)]
+        meta: Option<ToolCallUpdateMeta>,
     },
     #[serde(rename = "stop")]
     Stop {
@@ -780,6 +784,40 @@ pub enum SessionUpdate {
     },
     #[serde(other)]
     Unknown,
+}
+
+/// The `_meta` sidecar on a `tool_call_update`, sourced from the Claude
+/// Agent SDK's `tool_result_meta` (`claude-agent-acp` src,
+/// `docs/gate4agent/research/gate4agent-blocked-action-signals-2026-09-02.md`
+/// §1a): `nonExecutionKind` is WHY the tool never actually ran --
+/// `"user-rejected"`, `"permission-rule"`, `"interrupted"`, `"cancelled"` --
+/// so a client can render the denial/cancellation distinctly from a real
+/// tool failure. The exact wire key for a companion user-typed rejection
+/// comment is UNCONFIRMED from the research (only "a companion free-text
+/// field" is documented, no field name); every plausible spelling is tried
+/// here so whichever one a live agent actually sends still surfaces, rather
+/// than committing to a guess and silently dropping the others.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ToolCallUpdateMeta {
+    #[serde(rename = "nonExecutionKind", default)]
+    pub non_execution_kind: Option<String>,
+    #[serde(default)]
+    pub comment: Option<String>,
+    #[serde(rename = "userComment", default)]
+    pub user_comment: Option<String>,
+    #[serde(rename = "user_comment", default)]
+    pub user_comment_snake: Option<String>,
+}
+
+impl ToolCallUpdateMeta {
+    /// The first user-typed rejection comment found under any of the
+    /// plausible wire spellings -- see this type's own doc comment.
+    fn comment_text(&self) -> Option<&str> {
+        self.comment
+            .as_deref()
+            .or(self.user_comment.as_deref())
+            .or(self.user_comment_snake.as_deref())
+    }
 }
 
 /// Priority of a single [`PlanEntry`] within a `plan` update.
@@ -1353,18 +1391,42 @@ pub(crate) fn update_to_event(params: &SessionUpdateParams) -> Vec<AgentEvent> {
             }]
         }
 
-        SessionUpdate::ToolCallUpdate { tool_call_id, status, content } => {
-            let output = content
+        SessionUpdate::ToolCallUpdate { tool_call_id, status, content, meta } => {
+            let mut output = content
                 .iter()
                 .filter_map(|v| v.as_str())
                 .collect::<Vec<_>>()
                 .join("");
-            let is_error = status == "error";
+            let non_execution_kind = meta.as_ref().and_then(|m| m.non_execution_kind.clone());
+            if let Some(comment) = meta.as_ref().and_then(ToolCallUpdateMeta::comment_text) {
+                let comment = crate::utils::truncate_str(
+                    comment,
+                    gate4agent_types::PROVIDER_EVENT_TEXT_MAX_BYTES,
+                );
+                if !comment.is_empty() {
+                    if !output.is_empty() {
+                        output.push('\n');
+                    }
+                    output.push_str(comment);
+                }
+            }
+            // ACP's own status vocabulary is `pending | in_progress |
+            // completed | failed` (this file's `ToolCallStatus`-shaped
+            // uses elsewhere) -- a declined/denied call resolves as
+            // `"failed"` on every provider surveyed (Codex's codex-acp
+            // maps a decline to `ToolCallStatus::Failed` the same way a
+            // real execution failure is). `"error"` is kept as a
+            // tolerated alias: no live capture has ever sent it, but
+            // nothing in the spec forbids a future/vendor agent doing so,
+            // and accepting it costs nothing a real `"failed"`/`"error"`
+            // provider would notice.
+            let is_error = status == "failed" || status == "error";
             vec![AgentEvent::ToolResult {
                 id: tool_call_id.clone(),
                 output,
                 is_error,
                 duration_ms: None,
+                non_execution_kind,
             }]
         }
 
@@ -1377,6 +1439,8 @@ pub(crate) fn update_to_event(params: &SessionUpdateParams) -> Vec<AgentEvent> {
             } else {
                 (0, 0)
             };
+            let parsed_stop_reason = StopReason::from_wire_str(stop_reason);
+            let is_error = parsed_stop_reason.is_refusal();
             vec![
                 AgentEvent::TurnComplete {
                     input_tokens: tok_in,
@@ -1390,7 +1454,8 @@ pub(crate) fn update_to_event(params: &SessionUpdateParams) -> Vec<AgentEvent> {
                 AgentEvent::SessionEnd {
                     result: stop_reason.clone(),
                     cost_usd: None,
-                    is_error: false,
+                    is_error,
+                    stop_reason: Some(parsed_stop_reason),
                 },
             ]
         }
@@ -1916,13 +1981,66 @@ mod tests {
             tool_call_id: "t1".to_string(),
             status: "done".to_string(),
             content: vec![json!("ok")],
+            meta: None,
         });
         let events = update_to_event(&p);
         assert_eq!(events.len(), 1);
         assert!(
-            matches!(&events[0], AgentEvent::ToolResult { id, output, is_error, .. }
-                if id == "t1" && output == "ok" && !is_error)
+            matches!(&events[0], AgentEvent::ToolResult { id, output, is_error, non_execution_kind, .. }
+                if id == "t1" && output == "ok" && !is_error && non_execution_kind.is_none())
         );
+    }
+
+    #[test]
+    fn update_to_event_tool_result_failed_status_is_error() {
+        // ACP's own status vocabulary is `pending | in_progress | completed
+        // | failed` -- a `"done"`/`"error"`-shaped guess never matches a
+        // real provider's `"failed"`. No `_meta` on this update -- a plain
+        // execution failure, not a block.
+        let p = make_update(SessionUpdate::ToolCallUpdate {
+            tool_call_id: "t1".to_string(),
+            status: "failed".to_string(),
+            content: vec![json!("boom")],
+            meta: None,
+        });
+        let events = update_to_event(&p);
+        assert_eq!(events.len(), 1);
+        assert!(
+            matches!(&events[0], AgentEvent::ToolResult { is_error, non_execution_kind, .. }
+                if *is_error && non_execution_kind.is_none())
+        );
+    }
+
+    #[test]
+    fn update_to_event_tool_result_classifier_permission_rule_sample() {
+        // The owner's classifier sample, verbatim
+        // (`docs/gate4agent/research/gate4agent-blocked-action-signals-2026-09-02.md`
+        // appendix), arriving as a `tool_call_update` with
+        // `_meta.nonExecutionKind: "permission-rule"` -- the shape
+        // claude-agent-acp uses to report a classifier/permission-rule
+        // denial.
+        let sample = "Permission for this action was denied by the Claude Code auto mode classifier. Reason: Blocked by classifier. If you have other tasks that don't depend on this action, continue working on those.";
+        let p = make_update(SessionUpdate::ToolCallUpdate {
+            tool_call_id: "t1".to_string(),
+            status: "failed".to_string(),
+            content: vec![json!(sample)],
+            meta: Some(ToolCallUpdateMeta {
+                non_execution_kind: Some("permission-rule".to_owned()),
+                comment: None,
+                user_comment: None,
+                user_comment_snake: None,
+            }),
+        });
+        let events = update_to_event(&p);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            AgentEvent::ToolResult { is_error, non_execution_kind, output, .. } => {
+                assert!(*is_error);
+                assert_eq!(non_execution_kind.as_deref(), Some("permission-rule"));
+                assert_eq!(output, sample);
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1936,7 +2054,26 @@ mod tests {
         let events = update_to_event(&p);
         assert_eq!(events.len(), 2);
         assert!(matches!(&events[0], AgentEvent::TurnComplete { .. }));
-        assert!(matches!(&events[1], AgentEvent::SessionEnd { is_error: false, .. }));
+        assert!(matches!(
+            &events[1],
+            AgentEvent::SessionEnd { is_error: false, stop_reason: Some(StopReason::EndTurn), .. }
+        ));
+    }
+
+    #[test]
+    fn update_to_event_stop_refusal_is_error() {
+        let p = make_update(SessionUpdate::Stop {
+            stop_reason: "refusal".to_string(),
+            input_tokens: 0,
+            output_tokens: 0,
+            usage: None,
+        });
+        let events = update_to_event(&p);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[1],
+            AgentEvent::SessionEnd { is_error: true, stop_reason: Some(StopReason::Refusal), .. }
+        ));
     }
 
     #[test]
@@ -1987,7 +2124,7 @@ mod tests {
         // `extra`.
         let raw = r#"{"stopReason":"end_turn","usage":{"inputTokens":2,"outputTokens":4,"cachedReadTokens":15320,"cachedWriteTokens":17081,"totalTokens":32407},"_meta":{"quota":{"token_count":{"totalTokens":32407,"inputTokens":2,"cachedInputTokens":15320,"cachedWriteTokens":17081,"outputTokens":4,"reasoningOutputTokens":0},"model_usage":[{"model":"claude-opus-5[1m]","token_count":{"totalTokens":32407,"inputTokens":2,"cachedInputTokens":15320,"cachedWriteTokens":17081,"outputTokens":4,"reasoningOutputTokens":0}}]}}}"#;
         let result: SessionPromptResult = serde_json::from_str(raw).unwrap();
-        assert_eq!(result.stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(result.stop_reason, Some(StopReason::EndTurn));
         let usage = result.usage.expect("claude sends usage");
         assert_eq!(usage.input_tokens, Some(2));
         assert_eq!(usage.output_tokens, Some(4));
@@ -2012,7 +2149,7 @@ mod tests {
         // separately (kept intact via `extra`).
         let raw = r#"{"stopReason":"end_turn","_meta":{"sessionId":"01a05e6a-aa4d-7a13-9e9c-2077aa244389","requestId":"97238a1c-461a-4f9a-ba2f-4acc677b762b","promptId":"97238a1c-461a-4f9a-ba2f-4acc677b762b","totalTokens":19885,"modelId":"grok-4.6","inputTokens":19807,"outputTokens":78,"cachedReadTokens":1408,"reasoningTokens":73,"usage":{"inputTokens":19807,"outputTokens":78,"totalTokens":19885,"cachedReadTokens":1408,"cacheCreationTokens":0,"reasoningTokens":73,"modelCalls":1,"apiDurationMs":3284,"costUsdTicks":64549000,"numTurns":1}}}"#;
         let result: SessionPromptResult = serde_json::from_str(raw).unwrap();
-        assert_eq!(result.stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(result.stop_reason, Some(StopReason::EndTurn));
         assert!(result.usage.is_none());
         let meta = result.meta.expect("grok sends _meta");
         assert_eq!(meta.session_id.as_deref(), Some("01a05e6a-aa4d-7a13-9e9c-2077aa244389"));
@@ -2033,7 +2170,7 @@ mod tests {
         // `turn-kimi.jsonl` -- no `usage`, no `_meta` at all.
         let raw = r#"{"stopReason":"end_turn"}"#;
         let result: SessionPromptResult = serde_json::from_str(raw).unwrap();
-        assert_eq!(result.stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(result.stop_reason, Some(StopReason::EndTurn));
         assert!(result.usage.is_none());
         assert!(result.meta.is_none());
     }
@@ -2043,7 +2180,7 @@ mod tests {
         // `turn-codex.jsonl` -- identical bare shape to Kimi's.
         let raw = r#"{"stopReason":"end_turn"}"#;
         let result: SessionPromptResult = serde_json::from_str(raw).unwrap();
-        assert_eq!(result.stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(result.stop_reason, Some(StopReason::EndTurn));
         assert!(result.usage.is_none());
         assert!(result.meta.is_none());
     }

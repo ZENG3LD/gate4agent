@@ -138,6 +138,21 @@ pub enum BlockAuthorityV1 {
     /// harness's operator surface) -- the provider's own `user-rejected`-
     /// shaped outcome.
     UserRejected,
+    /// The provider's own account/plan quota, rate limit, or usage cap was
+    /// exhausted -- e.g. codex-acp's `session/prompt` RPC error carrying
+    /// `data.codexErrorInfo: "usageLimitExceeded"` (measured live
+    /// 2026-09-05). `reason_kind` on the sibling `ActionBlocked` carries
+    /// the provider's own vendor code for this (`"usageLimitExceeded"`,
+    /// `"rate_limit"`, ...) -- this variant only says WHO/WHAT the
+    /// authority is, never a second copy of the code itself. Distinct from
+    /// `ProviderRefusal`: a quota exhaustion is an account/plan state, not
+    /// the model declining the specific request. A new unit variant on a
+    /// closed, exact-version-negotiated wire enum needs no `#[serde(default)]`
+    /// fallback -- there is no older payload that could ever carry it, and
+    /// `NODE_PROTOCOL_VERSION`'s exact-match negotiation means an older
+    /// binary that does not know this variant never receives one in the
+    /// first place.
+    ProviderQuota,
     /// No typed field named who blocked it -- text matching may still have
     /// filled `reason`/`help`, but never this field; see the module doc
     /// comment's rule that authority is never guessed.
@@ -1022,6 +1037,7 @@ impl BlockAuthorityV1 {
             Self::ProviderRefusal => "provider-refusal",
             Self::ProviderHook => "provider-hook",
             Self::UserRejected => "user-rejected",
+            Self::ProviderQuota => "provider-quota",
             Self::Unknown => "unknown",
         }
     }
@@ -1915,6 +1931,7 @@ mod tests {
             BlockAuthorityV1::ProviderRefusal,
             BlockAuthorityV1::ProviderHook,
             BlockAuthorityV1::UserRejected,
+            BlockAuthorityV1::ProviderQuota,
             BlockAuthorityV1::Unknown,
         ] {
             let value = observation(
@@ -1947,6 +1964,7 @@ mod tests {
             BlockAuthorityV1::ProviderRefusal,
             BlockAuthorityV1::ProviderHook,
             BlockAuthorityV1::UserRejected,
+            BlockAuthorityV1::ProviderQuota,
         ];
         for authority in refused {
             let rejected = observation(

@@ -496,6 +496,7 @@ fn tool_completed(payload: &Map<String, Value>, is_error: bool) -> ProviderEvent
         is_error,
         duration_ms: first_value(payload, &["duration_ms", "durationMs"]).and_then(Value::as_u64),
         agent_id: provider_agent_id(payload),
+        non_execution_kind: None,
     }
 }
 

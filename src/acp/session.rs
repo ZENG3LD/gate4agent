@@ -22,7 +22,7 @@ use tokio::task::JoinHandle;
 
 use crate::core::error::AgentError;
 use crate::core::types::{
-    AgentEvent, CliTool, HostDecisionAuthority, HostRequestDecision, HostRequestOutcome,
+    AgentEvent, CliTool, HostDecisionAuthority, HostRequestDecision, HostRequestOutcome, StopReason,
 };
 use crate::rpc::id::IdGen;
 use crate::rpc::message::{RpcId, RpcNotification, RpcRequest, RpcResponse};
@@ -633,7 +633,7 @@ impl AcpSession {
             match tokio::time::timeout(timeout, receiver).await {
                 Ok(Ok(Ok(result))) => emit_prompt_result(&tx, &result),
                 Ok(Ok(Err(error))) => {
-                    interrupt_turn(&tx, error.to_string());
+                    report_agent_rpc_error(&tx, &error);
                 }
                 Ok(Err(_)) => {
                     interrupt_turn(
@@ -1394,6 +1394,72 @@ fn interrupt_turn(tx: &broadcast::Sender<AgentEvent>, reason: String) {
     let _ = tx.send(AgentEvent::TurnInterrupted { reason });
 }
 
+/// Report a `session/prompt` call that ended with a JSON-RPC error FROM
+/// THE AGENT ITSELF -- e.g. codex-acp's `-32603` "usage limit exceeded"
+/// when the account's quota is exhausted (measured live 2026-09-05,
+/// `error: {"code": -32603, "message": "Internal error", "data":
+/// {"message": "You've hit your usage limit...", "codexErrorInfo":
+/// "usageLimitExceeded"}}`). Sends the same `Error`+`TurnInterrupted` pair
+/// [`interrupt_turn`] already sends (nothing that depends on that pair
+/// changes), PLUS a `SessionEnd` carrying `StopReason::ProviderError` --
+/// the one place downstream (`gate4agent-shell-native`'s `provider_event`,
+/// `gate4agent-node`'s mint) can classify a vendor code into a typed
+/// `ActionBlocked`/`ProviderQuota` fact, rather than only the human-
+/// readable string `TurnInterrupted::reason` already carried.
+fn report_agent_rpc_error(tx: &broadcast::Sender<AgentEvent>, error: &crate::rpc::message::RpcError) {
+    let reason = error.to_string();
+    let _ = tx.send(AgentEvent::Error { message: reason.clone() });
+    let _ = tx.send(AgentEvent::TurnInterrupted { reason: reason.clone() });
+    let (message, vendor_code) = extract_rpc_error_detail(error);
+    let _ = tx.send(AgentEvent::SessionEnd {
+        result: reason,
+        cost_usd: None,
+        is_error: true,
+        stop_reason: Some(StopReason::ProviderError {
+            code: error.code,
+            message,
+            vendor_code,
+        }),
+    });
+}
+
+/// Pulls the verbatim message and the vendor's own machine code out of an
+/// agent RPC error's `data` -- Codex's shape verified live 2026-09-05:
+/// `data: {"message": "<real human text>", "codexErrorInfo":
+/// "usageLimitExceeded"}`. `error.message` itself is only the generic
+/// "Internal error" on that shape, so `data.message` is preferred when
+/// present; `data.codexErrorInfo` is the vendor code, or -- absent that
+/// exact key -- any OTHER string-valued field found directly on `data`
+/// (bounded, single-level scan; never invented beyond what the wire
+/// actually named). Both are cut to `PROVIDER_EVENT_TEXT_MAX_BYTES` at a
+/// safe UTF-8 boundary before this build carries them any further.
+fn extract_rpc_error_detail(error: &crate::rpc::message::RpcError) -> (String, Option<String>) {
+    let Some(data) = error.data.as_ref() else {
+        return (error.message.clone(), None);
+    };
+    let message = data
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| data.as_str())
+        .unwrap_or(&error.message);
+    let vendor_code = data
+        .get("codexErrorInfo")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            data.as_object().and_then(|obj| {
+                obj.iter()
+                    .find(|(key, value)| key.as_str() != "message" && value.is_string())
+                    .and_then(|(_, value)| value.as_str())
+            })
+        });
+    (
+        crate::utils::truncate_str(message, gate4agent_types::PROVIDER_EVENT_TEXT_MAX_BYTES)
+            .to_owned(),
+        vendor_code
+            .map(|s| crate::utils::truncate_str(s, gate4agent_types::PROVIDER_EVENT_TEXT_MAX_BYTES).to_owned()),
+    )
+}
+
 /// Fold a `session/prompt` response into the two events every caller of
 /// `prompt()`/`start_prompt()` waits on.
 ///
@@ -1406,7 +1472,9 @@ fn interrupt_turn(tx: &broadcast::Sender<AgentEvent>, reason: String) {
 /// -- they never report per-turn usage on this response at all.
 fn emit_prompt_result(tx: &broadcast::Sender<AgentEvent>, result: &Value) {
     let parsed: SessionPromptResult = serde_json::from_value(result.clone()).unwrap_or_default();
-    let stop_reason = parsed.stop_reason.unwrap_or_else(|| "end_turn".to_owned());
+    let stop_reason = parsed.stop_reason.unwrap_or(StopReason::EndTurn);
+    let is_error = stop_reason.is_refusal();
+    let stop_reason_text = stop_reason.as_wire_str().to_owned();
 
     let (input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens) =
         if let Some(usage) = parsed.usage {
@@ -1440,9 +1508,10 @@ fn emit_prompt_result(tx: &broadcast::Sender<AgentEvent>, result: &Value) {
         is_cumulative: false,
     });
     let _ = tx.send(AgentEvent::SessionEnd {
-        result: stop_reason,
+        result: stop_reason_text,
         cost_usd: None,
-        is_error: false,
+        is_error,
+        stop_reason: Some(stop_reason),
     });
 }
 
@@ -1745,5 +1814,44 @@ mod tests {
             other => panic!("expected TurnInterrupted, got {other:?}"),
         }
         assert!(rx.try_recv().is_err(), "no third event should follow");
+    }
+
+    #[test]
+    fn report_agent_rpc_error_codex_quota_transcript_verbatim() {
+        // Live fixture, codex-acp 1.10.0, 2026-09-05 (account over quota):
+        // `{"jsonrpc":"2.0","id":4,"error":{"code":-32603,"message":
+        // "Internal error","data":{"message":"You've hit your usage
+        // limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit
+        // https://chatgpt.com/codex/settings/usage to purchase more
+        // credits or try again at Sep 7th, 2026 6:19 PM.","codexErrorInfo":
+        // "usageLimitExceeded"}}}`.
+        use crate::rpc::message::RpcError;
+        let error = RpcError {
+            code: RpcError::INTERNAL_ERROR,
+            message: "Internal error".to_owned(),
+            data: Some(json!({
+                "message": "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 7th, 2026 6:19 PM.",
+                "codexErrorInfo": "usageLimitExceeded",
+            })),
+        };
+        let (tx, mut rx) = broadcast::channel(8);
+        report_agent_rpc_error(&tx, &error);
+
+        assert!(matches!(rx.try_recv().unwrap(), AgentEvent::Error { .. }));
+        assert!(matches!(rx.try_recv().unwrap(), AgentEvent::TurnInterrupted { .. }));
+        match rx.try_recv().expect("SessionEnd event") {
+            AgentEvent::SessionEnd { is_error, stop_reason, .. } => {
+                assert!(is_error);
+                match stop_reason {
+                    Some(StopReason::ProviderError { code, message, vendor_code }) => {
+                        assert_eq!(code, RpcError::INTERNAL_ERROR);
+                        assert!(message.starts_with("You've hit your usage limit"));
+                        assert_eq!(vendor_code.as_deref(), Some("usageLimitExceeded"));
+                    }
+                    other => panic!("expected StopReason::ProviderError, got {other:?}"),
+                }
+            }
+            other => panic!("expected SessionEnd, got {other:?}"),
+        }
     }
 }

@@ -3327,6 +3327,10 @@ pub enum HarnessBlockAuthorityV1 {
     ProviderRefusal,
     ProviderHook,
     UserRejected,
+    /// Mirrors `gate4agent_observation_protocol::BlockAuthorityV1::
+    /// ProviderQuota` -- the provider's own account/plan quota, rate
+    /// limit, or usage cap was exhausted.
+    ProviderQuota,
     Unknown,
 }
 

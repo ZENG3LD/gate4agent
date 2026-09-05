@@ -128,6 +128,7 @@ pub(crate) fn acp_reader_loop(
                             result: format!("exit_code={}", exit_code),
                             cost_usd: None,
                             is_error: exit_code != 0,
+                            stop_reason: None,
                         });
                     }
                     let _ = tx.send(AgentEvent::Exited { code: exit_code });

@@ -812,8 +812,23 @@ impl HarnessContextSourceSelectionV1 {
                 pack.validate()?;
             }
         }
-        if self.message_count == 0
-            || self.completed_turn_count.is_some_and(|count| count > self.message_count)
+        // A `Live` source's counts are best-effort: the Node's own pack
+        // export never reads them (it asks the live session's adapter for
+        // its transcript directly), so a source whose history was never
+        // observed still carries the same "not observed" shape
+        // `HarnessRunContextSourceObservationV1::validate` already accepts
+        // -- `message_count: 0`, `message_count_exact: false`, no turn/token
+        // counts. Any other combination (an exact-zero count, a nonzero
+        // count claimed inexact-and-empty, `Durable`'s pack-backed count
+        // being zero, etc.) stays rejected below exactly as before.
+        let unobserved_live = self.availability == HarnessContextSourceAvailabilityV1::Live
+            && self.message_count == 0
+            && !self.message_count_exact
+            && self.completed_turn_count.is_none()
+            && self.total_tokens.is_none();
+        if !unobserved_live
+            && (self.message_count == 0
+                || self.completed_turn_count.is_some_and(|count| count > self.message_count))
         {
             return Err(HarnessValidationError::InvalidContextSourceCounts);
         }
@@ -4402,6 +4417,79 @@ mod tests {
         durable_missing_pack.context_pack = None;
         assert_eq!(
             durable_missing_pack.validate(),
+            Err(HarnessValidationError::InvalidContextSourceCounts),
+        );
+    }
+
+    #[test]
+    fn context_source_counts_accept_the_unobserved_live_shape_but_not_incoherent_mixes() {
+        let base = HarnessContextSourceSelectionV1 {
+            source_run_id: run_id('3'),
+            source_run_revision: HarnessRevision::new(4).unwrap(),
+            observed_at_unix_ms: 30,
+            metadata_digest: HarnessRequestDigest::new("4".repeat(64)).unwrap(),
+            node_id: selector("node-a"),
+            node_incarnation: selector("incarnation-a"),
+            workspace_id: selector("workspace-a"),
+            session_record_id: selector("record-a"),
+            active_session: Some(HarnessRuntimeIdentityV1 {
+                instance_id: 7,
+                generation: 3,
+            }),
+            message_count: 0,
+            message_count_exact: false,
+            completed_turn_count: None,
+            total_tokens: None,
+            availability: HarnessContextSourceAvailabilityV1::Live,
+            context_pack: None,
+        };
+        base.validate().unwrap();
+
+        let mut exact_zero = base.clone();
+        exact_zero.message_count_exact = true;
+        assert_eq!(
+            exact_zero.validate(),
+            Err(HarnessValidationError::InvalidContextSourceCounts),
+        );
+
+        let mut leftover_turn_count = base.clone();
+        leftover_turn_count.completed_turn_count = Some(0);
+        assert_eq!(
+            leftover_turn_count.validate(),
+            Err(HarnessValidationError::InvalidContextSourceCounts),
+        );
+
+        let mut leftover_tokens = base.clone();
+        leftover_tokens.total_tokens = Some(0);
+        assert_eq!(
+            leftover_tokens.validate(),
+            Err(HarnessValidationError::InvalidContextSourceCounts),
+        );
+
+        // The bypass is Live-only: a Durable source (pack itself perfectly
+        // valid) whose own `message_count` field is left at zero must still
+        // be rejected exactly as before -- Durable never gets an unobserved
+        // shape, its count always comes from the resolved pack.
+        let mut durable_zero_count = base;
+        durable_zero_count.availability = HarnessContextSourceAvailabilityV1::Durable;
+        durable_zero_count.active_session = None;
+        durable_zero_count.context_pack = Some(HarnessResolvedContextPackReceiptV1 {
+            id: selector("context-c"),
+            digest: format!("sha256:{}", "e".repeat(64)),
+            lineage: HarnessContextPackLineageV1 {
+                source_node_id: selector("node-a"),
+                source_workspace_id: selector("workspace-a"),
+                source_instance_id: 7,
+                source_generation: 3,
+                source_provider: selector("claude"),
+            },
+            source_message_count: 12,
+            retained_message_count: 12,
+            byte_len: 128,
+            truncated: false,
+        });
+        assert_eq!(
+            durable_zero_count.validate(),
             Err(HarnessValidationError::InvalidContextSourceCounts),
         );
     }

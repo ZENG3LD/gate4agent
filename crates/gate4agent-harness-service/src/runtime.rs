@@ -9082,12 +9082,39 @@ fn context_source_option(
     if monitor.availability != ProjectionAvailabilityV1::Current
         || monitor.freshness != ProjectionFreshnessV1::Live
         || monitor.transport_incomplete
-        || monitor.features.history != FeatureObservationStateV1::Observed
     {
         return Ok(None);
     }
-    let Some(history) = monitor.history else { return Ok(None); };
-    if history.message_count == 0 || !history.message_count_exact { return Ok(None); }
+    // The counts below are best-effort telemetry, not a precondition for
+    // this source to exist. `export_context_pack_for_session_record_inner`
+    // (the Node's own pack export) never reads this projection at all -- it
+    // asks the live session's own adapter (`DiscoverHistory`/`LoadHistory`)
+    // for its transcript directly -- and no live transport has ever been
+    // observed to emit a `HistorySnapshot` for a normal run, so requiring
+    // `monitor.features.history == Observed` here made every live run's
+    // `context_sources` permanently empty. Fill the aggregate fields from
+    // the monitor's history projection when it happens to be present and
+    // exact; otherwise fall back to the same "not observed" shape
+    // `HarnessRunContextSourceObservationV1::validate` already treats as
+    // valid (`message_count: 0, message_count_exact: false`, no turn/token
+    // counts) -- the caller still gets a Live source to route the export
+    // through, just without pre-known counts. `availability`/`freshness`/
+    // `transport_incomplete` above stay hard gates: those describe whether
+    // the route to the session is healthy right now, which the export
+    // genuinely needs.
+    let observed_history = monitor.history.filter(|history| {
+        history.message_count > 0 && history.message_count_exact
+    });
+    let (message_count, message_count_exact, completed_turn_count, total_tokens) =
+        match observed_history {
+            Some(history) => (
+                history.message_count,
+                history.message_count_exact,
+                history.completed_turn_count,
+                history.total_tokens,
+            ),
+            None => (0, false, None, None),
+        };
     let mut source = HarnessContextSourceSelectionV1 {
         source_run_id: run.run_id.clone(),
         source_run_revision: run.revision,
@@ -9099,10 +9126,10 @@ fn context_source_option(
         workspace_id: binding.workspace_id.clone(),
         session_record_id: record_id.clone(),
         active_session: Some(active_session.clone()),
-        message_count: history.message_count,
-        message_count_exact: history.message_count_exact,
-        completed_turn_count: history.completed_turn_count,
-        total_tokens: history.total_tokens,
+        message_count,
+        message_count_exact,
+        completed_turn_count,
+        total_tokens,
         availability: HarnessContextSourceAvailabilityV1::Live,
         context_pack: None,
     };
@@ -13968,6 +13995,119 @@ mod tests {
             context_source_option(&harness, &observation, &support, &runtime_inventory, &cancelled_run).unwrap(),
             None,
         );
+
+        observation.close().unwrap();
+        for candidate in [
+            observation_path.clone(),
+            PathBuf::from(format!("{}-wal", observation_path.display())),
+            PathBuf::from(format!("{}-shm", observation_path.display())),
+        ] {
+            let _ = fs::remove_file(candidate);
+        }
+    }
+
+    /// A projection reaches `Current`/`Live` off ANY observation event, not
+    /// specifically a `HistorySnapshot` -- and no live transport (ACP
+    /// included) has ever been observed to emit one or to advertise the
+    /// `history_summary` capability. Requiring
+    /// `monitor.features.history == Observed` therefore made every normal
+    /// live run's `context_sources` permanently empty, even though the
+    /// Node's own pack export never consults this projection at all. The
+    /// predicate must still admit the run, carrying the same "not observed"
+    /// aggregate shape `HarnessRunContextSourceObservationV1::validate`
+    /// already accepts: `message_count: 0`, `message_count_exact: false`,
+    /// no turn/token counts.
+    #[test]
+    fn context_source_option_admits_a_live_run_with_unobserved_history() {
+        let (harness, _task_id, run_id, route) = running_harness_fixture();
+        let snapshot = bound_snapshot(
+            &route.node_id,
+            ManagedSessionState::Live,
+            Some(bound_session_address()),
+            C2SessionStatus::Running,
+        );
+        let runtime_inventory = correlation_inventory(route.clone(), snapshot, 20);
+        let mut support = ObservationSupportRegistry::default();
+        support.replace(
+            route.node_id.clone(),
+            route.expected_incarnation_id,
+            Some(C2ObservationSupport {
+                events: true,
+                managed_target: true,
+                workflow_detail: false,
+            }),
+        );
+        let observation_path = database_path();
+        let mut observation = ObservationService::open(&observation_path).unwrap();
+        let managed_key = ManagedSessionKey {
+            node_id: route.node_id.clone(),
+            incarnation_id: route.expected_incarnation_id,
+            record_id: SessionRecordId::new("record-a").unwrap(),
+        };
+        observation.apply_resync(ObservationResyncBatch {
+            node_id: route.node_id.clone(),
+            incarnation_id: route.expected_incarnation_id,
+            requested_after: 0,
+            high_watermark: NodeCursor {
+                incarnation_id: route.expected_incarnation_id,
+                sequence: 5,
+            },
+            oldest_available_sequence: 1,
+            records: vec![ManagedRecordLink {
+                managed: managed_key,
+                runtime: Some(RuntimeSessionKey {
+                    node_id: route.node_id.clone(),
+                    incarnation_id: route.expected_incarnation_id,
+                    workspace_id: gate4agent_node_protocol::WorkspaceId::new(
+                        "workspace-a",
+                    ).unwrap(),
+                    instance_id: AgentInstanceId(7),
+                    generation: SessionGeneration(3),
+                }),
+            }],
+            records_complete: true,
+            gaps: Vec::new(),
+            events: Vec::new(),
+        }).unwrap();
+        // A non-history event still brings the projection to `Current`/
+        // `Live` without ever populating `history` -- exactly what a live
+        // ACP transport actually produces.
+        apply_routed_observation_event(
+            &mut observation,
+            RoutedNodeEvent {
+                node_id: route.node_id.clone(),
+                cursor: NodeCursor {
+                    incarnation_id: route.expected_incarnation_id,
+                    sequence: 6,
+                },
+                event: C2NodeEvent::ManagedObservation {
+                    record_id: SessionRecordId::new("record-a").unwrap(),
+                    observation: ObservationV1 {
+                        source_sequence: 99,
+                        observed_at_unix_ms: Some(1_230),
+                        evidence: ObservationEvidenceV1::StructuredProvider,
+                        kind: ObservationKindV1::Ready,
+                        truncated: false,
+                    },
+                },
+            },
+            1_234,
+        ).unwrap();
+
+        let run = harness.engine().run(&run_id).unwrap();
+        let source = context_source_option(
+            &harness,
+            &observation,
+            &support,
+            &runtime_inventory,
+            run,
+        ).unwrap().unwrap();
+        assert_eq!(source.availability, HarnessContextSourceAvailabilityV1::Live);
+        assert_eq!(source.message_count, 0);
+        assert!(!source.message_count_exact);
+        assert_eq!(source.completed_turn_count, None);
+        assert_eq!(source.total_tokens, None);
+        source.validate().unwrap();
 
         observation.close().unwrap();
         for candidate in [

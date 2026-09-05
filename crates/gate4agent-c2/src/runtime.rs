@@ -1872,6 +1872,59 @@ fn routed_transient_node_event(
     })
 }
 
+/// `NodeEvent::AgentStream` chunks are published unconditionally -- never
+/// gated on `cursor` contiguity, and never the cause of a
+/// `CursorRegression`/`NonContiguousEvents` gap -- but, unlike
+/// `HarnessMcpReadCall` (always `sequence: 0`, see
+/// `gate4agent-node/src/server.rs::publish_transient`), an
+/// `AgentStreamChunkV1` envelope draws its `sequence` from the
+/// SAME counter every durable `NodeEvent` shares
+/// (`gate4agent-node/src/server.rs::publish_agent_stream_chunk`'s own doc,
+/// there purely so the node's per-connection discard watermark can compare
+/// it against everything else). So a chunk really does consume a slot in
+/// the durable sequence space, and `routed_transient_node_event`'s
+/// "leave `cursor` untouched" rule -- correct for a call that never had a
+/// slot to begin with -- would otherwise make the very next durable event
+/// look one short of contiguous, forcing a resync round trip on every
+/// single provider turn that streams so much as one chunk.
+///
+/// This folds the chunk's sequence into `cursor` with `max` instead: on the
+/// ordinary, non-bursty path (`Control(N)` then its own `AgentStream(N+1)`,
+/// each one delivered as they are produced) that keeps `cursor` moving
+/// exactly as it did before this function existed, so the very next
+/// `Control(N+2)` still finds `cursor == N+1` and stays contiguous. On the
+/// bursty path -- the one actually measured live: 19 chunks published
+/// `source_sequence` 22-40 in a 17ms window, `envelope_sequence` interleaved
+/// 1:1 with `Control`, only 2 of the 19 ever reached the harness -- the
+/// node's connection loop can drain its durable channel far enough ahead of
+/// this dedicated one that a lower-sequence chunk arrives at this relay
+/// AFTER `cursor` has already been carried past it by a resync recovering
+/// the higher-sequence `Control` envelopes around it. `max` refuses to let
+/// that late chunk rewind `cursor` -- it is still published (chunks promise
+/// no resync, so there is nothing to recover if it were dropped instead:
+/// `gate4agent-node-protocol::AgentStreamChunkV1`'s own doc, "no
+/// `ObservationV1` resync promise") -- it simply stops mattering to the
+/// durable cursor's own contiguity bookkeeping once something newer has
+/// already passed it by. Ordering and true loss within the agent-stream
+/// channel itself remain the node's own broadcast `Lagged` warn to name,
+/// not this cursor's to adjudicate.
+fn route_agent_stream_event(
+    node_id: &NodeId,
+    cursor: &mut NodeCursor,
+    envelope: &NodeEventEnvelope,
+) -> Option<RoutedNodeEvent> {
+    if !matches!(&envelope.event, NodeEvent::AgentStream { .. }) {
+        return None;
+    }
+    let routed = RoutedNodeEvent {
+        node_id: node_id.clone(),
+        cursor: *cursor,
+        event: C2NodeEvent::from(&envelope.event),
+    };
+    cursor.sequence = cursor.sequence.max(envelope.sequence);
+    Some(routed)
+}
+
 async fn drain_pending_events(
     client: &mut LocalNodeClient,
     node_id: &NodeId,
@@ -1889,6 +1942,10 @@ async fn drain_pending_events(
         let mut repair = false;
         while let Some(envelope) = client.take_event() {
             if let Some(event) = routed_transient_node_event(node_id, *cursor, &envelope) {
+                hub.publish(event);
+                continue;
+            }
+            if let Some(event) = route_agent_stream_event(node_id, cursor, &envelope) {
                 hub.publish(event);
                 continue;
             }
@@ -1999,6 +2056,10 @@ async fn handle_live_node_event(
     ingress: &mpsc::Sender<Attempt>,
 ) -> Result<(), NodeClientError> {
     if let Some(event) = routed_transient_node_event(node_id, *cursor, &envelope) {
+        hub.publish(event);
+        return Ok(());
+    }
+    if let Some(event) = route_agent_stream_event(node_id, cursor, &envelope) {
         hub.publish(event);
         return Ok(());
     }
@@ -2628,7 +2689,8 @@ mod endpoint_tests {
 mod tests {
     use super::*;
     use gate4agent_node_protocol::{
-        AgentId, CapabilityId, SessionAddress, SessionKey, SessionMode, SessionRecordId,
+        AgentId, AgentStreamChunkKindV1, AgentStreamChunkV1, CapabilityId, SessionAddress,
+        SessionKey, SessionMode, SessionRecordId,
         HarnessMcpActivationDigest, HarnessMcpCallId, HarnessMcpReservationId,
         HarnessReadRequestV1,
         SpawnDeadlineMs, SpawnFieldProvenance, SpawnIdempotencyKey, SpawnOverrides,
@@ -3419,6 +3481,128 @@ mod tests {
             &envelope,
         ).is_none());
         assert_eq!(cursor.sequence, 41);
+    }
+
+    fn agent_stream_test_address() -> SessionAddress {
+        SessionAddress {
+            workspace_id: WorkspaceId::new("repo").unwrap(),
+            session: SessionKey {
+                instance_id: AgentInstanceId(8),
+                generation: SessionGeneration(1),
+            },
+        }
+    }
+
+    fn agent_stream_test_envelope(sequence: u64, source_sequence: u64) -> NodeEventEnvelope {
+        NodeEventEnvelope {
+            sequence,
+            event: NodeEvent::AgentStream {
+                address: agent_stream_test_address(),
+                chunk: AgentStreamChunkV1 {
+                    source_sequence,
+                    kind: AgentStreamChunkKindV1::Text {
+                        text: format!("chunk-{source_sequence}"),
+                        is_delta: true,
+                    },
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn agent_stream_chunk_publishes_unconditionally_and_only_advances_cursor_forward() {
+        let node_id = NodeId::new("node-a").unwrap();
+        let mut cursor = NodeCursor {
+            incarnation_id: NodeIncarnationId::from_bytes([7; 16]),
+            sequence: 674,
+        };
+
+        // A non-`AgentStream` envelope is not this function's to route.
+        let control = NodeEventEnvelope {
+            sequence: 675,
+            event: NodeEvent::WorkspaceRemoved {
+                workspace_id: WorkspaceId::new("work").unwrap(),
+            },
+        };
+        assert!(route_agent_stream_event(&node_id, &mut cursor, &control).is_none());
+        assert_eq!(cursor.sequence, 674);
+
+        // A chunk one past the cursor is published, and its OWN cursor
+        // field on the wire reads the cursor as it stood before this
+        // chunk (mirroring `HarnessMcpReadCall`'s convention exactly) --
+        // then the live cursor moves forward to make room for it.
+        let forward = agent_stream_test_envelope(675, 22);
+        let routed = route_agent_stream_event(&node_id, &mut cursor, &forward).unwrap();
+        assert_eq!(routed.cursor.sequence, 674);
+        assert!(matches!(
+            &routed.event,
+            C2NodeEvent::AgentStream { chunk, .. } if chunk.source_sequence == 22
+        ));
+        assert_eq!(cursor.sequence, 675);
+
+        // A chunk that arrives (or, after a durable resync already carried
+        // the cursor past it, is only now examined) BEHIND the cursor is
+        // still published -- chunks promise no resync, so there is nothing
+        // to recover if this one were dropped instead -- but it must never
+        // rewind the cursor a genuinely later `Control` envelope already
+        // advanced past.
+        cursor.sequence = 711;
+        let late = agent_stream_test_envelope(677, 23);
+        let routed = route_agent_stream_event(&node_id, &mut cursor, &late).unwrap();
+        assert_eq!(routed.cursor.sequence, 711);
+        assert!(matches!(
+            &routed.event,
+            C2NodeEvent::AgentStream { chunk, .. } if chunk.source_sequence == 23
+        ));
+        assert_eq!(cursor.sequence, 711, "a late chunk must never rewind the cursor");
+    }
+
+    #[test]
+    fn agent_stream_burst_survives_a_durable_cursor_that_already_ran_past_it() {
+        // Reproduces the measured live defect's mechanism at its worst: the
+        // node's connection loop can drain its durable channel to
+        // exhaustion across several ticks before this dedicated channel
+        // gets any budget at all, so a whole burst's `Control` envelopes
+        // can reach this relay, and carry `cursor` forward, before a
+        // single one of the SAME burst's interleaved `AgentStream` chunks
+        // is even looked at. `route_agent_stream_event` must publish every
+        // one of them regardless.
+        let node_id = NodeId::new("node-a").unwrap();
+        let mut cursor = NodeCursor {
+            incarnation_id: NodeIncarnationId::from_bytes([9; 16]),
+            sequence: 0,
+        };
+        let chunk_count = 200_u64;
+
+        for turn in 1..=chunk_count {
+            // Durable (`Control`) processing advancing the cursor is the
+            // pre-existing, unchanged path (`live_event_gap` and its
+            // resync repair, exercised by this module's other tests) --
+            // simulated here only by its end effect on `cursor`, since
+            // this test is about the `AgentStream` side's own contract.
+            cursor.sequence = turn * 2;
+        }
+
+        let mut recovered = Vec::new();
+        for turn in 1..=chunk_count {
+            let envelope = agent_stream_test_envelope(turn * 2 - 1, turn);
+            let routed = route_agent_stream_event(&node_id, &mut cursor, &envelope)
+                .expect("every chunk in the burst must be published, however far the durable cursor already ran past its sequence");
+            recovered.push(routed);
+        }
+
+        assert_eq!(recovered.len(), chunk_count as usize);
+        for (turn, routed) in (1..=chunk_count).zip(recovered.iter()) {
+            assert!(matches!(
+                &routed.event,
+                C2NodeEvent::AgentStream { chunk, .. } if chunk.source_sequence == turn
+            ));
+        }
+        assert_eq!(
+            cursor.sequence,
+            chunk_count * 2,
+            "a whole burst of stale chunks must never rewind the cursor the durable side already advanced",
+        );
     }
 
     #[test]

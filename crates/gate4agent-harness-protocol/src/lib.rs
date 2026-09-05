@@ -37,6 +37,15 @@ pub const HARNESS_DELIVERY_COMPONENTS_MAX: u32 = 4_096;
 /// of dereferenceable results, never a manifest -- the mailbox stays S9's
 /// "bounded text, or an artifact reference plus hash", plural but small.
 pub const HARNESS_MAIL_REFS_MAX: usize = 8;
+/// Bound on `HarnessTaskCreateResultV1`/`HarnessTaskMoveResultV1`'s own
+/// `why` fields (D5, Slice D). The value they carry is always a short,
+/// fixed-format `HarnessValidationError` `Display` rendering, never
+/// arbitrary caller-supplied prose, but this side still bounds it
+/// defensively -- the same 256-byte ceiling `HARNESS_TITLE_MAX_BYTES`
+/// already holds a task title to, and the same discipline
+/// `HarnessMailSendResultV1::Refused.reason` (`gate4agent-harness-api`)
+/// applies to `HarnessEngineError`'s own text.
+pub const HARNESS_TASK_RESULT_WHY_MAX_BYTES: usize = 256;
 
 macro_rules! opaque_id {
     ($name:ident, $prefix:literal, $label:literal) => {
@@ -388,6 +397,100 @@ impl HarnessRetryTaskRequestV1 {
         self.authority.validate()?;
         self.task_id.validate()?;
         self.expected_revision.validate()
+    }
+}
+
+/// The outcome of one `g4a_task_create` call (D5, Slice D): an agent creates
+/// a task only under a parent already inside its own subtree (the caller's
+/// own task by default -- the tool's contract), never system-wide the way
+/// the operator's own `HarnessCreateTaskRequestV1` can. `Created` names the
+/// minted id and its first revision; every other variant is a named
+/// refusal, never prose -- the same discipline `HarnessMailSendResultV1`
+/// (`gate4agent-harness-api`) established for mail, carried one step
+/// further: each refusal is its own variant with its own typed fields
+/// rather than one `Refused { reason }` catch-all. `TitleInvalid` /
+/// `BodyInvalid` / `DependenciesInvalid` carry `why` -- the underlying
+/// `HarnessValidationError`'s own `Display` text for `InvalidTitle` /
+/// `InvalidBody` / (`SelfLink`, `CollectionTooLarge`, or
+/// `CollectionNotCanonical` on `dependencies`) respectively, verbatim, the
+/// same convention `HarnessMailSendResultV1::Refused.reason` established
+/// for `HarnessEngineError`'s text.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "outcome", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum HarnessTaskCreateResultV1 {
+    Created { task_id: HarnessTaskId, revision: HarnessRevision },
+    ParentOutsideOwnSubtree { parent_task_id: HarnessTaskId, own_task_id: HarnessTaskId },
+    ParentTerminal { parent_task_id: HarnessTaskId, state: HarnessTaskStateV1 },
+    TitleInvalid { why: String },
+    BodyInvalid { why: String },
+    DependenciesInvalid { why: String },
+}
+
+impl HarnessTaskCreateResultV1 {
+    pub fn validate(&self) -> Result<(), HarnessValidationError> {
+        match self {
+            Self::Created { task_id, revision } => {
+                task_id.validate()?;
+                revision.validate()
+            }
+            Self::ParentOutsideOwnSubtree { parent_task_id, own_task_id } => {
+                parent_task_id.validate()?;
+                own_task_id.validate()
+            }
+            Self::ParentTerminal { parent_task_id, .. } => parent_task_id.validate(),
+            Self::TitleInvalid { why } | Self::BodyInvalid { why } | Self::DependenciesInvalid { why } => {
+                validate_task_result_why(why)
+            }
+        }
+    }
+}
+
+/// The outcome of one `g4a_task_move` call (D5, Slice D): restricted to a
+/// task inside the caller's own subtree, and never the task that governs
+/// the caller's own run -- a session never moves the task its own run is
+/// attributed to (scope discipline: an agent narrates its own subtree, it
+/// does not narrate itself). `Moved` names the resulting revision and both
+/// endpoints of the transition; every other variant is a named refusal in
+/// the same style `HarnessTaskCreateResultV1` establishes. `IllegalTransition`
+/// answers to the same shape of rule the operator's own
+/// `validate_operator_move` (`gate4agent-harness-service`) enforces --
+/// `from != to`, no move out of a terminal state, `Done` only from
+/// `Review` -- without duplicating that function here: the service applies
+/// its own agent-scoped rule and reports the two states it rejected.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "outcome", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum HarnessTaskMoveResultV1 {
+    Moved {
+        task_id: HarnessTaskId,
+        revision: HarnessRevision,
+        from: HarnessTaskStateV1,
+        to: HarnessTaskStateV1,
+    },
+    TaskIsOwn { task_id: HarnessTaskId },
+    TaskOutsideOwnSubtree { task_id: HarnessTaskId, own_task_id: HarnessTaskId },
+    IllegalTransition { task_id: HarnessTaskId, from: HarnessTaskStateV1, to: HarnessTaskStateV1 },
+    RevisionConflict { task_id: HarnessTaskId, expected: HarnessRevision, current: HarnessRevision },
+}
+
+impl HarnessTaskMoveResultV1 {
+    pub fn validate(&self) -> Result<(), HarnessValidationError> {
+        match self {
+            Self::Moved { task_id, revision, .. } => {
+                task_id.validate()?;
+                revision.validate()
+            }
+            Self::TaskIsOwn { task_id } => task_id.validate(),
+            Self::TaskOutsideOwnSubtree { task_id, own_task_id } => {
+                task_id.validate()?;
+                own_task_id.validate()
+            }
+            Self::IllegalTransition { task_id, .. } => task_id.validate(),
+            Self::RevisionConflict { task_id, expected, current } => {
+                task_id.validate()?;
+                expected.validate()?;
+                current.validate()
+            }
+        }
     }
 }
 
@@ -2164,11 +2267,20 @@ impl HarnessReadPermissionsV1 {
     pub fn validate(&self) -> Result<(), HarnessValidationError> { Ok(()) }
 }
 
+/// `create`/`mutate` gate `g4a_task_create`/`g4a_task_move` (D5, Slice D:
+/// an agent's own subtree only, never system-wide). `#[serde(default)]` on
+/// both so a grant persisted before Slice D decodes with `create: false`,
+/// `mutate: false` rather than failing closed on the whole record -- the
+/// rule since 2026-09-05: a persisted type gains a field only behind
+/// `#[serde(default)]`, proven by a test deserializing the pre-Slice-D
+/// shape (the same discipline `SessionGrantV1.mail` already established).
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HarnessTaskPermissionsV1 {
     pub read: bool,
+    #[serde(default)]
     pub create: bool,
+    #[serde(default)]
     pub mutate: bool,
     pub request_run: bool,
 }
@@ -2312,8 +2424,11 @@ impl SessionGrantV1 {
     /// outside the one run it was minted for) plus `Timeline` monitoring, so
     /// every currently-shipped `g4a_*` read tool resolves (see
     /// `allowed_tool_ids`); the task's own sibling runs still surface through
-    /// `g4a_context_get`, which derives them independently of this scope. No
-    /// task or context writes, no delivery bundles, no child runs.
+    /// `g4a_context_get`, which derives them independently of this scope.
+    /// `task_permissions.create`/`.mutate` are open (D5, Slice D: the owner's
+    /// mandate reaches `g4a_task_create`/`g4a_task_move` in the caller's own
+    /// subtree) but `request_run` stays closed -- spawning runs stays
+    /// operator-only. No context writes, no delivery bundles, no child runs.
     /// `operation_timeouts` and the child limits are this crate's own
     /// `valid_grant()` test fixture values, not invented here.
     pub fn default_for_run(
@@ -2338,8 +2453,12 @@ impl SessionGrantV1 {
             },
             task_permissions: HarnessTaskPermissionsV1 {
                 read: true,
-                create: false,
-                mutate: false,
+                // D5, Slice D: the owner opened create/move in the
+                // caller's own subtree for every default-granted run;
+                // `request_run` stays closed -- spawning remains
+                // operator-only.
+                create: true,
+                mutate: true,
                 request_run: false,
             },
             read_permissions: HarnessReadPermissionsV1 {
@@ -2760,6 +2879,13 @@ fn validate_body(value: &str) -> Result<(), HarnessValidationError> {
     Ok(())
 }
 
+fn validate_task_result_why(value: &str) -> Result<(), HarnessValidationError> {
+    if value.is_empty() || value.len() > HARNESS_TASK_RESULT_WHY_MAX_BYTES || value.chars().any(char::is_control) {
+        return Err(HarnessValidationError::InvalidTaskResultWhy);
+    }
+    Ok(())
+}
+
 fn validate_sorted_ids<T: Ord>(field: &'static str, values: &[T], maximum: usize) -> Result<(), HarnessValidationError> {
     if values.len() > maximum {
         return Err(HarnessValidationError::CollectionTooLarge { field, maximum });
@@ -2859,6 +2985,8 @@ pub enum HarnessValidationError {
     InvalidGitSummary,
     #[error("mail {field} is empty, unbounded, malformed, or contains a control character")]
     InvalidMailRef { field: &'static str },
+    #[error("task result `why` value is empty, unbounded, or contains a control character")]
+    InvalidTaskResultWhy,
 }
 
 #[cfg(test)]
@@ -3144,6 +3272,42 @@ mod tests {
             1_000,
         );
         assert!(default_grant.mail);
+        default_grant.validate().unwrap();
+    }
+
+    #[test]
+    fn harness_task_create_and_mutate_permission_default_true_and_legacy_shape_deserialises() {
+        let grant = valid_grant();
+        assert!(!grant.task_permissions.create, "valid_grant() fixture predates Slice D");
+        assert!(!grant.task_permissions.mutate, "valid_grant() fixture predates Slice D");
+        let mut legacy_wire = serde_json::to_value(&grant).unwrap();
+        let task_permissions = legacy_wire
+            .as_object_mut()
+            .unwrap()
+            .get_mut("task_permissions")
+            .unwrap()
+            .as_object_mut()
+            .unwrap();
+        task_permissions.remove("create");
+        task_permissions.remove("mutate");
+        let decoded: SessionGrantV1 = serde_json::from_value(legacy_wire).unwrap();
+        assert!(!decoded.task_permissions.create);
+        assert!(!decoded.task_permissions.mutate);
+
+        let default_grant = SessionGrantV1::default_for_run(
+            grant_id('9'),
+            run_id('4'),
+            HarnessGrantTargetV1 {
+                node_id: selector("node-a"),
+                workspace_id: selector("workspace-a"),
+                provider_profile: selector("claude"),
+                mode: HarnessExecutionModeV1::Acp,
+            },
+            1_000,
+        );
+        assert!(default_grant.task_permissions.create);
+        assert!(default_grant.task_permissions.mutate);
+        assert!(!default_grant.task_permissions.request_run, "spawning stays operator-only");
         default_grant.validate().unwrap();
     }
 
@@ -4306,5 +4470,121 @@ mod tests {
             serde_json::json!("D".repeat(64)),
         );
         assert!(serde_json::from_value::<HarnessStartTaskRequestV1>(invalid).is_err());
+    }
+
+    #[test]
+    fn harness_task_create_result_round_trips_and_names_each_refusal() {
+        let created = HarnessTaskCreateResultV1::Created {
+            task_id: task_id('1'),
+            revision: HarnessRevision::new(1).unwrap(),
+        };
+        created.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(&created).unwrap(),
+            serde_json::json!({
+                "outcome": "created",
+                "task_id": task_id('1').as_str(),
+                "revision": 1,
+            }),
+        );
+        let encoded = serde_json::to_vec(&created).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<HarnessTaskCreateResultV1>(&encoded).unwrap(),
+            created,
+        );
+
+        let variants = [
+            HarnessTaskCreateResultV1::ParentOutsideOwnSubtree {
+                parent_task_id: task_id('2'),
+                own_task_id: task_id('3'),
+            },
+            HarnessTaskCreateResultV1::ParentTerminal {
+                parent_task_id: task_id('2'),
+                state: HarnessTaskStateV1::Done,
+            },
+            HarnessTaskCreateResultV1::TitleInvalid { why: "task title is empty".to_owned() },
+            HarnessTaskCreateResultV1::BodyInvalid { why: "task body is unbounded".to_owned() },
+            HarnessTaskCreateResultV1::DependenciesInvalid {
+                why: "dependencies must be strictly sorted and duplicate-free".to_owned(),
+            },
+        ];
+        for variant in variants {
+            variant.validate().unwrap();
+            let encoded = serde_json::to_vec(&variant).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<HarnessTaskCreateResultV1>(&encoded).unwrap(),
+                variant,
+            );
+        }
+
+        let oversized_why = HarnessTaskCreateResultV1::TitleInvalid {
+            why: "x".repeat(HARNESS_TASK_RESULT_WHY_MAX_BYTES + 1),
+        };
+        assert_eq!(oversized_why.validate(), Err(HarnessValidationError::InvalidTaskResultWhy));
+        let empty_why = HarnessTaskCreateResultV1::BodyInvalid { why: String::new() };
+        assert_eq!(empty_why.validate(), Err(HarnessValidationError::InvalidTaskResultWhy));
+        let control_why = HarnessTaskCreateResultV1::DependenciesInvalid { why: "bad\u{0007}why".to_owned() };
+        assert_eq!(control_why.validate(), Err(HarnessValidationError::InvalidTaskResultWhy));
+    }
+
+    #[test]
+    fn harness_task_move_result_round_trips_and_names_each_refusal() {
+        let moved = HarnessTaskMoveResultV1::Moved {
+            task_id: task_id('1'),
+            revision: HarnessRevision::new(2).unwrap(),
+            from: HarnessTaskStateV1::Ready,
+            to: HarnessTaskStateV1::Running,
+        };
+        moved.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(&moved).unwrap(),
+            serde_json::json!({
+                "outcome": "moved",
+                "task_id": task_id('1').as_str(),
+                "revision": 2,
+                "from": "ready",
+                "to": "running",
+            }),
+        );
+        let encoded = serde_json::to_vec(&moved).unwrap();
+        assert_eq!(serde_json::from_slice::<HarnessTaskMoveResultV1>(&encoded).unwrap(), moved);
+
+        let revision_conflict = HarnessTaskMoveResultV1::RevisionConflict {
+            task_id: task_id('1'),
+            expected: HarnessRevision::new(2).unwrap(),
+            current: HarnessRevision::new(3).unwrap(),
+        };
+        revision_conflict.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(&revision_conflict).unwrap(),
+            serde_json::json!({
+                "outcome": "revision-conflict",
+                "task_id": task_id('1').as_str(),
+                "expected": 2,
+                "current": 3,
+            }),
+        );
+
+        let variants = [
+            HarnessTaskMoveResultV1::TaskIsOwn { task_id: task_id('1') },
+            HarnessTaskMoveResultV1::TaskOutsideOwnSubtree {
+                task_id: task_id('1'),
+                own_task_id: task_id('2'),
+            },
+            HarnessTaskMoveResultV1::IllegalTransition {
+                task_id: task_id('1'),
+                from: HarnessTaskStateV1::Done,
+                to: HarnessTaskStateV1::Running,
+            },
+            revision_conflict,
+        ];
+        for variant in variants {
+            variant.validate().unwrap();
+            let encoded = serde_json::to_vec(&variant).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<HarnessTaskMoveResultV1>(&encoded).unwrap(),
+                variant,
+            );
+        }
     }
 }

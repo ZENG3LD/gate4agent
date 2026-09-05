@@ -3119,6 +3119,85 @@ impl HarnessEngine {
         visible_tasks
     }
 
+    /// The bounded set of task ids reachable from `root` by walking
+    /// `parent_task_id` downward -- `root` itself is included. Mirrors
+    /// `visible_runs_for_scope`'s own `Descendants` shape (above) and its
+    /// `HARNESS_CHILD_DEPTH_MAX`-class bound, just walked over the task
+    /// graph's own parent link instead of the run graph's, and over
+    /// `depth_bound` rather than a fixed constant so a caller can choose
+    /// how deep this particular subtree check reaches. Unlike
+    /// `visible_runs_for_scope`, hitting the bound does not fail closed
+    /// with an error: this is a query, not an authorization decision by
+    /// itself, and the direction is safe either way it is used for one --
+    /// a task past the cut is simply absent from the returned set, which
+    /// is exactly the answer a caller checking subtree membership wants
+    /// for anything it cannot prove is inside (D5, Slice D:
+    /// `ParentOutsideOwnSubtree` / `TaskOutsideOwnSubtree`).
+    pub fn task_subtree(
+        &self,
+        root: &HarnessTaskId,
+        depth_bound: u16,
+    ) -> BTreeSet<HarnessTaskId> {
+        let mut visible = BTreeSet::from([root.clone()]);
+        let mut changed = true;
+        let mut depth = 0_u16;
+        while changed {
+            changed = false;
+            for task in self.tasks.values() {
+                if !visible.contains(&task.task_id)
+                    && task.parent_task_id.as_ref().is_some_and(|parent| visible.contains(parent))
+                {
+                    visible.insert(task.task_id.clone());
+                    changed = true;
+                }
+            }
+            if changed {
+                depth = depth.saturating_add(1);
+                if depth > depth_bound {
+                    break;
+                }
+            }
+        }
+        visible
+    }
+
+    /// Whether `task` is a strict (non-self) descendant of `root` --
+    /// `task_subtree(root, HARNESS_CHILD_DEPTH_MAX)` minus `root` itself,
+    /// the same depth fence the run graph's own `Descendants` scope uses.
+    pub fn task_is_strict_descendant(&self, task: &HarnessTaskId, root: &HarnessTaskId) -> bool {
+        task != root && self.task_subtree(root, HARNESS_CHILD_DEPTH_MAX).contains(task)
+    }
+
+    /// The task a run's own grant governs -- `engine.run(run_id)?.task_id`,
+    /// named so a caller deciding "is this the caller's own task"
+    /// (`HarnessTaskMoveResultV1::TaskIsOwn`, D5) reads its intent rather
+    /// than reaching into `HarnessRunV1` directly.
+    pub fn own_task_of_run(&self, run_id: &HarnessRunId) -> Option<HarnessTaskId> {
+        self.run(run_id).map(|run| run.task_id.clone())
+    }
+
+    /// Every persisted `HarnessOperationV1` naming `task_id`, newest first
+    /// (`created_at_unix_ms` descending, ties broken by `operation_id`
+    /// descending so the order is deterministic), bounded by `limit` --
+    /// `HarnessOperationV1.actor` is stored today but had no read surface;
+    /// this lets the service render an operator-side ledger with the raw
+    /// actor for a given task.
+    pub fn operations_for_task(
+        &self,
+        task_id: &HarnessTaskId,
+        limit: usize,
+    ) -> Vec<&HarnessOperationV1> {
+        let mut matching: Vec<&HarnessOperationV1> = self.operations.values()
+            .filter(|operation| operation.task_id.as_ref() == Some(task_id))
+            .collect();
+        matching.sort_by(|left, right| {
+            right.created_at_unix_ms.cmp(&left.created_at_unix_ms)
+                .then_with(|| right.operation_id.cmp(&left.operation_id))
+        });
+        matching.truncate(limit);
+        matching
+    }
+
     fn validate_task_links(&self, task: &HarnessTaskV1) -> Result<(), HarnessEngineError> {
         self.validate_actor(&task.creator)?;
         if let Some(parent) = &task.parent_task_id {
@@ -8432,5 +8511,146 @@ mod tests {
             }
             other => panic!("expected MailRefTargetUnknown, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn harness_task_subtree_three_level_tree_and_depth_bound_cuts() {
+        // Ids assigned in descending order down the tree (root's own id
+        // sorts highest) so a single outer pass of `task_subtree` can only
+        // ever pull in one generation at a time regardless of `BTreeMap`
+        // iteration order -- the same property `visible_runs_for_scope`
+        // relies on for its own depth fence, made explicit here so the
+        // depth-bound assertion below is not an artifact of id ordering.
+        let root_id = numbered_task_id(30);
+        let child_id = numbered_task_id(20);
+        let grandchild_id = numbered_task_id(10);
+        let stranger_id = numbered_task_id(99);
+
+        let mut engine = HarnessEngine::new();
+        let root = task(root_id.clone(), 1, "root");
+        let mut child = task(child_id.clone(), 1, "child");
+        child.parent_task_id = Some(root_id.clone());
+        let mut grandchild = task(grandchild_id.clone(), 1, "grandchild");
+        grandchild.parent_task_id = Some(child_id.clone());
+        let stranger = task(stranger_id.clone(), 1, "stranger");
+        for record in [root, child, grandchild, stranger] {
+            engine.tasks.insert(record.task_id.clone(), record);
+        }
+
+        let root_subtree = engine.task_subtree(&root_id, HARNESS_CHILD_DEPTH_MAX);
+        assert_eq!(
+            root_subtree,
+            BTreeSet::from([root_id.clone(), child_id.clone(), grandchild_id.clone()]),
+        );
+
+        let leaf_subtree = engine.task_subtree(&grandchild_id, HARNESS_CHILD_DEPTH_MAX);
+        assert_eq!(leaf_subtree, BTreeSet::from([grandchild_id.clone()]));
+
+        assert!(!engine.task_is_strict_descendant(&stranger_id, &root_id));
+        assert!(engine.task_is_strict_descendant(&child_id, &root_id));
+        assert!(engine.task_is_strict_descendant(&grandchild_id, &root_id));
+        assert!(!engine.task_is_strict_descendant(&root_id, &root_id), "a root is not its own strict descendant");
+
+        let bounded = engine.task_subtree(&root_id, 0);
+        assert_eq!(
+            bounded,
+            BTreeSet::from([root_id, child_id]),
+            "a zero depth bound cuts the grandchild generation",
+        );
+    }
+
+    #[test]
+    fn harness_tasks_attributed_to_runs_includes_a_task_whose_creator_is_that_run() {
+        let mut engine = HarnessEngine::new();
+        let attributing_run = run_id();
+        let mut authored = task(task_id('a'), 1, "authored by its own run");
+        authored.creator = HarnessActorV1::ParentRun { run_id: attributing_run.clone() };
+        engine.tasks.insert(authored.task_id.clone(), authored.clone());
+
+        let attributed = engine.tasks_attributed_to_runs(&BTreeSet::from([attributing_run]));
+        assert!(attributed.contains(&authored.task_id));
+
+        assert!(engine.tasks_attributed_to_runs(&BTreeSet::new()).is_empty());
+
+        let other_run = numbered_run_id(2);
+        assert!(!engine.tasks_attributed_to_runs(&BTreeSet::from([other_run])).contains(&authored.task_id));
+    }
+
+    #[test]
+    fn harness_operations_for_task_are_newest_first_bounded_and_store_the_prepared_actor() {
+        // A `ParentRun` actor validates only against a run that already
+        // exists, so two runs are seeded first, each with its own
+        // placeholder task and coherent `CreateRun` operation (the same
+        // direct-construction shape `visibility_fixture` uses elsewhere in
+        // this module) -- neither is the task under test.
+        let placeholder_task_id = task_id('e');
+        let authoring_run_id = run_id();
+        let replacing_run_id = numbered_run_id(9);
+        let mut engine = HarnessEngine::new();
+        let mut placeholder_task = task(placeholder_task_id.clone(), 1, "placeholder");
+        // Sorted ascending (`validate_sorted_ids`/the backlink check both
+        // read `run_ids` as a sorted set): `replacing_run_id` (`hrun_000...09`)
+        // sorts before `authoring_run_id` (`hrun_aaa...`).
+        placeholder_task.run_ids = vec![replacing_run_id.clone(), authoring_run_id.clone()];
+        engine.tasks.insert(placeholder_task_id.clone(), placeholder_task);
+
+        let mut authoring_run = run(HarnessRunLifecycleV1::Requested, 1);
+        authoring_run.task_id = placeholder_task_id.clone();
+        engine.runs.insert(authoring_run.run_id.clone(), authoring_run);
+        let mut authoring_run_operation = original_run_operation(HarnessOperationStateV1::Prepared);
+        authoring_run_operation.task_id = Some(placeholder_task_id.clone());
+        engine.operations.insert(operation_id('b'), authoring_run_operation);
+
+        let mut replacing_run = run(HarnessRunLifecycleV1::Requested, 1);
+        replacing_run.run_id = replacing_run_id.clone();
+        replacing_run.task_id = placeholder_task_id.clone();
+        replacing_run.operation_id = operation_id('c');
+        engine.runs.insert(replacing_run_id.clone(), replacing_run);
+        let mut replacing_run_operation = original_run_operation(HarnessOperationStateV1::Prepared);
+        replacing_run_operation.operation_id = operation_id('c');
+        replacing_run_operation.run_id = Some(replacing_run_id.clone());
+        replacing_run_operation.task_id = Some(placeholder_task_id);
+        engine.operations.insert(operation_id('c'), replacing_run_operation);
+
+        let id = task_id('a');
+        let mut created_task = task(id.clone(), 1, "authored by its own run");
+        created_task.creator = HarnessActorV1::ParentRun { run_id: authoring_run_id.clone() };
+        // Deliberately the alphabetically LATER operation id for the
+        // EARLIER (lower `created_at_unix_ms`) operation: if
+        // `operations_for_task` ever regressed to an id-only sort instead
+        // of a `created_at_unix_ms`-first one, this ordering would flip
+        // and the assertions below would fail.
+        let mut create_operation = task_operation(operation_id('f'), id.clone(), 'f', None);
+        create_operation.actor = HarnessActorV1::ParentRun { run_id: authoring_run_id.clone() };
+        let prepared = engine.prepare(HarnessMutationV1::CreateTask {
+            operation: create_operation.clone(),
+            task: created_task,
+        }).unwrap();
+        engine.accept(prepared);
+
+        let mut replaced_task = task(id.clone(), 2, "authored by its own run, replaced");
+        replaced_task.creator = HarnessActorV1::ParentRun { run_id: authoring_run_id.clone() };
+        let mut replace_operation = task_operation(operation_id('a'), id.clone(), 'd', Some(revision(1)));
+        replace_operation.actor = HarnessActorV1::ParentRun { run_id: replacing_run_id.clone() };
+        replace_operation.created_at_unix_ms = 20;
+        replace_operation.updated_at_unix_ms = 22;
+        replace_operation.finished_at_unix_ms = Some(22);
+        let prepared = engine.prepare(HarnessMutationV1::ReplaceTask {
+            operation: replace_operation.clone(),
+            expected_revision: revision(1),
+            task: replaced_task,
+        }).unwrap();
+        engine.accept(prepared);
+
+        let ledger = engine.operations_for_task(&id, 10);
+        assert_eq!(ledger.len(), 2, "only the two operations naming this task, not the seeded run operations");
+        assert_eq!(ledger[0].operation_id, replace_operation.operation_id, "newest (highest created_at_unix_ms) first");
+        assert_eq!(ledger[1].operation_id, create_operation.operation_id);
+        assert_eq!(ledger[0].actor, HarnessActorV1::ParentRun { run_id: replacing_run_id });
+        assert_eq!(ledger[1].actor, HarnessActorV1::ParentRun { run_id: authoring_run_id });
+
+        let bounded = engine.operations_for_task(&id, 1);
+        assert_eq!(bounded.len(), 1);
+        assert_eq!(bounded[0].operation_id, replace_operation.operation_id);
     }
 }

@@ -106,8 +106,9 @@ use crate::protocol::{
     NativeSessionCatalogRoute, NativeSessionSelection, SessionTaskBindingV1,
     SessionTaskTargetV1, TaskId,
     truncate_observation_text, BlockAuthorityV1, HostDecisionAuthorityV1, HostRequestDecisionV1,
-    ObservationCapabilitiesV1, ObservationEvidenceV1, ObservationInteractionOutcomeV1,
-    ObservationKindV1, ObservationSourceFamilyV1, ObservationTodoItemV1, ObservationTodoStateV1,
+    HostRequestOutcomeV1, ObservationCapabilitiesV1, ObservationEvidenceV1,
+    ObservationInteractionOutcomeV1, ObservationKindV1, ObservationSourceFamilyV1,
+    ObservationTodoItemV1, ObservationTodoStateV1,
     ObservationV1, OBSERVATION_ACTION_BLOCKED_REASON_MAX_BYTES,
     StateSchemaSupport, WorkspaceEntry, WorkspaceEntryKind, WorktreeProfileId,
     SpawnContextId, SpawnEnvironmentProfileId, SpawnIdempotencyKey,
@@ -183,7 +184,8 @@ use gate4agent_types::{
     validate_candidate_id, ControlCommand, ControlEvent, ControlEventKind,
     HistoryCandidateSummary, HistoryOperation, HistoryQuery, HistorySessionRecord,
     HostDecisionAuthority as ProviderHostDecisionAuthority,
-    HostRequestDecision as ProviderHostRequestDecision, InputAction,
+    HostRequestDecision as ProviderHostRequestDecision,
+    HostRequestOutcome as ProviderHostRequestOutcome, InputAction,
     PromptFraming, PromptPayload, ResumeLaunchRequest,
     ProviderActivity, ProviderEvent, ProviderInteractionKind, ProviderInteractionStatus,
     ProviderPlanStatus,
@@ -688,6 +690,26 @@ fn observation_host_request_decision(decision: &ProviderHostRequestDecision) -> 
     }
 }
 
+/// Map `gate4agent-types`' `ProviderHostRequestOutcome` onto this crate's
+/// observation-wire `HostRequestOutcomeV1` -- same reason
+/// `observation_host_request_decision` exists rather than a `From` impl on
+/// either side (`gate4agent-observation-protocol` cannot depend on
+/// `gate4agent-types`). A `Failed` error is cut to the wire bound BEFORE the
+/// observation is constructed, at a safe UTF-8 boundary -- the same
+/// producer-side truncation `host_request_denied_block` already applies to
+/// `ActionBlocked::reason` -- since `ObservationKindV1::validate` rejects an
+/// over-long value outright rather than truncating.
+fn observation_host_request_outcome(outcome: &ProviderHostRequestOutcome) -> HostRequestOutcomeV1 {
+    match outcome {
+        ProviderHostRequestOutcome::Executed => HostRequestOutcomeV1::Executed,
+        ProviderHostRequestOutcome::Failed { error } => {
+            let (error, _) =
+                truncate_observation_text(error, OBSERVATION_ACTION_BLOCKED_REASON_MAX_BYTES);
+            HostRequestOutcomeV1::Failed { error }
+        }
+    }
+}
+
 fn observation_host_decision_authority(by: ProviderHostDecisionAuthority) -> HostDecisionAuthorityV1 {
     match by {
         ProviderHostDecisionAuthority::Gate => HostDecisionAuthorityV1::Gate,
@@ -1093,10 +1115,11 @@ fn provider_observations(event: &ControlEvent) -> Vec<ObservationV1> {
             });
         }
         ProviderEvent::RateLimited { .. } => kinds.push(ObservationKindV1::RateLimited),
-        ProviderEvent::HostRequestObserved { method, decision, reason, .. } => {
+        ProviderEvent::HostRequestObserved { method, decision, outcome, reason, .. } => {
             kinds.push(ObservationKindV1::HostRequestObserved {
                 class: observation_tool_class(method),
                 decision: observation_host_request_decision(decision),
+                outcome: observation_host_request_outcome(outcome),
             });
             // Alongside, never instead of, the audit-only observation
             // above: a `Denied` decision is ALSO a typed block event an
@@ -17333,6 +17356,7 @@ mod observation_projection_tests {
                 decision: ProviderHostRequestDecision::Denied {
                     by: ProviderHostDecisionAuthority::Gate,
                 },
+                outcome: ProviderHostRequestOutcome::Executed,
                 reason: Some(gate_text.to_owned()),
             },
         ));
@@ -17389,6 +17413,7 @@ mod observation_projection_tests {
                 decision: ProviderHostRequestDecision::Denied {
                     by: ProviderHostDecisionAuthority::Gate,
                 },
+                outcome: ProviderHostRequestOutcome::Executed,
                 reason: Some(gate_text.to_owned()),
             },
         );
@@ -17443,6 +17468,7 @@ mod observation_projection_tests {
                     method: "fs/read_text_file".to_owned(),
                     params_json: String::new(),
                     decision,
+                    outcome: ProviderHostRequestOutcome::Executed,
                     reason: None,
                 },
             ));
@@ -17472,6 +17498,7 @@ mod observation_projection_tests {
                     method: "fs/read_text_file".to_owned(),
                     params_json: String::new(),
                     decision,
+                    outcome: ProviderHostRequestOutcome::Executed,
                     reason: None,
                 },
             );
@@ -17510,6 +17537,7 @@ mod observation_projection_tests {
                     method: "session/request_permission".to_owned(),
                     params_json: String::new(),
                     decision: ProviderHostRequestDecision::Denied { by: authority },
+                    outcome: ProviderHostRequestOutcome::Executed,
                     reason: None,
                 },
             ));
@@ -17545,6 +17573,7 @@ mod observation_projection_tests {
                 decision: ProviderHostRequestDecision::Denied {
                     by: ProviderHostDecisionAuthority::Policy,
                 },
+                outcome: ProviderHostRequestOutcome::Executed,
                 reason: Some(oversized),
             },
         ));
@@ -17559,6 +17588,67 @@ mod observation_projection_tests {
         for observation in &projected {
             observation.validate().expect("truncated reason must validate");
         }
+    }
+
+    /// K1c's split: an authorized (`Granted`) host request that failed
+    /// WHILE EXECUTING (a `terminal/create` spawn error) carries
+    /// `HostRequestOutcomeV1::Failed` on the SAME audit-only
+    /// `HostRequestObserved` observation `decision: Granted` already mints
+    /// -- it is NEVER `ActionBlocked`/`Blocked`, because K1a's block-mint
+    /// keys on `Denied` alone (see `provider_observations`'s and
+    /// `agent_stream_chunk`'s own `HostRequestObserved` arms, both of which
+    /// branch on `decision`, never `outcome`): the request WAS authorized,
+    /// it just did not run cleanly.
+    #[test]
+    fn granted_host_request_execution_failure_carries_a_failed_outcome_never_a_block() {
+        let spawn_error = "terminal/create spawn failed: os error 3";
+        let event = provider_control_event_at(
+            AdapterFamily::Acp,
+            "claude-code",
+            6,
+            ProviderEvent::HostRequestObserved {
+                method: "terminal/create".to_owned(),
+                params_json: String::new(),
+                decision: ProviderHostRequestDecision::Granted {
+                    by: ProviderHostDecisionAuthority::Policy,
+                },
+                outcome: ProviderHostRequestOutcome::Failed { error: spawn_error.to_owned() },
+                reason: None,
+            },
+        );
+        let projected = provider_observations(&event);
+        let timeline = timeline_observations(&projected);
+        let (observed_decision, observed_outcome) = timeline
+            .iter()
+            .find_map(|observation| match &observation.kind {
+                ObservationKindV1::HostRequestObserved { decision, outcome, .. } => {
+                    Some((*decision, outcome.clone()))
+                }
+                _ => None,
+            })
+            .expect("expected a HostRequestObserved observation");
+        assert_eq!(
+            observed_decision,
+            HostRequestDecisionV1::Granted { by: HostDecisionAuthorityV1::Policy }
+        );
+        assert_eq!(
+            observed_outcome,
+            HostRequestOutcomeV1::Failed { error: spawn_error.to_owned() }
+        );
+        assert!(
+            !timeline
+                .iter()
+                .any(|observation| matches!(observation.kind, ObservationKindV1::ActionBlocked { .. })),
+            "a Granted decision must never mint ActionBlocked, regardless of outcome: {timeline:?}"
+        );
+        for observation in &projected {
+            observation.validate().expect("minted observation must validate");
+        }
+
+        assert!(
+            agent_stream_chunk(&event).is_none(),
+            "a Granted decision must never mint a Blocked chunk, regardless of outcome"
+        );
     }
 
     #[test]

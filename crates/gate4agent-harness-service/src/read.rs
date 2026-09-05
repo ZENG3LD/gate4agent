@@ -14,7 +14,7 @@ use gate4agent_observation_api::{
 };
 use gate4agent_observation_engine::{CorrelationProjection, CorrelationState, SessionProjection};
 use gate4agent_observation_protocol::{
-    HostRequestDecisionV1, ObservationEvidenceV1 as SourceEvidenceV1,
+    HostRequestDecisionV1, HostRequestOutcomeV1, ObservationEvidenceV1 as SourceEvidenceV1,
     ObservationInteractionOutcomeV1, ObservationKindV1, ObservationTodoStateV1,
 };
 use gate4agent_observation_service::ObservationService;
@@ -912,14 +912,28 @@ fn timeline_entry(
         ObservationKindV1::RateLimited => {
             (Some("rate-limit".to_owned()), TimelineStateV1::Waiting, None)
         }
-        ObservationKindV1::HostRequestObserved { class, decision } => (
-            Some(class.clone()),
-            match decision {
+        ObservationKindV1::HostRequestObserved { class, decision, outcome } => (
+            // A `Granted` request that failed WHILE EXECUTING renders its
+            // own bounded, verbatim error text as the label -- the same
+            // convention `ActionBlocked`'s `reason` uses below -- rather
+            // than the coarse `class` bucket an `Executed` outcome shows;
+            // an operator scanning the timeline needs to see WHY it failed,
+            // not just that a `Terminal`/`Fs` request happened.
+            match outcome {
+                HostRequestOutcomeV1::Failed { error } => Some(error.clone()),
+                HostRequestOutcomeV1::Executed => Some(class.clone()),
+            },
+            match (decision, outcome) {
                 // A pending approval must never render as `Failed` -- see
                 // `HostRequestDecisionV1::Deferred`'s own doc comment.
-                HostRequestDecisionV1::Granted { .. } => TimelineStateV1::Completed,
-                HostRequestDecisionV1::Denied { .. } => TimelineStateV1::Failed,
-                HostRequestDecisionV1::Deferred => TimelineStateV1::Waiting,
+                (HostRequestDecisionV1::Granted { .. }, HostRequestOutcomeV1::Failed { .. }) => {
+                    TimelineStateV1::Failed
+                }
+                (HostRequestDecisionV1::Granted { .. }, HostRequestOutcomeV1::Executed) => {
+                    TimelineStateV1::Completed
+                }
+                (HostRequestDecisionV1::Denied { .. }, _) => TimelineStateV1::Failed,
+                (HostRequestDecisionV1::Deferred, _) => TimelineStateV1::Waiting,
             },
             None,
         ),

@@ -1561,6 +1561,29 @@ pub enum HostRequestDecision {
     Deferred,
 }
 
+/// Whether a `Granted` host request's underlying operation actually ran
+/// without an I/O or execution problem -- see [`ProviderEvent::
+/// HostRequestObserved`]. Mirrors `gate4agent`'s own `HostRequestOutcome`
+/// one-for-one; see [`HostDecisionAuthority`]'s doc comment for why this
+/// crate keeps its own copy rather than importing it.
+///
+/// Only meaningful paired with `HostRequestDecision::Granted`: a `Denied` or
+/// `Deferred` request never attempted its underlying operation, so it is
+/// always `Executed` there for lack of anything to have failed running.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum HostRequestOutcome {
+    /// No execution problem -- either the request ran cleanly, or (for
+    /// `Denied`/`Deferred`) no execution was ever attempted to fail.
+    Executed,
+    /// The request was authorized but failed while running it. `error` is
+    /// the bounded underlying I/O/execution failure text (e.g. an OS error
+    /// from a spawn call) -- never a policy/gate refusal message, which
+    /// stays on `HostRequestObserved::reason` instead, exactly as it did
+    /// before this variant existed.
+    Failed { error: String },
+}
+
 /// One option the agent offered on a `session/request_permission`-style
 /// interaction, carried on `ProviderEvent::InteractionRequested::options`
 /// exactly as the agent gave it -- see ACP's `PermissionOption` in
@@ -1696,6 +1719,12 @@ pub enum ProviderEvent {
         method: String,
         params_json: String,
         decision: HostRequestDecision,
+        /// Whether an authorized (`Granted`) request actually ran cleanly
+        /// or failed doing so -- see [`HostRequestOutcome`]'s own doc
+        /// comment for why this is a separate field from `decision` rather
+        /// than a third flavor of `Denied`. Always `Executed` for `Denied`/
+        /// `Deferred` (nothing ran to fail).
+        outcome: HostRequestOutcome,
         /// The refusal text behind a `Denied` decision, when this session
         /// actually computed one -- the dangerous-command gate's own
         /// "blocked by dangerous-command gate: rule=…, argument=…", or
@@ -1955,6 +1984,7 @@ impl ProviderEvent {
                 method,
                 params_json,
                 reason,
+                outcome,
                 ..
             } => {
                 validate_required("host request method", method, PROVIDER_EVENT_ID_MAX_BYTES)?;
@@ -1965,6 +1995,13 @@ impl ProviderEvent {
                 )?;
                 if let Some(reason) = reason {
                     validate_text("host request reason", reason, PROVIDER_EVENT_TEXT_MAX_BYTES)?;
+                }
+                if let HostRequestOutcome::Failed { error } = outcome {
+                    validate_text(
+                        "host request outcome error",
+                        error,
+                        PROVIDER_EVENT_TEXT_MAX_BYTES,
+                    )?;
                 }
             }
             Self::UnrecognizedNotification {
@@ -2753,7 +2790,7 @@ mod tests {
     use super::{
         AgentInstanceId, CapabilitySnapshot, ContextWindowUsage, ForegroundProcess,
         ForegroundProcessKind, ForegroundSnapshot, HistorySnapshot, HostDecisionAuthority,
-        HostRequestDecision, OperatorGateInput,
+        HostRequestDecision, HostRequestOutcome, OperatorGateInput,
         OperatorGateKind, OperatorGateOption, OperatorGateOptionSemantics, OperatorGateState,
         OperatorGateSubject, ProviderAvailableCommand, ProviderConfigChoice, ProviderConfigOption,
         ProviderConfigOptionKind, ProviderEvent,
@@ -3399,6 +3436,7 @@ mod tests {
             method: "session/request_permission".to_owned(),
             params_json: "{\"toolName\":\"bash\"}".to_owned(),
             decision: HostRequestDecision::Denied { by: HostDecisionAuthority::Policy },
+            outcome: HostRequestOutcome::Executed,
             reason: Some("session/request_permission denied by host policy".to_owned()),
         };
         assert_eq!(valid.validate_ingress(), Ok(()));
@@ -3408,6 +3446,7 @@ mod tests {
                 method: String::new(),
                 params_json: String::new(),
                 decision: HostRequestDecision::Denied { by: HostDecisionAuthority::Policy },
+                outcome: HostRequestOutcome::Executed,
                 reason: None,
             }
             .validate_ingress(),
@@ -3420,6 +3459,7 @@ mod tests {
                 method: oversized_method,
                 params_json: String::new(),
                 decision: HostRequestDecision::Granted { by: HostDecisionAuthority::Policy },
+                outcome: HostRequestOutcome::Executed,
                 reason: None,
             }
             .validate_ingress(),
@@ -3435,6 +3475,7 @@ mod tests {
                 method: "fs/read_text_file".to_owned(),
                 params_json: oversized_params,
                 decision: HostRequestDecision::Granted { by: HostDecisionAuthority::Policy },
+                outcome: HostRequestOutcome::Executed,
                 reason: None,
             }
             .validate_ingress(),
@@ -3450,6 +3491,7 @@ mod tests {
                 method: "terminal/create".to_owned(),
                 params_json: String::new(),
                 decision: HostRequestDecision::Denied { by: HostDecisionAuthority::Gate },
+                outcome: HostRequestOutcome::Executed,
                 reason: Some(oversized_reason),
             }
             .validate_ingress(),
@@ -3457,6 +3499,47 @@ mod tests {
                 field: "host request reason",
                 ..
             })
+        ));
+
+        let oversized_error = "e".repeat(PROVIDER_EVENT_TEXT_MAX_BYTES + 1);
+        assert!(matches!(
+            ProviderEvent::HostRequestObserved {
+                method: "terminal/create".to_owned(),
+                params_json: String::new(),
+                decision: HostRequestDecision::Granted { by: HostDecisionAuthority::Policy },
+                outcome: HostRequestOutcome::Failed { error: oversized_error },
+                reason: None,
+            }
+            .validate_ingress(),
+            Err(ProviderEventValidationError::InvalidField {
+                field: "host request outcome error",
+                ..
+            })
+        ));
+    }
+
+    /// A `Granted` request that failed WHILE EXECUTING (a spawn error, an
+    /// I/O failure) carries `HostRequestOutcome::Failed` -- distinct from,
+    /// and never collapsed into, a `Denied` decision: the request was
+    /// authorized, it just did not run cleanly.
+    #[test]
+    fn host_request_execution_failure_is_a_distinct_bounded_outcome_not_a_denial() {
+        let spawn_error = "terminal/create spawn failed: os error 3";
+        let granted_but_failed = ProviderEvent::HostRequestObserved {
+            method: "terminal/create".to_owned(),
+            params_json: String::new(),
+            decision: HostRequestDecision::Granted { by: HostDecisionAuthority::Policy },
+            outcome: HostRequestOutcome::Failed { error: spawn_error.to_owned() },
+            reason: None,
+        };
+        assert_eq!(granted_but_failed.validate_ingress(), Ok(()));
+        assert!(matches!(
+            granted_but_failed,
+            ProviderEvent::HostRequestObserved {
+                decision: HostRequestDecision::Granted { .. },
+                outcome: HostRequestOutcome::Failed { .. },
+                ..
+            }
         ));
     }
 
@@ -3474,6 +3557,7 @@ mod tests {
             method: "terminal/create".to_owned(),
             params_json: String::new(),
             decision: HostRequestDecision::Denied { by: HostDecisionAuthority::Gate },
+            outcome: HostRequestOutcome::Executed,
             reason: Some(gate_text.to_owned()),
         };
         assert_eq!(with_reason.validate_ingress(), Ok(()));
@@ -3482,6 +3566,7 @@ mod tests {
             method: "terminal/create".to_owned(),
             params_json: String::new(),
             decision: HostRequestDecision::Granted { by: HostDecisionAuthority::Policy },
+            outcome: HostRequestOutcome::Executed,
             reason: None,
         };
         assert_eq!(without_reason.validate_ingress(), Ok(()));

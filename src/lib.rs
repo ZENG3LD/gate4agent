@@ -25,7 +25,8 @@ pub use agent::{
 pub use core::capabilities::{CliCapabilities, CliFeatures, ModelInfo, PermissionModeInfo};
 pub use core::error::AgentError;
 pub use core::types::{
-    AgentEvent, CliTool, HostDecisionAuthority, HostRequestDecision, SessionConfig,
+    AgentEvent, CliTool, HostDecisionAuthority, HostRequestDecision, HostRequestOutcome,
+    SessionConfig,
 };
 pub use transport::{SpawnOptions, TransportSession};
 pub use pipe::{PipeSession, PipeProcessOptions, ClaudeOptions};

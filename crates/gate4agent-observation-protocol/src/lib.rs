@@ -161,6 +161,33 @@ pub enum HostRequestDecisionV1 {
     Deferred,
 }
 
+/// Whether a `Granted` host request's underlying operation actually ran
+/// without an I/O or execution problem -- see [`ObservationKindV1::
+/// HostRequestObserved`]. Mirrors `gate4agent`'s own `HostRequestOutcome`
+/// one-for-one; see [`HostDecisionAuthorityV1`]'s doc comment for why this
+/// crate keeps its own copy rather than importing it.
+///
+/// Only meaningful paired with `HostRequestDecisionV1::Granted`: a `Denied`
+/// or `Deferred` request never attempted its underlying operation, so it is
+/// always `Executed` there for lack of anything to have failed running.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum HostRequestOutcomeV1 {
+    /// No execution problem -- either the request ran cleanly, or (for
+    /// `Denied`/`Deferred`) no execution was ever attempted to fail.
+    Executed,
+    /// The request was authorized but failed while running it. `error` is
+    /// the bounded underlying I/O/execution failure text (e.g. an OS error
+    /// from a spawn call) -- never a policy/gate refusal message, which
+    /// stays on `ObservationKindV1::HostRequestObserved`'s own audit trail
+    /// via the sibling `ActionBlocked` observation instead. This is NEVER a
+    /// `Denied` decision in disguise: a gate/policy/deadline refusal is
+    /// `HostRequestDecisionV1::Denied`, never `Granted` paired with
+    /// `Failed` -- the two answer different questions ("was this allowed"
+    /// versus "did doing it succeed") and must never be folded into one.
+    Failed { error: String },
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObservationTodoItemV1 {
@@ -299,6 +326,12 @@ pub enum ObservationKindV1 {
     HostRequestObserved {
         class: String,
         decision: HostRequestDecisionV1,
+        /// Whether an authorized (`Granted`) request actually ran cleanly
+        /// or failed doing so -- see [`HostRequestOutcomeV1`]'s own doc
+        /// comment for why this is a separate field from `decision` rather
+        /// than a third flavor of `Denied`. Always `Executed` for `Denied`/
+        /// `Deferred` (nothing ran to fail).
+        outcome: HostRequestOutcomeV1,
     },
     /// Something the agent tried was blocked mid-turn -- by this harness's
     /// own gate/policy/deadline, by an operator, or by the provider itself
@@ -584,8 +617,16 @@ impl ObservationKindV1 {
             Self::Error { detail } => {
                 validate_required_text("error detail", detail, OBSERVATION_DETAIL_MAX_BYTES)
             }
-            Self::HostRequestObserved { class, .. } => {
-                validate_required_text("host request class", class, OBSERVATION_LABEL_MAX_BYTES)
+            Self::HostRequestObserved { class, outcome, .. } => {
+                validate_required_text("host request class", class, OBSERVATION_LABEL_MAX_BYTES)?;
+                if let HostRequestOutcomeV1::Failed { error } = outcome {
+                    validate_required_text(
+                        "host request outcome error",
+                        error,
+                        OBSERVATION_ACTION_BLOCKED_REASON_MAX_BYTES,
+                    )?;
+                }
+                Ok(())
             }
             Self::ActionBlocked {
                 correlation_id,
@@ -823,9 +864,10 @@ impl ObservationKindV1 {
             Self::Error { detail } => {
                 len += ",\"detail\":".len() + json_string_len(detail);
             }
-            Self::HostRequestObserved { class, decision } => {
+            Self::HostRequestObserved { class, decision, outcome } => {
                 len += ",\"class\":".len() + json_string_len(class);
                 len += ",\"decision\":".len() + decision.json_encoded_len();
+                len += ",\"outcome\":".len() + outcome.json_encoded_len();
             }
             Self::ActionBlocked {
                 correlation_id,
@@ -982,6 +1024,23 @@ impl HostRequestDecisionV1 {
         let mut len = "{\"kind\":".len() + json_string_len(self.wire_name());
         if let Self::Granted { by } | Self::Denied { by } = self {
             len += ",\"by\":".len() + json_string_len(by.wire_name());
+        }
+        len + "}".len()
+    }
+}
+
+impl HostRequestOutcomeV1 {
+    fn wire_name(&self) -> &'static str {
+        match self {
+            Self::Executed => "executed",
+            Self::Failed { .. } => "failed",
+        }
+    }
+
+    fn json_encoded_len(&self) -> usize {
+        let mut len = "{\"kind\":".len() + json_string_len(self.wire_name());
+        if let Self::Failed { error } = self {
+            len += ",\"error\":".len() + json_string_len(error);
         }
         len + "}".len()
     }
@@ -1468,6 +1527,58 @@ mod tests {
                 "unexpected serde error for {evidence:?}: {error}"
             );
         }
+    }
+
+    /// A `Granted` decision paired with a `Failed` outcome (an authorized
+    /// host request that failed WHILE EXECUTING, e.g. a `terminal/create`
+    /// spawn error) is a distinct, bounded, serde-stable fact -- never
+    /// collapsed into `Denied`, and its `error` text is bounded the same
+    /// way `ActionBlocked::reason` is.
+    #[test]
+    fn host_request_observed_carries_a_bounded_failed_outcome() {
+        let value = observation(
+            ObservationEvidenceV1::StructuredProvider,
+            ObservationKindV1::HostRequestObserved {
+                class: "Terminal".to_owned(),
+                decision: HostRequestDecisionV1::Granted { by: HostDecisionAuthorityV1::Policy },
+                outcome: HostRequestOutcomeV1::Failed {
+                    error: "terminal/create spawn failed: os error 3".to_owned(),
+                },
+            },
+        );
+        value.validate().expect("bounded granted-but-failed host request");
+        let encoded = serde_json::to_vec(&value).expect("serialize host request observed");
+        assert_eq!(value.json_encoded_len(), encoded.len());
+        assert_eq!(serde_json::from_slice::<ObservationV1>(&encoded).unwrap(), value);
+
+        let executed = observation(
+            ObservationEvidenceV1::StructuredProvider,
+            ObservationKindV1::HostRequestObserved {
+                class: "Terminal".to_owned(),
+                decision: HostRequestDecisionV1::Granted { by: HostDecisionAuthorityV1::Policy },
+                outcome: HostRequestOutcomeV1::Executed,
+            },
+        );
+        executed.validate().expect("bounded granted-and-executed host request");
+        let encoded_executed = serde_json::to_vec(&executed).expect("serialize executed outcome");
+        assert_eq!(executed.json_encoded_len(), encoded_executed.len());
+
+        let oversized_error = "e".repeat(OBSERVATION_ACTION_BLOCKED_REASON_MAX_BYTES + 1);
+        let rejected = observation(
+            ObservationEvidenceV1::StructuredProvider,
+            ObservationKindV1::HostRequestObserved {
+                class: "Terminal".to_owned(),
+                decision: HostRequestDecisionV1::Granted { by: HostDecisionAuthorityV1::Policy },
+                outcome: HostRequestOutcomeV1::Failed { error: oversized_error },
+            },
+        );
+        assert_eq!(
+            rejected.validate(),
+            Err(ObservationValidationError::InvalidText {
+                field: "host request outcome error",
+                max: OBSERVATION_ACTION_BLOCKED_REASON_MAX_BYTES,
+            })
+        );
     }
 
     #[test]

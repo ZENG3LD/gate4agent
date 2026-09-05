@@ -33,8 +33,8 @@ use gate4agent::pty::{
 };
 use gate4agent::{
     AcpSession, AcpSessionOptions, AgentEvent, CliTool, HostDecisionAuthority, HostPolicy,
-    HostRequestDecision, LaunchRequest, OperatorPermissionChoice, PipeProcessOptions,
-    PipeSession, PromptFraming,
+    HostRequestDecision, HostRequestOutcome, LaunchRequest, OperatorPermissionChoice,
+    PipeProcessOptions, PipeSession, PromptFraming,
     ReadinessIntent, ReadinessPermit, ReadinessTracker, RpcId, RuntimePlatform, SessionConfig,
 };
 use gate4agent_adapters::{
@@ -51,7 +51,8 @@ use gate4agent_types::{
     ContextWindowUsage as ProviderContextWindowUsage, ControlEffect,
     ControlObservation, EffectEnvelope, ForegroundProcess, ForegroundProcessKind,
     ForegroundRequirement, HostDecisionAuthority as ProviderHostDecisionAuthority,
-    HostRequestDecision as ProviderHostRequestDecision, InputAction, ObservationEnvelope,
+    HostRequestDecision as ProviderHostRequestDecision,
+    HostRequestOutcome as ProviderHostRequestOutcome, InputAction, ObservationEnvelope,
     OperationId, OperatorGateInput,
     OperatorGateKind, OperatorGateOption, OperatorGateOptionSemantics, OperatorGateState,
     OperatorGateSubject, PipeProtocol,
@@ -2535,6 +2536,20 @@ fn provider_host_decision_authority(by: HostDecisionAuthority) -> ProviderHostDe
     }
 }
 
+/// Map `gate4agent`'s `HostRequestOutcome` onto this crate's wire-typed
+/// `ProviderHostRequestOutcome` -- same reason `provider_host_request_
+/// decision` exists rather than a `From` impl on either side. Carried
+/// through verbatim, the same convention `reason` already follows on this
+/// mapping: bounding happens at `ProviderEvent::validate_ingress`
+/// (`PROVIDER_EVENT_TEXT_MAX_BYTES`, rejecting rather than truncating), not
+/// here.
+fn provider_host_request_outcome(outcome: HostRequestOutcome) -> ProviderHostRequestOutcome {
+    match outcome {
+        HostRequestOutcome::Executed => ProviderHostRequestOutcome::Executed,
+        HostRequestOutcome::Failed { error } => ProviderHostRequestOutcome::Failed { error },
+    }
+}
+
 /// Map the detector's own `RateLimitType` onto the wire-typed
 /// `ProviderRateLimitKind`. A plain match, not `format!("{:?}", ..)`: the
 /// wire carries the typed value itself, not a Debug-rendering of it.
@@ -3085,27 +3100,21 @@ fn provider_event(event: AgentEvent, available_modes: &[SessionMode]) -> Option<
             method,
             params,
             decision,
-            reason,
             // `outcome` distinguishes a `Granted` request that ran cleanly
-            // from one that was authorized and then failed WHILE
-            // EXECUTING (`HostRequestOutcome::Failed` -- e.g. a
-            // `terminal/create` spawn error; see that type's own doc
-            // comment). `gate4agent_types::ProviderEvent::
-            // HostRequestObserved` has no field for it yet -- it mirrors
-            // `gate4agent`'s own `AgentEvent::RpcIncomingRequest` one field
-            // at a time, and this one has not been added there (follow-up:
-            // `gate4agent-types`/`gate4agent-node` need their own
-            // `HostRequestOutcome` mirror plus an `outcome` field on
-            // `HostRequestObserved`). Until that lands, an execution
-            // failure still reaches the operator as an undifferentiated
-            // `Granted` -- not `Denied`, so a block is never claimed where
-            // none happened; just not yet the distinct "tool/host failure"
-            // observation it deserves.
-            outcome: _,
+            // from one that was authorized and then failed WHILE EXECUTING
+            // (`HostRequestOutcome::Failed` -- e.g. a `terminal/create`
+            // spawn error; see that type's own doc comment). Carried
+            // through, never dropped: an execution failure must reach the
+            // operator as `Granted` + `Failed { error }`, not an
+            // undifferentiated `Granted` that silently swallows the
+            // failure text.
+            outcome,
+            reason,
         } => Some(ProviderEvent::HostRequestObserved {
             method,
             params_json: params.map(|value| value.to_string()).unwrap_or_default(),
             decision: provider_host_request_decision(decision),
+            outcome: provider_host_request_outcome(outcome),
             reason,
         }),
         AgentEvent::RpcNotification { method, params } => {
@@ -4804,7 +4813,8 @@ mod tests {
     use gate4agent_types::{
         AdapterFamily, AgentId, ApprovalLevel,
         HostDecisionAuthority as ProviderHostDecisionAuthority,
-        HostRequestDecision as ProviderHostRequestDecision, OperatorGateInput,
+        HostRequestDecision as ProviderHostRequestDecision,
+        HostRequestOutcome as ProviderHostRequestOutcome, OperatorGateInput,
         OperatorGateKind, OperatorGateOptionSemantics, OperatorGateState, OperatorGateSubject,
         ProviderEvent, ProviderInteractionKind, ProviderInteractionOption, ProviderRuntimePolicy,
         PtyScreenState, RuntimePlatform, TerminalMouseProtocolEncoding, TransportKind,
@@ -4946,6 +4956,7 @@ mod tests {
                 decision: ProviderHostRequestDecision::Denied {
                     by: ProviderHostDecisionAuthority::Policy
                 },
+                outcome: ProviderHostRequestOutcome::Executed,
                 reason: None,
             })
         );
@@ -4969,6 +4980,7 @@ mod tests {
                 decision: ProviderHostRequestDecision::Granted {
                     by: ProviderHostDecisionAuthority::Policy
                 },
+                outcome: ProviderHostRequestOutcome::Executed,
                 reason: None,
             })
         );
@@ -4995,6 +5007,7 @@ mod tests {
                 decision: ProviderHostRequestDecision::Denied {
                     by: ProviderHostDecisionAuthority::Gate
                 },
+                outcome: ProviderHostRequestOutcome::Executed,
                 reason: None,
             })
         );
@@ -5018,6 +5031,7 @@ mod tests {
                 decision: ProviderHostRequestDecision::Granted {
                     by: ProviderHostDecisionAuthority::Operator
                 },
+                outcome: ProviderHostRequestOutcome::Executed,
                 reason: None,
             })
         );
@@ -5041,6 +5055,7 @@ mod tests {
                 decision: ProviderHostRequestDecision::Denied {
                     by: ProviderHostDecisionAuthority::DeadlinePolicy
                 },
+                outcome: ProviderHostRequestOutcome::Executed,
                 reason: None,
             })
         );
@@ -5050,6 +5065,41 @@ mod tests {
         // `HostRequestObserved`; see
         // `deferred_acp_permission_request_becomes_an_interaction_with_its_id`
         // below.
+    }
+
+    /// K1c's split: an authorized (`Granted`) host request that failed
+    /// WHILE EXECUTING (e.g. a `terminal/create` spawn error) must carry
+    /// `HostRequestOutcome::Failed` through to `ProviderEvent::
+    /// HostRequestObserved` verbatim -- never dropped, and never collapsed
+    /// into `Denied`: the request WAS authorized, only its execution
+    /// failed.
+    #[test]
+    fn granted_host_request_execution_failure_carries_through_as_a_failed_outcome() {
+        let spawn_error = "terminal/create spawn failed: os error 3";
+        let mapped = super::provider_event(
+            AgentEvent::RpcIncomingRequest {
+                id: gate4agent::rpc::message::RpcId::Number(10),
+                method: "terminal/create".to_owned(),
+                params: None,
+                decision: HostRequestDecision::Granted { by: HostDecisionAuthority::Policy },
+                outcome: HostRequestOutcome::Failed { error: spawn_error.to_owned() },
+                reason: None,
+            },
+            &[],
+        );
+        assert_eq!(
+            mapped,
+            Some(ProviderEvent::HostRequestObserved {
+                method: "terminal/create".to_owned(),
+                params_json: String::new(),
+                decision: ProviderHostRequestDecision::Granted {
+                    by: ProviderHostDecisionAuthority::Policy
+                },
+                outcome: ProviderHostRequestOutcome::Failed { error: spawn_error.to_owned() },
+                reason: None,
+            })
+        );
+        mapped.expect("mapped").validate_ingress().expect("bounded free-text error validates");
     }
 
     /// The bug this change fixes: the gate's own refusal text used to be
@@ -5081,6 +5131,7 @@ mod tests {
                 decision: ProviderHostRequestDecision::Denied {
                     by: ProviderHostDecisionAuthority::Gate
                 },
+                outcome: ProviderHostRequestOutcome::Executed,
                 reason: Some(gate_text.to_owned()),
             })
         );
@@ -5195,6 +5246,7 @@ mod tests {
                 decision: ProviderHostRequestDecision::Denied {
                     by: ProviderHostDecisionAuthority::Operator
                 },
+                outcome: ProviderHostRequestOutcome::Executed,
                 reason: None,
             })
         );

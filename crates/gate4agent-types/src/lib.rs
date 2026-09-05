@@ -28,6 +28,7 @@ pub use control::{
     ControlError, ControlEvent, ControlEventKind, ControlHealth, ControlObservation,
     ControlSnapshot, EffectEnvelope, ForegroundAuthority, ForegroundProcess, ForegroundProcessKind,
     ForegroundRequirement, ForegroundSnapshot, HostDecisionAuthority, HostRequestDecision,
+    HostRequestOutcome,
     ObservationEnvelope, ObservationIgnoredReason,
     OperationId, OperatorGateInput, OperatorGateKind, OperatorGateOption,
     OperatorGateOptionSemantics, OperatorGateState, OperatorGateSubject, ProviderActivity,

@@ -463,6 +463,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -481,6 +482,7 @@ dependencies = [
  "gate4agent-c2",
  "gate4agent-c2-client",
  "gate4agent-c2-protocol",
+ "gate4agent-catalog",
  "gate4agent-harness-api",
  "gate4agent-harness-client",
  "gate4agent-harness-delivery",

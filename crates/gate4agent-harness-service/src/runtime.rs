@@ -8030,6 +8030,7 @@ fn log_if_derived_launch_plan_used(
         plan_id = scheduled.plan.plan_id.as_str(),
         node_id = plan.node_id.as_str(),
         provider = plan.provider.as_str(),
+        approval_level = ?plan.approval_level,
         "derived launch plan used for a new task dispatch",
     );
 }
@@ -8472,6 +8473,7 @@ fn task_launch_options(
                     plan_id = plan.plan_id.as_str(),
                     node_id = plan.node_id.as_str(),
                     provider = plan.provider.as_str(),
+                    approval_level = ?plan.approval_level,
                     "derived launch plan surfaced in task launch options",
                 );
             }
@@ -11560,7 +11562,7 @@ mod tests {
         HarnessEngine, HarnessEngineCheckpointV1, HARNESS_ENGINE_CHECKPOINT_VERSION_V1,
     };
     use gate4agent_types::{
-        AgentId, AgentInstanceId, ProviderActivity, PtyScreenState, SessionGeneration,
+        AgentId, AgentInstanceId, ApprovalLevel, ProviderActivity, PtyScreenState, SessionGeneration,
         TerminalSize, TransportKind,
     };
     use gate4agent_c2_protocol::{SlimNodeInventory, SlimSession, SlimSessionStatus, SlimWorkspace};
@@ -11671,6 +11673,7 @@ mod tests {
                 crate::dispatch::HarnessGrantPolicyV1::Operator
             },
             harness_mcp,
+            approval_level: ApprovalLevel::default(),
             deadline_ms: 30_000,
         };
         plan.validate().unwrap();

@@ -6853,7 +6853,7 @@ mod tests {
         SpawnDeadlineMs, SpawnIdempotencyKey, SpawnOverrides, SpawnProfileId, SpawnPrompt,
         SpawnRequiredCapabilities, SpawnTarget, WorkspaceId,
     };
-    use gate4agent_types::{AgentId, AgentInstanceId, SessionGeneration, TerminalSize};
+    use gate4agent_types::{AgentId, AgentInstanceId, ApprovalLevel, SessionGeneration, TerminalSize};
     use rusqlite::Connection;
     use std::{fs, path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
 
@@ -7546,6 +7546,7 @@ mod tests {
             } else {
                 dispatch::HarnessMcpPolicyV1::Disabled
             },
+            approval_level: ApprovalLevel::default(),
             deadline_ms: 20_000,
         }
     }

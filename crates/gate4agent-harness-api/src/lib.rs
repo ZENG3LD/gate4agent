@@ -39,6 +39,8 @@ pub use gate4agent_harness_protocol::{
     HarnessRunGitFactsV1, HarnessRunLifecycleV1,
     HarnessRuntimeIdentityV1, HarnessSelectorV1, HarnessTaskId, HarnessTaskStateV1,
     HarnessValidationError, HarnessWorktreeIntentV1, SessionGrantId,
+    HarnessMailAckV1, HarnessMailAddressV1, HarnessMailMessageId, HarnessMailMessageV1,
+    HarnessRecordRef,
     HARNESS_ARTIFACTS_MAX, HARNESS_BODY_MAX_BYTES,
     HARNESS_CHILD_COUNT_MAX, HARNESS_CHILD_DEPTH_MAX, HARNESS_DEPENDENCIES_MAX,
     HARNESS_CONTEXT_PACK_MAX_BYTES, HARNESS_CONTEXT_PACK_RETAINED_MESSAGES_MAX,
@@ -122,7 +124,19 @@ pub const HARNESS_MCP_AUDIENCE: &str = "gate4agent-harness-mcp-read-v1";
 /// new one both move the version even though a pre-`20` reader would have
 /// silently read zero for the new field and never received the new variant
 /// at all.
-pub const HARNESS_OPERATOR_WIRE_VERSION: u16 = 20;
+///
+/// `21` adds the mailbox arc's Slice B operator surface
+/// (`docs/gate4agent/plans/gate4agent-arc-mailbox-and-task-layer-2026-09-02.md`
+/// §3 Slice B): `HarnessOperatorRequestV1::MailInbox` (a bounded, redacted
+/// mailbox page for one session record) and `::AckMail` (the operator's own
+/// ack, applied through the same `HarnessMutationV1::AckMail` mutation an
+/// agent's own `g4a_mail_ack` uses, under the operator's authority), plus
+/// `unread_mail: u64` on `HarnessRuntimeManagedSessionV1` -- the mailbox
+/// counterpart of `19`'s `blocked_count`, filled the same way. Same rule as
+/// every bump above: two new verbs and a widened struct move the version
+/// even though a pre-`21` reader would have silently read zero for the new
+/// field and never sent either new request.
+pub const HARNESS_OPERATOR_WIRE_VERSION: u16 = 21;
 // Realistic multi-pane ceiling with headroom; bounds the harness-side
 // per-subscriber HashSet<RuntimeSessionKey> and the connect-time seed burst
 // `SubscribeTerminal`'s handler sends immediately after registering (see
@@ -238,6 +252,35 @@ pub const HARNESS_READ_TOOL_IDS: [&str; 8] = [
     "g4a_runs_get",
     "g4a_operation_get",
 ];
+
+/// The mailbox arc's Slice B write allow-list (D1 + D7): the harness MCP
+/// server's first writes. Kept separate from `HARNESS_READ_TOOL_IDS` rather
+/// than folded into it -- that array's own test
+/// (`all_eight_tool_schemas_are_stable_and_closed`) pins it as exactly the
+/// eight read-only tools zipped in `tool_definitions()`'s declared order, and
+/// `g4a_mail_inbox` is a read in effect but gated by `grant.mail`, not by any
+/// of the three `read_permissions`/`monitoring_visibility` scopes the eight
+/// reads use -- it belongs with its two write siblings, not with them. D7:
+/// this array, and `HARNESS_READ_TOOL_IDS`, are the only two names
+/// `tools/call` ever admits; `ResolveInteraction` (or any other name) is
+/// refused by name regardless of what a grant's `allowed_tool_ids` claims.
+pub const HARNESS_WRITE_TOOL_IDS: [&str; 3] = [
+    "g4a_mail_ack",
+    "g4a_mail_inbox",
+    "g4a_mail_send",
+];
+/// Bound on a mail send/ack named-refusal reason string
+/// (`HarnessMailSendResultV1::Refused`). The longest reason
+/// `HarnessEngineError` actually produces for `SendMail` (`MailRecipientUnknown`/
+/// `MailRecipientEnded`/`MailPermissionDenied`, formatted via `to_string()`)
+/// runs well under 128 bytes even with a maximal opaque id embedded; this
+/// stays generous headroom rather than a tight fit.
+pub const HARNESS_MAIL_REFUSAL_REASON_MAX_BYTES: usize = 256;
+/// Bound on the `thread` id list `g4a_mail_inbox` attaches to one page entry
+/// -- the wire-level cap on what is otherwise an unbounded transitive
+/// closure (`HarnessEngine::mail_inbox`'s own doc comment), sized like the
+/// other page-shaped limits in this crate (`HARNESS_TIMELINE_PAGE_LIMIT_MAX`).
+pub const HARNESS_MAIL_THREAD_IDS_MAX: u16 = 128;
 
 const TOKEN_PREFIX: &str = "g4ah2_";
 const OPERATOR_TOKEN_PREFIX: &str = "g4aho_";
@@ -2175,6 +2218,28 @@ impl HarnessProviderInteractionResponseV1 {
     }
 }
 
+/// Authority for `HarnessOperatorRequestV1::AckMail`: the operator's own ack
+/// of one message on behalf of `record_id`, applied through
+/// `HarnessMutationV1::AckMail` with the operator as the operation's actor
+/// (`gate4agent-harness-service::operator_ack_mail` resolves the mail-
+/// permitted grant currently bound to `record_id` to satisfy that mutation's
+/// own `grant_id` authority -- see that function's doc comment).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessMailAckOperatorRequestV1 {
+    pub authority: HarnessOperatorAuthorityV1,
+    pub record_id: HarnessSelectorV1,
+    pub message_id: HarnessMailMessageId,
+}
+
+impl HarnessMailAckOperatorRequestV1 {
+    pub fn validate(&self) -> Result<(), HarnessValidationError> {
+        self.authority.validate()?;
+        self.record_id.validate()?;
+        self.message_id.validate()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum HarnessOperatorRequestV1 {
@@ -2287,6 +2352,14 @@ pub enum HarnessOperatorRequestV1 {
     TerminalRead {
         session: HarnessRuntimeSessionAddressV1,
         after_sequence: Option<u64>,
+        limit: u16,
+    },
+    /// D1/D8, Slice B: the operator's own bounded, redacted mailbox read for
+    /// one session record -- the same `HarnessMailInboxPageV1` shape
+    /// `g4a_mail_inbox` returns.
+    MailInbox {
+        record_id: HarnessSelectorV1,
+        since_unix_ms: Option<u64>,
         limit: u16,
     },
     // Direct operator session verbs: unlike the CAS/task-mutation family
@@ -2547,6 +2620,14 @@ pub enum HarnessOperatorRequestV1 {
     StartTask { request: HarnessStartTaskRequestV1 },
     ReplaceTaskExecutionSpecV2 { request: HarnessReplaceTaskExecutionSpecRequestV2 },
     StartTaskV2 { request: HarnessStartTaskRequestV2 },
+    /// The operator's own ack (D1, Slice B): an operator act, applied
+    /// through the same `HarnessMutationV1::AckMail` mutation an agent's own
+    /// `g4a_mail_ack` uses -- not a distinct authority channel, so it is not
+    /// routed through `HarnessOperatorActionV1`/`SubmitIntent` the way the
+    /// task-mutation family above is; there is no task to CAS against, the
+    /// same reason the direct session-control verbs below skip that layer
+    /// too.
+    AckMail { request: HarnessMailAckOperatorRequestV1 },
     SubmitIntent { intent: HarnessOperatorIntentV1 },
     // Node-scoped, paged host-directory listing behind the folder-browser
     // dialog: the harness-mode sibling of the light TUI's own
@@ -2780,6 +2861,11 @@ impl HarnessOperatorRequestV1 {
                 session.validate()?;
                 validate_operator_terminal_limit(*limit)
             }
+            Self::MailInbox { record_id, limit, .. } => {
+                record_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+                validate_operator_limit(*limit)
+            }
+            Self::AckMail { request } => request.validate().map_err(HarnessOperatorApiError::Protocol),
             Self::SpawnSession { node_id, workspace_id, provider, provider_profile, terminal_size, .. } => {
                 validate_node_workspace_route(node_id, workspace_id)?;
                 if !valid_runtime_id(provider, 128) || !valid_runtime_id(provider_profile, 128) {
@@ -3695,6 +3781,7 @@ pub enum HarnessOperatorResponseV1 {
     TaskLaunchOptions(HarnessTaskLaunchOptionsV1),
     RuntimeInventory(HarnessRuntimeInventoryPageV1),
     TerminalRead(HarnessRuntimeTerminalPageV1),
+    MailInbox(HarnessMailInboxPageV1),
     SessionSpawned(HarnessRuntimeSessionAddressV1),
     SessionInputWritten,
     SessionResized,
@@ -3780,6 +3867,7 @@ impl HarnessOperatorResponseV1 {
             Self::TaskLaunchOptions(value) => value.validate(),
             Self::RuntimeInventory(value) => value.validate(),
             Self::TerminalRead(value) => value.validate(),
+            Self::MailInbox(value) => value.validate().map_err(HarnessOperatorApiError::Read),
             Self::SessionSpawned(value) => value.validate(),
             Self::SessionInputWritten
             | Self::SessionResized
@@ -4976,6 +5064,12 @@ pub struct HarnessRuntimeManagedSessionV1 {
     /// `received_at_ms` of the most recent such observation, or `None` when
     /// `blocked_count` is zero.
     pub last_blocked_at_ms: Option<u64>,
+    /// Unacked mail addressed to this record directly, plus mail addressed
+    /// to a task this record's currently bound grant can see -- the mailbox
+    /// arc's counterpart of `blocked_count` immediately above, filled the
+    /// same way (`gate4agent-harness-service::runtime::
+    /// fill_managed_session_blocked_stats`).
+    pub unread_mail: u64,
 }
 
 impl HarnessRuntimeManagedSessionV1 {
@@ -5489,11 +5583,49 @@ pub enum HarnessReadRequestV1 {
     },
     RunGet { run_id: HarnessRunId },
     OperationGet { operation_id: HarnessOperationId },
+    /// D1/D8: `to` addresses a session record or a task (forum); `subject`/
+    /// `body` reuse the task title/body bounds (S9, unchanged). The named
+    /// refusal (unknown/ended recipient, no `mail` permission) travels back
+    /// as `HarnessMailSendResultV1::Refused`, never as a host error -- see
+    /// that type's own doc comment.
+    MailSend {
+        to: HarnessMailAddressV1,
+        subject: String,
+        body: String,
+        reply_to: Option<HarnessMailMessageId>,
+    },
+    /// D8's forum read: mail addressed to the caller's own session record
+    /// plus every message addressed to a task currently visible to the
+    /// caller's grant. Unacked entries sort first.
+    MailInbox {
+        since_unix_ms: Option<u64>,
+        limit: u16,
+    },
+    /// Idempotent: acking an already-acked message is a no-op success (S9's
+    /// at-least-once delivery termination).
+    MailAck { message_id: HarnessMailMessageId },
 }
 
 impl HarnessReadRequestV1 {
     pub fn validate(&self) -> Result<(), HarnessReadApiError> {
         match self {
+            Self::MailSend { to, subject, body, reply_to } => {
+                to.validate().map_err(HarnessReadApiError::Protocol)?;
+                if subject.is_empty()
+                    || subject.len() > HARNESS_TITLE_MAX_BYTES
+                    || body.len() > HARNESS_BODY_MAX_BYTES
+                {
+                    return Err(HarnessReadApiError::InvalidMailMessage);
+                }
+                if let Some(reply_to) = reply_to {
+                    reply_to.validate().map_err(HarnessReadApiError::Protocol)?;
+                }
+                Ok(())
+            }
+            Self::MailInbox { limit, .. } => validate_limit(*limit, HARNESS_ENTITY_PAGE_LIMIT_MAX),
+            Self::MailAck { message_id } => {
+                message_id.validate().map_err(HarnessReadApiError::Protocol)
+            }
             Self::TimelineRead { run_id, after_sequence, limit } => {
                 if let Some(run_id) = run_id {
                     run_id.validate().map_err(HarnessReadApiError::Protocol)?;
@@ -5561,6 +5693,9 @@ pub enum HarnessReadResponseV1 {
     Runs(RunPageV1),
     Run(RedactedRunV1),
     Operation(RedactedOperationV1),
+    MailSend(HarnessMailSendResultV1),
+    MailInbox(HarnessMailInboxPageV1),
+    MailAck(HarnessMailAckResultV1),
 }
 
 impl HarnessReadResponseV1 {
@@ -5574,8 +5709,123 @@ impl HarnessReadResponseV1 {
             Self::Runs(value) => value.validate(),
             Self::Run(value) => value.validate(),
             Self::Operation(value) => value.validate(),
+            Self::MailSend(value) => value.validate(),
+            Self::MailInbox(value) => value.validate(),
+            Self::MailAck(value) => value.validate(),
         }
     }
+}
+
+/// The outcome of one `g4a_mail_send` call. A refusal is a domain answer,
+/// never a host error (D1's "an unknown, ended or unreachable recipient is a
+/// named refusal, never a silent drop"): `reason` is
+/// `HarnessEngineError`'s own `Display` text for `MailRecipientUnknown`/
+/// `MailRecipientEnded`/`MailPermissionDenied`, carried verbatim so the
+/// caller sees exactly what the engine refused and why.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "outcome", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum HarnessMailSendResultV1 {
+    Accepted { message_id: HarnessMailMessageId },
+    Refused { reason: String },
+}
+
+impl HarnessMailSendResultV1 {
+    pub fn validate(&self) -> Result<(), HarnessReadApiError> {
+        match self {
+            Self::Accepted { message_id } => {
+                message_id.validate().map_err(HarnessReadApiError::Protocol)
+            }
+            Self::Refused { reason } => {
+                if reason.is_empty()
+                    || reason.len() > HARNESS_MAIL_REFUSAL_REASON_MAX_BYTES
+                    || reason.chars().any(char::is_control)
+                {
+                    return Err(HarnessReadApiError::InvalidMailMessage);
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// One `g4a_mail_inbox` page entry: the envelope, whether the caller has
+/// acked it, and its `thread` -- the ids of every message in the transitive
+/// `reply_to` closure (S9: "threading needs no second concept"), bounded by
+/// `HARNESS_MAIL_THREAD_IDS_MAX`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessMailInboxEntryV1 {
+    pub message_id: HarnessMailMessageId,
+    pub from: HarnessRecordRef,
+    pub to: HarnessMailAddressV1,
+    pub subject: String,
+    pub body: String,
+    pub reply_to: Option<HarnessMailMessageId>,
+    pub task_id: Option<HarnessTaskId>,
+    pub created_at_unix_ms: u64,
+    pub acked: bool,
+    pub thread: Vec<HarnessMailMessageId>,
+}
+
+impl HarnessMailInboxEntryV1 {
+    pub fn validate(&self) -> Result<(), HarnessReadApiError> {
+        self.message_id.validate().map_err(HarnessReadApiError::Protocol)?;
+        self.from.validate().map_err(HarnessReadApiError::Protocol)?;
+        self.to.validate().map_err(HarnessReadApiError::Protocol)?;
+        if self.subject.is_empty()
+            || self.subject.len() > HARNESS_TITLE_MAX_BYTES
+            || self.body.len() > HARNESS_BODY_MAX_BYTES
+        {
+            return Err(HarnessReadApiError::InvalidMailMessage);
+        }
+        if let Some(reply_to) = &self.reply_to {
+            reply_to.validate().map_err(HarnessReadApiError::Protocol)?;
+        }
+        if let Some(task_id) = &self.task_id {
+            task_id.validate().map_err(HarnessReadApiError::Protocol)?;
+        }
+        if self.created_at_unix_ms == 0 || self.thread.len() > usize::from(HARNESS_MAIL_THREAD_IDS_MAX) {
+            return Err(HarnessReadApiError::InvalidMailInbox);
+        }
+        for message_id in &self.thread {
+            message_id.validate().map_err(HarnessReadApiError::Protocol)?;
+        }
+        Ok(())
+    }
+}
+
+/// `g4a_mail_inbox`'s full reply, and the operator wire's `MailInbox` reply
+/// -- the same shape both doors read (`docs/gate4agent/plans/
+/// gate4agent-arc-mailbox-and-task-layer-2026-09-02.md` §3 Slice B).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessMailInboxPageV1 {
+    pub messages: Vec<HarnessMailInboxEntryV1>,
+    pub unacked: u64,
+}
+
+impl HarnessMailInboxPageV1 {
+    pub fn validate(&self) -> Result<(), HarnessReadApiError> {
+        if self.messages.len() > usize::from(HARNESS_ENTITY_PAGE_LIMIT_MAX) {
+            return Err(HarnessReadApiError::InvalidMailInbox);
+        }
+        for message in &self.messages {
+            message.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// `g4a_mail_ack`'s reply -- idempotent, so `acked` is `true` on every
+/// success (an already-acked message acks again as a no-op).
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessMailAckResultV1 {
+    pub acked: bool,
+}
+
+impl HarnessMailAckResultV1 {
+    pub fn validate(&self) -> Result<(), HarnessReadApiError> { Ok(()) }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -5609,6 +5859,11 @@ pub struct SessionContextV1 {
     pub monitoring_visibility: HarnessMonitoringVisibilityV1,
     pub maximum_child_count: u16,
     pub maximum_child_depth: u16,
+    /// D1: whether this grant holds the mail permission -- the source
+    /// `expected_allowed_tool_ids` reads to decide whether the three
+    /// `g4a_mail_*` ids belong in `allowed_tool_ids`, the same way
+    /// `read_permissions`/`monitoring_visibility` decide the eight reads.
+    pub mail: bool,
     pub allowed_tool_ids: Vec<String>,
     pub history_message_count: Option<u64>,
     pub completed_turn_count: Option<u64>,
@@ -5650,9 +5905,12 @@ impl SessionContextV1 {
         {
             return Err(HarnessReadApiError::InvalidChildLimits);
         }
-        if self.allowed_tool_ids.len() > HARNESS_READ_TOOL_IDS.len()
+        if self.allowed_tool_ids.len() > HARNESS_READ_TOOL_IDS.len() + HARNESS_WRITE_TOOL_IDS.len()
             || self.allowed_tool_ids.windows(2).any(|pair| pair[0] >= pair[1])
-            || self.allowed_tool_ids.iter().any(|id| !HARNESS_READ_TOOL_IDS.contains(&id.as_str()))
+            || self.allowed_tool_ids.iter().any(|id| {
+                !HARNESS_READ_TOOL_IDS.contains(&id.as_str())
+                    && !HARNESS_WRITE_TOOL_IDS.contains(&id.as_str())
+            })
             || self.allowed_tool_ids != expected_allowed_tool_ids(self)
         {
             return Err(HarnessReadApiError::InvalidAllowedTools);
@@ -5677,6 +5935,9 @@ fn expected_allowed_tool_ids(context: &SessionContextV1) -> Vec<String> {
     }
     if context.read_permissions.operations != HarnessEntityReadScopeV1::None {
         tools.push("g4a_operation_get");
+    }
+    if context.mail {
+        tools.extend(["g4a_mail_send", "g4a_mail_inbox", "g4a_mail_ack"]);
     }
     tools.sort_unstable();
     tools.into_iter().map(str::to_owned).collect()
@@ -6324,6 +6585,10 @@ pub enum HarnessReadApiError {
     InvalidContextTask,
     #[error("harness read text field is invalid: {0}")]
     InvalidText(&'static str),
+    #[error("harness mail message is invalid")]
+    InvalidMailMessage,
+    #[error("harness mail inbox page is invalid")]
+    InvalidMailInbox,
     #[error("harness protocol value is invalid: {0}")]
     Protocol(#[from] gate4agent_harness_protocol::HarnessValidationError),
 }
@@ -9480,6 +9745,7 @@ mod tests {
             updated_at_unix_ms: 10,
             blocked_count: 0,
             last_blocked_at_ms: None,
+            unread_mail: 0,
         }
     }
 
@@ -10580,17 +10846,13 @@ mod tests {
         }
     }
 
-    /// The bounded agent-stream replay (a subscriber missed a session's
-    /// first turn, so the harness hands back its recent instant chunks
-    /// once, marked, instead of nothing at all) moved
-    /// `HARNESS_OPERATOR_WIRE_VERSION` from `19` to `20`: `AgentChunk` widens
-    /// with `published_at_ms` and the new `ReplayBoundary` variant round-
-    /// trips through JSON intact, both already exercised for content by
-    /// `operator_agent_event_variants_are_exact_round_trips` above -- this
-    /// test is the version pin itself.
+    /// The mailbox arc's Slice B operator surface (`MailInbox`/`AckMail`,
+    /// `unread_mail` on `HarnessRuntimeManagedSessionV1`) moved
+    /// `HARNESS_OPERATOR_WIRE_VERSION` from `20` to `21` -- see the
+    /// constant's own doc comment for the shape.
     #[test]
-    fn agent_stream_replay_moved_the_wire_pin_to_20() {
-        assert_eq!(HARNESS_OPERATOR_WIRE_VERSION, 20);
+    fn mailbox_operator_surface_moved_the_wire_pin_to_21() {
+        assert_eq!(HARNESS_OPERATOR_WIRE_VERSION, 21);
     }
 
     #[test]

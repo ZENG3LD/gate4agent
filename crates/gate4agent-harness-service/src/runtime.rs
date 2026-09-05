@@ -4846,11 +4846,12 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                         &claims.binding,
                                     )?;
                                     let response = execute_read(
-                                        &harness,
+                                        &mut harness,
                                         &observation,
                                         &support,
                                         &claims,
                                         envelope.request,
+                                        &runtime_inventory,
                                     )?;
                                     response.validate()
                                         .map_err(|_| HarnessReadHostErrorV1::Internal)?;
@@ -6917,9 +6918,10 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                             ) {
                                 let plan = prepare_harness_mcp_read_call(
                                     &adapter,
-                                    &harness,
+                                    &mut harness,
                                     &observation,
                                     &support,
+                                    &runtime_inventory,
                                     event,
                                 )?;
                                 let _ = schedule_harness_mcp_relay(
@@ -7871,7 +7873,7 @@ impl HarnessRuntimeInventoryCache {
     /// unchanged value; this still finds it) -- used by
     /// `finish_observation_recovery` to check `awaiting_absent_sessions`
     /// against whatever is now cached.
-    fn node(&self, node_id: &NodeId) -> Option<&HarnessRuntimeNodeInventoryV1> {
+    pub(crate) fn node(&self, node_id: &NodeId) -> Option<&HarnessRuntimeNodeInventoryV1> {
         self.nodes.get(node_id)
     }
 
@@ -8311,6 +8313,7 @@ pub fn redact_runtime_inventory(
             // projection of it (see this function's own doc comment).
             blocked_count: 0,
             last_blocked_at_ms: None,
+            unread_mail: 0,
         }
     }).collect();
     HarnessRuntimeInventoryV1 {
@@ -8327,24 +8330,27 @@ pub fn redact_runtime_inventory(
     }
 }
 
-/// Overlays `blocked_count`/`last_blocked_at_ms` onto every managed session
-/// in a `RuntimeInventoryList` reply from the harness's own observation
-/// projection -- the `runtime-inventory` counterpart of `observation_state`
-/// (`read.rs`), which does the same lookup-by-`ManagedSessionKey` for a
-/// single run's freshness/availability. `redact_runtime_inventory` cannot
-/// fill these itself: it is a pure mapping of the node's own
-/// `SlimNodeInventory`, which carries nothing about the harness's own
-/// `ActionBlocked` observations (see that function's own doc comment).
+/// Overlays `blocked_count`/`last_blocked_at_ms`/`unread_mail` onto every
+/// managed session in a `RuntimeInventoryList` reply from the harness's own
+/// observation projection and mailbox state -- the `runtime-inventory`
+/// counterpart of `observation_state` (`read.rs`), which does the same
+/// lookup-by-`ManagedSessionKey` for a single run's freshness/availability.
+/// `redact_runtime_inventory` cannot fill these itself: it is a pure mapping
+/// of the node's own `SlimNodeInventory`, which carries nothing about the
+/// harness's own `ActionBlocked` observations or mailbox
+/// (see that function's own doc comment).
 ///
-/// A node id, incarnation id, or record id that fails to parse back into
-/// its typed form is left at the zero/`None` `redact_runtime_inventory`
-/// already set -- every value here round-tripped through validated wire
-/// types on the way in, so a parse failure is unreachable in practice, not
-/// a case worth surfacing as an error to an operator asking a read-only
-/// question.
+/// A node id or record id that fails to parse back into its typed form is
+/// left at the zero/`None` `redact_runtime_inventory` already set -- every
+/// value here round-tripped through validated wire types on the way in, so
+/// a parse failure is unreachable in practice, not a case worth surfacing as
+/// an error to an operator asking a read-only question. `unread_mail` is
+/// filled from `engine` alone (no observation projection needed) and is
+/// therefore filled even when the observation-side lookup below misses.
 fn fill_managed_session_blocked_stats(
     page: &mut HarnessRuntimeInventoryPageV1,
     observation: &ObservationService,
+    engine: &gate4agent_harness_engine::HarnessEngine,
 ) {
     for node in &mut page.nodes {
         let Ok(node_id) = NodeId::new(node.node_id.as_str()) else { continue; };
@@ -8352,6 +8358,9 @@ fn fill_managed_session_blocked_stats(
             continue;
         };
         for record in &mut node.inventory.managed_sessions {
+            if let Ok(selector) = HarnessSelectorV1::new(record.record_id.clone()) {
+                record.unread_mail = crate::read::count_unread_mail(engine, &selector);
+            }
             let Ok(record_id) = SessionRecordId::new(record.record_id.as_str()) else {
                 continue;
             };
@@ -8847,7 +8856,7 @@ fn execute_operator_request(
         }
         HarnessOperatorRequestV1::RuntimeInventoryList { after_node_id, limit } => {
             let mut page = runtime_inventory.page(after_node_id.as_deref(), limit);
-            fill_managed_session_blocked_stats(&mut page, observation);
+            fill_managed_session_blocked_stats(&mut page, observation, harness.engine());
             HarnessOperatorResponseV1::RuntimeInventory(page)
         }
         HarnessOperatorRequestV1::TerminalRead { session, after_sequence, limit } => {
@@ -8863,6 +8872,15 @@ fn execute_operator_request(
                 transport_incomplete: page.transport_incomplete,
                 next_cursor: page.next_cursor,
             })
+        }
+        HarnessOperatorRequestV1::MailInbox { record_id, since_unix_ms, limit } => {
+            HarnessOperatorResponseV1::MailInbox(
+                crate::read::operator_mail_inbox(harness.engine(), &record_id, since_unix_ms, limit)
+                    .map_err(map_operator_read_error)?,
+            )
+        }
+        HarnessOperatorRequestV1::AckMail { request } => {
+            operator_mutation_response(harness.operator_ack_mail(request))?
         }
         HarnessOperatorRequestV1::CatalogNativeSessions { .. }
         | HarnessOperatorRequestV1::PageNativeSessions { .. }
@@ -10574,9 +10592,10 @@ struct HarnessMcpRelayPlan {
 
 fn prepare_harness_mcp_read_call(
     adapter: &HarnessC2Adapter,
-    harness: &HarnessService,
+    harness: &mut HarnessService,
     observation: &ObservationService,
     support: &ObservationSupportRegistry,
+    runtime_inventory: &HarnessRuntimeInventoryCache,
     routed: RoutedNodeEvent,
 ) -> Result<HarnessMcpRelayPlan, HarnessRuntimeError> {
     let route = NodeRoute {
@@ -10615,7 +10634,7 @@ fn prepare_harness_mcp_read_call(
     let grant_id = authorization.as_ref().ok().map(|binding| binding.grant_id.clone());
     let response = authorization.and_then(|binding| {
         verify_observation_credential_binding(observation, support, &binding)?;
-        execute_exact_binding_read(harness, observation, support, &binding, request)
+        execute_exact_binding_read(harness, observation, support, &binding, request, runtime_inventory)
     });
     let outcome = match response {
         Ok(response) => {
@@ -14168,7 +14187,7 @@ mod tests {
         }
 
         let mut page = cache.page(None, 1);
-        fill_managed_session_blocked_stats(&mut page, &observation);
+        fill_managed_session_blocked_stats(&mut page, &observation, &gate4agent_harness_engine::HarnessEngine::new());
         page.validate().unwrap();
         assert_eq!(page.nodes[0].inventory.managed_sessions.len(), 1);
         let record = &page.nodes[0].inventory.managed_sessions[0];
@@ -15325,7 +15344,7 @@ mod tests {
     fn credential_read_rejects_observation_generation_replaced_after_mint() {
         let path = database_path();
         let incarnation_id = NodeIncarnationId::from_bytes([4; 16]);
-        let harness = HarnessService::from_engine_for_test(
+        let mut harness = HarnessService::from_engine_for_test(
             crate::credential::tests::engine(
                 1,
                 SessionGrantStateV1::Active,
@@ -15355,7 +15374,7 @@ mod tests {
         apply_managed_link(&mut observation, incarnation_id, 2, 2);
         assert_eq!(
             crate::read::verify_and_execute_read(
-                &harness,
+                &mut harness,
                 &observation,
                 &support,
                 &authority,

@@ -7825,6 +7825,7 @@ mod tests {
                         updated_at_unix_ms: observed_at_unix_ms,
                         blocked_count: 0,
                         last_blocked_at_ms: None,
+                        unread_mail: 0,
                     },
                     HarnessRuntimeManagedSessionV1 {
                         record_id: "record-b".to_owned(),
@@ -7845,6 +7846,7 @@ mod tests {
                         updated_at_unix_ms: observed_at_unix_ms,
                         blocked_count: 0,
                         last_blocked_at_ms: None,
+                        unread_mail: 0,
                     },
                 ],
                 managed_session_count: 2,

@@ -27,7 +27,7 @@ enum ObservationAudience {
 
 #[cfg(test)]
 pub(crate) fn verify_and_execute_read(
-    harness: &HarnessService,
+    harness: &mut HarnessService,
     observation: &ObservationService,
     support: &ObservationSupportRegistry,
     authority: &crate::credential::CredentialAuthority,
@@ -38,7 +38,8 @@ pub(crate) fn verify_and_execute_read(
     let claims = authority.verify(harness.engine(), credential, now_unix_ms)
         .map_err(|_| HarnessReadHostErrorV1::Unauthorized)?;
     verify_observation_binding(observation, support, &claims)?;
-    let response = execute_read(harness, observation, support, &claims, request)?;
+    let runtime_inventory = crate::runtime::HarnessRuntimeInventoryCache::default();
+    let response = execute_read(harness, observation, support, &claims, request, &runtime_inventory)?;
     response.validate().map_err(|_| HarnessReadHostErrorV1::Internal)?;
     Ok(response)
 }
@@ -81,11 +82,12 @@ pub(crate) fn verify_observation_credential_binding(
 }
 
 pub(crate) fn execute_read(
-    harness: &HarnessService,
+    harness: &mut HarnessService,
     observation: &ObservationService,
     support: &ObservationSupportRegistry,
     claims: &VerifiedCredentialV1,
     request: HarnessReadRequestV1,
+    runtime_inventory: &crate::runtime::HarnessRuntimeInventoryCache,
 ) -> Result<HarnessReadResponseV1, HarnessReadHostErrorV1> {
     execute_exact_binding_read(
         harness,
@@ -93,6 +95,7 @@ pub(crate) fn execute_read(
         support,
         &claims.binding,
         request,
+        runtime_inventory,
     )
 }
 
@@ -138,11 +141,12 @@ pub(crate) fn execute_operator_timeline(
 }
 
 pub(crate) fn execute_exact_binding_read(
-    harness: &HarnessService,
+    harness: &mut HarnessService,
     observation: &ObservationService,
     support: &ObservationSupportRegistry,
     binding: &CredentialBindingV1,
     request: HarnessReadRequestV1,
+    runtime_inventory: &crate::runtime::HarnessRuntimeInventoryCache,
 ) -> Result<HarnessReadResponseV1, HarnessReadHostErrorV1> {
     request.validate().map_err(|_| HarnessReadHostErrorV1::InvalidRequest)?;
     let engine = harness.engine();
@@ -155,12 +159,59 @@ pub(crate) fn execute_exact_binding_read(
     let visibility = engine.read_visibility(&grant.grant_id)
         .map_err(|_| HarnessReadHostErrorV1::Internal)?;
     authorize_request(grant, &request)?;
+    // Everything below this line that mutates (`SendMail`/`AckMail`) reads
+    // only owned values out of `grant`/`binding` first, then calls into
+    // `harness` -- never `engine`/`grant`/`visibility` again in that same
+    // arm -- so the immutable borrow of `harness` those two hold ends before
+    // the mutable one `HarnessService::send_mail`/`ack_mail` needs begins.
+    match request {
+        HarnessReadRequestV1::MailSend { to, subject, body, reply_to } => {
+            let grant_id = grant.grant_id.clone();
+            let actor_run_id = binding.actor_run_id.clone();
+            let now_unix_ms = unix_time_ms();
+            let from = resolve_caller_record_ref(binding, runtime_inventory);
+            let result = harness.send_mail(
+                grant_id, actor_run_id, from, to, subject, body, reply_to, now_unix_ms,
+            ).map_err(|_| HarnessReadHostErrorV1::Internal)?;
+            Ok(HarnessReadResponseV1::MailSend(result))
+        }
+        HarnessReadRequestV1::MailInbox { since_unix_ms, limit } => {
+            let page = mail_inbox_page(engine, &grant.grant_id, &binding.record_id, since_unix_ms, limit)?;
+            Ok(HarnessReadResponseV1::MailInbox(page))
+        }
+        HarnessReadRequestV1::MailAck { message_id } => {
+            let grant_id = grant.grant_id.clone();
+            let reader_record_id = binding.record_id.clone();
+            let actor_run_id = binding.actor_run_id.clone();
+            let now_unix_ms = unix_time_ms();
+            harness.ack_mail(
+                grant_id,
+                HarnessActorV1::ParentRun { run_id: actor_run_id },
+                reader_record_id,
+                message_id,
+                now_unix_ms,
+            ).map_err(|_| HarnessReadHostErrorV1::Internal)?;
+            Ok(HarnessReadResponseV1::MailAck(HarnessMailAckResultV1 { acked: true }))
+        }
+        _ => execute_exact_binding_read_only(harness.engine(), observation, support, binding, grant, &visibility, request),
+    }
+}
+
+fn execute_exact_binding_read_only(
+    engine: &gate4agent_harness_engine::HarnessEngine,
+    observation: &ObservationService,
+    support: &ObservationSupportRegistry,
+    binding: &CredentialBindingV1,
+    grant: &SessionGrantV1,
+    visibility: &HarnessReadVisibilityV1,
+    request: HarnessReadRequestV1,
+) -> Result<HarnessReadResponseV1, HarnessReadHostErrorV1> {
     match request {
         HarnessReadRequestV1::ContextGet => context(
-            engine, observation, grant, binding, &visibility,
+            engine, observation, grant, binding, visibility,
         ),
         HarnessReadRequestV1::MonitorGet { run_id } => {
-            let run_id = authorized_monitor_run(engine, grant, binding, &visibility, run_id)?;
+            let run_id = authorized_monitor_run(engine, grant, binding, visibility, run_id)?;
             monitor(
                 engine,
                 observation,
@@ -174,7 +225,7 @@ pub(crate) fn execute_exact_binding_read(
             if grant.monitoring_visibility != HarnessMonitoringVisibilityV1::Timeline {
                 return Err(HarnessReadHostErrorV1::NotFoundOrDenied);
             }
-            let run_id = authorized_monitor_run(engine, grant, binding, &visibility, run_id)?;
+            let run_id = authorized_monitor_run(engine, grant, binding, visibility, run_id)?;
             timeline(
                 engine,
                 observation,
@@ -190,7 +241,7 @@ pub(crate) fn execute_exact_binding_read(
                 .filter(|task_id| after_task_id.as_ref().map_or(true, |after| *task_id > after))
                 .filter_map(|task_id| engine.task(task_id))
                 .filter(|task| state.map_or(true, |state| task.state == state))
-                .map(|task| redact_task(task, &visibility))
+                .map(|task| redact_task(task, visibility))
                 .take(usize::from(limit) + 1)
                 .collect::<Vec<_>>();
             let has_more = values.len() > usize::from(limit);
@@ -206,7 +257,7 @@ pub(crate) fn execute_exact_binding_read(
             }
             let task = engine.task(&task_id)
                 .ok_or(HarnessReadHostErrorV1::NotFoundOrDenied)?;
-            Ok(HarnessReadResponseV1::Task(redact_task(task, &visibility)))
+            Ok(HarnessReadResponseV1::Task(redact_task(task, visibility)))
         }
         HarnessReadRequestV1::RunsList { task_id, after_run_id, lifecycle, limit } => {
             if task_id.as_ref().is_some_and(|task_id| !visibility.task_visible(task_id)) {
@@ -217,7 +268,7 @@ pub(crate) fn execute_exact_binding_read(
                 .filter_map(|run_id| engine.run(run_id))
                 .filter(|run| task_id.as_ref().map_or(true, |task_id| &run.task_id == task_id))
                 .filter(|run| lifecycle.map_or(true, |lifecycle| run.lifecycle == lifecycle))
-                .map(|run| redact_run(run, &visibility))
+                .map(|run| redact_run(run, visibility))
                 .take(usize::from(limit) + 1)
                 .collect::<Vec<_>>();
             let has_more = values.len() > usize::from(limit);
@@ -233,7 +284,7 @@ pub(crate) fn execute_exact_binding_read(
             }
             let run = engine.run(&run_id)
                 .ok_or(HarnessReadHostErrorV1::NotFoundOrDenied)?;
-            Ok(HarnessReadResponseV1::Run(redact_run(run, &visibility)))
+            Ok(HarnessReadResponseV1::Run(redact_run(run, visibility)))
         }
         HarnessReadRequestV1::OperationGet { operation_id } => {
             if !visibility.operation_visible(&operation_id) {
@@ -241,8 +292,15 @@ pub(crate) fn execute_exact_binding_read(
             }
             let operation = engine.operation(&operation_id)
                 .ok_or(HarnessReadHostErrorV1::NotFoundOrDenied)?;
-            Ok(HarnessReadResponseV1::Operation(redact_operation(operation, &visibility)))
+            Ok(HarnessReadResponseV1::Operation(redact_operation(operation, visibility)))
         }
+        // `MailSend`/`MailInbox`/`MailAck` never reach this function --
+        // `execute_exact_binding_read` dispatches all three itself, before
+        // ever delegating here. Never reached in practice; refused rather
+        // than panicking if it somehow were.
+        HarnessReadRequestV1::MailSend { .. }
+        | HarnessReadRequestV1::MailInbox { .. }
+        | HarnessReadRequestV1::MailAck { .. } => Err(HarnessReadHostErrorV1::InvalidRequest),
     }
 }
 
@@ -263,6 +321,12 @@ fn authorize_request(
         }
         HarnessReadRequestV1::OperationGet { .. }
             if grant.read_permissions.operations == HarnessEntityReadScopeV1::None =>
+        {
+            return Err(HarnessReadHostErrorV1::NotFoundOrDenied);
+        }
+        HarnessReadRequestV1::MailSend { .. }
+        | HarnessReadRequestV1::MailInbox { .. }
+        | HarnessReadRequestV1::MailAck { .. } if !grant.mail =>
         {
             return Err(HarnessReadHostErrorV1::NotFoundOrDenied);
         }
@@ -308,6 +372,7 @@ fn context(
         monitoring_visibility: grant.monitoring_visibility,
         maximum_child_count: grant.maximum_child_count,
         maximum_child_depth: grant.maximum_child_depth,
+        mail: grant.mail,
         allowed_tool_ids: allowed_tool_ids(grant),
         history_message_count: history.map(|history| history.message_count),
         completed_turn_count: history.and_then(|history| history.completed_turn_count),
@@ -557,7 +622,150 @@ pub(crate) fn harness_mcp_tool_id(request: &HarnessReadRequestV1) -> &'static st
         HarnessReadRequestV1::RunsList { .. } => "g4a_runs_list",
         HarnessReadRequestV1::RunGet { .. } => "g4a_runs_get",
         HarnessReadRequestV1::OperationGet { .. } => "g4a_operation_get",
+        HarnessReadRequestV1::MailSend { .. } => "g4a_mail_send",
+        HarnessReadRequestV1::MailInbox { .. } => "g4a_mail_inbox",
+        HarnessReadRequestV1::MailAck { .. } => "g4a_mail_ack",
     }
+}
+
+fn unix_time_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(1).max(1)
+}
+
+/// The sender identity a mail message's `from` carries -- read once, at send
+/// time, off the harness's own cached runtime inventory
+/// (`gate4agent-harness-service::runtime::HarnessRuntimeInventoryCache`, the
+/// same source `HarnessRuntimeManagedSessionV1.provider` already reads);
+/// never recomputed on a later `g4a_mail_inbox` read, which returns the
+/// stored `HarnessMailMessageV1.from` verbatim. Falls back to the literal
+/// `"unknown"` -- itself always a valid `HarnessSelectorV1` -- when the
+/// cache has no entry yet for this record (a fresh session, or an `Inline`
+/// caller with no `ManagedSessionRecord` at all): informational only, S9's
+/// mailbox never reads `from` to decide anything.
+fn resolve_caller_record_ref(
+    binding: &CredentialBindingV1,
+    runtime_inventory: &crate::runtime::HarnessRuntimeInventoryCache,
+) -> gate4agent_harness_protocol::HarnessRecordRef {
+    let provider_name = gate4agent_observation_api::NodeId::new(binding.node_id.as_str())
+        .ok()
+        .and_then(|node_id| runtime_inventory.node(&node_id))
+        .and_then(|node| {
+            node.inventory.managed_sessions.iter()
+                .find(|session| session.record_id == binding.record_id.as_str())
+                .map(|session| session.provider.clone())
+        });
+    let provider = provider_name
+        .and_then(|name| HarnessSelectorV1::new(name).ok())
+        .unwrap_or_else(|| {
+            HarnessSelectorV1::new("unknown")
+                .expect("the literal \"unknown\" satisfies HarnessSelectorV1's charset and length bound")
+        });
+    gate4agent_harness_protocol::HarnessRecordRef {
+        record_id: binding.record_id.clone(),
+        provider,
+    }
+}
+
+/// Builds the `g4a_mail_inbox` / operator `MailInbox` page for
+/// `reader_record_id` under `grant_id`'s own visibility
+/// (`HarnessEngine::mail_inbox`), converting each engine entry to the wire
+/// shape and counting unacked entries.
+fn mail_inbox_page(
+    engine: &gate4agent_harness_engine::HarnessEngine,
+    grant_id: &SessionGrantId,
+    reader_record_id: &HarnessSelectorV1,
+    since_unix_ms: Option<u64>,
+    limit: u16,
+) -> Result<HarnessMailInboxPageV1, HarnessReadHostErrorV1> {
+    let entries = engine.mail_inbox(grant_id, reader_record_id, since_unix_ms, usize::from(limit))
+        .map_err(|_| HarnessReadHostErrorV1::Internal)?;
+    let unacked = entries.iter().filter(|entry| !entry.acked).count() as u64;
+    let messages = entries.into_iter().map(|entry| HarnessMailInboxEntryV1 {
+        message_id: entry.message.message_id,
+        from: entry.message.from,
+        to: entry.message.to,
+        subject: entry.message.subject,
+        body: entry.message.body,
+        reply_to: entry.message.reply_to,
+        task_id: entry.message.task_id,
+        created_at_unix_ms: entry.message.created_at_unix_ms,
+        acked: entry.acked,
+        thread: entry.thread.into_iter()
+            .map(|message| message.message_id)
+            .take(usize::from(HARNESS_MAIL_THREAD_IDS_MAX))
+            .collect(),
+    }).collect();
+    Ok(HarnessMailInboxPageV1 { messages, unacked })
+}
+
+/// The operator wire's `MailInbox`, keyed by a bare `record_id` rather than
+/// a grant -- resolves the record's own current mail-permitted grant
+/// (`crate::mail_grant_for_record`) and reuses `mail_inbox_page` when one
+/// exists. Without one (a dormant record with no currently mail-permitted
+/// run bound to it), falls back to a direct scan of session-addressed mail
+/// only: task-addressed/forum mail needs a grant's own visibility and stays
+/// unavailable without one, and this fallback's entries carry an empty
+/// `thread` (the transitive `reply_to` closure is `HarnessEngine::mail_inbox`'s
+/// own internal algorithm, not reproduced here without a grant to call it
+/// through).
+pub(crate) fn operator_mail_inbox(
+    engine: &gate4agent_harness_engine::HarnessEngine,
+    record_id: &HarnessSelectorV1,
+    since_unix_ms: Option<u64>,
+    limit: u16,
+) -> Result<HarnessMailInboxPageV1, HarnessReadHostErrorV1> {
+    if let Some(grant_id) = crate::mail_grant_for_record(engine, record_id) {
+        return mail_inbox_page(engine, &grant_id, record_id, since_unix_ms, limit);
+    }
+    let mut matches: Vec<_> = engine.mail_messages()
+        .filter(|message| matches!(
+            &message.to,
+            HarnessMailAddressV1::Session { record_id: to } if to == record_id
+        ))
+        .filter(|message| since_unix_ms.map_or(true, |since| message.created_at_unix_ms >= since))
+        .cloned()
+        .collect();
+    matches.sort_by(|left, right| {
+        let left_acked = engine.mail_ack(&left.message_id, record_id).is_some();
+        let right_acked = engine.mail_ack(&right.message_id, record_id).is_some();
+        left_acked.cmp(&right_acked)
+            .then(left.created_at_unix_ms.cmp(&right.created_at_unix_ms))
+            .then(left.message_id.cmp(&right.message_id))
+    });
+    matches.truncate(usize::from(limit));
+    let unacked = matches.iter()
+        .filter(|message| engine.mail_ack(&message.message_id, record_id).is_none())
+        .count() as u64;
+    let messages = matches.into_iter().map(|message| {
+        let acked = engine.mail_ack(&message.message_id, record_id).is_some();
+        HarnessMailInboxEntryV1 {
+            message_id: message.message_id,
+            from: message.from,
+            to: message.to,
+            subject: message.subject,
+            body: message.body,
+            reply_to: message.reply_to,
+            task_id: message.task_id,
+            created_at_unix_ms: message.created_at_unix_ms,
+            acked,
+            thread: Vec::new(),
+        }
+    }).collect();
+    Ok(HarnessMailInboxPageV1 { messages, unacked })
+}
+
+/// The `unread_mail` fill for one managed session (`runtime.rs`'s
+/// `fill_managed_session_blocked_stats`): the same page `operator_mail_inbox`
+/// would build for this record right now, counted rather than paged.
+pub(crate) fn count_unread_mail(
+    engine: &gate4agent_harness_engine::HarnessEngine,
+    record_id: &HarnessSelectorV1,
+) -> u64 {
+    operator_mail_inbox(engine, record_id, None, HARNESS_ENTITY_PAGE_LIMIT_MAX)
+        .map(|page| page.unacked)
+        .unwrap_or(0)
 }
 
 fn redact_task(
@@ -1564,17 +1772,18 @@ mod tests {
     #[test]
     fn context_task_and_sibling_runs_are_scoped_to_the_actor_task_and_never_cross_tasks() {
         let path = observation_path("context-task-siblings");
-        let harness = HarnessService::from_engine_for_test(task_with_siblings_engine());
+        let mut harness = HarnessService::from_engine_for_test(task_with_siblings_engine());
         let observation = ObservationService::open(&path).unwrap();
         let binding = crate::credential::tests::binding(1, 1);
         let support = ObservationSupportRegistry::default();
 
         let HarnessReadResponseV1::Context(context) = execute_exact_binding_read(
-            &harness,
+            &mut harness,
             &observation,
             &support,
             &binding,
             HarnessReadRequestV1::ContextGet,
+            &crate::runtime::HarnessRuntimeInventoryCache::default(),
         ).unwrap() else {
             panic!("context response");
         };
@@ -1637,7 +1846,7 @@ mod tests {
     #[test]
     fn context_hides_task_and_sibling_runs_when_grant_denies_task_reads() {
         let path = observation_path("context-task-siblings-denied");
-        let harness = HarnessService::from_engine_for_test(
+        let mut harness = HarnessService::from_engine_for_test(
             crate::credential::tests::engine(
                 1,
                 SessionGrantStateV1::Active,
@@ -1650,11 +1859,12 @@ mod tests {
         let support = ObservationSupportRegistry::default();
 
         let HarnessReadResponseV1::Context(context) = execute_exact_binding_read(
-            &harness,
+            &mut harness,
             &observation,
             &support,
             &binding,
             HarnessReadRequestV1::ContextGet,
+            &crate::runtime::HarnessRuntimeInventoryCache::default(),
         ).unwrap() else {
             panic!("context response");
         };
@@ -1886,7 +2096,7 @@ mod tests {
             HarnessRunLifecycleV1::Running,
         ).checkpoint();
         checkpoint.grants[0].monitoring_visibility = HarnessMonitoringVisibilityV1::Timeline;
-        let harness = HarnessService::from_engine_for_test(
+        let mut harness = HarnessService::from_engine_for_test(
             gate4agent_harness_engine::HarnessEngine::restore(checkpoint).unwrap(),
         );
         let mut observation = ObservationService::open(&path).unwrap();
@@ -1972,16 +2182,17 @@ mod tests {
         let binding = crate::credential::tests::binding(1, 1);
         let support = ObservationSupportRegistry::default();
         let HarnessReadResponseV1::Monitor(monitor) = execute_exact_binding_read(
-            &harness,
+            &mut harness,
             &observation,
             &support,
             &binding,
             HarnessReadRequestV1::MonitorGet { run_id: Some(run_id.clone()) },
+            &crate::runtime::HarnessRuntimeInventoryCache::default(),
         ).unwrap() else {
             panic!("monitor response");
         };
         let HarnessReadResponseV1::Timeline(timeline) = execute_exact_binding_read(
-            &harness,
+            &mut harness,
             &observation,
             &support,
             &binding,
@@ -1990,6 +2201,7 @@ mod tests {
                 after_sequence: None,
                 limit: HARNESS_TIMELINE_PAGE_LIMIT_MAX,
             },
+            &crate::runtime::HarnessRuntimeInventoryCache::default(),
         ).unwrap() else {
             panic!("timeline response");
         };

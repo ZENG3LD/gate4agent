@@ -15,8 +15,8 @@ use gate4agent_harness_engine::{
     HarnessMutationV1, PreparedHarnessMutation,
 };
 use gate4agent_harness_api::{
-    HarnessReplaceTaskExecutionSpecRequestV2, HarnessReviewedWorktreeSelectionV1,
-    HarnessStartTaskRequestV2, HarnessTaskLaunchOptionsV1,
+    HarnessMailSendResultV1, HarnessReplaceTaskExecutionSpecRequestV2,
+    HarnessReviewedWorktreeSelectionV1, HarnessStartTaskRequestV2, HarnessTaskLaunchOptionsV1,
 };
 use gate4agent_harness_protocol::{
     HarnessActorV1, HarnessCancelTaskRequestV1, HarnessCreateTaskRequestV1,
@@ -773,6 +773,47 @@ impl HarnessService {
             HarnessTaskStateV1::Ready,
             command_digest,
         )
+    }
+
+    /// The operator's own ack (`docs/gate4agent/plans/
+    /// gate4agent-arc-mailbox-and-task-layer-2026-09-02.md` §3 Slice B): an
+    /// operator act, applied through the identical `HarnessMutationV1::
+    /// AckMail` mutation an agent's own `g4a_mail_ack` uses. `AckMail`'s own
+    /// authority is a `mail`-permitted `SessionGrantV1`, not a bare operator
+    /// identity (`HarnessOperationKindV1::AckMail`'s `validate_kind_targets`
+    /// requires `grant_id: Some(_)`) -- this resolves the most recently
+    /// created active, mail-permitted grant currently bound to
+    /// `request.record_id` (the record's own run, whichever one that is) to
+    /// supply it, while the operation's own `actor` records the operator,
+    /// not that grant's run, so the audit trail names who actually acted.
+    pub fn operator_ack_mail(
+        &mut self,
+        request: gate4agent_harness_api::HarnessMailAckOperatorRequestV1,
+    ) -> Result<HarnessApplyOutcome, HarnessServiceError> {
+        self.ensure_healthy()?;
+        request.validate()?;
+        let command_digest = operator_command_digest("ack-mail", &request)?;
+        if let Some(outcome) = self.replay_operator_request(
+            &request.authority.operation_id,
+            &command_digest,
+            HarnessOperationKindV1::AckMail,
+        )? {
+            return Ok(outcome);
+        }
+        let grant_id = mail_grant_for_record(&self.engine, &request.record_id)
+            .ok_or_else(|| HarnessEngineError::NotFound(request.record_id.as_str().to_owned()))?;
+        let operation = mail_operation(
+            &grant_id,
+            HarnessActorV1::User { actor_id: request.authority.actor_id.clone() },
+            HarnessOperationKindV1::AckMail,
+            request.authority.now_unix_ms,
+        )?;
+        let ack = gate4agent_harness_protocol::HarnessMailAckV1 {
+            message_id: request.message_id,
+            reader_record_id: request.record_id,
+            acked_at_unix_ms: request.authority.now_unix_ms,
+        };
+        self.commit_operator_mutation(HarnessMutationV1::AckMail { operation, ack }, command_digest)
     }
 
     pub fn task_execution_spec(
@@ -2653,6 +2694,87 @@ impl HarnessService {
         }
         self.commit_prepared(prepared, self.dispatch_contexts.clone())?;
         Ok(outcome)
+    }
+
+    /// D1's `g4a_mail_send`, called under `grant_id`'s own authority
+    /// (`ParentRun` actor, the calling run) through `HarnessMutationV1::
+    /// SendMail` -- the same `apply` every other mutation kind uses, digest
+    /// computed here the same way `resolve_harness_mcp_grant` computes one
+    /// for a freshly minted grant. A named refusal (unknown/ended recipient,
+    /// no `mail` permission) is `engine.prepare`'s own `HarnessEngineError`
+    /// `Display` text, carried back as `HarnessMailSendResultV1::Refused`
+    /// rather than propagated as a host error (D1: "a named refusal, never a
+    /// silent drop").
+    pub(crate) fn send_mail(
+        &mut self,
+        grant_id: SessionGrantId,
+        actor_run_id: HarnessRunId,
+        from: gate4agent_harness_protocol::HarnessRecordRef,
+        to: HarnessMailAddressV1,
+        subject: String,
+        body: String,
+        reply_to: Option<gate4agent_harness_protocol::HarnessMailMessageId>,
+        now_unix_ms: u64,
+    ) -> Result<HarnessMailSendResultV1, HarnessServiceError> {
+        self.ensure_healthy()?;
+        let message_id = derived_mail_id(
+            "hmail_",
+            b"gate4agent-harness-mail-message-id-v1",
+            &next_mail_nonce_material(&grant_id, now_unix_ms),
+            gate4agent_harness_protocol::HarnessMailMessageId::new,
+        )?;
+        let operation = mail_operation(
+            &grant_id,
+            HarnessActorV1::ParentRun { run_id: actor_run_id },
+            HarnessOperationKindV1::SendMail,
+            now_unix_ms,
+        )?;
+        let message = gate4agent_harness_protocol::HarnessMailMessageV1 {
+            message_id: message_id.clone(),
+            from,
+            to,
+            subject,
+            body,
+            reply_to,
+            task_id: None,
+            created_at_unix_ms: now_unix_ms,
+        };
+        let mut mutation = HarnessMutationV1::SendMail { operation, message };
+        mutation.operation_mut().request_digest = mutation_request_digest(&mutation)?;
+        match self.apply(mutation) {
+            Ok(_) => Ok(HarnessMailSendResultV1::Accepted { message_id }),
+            Err(HarnessServiceError::Engine(error @ (
+                HarnessEngineError::MailRecipientUnknown { .. }
+                | HarnessEngineError::MailRecipientEnded { .. }
+                | HarnessEngineError::MailPermissionDenied { .. }
+            ))) => Ok(HarnessMailSendResultV1::Refused { reason: error.to_string() }),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// D1's `g4a_mail_ack`, and the operator's own ack
+    /// (`operator_ack_mail`'s call site below passes an operator `actor`
+    /// with the record's own resolved grant). Idempotent by construction
+    /// (`HarnessEngine::prepare`'s `AckMail` arm): acking an already-acked
+    /// `(message_id, reader_record_id)` pair is a no-op success.
+    pub(crate) fn ack_mail(
+        &mut self,
+        grant_id: SessionGrantId,
+        actor: HarnessActorV1,
+        reader_record_id: HarnessSelectorV1,
+        message_id: gate4agent_harness_protocol::HarnessMailMessageId,
+        now_unix_ms: u64,
+    ) -> Result<HarnessApplyOutcome, HarnessServiceError> {
+        self.ensure_healthy()?;
+        let operation = mail_operation(&grant_id, actor, HarnessOperationKindV1::AckMail, now_unix_ms)?;
+        let ack = gate4agent_harness_protocol::HarnessMailAckV1 {
+            message_id,
+            reader_record_id,
+            acked_at_unix_ms: now_unix_ms,
+        };
+        let mut mutation = HarnessMutationV1::AckMail { operation, ack };
+        mutation.operation_mut().request_digest = mutation_request_digest(&mutation)?;
+        self.apply(mutation)
     }
 
     pub fn prepare_delivery_from_compiled(
@@ -5214,6 +5336,115 @@ fn operator_actor(authority: &HarnessOperatorAuthorityV1) -> HarnessActorV1 {
     HarnessActorV1::User {
         actor_id: authority.actor_id.clone(),
     }
+}
+
+/// The mailbox arc's own operation builder for `SendMail`/`AckMail`: unlike
+/// `operator_task_operation`, these two kinds carry `grant_id: Some(_)` and
+/// no `task_id` (`HarnessOperationKindV1::validate_kind_targets`), so they do
+/// not fit that helper's shape. `request_digest` is the same "0".repeat(64)
+/// placeholder every other production call site uses before the real digest
+/// is computed over the finished mutation (`mutation_request_digest`) --
+/// see `send_mail`/`ack_mail`/`operator_ack_mail`'s own call sites.
+fn mail_operation(
+    grant_id: &SessionGrantId,
+    actor: HarnessActorV1,
+    kind: HarnessOperationKindV1,
+    now_unix_ms: u64,
+) -> Result<HarnessOperationV1, HarnessServiceError> {
+    let material = next_mail_nonce_material(grant_id, now_unix_ms);
+    Ok(HarnessOperationV1 {
+        operation_id: derived_mail_id(
+            "hop_",
+            b"gate4agent-harness-mail-operation-id-v1",
+            &material,
+            HarnessOperationId::new,
+        )?,
+        revision: HarnessRevision::new(1)?,
+        actor,
+        kind,
+        state: HarnessOperationStateV1::Succeeded,
+        task_id: None,
+        run_id: None,
+        grant_id: Some(grant_id.clone()),
+        reconciles_operation_id: None,
+        expected_revision: None,
+        request_digest: HarnessRequestDigest::new("0".repeat(64))?,
+        idempotency_ref: derived_mail_id(
+            "hidem_",
+            b"gate4agent-harness-mail-idempotency-ref-v1",
+            &material,
+            HarnessIdempotencyRef::new,
+        )?,
+        failure: None,
+        outcome_unknown_reason: None,
+        reconciliation_outcome: None,
+        created_at_unix_ms: now_unix_ms,
+        updated_at_unix_ms: now_unix_ms,
+        dispatched_at_unix_ms: None,
+        finished_at_unix_ms: Some(now_unix_ms),
+    })
+}
+
+/// One-shot, process-local nonce material for minting a mail message,
+/// operation, or idempotency id: `harnessctl`'s own `random_hex24` doc
+/// comment states the bar this meets exactly -- "uniqueness (not
+/// unpredictability) is all that is required here." Domain-separated HMAC
+/// (`derived_mail_id`'s own `domain` argument) turns this one nonce into as
+/// many independent ids as a caller needs from it.
+fn next_mail_nonce_material(grant_id: &SessionGrantId, now_unix_ms: u64) -> Vec<u8> {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{grant_id}|{now_unix_ms}|{sequence}|{}", std::process::id()).into_bytes()
+}
+
+fn derived_mail_id<T>(
+    prefix: &str,
+    domain: &[u8],
+    material: &[u8],
+    constructor: impl FnOnce(String) -> Result<T, HarnessValidationError>,
+) -> Result<T, HarnessServiceError> {
+    let digest = gate4agent_node_wire::local_hmac_sha256(domain, material)
+        .map_err(HarnessServiceError::MutationDigest)?;
+    let mut nonce = String::with_capacity(24);
+    for byte in &digest[..12] {
+        use std::fmt::Write as _;
+        write!(&mut nonce, "{byte:02x}").expect("writing a hex byte to a String cannot fail");
+    }
+    Ok(constructor(format!("{prefix}{nonce}"))?)
+}
+
+/// Resolves the grant `operator_ack_mail`/the mailbox-inventory fill
+/// (`gate4agent-harness-service::runtime::fill_managed_session_blocked_stats`)
+/// use to read or ack mail on behalf of a bare `record_id`: the most
+/// recently created active, mail-permitted grant whose `actor_run_id` is
+/// bound to a run currently claiming that record (the same `Managed`
+/// binding match `HarnessEngine::validate_mail_recipient` uses internally,
+/// reproduced here from the engine's public `runs()`/`grants()` iterators
+/// since this lookup belongs to the operator-wire surface, not the engine
+/// itself). `None` when no such grant exists -- callers decide what that
+/// means (a `NotFound` refusal for an ack, an empty fallback scan for a
+/// count).
+pub(crate) fn mail_grant_for_record(
+    engine: &HarnessEngine,
+    record_id: &HarnessSelectorV1,
+) -> Option<SessionGrantId> {
+    let bound_runs: BTreeSet<HarnessRunId> = engine.runs()
+        .filter(|run| {
+            matches!(
+                run.binding.as_ref().map(|binding| &binding.session),
+                Some(HarnessSessionIdentityV1::Managed { record_id: bound, .. })
+                    if bound == record_id
+            )
+        })
+        .map(|run| run.run_id.clone())
+        .collect();
+    engine.grants()
+        .filter(|grant| bound_runs.contains(&grant.actor_run_id))
+        .filter(|grant| {
+            grant.state == gate4agent_harness_protocol::SessionGrantStateV1::Active && grant.mail
+        })
+        .max_by_key(|grant| grant.created_at_unix_ms)
+        .map(|grant| grant.grant_id.clone())
 }
 
 fn operator_task_operation(

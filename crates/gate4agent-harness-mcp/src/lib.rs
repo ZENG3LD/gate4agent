@@ -3,10 +3,11 @@
 use std::{io::{BufRead, Write}, net::SocketAddr};
 
 use gate4agent_harness_client::{
-    HarnessOperationId, HarnessReadClient, HarnessReadClientError, HarnessReadCredential,
-    HarnessReadHostErrorV1, HarnessReadResponseV1, HarnessRunId, HarnessRunLifecycleV1,
-    HarnessTaskId, HarnessTaskStateV1, SessionContextV1, HARNESS_READ_REQUEST_MAX_BYTES,
-    HARNESS_READ_RESPONSE_MAX_BYTES, HARNESS_READ_TOOL_IDS,
+    HarnessMailAddressV1, HarnessMailMessageId, HarnessOperationId, HarnessReadClient,
+    HarnessReadClientError, HarnessReadCredential, HarnessReadHostErrorV1, HarnessReadResponseV1,
+    HarnessRunId, HarnessRunLifecycleV1, HarnessSelectorV1, HarnessTaskId, HarnessTaskStateV1,
+    SessionContextV1, HARNESS_READ_REQUEST_MAX_BYTES, HARNESS_READ_RESPONSE_MAX_BYTES,
+    HARNESS_READ_TOOL_IDS, HARNESS_WRITE_TOOL_IDS,
 };
 use gate4agent_node_protocol::HarnessReadRequestV1;
 use gate4agent_node_wire::{LocalSessionHarnessMcpClient, LocalSessionHarnessMcpError};
@@ -58,6 +59,19 @@ impl HarnessMcpBackend for HarnessReadClient {
             HarnessMcpToolCall::OperationGet { operation_id } => {
                 HarnessReadResponseV1::Operation(self.operation_get(operation_id).map_err(HarnessMcpBackendError::from)?)
             }
+            HarnessMcpToolCall::MailSend { to, subject, body, reply_to } => {
+                HarnessReadResponseV1::MailSend(
+                    self.mail_send(to, subject, body, reply_to).map_err(HarnessMcpBackendError::from)?,
+                )
+            }
+            HarnessMcpToolCall::MailInbox { since_unix_ms, limit } => {
+                HarnessReadResponseV1::MailInbox(
+                    self.mail_inbox(since_unix_ms, limit).map_err(HarnessMcpBackendError::from)?,
+                )
+            }
+            HarnessMcpToolCall::MailAck { message_id } => {
+                HarnessReadResponseV1::MailAck(self.mail_ack(message_id).map_err(HarnessMcpBackendError::from)?)
+            }
         };
         Ok(response)
     }
@@ -96,6 +110,13 @@ fn tool_call_request(call: HarnessMcpToolCall) -> HarnessReadRequestV1 {
         HarnessMcpToolCall::OperationGet { operation_id } => {
             HarnessReadRequestV1::OperationGet { operation_id }
         }
+        HarnessMcpToolCall::MailSend { to, subject, body, reply_to } => {
+            HarnessReadRequestV1::MailSend { to, subject, body, reply_to }
+        }
+        HarnessMcpToolCall::MailInbox { since_unix_ms, limit } => {
+            HarnessReadRequestV1::MailInbox { since_unix_ms, limit }
+        }
+        HarnessMcpToolCall::MailAck { message_id } => HarnessReadRequestV1::MailAck { message_id },
     }
 }
 
@@ -114,6 +135,14 @@ pub enum HarnessMcpToolCall {
     },
     RunGet { run_id: HarnessRunId },
     OperationGet { operation_id: HarnessOperationId },
+    MailSend {
+        to: HarnessMailAddressV1,
+        subject: String,
+        body: String,
+        reply_to: Option<HarnessMailMessageId>,
+    },
+    MailInbox { since_unix_ms: Option<u64>, limit: u16 },
+    MailAck { message_id: HarnessMailMessageId },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -302,7 +331,8 @@ impl<B: HarnessMcpBackend> HarnessMcpServer<B> {
             return rpc_error(id, -32603, "harness read unavailable");
         }
         if !context.allowed_tool_ids.iter().any(|allowed| allowed == &params.name)
-            || !HARNESS_READ_TOOL_IDS.contains(&params.name.as_str())
+            || !(HARNESS_READ_TOOL_IDS.contains(&params.name.as_str())
+                || HARNESS_WRITE_TOOL_IDS.contains(&params.name.as_str()))
         {
             return rpc_error(id, -32601, "method not found");
         }
@@ -477,6 +507,34 @@ struct RunGetArgs { run_id: String }
 #[serde(deny_unknown_fields)]
 struct OperationGetArgs { operation_id: String }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MailAddressArgs { session: Option<String>, task: Option<String> }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MailSendArgs { to: MailAddressArgs, subject: String, body: String, reply_to: Option<String> }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MailInboxArgs { since_unix_ms: Option<u64>, #[serde(default = "default_limit")] limit: u16 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MailAckArgs { message_id: String }
+
+fn parse_mail_address(args: MailAddressArgs) -> Result<HarnessMailAddressV1, ()> {
+    match (args.session, args.task) {
+        (Some(record_id), None) => Ok(HarnessMailAddressV1::Session {
+            record_id: HarnessSelectorV1::new(record_id).map_err(|_| ())?,
+        }),
+        (None, Some(task_id)) => Ok(HarnessMailAddressV1::Task {
+            task_id: HarnessTaskId::new(task_id).map_err(|_| ())?,
+        }),
+        _ => Err(()),
+    }
+}
+
 fn parse_tool_call(name: &str, arguments: Value) -> Result<HarnessMcpToolCall, ()> {
     match name {
         "g4a_context_get" => {
@@ -527,6 +585,24 @@ fn parse_tool_call(name: &str, arguments: Value) -> Result<HarnessMcpToolCall, (
             let args: OperationGetArgs = serde_json::from_value(arguments).map_err(|_| ())?;
             Ok(HarnessMcpToolCall::OperationGet { operation_id: HarnessOperationId::new(args.operation_id).map_err(|_| ())? })
         }
+        "g4a_mail_send" => {
+            let args: MailSendArgs = serde_json::from_value(arguments).map_err(|_| ())?;
+            Ok(HarnessMcpToolCall::MailSend {
+                to: parse_mail_address(args.to)?,
+                subject: args.subject,
+                body: args.body,
+                reply_to: parse_optional(args.reply_to, HarnessMailMessageId::new)?,
+            })
+        }
+        "g4a_mail_inbox" => {
+            let args: MailInboxArgs = serde_json::from_value(arguments).map_err(|_| ())?;
+            if !(1..=64).contains(&args.limit) { return Err(()); }
+            Ok(HarnessMcpToolCall::MailInbox { since_unix_ms: args.since_unix_ms, limit: args.limit })
+        }
+        "g4a_mail_ack" => {
+            let args: MailAckArgs = serde_json::from_value(arguments).map_err(|_| ())?;
+            Ok(HarnessMcpToolCall::MailAck { message_id: HarnessMailMessageId::new(args.message_id).map_err(|_| ())? })
+        }
         _ => Err(()),
     }
 }
@@ -545,18 +621,60 @@ fn tool_definitions() -> Vec<Value> {
         tool("g4a_runs_list", "List visible harness runs.", object_schema(vec![("task_id", string_schema()), ("after_run_id", string_schema()), ("lifecycle", enum_schema(&["requested","preparing","dispatching","outcome-unknown","running","waiting","completed","failed","cancelled"])), ("limit", integer_schema(1, 64))], vec![])),
         tool("g4a_runs_get", "Read one visible harness run.", object_schema(vec![("run_id", string_schema())], vec!["run_id"])),
         tool("g4a_operation_get", "Read one visible harness operation.", object_schema(vec![("operation_id", string_schema())], vec!["operation_id"])),
+        // Ordered to match `HARNESS_WRITE_TOOL_IDS` (alphabetical), the same
+        // way the eight reads above are ordered to match `HARNESS_READ_TOOL_IDS`
+        // -- `all_eight_tool_schemas_are_stable_and_closed` zips both.
+        tool_with_hints(
+            "g4a_mail_ack",
+            "Acknowledge one mail message. Idempotent: acking an already-acked message succeeds again.",
+            object_schema(vec![("message_id", string_schema())], vec!["message_id"]),
+            false,
+            true,
+        ),
+        tool_with_hints(
+            "g4a_mail_inbox",
+            "Read waiting mail addressed to this session or to a task it can see.",
+            object_schema(vec![
+                ("since_unix_ms", integer_schema(1, u64::MAX)),
+                ("limit", integer_schema(1, 64)),
+            ], vec![]),
+            true,
+            true,
+        ),
+        tool_with_hints(
+            "g4a_mail_send",
+            "Send mail to a session record or a task's forum. Returns the queued message id or the engine's named refusal.",
+            object_schema(vec![
+                ("to", mail_address_schema()),
+                ("subject", title_schema()),
+                ("body", body_schema()),
+                ("reply_to", string_schema()),
+            ], vec!["to", "subject", "body"]),
+            false,
+            false,
+        ),
     ]
 }
 
 fn tool(name: &str, description: &str, input_schema: Value) -> Value {
+    tool_with_hints(name, description, input_schema, true, true)
+}
+
+fn tool_with_hints(
+    name: &str,
+    description: &str,
+    input_schema: Value,
+    read_only: bool,
+    idempotent: bool,
+) -> Value {
     json!({
         "name": name,
         "description": description,
         "inputSchema": input_schema,
         "annotations": {
-            "readOnlyHint": true,
+            "readOnlyHint": read_only,
             "destructiveHint": false,
-            "idempotentHint": true,
+            "idempotentHint": idempotent,
             "openWorldHint": false
         }
     })
@@ -570,6 +688,15 @@ fn object_schema(properties: Vec<(&str, Value)>, required: Vec<&str>) -> Value {
 fn string_schema() -> Value { json!({ "type": "string", "minLength": 1, "maxLength": 128 }) }
 fn integer_schema(minimum: u64, maximum: u64) -> Value { json!({ "type": "integer", "minimum": minimum, "maximum": maximum }) }
 fn enum_schema(values: &[&str]) -> Value { json!({ "type": "string", "enum": values }) }
+fn title_schema() -> Value { json!({ "type": "string", "minLength": 1, "maxLength": 256 }) }
+fn body_schema() -> Value { json!({ "type": "string", "maxLength": 8_192 }) }
+fn mail_address_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": { "session": string_schema(), "task": string_schema() },
+        "additionalProperties": false
+    })
+}
 fn empty_object() -> Value { json!({}) }
 fn default_limit() -> u16 { DEFAULT_LIMIT }
 
@@ -729,6 +856,7 @@ mod tests {
                 monitoring_visibility: HarnessMonitoringVisibilityV1::None,
                 maximum_child_count: 0,
                 maximum_child_depth: 0,
+                mail: false,
                 allowed_tool_ids: self.allowed.borrow().clone(),
                 history_message_count: None,
                 completed_turn_count: None,
@@ -897,12 +1025,36 @@ mod tests {
     #[test]
     fn all_eight_tool_schemas_are_stable_and_closed() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), HARNESS_READ_TOOL_IDS.len());
-        for (tool, expected_name) in tools.iter().zip(HARNESS_READ_TOOL_IDS) {
-            assert_eq!(tool["name"], expected_name);
+        assert_eq!(tools.len(), HARNESS_READ_TOOL_IDS.len() + HARNESS_WRITE_TOOL_IDS.len());
+        let expected_names = HARNESS_READ_TOOL_IDS.iter().chain(HARNESS_WRITE_TOOL_IDS.iter());
+        for (tool, expected_name) in tools.iter().zip(expected_names) {
+            assert_eq!(tool["name"], *expected_name);
             assert_eq!(tool["inputSchema"]["type"], "object");
             assert_eq!(tool["inputSchema"]["additionalProperties"], false);
         }
+    }
+
+    /// D7: "not an authority channel, by construction and by test." No
+    /// catalog id resembles `ResolveInteraction` (the sole approval-answering
+    /// verb, operator-wire only) and `tools/call` refuses that exact name by
+    /// name (-32601), the same closed-catalog path `hidden_tools_are_method_
+    /// not_found_and_object_denial_is_generic` above already exercises for a
+    /// legitimate-but-ungranted tool id.
+    #[test]
+    fn d7_no_tool_reaches_resolve_interaction_and_write_tool_ids_are_exactly_mail() {
+        assert_eq!(HARNESS_WRITE_TOOL_IDS, ["g4a_mail_ack", "g4a_mail_inbox", "g4a_mail_send"]);
+        assert!(HARNESS_READ_TOOL_IDS.iter().chain(HARNESS_WRITE_TOOL_IDS.iter()).all(|id| {
+            !id.contains("resolve_interaction") && !id.contains("resolve-interaction")
+        }));
+
+        let mut server = HarnessMcpServer::new(fixture());
+        initialize(&mut server);
+        let refused = request(&mut server, json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"g4a_resolve_interaction","arguments":{}}
+        }));
+        assert_eq!(refused["error"]["code"], -32601);
+        assert_eq!(server.backend.calls.get(), 0);
     }
 
     #[test]

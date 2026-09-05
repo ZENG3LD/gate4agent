@@ -3377,12 +3377,13 @@ pub fn correlate_session_record_mutation_response(
 /// `provider_session`/`last_error`), the type every session-record `C2NodeResponse`
 /// carries.
 ///
-/// `blocked_count`/`last_blocked_at_ms` are always `0`/`None` here, same as
-/// in `redact_runtime_inventory`: this function has no `ObservationService`
-/// in scope (it runs off a C2 mutation-completion reply, not an operator
-/// read), and only `fill_managed_session_blocked_stats` in `runtime.rs`
-/// (the `RuntimeInventoryList` reply path) fills them from the harness's own
-/// observation projection.
+/// `blocked_count`/`last_blocked_at_ms`/`unread_mail` are always `0`/`None`/
+/// `0` here, same as in `redact_runtime_inventory`: this function has no
+/// `ObservationService` or `HarnessEngine` in scope (it runs off a C2
+/// mutation-completion reply, not an operator read), and only
+/// `fill_managed_session_blocked_stats` in `runtime.rs` (the
+/// `RuntimeInventoryList` reply path) fills all three from the harness's own
+/// state.
 fn project_c2_managed_session(
     record: C2ManagedSessionRecord,
 ) -> Result<HarnessRuntimeManagedSessionV1, HarnessC2Error> {
@@ -3424,6 +3425,7 @@ fn project_c2_managed_session(
         updated_at_unix_ms: record.updated_at_unix_ms,
         blocked_count: 0,
         last_blocked_at_ms: None,
+        unread_mail: 0,
     })
 }
 

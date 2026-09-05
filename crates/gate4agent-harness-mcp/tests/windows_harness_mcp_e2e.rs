@@ -60,7 +60,7 @@ use gate4agent_testkit::{
     MONITORING_PROVIDER_SESSION_CANARY, MONITORING_TOOL_INPUT_CANARY,
     MONITORING_TOOL_OUTPUT_CANARY,
 };
-use gate4agent_types::{AgentId, TerminalSize};
+use gate4agent_types::{AgentId, ApprovalLevel, TerminalSize};
 use serde_json::{json, Value};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -330,6 +330,7 @@ fn create_grant(
         },
         monitoring_visibility: HarnessMonitoringVisibilityV1::Timeline,
         context_permissions: HarnessContextPermissionsV1 { export: false, restore: false },
+        mail: false,
         state: SessionGrantStateV1::Active,
         created_at_unix_ms: now,
         updated_at_unix_ms: now,
@@ -386,6 +387,7 @@ fn create_h3b_grant(
         },
         monitoring_visibility: HarnessMonitoringVisibilityV1::Timeline,
         context_permissions: HarnessContextPermissionsV1 { export: false, restore: false },
+        mail: false,
         state: SessionGrantStateV1::Active,
         created_at_unix_ms: now,
         updated_at_unix_ms: now,
@@ -427,6 +429,7 @@ fn h3b_schedule_plan(
             revision: grant.revision,
         },
         harness_mcp: HarnessMcpPolicyV1::GrantBound,
+        approval_level: ApprovalLevel::FullAuto,
         deadline_ms: 90_000,
     }
 }
@@ -453,6 +456,7 @@ fn ordinary_schedule_plan(
         continuation: HarnessContinuationPolicyV1::None,
         grant: HarnessGrantPolicyV1::Operator,
         harness_mcp: HarnessMcpPolicyV1::Disabled,
+        approval_level: ApprovalLevel::FullAuto,
         deadline_ms: 20_000,
     }
 }

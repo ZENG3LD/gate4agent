@@ -4296,10 +4296,11 @@ fn prepare_context_pack_fetch(
 /// bytes actually received, so a corrupted store or a wrong pack cannot pass
 /// as a match on the wire's say-so alone. The node naming the digest unknown
 /// (`NodeFailureCode::UnknownContextPack` -- the pack was evicted between
-/// the engine's scan and this fetch) is worded identically to
-/// `HarnessEngineError::MailRefTargetUnknown`'s own text, since both mean the
-/// same thing to the caller: nothing answers for this digest any more. Any
-/// other transport/rejection failure is `HarnessReadHostErrorV1::Internal`,
+/// the engine's scan and this fetch) folds into the same
+/// `MailRefContextPackUnknown` outcome `HarnessEngineError::MailRefTargetUnknown`
+/// already maps to at scan time (`read.rs`'s own mapping), since both mean
+/// the same thing to the caller: nothing answers for this digest any more.
+/// Any other transport/rejection failure is `HarnessReadHostErrorV1::Internal`,
 /// the same bucket every other unreachable-Node condition on this read wire
 /// already collapses to (this wire has no dedicated "upstream unavailable"
 /// variant).
@@ -4314,11 +4315,9 @@ async fn finish_context_pack_fetch(
             if code == NodeFailureCode::UnknownContextPack =>
         {
             return HarnessReadReplyV1::Ok {
-                response: HarnessReadResponseV1::MailFetch(HarnessMailFetchResultV1::Refused {
-                    reason: format!(
-                        "no run carries a context pack receipt with digest {expected_digest}",
-                    ),
-                }),
+                response: HarnessReadResponseV1::MailFetch(
+                    HarnessMailFetchResultV1::MailRefContextPackUnknown { digest: expected_digest },
+                ),
             };
         }
         Err(_) => {
@@ -4331,12 +4330,12 @@ async fn finish_context_pack_fetch(
     };
     if recomputed != expected_digest {
         return HarnessReadReplyV1::Ok {
-            response: HarnessReadResponseV1::MailFetch(HarnessMailFetchResultV1::Refused {
-                reason: format!(
-                    "mailed context pack bytes for digest {expected_digest} do not hash to \
-                     it (recomputed {recomputed})",
-                ),
-            }),
+            response: HarnessReadResponseV1::MailFetch(
+                HarnessMailFetchResultV1::MailedContextPackDigestMismatch {
+                    expected: expected_digest,
+                    recomputed,
+                },
+            ),
         };
     }
     let response = HarnessReadResponseV1::MailFetch(HarnessMailFetchResultV1::ContextPack {

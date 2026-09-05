@@ -4,7 +4,9 @@ use crate::{
     HarnessService,
 };
 use gate4agent_harness_api::*;
-use gate4agent_harness_engine::{HarnessMailFetchResolutionV1, HarnessReadVisibilityV1};
+use gate4agent_harness_engine::{
+    HarnessEngineError, HarnessMailFetchResolutionV1, HarnessReadVisibilityV1,
+};
 use gate4agent_harness_protocol::{
     HarnessActorV1, HarnessEntityReadScopeV1, HarnessMonitoringVisibilityV1,
     HarnessSessionIdentityV1, HarnessWorktreeIntentV1, SessionGrantV1,
@@ -321,15 +323,19 @@ fn execute_exact_binding_read_only(
 
 /// D3/Slice C's `g4a_mail_fetch`: first verifies the message is in
 /// `binding.record_id`'s inbox (`HarnessEngine::mail_fetch`'s own membership
-/// predicate -- the same one `mail_inbox` uses), then resolves the ref.
-/// `Run`/`Result`/`ContextPack` refusals from the engine (not addressed to
-/// this reader, an out-of-range index, an unknown context pack digest)
-/// travel back as `HarnessMailFetchResultV1::Refused` with the engine's own
+/// predicate -- the same one `mail_inbox` uses), then resolves the ref. An
+/// engine refusal (not addressed to this reader, an out-of-range index)
+/// travels back as `HarnessMailFetchResultV1::Refused` with the engine's own
 /// `Display` text -- a named domain refusal, never a host error, same
-/// pattern as `MailSend`. Deliberately does NOT call `authorized_monitor_run`
-/// -- that enforces the caller's own lineage (`visibility.run_visible`),
-/// which a mailed `Run` ref is explicitly allowed to cross; the ONLY gate
-/// here is `HarnessEngine::mail_fetch`'s own inbox-membership check.
+/// pattern as `MailSend` -- except `HarnessEngineError::MailRefTargetUnknown`
+/// (no run's own `context_pack` receipt carries the ref's digest), which
+/// `mail_fetch_engine_error_result` maps onto its own typed
+/// `MailRefContextPackUnknown` instead, mirroring `WorkspacePath`'s typed
+/// refusal family (D3/Slice C2). Deliberately does NOT call
+/// `authorized_monitor_run` -- that enforces the caller's own lineage
+/// (`visibility.run_visible`), which a mailed `Run` ref is explicitly allowed
+/// to cross; the ONLY gate here is `HarnessEngine::mail_fetch`'s own
+/// inbox-membership check.
 ///
 /// A resolved `ContextPack` or `WorkspacePath` is refused locally here --
 /// this function (via `execute_exact_binding_read_only`) has no C2/Node
@@ -359,9 +365,7 @@ fn mail_fetch(
     ) {
         Ok(resolved) => resolved,
         Err(error) => {
-            return Ok(HarnessReadResponseV1::MailFetch(HarnessMailFetchResultV1::Refused {
-                reason: error.to_string(),
-            }));
+            return Ok(HarnessReadResponseV1::MailFetch(mail_fetch_engine_error_result(error)));
         }
     };
     if let HarnessMailFetchResolutionV1::ContextPack { digest, .. } = &resolved {
@@ -381,6 +385,25 @@ fn mail_fetch(
     }
     project_resolved_mail_fetch(engine, observation, support, resolved)
         .map(HarnessReadResponseV1::MailFetch)
+}
+
+/// Maps `HarnessEngine::mail_fetch`'s error onto the wire, shared by both of
+/// this crate's call sites (`mail_fetch` above and `dispatch_mail_fetch`
+/// below): `MailRefTargetUnknown` (no run's own `context_pack` receipt
+/// carries the ref's digest) is a typed refusal in its own right --
+/// `MailRefContextPackUnknown`, naming its input as a field rather than
+/// prose, the same doctrine `WorkspacePath`'s own named refusals (D3/Slice
+/// C3) already follow. Every other engine error (`MailNotForReader`,
+/// `MailRefIndexOutOfRange`, and a `NotFound` unknown message id) has no
+/// bounded, reusable set of inputs the way that one does, so it stays
+/// `Refused` with the engine's own `Display` text verbatim.
+fn mail_fetch_engine_error_result(error: HarnessEngineError) -> HarnessMailFetchResultV1 {
+    match error {
+        HarnessEngineError::MailRefTargetUnknown { digest } => {
+            HarnessMailFetchResultV1::MailRefContextPackUnknown { digest }
+        }
+        other => HarnessMailFetchResultV1::Refused { reason: other.to_string() },
+    }
 }
 
 /// The `Run`/`Result` projection half of `mail_fetch`, split out so
@@ -491,7 +514,7 @@ pub(crate) fn dispatch_mail_fetch(
         Ok(resolved) => project_resolved_mail_fetch(engine, observation, support, resolved)
             .map(|result| ReadDispatch::Response(HarnessReadResponseV1::MailFetch(result))),
         Err(error) => Ok(ReadDispatch::Response(HarnessReadResponseV1::MailFetch(
-            HarnessMailFetchResultV1::Refused { reason: error.to_string() },
+            mail_fetch_engine_error_result(error),
         ))),
     }
 }
@@ -2643,7 +2666,7 @@ mod tests {
     /// by the message, gets the named membership refusal
     /// (`MailNotForReader`) on the identical fetch; B's second ref
     /// (`ContextPack`, a digest no run in this fixture carries) is refused
-    /// as `MailRefTargetUnknown`.
+    /// as `MailRefContextPackUnknown`.
     #[test]
     fn mail_fetch_crosses_lineage_for_the_addressed_reader_and_refuses_everyone_and_everything_else() {
         let path = observation_path("mail-fetch");
@@ -2851,12 +2874,14 @@ mod tests {
             HarnessReadRequestV1::MailFetch { message_id: message_id.clone(), ref_index: 1 },
             &inventory,
         ).unwrap();
-        let HarnessReadResponseV1::MailFetch(HarnessMailFetchResultV1::Refused { reason }) = fetched_context_pack else {
-            panic!("expected the ContextPack ref to be refused, got {fetched_context_pack:?}");
+        let HarnessReadResponseV1::MailFetch(HarnessMailFetchResultV1::MailRefContextPackUnknown {
+            digest,
+        }) = fetched_context_pack else {
+            panic!("expected the ContextPack ref to be MailRefContextPackUnknown, got {fetched_context_pack:?}");
         };
-        // No run in this fixture carries the fixture digest -- `MailRefTargetUnknown`,
-        // not a kind-level refusal (that's `WorkspacePath`'s alone now).
-        assert!(reason.contains("no run carries"), "{reason}");
+        // No run in this fixture carries the fixture digest -- `MailRefTargetUnknown`
+        // from the engine, mapped to this typed refusal, not free-text `Refused`.
+        assert_eq!(digest, format!("sha256:{}", "a".repeat(64)));
 
         let fetched_by_stranger = execute_exact_binding_read(
             &mut harness, &observation, &support, &stranger_binding,

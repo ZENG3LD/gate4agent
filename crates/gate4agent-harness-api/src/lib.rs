@@ -5868,23 +5868,38 @@ pub const HARNESS_MAIL_FETCH_AMBIGUOUS_NODES_MAX: usize = 16;
 /// recomputed by the service against the mailed ref's own `sha256` before
 /// this is ever returned -- a mismatch is `MailedWorkspacePathDigestMismatch`
 /// instead. `Refused` carries `HarnessEngineError`'s own `Display` text
-/// verbatim for `MailNotForReader`/`MailRefIndexOutOfRange`/
-/// `MailRefTargetUnknown`, or `gate4agent-harness-service`'s own text for a
-/// malformed mailed ref (an invalid workspace or path identifier) or an
-/// evicted `ContextPack`. The remaining five variants are
-/// `gate4agent-harness-service`'s own named resolutions of a `WorkspacePath`
-/// ref it could not complete: `MailRefWorkspaceUnknown` (no connected node's
-/// runtime inventory registers `workspace`, or the node no longer does by
-/// the time the read reaches it), `MailRefWorkspaceAmbiguous` (more than one
-/// connected node does, named in `nodes`), `MailRefWorkspacePathUnknown`
-/// (the one node that does has no such file at `path`, or cannot read it),
+/// verbatim for `MailNotForReader` (message not addressed to this reader) or
+/// `MailRefIndexOutOfRange` (no such ref on the message), or
+/// `gate4agent-harness-service`'s own text for a malformed mailed
+/// `WorkspacePath` ref (an invalid workspace or path identifier), a mailed
+/// `Run`/`Result` ref naming a run that no longer exists, or a malformed
+/// `Result` reference -- none of these name a bounded, reusable set of
+/// inputs the way the typed variants below do, so they stay prose. The
+/// remaining seven variants are named resolutions of a ref this side could
+/// not complete, each carrying its own inputs directly rather than a
+/// formatted string, the same pattern `HarnessMailSendResultV1` established
+/// for `Refused` alone. Two are `ContextPack` (C2)'s own:
+/// `MailRefContextPackUnknown` folds together the two moments nothing
+/// answers for a mailed pack's `digest` any more -- no run's own
+/// `context_pack` receipt carries it at the engine's scan time
+/// (`HarnessEngineError::MailRefTargetUnknown`, D3/Slice C's own resolution
+/// gate) and the pack having been evicted at the node by the time the fetch
+/// actually reaches it (`NodeFailureCode::UnknownContextPack`) -- both mean
+/// the identical thing to the caller, so both fold into this one variant;
+/// `MailedContextPackDigestMismatch` is the pack's own bytes not hashing to
+/// `digest` once fetched (`expected`/`recomputed` are `SpawnContextDigest`'s
+/// own `sha256:<64 hex>` rendering, unlike `WorkspacePath`'s bare hex,
+/// because a `ContextPack` ref's digest was always a `SpawnContextDigest` to
+/// begin with). The other five are `WorkspacePath` (C3)'s own, unchanged:
+/// `MailRefWorkspaceUnknown` (no connected node's runtime inventory
+/// registers `workspace`, or the node no longer does by the time the read
+/// reaches it), `MailRefWorkspaceAmbiguous` (more than one connected node
+/// does, named in `nodes`), `MailRefWorkspacePathUnknown` (the one node that
+/// does has no such file at `path`, or cannot read it),
 /// `MailedWorkspacePathContentNotFetchable` (the file exists but is not
 /// UTF-8, or exceeds the node's read bound -- `why` names which), and
 /// `MailedWorkspacePathDigestMismatch` (the file's own bytes do not hash to
-/// the digest the mailed ref named). Each is a named refusal in its own
-/// right, carrying its own inputs directly rather than a formatted string,
-/// the same pattern `HarnessMailSendResultV1` established for `Refused`
-/// alone.
+/// the digest the mailed ref named).
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "outcome", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum HarnessMailFetchResultV1 {
@@ -5893,6 +5908,8 @@ pub enum HarnessMailFetchResultV1 {
     ContextPack { digest: String, id: String, byte_len: u32, bytes_hex: String },
     WorkspacePath { workspace: String, path: String, byte_len: u32, sha256: String, text: String },
     Refused { reason: String },
+    MailRefContextPackUnknown { digest: String },
+    MailedContextPackDigestMismatch { expected: String, recomputed: String },
     MailRefWorkspaceUnknown { workspace: String },
     MailRefWorkspaceAmbiguous { workspace: String, nodes: Vec<String> },
     MailRefWorkspacePathUnknown { workspace: String, path: String },
@@ -5955,6 +5972,18 @@ impl HarnessMailFetchResultV1 {
                     || reason.len() > HARNESS_MAIL_REFUSAL_REASON_MAX_BYTES
                     || reason.chars().any(char::is_control)
                 {
+                    return Err(HarnessReadApiError::InvalidMailFetch);
+                }
+                Ok(())
+            }
+            Self::MailRefContextPackUnknown { digest } => {
+                if !valid_sha256_digest(digest) {
+                    return Err(HarnessReadApiError::InvalidMailFetch);
+                }
+                Ok(())
+            }
+            Self::MailedContextPackDigestMismatch { expected, recomputed } => {
+                if !valid_sha256_digest(expected) || !valid_sha256_digest(recomputed) {
                     return Err(HarnessReadApiError::InvalidMailFetch);
                 }
                 Ok(())
@@ -11183,6 +11212,39 @@ mod tests {
             bytes_hex: "0a1b2c".to_owned(),
         };
         assert!(matches!(bad_digest.validate(), Err(HarnessReadApiError::InvalidMailFetch)));
+    }
+
+    /// D3/Slice C2: the two named `ContextPack`-fetch refusals round-trip and
+    /// bound their own inputs to `SpawnContextDigest`'s own `sha256:<64 hex>`
+    /// rendering -- unlike `WorkspacePath`'s sibling refusals, whose digests
+    /// are bare (no `sha256:` prefix).
+    #[test]
+    fn mail_fetch_context_pack_refusals_round_trip_and_bound_their_inputs() {
+        let unknown = HarnessMailFetchResultV1::MailRefContextPackUnknown {
+            digest: format!("sha256:{}", "a".repeat(64)),
+        };
+        unknown.validate().unwrap();
+        let encoded = serde_json::to_string(&unknown).unwrap();
+        assert_eq!(serde_json::from_str::<HarnessMailFetchResultV1>(&encoded).unwrap(), unknown);
+
+        let bare_digest = HarnessMailFetchResultV1::MailRefContextPackUnknown {
+            digest: "a".repeat(64),
+        };
+        assert!(matches!(bare_digest.validate(), Err(HarnessReadApiError::InvalidMailFetch)));
+
+        let digest_mismatch = HarnessMailFetchResultV1::MailedContextPackDigestMismatch {
+            expected: format!("sha256:{}", "a".repeat(64)),
+            recomputed: format!("sha256:{}", "b".repeat(64)),
+        };
+        digest_mismatch.validate().unwrap();
+        let encoded = serde_json::to_string(&digest_mismatch).unwrap();
+        assert_eq!(serde_json::from_str::<HarnessMailFetchResultV1>(&encoded).unwrap(), digest_mismatch);
+
+        let bare_mismatch = HarnessMailFetchResultV1::MailedContextPackDigestMismatch {
+            expected: "a".repeat(64),
+            recomputed: format!("sha256:{}", "b".repeat(64)),
+        };
+        assert!(matches!(bare_mismatch.validate(), Err(HarnessReadApiError::InvalidMailFetch)));
     }
 
     /// D3/Slice C3: `HarnessMailFetchResultV1::WorkspacePath` round-trips,

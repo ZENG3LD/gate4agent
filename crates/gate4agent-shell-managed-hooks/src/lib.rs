@@ -410,7 +410,7 @@ impl ManagedHookManager {
                 event_assignment.unwrap_or_default(), quoted, quoted
             );
             return Ok(format!(
-                "{} -NoProfile -ExecutionPolicy Bypass -EncodedCommand {}",
+                "{} -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -EncodedCommand {}",
                 powershell,
                 base64_utf16le(&command)
             ));
@@ -1340,7 +1340,7 @@ fn managed_cmd_script(target: &str) -> String {
         ""
     };
     format!(
-        "@echo off\r\nrem {MANAGED_MARKER}\r\nsetlocal\r\n{skip_devin}if \"%GATE4AGENT_HOOK_URL%\"==\"\" goto :drain\r\nif \"%GATE4AGENT_HOOK_TOKEN%\"==\"\" goto :drain\r\nif \"%GATE4AGENT_HOOK_ROUTE%\"==\"\" goto :drain\r\n\"%SystemRoot%\\System32\\curl.exe\" -sS -X POST \"%GATE4AGENT_HOOK_URL%\" --connect-timeout 0.5 --max-time 1.5 -H \"Content-Type: application/x-www-form-urlencoded\" -H \"x-gate4agent-hook-token: %GATE4AGENT_HOOK_TOKEN%\" -H \"x-gate4agent-hook-route: %GATE4AGENT_HOOK_ROUTE%\" --data-urlencode \"event_name=%GATE4AGENT_HOOK_EVENT%\" --data-urlencode \"payload@-\" >nul 2>nul\r\nexit /b 0\r\n:drain\r\nmore >nul\r\nexit /b 0\r\n"
+        "@echo off\r\nrem {MANAGED_MARKER}\r\nsetlocal\r\n{skip_devin}if \"%GATE4AGENT_HOOK_URL%\"==\"\" goto :drain\r\nif \"%GATE4AGENT_HOOK_TOKEN%\"==\"\" goto :drain\r\nif \"%GATE4AGENT_HOOK_ROUTE%\"==\"\" goto :drain\r\n\"%SystemRoot%\\System32\\curl.exe\" -sS -X POST \"%GATE4AGENT_HOOK_URL%\" --connect-timeout 0.5 --max-time 1.5 -H \"Content-Type: application/x-www-form-urlencoded\" -H \"x-gate4agent-hook-token: %GATE4AGENT_HOOK_TOKEN%\" -H \"x-gate4agent-hook-route: %GATE4AGENT_HOOK_ROUTE%\" --data-urlencode \"event_name=%GATE4AGENT_HOOK_EVENT%\" --data-urlencode \"payload@-\" >nul 2>nul\r\nexit /b 0\r\n:drain\r\nrem Match POSIX: missing ingress env => exit 0. Do not spawn a console helper.\r\nexit /b 0\r\n"
     )
 }
 
@@ -1938,7 +1938,23 @@ mod tests {
         // re-entry) remains fleet-relevant.
         assert!(claude_script.contains("%DEVIN_PROJECT_DIR%"));
         assert!(claude_script.contains("goto :drain"));
+        assert!(
+            !claude_script.contains("more >nul"),
+            "Windows drain must not spawn more.com (visible conhost)"
+        );
         assert!(!claude_script.contains("x-gate4agent-hook-token: 00000000"));
+        let spec = managed_hook_spec(&binding("claude")).unwrap();
+        let event = spec
+            .events
+            .iter()
+            .find(|event| event.name == "PreToolUse")
+            .unwrap();
+        let pre_tool = manager.managed_command(spec, event).unwrap();
+        assert!(
+            pre_tool.contains("-WindowStyle Hidden"),
+            "native CLIs spawn this command without CREATE_NO_WINDOW"
+        );
+        assert!(pre_tool.contains("-NonInteractive"));
     }
 
     #[test]

@@ -188,6 +188,17 @@ pub enum HostRequestOutcomeV1 {
     Failed { error: String },
 }
 
+impl Default for HostRequestOutcomeV1 {
+    /// Backs `ObservationKindV1::HostRequestObserved::outcome`'s
+    /// `#[serde(default)]` -- a durable record written before this field
+    /// existed (pre-K1d) never recorded an execution failure at all, so an
+    /// observed `HostRequestObserved` from that era always meant the
+    /// request ran; see that field's own doc comment.
+    fn default() -> Self {
+        Self::Executed
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObservationTodoItemV1 {
@@ -330,7 +341,12 @@ pub enum ObservationKindV1 {
         /// or failed doing so -- see [`HostRequestOutcomeV1`]'s own doc
         /// comment for why this is a separate field from `decision` rather
         /// than a third flavor of `Denied`. Always `Executed` for `Denied`/
-        /// `Deferred` (nothing ran to fail).
+        /// `Deferred` (nothing ran to fail). `#[serde(default)]` reads a
+        /// durable record written before this field existed (K1d) as
+        /// `Executed` -- honest, since before this field existed an
+        /// observed `HostRequestObserved` implied a `Granted` request had
+        /// run, and there was nothing else it could have meant.
+        #[serde(default)]
         outcome: HostRequestOutcomeV1,
     },
     /// Something the agent tried was blocked mid-turn -- by this harness's
@@ -1579,6 +1595,43 @@ mod tests {
                 max: OBSERVATION_ACTION_BLOCKED_REASON_MAX_BYTES,
             })
         );
+    }
+
+    /// A `host-request-observed` record written before `outcome` existed
+    /// (pre-K1d) -- the exact shape the durable observation checkpoint
+    /// holds for every such record minted before this field shipped --
+    /// carries no `outcome` field at all. `#[serde(default)]` must still
+    /// read it back, as `HostRequestOutcomeV1::Executed`: before this field
+    /// existed, an observed `HostRequestObserved` always meant a `Granted`
+    /// request ran, so that is the only honest default for the old shape.
+    /// This is the forward migration a new required field on a persisted
+    /// type owes its old data -- see the crate's own contract for the rule.
+    #[test]
+    fn host_request_observed_outcome_defaults_to_executed_for_pre_k1d_json() {
+        let pre_k1d = serde_json::json!({
+            "source_sequence": 1,
+            "observed_at_unix_ms": 1_786_671_234_567u64,
+            "evidence": "structured-provider",
+            "kind": {
+                "kind": "host-request-observed",
+                "class": "Terminal",
+                "decision": { "kind": "granted", "by": "policy" }
+            },
+            "truncated": false
+        });
+        let decoded: ObservationV1 = serde_json::from_value(pre_k1d)
+            .expect("pre-K1d shape without outcome must still deserialize");
+        assert!(matches!(
+            decoded.kind,
+            ObservationKindV1::HostRequestObserved {
+                decision: HostRequestDecisionV1::Granted {
+                    by: HostDecisionAuthorityV1::Policy
+                },
+                outcome: HostRequestOutcomeV1::Executed,
+                ..
+            }
+        ));
+        decoded.validate().expect("defaulted outcome remains a valid observation");
     }
 
     #[test]

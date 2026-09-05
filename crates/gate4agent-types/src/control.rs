@@ -1584,6 +1584,17 @@ pub enum HostRequestOutcome {
     Failed { error: String },
 }
 
+impl Default for HostRequestOutcome {
+    /// Backs `ProviderEvent::HostRequestObserved::outcome`'s
+    /// `#[serde(default)]` -- mirrors `gate4agent_observation_protocol`'s
+    /// own `HostRequestOutcomeV1::default`, the same field added at the
+    /// same commit; see that type's doc comment for why a record from
+    /// before this field existed always means `Executed`.
+    fn default() -> Self {
+        Self::Executed
+    }
+}
+
 /// One option the agent offered on a `session/request_permission`-style
 /// interaction, carried on `ProviderEvent::InteractionRequested::options`
 /// exactly as the agent gave it -- see ACP's `PermissionOption` in
@@ -1723,7 +1734,10 @@ pub enum ProviderEvent {
         /// or failed doing so -- see [`HostRequestOutcome`]'s own doc
         /// comment for why this is a separate field from `decision` rather
         /// than a third flavor of `Denied`. Always `Executed` for `Denied`/
-        /// `Deferred` (nothing ran to fail).
+        /// `Deferred` (nothing ran to fail). `#[serde(default)]` reads a
+        /// record from before this field existed as `Executed` -- see
+        /// `HostRequestOutcome::default`.
+        #[serde(default)]
         outcome: HostRequestOutcome,
         /// The refusal text behind a `Denied` decision, when this session
         /// actually computed one -- the dangerous-command gate's own
@@ -3538,6 +3552,32 @@ mod tests {
             ProviderEvent::HostRequestObserved {
                 decision: HostRequestDecision::Granted { .. },
                 outcome: HostRequestOutcome::Failed { .. },
+                ..
+            }
+        ));
+    }
+
+    /// A `HostRequestObserved` record written before `outcome` existed
+    /// (pre-K1d) carries no `outcome` field at all -- `#[serde(default)]`
+    /// must still read it back, as `HostRequestOutcome::Executed`: before
+    /// this field existed, an observed `Granted` request always meant it
+    /// ran, so that is the only honest default for the old shape.
+    #[test]
+    fn host_request_observed_outcome_defaults_to_executed_for_pre_k1d_json() {
+        let pre_k1d = serde_json::json!({
+            "kind": "host-request-observed",
+            "method": "session/request_permission",
+            "params_json": "{\"toolName\":\"bash\"}",
+            "decision": { "kind": "granted", "by": "policy" },
+            "reason": null,
+        });
+        let decoded: ProviderEvent = serde_json::from_value(pre_k1d)
+            .expect("pre-K1d shape without outcome must still deserialize");
+        assert!(matches!(
+            decoded,
+            ProviderEvent::HostRequestObserved {
+                decision: HostRequestDecision::Granted { by: HostDecisionAuthority::Policy },
+                outcome: HostRequestOutcome::Executed,
                 ..
             }
         ));

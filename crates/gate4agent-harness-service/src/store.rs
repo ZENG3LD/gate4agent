@@ -25,6 +25,30 @@ pub struct PersistedOperation {
     pub payload: Vec<u8>,
 }
 
+/// A write-only introspection mirror of one `HarnessMailMessageV1` --
+/// durability comes from `checkpoint` (the engine's own `mail_messages`
+/// field), exactly like `harness_tasks`/`harness_runs`/etc already work for
+/// their entities; this row exists so an operator can query the mailbox by
+/// recipient or task without decoding the checkpoint blob.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedMailMessage {
+    pub message_id: String,
+    pub to_record_id: Option<String>,
+    pub to_task_id: Option<String>,
+    pub created_at_unix_ms: i64,
+    pub payload: Vec<u8>,
+}
+
+/// A write-only introspection mirror of one `HarnessMailAckV1`, keyed the
+/// same way the engine dedups acks: `(message_id, reader_record_id)`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedMailAck {
+    pub message_id: String,
+    pub reader_record_id: String,
+    pub acked_at_unix_ms: i64,
+    pub payload: Vec<u8>,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PersistedHarnessState {
     pub checkpoint: Vec<u8>,
@@ -36,6 +60,8 @@ pub struct PersistedHarnessState {
     pub dispatches: Vec<PersistedEntity>,
     pub harness_mcp_reservations: Vec<PersistedEntity>,
     pub operations: Vec<PersistedOperation>,
+    pub mail_messages: Vec<PersistedMailMessage>,
+    pub mail_acks: Vec<PersistedMailAck>,
 }
 
 pub struct HarnessStore {
@@ -122,6 +148,26 @@ impl HarnessStore {
              );
              CREATE INDEX IF NOT EXISTS harness_operation_tail_id
                 ON harness_operation_tail(operation_id, revision);
+             CREATE TABLE IF NOT EXISTS harness_mail_messages (
+                message_id TEXT PRIMARY KEY,
+                to_record_id TEXT,
+                to_task_id TEXT,
+                created_at_unix_ms INTEGER NOT NULL,
+                payload BLOB NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS harness_mail_messages_to_record
+                ON harness_mail_messages(to_record_id, created_at_unix_ms);
+             CREATE INDEX IF NOT EXISTS harness_mail_messages_to_task
+                ON harness_mail_messages(to_task_id, created_at_unix_ms);
+             CREATE TABLE IF NOT EXISTS harness_mail_acks (
+                message_id TEXT NOT NULL,
+                reader_record_id TEXT NOT NULL,
+                acked_at_unix_ms INTEGER NOT NULL,
+                payload BLOB NOT NULL,
+                PRIMARY KEY (message_id, reader_record_id)
+             );
+             CREATE INDEX IF NOT EXISTS harness_mail_acks_message_reader
+                ON harness_mail_acks(message_id, reader_record_id);
              COMMIT;",
         )?;
         if version == 0 {
@@ -206,6 +252,8 @@ impl HarnessStore {
                 "harness_mcp_reservations",
                 &state.harness_mcp_reservations,
             )?;
+            replace_mail_messages(&transaction, &state.mail_messages)?;
+            replace_mail_acks(&transaction, &state.mail_acks)?;
             transaction.execute("DELETE FROM harness_operations", [])?;
             for operation in &state.operations {
                 transaction.execute(
@@ -284,6 +332,49 @@ fn replace_entities(
     Ok(())
 }
 
+fn replace_mail_messages(
+    transaction: &rusqlite::Transaction<'_>,
+    rows: &[PersistedMailMessage],
+) -> Result<(), rusqlite::Error> {
+    transaction.execute("DELETE FROM harness_mail_messages", [])?;
+    for row in rows {
+        transaction.execute(
+            "INSERT INTO harness_mail_messages(
+                message_id, to_record_id, to_task_id, created_at_unix_ms, payload
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                &row.message_id,
+                &row.to_record_id,
+                &row.to_task_id,
+                row.created_at_unix_ms,
+                &row.payload,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn replace_mail_acks(
+    transaction: &rusqlite::Transaction<'_>,
+    rows: &[PersistedMailAck],
+) -> Result<(), rusqlite::Error> {
+    transaction.execute("DELETE FROM harness_mail_acks", [])?;
+    for row in rows {
+        transaction.execute(
+            "INSERT INTO harness_mail_acks(
+                message_id, reader_record_id, acked_at_unix_ms, payload
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                &row.message_id,
+                &row.reader_record_id,
+                row.acked_at_unix_ms,
+                &row.payload,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 impl PersistedHarnessState {
     fn validate(&self) -> Result<(), HarnessStoreError> {
         ensure_bound("checkpoint", self.checkpoint.len(), MAX_CHECKPOINT_BYTES)?;
@@ -295,8 +386,52 @@ impl PersistedHarnessState {
         validate_entities("dispatches", &self.dispatches)?;
         validate_entities("harness_mcp_reservations", &self.harness_mcp_reservations)?;
         validate_operations(&self.operations)?;
+        validate_mail_messages(&self.mail_messages)?;
+        validate_mail_acks(&self.mail_acks)?;
         Ok(())
     }
+}
+
+fn validate_mail_messages(rows: &[PersistedMailMessage]) -> Result<(), HarnessStoreError> {
+    if rows.len() > HARNESS_ENTITY_ROWS_MAX {
+        return Err(HarnessStoreError::RowsTooMany {
+            kind: "mail_messages",
+            actual: rows.len(),
+            max: HARNESS_ENTITY_ROWS_MAX,
+        });
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    for row in rows {
+        if row.message_id.is_empty() {
+            return Err(HarnessStoreError::Corrupt("empty persisted mail message id"));
+        }
+        ensure_bound("mail message", row.payload.len(), MAX_ENTITY_BYTES)?;
+        if !ids.insert(&row.message_id) {
+            return Err(HarnessStoreError::DuplicateId { kind: "mail_messages" });
+        }
+    }
+    Ok(())
+}
+
+fn validate_mail_acks(rows: &[PersistedMailAck]) -> Result<(), HarnessStoreError> {
+    if rows.len() > HARNESS_ENTITY_ROWS_MAX {
+        return Err(HarnessStoreError::RowsTooMany {
+            kind: "mail_acks",
+            actual: rows.len(),
+            max: HARNESS_ENTITY_ROWS_MAX,
+        });
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    for row in rows {
+        if row.message_id.is_empty() || row.reader_record_id.is_empty() {
+            return Err(HarnessStoreError::Corrupt("empty persisted mail ack identity"));
+        }
+        ensure_bound("mail ack", row.payload.len(), MAX_ENTITY_BYTES)?;
+        if !ids.insert((&row.message_id, &row.reader_record_id)) {
+            return Err(HarnessStoreError::DuplicateId { kind: "mail_acks" });
+        }
+    }
+    Ok(())
 }
 
 fn validate_entities(
@@ -433,6 +568,75 @@ mod tests {
             |row| row.get(0),
         ).unwrap();
         assert_eq!(count, HARNESS_OPERATION_TAIL_MAX as i64);
+        connection.close().unwrap();
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{}-wal", path.display()));
+        let _ = fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn harness_mail_tables_round_trip_and_are_queryable_by_recipient() {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "gate4agent-harness-mail-{}-{nonce}.sqlite",
+            std::process::id(),
+        ));
+        let mut store = HarnessStore::open(&path).unwrap();
+        let state = PersistedHarnessState {
+            checkpoint: vec![1],
+            mail_messages: vec![
+                PersistedMailMessage {
+                    message_id: "hmail_1".to_owned(),
+                    to_record_id: Some("record-recipient".to_owned()),
+                    to_task_id: None,
+                    created_at_unix_ms: 20,
+                    payload: vec![1, 2, 3],
+                },
+                PersistedMailMessage {
+                    message_id: "hmail_2".to_owned(),
+                    to_record_id: None,
+                    to_task_id: Some("htask_1".to_owned()),
+                    created_at_unix_ms: 21,
+                    payload: vec![4, 5, 6],
+                },
+            ],
+            mail_acks: vec![PersistedMailAck {
+                message_id: "hmail_1".to_owned(),
+                reader_record_id: "record-recipient".to_owned(),
+                acked_at_unix_ms: 25,
+                payload: vec![7],
+            }],
+            ..PersistedHarnessState::default()
+        };
+        let tail = PersistedOperation {
+            id: format!("hop_{}", "a".repeat(24)),
+            revision: 1,
+            request_digest: "b".repeat(64),
+            state: "Succeeded".to_owned(),
+            payload: vec![1],
+        };
+        store.commit(&state, &tail).unwrap();
+        store.close().unwrap();
+
+        let connection = Connection::open(&path).unwrap();
+        let by_record: String = connection.query_row(
+            "SELECT message_id FROM harness_mail_messages WHERE to_record_id = ?1",
+            params!["record-recipient"],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(by_record, "hmail_1");
+        let by_task: String = connection.query_row(
+            "SELECT message_id FROM harness_mail_messages WHERE to_task_id = ?1",
+            params!["htask_1"],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(by_task, "hmail_2");
+        let ack_count: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM harness_mail_acks WHERE message_id = ?1 AND reader_record_id = ?2",
+            params!["hmail_1", "record-recipient"],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(ack_count, 1);
         connection.close().unwrap();
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(format!("{}-wal", path.display()));

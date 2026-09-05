@@ -27,7 +27,7 @@ use gate4agent_harness_protocol::{
     HarnessDeliveryRef, HarnessDeliveryStateV1, HarnessDeliveryV1, HarnessDispatchIntentV1,
     HarnessExecutionModeV1, HarnessExecutionSpecId,
     HarnessExpectedExecutionSpecRevisionV1, HarnessGrantTargetV1, HarnessIdempotencyRef,
-    HarnessMoveTaskRequestV1,
+    HarnessMailAddressV1, HarnessMoveTaskRequestV1,
     HarnessOperationId, HarnessOperationKindV1, HarnessOperationStateV1, HarnessOperationV1,
     HarnessOperatorAuthorityV1, HarnessReplaceTaskExecutionSpecRequestV1,
     HarnessReplaceTaskRequestV1, HarnessRequestDigest,
@@ -57,7 +57,8 @@ use std::{collections::{BTreeMap, BTreeSet}, path::Path};
 use thiserror::Error;
 
 use store::{
-    HarnessStore, PersistedEntity, PersistedHarnessState, PersistedOperation,
+    HarnessStore, PersistedEntity, PersistedHarnessState, PersistedMailAck,
+    PersistedMailMessage, PersistedOperation,
 };
 use dispatch::{
     derive_schedule_request, HarnessGrantPolicyV1, HarnessLaunchCatalog,
@@ -6554,6 +6555,12 @@ fn encode_persisted_state(
             reservation,
         ))
         .collect::<Result<Vec<_>, _>>()?;
+    let mail_messages = checkpoint.engine.mail_messages.iter()
+        .map(encode_mail_message)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mail_acks = checkpoint.engine.mail_acks.iter()
+        .map(encode_mail_ack)
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(PersistedHarnessState {
         checkpoint: checkpoint_bytes,
         tasks,
@@ -6564,6 +6571,37 @@ fn encode_persisted_state(
         dispatches,
         harness_mcp_reservations,
         operations,
+        mail_messages,
+        mail_acks,
+    })
+}
+
+fn encode_mail_message(
+    message: &gate4agent_harness_protocol::HarnessMailMessageV1,
+) -> Result<PersistedMailMessage, HarnessServiceError> {
+    let (to_record_id, to_task_id) = match &message.to {
+        HarnessMailAddressV1::Session { record_id } => (Some(record_id.as_str().to_owned()), None),
+        HarnessMailAddressV1::Task { task_id } => (None, Some(task_id.to_string())),
+    };
+    Ok(PersistedMailMessage {
+        message_id: message.message_id.to_string(),
+        to_record_id,
+        to_task_id,
+        created_at_unix_ms: i64::try_from(message.created_at_unix_ms)
+            .map_err(|_| HarnessServiceError::Corrupt("mail message timestamp out of range"))?,
+        payload: serde_json::to_vec(message)?,
+    })
+}
+
+fn encode_mail_ack(
+    ack: &gate4agent_harness_protocol::HarnessMailAckV1,
+) -> Result<PersistedMailAck, HarnessServiceError> {
+    Ok(PersistedMailAck {
+        message_id: ack.message_id.to_string(),
+        reader_record_id: ack.reader_record_id.as_str().to_owned(),
+        acked_at_unix_ms: i64::try_from(ack.acked_at_unix_ms)
+            .map_err(|_| HarnessServiceError::Corrupt("mail ack timestamp out of range"))?,
+        payload: serde_json::to_vec(ack)?,
     })
 }
 
@@ -7383,6 +7421,8 @@ mod tests {
             execution_specs_v2: Vec::new(),
             deliveries: Vec::new(),
             continuations: Vec::new(),
+            mail_messages: Vec::new(),
+            mail_acks: Vec::new(),
         }).unwrap();
         HarnessService::from_engine_for_test(engine)
     }
@@ -7466,6 +7506,8 @@ mod tests {
             execution_specs_v2: Vec::new(),
             deliveries: Vec::new(),
             continuations: Vec::new(),
+            mail_messages: Vec::new(),
+            mail_acks: Vec::new(),
         }).unwrap();
         let mut service = HarnessService::from_engine_for_test(engine);
         let overflow_run = HarnessRunId::new(format!("hrun_{HARNESS_RESULTS_MAX:024x}")).unwrap();
@@ -7715,6 +7757,7 @@ mod tests {
                 export: false,
                 restore: false,
             },
+            mail: false,
             state: SessionGrantStateV1::Active,
             created_at_unix_ms: 12,
             updated_at_unix_ms: 12,
@@ -7730,6 +7773,8 @@ mod tests {
             execution_specs_v2: Vec::new(),
             deliveries: Vec::new(),
             continuations: Vec::new(),
+            mail_messages: Vec::new(),
+            mail_acks: Vec::new(),
         }).unwrap()
     }
 
@@ -7891,6 +7936,7 @@ mod tests {
             read_permissions: HarnessReadPermissionsV1::default(),
             monitoring_visibility: HarnessMonitoringVisibilityV1::None,
             context_permissions: HarnessContextPermissionsV1 { export, restore },
+            mail: false,
             state: SessionGrantStateV1::Active,
             created_at_unix_ms: 12,
             updated_at_unix_ms: 12,
@@ -7920,6 +7966,8 @@ mod tests {
             execution_specs_v2: Vec::new(),
             deliveries: Vec::new(),
             continuations: Vec::new(),
+            mail_messages: Vec::new(),
+            mail_acks: Vec::new(),
         }).unwrap();
         let continuation = HarnessContinuationV1 {
             continuation_ref: HarnessContinuationRef::new(format!(

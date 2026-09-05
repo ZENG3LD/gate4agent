@@ -375,6 +375,7 @@ fn seed_target_task_and_grant(service: &mut HarnessService, source_run_id: &Harn
                     export: true,
                     restore: true,
                 },
+                mail: false,
                 state: SessionGrantStateV1::Active,
                 created_at_unix_ms: now + 1,
                 updated_at_unix_ms: now + 1,

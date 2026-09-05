@@ -310,6 +310,7 @@ pub(crate) mod tests {
             read_permissions: HarnessReadPermissionsV1::default(),
             monitoring_visibility: HarnessMonitoringVisibilityV1::Summary,
             context_permissions: HarnessContextPermissionsV1 { export: false, restore: false },
+            mail: false,
             state: grant_state,
             created_at_unix_ms: 10,
             updated_at_unix_ms: 10 + grant_revision,
@@ -348,6 +349,8 @@ pub(crate) mod tests {
             execution_specs_v2: Vec::new(),
             deliveries: Vec::new(),
             continuations: Vec::new(),
+            mail_messages: Vec::new(),
+            mail_acks: Vec::new(),
         }).unwrap()
     }
 

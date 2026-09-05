@@ -96,6 +96,7 @@ opaque_id!(HarnessDeliveryRef, "hdelivery_", "delivery reference");
 opaque_id!(HarnessContinuationRef, "hcontinuation_", "continuation reference");
 opaque_id!(HarnessExecutionSpecId, "hespec_", "execution specification id");
 opaque_id!(HarnessTaskLaunchIssuanceId, "hissue_", "task launch issuance id");
+opaque_id!(HarnessMailMessageId, "hmail_", "mail message id");
 
 impl HarnessResultRef {
     /// Derives the result reference for `run_id` by reprefixing its hex
@@ -2229,6 +2230,15 @@ pub struct SessionGrantV1 {
     pub read_permissions: HarnessReadPermissionsV1,
     pub monitoring_visibility: HarnessMonitoringVisibilityV1,
     pub context_permissions: HarnessContextPermissionsV1,
+    /// Whether a session bound to this grant may use the mailbox
+    /// (`g4a_mail_send` / `g4a_mail_inbox` / `g4a_mail_ack`, see
+    /// `allowed_tool_ids`). `#[serde(default)]` so a grant persisted before
+    /// this field existed decodes with `mail: false` rather than failing
+    /// closed on the whole record (the rule since 2026-09-05: a persisted
+    /// type gains a field only behind `#[serde(default)]`, proven by a test
+    /// deserializing the pre-mail shape).
+    #[serde(default)]
+    pub mail: bool,
     pub state: SessionGrantStateV1,
     pub created_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
@@ -2336,6 +2346,11 @@ impl SessionGrantV1 {
             },
             monitoring_visibility: HarnessMonitoringVisibilityV1::Timeline,
             context_permissions: HarnessContextPermissionsV1 { export: false, restore: false },
+            // The fleet's default grant may write mail: the mailbox arc
+            // (gate4agent-arc-mailbox-and-task-layer, D1) exists precisely so
+            // an ACP/inline session dispatched under this default can reach
+            // g4a_mail_send/inbox/ack; it stays read-only on every other axis.
+            mail: true,
             state: SessionGrantStateV1::Active,
             created_at_unix_ms: now_unix_ms,
             updated_at_unix_ms: now_unix_ms,
@@ -2359,6 +2374,8 @@ pub enum HarnessOperationKindV1 {
     RecordRunContextPack,
     RecordRunGitFacts,
     RecordTaskResultRef,
+    SendMail,
+    AckMail,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -2489,9 +2506,116 @@ impl HarnessOperationV1 {
             HarnessOperationKindV1::CreateGrant => self.task_id.is_none() && self.run_id.is_none() && self.grant_id.is_some() && self.reconciles_operation_id.is_none() && self.expected_revision.is_none(),
             HarnessOperationKindV1::MutateGrant | HarnessOperationKindV1::RevokeGrant => self.task_id.is_none() && self.run_id.is_none() && self.grant_id.is_some() && self.reconciles_operation_id.is_none() && self.expected_revision.is_some(),
             HarnessOperationKindV1::Reconcile => self.task_id.is_none() && self.run_id.is_some() && self.grant_id.is_none() && self.reconciles_operation_id.is_some() && self.expected_revision.is_some(),
+            // The authorizing grant, never the mail message itself (there is
+            // no operation field for a message id) -- `grant_id` here names
+            // *whose* mail permission authorized the send/ack, not an entity
+            // being created or mutated the way CreateGrant/MutateGrant use it.
+            HarnessOperationKindV1::SendMail | HarnessOperationKindV1::AckMail => self.task_id.is_none() && self.run_id.is_none() && self.grant_id.is_some() && self.reconciles_operation_id.is_none() && self.expected_revision.is_none(),
         };
         if !valid {
             return Err(HarnessValidationError::InvalidOperationTarget);
+        }
+        Ok(())
+    }
+}
+
+/// Sender identity carried on a mail envelope. Named again here rather than
+/// reused from `ManagedSessionRecord` (`node-protocol`) for the same reason
+/// `HarnessApprovalLevelV1` mirrors `ApprovalLevel`: this crate takes no
+/// dependency outside its own bounded domain contract.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessRecordRef {
+    pub record_id: HarnessSelectorV1,
+    pub provider: HarnessSelectorV1,
+}
+
+impl HarnessRecordRef {
+    pub fn validate(&self) -> Result<(), HarnessValidationError> {
+        self.record_id.validate()?;
+        self.provider.validate()
+    }
+}
+
+/// Topic addressing (D8): direct mail to a session record, or a forum
+/// message to every grant that can currently read `task_id`
+/// (`HarnessEngine::read_visibility`). Never both -- a message has exactly
+/// one addressee shape.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum HarnessMailAddressV1 {
+    Session { record_id: HarnessSelectorV1 },
+    Task { task_id: HarnessTaskId },
+}
+
+impl HarnessMailAddressV1 {
+    pub fn validate(&self) -> Result<(), HarnessValidationError> {
+        match self {
+            Self::Session { record_id } => record_id.validate(),
+            Self::Task { task_id } => task_id.validate(),
+        }
+    }
+}
+
+/// S9's envelope, unchanged: sender, recipient, `reply_to`, bounded text.
+/// `subject` reuses the task title bound (`HARNESS_TITLE_MAX_BYTES` via
+/// `validate_title`) and `body` reuses the task body bound
+/// (`HARNESS_BODY_MAX_BYTES` via `validate_body`) -- no new size constant.
+/// `task_id` is correlation only: the harness never reads it to decide
+/// anything (D5); it exists so a panel can group mail by task.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessMailMessageV1 {
+    pub message_id: HarnessMailMessageId,
+    pub from: HarnessRecordRef,
+    pub to: HarnessMailAddressV1,
+    pub subject: String,
+    pub body: String,
+    pub reply_to: Option<HarnessMailMessageId>,
+    pub task_id: Option<HarnessTaskId>,
+    pub created_at_unix_ms: u64,
+}
+
+impl HarnessMailMessageV1 {
+    pub fn validate(&self) -> Result<(), HarnessValidationError> {
+        self.message_id.validate()?;
+        self.from.validate()?;
+        self.to.validate()?;
+        validate_title(&self.subject)?;
+        validate_body(&self.body)?;
+        if let Some(reply_to) = &self.reply_to {
+            reply_to.validate()?;
+            if reply_to == &self.message_id {
+                return Err(HarnessValidationError::SelfLink { field: "reply_to" });
+            }
+        }
+        if let Some(task_id) = &self.task_id {
+            task_id.validate()?;
+        }
+        if self.created_at_unix_ms == 0 {
+            return Err(HarnessValidationError::InvalidTimestamps);
+        }
+        Ok(())
+    }
+}
+
+/// Per-reader acknowledgement. What makes S9's at-least-once delivery
+/// terminate: dedup is `(message_id, reader_record_id)`, never the message
+/// alone -- a task-addressed message has one ack per reader, not one total.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessMailAckV1 {
+    pub message_id: HarnessMailMessageId,
+    pub reader_record_id: HarnessSelectorV1,
+    pub acked_at_unix_ms: u64,
+}
+
+impl HarnessMailAckV1 {
+    pub fn validate(&self) -> Result<(), HarnessValidationError> {
+        self.message_id.validate()?;
+        self.reader_record_id.validate()?;
+        if self.acked_at_unix_ms == 0 {
+            return Err(HarnessValidationError::InvalidTimestamps);
         }
         Ok(())
     }
@@ -2746,6 +2870,7 @@ mod tests {
             read_permissions: HarnessReadPermissionsV1::default(),
             monitoring_visibility: HarnessMonitoringVisibilityV1::Summary,
             context_permissions: HarnessContextPermissionsV1 { export: false, restore: false },
+            mail: false,
             state: SessionGrantStateV1::Active,
             created_at_unix_ms: 1_000,
             updated_at_unix_ms: 1_000,
@@ -2935,6 +3060,87 @@ mod tests {
             scoped.validate(),
             Err(HarnessValidationError::ReadScopeRequiresTaskRead),
         );
+    }
+
+    #[test]
+    fn harness_mail_grant_permission_is_legacy_safe_and_default_for_run_grants_it() {
+        let grant = valid_grant();
+        assert!(!grant.mail, "valid_grant() fixture predates the mail permission");
+        let mut legacy_wire = serde_json::to_value(&grant).unwrap();
+        legacy_wire.as_object_mut().unwrap().remove("mail");
+        let decoded: SessionGrantV1 = serde_json::from_value(legacy_wire).unwrap();
+        assert!(!decoded.mail);
+
+        let default_grant = SessionGrantV1::default_for_run(
+            grant_id('9'),
+            run_id('4'),
+            HarnessGrantTargetV1 {
+                node_id: selector("node-a"),
+                workspace_id: selector("workspace-a"),
+                provider_profile: selector("claude"),
+                mode: HarnessExecutionModeV1::Acp,
+            },
+            1_000,
+        );
+        assert!(default_grant.mail);
+        default_grant.validate().unwrap();
+    }
+
+    fn mail_message_id(hex: char) -> HarnessMailMessageId {
+        HarnessMailMessageId::new(format!("hmail_{}", hex.to_string().repeat(24))).unwrap()
+    }
+
+    fn valid_mail_message() -> HarnessMailMessageV1 {
+        HarnessMailMessageV1 {
+            message_id: mail_message_id('1'),
+            from: HarnessRecordRef { record_id: selector("record-a"), provider: selector("claude") },
+            to: HarnessMailAddressV1::Session { record_id: selector("record-b") },
+            subject: "status".to_owned(),
+            body: "handing off the result".to_owned(),
+            reply_to: None,
+            task_id: None,
+            created_at_unix_ms: 1_000,
+        }
+    }
+
+    #[test]
+    fn harness_mail_message_reuses_title_and_body_bounds_and_rejects_self_reply() {
+        let message = valid_mail_message();
+        message.validate().unwrap();
+
+        let mut oversized_subject = message.clone();
+        oversized_subject.subject = "x".repeat(HARNESS_TITLE_MAX_BYTES + 1);
+        assert_eq!(oversized_subject.validate(), Err(HarnessValidationError::InvalidTitle));
+
+        let mut oversized_body = message.clone();
+        oversized_body.body = "x".repeat(HARNESS_BODY_MAX_BYTES + 1);
+        assert_eq!(oversized_body.validate(), Err(HarnessValidationError::InvalidBody));
+
+        let mut self_reply = message.clone();
+        self_reply.reply_to = Some(self_reply.message_id.clone());
+        assert_eq!(
+            self_reply.validate(),
+            Err(HarnessValidationError::SelfLink { field: "reply_to" }),
+        );
+
+        let task_addressed = HarnessMailMessageV1 {
+            to: HarnessMailAddressV1::Task { task_id: task_id('1') },
+            ..message
+        };
+        task_addressed.validate().unwrap();
+    }
+
+    #[test]
+    fn harness_mail_ack_rejects_zero_timestamp() {
+        let ack = HarnessMailAckV1 {
+            message_id: mail_message_id('1'),
+            reader_record_id: selector("record-b"),
+            acked_at_unix_ms: 1_000,
+        };
+        ack.validate().unwrap();
+        let mut zero = ack;
+        zero.acked_at_unix_ms = 0;
+        assert_eq!(zero.validate(), Err(HarnessValidationError::InvalidTimestamps));
     }
 
     #[test]

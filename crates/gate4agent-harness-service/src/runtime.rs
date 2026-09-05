@@ -11900,13 +11900,22 @@ mod tests {
         assert_eq!(grant.maximum_child_count, 0);
         assert_eq!(grant.maximum_child_depth, 0);
         assert!(grant.allowed_delivery_bundles.is_empty());
+        assert!(grant.mail, "the default grant may write mail (mailbox arc D1)");
 
         let mut tool_ids = crate::read::allowed_tool_ids(&grant);
         tool_ids.sort();
         let mut expected: Vec<String> = gate4agent_harness_api::HARNESS_READ_TOOL_IDS
             .iter().map(|id| (*id).to_owned()).collect();
+        expected.extend([
+            "g4a_mail_send".to_owned(),
+            "g4a_mail_inbox".to_owned(),
+            "g4a_mail_ack".to_owned(),
+        ]);
         expected.sort();
-        assert_eq!(tool_ids, expected, "no mailbox tools exist yet, so this is the full ceiling");
+        assert_eq!(
+            tool_ids, expected,
+            "the eight reads plus the three mailbox writes are the full ceiling now that the default grant carries mail",
+        );
 
         // Retrying the identical dispatch replays the same grant rather than
         // minting a second one -- required for a dispatch retry not to leak
@@ -12133,6 +12142,8 @@ mod tests {
             execution_specs_v2: Vec::new(),
             deliveries: Vec::new(),
             continuations: Vec::new(),
+            mail_messages: Vec::new(),
+            mail_acks: Vec::new(),
         }).unwrap();
         let harness = HarnessService::from_engine_for_test(engine);
         let route = NodeRoute {

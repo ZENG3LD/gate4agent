@@ -4,9 +4,11 @@ use gate4agent_harness_protocol::{
     HarnessActorV1, HarnessContinuationRef, HarnessContinuationStateV1,
     HarnessContinuationV1, HarnessDeliveryRef, HarnessDeliveryStateV1, HarnessDeliveryV1,
     HarnessEntityReadScopeV1, HarnessExpectedExecutionSpecRevisionV1,
+    HarnessMailAckV1, HarnessMailAddressV1, HarnessMailMessageId, HarnessMailMessageV1,
     HarnessOperationId, HarnessOperationKindV1,
     HarnessOperationStateV1, HarnessOperationV1, HarnessResultRef, HarnessRevision,
-    HarnessRunId, HarnessRunLifecycleV1, HarnessRunV1, HarnessTaskExecutionSpecV1,
+    HarnessRunId, HarnessRunLifecycleV1, HarnessRunV1, HarnessSelectorV1,
+    HarnessSessionIdentityV1, HarnessTaskExecutionSpecV1,
     HarnessTaskExecutionSpecV2, HarnessTaskId, HarnessTaskLaunchIssuanceV1,
     HarnessTaskStateV1, HarnessTaskV1, HarnessTransferAuthorityRefV1,
     HarnessValidationError, SessionGrantId, SessionGrantStateV1, SessionGrantV1,
@@ -82,6 +84,14 @@ pub enum HarnessMutationV1 {
         expected_revision: HarnessRevision,
         grant: SessionGrantV1,
     },
+    SendMail {
+        operation: HarnessOperationV1,
+        message: HarnessMailMessageV1,
+    },
+    AckMail {
+        operation: HarnessOperationV1,
+        ack: HarnessMailAckV1,
+    },
 }
 
 impl HarnessMutationV1 {
@@ -95,7 +105,9 @@ impl HarnessMutationV1 {
             | Self::CreateIssuedRun { operation, .. }
             | Self::ReplaceRun { operation, .. }
             | Self::CreateGrant { operation, .. }
-            | Self::ReplaceGrant { operation, .. } => operation,
+            | Self::ReplaceGrant { operation, .. }
+            | Self::SendMail { operation, .. }
+            | Self::AckMail { operation, .. } => operation,
         }
     }
 
@@ -109,7 +121,9 @@ impl HarnessMutationV1 {
             | Self::CreateIssuedRun { operation, .. }
             | Self::ReplaceRun { operation, .. }
             | Self::CreateGrant { operation, .. }
-            | Self::ReplaceGrant { operation, .. } => operation,
+            | Self::ReplaceGrant { operation, .. }
+            | Self::SendMail { operation, .. }
+            | Self::AckMail { operation, .. } => operation,
         }
     }
 
@@ -184,6 +198,8 @@ impl HarnessMutationV1 {
                 expected_revision.validate()?;
                 grant.validate()?;
             }
+            Self::SendMail { message, .. } => message.validate()?,
+            Self::AckMail { ack, .. } => ack.validate()?,
         }
         Ok(())
     }
@@ -207,6 +223,10 @@ pub struct HarnessEngineCheckpointV1 {
     pub deliveries: Vec<HarnessDeliveryV1>,
     #[serde(default)]
     pub continuations: Vec<HarnessContinuationV1>,
+    #[serde(default)]
+    pub mail_messages: Vec<HarnessMailMessageV1>,
+    #[serde(default)]
+    pub mail_acks: Vec<HarnessMailAckV1>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -220,6 +240,8 @@ pub struct HarnessEngine {
     execution_specs_v2: BTreeMap<HarnessTaskId, HarnessTaskExecutionSpecV2>,
     deliveries: BTreeMap<HarnessDeliveryRef, HarnessDeliveryV1>,
     continuations: BTreeMap<HarnessContinuationRef, HarnessContinuationV1>,
+    mail_messages: BTreeMap<HarnessMailMessageId, HarnessMailMessageV1>,
+    mail_acks: BTreeMap<(HarnessMailMessageId, HarnessSelectorV1), HarnessMailAckV1>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -266,6 +288,16 @@ impl HarnessReadVisibilityV1 {
     pub fn is_empty(&self) -> bool {
         self.task_ids.is_empty() && self.run_ids.is_empty() && self.operation_ids.is_empty()
     }
+}
+
+/// One `mail_inbox` page entry: the message itself, whether this reader has
+/// acked it, and its thread -- the transitive closure over `reply_to`
+/// (S9: "threading needs no second concept").
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HarnessMailInboxEntryV1 {
+    pub message: HarnessMailMessageV1,
+    pub acked: bool,
+    pub thread: Vec<HarnessMailMessageV1>,
 }
 
 #[derive(Clone, Debug)]
@@ -397,6 +429,22 @@ impl HarnessEngine {
 
     pub fn deliveries(&self) -> impl Iterator<Item = &HarnessDeliveryV1> {
         self.deliveries.values()
+    }
+
+    pub fn mail_message(&self, message_id: &HarnessMailMessageId) -> Option<&HarnessMailMessageV1> {
+        self.mail_messages.get(message_id)
+    }
+
+    pub fn mail_messages(&self) -> impl Iterator<Item = &HarnessMailMessageV1> {
+        self.mail_messages.values()
+    }
+
+    pub fn mail_ack(
+        &self,
+        message_id: &HarnessMailMessageId,
+        reader_record_id: &HarnessSelectorV1,
+    ) -> Option<&HarnessMailAckV1> {
+        self.mail_acks.get(&(message_id.clone(), reader_record_id.clone()))
     }
 
     pub fn scheduler_pending_dispatch(
@@ -585,6 +633,129 @@ impl HarnessEngine {
         })
     }
 
+    /// D8's forum read: mail addressed directly to `reader_record_id`
+    /// (`Session`) plus every message addressed to a task currently visible
+    /// to `grant_id` (`Task`, via `read_visibility` -- the same lineage
+    /// fence every other read tool already uses, never widened for mail).
+    /// Unacked entries sort first; each carries its `thread`. `limit` bounds
+    /// the returned page -- the caller passes a value already bounded by its
+    /// own request schema (harness MCP's `HARNESS_ENTITY_PAGE_LIMIT_MAX`,
+    /// reused there); this layer additionally caps its own scan at
+    /// `HARNESS_VISIBILITY_SCAN_MAX`, the same bound `read_visibility`
+    /// already uses, so an inbox read costs no more than a visibility scan.
+    pub fn mail_inbox(
+        &self,
+        grant_id: &SessionGrantId,
+        reader_record_id: &HarnessSelectorV1,
+        since_unix_ms: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<HarnessMailInboxEntryV1>, HarnessEngineError> {
+        if self.mail_messages.len() > HARNESS_VISIBILITY_SCAN_MAX {
+            return Err(HarnessEngineError::ReadVisibilityResourceExhausted);
+        }
+        let visibility = self.read_visibility(grant_id)?;
+        let mut matches: Vec<&HarnessMailMessageV1> = self.mail_messages.values()
+            .filter(|message| match &message.to {
+                HarnessMailAddressV1::Session { record_id } => record_id == reader_record_id,
+                HarnessMailAddressV1::Task { task_id } => visibility.task_visible(task_id),
+            })
+            .filter(|message| {
+                since_unix_ms.map_or(true, |since| message.created_at_unix_ms >= since)
+            })
+            .collect();
+        matches.sort_by(|left, right| {
+            let left_acked = self.mail_ack(&left.message_id, reader_record_id).is_some();
+            let right_acked = self.mail_ack(&right.message_id, reader_record_id).is_some();
+            left_acked.cmp(&right_acked)
+                .then(left.created_at_unix_ms.cmp(&right.created_at_unix_ms))
+                .then(left.message_id.cmp(&right.message_id))
+        });
+        matches.truncate(limit);
+        Ok(matches.into_iter()
+            .map(|message| HarnessMailInboxEntryV1 {
+                acked: self.mail_ack(&message.message_id, reader_record_id).is_some(),
+                thread: self.mail_thread(&message.message_id),
+                message: message.clone(),
+            })
+            .collect())
+    }
+
+    /// The transitive closure of `reply_to`: every message connected to
+    /// `message_id` through a chain of replies in either direction, sorted
+    /// by `created_at_unix_ms`. Bounded by `HARNESS_VISIBILITY_SCAN_MAX`, the
+    /// same scan bound the rest of this engine's read paths already use.
+    fn mail_thread(&self, message_id: &HarnessMailMessageId) -> Vec<HarnessMailMessageV1> {
+        let mut component = BTreeSet::new();
+        let mut frontier = vec![message_id.clone()];
+        while let Some(current) = frontier.pop() {
+            if component.len() > HARNESS_VISIBILITY_SCAN_MAX || !component.insert(current.clone()) {
+                continue;
+            }
+            let Some(message) = self.mail_messages.get(&current) else { continue };
+            if let Some(reply_to) = &message.reply_to {
+                if !component.contains(reply_to) {
+                    frontier.push(reply_to.clone());
+                }
+            }
+            for candidate in self.mail_messages.values() {
+                if candidate.reply_to.as_ref() == Some(&current)
+                    && !component.contains(&candidate.message_id)
+                {
+                    frontier.push(candidate.message_id.clone());
+                }
+            }
+        }
+        let mut thread: Vec<HarnessMailMessageV1> = component.iter()
+            .filter_map(|id| self.mail_messages.get(id).cloned())
+            .collect();
+        thread.sort_by_key(|message| message.created_at_unix_ms);
+        thread
+    }
+
+    /// Retention: mail addressed to `task_id` stays readable exactly as long
+    /// as the task exists and is removed with it. Measured, not assumed:
+    /// this engine has no existing task-deletion path to hook into --
+    /// `CreateTask`/`ReplaceTask` only ever insert or replace a task in
+    /// place, a task is never removed once created (`self.tasks` only
+    /// grows). This is therefore a new primitive with no call site yet;
+    /// whichever future retention trigger decides a terminal task's mail
+    /// should stop being retained (a scheduled sweep, or the task's own
+    /// terminal-state transition) calls it.
+    pub fn delete_mail_for_task(&mut self, task_id: &HarnessTaskId) {
+        let doomed: Vec<HarnessMailMessageId> = self.mail_messages.values()
+            .filter(|message| {
+                matches!(&message.to, HarnessMailAddressV1::Task { task_id: to } if to == task_id)
+            })
+            .map(|message| message.message_id.clone())
+            .collect();
+        self.delete_mail_messages(&doomed);
+    }
+
+    /// Retention: mail addressed to `record_id` stays readable exactly as
+    /// long as the session record exists and is removed with it. This
+    /// engine has no session-record registry or deletion path to hook into
+    /// at all -- `ManagedSessionRecord` lifecycle lives in `node-protocol`
+    /// and `node/server.rs`, components harness-engine has no dependency on
+    /// and no visibility into. The hook this retention rule needs is
+    /// therefore outside this crate: whoever removes or forgets a
+    /// `ManagedSessionRecord` must also call this.
+    pub fn delete_mail_for_record(&mut self, record_id: &HarnessSelectorV1) {
+        let doomed: Vec<HarnessMailMessageId> = self.mail_messages.values()
+            .filter(|message| {
+                matches!(&message.to, HarnessMailAddressV1::Session { record_id: to } if to == record_id)
+            })
+            .map(|message| message.message_id.clone())
+            .collect();
+        self.delete_mail_messages(&doomed);
+    }
+
+    fn delete_mail_messages(&mut self, message_ids: &[HarnessMailMessageId]) {
+        for message_id in message_ids {
+            self.mail_messages.remove(message_id);
+            self.mail_acks.retain(|(id, _), _| id != message_id);
+        }
+    }
+
     pub fn checkpoint(&self) -> HarnessEngineCheckpointV1 {
         HarnessEngineCheckpointV1 {
             version: HARNESS_ENGINE_CHECKPOINT_VERSION_V1,
@@ -597,6 +768,8 @@ impl HarnessEngine {
             execution_specs_v2: self.execution_specs_v2.values().cloned().collect(),
             deliveries: self.deliveries.values().cloned().collect(),
             continuations: self.continuations.values().cloned().collect(),
+            mail_messages: self.mail_messages.values().cloned().collect(),
+            mail_acks: self.mail_acks.values().cloned().collect(),
         }
     }
 
@@ -689,6 +862,22 @@ impl HarnessEngine {
             if engine.continuations.insert(continuation_ref.clone(), continuation).is_some() {
                 return Err(HarnessEngineError::DuplicateCheckpointId(
                     continuation_ref.to_string(),
+                ));
+            }
+        }
+        for message in checkpoint.mail_messages {
+            message.validate()?;
+            let message_id = message.message_id.clone();
+            if engine.mail_messages.insert(message_id.clone(), message).is_some() {
+                return Err(HarnessEngineError::DuplicateCheckpointId(message_id.to_string()));
+            }
+        }
+        for ack in checkpoint.mail_acks {
+            ack.validate()?;
+            let key = (ack.message_id.clone(), ack.reader_record_id.clone());
+            if engine.mail_acks.insert(key, ack).is_some() {
+                return Err(HarnessEngineError::DuplicateCheckpointId(
+                    "mail ack".to_owned(),
                 ));
             }
         }
@@ -1171,6 +1360,51 @@ impl HarnessEngine {
                 }
                 validate_grant_transition(current, &grant, operation.kind)?;
                 next.grants.insert(grant.grant_id.clone(), grant);
+                next.operations.insert(operation.operation_id.clone(), operation.clone());
+                next.finish(operation, HarnessApplyOutcome::Applied)
+            }
+            HarnessMutationV1::SendMail { operation, message } => {
+                require_kind(operation.kind, HarnessOperationKindV1::SendMail)?;
+                require_operation_state(operation.state, HarnessOperationStateV1::Succeeded)?;
+                let sender_grant_id = operation.grant_id.as_ref()
+                    .ok_or(HarnessEngineError::WrongOperationKind)?;
+                let sender_grant = next.grants.get(sender_grant_id)
+                    .ok_or_else(|| HarnessEngineError::NotFound(sender_grant_id.to_string()))?;
+                if sender_grant.state != SessionGrantStateV1::Active || !sender_grant.mail {
+                    return Err(HarnessEngineError::MailPermissionDenied {
+                        grant_id: sender_grant_id.clone(),
+                    });
+                }
+                if next.mail_messages.contains_key(&message.message_id) {
+                    return Err(HarnessEngineError::AlreadyExists(message.message_id.to_string()));
+                }
+                next.validate_mail_recipient(&message.to)?;
+                next.mail_messages.insert(message.message_id.clone(), message);
+                next.operations.insert(operation.operation_id.clone(), operation.clone());
+                next.finish(operation, HarnessApplyOutcome::Applied)
+            }
+            HarnessMutationV1::AckMail { operation, ack } => {
+                require_kind(operation.kind, HarnessOperationKindV1::AckMail)?;
+                require_operation_state(operation.state, HarnessOperationStateV1::Succeeded)?;
+                let reader_grant_id = operation.grant_id.as_ref()
+                    .ok_or(HarnessEngineError::WrongOperationKind)?;
+                let reader_grant = next.grants.get(reader_grant_id)
+                    .ok_or_else(|| HarnessEngineError::NotFound(reader_grant_id.to_string()))?;
+                if reader_grant.state != SessionGrantStateV1::Active || !reader_grant.mail {
+                    return Err(HarnessEngineError::MailPermissionDenied {
+                        grant_id: reader_grant_id.clone(),
+                    });
+                }
+                if !next.mail_messages.contains_key(&ack.message_id) {
+                    return Err(HarnessEngineError::NotFound(ack.message_id.to_string()));
+                }
+                // Idempotent by construction: acking an already-acked
+                // (message_id, reader) pair from a fresh operation id is a
+                // no-op success, never a conflict -- that is what makes S9's
+                // at-least-once delivery terminate.
+                next.mail_acks
+                    .entry((ack.message_id.clone(), ack.reader_record_id.clone()))
+                    .or_insert(ack);
                 next.operations.insert(operation.operation_id.clone(), operation.clone());
                 next.finish(operation, HarnessApplyOutcome::Applied)
             }
@@ -2211,6 +2445,18 @@ impl HarnessEngine {
                 return Err(HarnessEngineError::MismatchedIdentity("run task backlink"));
             }
         }
+        for message in self.mail_messages.values() {
+            if let HarnessMailAddressV1::Task { task_id } = &message.to {
+                if !self.tasks.contains_key(task_id) {
+                    return Err(HarnessEngineError::NotFound(task_id.to_string()));
+                }
+            }
+        }
+        for ack in self.mail_acks.values() {
+            if !self.mail_messages.contains_key(&ack.message_id) {
+                return Err(HarnessEngineError::NotFound(ack.message_id.to_string()));
+            }
+        }
         self.validate_task_cycles()?;
         self.validate_run_cycles()?;
         Ok(())
@@ -2870,6 +3116,56 @@ impl HarnessEngine {
         Ok(())
     }
 
+    /// A named, fail-closed refusal (never a silent drop, per S9 §3) for an
+    /// unknown or ended mail recipient. `Task` reachability is the task's own
+    /// terminal states; `Session` reachability is read off the run bindings
+    /// that ever claimed `record_id` -- the engine has no independent record
+    /// registry (that lives in `ManagedSessionRecord`, node-protocol, outside
+    /// harness-engine's ken), so a record with no run ever bound to it is
+    /// `RecipientUnknown` and a record whose every bound run has reached a
+    /// terminal lifecycle is `RecipientEnded`.
+    fn validate_mail_recipient(&self, to: &HarnessMailAddressV1) -> Result<(), HarnessEngineError> {
+        match to {
+            HarnessMailAddressV1::Task { task_id } => {
+                let task = self.tasks.get(task_id).ok_or_else(|| {
+                    HarnessEngineError::MailRecipientUnknown { to: describe_mail_address(to) }
+                })?;
+                if matches!(
+                    task.state,
+                    HarnessTaskStateV1::Done | HarnessTaskStateV1::Failed | HarnessTaskStateV1::Cancelled
+                ) {
+                    return Err(HarnessEngineError::MailRecipientEnded { to: describe_mail_address(to) });
+                }
+                Ok(())
+            }
+            HarnessMailAddressV1::Session { record_id } => {
+                let mut seen_any = false;
+                let mut all_terminal = true;
+                for run in self.runs.values() {
+                    if session_record_id_of(run) != Some(record_id) {
+                        continue;
+                    }
+                    seen_any = true;
+                    if !matches!(
+                        run.lifecycle,
+                        HarnessRunLifecycleV1::Completed
+                            | HarnessRunLifecycleV1::Failed
+                            | HarnessRunLifecycleV1::Cancelled
+                    ) {
+                        all_terminal = false;
+                    }
+                }
+                if !seen_any {
+                    return Err(HarnessEngineError::MailRecipientUnknown { to: describe_mail_address(to) });
+                }
+                if all_terminal {
+                    return Err(HarnessEngineError::MailRecipientEnded { to: describe_mail_address(to) });
+                }
+                Ok(())
+            }
+        }
+    }
+
     fn validate_operation_links(
         &self,
         operation: &HarnessOperationV1,
@@ -2943,6 +3239,20 @@ fn visit_run(
     visiting.remove(run_id);
     complete.insert(run_id.clone());
     Ok(())
+}
+
+fn session_record_id_of(run: &HarnessRunV1) -> Option<&HarnessSelectorV1> {
+    match run.binding.as_ref()?.session {
+        HarnessSessionIdentityV1::Managed { ref record_id, .. } => Some(record_id),
+        HarnessSessionIdentityV1::Inline { .. } => None,
+    }
+}
+
+fn describe_mail_address(to: &HarnessMailAddressV1) -> String {
+    match to {
+        HarnessMailAddressV1::Session { record_id } => format!("session:{}", record_id.as_str()),
+        HarnessMailAddressV1::Task { task_id } => format!("task:{task_id}"),
+    }
 }
 
 fn same_operation_request(left: &HarnessOperationV1, right: &HarnessOperationV1) -> bool {
@@ -3891,6 +4201,12 @@ pub enum HarnessEngineError {
     DeliveryCapacityExceeded,
     #[error("delivery restage must change only to a different current authoritative Node incarnation")]
     InvalidDeliveryRestage,
+    #[error("mail recipient {to} is unknown")]
+    MailRecipientUnknown { to: String },
+    #[error("mail recipient {to} has ended and can no longer receive mail")]
+    MailRecipientEnded { to: String },
+    #[error("grant {grant_id} does not hold the mail permission")]
+    MailPermissionDenied { grant_id: SessionGrantId },
 }
 
 #[cfg(test)]
@@ -3911,6 +4227,8 @@ mod tests {
         HarnessFailureV1, HarnessLaunchAuthorityRefV1, HarnessLaunchPlanRefV1,
         HarnessLaunchTargetSelectionV1, HarnessLaunchWorktreeSelectionV1,
         HarnessGrantTargetV1, HarnessIdempotencyRef,
+        HarnessMailAckV1, HarnessMailAddressV1, HarnessMailMessageId, HarnessMailMessageV1,
+        HarnessRecordRef,
         HarnessMonitoringVisibilityV1, HarnessOutcomeUnknownReasonV1,
         HarnessReadPermissionsV1,
         HarnessOperationKindV1, HarnessOperationStateV1, HarnessOperationTimeoutsV1,
@@ -3997,6 +4315,14 @@ mod tests {
 
     fn grant_id() -> SessionGrantId {
         SessionGrantId::new(format!("hgrant_{}", "a".repeat(24))).unwrap()
+    }
+
+    fn numbered_grant_id(value: usize) -> SessionGrantId {
+        SessionGrantId::new(format!("hgrant_{value:024x}")).unwrap()
+    }
+
+    fn mail_message_id(hex: char) -> HarnessMailMessageId {
+        HarnessMailMessageId::new(format!("hmail_{}", hex.to_string().repeat(24))).unwrap()
     }
 
     fn revision(value: u64) -> HarnessRevision {
@@ -4263,9 +4589,125 @@ mod tests {
                 export: false,
                 restore: false,
             },
+            mail: false,
             state,
             created_at_unix_ms: 10,
             updated_at_unix_ms: 10 + revision_value,
+        }
+    }
+
+    fn mail_grant(state: SessionGrantStateV1, revision_value: u64) -> SessionGrantV1 {
+        let mut record = grant(state, revision_value);
+        record.mail = true;
+        record
+    }
+
+    fn numbered_operation_id(value: usize) -> HarnessOperationId {
+        HarnessOperationId::new(format!("hop_{value:024x}")).unwrap()
+    }
+
+    fn managed_run(
+        id: HarnessRunId,
+        owning_task_id: HarnessTaskId,
+        operation_id_value: HarnessOperationId,
+        lifecycle: HarnessRunLifecycleV1,
+        revision_value: u64,
+        record_id: &str,
+    ) -> HarnessRunV1 {
+        let mut value = run(lifecycle, revision_value);
+        value.run_id = id;
+        value.task_id = owning_task_id;
+        value.operation_id = operation_id_value;
+        if let Some(binding) = value.binding.as_mut() {
+            binding.session = HarnessSessionIdentityV1::Managed {
+                record_id: HarnessSelectorV1::new(record_id).unwrap(),
+                active_session: Some(HarnessRuntimeIdentityV1 { instance_id: 1, generation: 1 }),
+            };
+        }
+        value
+    }
+
+    /// Inserts a run together with the `CreateRun` operation
+    /// `validate_run_links` requires every run to carry -- fixture setup
+    /// only, never the mutation path under test. Covers the two lifecycles
+    /// this file's mail tests use.
+    fn insert_managed_run(
+        engine: &mut HarnessEngine,
+        id: HarnessRunId,
+        owning_task_id: HarnessTaskId,
+        operation_id_value: HarnessOperationId,
+        lifecycle: HarnessRunLifecycleV1,
+        revision_value: u64,
+        record_id: &str,
+    ) {
+        let (state, dispatched_at, finished_at) = match lifecycle {
+            HarnessRunLifecycleV1::Requested => (HarnessOperationStateV1::Prepared, None, None),
+            HarnessRunLifecycleV1::Running => (HarnessOperationStateV1::Succeeded, Some(6), Some(8)),
+            other => panic!("insert_managed_run fixture does not cover lifecycle {other:?}"),
+        };
+        let run_record = managed_run(
+            id.clone(),
+            owning_task_id.clone(),
+            operation_id_value.clone(),
+            lifecycle,
+            revision_value,
+            record_id,
+        );
+        let operation = HarnessOperationV1 {
+            operation_id: operation_id_value,
+            revision: revision(1),
+            actor: HarnessActorV1::User { actor_id: HarnessSelectorV1::new("operator").unwrap() },
+            kind: HarnessOperationKindV1::CreateRun,
+            state,
+            task_id: Some(owning_task_id),
+            run_id: Some(id.clone()),
+            grant_id: None,
+            reconciles_operation_id: None,
+            expected_revision: Some(revision(1)),
+            request_digest: HarnessRequestDigest::new("c".repeat(64)).unwrap(),
+            idempotency_ref: HarnessIdempotencyRef::new(format!("hidem_{}", "c".repeat(24))).unwrap(),
+            failure: None,
+            outcome_unknown_reason: None,
+            reconciliation_outcome: None,
+            created_at_unix_ms: 5,
+            updated_at_unix_ms: finished_at.unwrap_or(5),
+            dispatched_at_unix_ms: dispatched_at,
+            finished_at_unix_ms: finished_at,
+        };
+        engine.operations.insert(operation.operation_id.clone(), operation);
+        engine.runs.insert(id, run_record);
+    }
+
+    fn mail_operation(
+        id: HarnessOperationId,
+        authorizing_grant_id: SessionGrantId,
+        kind: HarnessOperationKindV1,
+        digest_hex: char,
+        actor_run_id: HarnessRunId,
+    ) -> HarnessOperationV1 {
+        HarnessOperationV1 {
+            operation_id: id,
+            revision: revision(1),
+            actor: HarnessActorV1::ParentRun { run_id: actor_run_id },
+            kind,
+            state: HarnessOperationStateV1::Succeeded,
+            task_id: None,
+            run_id: None,
+            grant_id: Some(authorizing_grant_id),
+            reconciles_operation_id: None,
+            expected_revision: None,
+            request_digest: HarnessRequestDigest::new(digest_hex.to_string().repeat(64)).unwrap(),
+            idempotency_ref: HarnessIdempotencyRef::new(format!(
+                "hidem_{}",
+                digest_hex.to_string().repeat(24)
+            )).unwrap(),
+            failure: None,
+            outcome_unknown_reason: None,
+            reconciliation_outcome: None,
+            created_at_unix_ms: 10,
+            updated_at_unix_ms: 12,
+            dispatched_at_unix_ms: None,
+            finished_at_unix_ms: Some(12),
         }
     }
 
@@ -5088,6 +5530,8 @@ mod tests {
             execution_specs_v2: Vec::new(),
             deliveries: Vec::new(),
             continuations: Vec::new(),
+            mail_messages: Vec::new(),
+            mail_acks: Vec::new(),
         };
         assert!(matches!(HarnessEngine::restore(checkpoint), Err(HarnessEngineError::Cycle(_))));
     }
@@ -5177,6 +5621,8 @@ mod tests {
                 execution_specs_v2: Vec::new(),
                 deliveries: Vec::new(),
                 continuations: Vec::new(),
+                mail_messages: Vec::new(),
+                mail_acks: Vec::new(),
             }).unwrap();
             let before = engine.checkpoint();
             let mut next_run = run(next_lifecycle, 4);
@@ -5291,6 +5737,8 @@ mod tests {
             execution_specs_v2: Vec::new(),
             deliveries: Vec::new(),
             continuations: Vec::new(),
+            mail_messages: Vec::new(),
+            mail_acks: Vec::new(),
         }).unwrap()
     }
 
@@ -5471,6 +5919,8 @@ mod tests {
             execution_specs_v2: Vec::new(),
             deliveries: Vec::new(),
             continuations: Vec::new(),
+            mail_messages: Vec::new(),
+            mail_acks: Vec::new(),
         }).unwrap();
         let operation = context_pack_record_operation('6', current_run.revision, 30);
         let before = engine.checkpoint();
@@ -5709,6 +6159,8 @@ mod tests {
             execution_specs_v2: Vec::new(),
             deliveries: Vec::new(),
             continuations: Vec::new(),
+            mail_messages: Vec::new(),
+            mail_acks: Vec::new(),
         }).unwrap();
         let operation = git_facts_record_operation('6', current_run.revision, 30);
         let before = engine.checkpoint();
@@ -5783,6 +6235,8 @@ mod tests {
             execution_specs_v2: Vec::new(),
             deliveries: Vec::new(),
             continuations: Vec::new(),
+            mail_messages: Vec::new(),
+            mail_acks: Vec::new(),
         }).unwrap()
     }
 
@@ -5985,6 +6439,8 @@ mod tests {
             execution_specs_v2: Vec::new(),
             deliveries: Vec::new(),
             continuations: Vec::new(),
+            mail_messages: Vec::new(),
+            mail_acks: Vec::new(),
         }).unwrap();
 
         // Same-value replay at capacity is a legal no-op: the delta is
@@ -6055,6 +6511,8 @@ mod tests {
             execution_specs_v2: Vec::new(),
             deliveries: Vec::new(),
             continuations: Vec::new(),
+            mail_messages: Vec::new(),
+            mail_acks: Vec::new(),
         }).unwrap();
         let before = engine.checkpoint();
 
@@ -6140,6 +6598,8 @@ mod tests {
                 execution_specs_v2: Vec::new(),
                 deliveries: Vec::new(),
                 continuations: Vec::new(),
+                mail_messages: Vec::new(),
+                mail_acks: Vec::new(),
             }).unwrap();
             let before = engine.checkpoint();
             let next_lifecycle = if outcome_unknown {
@@ -6356,6 +6816,8 @@ mod tests {
             execution_specs_v2: Vec::new(),
             deliveries: Vec::new(),
             continuations: Vec::new(),
+            mail_messages: Vec::new(),
+            mail_acks: Vec::new(),
         };
         assert!(matches!(
             HarnessEngine::restore(orphan_checkpoint),
@@ -6373,6 +6835,8 @@ mod tests {
             execution_specs_v2: Vec::new(),
             deliveries: Vec::new(),
             continuations: Vec::new(),
+            mail_messages: Vec::new(),
+            mail_acks: Vec::new(),
         };
         assert!(matches!(
             HarnessEngine::restore(incoherent_checkpoint),
@@ -6395,6 +6859,8 @@ mod tests {
             execution_specs_v2: Vec::new(),
             deliveries: Vec::new(),
             continuations: Vec::new(),
+            mail_messages: Vec::new(),
+            mail_acks: Vec::new(),
         };
         assert!(matches!(
             HarnessEngine::restore(checkpoint),
@@ -6728,6 +7194,8 @@ mod tests {
             execution_specs_v2: Vec::new(),
             deliveries: Vec::new(),
             continuations: vec![exporting.clone()],
+            mail_messages: Vec::new(),
+            mail_acks: Vec::new(),
         };
         let mut legacy_wire = serde_json::to_value(&checkpoint).unwrap();
         let continuation_wire = legacy_wire.get_mut("continuations").unwrap()
@@ -7060,5 +7528,500 @@ mod tests {
             ).unwrap().outcome(),
             HarnessApplyOutcome::Replayed,
         );
+    }
+
+    fn mail_record_ref(record_id: &str, provider: &str) -> HarnessRecordRef {
+        HarnessRecordRef {
+            record_id: HarnessSelectorV1::new(record_id).unwrap(),
+            provider: HarnessSelectorV1::new(provider).unwrap(),
+        }
+    }
+
+    #[test]
+    fn harness_mail_send_to_session_then_inbox_ack_is_idempotent() {
+        let mut engine = HarnessEngine::new();
+        let sender_run_id = numbered_run_id(101);
+        let recipient_run_id = numbered_run_id(102);
+        let sender_task_id = numbered_task_id(101);
+        let recipient_task_id = numbered_task_id(102);
+
+        let mut sender_task = task(sender_task_id.clone(), 1, "sender task");
+        sender_task.run_ids = vec![sender_run_id.clone()];
+        engine.tasks.insert(sender_task_id.clone(), sender_task);
+        insert_managed_run(
+            &mut engine,
+            sender_run_id.clone(),
+            sender_task_id,
+            numbered_operation_id(101),
+            HarnessRunLifecycleV1::Running,
+            1,
+            "record-sender",
+        );
+
+        let mut recipient_task = task(recipient_task_id.clone(), 1, "recipient task");
+        recipient_task.run_ids = vec![recipient_run_id.clone()];
+        engine.tasks.insert(recipient_task_id.clone(), recipient_task);
+        insert_managed_run(
+            &mut engine,
+            recipient_run_id.clone(),
+            recipient_task_id,
+            numbered_operation_id(102),
+            HarnessRunLifecycleV1::Running,
+            1,
+            "record-recipient",
+        );
+
+        let mut sender_grant = mail_grant(SessionGrantStateV1::Active, 1);
+        sender_grant.grant_id = numbered_grant_id(101);
+        sender_grant.actor_run_id = sender_run_id.clone();
+        engine.grants.insert(sender_grant.grant_id.clone(), sender_grant.clone());
+
+        let mut reader_grant = mail_grant(SessionGrantStateV1::Active, 1);
+        reader_grant.grant_id = numbered_grant_id(102);
+        reader_grant.actor_run_id = recipient_run_id.clone();
+        engine.grants.insert(reader_grant.grant_id.clone(), reader_grant.clone());
+
+        let message = HarnessMailMessageV1 {
+            message_id: mail_message_id('1'),
+            from: mail_record_ref("record-sender", "claude"),
+            to: HarnessMailAddressV1::Session { record_id: HarnessSelectorV1::new("record-recipient").unwrap() },
+            subject: "status".to_owned(),
+            body: "handing off the result".to_owned(),
+            reply_to: None,
+            task_id: None,
+            created_at_unix_ms: 20,
+        };
+        let send_operation = mail_operation(
+            operation_id('1'),
+            sender_grant.grant_id.clone(),
+            HarnessOperationKindV1::SendMail,
+            '1',
+            sender_run_id,
+        );
+        let prepared = engine.prepare(HarnessMutationV1::SendMail {
+            operation: send_operation,
+            message: message.clone(),
+        }).unwrap();
+        assert_eq!(prepared.outcome(), HarnessApplyOutcome::Applied);
+        engine.accept(prepared);
+        assert!(engine.mail_message(&message.message_id).is_some());
+
+        let reader_record_id = HarnessSelectorV1::new("record-recipient").unwrap();
+        let inbox_before_ack = engine.mail_inbox(&reader_grant.grant_id, &reader_record_id, None, 64).unwrap();
+        assert_eq!(inbox_before_ack.len(), 1);
+        assert!(!inbox_before_ack[0].acked);
+        assert_eq!(inbox_before_ack[0].message.message_id, message.message_id);
+
+        let ack = HarnessMailAckV1 {
+            message_id: message.message_id.clone(),
+            reader_record_id: reader_record_id.clone(),
+            acked_at_unix_ms: 25,
+        };
+        let ack_operation = mail_operation(
+            operation_id('2'),
+            reader_grant.grant_id.clone(),
+            HarnessOperationKindV1::AckMail,
+            '2',
+            recipient_run_id.clone(),
+        );
+        let prepared = engine.prepare(HarnessMutationV1::AckMail {
+            operation: ack_operation,
+            ack: ack.clone(),
+        }).unwrap();
+        engine.accept(prepared);
+        assert!(engine.mail_ack(&message.message_id, &reader_record_id).is_some());
+
+        let inbox_after_ack = engine.mail_inbox(&reader_grant.grant_id, &reader_record_id, None, 64).unwrap();
+        assert_eq!(inbox_after_ack.len(), 1);
+        assert!(inbox_after_ack[0].acked);
+
+        // Second ack, a fresh operation id targeting the same (message, reader)
+        // pair: idempotent no-op success, never a conflict.
+        let second_ack_operation = mail_operation(
+            operation_id('3'),
+            reader_grant.grant_id.clone(),
+            HarnessOperationKindV1::AckMail,
+            '3',
+            recipient_run_id,
+        );
+        let prepared = engine.prepare(HarnessMutationV1::AckMail {
+            operation: second_ack_operation,
+            ack,
+        }).unwrap();
+        assert_eq!(prepared.outcome(), HarnessApplyOutcome::Applied);
+        engine.accept(prepared);
+        assert!(engine.mail_ack(&message.message_id, &reader_record_id).is_some());
+    }
+
+    #[test]
+    fn harness_mail_send_to_task_visibility_gates_readers() {
+        let mut engine = HarnessEngine::new();
+        let run_a = numbered_run_id(201);
+        let run_b = numbered_run_id(202);
+        let run_c = numbered_run_id(203);
+        let shared_task_id = numbered_task_id(201);
+        let other_task_id = numbered_task_id(202);
+
+        let mut shared_task = task(shared_task_id.clone(), 1, "shared task");
+        shared_task.run_ids = vec![run_a.clone(), run_b.clone()];
+        engine.tasks.insert(shared_task_id.clone(), shared_task);
+        let mut other_task = task(other_task_id.clone(), 1, "other task");
+        other_task.run_ids = vec![run_c.clone()];
+        engine.tasks.insert(other_task_id.clone(), other_task);
+
+        for (index, (id, owner)) in [
+            (run_a.clone(), shared_task_id.clone()),
+            (run_b.clone(), shared_task_id.clone()),
+            (run_c.clone(), other_task_id),
+        ].into_iter().enumerate() {
+            insert_managed_run(
+                &mut engine,
+                id,
+                owner,
+                numbered_operation_id(210 + index),
+                HarnessRunLifecycleV1::Requested,
+                1,
+                "record-unused",
+            );
+        }
+
+        let mut grant_a = mail_grant(SessionGrantStateV1::Active, 1);
+        grant_a.grant_id = numbered_grant_id(201);
+        grant_a.actor_run_id = run_a.clone();
+        grant_a.read_permissions.tasks = HarnessEntityReadScopeV1::SelfOnly;
+        engine.grants.insert(grant_a.grant_id.clone(), grant_a.clone());
+
+        let mut grant_b = mail_grant(SessionGrantStateV1::Active, 1);
+        grant_b.grant_id = numbered_grant_id(202);
+        grant_b.actor_run_id = run_b.clone();
+        grant_b.read_permissions.tasks = HarnessEntityReadScopeV1::SelfOnly;
+        engine.grants.insert(grant_b.grant_id.clone(), grant_b.clone());
+
+        let mut grant_c = mail_grant(SessionGrantStateV1::Active, 1);
+        grant_c.grant_id = numbered_grant_id(203);
+        grant_c.actor_run_id = run_c.clone();
+        grant_c.read_permissions.tasks = HarnessEntityReadScopeV1::SelfOnly;
+        engine.grants.insert(grant_c.grant_id.clone(), grant_c.clone());
+
+        let message = HarnessMailMessageV1 {
+            message_id: mail_message_id('2'),
+            from: mail_record_ref("record-a", "claude"),
+            to: HarnessMailAddressV1::Task { task_id: shared_task_id },
+            subject: "handoff".to_owned(),
+            body: "posting the result to the shared task".to_owned(),
+            reply_to: None,
+            task_id: None,
+            created_at_unix_ms: 30,
+        };
+        let send_operation = mail_operation(
+            operation_id('4'),
+            grant_a.grant_id.clone(),
+            HarnessOperationKindV1::SendMail,
+            '4',
+            run_a,
+        );
+        let prepared = engine.prepare(HarnessMutationV1::SendMail {
+            operation: send_operation,
+            message: message.clone(),
+        }).unwrap();
+        engine.accept(prepared);
+
+        let placeholder_record = HarnessSelectorV1::new("record-unused").unwrap();
+        let inbox_a = engine.mail_inbox(&grant_a.grant_id, &placeholder_record, None, 64).unwrap();
+        let inbox_b = engine.mail_inbox(&grant_b.grant_id, &placeholder_record, None, 64).unwrap();
+        let inbox_c = engine.mail_inbox(&grant_c.grant_id, &placeholder_record, None, 64).unwrap();
+        assert_eq!(inbox_a.len(), 1);
+        assert_eq!(inbox_a[0].message.message_id, message.message_id);
+        assert_eq!(inbox_b.len(), 1);
+        assert_eq!(inbox_b[0].message.message_id, message.message_id);
+        assert!(inbox_c.is_empty(), "a reader without task visibility must not see the message");
+    }
+
+    #[test]
+    fn harness_mail_reply_threads_under_the_original() {
+        let mut engine = HarnessEngine::new();
+        let run_a = numbered_run_id(301);
+        let run_b = numbered_run_id(302);
+        let task_a = numbered_task_id(301);
+        let task_b = numbered_task_id(302);
+        let mut owner_task_a = task(task_a.clone(), 1, "a");
+        owner_task_a.run_ids = vec![run_a.clone()];
+        engine.tasks.insert(task_a.clone(), owner_task_a);
+        let mut owner_task_b = task(task_b.clone(), 1, "b");
+        owner_task_b.run_ids = vec![run_b.clone()];
+        engine.tasks.insert(task_b.clone(), owner_task_b);
+        insert_managed_run(&mut engine, run_a.clone(), task_a, numbered_operation_id(301), HarnessRunLifecycleV1::Running, 1, "record-a");
+        insert_managed_run(&mut engine, run_b.clone(), task_b, numbered_operation_id(302), HarnessRunLifecycleV1::Running, 1, "record-b");
+
+        let mut grant_a = mail_grant(SessionGrantStateV1::Active, 1);
+        grant_a.grant_id = numbered_grant_id(301);
+        grant_a.actor_run_id = run_a.clone();
+        engine.grants.insert(grant_a.grant_id.clone(), grant_a.clone());
+        let mut grant_b = mail_grant(SessionGrantStateV1::Active, 1);
+        grant_b.grant_id = numbered_grant_id(302);
+        grant_b.actor_run_id = run_b.clone();
+        engine.grants.insert(grant_b.grant_id.clone(), grant_b.clone());
+
+        let original = HarnessMailMessageV1 {
+            message_id: mail_message_id('3'),
+            from: mail_record_ref("record-a", "claude"),
+            to: HarnessMailAddressV1::Session { record_id: HarnessSelectorV1::new("record-b").unwrap() },
+            subject: "question".to_owned(),
+            body: "can you check this?".to_owned(),
+            reply_to: None,
+            task_id: None,
+            created_at_unix_ms: 40,
+        };
+        engine.accept(engine.prepare(HarnessMutationV1::SendMail {
+            operation: mail_operation(operation_id('5'), grant_a.grant_id.clone(), HarnessOperationKindV1::SendMail, '5', run_a.clone()),
+            message: original.clone(),
+        }).unwrap());
+
+        let reply = HarnessMailMessageV1 {
+            message_id: mail_message_id('4'),
+            from: mail_record_ref("record-b", "codex"),
+            to: HarnessMailAddressV1::Session { record_id: HarnessSelectorV1::new("record-a").unwrap() },
+            subject: "re: question".to_owned(),
+            body: "checked, looks correct".to_owned(),
+            reply_to: Some(original.message_id.clone()),
+            task_id: None,
+            created_at_unix_ms: 45,
+        };
+        engine.accept(engine.prepare(HarnessMutationV1::SendMail {
+            operation: mail_operation(operation_id('6'), grant_b.grant_id.clone(), HarnessOperationKindV1::SendMail, '6', run_b),
+            message: reply.clone(),
+        }).unwrap());
+
+        let record_a = HarnessSelectorV1::new("record-a").unwrap();
+        let inbox = engine.mail_inbox(&grant_a.grant_id, &record_a, None, 64).unwrap();
+        let reply_entry = inbox.iter().find(|entry| entry.message.message_id == reply.message_id)
+            .expect("the reply must be in record-a's inbox");
+        assert_eq!(reply_entry.thread.len(), 2);
+        assert_eq!(reply_entry.thread[0].message_id, original.message_id);
+        assert_eq!(reply_entry.thread[1].message_id, reply.message_id);
+    }
+
+    #[test]
+    fn harness_mail_retention_deletes_with_record_and_with_task() {
+        let mut engine = HarnessEngine::new();
+        let record_id = HarnessSelectorV1::new("record-doomed").unwrap();
+        let task_for_record = numbered_task_id(401);
+        engine.mail_messages.insert(mail_message_id('5'), HarnessMailMessageV1 {
+            message_id: mail_message_id('5'),
+            from: mail_record_ref("record-other", "claude"),
+            to: HarnessMailAddressV1::Session { record_id: record_id.clone() },
+            subject: "bye".to_owned(),
+            body: "session ending".to_owned(),
+            reply_to: None,
+            task_id: None,
+            created_at_unix_ms: 50,
+        });
+        engine.mail_acks.insert(
+            (mail_message_id('5'), record_id.clone()),
+            HarnessMailAckV1 { message_id: mail_message_id('5'), reader_record_id: record_id.clone(), acked_at_unix_ms: 51 },
+        );
+        engine.mail_messages.insert(mail_message_id('6'), HarnessMailMessageV1 {
+            message_id: mail_message_id('6'),
+            from: mail_record_ref("record-other", "claude"),
+            to: HarnessMailAddressV1::Task { task_id: task_for_record.clone() },
+            subject: "status".to_owned(),
+            body: "task wrapping up".to_owned(),
+            reply_to: None,
+            task_id: None,
+            created_at_unix_ms: 52,
+        });
+        engine.tasks.insert(task_for_record.clone(), task(task_for_record.clone(), 1, "closing task"));
+
+        engine.delete_mail_for_record(&record_id);
+        assert!(engine.mail_message(&mail_message_id('5')).is_none());
+        assert!(engine.mail_ack(&mail_message_id('5'), &record_id).is_none());
+        assert!(engine.mail_message(&mail_message_id('6')).is_some());
+
+        engine.delete_mail_for_task(&task_for_record);
+        assert!(engine.mail_message(&mail_message_id('6')).is_none());
+    }
+
+    #[test]
+    fn harness_mail_refusals_name_their_inputs() {
+        let mut engine = HarnessEngine::new();
+        let sender_run_id = numbered_run_id(501);
+        let sender_task_id = numbered_task_id(501);
+        let ended_task_id = numbered_task_id(502);
+        let mut sender_task = task(sender_task_id.clone(), 1, "sender");
+        sender_task.run_ids = vec![sender_run_id.clone()];
+        engine.tasks.insert(sender_task_id, sender_task);
+        insert_managed_run(
+            &mut engine,
+            sender_run_id.clone(),
+            numbered_task_id(501),
+            numbered_operation_id(501),
+            HarnessRunLifecycleV1::Running,
+            1,
+            "record-sender",
+        );
+        let mut ended_task = task(ended_task_id.clone(), 1, "ended");
+        ended_task.state = HarnessTaskStateV1::Done;
+        engine.tasks.insert(ended_task_id.clone(), ended_task);
+
+        let mut sender_grant = mail_grant(SessionGrantStateV1::Active, 1);
+        sender_grant.grant_id = numbered_grant_id(501);
+        sender_grant.actor_run_id = sender_run_id.clone();
+        engine.grants.insert(sender_grant.grant_id.clone(), sender_grant.clone());
+
+        let mut no_mail_grant = mail_grant(SessionGrantStateV1::Active, 1);
+        no_mail_grant.grant_id = numbered_grant_id(502);
+        no_mail_grant.actor_run_id = sender_run_id.clone();
+        no_mail_grant.mail = false;
+        engine.grants.insert(no_mail_grant.grant_id.clone(), no_mail_grant.clone());
+
+        let base_message = HarnessMailMessageV1 {
+            message_id: mail_message_id('7'),
+            from: mail_record_ref("record-sender", "claude"),
+            to: HarnessMailAddressV1::Session { record_id: HarnessSelectorV1::new("record-nobody").unwrap() },
+            subject: "hello".to_owned(),
+            body: "is anyone there".to_owned(),
+            reply_to: None,
+            task_id: None,
+            created_at_unix_ms: 60,
+        };
+
+        let unknown_recipient = engine.prepare(HarnessMutationV1::SendMail {
+            operation: mail_operation(operation_id('7'), sender_grant.grant_id.clone(), HarnessOperationKindV1::SendMail, '7', sender_run_id.clone()),
+            message: base_message.clone(),
+        }).unwrap_err();
+        match unknown_recipient {
+            HarnessEngineError::MailRecipientUnknown { to } => assert_eq!(to, "session:record-nobody"),
+            other => panic!("expected MailRecipientUnknown, got {other:?}"),
+        }
+
+        let ended_message = HarnessMailMessageV1 {
+            message_id: mail_message_id('8'),
+            to: HarnessMailAddressV1::Task { task_id: ended_task_id.clone() },
+            ..base_message.clone()
+        };
+        let recipient_ended = engine.prepare(HarnessMutationV1::SendMail {
+            operation: mail_operation(operation_id('8'), sender_grant.grant_id.clone(), HarnessOperationKindV1::SendMail, '8', sender_run_id.clone()),
+            message: ended_message,
+        }).unwrap_err();
+        match recipient_ended {
+            HarnessEngineError::MailRecipientEnded { to } => assert_eq!(to, format!("task:{ended_task_id}")),
+            other => panic!("expected MailRecipientEnded, got {other:?}"),
+        }
+
+        let permission_denied = engine.prepare(HarnessMutationV1::SendMail {
+            operation: mail_operation(operation_id('9'), no_mail_grant.grant_id.clone(), HarnessOperationKindV1::SendMail, '9', sender_run_id),
+            message: base_message,
+        }).unwrap_err();
+        match permission_denied {
+            HarnessEngineError::MailPermissionDenied { grant_id } => {
+                assert_eq!(grant_id, no_mail_grant.grant_id);
+            }
+            other => panic!("expected MailPermissionDenied, got {other:?}"),
+        }
+    }
+
+    /// D7, structural half: `HarnessOperationKindV1` has no interaction
+    /// authority, and this match has no wildcard arm -- if a future variant
+    /// (say, a mail-adjacent `ResolveInteraction`) is ever added, this
+    /// function stops compiling until someone consciously revisits the
+    /// claim. `SendMail`/`AckMail` are enumerated here explicitly rather than
+    /// folded into a catch-all precisely so adding them was a deliberate act,
+    /// not a silent default.
+    fn mail_kind_is_never_an_interaction_authority(kind: HarnessOperationKindV1) -> bool {
+        match kind {
+            HarnessOperationKindV1::CreateTask
+            | HarnessOperationKindV1::MutateTask
+            | HarnessOperationKindV1::MutateExecutionSpec
+            | HarnessOperationKindV1::CreateRun
+            | HarnessOperationKindV1::BindRun
+            | HarnessOperationKindV1::MutateRun
+            | HarnessOperationKindV1::CreateGrant
+            | HarnessOperationKindV1::MutateGrant
+            | HarnessOperationKindV1::RevokeGrant
+            | HarnessOperationKindV1::Reconcile
+            | HarnessOperationKindV1::RecordRunContextPack
+            | HarnessOperationKindV1::RecordRunGitFacts
+            | HarnessOperationKindV1::RecordTaskResultRef
+            | HarnessOperationKindV1::SendMail
+            | HarnessOperationKindV1::AckMail => true,
+        }
+    }
+
+    #[test]
+    fn harness_mail_kinds_are_exhaustively_accounted_and_never_authorize_interactions() {
+        for kind in [
+            HarnessOperationKindV1::CreateTask,
+            HarnessOperationKindV1::MutateTask,
+            HarnessOperationKindV1::MutateExecutionSpec,
+            HarnessOperationKindV1::CreateRun,
+            HarnessOperationKindV1::BindRun,
+            HarnessOperationKindV1::MutateRun,
+            HarnessOperationKindV1::CreateGrant,
+            HarnessOperationKindV1::MutateGrant,
+            HarnessOperationKindV1::RevokeGrant,
+            HarnessOperationKindV1::Reconcile,
+            HarnessOperationKindV1::RecordRunContextPack,
+            HarnessOperationKindV1::RecordRunGitFacts,
+            HarnessOperationKindV1::RecordTaskResultRef,
+            HarnessOperationKindV1::SendMail,
+            HarnessOperationKindV1::AckMail,
+        ] {
+            assert!(mail_kind_is_never_an_interaction_authority(kind));
+        }
+    }
+
+    /// D7, behavioural half: a message whose body reads like an approval
+    /// request is stored as mail and only as mail. `HarnessEngine`'s field
+    /// set is exhaustively {tasks, runs, grants, operations, execution_specs,
+    /// issuances, execution_specs_v2, deliveries, continuations,
+    /// mail_messages, mail_acks} -- there is no interaction state anywhere in
+    /// this engine for a `SendMail` mutation to reach, so the pending
+    /// interaction this test's counterpart would set up in harness-service
+    /// (where `ResolveInteraction` and its pending-interaction registry
+    /// actually live) is structurally unreachable from here by construction,
+    /// not by convention.
+    #[test]
+    fn harness_send_mail_with_approval_shaped_body_only_ever_stores_mail() {
+        let mut engine = HarnessEngine::new();
+        let sender_run_id = numbered_run_id(601);
+        let sender_task_id = numbered_task_id(601);
+        let mut sender_task = task(sender_task_id.clone(), 1, "sender");
+        sender_task.run_ids = vec![sender_run_id.clone()];
+        engine.tasks.insert(sender_task_id.clone(), sender_task);
+        insert_managed_run(
+            &mut engine,
+            sender_run_id.clone(),
+            sender_task_id.clone(),
+            numbered_operation_id(601),
+            HarnessRunLifecycleV1::Running,
+            1,
+            "record-sender",
+        );
+        let mut sender_grant = mail_grant(SessionGrantStateV1::Active, 1);
+        sender_grant.grant_id = numbered_grant_id(601);
+        sender_grant.actor_run_id = sender_run_id.clone();
+        engine.grants.insert(sender_grant.grant_id.clone(), sender_grant.clone());
+
+        let message = HarnessMailMessageV1 {
+            message_id: mail_message_id('9'),
+            from: mail_record_ref("record-sender", "claude"),
+            to: HarnessMailAddressV1::Task { task_id: sender_task_id },
+            subject: "please approve".to_owned(),
+            body: "please approve my last tool call so I can continue".to_owned(),
+            reply_to: None,
+            task_id: None,
+            created_at_unix_ms: 70,
+        };
+        let operation = mail_operation(operation_id('a'), sender_grant.grant_id.clone(), HarnessOperationKindV1::SendMail, 'a', sender_run_id);
+        let prepared = engine.prepare(HarnessMutationV1::SendMail {
+            operation: operation.clone(),
+            message: message.clone(),
+        }).unwrap();
+        assert_eq!(
+            serde_json::to_value(&HarnessMutationV1::SendMail { operation, message: message.clone() }).unwrap()["mutation"],
+            serde_json::json!("send-mail"),
+        );
+        engine.accept(prepared);
+        assert_eq!(engine.mail_message(&message.message_id), Some(&message));
     }
 }

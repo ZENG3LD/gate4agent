@@ -536,6 +536,9 @@ pub(crate) fn allowed_tool_ids(grant: &SessionGrantV1) -> Vec<String> {
     if grant.read_permissions.operations != HarnessEntityReadScopeV1::None {
         tools.push("g4a_operation_get");
     }
+    if grant.mail {
+        tools.extend(["g4a_mail_send", "g4a_mail_inbox", "g4a_mail_ack"]);
+    }
     tools.sort_unstable();
     tools.into_iter().map(str::to_owned).collect()
 }
@@ -1175,6 +1178,7 @@ mod tests {
             read_permissions: HarnessReadPermissionsV1::default(),
             monitoring_visibility: HarnessMonitoringVisibilityV1::None,
             context_permissions: HarnessContextPermissionsV1 { export: false, restore: false },
+            mail: false,
             state: SessionGrantStateV1::Active,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,

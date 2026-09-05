@@ -9,7 +9,7 @@
 use std::{collections::BTreeMap, fmt};
 
 pub use gate4agent_harness_protocol::{
-    HarnessApprovalLevelV1,
+    HarnessActorV1, HarnessApprovalLevelV1,
     HarnessArtifactRef, HarnessEntityReadScopeV1, HarnessExecutionModeV1,
     HarnessFailureCategoryV1, HarnessIdempotencyRef, HarnessMonitoringVisibilityV1,
     HarnessOperationId,
@@ -39,6 +39,7 @@ pub use gate4agent_harness_protocol::{
     HarnessInlineRef, HarnessReceiptRef, HarnessResultRef, HarnessRevision, HarnessRunId, HarnessRunIntentV1,
     HarnessRunGitFactsV1, HarnessRunLifecycleV1,
     HarnessRuntimeIdentityV1, HarnessSelectorV1, HarnessTaskId, HarnessTaskStateV1,
+    HarnessTaskCreateResultV1, HarnessTaskMoveResultV1,
     HarnessValidationError, HarnessWorktreeIntentV1, SessionGrantId,
     HarnessMailAckV1, HarnessMailAddressV1, HarnessMailMessageId, HarnessMailMessageV1,
     HarnessMailRefV1,
@@ -205,7 +206,8 @@ pub const HARNESS_READ_TOOL_IDS: [&str; 8] = [
 ];
 
 /// The mailbox arc's Slice B write allow-list (D1 + D7), joined by Slice C's
-/// `g4a_mail_fetch`. Kept separate from `HARNESS_READ_TOOL_IDS` rather than
+/// `g4a_mail_fetch` and Slice D's `g4a_task_create`/`g4a_task_move` (D5).
+/// Kept separate from `HARNESS_READ_TOOL_IDS` rather than
 /// folded into it -- that array's own test
 /// (`all_eight_tool_schemas_are_stable_and_closed`) pins it as exactly the
 /// eight read-only tools zipped in `tool_definitions()`'s declared order, and
@@ -215,15 +217,20 @@ pub const HARNESS_READ_TOOL_IDS: [&str; 8] = [
 /// reads in effect, `g4a_mail_fetch`'s the C1 read whose authorization is
 /// message-membership ("it was mailed to me") rather than lineage scope --
 /// but both belong here with their mutating siblings because the gate they
-/// share is the same one, not the eight reads' gate. D7: this array, and
+/// share is the same one, not the eight reads' gate. `g4a_task_create`/
+/// `g4a_task_move` are gated by `grant.task_permissions.create`/`.mutate`
+/// respectively, the same wiring `mail` already establishes for its own four
+/// siblings here. D7: this array, and
 /// `HARNESS_READ_TOOL_IDS`, are the only two names `tools/call` ever admits;
 /// `ResolveInteraction` (or any other name) is refused by name regardless of
 /// what a grant's `allowed_tool_ids` claims.
-pub const HARNESS_WRITE_TOOL_IDS: [&str; 4] = [
+pub const HARNESS_WRITE_TOOL_IDS: [&str; 6] = [
     "g4a_mail_ack",
     "g4a_mail_fetch",
     "g4a_mail_inbox",
     "g4a_mail_send",
+    "g4a_task_create",
+    "g4a_task_move",
 ];
 /// Bound on a mail send/ack named-refusal reason string
 /// (`HarnessMailSendResultV1::Refused`). The longest reason
@@ -2239,6 +2246,13 @@ pub enum HarnessOperatorRequestV1 {
         limit: u16,
     },
     TaskGet { task_id: HarnessTaskId },
+    /// D5, Slice D: the operator's own per-task operations ledger --
+    /// `HarnessEngine::operations_for_task`'s bounded, newest-first page,
+    /// with the raw `HarnessActorV1` (the operator is already trusted with
+    /// every other raw identity this wire exposes; the agent side never
+    /// sees this, only the category -- see `HarnessOperationLedgerEntryV1`'s
+    /// own doc comment).
+    TaskOperations { task_id: HarnessTaskId, limit: u16 },
     RunsList {
         task_id: Option<HarnessTaskId>,
         after_run_id: Option<HarnessRunId>,
@@ -2756,6 +2770,10 @@ impl HarnessOperatorRequestV1 {
             }
             Self::TaskGet { task_id } => {
                 task_id.validate().map_err(HarnessOperatorApiError::Protocol)
+            }
+            Self::TaskOperations { task_id, limit } => {
+                task_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+                validate_operator_limit(*limit)
             }
             Self::RunsList { task_id, after_run_id, limit, .. } => {
                 if let Some(task_id) = task_id {
@@ -3770,6 +3788,7 @@ pub enum HarnessOperatorResponseV1 {
     Timeline(TimelinePageV1),
     Tasks(TaskPageV1),
     Task(RedactedTaskV1),
+    TaskOperations(Vec<HarnessOperationLedgerEntryV1>),
     Runs(RunPageV1),
     Run(RedactedRunV1),
     RunCorrelation(HarnessRunCorrelationV1),
@@ -3854,6 +3873,15 @@ impl HarnessOperatorResponseV1 {
             Self::Timeline(value) => value.validate().map_err(HarnessOperatorApiError::Read),
             Self::Tasks(value) => value.validate().map_err(HarnessOperatorApiError::Read),
             Self::Task(value) => value.validate().map_err(HarnessOperatorApiError::Read),
+            Self::TaskOperations(entries) => {
+                if entries.len() > usize::from(HARNESS_ENTITY_PAGE_LIMIT_MAX) {
+                    return Err(HarnessOperatorApiError::InvalidOperationLedger);
+                }
+                for entry in entries {
+                    entry.validate()?;
+                }
+                Ok(())
+            }
             Self::Runs(value) => value.validate().map_err(HarnessOperatorApiError::Read),
             Self::Run(value) => value.validate().map_err(HarnessOperatorApiError::Read),
             Self::RunCorrelation(value) => value.validate(),
@@ -5794,11 +5822,56 @@ pub enum HarnessReadRequestV1 {
         message_id: HarnessMailMessageId,
         ref_index: u16,
     },
+    /// D5, Slice D: an agent creates a task under its own subtree --
+    /// `parent_task_id: None` means "under my own task"; `Some` must name
+    /// the caller's own task or a strict descendant of it (checked
+    /// service-side, `HarnessEngine::task_is_strict_descendant`), never a
+    /// task system-wide the way the operator's own `HarnessCreateTaskRequestV1`
+    /// can. Gated by `grant.task_permissions.create`. Every refusal --
+    /// unreachable parent, a terminal parent, or an invalid title/body/
+    /// dependencies -- travels back as `HarnessTaskCreateResultV1`'s own
+    /// named variant, never a host error (the same discipline `MailSend`
+    /// established for mail). This bound is the coarse wire-level ceiling
+    /// only; the authoritative title/body rule is the engine's own
+    /// `HarnessTaskV1::validate()`, reached when the mutation applies.
+    TaskCreate {
+        title: String,
+        body: String,
+        parent_task_id: Option<HarnessTaskId>,
+    },
+    /// D5, Slice D: restricted service-side to a STRICT descendant of the
+    /// caller's own task -- never the task that governs the caller's own
+    /// run (`HarnessTaskMoveResultV1::TaskIsOwn`). Gated by
+    /// `grant.task_permissions.mutate`. `to` names the operator's own task
+    /// graph (`validate_operator_move` in `gate4agent-harness-service`); an
+    /// illegal transition or a stale `expected_revision` is a named refusal,
+    /// never a host error.
+    TaskMove {
+        task_id: HarnessTaskId,
+        expected_revision: HarnessRevision,
+        to: HarnessTaskStateV1,
+    },
 }
 
 impl HarnessReadRequestV1 {
     pub fn validate(&self) -> Result<(), HarnessReadApiError> {
         match self {
+            Self::TaskCreate { title, body, parent_task_id } => {
+                if title.is_empty()
+                    || title.len() > HARNESS_TITLE_MAX_BYTES
+                    || body.len() > HARNESS_BODY_MAX_BYTES
+                {
+                    return Err(HarnessReadApiError::InvalidTaskCreate);
+                }
+                if let Some(parent_task_id) = parent_task_id {
+                    parent_task_id.validate().map_err(HarnessReadApiError::Protocol)?;
+                }
+                Ok(())
+            }
+            Self::TaskMove { task_id, expected_revision, .. } => {
+                task_id.validate().map_err(HarnessReadApiError::Protocol)?;
+                expected_revision.validate().map_err(HarnessReadApiError::Protocol)
+            }
             Self::MailSend { to, subject, body, reply_to, refs } => {
                 to.validate().map_err(HarnessReadApiError::Protocol)?;
                 if subject.is_empty()
@@ -5894,6 +5967,8 @@ pub enum HarnessReadResponseV1 {
     MailInbox(HarnessMailInboxPageV1),
     MailAck(HarnessMailAckResultV1),
     MailFetch(HarnessMailFetchResultV1),
+    TaskCreate(HarnessTaskCreateResultV1),
+    TaskMove(HarnessTaskMoveResultV1),
 }
 
 impl HarnessReadResponseV1 {
@@ -5911,6 +5986,8 @@ impl HarnessReadResponseV1 {
             Self::MailInbox(value) => value.validate(),
             Self::MailAck(value) => value.validate(),
             Self::MailFetch(value) => value.validate(),
+            Self::TaskCreate(value) => value.validate().map_err(HarnessReadApiError::Protocol),
+            Self::TaskMove(value) => value.validate().map_err(HarnessReadApiError::Protocol),
         }
     }
 }
@@ -6262,10 +6339,17 @@ pub struct SessionContextV1 {
     pub maximum_child_count: u16,
     pub maximum_child_depth: u16,
     /// D1: whether this grant holds the mail permission -- the source
-    /// `expected_allowed_tool_ids` reads to decide whether the three
+    /// `expected_allowed_tool_ids` reads to decide whether the four
     /// `g4a_mail_*` ids belong in `allowed_tool_ids`, the same way
     /// `read_permissions`/`monitoring_visibility` decide the eight reads.
     pub mail: bool,
+    /// D5, Slice D: mirrors `grant.task_permissions.create` -- gates
+    /// `g4a_task_create` in `allowed_tool_ids`, the same wiring `mail`
+    /// already establishes for its own four siblings.
+    pub task_create: bool,
+    /// D5, Slice D: mirrors `grant.task_permissions.mutate` -- gates
+    /// `g4a_task_move` in `allowed_tool_ids`.
+    pub task_mutate: bool,
     pub allowed_tool_ids: Vec<String>,
     pub history_message_count: Option<u64>,
     pub completed_turn_count: Option<u64>,
@@ -6339,7 +6423,13 @@ fn expected_allowed_tool_ids(context: &SessionContextV1) -> Vec<String> {
         tools.push("g4a_operation_get");
     }
     if context.mail {
-        tools.extend(["g4a_mail_send", "g4a_mail_inbox", "g4a_mail_ack"]);
+        tools.extend(["g4a_mail_send", "g4a_mail_inbox", "g4a_mail_ack", "g4a_mail_fetch"]);
+    }
+    if context.task_create {
+        tools.push("g4a_task_create");
+    }
+    if context.task_mutate {
+        tools.push("g4a_task_move");
     }
     tools.sort_unstable();
     tools.into_iter().map(str::to_owned).collect()
@@ -6971,6 +7061,36 @@ impl RedactedRunV1 {
 #[serde(rename_all = "kebab-case")]
 pub enum RedactedBindingStateV1 { None, ManagedDormant, ManagedActive, Inline }
 
+/// D5, Slice D's operator-side per-task operations ledger entry
+/// (`HarnessOperatorRequestV1::TaskOperations` /
+/// `HarnessOperatorResponseV1::TaskOperations`), one row per
+/// `HarnessEngine::operations_for_task` entry. Unlike `RedactedOperationV1`,
+/// `actor` here is the RAW `HarnessActorV1` -- the operator is already
+/// trusted with every other raw identity this wire exposes (session
+/// records, node/workspace ids, ...), and this ledger is the audit trail
+/// the plan promises ("the operator's ledger on T1 shows A's run as the
+/// actor of both writes"). The agent side never gets this: `g4a_tasks_get`
+/// keeps `RedactedTaskV1`'s existing category-only exposure.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessOperationLedgerEntryV1 {
+    pub operation_id: HarnessOperationId,
+    pub created_at_unix_ms: u64,
+    pub kind: HarnessOperationKindV1,
+    pub actor: HarnessActorV1,
+}
+
+impl HarnessOperationLedgerEntryV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        self.operation_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.actor.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        if self.created_at_unix_ms == 0 {
+            return Err(HarnessOperatorApiError::InvalidOperationLedger);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RedactedOperationV1 {
@@ -7065,6 +7185,8 @@ pub enum HarnessReadApiError {
     InvalidMailInbox,
     #[error("harness mail fetch result is invalid")]
     InvalidMailFetch,
+    #[error("harness task create request is invalid")]
+    InvalidTaskCreate,
     #[error("harness protocol value is invalid: {0}")]
     Protocol(#[from] gate4agent_harness_protocol::HarnessValidationError),
 }
@@ -7140,6 +7262,8 @@ pub enum HarnessOperatorApiError {
     InvalidHostDirectoryBrowseRequest,
     #[error("harness workspace or worktree resource mutation request is invalid")]
     InvalidResourceMutationRequest,
+    #[error("harness task operations ledger entry is invalid")]
+    InvalidOperationLedger,
     #[error("harness operator response is invalid")]
     Read(#[source] HarnessReadApiError),
     #[error("harness protocol value is invalid: {0}")]
@@ -11705,6 +11829,216 @@ mod tests {
         assert!(matches!(
             bad_prompt_event.validate(),
             Err(HarnessOperatorApiError::InvalidAgentStream),
+        ));
+    }
+
+    /// D5, Slice D: `g4a_task_create`'s wire request round-trips and bounds
+    /// title/body at this coarse wire-level ceiling -- the authoritative
+    /// rule (trim/control-character checks) is the engine's own
+    /// `HarnessTaskV1::validate`, reached at apply time, not this validate().
+    #[test]
+    fn task_create_request_round_trips_and_bounds_title_and_body() {
+        let request = HarnessReadRequestV1::TaskCreate {
+            title: "Investigate the flaky retry".to_owned(),
+            body: "See the timeline for the failing run.".to_owned(),
+            parent_task_id: Some(HarnessTaskId::new(format!("htask_{}", "a".repeat(24))).unwrap()),
+        };
+        request.validate().unwrap();
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert_eq!(serde_json::from_str::<HarnessReadRequestV1>(&encoded).unwrap(), request);
+
+        let no_parent = HarnessReadRequestV1::TaskCreate {
+            title: "Child under my own task".to_owned(),
+            body: String::new(),
+            parent_task_id: None,
+        };
+        no_parent.validate().unwrap();
+
+        let empty_title = HarnessReadRequestV1::TaskCreate {
+            title: String::new(),
+            body: String::new(),
+            parent_task_id: None,
+        };
+        assert!(matches!(empty_title.validate(), Err(HarnessReadApiError::InvalidTaskCreate)));
+
+        let oversized_title = HarnessReadRequestV1::TaskCreate {
+            title: "x".repeat(HARNESS_TITLE_MAX_BYTES + 1),
+            body: String::new(),
+            parent_task_id: None,
+        };
+        assert!(matches!(oversized_title.validate(), Err(HarnessReadApiError::InvalidTaskCreate)));
+
+        let oversized_body = HarnessReadRequestV1::TaskCreate {
+            title: "ok".to_owned(),
+            body: "x".repeat(HARNESS_BODY_MAX_BYTES + 1),
+            parent_task_id: None,
+        };
+        assert!(matches!(oversized_body.validate(), Err(HarnessReadApiError::InvalidTaskCreate)));
+    }
+
+    /// D5, Slice D: `g4a_task_move`'s wire request round-trips.
+    #[test]
+    fn task_move_request_round_trips() {
+        let request = HarnessReadRequestV1::TaskMove {
+            task_id: HarnessTaskId::new(format!("htask_{}", "b".repeat(24))).unwrap(),
+            expected_revision: HarnessRevision::new(3).unwrap(),
+            to: HarnessTaskStateV1::Ready,
+        };
+        request.validate().unwrap();
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert_eq!(serde_json::from_str::<HarnessReadRequestV1>(&encoded).unwrap(), request);
+    }
+
+    /// D5, Slice D: every `HarnessTaskCreateResultV1`/`HarnessTaskMoveResultV1`
+    /// variant round-trips through the read response wire
+    /// (`HarnessReadResponseV1::TaskCreate`/`TaskMove`).
+    #[test]
+    fn task_create_and_move_results_round_trip_every_variant() {
+        let created = HarnessReadResponseV1::TaskCreate(HarnessTaskCreateResultV1::Created {
+            task_id: HarnessTaskId::new(format!("htask_{}", "c".repeat(24))).unwrap(),
+            revision: HarnessRevision::new(1).unwrap(),
+        });
+        created.validate().unwrap();
+        let encoded = serde_json::to_string(&created).unwrap();
+        assert_eq!(serde_json::from_str::<HarnessReadResponseV1>(&encoded).unwrap(), created);
+
+        let parent_outside = HarnessReadResponseV1::TaskCreate(
+            HarnessTaskCreateResultV1::ParentOutsideOwnSubtree {
+                parent_task_id: HarnessTaskId::new(format!("htask_{}", "d".repeat(24))).unwrap(),
+                own_task_id: HarnessTaskId::new(format!("htask_{}", "e".repeat(24))).unwrap(),
+            },
+        );
+        parent_outside.validate().unwrap();
+
+        let parent_terminal = HarnessReadResponseV1::TaskCreate(HarnessTaskCreateResultV1::ParentTerminal {
+            parent_task_id: HarnessTaskId::new(format!("htask_{}", "d".repeat(24))).unwrap(),
+            state: HarnessTaskStateV1::Done,
+        });
+        parent_terminal.validate().unwrap();
+
+        let title_invalid = HarnessReadResponseV1::TaskCreate(HarnessTaskCreateResultV1::TitleInvalid {
+            why: "task title is empty, unbounded, padded, or contains control characters".to_owned(),
+        });
+        title_invalid.validate().unwrap();
+
+        let body_invalid = HarnessReadResponseV1::TaskCreate(HarnessTaskCreateResultV1::BodyInvalid {
+            why: "task body is unbounded".to_owned(),
+        });
+        body_invalid.validate().unwrap();
+
+        let dependencies_invalid = HarnessReadResponseV1::TaskCreate(
+            HarnessTaskCreateResultV1::DependenciesInvalid { why: "dependencies must not self-link".to_owned() },
+        );
+        dependencies_invalid.validate().unwrap();
+
+        let moved = HarnessReadResponseV1::TaskMove(HarnessTaskMoveResultV1::Moved {
+            task_id: HarnessTaskId::new(format!("htask_{}", "f".repeat(24))).unwrap(),
+            revision: HarnessRevision::new(2).unwrap(),
+            from: HarnessTaskStateV1::Backlog,
+            to: HarnessTaskStateV1::Ready,
+        });
+        moved.validate().unwrap();
+        let encoded = serde_json::to_string(&moved).unwrap();
+        assert_eq!(serde_json::from_str::<HarnessReadResponseV1>(&encoded).unwrap(), moved);
+
+        let task_is_own = HarnessReadResponseV1::TaskMove(HarnessTaskMoveResultV1::TaskIsOwn {
+            task_id: HarnessTaskId::new(format!("htask_{}", "f".repeat(24))).unwrap(),
+        });
+        task_is_own.validate().unwrap();
+
+        let outside_subtree = HarnessReadResponseV1::TaskMove(HarnessTaskMoveResultV1::TaskOutsideOwnSubtree {
+            task_id: HarnessTaskId::new(format!("htask_{}", "f".repeat(24))).unwrap(),
+            own_task_id: HarnessTaskId::new(format!("htask_{}", "0".repeat(24))).unwrap(),
+        });
+        outside_subtree.validate().unwrap();
+
+        let illegal_transition = HarnessReadResponseV1::TaskMove(HarnessTaskMoveResultV1::IllegalTransition {
+            task_id: HarnessTaskId::new(format!("htask_{}", "f".repeat(24))).unwrap(),
+            from: HarnessTaskStateV1::Done,
+            to: HarnessTaskStateV1::Ready,
+        });
+        illegal_transition.validate().unwrap();
+
+        let revision_conflict = HarnessReadResponseV1::TaskMove(HarnessTaskMoveResultV1::RevisionConflict {
+            task_id: HarnessTaskId::new(format!("htask_{}", "f".repeat(24))).unwrap(),
+            expected: HarnessRevision::new(2).unwrap(),
+            current: HarnessRevision::new(3).unwrap(),
+        });
+        revision_conflict.validate().unwrap();
+    }
+
+    fn base_session_context() -> SessionContextV1 {
+        SessionContextV1 {
+            grant_id: SessionGrantId::new(format!("hgrant_{}", "a".repeat(24))).unwrap(),
+            grant_revision: HarnessRevision::new(1).unwrap(),
+            actor_run: CallerRunV1 {
+                run_id: HarnessRunId::new(format!("hrun_{}", "a".repeat(24))).unwrap(),
+                task_id: None,
+                parent_run_id: None,
+                lifecycle: HarnessRunLifecycleV1::Running,
+                references_redacted: false,
+            },
+            task: None,
+            sibling_runs: Vec::new(),
+            read_permissions: HarnessReadPermissionsV1 {
+                tasks: HarnessEntityReadScopeV1::None,
+                runs: HarnessEntityReadScopeV1::None,
+                operations: HarnessEntityReadScopeV1::None,
+            },
+            monitoring_visibility: HarnessMonitoringVisibilityV1::None,
+            maximum_child_count: 0,
+            maximum_child_depth: 0,
+            mail: false,
+            task_create: false,
+            task_mutate: false,
+            allowed_tool_ids: vec!["g4a_context_get".to_owned()],
+            history_message_count: None,
+            completed_turn_count: None,
+            total_tokens: None,
+        }
+    }
+
+    /// D5, Slice D: `expected_allowed_tool_ids` derives `g4a_task_create`/
+    /// `g4a_task_move` from `task_permissions.create`/`.mutate` exactly like
+    /// `mail` already derives its own four siblings -- create-only advertises
+    /// `g4a_task_create` alone, and a grant cannot claim a tool it was not
+    /// actually granted (`InvalidAllowedTools`).
+    #[test]
+    fn expected_allowed_tool_ids_derives_task_tools_from_task_permissions() {
+        let base = base_session_context();
+        base.validate().unwrap();
+
+        let create_only = SessionContextV1 {
+            task_create: true,
+            allowed_tool_ids: vec!["g4a_context_get".to_owned(), "g4a_task_create".to_owned()],
+            ..base.clone()
+        };
+        create_only.validate().unwrap();
+
+        let both = SessionContextV1 {
+            task_create: true,
+            task_mutate: true,
+            allowed_tool_ids: vec![
+                "g4a_context_get".to_owned(),
+                "g4a_task_create".to_owned(),
+                "g4a_task_move".to_owned(),
+            ],
+            ..base.clone()
+        };
+        both.validate().unwrap();
+
+        let create_only_claims_move = SessionContextV1 {
+            task_create: true,
+            allowed_tool_ids: vec![
+                "g4a_context_get".to_owned(),
+                "g4a_task_create".to_owned(),
+                "g4a_task_move".to_owned(),
+            ],
+            ..base
+        };
+        assert!(matches!(
+            create_only_claims_move.validate(),
+            Err(HarnessReadApiError::InvalidAllowedTools),
         ));
     }
 }

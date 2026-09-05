@@ -173,11 +173,13 @@ pub(crate) fn execute_exact_binding_read(
     let visibility = engine.read_visibility(&grant.grant_id)
         .map_err(|_| HarnessReadHostErrorV1::Internal)?;
     authorize_request(grant, &request)?;
-    // Everything below this line that mutates (`SendMail`/`AckMail`) reads
-    // only owned values out of `grant`/`binding` first, then calls into
-    // `harness` -- never `engine`/`grant`/`visibility` again in that same
-    // arm -- so the immutable borrow of `harness` those two hold ends before
-    // the mutable one `HarnessService::send_mail`/`ack_mail` needs begins.
+    // Everything below this line that mutates (`SendMail`/`AckMail`/
+    // `TaskCreate`/`TaskMove`) reads only owned values out of `grant`/
+    // `binding` first, then calls into `harness` -- never `engine`/`grant`/
+    // `visibility` again in that same arm -- so the immutable borrow of
+    // `harness` those two hold ends before the mutable one
+    // `HarnessService::send_mail`/`ack_mail`/`agent_create_task`/
+    // `agent_move_task` needs begins.
     match request {
         HarnessReadRequestV1::MailSend { to, subject, body, reply_to, refs } => {
             let grant_id = grant.grant_id.clone();
@@ -206,6 +208,24 @@ pub(crate) fn execute_exact_binding_read(
                 now_unix_ms,
             ).map_err(|_| HarnessReadHostErrorV1::Internal)?;
             Ok(HarnessReadResponseV1::MailAck(HarnessMailAckResultV1 { acked: true }))
+        }
+        HarnessReadRequestV1::TaskCreate { title, body, parent_task_id } => {
+            let grant_id = grant.grant_id.clone();
+            let actor_run_id = binding.actor_run_id.clone();
+            let now_unix_ms = unix_time_ms();
+            let result = harness.agent_create_task(
+                actor_run_id, grant_id, title, body, parent_task_id, now_unix_ms,
+            ).map_err(|_| HarnessReadHostErrorV1::Internal)?;
+            Ok(HarnessReadResponseV1::TaskCreate(result))
+        }
+        HarnessReadRequestV1::TaskMove { task_id, expected_revision, to } => {
+            let grant_id = grant.grant_id.clone();
+            let actor_run_id = binding.actor_run_id.clone();
+            let now_unix_ms = unix_time_ms();
+            let result = harness.agent_move_task(
+                actor_run_id, grant_id, task_id, expected_revision, to, now_unix_ms,
+            ).map_err(|_| HarnessReadHostErrorV1::Internal)?;
+            Ok(HarnessReadResponseV1::TaskMove(result))
         }
         _ => execute_exact_binding_read_only(harness.engine(), observation, support, binding, grant, &visibility, request),
     }
@@ -311,13 +331,15 @@ fn execute_exact_binding_read_only(
         HarnessReadRequestV1::MailFetch { message_id, ref_index } => {
             mail_fetch(engine, observation, support, grant, binding, message_id, ref_index)
         }
-        // `MailSend`/`MailInbox`/`MailAck` never reach this function --
-        // `execute_exact_binding_read` dispatches all three itself, before
-        // ever delegating here. Never reached in practice; refused rather
-        // than panicking if it somehow were.
+        // `MailSend`/`MailInbox`/`MailAck`/`TaskCreate`/`TaskMove` never
+        // reach this function -- `execute_exact_binding_read` dispatches all
+        // five itself, before ever delegating here. Never reached in
+        // practice; refused rather than panicking if it somehow were.
         HarnessReadRequestV1::MailSend { .. }
         | HarnessReadRequestV1::MailInbox { .. }
-        | HarnessReadRequestV1::MailAck { .. } => Err(HarnessReadHostErrorV1::InvalidRequest),
+        | HarnessReadRequestV1::MailAck { .. }
+        | HarnessReadRequestV1::TaskCreate { .. }
+        | HarnessReadRequestV1::TaskMove { .. } => Err(HarnessReadHostErrorV1::InvalidRequest),
     }
 }
 
@@ -580,6 +602,12 @@ fn authorize_request(
         {
             return Err(HarnessReadHostErrorV1::NotFoundOrDenied);
         }
+        HarnessReadRequestV1::TaskCreate { .. } if !grant.task_permissions.create => {
+            return Err(HarnessReadHostErrorV1::NotFoundOrDenied);
+        }
+        HarnessReadRequestV1::TaskMove { .. } if !grant.task_permissions.mutate => {
+            return Err(HarnessReadHostErrorV1::NotFoundOrDenied);
+        }
         _ => {}
     }
     Ok(())
@@ -623,6 +651,8 @@ fn context(
         maximum_child_count: grant.maximum_child_count,
         maximum_child_depth: grant.maximum_child_depth,
         mail: grant.mail,
+        task_create: grant.task_permissions.create,
+        task_mutate: grant.task_permissions.mutate,
         allowed_tool_ids: allowed_tool_ids(grant),
         history_message_count: history.map(|history| history.message_count),
         completed_turn_count: history.and_then(|history| history.completed_turn_count),
@@ -857,6 +887,12 @@ pub(crate) fn allowed_tool_ids(grant: &SessionGrantV1) -> Vec<String> {
     if grant.mail {
         tools.extend(["g4a_mail_send", "g4a_mail_inbox", "g4a_mail_ack", "g4a_mail_fetch"]);
     }
+    if grant.task_permissions.create {
+        tools.push("g4a_task_create");
+    }
+    if grant.task_permissions.mutate {
+        tools.push("g4a_task_move");
+    }
     tools.sort_unstable();
     tools.into_iter().map(str::to_owned).collect()
 }
@@ -879,6 +915,8 @@ pub(crate) fn harness_mcp_tool_id(request: &HarnessReadRequestV1) -> &'static st
         HarnessReadRequestV1::MailInbox { .. } => "g4a_mail_inbox",
         HarnessReadRequestV1::MailAck { .. } => "g4a_mail_ack",
         HarnessReadRequestV1::MailFetch { .. } => "g4a_mail_fetch",
+        HarnessReadRequestV1::TaskCreate { .. } => "g4a_task_create",
+        HarnessReadRequestV1::TaskMove { .. } => "g4a_task_move",
     }
 }
 
@@ -2892,6 +2930,271 @@ mod tests {
             panic!("expected the stranger's fetch to be refused, got {fetched_by_stranger:?}");
         };
         assert!(reason.contains("not addressed to this reader"), "{reason}");
+
+        close_observation(observation, &path);
+    }
+
+    /// D5, Slice D, end to end through `execute_exact_binding_read`: A
+    /// (create+mutate) creates a child task under its own task and it is
+    /// visible via `g4a_tasks_get` (created_by_run attribution, D5's read
+    /// side); A moves it Backlog -> Ready (`Moved`); A is refused moving its
+    /// own task (`TaskIsOwn` -- a session never ends its own oversight); a
+    /// stranger grant that DOES hold `mutate` is refused moving A's child
+    /// because the child sits outside the stranger's own subtree
+    /// (`TaskOutsideOwnSubtree`); a grant without `mutate` is refused at the
+    /// `authorize_request` gate, before the engine is ever reached
+    /// (`NotFoundOrDenied`).
+    #[test]
+    fn agent_task_create_and_move_stay_inside_the_callers_own_subtree() {
+        let path = observation_path("agent-task-create-move");
+        let mut checkpoint = crate::credential::tests::engine(
+            1,
+            SessionGrantStateV1::Active,
+            1,
+            HarnessRunLifecycleV1::Running,
+        ).checkpoint();
+        // A (task/run/grant 'a', from the base fixture) gets create+mutate
+        // plus enough task read scope to see what it just created.
+        checkpoint.grants[0].task_permissions.create = true;
+        checkpoint.grants[0].task_permissions.mutate = true;
+        checkpoint.grants[0].read_permissions.tasks = HarnessEntityReadScopeV1::SelfOnly;
+
+        let node_incarnation = HarnessSelectorV1::new(
+            gate4agent_node_protocol::NodeIncarnationId::from_bytes([4; 16]).to_string(),
+        ).unwrap();
+
+        let stranger_task_id = HarnessTaskId::new(format!("htask_{}", "b".repeat(24))).unwrap();
+        let stranger_run_id = HarnessRunId::new(format!("hrun_{}", "b".repeat(24))).unwrap();
+        let stranger_grant_id = SessionGrantId::new(format!("hgrant_{}", "b".repeat(24))).unwrap();
+        let stranger_operation_id = HarnessOperationId::new(format!("hop_{}", "b".repeat(24))).unwrap();
+
+        let unmutated_task_id = HarnessTaskId::new(format!("htask_{}", "d".repeat(24))).unwrap();
+        let unmutated_run_id = HarnessRunId::new(format!("hrun_{}", "d".repeat(24))).unwrap();
+        let unmutated_grant_id = SessionGrantId::new(format!("hgrant_{}", "d".repeat(24))).unwrap();
+        let unmutated_operation_id = HarnessOperationId::new(format!("hop_{}", "d".repeat(24))).unwrap();
+
+        for (task_id, run_id, grant_id, operation_id, mutate, digest_hex) in [
+            (stranger_task_id, stranger_run_id.clone(), stranger_grant_id.clone(), stranger_operation_id, true, 'b'),
+            (unmutated_task_id, unmutated_run_id.clone(), unmutated_grant_id.clone(), unmutated_operation_id, false, 'd'),
+        ] {
+            checkpoint.tasks.push(HarnessTaskV1 {
+                task_id: task_id.clone(),
+                revision: HarnessRevision::new(1).unwrap(),
+                title: "stranger fixture".to_owned(),
+                body: String::new(),
+                creator: HarnessActorV1::User { actor_id: selector("operator") },
+                parent_task_id: None,
+                dependencies: Vec::new(),
+                state: HarnessTaskStateV1::Running,
+                run_ids: vec![run_id.clone()],
+                result_refs: Vec::new(),
+                artifact_refs: Vec::new(),
+                created_at_unix_ms: 10,
+                updated_at_unix_ms: 10,
+            });
+            checkpoint.runs.push(HarnessRunV1 {
+                run_id: run_id.clone(),
+                revision: HarnessRevision::new(1).unwrap(),
+                parent_run_id: None,
+                task_id: task_id.clone(),
+                operation_id: operation_id.clone(),
+                intent: HarnessRunIntentV1 {
+                    node_id: selector("node-a"),
+                    workspace_id: selector("workspace-a"),
+                    worktree: HarnessWorktreeIntentV1::Existing,
+                    provider_profile: selector("claude-default"),
+                    mode: HarnessExecutionModeV1::Pty,
+                    delivery_bundle: None,
+                    continuation: None,
+                },
+                delivery_receipt: None,
+                continuation_receipt: None,
+                context_pack: None,
+                git_facts: None,
+                binding: None,
+                lifecycle: HarnessRunLifecycleV1::Running,
+                result_disposition: None,
+                failure: None,
+                created_at_unix_ms: 10,
+                updated_at_unix_ms: 10,
+            });
+            checkpoint.grants.push(SessionGrantV1 {
+                grant_id: grant_id.clone(),
+                revision: HarnessRevision::new(1).unwrap(),
+                actor_run_id: run_id.clone(),
+                allowed_targets: vec![HarnessGrantTargetV1 {
+                    node_id: selector("node-a"),
+                    workspace_id: selector("workspace-a"),
+                    provider_profile: selector("claude-default"),
+                    mode: HarnessExecutionModeV1::Pty,
+                }],
+                allowed_delivery_bundles: Vec::new(),
+                maximum_child_count: 0,
+                maximum_child_depth: 0,
+                operation_timeouts: HarnessOperationTimeoutsV1 {
+                    dispatch_ms: 1_000,
+                    wait_ms: 1_000,
+                    reconciliation_ms: 1_000,
+                },
+                task_permissions: HarnessTaskPermissionsV1 {
+                    read: true,
+                    create: false,
+                    mutate,
+                    request_run: false,
+                },
+                read_permissions: HarnessReadPermissionsV1::default(),
+                monitoring_visibility: HarnessMonitoringVisibilityV1::None,
+                context_permissions: HarnessContextPermissionsV1 { export: false, restore: false },
+                mail: false,
+                state: SessionGrantStateV1::Active,
+                created_at_unix_ms: 10,
+                updated_at_unix_ms: 11,
+            });
+            checkpoint.operations.push(HarnessOperationV1 {
+                operation_id: operation_id.clone(),
+                revision: HarnessRevision::new(1).unwrap(),
+                actor: HarnessActorV1::User { actor_id: selector("operator") },
+                kind: HarnessOperationKindV1::CreateRun,
+                state: HarnessOperationStateV1::Succeeded,
+                task_id: Some(task_id),
+                run_id: Some(run_id),
+                grant_id: None,
+                reconciles_operation_id: None,
+                expected_revision: Some(HarnessRevision::new(1).unwrap()),
+                request_digest: HarnessRequestDigest::new(digest_hex.to_string().repeat(64)).unwrap(),
+                idempotency_ref: HarnessIdempotencyRef::new(format!(
+                    "hidem_{}", digest_hex.to_string().repeat(24),
+                )).unwrap(),
+                failure: None,
+                outcome_unknown_reason: None,
+                reconciliation_outcome: None,
+                created_at_unix_ms: 10,
+                updated_at_unix_ms: 10,
+                dispatched_at_unix_ms: Some(10),
+                finished_at_unix_ms: Some(10),
+            });
+        }
+
+        let mut harness = HarnessService::from_engine_for_test(
+            gate4agent_harness_engine::HarnessEngine::restore(checkpoint).unwrap(),
+        );
+        let observation = ObservationService::open(&path).unwrap();
+        let support = ObservationSupportRegistry::default();
+        let inventory = crate::runtime::HarnessRuntimeInventoryCache::default();
+
+        let own_binding = crate::credential::tests::binding(1, 1);
+        let own_task_id = HarnessTaskId::new(format!("htask_{}", "a".repeat(24))).unwrap();
+        let stranger_binding = CredentialBindingV1 {
+            grant_id: stranger_grant_id,
+            grant_revision: HarnessRevision::new(1).unwrap(),
+            actor_run_id: stranger_run_id,
+            node_id: selector("node-a"),
+            workspace_id: selector("workspace-a"),
+            node_incarnation: node_incarnation.clone(),
+            record_id: selector("record-b"),
+            instance_id: 7,
+            generation: 1,
+        };
+        let unmutated_binding = CredentialBindingV1 {
+            grant_id: unmutated_grant_id,
+            grant_revision: HarnessRevision::new(1).unwrap(),
+            actor_run_id: unmutated_run_id,
+            node_id: selector("node-a"),
+            workspace_id: selector("workspace-a"),
+            node_incarnation,
+            record_id: selector("record-d"),
+            instance_id: 7,
+            generation: 1,
+        };
+
+        let created = execute_exact_binding_read(
+            &mut harness, &observation, &support, &own_binding,
+            HarnessReadRequestV1::TaskCreate {
+                title: "child work".to_owned(),
+                body: "narrow scope".to_owned(),
+                parent_task_id: None,
+            },
+            &inventory,
+        ).unwrap();
+        let HarnessReadResponseV1::TaskCreate(HarnessTaskCreateResultV1::Created {
+            task_id: child_task_id, revision: created_revision,
+        }) = created else {
+            panic!("expected Created, got {created:?}");
+        };
+        assert_eq!(created_revision, HarnessRevision::new(1).unwrap());
+
+        let fetched = execute_exact_binding_read(
+            &mut harness, &observation, &support, &own_binding,
+            HarnessReadRequestV1::TaskGet { task_id: child_task_id.clone() },
+            &inventory,
+        ).unwrap();
+        let HarnessReadResponseV1::Task(fetched_task) = fetched else {
+            panic!("expected Task, got {fetched:?}");
+        };
+        assert_eq!(fetched_task.task_id, child_task_id);
+        assert_eq!(fetched_task.state, HarnessTaskStateV1::Backlog);
+
+        let moved = execute_exact_binding_read(
+            &mut harness, &observation, &support, &own_binding,
+            HarnessReadRequestV1::TaskMove {
+                task_id: child_task_id.clone(),
+                expected_revision: HarnessRevision::new(1).unwrap(),
+                to: HarnessTaskStateV1::Ready,
+            },
+            &inventory,
+        ).unwrap();
+        assert_eq!(
+            moved,
+            HarnessReadResponseV1::TaskMove(HarnessTaskMoveResultV1::Moved {
+                task_id: child_task_id.clone(),
+                revision: HarnessRevision::new(2).unwrap(),
+                from: HarnessTaskStateV1::Backlog,
+                to: HarnessTaskStateV1::Ready,
+            }),
+        );
+
+        let own_task_refused = execute_exact_binding_read(
+            &mut harness, &observation, &support, &own_binding,
+            HarnessReadRequestV1::TaskMove {
+                task_id: own_task_id.clone(),
+                expected_revision: HarnessRevision::new(1).unwrap(),
+                to: HarnessTaskStateV1::Ready,
+            },
+            &inventory,
+        ).unwrap();
+        assert_eq!(
+            own_task_refused,
+            HarnessReadResponseV1::TaskMove(HarnessTaskMoveResultV1::TaskIsOwn { task_id: own_task_id }),
+        );
+
+        let stranger_refused = execute_exact_binding_read(
+            &mut harness, &observation, &support, &stranger_binding,
+            HarnessReadRequestV1::TaskMove {
+                task_id: child_task_id.clone(),
+                expected_revision: HarnessRevision::new(2).unwrap(),
+                to: HarnessTaskStateV1::Review,
+            },
+            &inventory,
+        ).unwrap();
+        let HarnessReadResponseV1::TaskMove(HarnessTaskMoveResultV1::TaskOutsideOwnSubtree {
+            task_id: refused_task_id,
+            own_task_id: stranger_own_task_id,
+        }) = stranger_refused else {
+            panic!("expected TaskOutsideOwnSubtree, got {stranger_refused:?}");
+        };
+        assert_eq!(refused_task_id, child_task_id);
+        assert_eq!(stranger_own_task_id.as_str(), format!("htask_{}", "b".repeat(24)));
+
+        let gated = execute_exact_binding_read(
+            &mut harness, &observation, &support, &unmutated_binding,
+            HarnessReadRequestV1::TaskMove {
+                task_id: child_task_id,
+                expected_revision: HarnessRevision::new(2).unwrap(),
+                to: HarnessTaskStateV1::Review,
+            },
+            &inventory,
+        );
+        assert_eq!(gated, Err(HarnessReadHostErrorV1::NotFoundOrDenied));
 
         close_observation(observation, &path);
     }

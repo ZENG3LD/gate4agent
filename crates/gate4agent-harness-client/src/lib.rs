@@ -198,6 +198,36 @@ impl HarnessReadClient {
         }
     }
 
+    /// D5, Slice D: create a task under this grant's own subtree. See
+    /// `HarnessReadRequestV1::TaskCreate`'s own doc comment for the subtree
+    /// rule (`parent_task_id: None` means "under my own task").
+    pub fn task_create(
+        &self,
+        title: String,
+        body: String,
+        parent_task_id: Option<HarnessTaskId>,
+    ) -> Result<HarnessTaskCreateResultV1, HarnessReadClientError> {
+        match self.send(HarnessReadRequestV1::TaskCreate { title, body, parent_task_id })? {
+            HarnessReadResponseV1::TaskCreate(value) => Ok(value),
+            _ => Err(HarnessReadClientError::UnexpectedResponse),
+        }
+    }
+
+    /// D5, Slice D: move a task that is a strict descendant of this grant's
+    /// own task. See `HarnessReadRequestV1::TaskMove`'s own doc comment for
+    /// why the caller's own task is always refused (`TaskIsOwn`).
+    pub fn task_move(
+        &self,
+        task_id: HarnessTaskId,
+        expected_revision: HarnessRevision,
+        to: HarnessTaskStateV1,
+    ) -> Result<HarnessTaskMoveResultV1, HarnessReadClientError> {
+        match self.send(HarnessReadRequestV1::TaskMove { task_id, expected_revision, to })? {
+            HarnessReadResponseV1::TaskMove(value) => Ok(value),
+            _ => Err(HarnessReadClientError::UnexpectedResponse),
+        }
+    }
+
     fn send(&self, request: HarnessReadRequestV1) -> Result<HarnessReadResponseV1, HarnessReadClientError> {
         request.validate()?;
         let envelope = HarnessReadEnvelopeV1::new(self.credential.clone(), request);
@@ -542,6 +572,19 @@ impl HarnessOperatorClient {
     ) -> Result<RedactedTaskV1, HarnessOperatorClientError> {
         match self.send(HarnessOperatorRequestV1::TaskGet { task_id })? {
             HarnessOperatorResponseV1::Task(value) => Ok(value),
+            _ => Err(HarnessOperatorClientError::UnexpectedResponse),
+        }
+    }
+
+    /// D5, Slice D: the operator's own per-task operations ledger, raw actor
+    /// included -- see `HarnessOperationLedgerEntryV1`'s own doc comment.
+    pub fn task_operations(
+        &self,
+        task_id: HarnessTaskId,
+        limit: u16,
+    ) -> Result<Vec<HarnessOperationLedgerEntryV1>, HarnessOperatorClientError> {
+        match self.send(HarnessOperatorRequestV1::TaskOperations { task_id, limit })? {
+            HarnessOperatorResponseV1::TaskOperations(value) => Ok(value),
             _ => Err(HarnessOperatorClientError::UnexpectedResponse),
         }
     }

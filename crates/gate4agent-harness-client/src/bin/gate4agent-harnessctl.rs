@@ -45,6 +45,7 @@ fn usage() -> &'static str {
      \x20 results TASK_ID\n\
      \x20 task create --title TITLE --body BODY [--parent TASK_ID]\n\
      \x20 task move TASK_ID --to STATE\n\
+     \x20 task operations TASK_ID [--limit N]\n\
      \x20 launch-options TASK_ID [--provider ID] [--workspace ID] [--plan ID] [--after PLAN_ID]\n\
      \x20 spec save TASK_ID --plan PLAN_ID [--context-source-run RUN_ID] [--delivery BUNDLE_ID] [--review POLICY]\n\
      \x20 task start TASK_ID\n\
@@ -92,6 +93,7 @@ enum Command {
     Results { task_id: HarnessTaskId },
     TaskCreate { title: String, body: String, parent: Option<HarnessTaskId> },
     TaskMove { task_id: HarnessTaskId, to: HarnessTaskStateV1 },
+    TaskOperations { task_id: HarnessTaskId, limit: u16 },
     LaunchOptions {
         task_id: HarnessTaskId,
         provider: Option<HarnessSelectorV1>,
@@ -149,6 +151,7 @@ enum Verb {
     Results,
     TaskCreate,
     TaskMove,
+    TaskOperations,
     LaunchOptions,
     SpecSave,
     TaskStart,
@@ -177,6 +180,7 @@ fn resolve_verb(args: &[String]) -> Result<(Verb, usize), String> {
             Some("get") => Ok((Verb::TaskGet, 2)),
             Some("create") => Ok((Verb::TaskCreate, 2)),
             Some("move") => Ok((Verb::TaskMove, 2)),
+            Some("operations") => Ok((Verb::TaskOperations, 2)),
             Some("start") => Ok((Verb::TaskStart, 2)),
             _ => Err(usage().to_owned()),
         },
@@ -426,6 +430,11 @@ fn build_command(
             let task_id = expect_single_positional(positionals, "task-id").and_then(parse_task_id)?;
             let to = parse_kebab::<HarnessTaskStateV1>(&require_flag(flags, "to")?, "--to")?;
             Ok(Command::TaskMove { task_id, to })
+        }
+        Verb::TaskOperations => {
+            let task_id = expect_single_positional(positionals, "task-id").and_then(parse_task_id)?;
+            let limit = parse_limit(flags, HARNESS_ENTITY_PAGE_LIMIT_MAX)?;
+            Ok(Command::TaskOperations { task_id, limit })
         }
         Verb::LaunchOptions => {
             let task_id = expect_single_positional(positionals, "task-id").and_then(parse_task_id)?;
@@ -825,6 +834,10 @@ fn execute(invocation: Invocation) -> Result<String, String> {
                 })
                 .map_err(|error| error.to_string())?;
             render(&outcome)
+        }
+        Command::TaskOperations { task_id, limit } => {
+            let ledger = client.task_operations(task_id, limit).map_err(|error| error.to_string())?;
+            render(&ledger)
         }
         Command::LaunchOptions { task_id, provider, workspace, plan_id, after } => {
             let options = client
@@ -1539,6 +1552,39 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error, "--to has an invalid value: bogus-state");
+    }
+
+    #[test]
+    fn task_operations_defaults_limit_and_parses_explicit_limit() {
+        let task_id = format!("htask_{}", "2".repeat(24));
+        let outcome = parse(
+            &["gate4agent-harnessctl", "task", "operations", &task_id, "--harness-operator", "127.0.0.1:18080"],
+            &[(HARNESS_OPERATOR_TOKEN_ENV, &token())],
+        )
+        .unwrap();
+        let ParseOutcome::Run(invocation) = outcome else { panic!("expected run") };
+        assert!(matches!(
+            invocation.command,
+            Command::TaskOperations { task_id: actual, limit: HARNESS_ENTITY_PAGE_LIMIT_MAX }
+                if actual.as_str() == task_id
+        ));
+
+        let outcome = parse(
+            &[
+                "gate4agent-harnessctl",
+                "task",
+                "operations",
+                &task_id,
+                "--limit",
+                "5",
+                "--harness-operator",
+                "127.0.0.1:18080",
+            ],
+            &[(HARNESS_OPERATOR_TOKEN_ENV, &token())],
+        )
+        .unwrap();
+        let ParseOutcome::Run(invocation) = outcome else { panic!("expected run") };
+        assert!(matches!(invocation.command, Command::TaskOperations { limit: 5, .. }));
     }
 
     #[test]

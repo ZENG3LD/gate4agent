@@ -6,7 +6,7 @@ use gate4agent_harness_client::{
     HarnessMailAddressV1, HarnessMailMessageId, HarnessMailRefV1, HarnessOperationId,
     HarnessReadClient,
     HarnessReadClientError, HarnessReadCredential, HarnessReadHostErrorV1, HarnessReadResponseV1,
-    HarnessRunId, HarnessRunLifecycleV1, HarnessSelectorV1, HarnessTaskId, HarnessTaskStateV1,
+    HarnessRevision, HarnessRunId, HarnessRunLifecycleV1, HarnessSelectorV1, HarnessTaskId, HarnessTaskStateV1,
     SessionContextV1, HARNESS_MAIL_REFS_MAX, HARNESS_READ_REQUEST_MAX_BYTES,
     HARNESS_READ_RESPONSE_MAX_BYTES,
     HARNESS_READ_TOOL_IDS, HARNESS_WRITE_TOOL_IDS,
@@ -79,6 +79,16 @@ impl HarnessMcpBackend for HarnessReadClient {
                     self.mail_fetch(message_id, ref_index).map_err(HarnessMcpBackendError::from)?,
                 )
             }
+            HarnessMcpToolCall::TaskCreate { title, body, parent_task_id } => {
+                HarnessReadResponseV1::TaskCreate(
+                    self.task_create(title, body, parent_task_id).map_err(HarnessMcpBackendError::from)?,
+                )
+            }
+            HarnessMcpToolCall::TaskMove { task_id, expected_revision, to } => {
+                HarnessReadResponseV1::TaskMove(
+                    self.task_move(task_id, expected_revision, to).map_err(HarnessMcpBackendError::from)?,
+                )
+            }
         };
         Ok(response)
     }
@@ -127,6 +137,12 @@ fn tool_call_request(call: HarnessMcpToolCall) -> HarnessReadRequestV1 {
         HarnessMcpToolCall::MailFetch { message_id, ref_index } => {
             HarnessReadRequestV1::MailFetch { message_id, ref_index }
         }
+        HarnessMcpToolCall::TaskCreate { title, body, parent_task_id } => {
+            HarnessReadRequestV1::TaskCreate { title, body, parent_task_id }
+        }
+        HarnessMcpToolCall::TaskMove { task_id, expected_revision, to } => {
+            HarnessReadRequestV1::TaskMove { task_id, expected_revision, to }
+        }
     }
 }
 
@@ -155,6 +171,16 @@ pub enum HarnessMcpToolCall {
     MailInbox { since_unix_ms: Option<u64>, limit: u16 },
     MailAck { message_id: HarnessMailMessageId },
     MailFetch { message_id: HarnessMailMessageId, ref_index: u16 },
+    TaskCreate {
+        title: String,
+        body: String,
+        parent_task_id: Option<HarnessTaskId>,
+    },
+    TaskMove {
+        task_id: HarnessTaskId,
+        expected_revision: HarnessRevision,
+        to: HarnessTaskStateV1,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -546,6 +572,22 @@ struct MailAckArgs { message_id: String }
 #[serde(deny_unknown_fields)]
 struct MailFetchArgs { message_id: String, ref_index: u16 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskCreateArgs {
+    title: String,
+    body: String,
+    parent_task_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskMoveArgs {
+    task_id: String,
+    expected_revision: u64,
+    to: HarnessTaskStateV1,
+}
+
 fn parse_mail_address(args: MailAddressArgs) -> Result<HarnessMailAddressV1, ()> {
     match (args.session, args.task) {
         (Some(record_id), None) => Ok(HarnessMailAddressV1::Session {
@@ -636,6 +678,22 @@ fn parse_tool_call(name: &str, arguments: Value) -> Result<HarnessMcpToolCall, (
                 ref_index: args.ref_index,
             })
         }
+        "g4a_task_create" => {
+            let args: TaskCreateArgs = serde_json::from_value(arguments).map_err(|_| ())?;
+            Ok(HarnessMcpToolCall::TaskCreate {
+                title: args.title,
+                body: args.body,
+                parent_task_id: parse_optional(args.parent_task_id, HarnessTaskId::new)?,
+            })
+        }
+        "g4a_task_move" => {
+            let args: TaskMoveArgs = serde_json::from_value(arguments).map_err(|_| ())?;
+            Ok(HarnessMcpToolCall::TaskMove {
+                task_id: HarnessTaskId::new(args.task_id).map_err(|_| ())?,
+                expected_revision: HarnessRevision::new(args.expected_revision).map_err(|_| ())?,
+                to: args.to,
+            })
+        }
         _ => Err(()),
     }
 }
@@ -694,6 +752,28 @@ fn tool_definitions() -> Vec<Value> {
                 ("reply_to", string_schema()),
                 ("refs", mail_refs_schema()),
             ], vec!["to", "subject", "body"]),
+            false,
+            false,
+        ),
+        tool_with_hints(
+            "g4a_task_create",
+            "Create a task under this session's own task, or under one of its strict descendants (parent_task_id, defaults to this session's own task). Refuses by name if the parent is outside this session's own subtree or already terminal.",
+            object_schema(vec![
+                ("title", title_schema()),
+                ("body", body_schema()),
+                ("parent_task_id", string_schema()),
+            ], vec!["title", "body"]),
+            false,
+            false,
+        ),
+        tool_with_hints(
+            "g4a_task_move",
+            "Move a task that is a strict descendant of this session's own task to a new state (never this session's own task -- refused by name as task-is-own). Not idempotent: replaying the same call after it already moved the task is refused by name as a revision conflict, not repeated as a no-op.",
+            object_schema(vec![
+                ("task_id", string_schema()),
+                ("expected_revision", integer_schema(1, u64::MAX)),
+                ("to", enum_schema(&["backlog","ready","running","waiting","review","done","failed","cancelled"])),
+            ], vec!["task_id", "expected_revision", "to"]),
             false,
             false,
         ),
@@ -948,6 +1028,8 @@ mod tests {
                 maximum_child_count: 0,
                 maximum_child_depth: 0,
                 mail: false,
+                task_create: false,
+                task_mutate: false,
                 allowed_tool_ids: self.allowed.borrow().clone(),
                 history_message_count: None,
                 completed_turn_count: None,
@@ -1184,8 +1266,11 @@ mod tests {
     /// not_found_and_object_denial_is_generic` above already exercises for a
     /// legitimate-but-ungranted tool id.
     #[test]
-    fn d7_no_tool_reaches_resolve_interaction_and_write_tool_ids_are_exactly_mail() {
-        assert_eq!(HARNESS_WRITE_TOOL_IDS, ["g4a_mail_ack", "g4a_mail_fetch", "g4a_mail_inbox", "g4a_mail_send"]);
+    fn d7_no_tool_reaches_resolve_interaction_and_write_tool_ids_are_exactly_mail_and_task() {
+        assert_eq!(HARNESS_WRITE_TOOL_IDS, [
+            "g4a_mail_ack", "g4a_mail_fetch", "g4a_mail_inbox", "g4a_mail_send",
+            "g4a_task_create", "g4a_task_move",
+        ]);
         assert!(HARNESS_READ_TOOL_IDS.iter().chain(HARNESS_WRITE_TOOL_IDS.iter()).all(|id| {
             !id.contains("resolve_interaction") && !id.contains("resolve-interaction")
         }));

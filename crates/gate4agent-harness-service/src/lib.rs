@@ -17,6 +17,7 @@ use gate4agent_harness_engine::{
 use gate4agent_harness_api::{
     HarnessMailSendResultV1, HarnessReplaceTaskExecutionSpecRequestV2,
     HarnessReviewedWorktreeSelectionV1, HarnessStartTaskRequestV2, HarnessTaskLaunchOptionsV1,
+    HarnessTaskCreateResultV1, HarnessTaskMoveResultV1,
 };
 use gate4agent_harness_protocol::{
     HarnessActorV1, HarnessCancelTaskRequestV1, HarnessCreateTaskRequestV1,
@@ -2819,6 +2820,167 @@ impl HarnessService {
         self.apply(mutation)
     }
 
+    /// D5's `g4a_task_create` (Slice D): an agent creates a child task
+    /// under its own subtree, called under `grant_id`'s own authority
+    /// (`ParentRun` actor, the calling run) -- same `apply` every other
+    /// mutation kind uses, same digest-then-apply shape `send_mail`
+    /// establishes. `parent_task_id: None` means "under my own task";
+    /// `Some` must name the caller's own task or one of its strict
+    /// descendants (`HarnessEngine::task_is_strict_descendant`) and must not
+    /// be terminal -- both are named refusals, never host errors, resolved
+    /// BEFORE any mutation is built. The mutation itself is the identical
+    /// `HarnessMutationV1::CreateTask` the operator's own
+    /// `operator_create_task` builds (`creator`/`actor` both `ParentRun`,
+    /// initial state `Backlog`, no dependencies -- `g4a_task_create` never
+    /// accepts any). A title/body the engine's own `HarnessTaskV1::validate`
+    /// refuses at `apply` time comes back as `HarnessTaskCreateResultV1`'s
+    /// own named variant (`TitleInvalid`/`BodyInvalid`/`DependenciesInvalid`),
+    /// never propagated as a service error -- the same "a named refusal,
+    /// never a silent drop" discipline `send_mail` established for mail.
+    pub(crate) fn agent_create_task(
+        &mut self,
+        actor_run_id: HarnessRunId,
+        grant_id: SessionGrantId,
+        title: String,
+        body: String,
+        parent_task_id: Option<HarnessTaskId>,
+        now_unix_ms: u64,
+    ) -> Result<HarnessTaskCreateResultV1, HarnessServiceError> {
+        self.ensure_healthy()?;
+        let own_task_id = self.engine.own_task_of_run(&actor_run_id)
+            .ok_or_else(|| HarnessEngineError::NotFound(actor_run_id.to_string()))?;
+        let parent_task_id = parent_task_id.unwrap_or_else(|| own_task_id.clone());
+        if parent_task_id != own_task_id
+            && !self.engine.task_is_strict_descendant(&parent_task_id, &own_task_id)
+        {
+            return Ok(HarnessTaskCreateResultV1::ParentOutsideOwnSubtree {
+                parent_task_id,
+                own_task_id,
+            });
+        }
+        let parent_state = self.engine.task(&parent_task_id)
+            .ok_or_else(|| HarnessEngineError::NotFound(parent_task_id.to_string()))?
+            .state;
+        if matches!(
+            parent_state,
+            HarnessTaskStateV1::Done | HarnessTaskStateV1::Failed | HarnessTaskStateV1::Cancelled
+        ) {
+            return Ok(HarnessTaskCreateResultV1::ParentTerminal { parent_task_id, state: parent_state });
+        }
+        let material = next_mail_nonce_material(&grant_id, now_unix_ms);
+        let task_id = derived_mail_id(
+            "htask_",
+            b"gate4agent-harness-agent-task-create-id-v1",
+            &material,
+            HarnessTaskId::new,
+        )?;
+        let actor = HarnessActorV1::ParentRun { run_id: actor_run_id };
+        let operation = agent_task_operation(
+            &grant_id,
+            actor.clone(),
+            HarnessOperationKindV1::CreateTask,
+            task_id.clone(),
+            None,
+            now_unix_ms,
+        )?;
+        let revision = HarnessRevision::new(1)?;
+        let task = HarnessTaskV1 {
+            task_id: task_id.clone(),
+            revision,
+            title,
+            body,
+            creator: actor,
+            parent_task_id: Some(parent_task_id),
+            dependencies: Vec::new(),
+            state: HarnessTaskStateV1::Backlog,
+            run_ids: Vec::new(),
+            result_refs: Vec::new(),
+            artifact_refs: Vec::new(),
+            created_at_unix_ms: now_unix_ms,
+            updated_at_unix_ms: now_unix_ms,
+        };
+        let mut mutation = HarnessMutationV1::CreateTask { operation, task };
+        mutation.operation_mut().request_digest = mutation_request_digest(&mutation)?;
+        match self.apply(mutation) {
+            Ok(_) => Ok(HarnessTaskCreateResultV1::Created { task_id, revision }),
+            Err(HarnessServiceError::Engine(HarnessEngineError::Validation(
+                error @ HarnessValidationError::InvalidTitle,
+            ))) => Ok(HarnessTaskCreateResultV1::TitleInvalid { why: error.to_string() }),
+            Err(HarnessServiceError::Engine(HarnessEngineError::Validation(
+                error @ HarnessValidationError::InvalidBody,
+            ))) => Ok(HarnessTaskCreateResultV1::BodyInvalid { why: error.to_string() }),
+            Err(HarnessServiceError::Engine(HarnessEngineError::Validation(error @ (
+                HarnessValidationError::SelfLink { field: "dependencies" }
+                | HarnessValidationError::CollectionTooLarge { field: "dependencies", .. }
+                | HarnessValidationError::CollectionNotCanonical { field: "dependencies" }
+            )))) => Ok(HarnessTaskCreateResultV1::DependenciesInvalid { why: error.to_string() }),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// D5's `g4a_task_move` (Slice D): restricted to a STRICT descendant of
+    /// the caller's own task -- never the caller's own task
+    /// (`TaskIsOwn`: a session must not end its own oversight by moving
+    /// itself). `validate_operator_move` reuses the operator's own
+    /// transition graph without duplicating it; a stale `expected_revision`
+    /// is `RevisionConflict`. Once past those, the mutation is the identical
+    /// `HarnessMutationV1::ReplaceTask` `operator_move_task` builds (only
+    /// `state`/`revision`/`updated_at_unix_ms` change; title/body/parent/
+    /// dependencies are carried forward verbatim from the current task, so
+    /// no title/body validation failure is reachable here the way it is in
+    /// `agent_create_task`).
+    pub(crate) fn agent_move_task(
+        &mut self,
+        actor_run_id: HarnessRunId,
+        grant_id: SessionGrantId,
+        task_id: HarnessTaskId,
+        expected_revision: HarnessRevision,
+        to: HarnessTaskStateV1,
+        now_unix_ms: u64,
+    ) -> Result<HarnessTaskMoveResultV1, HarnessServiceError> {
+        self.ensure_healthy()?;
+        let own_task_id = self.engine.own_task_of_run(&actor_run_id)
+            .ok_or_else(|| HarnessEngineError::NotFound(actor_run_id.to_string()))?;
+        if task_id == own_task_id {
+            return Ok(HarnessTaskMoveResultV1::TaskIsOwn { task_id });
+        }
+        if !self.engine.task_is_strict_descendant(&task_id, &own_task_id) {
+            return Ok(HarnessTaskMoveResultV1::TaskOutsideOwnSubtree { task_id, own_task_id });
+        }
+        let current = self.engine.task(&task_id)
+            .ok_or_else(|| HarnessEngineError::NotFound(task_id.to_string()))?
+            .clone();
+        if validate_operator_move(current.state, to).is_err() {
+            return Ok(HarnessTaskMoveResultV1::IllegalTransition { task_id, from: current.state, to });
+        }
+        if current.revision != expected_revision {
+            return Ok(HarnessTaskMoveResultV1::RevisionConflict {
+                task_id,
+                expected: expected_revision,
+                current: current.revision,
+            });
+        }
+        let from = current.state;
+        let new_revision = next_harness_revision(current.revision, "task")?;
+        let mut task = current;
+        task.revision = new_revision;
+        task.state = to;
+        task.updated_at_unix_ms = now_unix_ms;
+        let actor = HarnessActorV1::ParentRun { run_id: actor_run_id };
+        let operation = agent_task_operation(
+            &grant_id,
+            actor,
+            HarnessOperationKindV1::MutateTask,
+            task_id.clone(),
+            Some(expected_revision),
+            now_unix_ms,
+        )?;
+        let mut mutation = HarnessMutationV1::ReplaceTask { operation, expected_revision, task };
+        mutation.operation_mut().request_digest = mutation_request_digest(&mutation)?;
+        self.apply(mutation)?;
+        Ok(HarnessTaskMoveResultV1::Moved { task_id, revision: new_revision, from, to })
+    }
+
     pub fn prepare_delivery_from_compiled(
         &mut self,
         delivery_ref: HarnessDeliveryRef,
@@ -5565,6 +5727,57 @@ fn mail_operation(
         idempotency_ref: derived_mail_id(
             "hidem_",
             b"gate4agent-harness-mail-idempotency-ref-v1",
+            &material,
+            HarnessIdempotencyRef::new,
+        )?,
+        failure: None,
+        outcome_unknown_reason: None,
+        reconciliation_outcome: None,
+        created_at_unix_ms: now_unix_ms,
+        updated_at_unix_ms: now_unix_ms,
+        dispatched_at_unix_ms: None,
+        finished_at_unix_ms: Some(now_unix_ms),
+    })
+}
+
+/// D5, Slice D's own operation builder for `agent_create_task`/
+/// `agent_move_task`: unlike `mail_operation`, `CreateTask`/`MutateTask`
+/// carry `task_id: Some(_)` and `grant_id: None`
+/// (`HarnessOperationKindV1::validate_kind_targets` -- the same rule
+/// `operator_task_operation` already satisfies for the operator's own task
+/// writes), so this reuses `operator_task_operation`'s field shape but mints
+/// its own ids off the calling grant's nonce material the way `mail_operation`
+/// does, since the agent path has no `HarnessOperatorAuthorityV1` to draw
+/// `operation_id`/`idempotency_ref` from.
+fn agent_task_operation(
+    grant_id: &SessionGrantId,
+    actor: HarnessActorV1,
+    kind: HarnessOperationKindV1,
+    task_id: HarnessTaskId,
+    expected_revision: Option<HarnessRevision>,
+    now_unix_ms: u64,
+) -> Result<HarnessOperationV1, HarnessServiceError> {
+    let material = next_mail_nonce_material(grant_id, now_unix_ms);
+    Ok(HarnessOperationV1 {
+        operation_id: derived_mail_id(
+            "hop_",
+            b"gate4agent-harness-agent-task-operation-id-v1",
+            &material,
+            HarnessOperationId::new,
+        )?,
+        revision: HarnessRevision::new(1)?,
+        actor,
+        kind,
+        state: HarnessOperationStateV1::Succeeded,
+        task_id: Some(task_id),
+        run_id: None,
+        grant_id: None,
+        reconciles_operation_id: None,
+        expected_revision,
+        request_digest: HarnessRequestDigest::new("0".repeat(64))?,
+        idempotency_ref: derived_mail_id(
+            "hidem_",
+            b"gate4agent-harness-agent-task-idempotency-ref-v1",
             &material,
             HarnessIdempotencyRef::new,
         )?,

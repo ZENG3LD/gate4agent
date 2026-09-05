@@ -60,7 +60,7 @@ use gate4agent_observation_service::{ObservationService, ObservationServiceError
 use gate4agent_harness_api::{
     HarnessInlineRunSessionV1, HarnessManagedRunSessionV1,
     HarnessLaunchPlanPageV1, HarnessLaunchPlanSummaryV1,
-    HarnessNodeIncarnationV1,
+    HarnessNodeIncarnationV1, HarnessOperationLedgerEntryV1,
     HarnessOperatorAgentEventV1,
     HarnessOperatorApiError,
     HarnessOperatorCredential, HarnessOperatorEnvelopeV1, HarnessOperatorEventV1,
@@ -9153,6 +9153,21 @@ fn execute_operator_request(
             let task = harness.engine().task(&task_id)
                 .ok_or(HarnessOperatorHostErrorV1::NotFound)?;
             HarnessOperatorResponseV1::Task(redact_operator_task(task))
+        }
+        HarnessOperatorRequestV1::TaskOperations { task_id, limit } => {
+            if harness.engine().task(&task_id).is_none() {
+                return Err(HarnessOperatorHostErrorV1::NotFound);
+            }
+            let entries = harness.engine().operations_for_task(&task_id, usize::from(limit))
+                .into_iter()
+                .map(|operation| HarnessOperationLedgerEntryV1 {
+                    operation_id: operation.operation_id.clone(),
+                    created_at_unix_ms: operation.created_at_unix_ms,
+                    kind: operation.kind,
+                    actor: operation.actor.clone(),
+                })
+                .collect();
+            HarnessOperatorResponseV1::TaskOperations(entries)
         }
         HarnessOperatorRequestV1::RunsList {
             task_id,

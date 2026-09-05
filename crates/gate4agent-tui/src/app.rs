@@ -4856,6 +4856,7 @@ pub fn observation_kind_label(kind: &ObservationKindV1) -> &'static str {
         ObservationKindV1::SourceReset => "source-reset",
         ObservationKindV1::Stale => "stale",
         ObservationKindV1::Error { .. } => "error",
+        ObservationKindV1::ActionBlocked { .. } => "action-blocked",
     }
 }
 

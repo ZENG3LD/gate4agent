@@ -7823,6 +7823,8 @@ mod tests {
                         active_binding: None,
                         provider_identity_present: true,
                         updated_at_unix_ms: observed_at_unix_ms,
+                        blocked_count: 0,
+                        last_blocked_at_ms: None,
                     },
                     HarnessRuntimeManagedSessionV1 {
                         record_id: "record-b".to_owned(),
@@ -7841,6 +7843,8 @@ mod tests {
                         ),
                         provider_identity_present: true,
                         updated_at_unix_ms: observed_at_unix_ms,
+                        blocked_count: 0,
+                        last_blocked_at_ms: None,
                     },
                 ],
                 managed_session_count: 2,

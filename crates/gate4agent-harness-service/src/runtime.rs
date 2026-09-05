@@ -6,7 +6,7 @@ use crate::{
         HarnessC2Error, HarnessC2EventReceiver,
         HarnessObservationResync, PendingContextPackFetch, PendingHostDirectoryBrowse,
         PendingNativeHistoryRequest,
-        PendingNodeWorkspaceRead,
+        PendingNodeWorkspaceRead, PendingWorkspacePathFetch,
         PendingNodeWorkspaceWrite, PendingResourceMutation, PendingRunRead,
         PendingRunContextSourceObservation, PendingSessionControl,
         PendingSessionRecordMutation, PreparedHostDirectoryBrowse,
@@ -117,7 +117,7 @@ use gate4agent_node_protocol::{
     HarnessMcpActivationDigest, HarnessMcpCallId, HarnessMcpLocalReplyV1,
     HarnessMcpRejectReasonV1, HarnessMcpReplyChunkHexV1, HarnessMcpReservationId,
     NodeFailureCode, SessionAddress,
-    SessionRecordId, SpawnBundleId, SpawnContextId, SpawnProfileId,
+    SessionRecordId, SpawnBundleId, SpawnContextId, SpawnProfileId, WorkspaceFileContent,
     MAX_HARNESS_MCP_AGGREGATE_REPLY_BYTES, MAX_HARNESS_MCP_REPLY_CHUNK_RAW_BYTES,
     MAX_HARNESS_MCP_PENDING_CALLS_PER_NODE,
 };
@@ -4351,6 +4351,176 @@ async fn finish_context_pack_fetch(
     }
 }
 
+fn mail_fetch_refused_reply(result: HarnessMailFetchResultV1) -> HarnessReadReplyV1 {
+    HarnessReadReplyV1::Ok { response: HarnessReadResponseV1::MailFetch(result) }
+}
+
+/// D3/Slice C3's deferred half of `HostCommand::Read`'s `MailFetch` path for
+/// a `WorkspacePath` ref: resolves the ref's own `workspace` to a node
+/// synchronously from the cached runtime inventory (still holding this one
+/// turn of the select loop -- no `&mut harness` needed here at all, unlike
+/// `start_context_pack_fetch_reply`, since a `WorkspacePath` ref carries no
+/// run to re-check), starts the C2/Node round trip, then hands the caller's
+/// own `reply` sender to a `tokio::spawn`ed task together with the pending
+/// handle and the ref's own fields -- the loop iteration ends here, exactly
+/// like `start_context_pack_fetch_reply` and every other node round trip
+/// this host starts. Never touches `HostCommand`/`&mut harness`/
+/// `HarnessRuntimeInventoryCache` again once spawned: `PendingWorkspacePathFetch`
+/// owns its own C2 waiter, and `intent`'s fields are plain owned `String`s
+/// moved into the task.
+fn start_workspace_path_fetch_reply(
+    adapter: &HarnessC2Adapter,
+    runtime_inventory: &HarnessRuntimeInventoryCache,
+    intent: crate::read::WorkspacePathFetchIntent,
+    reply: oneshot::Sender<HarnessReadReplyV1>,
+) {
+    match prepare_workspace_path_fetch(adapter, runtime_inventory, &intent) {
+        Ok(pending) => {
+            tokio::spawn(async move {
+                let reply_value = finish_workspace_path_fetch(pending, intent).await;
+                let _ = reply.send(reply_value);
+            });
+        }
+        Err(reply_value) => {
+            let _ = reply.send(reply_value);
+        }
+    }
+}
+
+/// Synchronous half: resolves `intent.workspace` to exactly one connected
+/// node by scanning the cached runtime inventory's own workspace roster per
+/// node (`HarnessRuntimeInventoryCache::all_nodes`, the same cache
+/// `node_still_has_session` reads from elsewhere in this file) -- no node
+/// registering it at all is `MailRefWorkspaceUnknown`, more than one is
+/// `MailRefWorkspaceAmbiguous` naming every node that does (sorted, for a
+/// stable reply). Converts the ref's own `workspace`/`path` strings into
+/// their typed Node-protocol forms only once exactly one node is settled
+/// on; a conversion failure here means the mailed ref itself is malformed
+/// (a workspace or path string a session was allowed to mail but the Node
+/// protocol's own identifier/path rules reject), so it is refused by name
+/// -- naming the malformed input -- rather than surfaced as a host error.
+fn prepare_workspace_path_fetch(
+    adapter: &HarnessC2Adapter,
+    runtime_inventory: &HarnessRuntimeInventoryCache,
+    intent: &crate::read::WorkspacePathFetchIntent,
+) -> Result<PendingWorkspacePathFetch, HarnessReadReplyV1> {
+    let mut matching_node_ids: Vec<String> = runtime_inventory.all_nodes().into_iter()
+        .filter(|node| node.inventory.workspaces.contains_key(intent.workspace.as_str()))
+        .map(|node| node.node_id)
+        .collect();
+    matching_node_ids.sort();
+    let node_id_str = match matching_node_ids.len() {
+        0 => return Err(mail_fetch_refused_reply(HarnessMailFetchResultV1::MailRefWorkspaceUnknown {
+            workspace: intent.workspace.clone(),
+        })),
+        1 => matching_node_ids.remove(0),
+        _ => return Err(mail_fetch_refused_reply(HarnessMailFetchResultV1::MailRefWorkspaceAmbiguous {
+            workspace: intent.workspace.clone(),
+            nodes: matching_node_ids,
+        })),
+    };
+    // `node_id_str` round-tripped through a validated `NodeId` on the way
+    // into the runtime inventory cache (`refresh`'s own route), so a parse
+    // failure here is a harness-internal invariant break, not a caller
+    // input problem -- the same "unreachable in practice" reasoning
+    // `fill_managed_session_blocked_stats` documents for the identical
+    // round trip.
+    let node_id = gate4agent_node_protocol::NodeId::new(node_id_str.as_str())
+        .map_err(|_| HarnessReadReplyV1::Error { error: HarnessReadHostErrorV1::Internal })?;
+    let workspace_id = gate4agent_node_protocol::WorkspaceId::new(intent.workspace.as_str())
+        .map_err(|_| mail_fetch_refused_reply(HarnessMailFetchResultV1::Refused {
+            reason: format!("workspace {} is not a valid workspace identifier", intent.workspace),
+        }))?;
+    let path = gate4agent_node_protocol::RepositoryPath::utf8(intent.path.clone())
+        .map_err(|_| mail_fetch_refused_reply(HarnessMailFetchResultV1::Refused {
+            reason: format!("path {} is not a valid repository path", intent.path),
+        }))?;
+    adapter.start_workspace_path_fetch(&node_id, workspace_id, path)
+        .map_err(|_| HarnessReadReplyV1::Error { error: HarnessReadHostErrorV1::Internal })
+}
+
+/// Asynchronous half: awaits the node round trip. The node reporting no such
+/// workspace any more (`NodeFailureCode::UnknownWorkspace` -- the workspace
+/// was unregistered between the inventory scan above and this fetch) folds
+/// into the same `MailRefWorkspaceUnknown` outcome `prepare_workspace_path_
+/// fetch` already uses for the cache-time case, since both mean the same
+/// thing to the caller: no node answers for this workspace any more. The
+/// node reporting no such file, or one it cannot read
+/// (`RepositoryFileNotFound`/`RepositoryFileNotRegular`/`InvalidRepositoryPath`/
+/// `RepositoryPathUnsafe`/`RepositoryFileReadFailed` -- every failure code
+/// that names a property of THIS path rather than a generic node-capacity
+/// condition) is `MailRefWorkspacePathUnknown`. Any other transport/
+/// rejection failure (a busy node, a read timeout, a route mismatch) is
+/// `HarnessReadHostErrorV1::Internal`, the same bucket every other
+/// unreachable-Node condition on this read wire already collapses to. A
+/// `Utf8` file recomputes `sha256_hex` over its own bytes and compares it to
+/// the ref's own `sha256` -- never trusting the node's `revision` alone --
+/// answering `WorkspacePath` on a match or `MailedWorkspacePathDigestMismatch`
+/// otherwise; `NonUtf8`/`TooLarge` answer
+/// `MailedWorkspacePathContentNotFetchable` naming which and its size.
+async fn finish_workspace_path_fetch(
+    pending: PendingWorkspacePathFetch,
+    intent: crate::read::WorkspacePathFetchIntent,
+) -> HarnessReadReplyV1 {
+    let crate::read::WorkspacePathFetchIntent { workspace, path, sha256: expected_sha256 } = intent;
+    let file = match pending.finish().await {
+        Ok(file) => file,
+        Err(HarnessC2Error::WorkspacePathFetchRejected { code })
+            if code == NodeFailureCode::UnknownWorkspace =>
+        {
+            return mail_fetch_refused_reply(HarnessMailFetchResultV1::MailRefWorkspaceUnknown { workspace });
+        }
+        Err(HarnessC2Error::WorkspacePathFetchRejected { code })
+            if matches!(
+                code,
+                NodeFailureCode::RepositoryFileNotFound
+                    | NodeFailureCode::RepositoryFileNotRegular
+                    | NodeFailureCode::InvalidRepositoryPath
+                    | NodeFailureCode::RepositoryPathUnsafe
+                    | NodeFailureCode::RepositoryFileReadFailed
+            ) =>
+        {
+            return mail_fetch_refused_reply(HarnessMailFetchResultV1::MailRefWorkspacePathUnknown {
+                workspace,
+                path,
+            });
+        }
+        Err(_) => return HarnessReadReplyV1::Error { error: HarnessReadHostErrorV1::Internal },
+    };
+    match file.content {
+        WorkspaceFileContent::Utf8 { text, byte_len } => {
+            let recomputed = gate4agent_node_protocol::sha256_hex(text.as_bytes());
+            if recomputed != expected_sha256 {
+                return mail_fetch_refused_reply(HarnessMailFetchResultV1::MailedWorkspacePathDigestMismatch {
+                    expected: expected_sha256,
+                    recomputed,
+                });
+            }
+            let response = HarnessReadResponseV1::MailFetch(HarnessMailFetchResultV1::WorkspacePath {
+                workspace, path, byte_len, sha256: recomputed, text,
+            });
+            match response.validate() {
+                Ok(()) => HarnessReadReplyV1::Ok { response },
+                Err(_) => HarnessReadReplyV1::Error { error: HarnessReadHostErrorV1::Internal },
+            }
+        }
+        WorkspaceFileContent::NonUtf8 { byte_len } => {
+            mail_fetch_refused_reply(HarnessMailFetchResultV1::MailedWorkspacePathContentNotFetchable {
+                workspace,
+                path,
+                why: format!("file is not valid UTF-8 ({byte_len} bytes)"),
+            })
+        }
+        WorkspaceFileContent::TooLarge { limit_bytes } => {
+            mail_fetch_refused_reply(HarnessMailFetchResultV1::MailedWorkspacePathContentNotFetchable {
+                workspace,
+                path,
+                why: format!("file exceeds the {limit_bytes}-byte limit"),
+            })
+        }
+    }
+}
+
 fn start_harness_mcp_arm_finish(
     commands: mpsc::Sender<HostCommand>,
     operation_id: HarnessOperationId,
@@ -4986,6 +5156,14 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                     start_context_pack_fetch_reply(
                                         &adapter,
                                         harness.engine(),
+                                        intent,
+                                        reply,
+                                    );
+                                }
+                                Ok(ReadDispatch::WorkspacePathFetch(intent)) => {
+                                    start_workspace_path_fetch_reply(
+                                        &adapter,
+                                        &runtime_inventory,
                                         intent,
                                         reply,
                                     );
@@ -8783,7 +8961,19 @@ fn context_source_option(
         source.validate().map_err(|_| HarnessOperatorHostErrorV1::Internal)?;
         return Ok(Some(source));
     }
-    if run.lifecycle != HarnessRunLifecycleV1::Running { return Ok(None); }
+    // `Running` and `Waiting` both admit a Live source here: a run frozen
+    // `Waiting` by the observation-gap rule still has a live session bound
+    // to a current node/incarnation (the checks right below this one), and
+    // its continuation export is already authorized in that state
+    // (`HarnessEngine`'s own continuation authorization admits `Running`,
+    // `Waiting`, and `Completed`) -- excluding `Waiting` here made a launch-
+    // option invisible for a run whose export the engine would accept.
+    // `Cancelled`/`Failed` stay excluded: those are dead sessions, exactly
+    // what the Managed-binding/current-node-incarnation/instance-generation
+    // checks below exist to keep out.
+    if !matches!(run.lifecycle, HarnessRunLifecycleV1::Running | HarnessRunLifecycleV1::Waiting) {
+        return Ok(None);
+    }
     let Some(binding) = &run.binding else { return Ok(None); };
     let HarnessSessionIdentityV1::Managed {
         record_id,
@@ -12564,7 +12754,6 @@ mod tests {
                     },
                 },
                 event: C2ControlEvent {
-                    protocol_version: gate4agent_types::CONTROL_PROTOCOL_VERSION,
                     sequence,
                     command_id: None,
                     instance_id: gate4agent_types::AgentInstanceId(7),
@@ -13060,6 +13249,128 @@ mod tests {
         assert_eq!(source.message_count, 7);
         assert_eq!(source.completed_turn_count, Some(3));
         reopened.close().unwrap();
+        for candidate in [
+            observation_path.clone(),
+            PathBuf::from(format!("{}-wal", observation_path.display())),
+            PathBuf::from(format!("{}-shm", observation_path.display())),
+        ] {
+            let _ = fs::remove_file(candidate);
+        }
+    }
+
+    /// A run frozen `Waiting` by the observation-gap rule still has a live
+    /// managed binding on a known node/incarnation -- its continuation
+    /// export is already authorized in that state (`HarnessEngine`'s own
+    /// authorization admits `Running`/`Waiting`/`Completed`), so it must
+    /// appear as a Live `context_sources` option exactly like a `Running`
+    /// run does, not be invisible to `launch-options` the way it was before
+    /// the Live-branch lifecycle gate in `context_source_option` admitted
+    /// only `Running`. `Cancelled` stays excluded: a dead session has
+    /// nothing live to source from, and the gate must still refuse it.
+    #[test]
+    fn context_source_option_admits_a_waiting_run_with_a_live_binding_and_excludes_cancelled() {
+        let (harness, _task_id, run_id, route) = running_harness_fixture();
+        let snapshot = bound_snapshot(
+            &route.node_id,
+            ManagedSessionState::Live,
+            Some(bound_session_address()),
+            C2SessionStatus::Running,
+        );
+        let runtime_inventory = correlation_inventory(route.clone(), snapshot, 20);
+        let mut support = ObservationSupportRegistry::default();
+        support.replace(
+            route.node_id.clone(),
+            route.expected_incarnation_id,
+            Some(C2ObservationSupport {
+                events: true,
+                managed_target: true,
+                workflow_detail: false,
+            }),
+        );
+        let observation_path = database_path();
+        let mut observation = ObservationService::open(&observation_path).unwrap();
+        let managed_key = ManagedSessionKey {
+            node_id: route.node_id.clone(),
+            incarnation_id: route.expected_incarnation_id,
+            record_id: SessionRecordId::new("record-a").unwrap(),
+        };
+        observation.apply_resync(ObservationResyncBatch {
+            node_id: route.node_id.clone(),
+            incarnation_id: route.expected_incarnation_id,
+            requested_after: 0,
+            high_watermark: NodeCursor {
+                incarnation_id: route.expected_incarnation_id,
+                sequence: 5,
+            },
+            oldest_available_sequence: 1,
+            records: vec![ManagedRecordLink {
+                managed: managed_key,
+                runtime: Some(RuntimeSessionKey {
+                    node_id: route.node_id.clone(),
+                    incarnation_id: route.expected_incarnation_id,
+                    workspace_id: gate4agent_node_protocol::WorkspaceId::new(
+                        "workspace-a",
+                    ).unwrap(),
+                    instance_id: AgentInstanceId(7),
+                    generation: SessionGeneration(3),
+                }),
+            }],
+            records_complete: true,
+            gaps: Vec::new(),
+            events: Vec::new(),
+        }).unwrap();
+        apply_routed_observation_event(
+            &mut observation,
+            RoutedNodeEvent {
+                node_id: route.node_id.clone(),
+                cursor: NodeCursor {
+                    incarnation_id: route.expected_incarnation_id,
+                    sequence: 6,
+                },
+                event: C2NodeEvent::ManagedObservation {
+                    record_id: SessionRecordId::new("record-a").unwrap(),
+                    observation: ObservationV1 {
+                        source_sequence: 99,
+                        observed_at_unix_ms: Some(1_230),
+                        evidence: ObservationEvidenceV1::HistoryProjection,
+                        kind: ObservationKindV1::HistorySnapshot {
+                            message_count: 7,
+                            message_count_exact: true,
+                            completed_turn_count: Some(3),
+                            total_tokens: Some(700),
+                        },
+                        truncated: false,
+                    },
+                },
+            },
+            1_234,
+        ).unwrap();
+
+        let stored_run = harness.engine().run(&run_id).unwrap();
+        let waiting_run = HarnessRunV1 {
+            lifecycle: HarnessRunLifecycleV1::Waiting,
+            ..stored_run.clone()
+        };
+        let waiting_source = context_source_option(
+            &harness,
+            &observation,
+            &support,
+            &runtime_inventory,
+            &waiting_run,
+        ).unwrap().unwrap();
+        assert_eq!(waiting_source.availability, HarnessContextSourceAvailabilityV1::Live);
+        assert_eq!(waiting_source.message_count, 7);
+
+        let cancelled_run = HarnessRunV1 {
+            lifecycle: HarnessRunLifecycleV1::Cancelled,
+            ..stored_run.clone()
+        };
+        assert_eq!(
+            context_source_option(&harness, &observation, &support, &runtime_inventory, &cancelled_run).unwrap(),
+            None,
+        );
+
+        observation.close().unwrap();
         for candidate in [
             observation_path.clone(),
             PathBuf::from(format!("{}-wal", observation_path.display())),

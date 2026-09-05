@@ -46,6 +46,7 @@ pub use gate4agent_harness_protocol::{
     HARNESS_CHILD_COUNT_MAX, HARNESS_CHILD_DEPTH_MAX, HARNESS_DEPENDENCIES_MAX,
     HARNESS_CONTEXT_PACK_MAX_BYTES, HARNESS_CONTEXT_PACK_RETAINED_MESSAGES_MAX,
     HARNESS_LINKS_MAX, HARNESS_MAIL_REFS_MAX, HARNESS_RESULTS_MAX, HARNESS_TITLE_MAX_BYTES,
+    HARNESS_RUN_GIT_PATH_MAX_BYTES,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
@@ -5843,6 +5844,13 @@ impl HarnessMailAckResultV1 {
     pub fn validate(&self) -> Result<(), HarnessReadApiError> { Ok(()) }
 }
 
+/// Bound on `HarnessMailFetchResultV1::MailRefWorkspaceAmbiguous.nodes` --
+/// generous for any real deployment (a workspace name registered on this
+/// many distinct connected nodes at once would itself be the anomaly worth
+/// investigating), and small enough that the list never threatens this
+/// wire's response-size bound the way an unbounded node roster could.
+pub const HARNESS_MAIL_FETCH_AMBIGUOUS_NODES_MAX: usize = 16;
+
 /// The outcome of one `g4a_mail_fetch` call (D3, Slice C). `Run` and
 /// `Result` are the two kinds C1 dereferences: `Run` returns the named run's
 /// redacted monitor projection plus a bounded timeline page -- the same
@@ -5853,20 +5861,63 @@ impl HarnessMailAckResultV1 {
 /// byte payload this wire carries (`HarnessMcpReplyChunkHexV1`'s convention):
 /// `digest`/`id` mirror `HarnessResolvedContextPackReceiptV1`'s own fields,
 /// `byte_len` is the RAW (pre-hex) length, and `bytes_hex.len()` is always
-/// exactly `byte_len * 2`. `Refused` carries `HarnessEngineError`'s own
-/// `Display` text verbatim for `MailNotForReader`/`MailRefIndexOutOfRange`/
-/// `MailRefKindNotYetFetchable`/`MailRefTargetUnknown`, or
-/// `gate4agent-harness-service`'s own text when the Node round trip itself
-/// fails after resolution (an evicted pack, or a digest mismatch between what
-/// was requested and what hashed out) -- a named refusal, never a host
-/// error, same pattern as `HarnessMailSendResultV1`.
+/// exactly `byte_len * 2`. `WorkspacePath` (C3) is the mailed file's own
+/// UTF-8 text verbatim (never hex -- there is no non-UTF-8 case to encode
+/// around, see below): `byte_len` is `text`'s own byte length, and `sha256`
+/// is the bare (no `sha256:` prefix) lowercase hex digest of `text`'s bytes,
+/// recomputed by the service against the mailed ref's own `sha256` before
+/// this is ever returned -- a mismatch is `MailedWorkspacePathDigestMismatch`
+/// instead. `Refused` carries `HarnessEngineError`'s own `Display` text
+/// verbatim for `MailNotForReader`/`MailRefIndexOutOfRange`/
+/// `MailRefTargetUnknown`, or `gate4agent-harness-service`'s own text for a
+/// malformed mailed ref (an invalid workspace or path identifier) or an
+/// evicted `ContextPack`. The remaining five variants are
+/// `gate4agent-harness-service`'s own named resolutions of a `WorkspacePath`
+/// ref it could not complete: `MailRefWorkspaceUnknown` (no connected node's
+/// runtime inventory registers `workspace`, or the node no longer does by
+/// the time the read reaches it), `MailRefWorkspaceAmbiguous` (more than one
+/// connected node does, named in `nodes`), `MailRefWorkspacePathUnknown`
+/// (the one node that does has no such file at `path`, or cannot read it),
+/// `MailedWorkspacePathContentNotFetchable` (the file exists but is not
+/// UTF-8, or exceeds the node's read bound -- `why` names which), and
+/// `MailedWorkspacePathDigestMismatch` (the file's own bytes do not hash to
+/// the digest the mailed ref named). Each is a named refusal in its own
+/// right, carrying its own inputs directly rather than a formatted string,
+/// the same pattern `HarnessMailSendResultV1` established for `Refused`
+/// alone.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "outcome", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum HarnessMailFetchResultV1 {
     Run { monitor: SessionMonitorV1, timeline: TimelinePageV1 },
     Result { run: RedactedRunV1 },
     ContextPack { digest: String, id: String, byte_len: u32, bytes_hex: String },
+    WorkspacePath { workspace: String, path: String, byte_len: u32, sha256: String, text: String },
     Refused { reason: String },
+    MailRefWorkspaceUnknown { workspace: String },
+    MailRefWorkspaceAmbiguous { workspace: String, nodes: Vec<String> },
+    MailRefWorkspacePathUnknown { workspace: String, path: String },
+    MailedWorkspacePathContentNotFetchable { workspace: String, path: String, why: String },
+    MailedWorkspacePathDigestMismatch { expected: String, recomputed: String },
+}
+
+fn valid_mail_fetch_workspace(workspace: &str) -> bool {
+    valid_runtime_id(workspace, 128)
+}
+
+fn valid_mail_fetch_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= HARNESS_RUN_GIT_PATH_MAX_BYTES
+        && !path.chars().any(char::is_control)
+}
+
+fn valid_mail_fetch_why(why: &str) -> bool {
+    !why.is_empty()
+        && why.len() <= HARNESS_MAIL_REFUSAL_REASON_MAX_BYTES
+        && !why.chars().any(char::is_control)
+}
+
+fn valid_bare_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(is_lower_hex)
 }
 
 impl HarnessMailFetchResultV1 {
@@ -5889,11 +5940,58 @@ impl HarnessMailFetchResultV1 {
                 }
                 Ok(())
             }
+            Self::WorkspacePath { workspace, path, byte_len, sha256, text } => {
+                if !valid_mail_fetch_workspace(workspace)
+                    || !valid_mail_fetch_path(path)
+                    || !valid_bare_sha256(sha256)
+                    || text.len() as u64 != u64::from(*byte_len)
+                {
+                    return Err(HarnessReadApiError::InvalidMailFetch);
+                }
+                Ok(())
+            }
             Self::Refused { reason } => {
                 if reason.is_empty()
                     || reason.len() > HARNESS_MAIL_REFUSAL_REASON_MAX_BYTES
                     || reason.chars().any(char::is_control)
                 {
+                    return Err(HarnessReadApiError::InvalidMailFetch);
+                }
+                Ok(())
+            }
+            Self::MailRefWorkspaceUnknown { workspace } => {
+                if !valid_mail_fetch_workspace(workspace) {
+                    return Err(HarnessReadApiError::InvalidMailFetch);
+                }
+                Ok(())
+            }
+            Self::MailRefWorkspaceAmbiguous { workspace, nodes } => {
+                if !valid_mail_fetch_workspace(workspace)
+                    || nodes.len() < 2
+                    || nodes.len() > HARNESS_MAIL_FETCH_AMBIGUOUS_NODES_MAX
+                    || !nodes.iter().all(|node| valid_runtime_id(node, 128))
+                {
+                    return Err(HarnessReadApiError::InvalidMailFetch);
+                }
+                Ok(())
+            }
+            Self::MailRefWorkspacePathUnknown { workspace, path } => {
+                if !valid_mail_fetch_workspace(workspace) || !valid_mail_fetch_path(path) {
+                    return Err(HarnessReadApiError::InvalidMailFetch);
+                }
+                Ok(())
+            }
+            Self::MailedWorkspacePathContentNotFetchable { workspace, path, why } => {
+                if !valid_mail_fetch_workspace(workspace)
+                    || !valid_mail_fetch_path(path)
+                    || !valid_mail_fetch_why(why)
+                {
+                    return Err(HarnessReadApiError::InvalidMailFetch);
+                }
+                Ok(())
+            }
+            Self::MailedWorkspacePathDigestMismatch { expected, recomputed } => {
+                if !valid_bare_sha256(expected) || !valid_bare_sha256(recomputed) {
                     return Err(HarnessReadApiError::InvalidMailFetch);
                 }
                 Ok(())
@@ -11085,6 +11183,117 @@ mod tests {
             bytes_hex: "0a1b2c".to_owned(),
         };
         assert!(matches!(bad_digest.validate(), Err(HarnessReadApiError::InvalidMailFetch)));
+    }
+
+    /// D3/Slice C3: `HarnessMailFetchResultV1::WorkspacePath` round-trips,
+    /// `text.len()` must equal `byte_len` exactly (a lying declared length is
+    /// `InvalidMailFetch`, same shape as `ContextPack`'s `bytes_hex` bound),
+    /// and `sha256` must be a bare (unprefixed) 64-lowercase-hex digest --
+    /// unlike `ContextPack.digest`, which carries the `sha256:` prefix.
+    #[test]
+    fn mail_fetch_result_workspace_path_round_trips_and_bounds_text_to_byte_len() {
+        let workspace_path = HarnessMailFetchResultV1::WorkspacePath {
+            workspace: "primary".to_owned(),
+            path: "reports/handoff.md".to_owned(),
+            byte_len: 5,
+            sha256: "a".repeat(64),
+            text: "hello".to_owned(),
+        };
+        workspace_path.validate().unwrap();
+        let encoded = serde_json::to_string(&workspace_path).unwrap();
+        assert_eq!(serde_json::from_str::<HarnessMailFetchResultV1>(&encoded).unwrap(), workspace_path);
+
+        let short_byte_len = HarnessMailFetchResultV1::WorkspacePath {
+            workspace: "primary".to_owned(),
+            path: "reports/handoff.md".to_owned(),
+            byte_len: 4,
+            sha256: "a".repeat(64),
+            text: "hello".to_owned(),
+        };
+        assert!(matches!(short_byte_len.validate(), Err(HarnessReadApiError::InvalidMailFetch)));
+
+        let prefixed_digest = HarnessMailFetchResultV1::WorkspacePath {
+            workspace: "primary".to_owned(),
+            path: "reports/handoff.md".to_owned(),
+            byte_len: 5,
+            sha256: format!("sha256:{}", "a".repeat(64)),
+            text: "hello".to_owned(),
+        };
+        assert!(matches!(prefixed_digest.validate(), Err(HarnessReadApiError::InvalidMailFetch)));
+
+        let empty_path = HarnessMailFetchResultV1::WorkspacePath {
+            workspace: "primary".to_owned(),
+            path: String::new(),
+            byte_len: 5,
+            sha256: "a".repeat(64),
+            text: "hello".to_owned(),
+        };
+        assert!(matches!(empty_path.validate(), Err(HarnessReadApiError::InvalidMailFetch)));
+    }
+
+    /// D3/Slice C3: the five named `WorkspacePath`-fetch refusals round-trip
+    /// and bound their own inputs -- `MailRefWorkspaceAmbiguous.nodes` must
+    /// name at least two nodes (one node is not an ambiguity) and never more
+    /// than `HARNESS_MAIL_FETCH_AMBIGUOUS_NODES_MAX`.
+    #[test]
+    fn mail_fetch_workspace_path_refusals_round_trip_and_bound_their_inputs() {
+        let unknown = HarnessMailFetchResultV1::MailRefWorkspaceUnknown { workspace: "primary".to_owned() };
+        unknown.validate().unwrap();
+        let encoded = serde_json::to_string(&unknown).unwrap();
+        assert_eq!(serde_json::from_str::<HarnessMailFetchResultV1>(&encoded).unwrap(), unknown);
+
+        let ambiguous = HarnessMailFetchResultV1::MailRefWorkspaceAmbiguous {
+            workspace: "primary".to_owned(),
+            nodes: vec!["node-a".to_owned(), "node-b".to_owned()],
+        };
+        ambiguous.validate().unwrap();
+        let encoded = serde_json::to_string(&ambiguous).unwrap();
+        assert_eq!(serde_json::from_str::<HarnessMailFetchResultV1>(&encoded).unwrap(), ambiguous);
+
+        let one_node = HarnessMailFetchResultV1::MailRefWorkspaceAmbiguous {
+            workspace: "primary".to_owned(),
+            nodes: vec!["node-a".to_owned()],
+        };
+        assert!(matches!(one_node.validate(), Err(HarnessReadApiError::InvalidMailFetch)));
+
+        let too_many_nodes = HarnessMailFetchResultV1::MailRefWorkspaceAmbiguous {
+            workspace: "primary".to_owned(),
+            nodes: (0..HARNESS_MAIL_FETCH_AMBIGUOUS_NODES_MAX + 1)
+                .map(|index| format!("node-{index}"))
+                .collect(),
+        };
+        assert!(matches!(too_many_nodes.validate(), Err(HarnessReadApiError::InvalidMailFetch)));
+
+        let path_unknown = HarnessMailFetchResultV1::MailRefWorkspacePathUnknown {
+            workspace: "primary".to_owned(),
+            path: "reports/handoff.md".to_owned(),
+        };
+        path_unknown.validate().unwrap();
+        let encoded = serde_json::to_string(&path_unknown).unwrap();
+        assert_eq!(serde_json::from_str::<HarnessMailFetchResultV1>(&encoded).unwrap(), path_unknown);
+
+        let not_fetchable = HarnessMailFetchResultV1::MailedWorkspacePathContentNotFetchable {
+            workspace: "primary".to_owned(),
+            path: "reports/handoff.md".to_owned(),
+            why: "file exceeds the 262144-byte limit".to_owned(),
+        };
+        not_fetchable.validate().unwrap();
+        let encoded = serde_json::to_string(&not_fetchable).unwrap();
+        assert_eq!(serde_json::from_str::<HarnessMailFetchResultV1>(&encoded).unwrap(), not_fetchable);
+
+        let digest_mismatch = HarnessMailFetchResultV1::MailedWorkspacePathDigestMismatch {
+            expected: "a".repeat(64),
+            recomputed: "b".repeat(64),
+        };
+        digest_mismatch.validate().unwrap();
+        let encoded = serde_json::to_string(&digest_mismatch).unwrap();
+        assert_eq!(serde_json::from_str::<HarnessMailFetchResultV1>(&encoded).unwrap(), digest_mismatch);
+
+        let prefixed_mismatch = HarnessMailFetchResultV1::MailedWorkspacePathDigestMismatch {
+            expected: format!("sha256:{}", "a".repeat(64)),
+            recomputed: "b".repeat(64),
+        };
+        assert!(matches!(prefixed_mismatch.validate(), Err(HarnessReadApiError::InvalidMailFetch)));
     }
 
     /// C1: `HarnessMailInboxEntryV1` written before `refs` existed

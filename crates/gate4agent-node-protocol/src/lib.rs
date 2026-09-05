@@ -1625,6 +1625,22 @@ pub fn context_pack_digest(lineage: &ContextPackLineageReceipt, bytes: &[u8]) ->
         .expect("a freshly rendered sha256:<64 lowercase hex> string always satisfies SpawnContextDigest::new")
 }
 
+/// A bare (no `sha256:` prefix) lowercase hex SHA-256 digest of `bytes`.
+/// Used where the wire already names the hash algorithm by convention rather
+/// than in the value itself -- `HarnessMailRefV1::WorkspacePath.sha256` and
+/// the node's own `WorkspaceFileRevision` are both this shape (unlike the
+/// context pack digest above, which reuses the prefixed `sha256:<hex>` form
+/// since it must distinguish itself from any other hash the wire might one
+/// day carry for the same object). Plain SHA-256 with no domain separation:
+/// a workspace file's bytes are not reused as an input to any other digest
+/// this wire computes, so there is nothing for a domain tag to separate it
+/// from.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    let mut context = Context::new(&SHA256);
+    context.update(bytes);
+    context.finish().as_ref().iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContextPackBytesRead {
@@ -10376,6 +10392,20 @@ mod tests {
         assert_eq!(
             digest.as_str(),
             "sha256:d35f4bd15866f03ca3621129bd661862a307a46002fd90e1ff2ca988c72a7035",
+        );
+    }
+
+    /// Pins `sha256_hex`'s formula (plain `SHA256(bytes)`, bare lowercase hex,
+    /// no prefix and no domain separation) to a literal so a future edit
+    /// shows up here as a changed digest rather than drifting silently
+    /// between the node (which stamps `WorkspaceFileRevision` with it on
+    /// read) and the harness (which recomputes it to check a mailed
+    /// `WorkspacePath` ref's bytes).
+    #[test]
+    fn sha256_hex_formula_is_pinned() {
+        assert_eq!(
+            sha256_hex(b"gate4agent"),
+            "dfcb966151fe0d63481517c76a7ff6237aeaa5e24f7d76dba7fa862a3a3c5b6b",
         );
     }
 

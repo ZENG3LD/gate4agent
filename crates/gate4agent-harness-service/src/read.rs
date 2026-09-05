@@ -41,11 +41,13 @@ pub(crate) fn verify_and_execute_read(
     verify_observation_binding(observation, support, &claims)?;
     let runtime_inventory = crate::runtime::HarnessRuntimeInventoryCache::default();
     let dispatch = execute_read(harness, observation, support, &claims, request, &runtime_inventory)?;
-    // This test-only wrapper has no C2/Node adapter, so it cannot complete a
-    // `ContextPack` fetch -- see `dispatch_mail_fetch`'s own doc comment.
+    // This test-only wrapper has no C2/Node adapter (and no runtime
+    // inventory), so it cannot complete a `ContextPack` or `WorkspacePath`
+    // fetch -- see `dispatch_mail_fetch`'s own doc comment.
     let response = match dispatch {
         ReadDispatch::Response(response) => response,
         ReadDispatch::ContextPackFetch(_) => return Err(HarnessReadHostErrorV1::Internal),
+        ReadDispatch::WorkspacePathFetch(_) => return Err(HarnessReadHostErrorV1::Internal),
     };
     response.validate().map_err(|_| HarnessReadHostErrorV1::Internal)?;
     Ok(response)
@@ -321,25 +323,25 @@ fn execute_exact_binding_read_only(
 /// `binding.record_id`'s inbox (`HarnessEngine::mail_fetch`'s own membership
 /// predicate -- the same one `mail_inbox` uses), then resolves the ref.
 /// `Run`/`Result`/`ContextPack` refusals from the engine (not addressed to
-/// this reader, an out-of-range index, an unknown context pack digest,
-/// `WorkspacePath` not yet fetchable) travel back as
-/// `HarnessMailFetchResultV1::Refused` with the engine's own `Display` text
-/// -- a named domain refusal, never a host error, same pattern as
-/// `MailSend`. Deliberately does NOT call `authorized_monitor_run` -- that
-/// enforces the caller's own lineage (`visibility.run_visible`), which a
-/// mailed `Run` ref is explicitly allowed to cross; the ONLY gate here is
-/// `HarnessEngine::mail_fetch`'s own inbox-membership check.
+/// this reader, an out-of-range index, an unknown context pack digest)
+/// travel back as `HarnessMailFetchResultV1::Refused` with the engine's own
+/// `Display` text -- a named domain refusal, never a host error, same
+/// pattern as `MailSend`. Deliberately does NOT call `authorized_monitor_run`
+/// -- that enforces the caller's own lineage (`visibility.run_visible`),
+/// which a mailed `Run` ref is explicitly allowed to cross; the ONLY gate
+/// here is `HarnessEngine::mail_fetch`'s own inbox-membership check.
 ///
-/// A resolved `ContextPack` is refused locally here -- this function (via
-/// `execute_exact_binding_read_only`) has no C2/Node adapter, so it cannot
-/// complete the byte fetch. The one caller that CAN, `execute_read`'s own
-/// `HostCommand::Read` production path, never reaches this function for a
-/// `MailFetch` request at all: it intercepts the request before delegating
-/// down (see `dispatch_mail_fetch`), resolves the ref itself, and only
-/// falls through to `project_resolved_mail_fetch` for `Run`/`Result`. Direct
-/// test callers of `execute_exact_binding_read` and the harness-MCP relay
-/// path (`relay_harness_mcp_read_call`) still reach this function and its
-/// local ContextPack refusal.
+/// A resolved `ContextPack` or `WorkspacePath` is refused locally here --
+/// this function (via `execute_exact_binding_read_only`) has no C2/Node
+/// adapter (and, for `WorkspacePath`, no runtime inventory to resolve a
+/// node from), so it cannot complete either byte fetch. The one caller that
+/// CAN, `execute_read`'s own `HostCommand::Read` production path, never
+/// reaches this function for a `MailFetch` request at all: it intercepts
+/// the request before delegating down (see `dispatch_mail_fetch`), resolves
+/// the ref itself, and only falls through to `project_resolved_mail_fetch`
+/// for `Run`/`Result`. Direct test callers of `execute_exact_binding_read`
+/// and the harness-MCP relay path (`relay_harness_mcp_read_call`) still
+/// reach this function and its local refusals.
 fn mail_fetch(
     engine: &gate4agent_harness_engine::HarnessEngine,
     observation: &ObservationService,
@@ -369,16 +371,24 @@ fn mail_fetch(
             ),
         }));
     }
+    if let HarnessMailFetchResolutionV1::WorkspacePath { workspace, path, .. } = &resolved {
+        return Ok(HarnessReadResponseV1::MailFetch(HarnessMailFetchResultV1::Refused {
+            reason: format!(
+                "mailed workspace path {}:{path} requires the node-connected read path",
+                workspace.as_str(),
+            ),
+        }));
+    }
     project_resolved_mail_fetch(engine, observation, support, resolved)
         .map(HarnessReadResponseV1::MailFetch)
 }
 
 /// The `Run`/`Result` projection half of `mail_fetch`, split out so
 /// `dispatch_mail_fetch` (the C2-connected production path) can reuse it
-/// without re-resolving the ref through the engine a second time. Panics via
-/// `HarnessReadHostErrorV1::Internal` if given the `ContextPack` resolution --
-/// every caller special-cases that variant itself first (see each caller's
-/// own doc comment).
+/// without re-resolving the ref through the engine a second time. Returns
+/// `HarnessReadHostErrorV1::Internal` if given the `ContextPack` or
+/// `WorkspacePath` resolution -- every caller special-cases both variants
+/// itself first (see each caller's own doc comment).
 fn project_resolved_mail_fetch(
     engine: &gate4agent_harness_engine::HarnessEngine,
     observation: &ObservationService,
@@ -434,18 +444,20 @@ fn project_resolved_mail_fetch(
             })
         }
         HarnessMailFetchResolutionV1::ContextPack { .. } => Err(HarnessReadHostErrorV1::Internal),
+        HarnessMailFetchResolutionV1::WorkspacePath { .. } => Err(HarnessReadHostErrorV1::Internal),
     }
 }
 
-/// D3/Slice C2: the one call site of `execute_read` that can complete a
-/// resolved `ContextPack` ref's byte fetch (`HostCommand::Read`'s production
-/// arm in `runtime.rs`, which owns a `HarnessC2Adapter`). Re-does the small
-/// slice of `execute_exact_binding_read`'s prologue that applies to
-/// `MailFetch` (request validation, the exact grant/binding CAS check, the
-/// `grant.mail` gate `authorize_request` enforces for every other MailFetch
-/// path) rather than routing through that function, so the C2-capable
-/// `ContextPack` resolution can be signalled back as `ReadDispatch::
-/// ContextPackFetch` instead of a `HarnessReadResponseV1`.
+/// D3/Slice C2+C3: the one call site of `execute_read` that can complete a
+/// resolved `ContextPack` or `WorkspacePath` ref's byte fetch
+/// (`HostCommand::Read`'s production arm in `runtime.rs`, which owns a
+/// `HarnessC2Adapter` and the runtime inventory a `WorkspacePath` ref needs
+/// to resolve a node). Re-does the small slice of `execute_exact_binding_
+/// read`'s prologue that applies to `MailFetch` (request validation, the
+/// exact grant/binding CAS check, the `grant.mail` gate `authorize_request`
+/// enforces for every other MailFetch path) rather than routing through
+/// that function, so either C2-capable resolution can be signalled back as
+/// its own `ReadDispatch` variant instead of a `HarnessReadResponseV1`.
 pub(crate) fn dispatch_mail_fetch(
     harness: &mut HarnessService,
     observation: &ObservationService,
@@ -469,6 +481,13 @@ pub(crate) fn dispatch_mail_fetch(
         Ok(HarnessMailFetchResolutionV1::ContextPack { run_id, digest }) => {
             Ok(ReadDispatch::ContextPackFetch(ContextPackFetchIntent { run_id, digest }))
         }
+        Ok(HarnessMailFetchResolutionV1::WorkspacePath { workspace, path, sha256 }) => {
+            Ok(ReadDispatch::WorkspacePathFetch(WorkspacePathFetchIntent {
+                workspace: workspace.as_str().to_owned(),
+                path,
+                sha256,
+            }))
+        }
         Ok(resolved) => project_resolved_mail_fetch(engine, observation, support, resolved)
             .map(|result| ReadDispatch::Response(HarnessReadResponseV1::MailFetch(result))),
         Err(error) => Ok(ReadDispatch::Response(HarnessReadResponseV1::MailFetch(
@@ -478,12 +497,13 @@ pub(crate) fn dispatch_mail_fetch(
 }
 
 /// `execute_read`'s outcome: either a complete response, or -- for a
-/// `MailFetch` request whose ref resolved to a `ContextPack` -- the intent
-/// the caller (`HostCommand::Read`'s production arm) must start a C2/Node
-/// round trip for before it can reply.
+/// `MailFetch` request whose ref resolved to a `ContextPack` or a
+/// `WorkspacePath` -- the intent the caller (`HostCommand::Read`'s
+/// production arm) must start a C2/Node round trip for before it can reply.
 pub(crate) enum ReadDispatch {
     Response(HarnessReadResponseV1),
     ContextPackFetch(ContextPackFetchIntent),
+    WorkspacePathFetch(WorkspacePathFetchIntent),
 }
 
 /// `dispatch_mail_fetch`'s deferred outcome: the run whose own
@@ -495,6 +515,19 @@ pub(crate) enum ReadDispatch {
 pub(crate) struct ContextPackFetchIntent {
     pub(crate) run_id: HarnessRunId,
     pub(crate) digest: String,
+}
+
+/// `dispatch_mail_fetch`'s deferred outcome for a `WorkspacePath` ref
+/// (D3/Slice C3): the ref's own fields verbatim, exactly as `HarnessEngine::
+/// mail_fetch` resolved them -- unlike `ContextPackFetchIntent`, this names
+/// no run at all, since a `WorkspacePath` ref carries no run binding to
+/// resolve a node from. The caller resolves `workspace` to a node from its
+/// own runtime inventory instead (`HarnessRuntimeInventoryCache::
+/// all_nodes`), a lookup this crate's read layer does not depend on either.
+pub(crate) struct WorkspacePathFetchIntent {
+    pub(crate) workspace: String,
+    pub(crate) path: String,
+    pub(crate) sha256: String,
 }
 
 fn authorize_request(

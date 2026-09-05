@@ -5342,6 +5342,86 @@ pub(crate) fn recompute_context_pack_digest(
     Ok(context_pack_digest(&node_receipt.lineage, bytes).to_string())
 }
 
+/// D3/Slice C3's fetch-only node round trip for one mailed `WorkspacePath`
+/// ref already resolved by `HarnessEngine::mail_fetch` to its own fields
+/// verbatim (there is no run or durable receipt to check it against, unlike
+/// `ContextPack`) and by the caller (`prepare_workspace_path_fetch`) to
+/// exactly one connected node. Unlike `start_context_pack_fetch`, there is
+/// no stored session binding to derive a route from -- the route is
+/// resolved live via `exact_route`, the same way `PreparedNodeWorkspaceRead`
+/// resolves one for the operator-facing node/workspace read family this
+/// mirrors the wire shape of (`NodeRequest::ReadWorkspaceFile` /
+/// `C2NodeResponse::WorkspaceFileRead`), but kept as its own narrow pending
+/// type rather than routed through that family's `WorkspaceReadKind`: this
+/// fetch answers plain `WorkspaceFileRead` for `finish_workspace_path_fetch`
+/// to project into `HarnessMailFetchResultV1` directly, never
+/// `HarnessOperatorResponseV1`.
+impl HarnessC2Adapter {
+    pub(crate) fn start_workspace_path_fetch(
+        &self,
+        node_id: &NodeId,
+        workspace_id: WorkspaceId,
+        path: RepositoryPath,
+    ) -> Result<PendingWorkspacePathFetch, HarnessC2Error> {
+        let route = self.exact_route(node_id)?;
+        let pending = self.control.start_request(
+            route.clone(),
+            NodeRequest::ReadWorkspaceFile { workspace_id: workspace_id.clone(), path: path.clone() },
+        ).map_err(HarnessC2Error::WorkspacePathFetchEnqueue)?;
+        Ok(PendingWorkspacePathFetch {
+            route,
+            workspace_id,
+            path,
+            started_at: Instant::now(),
+            pending: Some(pending),
+        })
+    }
+}
+
+pub(crate) struct PendingWorkspacePathFetch {
+    route: NodeRoute,
+    workspace_id: WorkspaceId,
+    path: RepositoryPath,
+    started_at: Instant,
+    pending: Option<C2PendingRequest>,
+}
+
+impl PendingWorkspacePathFetch {
+    pub(crate) async fn finish(mut self) -> Result<WorkspaceFileRead, HarnessC2Error> {
+        let pending = self.pending.take()
+            .expect("pending workspace path fetch owns exactly one C2 waiter");
+        match pending.finish().await {
+            Err(C2ControlError::Closed)
+                if self.started_at.elapsed() >= RUN_READ_TIMEOUT_FLOOR => {
+                    Err(HarnessC2Error::WorkspacePathFetchDeadline)
+                }
+            Err(error) => Err(HarnessC2Error::WorkspacePathFetchTransport(error)),
+            Ok(routed) if routed.node_id != self.route.node_id
+                || routed.incarnation_id != self.route.expected_incarnation_id => {
+                    Err(HarnessC2Error::WorkspacePathFetchRouteMismatch)
+                }
+            Ok(routed) => match routed.response {
+                Err(failure) => Err(HarnessC2Error::WorkspacePathFetchRejected { code: failure.code }),
+                Ok(response) => {
+                    correlate_workspace_path_fetch_response(&self.workspace_id, &self.path, response)
+                }
+            },
+        }
+    }
+}
+
+fn correlate_workspace_path_fetch_response(
+    workspace_id: &WorkspaceId,
+    path: &RepositoryPath,
+    response: C2NodeResponse,
+) -> Result<WorkspaceFileRead, HarnessC2Error> {
+    match response {
+        C2NodeResponse::WorkspaceFileRead { file }
+            if &file.workspace_id == workspace_id && &file.path == path => Ok(file),
+        _ => Err(HarnessC2Error::WorkspacePathFetchCorrelationMismatch),
+    }
+}
+
 #[derive(Debug)]
 struct PreparedSpawnHarnessMcp {
     reservation_id: HarnessMcpReservationId,
@@ -6355,6 +6435,18 @@ pub enum HarnessC2Error {
     ContextPackFetchCorrelationMismatch,
     #[error("Node rejected mailed context pack fetch with {code:?}")]
     ContextPackFetchRejected { code: NodeFailureCode },
+    #[error("mailed workspace path fetch was not enqueued: {0}")]
+    WorkspacePathFetchEnqueue(C2ControlError),
+    #[error("mailed workspace path fetch transport failed: {0}")]
+    WorkspacePathFetchTransport(C2ControlError),
+    #[error("mailed workspace path fetch deadline elapsed")]
+    WorkspacePathFetchDeadline,
+    #[error("mailed workspace path fetch response route or incarnation does not match")]
+    WorkspacePathFetchRouteMismatch,
+    #[error("mailed workspace path fetch response does not exactly correlate with the request")]
+    WorkspacePathFetchCorrelationMismatch,
+    #[error("Node rejected mailed workspace path fetch with {code:?}")]
+    WorkspacePathFetchRejected { code: NodeFailureCode },
     #[error("node workspace write request is invalid")]
     InvalidNodeWorkspaceWriteRequest,
     #[error("node workspace write was not enqueued: {0}")]
@@ -7775,7 +7867,6 @@ mod tests {
                     },
                 },
                 event: gate4agent_c2_protocol::C2ControlEvent {
-                    protocol_version: gate4agent_types::CONTROL_PROTOCOL_VERSION,
                     sequence,
                     command_id: None,
                     instance_id: AgentInstanceId(7),

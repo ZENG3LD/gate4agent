@@ -719,18 +719,22 @@ impl HarnessEngine {
     /// own `read_visibility`) -- and only then resolves `ref_index`. A message
     /// not in the reader's inbox is `MailNotForReader` by name, never
     /// `NotFound` (that would leak whether the id exists at all to a caller it
-    /// was never mailed to). `WorkspacePath` refs are refused by name,
-    /// `MailRefKindNotYetFetchable` (C3 wires those bytes); `ContextPack`
-    /// resolves to the run whose own `context_pack.digest` matches the ref --
-    /// a linear scan of `self.runs` (bounded by the same durable-record
-    /// capacity every other unbounded run scan in this engine already
-    /// accepts), never `read_visibility` -- an unknown digest is
-    /// `MailRefTargetUnknown` by name. `Run`/`Result` are returned for the
-    /// caller (`gate4agent-harness-service`) to dereference the rest of the
-    /// way -- that caller has the observation data (and, for `ContextPack`,
-    /// the C2/Node route) this crate deliberately does not depend on, and it
-    /// must NOT re-consult `read_visibility` for the resolved run: membership
-    /// above is the only gate a mailed ref crosses.
+    /// was never mailed to). `ContextPack` resolves to the run whose own
+    /// `context_pack.digest` matches the ref -- a linear scan of `self.runs`
+    /// (bounded by the same durable-record capacity every other unbounded run
+    /// scan in this engine already accepts), never `read_visibility` -- an
+    /// unknown digest is `MailRefTargetUnknown` by name. `WorkspacePath`
+    /// resolves to the ref's own fields verbatim (C3): unlike `ContextPack`
+    /// this crate has no run or receipt to check it against -- the mailed
+    /// `workspace`/`path`/`sha256` are the entire resolution, and the caller
+    /// (`gate4agent-harness-service`) is the one with the C2/Node route and
+    /// runtime inventory needed to resolve a workspace to a node and fetch
+    /// the bytes, exactly as it already does for `ContextPack`'s run/route.
+    /// `Run`/`Result` are returned for the caller to dereference the rest of
+    /// the way -- that caller has the observation data this crate
+    /// deliberately does not depend on, and it must NOT re-consult
+    /// `read_visibility` for the resolved run: membership above is the only
+    /// gate a mailed ref crosses.
     pub fn mail_fetch(
         &self,
         grant_id: &SessionGrantId,
@@ -765,8 +769,12 @@ impl HarnessEngine {
                     })?;
                 Ok(HarnessMailFetchResolutionV1::ContextPack { run_id, digest: digest.clone() })
             }
-            HarnessMailRefV1::WorkspacePath { .. } => {
-                Err(HarnessEngineError::MailRefKindNotYetFetchable { kind: "workspace-path" })
+            HarnessMailRefV1::WorkspacePath { workspace, path, sha256 } => {
+                Ok(HarnessMailFetchResolutionV1::WorkspacePath {
+                    workspace: workspace.clone(),
+                    path: path.clone(),
+                    sha256: sha256.clone(),
+                })
             }
             HarnessMailRefV1::Run { run_id } => {
                 Ok(HarnessMailFetchResolutionV1::Run { run_id: run_id.clone() })
@@ -4111,12 +4119,16 @@ fn validate_grant_transition(
 /// run whose `context_pack.digest` the ref named, since dereferencing it
 /// needs that run's C2/Node route -- a dependency this crate deliberately
 /// does not carry, so the caller (`gate4agent-harness-service`) resolves the
-/// route and fetches the bytes itself.
+/// route and fetches the bytes itself. `WorkspacePath` (C3) mirrors
+/// `HarnessMailRefV1::WorkspacePath` verbatim for the identical reason: this
+/// crate has no node/workspace inventory of its own, so the caller resolves
+/// `workspace` to a node and fetches the file.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HarnessMailFetchResolutionV1 {
     Run { run_id: HarnessRunId },
     Result { result_ref: HarnessResultRef },
     ContextPack { run_id: HarnessRunId, digest: String },
+    WorkspacePath { workspace: HarnessSelectorV1, path: String, sha256: String },
 }
 
 #[derive(Debug, Error)]
@@ -4290,8 +4302,6 @@ pub enum HarnessEngineError {
     MailNotForReader { message_id: HarnessMailMessageId },
     #[error("mail message {message_id} has no ref at index {ref_index}")]
     MailRefIndexOutOfRange { message_id: HarnessMailMessageId, ref_index: usize },
-    #[error("mail ref kind {kind} is not yet fetchable")]
-    MailRefKindNotYetFetchable { kind: &'static str },
     #[error("no run carries a context pack receipt with digest {digest}")]
     MailRefTargetUnknown { digest: String },
 }
@@ -7847,14 +7857,16 @@ mod tests {
         }
     }
 
-    /// D3/C1+C2: `WorkspacePath` refs are refused by name --
-    /// `mail_fetch` never returns their bytes (C3 wires them later). An
-    /// unknown-digest `ContextPack` ref is refused by name too
+    /// D3/C1+C3: an unknown-digest `ContextPack` ref is refused by name
     /// (`MailRefTargetUnknown`) -- the resolves-to-a-real-run case is
     /// `harness_mail_fetch_resolves_context_pack_ref_to_its_owning_run_and_refuses_unknown_digests`
-    /// above.
+    /// above. A `WorkspacePath` ref resolves to its own fields verbatim (C3):
+    /// this crate has no node/workspace inventory to check it against, so
+    /// there is nothing more for `mail_fetch` itself to verify or refuse --
+    /// the caller (`gate4agent-harness-service`) resolves the workspace to a
+    /// node and fetches the bytes.
     #[test]
-    fn harness_mail_fetch_refuses_context_pack_and_workspace_path_refs_by_name() {
+    fn harness_mail_fetch_refuses_unknown_context_pack_digest_and_resolves_workspace_path_by_name() {
         let mut engine = HarnessEngine::new();
         let sender_run_id = numbered_run_id(121);
         let sender_task_id = numbered_task_id(121);
@@ -7934,10 +7946,14 @@ mod tests {
             }
             other => panic!("expected MailRefTargetUnknown, got {other:?}"),
         }
-        match engine.mail_fetch(&reader_grant.grant_id, &recipient_record_id, &message.message_id, 1) {
-            Err(HarnessEngineError::MailRefKindNotYetFetchable { kind }) => assert_eq!(kind, "workspace-path"),
-            other => panic!("expected MailRefKindNotYetFetchable(workspace-path), got {other:?}"),
-        }
+        assert_eq!(
+            engine.mail_fetch(&reader_grant.grant_id, &recipient_record_id, &message.message_id, 1).unwrap(),
+            HarnessMailFetchResolutionV1::WorkspacePath {
+                workspace: HarnessSelectorV1::new("workspace-a").unwrap(),
+                path: "reports/handoff.md".to_owned(),
+                sha256: "b".repeat(64),
+            },
+        );
     }
 
     #[test]
@@ -8334,9 +8350,8 @@ mod tests {
     /// D3/Slice C: a `ContextPack` ref whose digest matches a real run's own
     /// `context_pack.digest` resolves to that run -- the caller
     /// (`gate4agent-harness-service`) fetches the bytes from that run's own
-    /// node/route. A digest that names no run at all is
-    /// `MailRefTargetUnknown` by name, never `MailRefKindNotYetFetchable`
-    /// (that refusal is now `WorkspacePath`'s alone).
+    /// node/route. A digest that names no run at all is `MailRefTargetUnknown`
+    /// by name.
     #[test]
     fn harness_mail_fetch_resolves_context_pack_ref_to_its_owning_run_and_refuses_unknown_digests() {
         let mut engine = HarnessEngine::new();

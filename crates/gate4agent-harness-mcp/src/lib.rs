@@ -666,7 +666,7 @@ fn tool_definitions() -> Vec<Value> {
         ),
         tool_with_hints(
             "g4a_mail_fetch",
-            "Dereference one ref attached to a mail message already in this session's inbox. Authorized by message membership, not by this grant's own lineage. A Run ref returns a monitor projection plus a timeline page; a Result ref returns the redacted run record; a ContextPack ref returns its digest, id, byte_len, and its bytes as lower-hex (bytes_hex, exactly byte_len * 2 hex characters); anything else refuses by name.",
+            "Dereference one ref attached to a mail message already in this session's inbox. Authorized by message membership, not by this grant's own lineage. A Run ref returns a monitor projection plus a timeline page; a Result ref returns the redacted run record; a ContextPack ref returns its digest, id, byte_len, and its bytes as lower-hex (bytes_hex, exactly byte_len * 2 hex characters); a WorkspacePath ref returns its workspace, path, byte_len, bare-hex sha256, and its UTF-8 text verbatim; anything else refuses by name.",
             object_schema(vec![
                 ("message_id", string_schema()),
                 ("ref_index", integer_schema(0, HARNESS_MAIL_REFS_MAX as u64 - 1)),

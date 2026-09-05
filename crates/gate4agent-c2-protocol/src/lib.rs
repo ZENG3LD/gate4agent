@@ -18,7 +18,7 @@ pub use gate4agent_node_protocol::{
     ProviderRuntimeStatuses, ProviderRuntimeVersion,
     LaunchInventory, ResolvedBundleReceipt, ResolvedEnvironmentProfileReceipt,
     ResolvedSpawnReceipt, SpawnProfileSummary,
-    ContextPackLineageReceipt, ResolvedContextPackReceipt, SpawnContextDigest,
+    ContextPackBytesRead, ContextPackLineageReceipt, ResolvedContextPackReceipt, SpawnContextDigest,
     ResolvedSpawnSpec, SpawnBundleDigest, SpawnBundleId, SpawnBundleRevision,
     SpawnContextId, SpawnDeadlineMs, SpawnEnvironmentProfileId,
     SpawnEnvironmentProfileRevision, SpawnFieldProvenance, SpawnIdempotencyKey, SpawnOverride,
@@ -1537,6 +1537,7 @@ pub enum C2NodeResponse {
     },
     ContextPackForgotten { context_id: SpawnContextId },
     DurableContextPackResolved { context: ResolvedContextPackReceipt },
+    ContextPackBytesRead { pack: ContextPackBytesRead },
     WorkspaceRegistered {
         workspace: C2WorkspaceSnapshot,
     },
@@ -1787,6 +1788,7 @@ impl From<&NodeResponse> for C2NodeResponse {
                     context: context.clone(),
                 }
             }
+            NodeResponse::ContextPackBytesRead { pack } => Self::ContextPackBytesRead { pack: pack.clone() },
             NodeResponse::WorkspaceRegistered { workspace } => Self::WorkspaceRegistered {
                 workspace: C2WorkspaceSnapshot::from(workspace),
             },
@@ -1949,7 +1951,7 @@ impl C2NodeResponse {
             | Self::SessionRecordResumed { record, .. } => {
                 record.environment_profile.is_some()
             }
-            Self::DurableContextPackResolved { .. } => false,
+            Self::DurableContextPackResolved { .. } | Self::ContextPackBytesRead { .. } => false,
             Self::Armed { .. }
             | Self::Activated { .. }
             | Self::Aborted { .. }
@@ -2010,7 +2012,7 @@ impl C2NodeResponse {
             | Self::ProviderSessionIndexed { record }
             | Self::NativeSessionIndexed { record, .. }
             | Self::SessionRecordResumed { record, .. } => record.bundle.is_some(),
-            Self::DurableContextPackResolved { .. } => false,
+            Self::DurableContextPackResolved { .. } | Self::ContextPackBytesRead { .. } => false,
             Self::Armed { .. }
             | Self::Activated { .. }
             | Self::Aborted { .. }
@@ -2082,7 +2084,8 @@ impl C2NodeResponse {
             | Self::ContextPackForSessionRecordExported { .. }
             | Self::ContextPackExported { .. }
             | Self::ContextPackForgotten { .. }
-            | Self::DurableContextPackResolved { .. } => true,
+            | Self::DurableContextPackResolved { .. }
+            | Self::ContextPackBytesRead { .. } => true,
             Self::Armed { .. }
             | Self::Activated { .. }
             | Self::Aborted { .. }
@@ -2274,6 +2277,14 @@ pub enum C2RelayFailureCode {
     RequestForbidden,
     ClientLagged,
     ShuttingDown,
+    /// The connecting side's [`BUILD_STAMP`] did not match this side's own
+    /// -- carries nothing itself; the accompanying `C2RelayFailure::
+    /// message` names both stamps (`"build stamp mismatch: local=<s>
+    /// remote=<s>"`), the same "both values, one text" idiom the harness
+    /// operator/read wires already use for their own build-stamp
+    /// mismatches. Sent pre-handshake, before the connection is closed, so
+    /// the peer sees a named refusal instead of a bare disconnect.
+    BuildStampMismatch,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -166,6 +166,18 @@ async fn serve_connection(
             remote = %hello.build_stamp,
             "control connection rejected: build stamp mismatch",
         );
+        timeout(AUTH_DEADLINE, write_json_frame_limited(
+            &mut pipe,
+            &C2ServerFrame::Rejected(C2RelayFailure {
+                code: C2RelayFailureCode::BuildStampMismatch,
+                message: format!(
+                    "build stamp mismatch: local={BUILD_STAMP} remote={}",
+                    hello.build_stamp,
+                ),
+                current_incarnation_id: None,
+            }),
+            MAX_C2_AUTH_FRAME_BYTES,
+        )).await.map_err(|_| FrameError::BodyTimedOut { length: 0 })??;
         return Ok(());
     }
     let negotiated = c2_control_compatibility_support()?
@@ -961,6 +973,7 @@ fn server_frame_terminal_frame_payload(frame: &C2ServerFrame) -> TerminalFramePa
                     | C2NodeResponse::ContextPackExported { .. }
                     | C2NodeResponse::ContextPackForgotten { .. }
                     | C2NodeResponse::DurableContextPackResolved { .. }
+                    | C2NodeResponse::ContextPackBytesRead { .. }
                     | C2NodeResponse::WorkspaceRegistered { .. }
                     | C2NodeResponse::StandaloneWorkspaceCreated { .. }
                     | C2NodeResponse::WorkspaceUnregistered { .. }
@@ -1056,6 +1069,7 @@ fn server_frame_agent_stream_payload(frame: &C2ServerFrame) -> AgentStreamPayloa
                     | C2NodeResponse::ContextPackExported { .. }
                     | C2NodeResponse::ContextPackForgotten { .. }
                     | C2NodeResponse::DurableContextPackResolved { .. }
+                    | C2NodeResponse::ContextPackBytesRead { .. }
                     | C2NodeResponse::WorkspaceRegistered { .. }
                     | C2NodeResponse::StandaloneWorkspaceCreated { .. }
                     | C2NodeResponse::WorkspaceUnregistered { .. }
@@ -1395,6 +1409,7 @@ fn node_request_contains_opaque_unix_path(request: &NodeRequest) -> bool {
         | NodeRequest::ExportContextPack { .. }
         | NodeRequest::ForgetContextPack { .. }
         | NodeRequest::ResolveDurableContextPack { .. }
+        | NodeRequest::ReadContextPack { .. }
         | NodeRequest::Prompt { .. }
         | NodeRequest::Paste { .. }
         | NodeRequest::Input { .. }
@@ -1502,6 +1517,7 @@ fn server_frame_contains_unix_repository_path(frame: &C2ServerFrame) -> bool {
                         .as_ref()
                         .is_some_and(|path| path.as_unix_bytes().is_some()),
                     C2NodeResponse::DurableContextPackResolved { .. } => false,
+                    C2NodeResponse::ContextPackBytesRead { .. } => false,
                     C2NodeResponse::Snapshot { .. }
                     | C2NodeResponse::Resync { .. }
                     | C2NodeResponse::Armed { .. }
@@ -1870,7 +1886,8 @@ fn strip_history_context_pack_from_response(response: &mut C2NodeResponse) -> bo
         | C2NodeResponse::ContextPackForSessionRecordExported { .. }
         | C2NodeResponse::ContextPackExported { .. }
         | C2NodeResponse::ContextPackForgotten { .. }
-        | C2NodeResponse::DurableContextPackResolved { .. } => false,
+        | C2NodeResponse::DurableContextPackResolved { .. }
+        | C2NodeResponse::ContextPackBytesRead { .. } => false,
         C2NodeResponse::Armed { .. }
         | C2NodeResponse::Activated { .. }
         | C2NodeResponse::Aborted { .. }
@@ -2057,6 +2074,7 @@ fn c2_response_contains_opaque_unix_path(response: &C2NodeResponse) -> bool {
         | C2NodeResponse::ContextPackExported { .. }
         | C2NodeResponse::ContextPackForgotten { .. }
         | C2NodeResponse::DurableContextPackResolved { .. }
+        | C2NodeResponse::ContextPackBytesRead { .. }
         | C2NodeResponse::WorkspaceUnregistered { .. }
         | C2NodeResponse::Accepted
         | C2NodeResponse::ShuttingDown => false,
@@ -2445,6 +2463,7 @@ fn request_targets_unavailable_provider(
         }
         NodeRequest::ForgetContextPack { .. } => true,
         NodeRequest::ResolveDurableContextPack { .. } => true,
+        NodeRequest::ReadContextPack { .. } => true,
         NodeRequest::IndexProviderSession { provider, .. } => !provider_id_is_legacy(provider),
         NodeRequest::CatalogNativeSessions { route, .. }
         | NodeRequest::PageNativeSessions { route, .. } => {
@@ -2719,6 +2738,7 @@ fn project_legacy_response(
         | C2NodeResponse::HistoryDiscovered { .. }
         | C2NodeResponse::HistoryLoaded { .. }
         | C2NodeResponse::ContextPackForgotten { .. }
+        | C2NodeResponse::ContextPackBytesRead { .. }
         | C2NodeResponse::WorkspaceUnregistered { .. }
         | C2NodeResponse::WorktreeRemoved { .. }
         | C2NodeResponse::Accepted
@@ -2872,6 +2892,7 @@ fn clear_server_frame_provider_runtime_status(frame: &mut C2ServerFrame) {
         | C2NodeResponse::ContextPackExported { .. }
         | C2NodeResponse::ContextPackForgotten { .. }
         | C2NodeResponse::DurableContextPackResolved { .. }
+        | C2NodeResponse::ContextPackBytesRead { .. }
         | C2NodeResponse::WorkspaceRegistered { .. }
         | C2NodeResponse::StandaloneWorkspaceCreated { .. }
         | C2NodeResponse::WorkspaceUnregistered { .. }

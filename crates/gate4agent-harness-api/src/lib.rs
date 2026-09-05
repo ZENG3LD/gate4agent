@@ -50,7 +50,6 @@ pub use gate4agent_harness_protocol::{
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
-pub const HARNESS_READ_WIRE_VERSION_V1: u16 = 1;
 pub const HARNESS_READ_REQUEST_MAX_BYTES: usize = 64 * 1024;
 pub const HARNESS_READ_RESPONSE_MAX_BYTES: usize = 1024 * 1024;
 pub const HARNESS_READ_LIMIT_MAX: u16 = 256;
@@ -5513,14 +5512,27 @@ pub enum HarnessOperatorHostErrorV1 {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HarnessReadEnvelopeV1 {
-    pub version: u16,
+    pub build_stamp: String,
     pub credential: HarnessReadCredential,
     pub request: HarnessReadRequestV1,
 }
 
 impl HarnessReadEnvelopeV1 {
+    /// Builds an envelope carrying this binary's own [`BUILD_STAMP`] -- the
+    /// one place every caller in this tree (this crate's own tests,
+    /// `gate4agent-harness-client`) should build one from, rather than
+    /// hand-filling `build_stamp` at each site.
+    pub fn new(credential: HarnessReadCredential, request: HarnessReadRequestV1) -> Self {
+        Self { build_stamp: BUILD_STAMP.to_string(), credential, request }
+    }
+
     pub fn validate(&self) -> Result<(), HarnessReadApiError> {
-        validate_version(self.version)?;
+        if self.build_stamp != BUILD_STAMP {
+            return Err(HarnessReadApiError::BuildStampMismatch {
+                expected: BUILD_STAMP.to_string(),
+                received: self.build_stamp.clone(),
+            });
+        }
         validate_credential(self.credential.expose())?;
         self.request.validate()
     }
@@ -5836,16 +5848,24 @@ impl HarnessMailAckResultV1 {
 /// redacted monitor projection plus a bounded timeline page -- the same
 /// shapes `g4a_monitor_get`/`g4a_timeline_read` already return, just reached
 /// through the mailed ref instead of the caller's own lineage; `Result`
-/// returns the redacted run record the result reference names. `Refused`
-/// carries `HarnessEngineError`'s own `Display` text verbatim for
-/// `MailNotForReader`/`MailRefIndexOutOfRange`/`MailRefKindNotYetFetchable`
-/// -- a named refusal, never a host error, same pattern as
-/// `HarnessMailSendResultV1`.
+/// returns the redacted run record the result reference names. `ContextPack`
+/// (C2) is the mailed pack's own bytes, hex-encoded like every other raw
+/// byte payload this wire carries (`HarnessMcpReplyChunkHexV1`'s convention):
+/// `digest`/`id` mirror `HarnessResolvedContextPackReceiptV1`'s own fields,
+/// `byte_len` is the RAW (pre-hex) length, and `bytes_hex.len()` is always
+/// exactly `byte_len * 2`. `Refused` carries `HarnessEngineError`'s own
+/// `Display` text verbatim for `MailNotForReader`/`MailRefIndexOutOfRange`/
+/// `MailRefKindNotYetFetchable`/`MailRefTargetUnknown`, or
+/// `gate4agent-harness-service`'s own text when the Node round trip itself
+/// fails after resolution (an evicted pack, or a digest mismatch between what
+/// was requested and what hashed out) -- a named refusal, never a host
+/// error, same pattern as `HarnessMailSendResultV1`.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "outcome", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum HarnessMailFetchResultV1 {
     Run { monitor: SessionMonitorV1, timeline: TimelinePageV1 },
     Result { run: RedactedRunV1 },
+    ContextPack { digest: String, id: String, byte_len: u32, bytes_hex: String },
     Refused { reason: String },
 }
 
@@ -5857,6 +5877,18 @@ impl HarnessMailFetchResultV1 {
                 timeline.validate()
             }
             Self::Result { run } => run.validate(),
+            Self::ContextPack { digest, id, byte_len, bytes_hex } => {
+                if !valid_sha256_digest(digest)
+                    || !valid_runtime_id(id, 128)
+                    || *byte_len == 0
+                    || *byte_len > HARNESS_CONTEXT_PACK_MAX_BYTES
+                    || bytes_hex.len() != (*byte_len as usize) * 2
+                    || !bytes_hex.bytes().all(is_lower_hex)
+                {
+                    return Err(HarnessReadApiError::InvalidMailFetch);
+                }
+                Ok(())
+            }
             Self::Refused { reason } => {
                 if reason.is_empty()
                     || reason.len() > HARNESS_MAIL_REFUSAL_REASON_MAX_BYTES
@@ -5870,7 +5902,7 @@ impl HarnessMailFetchResultV1 {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HarnessReadHostErrorV1 {
     InvalidRequest,
@@ -5879,6 +5911,15 @@ pub enum HarnessReadHostErrorV1 {
     TooLarge,
     Deadline,
     Internal,
+    // The host decoded the envelope but its declared `build_stamp` did not
+    // match this side's own `BUILD_STAMP` (see `HarnessReadApiError::
+    // BuildStampMismatch`, which this carries verbatim onto the wire so the
+    // caller sees both stamps instead of the generic `InvalidRequest` every
+    // other malformed-envelope shape collapses to). Reaching this variant
+    // itself proves a build skew between the two loopback sides -- this
+    // protocol has exactly one accepted build stamp, so a well-formed peer
+    // never triggers it against a matching one.
+    BuildStampMismatch { expected: String, received: String },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -6664,8 +6705,13 @@ impl RedactedOperationV1 {
 
 #[derive(Debug, Error)]
 pub enum HarnessReadApiError {
-    #[error("unsupported harness read wire version")]
-    UnsupportedVersion,
+    #[error(
+        "build stamp mismatch: this side was built from tree {expected}, the peer from \
+         tree {received} -- rebuild and restart the out-of-date side (gate4agent-harness \
+         and its gate4agent-harness-client-based peers are built from the same tree and \
+         must be rolled together)"
+    )]
+    BuildStampMismatch { expected: String, received: String },
     #[error("harness read credential is malformed")]
     MalformedCredential,
     #[error("harness read limit is outside the supported range")]
@@ -6779,13 +6825,6 @@ pub enum HarnessOperatorApiError {
     Read(#[source] HarnessReadApiError),
     #[error("harness protocol value is invalid: {0}")]
     Protocol(#[source] gate4agent_harness_protocol::HarnessValidationError),
-}
-
-fn validate_version(version: u16) -> Result<(), HarnessReadApiError> {
-    if version != HARNESS_READ_WIRE_VERSION_V1 {
-        return Err(HarnessReadApiError::UnsupportedVersion);
-    }
-    Ok(())
 }
 
 fn validate_credential(value: &str) -> Result<(), HarnessReadApiError> {
@@ -10996,6 +11035,56 @@ mod tests {
             reason: "x".repeat(HARNESS_MAIL_REFUSAL_REASON_MAX_BYTES + 1),
         };
         assert!(matches!(oversized_reason.validate(), Err(HarnessReadApiError::InvalidMailFetch)));
+    }
+
+    /// D3/Slice C2: `HarnessMailFetchResultV1::ContextPack` round-trips, and
+    /// `bytes_hex` must be exactly `byte_len * 2` lower-hex bytes -- a short
+    /// or long `bytes_hex` (declared length lying about the payload) is
+    /// `InvalidMailFetch`, the same shape every other length-declaring wire
+    /// value in this crate is checked.
+    #[test]
+    fn mail_fetch_result_context_pack_round_trips_and_bounds_bytes_hex_to_byte_len() {
+        let context_pack = HarnessMailFetchResultV1::ContextPack {
+            digest: format!("sha256:{}", "a".repeat(64)),
+            id: "ctx-deadbeef".to_owned(),
+            byte_len: 3,
+            bytes_hex: "0a1b2c".to_owned(),
+        };
+        context_pack.validate().unwrap();
+        let encoded = serde_json::to_string(&context_pack).unwrap();
+        assert_eq!(serde_json::from_str::<HarnessMailFetchResultV1>(&encoded).unwrap(), context_pack);
+
+        let short_bytes_hex = HarnessMailFetchResultV1::ContextPack {
+            digest: format!("sha256:{}", "a".repeat(64)),
+            id: "ctx-deadbeef".to_owned(),
+            byte_len: 3,
+            bytes_hex: "0a1b".to_owned(),
+        };
+        assert!(matches!(short_bytes_hex.validate(), Err(HarnessReadApiError::InvalidMailFetch)));
+
+        let long_bytes_hex = HarnessMailFetchResultV1::ContextPack {
+            digest: format!("sha256:{}", "a".repeat(64)),
+            id: "ctx-deadbeef".to_owned(),
+            byte_len: 3,
+            bytes_hex: "0a1b2c3d".to_owned(),
+        };
+        assert!(matches!(long_bytes_hex.validate(), Err(HarnessReadApiError::InvalidMailFetch)));
+
+        let zero_byte_len = HarnessMailFetchResultV1::ContextPack {
+            digest: format!("sha256:{}", "a".repeat(64)),
+            id: "ctx-deadbeef".to_owned(),
+            byte_len: 0,
+            bytes_hex: String::new(),
+        };
+        assert!(matches!(zero_byte_len.validate(), Err(HarnessReadApiError::InvalidMailFetch)));
+
+        let bad_digest = HarnessMailFetchResultV1::ContextPack {
+            digest: "not-a-digest".to_owned(),
+            id: "ctx-deadbeef".to_owned(),
+            byte_len: 3,
+            bytes_hex: "0a1b2c".to_owned(),
+        };
+        assert!(matches!(bad_digest.validate(), Err(HarnessReadApiError::InvalidMailFetch)));
     }
 
     /// C1: `HarnessMailInboxEntryV1` written before `refs` existed

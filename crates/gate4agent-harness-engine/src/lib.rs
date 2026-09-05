@@ -719,20 +719,25 @@ impl HarnessEngine {
     /// own `read_visibility`) -- and only then resolves `ref_index`. A message
     /// not in the reader's inbox is `MailNotForReader` by name, never
     /// `NotFound` (that would leak whether the id exists at all to a caller it
-    /// was never mailed to). `ContextPack`/`WorkspacePath` refs are refused by
-    /// name, `MailRefKindNotYetFetchable` (C2/C3 wire their bytes); `Run`/
-    /// `Result` are returned for the caller (`gate4agent-harness-service`) to
-    /// dereference the rest of the way -- that caller has the observation data
-    /// this crate deliberately does not depend on, and it must NOT re-consult
-    /// `read_visibility` for the resolved run: membership above is the only
-    /// gate a mailed ref crosses.
+    /// was never mailed to). `WorkspacePath` refs are refused by name,
+    /// `MailRefKindNotYetFetchable` (C3 wires those bytes); `ContextPack`
+    /// resolves to the run whose own `context_pack.digest` matches the ref --
+    /// a linear scan of `self.runs` (bounded by the same durable-record
+    /// capacity every other unbounded run scan in this engine already
+    /// accepts), never `read_visibility` -- an unknown digest is
+    /// `MailRefTargetUnknown` by name. `Run`/`Result` are returned for the
+    /// caller (`gate4agent-harness-service`) to dereference the rest of the
+    /// way -- that caller has the observation data (and, for `ContextPack`,
+    /// the C2/Node route) this crate deliberately does not depend on, and it
+    /// must NOT re-consult `read_visibility` for the resolved run: membership
+    /// above is the only gate a mailed ref crosses.
     pub fn mail_fetch(
         &self,
         grant_id: &SessionGrantId,
         reader_record_id: &HarnessSelectorV1,
         message_id: &HarnessMailMessageId,
         ref_index: usize,
-    ) -> Result<HarnessMailRefV1, HarnessEngineError> {
+    ) -> Result<HarnessMailFetchResolutionV1, HarnessEngineError> {
         let message = self.mail_messages.get(message_id)
             .ok_or_else(|| HarnessEngineError::NotFound(message_id.to_string()))?;
         let for_reader = match &message.to {
@@ -750,13 +755,25 @@ impl HarnessEngine {
                 ref_index,
             })?;
         match reference {
-            HarnessMailRefV1::ContextPack { .. } => {
-                Err(HarnessEngineError::MailRefKindNotYetFetchable { kind: "context-pack" })
+            HarnessMailRefV1::ContextPack { digest } => {
+                let run_id = self.runs.values()
+                    .find(|run| run.context_pack.as_ref()
+                        .is_some_and(|pack| &pack.digest == digest))
+                    .map(|run| run.run_id.clone())
+                    .ok_or_else(|| HarnessEngineError::MailRefTargetUnknown {
+                        digest: digest.clone(),
+                    })?;
+                Ok(HarnessMailFetchResolutionV1::ContextPack { run_id, digest: digest.clone() })
             }
             HarnessMailRefV1::WorkspacePath { .. } => {
                 Err(HarnessEngineError::MailRefKindNotYetFetchable { kind: "workspace-path" })
             }
-            HarnessMailRefV1::Run { .. } | HarnessMailRefV1::Result { .. } => Ok(reference.clone()),
+            HarnessMailRefV1::Run { run_id } => {
+                Ok(HarnessMailFetchResolutionV1::Run { run_id: run_id.clone() })
+            }
+            HarnessMailRefV1::Result { result_ref } => {
+                Ok(HarnessMailFetchResolutionV1::Result { result_ref: result_ref.clone() })
+            }
         }
     }
 
@@ -4088,6 +4105,20 @@ fn validate_grant_transition(
     }
 }
 
+/// `HarnessEngine::mail_fetch`'s own resolution of one mailed ref, once
+/// inbox membership authorizes it -- `Run`/`Result` mirror `HarnessMailRefV1`'s
+/// two directly-fetchable kinds verbatim; `ContextPack` additionally names the
+/// run whose `context_pack.digest` the ref named, since dereferencing it
+/// needs that run's C2/Node route -- a dependency this crate deliberately
+/// does not carry, so the caller (`gate4agent-harness-service`) resolves the
+/// route and fetches the bytes itself.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HarnessMailFetchResolutionV1 {
+    Run { run_id: HarnessRunId },
+    Result { result_ref: HarnessResultRef },
+    ContextPack { run_id: HarnessRunId, digest: String },
+}
+
 #[derive(Debug, Error)]
 pub enum HarnessEngineError {
     #[error(transparent)]
@@ -4261,6 +4292,8 @@ pub enum HarnessEngineError {
     MailRefIndexOutOfRange { message_id: HarnessMailMessageId, ref_index: usize },
     #[error("mail ref kind {kind} is not yet fetchable")]
     MailRefKindNotYetFetchable { kind: &'static str },
+    #[error("no run carries a context pack receipt with digest {digest}")]
+    MailRefTargetUnknown { digest: String },
 }
 
 #[cfg(test)]
@@ -7790,7 +7823,7 @@ mod tests {
 
         let reader_record_id = HarnessSelectorV1::new("record-recipient-2").unwrap();
         let resolved = engine.mail_fetch(&reader_grant.grant_id, &reader_record_id, &message.message_id, 0).unwrap();
-        assert_eq!(resolved, HarnessMailRefV1::Run { run_id: sender_run_id });
+        assert_eq!(resolved, HarnessMailFetchResolutionV1::Run { run_id: sender_run_id });
 
         // A third record, never addressed, gets the named membership refusal
         // -- never `NotFound` (that would leak that the message id exists).
@@ -7814,8 +7847,12 @@ mod tests {
         }
     }
 
-    /// D3/C1: `ContextPack`/`WorkspacePath` refs are refused by name --
-    /// `mail_fetch` never returns their bytes (C2/C3 wire them later).
+    /// D3/C1+C2: `WorkspacePath` refs are refused by name --
+    /// `mail_fetch` never returns their bytes (C3 wires them later). An
+    /// unknown-digest `ContextPack` ref is refused by name too
+    /// (`MailRefTargetUnknown`) -- the resolves-to-a-real-run case is
+    /// `harness_mail_fetch_resolves_context_pack_ref_to_its_owning_run_and_refuses_unknown_digests`
+    /// above.
     #[test]
     fn harness_mail_fetch_refuses_context_pack_and_workspace_path_refs_by_name() {
         let mut engine = HarnessEngine::new();
@@ -7892,8 +7929,10 @@ mod tests {
         engine.grants.insert(reader_grant.grant_id.clone(), reader_grant.clone());
 
         match engine.mail_fetch(&reader_grant.grant_id, &recipient_record_id, &message.message_id, 0) {
-            Err(HarnessEngineError::MailRefKindNotYetFetchable { kind }) => assert_eq!(kind, "context-pack"),
-            other => panic!("expected MailRefKindNotYetFetchable(context-pack), got {other:?}"),
+            Err(HarnessEngineError::MailRefTargetUnknown { digest }) => {
+                assert_eq!(digest, format!("sha256:{}", "a".repeat(64)));
+            }
+            other => panic!("expected MailRefTargetUnknown, got {other:?}"),
         }
         match engine.mail_fetch(&reader_grant.grant_id, &recipient_record_id, &message.message_id, 1) {
             Err(HarnessEngineError::MailRefKindNotYetFetchable { kind }) => assert_eq!(kind, "workspace-path"),
@@ -8289,6 +8328,94 @@ mod tests {
         // not merely an unexercised one.
         let reader_record_id = HarnessSelectorV1::new("record-sender").unwrap();
         let resolved = engine.mail_fetch(&sender_grant.grant_id, &reader_record_id, &message.message_id, 0).unwrap();
-        assert_eq!(resolved, HarnessMailRefV1::Run { run_id: sender_run_id });
+        assert_eq!(resolved, HarnessMailFetchResolutionV1::Run { run_id: sender_run_id });
+    }
+
+    /// D3/Slice C: a `ContextPack` ref whose digest matches a real run's own
+    /// `context_pack.digest` resolves to that run -- the caller
+    /// (`gate4agent-harness-service`) fetches the bytes from that run's own
+    /// node/route. A digest that names no run at all is
+    /// `MailRefTargetUnknown` by name, never `MailRefKindNotYetFetchable`
+    /// (that refusal is now `WorkspacePath`'s alone).
+    #[test]
+    fn harness_mail_fetch_resolves_context_pack_ref_to_its_owning_run_and_refuses_unknown_digests() {
+        let mut engine = HarnessEngine::new();
+        let sender_run_id = numbered_run_id(131);
+        let sender_task_id = numbered_task_id(131);
+        let mut sender_task = task(sender_task_id.clone(), 1, "sender task");
+        sender_task.run_ids = vec![sender_run_id.clone()];
+        engine.tasks.insert(sender_task_id.clone(), sender_task);
+        insert_managed_run(
+            &mut engine,
+            sender_run_id.clone(),
+            sender_task_id,
+            numbered_operation_id(131),
+            HarnessRunLifecycleV1::Running,
+            1,
+            "record-sender-4",
+        );
+        let receipt = context_pack_receipt('d');
+        engine.runs.get_mut(&sender_run_id).unwrap().context_pack = Some(receipt.clone());
+
+        let mut sender_grant = mail_grant(SessionGrantStateV1::Active, 1);
+        sender_grant.grant_id = numbered_grant_id(131);
+        sender_grant.actor_run_id = sender_run_id.clone();
+        engine.grants.insert(sender_grant.grant_id.clone(), sender_grant.clone());
+
+        let recipient_run_id = numbered_run_id(132);
+        let recipient_task_id = numbered_task_id(132);
+        let mut recipient_task = task(recipient_task_id.clone(), 1, "recipient task");
+        recipient_task.run_ids = vec![recipient_run_id];
+        engine.tasks.insert(recipient_task_id.clone(), recipient_task);
+        insert_managed_run(
+            &mut engine,
+            numbered_run_id(132),
+            recipient_task_id,
+            numbered_operation_id(132),
+            HarnessRunLifecycleV1::Running,
+            1,
+            "record-recipient-4",
+        );
+        let recipient_record_id = HarnessSelectorV1::new("record-recipient-4").unwrap();
+        let mut reader_grant = mail_grant(SessionGrantStateV1::Active, 1);
+        reader_grant.grant_id = numbered_grant_id(132);
+        reader_grant.actor_run_id = numbered_run_id(132);
+        engine.grants.insert(reader_grant.grant_id.clone(), reader_grant.clone());
+
+        let unknown_digest = format!("sha256:{}", "9".repeat(64));
+        let message = HarnessMailMessageV1 {
+            message_id: mail_message_id('e'),
+            from: mail_record_ref("record-sender-4", "claude"),
+            to: HarnessMailAddressV1::Session { record_id: recipient_record_id.clone() },
+            subject: "handoff".to_owned(),
+            body: "see the attached pack".to_owned(),
+            reply_to: None,
+            task_id: None,
+            refs: vec![
+                HarnessMailRefV1::ContextPack { digest: receipt.digest.clone() },
+                HarnessMailRefV1::ContextPack { digest: unknown_digest.clone() },
+            ],
+            created_at_unix_ms: 100,
+        };
+        engine.accept(engine.prepare(HarnessMutationV1::SendMail {
+            operation: mail_operation(operation_id('f'), sender_grant.grant_id.clone(), HarnessOperationKindV1::SendMail, 'f', sender_run_id),
+            message: message.clone(),
+        }).unwrap());
+
+        let resolved = engine.mail_fetch(&reader_grant.grant_id, &recipient_record_id, &message.message_id, 0).unwrap();
+        assert_eq!(
+            resolved,
+            HarnessMailFetchResolutionV1::ContextPack {
+                run_id: numbered_run_id(131),
+                digest: receipt.digest,
+            },
+        );
+
+        match engine.mail_fetch(&reader_grant.grant_id, &recipient_record_id, &message.message_id, 1) {
+            Err(HarnessEngineError::MailRefTargetUnknown { digest }) => {
+                assert_eq!(digest, unknown_digest);
+            }
+            other => panic!("expected MailRefTargetUnknown, got {other:?}"),
+        }
     }
 }

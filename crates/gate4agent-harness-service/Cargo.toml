@@ -23,6 +23,7 @@ gate4agent-observation-engine = { path = "../gate4agent-observation-engine" }
 gate4agent-observation-protocol = { path = "../gate4agent-observation-protocol" }
 gate4agent-observation-service = { path = "../gate4agent-observation-service" }
 gate4agent-types = { path = "../gate4agent-types" }
+ring = "=0.17.14"
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -35,7 +36,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 gate4agent-c2 = { path = "../gate4agent-c2" }
 gate4agent-harness-client = { path = "../gate4agent-harness-client" }
 gate4agent-node = { path = "../gate4agent-node", features = ["fixture"] }
-ring = "=0.17.14"
 
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys = { version = "0.61", features = [

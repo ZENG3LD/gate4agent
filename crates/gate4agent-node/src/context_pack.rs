@@ -836,6 +836,16 @@ impl ContextPackCatalog {
         self.packs.get(id)
     }
 
+    /// Linear scan over the bounded catalog (`MAX_CONTEXT_PACK_CATALOG_ENTRIES`
+    /// entries at most). Packs are content-addressed, so two entries sharing a
+    /// digest carry identical bytes; the first match by catalog (id) order is
+    /// returned.
+    pub(crate) fn get_by_digest(&self, digest: &SpawnContextDigest) -> Option<&NodeContextPack> {
+        self.packs
+            .values()
+            .find(|pack| &pack.receipt().digest == digest)
+    }
+
     pub(crate) fn remove(&mut self, id: &SpawnContextId) -> Option<NodeContextPack> {
         self.packs.remove(id)
     }

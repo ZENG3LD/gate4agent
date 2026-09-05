@@ -46,7 +46,8 @@ use gate4agent_harness_api::{
     HARNESS_WORKSPACE_FILE_MAX_BYTES, HARNESS_WORKSPACE_TREE_ENTRIES_MAX,
 };
 use gate4agent_node_protocol::{
-    CapabilityId, DeliveryBlobChunkHexV1, DeliveryBlobDigestV1, DeliveryBundleManifestV2,
+    CapabilityId, ContextPackBytesRead, DeliveryBlobChunkHexV1,
+    DeliveryBlobDigestV1, DeliveryBundleManifestV2,
     DeliveryCommitReceiptV1, DeliveryStageId, HarnessMcpActivationDigest,
     HarnessMcpCallId, HarnessMcpRejectReasonV1, HarnessMcpReplyChunkHexV1,
     HarnessMcpReservationId, ManagedWorktreeLeaseId, ManagedWorktreeLeaseSnapshot,
@@ -58,7 +59,7 @@ use gate4agent_node_protocol::{
     ResolvedSpawnReceipt, ResolvedSpawnSpec,
     GitDiff, GitDiffMode, GitDiffRequest, GitHistoryPage, GitObjectId,
     GitSignatureStatus, HostDirectoryListing, OpaqueHostPath, RepositoryPath,
-    SpawnContextId,
+    SpawnContextDigest, SpawnContextId,
     WorkspaceEntryKind, WorkspaceFileContent,
     WorkspaceFileRead, WorkspaceFileRevision, WorktreeServiceMode,
     SessionAddress, SessionKey, SessionMode,
@@ -71,7 +72,8 @@ use gate4agent_node_protocol::{
     MAX_DELIVERY_CHUNK_RAW_BYTES, SPAWN_RUNTIME_RAW_PTY_LIFECYCLE,
 };
 use gate4agent_harness_protocol::{
-    HarnessContinuationRef, HarnessContinuationStateV1, HarnessExecutionModeV1,
+    HarnessContinuationRef, HarnessContinuationStateV1,
+    HarnessExecutionModeV1,
     HarnessIdempotencyRef,
     HarnessOperationId, HarnessRequestDigest, HarnessResolvedContextPackReceiptV1,
     HarnessRunId, HarnessRunV1,
@@ -5248,6 +5250,113 @@ impl PendingDurableContextPackResolve {
     }
 }
 
+/// D3/Slice C2's fetch-only node round trip for one mailed `ContextPack` ref
+/// already resolved by `HarnessEngine::mail_fetch` to an owning run:
+/// `binding` is that run's own stored session binding (the node/incarnation
+/// it last dispatched to), `digest` its context pack's own digest. No
+/// durable authority is consulted here (unlike `start_context_pack_export`'s
+/// continuation authority) -- this is a plain read of bytes the harness
+/// already knows exist, gated by mail membership alone (see
+/// `HarnessEngine::mail_fetch`'s own doc comment).
+impl HarnessC2Adapter {
+    pub(crate) fn start_context_pack_fetch(
+        &self,
+        binding: &HarnessSessionBindingV1,
+        digest: &str,
+    ) -> Result<PendingContextPackFetch, HarnessC2Error> {
+        let node_id = NodeId::new(binding.node_id.as_str())
+            .map_err(|_| HarnessC2Error::InvalidContextPackFetchRequest)?;
+        let expected_incarnation_id = binding.node_incarnation.as_str().parse()
+            .map_err(|_| HarnessC2Error::InvalidContextPackFetchRequest)?;
+        let route = NodeRoute { node_id, expected_incarnation_id };
+        self.ensure_current_incarnation(&route)?;
+        let context_digest = SpawnContextDigest::new(digest)
+            .map_err(|_| HarnessC2Error::InvalidContextPackFetchRequest)?;
+        let pending = self.control.start_request(
+            route.clone(),
+            NodeRequest::ReadContextPack { digest: context_digest.clone() },
+        ).map_err(HarnessC2Error::ContextPackFetchEnqueue)?;
+        Ok(PendingContextPackFetch {
+            route,
+            digest: context_digest,
+            started_at: Instant::now(),
+            pending: Some(pending),
+        })
+    }
+}
+
+pub(crate) struct PendingContextPackFetch {
+    route: NodeRoute,
+    digest: SpawnContextDigest,
+    started_at: Instant,
+    pending: Option<C2PendingRequest>,
+}
+
+impl PendingContextPackFetch {
+    pub(crate) async fn finish(mut self) -> Result<ContextPackBytesRead, HarnessC2Error> {
+        let pending = self.pending.take()
+            .expect("pending context pack fetch owns exactly one C2 waiter");
+        match pending.finish().await {
+            Err(C2ControlError::Closed)
+                if self.started_at.elapsed() >= RUN_READ_TIMEOUT_FLOOR => {
+                    Err(HarnessC2Error::ContextPackFetchDeadline)
+                }
+            Err(error) => Err(HarnessC2Error::ContextPackFetchTransport(error)),
+            Ok(routed) if routed.node_id != self.route.node_id
+                || routed.incarnation_id != self.route.expected_incarnation_id => {
+                    Err(HarnessC2Error::ContextPackFetchRouteMismatch)
+                }
+            Ok(routed) => match routed.response {
+                Err(failure) => Err(HarnessC2Error::ContextPackFetchRejected { code: failure.code }),
+                Ok(response) => correlate_context_pack_fetch_response(&self.digest, response),
+            },
+        }
+    }
+}
+
+fn correlate_context_pack_fetch_response(
+    digest: &SpawnContextDigest,
+    response: C2NodeResponse,
+) -> Result<ContextPackBytesRead, HarnessC2Error> {
+    match response {
+        C2NodeResponse::ContextPackBytesRead { pack } if &pack.digest == digest => Ok(pack),
+        _ => Err(HarnessC2Error::ContextPackFetchCorrelationMismatch),
+    }
+}
+
+/// Recomputes `gate4agent-node`'s own context-pack digest
+/// (`context_pack.rs::context_digest`, private to that crate/module) over
+/// the lineage this run's own receipt carries plus the bytes the Node just
+/// returned -- so bytes that don't hash to the digest a mailed ref actually
+/// named (a corrupted store, a stale pack) are caught here rather than
+/// trusted on the wire's say-so alone. The formula is replicated verbatim
+/// (SHA256 over a fixed domain tag, the lineage receipt's own JSON encoding,
+/// one zero byte, then the bytes) since `gate4agent-node` cannot be depended
+/// on directly (PTY/process/workspace runtime) and the function itself is
+/// private to its module; `harness_context_to_node` already reconstructs the
+/// exact `ContextPackLineageReceipt` value node serialized when it first
+/// computed this digest, so the JSON bytes hashed here are byte-identical to
+/// node's own.
+const CONTEXT_PACK_DIGEST_DOMAIN: &[u8] = b"g4a-context-pack-v1\0";
+
+pub(crate) fn recompute_context_pack_digest(
+    receipt: &HarnessResolvedContextPackReceiptV1,
+    bytes: &[u8],
+) -> Result<String, HarnessC2Error> {
+    let node_receipt = harness_context_to_node(receipt)?;
+    let lineage_bytes: Vec<u8> = serde_json::to_vec(&node_receipt.lineage)
+        .map_err(|_| HarnessC2Error::ContextPackFetchDigestReconstruction)?;
+    let mut hasher = ring::digest::Context::new(&ring::digest::SHA256);
+    hasher.update(CONTEXT_PACK_DIGEST_DOMAIN);
+    hasher.update(&lineage_bytes);
+    hasher.update(&[0]);
+    hasher.update(bytes);
+    let hex = hasher.finish().as_ref().iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(format!("sha256:{hex}"))
+}
+
 #[derive(Debug)]
 struct PreparedSpawnHarnessMcp {
     reservation_id: HarnessMcpReservationId,
@@ -6247,6 +6356,22 @@ pub enum HarnessC2Error {
     NodeWorkspaceReadTooLarge,
     #[error("Node rejected node workspace read with {code:?}")]
     NodeWorkspaceReadRejected { code: NodeFailureCode },
+    #[error("mailed context pack fetch request is invalid")]
+    InvalidContextPackFetchRequest,
+    #[error("mailed context pack fetch was not enqueued: {0}")]
+    ContextPackFetchEnqueue(C2ControlError),
+    #[error("mailed context pack fetch transport failed: {0}")]
+    ContextPackFetchTransport(C2ControlError),
+    #[error("mailed context pack fetch deadline elapsed")]
+    ContextPackFetchDeadline,
+    #[error("mailed context pack fetch response route or incarnation does not match")]
+    ContextPackFetchRouteMismatch,
+    #[error("mailed context pack fetch response does not exactly correlate with the request")]
+    ContextPackFetchCorrelationMismatch,
+    #[error("Node rejected mailed context pack fetch with {code:?}")]
+    ContextPackFetchRejected { code: NodeFailureCode },
+    #[error("mailed context pack lineage could not be reconstructed into the Node's own receipt shape")]
+    ContextPackFetchDigestReconstruction,
     #[error("node workspace write request is invalid")]
     InvalidNodeWorkspaceWriteRequest,
     #[error("node workspace write was not enqueued: {0}")]

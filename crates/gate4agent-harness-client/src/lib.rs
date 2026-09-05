@@ -200,11 +200,7 @@ impl HarnessReadClient {
 
     fn send(&self, request: HarnessReadRequestV1) -> Result<HarnessReadResponseV1, HarnessReadClientError> {
         request.validate()?;
-        let envelope = HarnessReadEnvelopeV1 {
-            version: HARNESS_READ_WIRE_VERSION_V1,
-            credential: self.credential.clone(),
-            request,
-        };
+        let envelope = HarnessReadEnvelopeV1::new(self.credential.clone(), request);
         envelope.validate()?;
         let mut encoded = serde_json::to_vec(&envelope).map_err(|_| HarnessReadClientError::Encoding)?;
         if encoded.len() >= HARNESS_READ_REQUEST_MAX_BYTES {

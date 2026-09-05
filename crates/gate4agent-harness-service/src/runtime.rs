@@ -4,7 +4,8 @@ use crate::{
         ArmedHarnessMcpReservationProof,
         ContextPackExportStart, ExportContextPackOutcome, HarnessC2Adapter,
         HarnessC2Error, HarnessC2EventReceiver,
-        HarnessObservationResync, PendingHostDirectoryBrowse, PendingNativeHistoryRequest,
+        HarnessObservationResync, PendingContextPackFetch, PendingHostDirectoryBrowse,
+        PendingNativeHistoryRequest,
         PendingNodeWorkspaceRead,
         PendingNodeWorkspaceWrite, PendingResourceMutation, PendingRunRead,
         PendingRunContextSourceObservation, PendingSessionControl,
@@ -23,7 +24,7 @@ use crate::{
     credential::{CredentialAuthority, CredentialBindingV1, CredentialError},
     read::{
         execute_exact_binding_read, execute_operator_monitor, execute_operator_timeline,
-        execute_read, verify_observation_credential_binding,
+        execute_read, verify_observation_credential_binding, ReadDispatch,
     },
     mutation_request_digest,
     HarnessApplyOutcome, HarnessMutationV1, HarnessService, HarnessServiceError,
@@ -66,7 +67,7 @@ use gate4agent_harness_api::{
     HarnessOperatorHostErrorV1, HarnessOperatorTerminalEventV1,
     HarnessOperatorIntentV1,
     HarnessOperatorMutationOutcomeV1, HarnessOperatorReplyV1, HarnessOperatorRequestV1,
-    HarnessOperatorResponseV1, HarnessReadCredential, HarnessReadEnvelopeV1,
+    HarnessOperatorResponseV1, HarnessReadApiError, HarnessReadCredential, HarnessReadEnvelopeV1,
     HarnessIssuedExecutionSpecSummaryV1, HarnessManagedWorktreeProfileOptionV1,
     HarnessManagedWorktreeRetentionV1, HarnessOrdinaryLaunchPlanOptionV1,
     HarnessRunContextTransferV1, HarnessRunContinuationTransferV1,
@@ -88,7 +89,8 @@ use gate4agent_harness_api::{
     HarnessReverseAttributionOutcomeV1, HarnessReverseAttributionRelationV1,
     HarnessReverseAttributionSubjectV1, HarnessReverseAttributionV1,
     FeatureObservationStateV1, ProjectionAvailabilityV1, ProjectionFreshnessV1,
-    HarnessReadHostErrorV1, HarnessReadReplyV1, RedactedBindingStateV1,
+    HarnessMailFetchResultV1, HarnessReadHostErrorV1, HarnessReadReplyV1,
+    HarnessReadResponseV1, RedactedBindingStateV1,
     RedactedRunIntentV1, RedactedRunV1, RedactedTaskV1, RedactedWorktreeIntentV1,
     RunPageV1, TaskCreatorCategoryV1, TaskPageV1,
     HARNESS_OPERATOR_RESPONSE_MAX_BYTES, HARNESS_READ_REQUEST_MAX_BYTES,
@@ -4233,6 +4235,122 @@ fn start_continuation_export_finish(
     });
 }
 
+/// D3/Slice C2's deferred half of `HostCommand::Read`'s `MailFetch` path:
+/// resolves the intent's run to a node route synchronously (still holding
+/// `harness`/`&mut harness` for this one turn of the select loop), starts the
+/// C2/Node round trip, then hands the caller's own `reply` sender to a
+/// `tokio::spawn`ed task together with the pending handle -- the loop
+/// iteration ends here, exactly like every other node round trip this host
+/// starts (`start_continuation_export_finish` and siblings). Never touches
+/// `HostCommand`/`&mut harness` again once spawned: `PendingContextPackFetch`
+/// owns its own C2 waiter, and the run's receipt this needs was already
+/// cloned out before the synchronous half returned.
+fn start_context_pack_fetch_reply(
+    adapter: &HarnessC2Adapter,
+    engine: &gate4agent_harness_engine::HarnessEngine,
+    intent: crate::read::ContextPackFetchIntent,
+    reply: oneshot::Sender<HarnessReadReplyV1>,
+) {
+    match prepare_context_pack_fetch(adapter, engine, &intent) {
+        Ok((pending, receipt)) => {
+            tokio::spawn(async move {
+                let reply_value = finish_context_pack_fetch(pending, receipt, intent.digest).await;
+                let _ = reply.send(reply_value);
+            });
+        }
+        Err(error) => {
+            let _ = reply.send(HarnessReadReplyV1::Error { error });
+        }
+    }
+}
+
+/// Synchronous half: looks up the intent's run, re-checks its receipt still
+/// carries the exact digest the engine resolved (defends against a run
+/// mutating between `HarnessEngine::mail_fetch`'s scan and this lookup --
+/// both happen inside the same `&mut harness` turn today, so this can never
+/// actually diverge, but costs nothing to assert), and starts the node
+/// round trip from that run's own stored binding.
+fn prepare_context_pack_fetch(
+    adapter: &HarnessC2Adapter,
+    engine: &gate4agent_harness_engine::HarnessEngine,
+    intent: &crate::read::ContextPackFetchIntent,
+) -> Result<
+    (PendingContextPackFetch, gate4agent_harness_protocol::HarnessResolvedContextPackReceiptV1),
+    HarnessReadHostErrorV1,
+> {
+    let run = engine.run(&intent.run_id).ok_or(HarnessReadHostErrorV1::Internal)?;
+    let receipt = run.context_pack.as_ref()
+        .filter(|receipt| receipt.digest == intent.digest)
+        .ok_or(HarnessReadHostErrorV1::Internal)?
+        .clone();
+    let binding = run.binding.as_ref().ok_or(HarnessReadHostErrorV1::Internal)?;
+    let pending = adapter.start_context_pack_fetch(binding, &intent.digest)
+        .map_err(|_| HarnessReadHostErrorV1::Internal)?;
+    Ok((pending, receipt))
+}
+
+/// Asynchronous half: awaits the node round trip, then applies both digest
+/// checks D3/C2 requires -- `correlate_context_pack_fetch_response` (inside
+/// `pending.finish()`) already proved the node's own echoed digest matches
+/// what was requested; this additionally recomputes the digest over the
+/// bytes actually received, so a corrupted store or a wrong pack cannot pass
+/// as a match on the wire's say-so alone. The node naming the digest unknown
+/// (`NodeFailureCode::UnknownContextPack` -- the pack was evicted between
+/// the engine's scan and this fetch) is worded identically to
+/// `HarnessEngineError::MailRefTargetUnknown`'s own text, since both mean the
+/// same thing to the caller: nothing answers for this digest any more. Any
+/// other transport/rejection failure is `HarnessReadHostErrorV1::Internal`,
+/// the same bucket every other unreachable-Node condition on this read wire
+/// already collapses to (this wire has no dedicated "upstream unavailable"
+/// variant).
+async fn finish_context_pack_fetch(
+    pending: PendingContextPackFetch,
+    receipt: gate4agent_harness_protocol::HarnessResolvedContextPackReceiptV1,
+    expected_digest: String,
+) -> HarnessReadReplyV1 {
+    let pack = match pending.finish().await {
+        Ok(pack) => pack,
+        Err(HarnessC2Error::ContextPackFetchRejected { code })
+            if code == NodeFailureCode::UnknownContextPack =>
+        {
+            return HarnessReadReplyV1::Ok {
+                response: HarnessReadResponseV1::MailFetch(HarnessMailFetchResultV1::Refused {
+                    reason: format!(
+                        "no run carries a context pack receipt with digest {expected_digest}",
+                    ),
+                }),
+            };
+        }
+        Err(_) => {
+            return HarnessReadReplyV1::Error { error: HarnessReadHostErrorV1::Internal };
+        }
+    };
+    let recomputed = match crate::c2::recompute_context_pack_digest(&receipt, &pack.bytes) {
+        Ok(digest) => digest,
+        Err(_) => return HarnessReadReplyV1::Error { error: HarnessReadHostErrorV1::Internal },
+    };
+    if recomputed != expected_digest {
+        return HarnessReadReplyV1::Ok {
+            response: HarnessReadResponseV1::MailFetch(HarnessMailFetchResultV1::Refused {
+                reason: format!(
+                    "mailed context pack bytes for digest {expected_digest} do not hash to \
+                     it (recomputed {recomputed})",
+                ),
+            }),
+        };
+    }
+    let response = HarnessReadResponseV1::MailFetch(HarnessMailFetchResultV1::ContextPack {
+        digest: expected_digest,
+        id: pack.id.as_str().to_owned(),
+        byte_len: pack.byte_len,
+        bytes_hex: encode_hex(&pack.bytes),
+    });
+    match response.validate() {
+        Ok(()) => HarnessReadReplyV1::Ok { response },
+        Err(_) => HarnessReadReplyV1::Error { error: HarnessReadHostErrorV1::Internal },
+    }
+}
+
 fn start_harness_mcp_arm_finish(
     commands: mpsc::Sender<HostCommand>,
     operation_id: HarnessOperationId,
@@ -4830,7 +4948,7 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                             let _ = reply.send(result);
                         }
                         Some(HostCommand::Read { envelope, reply }) => {
-                            let response = authority.verify(
+                            let dispatch = authority.verify(
                                 harness.engine(),
                                 &envelope.credential,
                                 unix_time_ms(),
@@ -4845,23 +4963,37 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                         &support,
                                         &claims.binding,
                                     )?;
-                                    let response = execute_read(
+                                    execute_read(
                                         &mut harness,
                                         &observation,
                                         &support,
                                         &claims,
                                         envelope.request,
                                         &runtime_inventory,
-                                    )?;
-                                    response.validate()
-                                        .map_err(|_| HarnessReadHostErrorV1::Internal)?;
-                                    Ok(response)
+                                    )
                                 });
-                            let reply_value = match response {
-                                Ok(response) => HarnessReadReplyV1::Ok { response },
-                                Err(error) => HarnessReadReplyV1::Error { error },
-                            };
-                            let _ = reply.send(reply_value);
+                            match dispatch {
+                                Ok(ReadDispatch::Response(response)) => {
+                                    let reply_value = match response.validate() {
+                                        Ok(()) => HarnessReadReplyV1::Ok { response },
+                                        Err(_) => HarnessReadReplyV1::Error {
+                                            error: HarnessReadHostErrorV1::Internal,
+                                        },
+                                    };
+                                    let _ = reply.send(reply_value);
+                                }
+                                Ok(ReadDispatch::ContextPackFetch(intent)) => {
+                                    start_context_pack_fetch_reply(
+                                        &adapter,
+                                        harness.engine(),
+                                        intent,
+                                        reply,
+                                    );
+                                }
+                                Err(error) => {
+                                    let _ = reply.send(HarnessReadReplyV1::Error { error });
+                                }
+                            }
                         }
                         Some(HostCommand::Operator { request, reply, cancel }) => {
                             if is_run_context_source_request(&request) {
@@ -9270,9 +9402,15 @@ fn map_operator_read_error(error: HarnessReadHostErrorV1) -> HarnessOperatorHost
         HarnessReadHostErrorV1::NotFoundOrDenied => HarnessOperatorHostErrorV1::NotFound,
         HarnessReadHostErrorV1::TooLarge => HarnessOperatorHostErrorV1::TooLarge,
         HarnessReadHostErrorV1::Deadline => HarnessOperatorHostErrorV1::Deadline,
-        HarnessReadHostErrorV1::Unauthorized | HarnessReadHostErrorV1::Internal => {
-            HarnessOperatorHostErrorV1::Internal
-        }
+        // Never actually reached on this path: the in-process operator
+        // read calls above build no `HarnessReadEnvelopeV1` and so never
+        // run its `build_stamp` check -- only the read wire's own TCP
+        // connection handler does. Bucketed with `Unauthorized`/`Internal`
+        // rather than invented, since there is no real expected/received
+        // pair to report here.
+        HarnessReadHostErrorV1::Unauthorized
+        | HarnessReadHostErrorV1::Internal
+        | HarnessReadHostErrorV1::BuildStampMismatch { .. } => HarnessOperatorHostErrorV1::Internal,
     }
 }
 
@@ -9662,9 +9800,35 @@ async fn handle_connection(
                 result => result,
             };
         }
-        let envelope: HarnessReadEnvelopeV1 = serde_json::from_slice(&frame)
-            .map_err(|_| HarnessRuntimeError::InvalidFrame)?;
-        envelope.validate().map_err(|_| HarnessRuntimeError::InvalidFrame)?;
+        let envelope: HarnessReadEnvelopeV1 = match serde_json::from_slice(&frame) {
+            Ok(envelope) => envelope,
+            Err(_) => {
+                write_reply(
+                    &mut stream,
+                    HarnessReadReplyV1::Error { error: HarnessReadHostErrorV1::InvalidRequest },
+                ).await?;
+                return Err(HarnessRuntimeError::InvalidFrame);
+            }
+        };
+        if let Err(error) = envelope.validate() {
+            let host_error = match error {
+                HarnessReadApiError::BuildStampMismatch { expected, received } => {
+                    tracing::warn!(
+                        expected = %expected,
+                        received = %received,
+                        "harness read build stamp mismatch: rebuild and restart the \
+                         out-of-date side",
+                    );
+                    HarnessReadHostErrorV1::BuildStampMismatch { expected, received }
+                }
+                _ => HarnessReadHostErrorV1::InvalidRequest,
+            };
+            write_reply(
+                &mut stream,
+                HarnessReadReplyV1::Error { error: host_error },
+            ).await?;
+            return Err(HarnessRuntimeError::InvalidFrame);
+        }
         let (reply, receive) = oneshot::channel();
         commands.send(HostCommand::Read { envelope, reply }).await
             .map_err(|_| HarnessRuntimeError::HostStopped)?;
@@ -10770,7 +10934,15 @@ fn reject_reason(error: HarnessReadHostErrorV1) -> HarnessMcpRejectReasonV1 {
         HarnessReadHostErrorV1::NotFoundOrDenied => HarnessMcpRejectReasonV1::NotFoundOrDenied,
         HarnessReadHostErrorV1::TooLarge => HarnessMcpRejectReasonV1::ResponseTooLarge,
         HarnessReadHostErrorV1::Deadline => HarnessMcpRejectReasonV1::Deadline,
-        HarnessReadHostErrorV1::Internal => HarnessMcpRejectReasonV1::Internal,
+        // Never actually reached: the routed MCP read call this feeds
+        // never builds a `HarnessReadEnvelopeV1`, so its `build_stamp`
+        // check never runs here -- only the read wire's own TCP connection
+        // handler does. `HarnessMcpRejectReasonV1` carries no
+        // expected/received pair, so this collapses into `Internal` the
+        // same way it already did before this variant existed.
+        HarnessReadHostErrorV1::Internal | HarnessReadHostErrorV1::BuildStampMismatch { .. } => {
+            HarnessMcpRejectReasonV1::Internal
+        }
     }
 }
 

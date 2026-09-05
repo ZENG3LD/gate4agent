@@ -94,7 +94,7 @@ use crate::protocol::{
     ProviderAdapterContractSupport,
     ProviderContractRevision, ProviderContractSupport, RepositoryPath, RequestEnvelope,
     ProviderRuntimeStatuses, ResolvedBundleReceipt, ResolvedEnvironmentProfileReceipt,
-    ContextPackLineageReceipt, ResolvedContextPackReceipt,
+    ContextPackLineageReceipt, ContextPackBytesRead, ResolvedContextPackReceipt,
     ResolvedHarnessMcpProxyReceiptV1, ResolvedSpawnReceipt,
     ResolvedSpawnSpec, ResponseEnvelope,
     ServerChallenge, ServerFrame, SessionAddress, SessionAgentProgress, SessionKey, SessionMode,
@@ -13843,6 +13843,7 @@ fn request_requires_child_environment_profile(
         | NodeRequest::PreviewSessionRecord { .. }
         | NodeRequest::ForgetContextPack { .. }
         | NodeRequest::ResolveDurableContextPack { .. }
+        | NodeRequest::ReadContextPack { .. }
         | NodeRequest::Shutdown => false,
     }
 }
@@ -13934,6 +13935,7 @@ fn request_requires_session_bundle(shared: &NodeShared, request: &NodeRequest) -
         | NodeRequest::PreviewSessionRecord { .. }
         | NodeRequest::ForgetContextPack { .. }
         | NodeRequest::ResolveDurableContextPack { .. }
+        | NodeRequest::ReadContextPack { .. }
         | NodeRequest::Shutdown => false,
     }
 }
@@ -14028,6 +14030,7 @@ fn request_requires_history_context_pack(shared: &NodeShared, request: &NodeRequ
         | NodeRequest::ExportContextPack { .. }
         | NodeRequest::ForgetContextPack { .. }
         | NodeRequest::ResolveDurableContextPack { .. }
+        | NodeRequest::ReadContextPack { .. }
         | NodeRequest::Shutdown => false,
     }
 }
@@ -14109,8 +14112,11 @@ fn request_requires_open_provider_ids_with(
         NodeRequest::ForgetContextPack { .. } => true,
         // No session/record to cheaply resolve a provider from here either;
         // the resolved receipt can carry an open-id provider, so require the
-        // same capability as ForgetContextPack unconditionally.
-        NodeRequest::ResolveDurableContextPack { .. } => true,
+        // same capability as ForgetContextPack unconditionally. `ReadContextPack`
+        // is the same digest-keyed lookup one step further into the same
+        // catalog, so it inherits the same conservative answer.
+        NodeRequest::ResolveDurableContextPack { .. }
+        | NodeRequest::ReadContextPack { .. } => true,
     }
 }
 
@@ -14230,6 +14236,7 @@ fn project_response_without_child_environment_profile(reply: &mut ResponseEnvelo
         | NodeResponse::ContextPackExported { .. }
         | NodeResponse::ContextPackForgotten { .. }
         | NodeResponse::DurableContextPackResolved { .. }
+        | NodeResponse::ContextPackBytesRead { .. }
         | NodeResponse::SessionRecordForgotten { .. }
         | NodeResponse::WorkspaceRegistered { .. }
         | NodeResponse::StandaloneWorkspaceCreated { .. }
@@ -14321,6 +14328,7 @@ fn project_response_without_session_bundle(reply: &mut ResponseEnvelope) {
         | NodeResponse::ContextPackExported { .. }
         | NodeResponse::ContextPackForgotten { .. }
         | NodeResponse::DurableContextPackResolved { .. }
+        | NodeResponse::ContextPackBytesRead { .. }
         | NodeResponse::SessionRecordForgotten { .. }
         | NodeResponse::WorkspaceRegistered { .. }
         | NodeResponse::StandaloneWorkspaceCreated { .. }
@@ -14556,6 +14564,7 @@ fn project_response_legacy_provider_ids(shared: &NodeShared, reply: &mut Respons
         | NodeResponse::ContextPackExported { .. }
         | NodeResponse::ContextPackForgotten { .. }
         | NodeResponse::DurableContextPackResolved { .. }
+        | NodeResponse::ContextPackBytesRead { .. }
         | NodeResponse::SessionRecordUpdated { .. }
         | NodeResponse::ProviderSessionIndexed { .. }
         | NodeResponse::NativeSessionIndexed { .. }
@@ -14647,6 +14656,7 @@ fn clear_response_provider_runtime_status(reply: &mut ResponseEnvelope) {
         | NodeResponse::ContextPackExported { .. }
         | NodeResponse::ContextPackForgotten { .. }
         | NodeResponse::DurableContextPackResolved { .. }
+        | NodeResponse::ContextPackBytesRead { .. }
         | NodeResponse::SessionRecordUpdated { .. }
         | NodeResponse::ProviderSessionIndexed { .. }
         | NodeResponse::NativeSessionIndexed { .. }
@@ -15946,6 +15956,39 @@ async fn process_request_inner(shared: &NodeShared, connection_id: u64, role: Cl
                     )
                 })?;
             Ok(NodeResponse::DurableContextPackResolved { context })
+        }
+        NodeRequest::ReadContextPack { digest } => {
+            // Read-only fetch of the pack's own bytes, keyed by content digest
+            // rather than the caller's `SpawnContextId`: same no-controller-lease
+            // rationale as `ResolveDurableContextPack` above, one step further
+            // down the same catalog.
+            let (id, byte_len, bytes) = shared
+                .context_catalog
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get_by_digest(&digest)
+                .map(|pack| {
+                    (pack.receipt().id.clone(), pack.receipt().byte_len, pack.bytes().to_vec())
+                })
+                .ok_or_else(|| {
+                    failure(
+                        NodeFailureCode::UnknownContextPack,
+                        &format!("context pack {digest} not on this node"),
+                    )
+                })?;
+            tracing::debug!(
+                digest = digest.as_str(),
+                byte_len,
+                "read context pack bytes",
+            );
+            Ok(NodeResponse::ContextPackBytesRead {
+                pack: ContextPackBytesRead {
+                    digest,
+                    id,
+                    byte_len,
+                    bytes,
+                },
+            })
         }
         NodeRequest::Resume { session, terminal_size, initial_prompt } => {
             let provider = controlled_session(shared, connection_id, role, &session)?;

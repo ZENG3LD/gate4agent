@@ -1595,6 +1595,52 @@ impl ResolvedContextPackReceipt {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextPackBytesRead {
+    pub digest: SpawnContextDigest,
+    pub id: SpawnContextId,
+    pub byte_len: u32,
+    pub bytes: Vec<u8>,
+}
+
+impl<'de> Deserialize<'de> for ContextPackBytesRead {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireContextPackBytesRead {
+            digest: SpawnContextDigest,
+            id: SpawnContextId,
+            byte_len: u32,
+            bytes: Vec<u8>,
+        }
+
+        let wire = WireContextPackBytesRead::deserialize(deserializer)?;
+        let actual_bytes = wire.bytes.len();
+        if u64::from(wire.byte_len) != actual_bytes as u64 {
+            return Err(serde::de::Error::custom(format!(
+                "context pack bytes declare {} bytes but contain {actual_bytes}",
+                wire.byte_len,
+            )));
+        }
+        if wire.byte_len > MAX_CONTEXT_PACK_BYTES {
+            return Err(serde::de::Error::custom(format!(
+                "context pack bytes length {} exceeds the {MAX_CONTEXT_PACK_BYTES}-byte limit",
+                wire.byte_len,
+            )));
+        }
+        Ok(Self {
+            digest: wire.digest,
+            id: wire.id,
+            byte_len: wire.byte_len,
+            bytes: wire.bytes,
+        })
+    }
+}
+
 fn context_receipt_binding_is_valid(
     context_id: Option<&SpawnContextId>,
     context: Option<&ResolvedContextPackReceipt>,
@@ -5730,6 +5776,9 @@ pub enum NodeRequest {
     ResolveDurableContextPack {
         context_id: SpawnContextId,
     },
+    ReadContextPack {
+        digest: SpawnContextDigest,
+    },
     Prompt { session: SessionAddress, text: String },
     Paste { session: SessionAddress, text: String },
     Input { session: SessionAddress, text: String },
@@ -5993,6 +6042,7 @@ impl NodeRequest {
             | Self::ExportContextPack { .. }
             | Self::ForgetContextPack { .. }
             | Self::ResolveDurableContextPack { .. }
+            | Self::ReadContextPack { .. }
             | Self::Prompt { .. }
             | Self::Paste { .. }
             | Self::Input { .. }
@@ -6064,7 +6114,8 @@ impl NodeRequest {
             | Self::LoadHistory { .. }
             | Self::ExportContextPack { .. }
             | Self::ForgetContextPack { .. }
-            | Self::ResolveDurableContextPack { .. } => {
+            | Self::ResolveDurableContextPack { .. }
+            | Self::ReadContextPack { .. } => {
                 Some(NODE_HISTORY_CONTEXT_PACK_CAPABILITY)
             }
             Self::ResolveInteraction { .. }
@@ -6371,6 +6422,9 @@ pub enum NodeResponse {
     DurableContextPackResolved {
         context: ResolvedContextPackReceipt,
     },
+    ContextPackBytesRead {
+        pack: ContextPackBytesRead,
+    },
     WorkspaceRegistered {
         workspace: WorkspaceSnapshot,
     },
@@ -6556,6 +6610,7 @@ impl NodeResponse {
             | Self::ContextPackExported { .. }
             | Self::ContextPackForgotten { .. }
             | Self::DurableContextPackResolved { .. }
+            | Self::ContextPackBytesRead { .. }
             | Self::WorkspaceRegistered { .. }
             | Self::StandaloneWorkspaceCreated { .. }
             | Self::WorkspaceUnregistered { .. }
@@ -6617,6 +6672,7 @@ impl NodeResponse {
             | Self::ContextPackForSessionRecordExported { .. }
             | Self::ContextPackExported { .. }
             | Self::ContextPackForgotten { .. }
+            | Self::ContextPackBytesRead { .. }
             | Self::WorkspaceRegistered { .. }
             | Self::StandaloneWorkspaceCreated { .. }
             | Self::WorkspaceUnregistered { .. }
@@ -6658,7 +6714,8 @@ impl NodeResponse {
             | Self::ContextPackForSessionRecordExported { .. }
             | Self::ContextPackExported { .. }
             | Self::ContextPackForgotten { .. }
-            | Self::DurableContextPackResolved { .. } => true,
+            | Self::DurableContextPackResolved { .. }
+            | Self::ContextPackBytesRead { .. } => true,
             Self::Armed { .. }
             | Self::Activated { .. }
             | Self::Aborted { .. }
@@ -10193,6 +10250,83 @@ mod tests {
         };
         let encoded = serde_json::to_vec(&response).unwrap();
         assert!(encoded.len() <= MAX_NODE_FRAME_BYTES, "{}", encoded.len());
+    }
+
+    #[test]
+    fn read_context_pack_has_an_exact_capability_gated_wire_contract() {
+        let digest = SpawnContextDigest::new(format!("sha256:{}", "a".repeat(64))).unwrap();
+        let request = NodeRequest::ReadContextPack {
+            digest: digest.clone(),
+        };
+        let request_json = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            request_json,
+            format!(
+                r#"{{"kind":"read-context-pack","digest":"sha256:{}"}}"#,
+                "a".repeat(64),
+            ),
+        );
+        assert_eq!(
+            request.required_capability(),
+            Some(NODE_HISTORY_CONTEXT_PACK_CAPABILITY),
+        );
+        assert!(request.history_context_pack_contract_is_valid());
+        assert_eq!(serde_json::from_str::<NodeRequest>(&request_json).unwrap(), request);
+
+        let id = SpawnContextId::new(format!("ctx-{}", "a".repeat(64))).unwrap();
+        let response = NodeResponse::ContextPackBytesRead {
+            pack: ContextPackBytesRead {
+                digest: digest.clone(),
+                id: id.clone(),
+                byte_len: 11,
+                bytes: b"pack-bytes!".to_vec(),
+            },
+        };
+        assert!(response.requires_history_context_pack_capability());
+        let response_json = serde_json::to_string(&response).unwrap();
+        assert_eq!(
+            response_json,
+            format!(
+                r#"{{"kind":"context-pack-bytes-read","pack":{{"digest":"sha256:{}","id":"{}","byte_len":11,"bytes":[112,97,99,107,45,98,121,116,101,115,33]}}}}"#,
+                "a".repeat(64),
+                id.as_str(),
+            ),
+        );
+        assert_eq!(serde_json::from_str::<NodeResponse>(&response_json).unwrap(), response);
+    }
+
+    #[test]
+    fn context_pack_bytes_read_deserialization_rejects_inconsistent_or_oversized_lengths() {
+        let digest = SpawnContextDigest::new(format!("sha256:{}", "b".repeat(64))).unwrap();
+        let id = SpawnContextId::new(format!("ctx-{}", "b".repeat(64))).unwrap();
+
+        let valid = ContextPackBytesRead {
+            digest: digest.clone(),
+            id: id.clone(),
+            byte_len: 4,
+            bytes: b"test".to_vec(),
+        };
+        let encoded = serde_json::to_string(&valid).unwrap();
+        assert_eq!(serde_json::from_str::<ContextPackBytesRead>(&encoded).unwrap(), valid);
+
+        let declares_more_than_it_carries = ContextPackBytesRead {
+            digest: digest.clone(),
+            id: id.clone(),
+            byte_len: 5,
+            bytes: b"test".to_vec(),
+        };
+        let encoded = serde_json::to_string(&declares_more_than_it_carries).unwrap();
+        assert!(serde_json::from_str::<ContextPackBytesRead>(&encoded).is_err());
+
+        let oversized_len = MAX_CONTEXT_PACK_BYTES + 1;
+        let oversized = ContextPackBytesRead {
+            digest,
+            id,
+            byte_len: oversized_len,
+            bytes: vec![0u8; oversized_len as usize],
+        };
+        let encoded = serde_json::to_string(&oversized).unwrap();
+        assert!(serde_json::from_str::<ContextPackBytesRead>(&encoded).is_err());
     }
 
     #[test]

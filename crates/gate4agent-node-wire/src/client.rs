@@ -1900,7 +1900,8 @@ fn ensure_node_request_provider_capability(
             }
         }
         NodeRequest::ForgetContextPack { .. }
-        | NodeRequest::ResolveDurableContextPack { .. } => {
+        | NodeRequest::ResolveDurableContextPack { .. }
+        | NodeRequest::ReadContextPack { .. } => {
             if !open_provider_ids_enabled {
                 return Err(NodeClientError::UnsupportedCapability(
                     NODE_PROVIDER_ID_OPEN_CAPABILITY.to_owned(),
@@ -2080,6 +2081,7 @@ fn node_request_contains_opaque_unix_path(request: &NodeRequest) -> bool {
         | NodeRequest::ExportContextPack { .. }
         | NodeRequest::ForgetContextPack { .. }
         | NodeRequest::ResolveDurableContextPack { .. }
+        | NodeRequest::ReadContextPack { .. }
         | NodeRequest::Prompt { .. }
         | NodeRequest::Paste { .. }
         | NodeRequest::Input { .. }
@@ -2174,6 +2176,7 @@ fn node_response_contains_open_provider_id(response: &NodeResponse) -> bool {
         | NodeResponse::HistoryDiscovered { .. }
         | NodeResponse::HistoryLoaded { .. }
         | NodeResponse::ContextPackForgotten { .. }
+        | NodeResponse::ContextPackBytesRead { .. }
         | NodeResponse::WorkspaceUnregistered { .. }
         | NodeResponse::WorktreeRemoved { .. }
         | NodeResponse::Accepted
@@ -2298,6 +2301,7 @@ fn node_request_contains_tagged_repository_path(request: &NodeRequest) -> bool {
         | NodeRequest::ExportContextPack { .. }
         | NodeRequest::ForgetContextPack { .. }
         | NodeRequest::ResolveDurableContextPack { .. }
+        | NodeRequest::ReadContextPack { .. }
         | NodeRequest::Prompt { .. }
         | NodeRequest::Paste { .. }
         | NodeRequest::Input { .. }
@@ -2391,6 +2395,7 @@ fn node_response_contains_tagged_repository_path(response: &NodeResponse) -> boo
         | NodeResponse::ContextPackExported { .. }
         | NodeResponse::ContextPackForgotten { .. }
         | NodeResponse::DurableContextPackResolved { .. }
+        | NodeResponse::ContextPackBytesRead { .. }
         | NodeResponse::WorkspaceRegistered { .. }
         | NodeResponse::StandaloneWorkspaceCreated { .. }
         | NodeResponse::WorkspaceUnregistered { .. }
@@ -2470,6 +2475,7 @@ fn node_response_contains_opaque_unix_path(response: &NodeResponse) -> bool {
         | NodeResponse::ContextPackExported { .. }
         | NodeResponse::ContextPackForgotten { .. }
         | NodeResponse::DurableContextPackResolved { .. }
+        | NodeResponse::ContextPackBytesRead { .. }
         | NodeResponse::WorkspaceUnregistered { .. }
         | NodeResponse::Accepted
         | NodeResponse::ShuttingDown => false,

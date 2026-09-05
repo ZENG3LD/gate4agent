@@ -1,6 +1,7 @@
 use gate4agent_c2_protocol::{
     c2_auth_transcript, c2_bound_auth_transcript, provider_id_is_legacy, C2AuthDirection, C2ClientAuthentication, C2ClientFrame,
     C2ClientHello, C2Hello, C2NodeEvent, C2NodeResponse, C2ObservationSupport, C2RelayFailure,
+    C2RelayFailureCode,
     C2RequestEnvelope, C2RequestId, C2ServerFrame, C2Topology, CapabilityId,
     ClientCompatibilityOffer, NegotiatedC2ControlCompatibility, NodeRequest, NodeRoute,
     RoutedNodeEvent, RoutedNodeRequest, RoutedNodeResponse,
@@ -340,6 +341,30 @@ struct ControlCommand {
     reply: oneshot::Sender<Result<RoutedNodeResponse, C2ControlError>>,
 }
 
+/// Recovers a `BuildStampMismatch` relay rejection's [`C2ControlError::
+/// BuildStampMismatch`] shape from the frame `gate4agent-c2`'s own
+/// pre-handshake refusal actually sends. `C2RelayFailureCode::
+/// BuildStampMismatch` itself carries nothing -- both stamps travel only in
+/// `failure.message` (`"build stamp mismatch: local=<s> remote=<s>"`,
+/// produced by this exact tree's own `gate4agent-c2`), so the peer's stamp
+/// is recovered by parsing that self-authored, fixed-format text rather
+/// than inventing a second wire shape for the same two values. Any other
+/// code, or a `BuildStampMismatch` whose message does not parse (never
+/// happens against a peer built from this tree, but never trusted blindly
+/// either), falls back to the generic [`C2ControlError::Relay`].
+fn map_relay_rejection(failure: C2RelayFailure) -> C2ControlError {
+    if failure.code != C2RelayFailureCode::BuildStampMismatch {
+        return C2ControlError::Relay(failure);
+    }
+    match failure.message.split_whitespace().find_map(|token| token.strip_prefix("remote=")) {
+        Some(remote) => C2ControlError::BuildStampMismatch {
+            local: BUILD_STAMP.to_owned(),
+            remote: remote.to_owned(),
+        },
+        None => C2ControlError::Relay(failure),
+    }
+}
+
 enum OwnerInput {
     Frame(C2ServerFrame),
     Closed,
@@ -364,8 +389,12 @@ pub async fn connect_local(
     )).await.map_err(|_| C2ControlError::AuthenticationTimedOut)??;
     let challenge = timeout(AUTH_DEADLINE, read_server_frame(&mut pipe, MAX_C2_AUTH_FRAME_BYTES))
         .await.map_err(|_| C2ControlError::AuthenticationTimedOut)??;
-    let C2ServerFrame::Challenge(challenge) = challenge else {
-        return Err(C2ControlError::Protocol("C2 did not return an authentication challenge".to_owned()));
+    let challenge = match challenge {
+        C2ServerFrame::Challenge(challenge) => challenge,
+        C2ServerFrame::Rejected(failure) => return Err(map_relay_rejection(failure)),
+        _ => return Err(C2ControlError::Protocol(
+            "C2 did not return an authentication challenge".to_owned(),
+        )),
     };
     if challenge.build_stamp != BUILD_STAMP {
         return Err(C2ControlError::BuildStampMismatch {
@@ -409,7 +438,7 @@ pub async fn connect_local(
     let hello = match hello {
         C2ServerFrame::Hello(hello) if hello.build_stamp == BUILD_STAMP => hello,
         C2ServerFrame::Rejected(failure) =>
-            return Err(C2ControlError::Relay(failure)),
+            return Err(map_relay_rejection(failure)),
         C2ServerFrame::Hello(hello) =>
             return Err(C2ControlError::BuildStampMismatch {
                 local: BUILD_STAMP.to_owned(),
@@ -983,6 +1012,7 @@ fn node_request_has_unix_repository_path(request: &NodeRequest) -> bool {
         | NodeRequest::ExportContextPack { .. }
         | NodeRequest::ForgetContextPack { .. }
         | NodeRequest::ResolveDurableContextPack { .. }
+        | NodeRequest::ReadContextPack { .. }
         | NodeRequest::Prompt { .. }
         | NodeRequest::Paste { .. }
         | NodeRequest::Input { .. }
@@ -1058,6 +1088,7 @@ fn node_request_has_unix_bytes(request: &NodeRequest) -> bool {
         | NodeRequest::ExportContextPack { .. }
         | NodeRequest::ForgetContextPack { .. }
         | NodeRequest::ResolveDurableContextPack { .. }
+        | NodeRequest::ReadContextPack { .. }
         | NodeRequest::Prompt { .. }
         | NodeRequest::Paste { .. }
         | NodeRequest::Input { .. }
@@ -1518,6 +1549,7 @@ fn c2_node_response_has_terminal_frame_event(response: &C2NodeResponse) -> bool 
         | C2NodeResponse::ContextPackExported { .. }
         | C2NodeResponse::ContextPackForgotten { .. }
         | C2NodeResponse::DurableContextPackResolved { .. }
+        | C2NodeResponse::ContextPackBytesRead { .. }
         | C2NodeResponse::WorkspaceRegistered { .. }
         | C2NodeResponse::StandaloneWorkspaceCreated { .. }
         | C2NodeResponse::WorkspaceUnregistered { .. }
@@ -1591,6 +1623,7 @@ fn c2_node_response_has_agent_stream_event(response: &C2NodeResponse) -> bool {
         | C2NodeResponse::ContextPackExported { .. }
         | C2NodeResponse::ContextPackForgotten { .. }
         | C2NodeResponse::DurableContextPackResolved { .. }
+        | C2NodeResponse::ContextPackBytesRead { .. }
         | C2NodeResponse::WorkspaceRegistered { .. }
         | C2NodeResponse::StandaloneWorkspaceCreated { .. }
         | C2NodeResponse::WorkspaceUnregistered { .. }
@@ -1734,6 +1767,7 @@ fn c2_node_response_has_unix_bytes(response: &C2NodeResponse) -> bool {
         | C2NodeResponse::ContextPackExported { .. }
         | C2NodeResponse::ContextPackForgotten { .. }
         | C2NodeResponse::DurableContextPackResolved { .. }
+        | C2NodeResponse::ContextPackBytesRead { .. }
         | C2NodeResponse::WorkspaceUnregistered { .. }
         | C2NodeResponse::Accepted
         | C2NodeResponse::ShuttingDown => false,
@@ -1769,7 +1803,8 @@ fn c2_node_response_has_unix_repository_path(response: &C2NodeResponse) -> bool 
             .path
             .as_ref()
             .is_some_and(|path| path.as_unix_bytes().is_some()),
-        C2NodeResponse::DurableContextPackResolved { .. } => false,
+        C2NodeResponse::DurableContextPackResolved { .. }
+        | C2NodeResponse::ContextPackBytesRead { .. } => false,
         C2NodeResponse::Snapshot { .. }
         | C2NodeResponse::Resync { .. }
         | C2NodeResponse::Armed { .. }
@@ -2235,6 +2270,7 @@ fn c2_node_response_has_open_provider_id(response: &C2NodeResponse) -> bool {
         | C2NodeResponse::HistoryDiscovered { .. }
         | C2NodeResponse::HistoryLoaded { .. }
         | C2NodeResponse::ContextPackForgotten { .. }
+        | C2NodeResponse::ContextPackBytesRead { .. }
         | C2NodeResponse::WorkspaceUnregistered { .. }
         | C2NodeResponse::WorktreeRemoved { .. }
         | C2NodeResponse::Accepted

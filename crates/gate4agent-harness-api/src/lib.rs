@@ -23,6 +23,7 @@ pub use gate4agent_harness_protocol::{
     HarnessDeliveryComponentKindV1, HarnessContextSourceSelectionV1,
     HarnessContextSourceAvailabilityV1,
     HarnessDeliveryManifestDigestV2, HarnessDeliveryRef, HarnessDeliveryStateV1,
+    HarnessGrantTargetV1,
     HarnessLaunchAuthorityRefV1, HarnessLaunchPlanRefV1, HarnessMoveTaskRequestV1,
     HarnessOperatorAuthorityV1, HarnessReplaceTaskExecutionSpecRequestV1,
     HarnessReplaceTaskRequestV1, HarnessRequestDigest, HarnessRetryTaskRequestV1,
@@ -794,6 +795,14 @@ pub struct HarnessTaskLaunchOptionsV1 {
     pub delivery_bundles: Vec<HarnessDeliveryBundleSelectionV1>,
     pub current_issued_spec: Option<HarnessIssuedExecutionSpecSummaryV1>,
     pub truncated: bool,
+    /// Resumes specifically the `plans` list's own page (mirrors
+    /// `HarnessLaunchPlanPageV1::next_plan_id`) -- `Some` only when `plans`
+    /// itself was cut for paging, `None` whenever that list's page is
+    /// complete even if `truncated` is `true` for one of the other three
+    /// lists. `#[serde(default)]`: additive over the original response
+    /// shape, an older caller that never asked for it still deserializes.
+    #[serde(default)]
+    pub next_after: Option<HarnessSelectorV1>,
 }
 
 impl HarnessTaskLaunchOptionsV1 {
@@ -843,6 +852,14 @@ impl HarnessTaskLaunchOptionsV1 {
         if let Some(current) = &self.current_issued_spec {
             current.validate()?;
             if current.task_id != self.task_id {
+                return Err(HarnessOperatorApiError::InvalidTaskLaunchOptions);
+            }
+        }
+        if let Some(next_after) = &self.next_after {
+            next_after.validate().map_err(HarnessOperatorApiError::Protocol)?;
+            if !self.truncated
+                || self.plans.last().map(|plan| &plan.plan.plan_id) != Some(next_after)
+            {
                 return Err(HarnessOperatorApiError::InvalidTaskLaunchOptions);
             }
         }
@@ -2311,7 +2328,23 @@ pub enum HarnessOperatorRequestV1 {
         limit: u16,
     },
     TaskExecutionSpecGet { task_id: HarnessTaskId },
-    TaskLaunchOptionsGet { task_id: HarnessTaskId },
+    /// `provider`/`workspace`/`plan_id` filter the derived plan catalogue,
+    /// `after` pages it (same idiom as `LaunchPlansList`'s `after_plan_id`):
+    /// the catalogue itself has no cap (see `HarnessTaskLaunchOptionsV1`'s
+    /// own doc comment), only a page of it does. All four are additive over
+    /// the original bare `{ task_id }` shape -- `#[serde(default)]` so an
+    /// older caller that only ever sent `task_id` keeps deserializing.
+    TaskLaunchOptionsGet {
+        task_id: HarnessTaskId,
+        #[serde(default)]
+        provider: Option<HarnessSelectorV1>,
+        #[serde(default)]
+        workspace: Option<HarnessSelectorV1>,
+        #[serde(default)]
+        plan_id: Option<HarnessSelectorV1>,
+        #[serde(default)]
+        after: Option<HarnessSelectorV1>,
+    },
     RuntimeInventoryList {
         after_node_id: Option<String>,
         limit: u16,
@@ -2807,9 +2840,24 @@ impl HarnessOperatorRequestV1 {
                 }
                 Ok(())
             }
-            Self::TaskExecutionSpecGet { task_id }
-            | Self::TaskLaunchOptionsGet { task_id } => {
+            Self::TaskExecutionSpecGet { task_id } => {
                 task_id.validate().map_err(HarnessOperatorApiError::Protocol)
+            }
+            Self::TaskLaunchOptionsGet { task_id, provider, workspace, plan_id, after } => {
+                task_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+                if let Some(provider) = provider {
+                    provider.validate().map_err(HarnessOperatorApiError::Protocol)?;
+                }
+                if let Some(workspace) = workspace {
+                    workspace.validate().map_err(HarnessOperatorApiError::Protocol)?;
+                }
+                if let Some(plan_id) = plan_id {
+                    plan_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+                }
+                if let Some(after) = after {
+                    after.validate().map_err(|_| HarnessOperatorApiError::InvalidCursor)?;
+                }
+                Ok(())
             }
             Self::RuntimeInventoryList { after_node_id, limit } => {
                 if !(1..=HARNESS_RUNTIME_INVENTORY_PAGE_LIMIT_MAX).contains(limit) {
@@ -5508,6 +5556,150 @@ pub enum HarnessOperatorHostErrorV1 {
     // protocol has exactly one accepted build stamp, so a well-formed peer
     // never triggers it against a matching one.
     BuildStampMismatch { expected: String, received: String },
+    // -- Everything below names its own inputs instead of collapsing into a
+    // bare `Conflict`. `map_operator_service_error` (`gate4agent-harness-
+    // service`'s `runtime.rs`) used to have a catch-all `_ => Conflict` arm
+    // covering every one of these -- the reason a stack whose derived
+    // launch-plan catalogue exceeded its page size had every `spec save`
+    // refused with nothing but the word "Conflict": `InvalidTaskLaunchSelection`
+    // was one of the swallowed variants. Every `HarnessServiceError` variant
+    // that arm used to swallow now has its own arm there and its own named
+    // variant here; the catch-all is gone. Fields whose native type lives in
+    // a crate this one does not depend on (`gate4agent-node-protocol`,
+    // `gate4agent-harness-service`, or the foreign `HarnessEngineError` this
+    // crate must not open) ride the wire as `String` -- the same treatment
+    // `UnsupportedTransport::agent` above already gives an unreachable id.
+    //
+    // The one exception is `HarnessServiceError::Engine`, whose OWN inner
+    // variants live in `gate4agent-harness-engine` -- a crate under active
+    // edit by another worker this fix must not open. Every non-`NotFound`
+    // `HarnessEngineError` still collapses into `EngineRefused { detail }`
+    // (its Debug rendering), which is strictly more than the bare `Conflict`
+    // it used to get, without requiring that file's variant list.
+    EngineRefused { detail: String },
+    /// The one variant named explicitly in this fix's own brief: a reviewed
+    /// task-launch selection failed one of `validate_current_launch_options`/
+    /// `validate_current_issued_launch_options`'s checks. `why` is always one
+    /// of a small set of fixed literals (see `HarnessServiceError::
+    /// InvalidTaskLaunchSelection`'s doc comment); `plan_id` is `Some`
+    /// whenever the failing check concerns a specific plan.
+    InvalidLaunchSelection {
+        task_id: HarnessTaskId,
+        plan_id: Option<HarnessSelectorV1>,
+        why: String,
+    },
+    UnsupportedCheckpointVersion { version: u16 },
+    InvalidDispatchContext { reason: String },
+    MutationDigestMismatch,
+    DispatchFingerprintUnavailable,
+    NonAtomicRunOperation,
+    AcceptedSpawnProofRequired,
+    InvalidAcceptedSpawnProof { reason: String },
+    DeliveryAuthorityWindowClosed,
+    DeliveryCompilationInvalid,
+    InvalidStagedDeliveryProof { reason: String },
+    AtomicDeliveryCommitRequired,
+    ContinuationAuthorityWindowClosed,
+    InvalidContinuationProof { reason: String },
+    AtomicContinuationBindRequired,
+    InvalidHarnessMcpReservation { reason: String },
+    HarnessMcpGrantActorRefused {
+        actor_kind: String,
+        parent_run_id: Option<HarnessRunId>,
+        grant_actor_run_id: HarnessRunId,
+    },
+    HarnessMcpGrantOperationLinkRefused {
+        grant_id: SessionGrantId,
+        operation_id: HarnessOperationId,
+        existing_grant_id: SessionGrantId,
+    },
+    HarnessMcpGrantRevisionRefused {
+        grant_id: SessionGrantId,
+        durable_revision: HarnessRevision,
+        presented_revision: HarnessRevision,
+    },
+    HarnessMcpGrantLinkRefused {
+        grant_id: SessionGrantId,
+        grant_actor_run_id: HarnessRunId,
+        dispatch_actor_run_id: HarnessRunId,
+    },
+    HarnessMcpGrantTargetRefused {
+        grant_id: SessionGrantId,
+        presented_target: HarnessGrantTargetV1,
+        allowed_targets: Vec<HarnessGrantTargetV1>,
+    },
+    HarnessMcpReplayMismatch,
+    HarnessMcpProofMismatch,
+    HarnessMcpArmProofReservationFieldRefused {
+        field: String,
+        durable: String,
+        proof: String,
+    },
+    HarnessMcpArmProofRouteRefused {
+        field: String,
+        durable: String,
+        route: String,
+    },
+    HarnessMcpArmProofBindingRefused {
+        field: String,
+        expected: String,
+        actual: String,
+    },
+    HarnessMcpArmDurableLookupMissing {
+        missing: String,
+        operation_id: Option<HarnessOperationId>,
+        reservation_id: Option<String>,
+    },
+    HarnessMcpArmReservationNotReadyRefused {
+        reservation_id: String,
+        state: String,
+        armed_at_unix_ms: u64,
+        updated_at_unix_ms: u64,
+        expires_at_unix_ms: u64,
+    },
+    HarnessMcpArmRouteInvalid {
+        operation_id: HarnessOperationId,
+        field: String,
+        value: String,
+    },
+    HarnessMcpLaunchPolicyRefused {
+        plan_policy: String,
+        reservation_present: bool,
+    },
+    HarnessMcpLaunchReservationNotArmedRefused {
+        reservation_id: String,
+        state: String,
+    },
+    HarnessMcpLaunchOperationRefused {
+        reservation_operation_id: HarnessOperationId,
+        dispatch_operation_id: HarnessOperationId,
+    },
+    HarnessMcpLaunchGrantRefused {
+        plan_grant_id: SessionGrantId,
+        plan_grant_revision: HarnessRevision,
+        reservation_grant_id: SessionGrantId,
+        reservation_grant_revision: HarnessRevision,
+    },
+    HarnessMcpSpecializedTransitionRequired,
+    OperatorRequestConflict { operation_id: HarnessOperationId },
+    InvalidOperatorTaskTransition {
+        from: HarnessTaskStateV1,
+        to: HarnessTaskStateV1,
+    },
+    TaskHasActiveRun,
+    ExecutionSpecRevisionMismatch {
+        expected: Option<HarnessRevision>,
+        actual: Option<HarnessRevision>,
+    },
+    ExecutionSpecLaunchMismatch,
+    IssuedExecutionCasMismatch {
+        expected: HarnessExpectedExecutionSpecRevisionV1,
+        spec: Option<HarnessRevision>,
+        issuance: Option<HarnessRevision>,
+    },
+    TaskNotReady,
+    SchedulerResourceExhausted,
+    SchedulerInvalidGraph { reason: String },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -7777,6 +7969,7 @@ mod tests {
                 updated_at_unix_ms: 90,
             }),
             truncated: false,
+            next_after: None,
         }
     }
 
@@ -7828,7 +8021,13 @@ mod tests {
             },
         };
         for request in [
-            HarnessOperatorRequestV1::TaskLaunchOptionsGet { task_id: task_id.clone() },
+            HarnessOperatorRequestV1::TaskLaunchOptionsGet {
+                task_id: task_id.clone(),
+                provider: None,
+                workspace: None,
+                plan_id: None,
+                after: None,
+            },
             replace.clone(),
             start.clone(),
         ] {
@@ -7930,6 +8129,51 @@ mod tests {
             options.validate_for(&other_task),
             Err(HarnessOperatorApiError::InvalidTaskLaunchOptions),
         ));
+    }
+
+    /// The launch-catalogue ceiling fix's read-side pagination: `provider`/
+    /// `workspace`/`plan_id`/`after` on the request and `next_after` on the
+    /// response are additive over the pre-pagination wire shape, so an older
+    /// peer's JSON (never carrying any of them) must still decode.
+    #[test]
+    fn task_launch_options_paging_fields_are_additive_and_next_after_is_checked() {
+        let task_id = HarnessTaskId::new(format!("htask_{}", "9".repeat(24))).unwrap();
+        let legacy_request_json = serde_json::json!({
+            "kind": "task-launch-options-get",
+            "task_id": task_id.as_str(),
+        });
+        let decoded: HarnessOperatorRequestV1 =
+            serde_json::from_value(legacy_request_json).unwrap();
+        assert!(matches!(
+            decoded,
+            HarnessOperatorRequestV1::TaskLaunchOptionsGet {
+                provider: None, workspace: None, plan_id: None, after: None, ..
+            },
+        ));
+
+        let mut options = task_launch_options();
+        let legacy_response_json = serde_json::to_value(&options).unwrap();
+        assert!(legacy_response_json.get("next_after").is_some());
+        let mut without_next_after = legacy_response_json.clone();
+        without_next_after.as_object_mut().unwrap().remove("next_after");
+        let redecoded: HarnessTaskLaunchOptionsV1 =
+            serde_json::from_value(without_next_after).unwrap();
+        assert_eq!(redecoded.next_after, None);
+        redecoded.validate().unwrap();
+
+        let plan_id = options.plans[0].plan.plan_id.clone();
+        options.next_after = Some(plan_id.clone());
+        assert!(matches!(
+            options.validate(),
+            Err(HarnessOperatorApiError::InvalidTaskLaunchOptions),
+        ), "next_after without truncated must be refused");
+        options.truncated = true;
+        options.validate().unwrap();
+        options.next_after = Some(HarnessSelectorV1::new("not-the-last-plan").unwrap());
+        assert!(matches!(
+            options.validate(),
+            Err(HarnessOperatorApiError::InvalidTaskLaunchOptions),
+        ), "next_after must name the last plan on the page");
     }
 
     #[test]

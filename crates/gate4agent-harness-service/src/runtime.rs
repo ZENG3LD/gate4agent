@@ -8757,7 +8757,16 @@ fn authorize_operator_intent(
     Ok(request)
 }
 
-fn task_launch_options(
+/// Every current plan / managed-worktree profile / context source / delivery
+/// bundle for `task_id`, with no `HARNESS_TASK_LAUNCH_OPTIONS_MAX` cap --
+/// the untruncated basis both `task_launch_options` (the operator read's own
+/// bounded PAGE of this, below) and the `ReplaceTaskExecutionSpecV2`/
+/// `StartTaskV2` mutation handlers build their
+/// `HarnessFullTaskLaunchCatalogueV1` from. A selection is validated against
+/// THIS, never against a page: a stack whose derived launch-plan catalogue
+/// exceeds the page size must still accept a `spec save` naming a plan past
+/// that boundary.
+fn full_task_launch_catalogue(
     harness: &HarnessService,
     observation: &ObservationService,
     support: &ObservationSupportRegistry,
@@ -8765,7 +8774,7 @@ fn task_launch_options(
     delivery_catalog: &DeliveryCatalogV2,
     runtime_inventory: &HarnessRuntimeInventoryCache,
     task_id: &gate4agent_harness_protocol::HarnessTaskId,
-) -> Result<HarnessTaskLaunchOptionsV1, HarnessOperatorHostErrorV1> {
+) -> Result<crate::HarnessFullTaskLaunchCatalogueV1, HarnessOperatorHostErrorV1> {
     let task = harness.engine().task(task_id)
         .ok_or(HarnessOperatorHostErrorV1::NotFound)?;
     let (effective_launch, catalog_truncated) =
@@ -8783,7 +8792,7 @@ fn task_launch_options(
              are both empty, starting this task would fail",
         );
     }
-    let mut plans = effective_launch.ordinary_plans()
+    let plans = effective_launch.ordinary_plans()
         .filter(|plan| matches!(plan.worktree, HarnessWorktreeIntentV1::Existing))
         .map(|plan| {
             if !launch_catalog.contains(&plan.plan_id) {
@@ -8806,8 +8815,6 @@ fn task_launch_options(
         })
         .collect::<Result<Vec<_>, HarnessServiceError>>()
         .map_err(map_operator_service_error)?;
-    let mut truncated = plans.len() > gate4agent_harness_api::HARNESS_TASK_LAUNCH_OPTIONS_MAX;
-    plans.truncate(gate4agent_harness_api::HARNESS_TASK_LAUNCH_OPTIONS_MAX);
 
     let mut managed_worktree_profiles = runtime_inventory.managed_worktree_profiles.values()
         .flat_map(|cache| cache.profiles.iter())
@@ -8836,13 +8843,6 @@ fn task_launch_options(
             && left.profile_id == right.profile_id
             && left.profile_revision == right.profile_revision
     });
-    truncated |= managed_worktree_profiles.len()
-        > gate4agent_harness_api::HARNESS_TASK_LAUNCH_OPTIONS_MAX;
-    truncated |= runtime_inventory.managed_worktree_profiles.values()
-        .any(|cache| cache.truncated);
-    managed_worktree_profiles.truncate(
-        gate4agent_harness_api::HARNESS_TASK_LAUNCH_OPTIONS_MAX,
-    );
 
     let mut context_sources = Vec::new();
     for run in harness.engine().runs() {
@@ -8860,14 +8860,82 @@ fn task_launch_options(
         (&left.source_run_id, left.source_run_revision)
             .cmp(&(&right.source_run_id, right.source_run_revision))
     });
-    truncated |= context_sources.len() > gate4agent_harness_api::HARNESS_TASK_LAUNCH_OPTIONS_MAX;
-    context_sources.truncate(gate4agent_harness_api::HARNESS_TASK_LAUNCH_OPTIONS_MAX);
 
-    let mut delivery_bundles = delivery_catalog.iter().map(|(bundle_id, compiled)| {
+    let delivery_bundles = delivery_catalog.iter().map(|(bundle_id, compiled)| {
         let selector = HarnessSelectorV1::new(bundle_id.as_str())?;
         crate::delivery::compiled_bundle_selection(selector, compiled)
     }).collect::<Result<Vec<_>, HarnessServiceError>>()
         .map_err(map_operator_service_error)?;
+
+    let mut catalogue = crate::HarnessFullTaskLaunchCatalogueV1 {
+        task_id: task.task_id.clone(),
+        task_revision: task.revision,
+        policy_digest: HarnessRequestDigest::new("0".repeat(64))
+            .map_err(|_| HarnessOperatorHostErrorV1::Internal)?,
+        plans,
+        managed_worktree_profiles,
+        context_sources,
+        delivery_bundles,
+    };
+    catalogue.policy_digest = crate::task_launch_policy_digest_full(&catalogue)
+        .map_err(map_operator_service_error)?;
+    Ok(catalogue)
+}
+
+/// The operator read's own bounded PAGE of [`full_task_launch_catalogue`]:
+/// `provider`/`workspace`/`plan_id` filter the plan list, `after` pages it
+/// (same `> cursor` idiom as `LaunchPlansList`'s `after_plan_id`), and
+/// `HARNESS_TASK_LAUNCH_OPTIONS_MAX` bounds this one response -- never the
+/// underlying catalogue, which `full_task_launch_catalogue` above computes
+/// with no cap at all. `truncated` is set whenever ANY of the four lists
+/// carries more than fit on this page; `next_after` resumes specifically the
+/// plan list's own cursor and is `None` whenever that list's page was
+/// already complete, even if `truncated` is `true` for another reason.
+fn task_launch_options(
+    harness: &HarnessService,
+    observation: &ObservationService,
+    support: &ObservationSupportRegistry,
+    launch_catalog: &HarnessLaunchCatalog,
+    delivery_catalog: &DeliveryCatalogV2,
+    runtime_inventory: &HarnessRuntimeInventoryCache,
+    task_id: &gate4agent_harness_protocol::HarnessTaskId,
+    provider: Option<&HarnessSelectorV1>,
+    workspace: Option<&HarnessSelectorV1>,
+    plan_id: Option<&HarnessSelectorV1>,
+    after: Option<&HarnessSelectorV1>,
+) -> Result<HarnessTaskLaunchOptionsV1, HarnessOperatorHostErrorV1> {
+    let full = full_task_launch_catalogue(
+        harness, observation, support, launch_catalog, delivery_catalog, runtime_inventory,
+        task_id,
+    )?;
+    let mut plans = full.plans.into_iter()
+        .filter(|plan| provider.map_or(true, |value| &plan.provider_id == value))
+        .filter(|plan| workspace.map_or(true, |value| &plan.source_workspace_id == value))
+        .filter(|plan| plan_id.map_or(true, |value| &plan.plan.plan_id == value))
+        .filter(|plan| after.map_or(true, |cursor| &plan.plan.plan_id > cursor))
+        .take(gate4agent_harness_api::HARNESS_TASK_LAUNCH_OPTIONS_MAX + 1)
+        .collect::<Vec<_>>();
+    let plans_has_more = plans.len() > gate4agent_harness_api::HARNESS_TASK_LAUNCH_OPTIONS_MAX;
+    if plans_has_more { plans.pop(); }
+    let next_after = plans_has_more.then(|| {
+        plans.last().expect("nonzero task launch options page limit").plan.plan_id.clone()
+    });
+    let mut truncated = plans_has_more;
+
+    let mut managed_worktree_profiles = full.managed_worktree_profiles;
+    truncated |= managed_worktree_profiles.len()
+        > gate4agent_harness_api::HARNESS_TASK_LAUNCH_OPTIONS_MAX;
+    truncated |= runtime_inventory.managed_worktree_profiles.values()
+        .any(|cache| cache.truncated);
+    managed_worktree_profiles.truncate(
+        gate4agent_harness_api::HARNESS_TASK_LAUNCH_OPTIONS_MAX,
+    );
+
+    let mut context_sources = full.context_sources;
+    truncated |= context_sources.len() > gate4agent_harness_api::HARNESS_TASK_LAUNCH_OPTIONS_MAX;
+    context_sources.truncate(gate4agent_harness_api::HARNESS_TASK_LAUNCH_OPTIONS_MAX);
+
+    let mut delivery_bundles = full.delivery_bundles;
     truncated |= delivery_bundles.len() > gate4agent_harness_api::HARNESS_TASK_LAUNCH_OPTIONS_MAX;
     delivery_bundles.truncate(gate4agent_harness_api::HARNESS_TASK_LAUNCH_OPTIONS_MAX);
 
@@ -8883,8 +8951,8 @@ fn task_launch_options(
         }
     });
     let mut options = HarnessTaskLaunchOptionsV1 {
-        task_id: task.task_id.clone(),
-        task_revision: task.revision,
+        task_id: full.task_id,
+        task_revision: full.task_revision,
         policy_digest: HarnessRequestDigest::new("0".repeat(64))
             .map_err(|_| HarnessOperatorHostErrorV1::Internal)?,
         plans,
@@ -8893,6 +8961,7 @@ fn task_launch_options(
         delivery_bundles,
         current_issued_spec,
         truncated,
+        next_after,
     };
     options.policy_digest = crate::task_launch_policy_digest(&options)
         .map_err(map_operator_service_error)?;
@@ -9164,7 +9233,9 @@ fn execute_operator_request(
                 harness.task_execution_spec(&task_id).cloned(),
             )
         }
-        HarnessOperatorRequestV1::TaskLaunchOptionsGet { task_id } => {
+        HarnessOperatorRequestV1::TaskLaunchOptionsGet {
+            task_id, provider, workspace, plan_id, after,
+        } => {
             HarnessOperatorResponseV1::TaskLaunchOptions(task_launch_options(
                 harness,
                 observation,
@@ -9173,6 +9244,10 @@ fn execute_operator_request(
                 delivery_catalog,
                 runtime_inventory,
                 &task_id,
+                provider.as_ref(),
+                workspace.as_ref(),
+                plan_id.as_ref(),
+                after.as_ref(),
             )?)
         }
         HarnessOperatorRequestV1::RuntimeInventoryList { after_node_id, limit } => {
@@ -9273,7 +9348,13 @@ fn execute_operator_request(
             )
         }
         HarnessOperatorRequestV1::ReplaceTaskExecutionSpecV2 { request } => {
-            let options = task_launch_options(
+            // The FULL, unpaged catalogue -- never `task_launch_options`'s
+            // own bounded page -- is what a selection is validated against
+            // (see `HarnessFullTaskLaunchCatalogueV1`'s doc comment): a
+            // catalogue whose derived plan list exceeds the operator read's
+            // page size must still accept a `spec save` naming a plan past
+            // that boundary.
+            let catalogue = full_task_launch_catalogue(
                 harness,
                 observation,
                 support,
@@ -9283,7 +9364,7 @@ fn execute_operator_request(
                 &request.task_id,
             )?;
             let outcome = harness.operator_replace_task_execution_spec_v2(
-                &options,
+                &catalogue,
                 request,
             ).map_err(map_operator_service_error)?;
             HarnessOperatorResponseV1::ExecutionSpecMutation(match outcome {
@@ -9292,7 +9373,9 @@ fn execute_operator_request(
             })
         }
         HarnessOperatorRequestV1::StartTaskV2 { request } => {
-            let options = task_launch_options(
+            // Same reasoning as `ReplaceTaskExecutionSpecV2` above: validate
+            // against the full catalogue, not a page of it.
+            let catalogue = full_task_launch_catalogue(
                 harness,
                 observation,
                 support,
@@ -9305,7 +9388,7 @@ fn execute_operator_request(
                 effective_launch_catalog(launch_catalog, runtime_inventory);
             HarnessOperatorResponseV1::TaskStarted(
                 harness
-                    .start_task_v2(&effective_launch, &options, request)
+                    .start_task_v2(&effective_launch, &catalogue, request)
                     .map_err(map_operator_service_error)?,
             )
         }
@@ -9564,15 +9647,32 @@ fn operator_mutation_response(
     Ok(HarnessOperatorResponseV1::Mutation(outcome))
 }
 
+/// Every `HarnessServiceError` variant gets its own explicit arm here -- no
+/// `_` catch-all. There used to be one, folding every arm below the first
+/// eight into a bare `HarnessOperatorHostErrorV1::Conflict`: the reason a
+/// stack whose derived launch-plan catalogue exceeded its page size had
+/// every `spec save` refused with nothing but the word "Conflict" and no way
+/// to tell a real conflict from a validation bug in the mapper itself.
 fn map_operator_service_error(error: HarnessServiceError) -> HarnessOperatorHostErrorV1 {
     match error {
         HarnessServiceError::Validation(_) => HarnessOperatorHostErrorV1::InvalidRequest,
         HarnessServiceError::DispatchPolicy(_) => HarnessOperatorHostErrorV1::InvalidRequest,
-        HarnessServiceError::InvalidTaskLaunchSelection => {
-            HarnessOperatorHostErrorV1::Conflict
+        HarnessServiceError::InvalidTaskLaunchSelection { task_id, plan_id, why } => {
+            HarnessOperatorHostErrorV1::InvalidLaunchSelection {
+                task_id,
+                plan_id,
+                why: why.to_string(),
+            }
         }
         HarnessServiceError::Engine(gate4agent_harness_engine::HarnessEngineError::NotFound(_)) => {
             HarnessOperatorHostErrorV1::NotFound
+        }
+        // `HarnessEngineError`'s other variants live in `gate4agent-harness-
+        // engine`, a crate under active edit by another worker this fix must
+        // not open -- see `HarnessOperatorHostErrorV1::EngineRefused`'s own
+        // doc comment.
+        HarnessServiceError::Engine(other) => {
+            HarnessOperatorHostErrorV1::EngineRefused { detail: format!("{other:?}") }
         }
         HarnessServiceError::ExecutionSpecMissing => HarnessOperatorHostErrorV1::NotFound,
         HarnessServiceError::SchedulerBusy => HarnessOperatorHostErrorV1::Busy,
@@ -9581,7 +9681,167 @@ fn map_operator_service_error(error: HarnessServiceError) -> HarnessOperatorHost
         | HarnessServiceError::Json(_)
         | HarnessServiceError::Corrupt(_)
         | HarnessServiceError::MutationDigest(_) => HarnessOperatorHostErrorV1::Internal,
-        _ => HarnessOperatorHostErrorV1::Conflict,
+        HarnessServiceError::UnsupportedCheckpoint(version) => {
+            HarnessOperatorHostErrorV1::UnsupportedCheckpointVersion { version }
+        }
+        HarnessServiceError::InvalidDispatchContext(reason) => {
+            HarnessOperatorHostErrorV1::InvalidDispatchContext { reason: reason.to_string() }
+        }
+        HarnessServiceError::MutationDigestMismatch => {
+            HarnessOperatorHostErrorV1::MutationDigestMismatch
+        }
+        HarnessServiceError::DispatchFingerprint => {
+            HarnessOperatorHostErrorV1::DispatchFingerprintUnavailable
+        }
+        HarnessServiceError::NonAtomicRunOperation => {
+            HarnessOperatorHostErrorV1::NonAtomicRunOperation
+        }
+        HarnessServiceError::AcceptedSpawnProofRequired => {
+            HarnessOperatorHostErrorV1::AcceptedSpawnProofRequired
+        }
+        HarnessServiceError::InvalidAcceptedSpawnProof(reason) => {
+            HarnessOperatorHostErrorV1::InvalidAcceptedSpawnProof { reason: reason.to_string() }
+        }
+        HarnessServiceError::DeliveryAuthorityWindowClosed => {
+            HarnessOperatorHostErrorV1::DeliveryAuthorityWindowClosed
+        }
+        HarnessServiceError::DeliveryCompilationInvalid => {
+            HarnessOperatorHostErrorV1::DeliveryCompilationInvalid
+        }
+        HarnessServiceError::InvalidStagedDeliveryProof(reason) => {
+            HarnessOperatorHostErrorV1::InvalidStagedDeliveryProof { reason: reason.to_string() }
+        }
+        HarnessServiceError::AtomicDeliveryCommitRequired => {
+            HarnessOperatorHostErrorV1::AtomicDeliveryCommitRequired
+        }
+        HarnessServiceError::ContinuationAuthorityWindowClosed => {
+            HarnessOperatorHostErrorV1::ContinuationAuthorityWindowClosed
+        }
+        HarnessServiceError::InvalidContinuationProof(reason) => {
+            HarnessOperatorHostErrorV1::InvalidContinuationProof { reason: reason.to_string() }
+        }
+        HarnessServiceError::AtomicContinuationBindRequired => {
+            HarnessOperatorHostErrorV1::AtomicContinuationBindRequired
+        }
+        HarnessServiceError::InvalidHarnessMcpReservation(reason) => {
+            HarnessOperatorHostErrorV1::InvalidHarnessMcpReservation { reason: reason.to_string() }
+        }
+        HarnessServiceError::HarnessMcpGrantActorRefused {
+            actor_kind, parent_run_id, grant_actor_run_id,
+        } => HarnessOperatorHostErrorV1::HarnessMcpGrantActorRefused {
+            actor_kind: actor_kind.to_string(),
+            parent_run_id,
+            grant_actor_run_id,
+        },
+        HarnessServiceError::HarnessMcpGrantOperationLinkRefused {
+            grant_id, operation_id, existing_grant_id,
+        } => HarnessOperatorHostErrorV1::HarnessMcpGrantOperationLinkRefused {
+            grant_id, operation_id, existing_grant_id,
+        },
+        HarnessServiceError::HarnessMcpGrantRevisionRefused {
+            grant_id, durable_revision, presented_revision,
+        } => HarnessOperatorHostErrorV1::HarnessMcpGrantRevisionRefused {
+            grant_id, durable_revision, presented_revision,
+        },
+        HarnessServiceError::HarnessMcpGrantLinkRefused {
+            grant_id, grant_actor_run_id, dispatch_actor_run_id,
+        } => HarnessOperatorHostErrorV1::HarnessMcpGrantLinkRefused {
+            grant_id, grant_actor_run_id, dispatch_actor_run_id,
+        },
+        HarnessServiceError::HarnessMcpGrantTargetRefused {
+            grant_id, presented_target, allowed_targets,
+        } => HarnessOperatorHostErrorV1::HarnessMcpGrantTargetRefused {
+            grant_id, presented_target, allowed_targets,
+        },
+        HarnessServiceError::HarnessMcpReplayMismatch => {
+            HarnessOperatorHostErrorV1::HarnessMcpReplayMismatch
+        }
+        HarnessServiceError::HarnessMcpProofMismatch => {
+            HarnessOperatorHostErrorV1::HarnessMcpProofMismatch
+        }
+        HarnessServiceError::HarnessMcpArmProofReservationFieldRefused {
+            field, durable, proof,
+        } => HarnessOperatorHostErrorV1::HarnessMcpArmProofReservationFieldRefused {
+            field: field.to_string(), durable, proof,
+        },
+        HarnessServiceError::HarnessMcpArmProofRouteRefused { field, durable, route } => {
+            HarnessOperatorHostErrorV1::HarnessMcpArmProofRouteRefused {
+                field: field.to_string(), durable, route,
+            }
+        }
+        HarnessServiceError::HarnessMcpArmProofBindingRefused { field, expected, actual } => {
+            HarnessOperatorHostErrorV1::HarnessMcpArmProofBindingRefused {
+                field: field.to_string(), expected, actual,
+            }
+        }
+        HarnessServiceError::HarnessMcpArmDurableLookupMissing {
+            missing, operation_id, reservation_id,
+        } => HarnessOperatorHostErrorV1::HarnessMcpArmDurableLookupMissing {
+            missing: missing.to_string(),
+            operation_id,
+            reservation_id: reservation_id.map(|id| id.as_str().to_string()),
+        },
+        HarnessServiceError::HarnessMcpArmReservationNotReadyRefused {
+            reservation_id, state, armed_at_unix_ms, updated_at_unix_ms, expires_at_unix_ms,
+        } => HarnessOperatorHostErrorV1::HarnessMcpArmReservationNotReadyRefused {
+            reservation_id: reservation_id.as_str().to_string(),
+            state: format!("{state:?}"),
+            armed_at_unix_ms,
+            updated_at_unix_ms,
+            expires_at_unix_ms,
+        },
+        HarnessServiceError::HarnessMcpArmRouteInvalid { operation_id, field, value } => {
+            HarnessOperatorHostErrorV1::HarnessMcpArmRouteInvalid {
+                operation_id, field: field.to_string(), value,
+            }
+        }
+        HarnessServiceError::HarnessMcpLaunchPolicyRefused { plan_policy, reservation_present } => {
+            HarnessOperatorHostErrorV1::HarnessMcpLaunchPolicyRefused {
+                plan_policy: plan_policy.to_string(), reservation_present,
+            }
+        }
+        HarnessServiceError::HarnessMcpLaunchReservationNotArmedRefused {
+            reservation_id, state,
+        } => HarnessOperatorHostErrorV1::HarnessMcpLaunchReservationNotArmedRefused {
+            reservation_id: reservation_id.as_str().to_string(),
+            state: format!("{state:?}"),
+        },
+        HarnessServiceError::HarnessMcpLaunchOperationRefused {
+            reservation_operation_id, dispatch_operation_id,
+        } => HarnessOperatorHostErrorV1::HarnessMcpLaunchOperationRefused {
+            reservation_operation_id, dispatch_operation_id,
+        },
+        HarnessServiceError::HarnessMcpLaunchGrantRefused {
+            plan_grant_id, plan_grant_revision, reservation_grant_id, reservation_grant_revision,
+        } => HarnessOperatorHostErrorV1::HarnessMcpLaunchGrantRefused {
+            plan_grant_id, plan_grant_revision, reservation_grant_id, reservation_grant_revision,
+        },
+        HarnessServiceError::HarnessMcpSpecializedTransitionRequired => {
+            HarnessOperatorHostErrorV1::HarnessMcpSpecializedTransitionRequired
+        }
+        HarnessServiceError::OperatorRequestConflict { operation_id } => {
+            HarnessOperatorHostErrorV1::OperatorRequestConflict { operation_id }
+        }
+        HarnessServiceError::InvalidOperatorTaskTransition { from, to } => {
+            HarnessOperatorHostErrorV1::InvalidOperatorTaskTransition { from, to }
+        }
+        HarnessServiceError::TaskHasActiveRun => HarnessOperatorHostErrorV1::TaskHasActiveRun,
+        HarnessServiceError::ExecutionSpecRevisionMismatch { expected, actual } => {
+            HarnessOperatorHostErrorV1::ExecutionSpecRevisionMismatch { expected, actual }
+        }
+        HarnessServiceError::ExecutionSpecLaunchMismatch => {
+            HarnessOperatorHostErrorV1::ExecutionSpecLaunchMismatch
+        }
+        HarnessServiceError::IssuedExecutionCasMismatch { expected, spec, issuance } => {
+            HarnessOperatorHostErrorV1::IssuedExecutionCasMismatch { expected, spec, issuance }
+        }
+        HarnessServiceError::TaskNotReady => HarnessOperatorHostErrorV1::TaskNotReady,
+        HarnessServiceError::SchedulerResourceExhausted => {
+            HarnessOperatorHostErrorV1::SchedulerResourceExhausted
+        }
+        HarnessServiceError::SchedulerInvalidGraph(reason) => {
+            HarnessOperatorHostErrorV1::SchedulerInvalidGraph { reason: reason.to_string() }
+        }
     }
 }
 

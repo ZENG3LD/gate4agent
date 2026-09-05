@@ -45,7 +45,7 @@ fn usage() -> &'static str {
      \x20 results TASK_ID\n\
      \x20 task create --title TITLE --body BODY [--parent TASK_ID]\n\
      \x20 task move TASK_ID --to STATE\n\
-     \x20 launch-options TASK_ID\n\
+     \x20 launch-options TASK_ID [--provider ID] [--workspace ID] [--plan ID] [--after PLAN_ID]\n\
      \x20 spec save TASK_ID --plan PLAN_ID [--context-source-run RUN_ID] [--delivery BUNDLE_ID] [--review POLICY]\n\
      \x20 task start TASK_ID\n\
      \x20 observe-context RUN_ID\n\
@@ -92,7 +92,13 @@ enum Command {
     Results { task_id: HarnessTaskId },
     TaskCreate { title: String, body: String, parent: Option<HarnessTaskId> },
     TaskMove { task_id: HarnessTaskId, to: HarnessTaskStateV1 },
-    LaunchOptions { task_id: HarnessTaskId },
+    LaunchOptions {
+        task_id: HarnessTaskId,
+        provider: Option<HarnessSelectorV1>,
+        workspace: Option<HarnessSelectorV1>,
+        plan_id: Option<HarnessSelectorV1>,
+        after: Option<HarnessSelectorV1>,
+    },
     SpecSave {
         task_id: HarnessTaskId,
         plan: String,
@@ -318,6 +324,13 @@ fn parse_record_id(value: String) -> Result<HarnessSelectorV1, String> {
     HarnessSelectorV1::new(value).map_err(|_| "invalid record id".to_owned())
 }
 
+/// `--provider`/`--workspace`/`--plan`/`--after` on `launch-options` all name
+/// a `HarnessSelectorV1` (a provider id, workspace id, or plan id -- the
+/// three fields `HarnessOrdinaryLaunchPlanOptionV1` filters on).
+fn parse_selector(value: String) -> Result<HarnessSelectorV1, String> {
+    HarnessSelectorV1::new(value.clone()).map_err(|_| format!("invalid selector value: {value}"))
+}
+
 fn parse_mail_message_id(value: String) -> Result<HarnessMailMessageId, String> {
     HarnessMailMessageId::new(value).map_err(|_| "invalid mail message id".to_owned())
 }
@@ -416,7 +429,11 @@ fn build_command(
         }
         Verb::LaunchOptions => {
             let task_id = expect_single_positional(positionals, "task-id").and_then(parse_task_id)?;
-            Ok(Command::LaunchOptions { task_id })
+            let provider = take_flag(flags, "provider").map(parse_selector).transpose()?;
+            let workspace = take_flag(flags, "workspace").map(parse_selector).transpose()?;
+            let plan_id = take_flag(flags, "plan").map(parse_selector).transpose()?;
+            let after = take_flag(flags, "after").map(parse_selector).transpose()?;
+            Ok(Command::LaunchOptions { task_id, provider, workspace, plan_id, after })
         }
         Verb::SpecSave => {
             let task_id = expect_single_positional(positionals, "task-id").and_then(parse_task_id)?;
@@ -809,13 +826,23 @@ fn execute(invocation: Invocation) -> Result<String, String> {
                 .map_err(|error| error.to_string())?;
             render(&outcome)
         }
-        Command::LaunchOptions { task_id } => {
-            let options = client.task_launch_options_get(task_id).map_err(|error| error.to_string())?;
+        Command::LaunchOptions { task_id, provider, workspace, plan_id, after } => {
+            let options = client
+                .task_launch_options_get_page(task_id, provider, workspace, plan_id, after)
+                .map_err(|error| error.to_string())?;
             render(&options)
         }
         Command::SpecSave { task_id, plan, context_source_run, delivery, review } => {
+            // One request, no paging loop: the catalogue's derived plan list
+            // can exceed a single page (`HARNESS_TASK_LAUNCH_OPTIONS_MAX`),
+            // so resolve `--plan` through the `plan_id` filter rather than
+            // scanning `launch-options`'s own unfiltered first page -- a
+            // plan sitting past that page boundary must still resolve here.
+            let plan_selector = parse_selector(plan.clone())?;
             let options = client
-                .task_launch_options_get(task_id.clone())
+                .task_launch_options_get_page(
+                    task_id.clone(), None, None, Some(plan_selector), None,
+                )
                 .map_err(|error| error.to_string())?;
             let plan = resolve_plan(&options, &plan)?;
             let context_source = context_source_run
@@ -1545,6 +1572,62 @@ mod tests {
     }
 
     #[test]
+    fn launch_options_parses_provider_workspace_plan_and_after_filters() {
+        let task_id = format!("htask_{}", "f".repeat(24));
+        let outcome = parse(
+            &[
+                "gate4agent-harnessctl",
+                "launch-options",
+                &task_id,
+                "--provider",
+                "codex",
+                "--workspace",
+                "workspace-a",
+                "--plan",
+                "ordinary-codex",
+                "--after",
+                "ordinary-a",
+                "--harness-operator",
+                "127.0.0.1:18080",
+            ],
+            &[(HARNESS_OPERATOR_TOKEN_ENV, &token())],
+        )
+        .unwrap();
+        let ParseOutcome::Run(invocation) = outcome else { panic!("expected run") };
+        let Command::LaunchOptions { task_id: actual, provider, workspace, plan_id, after } =
+            invocation.command
+        else {
+            panic!("expected launch-options")
+        };
+        assert_eq!(actual.as_str(), task_id);
+        assert_eq!(provider.unwrap().as_str(), "codex");
+        assert_eq!(workspace.unwrap().as_str(), "workspace-a");
+        assert_eq!(plan_id.unwrap().as_str(), "ordinary-codex");
+        assert_eq!(after.unwrap().as_str(), "ordinary-a");
+    }
+
+    #[test]
+    fn launch_options_filters_all_default_to_absent() {
+        let task_id = format!("htask_{}", "g".repeat(24));
+        let outcome = parse(
+            &[
+                "gate4agent-harnessctl",
+                "launch-options",
+                &task_id,
+                "--harness-operator",
+                "127.0.0.1:18080",
+            ],
+            &[(HARNESS_OPERATOR_TOKEN_ENV, &token())],
+        )
+        .unwrap();
+        let ParseOutcome::Run(invocation) = outcome else { panic!("expected run") };
+        assert!(matches!(
+            invocation.command,
+            Command::LaunchOptions { provider: None, workspace: None, plan_id: None, after: None, .. },
+        ));
+    }
+
+    #[test]
     fn resolve_plan_context_source_and_delivery_match_exactly_against_current_options() {
         let task_id = HarnessTaskId::new(format!("htask_{}", "d".repeat(24))).unwrap();
         let run_id = HarnessRunId::new(format!("hrun_{}", "e".repeat(24))).unwrap();
@@ -1603,6 +1686,7 @@ mod tests {
             }],
             current_issued_spec: None,
             truncated: false,
+            next_after: None,
         };
         options.validate().unwrap();
 

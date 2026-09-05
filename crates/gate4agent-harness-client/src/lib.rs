@@ -940,8 +940,30 @@ impl HarnessOperatorClient {
         &self,
         task_id: HarnessTaskId,
     ) -> Result<HarnessTaskLaunchOptionsV1, HarnessOperatorClientError> {
+        self.task_launch_options_get_page(task_id, None, None, None, None)
+    }
+
+    /// The paged/filtered form of [`Self::task_launch_options_get`]:
+    /// `provider`/`workspace`/`plan_id` filter the derived plan list, `after`
+    /// pages it (`HarnessOperatorRequestV1::TaskLaunchOptionsGet`'s own doc
+    /// comment). A `None` for all four is exactly `task_launch_options_get`'s
+    /// unfiltered first page.
+    pub fn task_launch_options_get_page(
+        &self,
+        task_id: HarnessTaskId,
+        provider: Option<HarnessSelectorV1>,
+        workspace: Option<HarnessSelectorV1>,
+        plan_id: Option<HarnessSelectorV1>,
+        after: Option<HarnessSelectorV1>,
+    ) -> Result<HarnessTaskLaunchOptionsV1, HarnessOperatorClientError> {
         let expected_task_id = task_id.clone();
-        match self.send(HarnessOperatorRequestV1::TaskLaunchOptionsGet { task_id })? {
+        match self.send(HarnessOperatorRequestV1::TaskLaunchOptionsGet {
+            task_id,
+            provider,
+            workspace,
+            plan_id,
+            after,
+        })? {
             HarnessOperatorResponseV1::TaskLaunchOptions(value) => {
                 value.validate_for(&expected_task_id)?;
                 Ok(value)
@@ -2299,6 +2321,7 @@ mod tests {
             delivery_bundles: Vec::new(),
             current_issued_spec: None,
             truncated: false,
+            next_after: None,
         }
     }
 
@@ -2366,7 +2389,7 @@ mod tests {
                     serde_json::from_str(request.trim_end()).expect("operator envelope");
                 assert_eq!(envelope.build_stamp, BUILD_STAMP);
                 let response = match (index, envelope.request) {
-                    (0, HarnessOperatorRequestV1::TaskLaunchOptionsGet { task_id }) => {
+                    (0, HarnessOperatorRequestV1::TaskLaunchOptionsGet { task_id, .. }) => {
                         assert_eq!(task_id, expected_task_id);
                         HarnessOperatorResponseV1::TaskLaunchOptions(expected_options.clone())
                     }

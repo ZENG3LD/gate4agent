@@ -830,13 +830,17 @@ impl HarnessService {
         self.engine.task_execution_spec_v2(task_id)
     }
 
-    pub fn operator_replace_task_execution_spec_v2(
+    pub(crate) fn operator_replace_task_execution_spec_v2(
         &mut self,
-        options: &HarnessTaskLaunchOptionsV1,
+        catalogue: &HarnessFullTaskLaunchCatalogueV1,
         request: HarnessReplaceTaskExecutionSpecRequestV2,
     ) -> Result<HarnessApplyOutcome, HarnessServiceError> {
         self.ensure_healthy()?;
-        request.validate().map_err(|_| HarnessServiceError::InvalidTaskLaunchSelection)?;
+        request.validate().map_err(|_| HarnessServiceError::InvalidTaskLaunchSelection {
+            task_id: request.task_id.clone(),
+            plan_id: Some(request.selection.plan.plan.plan_id.clone()),
+            why: "replace-task-execution-spec-v2 request failed structural validation",
+        })?;
         let command_digest = operator_command_digest(
             "replace-task-execution-spec-v2",
             &request,
@@ -853,9 +857,13 @@ impl HarnessService {
         if !matches!(task.state, HarnessTaskStateV1::Backlog | HarnessTaskStateV1::Ready)
             || self.scheduler_task_has_nonterminal_run(task)?
         {
-            return Err(HarnessServiceError::InvalidTaskLaunchSelection);
+            return Err(HarnessServiceError::InvalidTaskLaunchSelection {
+                task_id: request.task_id.clone(),
+                plan_id: Some(request.selection.plan.plan.plan_id.clone()),
+                why: "task is not in Backlog/Ready, or has a nonterminal run",
+            });
         }
-        validate_current_launch_options(options, &request)?;
+        validate_current_launch_options(catalogue, &request)?;
         let current_spec = self.engine.task_execution_spec_v2(&request.task_id);
         let current_issuance = self.engine.task_launch_issuance(&request.task_id);
         let (revision, created_at_unix_ms) = match (
@@ -913,7 +921,7 @@ impl HarnessService {
             },
             context_source: request.selection.context_source.clone(),
             delivery: request.selection.delivery.clone(),
-            policy_digest: options.policy_digest.clone(),
+            policy_digest: catalogue.policy_digest.clone(),
             created_at_unix_ms,
             updated_at_unix_ms: request.authority.now_unix_ms,
         };
@@ -951,12 +959,16 @@ impl HarnessService {
     pub(crate) fn start_task_v2(
         &mut self,
         catalog: &HarnessLaunchCatalog,
-        options: &HarnessTaskLaunchOptionsV1,
+        catalogue: &HarnessFullTaskLaunchCatalogueV1,
         request: HarnessStartTaskRequestV2,
     ) -> Result<HarnessTaskStartOutcomeV1, HarnessServiceError> {
         self.ensure_healthy()?;
         if request.validate().is_err() {
-            return Err(HarnessServiceError::InvalidTaskLaunchSelection);
+            return Err(HarnessServiceError::InvalidTaskLaunchSelection {
+                task_id: request.task_id.clone(),
+                plan_id: None,
+                why: "start-task-v2 request failed structural validation",
+            });
         }
         let command_digest = operator_command_digest("start-task-v2", &request)?;
         if self.replay_operator_request(
@@ -978,7 +990,7 @@ impl HarnessService {
             .ok_or(HarnessServiceError::ExecutionSpecMissing)?
             .clone();
         validate_service_issued_execution_spec(&issuance, &spec)?;
-        validate_current_issued_launch_options(options, &issuance)?;
+        validate_current_issued_launch_options(catalogue, &issuance)?;
         if spec.revision != request.expected_execution_spec_revision
             || issuance.revision != request.expected_execution_spec_revision
             || issuance.reference() != request.expected_launch_issuance
@@ -1002,7 +1014,11 @@ impl HarnessService {
         if current_task.revision != request.expected_task_revision
             || current_task.creator != operator_actor(&request.authority)
         {
-            return Err(HarnessServiceError::InvalidTaskLaunchSelection);
+            return Err(HarnessServiceError::InvalidTaskLaunchSelection {
+                task_id: request.task_id.clone(),
+                plan_id: Some(issuance.plan.plan_id.clone()),
+                why: "current ready task revision or creator no longer matches the issued launch",
+            });
         }
         let plan = catalog.resolve(&issuance.plan)?;
         if !plan.is_ordinary_dispatch()
@@ -1012,7 +1028,11 @@ impl HarnessService {
             || plan.provider_profile != issuance.target.provider_profile
             || plan.mode != issuance.target.mode
         {
-            return Err(HarnessServiceError::InvalidTaskLaunchSelection);
+            return Err(HarnessServiceError::InvalidTaskLaunchSelection {
+                task_id: request.task_id.clone(),
+                plan_id: Some(issuance.plan.plan_id.clone()),
+                why: "resolved launch plan no longer matches the issued target",
+            });
         }
         let scheduled = plan.scheduled_ref()?;
         let ids = dispatch::deterministic_issued_dispatch_ids(
@@ -1085,7 +1105,11 @@ impl HarnessService {
                 updated_at_unix_ms: request.authority.now_unix_ms,
             }),
             (None, None) => None,
-            _ => return Err(HarnessServiceError::InvalidTaskLaunchSelection),
+            _ => return Err(HarnessServiceError::InvalidTaskLaunchSelection {
+                task_id: request.task_id.clone(),
+                plan_id: Some(issuance.plan.plan_id.clone()),
+                why: "delivery selection shape does not match the issuance",
+            }),
         };
         let continuation = match (
             &issuance.context_source,
@@ -1094,12 +1118,24 @@ impl HarnessService {
         ) {
             (Some(source), Some(continuation_ref), Some(receipt_ref)) => {
                 let source_run = self.engine.run(&source.source_run_id)
-                    .ok_or(HarnessServiceError::InvalidTaskLaunchSelection)?;
+                    .ok_or_else(|| HarnessServiceError::InvalidTaskLaunchSelection {
+                        task_id: request.task_id.clone(),
+                        plan_id: Some(issuance.plan.plan_id.clone()),
+                        why: "context source run no longer exists",
+                    })?;
                 let source_binding = source_run.binding.as_ref()
                     .filter(|binding| source_binding_matches_context_selection(binding, source))
-                    .ok_or(HarnessServiceError::InvalidTaskLaunchSelection)?;
+                    .ok_or_else(|| HarnessServiceError::InvalidTaskLaunchSelection {
+                        task_id: request.task_id.clone(),
+                        plan_id: Some(issuance.plan.plan_id.clone()),
+                        why: "context source run binding no longer matches the context source",
+                    })?;
                 let source_context = self.dispatch_contexts.get(&source_run.operation_id)
-                    .ok_or(HarnessServiceError::InvalidTaskLaunchSelection)?;
+                    .ok_or_else(|| HarnessServiceError::InvalidTaskLaunchSelection {
+                        task_id: request.task_id.clone(),
+                        plan_id: Some(issuance.plan.plan_id.clone()),
+                        why: "context source dispatch context is missing",
+                    })?;
                 // For a Durable source, `source_binding.node_incarnation`
                 // (the source run's own original spawn-accept binding) is
                 // necessarily stale once the Node has restarted.
@@ -1153,7 +1189,11 @@ impl HarnessService {
                 })
             }
             (None, None, None) => None,
-            _ => return Err(HarnessServiceError::InvalidTaskLaunchSelection),
+            _ => return Err(HarnessServiceError::InvalidTaskLaunchSelection {
+                task_id: request.task_id.clone(),
+                plan_id: Some(issuance.plan.plan_id.clone()),
+                why: "continuation selection shape does not match the issuance",
+            }),
         };
         let mut operation = HarnessOperationV1 {
             operation_id: request.authority.operation_id.clone(),
@@ -4785,10 +4825,20 @@ impl HarnessService {
             let checkpoint = prepared.checkpoint();
             let run = prepared.operation().run_id.as_ref()
                 .and_then(|run_id| checkpoint.runs.iter().find(|run| &run.run_id == run_id))
-                .ok_or(HarnessServiceError::InvalidTaskLaunchSelection)?;
+                .ok_or_else(|| HarnessServiceError::InvalidTaskLaunchSelection {
+                    task_id: issuance.task_id.clone(),
+                    plan_id: Some(issuance.plan.plan_id.clone()),
+                    why: "prepared mutation names no run for its own issued launch",
+                })?;
             validate_issued_launch_snapshot(&issuance, run)?;
+            let issuance_task_id = issuance.task_id.clone();
+            let issuance_plan_id = issuance.plan.plan_id.clone();
             if issued_launches.insert(operation_id, issuance).is_some() {
-                return Err(HarnessServiceError::InvalidTaskLaunchSelection);
+                return Err(HarnessServiceError::InvalidTaskLaunchSelection {
+                    task_id: issuance_task_id,
+                    plan_id: Some(issuance_plan_id),
+                    why: "operation already carries a committed launch issuance",
+                });
             }
         }
         let reservations = reconcile_harness_mcp_reservations(
@@ -5116,85 +5166,226 @@ fn hmac_request_digest<T: Serialize>(
     Ok(HarnessRequestDigest::new(hex)?)
 }
 
+/// The full, unpaged derivation of a task's launch options: every currently
+/// valid plan / managed-worktree profile / context source / delivery bundle,
+/// with no `HARNESS_TASK_LAUNCH_OPTIONS_MAX` cap. `validate_current_launch_
+/// options`/`validate_current_issued_launch_options` check a selection
+/// against THIS, never against the operator wire's own
+/// `HarnessTaskLaunchOptionsV1` -- that type is one bounded PAGE of the same
+/// catalogue for display (`runtime.rs`'s `task_launch_options`), and a plan
+/// sitting past that page boundary must still be an acceptable selection. A
+/// stack whose derived catalogue exceeds the page size used to have every
+/// `spec save` refused outright, because the page's own `truncated: true`
+/// was (wrongly) read as "this selection cannot be validated" -- see
+/// `runtime.rs`'s `full_task_launch_catalogue`, the untruncated builder this
+/// type is constructed from.
+pub(crate) struct HarnessFullTaskLaunchCatalogueV1 {
+    pub task_id: HarnessTaskId,
+    pub task_revision: HarnessRevision,
+    pub policy_digest: HarnessRequestDigest,
+    pub plans: Vec<gate4agent_harness_api::HarnessOrdinaryLaunchPlanOptionV1>,
+    pub managed_worktree_profiles:
+        Vec<gate4agent_harness_api::HarnessManagedWorktreeProfileOptionV1>,
+    pub context_sources: Vec<HarnessContextSourceSelectionV1>,
+    pub delivery_bundles: Vec<gate4agent_harness_protocol::HarnessDeliveryBundleSelectionV1>,
+}
+
+impl HarnessFullTaskLaunchCatalogueV1 {
+    /// Defensive self-check on the catalogue's own shape: every item is
+    /// individually well-formed, each list is sorted and duplicate-free (the
+    /// same invariant `HarnessTaskLaunchOptionsV1::validate()` enforces on
+    /// its bounded page), and this catalogue actually belongs to `task_id`.
+    /// Never returns a reason -- a failure here means the catalogue was
+    /// built wrong, not that the caller's selection was wrong.
+    fn shape_is_valid_for(&self, task_id: &HarnessTaskId) -> bool {
+        &self.task_id == task_id
+            && self.task_id.validate().is_ok()
+            && self.task_revision.validate().is_ok()
+            && self.policy_digest.validate().is_ok()
+            && self.plans.iter().all(|plan| plan.validate().is_ok())
+            && self.managed_worktree_profiles.iter().all(|profile| profile.validate().is_ok())
+            && self.context_sources.iter().all(|source| source.validate().is_ok())
+            && self.delivery_bundles.iter().all(|delivery| delivery.validate().is_ok())
+            && !self.plans.windows(2).any(|items| {
+                (&items[0].plan.plan_id, items[0].plan.revision)
+                    >= (&items[1].plan.plan_id, items[1].plan.revision)
+            })
+            && !self.managed_worktree_profiles.windows(2).any(|items| {
+                (
+                    &items[0].node_id,
+                    &items[0].source_workspace_id,
+                    &items[0].profile_id,
+                    &items[0].profile_revision,
+                ) >= (
+                    &items[1].node_id,
+                    &items[1].source_workspace_id,
+                    &items[1].profile_id,
+                    &items[1].profile_revision,
+                )
+            })
+            && !self.context_sources.windows(2).any(|items| {
+                (&items[0].source_run_id, items[0].source_run_revision)
+                    >= (&items[1].source_run_id, items[1].source_run_revision)
+            })
+            && !self.delivery_bundles.windows(2).any(|items| {
+                (&items[0].bundle.bundle_id, &items[0].bundle.revision)
+                    >= (&items[1].bundle.bundle_id, &items[1].bundle.revision)
+            })
+    }
+}
+
+/// The full-catalogue twin of `task_launch_policy_digest`: same canonical
+/// hash domain, minus the `truncated` field that function's material used to
+/// carry -- a PAGE's truncation is a presentation artifact of the operator
+/// read wire, not part of what a launch selection is validated against, so
+/// it never belonged in a digest two DIFFERENT catalogue derivations (spec-
+/// save time and start time) are compared against each other by.
+pub(crate) fn task_launch_policy_digest_full(
+    catalogue: &HarnessFullTaskLaunchCatalogueV1,
+) -> Result<HarnessRequestDigest, HarnessServiceError> {
+    #[derive(Serialize)]
+    struct CanonicalFullLaunchPolicy<'a> {
+        task_id: &'a HarnessTaskId,
+        task_revision: HarnessRevision,
+        plans: &'a [gate4agent_harness_api::HarnessOrdinaryLaunchPlanOptionV1],
+        managed_worktree_profiles:
+            Vec<gate4agent_harness_api::HarnessManagedWorktreeProfileOptionV1>,
+        context_sources: Vec<HarnessContextSourceSelectionV1>,
+        delivery_bundles:
+            &'a [gate4agent_harness_protocol::HarnessDeliveryBundleSelectionV1],
+    }
+
+    let managed_worktree_profiles = catalogue.managed_worktree_profiles.iter()
+        .cloned()
+        .map(|mut profile| {
+            profile.observed_at_unix_ms = 0;
+            profile
+        })
+        .collect();
+    let context_sources = catalogue.context_sources.iter().cloned().map(|mut source| {
+        source.observed_at_unix_ms = 0;
+        source
+    }).collect();
+    let material = CanonicalFullLaunchPolicy {
+        task_id: &catalogue.task_id,
+        task_revision: catalogue.task_revision,
+        plans: &catalogue.plans,
+        managed_worktree_profiles,
+        context_sources,
+        delivery_bundles: &catalogue.delivery_bundles,
+    };
+    hmac_request_digest(HARNESS_LAUNCH_POLICY_DIGEST_DOMAIN, &material)
+}
+
 fn validate_current_launch_options(
-    options: &HarnessTaskLaunchOptionsV1,
+    catalogue: &HarnessFullTaskLaunchCatalogueV1,
     request: &HarnessReplaceTaskExecutionSpecRequestV2,
 ) -> Result<(), HarnessServiceError> {
-    options.validate_for(&request.task_id)
-        .map_err(|_| HarnessServiceError::InvalidTaskLaunchSelection)?;
-    if options.truncated
-        || options.task_revision != request.expected_task_revision
-        || options.policy_digest != task_launch_policy_digest(options)?
-        || !options.plans.contains(&request.selection.plan)
-        || request.selection.context_source.as_ref()
-            .is_some_and(|source| !options.context_sources.iter()
-                .any(|current| context_source_semantically_matches(current, source)))
-        || request.selection.delivery.as_ref()
-            .is_some_and(|delivery| !options.delivery_bundles.contains(delivery))
+    let invalid = |why: &'static str| HarnessServiceError::InvalidTaskLaunchSelection {
+        task_id: request.task_id.clone(),
+        plan_id: Some(request.selection.plan.plan.plan_id.clone()),
+        why,
+    };
+    if !catalogue.shape_is_valid_for(&request.task_id) {
+        return Err(invalid("full launch catalogue failed its own shape self-check"));
+    }
+    if catalogue.task_revision != request.expected_task_revision {
+        return Err(invalid("task revision no longer matches the full launch catalogue"));
+    }
+    if catalogue.policy_digest != task_launch_policy_digest_full(catalogue)? {
+        return Err(invalid("policy digest does not match the full launch catalogue's content"));
+    }
+    if !catalogue.plans.contains(&request.selection.plan) {
+        return Err(invalid("selected plan is not a current option in the full catalogue"));
+    }
+    if request.selection.context_source.as_ref()
+        .is_some_and(|source| !catalogue.context_sources.iter()
+            .any(|current| context_source_semantically_matches(current, source)))
     {
-        return Err(HarnessServiceError::InvalidTaskLaunchSelection);
+        return Err(invalid("selected context source is not a current option"));
+    }
+    if request.selection.delivery.as_ref()
+        .is_some_and(|delivery| !catalogue.delivery_bundles.contains(delivery))
+    {
+        return Err(invalid("selected delivery bundle is not a current option"));
     }
     match &request.selection.worktree {
         HarnessReviewedWorktreeSelectionV1::Existing => {}
         HarnessReviewedWorktreeSelectionV1::Managed { profile } => {
-            if !options.managed_worktree_profiles.iter()
+            if !catalogue.managed_worktree_profiles.iter()
                 .any(|current| managed_profile_semantically_matches(current, profile))
                 || profile.node_id != request.selection.plan.node_id
                 || profile.source_workspace_id != request.selection.plan.source_workspace_id
             {
-                return Err(HarnessServiceError::InvalidTaskLaunchSelection);
+                return Err(invalid("selected managed worktree profile is not a current option"));
             }
         }
     }
     if let Some(source) = &request.selection.context_source {
         if source.metadata_digest != context_source_metadata_digest(source)? {
-            return Err(HarnessServiceError::InvalidTaskLaunchSelection);
+            return Err(invalid("selected context source metadata digest does not match"));
         }
     }
     Ok(())
 }
 
 fn validate_current_issued_launch_options(
-    options: &HarnessTaskLaunchOptionsV1,
+    catalogue: &HarnessFullTaskLaunchCatalogueV1,
     issuance: &HarnessTaskLaunchIssuanceV1,
 ) -> Result<(), HarnessServiceError> {
-    options.validate_for(&issuance.task_id)
-        .map_err(|_| HarnessServiceError::InvalidTaskLaunchSelection)?;
-    if options.truncated
-        || options.task_revision != issuance.task_revision
-        || options.policy_digest != task_launch_policy_digest(options)?
-        || options.policy_digest != issuance.policy_digest
-        || !options.plans.iter().any(|plan| {
-            plan.plan == issuance.plan
-                && plan.node_id == issuance.target.node_id
-                && plan.source_workspace_id == issuance.target.source_workspace_id
-                && plan.provider_profile == issuance.target.provider_profile
-                && plan.mode == issuance.target.mode
-        })
-        || issuance.context_source.as_ref()
-            .is_some_and(|source| !options.context_sources.iter()
-                .any(|current| context_source_semantically_matches(current, source)))
-        || issuance.delivery.as_ref()
-            .is_some_and(|delivery| !options.delivery_bundles.contains(delivery))
+    let invalid = |why: &'static str| HarnessServiceError::InvalidTaskLaunchSelection {
+        task_id: issuance.task_id.clone(),
+        plan_id: Some(issuance.plan.plan_id.clone()),
+        why,
+    };
+    if !catalogue.shape_is_valid_for(&issuance.task_id) {
+        return Err(invalid("full launch catalogue failed its own shape self-check"));
+    }
+    if catalogue.task_revision != issuance.task_revision {
+        return Err(invalid("task revision no longer matches the full launch catalogue"));
+    }
+    if catalogue.policy_digest != task_launch_policy_digest_full(catalogue)? {
+        return Err(invalid("policy digest does not match the full launch catalogue's content"));
+    }
+    if catalogue.policy_digest != issuance.policy_digest {
+        return Err(invalid("issued launch's policy digest no longer matches the current catalogue"));
+    }
+    if !catalogue.plans.iter().any(|plan| {
+        plan.plan == issuance.plan
+            && plan.node_id == issuance.target.node_id
+            && plan.source_workspace_id == issuance.target.source_workspace_id
+            && plan.provider_profile == issuance.target.provider_profile
+            && plan.mode == issuance.target.mode
+    }) {
+        return Err(invalid("issued plan is not a current option in the full catalogue"));
+    }
+    if issuance.context_source.as_ref()
+        .is_some_and(|source| !catalogue.context_sources.iter()
+            .any(|current| context_source_semantically_matches(current, source)))
     {
-        return Err(HarnessServiceError::InvalidTaskLaunchSelection);
+        return Err(invalid("issued context source is not a current option"));
+    }
+    if issuance.delivery.as_ref()
+        .is_some_and(|delivery| !catalogue.delivery_bundles.contains(delivery))
+    {
+        return Err(invalid("issued delivery bundle is not a current option"));
     }
     if let HarnessLaunchWorktreeSelectionV1::Managed {
         profile_id,
         expected_profile_revision,
     } = &issuance.target.worktree {
-        if !options.managed_worktree_profiles.iter().any(|profile| {
+        if !catalogue.managed_worktree_profiles.iter().any(|profile| {
             profile.node_id == issuance.target.node_id
                 && profile.source_workspace_id == issuance.target.source_workspace_id
                 && profile.profile_id == *profile_id
                 && profile.profile_revision == *expected_profile_revision
         }) {
-            return Err(HarnessServiceError::InvalidTaskLaunchSelection);
+            return Err(invalid("issued managed worktree profile is not a current option"));
         }
     }
     if let Some(source) = &issuance.context_source {
         if source.metadata_digest != context_source_metadata_digest(source)? {
-            return Err(HarnessServiceError::InvalidTaskLaunchSelection);
+            return Err(invalid("issued context source metadata digest does not match"));
         }
     }
     Ok(())
@@ -7072,8 +7263,23 @@ pub enum HarnessServiceError {
     },
     #[error("task execution specification launch identity does not match")]
     ExecutionSpecLaunchMismatch,
-    #[error("reviewed task launch selection is stale, truncated, or not in current catalogs")]
-    InvalidTaskLaunchSelection,
+    // Names its own inputs -- the wire mapper (`map_operator_service_error`,
+    // `runtime.rs`) used to collapse every one of these into a bare
+    // `HarnessOperatorHostErrorV1::Conflict` with no further detail, which is
+    // exactly why a launch-catalogue ceiling silently refused every `spec
+    // save` on a stack with a large derived catalogue: the operator saw
+    // "Conflict" and nothing else, for a request that was in fact valid.
+    // `why` is always a fixed literal naming which of `validate_current_
+    // launch_options`'s/`validate_current_issued_launch_options`'s checks
+    // failed, `plan_id` is `Some` whenever the failing check concerns a
+    // specific plan (`None` for a worktree/delivery/continuation shape
+    // mismatch that is not about plan identity).
+    #[error("reviewed task launch selection for task {task_id} (plan {plan_id:?}) is invalid: {why}")]
+    InvalidTaskLaunchSelection {
+        task_id: HarnessTaskId,
+        plan_id: Option<HarnessSelectorV1>,
+        why: &'static str,
+    },
     #[error("issued execution CAS mismatch: expected {expected:?}, spec {spec:?}, issuance {issuance:?}")]
     IssuedExecutionCasMismatch {
         expected: HarnessExpectedExecutionSpecRevisionV1,
@@ -7195,6 +7401,7 @@ mod tests {
             delivery_bundles: Vec::new(),
             current_issued_spec: None,
             truncated: false,
+            next_after: None,
         };
         options.policy_digest = task_launch_policy_digest(&options).unwrap();
         options
@@ -8432,7 +8639,7 @@ mod tests {
             provider_id: HarnessSelectorV1::new(plan.provider.as_str()).unwrap(),
             mode: plan.mode,
         };
-        let mut options = HarnessTaskLaunchOptionsV1 {
+        let mut options = HarnessFullTaskLaunchCatalogueV1 {
             task_id: task_id(),
             task_revision: HarnessRevision::new(1).unwrap(),
             policy_digest: HarnessRequestDigest::new("0".repeat(64)).unwrap(),
@@ -8440,10 +8647,8 @@ mod tests {
             managed_worktree_profiles: Vec::new(),
             context_sources: Vec::new(),
             delivery_bundles: Vec::new(),
-            current_issued_spec: None,
-            truncated: false,
         };
-        options.policy_digest = task_launch_policy_digest(&options).unwrap();
+        options.policy_digest = task_launch_policy_digest_full(&options).unwrap();
         let replace = HarnessReplaceTaskExecutionSpecRequestV2 {
             authority: operator_authority('2', 20),
             task_id: task_id(),
@@ -8492,7 +8697,7 @@ mod tests {
                 &options,
                 replace_after_start,
             ),
-            Err(HarnessServiceError::InvalidTaskLaunchSelection),
+            Err(HarnessServiceError::InvalidTaskLaunchSelection { .. }),
         ));
         assert_eq!(
             service.engine().task_launch_issuance(&task_id()),
@@ -8509,6 +8714,104 @@ mod tests {
             service.start_task_v2(&catalog, &options, changed),
             Err(HarnessServiceError::OperatorRequestConflict { .. }),
         ));
+        service.close().unwrap();
+        remove_database(&path);
+    }
+
+    /// The launch-catalogue ceiling fix's core claim: a full catalogue whose
+    /// `plans` list is far larger than the operator wire's own
+    /// `HARNESS_TASK_LAUNCH_OPTIONS_MAX` (64) page must still accept a
+    /// selection naming a plan past that boundary, and must refuse an
+    /// unknown plan by naming it -- never a bare, unqualified `Conflict`.
+    #[test]
+    fn full_catalogue_past_the_page_ceiling_accepts_a_late_plan_and_names_an_unknown_one() {
+        let path = database_path("full-catalogue-past-page-ceiling");
+        let mut service = HarnessService::open(&path).unwrap();
+        service.operator_create_task(create_task_request(HarnessTaskStateV1::Ready)).unwrap();
+        let plan_option_count = 70;
+        let plans = (0..plan_option_count).map(|index| {
+            let plan = ordinary_launch_plan(&format!("plan-{index:03}"));
+            gate4agent_harness_api::HarnessOrdinaryLaunchPlanOptionV1 {
+                plan: plan.plan_ref().unwrap(),
+                node_id: plan.node_id.clone(),
+                source_workspace_id: plan.workspace_id.clone(),
+                provider_profile: plan.provider_profile.clone(),
+                provider_id: HarnessSelectorV1::new(plan.provider.as_str()).unwrap(),
+                mode: plan.mode,
+            }
+        }).collect::<Vec<_>>();
+        assert!(plan_option_count > gate4agent_harness_api::HARNESS_TASK_LAUNCH_OPTIONS_MAX);
+        let mut catalogue = HarnessFullTaskLaunchCatalogueV1 {
+            task_id: task_id(),
+            task_revision: HarnessRevision::new(1).unwrap(),
+            policy_digest: HarnessRequestDigest::new("0".repeat(64)).unwrap(),
+            plans,
+            managed_worktree_profiles: Vec::new(),
+            context_sources: Vec::new(),
+            delivery_bundles: Vec::new(),
+        };
+        catalogue.policy_digest = task_launch_policy_digest_full(&catalogue).unwrap();
+
+        // An unknown plan -- never in the 70-plan catalogue -- is refused
+        // BY NAME, not by a bare `Conflict`.
+        let unknown = ordinary_launch_plan("plan-unknown");
+        let unknown_option = gate4agent_harness_api::HarnessOrdinaryLaunchPlanOptionV1 {
+            plan: unknown.plan_ref().unwrap(),
+            node_id: unknown.node_id.clone(),
+            source_workspace_id: unknown.workspace_id.clone(),
+            provider_profile: unknown.provider_profile.clone(),
+            provider_id: HarnessSelectorV1::new(unknown.provider.as_str()).unwrap(),
+            mode: unknown.mode,
+        };
+        let refused = service.operator_replace_task_execution_spec_v2(
+            &catalogue,
+            HarnessReplaceTaskExecutionSpecRequestV2 {
+                authority: operator_authority('5', 50),
+                task_id: task_id(),
+                expected_task_revision: HarnessRevision::new(1).unwrap(),
+                expected_execution_spec_revision: HarnessExpectedExecutionSpecRevisionV1::Absent,
+                selection: gate4agent_harness_api::HarnessReviewedTaskLaunchSelectionV1 {
+                    plan: unknown_option,
+                    worktree: HarnessReviewedWorktreeSelectionV1::Existing,
+                    context_source: None,
+                    delivery: None,
+                    review_policy:
+                        gate4agent_harness_protocol::HarnessTaskReviewPolicyV1::OperatorReview,
+                },
+            },
+        );
+        match refused {
+            Err(HarnessServiceError::InvalidTaskLaunchSelection { plan_id, why, .. }) => {
+                assert_eq!(plan_id.as_ref().map(HarnessSelectorV1::as_str), Some("plan-unknown"));
+                assert_eq!(why, "selected plan is not a current option in the full catalogue");
+            }
+            other => panic!("expected a named InvalidTaskLaunchSelection, got {other:?}"),
+        }
+
+        // The chosen plan sits at index 69 -- past the 64-item page ceiling
+        // that used to make `truncated: true` refuse every save outright.
+        let chosen = catalogue.plans[69].clone();
+        assert_eq!(chosen.plan.plan_id.as_str(), "plan-069");
+        assert_eq!(
+            service.operator_replace_task_execution_spec_v2(
+                &catalogue,
+                HarnessReplaceTaskExecutionSpecRequestV2 {
+                    authority: operator_authority('6', 60),
+                    task_id: task_id(),
+                    expected_task_revision: HarnessRevision::new(1).unwrap(),
+                    expected_execution_spec_revision: HarnessExpectedExecutionSpecRevisionV1::Absent,
+                    selection: gate4agent_harness_api::HarnessReviewedTaskLaunchSelectionV1 {
+                        plan: chosen,
+                        worktree: HarnessReviewedWorktreeSelectionV1::Existing,
+                        context_source: None,
+                        delivery: None,
+                        review_policy:
+                            gate4agent_harness_protocol::HarnessTaskReviewPolicyV1::OperatorReview,
+                    },
+                },
+            ).unwrap(),
+            HarnessApplyOutcome::Applied,
+        );
         service.close().unwrap();
         remove_database(&path);
     }
@@ -8537,7 +8840,7 @@ mod tests {
             retention: gate4agent_harness_api::HarnessManagedWorktreeRetentionV1::Retain,
             observed_at_unix_ms: 15,
         };
-        let mut options = HarnessTaskLaunchOptionsV1 {
+        let mut options = HarnessFullTaskLaunchCatalogueV1 {
             task_id: task_id(),
             task_revision: HarnessRevision::new(1).unwrap(),
             policy_digest: HarnessRequestDigest::new("0".repeat(64)).unwrap(),
@@ -8545,10 +8848,8 @@ mod tests {
             managed_worktree_profiles: vec![profile.clone()],
             context_sources: Vec::new(),
             delivery_bundles: Vec::new(),
-            current_issued_spec: None,
-            truncated: false,
         };
-        options.policy_digest = task_launch_policy_digest(&options).unwrap();
+        options.policy_digest = task_launch_policy_digest_full(&options).unwrap();
         service.operator_replace_task_execution_spec_v2(
             &options,
             HarnessReplaceTaskExecutionSpecRequestV2 {

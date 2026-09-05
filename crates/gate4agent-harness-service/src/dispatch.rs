@@ -2170,23 +2170,6 @@ mod tests {
         assert_eq!(kimi_pty_levels.len(), 4);
     }
 
-    #[test]
-    fn zzz_temp_print_gate4agent_plan_ids() {
-        let node = node_inventory(
-            "node-a",
-            &["gate4agent"],
-            &["claude", "codex", "grok", "kimi"],
-            &["default"],
-        );
-        let plans = derive_launch_plans_from_inventory(&[node]);
-        let mut ids = plans.iter().map(|plan| plan.plan_id.as_str().to_owned()).collect::<Vec<_>>();
-        ids.sort();
-        for id in &ids {
-            eprintln!("PLANID {id}");
-        }
-        eprintln!("PLANCOUNT {}", ids.len());
-    }
-
     /// The regression this whole change closes: a derived plan's
     /// `approval_level` must reach `SpawnOverrides::approval_level` as
     /// `Some(_)`, never the hidden `None` the node used to resolve to

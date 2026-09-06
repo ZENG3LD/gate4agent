@@ -24226,6 +24226,7 @@ mod tests {
             digest: gate4agent_harness_client::HarnessRequestDigest::new("2".repeat(64)).unwrap(),
         };
         HarnessTaskLaunchOptionsV1 {
+            context_source_exclusions: Vec::new(),
             task_id: task.task_id.clone(),
             task_revision: task.revision,
             policy_digest: gate4agent_harness_client::HarnessRequestDigest::new("3".repeat(64)).unwrap(),

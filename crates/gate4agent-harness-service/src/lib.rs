@@ -7615,6 +7615,7 @@ mod tests {
             current_issued_spec: None,
             truncated: false,
             next_after: None,
+            context_source_exclusions: Vec::new(),
         };
         options.policy_digest = task_launch_policy_digest(&options).unwrap();
         options

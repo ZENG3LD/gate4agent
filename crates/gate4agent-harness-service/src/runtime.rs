@@ -89,6 +89,7 @@ use gate4agent_harness_api::{
     HarnessReverseAttributionOutcomeV1, HarnessReverseAttributionRelationV1,
     HarnessReverseAttributionSubjectV1, HarnessReverseAttributionV1,
     FeatureObservationStateV1, ProjectionAvailabilityV1, ProjectionFreshnessV1,
+    ContextSourceExclusionEntryV1, ContextSourceExclusionV1,
     HarnessMailFetchResultV1, HarnessReadHostErrorV1, HarnessReadReplyV1,
     HarnessReadResponseV1, RedactedBindingStateV1,
     RedactedRunIntentV1, RedactedRunV1, RedactedTaskV1, RedactedWorktreeIntentV1,
@@ -4113,14 +4114,15 @@ fn evaluate_pending_run_context_source(
         &pending.projection,
     )?;
     let Some(observed_at_unix_ms) = observed_at_unix_ms else { return Ok(None); };
-    let Some(source) = context_source_option(
+    let source = match context_source_option(
         harness,
         observation,
         support,
         runtime_inventory,
         current,
-    )? else {
-        return Ok(None);
+    )? {
+        ContextSourceOutcome::Ready(source) => source,
+        ContextSourceOutcome::Excluded(_) => return Ok(None),
     };
     let RunContextSourceProjection::Aggregate {
         message_count,
@@ -8789,7 +8791,10 @@ fn full_task_launch_catalogue(
     delivery_catalog: &DeliveryCatalogV2,
     runtime_inventory: &HarnessRuntimeInventoryCache,
     task_id: &gate4agent_harness_protocol::HarnessTaskId,
-) -> Result<crate::HarnessFullTaskLaunchCatalogueV1, HarnessOperatorHostErrorV1> {
+) -> Result<
+    (crate::HarnessFullTaskLaunchCatalogueV1, Vec<ContextSourceExclusionEntryV1>),
+    HarnessOperatorHostErrorV1,
+> {
     let task = harness.engine().task(task_id)
         .ok_or(HarnessOperatorHostErrorV1::NotFound)?;
     let (effective_launch, catalog_truncated) =
@@ -8860,21 +8865,29 @@ fn full_task_launch_catalogue(
     });
 
     let mut context_sources = Vec::new();
+    let mut context_source_exclusions = Vec::new();
     for run in harness.engine().runs() {
-        if let Some(source) = context_source_option(
+        match context_source_option(
             harness,
             observation,
             support,
             runtime_inventory,
             run,
         )? {
-            context_sources.push(source);
+            ContextSourceOutcome::Ready(source) => context_sources.push(source),
+            ContextSourceOutcome::Excluded(exclusion) => {
+                context_source_exclusions.push(ContextSourceExclusionEntryV1 {
+                    run_id: run.run_id.clone(),
+                    exclusion,
+                });
+            }
         }
     }
     context_sources.sort_by(|left, right| {
         (&left.source_run_id, left.source_run_revision)
             .cmp(&(&right.source_run_id, right.source_run_revision))
     });
+    context_source_exclusions.sort_by(|left, right| left.run_id.cmp(&right.run_id));
 
     let delivery_bundles = delivery_catalog.iter().map(|(bundle_id, compiled)| {
         let selector = HarnessSelectorV1::new(bundle_id.as_str())?;
@@ -8894,7 +8907,7 @@ fn full_task_launch_catalogue(
     };
     catalogue.policy_digest = crate::task_launch_policy_digest_full(&catalogue)
         .map_err(map_operator_service_error)?;
-    Ok(catalogue)
+    Ok((catalogue, context_source_exclusions))
 }
 
 /// The operator read's own bounded PAGE of [`full_task_launch_catalogue`]:
@@ -8919,7 +8932,7 @@ fn task_launch_options(
     plan_id: Option<&HarnessSelectorV1>,
     after: Option<&HarnessSelectorV1>,
 ) -> Result<HarnessTaskLaunchOptionsV1, HarnessOperatorHostErrorV1> {
-    let full = full_task_launch_catalogue(
+    let (full, mut context_source_exclusions) = full_task_launch_catalogue(
         harness, observation, support, launch_catalog, delivery_catalog, runtime_inventory,
         task_id,
     )?;
@@ -8954,6 +8967,12 @@ fn task_launch_options(
     truncated |= delivery_bundles.len() > gate4agent_harness_api::HARNESS_TASK_LAUNCH_OPTIONS_MAX;
     delivery_bundles.truncate(gate4agent_harness_api::HARNESS_TASK_LAUNCH_OPTIONS_MAX);
 
+    truncated |= context_source_exclusions.len()
+        > gate4agent_harness_api::HARNESS_CONTEXT_SOURCE_EXCLUSIONS_MAX;
+    context_source_exclusions.truncate(
+        gate4agent_harness_api::HARNESS_CONTEXT_SOURCE_EXCLUSIONS_MAX,
+    );
+
     let current_issued_spec = harness.engine().task_execution_spec_v2(task_id).map(|spec| {
         HarnessIssuedExecutionSpecSummaryV1 {
             task_id: spec.task_id.clone(),
@@ -8977,11 +8996,37 @@ fn task_launch_options(
         current_issued_spec,
         truncated,
         next_after,
+        context_source_exclusions,
     };
     options.policy_digest = crate::task_launch_policy_digest(&options)
         .map_err(map_operator_service_error)?;
     options.validate().map_err(|_| HarnessOperatorHostErrorV1::Internal)?;
     Ok(options)
+}
+
+/// `context_source_option`'s own return shape: `Ready` carries the same
+/// selection it always did, `Excluded` names the exact early exit the
+/// function took, via [`ContextSourceExclusionV1`], instead of a silent
+/// `None`. An enum rather than threading a `&mut Vec` through the function:
+/// this keeps `context_source_option` a pure query with no side-effecting
+/// output parameter, and lets a unit test assert the exact exclusion reason
+/// directly off the return value.
+#[derive(Debug, PartialEq)]
+enum ContextSourceOutcome {
+    Ready(HarnessContextSourceSelectionV1),
+    Excluded(ContextSourceExclusionV1),
+}
+
+/// The single choke point every early exit in `context_source_option` goes
+/// through: logs the exclusion so the reason reaches the harness's own logs
+/// even when nobody ever reads `HarnessTaskLaunchOptionsV1::
+/// context_source_exclusions`, then wraps it for return.
+fn context_source_excluded(
+    run_id: &gate4agent_harness_protocol::HarnessRunId,
+    exclusion: ContextSourceExclusionV1,
+) -> Result<ContextSourceOutcome, HarnessOperatorHostErrorV1> {
+    tracing::info!(run_id = run_id.as_str(), reason = ?exclusion, "context source excluded");
+    Ok(ContextSourceOutcome::Excluded(exclusion))
 }
 
 fn context_source_option(
@@ -8990,11 +9035,16 @@ fn context_source_option(
     support: &ObservationSupportRegistry,
     runtime_inventory: &HarnessRuntimeInventoryCache,
     run: &gate4agent_harness_protocol::HarnessRunV1,
-) -> Result<Option<HarnessContextSourceSelectionV1>, HarnessOperatorHostErrorV1> {
+) -> Result<ContextSourceOutcome, HarnessOperatorHostErrorV1> {
     if let Some(pack) = &run.context_pack {
-        let Some(binding) = &run.binding else { return Ok(None); };
+        let Some(binding) = &run.binding else {
+            return context_source_excluded(&run.run_id, ContextSourceExclusionV1::NoBinding);
+        };
         let HarnessSessionIdentityV1::Managed { record_id, .. } = &binding.session else {
-            return Ok(None);
+            return context_source_excluded(
+                &run.run_id,
+                ContextSourceExclusionV1::NoActiveManagedSession,
+            );
         };
         // The durable pack outlives the Node incarnation it was produced
         // under (surviving exactly that restart is the entire point of a
@@ -9018,7 +9068,10 @@ fn context_source_option(
             .find(|node| node.node_id == binding.node_id.as_str())
             .map(|node| node.incarnation_id.clone())
         else {
-            return Ok(None);
+            return context_source_excluded(
+                &run.run_id,
+                ContextSourceExclusionV1::DurableNodeUnknown { node_id: binding.node_id.clone() },
+            );
         };
         let mut source = HarnessContextSourceSelectionV1 {
             source_run_id: run.run_id.clone(),
@@ -9042,7 +9095,7 @@ fn context_source_option(
         source.metadata_digest = crate::context_source_metadata_digest(&source)
             .map_err(map_operator_service_error)?;
         source.validate().map_err(|_| HarnessOperatorHostErrorV1::Internal)?;
-        return Ok(Some(source));
+        return Ok(ContextSourceOutcome::Ready(source));
     }
     // `Running` and `Waiting` both admit a Live source here: a run frozen
     // `Waiting` by the observation-gap rule still has a live session bound
@@ -9055,17 +9108,46 @@ fn context_source_option(
     // what the Managed-binding/current-node-incarnation/instance-generation
     // checks below exist to keep out.
     if !matches!(run.lifecycle, HarnessRunLifecycleV1::Running | HarnessRunLifecycleV1::Waiting) {
-        return Ok(None);
+        return context_source_excluded(
+            &run.run_id,
+            ContextSourceExclusionV1::LifecycleNotLive { lifecycle: run.lifecycle },
+        );
     }
-    let Some(binding) = &run.binding else { return Ok(None); };
+    let Some(binding) = &run.binding else {
+        return context_source_excluded(&run.run_id, ContextSourceExclusionV1::NoBinding);
+    };
     let HarnessSessionIdentityV1::Managed {
         record_id,
         active_session: Some(active_session),
-    } = &binding.session else { return Ok(None); };
+    } = &binding.session else {
+        return context_source_excluded(
+            &run.run_id,
+            ContextSourceExclusionV1::NoActiveManagedSession,
+        );
+    };
     let Some(node) = runtime_inventory.nodes.values().find(|node| {
         node.node_id == binding.node_id.as_str()
             && node.incarnation_id == binding.node_incarnation.as_str()
-    }) else { return Ok(None); };
+    }) else {
+        // The incarnation(s) the inventory DOES currently hold for this
+        // `node_id`, so the operator can read what the binding is stale
+        // against instead of just "unknown" -- bounded, this is diagnostic
+        // context, not a page of anything.
+        let known_incarnations = runtime_inventory.nodes.values()
+            .filter(|candidate| candidate.node_id == binding.node_id.as_str())
+            .map(|candidate| HarnessSelectorV1::new(candidate.incarnation_id.clone()))
+            .take(gate4agent_harness_api::CONTEXT_SOURCE_EXCLUSION_KNOWN_INCARNATIONS_MAX)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| HarnessOperatorHostErrorV1::Internal)?;
+        return context_source_excluded(
+            &run.run_id,
+            ContextSourceExclusionV1::NodeIncarnationUnknown {
+                node_id: binding.node_id.clone(),
+                node_incarnation: binding.node_incarnation.clone(),
+                known_incarnations,
+            },
+        );
+    };
     let Some(_record) = node.inventory.managed_sessions.iter().find(|record| {
         record.record_id == record_id.as_str()
             && record.workspace_id == binding.workspace_id.as_str()
@@ -9074,16 +9156,56 @@ fn context_source_option(
                     && active.instance_id == active_session.instance_id
                     && active.generation == active_session.generation
             })
-    }) else { return Ok(None); };
+    }) else {
+        // The node's own `managed_sessions` page can be a PREFIX of its full
+        // record set (`managed_sessions_truncated`, set when the node holds
+        // more records than the runtime-inventory page carries) -- a record
+        // missing from a truncated page may simply be past that cut, not
+        // genuinely absent from the node. Read those as two different
+        // facts: `ManagedSessionsPageTruncated` names the cut,
+        // `ManagedSessionRecordMismatch` is reserved for an untruncated page
+        // that genuinely does not carry a matching record.
+        let page_len = u32::try_from(node.inventory.managed_sessions.len())
+            .unwrap_or(u32::MAX);
+        let exclusion = if node.inventory.managed_sessions_truncated {
+            ContextSourceExclusionV1::ManagedSessionsPageTruncated {
+                record_id: record_id.clone(),
+                page_len,
+                total: u32::try_from(node.inventory.managed_session_count)
+                    .unwrap_or(u32::MAX),
+            }
+        } else {
+            ContextSourceExclusionV1::ManagedSessionRecordMismatch {
+                record_id: record_id.clone(),
+                workspace_id: binding.workspace_id.clone(),
+                instance_id: active_session.instance_id,
+                generation: active_session.generation,
+                node_has_records: page_len,
+            }
+        };
+        return context_source_excluded(&run.run_id, exclusion);
+    };
     let monitor = match execute_operator_monitor(harness, observation, support, &run.run_id) {
         Ok(monitor) => monitor,
-        Err(_) => return Ok(None),
+        Err(_) => {
+            return context_source_excluded(
+                &run.run_id,
+                ContextSourceExclusionV1::MonitorUnavailable,
+            );
+        }
     };
     if monitor.availability != ProjectionAvailabilityV1::Current
         || monitor.freshness != ProjectionFreshnessV1::Live
         || monitor.transport_incomplete
     {
-        return Ok(None);
+        return context_source_excluded(
+            &run.run_id,
+            ContextSourceExclusionV1::ProjectionNotLive {
+                availability: monitor.availability,
+                freshness: monitor.freshness,
+                transport_incomplete: monitor.transport_incomplete,
+            },
+        );
     }
     // The counts below are best-effort telemetry, not a precondition for
     // this source to exist. `export_context_pack_for_session_record_inner`
@@ -9136,7 +9258,7 @@ fn context_source_option(
     source.metadata_digest = crate::context_source_metadata_digest(&source)
         .map_err(map_operator_service_error)?;
     source.validate().map_err(|_| HarnessOperatorHostErrorV1::Internal)?;
-    Ok(Some(source))
+    Ok(ContextSourceOutcome::Ready(source))
 }
 
 fn execute_operator_request(
@@ -9411,7 +9533,7 @@ fn execute_operator_request(
             // catalogue whose derived plan list exceeds the operator read's
             // page size must still accept a `spec save` naming a plan past
             // that boundary.
-            let catalogue = full_task_launch_catalogue(
+            let (catalogue, _context_source_exclusions) = full_task_launch_catalogue(
                 harness,
                 observation,
                 support,
@@ -9432,7 +9554,7 @@ fn execute_operator_request(
         HarnessOperatorRequestV1::StartTaskV2 { request } => {
             // Same reasoning as `ReplaceTaskExecutionSpecV2` above: validate
             // against the full catalogue, not a page of it.
-            let catalogue = full_task_launch_catalogue(
+            let (catalogue, _context_source_exclusions) = full_task_launch_catalogue(
                 harness,
                 observation,
                 support,
@@ -13865,13 +13987,18 @@ mod tests {
 
         observation.close().unwrap();
         let reopened = ObservationService::open(&observation_path).unwrap();
-        let source = context_source_option(
+        let source = match context_source_option(
             &harness,
             &reopened,
             &support,
             &runtime_inventory,
             harness.engine().run(&run_id).unwrap(),
-        ).unwrap().unwrap();
+        ).unwrap() {
+            ContextSourceOutcome::Ready(source) => source,
+            ContextSourceOutcome::Excluded(exclusion) => {
+                panic!("expected a ready context source, got {exclusion:?}")
+            }
+        };
         assert_eq!(source.message_count, 7);
         assert_eq!(source.completed_turn_count, Some(3));
         reopened.close().unwrap();
@@ -13977,13 +14104,18 @@ mod tests {
             lifecycle: HarnessRunLifecycleV1::Waiting,
             ..stored_run.clone()
         };
-        let waiting_source = context_source_option(
+        let waiting_source = match context_source_option(
             &harness,
             &observation,
             &support,
             &runtime_inventory,
             &waiting_run,
-        ).unwrap().unwrap();
+        ).unwrap() {
+            ContextSourceOutcome::Ready(source) => source,
+            ContextSourceOutcome::Excluded(exclusion) => {
+                panic!("expected a ready context source, got {exclusion:?}")
+            }
+        };
         assert_eq!(waiting_source.availability, HarnessContextSourceAvailabilityV1::Live);
         assert_eq!(waiting_source.message_count, 7);
 
@@ -13993,7 +14125,32 @@ mod tests {
         };
         assert_eq!(
             context_source_option(&harness, &observation, &support, &runtime_inventory, &cancelled_run).unwrap(),
-            None,
+            ContextSourceOutcome::Excluded(ContextSourceExclusionV1::LifecycleNotLive {
+                lifecycle: HarnessRunLifecycleV1::Cancelled,
+            }),
+        );
+
+        // A run bound to an incarnation the inventory does not currently
+        // hold for that node must name the incarnation(s) it DOES hold, not
+        // just "unknown" -- `route`'s own fixture incarnation is the only
+        // one `correlation_inventory` above populated for `route.node_id`.
+        let unknown_incarnation = NodeIncarnationId::from_bytes([9; 16]);
+        let mismatched_run = HarnessRunV1 {
+            binding: Some(HarnessSessionBindingV1 {
+                node_incarnation: selector(&unknown_incarnation.to_string()),
+                ..stored_run.binding.clone().unwrap()
+            }),
+            ..stored_run.clone()
+        };
+        assert_eq!(
+            context_source_option(
+                &harness, &observation, &support, &runtime_inventory, &mismatched_run,
+            ).unwrap(),
+            ContextSourceOutcome::Excluded(ContextSourceExclusionV1::NodeIncarnationUnknown {
+                node_id: selector(route.node_id.as_str()),
+                node_incarnation: selector(&unknown_incarnation.to_string()),
+                known_incarnations: vec![selector(&route.expected_incarnation_id.to_string())],
+            }),
         );
 
         observation.close().unwrap();
@@ -14095,19 +14252,87 @@ mod tests {
         ).unwrap();
 
         let run = harness.engine().run(&run_id).unwrap();
-        let source = context_source_option(
+        let source = match context_source_option(
             &harness,
             &observation,
             &support,
             &runtime_inventory,
             run,
-        ).unwrap().unwrap();
+        ).unwrap() {
+            ContextSourceOutcome::Ready(source) => source,
+            ContextSourceOutcome::Excluded(exclusion) => {
+                panic!("expected a ready context source, got {exclusion:?}")
+            }
+        };
         assert_eq!(source.availability, HarnessContextSourceAvailabilityV1::Live);
         assert_eq!(source.message_count, 0);
         assert!(!source.message_count_exact);
         assert_eq!(source.completed_turn_count, None);
         assert_eq!(source.total_tokens, None);
         source.validate().unwrap();
+
+        observation.close().unwrap();
+        for candidate in [
+            observation_path.clone(),
+            PathBuf::from(format!("{}-wal", observation_path.display())),
+            PathBuf::from(format!("{}-shm", observation_path.display())),
+        ] {
+            let _ = fs::remove_file(candidate);
+        }
+    }
+
+    /// A live run's managed-session record can be missing from
+    /// `node.inventory.managed_sessions` for two different reasons that
+    /// otherwise look identical to the mismatch check itself: either no
+    /// record on the node actually matches
+    /// (`ManagedSessionRecordMismatch`), or the node holds more records than
+    /// the runtime-inventory page carries and the matching one may simply
+    /// sit past that cut (`ManagedSessionsPageTruncated`,
+    /// `managed_sessions_truncated` set) -- the operator needs to read "your
+    /// record was cut off the page" as a different fact from "your record
+    /// does not match".
+    #[test]
+    fn context_source_option_distinguishes_a_missing_managed_session_record_from_a_truncated_page() {
+        let (harness, _task_id, run_id, route) = running_harness_fixture();
+        let support = ObservationSupportRegistry::default();
+        let observation_path = database_path();
+        let observation = ObservationService::open(&observation_path).unwrap();
+        let run = harness.engine().run(&run_id).unwrap().clone();
+
+        let mut node = sample_runtime_node_inventory(PtyScreenState::Ready);
+        node.node_id = route.node_id.as_str().to_owned();
+        node.incarnation_id = route.expected_incarnation_id.to_string();
+        node.inventory.managed_sessions = Vec::new();
+        node.inventory.managed_sessions_truncated = false;
+        node.inventory.managed_session_count = 0;
+
+        let mut untruncated_cache = HarnessRuntimeInventoryCache::default();
+        untruncated_cache.nodes.insert(route.node_id.clone(), node.clone());
+        assert_eq!(
+            context_source_option(&harness, &observation, &support, &untruncated_cache, &run)
+                .unwrap(),
+            ContextSourceOutcome::Excluded(ContextSourceExclusionV1::ManagedSessionRecordMismatch {
+                record_id: selector("record-a"),
+                workspace_id: selector("workspace-a"),
+                instance_id: 7,
+                generation: 3,
+                node_has_records: 0,
+            }),
+        );
+
+        node.inventory.managed_sessions_truncated = true;
+        node.inventory.managed_session_count = 185;
+        let mut truncated_cache = HarnessRuntimeInventoryCache::default();
+        truncated_cache.nodes.insert(route.node_id.clone(), node);
+        assert_eq!(
+            context_source_option(&harness, &observation, &support, &truncated_cache, &run)
+                .unwrap(),
+            ContextSourceOutcome::Excluded(ContextSourceExclusionV1::ManagedSessionsPageTruncated {
+                record_id: selector("record-a"),
+                page_len: 0,
+                total: 185,
+            }),
+        );
 
         observation.close().unwrap();
         for candidate in [

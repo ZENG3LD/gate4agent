@@ -17066,6 +17066,7 @@ mod tests {
             policy_digest: HarnessRequestDigest::new("3".repeat(64)).unwrap(),
             plans: vec![plan],
             next_after: None,
+            context_source_exclusions: Vec::new(),
             managed_worktree_profiles: vec![HarnessManagedWorktreeProfileOptionV1 {
                 node_id: HarnessSelectorV1::new("node-a").unwrap(),
                 node_incarnation: HarnessSelectorV1::new("07".repeat(16)).unwrap(),

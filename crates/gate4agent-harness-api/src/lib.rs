@@ -115,6 +115,15 @@ pub const HARNESS_PROVIDER_SESSION_ID_MAX_BYTES: usize = 512;
 pub const HARNESS_PROVIDER_SESSION_TRANSCRIPT_PATH_MAX_BYTES: usize = 32_768;
 pub const HARNESS_LAUNCH_PLAN_PAGE_LIMIT_MAX: u16 = 64;
 pub const HARNESS_TASK_LAUNCH_OPTIONS_MAX: usize = 64;
+/// Bounds `HarnessTaskLaunchOptionsV1::context_source_exclusions` -- a
+/// diagnostic dump of every run `context_source_option` declined to surface,
+/// not an operator-facing selection page, so it gets its own smaller ceiling
+/// rather than reusing [`HARNESS_TASK_LAUNCH_OPTIONS_MAX`].
+pub const HARNESS_CONTEXT_SOURCE_EXCLUSIONS_MAX: usize = 32;
+/// Bounds `ContextSourceExclusionV1::NodeIncarnationUnknown`'s own
+/// `known_incarnations` list -- the incarnation(s) the runtime inventory
+/// currently holds for the excluded run's `node_id`.
+pub const CONTEXT_SOURCE_EXCLUSION_KNOWN_INCARNATIONS_MAX: usize = 8;
 pub const HARNESS_RUNTIME_SPAWN_PROFILES_MAX: usize = 64;
 pub const HARNESS_RUNTIME_LAUNCH_BUNDLES_MAX: usize = 128;
 pub const HARNESS_REPOSITORY_PATH_MAX_BYTES: usize = 1_024;
@@ -790,6 +799,136 @@ impl HarnessIssuedExecutionSpecSummaryV1 {
     }
 }
 
+/// Names, with its compared inputs, the exact reason `context_source_option`
+/// (`gate4agent-harness-service::runtime`) declined to surface a run as a
+/// `context_sources` candidate. Instrumentation only, never a policy
+/// decision -- the admission logic itself is unchanged by this type's
+/// existence; it only makes an already-silent exclusion observable from
+/// `launch-options` and the harness's own logs (`context source excluded`).
+/// One variant per early exit in that function, Live and Durable branches
+/// alike; a Live-branch-only or Durable-branch-only condition says so in its
+/// own doc comment.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "reason", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum ContextSourceExclusionV1 {
+    /// The run's `lifecycle` is neither `Running` nor `Waiting`, and it
+    /// carries no durable context pack (which would have taken the Durable
+    /// branch instead of this lifecycle gate).
+    LifecycleNotLive { lifecycle: HarnessRunLifecycleV1 },
+    /// The run carries no `binding` at all -- Live or Durable branch alike.
+    NoBinding,
+    /// The bound session identity is not `Managed` at all (Durable branch),
+    /// or (Live branch) it is `Managed` with no `active_session`.
+    NoActiveManagedSession,
+    /// Live branch only: no entry in the runtime inventory carries this
+    /// run's exact `node_id` + `node_incarnation` pair (the Durable branch
+    /// re-resolves the node's CURRENT incarnation by `node_id` alone
+    /// instead; see `DurableNodeUnknown`). `known_incarnations` names the
+    /// incarnation(s) the inventory DOES hold for that `node_id`, bounded at
+    /// [`CONTEXT_SOURCE_EXCLUSION_KNOWN_INCARNATIONS_MAX`].
+    NodeIncarnationUnknown {
+        node_id: HarnessSelectorV1,
+        node_incarnation: HarnessSelectorV1,
+        known_incarnations: Vec<HarnessSelectorV1>,
+    },
+    /// The matched node's `managed_sessions` page carries no record whose
+    /// `record_id`/`workspace_id`/`active_binding` (workspace, instance,
+    /// generation) match the run's binding, and that page was NOT cut for
+    /// size -- the record genuinely does not exist on this node right now.
+    /// `node_has_records` is the page's own length, for scale.
+    ManagedSessionRecordMismatch {
+        record_id: HarnessSelectorV1,
+        workspace_id: HarnessSelectorV1,
+        instance_id: u64,
+        generation: u64,
+        node_has_records: u32,
+    },
+    /// Same missing-record shape as `ManagedSessionRecordMismatch`, but the
+    /// node's `managed_sessions_truncated` flag was set: the page the
+    /// harness received is a PREFIX of the node's full record set, so the
+    /// matching record may simply sit past that cut rather than genuinely be
+    /// absent. `page_len` is the page's own length, `total` the node's full
+    /// `managed_session_count`.
+    ManagedSessionsPageTruncated {
+        record_id: HarnessSelectorV1,
+        page_len: u32,
+        total: u32,
+    },
+    /// Live branch only: `execute_operator_monitor` returned an error for
+    /// this run.
+    MonitorUnavailable,
+    /// Live branch only: the monitor projection resolved but is not live
+    /// enough to route an export through right now.
+    ProjectionNotLive {
+        availability: ProjectionAvailabilityV1,
+        freshness: ProjectionFreshnessV1,
+        transport_incomplete: bool,
+    },
+    /// Durable branch only: the pack's `node_id` is not currently known by
+    /// the runtime inventory at all (any incarnation), so there is no route
+    /// to resolve the pack through right now.
+    DurableNodeUnknown { node_id: HarnessSelectorV1 },
+}
+
+impl ContextSourceExclusionV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        match self {
+            Self::LifecycleNotLive { .. }
+            | Self::NoBinding
+            | Self::NoActiveManagedSession
+            | Self::MonitorUnavailable
+            | Self::ProjectionNotLive { .. } => Ok(()),
+            Self::NodeIncarnationUnknown { node_id, node_incarnation, known_incarnations } => {
+                node_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+                node_incarnation.validate().map_err(HarnessOperatorApiError::Protocol)?;
+                if known_incarnations.len() > CONTEXT_SOURCE_EXCLUSION_KNOWN_INCARNATIONS_MAX {
+                    return Err(HarnessOperatorApiError::InvalidTaskLaunchOptions);
+                }
+                for incarnation in known_incarnations {
+                    incarnation.validate().map_err(HarnessOperatorApiError::Protocol)?;
+                }
+                Ok(())
+            }
+            Self::ManagedSessionRecordMismatch {
+                record_id, workspace_id, instance_id, generation, ..
+            } => {
+                record_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+                workspace_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+                if *instance_id == 0 || *generation == 0 {
+                    return Err(HarnessOperatorApiError::InvalidTaskLaunchOptions);
+                }
+                Ok(())
+            }
+            Self::ManagedSessionsPageTruncated { record_id, page_len, total } => {
+                record_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+                if total < page_len {
+                    return Err(HarnessOperatorApiError::InvalidTaskLaunchOptions);
+                }
+                Ok(())
+            }
+            Self::DurableNodeUnknown { node_id } => {
+                node_id.validate().map_err(HarnessOperatorApiError::Protocol)
+            }
+        }
+    }
+}
+
+/// One [`ContextSourceExclusionV1`] pinned to the run it was computed for --
+/// `HarnessTaskLaunchOptionsV1::context_source_exclusions`'s element type.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextSourceExclusionEntryV1 {
+    pub run_id: HarnessRunId,
+    pub exclusion: ContextSourceExclusionV1,
+}
+
+impl ContextSourceExclusionEntryV1 {
+    pub fn validate(&self) -> Result<(), HarnessOperatorApiError> {
+        self.run_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        self.exclusion.validate()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HarnessTaskLaunchOptionsV1 {
@@ -810,6 +949,17 @@ pub struct HarnessTaskLaunchOptionsV1 {
     /// shape, an older caller that never asked for it still deserializes.
     #[serde(default)]
     pub next_after: Option<HarnessSelectorV1>,
+    /// Every early exit `context_source_option` took while building
+    /// `context_sources` above, one entry per excluded run --
+    /// instrumentation only, see [`ContextSourceExclusionV1`]. Bounded
+    /// independently of the other four lists at
+    /// [`HARNESS_CONTEXT_SOURCE_EXCLUSIONS_MAX`]: their own
+    /// `HARNESS_TASK_LAUNCH_OPTIONS_MAX` sizes an operator-facing selection
+    /// page, this one sizes a diagnostic dump. `#[serde(default)]`:
+    /// additive over the pre-instrumentation wire shape, an older caller
+    /// that never asked for it still deserializes.
+    #[serde(default)]
+    pub context_source_exclusions: Vec<ContextSourceExclusionEntryV1>,
 }
 
 impl HarnessTaskLaunchOptionsV1 {
@@ -821,6 +971,7 @@ impl HarnessTaskLaunchOptionsV1 {
             || self.managed_worktree_profiles.len() > HARNESS_TASK_LAUNCH_OPTIONS_MAX
             || self.context_sources.len() > HARNESS_TASK_LAUNCH_OPTIONS_MAX
             || self.delivery_bundles.len() > HARNESS_TASK_LAUNCH_OPTIONS_MAX
+            || self.context_source_exclusions.len() > HARNESS_CONTEXT_SOURCE_EXCLUSIONS_MAX
         {
             return Err(HarnessOperatorApiError::InvalidTaskLaunchOptions);
         }
@@ -831,6 +982,14 @@ impl HarnessTaskLaunchOptionsV1 {
         }
         for delivery in &self.delivery_bundles {
             delivery.validate().map_err(HarnessOperatorApiError::Protocol)?;
+        }
+        for exclusion in &self.context_source_exclusions {
+            exclusion.validate()?;
+        }
+        if self.context_source_exclusions.windows(2).any(|items| {
+            items[0].run_id >= items[1].run_id
+        }) {
+            return Err(HarnessOperatorApiError::InvalidTaskLaunchOptions);
         }
         if self.plans.windows(2).any(|items| {
             (&items[0].plan.plan_id, items[0].plan.revision)
@@ -8094,6 +8253,14 @@ mod tests {
             }),
             truncated: false,
             next_after: None,
+            context_source_exclusions: vec![ContextSourceExclusionEntryV1 {
+                run_id: HarnessRunId::new(format!("hrun_{}", "9".repeat(24))).unwrap(),
+                exclusion: ContextSourceExclusionV1::NodeIncarnationUnknown {
+                    node_id: HarnessSelectorV1::new("node-a").unwrap(),
+                    node_incarnation: HarnessSelectorV1::new("07".repeat(16)).unwrap(),
+                    known_incarnations: vec![HarnessSelectorV1::new("08".repeat(16)).unwrap()],
+                },
+            }],
         }
     }
 
@@ -8298,6 +8465,104 @@ mod tests {
             options.validate(),
             Err(HarnessOperatorApiError::InvalidTaskLaunchOptions),
         ), "next_after must name the last plan on the page");
+    }
+
+    /// `context_source_exclusions` is additive over the pre-instrumentation
+    /// wire shape (same discipline as `next_after` above), round-trips
+    /// exactly, and is bounded/ordered independently of the other four
+    /// lists.
+    #[test]
+    fn context_source_exclusions_are_additive_bounded_and_ordered() {
+        let options = task_launch_options();
+        options.validate_for(&options.task_id).unwrap();
+        assert_eq!(options.context_source_exclusions.len(), 1);
+
+        let mut legacy_json = serde_json::to_value(&options).unwrap();
+        legacy_json.as_object_mut().unwrap().remove("context_source_exclusions");
+        let redecoded: HarnessTaskLaunchOptionsV1 = serde_json::from_value(legacy_json).unwrap();
+        assert!(redecoded.context_source_exclusions.is_empty());
+        redecoded.validate().unwrap();
+
+        let entry = options.context_source_exclusions[0].clone();
+        let encoded = serde_json::to_string(&entry).unwrap();
+        assert!(encoded.contains("\"reason\":\"node-incarnation-unknown\""));
+        let redecoded_entry: ContextSourceExclusionEntryV1 = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(redecoded_entry, entry);
+
+        let mut oversized = options.clone();
+        oversized.context_source_exclusions =
+            vec![entry.clone(); HARNESS_CONTEXT_SOURCE_EXCLUSIONS_MAX + 1];
+        assert!(matches!(
+            oversized.validate(),
+            Err(HarnessOperatorApiError::InvalidTaskLaunchOptions),
+        ));
+
+        let mut duplicated = options.clone();
+        duplicated.context_source_exclusions.push(entry);
+        assert!(matches!(
+            duplicated.validate(),
+            Err(HarnessOperatorApiError::InvalidTaskLaunchOptions),
+        ), "context_source_exclusions must stay sorted and duplicate-free by run_id");
+    }
+
+    /// Every [`ContextSourceExclusionV1`] variant round-trips through JSON
+    /// exactly and validates -- covers every field-carrying shape the
+    /// enum's `#[serde(tag = "reason")]` produces, not just the one sample
+    /// `task_launch_options()` carries above.
+    #[test]
+    fn context_source_exclusion_variants_round_trip_every_shape() {
+        let samples = [
+            ContextSourceExclusionV1::LifecycleNotLive {
+                lifecycle: HarnessRunLifecycleV1::Cancelled,
+            },
+            ContextSourceExclusionV1::NoBinding,
+            ContextSourceExclusionV1::NoActiveManagedSession,
+            ContextSourceExclusionV1::NodeIncarnationUnknown {
+                node_id: HarnessSelectorV1::new("node-a").unwrap(),
+                node_incarnation: HarnessSelectorV1::new("07".repeat(16)).unwrap(),
+                known_incarnations: vec![HarnessSelectorV1::new("08".repeat(16)).unwrap()],
+            },
+            ContextSourceExclusionV1::ManagedSessionRecordMismatch {
+                record_id: HarnessSelectorV1::new("record-a").unwrap(),
+                workspace_id: HarnessSelectorV1::new("workspace-a").unwrap(),
+                instance_id: 7,
+                generation: 3,
+                node_has_records: 4,
+            },
+            ContextSourceExclusionV1::ManagedSessionsPageTruncated {
+                record_id: HarnessSelectorV1::new("record-a").unwrap(),
+                page_len: 128,
+                total: 185,
+            },
+            ContextSourceExclusionV1::MonitorUnavailable,
+            ContextSourceExclusionV1::ProjectionNotLive {
+                availability: ProjectionAvailabilityV1::Partial,
+                freshness: ProjectionFreshnessV1::Stale,
+                transport_incomplete: true,
+            },
+            ContextSourceExclusionV1::DurableNodeUnknown {
+                node_id: HarnessSelectorV1::new("node-a").unwrap(),
+            },
+        ];
+        for exclusion in samples {
+            exclusion.validate().unwrap();
+            let encoded = serde_json::to_string(&exclusion).unwrap();
+            let decoded: ContextSourceExclusionV1 = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, exclusion);
+        }
+
+        let oversized = ContextSourceExclusionV1::NodeIncarnationUnknown {
+            node_id: HarnessSelectorV1::new("node-a").unwrap(),
+            node_incarnation: HarnessSelectorV1::new("07".repeat(16)).unwrap(),
+            known_incarnations: vec![
+                HarnessSelectorV1::new("08".repeat(16)).unwrap();
+                CONTEXT_SOURCE_EXCLUSION_KNOWN_INCARNATIONS_MAX + 1
+            ],
+        };
+        assert!(matches!(
+            oversized.validate(),
+            Err(HarnessOperatorApiError::InvalidTaskLaunchOptions),
+        ));
     }
 
     #[test]

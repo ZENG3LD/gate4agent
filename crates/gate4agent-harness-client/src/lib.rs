@@ -2365,6 +2365,7 @@ mod tests {
             current_issued_spec: None,
             truncated: false,
             next_after: None,
+            context_source_exclusions: Vec::new(),
         }
     }
 

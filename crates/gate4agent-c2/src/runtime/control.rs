@@ -2392,6 +2392,16 @@ fn provider_text_is_legacy(value: &str) -> bool {
     AgentId::new(value).is_ok_and(|provider| provider_id_is_legacy(&provider))
 }
 
+/// Projects a `StatusResponse` down to legacy-provider-only entries for
+/// clients that only understand the legacy provider set. This is a provider
+/// filter, not a page-size cut, so it can never truncate on its own — but the
+/// node's own page bound may already have truncated `workspace.sessions` /
+/// `inventory.managed_sessions` before this filter ever saw them. Each
+/// `*_truncated` flag is therefore carried through: the local contribution
+/// from this filter is always `false` (retain-by-provider is exact, not
+/// bounded), OR'd with whatever the node already reported, so a page that was
+/// truncated upstream never reports as complete just because this projection
+/// also happened to drop some now-hidden entries.
 fn retain_legacy_provider_status(status: &mut StatusResponse) {
     for inventory in status.nodes.values_mut().filter_map(|node| node.inventory.as_mut()) {
         inventory.enabled_providers.retain(provider_id_is_legacy);
@@ -2402,18 +2412,21 @@ fn retain_legacy_provider_status(status: &mut StatusResponse) {
         inventory.provider_adapter_contracts
             .retain(|contract| provider_id_is_legacy(&contract.provider));
         for workspace in inventory.workspaces.values_mut() {
+            let node_sessions_truncated = workspace.sessions_truncated;
             workspace.sessions.retain(|session| provider_text_is_legacy(&session.agent_id));
             workspace.session_count = workspace.sessions.len();
-            workspace.sessions_truncated = false;
+            workspace.sessions_truncated = node_sessions_truncated;
         }
+        let node_session_count_truncated = inventory.sessions_truncated;
         inventory.session_count = inventory.workspaces.values()
             .map(|workspace| workspace.sessions.len())
             .sum();
-        inventory.sessions_truncated = false;
+        inventory.sessions_truncated = node_session_count_truncated;
+        let node_managed_sessions_truncated = inventory.managed_sessions_truncated;
         inventory.managed_sessions
             .retain(|record| provider_id_is_legacy(&record.provider));
         inventory.managed_session_count = inventory.managed_sessions.len();
-        inventory.managed_sessions_truncated = false;
+        inventory.managed_sessions_truncated = node_managed_sessions_truncated;
     }
 }
 
@@ -4701,6 +4714,40 @@ mod tests {
         let json = serde_json::to_string(inventory).unwrap();
         assert!(json.contains(r#""enabled_providers":["claude","codex","kimi"]"#));
         assert!(!json.contains("third-party-agent"));
+    }
+
+    #[test]
+    fn legacy_provider_projection_keeps_a_true_managed_sessions_truncated_flag() {
+        // The node's own page bound already truncated `managed_sessions`
+        // before this legacy-provider projection ever runs. The projection
+        // then drops the one non-legacy record it can see. Dropping that
+        // record must NOT reset `managed_sessions_truncated` back to
+        // `false` -- the node already said there is more data than this
+        // page shows, and this filter has no way to un-say that.
+        let incarnation = NodeIncarnationId::from_bytes([13; 16]);
+        let mut status = status_with_provider_contract_manifest(incarnation);
+        let inventory = status.nodes.values_mut().next().unwrap().inventory.as_mut().unwrap();
+        inventory.managed_sessions = vec![
+            managed_record("legacy-record", "codex", None),
+            managed_record("open-record", "third-party-agent", None),
+        ];
+        inventory.managed_session_count = 130;
+        inventory.managed_sessions_truncated = true;
+
+        retain_legacy_provider_status(&mut status);
+
+        let inventory = status.nodes.values().next().unwrap().inventory.as_ref().unwrap();
+        assert_eq!(
+            inventory.managed_sessions.iter()
+                .map(|record| record.record_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["legacy-record"],
+        );
+        assert_eq!(inventory.managed_session_count, 1);
+        assert!(
+            inventory.managed_sessions_truncated,
+            "the node's truncation must survive the legacy-provider filter",
+        );
     }
 
     #[test]

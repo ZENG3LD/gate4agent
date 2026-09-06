@@ -2858,6 +2858,51 @@ fn usize_is_zero(value: &usize) -> bool { *value == 0 }
 
 fn bool_is_false(value: &bool) -> bool { !*value }
 
+/// Orders `ManagedSessionRecord`/`C2ManagedSessionRecord` entries by liveness
+/// before the `MAX_C2_MANAGED_SESSIONS_PER_NODE` page bound is applied, so a
+/// page cut never evicts a live record behind stale ones that merely sort
+/// earlier by id. `Live` sessions are the ones actively serving a run and
+/// must never be cut. `IdentityPending` is a real, just-spawned process
+/// still waiting on its identity observation -- exactly the window in which
+/// the harness must still see the record on the page for credential
+/// binding and context-source correlation -- so it ranks right behind
+/// `Live`, ahead of `Dormant`. `Dormant` has no live process but can still
+/// be resumed, so it ranks next. `Unavailable` is not usable at all and
+/// ranks last, ordered by record id within each tier like before.
+fn managed_session_liveness_rank(state: &ManagedSessionState) -> u8 {
+    match state {
+        ManagedSessionState::Live => 0,
+        ManagedSessionState::IdentityPending => 1,
+        ManagedSessionState::Dormant => 2,
+        ManagedSessionState::Unavailable => 3,
+    }
+}
+
+/// Same liveness-first rationale as `managed_session_liveness_rank`, applied
+/// to `gate4agent_types::SessionStatus` PTY sessions ahead of the
+/// `MAX_C2_SESSIONS_PER_NODE` page bound: `Running` sessions rank first,
+/// `Starting`/`Stopping` (mid-transition, still attached to a live process)
+/// next, not-yet-started `Registered` sessions next, and terminal
+/// `Exited`/`Failed` sessions rank last.
+fn session_liveness_rank(status: &SessionStatus) -> u8 {
+    match status {
+        SessionStatus::Running => 0,
+        SessionStatus::Starting | SessionStatus::Stopping => 1,
+        SessionStatus::Registered => 2,
+        SessionStatus::Exited { .. } | SessionStatus::Failed { .. } => 3,
+    }
+}
+
+/// Same as `session_liveness_rank`, for the C2-side `C2SessionStatus` mirror.
+fn c2_session_liveness_rank(status: &C2SessionStatus) -> u8 {
+    match status {
+        C2SessionStatus::Running => 0,
+        C2SessionStatus::Starting | C2SessionStatus::Stopping => 1,
+        C2SessionStatus::Registered => 2,
+        C2SessionStatus::Exited { .. } | C2SessionStatus::Failed => 3,
+    }
+}
+
 impl SlimNodeInventory {
     pub fn from_snapshot(snapshot: &NodeSnapshot) -> Self {
         let mut providers = snapshot.enabled_providers.clone();
@@ -2871,7 +2916,12 @@ impl SlimNodeInventory {
         ordered.sort_by(|left, right| left.workspace_id.cmp(&right.workspace_id));
         for workspace in ordered.into_iter().take(MAX_C2_WORKSPACES_PER_NODE) {
             let mut sessions = workspace.sessions.iter().collect::<Vec<_>>();
-            sessions.sort_by_key(|session| (session.instance_id, session.generation));
+            sessions.sort_by(|left, right| {
+                session_liveness_rank(&left.status)
+                    .cmp(&session_liveness_rank(&right.status))
+                    .then_with(|| left.instance_id.cmp(&right.instance_id))
+                    .then_with(|| left.generation.cmp(&right.generation))
+            });
             let take = remaining_sessions.min(sessions.len());
             let slim_sessions = sessions.into_iter().take(take).map(|session| SlimSession {
                 instance_id: session.instance_id,
@@ -2906,7 +2956,11 @@ impl SlimNodeInventory {
             .sum::<usize>();
         let managed_session_count = snapshot.session_records.len();
         let mut ordered_records = snapshot.session_records.iter().collect::<Vec<_>>();
-        ordered_records.sort_by(|left, right| left.record_id.cmp(&right.record_id));
+        ordered_records.sort_by(|left, right| {
+            managed_session_liveness_rank(&left.state)
+                .cmp(&managed_session_liveness_rank(&right.state))
+                .then_with(|| left.record_id.cmp(&right.record_id))
+        });
         let managed_sessions = ordered_records
             .into_iter()
             .take(MAX_C2_MANAGED_SESSIONS_PER_NODE)
@@ -2950,7 +3004,12 @@ impl SlimNodeInventory {
         ordered.sort_by(|left, right| left.workspace_id.cmp(&right.workspace_id));
         for workspace in ordered.into_iter().take(MAX_C2_WORKSPACES_PER_NODE) {
             let mut sessions = workspace.sessions.iter().collect::<Vec<_>>();
-            sessions.sort_by_key(|session| (session.instance_id, session.generation));
+            sessions.sort_by(|left, right| {
+                c2_session_liveness_rank(&left.status)
+                    .cmp(&c2_session_liveness_rank(&right.status))
+                    .then_with(|| left.instance_id.cmp(&right.instance_id))
+                    .then_with(|| left.generation.cmp(&right.generation))
+            });
             let take = remaining_sessions.min(sessions.len());
             let slim_sessions = sessions.into_iter().take(take).map(|session| SlimSession {
                 instance_id: session.instance_id,
@@ -2984,7 +3043,11 @@ impl SlimNodeInventory {
             .sum::<usize>();
         let managed_session_count = snapshot.session_records.len();
         let mut ordered_records = snapshot.session_records.iter().collect::<Vec<_>>();
-        ordered_records.sort_by(|left, right| left.record_id.cmp(&right.record_id));
+        ordered_records.sort_by(|left, right| {
+            managed_session_liveness_rank(&left.state)
+                .cmp(&managed_session_liveness_rank(&right.state))
+                .then_with(|| left.record_id.cmp(&right.record_id))
+        });
         let managed_sessions = ordered_records.into_iter()
             .take(MAX_C2_MANAGED_SESSIONS_PER_NODE)
             .map(SlimManagedSessionRecord::from)
@@ -6176,6 +6239,115 @@ mod tests {
         assert_eq!(slim.managed_session_count, MAX_C2_MANAGED_SESSIONS_PER_NODE + 1);
         assert_eq!(slim.managed_sessions.len(), MAX_C2_MANAGED_SESSIONS_PER_NODE);
         assert!(slim.managed_sessions_truncated);
+    }
+
+    #[test]
+    fn slim_managed_sessions_page_keeps_the_live_record_even_when_it_sorts_last_by_id() {
+        // 130 stale `Unavailable` records (ids sort ahead of both records
+        // below) plus one `Live` record and one `IdentityPending` record
+        // whose ids sort LAST of all -- the `IdentityPending` one sorts last
+        // by id even among the `Unavailable` records. An id-only sort
+        // followed by `.take(MAX_C2_MANAGED_SESSIONS_PER_NODE)` would cut
+        // both the live record and the just-spawned, identity-pending one
+        // from the page; liveness-first ordering must keep both in,
+        // `IdentityPending` right behind `Live` and ahead of every
+        // `Unavailable` record, regardless of where their ids fall.
+        let stale_count = MAX_C2_MANAGED_SESSIONS_PER_NODE + 2;
+        let mut session_records = (0..stale_count)
+            .map(|index| ManagedSessionRecord {
+                record_id: SessionRecordId::new(format!("session-{index:03}")).unwrap(),
+                display_name: format!("session {index}"),
+                provider: provider("claude"),
+                mode: SessionMode::Inline,
+                state: ManagedSessionState::Unavailable,
+                workspace_id: WorkspaceId::new("primary").unwrap(),
+                canonical_root: host_path(r"C:\repo"),
+                provider_session: None,
+                active_session: None,
+                environment_profile: None,
+                bundle: None,
+                context_id: None,
+                context: None,
+                exported_context: None,
+                task_binding: None,
+                created_at_unix_ms: index as u64,
+                updated_at_unix_ms: index as u64,
+                last_error: None,
+            })
+            .collect::<Vec<_>>();
+        session_records.push(ManagedSessionRecord {
+            record_id: SessionRecordId::new(format!("session-{stale_count:03}")).unwrap(),
+            display_name: "live-run".to_owned(),
+            provider: provider("claude"),
+            mode: SessionMode::Pty,
+            state: ManagedSessionState::Live,
+            workspace_id: WorkspaceId::new("primary").unwrap(),
+            canonical_root: host_path(r"C:\repo"),
+            provider_session: None,
+            active_session: None,
+            environment_profile: None,
+            bundle: None,
+            context_id: None,
+            context: None,
+            exported_context: None,
+            task_binding: None,
+            created_at_unix_ms: stale_count as u64,
+            updated_at_unix_ms: stale_count as u64,
+            last_error: None,
+        });
+        let pending_index = stale_count + 1;
+        session_records.push(ManagedSessionRecord {
+            record_id: SessionRecordId::new(format!("session-{pending_index:03}")).unwrap(),
+            display_name: "pending-spawn".to_owned(),
+            provider: provider("claude"),
+            mode: SessionMode::Pty,
+            state: ManagedSessionState::IdentityPending,
+            workspace_id: WorkspaceId::new("primary").unwrap(),
+            canonical_root: host_path(r"C:\repo"),
+            provider_session: None,
+            active_session: None,
+            environment_profile: None,
+            bundle: None,
+            context_id: None,
+            context: None,
+            exported_context: None,
+            task_binding: None,
+            created_at_unix_ms: pending_index as u64,
+            updated_at_unix_ms: pending_index as u64,
+            last_error: None,
+        });
+        let total = session_records.len();
+        assert!(total > MAX_C2_MANAGED_SESSIONS_PER_NODE);
+
+        let slim = SlimNodeInventory::from_snapshot(&NodeSnapshot {
+            node_id: NodeId::new("node-a").unwrap(),
+            enabled_providers: Vec::new(),
+            provider_runtime_statuses: ProviderRuntimeStatuses::default(),
+            workspaces: Vec::new(),
+            session_records,
+            managed_worktrees: Vec::new(),
+            launch_inventory: None,
+            agent_progress: Vec::new(),
+        });
+
+        assert_eq!(slim.managed_session_count, total);
+        assert!(slim.managed_sessions_truncated);
+        assert_eq!(slim.managed_sessions.len(), MAX_C2_MANAGED_SESSIONS_PER_NODE);
+        assert!(
+            slim.managed_sessions.iter().any(|record| record.state == ManagedSessionState::Live),
+            "the live record must survive the page cut even though its id sorts last",
+        );
+        assert!(
+            slim.managed_sessions.iter()
+                .any(|record| record.state == ManagedSessionState::IdentityPending),
+            "the identity-pending record must survive the page cut even though its id sorts last",
+        );
+        assert_eq!(slim.managed_sessions[0].state, ManagedSessionState::Live);
+        assert_eq!(slim.managed_sessions[1].state, ManagedSessionState::IdentityPending);
+        assert!(
+            slim.managed_sessions[2..].iter().all(|record| record.state == ManagedSessionState::Unavailable),
+            "every Unavailable record on the page must rank after Live and IdentityPending",
+        );
     }
 
     #[test]

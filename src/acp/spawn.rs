@@ -214,6 +214,7 @@ impl AcpProcess {
         launch: &LaunchSpec,
     ) -> Result<Self, std::io::Error> {
         let mut cmd = Command::new(&launch.program);
+        crate::utils::hide_console_window(&mut cmd);
         cmd.args(&launch.fixed_args);
         for (key, value) in env_vars {
             cmd.env(key, value);
@@ -386,6 +387,7 @@ fn build_command_windows(spec: &AcpSpawnSpec, extra_args: &[String]) -> Command 
 /// platform for every non-npm tool.
 fn direct_command(program: &str, args: &[&str], extra_args: &[String]) -> Command {
     let mut cmd = Command::new(program);
+    crate::utils::hide_console_window(&mut cmd);
     for arg in args {
         cmd.arg(arg);
     }
@@ -399,6 +401,7 @@ fn direct_command(program: &str, args: &[&str], extra_args: &[String]) -> Comman
 /// `Command::arg`, so no shell-quoting is needed here.
 fn windows_cmd_wrapper(cmd_name: &str, args: &[&str], extra_args: &[String]) -> Command {
     let mut cmd = Command::new("cmd");
+    crate::utils::hide_console_window(&mut cmd);
     cmd.arg("/C").arg(cmd_name);
     for arg in args {
         cmd.arg(arg);

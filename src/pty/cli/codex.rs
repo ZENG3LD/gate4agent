@@ -1373,6 +1373,7 @@ pub struct CodexPipeBuilder;
 impl CliCommandBuilder for CodexPipeBuilder {
     fn build_command(&self, opts: &SpawnOptions) -> std::process::Command {
         let mut cmd = std::process::Command::new("codex");
+        crate::utils::hide_console_window(&mut cmd);
 
         let resumed = opts.resume_session_id.is_some() || opts.continue_last;
         cmd.arg("exec");

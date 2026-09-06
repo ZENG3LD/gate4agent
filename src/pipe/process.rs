@@ -482,12 +482,16 @@ impl PipeProcess {
     pub(crate) fn kill_tree(&mut self) -> Result<(), std::io::Error> {
         let process_id = self.child.id();
         #[cfg(windows)]
-        let result = Command::new("taskkill.exe")
-            .args(["/PID", &process_id.to_string(), "/T", "/F"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        let result = {
+            let mut command = Command::new("taskkill.exe");
+            command
+                .args(["/PID", &process_id.to_string(), "/T", "/F"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            crate::utils::hide_console_window(&mut command);
+            command.status()
+        };
         #[cfg(unix)]
         let result = Command::new("kill")
             .args(["-KILL", "--", &format!("-{process_id}")])
@@ -511,9 +515,8 @@ impl PipeProcess {
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-            command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+            command.creation_flags(crate::utils::CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
         }
     }
 }

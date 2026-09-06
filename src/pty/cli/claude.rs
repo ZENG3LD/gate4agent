@@ -1177,6 +1177,7 @@ pub struct ClaudePipeBuilder;
 impl CliCommandBuilder for ClaudePipeBuilder {
     fn build_command(&self, opts: &SpawnOptions) -> std::process::Command {
         let mut cmd = std::process::Command::new("claude");
+        crate::utils::hide_console_window(&mut cmd);
         cmd.arg("-p");
         cmd.arg("--output-format");
         cmd.arg("stream-json");

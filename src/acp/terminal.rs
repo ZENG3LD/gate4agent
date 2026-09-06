@@ -68,6 +68,7 @@ impl TerminalStore {
         }
 
         let mut cmd = Command::new(&params.command);
+        crate::utils::hide_console_window(&mut cmd);
         cmd.args(&params.args);
         for EnvVariable { name, value } in &params.env {
             cmd.env(name, value);

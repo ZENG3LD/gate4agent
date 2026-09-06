@@ -224,6 +224,7 @@ pub struct KimiPipeBuilder;
 impl super::traits::CliCommandBuilder for KimiPipeBuilder {
     fn build_command(&self, opts: &SpawnOptions) -> std::process::Command {
         let mut command = std::process::Command::new("kimi");
+        crate::utils::hide_console_window(&mut command);
         if let Some(session_id) = &opts.resume_session_id {
             command.arg("-r");
             command.arg(session_id);

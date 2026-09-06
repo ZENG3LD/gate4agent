@@ -52,6 +52,7 @@ pub struct GrokPipeBuilder;
 impl super::traits::CliCommandBuilder for GrokPipeBuilder {
     fn build_command(&self, opts: &SpawnOptions) -> std::process::Command {
         let mut cmd = std::process::Command::new("grok");
+        crate::utils::hide_console_window(&mut cmd);
         cmd.arg(&opts.prompt);
         cmd
     }

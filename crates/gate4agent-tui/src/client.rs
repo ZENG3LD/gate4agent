@@ -7969,6 +7969,7 @@ mod tests {
                 ],
                 managed_session_count: 2,
                 managed_sessions_truncated: false,
+                retired_count: 0,
                 launch_inventory: None,
             },
         }

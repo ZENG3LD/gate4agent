@@ -100,6 +100,7 @@ use crate::protocol::{
     ServerChallenge, ServerFrame, SessionAddress, SessionAgentProgress, SessionKey, SessionMode,
     ManagedSessionRecord,
     ManagedSessionState, ManagedWorktreeCleanupFailure, ManagedWorktreeLeaseId,
+    SessionRecordRetentionConfig,
     ManagedWorktreeLeaseSnapshot, ManagedWorktreeLeaseState, ManagedWorktreeRetention,
     ManagedWorktreeSpawnReceipt, ManagedWorktreeSpawnRequest,
     ManagedWorktreeSpawnRequestV2, SessionRecordId,
@@ -240,6 +241,14 @@ const AUTH_FRAME_TIMEOUT_MS: u64 = 5_000;
 const FRAME_BODY_TIMEOUT_MS: u64 = 5_000;
 const CONNECTION_SHUTDOWN_GRACE_MS: u64 = 250;
 const SPAWN_DISPATCH_TIMEOUT_MS: u64 = 2_000;
+/// How often `drive_runtime_until_shutdown`'s loop re-evaluates the session
+/// record retention policy (`NodeServerConfig::session_record_retention`).
+/// A sweep cadence, not a policy value -- the policy itself lives entirely
+/// in the operator-configured age/keep-N flags; this just bounds how stale
+/// the in-memory view of dead `Unavailable` records can get between sweeps
+/// on an otherwise-idle node, mirroring the once-per-startup sweep that
+/// also runs alongside `reconcile_managed_worktrees`.
+const SESSION_RECORD_RETENTION_SWEEP_PERIOD: Duration = Duration::from_secs(5 * 60);
 /// TTL for `NodeShared::rejected_command_reasons` entries -- see that
 /// field's own doc for why a spawn waiter needs this at all. Must outlive
 /// the longest a waiter can still be polling for this exact command's
@@ -1812,6 +1821,7 @@ pub struct NodeServerConfig {
     pub workspaces: Vec<WorkspaceConfig>,
     access_token: String,
     pub runtime: NativeRuntimeConfig,
+    session_record_retention: SessionRecordRetentionConfig,
     state_path: Option<PathBuf>,
     spawn_profiles: SpawnProfileRegistry,
     session_environment: Option<NodeSessionEnvironmentConfig>,
@@ -1891,6 +1901,7 @@ impl NodeServerConfig {
             workspaces,
             access_token,
             runtime: NativeRuntimeConfig::default(),
+            session_record_retention: SessionRecordRetentionConfig::default(),
             state_path: None,
             spawn_profiles: SpawnProfileRegistry::default(),
             session_environment: None,
@@ -1959,6 +1970,19 @@ impl NodeServerConfig {
 
     pub fn with_spawn_profiles(mut self, spawn_profiles: SpawnProfileRegistry) -> Self {
         self.spawn_profiles = spawn_profiles;
+        self
+    }
+
+    /// Sets the age/keep-N policy the drive loop's retention sweep uses to
+    /// retire dead `ManagedSessionState::Unavailable` records. Both fields
+    /// default to `0` (disabled) via `SessionRecordRetentionConfig::default`
+    /// when this is never called -- a node never deletes a durable record
+    /// until an operator opts in with a real value.
+    pub fn with_session_record_retention(
+        mut self,
+        retention: SessionRecordRetentionConfig,
+    ) -> Self {
+        self.session_record_retention = retention;
         self
     }
 
@@ -2938,6 +2962,7 @@ try { $contextHash = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadA
             input_settle_timeout_ms,
         );
         shared.harness_mcp_registry = harness_mcp_registry.clone();
+        shared.session_record_retention = config.session_record_retention;
         shared.bundle_catalog = RwLock::new(delivered_catalog);
         shared.delivery_store = Mutex::new(delivery_store);
         shared.context_catalog = RwLock::new(durable_context_catalog);
@@ -3091,6 +3116,7 @@ try { $contextHash = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadA
         } = self;
         shared.reconcile_materializations();
         shared.reconcile_managed_worktrees().await;
+        shared.retire_unavailable_session_records().await;
         shared.reconcile_context_pack_exports().await;
         let hook_ingress_endpoint = runtime
             .start_hook_ingress(HookIngressConfig::default())
@@ -3206,6 +3232,7 @@ async fn drive_runtime_until_shutdown(
         .shell_efficiency_profile
         .set(runtime.shell_efficiency_profile());
     let mut shutdown_started = None;
+    let mut last_retention_sweep = Instant::now();
     loop {
         // Every phase below is timed unconditionally -- see
         // `drive_loop_profile`'s own doc comment for why an always-on,
@@ -3347,6 +3374,15 @@ async fn drive_runtime_until_shutdown(
         shared.drive_loop_iterations_total.fetch_add(1, Ordering::Relaxed);
         if tick_result.observations_applied == 0 && events_drained == 0 {
             shared.drive_loop_iterations_idle.fetch_add(1, Ordering::Relaxed);
+        }
+
+        // A sweep cadence, not a policy value -- see
+        // `SESSION_RECORD_RETENTION_SWEEP_PERIOD`'s own doc comment. The
+        // policy itself (whether this does anything at all) lives entirely
+        // in `NodeShared::session_record_retention`.
+        if last_retention_sweep.elapsed() >= SESSION_RECORD_RETENTION_SWEEP_PERIOD {
+            shared.retire_unavailable_session_records().await;
+            last_retention_sweep = Instant::now();
         }
 
         sleep(Duration::from_millis(10)).await;
@@ -3787,6 +3823,16 @@ struct NodeShared {
     rejected_command_reasons: Mutex<BTreeMap<CommandId, RejectedCommandReason>>,
     drive_loop_iterations_total: AtomicU64,
     drive_loop_iterations_idle: AtomicU64,
+    /// The operator-chosen age/keep-N policy the retention sweep applies to
+    /// `ManagedSessionState::Unavailable` records. Both `0` by default --
+    /// see `SessionRecordRetentionConfig`'s own doc comment.
+    session_record_retention: SessionRecordRetentionConfig,
+    /// Lifetime count of managed session records the retention sweep has
+    /// retired. Same tier as `rejected_commands_total` above: a live,
+    /// process-lifetime instrument, never persisted and never reloaded from
+    /// `state-v1.json` -- a restart legitimately resets it, matching every
+    /// other `*_total` counter here.
+    retired_records_total: AtomicU64,
     #[cfg(feature = "fixture")]
     fixture_semantic_hook_policy: bool,
     #[cfg(feature = "fixture")]
@@ -4123,6 +4169,8 @@ impl NodeShared {
             rejected_command_reasons: Mutex::new(BTreeMap::new()),
             drive_loop_iterations_total: AtomicU64::new(0),
             drive_loop_iterations_idle: AtomicU64::new(0),
+            session_record_retention: SessionRecordRetentionConfig::default(),
+            retired_records_total: AtomicU64::new(0),
             #[cfg(feature = "fixture")]
             fixture_semantic_hook_policy: false,
             #[cfg(feature = "fixture")]
@@ -7902,9 +7950,6 @@ impl NodeShared {
         record_id: &SessionRecordId,
     ) -> Result<(), NodeFailure> {
         let record = self.record(record_id)?;
-        let managed_lease_id = self.managed_worktrees.lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .lease_for_workspace(&record.workspace_id);
         if record.active_session.is_some()
             || matches!(
                 record.state,
@@ -7919,6 +7964,31 @@ impl NodeShared {
         if let Some(address) = self.bound_address_for_record(record_id) {
             self.remove_session(&address).await?;
         }
+        self.remove_managed_session_record(record_id, &record.workspace_id).await
+    }
+
+    /// Removes one managed session record from durable state and notifies
+    /// every listener -- the shared transaction body behind both
+    /// `forget_session_record`'s operator-driven path (busy-checked above
+    /// it, and clears any still-live session binding before calling in
+    /// here) and the retention sweep (`retire_unavailable_session_records`,
+    /// which only ever selects `ManagedSessionState::Unavailable` records
+    /// that are already known never-busy and never bound, so it calls
+    /// straight into this with neither check). Cleans a managed-worktree
+    /// lease if the record held one, removes the record's environment
+    /// materialization (or, absent one, removes it from memory directly),
+    /// persists under `state_transaction` with rollback on persist failure,
+    /// then publishes `NodeEvent::SessionRecordRemoved` so c2's own
+    /// legacy-provider bookkeeping (`record_is_legacy`) stays in sync
+    /// exactly as it does for an operator-driven forget.
+    async fn remove_managed_session_record(
+        &self,
+        record_id: &SessionRecordId,
+        workspace_id: &WorkspaceId,
+    ) -> Result<(), NodeFailure> {
+        let managed_lease_id = self.managed_worktrees.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .lease_for_workspace(workspace_id);
         if !self.destroy_record_materialization(record_id)? {
             let transaction = self
                 .state_transaction
@@ -7950,6 +8020,123 @@ impl NodeShared {
             let _ = self.cleanup_managed_worktree(&lease_id, false).await;
         }
         Ok(())
+    }
+
+    /// Retires `ManagedSessionState::Unavailable` records against the
+    /// node's configured `session_record_retention` age/keep-N policy.
+    /// Never touches `Live`, `IdentityPending`, or `Dormant` records --
+    /// `Dormant` is resumable and folding it into this sweep would delete
+    /// records a caller can still act on. Both policy fields default to
+    /// `0` (disabled); when both are `0` this is a no-op. When both are
+    /// set, a record is retired only if it fails BOTH tests (older than
+    /// `age_ms` AND beyond the newest `keep_per_workspace` in its
+    /// workspace); when only one is set, that one alone decides. Called
+    /// once at startup (alongside `reconcile_managed_worktrees`) and then
+    /// on a `SESSION_RECORD_RETENTION_SWEEP_PERIOD` cadence from the drive
+    /// loop -- see both call sites.
+    async fn retire_unavailable_session_records(&self) {
+        let policy = self.session_record_retention;
+        let age_enabled = policy.age_ms > 0;
+        let keep_enabled = policy.keep_per_workspace > 0;
+        if !age_enabled && !keep_enabled {
+            return;
+        }
+        let now = unix_time_ms();
+        let candidates: Vec<(SessionRecordId, WorkspaceId, AgentId, u64)> = {
+            self.session_records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .records
+                .values()
+                .filter(|record| record.state == ManagedSessionState::Unavailable)
+                .map(|record| {
+                    (
+                        record.record_id.clone(),
+                        record.workspace_id.clone(),
+                        record.provider.clone(),
+                        record.updated_at_unix_ms,
+                    )
+                })
+                .collect()
+        };
+        if candidates.is_empty() {
+            return;
+        }
+        let mut by_workspace: BTreeMap<WorkspaceId, Vec<(SessionRecordId, AgentId, u64)>> =
+            BTreeMap::new();
+        for (record_id, workspace_id, provider, updated_at_unix_ms) in candidates {
+            by_workspace
+                .entry(workspace_id)
+                .or_default()
+                .push((record_id, provider, updated_at_unix_ms));
+        }
+        let reason = if age_enabled && keep_enabled {
+            "age+keep-n"
+        } else if age_enabled {
+            "age"
+        } else {
+            "keep-n"
+        };
+        let mut retired: u64 = 0;
+        for (workspace_id, mut records) in by_workspace {
+            // Newest `updated_at_unix_ms` first, so index `>=
+            // keep_per_workspace` names exactly "beyond the newest N".
+            records.sort_by(|left, right| right.2.cmp(&left.2));
+            for (index, (record_id, provider, updated_at_unix_ms)) in
+                records.into_iter().enumerate()
+            {
+                let record_age_ms = now.saturating_sub(updated_at_unix_ms);
+                let age_hit = age_enabled && record_age_ms >= policy.age_ms;
+                let keep_hit = keep_enabled && index >= policy.keep_per_workspace as usize;
+                let should_retire = if age_enabled && keep_enabled {
+                    age_hit && keep_hit
+                } else {
+                    age_hit || keep_hit
+                };
+                if !should_retire {
+                    continue;
+                }
+                match self.remove_managed_session_record(&record_id, &workspace_id).await {
+                    Ok(()) => {
+                        self.retired_records_total.fetch_add(1, Ordering::Relaxed);
+                        retired += 1;
+                        tracing::info!(
+                            node_id = %self.node_id,
+                            record_id = %record_id,
+                            workspace_id = %workspace_id,
+                            provider = %provider,
+                            age_ms = record_age_ms,
+                            reason,
+                            "managed session record retired"
+                        );
+                    }
+                    Err(error) => tracing::warn!(
+                        node_id = %self.node_id,
+                        record_id = %record_id,
+                        workspace_id = %workspace_id,
+                        code = ?error.code,
+                        cause = %error.message,
+                        "session record retention sweep failed to retire a record"
+                    ),
+                }
+            }
+        }
+        if retired > 0 {
+            let remaining_unavailable = self
+                .session_records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .records
+                .values()
+                .filter(|record| record.state == ManagedSessionState::Unavailable)
+                .count();
+            tracing::info!(
+                node_id = %self.node_id,
+                retired,
+                remaining_unavailable,
+                "session record retention sweep completed"
+            );
+        }
     }
 
     async fn resume_session_record(
@@ -22513,6 +22700,229 @@ mod tests {
             updated_at_unix_ms: 1,
             last_error: None,
         }
+    }
+
+    fn retention_test_record(
+        workspace_id: &str,
+        record_id: &str,
+        state: ManagedSessionState,
+        updated_at_unix_ms: u64,
+    ) -> ManagedSessionRecord {
+        ManagedSessionRecord {
+            record_id: SessionRecordId::new(record_id).unwrap(),
+            display_name: format!("{record_id} display"),
+            provider: agent("claude"),
+            mode: SessionMode::Pty,
+            state,
+            workspace_id: WorkspaceId::new(workspace_id).unwrap(),
+            canonical_root: opaque_windows_path(
+                std::env::current_dir().unwrap().to_string_lossy().into_owned(),
+            ),
+            provider_session: None,
+            active_session: None,
+            environment_profile: None,
+            bundle: None,
+            context_id: None,
+            context: None,
+            exported_context: None,
+            task_binding: None,
+            created_at_unix_ms: updated_at_unix_ms,
+            updated_at_unix_ms,
+            last_error: None,
+        }
+    }
+
+    /// Two workspaces of three `Unavailable` records each, staggered by
+    /// age, plus one never-touchable decoy per non-`Unavailable` state in
+    /// `workspace-a` (all as old as that workspace's oldest real record --
+    /// if the sweep's state gate ever leaked, these would be the first
+    /// thing it wrongly retired). Ages, oldest to newest:
+    /// `workspace-a`: a1 (500s), a2 (300s), a3 (100s).
+    /// `workspace-b`: b1 (400s), b2 (200s), b3 (50s).
+    fn retention_fixture_records(now: u64) -> Vec<ManagedSessionRecord> {
+        vec![
+            retention_test_record("workspace-a", "a1", ManagedSessionState::Unavailable, now - 500_000),
+            retention_test_record("workspace-a", "a2", ManagedSessionState::Unavailable, now - 300_000),
+            retention_test_record("workspace-a", "a3", ManagedSessionState::Unavailable, now - 100_000),
+            retention_test_record("workspace-b", "b1", ManagedSessionState::Unavailable, now - 400_000),
+            retention_test_record("workspace-b", "b2", ManagedSessionState::Unavailable, now - 200_000),
+            retention_test_record("workspace-b", "b3", ManagedSessionState::Unavailable, now - 50_000),
+            retention_test_record("workspace-a", "decoy-live", ManagedSessionState::Live, now - 500_000),
+            retention_test_record(
+                "workspace-a",
+                "decoy-pending",
+                ManagedSessionState::IdentityPending,
+                now - 500_000,
+            ),
+            retention_test_record(
+                "workspace-a",
+                "decoy-dormant",
+                ManagedSessionState::Dormant,
+                now - 500_000,
+            ),
+        ]
+    }
+
+    fn retention_fixture_shared() -> (NodeShared, NativeRuntime, PathBuf, u64) {
+        let root = temporary_workspace_root("session-record-retention");
+        std::fs::create_dir_all(&root).unwrap();
+        let catalog = active_registry().unwrap();
+        let (handle, runtime) = NativeRuntime::new(catalog, NativeRuntimeConfig::default());
+        let workspace_a =
+            WorkspaceConfig::new(WorkspaceId::new("workspace-a").unwrap(), &root).unwrap();
+        let workspace_b =
+            WorkspaceConfig::new(WorkspaceId::new("workspace-b").unwrap(), &root).unwrap();
+        let mut shared = NodeShared::new(
+            handle,
+            "fixture-token".to_owned(),
+            NodeId::new("node-retention-test").unwrap(),
+            vec![workspace_a, workspace_b],
+            vec![agent("claude")],
+        );
+        shared.state_path = Some(root.join("node-state-v10.json"));
+        let now = unix_time_ms();
+        for record in retention_fixture_records(now) {
+            shared.insert_record(record).unwrap();
+        }
+        shared
+            .persist_state_locked()
+            .expect("fixture-only, empty-history persist against a fresh temp state path");
+        (shared, runtime, root, now)
+    }
+
+    fn retention_removed_record_ids(shared: &NodeShared) -> std::collections::BTreeSet<String> {
+        shared
+            .history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .events
+            .iter()
+            .filter_map(|envelope| match &envelope.event {
+                NodeEvent::SessionRecordRemoved { record_id } => {
+                    Some(record_id.as_str().to_owned())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn retention_remaining_record_ids(shared: &NodeShared) -> std::collections::BTreeSet<String> {
+        shared
+            .session_records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .records
+            .keys()
+            .map(|record_id| record_id.as_str().to_owned())
+            .collect()
+    }
+
+    fn owned(values: &[&str]) -> std::collections::BTreeSet<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[tokio::test]
+    async fn session_record_retention_age_only_retires_old_unavailable_records_and_spares_decoys() {
+        let (mut shared, runtime, root, _now) = retention_fixture_shared();
+        shared.session_record_retention = SessionRecordRetentionConfig {
+            age_ms: 250_000,
+            keep_per_workspace: 0,
+        };
+        shared.retire_unavailable_session_records().await;
+
+        assert_eq!(
+            retention_remaining_record_ids(&shared),
+            owned(&["a3", "b2", "b3", "decoy-live", "decoy-pending", "decoy-dormant"]),
+        );
+        assert_eq!(retention_removed_record_ids(&shared), owned(&["a1", "a2", "b1"]));
+        assert_eq!(shared.retired_records_total.load(Ordering::Relaxed), 3);
+
+        let state_path = shared.state_path.clone().unwrap();
+        let loaded = session_registry::load(Some(&state_path), &shared.node_id).unwrap();
+        let loaded_ids: std::collections::BTreeSet<String> = loaded
+            .records
+            .iter()
+            .map(|record| record.record_id.as_str().to_owned())
+            .collect();
+        assert_eq!(
+            loaded_ids,
+            owned(&["a3", "b2", "b3", "decoy-live", "decoy-pending", "decoy-dormant"]),
+        );
+
+        drop(shared);
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_record_retention_keep_n_only_keeps_the_newest_per_workspace() {
+        let (mut shared, runtime, root, _now) = retention_fixture_shared();
+        shared.session_record_retention = SessionRecordRetentionConfig {
+            age_ms: 0,
+            keep_per_workspace: 1,
+        };
+        shared.retire_unavailable_session_records().await;
+
+        assert_eq!(
+            retention_remaining_record_ids(&shared),
+            owned(&["a3", "b3", "decoy-live", "decoy-pending", "decoy-dormant"]),
+        );
+        assert_eq!(
+            retention_removed_record_ids(&shared),
+            owned(&["a1", "a2", "b1", "b2"]),
+        );
+        assert_eq!(shared.retired_records_total.load(Ordering::Relaxed), 4);
+
+        drop(shared);
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Age-only would retire {a1, a2, b1}; keep-N-only would retire
+    /// {a1, a2, b1, b2}. With both flags set the sweep must retire exactly
+    /// the intersection {a1, a2, b1} -- `b2` fails the age test (it is only
+    /// 200s old against a 250s threshold) even though it fails the keep-N
+    /// test too, proving retirement needs BOTH, not either.
+    #[tokio::test]
+    async fn session_record_retention_both_set_retires_only_the_intersection() {
+        let (mut shared, runtime, root, _now) = retention_fixture_shared();
+        shared.session_record_retention = SessionRecordRetentionConfig {
+            age_ms: 250_000,
+            keep_per_workspace: 1,
+        };
+        shared.retire_unavailable_session_records().await;
+
+        assert_eq!(
+            retention_remaining_record_ids(&shared),
+            owned(&["a3", "b2", "b3", "decoy-live", "decoy-pending", "decoy-dormant"]),
+        );
+        assert_eq!(retention_removed_record_ids(&shared), owned(&["a1", "a2", "b1"]));
+        assert_eq!(shared.retired_records_total.load(Ordering::Relaxed), 3);
+
+        drop(shared);
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_record_retention_both_disabled_is_a_no_op() {
+        let (mut shared, runtime, root, _now) = retention_fixture_shared();
+        shared.session_record_retention = SessionRecordRetentionConfig::default();
+        shared.retire_unavailable_session_records().await;
+
+        assert_eq!(
+            retention_remaining_record_ids(&shared),
+            owned(&[
+                "a1", "a2", "a3", "b1", "b2", "b3",
+                "decoy-live", "decoy-pending", "decoy-dormant",
+            ]),
+        );
+        assert!(retention_removed_record_ids(&shared).is_empty());
+        assert_eq!(shared.retired_records_total.load(Ordering::Relaxed), 0);
+
+        drop(shared);
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

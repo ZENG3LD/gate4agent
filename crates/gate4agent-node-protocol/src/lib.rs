@@ -3840,6 +3840,24 @@ pub enum ManagedSessionState {
     Unavailable,
 }
 
+/// Node-local policy for retiring dead `ManagedSessionState::Unavailable`
+/// records so a long-lived node's durable state does not grow forever.
+/// Both fields default to `0` (disabled) -- a freshly started node must
+/// never silently delete a record until an operator has chosen real values
+/// via `--session-record-retention-age-ms` / `--session-record-retention-keep`.
+/// Never applies to `Live`, `IdentityPending`, or `Dormant` records: only
+/// `Unavailable` is both inert (no `active_session`) and not resumable.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SessionRecordRetentionConfig {
+    /// Minimum age (`now - updated_at_unix_ms`) an `Unavailable` record must
+    /// reach before it is eligible for retirement. `0` disables the age test.
+    pub age_ms: u64,
+    /// Per-`workspace_id` floor: the newest `keep_per_workspace` `Unavailable`
+    /// records (by `updated_at_unix_ms`) in a workspace are never retired by
+    /// this test. `0` disables the keep-N test.
+    pub keep_per_workspace: u32,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionTaskBindingV1 {

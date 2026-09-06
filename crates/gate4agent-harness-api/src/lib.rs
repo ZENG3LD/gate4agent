@@ -4630,6 +4630,12 @@ pub struct HarnessRuntimeInventoryV1 {
     pub managed_sessions: Vec<HarnessRuntimeManagedSessionV1>,
     pub managed_session_count: usize,
     pub managed_sessions_truncated: bool,
+    /// Lifetime count of managed session records the node's own retention
+    /// sweep has retired (mirrors `gate4agent_c2_protocol::SlimNodeInventory::
+    /// retired_count`). Additive and informational only, `#[serde(default)]`
+    /// so a payload from before this field existed still deserializes.
+    #[serde(default)]
+    pub retired_count: usize,
     // Operator-visible surface: no redaction beyond what the direct-C2 TUI
     // already shows for the same node (`NodeView::launch_inventory`). Mirrors
     // `gate4agent_node_protocol::LaunchInventory` field-for-field rather than
@@ -4639,6 +4645,24 @@ pub struct HarnessRuntimeInventoryV1 {
     // type from this mirror on receipt (`client.rs::project_harness_inventory_node`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_inventory: Option<HarnessRuntimeLaunchInventoryV1>,
+}
+
+/// Same liveness-first rationale and exact rank table as c2-protocol's own
+/// `managed_session_liveness_rank` (`gate4agent_c2_protocol::SlimNodeInventory`
+/// page-cut ordering): `Live` ranks first, `IdentityPending` next, `Dormant`
+/// next, terminal `Unavailable` last. The producer orders a page by this
+/// rank before the `MAX_C2_MANAGED_SESSIONS_PER_NODE` cut, so a page is
+/// never sorted by bare `record_id` alone -- validating strict ascending
+/// `record_id` order regardless of state rejected every real page (fixed
+/// after `ed4fa61` regressed this: see `managed_session_liveness_rank`'s
+/// own doc comment in c2-protocol for why the producer's order changed).
+fn managed_session_liveness_rank(state: &HarnessRuntimeManagedStateV1) -> u8 {
+    match state {
+        HarnessRuntimeManagedStateV1::Live => 0,
+        HarnessRuntimeManagedStateV1::IdentityPending => 1,
+        HarnessRuntimeManagedStateV1::Dormant => 2,
+        HarnessRuntimeManagedStateV1::Unavailable => 3,
+    }
 }
 
 impl HarnessRuntimeInventoryV1 {
@@ -4659,7 +4683,11 @@ impl HarnessRuntimeInventoryV1 {
             || self.sessions_truncated != (self.session_count > included_sessions)
             || self.managed_sessions_truncated
                 != (self.managed_session_count > self.managed_sessions.len())
-            || self.managed_sessions.windows(2).any(|pair| pair[0].record_id >= pair[1].record_id)
+            || self.managed_sessions.windows(2).any(|pair| {
+                let left = (managed_session_liveness_rank(&pair[0].state), pair[0].record_id.as_str());
+                let right = (managed_session_liveness_rank(&pair[1].state), pair[1].record_id.as_str());
+                left >= right
+            })
         {
             return Err(HarnessOperatorApiError::InvalidRuntimeInventory);
         }
@@ -8831,6 +8859,76 @@ mod tests {
         assert!(counted_without_timestamp.validate().is_err());
     }
 
+    fn sample_runtime_inventory(
+        managed_sessions: Vec<HarnessRuntimeManagedSessionV1>,
+    ) -> HarnessRuntimeInventoryV1 {
+        HarnessRuntimeInventoryV1 {
+            enabled_providers: Vec::new(),
+            workspaces: BTreeMap::new(),
+            workspace_count: 0,
+            workspaces_truncated: false,
+            session_count: 0,
+            sessions_truncated: false,
+            managed_session_count: managed_sessions.len(),
+            managed_sessions_truncated: false,
+            managed_sessions,
+            retired_count: 0,
+            launch_inventory: None,
+        }
+    }
+
+    /// Regression for `ed4fa61`: the producer (`SlimNodeInventory::
+    /// from_snapshot`/`from_c2_snapshot`, c2-protocol) orders a managed-
+    /// session page by `managed_session_liveness_rank` (Live, IdentityPending,
+    /// Dormant, Unavailable) first and `record_id` only within a rank, so a
+    /// real page's `record_id`s are routinely NOT ascending overall. Before
+    /// this fix `validate` demanded flat ascending `record_id` order and
+    /// rejected every such page outright.
+    #[test]
+    fn managed_session_ordering_is_liveness_rank_then_record_id() {
+        let mut live = sample_managed_session("zzz-live");
+        live.state = HarnessRuntimeManagedStateV1::Live;
+        let mut pending = sample_managed_session("aaa-pending");
+        pending.state = HarnessRuntimeManagedStateV1::IdentityPending;
+        let mut unavailable = sample_managed_session("mmm-unavailable");
+        unavailable.state = HarnessRuntimeManagedStateV1::Unavailable;
+
+        let ordered = sample_runtime_inventory(vec![
+            live.clone(),
+            pending,
+            unavailable,
+        ]);
+        ordered.validate().expect(
+            "liveness-rank-then-record_id order validates even though record_id is not ascending overall",
+        );
+
+        let duplicate = sample_runtime_inventory(vec![live.clone(), live.clone()]);
+        assert!(duplicate.validate().is_err());
+
+        let mut dormant = sample_managed_session("aaa-dormant");
+        dormant.state = HarnessRuntimeManagedStateV1::Dormant;
+        let rank_out_of_order = sample_runtime_inventory(vec![dormant, live]);
+        assert!(rank_out_of_order.validate().is_err());
+    }
+
+    /// Slice R (`gate4agent-node`'s session-record retention sweep):
+    /// `retired_count` is additive, defaults to `0` for a pre-existing
+    /// payload that never had it, and round-trips intact once a producer
+    /// sets a real, nonzero value.
+    #[test]
+    fn runtime_inventory_retired_count_round_trips_and_defaults_to_zero() {
+        let mut inventory = sample_runtime_inventory(Vec::new());
+        assert_eq!(inventory.retired_count, 0);
+        inventory.validate().expect("a fresh sample inventory is valid");
+
+        inventory.retired_count = 5;
+        let encoded = serde_json::to_string(&inventory).unwrap();
+        assert!(encoded.contains("\"retired_count\":5"));
+        let decoded: HarnessRuntimeInventoryV1 = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, inventory);
+        decoded.validate().expect("a nonzero retired_count is still a valid inventory");
+    }
+
     #[test]
     fn runtime_inventory_launch_inventory_round_trips_and_fails_closed() {
         let node = HarnessRuntimeNodeInventoryV1 {
@@ -8848,6 +8946,7 @@ mod tests {
                 managed_sessions: Vec::new(),
                 managed_session_count: 0,
                 managed_sessions_truncated: false,
+                retired_count: 0,
                 launch_inventory: Some(HarnessRuntimeLaunchInventoryV1 {
                     spawn_profiles: Some(vec![HarnessRuntimeSpawnProfileSummaryV1 {
                         id: "default".to_owned(),
@@ -11249,6 +11348,7 @@ mod tests {
                 managed_sessions: Vec::new(),
                 managed_session_count: 0,
                 managed_sessions_truncated: false,
+                retired_count: 0,
                 launch_inventory: None,
             },
         }

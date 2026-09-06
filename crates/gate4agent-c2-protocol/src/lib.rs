@@ -2844,6 +2844,15 @@ pub struct SlimNodeInventory {
     pub managed_session_count: usize,
     #[serde(default)]
     pub managed_sessions_truncated: bool,
+    /// Lifetime count of managed session records the node's own retention
+    /// sweep has retired (`NodeShared::retired_records_total`, gate4agent-
+    /// node). Additive and informational only -- unlike `managed_session_
+    /// count`/`managed_sessions_truncated` it is not cross-checked against
+    /// `managed_sessions` (retired records are gone from that list by
+    /// definition, not merely paged out of it). `0` on any snapshot source
+    /// that does not yet carry the node's own counter through.
+    #[serde(default, skip_serializing_if = "usize_is_zero")]
+    pub retired_count: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub managed_worktrees: Vec<ManagedWorktreeLeaseSnapshot>,
     #[serde(default, skip_serializing_if = "usize_is_zero")]
@@ -2984,6 +2993,12 @@ impl SlimNodeInventory {
             managed_sessions_truncated: managed_sessions.len() < managed_session_count,
             managed_sessions,
             managed_session_count,
+            // Neither `NodeSnapshot` nor `C2NodeSnapshot` carries the
+            // node's own `retired_records_total` atomic through yet -- see
+            // this field's own doc comment. `0` here is the honest value
+            // for what this projection can see today, not a placeholder
+            // masking a real number.
+            retired_count: 0,
             managed_worktrees_truncated:
                 managed_worktrees.len() < managed_worktree_count,
             managed_worktrees,
@@ -3070,6 +3085,12 @@ impl SlimNodeInventory {
             managed_sessions_truncated: managed_sessions.len() < managed_session_count,
             managed_sessions,
             managed_session_count,
+            // Neither `NodeSnapshot` nor `C2NodeSnapshot` carries the
+            // node's own `retired_records_total` atomic through yet -- see
+            // this field's own doc comment. `0` here is the honest value
+            // for what this projection can see today, not a placeholder
+            // masking a real number.
+            retired_count: 0,
             managed_worktrees_truncated:
                 managed_worktrees.len() < managed_worktree_count,
             managed_worktrees,
@@ -6200,6 +6221,26 @@ mod tests {
         let reencoded = serde_json::to_string(&inventory).unwrap();
         assert!(!reencoded.contains("provider_contracts"));
         assert!(!reencoded.contains("provider_adapter_contracts"));
+        assert_eq!(inventory.retired_count, 0);
+        assert!(!reencoded.contains("retired_count"));
+    }
+
+    /// Slice R (`gate4agent-node`'s session-record retention sweep):
+    /// `retired_count` is additive, defaults to `0` for a pre-existing
+    /// payload that never had it, and round-trips intact once a producer
+    /// sets a real, nonzero value.
+    #[test]
+    fn slim_inventory_retired_count_round_trips_and_defaults_to_zero() {
+        let legacy = r#"{"node_id":"node-a","enabled_providers":[],"workspaces":{},"workspace_count":0,"workspaces_truncated":false,"session_count":0,"sessions_truncated":false}"#;
+        let inventory = serde_json::from_str::<SlimNodeInventory>(legacy).unwrap();
+        assert_eq!(inventory.retired_count, 0);
+
+        let mut inventory = inventory;
+        inventory.retired_count = 7;
+        let encoded = serde_json::to_string(&inventory).unwrap();
+        assert!(encoded.contains("\"retired_count\":7"));
+        let decoded: SlimNodeInventory = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.retired_count, 7);
     }
 
     #[test]

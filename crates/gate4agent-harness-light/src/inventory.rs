@@ -407,6 +407,7 @@ mod tests {
                 managed_sessions: Vec::new(),
                 managed_session_count: 0,
                 managed_sessions_truncated: false,
+                retired_count: 0,
                 launch_inventory: None,
             },
         }

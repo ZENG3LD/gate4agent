@@ -4,7 +4,8 @@ use gate4agent_node::{
     WorkspaceConfig, WorktreeServiceMode,
 };
 use gate4agent_node::protocol::{
-    ManagedWorktreeRetention, NodeId, WorktreeProfileId, WorktreeProfileRevision, WorkspaceId,
+    ManagedWorktreeRetention, NodeId, SessionRecordRetentionConfig, WorktreeProfileId,
+    WorktreeProfileRevision, WorkspaceId,
 };
 use gate4agent_types::AdapterId;
 use std::collections::BTreeMap;
@@ -37,6 +38,7 @@ async fn main() {
     let mut managed_profiles = Vec::new();
     let mut history_roots = Vec::new();
     let mut harness_mcp_helper: Option<PathBuf> = None;
+    let mut session_record_retention = SessionRecordRetentionConfig::default();
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
         match argument.as_str() {
@@ -46,6 +48,20 @@ async fn main() {
                 api_listen = value
                     .parse()
                     .unwrap_or_else(|error| fail(&format!("--api-listen is invalid: {error}")));
+            }
+            // Both default to `0` (disabled) via `SessionRecordRetentionConfig::default`
+            // above -- a fresh node must never start deleting durable
+            // records until an operator has chosen real values here.
+            "--session-record-retention-age-ms" => {
+                let value = required_value("--session-record-retention-age-ms", args.next());
+                session_record_retention.age_ms = parse_session_record_retention_age_ms(&value)
+                    .unwrap_or_else(|error| fail(&error));
+            }
+            "--session-record-retention-keep" => {
+                let value = required_value("--session-record-retention-keep", args.next());
+                session_record_retention.keep_per_workspace =
+                    parse_session_record_retention_keep(&value)
+                        .unwrap_or_else(|error| fail(&error));
             }
             // Dial the relay instead of only waiting to be dialled -- for
             // a node the relay has no way to reach. The node stays the
@@ -135,8 +151,9 @@ async fn main() {
             // Gate4Agent never derives provider storage from the process home.
             "--no-default-history" => {}
             "--help" | "-h" => {
-                println!("gate4agent-node --node-id ID --workspace ID=ABSOLUTE_PATH [--worktree-mode ID=manual|managed|off] [--managed-worktree-profile 'ID=PROFILE|REVISION|ABS_ROOT|BRANCH_PREFIX|BASE|RETENTION'] [--history-root 'ADAPTER|LAYOUT|ABS_ROOT'] [--harness-mcp-helper ABSOLUTE_REGULAR_FILE] [--endpoint ABSOLUTE_LOCAL_ENDPOINT] [--api-listen 127.0.0.1:PORT] [--c2-dial 127.0.0.1:PORT]");
+                println!("gate4agent-node --node-id ID --workspace ID=ABSOLUTE_PATH [--worktree-mode ID=manual|managed|off] [--managed-worktree-profile 'ID=PROFILE|REVISION|ABS_ROOT|BRANCH_PREFIX|BASE|RETENTION'] [--history-root 'ADAPTER|LAYOUT|ABS_ROOT'] [--harness-mcp-helper ABSOLUTE_REGULAR_FILE] [--endpoint ABSOLUTE_LOCAL_ENDPOINT] [--api-listen 127.0.0.1:PORT] [--c2-dial 127.0.0.1:PORT] [--session-record-retention-age-ms MILLISECONDS] [--session-record-retention-keep COUNT]");
                 println!("RETENTION: remove-when-released or retain");
+                println!("--session-record-retention-age-ms/--session-record-retention-keep: retire dead Unavailable managed session records; both default to 0 (disabled)");
                 println!("LAYOUT: single-ndjson|single-json|json-or-ndjson|ndjson-with-optional-index|summary-json-with-sibling-ndjson|metadata-json-with-sibling-json|session-json-with-sibling-message-json|readonly-sqlite-projection|state-json-with-index-and-sibling-ndjson");
                 println!("control token: {NODE_TOKEN_ENV} environment variable");
                 println!("--c2-dial: dial a relay's call-home listener instead of waiting to be dialled");
@@ -186,6 +203,7 @@ async fn main() {
     } else {
         config
     };
+    let config = config.with_session_record_retention(session_record_retention);
     let server = NodeServer::new(config).unwrap_or_else(|error| fail(&error.to_string()));
     if let Err(error) = server.run_until_ctrl_signal().await {
         fail(&error.to_string());
@@ -242,6 +260,16 @@ fn parse_history_layout(value: &str) -> HistorySourceLayout {
     }
 }
 
+fn parse_session_record_retention_age_ms(value: &str) -> Result<u64, String> {
+    value.parse()
+        .map_err(|error| format!("--session-record-retention-age-ms is invalid: {error}"))
+}
+
+fn parse_session_record_retention_keep(value: &str) -> Result<u32, String> {
+    value.parse()
+        .map_err(|error| format!("--session-record-retention-keep is invalid: {error}"))
+}
+
 fn required_value(flag: &str, value: Option<String>) -> String {
     value.unwrap_or_else(|| fail(&format!("{flag} requires a value")))
 }
@@ -267,5 +295,30 @@ mod tests {
         );
         let config = explicit_history_config(vec![root]).unwrap().unwrap();
         assert_eq!(config.roots().len(), 1);
+    }
+
+    #[test]
+    fn session_record_retention_age_ms_parses_a_valid_flag_value() {
+        assert_eq!(
+            parse_session_record_retention_age_ms("604800000").unwrap(),
+            604_800_000,
+        );
+    }
+
+    #[test]
+    fn session_record_retention_age_ms_refuses_a_non_numeric_value_by_name() {
+        let error = parse_session_record_retention_age_ms("not-a-number").unwrap_err();
+        assert!(error.starts_with("--session-record-retention-age-ms is invalid: "));
+    }
+
+    #[test]
+    fn session_record_retention_keep_parses_a_valid_flag_value() {
+        assert_eq!(parse_session_record_retention_keep("32").unwrap(), 32);
+    }
+
+    #[test]
+    fn session_record_retention_keep_refuses_a_non_numeric_value_by_name() {
+        let error = parse_session_record_retention_keep("not-a-number").unwrap_err();
+        assert!(error.starts_with("--session-record-retention-keep is invalid: "));
     }
 }

@@ -8652,6 +8652,7 @@ pub fn redact_runtime_inventory(
         managed_sessions,
         managed_session_count: inventory.managed_session_count,
         managed_sessions_truncated: inventory.managed_sessions_truncated,
+        retired_count: inventory.retired_count,
         launch_inventory: inventory.launch_inventory.map(redact_launch_inventory),
     }
 }
@@ -13639,6 +13640,7 @@ mod tests {
             managed_sessions: Vec::new(),
             managed_session_count: 0,
             managed_sessions_truncated: false,
+            retired_count: 0,
             managed_worktrees: Vec::new(),
             managed_worktree_count: 0,
             managed_worktrees_truncated: false,

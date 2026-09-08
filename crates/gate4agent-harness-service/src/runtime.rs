@@ -11552,7 +11552,29 @@ fn prepare_harness_mcp_read_call(
     let tool_id = crate::read::harness_mcp_tool_id(&request);
     let now = unix_time_ms();
     let current_route = adapter.exact_route(&route.node_id)?;
-    let authorization = if current_route != route || now >= deadline_unix_ms {
+    // Three unrelated conditions all answer the caller `Unauthorized`, and
+    // the served line below can only report `grant_id="unauthorized"` for
+    // every one of them. Name which one fired, with its own inputs, or a
+    // refused read is indistinguishable from a stale route and from a
+    // reservation that never armed -- the cause would exist in no log.
+    let authorization = if current_route != route {
+        tracing::warn!(
+            tool = tool_id,
+            expected_incarnation = ?route.expected_incarnation_id,
+            current_incarnation = ?current_route.expected_incarnation_id,
+            reason = "node route no longer matches the call's incarnation",
+            "harness MCP read call refused",
+        );
+        Err(HarnessReadHostErrorV1::Unauthorized)
+    } else if now >= deadline_unix_ms {
+        tracing::warn!(
+            tool = tool_id,
+            now,
+            deadline_unix_ms,
+            overshoot_ms = now.saturating_sub(deadline_unix_ms),
+            reason = "call deadline had already passed when the harness reached it",
+            "harness MCP read call refused",
+        );
         Err(HarnessReadHostErrorV1::Unauthorized)
     } else {
         harness.authorize_harness_mcp_call(
@@ -11561,7 +11583,16 @@ fn prepare_harness_mcp_read_call(
             &activation_digest,
             &record_id,
             &session,
-        ).map_err(|_| HarnessReadHostErrorV1::Unauthorized)
+        ).map_err(|error| {
+            tracing::warn!(
+                tool = tool_id,
+                reservation_id = reservation_id.as_str(),
+                error = ?error,
+                reason = "reservation/session binding rejected the call",
+                "harness MCP read call refused",
+            );
+            HarnessReadHostErrorV1::Unauthorized
+        })
     };
     // Captured before `authorization` is consumed below -- this is the one
     // piece of the served call's identity (`grant id`) that only exists on

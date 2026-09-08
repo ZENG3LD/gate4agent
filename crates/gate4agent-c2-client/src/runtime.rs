@@ -71,7 +71,7 @@ const WRITER_CAPACITY: usize = 64;
 /// down; teardown (`RegularEventBackpressure`) stays the last resort for a
 /// consumer that is genuinely stuck, not merely bursty.
 pub(crate) const EVENT_CAPACITY: usize = 1024;
-const HARNESS_MCP_EVENT_CAPACITY: usize = 128;
+pub(crate) const HARNESS_MCP_EVENT_CAPACITY: usize = 128;
 const OPAQUE_UNIX_PATH_NOT_NEGOTIATED: &str =
     "opaque Unix paths require negotiated C2 capability";
 const REPOSITORY_PATH_NOT_NEGOTIATED: &str =
@@ -325,6 +325,21 @@ impl C2EventReceiver {
                 }
             }
         }
+    }
+
+    /// Splits into two independent mutable borrows, one per channel, so a
+    /// caller can race both in a single `tokio::select!` (the reconnect
+    /// bridge's own `pump_one_connection`). Two separate `&mut self` async
+    /// accessor methods (one per channel) cannot be used together in one
+    /// `select!`: the future each returns borrows the whole receiver for
+    /// its lifetime, and the borrow checker rejects two such futures
+    /// coexisting even though the methods would only touch disjoint
+    /// fields. Splitting once, up front, hands out two genuinely disjoint
+    /// borrows instead.
+    pub(crate) fn split_mut(
+        &mut self,
+    ) -> (&mut mpsc::Receiver<RoutedNodeEvent>, &mut mpsc::Receiver<RoutedNodeEvent>) {
+        (&mut self.events, &mut self.harness_mcp_events)
     }
 }
 
@@ -4763,6 +4778,73 @@ mod tests {
         assert!(matches!(
             receiver.events.try_recv(),
             Err(mpsc::error::TryRecvError::Empty),
+        ));
+
+        drop(commands_tx);
+        drop(incoming_tx);
+        timeout(Duration::from_secs(1), owner).await.unwrap().unwrap();
+    }
+
+    /// `split_mut` (the Stage 1 accessor the reconnect bridge's
+    /// `pump_one_connection` needs to race both channels in one `select!`)
+    /// must hand out two receivers that each drain only their own class,
+    /// regardless of enqueue order -- proving the two channels are
+    /// genuinely independent streams, not merely `recv()`'s internal
+    /// biased-merge order.
+    #[tokio::test]
+    async fn split_mut_drains_each_channel_independently_of_enqueue_order() {
+        let (commands_tx, commands_rx) = mpsc::channel(1);
+        let (events_tx, events_rx) = mpsc::channel(EVENT_CAPACITY);
+        let (harness_tx, harness_rx) = mpsc::channel(HARNESS_MCP_EVENT_CAPACITY);
+        let (writer_tx, _writer_rx) = mpsc::channel(1);
+        let (incoming_tx, incoming_rx) = mpsc::channel(2);
+        let (topology_tx, _topology_rx) =
+            watch::channel(Arc::new(C2Topology { nodes: Vec::new() }));
+        let mut capabilities = all_path_capabilities();
+        capabilities.harness_mcp_read_proxy = true;
+        let deadline_unix_ms = current_unix_ms().unwrap() + 3_000;
+        // The regular event is enqueued FIRST -- if the two split
+        // receivers were secretly still merged, a naive FIFO reading of the
+        // harness_mcp side first would see nothing ready and this test
+        // would hang (caught by the outer `timeout`) or, worse, silently
+        // return the regular event.
+        incoming_tx.send(ordinary_state_event(42)).await.unwrap();
+        incoming_tx.send(harness_mcp_event(1, deadline_unix_ms)).await.unwrap();
+        let owner = tokio::spawn(control_owner(
+            commands_rx,
+            EventDelivery { regular: events_tx, harness_mcp: harness_tx },
+            topology_tx,
+            writer_tx,
+            incoming_rx,
+            capabilities,
+        ));
+        let mut receiver = C2EventReceiver {
+            events: events_rx,
+            harness_mcp_events: harness_rx,
+        };
+        timeout(Duration::from_secs(1), async {
+            while receiver.events.len() != 1 || receiver.harness_mcp_events.len() != 1 {
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+
+        let (regular_events, harness_mcp_events) = receiver.split_mut();
+
+        let mcp_event = timeout(Duration::from_secs(1), harness_mcp_events.recv())
+            .await
+            .expect("the harness_mcp receiver must not block on the regular channel")
+            .unwrap();
+        assert!(matches!(mcp_event.event, C2NodeEvent::HarnessMcpReadCall { .. }));
+
+        let regular_event = timeout(Duration::from_secs(1), regular_events.recv())
+            .await
+            .expect("the regular receiver must not block on the harness_mcp channel")
+            .unwrap();
+        assert_eq!(regular_event.cursor.sequence, 42);
+        assert!(matches!(
+            regular_event.event,
+            C2NodeEvent::WorkspaceRemoved { ref workspace_id }
+                if workspace_id.as_str() == "retired"
         ));
 
         drop(commands_tx);

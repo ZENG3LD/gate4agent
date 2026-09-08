@@ -4897,6 +4897,45 @@ fn start_dispatch_finish(
     });
 }
 
+/// Tags which of the two split C2 event channels
+/// [`next_harness_mcp_or_regular_event`] resolved to.
+enum HarnessMcpOrRegularEvent {
+    HarnessMcp(Option<RoutedNodeEvent>),
+    Regular(Option<RoutedNodeEvent>),
+}
+
+/// Resolves to whichever of the two split C2 event channels has an event
+/// ready, preferring `harness_mcp_events` whenever both are ready at once
+/// -- the Stage 1 priority fix (a `HarnessMcpReadCall` must never queue
+/// behind a regular-event backlog). Factored out of the main runtime
+/// loop's own `tokio::select!` arm so the priority rule itself is directly
+/// testable without spinning up a whole harness host.
+///
+/// Takes the two "still open" flags as plain `bool` parameters (rather
+/// than the main loop's own `&mut bool` locals) so this function's inner
+/// `select!` guards can disable either arm exactly as the main loop's
+/// outer arm guard already does for the call as a whole -- see the
+/// caller's own doc comment for why a further split into two arms of the
+/// SAME select as `command_rx.recv()`/`topology.changed()` is not safe
+/// here (the double-`&mut self` borrow `recv_regular`/`recv_harness_mcp`
+/// would need).
+async fn next_harness_mcp_or_regular_event(
+    harness_mcp_events: &mut mpsc::Receiver<RoutedNodeEvent>,
+    harness_mcp_events_open: bool,
+    regular_events: &mut mpsc::Receiver<RoutedNodeEvent>,
+    events_open: bool,
+) -> HarnessMcpOrRegularEvent {
+    tokio::select! {
+        biased;
+        harness_mcp_event = harness_mcp_events.recv(), if harness_mcp_events_open => {
+            HarnessMcpOrRegularEvent::HarnessMcp(harness_mcp_event)
+        }
+        regular_event = regular_events.recv(), if events_open => {
+            HarnessMcpOrRegularEvent::Regular(regular_event)
+        }
+    }
+}
+
 pub async fn start_harness_host(
     harness: HarnessService,
     observation: ObservationService,
@@ -5072,6 +5111,7 @@ pub async fn start_harness_host_with_operator_and_catalogs(
             )?;
         }
         let mut events_open = true;
+        let mut harness_mcp_events_open = true;
         let mut topology_open = true;
         let mut recovery_retry = interval_at(
             Instant::now() + OBSERVATION_RECOVERY_RETRY,
@@ -5094,6 +5134,16 @@ pub async fn start_harness_host_with_operator_and_catalogs(
         );
         subscriber_keepalive.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut observation_recovery = ObservationRecoveryRegistry::default();
+        // Split once, up front: `events.recv_harness_mcp()` and
+        // `events.recv_regular()` cannot both appear as arms of
+        // `next_harness_mcp_or_regular_event`'s own inner `select!` below --
+        // each is an `&mut self` async method, so the two futures would
+        // borrow the whole `HarnessC2EventReceiver` for the same lifetime,
+        // which the borrow checker rejects even though the methods only
+        // ever touch their own disjoint channel. `split_mut` hands out the
+        // two channels' receivers as genuinely independent `&mut` borrows
+        // instead.
+        let (regular_events, harness_mcp_events) = events.split_mut();
         loop {
             tokio::select! {
                 command = command_rx.recv() => {
@@ -7141,144 +7191,170 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                         None => return Err(HarnessRuntimeError::HostStopped),
                     }
                 }
-                event = events.recv(), if events_open => {
-                    match event {
-                        Some(event) => {
-                            match &event.event {
-                                C2NodeEvent::TerminalFrame { address, frame } => {
-                                    let key = RuntimeSessionKey {
-                                        node_id: event.node_id.clone(),
-                                        incarnation_id: event.cursor.incarnation_id,
-                                        workspace_id: address.workspace_id.clone(),
-                                        instance_id: address.session.instance_id,
-                                        generation: address.session.generation,
+                // A single arm slot for "the next C2 event" -- exactly the
+                // shape this outer (bare, unbiased) `select!` had before the
+                // channel split -- whose own future internally prefers a
+                // `HarnessMcpReadCall` over a regular event whenever both
+                // are ready (`next_harness_mcp_or_regular_event`'s own
+                // `biased` inner `select!`). Biasing the WHOLE outer
+                // `select!` instead would also reorder `command_rx.recv()`
+                // above and `topology.changed()`/the timer ticks below,
+                // none of which this change may touch.
+                event_source = next_harness_mcp_or_regular_event(
+                    harness_mcp_events,
+                    harness_mcp_events_open,
+                    regular_events,
+                    events_open,
+                ), if events_open || harness_mcp_events_open => {
+                    match event_source {
+                        HarnessMcpOrRegularEvent::HarnessMcp(event) => {
+                            match event {
+                                Some(event) => {
+                                    let result = match prepare_harness_mcp_read_call(
+                                        &adapter,
+                                        &mut harness,
+                                        &observation,
+                                        &support,
+                                        &runtime_inventory,
+                                        event,
+                                    )? {
+                                        PreparedHarnessMcpRead::Ready(plan) => {
+                                            let _ = schedule_harness_mcp_relay(
+                                                &adapter,
+                                                &commands,
+                                                &mut harness_mcp_workers,
+                                                &pending_harness_mcp_aborts,
+                                                &harness_mcp_rejects,
+                                                plan,
+                                            )?;
+                                            Ok(())
+                                        }
+                                        PreparedHarnessMcpRead::Deferred(deferred) => {
+                                            schedule_deferred_harness_mcp_relay(
+                                                &adapter,
+                                                &harness,
+                                                &commands,
+                                                &runtime_inventory,
+                                                &mut harness_mcp_workers,
+                                                &pending_harness_mcp_aborts,
+                                                &harness_mcp_rejects,
+                                                deferred,
+                                            )
+                                        }
                                     };
-                                    terminal_buffers.ingest(key.clone(), frame.clone());
-                                    terminal_subscribers.publish(&key, frame);
-                                    // The frame is also how the inventory
-                                    // learns this session's screen changed
-                                    // -- see `apply_screen_state` for why
-                                    // the resync cadence is not enough for
-                                    // this one field.
-                                    if let Some(node) = runtime_inventory
-                                        .apply_screen_state(&key, &frame.screen_state)
-                                    {
-                                        let node = node.clone();
-                                        subscribers.emit(|sequence| {
-                                            HarnessOperatorEventV1::RuntimeInventoryChanged {
-                                                sequence,
-                                                node: node.clone(),
-                                            }
-                                        });
+                                    if let Err(error) = result {
+                                        if !matches!(error, HarnessRuntimeError::C2(_)) {
+                                            return Err(error);
+                                        }
                                     }
                                 }
-                                C2NodeEvent::AgentStream { address, chunk } => {
-                                    let key = RuntimeSessionKey {
-                                        node_id: event.node_id.clone(),
-                                        incarnation_id: event.cursor.incarnation_id,
-                                        workspace_id: address.workspace_id.clone(),
-                                        instance_id: address.session.instance_id,
-                                        generation: address.session.generation,
-                                    };
-                                    agent_stream_subscribers.publish(&key, chunk);
-                                }
-                                // The generic sink for every way an
-                                // interaction can settle -- an operator's own
-                                // `ResolveInteraction` (via its C2 round
-                                // trip and the node's own report back) or
-                                // `HostPolicy` deciding it on a deadline both
-                                // land here the same way, since both produce
-                                // the same observation kind. See
-                                // `AgentStreamSubscriberRegistry::
-                                // resolve_interaction`'s own doc comment
-                                // (`agent_stream.rs`) for why a resolved
-                                // prompt must leave the agent-stream seed set
-                                // regardless of which of the two caused it.
-                                C2NodeEvent::Observation { address, observation } => {
-                                    if let gate4agent_observation_protocol::ObservationKindV1::ApprovalResolved {
-                                        correlation_id, ..
-                                    }
-                                    | gate4agent_observation_protocol::ObservationKindV1::QuestionResolved {
-                                        correlation_id, ..
-                                    }
-                                    | gate4agent_observation_protocol::ObservationKindV1::InteractionResolved {
-                                        correlation_id, ..
-                                    } = &observation.kind
-                                    {
-                                        let key = RuntimeSessionKey {
-                                            node_id: event.node_id.clone(),
-                                            incarnation_id: event.cursor.incarnation_id,
-                                            workspace_id: address.workspace_id.clone(),
-                                            instance_id: address.session.instance_id,
-                                            generation: address.session.generation,
-                                        };
-                                        agent_stream_subscribers.resolve_interaction(&key, correlation_id);
-                                    }
-                                }
-                                C2NodeEvent::ResyncRequired { .. } => {
-                                    terminal_buffers.invalidate(&NodeRoute {
-                                        node_id: event.node_id.clone(),
-                                        expected_incarnation_id: event.cursor.incarnation_id,
-                                    });
-                                }
-                                _ => {}
-                            }
-                            let result = if matches!(
-                                event.event,
-                                C2NodeEvent::HarnessMcpReadCall { .. }
-                            ) {
-                                match prepare_harness_mcp_read_call(
-                                    &adapter,
-                                    &mut harness,
-                                    &observation,
-                                    &support,
-                                    &runtime_inventory,
-                                    event,
-                                )? {
-                                    PreparedHarnessMcpRead::Ready(plan) => {
-                                        let _ = schedule_harness_mcp_relay(
-                                            &adapter,
-                                            &commands,
-                                            &mut harness_mcp_workers,
-                                            &pending_harness_mcp_aborts,
-                                            &harness_mcp_rejects,
-                                            plan,
-                                        )?;
-                                        Ok(())
-                                    }
-                                    PreparedHarnessMcpRead::Deferred(deferred) => {
-                                        schedule_deferred_harness_mcp_relay(
-                                            &adapter,
-                                            &harness,
-                                            &commands,
-                                            &runtime_inventory,
-                                            &mut harness_mcp_workers,
-                                            &pending_harness_mcp_aborts,
-                                            &harness_mcp_rejects,
-                                            deferred,
-                                        )
-                                    }
-                                }
-                            } else {
-                                apply_or_buffer_host_live_event(
-                                    &adapter,
-                                    &mut harness,
-                                    &mut observation,
-                                    &mut support,
-                                    &mut observation_recovery,
-                                    &mut subscribers,
-                                    event,
-                                )
-                            };
-                            if let Err(error) = result {
-                                if !matches!(error, HarnessRuntimeError::C2(_)) {
-                                    return Err(error);
+                                None => {
+                                    harness_mcp_events_open = false;
                                 }
                             }
                         }
-                        None => {
-                            support.mark_all_unhealthy();
-                            events_open = false;
+                        HarnessMcpOrRegularEvent::Regular(event) => {
+                            match event {
+                                Some(event) => {
+                                    match &event.event {
+                                        C2NodeEvent::TerminalFrame { address, frame } => {
+                                            let key = RuntimeSessionKey {
+                                                node_id: event.node_id.clone(),
+                                                incarnation_id: event.cursor.incarnation_id,
+                                                workspace_id: address.workspace_id.clone(),
+                                                instance_id: address.session.instance_id,
+                                                generation: address.session.generation,
+                                            };
+                                            terminal_buffers.ingest(key.clone(), frame.clone());
+                                            terminal_subscribers.publish(&key, frame);
+                                            // The frame is also how the inventory
+                                            // learns this session's screen changed
+                                            // -- see `apply_screen_state` for why
+                                            // the resync cadence is not enough for
+                                            // this one field.
+                                            if let Some(node) = runtime_inventory
+                                                .apply_screen_state(&key, &frame.screen_state)
+                                            {
+                                                let node = node.clone();
+                                                subscribers.emit(|sequence| {
+                                                    HarnessOperatorEventV1::RuntimeInventoryChanged {
+                                                        sequence,
+                                                        node: node.clone(),
+                                                    }
+                                                });
+                                            }
+                                        }
+                                        C2NodeEvent::AgentStream { address, chunk } => {
+                                            let key = RuntimeSessionKey {
+                                                node_id: event.node_id.clone(),
+                                                incarnation_id: event.cursor.incarnation_id,
+                                                workspace_id: address.workspace_id.clone(),
+                                                instance_id: address.session.instance_id,
+                                                generation: address.session.generation,
+                                            };
+                                            agent_stream_subscribers.publish(&key, chunk);
+                                        }
+                                        // The generic sink for every way an
+                                        // interaction can settle -- an operator's own
+                                        // `ResolveInteraction` (via its C2 round
+                                        // trip and the node's own report back) or
+                                        // `HostPolicy` deciding it on a deadline both
+                                        // land here the same way, since both produce
+                                        // the same observation kind. See
+                                        // `AgentStreamSubscriberRegistry::
+                                        // resolve_interaction`'s own doc comment
+                                        // (`agent_stream.rs`) for why a resolved
+                                        // prompt must leave the agent-stream seed set
+                                        // regardless of which of the two caused it.
+                                        C2NodeEvent::Observation { address, observation } => {
+                                            if let gate4agent_observation_protocol::ObservationKindV1::ApprovalResolved {
+                                                correlation_id, ..
+                                            }
+                                            | gate4agent_observation_protocol::ObservationKindV1::QuestionResolved {
+                                                correlation_id, ..
+                                            }
+                                            | gate4agent_observation_protocol::ObservationKindV1::InteractionResolved {
+                                                correlation_id, ..
+                                            } = &observation.kind
+                                            {
+                                                let key = RuntimeSessionKey {
+                                                    node_id: event.node_id.clone(),
+                                                    incarnation_id: event.cursor.incarnation_id,
+                                                    workspace_id: address.workspace_id.clone(),
+                                                    instance_id: address.session.instance_id,
+                                                    generation: address.session.generation,
+                                                };
+                                                agent_stream_subscribers.resolve_interaction(&key, correlation_id);
+                                            }
+                                        }
+                                        C2NodeEvent::ResyncRequired { .. } => {
+                                            terminal_buffers.invalidate(&NodeRoute {
+                                                node_id: event.node_id.clone(),
+                                                expected_incarnation_id: event.cursor.incarnation_id,
+                                            });
+                                        }
+                                        _ => {}
+                                    }
+                                    let result = apply_or_buffer_host_live_event(
+                                        &adapter,
+                                        &mut harness,
+                                        &mut observation,
+                                        &mut support,
+                                        &mut observation_recovery,
+                                        &mut subscribers,
+                                        event,
+                                    );
+                                    if let Err(error) = result {
+                                        if !matches!(error, HarnessRuntimeError::C2(_)) {
+                                            return Err(error);
+                                        }
+                                    }
+                                }
+                                None => {
+                                    support.mark_all_unhealthy();
+                                    events_open = false;
+                                }
+                            }
                         }
                     }
                 }
@@ -17014,5 +17090,81 @@ mod tests {
             HarnessOperatorEventV1::Ping { sequence: 0 },
         ));
         assert!(receiver.try_recv().is_err(), "exactly one keep-alive frame per tick");
+    }
+
+    /// Direct proof of the Stage 1 priority fix's own selection rule,
+    /// isolated from the whole harness host: with a backlog of regular
+    /// events already queued AND a `HarnessMcpReadCall` also queued,
+    /// `next_harness_mcp_or_regular_event` must resolve to the harness_mcp
+    /// event first, every time, regardless of how deep the regular backlog
+    /// is -- proving a `HarnessMcpReadCall` can never be stuck behind it.
+    #[tokio::test]
+    async fn next_harness_mcp_or_regular_event_prefers_harness_mcp_over_a_queued_regular_backlog() {
+        let (regular_tx, mut regular_events) = mpsc::channel::<RoutedNodeEvent>(16);
+        let (harness_mcp_tx, mut harness_mcp_events) = mpsc::channel::<RoutedNodeEvent>(16);
+
+        let node_id = NodeId::new("node-a").unwrap();
+        let incarnation_id = NodeIncarnationId::from_bytes([7; 16]);
+        let backlog_len = 8_usize;
+        for sequence in 0..backlog_len as u64 {
+            regular_tx.send(RoutedNodeEvent {
+                node_id: node_id.clone(),
+                cursor: NodeCursor { incarnation_id, sequence },
+                event: C2NodeEvent::ResyncRequired { oldest_available_sequence: sequence },
+            }).await.unwrap();
+        }
+        harness_mcp_tx.send(RoutedNodeEvent {
+            node_id: node_id.clone(),
+            cursor: NodeCursor { incarnation_id, sequence: 999 },
+            event: C2NodeEvent::HarnessMcpReadCall {
+                reservation_id: gate4agent_node_protocol::HarnessMcpReservationId::new(
+                    format!("hmcpres_{:024x}", 1),
+                ).unwrap(),
+                activation_digest: gate4agent_node_protocol::HarnessMcpActivationDigest::new(
+                    format!("sha256:{}", "b".repeat(64)),
+                ).unwrap(),
+                record_id: SessionRecordId::new("session-001").unwrap(),
+                session: gate4agent_node_protocol::SessionAddress {
+                    workspace_id: gate4agent_node_protocol::WorkspaceId::new("primary").unwrap(),
+                    session: gate4agent_node_protocol::SessionKey {
+                        instance_id: AgentInstanceId(7),
+                        generation: SessionGeneration(2),
+                    },
+                },
+                call_id: gate4agent_node_protocol::HarnessMcpCallId::new(
+                    format!("hmcpcall_{:024x}", 1),
+                ).unwrap(),
+                request: gate4agent_node_protocol::HarnessReadRequestV1::ContextGet,
+                deadline_unix_ms: u64::MAX,
+            },
+        }).await.unwrap();
+
+        // Both channels must actually hold their full backlog before the
+        // selection is exercised -- otherwise this would only prove that an
+        // empty harness_mcp channel loses to an already-ready regular one,
+        // not the priority rule this function exists for.
+        while regular_events.len() != backlog_len || harness_mcp_events.len() != 1 {
+            tokio::task::yield_now().await;
+        }
+
+        let selected = tokio::time::timeout(
+            Duration::from_secs(5),
+            next_harness_mcp_or_regular_event(
+                &mut harness_mcp_events,
+                true,
+                &mut regular_events,
+                true,
+            ),
+        ).await.expect("selection must not hang");
+        assert!(matches!(
+            selected,
+            HarnessMcpOrRegularEvent::HarnessMcp(Some(RoutedNodeEvent {
+                event: C2NodeEvent::HarnessMcpReadCall { .. },
+                ..
+            })),
+        ));
+        // The full regular backlog is still sitting there, untouched --
+        // the priority selection above never drained a single one of them.
+        assert_eq!(regular_events.len(), backlog_len);
     }
 }

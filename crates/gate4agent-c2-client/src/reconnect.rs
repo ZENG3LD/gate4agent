@@ -27,7 +27,7 @@
 
 use crate::runtime::{
     connect_local, C2ControlError, C2ControlHandle, C2EventReceiver, C2PendingRequest,
-    EVENT_CAPACITY,
+    EVENT_CAPACITY, HARNESS_MCP_EVENT_CAPACITY,
 };
 use gate4agent_c2_protocol::{C2Topology, NodeRequest, NodeRoute, RoutedNodeEvent, RoutedNodeResponse};
 use std::fmt;
@@ -173,17 +173,72 @@ impl C2ReconnectingHandle {
     }
 }
 
-/// The sole event stream for a reconnecting connection. Backed by a bridge
-/// channel created once, before the first physical connection, that only
-/// closes when the supervisor itself terminates -- a reconnect is
-/// invisible to it.
+/// The event stream for a reconnecting connection. Backed by two bridge
+/// channels created once, before the first physical connection, that only
+/// close when the supervisor itself terminates -- a reconnect is invisible
+/// to it. The two channels mirror the split `C2EventReceiver` already
+/// carries per physical connection (regular events vs. harness_mcp
+/// read-proxy events), so a caller that wants harness_mcp events served
+/// ahead of a regular-event backlog can drain them independently instead
+/// of going through the merged `recv()`.
 pub struct C2ReconnectingEventReceiver {
     inner: mpsc::Receiver<RoutedNodeEvent>,
+    harness_mcp: mpsc::Receiver<RoutedNodeEvent>,
 }
 
 impl C2ReconnectingEventReceiver {
+    /// Returns every event from both channels, harness_mcp-first when both
+    /// are ready -- the exact merge algorithm `C2EventReceiver::recv`
+    /// already implements per physical connection, moved one layer up to
+    /// this bridge's own two channels. Existing callers that only ever call
+    /// this method see the identical observable behavior as before the
+    /// split: same events, same relative order.
     pub async fn recv(&mut self) -> Option<RoutedNodeEvent> {
+        loop {
+            if self.harness_mcp.is_closed() && self.harness_mcp.is_empty() {
+                return self.inner.recv().await;
+            }
+            if self.inner.is_closed() && self.inner.is_empty() {
+                return self.harness_mcp.recv().await;
+            }
+            tokio::select! {
+                biased;
+                event = self.harness_mcp.recv() => {
+                    if event.is_some() { return event; }
+                }
+                event = self.inner.recv() => {
+                    if event.is_some() { return event; }
+                }
+            }
+        }
+    }
+
+    /// Drains only the regular-event channel, leaving harness_mcp events
+    /// untouched.
+    pub async fn recv_regular(&mut self) -> Option<RoutedNodeEvent> {
         self.inner.recv().await
+    }
+
+    /// Drains only the harness_mcp channel, leaving regular events
+    /// untouched.
+    pub async fn recv_harness_mcp(&mut self) -> Option<RoutedNodeEvent> {
+        self.harness_mcp.recv().await
+    }
+
+    /// Splits into two independent mutable borrows, one per channel, so a
+    /// caller can race both in a single `tokio::select!` (the harness
+    /// runtime's own main loop, prioritizing `HarnessMcpReadCall` ahead of
+    /// its regular-event backlog). Two separate `recv_regular`/
+    /// `recv_harness_mcp` calls cannot be used together in one `select!`:
+    /// each is an `&mut self` async method, so the future each returns
+    /// borrows the whole receiver for its lifetime, and the borrow checker
+    /// rejects two such futures coexisting even though they touch disjoint
+    /// fields. Splitting once, up front, hands out two genuinely disjoint
+    /// borrows instead.
+    pub fn split_mut(
+        &mut self,
+    ) -> (&mut mpsc::Receiver<RoutedNodeEvent>, &mut mpsc::Receiver<RoutedNodeEvent>) {
+        (&mut self.inner, &mut self.harness_mcp)
     }
 }
 
@@ -194,6 +249,7 @@ struct SupervisorChannels {
     topology: watch::Sender<Arc<C2Topology>>,
     link_state: watch::Sender<C2LinkState>,
     events: mpsc::Sender<RoutedNodeEvent>,
+    harness_mcp_events: mpsc::Sender<RoutedNodeEvent>,
     shutdown: watch::Receiver<bool>,
 }
 
@@ -217,14 +273,34 @@ async fn pump_one_connection(
     events: &mut C2EventReceiver,
     topology: &mut watch::Receiver<Arc<C2Topology>>,
     events_tx: &mpsc::Sender<RoutedNodeEvent>,
+    harness_mcp_events_tx: &mpsc::Sender<RoutedNodeEvent>,
     topology_tx: &watch::Sender<Arc<C2Topology>>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> ConnectionEnded {
+    // Split once, up front: `events.recv_harness_mcp()` and
+    // `events.recv_regular()` cannot both appear as arms of the same
+    // `select!` below -- each is an `&mut self` async method, so the two
+    // futures would borrow the whole `C2EventReceiver` for the same
+    // lifetime, which the borrow checker rejects even though the methods
+    // only ever touch their own disjoint field. `split_mut` hands out the
+    // two channels' receivers as genuinely independent `&mut` borrows
+    // instead.
+    let (regular_events, harness_mcp_events) = events.split_mut();
     loop {
         tokio::select! {
             biased;
             _ = shutdown.changed() => return ConnectionEnded::ShuttingDown,
-            event = events.recv() => {
+            event = harness_mcp_events.recv() => {
+                let Some(event) = event else { return ConnectionEnded::Lost; };
+                tokio::select! {
+                    biased;
+                    _ = shutdown.changed() => return ConnectionEnded::ShuttingDown,
+                    sent = harness_mcp_events_tx.send(event) => {
+                        if sent.is_err() { return ConnectionEnded::ConsumerGone; }
+                    }
+                }
+            }
+            event = regular_events.recv() => {
                 let Some(event) = event else { return ConnectionEnded::Lost; };
                 tokio::select! {
                     biased;
@@ -310,6 +386,7 @@ async fn reconnect_supervisor(
             &mut events,
             &mut topology,
             &channels.events,
+            &channels.harness_mcp_events,
             &channels.topology,
             &mut channels.shutdown,
         )
@@ -348,6 +425,7 @@ pub async fn connect_local_reconnecting(
     let (topology_tx, topology_rx) = watch::channel(initial_topology);
     let (link_state_tx, link_state_rx) = watch::channel(C2LinkState::Connected);
     let (events_tx, events_rx) = mpsc::channel(EVENT_CAPACITY);
+    let (harness_mcp_events_tx, harness_mcp_events_rx) = mpsc::channel(HARNESS_MCP_EVENT_CAPACITY);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     tokio::spawn(reconnect_supervisor(
@@ -358,6 +436,7 @@ pub async fn connect_local_reconnecting(
             topology: topology_tx,
             link_state: link_state_tx,
             events: events_tx,
+            harness_mcp_events: harness_mcp_events_tx,
             shutdown: shutdown_rx,
         },
         control,
@@ -371,7 +450,7 @@ pub async fn connect_local_reconnecting(
             link_state: link_state_rx,
             _supervisor: Arc::new(SupervisorShutdownGuard(shutdown_tx)),
         },
-        C2ReconnectingEventReceiver { inner: events_rx },
+        C2ReconnectingEventReceiver { inner: events_rx, harness_mcp: harness_mcp_events_rx },
     ))
 }
 
@@ -428,6 +507,43 @@ mod tests {
             node_id: node_id.clone(),
             cursor: NodeCursor { incarnation_id: NodeIncarnationId::from_bytes([7; 16]), sequence },
             event: C2NodeEvent::ResyncRequired { oldest_available_sequence: sequence },
+        }
+    }
+
+    fn now_unix_ms() -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis().try_into().unwrap()
+    }
+
+    /// A `HarnessMcpReadCall` event whose deadline is far enough in the
+    /// future (2.5s, under `MAX_HARNESS_MCP_CALL_DEADLINE_MS = 3s`) to
+    /// still pass `harness_mcp_contract_is_valid_at` by the time it lands
+    /// on the client, so `control_owner` classifies it onto the harness_mcp
+    /// channel rather than dropping it as an expired contract.
+    fn harness_mcp_routed_event(node_id: &NodeId, call_index: usize) -> RoutedNodeEvent {
+        RoutedNodeEvent {
+            node_id: node_id.clone(),
+            cursor: NodeCursor { incarnation_id: NodeIncarnationId::from_bytes([7; 16]), sequence: 41 },
+            event: C2NodeEvent::HarnessMcpReadCall {
+                reservation_id: gate4agent_node_protocol::HarnessMcpReservationId::new(
+                    format!("hmcpres_{:024x}", 1),
+                ).unwrap(),
+                activation_digest: gate4agent_node_protocol::HarnessMcpActivationDigest::new(
+                    format!("sha256:{}", "b".repeat(64)),
+                ).unwrap(),
+                record_id: gate4agent_node_protocol::SessionRecordId::new("session-001").unwrap(),
+                session: gate4agent_node_protocol::SessionAddress {
+                    workspace_id: gate4agent_node_protocol::WorkspaceId::new("primary").unwrap(),
+                    session: gate4agent_node_protocol::SessionKey {
+                        instance_id: gate4agent_types::AgentInstanceId(7),
+                        generation: gate4agent_types::SessionGeneration(2),
+                    },
+                },
+                call_id: gate4agent_node_protocol::HarnessMcpCallId::new(
+                    format!("hmcpcall_{call_index:024x}"),
+                ).unwrap(),
+                request: gate4agent_node_protocol::HarnessReadRequestV1::ContextGet,
+                deadline_unix_ms: now_unix_ms() + 2_500,
+            },
         }
     }
 
@@ -777,6 +893,86 @@ mod tests {
             .expect("topology change must arrive on the receiver acquired before the outage");
 
         server2.kill().await;
+    }
+
+    /// The bridge's split channels must stay genuinely independent, not
+    /// merely `recv()`'s internal biased-merge order: pushes a regular
+    /// event FIRST, then a harness_mcp event, both landing on the bridge
+    /// before either is drained -- `recv_harness_mcp()` must still return
+    /// the harness_mcp event without waiting on the regular one enqueued
+    /// ahead of it, and `recv_regular()` must still return the regular
+    /// event without ever seeing the harness_mcp one.
+    #[tokio::test]
+    async fn reconnecting_receiver_split_accessors_drain_only_their_own_channel() {
+        let endpoint = unique_control_endpoint();
+        let token = "reconnect-token-split-1";
+        let server = spawn_fake_server(&endpoint, token, empty_status(), "server-1");
+        let (_handle, mut events) =
+            connect_local_reconnecting(endpoint.clone(), token.to_owned()).await.unwrap();
+
+        let node_id = NodeId::new("node-a").unwrap();
+        server.to_client.send(C2ServerFrame::Event(routed_event(&node_id, 1))).await.unwrap();
+        server.to_client.send(C2ServerFrame::Event(harness_mcp_routed_event(&node_id, 1))).await.unwrap();
+
+        let mcp_event = tokio::time::timeout(Duration::from_secs(5), events.recv_harness_mcp())
+            .await
+            .expect("recv_harness_mcp must not block on the regular event queued ahead of it")
+            .expect("harness_mcp channel must not have closed");
+        assert!(matches!(mcp_event.event, C2NodeEvent::HarnessMcpReadCall { .. }));
+
+        let regular_event = tokio::time::timeout(Duration::from_secs(5), events.recv_regular())
+            .await
+            .expect("recv_regular must not block on the harness_mcp channel")
+            .expect("regular channel must not have closed");
+        assert!(matches!(regular_event.event, C2NodeEvent::ResyncRequired { .. }));
+
+        server.kill().await;
+    }
+
+    /// Legacy callers that only ever call the merged `recv()` must see the
+    /// exact same events, still harness-mcp-first when both are queued --
+    /// the split must be invisible to them.
+    #[tokio::test]
+    async fn reconnecting_receiver_recv_still_merges_both_harness_mcp_first() {
+        let endpoint = unique_control_endpoint();
+        let token = "reconnect-token-split-2";
+        let server = spawn_fake_server(&endpoint, token, empty_status(), "server-1");
+        let (_handle, mut events) =
+            connect_local_reconnecting(endpoint.clone(), token.to_owned()).await.unwrap();
+
+        let node_id = NodeId::new("node-a").unwrap();
+        server.to_client.send(C2ServerFrame::Event(routed_event(&node_id, 1))).await.unwrap();
+        server.to_client.send(C2ServerFrame::Event(harness_mcp_routed_event(&node_id, 1))).await.unwrap();
+
+        // Both events must be sitting in their respective bridge channels
+        // BEFORE `recv()` is called -- otherwise `select!`'s `biased`
+        // ordering (which only matters when multiple arms are
+        // simultaneously ready) is not actually exercised: the regular
+        // event, sent first on the wire, is always classified and
+        // forwarded strictly before the harness_mcp one that followed it,
+        // so a `recv()` issued too early would just see the regular event
+        // as the only one ready and return it -- not proof of anything.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while events.inner.len() != 1 || events.harness_mcp.len() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both events must reach the bridge's own channels");
+
+        let first = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("recv must not hang")
+            .expect("event stream must not have closed");
+        assert!(matches!(first.event, C2NodeEvent::HarnessMcpReadCall { .. }));
+
+        let second = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("recv must not hang")
+            .expect("event stream must not have closed");
+        assert!(matches!(second.event, C2NodeEvent::ResyncRequired { .. }));
+
+        server.kill().await;
     }
 
     #[tokio::test]

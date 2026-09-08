@@ -178,6 +178,34 @@ impl HarnessC2EventReceiver {
     pub async fn recv(&mut self) -> Option<RoutedNodeEvent> {
         self.inner.recv().await
     }
+
+    /// Drains only the regular-event side of the underlying reconnecting
+    /// receiver, leaving harness_mcp read-proxy events untouched. Used by
+    /// the main runtime loop's dedicated harness_mcp-priority arm so a
+    /// `HarnessMcpReadCall` is never queued behind a regular-event backlog.
+    pub async fn recv_regular(&mut self) -> Option<RoutedNodeEvent> {
+        self.inner.recv_regular().await
+    }
+
+    /// Drains only the harness_mcp read-proxy side of the underlying
+    /// reconnecting receiver, leaving regular events untouched. See
+    /// [`Self::recv_regular`].
+    pub async fn recv_harness_mcp(&mut self) -> Option<RoutedNodeEvent> {
+        self.inner.recv_harness_mcp().await
+    }
+
+    /// Splits into two independent mutable borrows, one per channel, so the
+    /// main runtime loop can race both in a single `tokio::select!` without
+    /// the double-`&mut self` borrow conflict two separate `recv_regular`/
+    /// `recv_harness_mcp` calls would hit in the same `select!` (each is an
+    /// `&mut self` async method, so the future each returns borrows the
+    /// whole receiver for its lifetime, even though the two only ever touch
+    /// disjoint underlying channels).
+    pub fn split_mut(
+        &mut self,
+    ) -> (&mut tokio::sync::mpsc::Receiver<RoutedNodeEvent>, &mut tokio::sync::mpsc::Receiver<RoutedNodeEvent>) {
+        self.inner.split_mut()
+    }
 }
 
 /// Pure decision function behind `HarnessC2Adapter::exact_route`, factored

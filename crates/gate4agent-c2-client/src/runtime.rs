@@ -65,9 +65,14 @@ const NATIVE_SESSION_RELAY_DEADLINE: Duration = Duration::from_secs(35);
 const COMMAND_CAPACITY: usize = 64;
 const INBOUND_CAPACITY: usize = 2;
 const WRITER_CAPACITY: usize = 64;
-pub(crate) const EVENT_CAPACITY: usize = 2;
+/// Buffer for the primary node-event stream (observation, control,
+/// managed-observation, and negotiated agent-stream text deltas). Sized so
+/// normal live-session bursts buffer instead of tearing the connection
+/// down; teardown (`RegularEventBackpressure`) stays the last resort for a
+/// consumer that is genuinely stuck, not merely bursty.
+pub(crate) const EVENT_CAPACITY: usize = 1024;
 const HARNESS_MCP_EVENT_CAPACITY: usize = 128;
-const REGULAR_EVENT_DELIVERY_DEADLINE: Duration = Duration::from_millis(250);
+const REGULAR_EVENT_DELIVERY_DEADLINE: Duration = Duration::from_secs(2);
 const OPAQUE_UNIX_PATH_NOT_NEGOTIATED: &str =
     "opaque Unix paths require negotiated C2 capability";
 const REPOSITORY_PATH_NOT_NEGOTIATED: &str =
@@ -5749,16 +5754,19 @@ mod tests {
         let (commands_tx, commands_rx) = mpsc::channel(1);
         let (events_tx, _events_rx) = mpsc::channel(EVENT_CAPACITY);
         let (writer_tx, _writer_rx) = mpsc::channel(1);
-        let (incoming_tx, incoming_rx) = mpsc::channel(4);
+        let (incoming_tx, incoming_rx) = mpsc::channel(EVENT_CAPACITY + 2);
         let (topology_tx, _topology_rx) = watch::channel(Arc::new(C2Topology { nodes: Vec::new() }));
         let owner = tokio::spawn(control_owner(
             commands_rx, events_tx, topology_tx, writer_tx, incoming_rx, no_path_capabilities(),
         ));
 
-        incoming_tx.send(event(1)).await.unwrap();
-        incoming_tx.send(event(2)).await.unwrap();
-        incoming_tx.send(event(3)).await.unwrap();
-        timeout(Duration::from_secs(1), owner).await.unwrap().unwrap();
+        for seq in 1..=(EVENT_CAPACITY as u64 + 1) {
+            incoming_tx.send(event(seq)).await.unwrap();
+        }
+        timeout(REGULAR_EVENT_DELIVERY_DEADLINE + Duration::from_secs(1), owner)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(commands_tx.is_closed());
     }
 
@@ -5766,8 +5774,10 @@ mod tests {
     async fn stalled_regular_event_consumer_fails_closed_without_hanging_following_reply() {
         let (commands_tx, commands_rx) = mpsc::channel(1);
         let (events_tx, _events_rx) = mpsc::channel(EVENT_CAPACITY);
-        events_tx.try_send(routed_event(1)).unwrap();
-        events_tx.try_send(routed_event(2)).unwrap();
+        let mut seq = 1u64;
+        while events_tx.try_send(routed_event(seq)).is_ok() {
+            seq += 1;
+        }
         let (writer_tx, mut writer_rx) = mpsc::channel(1);
         let (incoming_tx, incoming_rx) = mpsc::channel(2);
         let (topology_tx, _topology_rx) = watch::channel(Arc::new(C2Topology { nodes: Vec::new() }));
@@ -5828,7 +5838,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(sequences, vec![1, 2, 3, 4]);
+        assert_eq!(sequences, (1..=burst_len as u64).collect::<Vec<_>>());
 
         let (reply_tx, reply_rx) = oneshot::channel();
         commands_tx.send(ControlCommand {

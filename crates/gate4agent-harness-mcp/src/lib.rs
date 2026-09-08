@@ -21,6 +21,10 @@ pub const MCP_PROTOCOL_VERSION_CURRENT: &str = "2025-11-25";
 pub const MCP_PROTOCOL_VERSION_COMPATIBLE: &str = "2025-06-18";
 pub const HARNESS_MCP_ENDPOINT_ENV: &str = "GATE4AGENT_HARNESS_READ_ENDPOINT";
 pub const HARNESS_MCP_CREDENTIAL_ENV: &str = "GATE4AGENT_HARNESS_READ_CREDENTIAL";
+/// Names the file the helper appends a raw JSON-RPC stdio trace to, when
+/// set. Debugging-only: absent by default, and its absence changes nothing
+/// about the stdio loop's behaviour. See [`HarnessMcpStdioTrace`].
+pub const HARNESS_MCP_TRACE_ENV: &str = "G4A_HARNESS_MCP_TRACE";
 
 const JSONRPC_VERSION: &str = "2.0";
 const SERVER_NAME: &str = "gate4agent-harness-mcp";
@@ -400,14 +404,208 @@ pub fn run_stdio<B: HarnessMcpBackend>(
     reader: &mut impl BufRead,
     writer: &mut impl Write,
 ) -> Result<(), HarnessMcpIoError> {
+    run_stdio_traced(backend, reader, writer, None)
+}
+
+/// A raw stdio observer for [`run_stdio_traced`]. Each method is handed
+/// exactly the bytes the loop already read from, or is about to write to,
+/// the peer -- the hook can observe the wire, never change it. Built for
+/// [`HarnessMcpStdioTrace`]; nothing about `handle_line`'s behaviour,
+/// timing, or the set of harness calls it makes changes when a trace is
+/// attached.
+pub trait HarnessMcpTrace {
+    /// The raw inbound line, without its trailing newline, right after it is
+    /// read off the peer and before it is handed to the server.
+    fn on_inbound(&mut self, line: &[u8]);
+    /// The raw outbound line, exactly as [`HarnessMcpServer::handle_line`]
+    /// encoded it (its trailing newline included), right before it is
+    /// written back to the peer.
+    fn on_outbound(&mut self, line: &[u8]);
+    /// Called once, when the peer closes its side of stdin.
+    fn on_eof(&mut self);
+}
+
+/// Same loop as [`run_stdio`], plus an optional raw trace hook. `run_stdio`
+/// is exactly this function called with `None` -- passing a hook can only
+/// add observations, never alter what gets read, handled, or written.
+pub fn run_stdio_traced<B: HarnessMcpBackend>(
+    backend: B,
+    reader: &mut impl BufRead,
+    writer: &mut impl Write,
+    mut trace: Option<&mut dyn HarnessMcpTrace>,
+) -> Result<(), HarnessMcpIoError> {
     let mut server = HarnessMcpServer::new(backend);
     loop {
         let line = read_bounded_line(reader, HARNESS_READ_REQUEST_MAX_BYTES)?;
-        let Some(line) = line else { return Ok(()); };
+        let Some(line) = line else {
+            if let Some(trace) = trace.as_deref_mut() { trace.on_eof(); }
+            return Ok(());
+        };
+        if let Some(trace) = trace.as_deref_mut() { trace.on_inbound(&line); }
         if let Some(response) = server.handle_line(&line) {
+            if let Some(trace) = trace.as_deref_mut() { trace.on_outbound(&response); }
             writer.write_all(&response).map_err(|_| HarnessMcpIoError::Output)?;
             writer.flush().map_err(|_| HarnessMcpIoError::Output)?;
         }
+    }
+}
+
+/// An env-gated raw JSON-RPC stdio trace, appended to a file named by
+/// [`HARNESS_MCP_TRACE_ENV`]. Every record is one line: a millisecond
+/// Unix timestamp, a one-character marker (`<` inbound, `>` outbound, `#`
+/// lifecycle), and a body. A traced line is bounded to 64 KiB (truncated
+/// with `…`) and has any object field whose name looks like a credential
+/// (contains `credential` or `token`, case-insensitively) replaced with
+/// `<redacted>` -- this is a debugging artefact, and it must never carry
+/// the reservation credential or session token that reach this helper only
+/// through its own environment, never over stdio.
+///
+/// A write failure (a full disk, a file removed out from under the helper,
+/// ...) is logged to stderr exactly once and then silently swallowed on
+/// every later call: tracing is diagnostic, and must never be a reason the
+/// stdio loop itself breaks.
+pub struct HarnessMcpStdioTrace {
+    file: std::fs::File,
+    write_failed: bool,
+}
+
+const HARNESS_MCP_TRACE_LINE_MAX_BYTES: usize = 64 * 1024;
+const HARNESS_MCP_TRACE_ELLIPSIS: &str = "\u{2026}";
+
+impl HarnessMcpStdioTrace {
+    /// Opens the file named by `HARNESS_MCP_TRACE_ENV`, if the variable is
+    /// set, and appends a `# start` record naming `argv` and the names
+    /// (never the values) of every `GATE4AGENT_*` environment variable.
+    /// Returns `None` -- after logging once to stderr -- when the variable
+    /// is unset or the file cannot be opened; the parent directory is never
+    /// created.
+    pub fn open_from_env(argv: &[std::ffi::OsString]) -> Option<Self> {
+        let path = std::env::var_os(HARNESS_MCP_TRACE_ENV)?;
+        let file = match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(file) => file,
+            Err(error) => {
+                eprintln!("gate4agent-harness-mcp: trace file unavailable: {error}");
+                return None;
+            }
+        };
+        let mut trace = Self { file, write_failed: false };
+        trace.write_start(argv);
+        Some(trace)
+    }
+
+    fn write_start(&mut self, argv: &[std::ffi::OsString]) {
+        let pid = std::process::id();
+        let argv_display = argv
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let mut env_keys = std::env::vars_os()
+            .filter_map(|(key, _)| key.into_string().ok())
+            .filter(|key| key.starts_with("GATE4AGENT_"))
+            .collect::<Vec<_>>();
+        env_keys.sort();
+        let body = format!("start pid={pid} argv={argv_display:?} env_keys={env_keys:?}");
+        self.write_record('#', body.as_bytes());
+    }
+
+    fn write_record(&mut self, marker: char, body: &[u8]) {
+        let timestamp = unix_millis();
+        let mut record = format!("{timestamp} {marker} ").into_bytes();
+        record.extend_from_slice(body);
+        record.push(b'\n');
+        let outcome = self.file.write_all(&record).and_then(|_| self.file.flush());
+        if outcome.is_err() && !self.write_failed {
+            self.write_failed = true;
+            eprintln!("gate4agent-harness-mcp: trace write failed");
+        }
+    }
+}
+
+impl HarnessMcpTrace for HarnessMcpStdioTrace {
+    fn on_inbound(&mut self, line: &[u8]) {
+        let body = prepare_trace_body(line);
+        self.write_record('<', &body);
+    }
+
+    fn on_outbound(&mut self, line: &[u8]) {
+        let body = prepare_trace_body(line);
+        self.write_record('>', &body);
+    }
+
+    fn on_eof(&mut self) {
+        self.write_record('#', b"eof");
+    }
+}
+
+fn unix_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
+}
+
+fn prepare_trace_body(line: &[u8]) -> Vec<u8> {
+    bound_trace_line(redact_credentials(strip_trailing_newline(line)))
+}
+
+fn strip_trailing_newline(line: &[u8]) -> &[u8] {
+    let mut end = line.len();
+    if end > 0 && line[end - 1] == b'\n' { end -= 1; }
+    if end > 0 && line[end - 1] == b'\r' { end -= 1; }
+    &line[..end]
+}
+
+fn bound_trace_line(mut line: Vec<u8>) -> Vec<u8> {
+    if line.len() > HARNESS_MCP_TRACE_LINE_MAX_BYTES {
+        let ellipsis = HARNESS_MCP_TRACE_ELLIPSIS.as_bytes();
+        let keep = HARNESS_MCP_TRACE_LINE_MAX_BYTES.saturating_sub(ellipsis.len());
+        line.truncate(keep);
+        line.extend_from_slice(ellipsis);
+    }
+    line
+}
+
+/// Best-effort credential redaction for one traced line. The primary path
+/// parses the line as JSON (every line this helper reads or writes over
+/// MCP is JSON-RPC) and blanks the value of any object field whose name
+/// contains `credential` or `token`. A line that fails to parse (a
+/// malformed probe, say) falls back to a coarse textual check: if it even
+/// mentions one of those words, the whole line is replaced rather than
+/// risk carrying an un-redacted value this fallback has no parse tree to
+/// safely locate.
+fn redact_credentials(line: &[u8]) -> Vec<u8> {
+    match serde_json::from_slice::<Value>(line) {
+        Ok(mut value) => {
+            redact_credentials_in_place(&mut value);
+            serde_json::to_vec(&value).unwrap_or_else(|_| b"<redacted: re-encode failed>".to_vec())
+        }
+        Err(_) => {
+            let lowered = String::from_utf8_lossy(line).to_ascii_lowercase();
+            if lowered.contains("credential") || lowered.contains("token") {
+                b"<redacted: unparseable line named a credential-like field>".to_vec()
+            } else {
+                line.to_vec()
+            }
+        }
+    }
+}
+
+fn redact_credentials_in_place(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, entry) in map.iter_mut() {
+                let lowered_key = key.to_ascii_lowercase();
+                if lowered_key.contains("credential") || lowered_key.contains("token") {
+                    *entry = Value::String("<redacted>".to_owned());
+                } else {
+                    redact_credentials_in_place(entry);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items.iter_mut() { redact_credentials_in_place(item); }
+        }
+        _ => {}
     }
 }
 
@@ -1380,5 +1578,109 @@ mod tests {
         let response: Value = serde_json::from_str(text).unwrap();
         assert!(response["value"]["task"].is_null());
         assert_eq!(response["value"]["sibling_runs"], json!([]));
+    }
+
+    // -- G4A_HARNESS_MCP_TRACE ------------------------------------------
+
+    static TRACE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Restores whatever `HARNESS_MCP_TRACE_ENV` held before the test (or
+    /// clears it) on drop, the same `EnvironmentGuard` shape already used
+    /// by this workspace's other env-mutating tests.
+    struct TraceEnvGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl TraceEnvGuard {
+        fn set(path: &std::path::Path) -> Self {
+            let previous = std::env::var_os(HARNESS_MCP_TRACE_ENV);
+            std::env::set_var(HARNESS_MCP_TRACE_ENV, path);
+            Self { previous }
+        }
+    }
+
+    impl Drop for TraceEnvGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(previous) => std::env::set_var(HARNESS_MCP_TRACE_ENV, previous),
+                None => std::env::remove_var(HARNESS_MCP_TRACE_ENV),
+            }
+        }
+    }
+
+    fn unique_temp_trace_path(label: &str) -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "g4a-harness-mcp-trace-{label}-{}-{n}.log",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn stdio_trace_is_silent_without_the_env_var() {
+        let _guard = TRACE_ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::remove_var(HARNESS_MCP_TRACE_ENV);
+        let path = unique_temp_trace_path("absent");
+        let _ = std::fs::remove_file(&path);
+
+        let trace = HarnessMcpStdioTrace::open_from_env(&[std::ffi::OsString::from("gate4agent-harness-mcp")]);
+        assert!(trace.is_none());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn stdio_trace_records_wire_lines_and_redacts_credential_like_fields() {
+        let _guard = TRACE_ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let path = unique_temp_trace_path("gated");
+        let _ = std::fs::remove_file(&path);
+        let _env = TraceEnvGuard::set(&path);
+
+        let argv = vec![
+            std::ffi::OsString::from("gate4agent-harness-mcp"),
+            std::ffi::OsString::from("--session-proxy"),
+        ];
+        let mut trace = HarnessMcpStdioTrace::open_from_env(&argv).expect("trace file must open");
+
+        let secret = "do-not-leak-this-token-value";
+        let input = [
+            json!({
+                "jsonrpc":"2.0","id":1,"method":"initialize",
+                "params":{
+                    "protocolVersion": MCP_PROTOCOL_VERSION_CURRENT,
+                    "capabilities":{},
+                    "clientInfo":{"name":"fixture","version":"1"},
+                    "_meta":{"token": secret}
+                }
+            }),
+            json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
+        ]
+        .into_iter()
+        .map(|value| serde_json::to_string(&value).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+            + "\n";
+        let mut reader = std::io::BufReader::new(input.as_bytes());
+        let mut output = Vec::new();
+        run_stdio_traced(fixture(), &mut reader, &mut output, Some(&mut trace)).expect("stdio");
+        drop(trace);
+
+        let contents = std::fs::read_to_string(&path).expect("trace file readable");
+        let lines = contents.lines().collect::<Vec<_>>();
+
+        assert!(lines[0].contains("# start pid="));
+        assert!(lines[0].contains("argv=[\"gate4agent-harness-mcp\", \"--session-proxy\"]"));
+
+        let inbound = lines.iter().filter(|line| line.contains(" < ")).count();
+        let outbound = lines.iter().filter(|line| line.contains(" > ")).count();
+        assert_eq!(inbound, 3, "all three request lines were read: {lines:?}");
+        assert_eq!(outbound, 2, "only the two requests (not the notification) get a reply: {lines:?}");
+
+        assert!(!contents.contains(secret), "the traced file must never carry the credential-like value");
+        assert!(contents.contains("\"token\":\"<redacted>\""), "the field must be redacted in place: {contents}");
+        assert!(lines.last().is_some_and(|line| line.ends_with(" # eof")), "the last record marks stdin closing: {lines:?}");
+
+        let _ = std::fs::remove_file(&path);
     }
 }

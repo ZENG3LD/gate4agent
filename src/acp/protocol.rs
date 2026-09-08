@@ -1124,9 +1124,26 @@ pub struct PermissionToolCall {
 }
 
 /// The four option kinds the ACP spec defines for
-/// [`PermissionOption::kind`]. An agent is not required to offer all four —
-/// see [`PermissionRequestParams`] and the host policy that selects among
-/// whichever subset arrives.
+/// [`PermissionOption::kind`], plus [`Unknown`](Self::Unknown) for any
+/// `kind` string a third-party agent sends that is none of them. An agent
+/// is not required to offer all four -- see [`PermissionRequestParams`]
+/// and the host policy that selects among whichever subset arrives.
+///
+/// `Unknown` matters for the same reason `ToolKind::Other` does: without a
+/// `#[serde(other)]` catch-all here, ONE option in the offered list with an
+/// unfamiliar `kind` string used to fail this enum's `Deserialize`, which
+/// failed the whole [`PermissionOption`], which failed the whole
+/// `Vec<PermissionOption>`, which failed the whole
+/// [`PermissionRequestParams`] -- so a host never even saw the request, let
+/// alone the kinds it DID recognise, and every `session/request_permission`
+/// call from an adapter that words even one option differently ended up
+/// answered `PermissionOutcome::Cancelled` (a refusal) with the actual
+/// cause logged nowhere. `Unknown` is never selected by kind preference
+/// (`super::host::select_offered_option` only ever matches one of the
+/// other four); the only path that can still pick an option shaped like
+/// this is the allow-ish name/`optionId` fallback in
+/// `super::host::HostPolicy::select_permission_option`, and only when
+/// policy prefers allow and none of the four known kinds were offered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionOptionKind {
@@ -1134,6 +1151,14 @@ pub enum PermissionOptionKind {
     AllowAlways,
     RejectOnce,
     RejectAlways,
+    /// Any `kind` string the four variants above don't name. Serializes
+    /// back out as the literal `"unknown"` (`rename_all = "snake_case"`
+    /// applies to every variant including this one); nothing round-trips
+    /// through that string today since a host only ever deserializes this
+    /// type off an incoming agent request and never sends its own value
+    /// for it.
+    #[serde(other)]
+    Unknown,
 }
 
 /// One option the agent is offering the host for a `session/request_
@@ -2465,6 +2490,26 @@ mod tests {
         let params: PermissionRequestParams = serde_json::from_str(raw).unwrap();
         assert_eq!(params.tool_call.kind, ToolKind::Other);
         assert!(params.options.is_empty());
+    }
+
+    #[test]
+    fn permission_request_params_tolerates_an_unknown_option_kind() {
+        // Regression: before `PermissionOptionKind::Unknown` existed, one
+        // option in the list whose `kind` string was not one of the four
+        // known ones failed the WHOLE `PermissionRequestParams` to
+        // deserialize, hiding every option the agent DID offer.
+        let raw = r#"{
+            "sessionId": "s1",
+            "toolCall": {"toolCallId": "tc1", "kind": "execute"},
+            "options": [
+                {"optionId": "always_allow", "name": "Always allow", "kind": "allow_forever"},
+                {"optionId": "reject-once", "name": "Reject once", "kind": "reject_once"}
+            ]
+        }"#;
+        let params: PermissionRequestParams = serde_json::from_str(raw).unwrap();
+        assert_eq!(params.options.len(), 2);
+        assert_eq!(params.options[0].kind, PermissionOptionKind::Unknown);
+        assert_eq!(params.options[1].kind, PermissionOptionKind::RejectOnce);
     }
 
     #[test]

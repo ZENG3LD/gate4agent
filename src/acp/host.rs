@@ -306,11 +306,28 @@ impl HostPolicy {
     /// Pick one of the agent's offered `options` for a `session/request_
     /// permission` call, or decline to pick any of them.
     ///
-    /// `options` is whatever subset of the four
+    /// `options` is whatever subset of the four known
     /// [`PermissionOptionKind`] values the agent chose to offer -- this
     /// walks a preference order and returns the first offered kind that
     /// matches, so it tolerates an agent that omits some (or three) of
     /// them.
+    ///
+    /// When that walk finds nothing AND this policy prefers allow (`Yolo`,
+    /// `Auto`, or `ReadOnly` on a read-shaped call), it does not stop there:
+    /// a third-party adapter that words its options differently (every
+    /// `kind` string [`PermissionOptionKind::Unknown`]) must not read back
+    /// as a refusal when the policy would have allowed the call under any
+    /// of the four spellings it does recognise -- see
+    /// [`allow_ish_option`]'s own doc comment for the exact rule. This
+    /// fallback never runs when `prefer_allow` is false: `ReadOnly` on a
+    /// non-read call and `Deny` keep returning `Cancelled` exactly as
+    /// before, same as when the walk itself finds a known reject-kind
+    /// option.
+    ///
+    /// Every `Cancelled` result this returns is logged with every option
+    /// the agent actually offered (see [`warn_permission_cancelled`]) --
+    /// `PermissionOutcome` has no field to carry a reason on, so this is
+    /// the only place that reason is ever recorded.
     pub(crate) fn select_permission_option(
         self,
         tool_call: &PermissionToolCall,
@@ -330,8 +347,105 @@ impl HostPolicy {
         } else {
             &[PermissionOptionKind::RejectOnce, PermissionOptionKind::RejectAlways]
         };
-        select_offered_option(options, preference)
+        let outcome = select_offered_option(options, preference);
+
+        let outcome = if prefer_allow && outcome == PermissionOutcome::Cancelled {
+            match allow_ish_option(options) {
+                Some(option) => {
+                    eprintln!(
+                        "[gate4agent::acp::host] session/request_permission: no known \
+                         PermissionOptionKind offered under {self:?} for toolCallId={:?}; \
+                         falling back to allow-ish option optionId={:?} name={:?} kind={:?}",
+                        tool_call.tool_call_id, option.option_id, option.name, option.kind
+                    );
+                    PermissionOutcome::Selected { option_id: option.option_id.clone() }
+                }
+                None => outcome,
+            }
+        } else {
+            outcome
+        };
+
+        if outcome == PermissionOutcome::Cancelled {
+            warn_permission_cancelled(self, tool_call, options);
+        }
+        outcome
     }
+}
+
+/// Find the first offered option whose `optionId` or `name` reads as an
+/// allow -- case-insensitive `contains` of any of `allow`, `approve`,
+/// `always`, `yes` -- for [`HostPolicy::select_permission_option`]'s
+/// fallback when its by-`kind` preference walk found none of the four
+/// known kinds it was looking for. Only ever consulted when that policy
+/// already decided `prefer_allow`, so this never fires for `ReadOnly` on a
+/// non-read call or for `Deny`; it exists purely so an adapter that offers
+/// every option under an unfamiliar [`PermissionOptionKind::Unknown`]
+/// still gets an allow when the policy would have picked one under any of
+/// the four spellings it recognises.
+fn allow_ish_option(options: &[PermissionOption]) -> Option<&PermissionOption> {
+    const ALLOW_ISH: [&str; 4] = ["allow", "approve", "always", "yes"];
+    options.iter().find(|option| {
+        let id = option.option_id.to_lowercase();
+        let name = option.name.to_lowercase();
+        ALLOW_ISH.iter().any(|needle| id.contains(needle) || name.contains(needle))
+    })
+}
+
+/// Log every option the agent actually offered (`optionId`, `name`, `kind`)
+/// plus the deciding `policy`, at the moment [`HostPolicy::
+/// select_permission_option`] is about to answer `Cancelled` -- ACP has no
+/// wire field for a `Cancelled` outcome to carry a reason on, so without
+/// this call the actual inputs behind a refusal are gone the instant it is
+/// sent. An empty `options` slice is called out by name: that is either
+/// "the agent offered nothing" or "its `PermissionRequestParams` failed to
+/// parse and every `.ok()`/`parse_params` site upstream already fell back
+/// to an empty list" -- the parse-failure sites themselves warn separately
+/// (see [`warn_permission_params_parse_failed`]) with the actual serde
+/// error text, this call only ever sees the already-empty result.
+fn warn_permission_cancelled(policy: HostPolicy, tool_call: &PermissionToolCall, options: &[PermissionOption]) {
+    if options.is_empty() {
+        eprintln!(
+            "[gate4agent::acp::host] session/request_permission cancelled under {policy:?} for \
+             toolCallId={:?}: no options offered (params may have failed to parse, or the agent \
+             offered none)",
+            tool_call.tool_call_id
+        );
+        return;
+    }
+    let described: Vec<String> = options
+        .iter()
+        .map(|option| {
+            format!(
+                "(optionId={:?}, name={:?}, kind={:?})",
+                option.option_id, option.name, option.kind
+            )
+        })
+        .collect();
+    eprintln!(
+        "[gate4agent::acp::host] session/request_permission cancelled under {policy:?} for \
+         toolCallId={:?}: offered options were [{}]",
+        tool_call.tool_call_id,
+        described.join(", ")
+    );
+}
+
+/// Log that a `session/request_permission` `params` blob failed to
+/// deserialize into [`PermissionRequestParams`], naming which call site saw
+/// it (`context`) and the serde error text (`detail`). Every site that
+/// reads this type off raw `Value` folds a parse failure into a fallback --
+/// `false` in [`AcpHostAdapter::decision_authority`], `None` in
+/// [`AcpHostAdapter::permission_refusal_reason`], the immediate
+/// non-deferred path in [`AcpHostAdapter::dispatch_deferrable`], or the
+/// `INVALID_PARAMS` `RpcError` `dispatch` already sends back for
+/// `session/request_permission` itself -- without this call the actual
+/// reason a permission request never even reached [`HostPolicy::
+/// select_permission_option`] was invisible; the host just looked like it
+/// refused on purpose.
+fn warn_permission_params_parse_failed(context: &str, detail: &str) {
+    eprintln!(
+        "[gate4agent::acp::host] session/request_permission params failed to parse ({context}): {detail}"
+    );
 }
 
 /// Walk `preference` in order and return the first kind the agent actually
@@ -603,9 +717,16 @@ impl AcpHostAdapter {
             "terminal/create" => params
                 .and_then(|v| serde_json::from_value::<TerminalCreateParams>(v.clone()).ok())
                 .is_some_and(|p| self.inner.terminal_create_blocked_by_gate(&p)),
-            "session/request_permission" => params
-                .and_then(|v| serde_json::from_value::<PermissionRequestParams>(v.clone()).ok())
-                .is_some_and(|p| self.inner.permission_blocked_by_gate(&p.tool_call)),
+            "session/request_permission" => match params {
+                Some(v) => match serde_json::from_value::<PermissionRequestParams>(v.clone()) {
+                    Ok(p) => self.inner.permission_blocked_by_gate(&p.tool_call),
+                    Err(e) => {
+                        warn_permission_params_parse_failed("decision_authority", &e.to_string());
+                        false
+                    }
+                },
+                None => false,
+            },
             _ => false,
         };
         if gate_blocked {
@@ -624,8 +745,13 @@ impl AcpHostAdapter {
     /// unreachable branch `decision_authority` falls back on for the same
     /// reason) or when the wrapped handler has no reason to report.
     pub(crate) fn permission_refusal_reason(&self, params: Option<&Value>) -> Option<String> {
-        let parsed = params
-            .and_then(|v| serde_json::from_value::<PermissionRequestParams>(v.clone()).ok())?;
+        let parsed = match serde_json::from_value::<PermissionRequestParams>(params?.clone()) {
+            Ok(p) => p,
+            Err(e) => {
+                warn_permission_params_parse_failed("permission_refusal_reason", &e.to_string());
+                return None;
+            }
+        };
         self.inner.permission_refusal_reason(&parsed)
     }
 }
@@ -804,7 +930,10 @@ impl AcpHostAdapter {
             "session/request_permission" => {
                 let p: PermissionRequestParams = match parse_params(params) {
                     Ok(p) => p,
-                    Err(e) => return HostCallResult { response: Err(e), outcome: HostCallOutcome::Denied },
+                    Err(e) => {
+                        warn_permission_params_parse_failed("dispatch", &e.message);
+                        return HostCallResult { response: Err(e), outcome: HostCallOutcome::Denied };
+                    }
                 };
                 let outcome = self.inner.request_permission(&p);
                 HostCallResult {
@@ -847,10 +976,17 @@ impl AcpHostAdapter {
         // arm parses `params` again independently and reports the exact
         // same `INVALID_PARAMS` either way, so a parse failure is never
         // silently swallowed into a `Deferred` that can never be answered.
-        let Some(parsed) = params
-            .clone()
-            .and_then(|v| serde_json::from_value::<PermissionRequestParams>(v).ok())
-        else {
+        let parsed = match params.clone() {
+            Some(v) => match serde_json::from_value::<PermissionRequestParams>(v) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    warn_permission_params_parse_failed("dispatch_deferrable", &e.to_string());
+                    None
+                }
+            },
+            None => None,
+        };
+        let Some(parsed) = parsed else {
             let result = self.dispatch(method, params);
             return HostDispatchOutcome::Immediate { response: result.response, outcome: result.outcome };
         };
@@ -1174,6 +1310,91 @@ mod tests {
         let outcome = HostPolicy::Auto
             .select_permission_option(&tool_call(crate::acp::protocol::ToolKind::Execute), &options);
         assert_eq!(outcome, PermissionOutcome::Selected { option_id: "aa".to_owned() });
+    }
+
+    fn allow_ish_unknown_option() -> Vec<PermissionOption> {
+        // A third-party adapter that words every option under a `kind`
+        // string this build does not recognise -- deserializes as
+        // `PermissionOptionKind::Unknown` (see `protocol.rs`'s own test for
+        // that deserialization step); this is what the allow-ish
+        // name/`optionId` fallback in `select_permission_option` exists for.
+        vec![PermissionOption {
+            option_id: "always_allow".to_owned(),
+            name: "Always allow".to_owned(),
+            kind: PermissionOptionKind::Unknown,
+        }]
+    }
+
+    #[test]
+    fn auto_falls_back_to_allow_ish_unknown_option_when_no_known_kind_offered() {
+        let outcome = HostPolicy::Auto.select_permission_option(
+            &tool_call(crate::acp::protocol::ToolKind::Execute),
+            &allow_ish_unknown_option(),
+        );
+        assert_eq!(outcome, PermissionOutcome::Selected { option_id: "always_allow".to_owned() });
+    }
+
+    #[test]
+    fn yolo_falls_back_to_allow_ish_unknown_option_when_no_known_kind_offered() {
+        let outcome = HostPolicy::Yolo.select_permission_option(
+            &tool_call(crate::acp::protocol::ToolKind::Execute),
+            &allow_ish_unknown_option(),
+        );
+        assert_eq!(outcome, PermissionOutcome::Selected { option_id: "always_allow".to_owned() });
+    }
+
+    #[test]
+    fn known_kinds_still_win_over_the_allow_ish_fallback() {
+        // The fallback must never alter existing behaviour when the four
+        // known kinds ARE offered -- it only ever runs when the by-kind
+        // preference walk found nothing.
+        let outcome = HostPolicy::Yolo
+            .select_permission_option(&tool_call(crate::acp::protocol::ToolKind::Execute), &options_all_four());
+        assert_eq!(outcome, PermissionOutcome::Selected { option_id: "aa".to_owned() });
+
+        let outcome = HostPolicy::Auto
+            .select_permission_option(&tool_call(crate::acp::protocol::ToolKind::Execute), &options_all_four());
+        assert_eq!(outcome, PermissionOutcome::Selected { option_id: "ao".to_owned() });
+    }
+
+    #[test]
+    fn allow_ish_fallback_never_fires_under_read_only_for_a_non_read_call() {
+        let outcome = HostPolicy::ReadOnly.select_permission_option(
+            &tool_call(crate::acp::protocol::ToolKind::Execute),
+            &allow_ish_unknown_option(),
+        );
+        assert_eq!(outcome, PermissionOutcome::Cancelled);
+    }
+
+    #[test]
+    fn allow_ish_fallback_never_fires_under_deny() {
+        let outcome = HostPolicy::Deny.select_permission_option(
+            &tool_call(crate::acp::protocol::ToolKind::Execute),
+            &allow_ish_unknown_option(),
+        );
+        assert_eq!(outcome, PermissionOutcome::Cancelled);
+    }
+
+    #[test]
+    fn adapter_selects_allow_ish_option_when_agent_offers_only_an_unknown_kind() {
+        // End-to-end through the adapter: the agent's wire JSON uses a
+        // `kind` string this build does not recognise for the only option
+        // offered, so it deserializes as `PermissionOptionKind::Unknown`
+        // instead of failing the whole request -- the allow-ish
+        // name/optionId fallback must still pick it under `Auto`.
+        let result = adapter(HostPolicy::Auto).handle(
+            "session/request_permission",
+            Some(json!({
+                "sessionId": "s1",
+                "toolCall": {"toolCallId": "tc1", "kind": "execute"},
+                "options": [
+                    {"optionId": "always_allow", "name": "Always allow", "kind": "allow_forever"}
+                ]
+            })),
+        );
+        let value = result.unwrap();
+        assert_eq!(value["outcome"], "selected");
+        assert_eq!(value["optionId"], "always_allow");
     }
 
     // -----------------------------------------------------------------------

@@ -114,6 +114,15 @@ const HARNESS_MCP_SESSION_ENDPOINT_ENV: &str = "GATE4AGENT_HARNESS_SESSION_ENDPO
 /// Mirror of `HARNESS_MCP_SESSION_TOKEN_ENV` -- see
 /// [`HARNESS_MCP_PROGRAM_ENV`]'s doc comment for why it is duplicated here.
 const HARNESS_MCP_SESSION_TOKEN_ENV: &str = "GATE4AGENT_HARNESS_SESSION_TOKEN";
+/// Mirror of `gate4agent_runtime_native::launch_profiles::HARNESS_MCP_TRACE_ENV`
+/// (itself a mirror of `gate4agent_harness_mcp::HARNESS_MCP_TRACE_ENV`) --
+/// see [`HARNESS_MCP_PROGRAM_ENV`]'s doc comment for why it is duplicated
+/// here. Unlike the three keys above, this one is optional: the node only
+/// resolves it into `pty_env` when its own process opted in via
+/// `HARNESS_MCP_TRACE_DIR_ENV`, so [`harness_mcp_acp_server`] forwards it
+/// when present and omits it otherwise, never treating its absence as a
+/// partial overlay.
+const HARNESS_MCP_TRACE_ENV: &str = "G4A_HARNESS_MCP_TRACE";
 
 /// Reads the harness-MCP program/endpoint/token the node prepared for this
 /// exact spawn back out of the resolved environment overlay it handed down
@@ -145,14 +154,18 @@ fn harness_mcp_acp_server(pty_env: &[EnvMutation]) -> Option<McpServerConfig> {
     let command = env_value(pty_env, HARNESS_MCP_PROGRAM_ENV)?.to_owned();
     let endpoint = env_value(pty_env, HARNESS_MCP_SESSION_ENDPOINT_ENV)?.to_owned();
     let token = env_value(pty_env, HARNESS_MCP_SESSION_TOKEN_ENV)?.to_owned();
+    let mut env = vec![
+        (HARNESS_MCP_SESSION_ENDPOINT_ENV.to_owned(), endpoint),
+        (HARNESS_MCP_SESSION_TOKEN_ENV.to_owned(), token),
+    ];
+    if let Some(trace) = env_value(pty_env, HARNESS_MCP_TRACE_ENV) {
+        env.push((HARNESS_MCP_TRACE_ENV.to_owned(), trace.to_owned()));
+    }
     Some(McpServerConfig::stdio(
         HARNESS_MCP_SERVER_NAME,
         command,
         vec![HARNESS_MCP_SESSION_PROXY_ARG.to_owned()],
-        vec![
-            (HARNESS_MCP_SESSION_ENDPOINT_ENV.to_owned(), endpoint),
-            (HARNESS_MCP_SESSION_TOKEN_ENV.to_owned(), token),
-        ],
+        env,
     ))
 }
 
@@ -4915,7 +4928,7 @@ mod tests {
         validate_instance_launch_arguments, validate_spawn_runtime_policy,
         ForegroundProbeSchedule, ForegroundVerdict, ReadinessDiagnostics, RateLimitFeed,
         Utf8ChunkDecoder, HARNESS_MCP_PROGRAM_ENV, HARNESS_MCP_SERVER_NAME,
-        HARNESS_MCP_SESSION_ENDPOINT_ENV, HARNESS_MCP_SESSION_TOKEN_ENV,
+        HARNESS_MCP_SESSION_ENDPOINT_ENV, HARNESS_MCP_SESSION_TOKEN_ENV, HARNESS_MCP_TRACE_ENV,
     };
     use gate4agent::acp::protocol::{McpServerConfig, SessionMode};
     use gate4agent::HostPolicy;
@@ -5571,6 +5584,72 @@ mod tests {
             value: Some(OsString::from("C:\\gate4agent\\gate4agent-harness-mcp.exe")),
         }];
         assert!(harness_mcp_acp_server(&pty_env).is_none());
+    }
+
+    #[test]
+    fn harness_mcp_acp_server_forwards_the_trace_var_when_present() {
+        let pty_env = vec![
+            EnvMutation {
+                key: OsString::from(HARNESS_MCP_PROGRAM_ENV),
+                value: Some(OsString::from("C:\\gate4agent\\gate4agent-harness-mcp.exe")),
+            },
+            EnvMutation {
+                key: OsString::from(HARNESS_MCP_SESSION_ENDPOINT_ENV),
+                value: Some(OsString::from("\\\\.\\pipe\\gate4agent-harness-mcp-s1")),
+            },
+            EnvMutation {
+                key: OsString::from(HARNESS_MCP_SESSION_TOKEN_ENV),
+                value: Some(OsString::from("tok-abc")),
+            },
+            // The node only resolves this key into `pty_env` when its own
+            // process opted in via `HARNESS_MCP_TRACE_DIR_ENV`
+            // (`NativeHarnessMcpLaunchOverlay::new`'s `harness_mcp_trace_mutation`).
+            EnvMutation {
+                key: OsString::from(HARNESS_MCP_TRACE_ENV),
+                value: Some(OsString::from("C:\\g4a-trace-dir\\harness-mcp-7.trace")),
+            },
+        ];
+
+        let server = harness_mcp_acp_server(&pty_env).expect("a full overlay yields one server");
+        match server {
+            McpServerConfig::Stdio { env, .. } => {
+                assert_eq!(env.len(), 3, "endpoint, token, and the opt-in trace path");
+                assert_eq!(
+                    env.iter()
+                        .find(|pair| pair.name == HARNESS_MCP_TRACE_ENV)
+                        .map(|pair| pair.value.as_str()),
+                    Some("C:\\g4a-trace-dir\\harness-mcp-7.trace")
+                );
+            }
+            McpServerConfig::Sse { .. } => panic!("expected Stdio variant"),
+        }
+    }
+
+    #[test]
+    fn harness_mcp_acp_server_omits_the_trace_var_when_absent() {
+        let pty_env = vec![
+            EnvMutation {
+                key: OsString::from(HARNESS_MCP_PROGRAM_ENV),
+                value: Some(OsString::from("C:\\gate4agent\\gate4agent-harness-mcp.exe")),
+            },
+            EnvMutation {
+                key: OsString::from(HARNESS_MCP_SESSION_ENDPOINT_ENV),
+                value: Some(OsString::from("\\\\.\\pipe\\gate4agent-harness-mcp-s1")),
+            },
+            EnvMutation {
+                key: OsString::from(HARNESS_MCP_SESSION_TOKEN_ENV),
+                value: Some(OsString::from("tok-abc")),
+            },
+        ];
+
+        let server = harness_mcp_acp_server(&pty_env).expect("a full overlay yields one server");
+        match server {
+            McpServerConfig::Stdio { env, .. } => {
+                assert_eq!(env.len(), 2, "unchanged from before the trace opt-in existed");
+                assert!(!env.iter().any(|pair| pair.name == HARNESS_MCP_TRACE_ENV));
+            }
+            McpServerConfig::Sse { .. } => panic!("expected Stdio variant"),
+        }
     }
 
     #[test]

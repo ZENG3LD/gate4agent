@@ -4,6 +4,7 @@ use gate4agent_types::{AgentId, AgentInstanceId, TransportKind};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use thiserror::Error;
 
@@ -26,6 +27,20 @@ pub const HARNESS_MCP_SESSION_TOKEN_ENV: &str =
 pub const HARNESS_MCP_PROGRAM_ENV: &str = "GATE4AGENT_HARNESS_MCP_PROGRAM";
 pub const LEGACY_HARNESS_READ_ENDPOINT_ENV: &str = "GATE4AGENT_HARNESS_READ_ENDPOINT";
 pub const LEGACY_HARNESS_READ_CREDENTIAL_ENV: &str = "GATE4AGENT_HARNESS_READ_CREDENTIAL";
+/// Mirror of `gate4agent_harness_mcp::HARNESS_MCP_TRACE_ENV`. This crate
+/// does not depend on `gate4agent-harness-mcp` -- nothing here needs the
+/// helper's own stdio-trace machinery, only the one env key name it reads
+/// -- so the literal is duplicated rather than imported, the same choice
+/// `gate4agent-shell-native` already made for `HARNESS_MCP_PROGRAM_ENV` and
+/// its neighbors.
+pub const HARNESS_MCP_TRACE_ENV: &str = "G4A_HARNESS_MCP_TRACE";
+/// Node-process opt-in, read once per [`NativeHarnessMcpLaunchOverlay::new`]
+/// call: when this exact process has a non-empty
+/// `G4A_HARNESS_MCP_TRACE_DIR`, the overlay gets a fourth environment
+/// mutation naming a trace file under that directory for
+/// [`HARNESS_MCP_TRACE_ENV`]. Unset, overlay construction is byte-for-byte
+/// what it was before this opt-in existed.
+pub const HARNESS_MCP_TRACE_DIR_ENV: &str = "G4A_HARNESS_MCP_TRACE_DIR";
 const RESERVED_CLAUDE_LAUNCH_FLAGS: &[&str] = &[
     "--continue",
     "--print",
@@ -250,7 +265,7 @@ impl NativeHarnessMcpLaunchOverlay {
         token: OsString,
         program: OsString,
     ) -> Result<Self, NativeLaunchProfileError> {
-        let environment = vec![
+        let mut environment = vec![
             EnvMutation {
                 key: OsString::from(HARNESS_MCP_SESSION_ENDPOINT_ENV),
                 value: Some(endpoint),
@@ -263,18 +278,50 @@ impl NativeHarnessMcpLaunchOverlay {
                 key: OsString::from(HARNESS_MCP_PROGRAM_ENV),
                 value: Some(program),
             },
-            EnvMutation {
-                key: OsString::from(LEGACY_HARNESS_READ_ENDPOINT_ENV),
-                value: None,
-            },
-            EnvMutation {
-                key: OsString::from(LEGACY_HARNESS_READ_CREDENTIAL_ENV),
-                value: None,
-            },
         ];
+        if let Some(trace_mutation) = harness_mcp_trace_mutation() {
+            environment.push(trace_mutation);
+        }
+        environment.push(EnvMutation {
+            key: OsString::from(LEGACY_HARNESS_READ_ENDPOINT_ENV),
+            value: None,
+        });
+        environment.push(EnvMutation {
+            key: OsString::from(LEGACY_HARNESS_READ_CREDENTIAL_ENV),
+            value: None,
+        });
         validate_environment_mutations(&environment)?;
         Ok(Self { agent_id, environment })
     }
+}
+
+/// Numbers each harness-MCP overlay this process constructs, in
+/// construction order. `NativeHarnessMcpLaunchOverlay::new` carries no
+/// session `AgentInstanceId` or generation -- adding one would change the
+/// signature its one caller in `gate4agent-node` depends on, out of scope
+/// for this opt-in -- so [`harness_mcp_trace_mutation`] uses this
+/// process-local sequence as the overlay's own instance identity for the
+/// trace file name instead of the session's. Two overlays built back to
+/// back in one node process still get distinct trace files.
+static NEXT_HARNESS_MCP_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+/// Builds the optional fourth [`EnvMutation`] naming a stdio trace file for
+/// one harness-MCP overlay, gated on this process having opted in via
+/// [`HARNESS_MCP_TRACE_DIR_ENV`]. Returns `None` -- and therefore leaves
+/// [`NativeHarnessMcpLaunchOverlay::new`]'s output identical to before this
+/// opt-in existed -- when the directory is unset, empty, or not valid
+/// Unicode. Never creates the directory; that is the operator's job.
+fn harness_mcp_trace_mutation() -> Option<EnvMutation> {
+    let trace_dir = std::env::var(HARNESS_MCP_TRACE_DIR_ENV).ok()?;
+    if trace_dir.is_empty() {
+        return None;
+    }
+    let sequence = NEXT_HARNESS_MCP_TRACE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let path = std::path::Path::new(&trace_dir).join(format!("harness-mcp-{sequence}.trace"));
+    Some(EnvMutation {
+        key: OsString::from(HARNESS_MCP_TRACE_ENV),
+        value: Some(path.into_os_string()),
+    })
 }
 
 impl NativeInstanceLaunchOverlay {
@@ -1122,6 +1169,42 @@ fn validate_zai_glm_claude_environment(
 mod tests {
     use super::*;
 
+    /// Serializes every test that touches [`HARNESS_MCP_TRACE_DIR_ENV`]:
+    /// `std::env` is process-global, and unit tests in this binary run on
+    /// separate threads by default.
+    static HARNESS_MCP_TRACE_DIR_ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Restore-on-drop guard for [`HARNESS_MCP_TRACE_DIR_ENV`], mirroring
+    /// `EnvironmentGuard` in `tests/native_launch_profiles.rs`: capture
+    /// whatever the process had before, mutate for the test, then put it
+    /// back regardless of how the test exits.
+    struct HarnessMcpTraceDirGuard {
+        previous: Option<OsString>,
+    }
+
+    impl HarnessMcpTraceDirGuard {
+        fn set(value: &str) -> Self {
+            let previous = std::env::var_os(HARNESS_MCP_TRACE_DIR_ENV);
+            std::env::set_var(HARNESS_MCP_TRACE_DIR_ENV, value);
+            Self { previous }
+        }
+
+        fn unset() -> Self {
+            let previous = std::env::var_os(HARNESS_MCP_TRACE_DIR_ENV);
+            std::env::remove_var(HARNESS_MCP_TRACE_DIR_ENV);
+            Self { previous }
+        }
+    }
+
+    impl Drop for HarnessMcpTraceDirGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(previous) => std::env::set_var(HARNESS_MCP_TRACE_DIR_ENV, previous),
+                None => std::env::remove_var(HARNESS_MCP_TRACE_DIR_ENV),
+            }
+        }
+    }
+
     struct CodexEnvironment;
 
     impl NativeChildEnvironmentResolver for CodexEnvironment {
@@ -1327,6 +1410,97 @@ mod tests {
                 }
             ),
         }
+    }
+
+    #[test]
+    fn harness_mcp_overlay_adds_a_trace_mutation_when_the_node_process_opts_in() {
+        let _lock = HARNESS_MCP_TRACE_DIR_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = HarnessMcpTraceDirGuard::set("C:\\g4a-trace-dir");
+
+        let control = NativeLaunchProfileControl::new();
+        let instance_id = AgentInstanceId(45);
+        control
+            .install_native_harness_mcp_launch_overlay(
+                instance_id,
+                NativeHarnessMcpLaunchOverlay::new(
+                    AgentId::new("codex").unwrap(),
+                    OsString::from("private-endpoint"),
+                    OsString::from("private-token"),
+                    OsString::from("reviewed-program"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let resolved = control
+            .resolve_launch_overlay(
+                instance_id,
+                &AgentId::new("codex").unwrap(),
+                TransportKind::Pty,
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            resolved.environment.len(),
+            6,
+            "endpoint, token, program, the opt-in trace path, and two legacy scrubs"
+        );
+        let trace = resolved
+            .environment
+            .iter()
+            .find(|mutation| mutation.key == OsString::from(HARNESS_MCP_TRACE_ENV))
+            .expect("trace mutation present when the node process opted in");
+        let value = trace
+            .value
+            .as_deref()
+            .and_then(OsStr::to_str)
+            .expect("trace mutation carries a path value");
+        assert!(
+            value.starts_with("C:\\g4a-trace-dir\\harness-mcp-"),
+            "unexpected trace path {value}"
+        );
+        assert!(value.ends_with(".trace"), "unexpected trace path {value}");
+    }
+
+    #[test]
+    fn harness_mcp_overlay_omits_the_trace_mutation_without_the_opt_in() {
+        let _lock = HARNESS_MCP_TRACE_DIR_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = HarnessMcpTraceDirGuard::unset();
+
+        let control = NativeLaunchProfileControl::new();
+        let instance_id = AgentInstanceId(46);
+        control
+            .install_native_harness_mcp_launch_overlay(
+                instance_id,
+                NativeHarnessMcpLaunchOverlay::new(
+                    AgentId::new("codex").unwrap(),
+                    OsString::from("private-endpoint"),
+                    OsString::from("private-token"),
+                    OsString::from("reviewed-program"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let resolved = control
+            .resolve_launch_overlay(
+                instance_id,
+                &AgentId::new("codex").unwrap(),
+                TransportKind::Pty,
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            resolved.environment.len(),
+            5,
+            "unchanged from before the trace opt-in existed"
+        );
+        assert!(!resolved
+            .environment
+            .iter()
+            .any(|mutation| mutation.key == OsString::from(HARNESS_MCP_TRACE_ENV)));
     }
 }
 

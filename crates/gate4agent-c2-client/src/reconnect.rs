@@ -32,7 +32,7 @@ use crate::runtime::{
 use gate4agent_c2_protocol::{C2Topology, NodeRequest, NodeRoute, RoutedNodeEvent, RoutedNodeResponse};
 use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 
 /// Backoff durations for a transient reconnect failure, indexed by
@@ -54,6 +54,13 @@ const RECONNECT_TRANSIENT_BACKOFFS: [Duration; 5] = [
 /// (a bad credential, a protocol mismatch), and for any transient failure
 /// past `RECONNECT_TRANSIENT_BACKOFFS`'s last step.
 const RECONNECT_PARKED_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Hard cap on the number of physical send attempts
+/// [`C2ReconnectingHandle::request_until`] makes for one logical call,
+/// independent of the caller's own budget -- a link that keeps flapping
+/// back just long enough to fail again must not turn a generous budget
+/// into an unbounded retry storm.
+const REQUEST_UNTIL_MAX_ATTEMPTS: u32 = 3;
 
 /// Whether a reconnect attempt failed in a way that retrying with the same
 /// token/endpoint cannot fix.
@@ -169,6 +176,70 @@ impl C2ReconnectingHandle {
         match handle {
             Some(handle) => handle.request(route, request).await,
             None => Err(C2ControlError::Closed),
+        }
+    }
+
+    /// [`Self::request`], but for a caller willing to wait out a physical
+    /// reconnect: on `Err(C2ControlError::ConnectionLost { .. })` or
+    /// `Err(C2ControlError::Closed)` for a request
+    /// [`NodeRequest::is_replay_safe`] admits, awaits the link-state watch
+    /// ([`Self::link_state_receiver`]) turning [`C2LinkState::Connected`]
+    /// again -- bounded by whatever of `budget` is left -- then resends,
+    /// up to [`REQUEST_UNTIL_MAX_ATTEMPTS`] physical attempts total for
+    /// this one logical call. A request `is_replay_safe` refuses, or any
+    /// failure other than those two, returns on the very first attempt
+    /// exactly like `request` does -- this method changes nothing about
+    /// `request`'s own behaviour or about `control_owner`'s pending-request
+    /// failure handling; the retry lives here, one layer up.
+    ///
+    /// `budget == Duration::ZERO` degenerates to exactly one attempt (the
+    /// first elapsed-budget check trips before any wait), so a caller that
+    /// wants `request`'s existing all-or-nothing semantics can pass that
+    /// instead of calling `request` directly.
+    pub async fn request_until(
+        &self,
+        route: NodeRoute,
+        request: NodeRequest,
+        budget: Duration,
+    ) -> Result<RoutedNodeResponse, C2ControlError> {
+        let deadline = Instant::now() + budget;
+        let replay_safe = request.is_replay_safe();
+        let mut link_state = self.link_state.clone();
+        let mut attempts: u32 = 0;
+        loop {
+            attempts += 1;
+            let result = self.request(route.clone(), request.clone()).await;
+            let retryable = matches!(
+                result,
+                Err(C2ControlError::ConnectionLost { .. }) | Err(C2ControlError::Closed)
+            );
+            if !retryable || !replay_safe || attempts >= REQUEST_UNTIL_MAX_ATTEMPTS {
+                return result;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return result;
+            }
+            if tokio::time::timeout(deadline - now, wait_for_link_connected(&mut link_state))
+                .await
+                .is_err()
+            {
+                return result;
+            }
+        }
+    }
+}
+
+/// Awaits the link-state watch reporting [`C2LinkState::Connected`],
+/// returning immediately if it already does. Only ever raced against a
+/// caller-supplied timeout ([`C2ReconnectingHandle::request_until`]) -- a
+/// dropped supervisor (the sender side gone) also returns immediately,
+/// since a frozen `watch::Receiver` cannot change further and the next
+/// attempt in the caller's loop will just observe the same failure again.
+async fn wait_for_link_connected(link_state: &mut watch::Receiver<C2LinkState>) {
+    while *link_state.borrow() != C2LinkState::Connected {
+        if link_state.changed().await.is_err() {
+            return;
         }
     }
 }
@@ -471,7 +542,7 @@ mod tests {
         read_json_frame_limited_body_timeout, write_json_frame_limited, NodeIncarnationId,
     };
     use std::collections::BTreeMap;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
     use tokio::task::JoinHandle;
@@ -1045,5 +1116,179 @@ mod tests {
             gap < RECONNECT_PARKED_BACKOFF * 2,
             "parked backoff must fire close to {RECONNECT_PARKED_BACKOFF:?}, not stall further: gap was {gap:?}",
         );
+    }
+
+    /// A fully-authenticated fake C2 server that drops the physical
+    /// connection the instant the client's first `Request` frame arrives --
+    /// never replies -- so the pending request fails with
+    /// `C2ControlError::ConnectionLost`, exactly the failure mode the
+    /// relay's own mid-flight disconnect produces
+    /// (`control_owner`, `runtime.rs:3014-3024`). Returns an
+    /// `AtomicUsize` the caller can read after the fact to prove how many
+    /// physical `Request` frames this connection actually received --
+    /// `request_until`'s own attempt cap and replay-safety gate are only
+    /// provable by counting real sends, not just by timing.
+    fn spawn_fake_server_drop_on_request(
+        endpoint: &str,
+        token: &str,
+    ) -> (FakeServer, Arc<AtomicUsize>) {
+        let pipe = ServerOptions::new().first_pipe_instance(true).create(endpoint).unwrap();
+        let token = token.to_owned();
+        let requests_seen = Arc::new(AtomicUsize::new(0));
+        let requests_seen_in_task = Arc::clone(&requests_seen);
+        let (to_client, _to_client_rx) = mpsc::channel::<C2ServerFrame>(16);
+        let task = tokio::spawn(async move {
+            let mut pipe = pipe;
+            pipe.connect().await.unwrap();
+            let Some(selected) = accept_handshake(&mut pipe, &token, false).await else { return; };
+            write_json_frame_limited(
+                &mut pipe,
+                &C2ServerFrame::Hello(C2Hello {
+                    build_stamp: BUILD_STAMP.to_owned(),
+                    connection_id: 1,
+                    status: empty_status(),
+                    compatibility: Some(selected),
+                }),
+                MAX_C2_HELLO_FRAME_BYTES,
+            )
+            .await
+            .unwrap();
+            let (mut reader, _writer) = tokio::io::split(pipe);
+            if read_json_frame_limited_body_timeout::<_, C2ClientFrame>(
+                &mut reader,
+                MAX_C2_CLIENT_FRAME_BYTES,
+                Duration::from_secs(60),
+            )
+            .await
+            .is_ok()
+            {
+                requests_seen_in_task.fetch_add(1, Ordering::SeqCst);
+            }
+            // `reader`/`_writer`/`pipe` drop here, closing the physical
+            // connection without ever sending a `Reply` -- the client's
+            // pending request fails with `ConnectionLost`, not a clean
+            // answer.
+        });
+        (FakeServer { to_client, task }, requests_seen)
+    }
+
+    /// A replay-safe request (`NodeRequest::Snapshot`) whose first attempt
+    /// fails with `ConnectionLost` (the fake server drops the connection
+    /// the instant the request lands) must come back with the real answer
+    /// once the link is reconnected -- `request_until` retries it against
+    /// whichever physical connection the supervisor reconnects to, all
+    /// within its own budget, without the caller ever seeing the
+    /// intermediate failure.
+    #[tokio::test]
+    async fn request_until_survives_a_reconnect_for_a_replay_safe_request() {
+        let endpoint = unique_control_endpoint();
+        let token = "reconnect-token-request-until-1";
+        let (server1, requests_seen) = spawn_fake_server_drop_on_request(&endpoint, token);
+        let (handle, _events) =
+            connect_local_reconnecting(endpoint.clone(), token.to_owned()).await.unwrap();
+
+        let mut link_state_for_server2 = handle.link_state_receiver();
+        let endpoint_for_server2 = endpoint.clone();
+        let token_for_server2 = token.to_owned();
+        let start_server2 = tokio::spawn(async move {
+            wait_for_link_state(&mut link_state_for_server2, C2LinkState::Reconnecting).await;
+            spawn_fake_server(&endpoint_for_server2, &token_for_server2, empty_status(), "server-2")
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            handle.request_until(test_route(), NodeRequest::Snapshot, Duration::from_secs(5)),
+        )
+        .await
+        .expect("a replay-safe request must not hang past its own budget");
+        let response = result.expect("must succeed once the link comes back within the budget");
+        assert_snapshot_tag(&response, "server-2");
+        assert_eq!(
+            requests_seen.load(Ordering::SeqCst),
+            1,
+            "the first attempt must have actually gone out on server-1's connection",
+        );
+
+        let server2 = start_server2.await.unwrap();
+        server1.kill().await;
+        server2.kill().await;
+    }
+
+    /// The same connection-drops-on-request failure as above, but with a
+    /// request `NodeRequest::is_replay_safe` refuses
+    /// (`AcquireController`): it must fail immediately with the original
+    /// `ConnectionLost`, never wait for a reconnect, and never be resent --
+    /// proven by an outer timeout far shorter than the budget it was given,
+    /// and by the fake server's own attempt counter staying at exactly one.
+    #[tokio::test]
+    async fn request_until_never_retries_a_non_replay_safe_request() {
+        let endpoint = unique_control_endpoint();
+        let token = "reconnect-token-request-until-2";
+        let (server1, requests_seen) = spawn_fake_server_drop_on_request(&endpoint, token);
+        let (handle, _events) =
+            connect_local_reconnecting(endpoint.clone(), token.to_owned()).await.unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            handle.request_until(
+                test_route(),
+                NodeRequest::AcquireController { lease_ms: 1_000 },
+                Duration::from_secs(30),
+            ),
+        )
+        .await
+        .expect(
+            "a non-replay-safe request must not wait on a reconnect it will never use, \
+             no matter how generous its budget is",
+        );
+        assert!(matches!(result, Err(C2ControlError::ConnectionLost { .. })));
+        assert_eq!(
+            requests_seen.load(Ordering::SeqCst),
+            1,
+            "a non-replay-safe request must never be resent after its first attempt fails",
+        );
+
+        server1.kill().await;
+    }
+
+    /// A replay-safe request against a link that never comes back must
+    /// still end -- bounded by its own budget, not by spinning forever
+    /// waiting on a reconnect that never happens, and without exceeding
+    /// `REQUEST_UNTIL_MAX_ATTEMPTS` real sends in the process.
+    #[tokio::test]
+    async fn request_until_ends_by_its_budget_when_the_link_never_returns() {
+        let endpoint = unique_control_endpoint();
+        let token = "reconnect-token-request-until-3";
+        let (server1, requests_seen) = spawn_fake_server_drop_on_request(&endpoint, token);
+        let (handle, _events) =
+            connect_local_reconnecting(endpoint.clone(), token.to_owned()).await.unwrap();
+
+        let budget = Duration::from_millis(600);
+        let before = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            handle.request_until(test_route(), NodeRequest::Snapshot, budget),
+        )
+        .await
+        .expect("request_until must end on its own once its budget is exhausted, not hang");
+        let elapsed = tokio::time::Instant::now() - before;
+
+        assert!(matches!(result, Err(C2ControlError::ConnectionLost { .. })));
+        assert_eq!(
+            requests_seen.load(Ordering::SeqCst),
+            1,
+            "no server ever reconnected, so only the first attempt could ever be sent",
+        );
+        assert!(
+            elapsed + Duration::from_millis(50) >= budget,
+            "must not return well before the budget it was given: elapsed {elapsed:?}",
+        );
+        assert!(
+            elapsed < budget * 3,
+            "must not spin well past its own budget waiting on a link that never returns: \
+             elapsed {elapsed:?}",
+        );
+
+        server1.kill().await;
     }
 }

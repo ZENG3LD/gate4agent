@@ -11924,9 +11924,9 @@ async fn relay_harness_mcp_read_call(
         }
         let chunk_hex = HarnessMcpReplyChunkHexV1::new(encode_hex(chunk))
             .map_err(|_| HarnessRuntimeError::InvalidReply)?;
-        let remaining = deadline_unix_ms - now;
+        let budget = Duration::from_millis(deadline_unix_ms - now);
         offset = match timeout(
-            Duration::from_millis(remaining),
+            budget,
             adapter.put_harness_mcp_reply_chunk(
                 &route,
                 &reservation_id,
@@ -11937,6 +11937,7 @@ async fn relay_harness_mcp_read_call(
                 offset,
                 index + 1 == chunks.len(),
                 chunk_hex,
+                budget,
             ),
         ).await {
             Ok(result) => result?,
@@ -11959,8 +11960,9 @@ async fn reject_harness_mcp_before_deadline(
 ) {
     let now = unix_time_ms();
     if now >= deadline_unix_ms { return; }
+    let budget = Duration::from_millis(deadline_unix_ms - now);
     let _ = timeout(
-        Duration::from_millis(deadline_unix_ms - now),
+        budget,
         adapter.reject_harness_mcp_call(
             route,
             reservation_id,
@@ -11969,6 +11971,7 @@ async fn reject_harness_mcp_before_deadline(
             session,
             call_id,
             reason,
+            budget,
         ),
     ).await;
 }

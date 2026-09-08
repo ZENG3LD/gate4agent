@@ -6299,6 +6299,99 @@ impl NodeRequest {
             _ => false,
         }
     }
+
+    /// Whether a caller may resend this exact request after a physical C2
+    /// reconnect without risking a double application on the node --
+    /// `gate4agent_c2_client::reconnect::C2ReconnectingHandle::request_until`
+    /// is the only caller: it never retries a request this returns `false`
+    /// for, at any budget, no matter how long the link is down.
+    ///
+    /// Conservative by construction: `true` only for a request that is
+    /// either a pure read (nothing on the node changes, however many times
+    /// it is sent) or otherwise idempotent by design (the same bytes at the
+    /// same identity always land the same way, and a duplicate lands on an
+    /// already-settled node state as a clean no-op/mismatch rather than a
+    /// second effect) -- `PutHarnessMcpReplyChunk`/`RejectHarnessMcpCall`
+    /// (the harness-MCP read-proxy call's own terminal reply, keyed by
+    /// `(reservation_id, activation_digest, call_id, offset)`) are the only
+    /// non-read members of that second group. Every spawn, every
+    /// reservation/worktree/workspace lifecycle transition, every session
+    /// mutation, and every delivery-bundle stage transition returns `false`
+    /// -- including `PutDeliveryBlobChunk`, which looks offset-keyed like
+    /// `PutHarnessMcpReplyChunk` but backs a bundle commit this method does
+    /// not have a mandate to reclassify as retry-safe.
+    ///
+    /// Deliberately exhaustive with no `_` arm: a newly added `NodeRequest`
+    /// variant fails to compile here until someone classifies it, rather
+    /// than silently inheriting a default in either direction.
+    pub fn is_replay_safe(&self) -> bool {
+        match self {
+            Self::Snapshot
+            | Self::Resync { .. }
+            | Self::PutHarnessMcpReplyChunk { .. }
+            | Self::RejectHarnessMcpCall { .. }
+            | Self::BrowseHostDirectories { .. }
+            | Self::InspectWorkspace { .. }
+            | Self::ReadWorkspaceFile { .. }
+            | Self::ReadGitHistory { .. }
+            | Self::ReadGitDiff { .. }
+            | Self::CatalogNativeSessions { .. }
+            | Self::PageNativeSessions { .. }
+            | Self::PreviewNativeSession { .. }
+            | Self::PreviewSessionRecord { .. }
+            | Self::DiscoverHistory { .. }
+            | Self::ResolveDurableContextPack { .. }
+            | Self::ReadContextPack { .. } => true,
+            Self::ArmHarnessMcpReservation { .. }
+            | Self::SpawnSpecWithHarnessMcp { .. }
+            | Self::ActivateHarnessMcpReservation { .. }
+            | Self::AbortHarnessMcpReservation { .. }
+            | Self::BeginDeliveryStage { .. }
+            | Self::PutDeliveryBlobChunk { .. }
+            | Self::CommitDeliveryStage { .. }
+            | Self::AbortDeliveryStage { .. }
+            | Self::WriteWorkspaceFile { .. }
+            | Self::CreateWorkspaceFile { .. }
+            | Self::CreateWorkspaceDirectory { .. }
+            | Self::AcquireController { .. }
+            | Self::ReleaseController
+            | Self::RegisterWorkspace { .. }
+            | Self::CreateStandaloneWorkspace { .. }
+            | Self::UnregisterWorkspace { .. }
+            | Self::CreateWorktree { .. }
+            | Self::RemoveWorktree { .. }
+            | Self::Spawn { .. }
+            | Self::SpawnSpec { .. }
+            | Self::SpawnManagedWorktree { .. }
+            | Self::SpawnManagedWorktreeV2 { .. }
+            | Self::CleanupManagedWorktree { .. }
+            | Self::Resume { .. }
+            | Self::RenameSessionRecord { .. }
+            | Self::SetSessionTask { .. }
+            | Self::IndexProviderSession { .. }
+            | Self::IndexNativeSession { .. }
+            | Self::ResumeSessionRecord { .. }
+            | Self::ForgetSessionRecord { .. }
+            | Self::LoadHistory { .. }
+            | Self::ExportContextPackForSessionRecord { .. }
+            | Self::ExportContextPack { .. }
+            | Self::ForgetContextPack { .. }
+            | Self::Prompt { .. }
+            | Self::Paste { .. }
+            | Self::Input { .. }
+            | Self::TerminalBytes { .. }
+            | Self::TerminalControl { .. }
+            | Self::Resize { .. }
+            | Self::Interrupt { .. }
+            | Self::Stop { .. }
+            | Self::Remove { .. }
+            | Self::ResolveInteraction { .. }
+            | Self::SetSessionMode { .. }
+            | Self::SetSessionConfigOption { .. }
+            | Self::SetSessionModel { .. }
+            | Self::Shutdown => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -10968,5 +11061,57 @@ mod tests {
             digest_a,
         );
         assert!(serde_json::from_str::<NodeResponse>(&unsorted).is_err());
+    }
+
+    /// `NodeRequest::is_replay_safe` covers every variant with no `_` arm
+    /// (enforced at compile time, not by this test), so this only has to
+    /// spot-check representative members of each side: pure reads and the
+    /// harness-MCP read-proxy reply on the `true` side; a lifecycle
+    /// transition, a spawn, an export, and the request-less `Shutdown` on
+    /// the `false` side.
+    #[test]
+    fn replay_safety_predicate_admits_only_reads_and_the_harness_mcp_reply() {
+        assert!(NodeRequest::Snapshot.is_replay_safe());
+        assert!(NodeRequest::Resync { after_sequence: 0 }.is_replay_safe());
+        assert!(NodeRequest::ReadWorkspaceFile {
+            workspace_id: WorkspaceId::new("primary").unwrap(),
+            path: repository_path("README.md"),
+        }
+        .is_replay_safe());
+        assert!(NodeRequest::ReadContextPack {
+            digest: SpawnContextDigest::new(format!("sha256:{}", "a".repeat(64))).unwrap(),
+        }
+        .is_replay_safe());
+        assert!(NodeRequest::PutHarnessMcpReplyChunk {
+            reservation_id: HarnessMcpReservationId::new(format!(
+                "hmcpres_{}", "a".repeat(24),
+            )).unwrap(),
+            activation_digest: HarnessMcpActivationDigest::new(format!(
+                "sha256:{}", "b".repeat(64),
+            )).unwrap(),
+            record_id: SessionRecordId::new("record-a").unwrap(),
+            session: session_address("primary", 1),
+            call_id: HarnessMcpCallId::new(format!("hmcpcall_{}", "c".repeat(24))).unwrap(),
+            offset: 0,
+            final_chunk: true,
+            chunk_hex: HarnessMcpReplyChunkHexV1::new("00".repeat(4)).unwrap(),
+        }
+        .is_replay_safe());
+
+        assert!(!NodeRequest::Shutdown.is_replay_safe());
+        assert!(!NodeRequest::AcquireController { lease_ms: 1_000 }.is_replay_safe());
+        assert!(!NodeRequest::ActivateHarnessMcpReservation {
+            reservation_id: HarnessMcpReservationId::new(format!(
+                "hmcpres_{}", "a".repeat(24),
+            )).unwrap(),
+            activation_digest: HarnessMcpActivationDigest::new(format!(
+                "sha256:{}", "b".repeat(64),
+            )).unwrap(),
+            record_id: SessionRecordId::new("record-a").unwrap(),
+            session: session_address("primary", 1),
+        }
+        .is_replay_safe());
+        assert!(!NodeRequest::ExportContextPack { session: session_address("primary", 1) }
+            .is_replay_safe());
     }
 }

@@ -1216,6 +1216,18 @@ impl HarnessC2Adapter {
         }
     }
 
+    /// `budget` bounds how long this may keep retrying across a physical
+    /// C2 reconnect (`C2ReconnectingHandle::request_until`) -- the caller
+    /// (`relay_harness_mcp_read_call`, `runtime.rs`) derives it from the
+    /// harness-MCP call's own `deadline_unix_ms` and never hands over more
+    /// than what is left of it, so this can never outlive the call it is
+    /// answering. `PutHarnessMcpReplyChunk` is replay-safe
+    /// (`NodeRequest::is_replay_safe`): the same bytes at the same
+    /// `(reservation_id, activation_digest, call_id, offset)` either land
+    /// once or, if the node already applied them before the reconnect, are
+    /// rejected as an offset mismatch -- never double-applied -- so a
+    /// sub-second reconnect no longer loses the read the way it did before
+    /// this call retried through `request` alone.
     pub(crate) async fn put_harness_mcp_reply_chunk(
         &self,
         route: &NodeRoute,
@@ -1227,11 +1239,12 @@ impl HarnessC2Adapter {
         offset: u32,
         final_chunk: bool,
         chunk_hex: HarnessMcpReplyChunkHexV1,
+        budget: Duration,
     ) -> Result<u32, HarnessC2Error> {
         self.ensure_current_incarnation(route)?;
         let expected_next = offset.checked_add(chunk_hex.raw_len() as u32)
             .ok_or(HarnessC2Error::HarnessMcpCorrelationMismatch)?;
-        let routed = self.control.request(route.clone(), NodeRequest::PutHarnessMcpReplyChunk {
+        let routed = self.control.request_until(route.clone(), NodeRequest::PutHarnessMcpReplyChunk {
             reservation_id: reservation_id.clone(),
             activation_digest: activation_digest.clone(),
             record_id: record_id.clone(),
@@ -1240,7 +1253,7 @@ impl HarnessC2Adapter {
             offset,
             final_chunk,
             chunk_hex,
-        }).await.map_err(HarnessC2Error::HarnessMcpTransport)?;
+        }, budget).await.map_err(HarnessC2Error::HarnessMcpTransport)?;
         if routed.node_id != route.node_id
             || routed.incarnation_id != route.expected_incarnation_id
         {
@@ -1270,6 +1283,14 @@ impl HarnessC2Adapter {
         }
     }
 
+    /// `budget` -- see `put_harness_mcp_reply_chunk`'s own doc comment:
+    /// same derivation from the call's `deadline_unix_ms`, same
+    /// `request_until` retry-across-reconnect, same rationale.
+    /// `RejectHarnessMcpCall` is replay-safe (`NodeRequest::is_replay_safe`)
+    /// for the identical reason `PutHarnessMcpReplyChunk` is -- it is the
+    /// harness-MCP read-proxy call's other terminal reply, keyed the same
+    /// way, and a duplicate lands on an already-settled call as a clean
+    /// mismatch rather than a second effect.
     pub(crate) async fn reject_harness_mcp_call(
         &self,
         route: &NodeRoute,
@@ -1279,16 +1300,17 @@ impl HarnessC2Adapter {
         session: &SessionAddress,
         call_id: &HarnessMcpCallId,
         reason: HarnessMcpRejectReasonV1,
+        budget: Duration,
     ) -> Result<(), HarnessC2Error> {
         self.ensure_current_incarnation(route)?;
-        let routed = self.control.request(route.clone(), NodeRequest::RejectHarnessMcpCall {
+        let routed = self.control.request_until(route.clone(), NodeRequest::RejectHarnessMcpCall {
             reservation_id: reservation_id.clone(),
             activation_digest: activation_digest.clone(),
             record_id: record_id.clone(),
             session: session.clone(),
             call_id: call_id.clone(),
             reason,
-        }).await.map_err(HarnessC2Error::HarnessMcpTransport)?;
+        }, budget).await.map_err(HarnessC2Error::HarnessMcpTransport)?;
         if routed.node_id != route.node_id
             || routed.incarnation_id != route.expected_incarnation_id
         {

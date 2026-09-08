@@ -46,7 +46,8 @@ use gate4agent_node_wire::{
     local_hmac_sha256, proofs_match, random_nonce, LocalServerStream,
     OwnerOnlyLocalListener,
 };
-use std::sync::atomic::AtomicUsize;
+use std::fmt;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::OwnedSemaphorePermit;
 
@@ -94,6 +95,49 @@ struct NegotiatedPathCapabilities {
     delivery_bundle_v2_stage_commit: bool,
     harness_mcp_read_proxy: bool,
     acp_control: bool,
+}
+
+/// Which of the connection loop's `break` sites ended a control connection.
+/// Every `break` inside `serve_connection`'s loop sets one of these
+/// immediately before it fires, so the "control connection closed" log line
+/// always names why -- see `queue_reply`/`queue_topology_if_changed` and
+/// `QueueOutcome` for the split between a genuinely closed peer (still a
+/// `break`) and a single frame that could not be queued (never a `break`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlCloseReason {
+    /// The reader task stopped delivering frames, hit a frame error, or
+    /// handed up something other than a request after the handshake.
+    ReaderClosedOrProtocolViolation,
+    /// The client sent a request that used a host-path capability this
+    /// connection did not negotiate.
+    UnnegotiatedPathCapability,
+    /// A reply could not be queued because the outbound channel is closed:
+    /// the peer is genuinely gone.
+    ReplyChannelClosed,
+    /// A topology update could not be queued because the outbound channel
+    /// is closed: the peer is genuinely gone.
+    TopologyChannelClosed,
+    /// The connection's own disconnect signal fired (the writer task or a
+    /// spawned dispatch decided the peer is gone).
+    DisconnectSignaled,
+    /// The node status watch channel closed.
+    StatusWatchClosed,
+    /// The process-wide shutdown watch fired.
+    Shutdown,
+}
+
+impl fmt::Display for ControlCloseReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::ReaderClosedOrProtocolViolation => "reader closed or protocol violation",
+            Self::UnnegotiatedPathCapability => "request used an unnegotiated path capability",
+            Self::ReplyChannelClosed => "reply channel closed: peer is gone",
+            Self::TopologyChannelClosed => "topology channel closed: peer is gone",
+            Self::DisconnectSignaled => "disconnect signaled",
+            Self::StatusWatchClosed => "node status watch closed",
+            Self::Shutdown => "process shutdown",
+        })
+    }
 }
 
 pub(super) async fn run(
@@ -321,16 +365,20 @@ async fn serve_connection(
     ));
     let mut dispatches = JoinSet::new();
     let mut last_request_id = 0_u64;
+    let reply_drop_warned = Arc::new(AtomicBool::new(false));
+    let mut topology_drop_warned = false;
     tracing::info!(connection_id, "control connection opened");
 
-    loop {
+    let close_reason = loop {
         tokio::select! {
             incoming = incoming_rx.recv() => {
-                let Some(Ok(C2ClientFrame::Request(request))) = incoming else { break; };
+                let Some(Ok(C2ClientFrame::Request(request))) = incoming else {
+                    break ControlCloseReason::ReaderClosedOrProtocolViolation;
+                };
                 if !path_capabilities.opaque_host_paths
                     && node_request_contains_opaque_unix_path(&request.request.request)
                 {
-                    break;
+                    break ControlCloseReason::UnnegotiatedPathCapability;
                 }
                 if request.request_id.0 == 0 || request.request_id.0 <= last_request_id {
                     tracing::warn!(
@@ -339,7 +387,11 @@ async fn serve_connection(
                         "control request rejected: request ID must be nonzero and strictly increasing",
                     );
                     let failure = relay_failure(C2RelayFailureCode::RequestIdReused, "C2 request IDs must be nonzero and strictly increasing", None);
-                    if queue_reply(&outbound_tx, &budget, C2ReplyEnvelope { request_id: request.request_id, result: Err(failure) }).await.is_err() { break; }
+                    match queue_reply(&outbound_tx, &budget, C2ReplyEnvelope { request_id: request.request_id, result: Err(failure) }).await {
+                        QueueOutcome::Queued => note_reply_queued(&reply_drop_warned),
+                        QueueOutcome::Dropped(cause) => warn_reply_dropped(connection_id, request.request_id.0, cause, &reply_drop_warned),
+                        QueueOutcome::PeerGone => break ControlCloseReason::ReplyChannelClosed,
+                    }
                     continue;
                 }
                 last_request_id = request.request_id.0;
@@ -353,10 +405,14 @@ async fn serve_connection(
                         cause = ?failure,
                         "control request rejected: capability was not negotiated",
                     );
-                    if queue_reply(&outbound_tx, &budget, C2ReplyEnvelope {
+                    match queue_reply(&outbound_tx, &budget, C2ReplyEnvelope {
                         request_id: request.request_id,
                         result: Err(failure),
-                    }).await.is_err() { break; }
+                    }).await {
+                        QueueOutcome::Queued => note_reply_queued(&reply_drop_warned),
+                        QueueOutcome::Dropped(cause) => warn_reply_dropped(connection_id, request.request_id.0, cause, &reply_drop_warned),
+                        QueueOutcome::PeerGone => break ControlCloseReason::ReplyChannelClosed,
+                    }
                     continue;
                 }
                 if !path_capabilities.provider_ids_open
@@ -372,32 +428,45 @@ async fn serve_connection(
                         "provider identity capability was not negotiated with C2",
                         None,
                     );
-                    if queue_reply(&outbound_tx, &budget, C2ReplyEnvelope {
+                    match queue_reply(&outbound_tx, &budget, C2ReplyEnvelope {
                         request_id: request.request_id,
                         result: Err(failure),
-                    }).await.is_err() { break; }
+                    }).await {
+                        QueueOutcome::Queued => note_reply_queued(&reply_drop_warned),
+                        QueueOutcome::Dropped(cause) => warn_reply_dropped(connection_id, request.request_id.0, cause, &reply_drop_warned),
+                        QueueOutcome::PeerGone => break ControlCloseReason::ReplyChannelClosed,
+                    }
                     continue;
                 }
                 match dispatch_start(connection_id, request.request, &relays, &status) {
                     DispatchStart::Immediate(result) => {
-                        if queue_reply(&outbound_tx, &budget, C2ReplyEnvelope { request_id: request.request_id, result }).await.is_err() { break; }
+                        match queue_reply(&outbound_tx, &budget, C2ReplyEnvelope { request_id: request.request_id, result }).await {
+                            QueueOutcome::Queued => note_reply_queued(&reply_drop_warned),
+                            QueueOutcome::Dropped(cause) => warn_reply_dropped(connection_id, request.request_id.0, cause, &reply_drop_warned),
+                            QueueOutcome::PeerGone => break ControlCloseReason::ReplyChannelClosed,
+                        }
                     }
                     DispatchStart::Pending(reply) => {
                         let outbound = outbound_tx.clone();
                         let budget = Arc::clone(&budget);
                         let disconnect = disconnect_tx.clone();
+                        let reply_drop_warned = Arc::clone(&reply_drop_warned);
                         dispatches.spawn(async move {
                             let result = reply.await.unwrap_or_else(|_| Err(relay_failure(C2RelayFailureCode::NodeOffline, "node relay disconnected", None)));
-                            if queue_reply(&outbound, &budget, C2ReplyEnvelope { request_id: request.request_id, result }).await.is_err() {
-                                let _ = disconnect.send(true);
+                            match queue_reply(&outbound, &budget, C2ReplyEnvelope { request_id: request.request_id, result }).await {
+                                QueueOutcome::Queued => note_reply_queued(&reply_drop_warned),
+                                QueueOutcome::Dropped(cause) => warn_reply_dropped(connection_id, request.request_id.0, cause, &reply_drop_warned),
+                                QueueOutcome::PeerGone => { let _ = disconnect.send(true); }
                             }
                         });
                     }
                 }
             }
-            changed = disconnect_rx.changed() => if changed.is_err() || *disconnect_rx.borrow() { break; },
+            changed = disconnect_rx.changed() => if changed.is_err() || *disconnect_rx.borrow() {
+                break ControlCloseReason::DisconnectSignaled;
+            },
             changed = status.changed() => {
-                if changed.is_err() { break; }
+                if changed.is_err() { break ControlCloseReason::StatusWatchClosed; }
                 let next_topology = {
                     let latest = status.borrow_and_update();
                     let mut projected = latest.as_ref().clone();
@@ -413,19 +482,34 @@ async fn serve_connection(
                         path_capabilities.observation_workflow_detail,
                     )
                 };
-                if queue_topology_if_changed(
+                match queue_topology_if_changed(
                     &outbound_tx,
                     &budget,
                     &mut last_topology,
                     next_topology,
-                ).is_err() { break; }
+                ) {
+                    QueueOutcome::Queued => topology_drop_warned = false,
+                    QueueOutcome::Dropped(cause) => {
+                        if !topology_drop_warned {
+                            topology_drop_warned = true;
+                            tracing::warn!(
+                                connection_id,
+                                cause = %cause,
+                                "control topology update dropped: could not be queued for peer, will retry on next status change",
+                            );
+                        }
+                    }
+                    QueueOutcome::PeerGone => break ControlCloseReason::TopologyChannelClosed,
+                }
             }
-            changed = shutdown.changed() => if changed.is_err() || *shutdown.borrow() { break; },
+            changed = shutdown.changed() => if changed.is_err() || *shutdown.borrow() {
+                break ControlCloseReason::Shutdown;
+            },
         }
         while dispatches.try_join_next().is_some() {}
-    }
+    };
 
-    tracing::info!(connection_id, "control connection closed");
+    tracing::info!(connection_id, reason = %close_reason, "control connection closed");
     hub.detach(connection_id);
     dispatches.shutdown().await;
     release_all_controllers(&relays).await;
@@ -2110,22 +2194,129 @@ fn reserve_budget(budget: &AtomicUsize, bytes: usize) -> bool {
     }).is_ok()
 }
 
-fn queued(frame: C2ServerFrame, budget: &AtomicUsize) -> Result<QueuedFrame, ()> {
-    let bytes = serde_json::to_vec(&frame).map_err(|_| ())?.len();
-    if bytes > MAX_C2_SERVER_FRAME_BYTES || !reserve_budget(budget, bytes) { return Err(()); }
+/// Why one outbound frame (a reply or a topology update) could not be
+/// handed to this connection's writer. Always a condition local to that ONE
+/// frame -- never a sign the peer is gone; see `QueueOutcome::PeerGone` for
+/// the one outcome that does mean that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DropCause {
+    /// The frame did not fit inside the per-connection outbound byte budget
+    /// (`MAX_OUTBOUND_BYTES`), or could not be serialized at all.
+    BudgetExhausted,
+    /// The bounded outbound queue (`MAX_OUTBOUND_FRAMES`) was full at the
+    /// moment of a non-blocking enqueue attempt.
+    QueueFull,
+    /// The writer did not accept the frame before `REPLY_QUEUE_DEADLINE`
+    /// elapsed.
+    DeadlineExceeded,
+}
+
+impl fmt::Display for DropCause {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::BudgetExhausted => "outbound byte budget exhausted",
+            Self::QueueFull => "outbound queue full",
+            Self::DeadlineExceeded => "reply queue deadline exceeded",
+        })
+    }
+}
+
+/// Outcome of trying to hand one outbound frame to this connection's
+/// writer. `Dropped` is never fatal to the connection: only `PeerGone` is,
+/// because it means the outbound channel itself is closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueOutcome {
+    /// The frame was handed to the writer (or there was nothing new to
+    /// send, in `queue_topology_if_changed`'s no-op case).
+    Queued,
+    /// The frame was dropped for a reason local to itself; the connection
+    /// stays open and keeps serving other requests.
+    Dropped(DropCause),
+    /// The outbound channel is closed: the peer really is gone.
+    PeerGone,
+}
+
+/// Marks a successful queue attempt: clears the "already warned" flag so a
+/// FUTURE drop in a new backpressure episode earns its own log line again.
+fn note_reply_queued(warned: &AtomicBool) {
+    warned.store(false, Ordering::Relaxed);
+}
+
+/// Logs a dropped reply exactly once per contiguous backpressure episode
+/// (the first drop since `warned` was last cleared by `note_reply_queued`),
+/// naming the connection, the request whose reply was dropped, and which
+/// condition fired -- mirroring the "log once per episode" discipline used
+/// for full-channel event drops elsewhere in the tree.
+fn warn_reply_dropped(connection_id: u64, request_id: u64, cause: DropCause, warned: &AtomicBool) {
+    if !warned.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            connection_id,
+            request_id,
+            cause = %cause,
+            "control reply dropped: could not be queued for peer, connection stays open",
+        );
+    }
+}
+
+fn queued(frame: C2ServerFrame, budget: &AtomicUsize) -> Result<QueuedFrame, DropCause> {
+    let bytes = serde_json::to_vec(&frame).map_err(|_| DropCause::BudgetExhausted)?.len();
+    if bytes > MAX_C2_SERVER_FRAME_BYTES || !reserve_budget(budget, bytes) {
+        return Err(DropCause::BudgetExhausted);
+    }
     Ok(QueuedFrame { frame, bytes })
 }
 
+/// Queues one reply for this connection's writer. A budget/size failure or
+/// a `REPLY_QUEUE_DEADLINE` timeout returns `Dropped` -- ONE frame's
+/// backpressure, never a reason to tear down the connection. Only a closed
+/// outbound channel (the writer task, and with it the peer, is gone)
+/// returns `PeerGone`.
 async fn queue_reply(
     sender: &mpsc::Sender<QueuedFrame>,
     budget: &AtomicUsize,
     reply: C2ReplyEnvelope,
-) -> Result<(), ()> {
-    let queued = queued(C2ServerFrame::Reply(reply), budget)?;
+) -> QueueOutcome {
+    let queued = match queued(C2ServerFrame::Reply(reply), budget) {
+        Ok(queued) => queued,
+        Err(cause) => return QueueOutcome::Dropped(cause),
+    };
     let bytes = queued.bytes;
     match timeout(REPLY_QUEUE_DEADLINE, sender.send(queued)).await {
-        Ok(Ok(())) => Ok(()),
-        _ => { budget.fetch_sub(bytes, Ordering::AcqRel); Err(()) }
+        Ok(Ok(())) => QueueOutcome::Queued,
+        Ok(Err(_)) => {
+            budget.fetch_sub(bytes, Ordering::AcqRel);
+            QueueOutcome::PeerGone
+        }
+        Err(_) => {
+            budget.fetch_sub(bytes, Ordering::AcqRel);
+            QueueOutcome::Dropped(DropCause::DeadlineExceeded)
+        }
+    }
+}
+
+/// Non-blocking counterpart of `queue_reply` used for events and topology
+/// updates: a full bounded queue drops the frame (`Dropped`), a closed
+/// channel means the peer is gone (`PeerGone`).
+fn queue_event_outcome(
+    sender: &mpsc::Sender<QueuedFrame>,
+    budget: &AtomicUsize,
+    frame: C2ServerFrame,
+) -> QueueOutcome {
+    let queued = match queued(frame, budget) {
+        Ok(queued) => queued,
+        Err(cause) => return QueueOutcome::Dropped(cause),
+    };
+    let bytes = queued.bytes;
+    match sender.try_send(queued) {
+        Ok(()) => QueueOutcome::Queued,
+        Err(TrySendError::Full(_)) => {
+            budget.fetch_sub(bytes, Ordering::AcqRel);
+            QueueOutcome::Dropped(DropCause::QueueFull)
+        }
+        Err(TrySendError::Closed(_)) => {
+            budget.fetch_sub(bytes, Ordering::AcqRel);
+            QueueOutcome::PeerGone
+        }
     }
 }
 
@@ -2134,14 +2325,9 @@ fn queue_event(
     budget: &AtomicUsize,
     frame: C2ServerFrame,
 ) -> Result<(), ()> {
-    let queued = queued(frame, budget)?;
-    let bytes = queued.bytes;
-    match sender.try_send(queued) {
-        Ok(()) => Ok(()),
-        Err(TrySendError::Full(_) | TrySendError::Closed(_)) => {
-            budget.fetch_sub(bytes, Ordering::AcqRel);
-            Err(())
-        }
+    match queue_event_outcome(sender, budget, frame) {
+        QueueOutcome::Queued => Ok(()),
+        QueueOutcome::Dropped(_) | QueueOutcome::PeerGone => Err(()),
     }
 }
 
@@ -2153,16 +2339,25 @@ pub(super) fn queue_operator_event(
     queue_event(sender, budget, C2ServerFrame::Event(event))
 }
 
+/// Queues a topology update only if it differs from `previous`. A dropped
+/// frame leaves `previous` UNCHANGED, so the next status change re-sends
+/// the same update instead of the peer silently missing it forever.
 fn queue_topology_if_changed(
     sender: &mpsc::Sender<QueuedFrame>,
     budget: &AtomicUsize,
     previous: &mut C2Topology,
     next: C2Topology,
-) -> Result<(), ()> {
-    if *previous == next { return Ok(()); }
-    queue_event(sender, budget, C2ServerFrame::Topology(next.clone()))?;
-    *previous = next;
-    Ok(())
+) -> QueueOutcome {
+    if *previous == next {
+        return QueueOutcome::Queued;
+    }
+    match queue_event_outcome(sender, budget, C2ServerFrame::Topology(next.clone())) {
+        QueueOutcome::Queued => {
+            *previous = next;
+            QueueOutcome::Queued
+        }
+        other => other,
+    }
 }
 
 enum DispatchStart {
@@ -5661,20 +5856,144 @@ mod tests {
         let (sender, mut receiver) = mpsc::channel(2);
         let budget = AtomicUsize::new(0);
 
-        queue_topology_if_changed(&sender, &budget, &mut previous, recovered.clone()).unwrap();
+        assert_eq!(
+            queue_topology_if_changed(&sender, &budget, &mut previous, recovered.clone()),
+            QueueOutcome::Queued,
+        );
         let queued = receiver.try_recv().unwrap();
         assert_eq!(queued.frame, C2ServerFrame::Topology(recovered.clone()));
         budget.fetch_sub(queued.bytes, Ordering::AcqRel);
         assert_eq!(previous, recovered);
 
         recovered_status.observed_at_unix_ms += 1;
-        queue_topology_if_changed(
-            &sender,
-            &budget,
-            &mut previous,
-            C2Topology::from_status(&recovered_status),
-        ).unwrap();
+        assert_eq!(
+            queue_topology_if_changed(
+                &sender,
+                &budget,
+                &mut previous,
+                C2Topology::from_status(&recovered_status),
+            ),
+            QueueOutcome::Queued,
+        );
         assert!(receiver.try_recv().is_err());
         assert_eq!(budget.load(Ordering::Acquire), 0);
+    }
+
+    /// Minimal reply envelope for backpressure tests: the payload's shape
+    /// does not matter here, only that it is small and distinguishable by
+    /// `request_id`.
+    fn minimal_reply(request_id: u64) -> C2ReplyEnvelope {
+        C2ReplyEnvelope {
+            request_id: crate::protocol::C2RequestId(request_id),
+            result: Ok(RoutedNodeResponse {
+                node_id: NodeId::new("node-a").unwrap(),
+                incarnation_id: NodeIncarnationId::from_bytes([7; 16]),
+                response: Ok(C2NodeResponse::ShuttingDown),
+            }),
+        }
+    }
+
+    /// Brief item: "A reply that exceeds the byte budget is dropped with
+    /// the connection still open and still serving a following request."
+    /// The outbound channel here stands in for the connection: it is never
+    /// closed by the drop, and a following reply for a different request
+    /// still queues normally.
+    #[tokio::test]
+    async fn queue_reply_over_budget_is_dropped_and_a_following_reply_still_queues() {
+        let (sender, mut receiver) = mpsc::channel(4);
+        let budget = AtomicUsize::new(MAX_OUTBOUND_BYTES);
+
+        let outcome = queue_reply(&sender, &budget, minimal_reply(1)).await;
+        assert_eq!(outcome, QueueOutcome::Dropped(DropCause::BudgetExhausted));
+        assert!(receiver.try_recv().is_err());
+        // The failed reservation never touched the budget.
+        assert_eq!(budget.load(Ordering::Acquire), MAX_OUTBOUND_BYTES);
+
+        // The writer drains earlier frames and frees room; the connection
+        // was never torn down by the first drop, so the next reply for a
+        // different request still queues.
+        budget.store(0, Ordering::Release);
+        let reply = minimal_reply(2);
+        let outcome = queue_reply(&sender, &budget, reply.clone()).await;
+        assert_eq!(outcome, QueueOutcome::Queued);
+        let queued = receiver.try_recv().unwrap();
+        assert_eq!(queued.frame, C2ServerFrame::Reply(reply));
+    }
+
+    /// Brief item: "A reply whose outbound send hits
+    /// `REPLY_QUEUE_DEADLINE` is dropped with the connection still open."
+    /// No test-clock pausing is available in this crate's `tokio` feature
+    /// set, so this genuinely waits out the real `REPLY_QUEUE_DEADLINE`
+    /// (3s) -- the bounded channel's one slot is filled and nobody drains
+    /// it, so `queue_reply`'s internal send has nowhere to go until the
+    /// deadline fires.
+    #[tokio::test]
+    async fn queue_reply_hits_deadline_is_dropped_and_connection_stays_open() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let budget = AtomicUsize::new(0);
+        let filler = queued(C2ServerFrame::Reply(minimal_reply(0)), &budget).unwrap();
+        sender.try_send(filler).unwrap();
+
+        let outcome = queue_reply(&sender, &budget, minimal_reply(1)).await;
+        assert_eq!(outcome, QueueOutcome::Dropped(DropCause::DeadlineExceeded));
+
+        // The channel is still open: draining the backlog frees the slot,
+        // and a following reply queues normally.
+        receiver.try_recv().unwrap();
+        let reply = minimal_reply(2);
+        let outcome = queue_reply(&sender, &budget, reply.clone()).await;
+        assert_eq!(outcome, QueueOutcome::Queued);
+        let queued = receiver.try_recv().unwrap();
+        assert_eq!(queued.frame, C2ServerFrame::Reply(reply));
+    }
+
+    /// Brief item: "A closed outbound channel still closes the connection,
+    /// with the reason named." `queue_reply` returning `PeerGone` is
+    /// exactly the condition `serve_connection`'s loop maps to
+    /// `ControlCloseReason::ReplyChannelClosed` -- unlike `Dropped`, which
+    /// never breaks the loop.
+    #[tokio::test]
+    async fn queue_reply_reports_peer_gone_only_when_the_channel_is_actually_closed() {
+        let (sender, receiver) = mpsc::channel(4);
+        let budget = AtomicUsize::new(0);
+        drop(receiver);
+
+        let outcome = queue_reply(&sender, &budget, minimal_reply(1)).await;
+        assert_eq!(outcome, QueueOutcome::PeerGone);
+        assert_eq!(budget.load(Ordering::Acquire), 0);
+        assert_eq!(
+            ControlCloseReason::ReplyChannelClosed.to_string(),
+            "reply channel closed: peer is gone",
+        );
+    }
+
+    /// Brief item: "A topology frame that cannot be queued leaves
+    /// `last_topology` unchanged so the next change re-sends it."
+    #[test]
+    fn queue_topology_if_changed_leaves_previous_unchanged_when_dropped_so_next_change_resends() {
+        let incarnation_id = NodeIncarnationId::from_bytes([4; 16]);
+        let baseline = C2Topology::from_status(&status(NodeTransportState::Offline, None));
+        let mut previous = baseline.clone();
+        let recovered = C2Topology::from_status(&status(
+            NodeTransportState::Online,
+            Some(incarnation_id),
+        ));
+        let (sender, mut receiver) = mpsc::channel(1);
+        // Budget already exhausted: the topology frame cannot be reserved.
+        let budget = AtomicUsize::new(MAX_OUTBOUND_BYTES);
+
+        let outcome = queue_topology_if_changed(&sender, &budget, &mut previous, recovered.clone());
+        assert_eq!(outcome, QueueOutcome::Dropped(DropCause::BudgetExhausted));
+        assert_eq!(previous, baseline, "a dropped topology frame must not advance `previous`");
+        assert!(receiver.try_recv().is_err());
+
+        // Budget frees up: the SAME change is retried on the next status
+        // tick (because `previous` was never advanced) and now succeeds.
+        budget.store(0, Ordering::Release);
+        let outcome = queue_topology_if_changed(&sender, &budget, &mut previous, recovered.clone());
+        assert_eq!(outcome, QueueOutcome::Queued);
+        let queued = receiver.try_recv().unwrap();
+        assert_eq!(queued.frame, C2ServerFrame::Topology(recovered.clone()));
+        assert_eq!(previous, recovered);
     }
 }

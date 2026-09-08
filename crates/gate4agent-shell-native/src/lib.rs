@@ -2044,13 +2044,15 @@ fn host_policy_for_approval_level(level: ApprovalLevel) -> HostPolicy {
 /// function is reached; `Unsupported` here is defensive-only and defers,
 /// the conservative choice, rather than assuming silence.
 ///
-/// The vendor facts happen to still split along the same two groups
-/// `host_policy_for_approval_level` above uses (`FullAuto`/`ReadOnly` never
-/// ask, `Moderate`/`Unmanaged` do) for every provider currently in the
-/// catalog -- but that is a fact about today's four providers' vendor modes,
-/// not a rule this function encodes; a fifth provider or a vendor mode
-/// change could break that grouping without this function's logic changing
-/// at all, which is the point of reading the catalog instead of the level.
+/// `Unmanaged` always resolves `asks_for_permission: false` -- it decides
+/// `session/request_permission` immediately (auto-approve) rather than
+/// parking it, since some providers' ACP clients won't wait out a deferred
+/// decision (kimi reports the call as refused). The managed levels'
+/// `asks_for_permission` still varies per provider and per level -- that is
+/// a fact about today's four providers' vendor modes, not a rule this
+/// function encodes; a fifth provider or a vendor mode change could shift it
+/// without this function's logic changing at all, which is the point of
+/// reading the catalog instead of the level.
 fn defers_permission_requests(agent_id: &AgentId, level: ApprovalLevel) -> bool {
     match approval_level_resolution(agent_id, level) {
         ApprovalLevelResolution::Supported {
@@ -6750,7 +6752,10 @@ mod tests {
         // nor asks over ACP, measured twice) -- claude's own interactive
         // mode, which does ask about every write.
         assert!(defers_permission_requests(&claude, ApprovalLevel::ReadOnly));
-        assert!(defers_permission_requests(&claude, ApprovalLevel::Unmanaged));
+        // `Unmanaged` never defers: it decides `session/request_permission`
+        // immediately (auto-approve), since some providers' ACP clients
+        // won't wait out a parked decision.
+        assert!(!defers_permission_requests(&claude, ApprovalLevel::Unmanaged));
 
         let codex = AgentId::new("codex").unwrap();
         assert!(!defers_permission_requests(&codex, ApprovalLevel::FullAuto));
@@ -6760,7 +6765,8 @@ mod tests {
         // with.
         assert!(!defers_permission_requests(&codex, ApprovalLevel::Moderate));
         assert!(defers_permission_requests(&codex, ApprovalLevel::ReadOnly));
-        assert!(defers_permission_requests(&codex, ApprovalLevel::Unmanaged));
+        // `Unmanaged` never defers -- see the claude row's comment above.
+        assert!(!defers_permission_requests(&codex, ApprovalLevel::Unmanaged));
 
         let grok = AgentId::new("grok").unwrap();
         assert!(!defers_permission_requests(&grok, ApprovalLevel::FullAuto));
@@ -6769,7 +6775,8 @@ mod tests {
         // already have refused the session before this function would ever
         // see it live; the conservative fallback here still defers.
         assert!(defers_permission_requests(&grok, ApprovalLevel::ReadOnly));
-        assert!(defers_permission_requests(&grok, ApprovalLevel::Unmanaged));
+        // `Unmanaged` never defers -- see the claude row's comment above.
+        assert!(!defers_permission_requests(&grok, ApprovalLevel::Unmanaged));
 
         let kimi = AgentId::new("kimi").unwrap();
         assert!(!defers_permission_requests(&kimi, ApprovalLevel::FullAuto));
@@ -6780,7 +6787,8 @@ mod tests {
         // asking -- measured live, a write outside the working directory
         // produced no question at all.
         assert!(!defers_permission_requests(&kimi, ApprovalLevel::ReadOnly));
-        assert!(defers_permission_requests(&kimi, ApprovalLevel::Unmanaged));
+        // `Unmanaged` never defers -- see the claude row's comment above.
+        assert!(!defers_permission_requests(&kimi, ApprovalLevel::Unmanaged));
     }
 
     // -----------------------------------------------------------------------

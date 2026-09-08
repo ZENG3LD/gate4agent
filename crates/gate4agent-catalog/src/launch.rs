@@ -201,10 +201,11 @@ pub enum ApprovalLevelResolution {
 ///   here was a different build: the npm shell shim running under WSL
 ///   interop, not this native binary.
 /// - `Unmanaged` always resolves `Supported` with no flag and
-///   `asks_for_permission: true`, for every agent ID including one this
+///   `asks_for_permission: false`, for every agent ID including one this
 ///   catalog does not recognize: it imposes nothing by definition, so it can
-///   never be refused, and "impose nothing" means the vendor's own default
-///   is in control and cannot be predicted -- assume it can ask.
+///   never be refused, and it decides `session/request_permission`
+///   immediately (auto-approve) rather than parking it -- some providers'
+///   ACP clients won't wait out a deferred decision.
 /// - An agent ID this catalog does not recognize resolves `Unsupported` at
 ///   every other level: this function never guesses at an unknown
 ///   provider's flag surface, and refusing is honest where the old
@@ -385,7 +386,11 @@ pub fn approval_level_resolution(agent_id: &AgentId, level: ApprovalLevel) -> Ap
         // mechanism exists" -- the one row where those two readings differ.
         (_, ApprovalLevel::Unmanaged) => Supported {
             args: Vec::new(),
-            asks_for_permission: true,
+            // Unmanaged decides `session/request_permission` immediately
+            // (auto-approve) rather than parking it: some providers' ACP
+            // clients won't wait out a deferred decision (kimi reports the
+            // call as refused), so this level must never defer.
+            asks_for_permission: false,
             acp_mode_id: None,
         },
         // An agent ID this mapping does not carry verified data for at all.
@@ -1055,7 +1060,7 @@ mod tests {
         );
         assert_eq!(
             approval_level_resolution(&claude, ApprovalLevel::Unmanaged),
-            supported(&[], true, None)
+            supported(&[], false, None)
         );
 
         let codex = AgentId::new("codex").unwrap();
@@ -1085,7 +1090,7 @@ mod tests {
         );
         assert_eq!(
             approval_level_resolution(&codex, ApprovalLevel::Unmanaged),
-            supported(&[], true, None)
+            supported(&[], false, None)
         );
 
         let grok = AgentId::new("grok").unwrap();
@@ -1103,7 +1108,7 @@ mod tests {
         );
         assert_eq!(
             approval_level_resolution(&grok, ApprovalLevel::Unmanaged),
-            supported(&[], true, None)
+            supported(&[], false, None)
         );
 
         // measured 2026-09-05: kimi.exe 0.29.0 session/new offers no modes;
@@ -1124,7 +1129,7 @@ mod tests {
         );
         assert_eq!(
             approval_level_resolution(&kimi, ApprovalLevel::Unmanaged),
-            supported(&[], true, None)
+            supported(&[], false, None)
         );
 
         let unknown = AgentId::new("some-future-provider").unwrap();
@@ -1137,7 +1142,7 @@ mod tests {
         }
         assert_eq!(
             approval_level_resolution(&unknown, ApprovalLevel::Unmanaged),
-            supported(&[], true, None)
+            supported(&[], false, None)
         );
     }
 
@@ -1176,7 +1181,7 @@ mod tests {
                 approval_level_resolution(&agent, ApprovalLevel::Unmanaged),
                 ApprovalLevelResolution::Supported {
                     args: Vec::new(),
-                    asks_for_permission: true,
+                    asks_for_permission: false,
                     acp_mode_id: None,
                 },
                 "{id}: Unmanaged is the one level allowed to carry no ACP mode id"

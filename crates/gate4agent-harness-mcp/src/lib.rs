@@ -372,13 +372,13 @@ impl<B: HarnessMcpBackend> HarnessMcpServer<B> {
         if context.validate().is_err() {
             return rpc_error(id, -32603, "harness read unavailable");
         }
-        if !context.allowed_tool_ids.iter().any(|allowed| allowed == &params.name)
-            || !(HARNESS_READ_TOOL_IDS.contains(&params.name.as_str())
-                || HARNESS_WRITE_TOOL_IDS.contains(&params.name.as_str()))
+        let name = strip_server_prefix(&params.name);
+        if !context.allowed_tool_ids.iter().any(|allowed| allowed == name)
+            || !(HARNESS_READ_TOOL_IDS.contains(&name) || HARNESS_WRITE_TOOL_IDS.contains(&name))
         {
             return rpc_error(id, -32601, "method not found");
         }
-        let call = match parse_tool_call(&params.name, params.arguments) {
+        let call = match parse_tool_call(name, params.arguments) {
             Ok(call) => call,
             Err(_) => return rpc_error(id, -32602, "invalid params"),
         };
@@ -798,6 +798,26 @@ fn parse_mail_address(args: MailAddressArgs) -> Result<HarnessMailAddressV1, ()>
     }
 }
 
+/// Strip a leading MCP server-qualifier off a `tools/call` name, so a
+/// server-qualified id resolves to the bare id `tools/list` actually
+/// advertises and this module matches against everywhere else.
+///
+/// We advertise the MCP server as `"gate4agent"` and bare tool ids (e.g.
+/// `g4a_context_get`). codex, kimi, and claude forward that bare id
+/// unchanged. grok's third-party CLI instead forwards a server-qualified
+/// name -- `gate4agent__g4a_context_get`, or `mcp__gate4agent__g4a_context_get`
+/// -- which a strict-equality match against the bare id would reject with
+/// "method not found". The longer prefix is checked first so a name that
+/// happens to carry both is not left half-stripped; a name with neither
+/// prefix (the bare-id case) is returned unchanged.
+fn strip_server_prefix(name: &str) -> &str {
+    const MCP_QUALIFIED_PREFIX: &str = "mcp__gate4agent__";
+    const SERVER_QUALIFIED_PREFIX: &str = "gate4agent__";
+    name.strip_prefix(MCP_QUALIFIED_PREFIX)
+        .or_else(|| name.strip_prefix(SERVER_QUALIFIED_PREFIX))
+        .unwrap_or(name)
+}
+
 fn parse_tool_call(name: &str, arguments: Value) -> Result<HarnessMcpToolCall, ()> {
     match name {
         "g4a_context_get" => {
@@ -1145,6 +1165,7 @@ mod tests {
         call_error: Cell<Option<HarnessMcpBackendError>>,
         tasks_enabled: Cell<bool>,
         own_task_present: Cell<bool>,
+        mail_enabled: Cell<bool>,
     }
 
     /// The calling run's own task, returned only when `own_task_present` is set.
@@ -1225,7 +1246,7 @@ mod tests {
                 monitoring_visibility: HarnessMonitoringVisibilityV1::None,
                 maximum_child_count: 0,
                 maximum_child_depth: 0,
-                mail: false,
+                mail: self.mail_enabled.get(),
                 task_create: false,
                 task_mutate: false,
                 allowed_tool_ids: self.allowed.borrow().clone(),
@@ -1262,6 +1283,7 @@ mod tests {
             call_error: Cell::new(None),
             tasks_enabled: Cell::new(true),
             own_task_present: Cell::new(false),
+            mail_enabled: Cell::new(false),
         }
     }
 
@@ -1481,6 +1503,89 @@ mod tests {
         }));
         assert_eq!(refused["error"]["code"], -32601);
         assert_eq!(server.backend.calls.get(), 0);
+    }
+
+    #[test]
+    fn strip_server_prefix_strips_the_longer_prefix_first_and_leaves_bare_names_alone() {
+        assert_eq!(strip_server_prefix("mcp__gate4agent__g4a_mail_inbox"), "g4a_mail_inbox");
+        assert_eq!(strip_server_prefix("gate4agent__g4a_context_get"), "g4a_context_get");
+        assert_eq!(strip_server_prefix("g4a_context_get"), "g4a_context_get");
+        assert_eq!(strip_server_prefix("foo__g4a_context_get"), "foo__g4a_context_get");
+    }
+
+    /// grok's third-party MCP client forwards a server-qualified tool name
+    /// instead of the bare id `tools/list` advertises. `tools_call` must
+    /// strip a leading `gate4agent__` or `mcp__gate4agent__` before matching
+    /// against `allowed_tool_ids`/`HARNESS_READ_TOOL_IDS`/
+    /// `HARNESS_WRITE_TOOL_IDS` and before `parse_tool_call`, so both
+    /// prefixed spellings resolve exactly like the bare id -- while a bare
+    /// id (codex/kimi/claude), an unrecognized prefix, and an unknown tool
+    /// id all still behave exactly as before the shim.
+    #[test]
+    fn server_qualified_tool_names_resolve_to_the_bare_id() {
+        let mut server = HarnessMcpServer::new(fixture());
+        initialize(&mut server);
+        // Turn on the mail grant (and off the unrelated tasks grant) so
+        // `g4a_mail_inbox` joins `allowed_tool_ids` -- `SessionContextV1::
+        // validate` requires that list to equal exactly the ids the
+        // context's own flags derive, so it must carry every mail id once
+        // `mail` is on, not just the one this test calls.
+        server.backend.tasks_enabled.set(false);
+        server.backend.mail_enabled.set(true);
+        server.backend.allowed.replace(vec![
+            "g4a_context_get".to_owned(),
+            "g4a_mail_ack".to_owned(),
+            "g4a_mail_fetch".to_owned(),
+            "g4a_mail_inbox".to_owned(),
+            "g4a_mail_send".to_owned(),
+        ]);
+
+        // A bare id is unaffected -- codex/kimi/claude's own shape.
+        let bare = request(&mut server, json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"g4a_context_get","arguments":{}}
+        }));
+        assert_eq!(bare["result"]["isError"], false);
+
+        // `gate4agent__g4a_context_get` resolves to `g4a_context_get` and is
+        // served identically to the bare call above.
+        let server_qualified = request(&mut server, json!({
+            "jsonrpc":"2.0","id":3,"method":"tools/call",
+            "params":{"name":"gate4agent__g4a_context_get","arguments":{}}
+        }));
+        assert_eq!(server_qualified["result"]["isError"], false);
+        let text = server_qualified["result"]["content"][0]["text"].as_str().unwrap();
+        let response: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(response["kind"], "context");
+
+        // `mcp__gate4agent__g4a_mail_inbox` resolves to `g4a_mail_inbox` --
+        // it clears the allow-list and tool-id checks and reaches the
+        // backend (this fixture doesn't implement the call, so it comes
+        // back as a business-level refusal, never a protocol-level
+        // "method not found").
+        let mcp_qualified = request(&mut server, json!({
+            "jsonrpc":"2.0","id":4,"method":"tools/call",
+            "params":{"name":"mcp__gate4agent__g4a_mail_inbox","arguments":{}}
+        }));
+        assert!(mcp_qualified.get("error").is_none());
+        assert_eq!(mcp_qualified["result"]["isError"], true);
+        assert_eq!(mcp_qualified["result"]["content"][0]["text"], "not found or denied");
+
+        // An unrecognized prefix does not get stripped -- refused by name,
+        // same as any other tool id absent from both allow-lists.
+        let unknown_prefix = request(&mut server, json!({
+            "jsonrpc":"2.0","id":5,"method":"tools/call",
+            "params":{"name":"foo__g4a_context_get","arguments":{}}
+        }));
+        assert_eq!(unknown_prefix["error"]["code"], -32601);
+
+        // A bare but unknown tool id is refused after stripping, same as
+        // ever -- the shim never grants an id it wouldn't otherwise serve.
+        let bogus = request(&mut server, json!({
+            "jsonrpc":"2.0","id":6,"method":"tools/call",
+            "params":{"name":"g4a_bogus","arguments":{}}
+        }));
+        assert_eq!(bogus["error"]["code"], -32601);
     }
 
     #[test]

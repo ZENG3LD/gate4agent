@@ -72,7 +72,6 @@ const WRITER_CAPACITY: usize = 64;
 /// consumer that is genuinely stuck, not merely bursty.
 pub(crate) const EVENT_CAPACITY: usize = 1024;
 const HARNESS_MCP_EVENT_CAPACITY: usize = 128;
-const REGULAR_EVENT_DELIVERY_DEADLINE: Duration = Duration::from_secs(2);
 const OPAQUE_UNIX_PATH_NOT_NEGOTIATED: &str =
     "opaque Unix paths require negotiated C2 capability";
 const REPOSITORY_PATH_NOT_NEGOTIATED: &str =
@@ -2352,6 +2351,7 @@ async fn control_owner<E>(
     // next to it.
     let mut harness_mcp_channel_full_logged = false;
     let mut terminal_frame_channel_full_logged = false;
+    let mut regular_event_channel_full_logged = false;
     let mut loss_reason = C2ConnectionLossReason::Shutdown;
     loop {
         tokio::select! {
@@ -2941,22 +2941,32 @@ async fn control_owner<E>(
                             let kind = c2_node_event_kind_label(&event.event);
                             let sequence = event.cursor.sequence;
                             let cursor = event.cursor;
-                            if !matches!(
-                                timeout(
-                                    REGULAR_EVENT_DELIVERY_DEADLINE,
-                                    events.regular.send(event),
-                                ).await,
-                                Ok(Ok(())),
-                            ) {
-                                tracing::warn!(
-                                    kind,
-                                    sequence,
-                                    cursor = ?cursor,
-                                    reason = "regular event channel backpressure exceeded delivery deadline",
-                                    "dropping event and tearing down the C2 control connection",
-                                );
-                                loss_reason = C2ConnectionLossReason::RegularEventBackpressure;
-                                break;
+                            match events.regular.try_send(event) {
+                                Ok(()) => {
+                                    reset_channel_full_drop_episode(&mut regular_event_channel_full_logged);
+                                }
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    if should_log_channel_full_drop(&mut regular_event_channel_full_logged) {
+                                        tracing::warn!(
+                                            kind,
+                                            sequence,
+                                            cursor = ?cursor,
+                                            reason = "regular event channel full",
+                                            "dropped regular event; C2 control connection stays open",
+                                        );
+                                    }
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    tracing::warn!(
+                                        kind,
+                                        sequence,
+                                        cursor = ?cursor,
+                                        reason = "regular event receiver dropped",
+                                        "dropping event and tearing down the C2 control connection",
+                                    );
+                                    loss_reason = C2ConnectionLossReason::RegularEventBackpressure;
+                                    break;
+                                }
                             }
                         }
                     }
@@ -3097,9 +3107,10 @@ pub enum C2ConnectionLossReason {
     /// unnegotiated-capability leak, an invalid topology frame, or a
     /// repeated handshake frame after authentication.
     Protocol,
-    /// The `regular` event consumer fell behind: its channel closed (a
-    /// terminal-frame event found no receiver) or blocking delivery of a
-    /// non-terminal event exceeded `REGULAR_EVENT_DELIVERY_DEADLINE`.
+    /// The `regular` event consumer is gone: its channel closed because
+    /// the receiver was dropped. A merely full (but alive) `regular`
+    /// channel never reaches this reason -- the offending event is
+    /// dropped and the connection stays open instead.
     RegularEventBackpressure,
     /// The local caller side shut the connection down deliberately (every
     /// `C2ControlHandle` clone dropped) or the request id space was
@@ -5750,28 +5761,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn slow_event_consumer_closes_control_owner_without_silent_drop() {
+    async fn dropped_event_receiver_closes_control_owner() {
         let (commands_tx, commands_rx) = mpsc::channel(1);
-        let (events_tx, _events_rx) = mpsc::channel(EVENT_CAPACITY);
+        let (events_tx, events_rx) = mpsc::channel(EVENT_CAPACITY);
+        drop(events_rx);
         let (writer_tx, _writer_rx) = mpsc::channel(1);
-        let (incoming_tx, incoming_rx) = mpsc::channel(EVENT_CAPACITY + 2);
+        let (incoming_tx, incoming_rx) = mpsc::channel(1);
         let (topology_tx, _topology_rx) = watch::channel(Arc::new(C2Topology { nodes: Vec::new() }));
         let owner = tokio::spawn(control_owner(
             commands_rx, events_tx, topology_tx, writer_tx, incoming_rx, no_path_capabilities(),
         ));
 
-        for seq in 1..=(EVENT_CAPACITY as u64 + 1) {
-            incoming_tx.send(event(seq)).await.unwrap();
-        }
-        timeout(REGULAR_EVENT_DELIVERY_DEADLINE + Duration::from_secs(1), owner)
-            .await
-            .unwrap()
-            .unwrap();
+        incoming_tx.send(event(1)).await.unwrap();
+        timeout(Duration::from_secs(1), owner).await.unwrap().unwrap();
         assert!(commands_tx.is_closed());
     }
 
     #[tokio::test]
-    async fn stalled_regular_event_consumer_fails_closed_without_hanging_following_reply() {
+    async fn full_regular_channel_drops_event_and_still_serves_following_reply() {
         let (commands_tx, commands_rx) = mpsc::channel(1);
         let (events_tx, _events_rx) = mpsc::channel(EVENT_CAPACITY);
         let mut seq = 1u64;
@@ -5792,20 +5799,22 @@ mod tests {
             reply: reply_tx,
         }).await.unwrap();
         assert!(matches!(writer_rx.recv().await, Some(C2ClientFrame::Request(_))));
+        // The `regular` channel is full but its receiver is alive -- this
+        // event must be dropped, not tear the connection down.
         incoming_tx.send(event(3)).await.unwrap();
         incoming_tx.send(reply(1)).await.unwrap();
 
         assert!(matches!(
-            timeout(
-                REGULAR_EVENT_DELIVERY_DEADLINE + Duration::from_secs(1),
-                reply_rx,
-            ).await.unwrap().unwrap(),
-            Err(C2ControlError::ConnectionLost {
-                reason: C2ConnectionLossReason::RegularEventBackpressure,
-            }),
+            timeout(Duration::from_secs(1), reply_rx).await.unwrap().unwrap(),
+            Ok(RoutedNodeResponse {
+                response: Ok(gate4agent_c2_protocol::C2NodeResponse::Accepted),
+                ..
+            })
         ));
+        assert!(!commands_tx.is_closed());
+
+        drop(incoming_tx);
         timeout(Duration::from_secs(1), owner).await.unwrap().unwrap();
-        assert!(commands_tx.is_closed());
     }
 
     #[tokio::test]

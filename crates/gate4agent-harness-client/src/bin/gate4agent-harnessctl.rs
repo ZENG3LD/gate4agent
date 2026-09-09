@@ -28,7 +28,7 @@ use gate4agent_harness_api::{
     HarnessAgentStreamChunkKindV1, HarnessAgentStreamNamedIdV1, HarnessApprovalLevelV1,
     HarnessBlockAuthorityV1, HarnessExecutionModeV1,
     HarnessOperatorAgentEventV1, HarnessProviderInteractionResponseV1, HarnessRuntimeSessionAddressV1,
-    HarnessRuntimeTerminalSizeV1,
+    HarnessRuntimeTerminalSizeV1, HarnessTerminalControlV1,
 };
 
 const HARNESS_OPERATOR_TOKEN_ENV: &str = "GATE4AGENT_HARNESS_OPERATOR_TOKEN";
@@ -64,6 +64,7 @@ fn usage() -> &'static str {
      \x20 session set-config-option NODE_ID INCARNATION_ID WORKSPACE_ID INSTANCE_ID GENERATION OPTION_ID --value-json JSON\n\
      \x20 session prompt NODE_ID INCARNATION_ID WORKSPACE_ID INSTANCE_ID GENERATION TEXT (ACP/inline sessions only -- refused for a PTY session)\n\
      \x20 session input NODE_ID INCARNATION_ID WORKSPACE_ID INSTANCE_ID GENERATION TEXT (raw terminal input; the PTY counterpart of prompt)\n\
+     \x20 session control NODE_ID INCARNATION_ID WORKSPACE_ID INSTANCE_ID GENERATION CONTROL (enter|interrupt|eof -- submit a typed PTY line)\n\
      \x20 session subscribe NODE_ID INCARNATION_ID WORKSPACE_ID INSTANCE_ID GENERATION [...more session groups] [--verbose yes]"
 }
 
@@ -136,6 +137,7 @@ enum Command {
     SessionSetMode { session: HarnessRuntimeSessionAddressV1, mode_id: String },
     SessionPrompt { session: HarnessRuntimeSessionAddressV1, text: String },
     SessionInput { session: HarnessRuntimeSessionAddressV1, text: String },
+    SessionControl { session: HarnessRuntimeSessionAddressV1, control: HarnessTerminalControlV1 },
     SessionSetConfigOption {
         session: HarnessRuntimeSessionAddressV1,
         option_id: String,
@@ -170,6 +172,7 @@ enum Verb {
     SessionSetMode,
     SessionPrompt,
     SessionInput,
+    SessionControl,
     SessionSetConfigOption,
     SessionSetModel,
     SessionSubscribe,
@@ -207,6 +210,7 @@ fn resolve_verb(args: &[String]) -> Result<(Verb, usize), String> {
             Some("set-mode") => Ok((Verb::SessionSetMode, 2)),
             Some("prompt") => Ok((Verb::SessionPrompt, 2)),
             Some("input") => Ok((Verb::SessionInput, 2)),
+            Some("control") => Ok((Verb::SessionControl, 2)),
             Some("set-config-option") => Ok((Verb::SessionSetConfigOption, 2)),
             Some("set-model") => Ok((Verb::SessionSetModel, 2)),
             Some("subscribe") => Ok((Verb::SessionSubscribe, 2)),
@@ -216,6 +220,22 @@ fn resolve_verb(args: &[String]) -> Result<(Verb, usize), String> {
             Ok((Verb::WorkspaceInspect, 2))
         }
         _ => Err(usage().to_owned()),
+    }
+}
+
+/// The special keys `session control` accepts, by the name an operator would
+/// say out loud. `enter` is the one this exists for: `session input` carries
+/// printable text only -- the wire refuses a control character inside it --
+/// so a PTY session's typed line is submitted by a separate control verb, not
+/// by a trailing newline.
+fn parse_terminal_control(key: &str) -> Result<HarnessTerminalControlV1, String> {
+    match key.to_ascii_lowercase().as_str() {
+        "enter" | "return" | "cr" | "ctrl-m" => Ok(HarnessTerminalControlV1::ControlM),
+        "interrupt" | "ctrl-c" => Ok(HarnessTerminalControlV1::Interrupt),
+        "eof" | "ctrl-d" => Ok(HarnessTerminalControlV1::EndOfFile),
+        other => Err(format!(
+            "unknown control key {other:?}; known: enter, interrupt, eof"
+        )),
     }
 }
 
@@ -617,6 +637,12 @@ fn build_command(
             let text = expect_single_positional(positionals, "text")?;
             Ok(Command::SessionInput { session, text })
         }
+        Verb::SessionControl => {
+            let session = take_session_address_prefix(positionals)?;
+            let key = expect_single_positional(positionals, "control")?;
+            let control = parse_terminal_control(&key)?;
+            Ok(Command::SessionControl { session, control })
+        }
         Verb::SessionSetConfigOption => {
             let session = take_session_address_prefix(positionals)?;
             let option_id = expect_single_positional(positionals, "option-id")?;
@@ -1008,6 +1034,10 @@ fn execute(invocation: Invocation) -> Result<String, String> {
         Command::SessionInput { session, text } => {
             client.write_session_input(session, text).map_err(|error| error.to_string())?;
             render(&serde_json::json!({ "input_written": true }))
+        }
+        Command::SessionControl { session, control } => {
+            client.control_session(session, control).map_err(|error| error.to_string())?;
+            render(&serde_json::json!({ "controlled": true }))
         }
         Command::SessionSetConfigOption { session, option_id, value_json } => {
             client

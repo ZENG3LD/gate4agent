@@ -341,37 +341,40 @@ pub fn approval_level_resolution(agent_id: &AgentId, level: ApprovalLevel) -> Ap
         ("grok", ApprovalLevel::ReadOnly) => Unsupported,
 
         // kimi (Kimi Code) -- see this function's own doc comment.
+        // kimi's ACP session modes are restored from the 2026-09-02 live
+        // catalogue measurement (`docs/gate4agent/research/
+        // gate4agent-acp-mode-catalogues-measured-2026-09-02.md`, recorded
+        // "Live, not synthesized"): kimi announces `default`, `plan`, `auto`
+        // and `yolo`. A 2026-09-05 note set every kimi row to `None` on the
+        // claim that 0.29.0 announces no modes and that the earlier reading
+        // was "the npm shim under WSL interop". That write-off is what left
+        // kimi with NO mechanism at all over ACP -- no mode to set and, for
+        // the levels with empty `args`, nothing in argv either -- and it is
+        // exactly why kimi refused every `g4a_*` call at its own approval
+        // step all through 2026-09-09 while never sending the host a
+        // `session/request_permission`. `session/set_mode` is the mechanism
+        // ACP has for this; argv flags (`--yolo`/`--auto`) were measured
+        // reaching the process and changing nothing. If the agent does NOT
+        // announce a mode named here, `apply_acp_approval_mode` refuses by
+        // name and prints what it DID offer -- an honest, self-correcting
+        // failure, unlike the silent `None`.
         ("kimi", ApprovalLevel::FullAuto) => Supported {
-            // `--auto`, not `--yolo`. Both are real top-level options, read
-            // from `kimi --help` 2026-09-09, and they differ exactly where
-            // this level cares: `-y, --yolo` is "Auto-approve regular tool
-            // calls; the agent MAY STILL ASK QUESTIONS", while `--auto` is
-            // "Start in auto permission mode: fully autonomous, the agent
-            // WILL NOT ASK QUESTIONS". Measured live under `--yolo`, kimi
-            // still answered every `g4a_*` MCP call "rejected at the approval
-            // prompt" without ever asking the host -- the question it was
-            // still allowed to raise. `--auto` is what `FullAuto` means.
-            // Both are top-level, so they precede the `acp` subcommand (see
-            // `direct_command`, `src/acp/spawn.rs`); `kimi acp` itself takes
-            // only `--login`/`--help`.
-            args: vec!["--auto".to_owned()],
-            asks_for_permission: false,
-            // measured 2026-09-05: kimi.exe 0.29.0 session/new offers no
-            // modes; the 2026-09-02 yolo/auto/plan measurement was the npm
-            // shim under WSL interop
-            acp_mode_id: None,
-        },
-        ("kimi", ApprovalLevel::Moderate) => Supported {
-            // `--auto` is named in Kimi's own release notes but only as a
-            // flag rejected together with `--prompt`; whether it applies to
-            // (or means the same thing under) the `kimi acp` subcommand this
-            // project spawns is UNCONFIRMED, so it is not wired into `args`
-            // here -- falls back to no flag, same as `Unmanaged`.
+            // argv stays empty for a row that HAS a mode: the level is
+            // applied over the wire, and `acp_approval_level_args`
+            // (gate4agent-shell-native) passes flags only for a mode-less
+            // row. `--yolo`/`--auto` remain real top-level kimi options for
+            // the PTY transport.
             args: Vec::new(),
             asks_for_permission: false,
-            // measured 2026-09-05: kimi.exe 0.29.0 session/new offers no
-            // modes; the 2026-09-02 yolo/auto/plan measurement was the npm
-            // shim under WSL interop
+            acp_mode_id: Some(ModeId::new("yolo")),
+        },
+        // `auto` IS kimi's own vendor default, so naming it here would dress
+        // "applied nothing" up as a decision -- `acp_mode_id_is_never_silently_
+        // absent_for_a_managed_level` forbids exactly that. Left mode-less and
+        // flag-less: this level has no honest mechanism on kimi today.
+        ("kimi", ApprovalLevel::Moderate) => Supported {
+            args: Vec::new(),
+            asks_for_permission: false,
             acp_mode_id: None,
         },
         // `--plan`'s applicability to the PTY `kimi acp` subcommand remains
@@ -379,10 +382,7 @@ pub fn approval_level_resolution(agent_id: &AgentId, level: ApprovalLevel) -> Ap
         ("kimi", ApprovalLevel::ReadOnly) => Supported {
             args: Vec::new(),
             asks_for_permission: false,
-            // measured 2026-09-05: kimi.exe 0.29.0 session/new offers no
-            // modes; the 2026-09-02 yolo/auto/plan measurement was the npm
-            // shim under WSL interop
-            acp_mode_id: None,
+            acp_mode_id: Some(ModeId::new("plan")),
         },
 
         // Impose nothing, for every agent ID: never refused, and the
@@ -979,7 +979,7 @@ mod tests {
         assert!(approval_level_args(&grok, ApprovalLevel::Unmanaged).is_empty());
 
         let kimi = AgentId::new("kimi").unwrap();
-        assert_eq!(approval_level_args(&kimi, ApprovalLevel::FullAuto), ["--auto"]);
+        assert_eq!(approval_level_args(&kimi, ApprovalLevel::FullAuto), [] as [&str; 0]);
         assert!(approval_level_args(&kimi, ApprovalLevel::Unmanaged).is_empty());
     }
 
@@ -1125,7 +1125,7 @@ mod tests {
         let kimi = AgentId::new("kimi").unwrap();
         assert_eq!(
             approval_level_resolution(&kimi, ApprovalLevel::FullAuto),
-            supported(&["--auto"], false, None)
+            supported(&[], false, Some("yolo"))
         );
         assert_eq!(
             approval_level_resolution(&kimi, ApprovalLevel::Moderate),
@@ -1133,7 +1133,7 @@ mod tests {
         );
         assert_eq!(
             approval_level_resolution(&kimi, ApprovalLevel::ReadOnly),
-            supported(&[], false, None)
+            supported(&[], false, Some("plan"))
         );
         assert_eq!(
             approval_level_resolution(&kimi, ApprovalLevel::Unmanaged),

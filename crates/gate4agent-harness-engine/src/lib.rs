@@ -646,6 +646,26 @@ impl HarnessEngine {
         Ok(false)
     }
 
+    /// The subset of `task.dependencies` that `scheduler_task_is_eligible`'s
+    /// `dependencies_done` check would treat as unmet -- a dependency id that
+    /// does not resolve to a stored task, or one that resolves but has not
+    /// reached `HarnessTaskStateV1::Done`. This never decides admission itself
+    /// (that stays with `scheduler_task_is_eligible`, reached only through
+    /// `scheduler_ready_task`/`scheduler_ready_task_by_id`); it exists so a
+    /// caller that already knows a task was refused can name which specific
+    /// dependency id it is still waiting on instead of reporting a bare
+    /// ineligibility.
+    pub fn unmet_task_dependencies(&self, task: &HarnessTaskV1) -> Vec<HarnessTaskId> {
+        task.dependencies.iter()
+            .filter(|dependency_id| {
+                !self.tasks.get(*dependency_id)
+                    .map(|dependency| dependency.state == HarnessTaskStateV1::Done)
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect()
+    }
+
     fn validate_scheduler_bound(&self) -> Result<(), HarnessEngineError> {
         let scanned = self.tasks.len().checked_add(self.runs.len())
             .ok_or(HarnessEngineError::SchedulerResourceExhausted)?;

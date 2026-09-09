@@ -5919,6 +5919,27 @@ pub enum HarnessOperatorHostErrorV1 {
         issuance: Option<HarnessRevision>,
     },
     TaskNotReady,
+    // `TaskNotReady` answered three different questions with one word: the
+    // task is not in `Ready`, a dependency of it is unfinished, or it already
+    // has a live run. Only the first is something the operator can see for
+    // itself with `task get`; the other two are facts the host holds and the
+    // operator does not. These two carry them, for the same reason
+    // `UnsupportedTransport` above carries its own inputs -- the point is not
+    // making the operator already know what blocked it, it is proving the
+    // host looked. `dependency_ids` lists exactly the dependencies that are
+    // not `Done` yet, so an operator sees what to finish first instead of a
+    // shrug.
+    TaskDependenciesNotDone {
+        task_id: String,
+        dependency_ids: Vec<String>,
+    },
+    // Unreachable through today's paths -- every route back into `Ready`
+    // (`operator_move_task`, `operator_retry_task`) already refuses while a
+    // non-terminal run exists, and `start_task_v2` flips `Ready`->`Running`
+    // atomically with run creation. Named anyway rather than folded back into
+    // `TaskNotReady`, so that if a future path into `Ready` ever reopens it,
+    // the refusal arrives already saying which of the three things happened.
+    TaskStartBlockedByRun { task_id: String },
     SchedulerResourceExhausted,
     SchedulerInvalidGraph { reason: String },
 }

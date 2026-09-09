@@ -1008,10 +1008,12 @@ impl HarnessService {
         if self.scheduler_pending_dispatch()?.is_some() {
             return Err(HarnessServiceError::SchedulerBusy);
         }
-        let current_task = self.engine.scheduler_ready_task_by_id(&request.task_id)
+        let current_task = match self.engine.scheduler_ready_task_by_id(&request.task_id)
             .map_err(map_scheduler_error)?
-            .ok_or(HarnessServiceError::TaskNotReady)?
-            .clone();
+        {
+            Some(task) => task.clone(),
+            None => return Err(self.task_start_admission_refusal(&request.task_id)?),
+        };
         if current_task.revision != request.expected_task_revision
             || current_task.creator != operator_actor(&request.authority)
         {
@@ -5105,6 +5107,38 @@ impl HarnessService {
         self.engine.task_has_nonterminal_run(task).map_err(map_scheduler_error)
     }
 
+    /// Names why `scheduler_ready_task_by_id` refused `task_id` on the
+    /// `start_task_v2` admission path -- only ever called once that lookup
+    /// has already returned `None`, so it re-decides nothing: the admission
+    /// verdict stays with `scheduler_task_is_eligible`. If the task's own
+    /// state is not `Ready`, the refusal stays the bare `TaskNotReady` it is
+    /// today. Otherwise the task is `Ready` but ineligible, and this reports
+    /// which half of `scheduler_task_is_eligible` failed -- unmet
+    /// dependencies (named by id) take priority over a live nonterminal run,
+    /// since an operator acts on those differently.
+    fn task_start_admission_refusal(
+        &self,
+        task_id: &HarnessTaskId,
+    ) -> Result<HarnessServiceError, HarnessServiceError> {
+        let task = self.engine.task(task_id).ok_or(HarnessServiceError::TaskNotReady)?;
+        if task.state != HarnessTaskStateV1::Ready {
+            return Ok(HarnessServiceError::TaskNotReady);
+        }
+        let dependency_ids = self.engine.unmet_task_dependencies(task);
+        if !dependency_ids.is_empty() {
+            return Ok(HarnessServiceError::TaskDependenciesNotDone {
+                task_id: task_id.clone(),
+                dependency_ids,
+            });
+        }
+        if self.scheduler_task_has_nonterminal_run(task)? {
+            return Ok(HarnessServiceError::TaskStartBlockedByRun {
+                task_id: task_id.clone(),
+            });
+        }
+        Ok(HarnessServiceError::TaskNotReady)
+    }
+
     fn replayed_dispatch_intent_for_operation(
         &self,
         operation_id: &HarnessOperationId,
@@ -7549,6 +7583,34 @@ pub enum HarnessServiceError {
     },
     #[error("selected task is not ready with completed dependencies")]
     TaskNotReady,
+    // Names the specific unmet dependency ids instead of collapsing into the
+    // bare `TaskNotReady` a plain state/eligibility mismatch carries -- the
+    // admission decision itself is still made once, by `scheduler_task_is_
+    // eligible` (via `scheduler_ready_task_by_id`); `dependency_ids` is only
+    // `engine::unmet_task_dependencies` reporting which of `task.dependencies`
+    // that same predicate treated as unmet (missing task or not yet `Done`).
+    // An operator refused this way knows exactly which task(s) to wait on;
+    // one refused with a bare `TaskNotReady` does not.
+    #[error("task {task_id} start refused: dependencies not done: {dependency_ids:?}")]
+    TaskDependenciesNotDone {
+        task_id: HarnessTaskId,
+        dependency_ids: Vec<HarnessTaskId>,
+    },
+    // Distinct from `TaskDependenciesNotDone` on purpose: "wait on task X" and
+    // "wait for this task's own run to finish" are different actions for an
+    // operator, so they must not share a refusal. `scheduler_task_is_
+    // eligible`'s other half, `!task_has_nonterminal_run`, is already
+    // independently enforced at every path that can move a task back into
+    // `Ready` (`operator_move_task`, `operator_retry_task`, both gated on
+    // `scheduler_task_has_nonterminal_run` before the transition) plus the
+    // `Ready` -> `Running` flip `start_task_v2` itself performs on admission,
+    // so this refusal is belt-and-braces and should not be observable in
+    // production; it exists so a future path back into `Ready` fails named
+    // instead of silently admitting a second run for the same task.
+    #[error("task {task_id} start refused: task already has a live run")]
+    TaskStartBlockedByRun {
+        task_id: HarnessTaskId,
+    },
     #[error("another durable scheduled dispatch is pending")]
     SchedulerBusy,
     #[error("harness scheduler scan exceeded its fixed resource bound")]
@@ -7839,6 +7901,10 @@ mod tests {
 
     fn task_id() -> HarnessTaskId {
         HarnessTaskId::new(format!("htask_{}", "a".repeat(24))).unwrap()
+    }
+
+    fn dependency_task_id() -> HarnessTaskId {
+        HarnessTaskId::new(format!("htask_{}", "d".repeat(24))).unwrap()
     }
 
     fn run_id() -> HarnessRunId {
@@ -8306,14 +8372,23 @@ mod tests {
         marker: char,
         task_id: HarnessTaskId,
     ) -> HarnessCreateTaskRequestV1 {
+        create_task_request_with(marker, task_id, HarnessTaskStateV1::Ready, Vec::new())
+    }
+
+    fn create_task_request_with(
+        marker: char,
+        task_id: HarnessTaskId,
+        state: HarnessTaskStateV1,
+        dependencies: Vec<HarnessTaskId>,
+    ) -> HarnessCreateTaskRequestV1 {
         HarnessCreateTaskRequestV1 {
             authority: operator_authority(marker, 10),
             task_id,
             title: format!("Task {marker}"),
             body: format!("Run selected task {marker}"),
             parent_task_id: None,
-            dependencies: Vec::new(),
-            initial_state: HarnessTaskStateV1::Ready,
+            dependencies,
+            initial_state: state,
         }
     }
 
@@ -8975,6 +9050,327 @@ mod tests {
         assert!(matches!(
             service.start_task_v2(&catalog, &options, changed),
             Err(HarnessServiceError::OperatorRequestConflict { .. }),
+        ));
+        service.close().unwrap();
+        remove_database(&path);
+    }
+
+    /// Dependency admission gate, case 1: a task with an unfinished
+    /// dependency is refused by name, and the refusal carries that
+    /// dependency's own id -- not the bare `TaskNotReady` a plain
+    /// ineligibility collapses into.
+    #[test]
+    fn start_task_v2_refuses_by_name_when_a_dependency_is_not_done() {
+        let path = database_path("start-v2-dependency-not-done");
+        let plan = ordinary_launch_plan("dependency-not-done");
+        let catalog = HarnessLaunchCatalog::new([plan.clone()]).unwrap();
+        let mut service = HarnessService::open(&path).unwrap();
+        let dependency_id = dependency_task_id();
+        service.operator_create_task(
+            create_task_request_with('1', dependency_id.clone(), HarnessTaskStateV1::Ready, Vec::new()),
+        ).unwrap();
+        service.operator_create_task(
+            create_task_request_with(
+                '2',
+                task_id(),
+                HarnessTaskStateV1::Ready,
+                vec![dependency_id.clone()],
+            ),
+        ).unwrap();
+        let plan_option = gate4agent_harness_api::HarnessOrdinaryLaunchPlanOptionV1 {
+            plan: plan.plan_ref().unwrap(),
+            node_id: plan.node_id.clone(),
+            source_workspace_id: plan.workspace_id.clone(),
+            provider_profile: plan.provider_profile.clone(),
+            provider_id: HarnessSelectorV1::new(plan.provider.as_str()).unwrap(),
+            mode: plan.mode,
+        };
+        let mut options = HarnessFullTaskLaunchCatalogueV1 {
+            task_id: task_id(),
+            task_revision: HarnessRevision::new(1).unwrap(),
+            policy_digest: HarnessRequestDigest::new("0".repeat(64)).unwrap(),
+            plans: vec![plan_option.clone()],
+            managed_worktree_profiles: Vec::new(),
+            context_sources: Vec::new(),
+            delivery_bundles: Vec::new(),
+        };
+        options.policy_digest = task_launch_policy_digest_full(&options).unwrap();
+        let replace = HarnessReplaceTaskExecutionSpecRequestV2 {
+            authority: operator_authority('3', 20),
+            task_id: task_id(),
+            expected_task_revision: HarnessRevision::new(1).unwrap(),
+            expected_execution_spec_revision: HarnessExpectedExecutionSpecRevisionV1::Absent,
+            selection: gate4agent_harness_api::HarnessReviewedTaskLaunchSelectionV1 {
+                plan: plan_option,
+                worktree: HarnessReviewedWorktreeSelectionV1::Existing,
+                context_source: None,
+                delivery: None,
+                review_policy:
+                    gate4agent_harness_protocol::HarnessTaskReviewPolicyV1::OperatorReview,
+            },
+        };
+        service.operator_replace_task_execution_spec_v2(&options, replace).unwrap();
+        let spec = service.task_execution_spec_v2(&task_id()).unwrap().clone();
+        let start = HarnessStartTaskRequestV2 {
+            authority: operator_authority('4', 30),
+            task_id: task_id(),
+            expected_task_revision: HarnessRevision::new(1).unwrap(),
+            expected_execution_spec_revision: spec.revision,
+            expected_launch_issuance: spec.launch_issuance.clone(),
+        };
+        match service.start_task_v2(&catalog, &options, start) {
+            Err(HarnessServiceError::TaskDependenciesNotDone {
+                task_id: refused_task_id,
+                dependency_ids,
+            }) => {
+                assert_eq!(refused_task_id, task_id());
+                assert_eq!(dependency_ids, vec![dependency_id]);
+            }
+            other => panic!(
+                "expected a named TaskDependenciesNotDone for {dependency_id:?}, got {other:?}",
+            ),
+        }
+        service.close().unwrap();
+        remove_database(&path);
+    }
+
+    /// Dependency admission gate, case 2: once every dependency reaches
+    /// `Done`, the task starts exactly as it does today -- the eligibility
+    /// predicate this fix reuses (`scheduler_task_is_eligible`, unchanged)
+    /// never refuses a task whose dependencies are actually satisfied.
+    #[test]
+    fn start_task_v2_starts_when_all_dependencies_are_done() {
+        let path = database_path("start-v2-dependencies-done");
+        let plan = ordinary_launch_plan("dependencies-done");
+        let catalog = HarnessLaunchCatalog::new([plan.clone()]).unwrap();
+        let mut service = HarnessService::open(&path).unwrap();
+        let dependency_id = dependency_task_id();
+        service.operator_create_task(
+            create_task_request_with('1', dependency_id.clone(), HarnessTaskStateV1::Ready, Vec::new()),
+        ).unwrap();
+        service.operator_move_task(HarnessMoveTaskRequestV1 {
+            authority: operator_authority('2', 11),
+            task_id: dependency_id.clone(),
+            expected_revision: HarnessRevision::new(1).unwrap(),
+            state: HarnessTaskStateV1::Review,
+        }).unwrap();
+        service.operator_move_task(HarnessMoveTaskRequestV1 {
+            authority: operator_authority('3', 12),
+            task_id: dependency_id.clone(),
+            expected_revision: HarnessRevision::new(2).unwrap(),
+            state: HarnessTaskStateV1::Done,
+        }).unwrap();
+        service.operator_create_task(
+            create_task_request_with(
+                '4',
+                task_id(),
+                HarnessTaskStateV1::Ready,
+                vec![dependency_id.clone()],
+            ),
+        ).unwrap();
+        let plan_option = gate4agent_harness_api::HarnessOrdinaryLaunchPlanOptionV1 {
+            plan: plan.plan_ref().unwrap(),
+            node_id: plan.node_id.clone(),
+            source_workspace_id: plan.workspace_id.clone(),
+            provider_profile: plan.provider_profile.clone(),
+            provider_id: HarnessSelectorV1::new(plan.provider.as_str()).unwrap(),
+            mode: plan.mode,
+        };
+        let mut options = HarnessFullTaskLaunchCatalogueV1 {
+            task_id: task_id(),
+            task_revision: HarnessRevision::new(1).unwrap(),
+            policy_digest: HarnessRequestDigest::new("0".repeat(64)).unwrap(),
+            plans: vec![plan_option.clone()],
+            managed_worktree_profiles: Vec::new(),
+            context_sources: Vec::new(),
+            delivery_bundles: Vec::new(),
+        };
+        options.policy_digest = task_launch_policy_digest_full(&options).unwrap();
+        let replace = HarnessReplaceTaskExecutionSpecRequestV2 {
+            authority: operator_authority('5', 20),
+            task_id: task_id(),
+            expected_task_revision: HarnessRevision::new(1).unwrap(),
+            expected_execution_spec_revision: HarnessExpectedExecutionSpecRevisionV1::Absent,
+            selection: gate4agent_harness_api::HarnessReviewedTaskLaunchSelectionV1 {
+                plan: plan_option,
+                worktree: HarnessReviewedWorktreeSelectionV1::Existing,
+                context_source: None,
+                delivery: None,
+                review_policy:
+                    gate4agent_harness_protocol::HarnessTaskReviewPolicyV1::OperatorReview,
+            },
+        };
+        service.operator_replace_task_execution_spec_v2(&options, replace).unwrap();
+        let spec = service.task_execution_spec_v2(&task_id()).unwrap().clone();
+        let start = HarnessStartTaskRequestV2 {
+            authority: operator_authority('6', 30),
+            task_id: task_id(),
+            expected_task_revision: HarnessRevision::new(1).unwrap(),
+            expected_execution_spec_revision: spec.revision,
+            expected_launch_issuance: spec.launch_issuance.clone(),
+        };
+        let started = service.start_task_v2(&catalog, &options, start).unwrap();
+        assert!(!started.replayed);
+        assert_eq!(started.dispatch.task_id, task_id());
+        assert_eq!(
+            service.engine().task(&task_id()).unwrap().state,
+            HarnessTaskStateV1::Running,
+        );
+        service.close().unwrap();
+        remove_database(&path);
+    }
+
+    /// Regression guard: a task with an empty `dependencies` list -- the
+    /// shape of every task the live store has ever held (0 of 146 measured
+    /// 2026-09-09) -- is unaffected by this fix. `unmet_task_dependencies`
+    /// is vacuously empty for it, so `task_start_admission_refusal` is never
+    /// consulted and admission proceeds exactly as it did before.
+    #[test]
+    fn start_task_v2_with_empty_dependencies_is_unaffected() {
+        let path = database_path("start-v2-empty-dependencies");
+        let plan = ordinary_launch_plan("empty-dependencies");
+        let catalog = HarnessLaunchCatalog::new([plan.clone()]).unwrap();
+        let mut service = HarnessService::open(&path).unwrap();
+        service.operator_create_task(create_task_request(HarnessTaskStateV1::Ready)).unwrap();
+        let plan_option = gate4agent_harness_api::HarnessOrdinaryLaunchPlanOptionV1 {
+            plan: plan.plan_ref().unwrap(),
+            node_id: plan.node_id.clone(),
+            source_workspace_id: plan.workspace_id.clone(),
+            provider_profile: plan.provider_profile.clone(),
+            provider_id: HarnessSelectorV1::new(plan.provider.as_str()).unwrap(),
+            mode: plan.mode,
+        };
+        let mut options = HarnessFullTaskLaunchCatalogueV1 {
+            task_id: task_id(),
+            task_revision: HarnessRevision::new(1).unwrap(),
+            policy_digest: HarnessRequestDigest::new("0".repeat(64)).unwrap(),
+            plans: vec![plan_option.clone()],
+            managed_worktree_profiles: Vec::new(),
+            context_sources: Vec::new(),
+            delivery_bundles: Vec::new(),
+        };
+        options.policy_digest = task_launch_policy_digest_full(&options).unwrap();
+        let replace = HarnessReplaceTaskExecutionSpecRequestV2 {
+            authority: operator_authority('2', 20),
+            task_id: task_id(),
+            expected_task_revision: HarnessRevision::new(1).unwrap(),
+            expected_execution_spec_revision: HarnessExpectedExecutionSpecRevisionV1::Absent,
+            selection: gate4agent_harness_api::HarnessReviewedTaskLaunchSelectionV1 {
+                plan: plan_option,
+                worktree: HarnessReviewedWorktreeSelectionV1::Existing,
+                context_source: None,
+                delivery: None,
+                review_policy:
+                    gate4agent_harness_protocol::HarnessTaskReviewPolicyV1::OperatorReview,
+            },
+        };
+        service.operator_replace_task_execution_spec_v2(&options, replace).unwrap();
+        let spec = service.task_execution_spec_v2(&task_id()).unwrap().clone();
+        let start = HarnessStartTaskRequestV2 {
+            authority: operator_authority('3', 30),
+            task_id: task_id(),
+            expected_task_revision: HarnessRevision::new(1).unwrap(),
+            expected_execution_spec_revision: spec.revision,
+            expected_launch_issuance: spec.launch_issuance.clone(),
+        };
+        let started = service.start_task_v2(&catalog, &options, start).unwrap();
+        assert!(!started.replayed);
+        assert_eq!(started.dispatch.task_id, task_id());
+        service.close().unwrap();
+        remove_database(&path);
+    }
+
+    /// Pins `unmet_task_dependencies`'s handling of a dependency id that
+    /// does not resolve to any stored task. This cannot be exercised through
+    /// `start_task_v2` itself: `validate_task_links` (`gate4agent-harness-
+    /// engine`) requires every dependency to already resolve to a stored
+    /// task at `CreateTask`/`ReplaceTask` commit time, so a task carrying an
+    /// unresolvable dependency can never be committed through this crate's
+    /// own validated request API in the first place -- there is no live
+    /// task to call `start_task_v2` on. This pins the same guarantee
+    /// `task_start_admission_refusal` relies on directly against the engine
+    /// accessor it calls: a missing dependency counts as unmet, never as
+    /// vacuously satisfied.
+    #[test]
+    fn unmet_task_dependencies_treats_an_unresolvable_dependency_as_unmet() {
+        let path = database_path("unmet-dependency-missing");
+        let service = HarnessService::open(&path).unwrap();
+        let mut probe = task();
+        let missing_dependency = dependency_task_id();
+        probe.dependencies = vec![missing_dependency.clone()];
+        assert_eq!(
+            service.engine().unmet_task_dependencies(&probe),
+            vec![missing_dependency],
+        );
+        service.close().unwrap();
+        remove_database(&path);
+    }
+
+    /// Point 3 finding: `scheduler_task_is_eligible`'s other half, `!task_
+    /// has_nonterminal_run`, never gets a chance to fire on this admission
+    /// path in practice. `SchedulerBusy` (pre-existing, unrelated to the
+    /// dependency/eligibility predicate) already refuses a second admission
+    /// while the first dispatch is pending, and once that dispatch resolves
+    /// the task's own state has already left `Ready` for `Running` -- so
+    /// `TaskStartBlockedByRun` is belt-and-braces today: nothing in this
+    /// codebase can currently reach it, but it stands ready for a future
+    /// path back into `Ready` that skips those two existing guards.
+    #[test]
+    fn start_task_v2_refuses_a_fresh_admission_while_the_first_dispatch_is_pending() {
+        let path = database_path("start-v2-second-admission-pending");
+        let plan = ordinary_launch_plan("second-admission-pending");
+        let catalog = HarnessLaunchCatalog::new([plan.clone()]).unwrap();
+        let mut service = HarnessService::open(&path).unwrap();
+        service.operator_create_task(create_task_request(HarnessTaskStateV1::Ready)).unwrap();
+        let plan_option = gate4agent_harness_api::HarnessOrdinaryLaunchPlanOptionV1 {
+            plan: plan.plan_ref().unwrap(),
+            node_id: plan.node_id.clone(),
+            source_workspace_id: plan.workspace_id.clone(),
+            provider_profile: plan.provider_profile.clone(),
+            provider_id: HarnessSelectorV1::new(plan.provider.as_str()).unwrap(),
+            mode: plan.mode,
+        };
+        let mut options = HarnessFullTaskLaunchCatalogueV1 {
+            task_id: task_id(),
+            task_revision: HarnessRevision::new(1).unwrap(),
+            policy_digest: HarnessRequestDigest::new("0".repeat(64)).unwrap(),
+            plans: vec![plan_option.clone()],
+            managed_worktree_profiles: Vec::new(),
+            context_sources: Vec::new(),
+            delivery_bundles: Vec::new(),
+        };
+        options.policy_digest = task_launch_policy_digest_full(&options).unwrap();
+        let replace = HarnessReplaceTaskExecutionSpecRequestV2 {
+            authority: operator_authority('2', 20),
+            task_id: task_id(),
+            expected_task_revision: HarnessRevision::new(1).unwrap(),
+            expected_execution_spec_revision: HarnessExpectedExecutionSpecRevisionV1::Absent,
+            selection: gate4agent_harness_api::HarnessReviewedTaskLaunchSelectionV1 {
+                plan: plan_option,
+                worktree: HarnessReviewedWorktreeSelectionV1::Existing,
+                context_source: None,
+                delivery: None,
+                review_policy:
+                    gate4agent_harness_protocol::HarnessTaskReviewPolicyV1::OperatorReview,
+            },
+        };
+        service.operator_replace_task_execution_spec_v2(&options, replace).unwrap();
+        let spec = service.task_execution_spec_v2(&task_id()).unwrap().clone();
+        let start = HarnessStartTaskRequestV2 {
+            authority: operator_authority('3', 30),
+            task_id: task_id(),
+            expected_task_revision: HarnessRevision::new(1).unwrap(),
+            expected_execution_spec_revision: spec.revision,
+            expected_launch_issuance: spec.launch_issuance.clone(),
+        };
+        let first = service.start_task_v2(&catalog, &options, start.clone()).unwrap();
+        assert!(!first.replayed);
+
+        let mut second = start;
+        second.authority = operator_authority('4', 31);
+        assert!(matches!(
+            service.start_task_v2(&catalog, &options, second),
+            Err(HarnessServiceError::SchedulerBusy),
         ));
         service.close().unwrap();
         remove_database(&path);

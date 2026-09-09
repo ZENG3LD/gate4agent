@@ -10440,6 +10440,24 @@ fn map_operator_service_error(error: HarnessServiceError) -> HarnessOperatorHost
             HarnessOperatorHostErrorV1::IssuedExecutionCasMismatch { expected, spec, issuance }
         }
         HarnessServiceError::TaskNotReady => HarnessOperatorHostErrorV1::TaskNotReady,
+        // Both carry their cause all the way to the operator rather than
+        // collapsing onto the bare `TaskNotReady` the wire used to answer
+        // with, which said only "no" to three different questions. See those
+        // two variants' own doc comments in `gate4agent-harness-api`.
+        HarnessServiceError::TaskDependenciesNotDone { task_id, dependency_ids } => {
+            HarnessOperatorHostErrorV1::TaskDependenciesNotDone {
+                task_id: task_id.as_str().to_owned(),
+                dependency_ids: dependency_ids
+                    .iter()
+                    .map(|dependency_id| dependency_id.as_str().to_owned())
+                    .collect(),
+            }
+        }
+        HarnessServiceError::TaskStartBlockedByRun { task_id } => {
+            HarnessOperatorHostErrorV1::TaskStartBlockedByRun {
+                task_id: task_id.as_str().to_owned(),
+            }
+        }
         HarnessServiceError::SchedulerResourceExhausted => {
             HarnessOperatorHostErrorV1::SchedulerResourceExhausted
         }

@@ -44,7 +44,7 @@ fn usage() -> &'static str {
      \x20 task get TASK_ID\n\
      \x20 run get RUN_ID\n\
      \x20 results TASK_ID\n\
-     \x20 task create --title TITLE --body BODY [--parent TASK_ID]\n\
+     \x20 task create --title TITLE --body BODY [--parent TASK_ID] [--depends TASK_ID,TASK_ID]\n\
      \x20 task move TASK_ID --to STATE\n\
      \x20 task operations TASK_ID [--limit N]\n\
      \x20 launch-options TASK_ID [--provider ID] [--workspace ID] [--plan ID] [--after PLAN_ID]\n\
@@ -95,7 +95,12 @@ enum Command {
     TaskGet { task_id: HarnessTaskId },
     RunGet { run_id: HarnessRunId },
     Results { task_id: HarnessTaskId },
-    TaskCreate { title: String, body: String, parent: Option<HarnessTaskId> },
+    TaskCreate {
+        title: String,
+        body: String,
+        parent: Option<HarnessTaskId>,
+        dependencies: Vec<HarnessTaskId>,
+    },
     TaskMove { task_id: HarnessTaskId, to: HarnessTaskStateV1 },
     TaskOperations { task_id: HarnessTaskId, limit: u16 },
     LaunchOptions {
@@ -349,6 +354,26 @@ fn parse_task_id(value: String) -> Result<HarnessTaskId, String> {
     HarnessTaskId::new(value).map_err(|_| "invalid task id".to_owned())
 }
 
+/// `--depends a,b` -> the wire's `dependencies`, which
+/// `validate_sorted_ids` requires to be strictly sorted and duplicate-free.
+/// Sorting and de-duplicating here rather than refusing keeps the operator
+/// from having to hand-order ids, and a duplicate is a typo, not an intent.
+/// Until this flag existed the CLI hardcoded `dependencies: Vec::new()`, so
+/// a dependency could not be expressed from any live client at all -- which
+/// is why, across 146 live tasks, not one had ever carried one.
+fn parse_dependencies(value: Option<String>) -> Result<Vec<HarnessTaskId>, String> {
+    let Some(value) = value else { return Ok(Vec::new()) };
+    let mut ids = value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| parse_task_id(entry.to_owned()))
+        .collect::<Result<Vec<_>, _>>()?;
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
+}
+
 fn parse_run_id(value: String) -> Result<HarnessRunId, String> {
     HarnessRunId::new(value).map_err(|_| "invalid run id".to_owned())
 }
@@ -453,7 +478,8 @@ fn build_command(
             let title = require_flag(flags, "title")?;
             let body = require_flag(flags, "body")?;
             let parent = take_flag(flags, "parent").map(parse_task_id).transpose()?;
-            Ok(Command::TaskCreate { title, body, parent })
+            let dependencies = parse_dependencies(take_flag(flags, "depends"))?;
+            Ok(Command::TaskCreate { title, body, parent, dependencies })
         }
         Verb::TaskMove => {
             let task_id = expect_single_positional(positionals, "task-id").and_then(parse_task_id)?;
@@ -860,7 +886,7 @@ fn execute(invocation: Invocation) -> Result<String, String> {
             runs.sort_by_key(|run| run.created_at_unix_ms);
             render(&TaskResults { task, runs })
         }
-        Command::TaskCreate { title, body, parent } => {
+        Command::TaskCreate { title, body, parent, dependencies } => {
             let task_id = fresh_task_id()?;
             let authority = fresh_authority()?;
             let outcome = client
@@ -870,7 +896,7 @@ fn execute(invocation: Invocation) -> Result<String, String> {
                     title,
                     body,
                     parent_task_id: parent,
-                    dependencies: Vec::new(),
+                    dependencies,
                     initial_state: HarnessTaskStateV1::Backlog,
                 })
                 .map_err(|error| error.to_string())?;
@@ -1575,8 +1601,37 @@ mod tests {
         let ParseOutcome::Run(invocation) = outcome else { panic!("expected run") };
         assert!(matches!(
             invocation.command,
-            Command::TaskCreate { title, body, parent: None } if title == "t" && body == "b"
+            Command::TaskCreate { title, body, parent: None, dependencies }
+                if title == "t" && body == "b" && dependencies.is_empty()
         ));
+    }
+
+    /// `--depends` is the only way an operator can express a task dependency:
+    /// until it existed the CLI hardcoded an empty list, which is why no live
+    /// task had ever carried one. The wire requires the ids strictly sorted
+    /// and duplicate-free, so the flag canonicalises rather than refusing.
+    #[test]
+    fn task_create_depends_is_canonicalised_before_it_reaches_the_wire() {
+        let b = format!("htask_{}", "b".repeat(24));
+        let a = format!("htask_{}", "a".repeat(24));
+        let outcome = parse(
+            &[
+                "gate4agent-harnessctl", "task", "create",
+                "--title", "t", "--body", "b",
+                "--depends", &format!("{b},{a},{b}"),
+                "--harness-operator", "127.0.0.1:18080",
+            ],
+            &[(HARNESS_OPERATOR_TOKEN_ENV, &token())],
+        )
+        .unwrap();
+        let ParseOutcome::Run(invocation) = outcome else { panic!("expected run") };
+        let Command::TaskCreate { dependencies, .. } = invocation.command else {
+            panic!("expected task create")
+        };
+        assert_eq!(
+            dependencies.iter().map(|id| id.as_str().to_owned()).collect::<Vec<_>>(),
+            vec![a, b],
+        );
     }
 
     #[test]

@@ -6890,31 +6890,28 @@ mod tests {
 
         // kimi: `acp_mode_id` is `None` for every managed level -- measured
         // 2026-09-05, `kimi.exe` 0.29.0's `session/new` result carries
-        // kimi's modes are restored from the 2026-09-02 live catalogue
-        // measurement (docs/gate4agent/research/gate4agent-acp-mode-
-        // catalogues-measured-2026-09-02.md): it announces `default`, `plan`,
-        // `auto`, `yolo`. `FullAuto` -> `yolo` and `ReadOnly` -> `plan` are
-        // applied over the wire by `session/set_mode`, so their argv stays
-        // clean. `Moderate` stays mode-less on purpose: its only candidate is
-        // `auto`, kimi's OWN default, and naming a vendor default dresses
-        // "applied nothing" up as a decision.
+        // `configOptions` (a `model` select) and no `modes` field at all.
+        // The 2026-09-02 `yolo`/`auto`/`plan` measurement this table used to
+        // pin was a different build: the npm shell shim running under WSL
+        // interop, not this native binary.
+        // `FullAuto` is the one kimi level that carries vendor flags
+        // (`--yolo`), so argv applies it and there is nothing left to refuse;
+        // `Moderate`/`ReadOnly` carry none (their `--auto`/`--plan` remain
+        // UNCONFIRMED under `kimi acp`) and still refuse, because for those
+        // no mechanism exists at all.
         let kimi = AgentId::new("kimi").unwrap();
+        assert_eq!(required_acp_mode(&kimi, ApprovalLevel::FullAuto), Ok(None));
         assert_eq!(
-            required_acp_mode(&kimi, ApprovalLevel::FullAuto),
-            Ok(Some(ModeId::new("yolo")))
+            acp_approval_level_args(&kimi, ApprovalLevel::FullAuto),
+            vec!["--auto".to_owned()],
+            "kimi's FullAuto must reach the process through argv, since it has no ACP mode"
         );
-        assert_eq!(
-            required_acp_mode(&kimi, ApprovalLevel::ReadOnly),
-            Ok(Some(ModeId::new("plan")))
-        );
-        assert!(
-            acp_approval_level_args(&kimi, ApprovalLevel::FullAuto).is_empty(),
-            "a level with a real ACP mode is applied over the wire, so its argv stays clean"
-        );
-        assert!(
-            required_acp_mode(&kimi, ApprovalLevel::Moderate).is_err(),
-            "kimi at Moderate has neither a sourced ACP mode id nor vendor flags, so it must refuse"
-        );
+        for level in [ApprovalLevel::Moderate, ApprovalLevel::ReadOnly] {
+            assert!(
+                required_acp_mode(&kimi, level).is_err(),
+                "kimi at {level:?} has neither a sourced ACP mode id nor vendor flags, so it must refuse"
+            );
+        }
         assert_eq!(required_acp_mode(&kimi, ApprovalLevel::Unmanaged), Ok(None));
         assert!(
             acp_approval_level_args(&kimi, ApprovalLevel::Unmanaged).is_empty(),

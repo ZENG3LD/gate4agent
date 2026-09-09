@@ -4618,14 +4618,35 @@ impl HarnessService {
         self.ensure_healthy()?;
         let (reservation, expected_record, expected_session) =
             self.validate_bound_harness_mcp_authority(reservation_id)?;
-        if reservation.state != HarnessMcpReservationStateV1::Active
-            || &reservation.activation_digest != activation_digest
-            || reservation.node_id.as_str() != route.node_id.as_str()
-            || reservation.node_incarnation_id.as_str()
-                != route.expected_incarnation_id.to_string()
-            || &expected_record != record_id
-            || &expected_session != session
+        // Six independent facts decide this, and every one of them answers the
+        // caller with the same opaque `HarnessMcpProofMismatch`. Live that
+        // reads as "harness read unavailable" at the agent with no way to tell
+        // a reservation that has not activated YET from one bound to another
+        // node, incarnation, record or session. Name the one that fired.
+        let mismatch = if reservation.state != HarnessMcpReservationStateV1::Active {
+            Some("reservation is not Active")
+        } else if &reservation.activation_digest != activation_digest {
+            Some("activation digest differs")
+        } else if reservation.node_id.as_str() != route.node_id.as_str() {
+            Some("reservation belongs to another node")
+        } else if reservation.node_incarnation_id.as_str()
+            != route.expected_incarnation_id.to_string()
         {
+            Some("reservation belongs to another node incarnation")
+        } else if &expected_record != record_id {
+            Some("reservation is bound to another session record")
+        } else if &expected_session != session {
+            Some("reservation is bound to another session address")
+        } else {
+            None
+        };
+        if let Some(reason) = mismatch {
+            tracing::warn!(
+                reservation_id = reservation_id.as_str(),
+                reservation_state = ?reservation.state,
+                reason,
+                "harness MCP call proof mismatch",
+            );
             return Err(HarnessServiceError::HarnessMcpProofMismatch);
         }
         Ok(harness_mcp_credential_binding(reservation)?)

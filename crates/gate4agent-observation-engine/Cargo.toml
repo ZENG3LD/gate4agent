@@ -13,6 +13,7 @@ gate4agent-observation-api = { path = "../gate4agent-observation-api" }
 gate4agent-observation-protocol = { path = "../gate4agent-observation-protocol" }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+tracing = "0.1"
 
 [dev-dependencies]
 gate4agent-c2 = { path = "../gate4agent-c2" }

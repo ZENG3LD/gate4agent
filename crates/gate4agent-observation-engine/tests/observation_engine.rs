@@ -5,16 +5,19 @@ use gate4agent_observation_api::{
     AgentInstanceId, ManagedRecordLink, ManagedSessionKey, ObservationApiError, ObservationGap,
     ObservationIngressEnvelope, ObservationIngressPayload, ObservationResyncBatch,
     ObservationTarget, ObservationTransport, ProjectionAvailability, ProjectionFreshness,
-    RuntimeSessionKey, SessionGeneration,
+    RuntimeSessionKey, SessionGeneration, PROJECTIONS_MAX,
 };
 use gate4agent_observation_engine::{
     ApplyOutcome, ContextOccupancyProvenance, CorrelationState, ObservationEngine,
-    ObservationEngineError, UsageTotals,
+    ObservationEngineCheckpointV1, ObservationCheckpointRouteV1, ObservationEngineError,
+    SessionProjection, TodoProjection, UsageProjection, UsageTotals,
+    OBSERVATION_ENGINE_CHECKPOINT_VERSION_V1,
 };
 use gate4agent_observation_protocol::{
     ObservationCapabilitiesV1, ObservationEvidenceV1, ObservationKindV1,
     ObservationSourceFamilyV1, ObservationTodoItemV1, ObservationTodoStateV1, ObservationV1,
 };
+use std::collections::VecDeque;
 
 fn node() -> NodeId {
     NodeId::new("node-a").expect("node ID")
@@ -1465,4 +1468,249 @@ fn exact_context_usage() -> ObservationKindV1 {
         used_tokens: 60,
         capacity_tokens: 100,
     }
+}
+
+// -- Session projection retirement (superseded node incarnations) --------
+
+fn retirement_workspace() -> WorkspaceId {
+    WorkspaceId::new("workspace-retirement").expect("workspace ID")
+}
+
+fn runtime_key_for(
+    node_id: NodeId,
+    incarnation_id: NodeIncarnationId,
+    instance_id: u64,
+) -> RuntimeSessionKey {
+    RuntimeSessionKey {
+        node_id,
+        incarnation_id,
+        workspace_id: retirement_workspace(),
+        instance_id: AgentInstanceId(instance_id),
+        generation: SessionGeneration(0),
+    }
+}
+
+fn runtime_target_for(
+    node_id: NodeId,
+    incarnation_id: NodeIncarnationId,
+    instance_id: u64,
+) -> ObservationTarget {
+    ObservationTarget::Runtime {
+        key: runtime_key_for(node_id, incarnation_id, instance_id),
+    }
+}
+
+fn envelope_for_node(
+    node_id: NodeId,
+    incarnation_id: NodeIncarnationId,
+    instance_id: u64,
+    sequence: u64,
+    kind: ObservationKindV1,
+) -> ObservationIngressEnvelope {
+    ObservationIngressEnvelope {
+        node_id: node_id.clone(),
+        cursor: NodeCursor {
+            incarnation_id,
+            sequence,
+        },
+        received_at_ms: 10_000 + sequence,
+        transport: ObservationTransport::DirectNode,
+        payload: ObservationIngressPayload::Observation {
+            address: runtime_target_for(node_id, incarnation_id, instance_id),
+            observation: ObservationV1 {
+                source_sequence: sequence,
+                observed_at_unix_ms: Some(9_000 + sequence),
+                evidence: ObservationEvidenceV1::StructuredProvider,
+                kind,
+                truncated: false,
+            },
+        },
+    }
+}
+
+// A minimal, fully-Live/Current fixture projection -- built from public
+// struct fields rather than the crate-private SessionProjection::new,
+// since a checkpoint is exactly how a real store hands the engine state
+// at scale without replaying an event per entry.
+fn fixture_projection(target: ObservationTarget) -> SessionProjection {
+    SessionProjection {
+        target,
+        availability: ProjectionAvailability::Current,
+        freshness: ProjectionFreshness::Live,
+        transport_incomplete: false,
+        incomplete_evidence: Vec::new(),
+        stale_evidence: Vec::new(),
+        source_capabilities: Vec::new(),
+        history: None,
+        todos: TodoProjection::default(),
+        tools: Vec::new(),
+        subagents: Vec::new(),
+        interactions: Vec::new(),
+        owned_processes: Vec::new(),
+        files: VecDeque::new(),
+        usage: UsageProjection::default(),
+        timeline: VecDeque::new(),
+        blocked_count: 0,
+        last_blocked_at_ms: None,
+    }
+}
+
+// Builds a checkpoint holding `count` distinct nodes, each with exactly
+// one live session projection at `shared_incarnation` and a matching
+// current_incarnations route -- none superseded, none dead. Used to put
+// the engine at exactly PROJECTIONS_MAX without paying for a
+// prepare/accept clone per entry.
+fn saturated_live_checkpoint(
+    count: usize,
+    shared_incarnation: NodeIncarnationId,
+) -> (Vec<NodeId>, ObservationEngineCheckpointV1) {
+    let mut node_ids = Vec::with_capacity(count);
+    let mut projections = Vec::with_capacity(count);
+    let mut current_incarnations = Vec::with_capacity(count);
+    for index in 0..count {
+        let node_id = NodeId::new(format!("node-retirement-cap-{index}")).expect("node ID");
+        projections.push(fixture_projection(runtime_target_for(
+            node_id.clone(),
+            shared_incarnation,
+            7,
+        )));
+        current_incarnations.push(ObservationCheckpointRouteV1 {
+            node_id: node_id.clone(),
+            incarnation_id: shared_incarnation,
+        });
+        node_ids.push(node_id);
+    }
+    let checkpoint = ObservationEngineCheckpointV1 {
+        version: OBSERVATION_ENGINE_CHECKPOINT_VERSION_V1,
+        projections,
+        cursor_journal: Vec::new(),
+        current_incarnations,
+        retired_incarnations: Vec::new(),
+        managed_links: Vec::new(),
+        transport_gaps: Vec::new(),
+        retention_floors: Vec::new(),
+        high_watermarks: Vec::new(),
+    };
+    (node_ids, checkpoint)
+}
+
+#[test]
+fn superseded_incarnation_projection_is_retired_on_checkpoint_load_current_kept() {
+    let old_incarnation = incarnation(1);
+    let new_incarnation = incarnation(2);
+    let mut engine = ObservationEngine::new();
+    accept(&mut engine, envelope(old_incarnation, 1, ObservationKindV1::Working));
+    accept(&mut engine, envelope(new_incarnation, 1, ObservationKindV1::Ready));
+
+    // Pre-checkpoint the old, now-superseded target is still present
+    // (frozen, but not yet swept) -- exactly the state a live process
+    // hands to its next checkpoint today.
+    assert!(engine.projection(&target(old_incarnation)).is_some());
+
+    let checkpoint = engine.checkpoint();
+    let restored = ObservationEngine::restore(checkpoint).expect("restore checkpoint");
+
+    assert!(
+        restored.projection(&target(old_incarnation)).is_none(),
+        "superseded incarnation projection must be retired on load"
+    );
+    let current = restored
+        .projection(&target(new_incarnation))
+        .expect("current incarnation projection must survive load");
+    assert_eq!(current.availability, ProjectionAvailability::Current);
+    assert_eq!(restored.projection_count(), 1);
+}
+
+#[test]
+fn ensure_projection_retires_a_dead_entry_to_make_room_at_capacity() {
+    let shared_incarnation = incarnation(1);
+    let (node_ids, checkpoint) = saturated_live_checkpoint(PROJECTIONS_MAX, shared_incarnation);
+    let mut engine = ObservationEngine::restore(checkpoint).expect("restore saturated checkpoint");
+    assert_eq!(engine.projection_count(), PROJECTIONS_MAX);
+
+    let superseding_node = node_ids[0].clone();
+    let new_incarnation = incarnation(2);
+    // The map sits exactly at PROJECTIONS_MAX with zero dead entries
+    // until this single envelope both supersedes superseding_node's
+    // incarnation (freezing its old target dead) and asks ensure_
+    // projection for a brand-new target -- the same instant a relaunched
+    // node's first observation lands against an already-full store.
+    let outcome = accept(
+        &mut engine,
+        envelope_for_node(superseding_node.clone(), new_incarnation, 7, 1, ObservationKindV1::Ready),
+    );
+    assert_eq!(outcome, ApplyOutcome::Applied);
+
+    assert_eq!(engine.projection_count(), PROJECTIONS_MAX);
+    assert!(
+        engine
+            .projection(&runtime_target_for(superseding_node.clone(), shared_incarnation, 7))
+            .is_none(),
+        "the dead entry must be retired to make room"
+    );
+    assert!(
+        engine
+            .projection(&runtime_target_for(superseding_node, new_incarnation, 7))
+            .is_some(),
+        "the new target must be admitted"
+    );
+    for bystander in &node_ids[1..4] {
+        assert!(
+            engine
+                .projection(&runtime_target_for(bystander.clone(), shared_incarnation, 7))
+                .is_some(),
+            "an untouched live bystander must never be retired by the capacity-pressure pass"
+        );
+    }
+}
+
+#[test]
+fn ensure_projection_still_reports_capacity_exhausted_when_every_entry_is_live() {
+    let shared_incarnation = incarnation(1);
+    let (node_ids, checkpoint) = saturated_live_checkpoint(PROJECTIONS_MAX, shared_incarnation);
+    let engine = ObservationEngine::restore(checkpoint).expect("restore saturated checkpoint");
+    assert_eq!(engine.projection_count(), PROJECTIONS_MAX);
+
+    // Same node, same (still current) incarnation, a second session on it
+    // distinguished only by instance id -- a legitimate brand-new target
+    // that must not retire anything, because nothing in the map is dead.
+    let existing_node = node_ids[0].clone();
+    let second_session = envelope_for_node(
+        existing_node,
+        shared_incarnation,
+        8,
+        1,
+        ObservationKindV1::Ready,
+    );
+
+    let error = engine
+        .prepare(second_session)
+        .expect_err("the backstop must still fire when every entry is live");
+    match error {
+        ObservationEngineError::CapacityExhausted { collection, max } => {
+            assert_eq!(collection, "session projections");
+            assert_eq!(max, PROJECTIONS_MAX);
+        }
+        other => panic!("expected CapacityExhausted, got {other:?}"),
+    }
+    assert_eq!(engine.projection_count(), PROJECTIONS_MAX);
+}
+
+#[test]
+fn current_incarnation_projection_survives_checkpoint_load_retirement() {
+    let incarnation_id = incarnation(1);
+    let mut engine = ObservationEngine::new();
+    accept(&mut engine, envelope(incarnation_id, 1, ObservationKindV1::Working));
+    let before = engine
+        .projection(&target(incarnation_id))
+        .expect("projection")
+        .clone();
+
+    let restored = ObservationEngine::restore(engine.checkpoint()).expect("restore checkpoint");
+    assert_eq!(
+        restored.projection(&target(incarnation_id)),
+        Some(&before),
+        "a projection for the node's current incarnation must never be retired"
+    );
+    assert_eq!(restored.projection_count(), 1);
 }

@@ -538,6 +538,7 @@ impl ObservationEngine {
                 route.cursor.sequence,
             );
         }
+        engine.retire_superseded_projections("checkpoint load");
         Ok(engine)
     }
 
@@ -754,16 +755,67 @@ impl ObservationEngine {
         Ok(())
     }
 
+    /// A projection can never receive another observation once its
+    /// target's incarnation is no longer the node's current one --
+    /// `observe_incarnation` rejects any envelope still addressed to a
+    /// superseded incarnation with `ReplacedIncarnation`, so nothing ever
+    /// writes to it again. `current_incarnations` is the authority for
+    /// "current"; a node absent from it (should not happen for a target
+    /// that already has a projection, but kept as a conservative fallback)
+    /// proves nothing, so its projections are left alone rather than
+    /// guessed dead.
+    fn projection_is_superseded(&self, target: &ObservationTarget) -> bool {
+        match self.current_incarnations.get(target.node_id()) {
+            Some(current) => *current != target.incarnation_id(),
+            None => false,
+        }
+    }
+
+    /// Removes every session projection whose target incarnation is
+    /// superseded, freeing room without ever raising `PROJECTIONS_MAX`.
+    /// Runs on checkpoint load, so a store already at the cap comes back
+    /// usable, and again from `ensure_projection` right before it would
+    /// otherwise report `CapacityExhausted` -- making room for a fresh
+    /// target instead of bricking on stale ones. A projection for a
+    /// node's CURRENT incarnation is never a candidate: live or idle, the
+    /// harness-MCP door's credential binding needs it to keep existing.
+    /// Logs one summary line per pass -- the same shape the node's own
+    /// session-record retention sweep logs -- because silence here is how
+    /// the unbounded growth went unnoticed until it bricked the harness.
+    fn retire_superseded_projections(&mut self, reason: &'static str) -> usize {
+        let dead = self
+            .projections
+            .keys()
+            .filter(|target| self.projection_is_superseded(target))
+            .cloned()
+            .collect::<Vec<_>>();
+        let retired = dead.len();
+        for target in &dead {
+            self.projections.remove(target);
+        }
+        tracing::info!(
+            retired,
+            remaining = self.projections.len(),
+            reason,
+            criterion = "target incarnation superseded by the node's current incarnation",
+            "session projection retirement pass completed",
+        );
+        retired
+    }
+
     fn ensure_projection(
         &mut self,
         target: ObservationTarget,
     ) -> Result<&mut SessionProjection, ObservationEngineError> {
         if !self.projections.contains_key(&target) {
             if self.projections.len() == PROJECTIONS_MAX {
-                return Err(ObservationEngineError::CapacityExhausted {
-                    collection: "session projections",
-                    max: PROJECTIONS_MAX,
-                });
+                self.retire_superseded_projections("capacity pressure");
+                if self.projections.len() == PROJECTIONS_MAX {
+                    return Err(ObservationEngineError::CapacityExhausted {
+                        collection: "session projections",
+                        max: PROJECTIONS_MAX,
+                    });
+                }
             }
             let mut projection = SessionProjection::new(target.clone());
             if self.transport_gaps.contains(&(

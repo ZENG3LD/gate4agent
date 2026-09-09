@@ -28,6 +28,26 @@ enum ObservationAudience {
     GrantBound,
 }
 
+/// Collapse a mutating agent-tool call's error into the wire's `Internal`
+/// WITHOUT losing it.
+///
+/// The `MailSend`/`MailAck`/`TaskCreate`/`TaskMove` arms each used a bare
+/// `map_err(|_| Internal)`, and `Internal` reaches the calling agent as
+/// "harness read unavailable" -- so mail refused on grant scope, a task moved
+/// to a state it may not reach, and a genuine store failure were one
+/// indistinguishable message whose cause existed in no log anywhere.
+/// Measured live 2026-09-09: a cross-provider `g4a_mail_send` came back
+/// `served=false` against a valid grant, with no other line recorded at all.
+/// The returned error is unchanged; only the silence is.
+fn internal_naming<E: std::fmt::Debug>(
+    operation: &'static str,
+) -> impl Fn(E) -> HarnessReadHostErrorV1 {
+    move |error| {
+        tracing::warn!(operation, error = ?error, "harness agent-tool call failed");
+        HarnessReadHostErrorV1::Internal
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn verify_and_execute_read(
     harness: &mut HarnessService,
@@ -188,7 +208,7 @@ pub(crate) fn execute_exact_binding_read(
             let from = resolve_caller_record_ref(binding, runtime_inventory);
             let result = harness.send_mail(
                 grant_id, actor_run_id, from, to, subject, body, reply_to, refs, now_unix_ms,
-            ).map_err(|_| HarnessReadHostErrorV1::Internal)?;
+            ).map_err(internal_naming("g4a_mail_send"))?;
             Ok(HarnessReadResponseV1::MailSend(result))
         }
         HarnessReadRequestV1::MailInbox { since_unix_ms, limit } => {
@@ -206,7 +226,7 @@ pub(crate) fn execute_exact_binding_read(
                 reader_record_id,
                 message_id,
                 now_unix_ms,
-            ).map_err(|_| HarnessReadHostErrorV1::Internal)?;
+            ).map_err(internal_naming("g4a_mail_ack"))?;
             Ok(HarnessReadResponseV1::MailAck(HarnessMailAckResultV1 { acked: true }))
         }
         HarnessReadRequestV1::TaskCreate { title, body, parent_task_id } => {
@@ -215,7 +235,7 @@ pub(crate) fn execute_exact_binding_read(
             let now_unix_ms = unix_time_ms();
             let result = harness.agent_create_task(
                 actor_run_id, grant_id, title, body, parent_task_id, now_unix_ms,
-            ).map_err(|_| HarnessReadHostErrorV1::Internal)?;
+            ).map_err(internal_naming("g4a_task_create"))?;
             Ok(HarnessReadResponseV1::TaskCreate(result))
         }
         HarnessReadRequestV1::TaskMove { task_id, expected_revision, to } => {
@@ -224,7 +244,7 @@ pub(crate) fn execute_exact_binding_read(
             let now_unix_ms = unix_time_ms();
             let result = harness.agent_move_task(
                 actor_run_id, grant_id, task_id, expected_revision, to, now_unix_ms,
-            ).map_err(|_| HarnessReadHostErrorV1::Internal)?;
+            ).map_err(internal_naming("g4a_task_create"))?;
             Ok(HarnessReadResponseV1::TaskMove(result))
         }
         _ => execute_exact_binding_read_only(harness.engine(), observation, support, binding, grant, &visibility, request),

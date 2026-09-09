@@ -2107,16 +2107,28 @@ const ACP_MODE_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(5);
 /// default instead, measured live as `mode:Mode="auto"`, which approves
 /// itself.
 fn required_acp_mode(agent_id: &AgentId, level: ApprovalLevel) -> Result<Option<ModeId>, String> {
-    let acp_mode_id = match approval_level_resolution(agent_id, level) {
-        ApprovalLevelResolution::Unsupported => None,
-        ApprovalLevelResolution::Supported { acp_mode_id, .. } => acp_mode_id,
+    let (acp_mode_id, carries_argv_flags) = match approval_level_resolution(agent_id, level) {
+        ApprovalLevelResolution::Unsupported => (None, false),
+        ApprovalLevelResolution::Supported { acp_mode_id, args, .. } => {
+            (acp_mode_id, !args.is_empty())
+        }
     };
     match (acp_mode_id, level) {
         (Some(mode_id), _) => Ok(Some(mode_id)),
         (None, ApprovalLevel::Unmanaged) => Ok(None),
+        // No mode, but the level carries vendor flags: `acp_approval_level_args`
+        // puts those in the agent's own argv, so the level IS applied and this
+        // is not a launch at the vendor's default. The refusal below exists to
+        // stop a session running at wider authority than asked for -- it must
+        // not also block the one mechanism that narrows it. Measured
+        // 2026-09-09: kimi announces no ACP modes at all, so before this every
+        // level but `Unmanaged` refused outright and its own `--yolo` was
+        // unreachable.
+        (None, _) if carries_argv_flags => Ok(None),
         (None, _) => Err(format!(
-            "agent '{agent_id}' has no verified ACP mode for {level:?}; refusing rather than \
-             launching at the vendor's own (wider-authority) default"
+            "agent '{agent_id}' has no verified ACP mode for {level:?} and the level carries no \
+             vendor flags to apply through argv either; refusing rather than launching at the \
+             vendor's own (wider-authority) default"
         )),
     }
 }
@@ -4950,6 +4962,7 @@ fn elapsed_ms(started: Instant) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
+        acp_approval_level_args,
         approval_level_not_offered_message,
         classify_operator_gate_option_semantics,
         classify_pty_screen_state,
@@ -6881,26 +6894,53 @@ mod tests {
         // The 2026-09-02 `yolo`/`auto`/`plan` measurement this table used to
         // pin was a different build: the npm shell shim running under WSL
         // interop, not this native binary.
+        // `FullAuto` is the one kimi level that carries vendor flags
+        // (`--yolo`), so argv applies it and there is nothing left to refuse;
+        // `Moderate`/`ReadOnly` carry none (their `--auto`/`--plan` remain
+        // UNCONFIRMED under `kimi acp`) and still refuse, because for those
+        // no mechanism exists at all.
         let kimi = AgentId::new("kimi").unwrap();
-        for level in [ApprovalLevel::FullAuto, ApprovalLevel::Moderate, ApprovalLevel::ReadOnly] {
+        assert_eq!(required_acp_mode(&kimi, ApprovalLevel::FullAuto), Ok(None));
+        assert_eq!(
+            acp_approval_level_args(&kimi, ApprovalLevel::FullAuto),
+            vec!["--yolo".to_owned()],
+            "kimi's FullAuto must reach the process through argv, since it has no ACP mode"
+        );
+        for level in [ApprovalLevel::Moderate, ApprovalLevel::ReadOnly] {
             assert!(
                 required_acp_mode(&kimi, level).is_err(),
-                "kimi at {level:?} has no sourced ACP mode id and must refuse"
+                "kimi at {level:?} has neither a sourced ACP mode id nor vendor flags, so it must refuse"
             );
         }
         assert_eq!(required_acp_mode(&kimi, ApprovalLevel::Unmanaged), Ok(None));
+        assert!(
+            acp_approval_level_args(&kimi, ApprovalLevel::Unmanaged).is_empty(),
+            "Unmanaged imposes nothing, so it must add no argv flags either"
+        );
 
         // grok: `acp_mode_id` is `None` for every managed level (`FullAuto`
         // and `Moderate` are `Supported` with no sourced ACP id yet,
         // `ReadOnly` is outright `Unsupported`) -- every one must refuse
         // rather than spawn unconfigured.
+        // Same split as kimi: `FullAuto` carries real flags
+        // (`--permission-mode bypassPermissions`) and so is applied through
+        // argv; `Moderate` carries none and refuses; `ReadOnly` is outright
+        // `Unsupported` and refuses for that reason.
         let grok = AgentId::new("grok").unwrap();
-        for level in [ApprovalLevel::FullAuto, ApprovalLevel::Moderate, ApprovalLevel::ReadOnly] {
-            assert!(
-                required_acp_mode(&grok, level).is_err(),
-                "grok at {level:?} has no sourced ACP mode id and must refuse"
-            );
-        }
+        assert_eq!(required_acp_mode(&grok, ApprovalLevel::FullAuto), Ok(None));
+        assert_eq!(
+            acp_approval_level_args(&grok, ApprovalLevel::FullAuto),
+            vec!["--permission-mode".to_owned(), "bypassPermissions".to_owned()],
+        );
+        assert_eq!(required_acp_mode(&grok, ApprovalLevel::Moderate), Ok(None));
+        assert_eq!(
+            acp_approval_level_args(&grok, ApprovalLevel::Moderate),
+            vec!["--permission-mode".to_owned(), "auto".to_owned()],
+        );
+        assert!(
+            required_acp_mode(&grok, ApprovalLevel::ReadOnly).is_err(),
+            "grok at ReadOnly is Unsupported outright, so it must refuse"
+        );
         assert_eq!(required_acp_mode(&grok, ApprovalLevel::Unmanaged), Ok(None));
     }
 
@@ -6925,8 +6965,11 @@ mod tests {
                         "auto",
                         "{id} at {level:?} must never silently resolve the vendor's own default 'auto'"
                     ),
-                    Ok(None) => panic!(
-                        "{id} at {level:?} resolved Ok(None) -- only Unmanaged may silently apply nothing"
+                    Ok(None) => assert!(
+                        !acp_approval_level_args(&agent, level).is_empty(),
+                        "{id} at {level:?} resolved Ok(None) while carrying no vendor flags -- \
+                         that leaves the session at the agent's own default. Only Unmanaged, or a \
+                         level argv actually applies, may resolve to no mode"
                     ),
                     Err(_) => {} // refused outright -- also never reaches `auto`
                 }

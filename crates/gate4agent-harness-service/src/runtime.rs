@@ -32,7 +32,7 @@ use crate::{
 };
 use crate::dispatch::{
     deterministic_default_grant_ids, deterministic_dispatch_ids, deterministic_issued_dispatch_ids,
-    deterministic_lifecycle_authority_ids,
+    deterministic_incarnation_settlement_ids, deterministic_lifecycle_authority_ids,
     derive_launch_plans_from_inventory,
     exact_bound_control_lifecycle,
     HarnessLaunchCatalog, HarnessLifecycleEventKindV1, HarnessLifecycleProjectionV1,
@@ -2419,6 +2419,216 @@ fn freeze_bound_route_waiting(
         touch.task_ids.push(task_id);
     }
     Ok(touch)
+}
+
+/// Pure selection-rule check behind
+/// `settle_stale_incarnation_bindings`, taking the node's current
+/// incarnation as a plain lookup rather than a live `HarnessC2Adapter` --
+/// the same reason `HarnessC2Adapter::exact_route` itself is layered over
+/// the free function `resolve_exact_route` in `c2.rs`: so the
+/// reconnect/offline/unknown-vs-genuinely-different-incarnation distinction
+/// stays testable without a live C2 connection, which `HarnessC2Adapter`
+/// cannot be constructed without. `current_incarnation` returning `None`
+/// covers every reason `HarnessC2Adapter::exact_route` can fail to name a
+/// route at all (unknown node, offline node, or the harness's own C2 link
+/// reconnecting) -- and `None` from THIS function covers every reason a run
+/// is left alone on top of that: wrong lifecycle, no binding, an `Inline`
+/// (non-managed) session, an unparseable node selector, or a route that
+/// resolved but named the SAME incarnation the run is already bound to. A
+/// route the caller cannot resolve proves nothing: the node may come back
+/// with the SAME incarnation and its sessions still alive, so only a route
+/// that resolves to a genuinely DIFFERENT incarnation is proof the bound
+/// session is gone. The production caller sources `current_incarnation`
+/// from `HarnessC2Adapter::exact_route` -- the same authority
+/// `apply_or_buffer_host_live_event` already reads for this exact question
+/// (a stale-vs-current route) -- and deliberately not from
+/// `HarnessRuntimeInventoryCache`, which is refreshed only on an
+/// observation resync and is left stale across a topology change until
+/// that resync lands (see its own `reconcile_topology` doc comment) --
+/// exactly the lag this reconciliation must not inherit.
+fn stale_incarnation_binding(
+    run: &HarnessRunV1,
+    current_incarnation: &impl Fn(&NodeId) -> Option<NodeIncarnationId>,
+) -> Option<(NodeId, NodeIncarnationId, NodeIncarnationId)> {
+    if !matches!(run.lifecycle, HarnessRunLifecycleV1::Running | HarnessRunLifecycleV1::Waiting) {
+        return None;
+    }
+    let binding = run.binding.as_ref()?;
+    if !matches!(binding.session, HarnessSessionIdentityV1::Managed { .. }) {
+        return None;
+    }
+    let node_id = NodeId::new(binding.node_id.as_str()).ok()?;
+    let bound_incarnation: NodeIncarnationId = binding.node_incarnation.as_str().parse().ok()?;
+    let current = current_incarnation(&node_id)?;
+    if current == bound_incarnation {
+        return None;
+    }
+    Some((node_id, bound_incarnation, current))
+}
+
+/// Builds and commits the settlement mutation for one run
+/// `stale_incarnation_binding` already proved eligible. Lands the run on
+/// `Failed` (`HarnessFailureCategoryV1::TargetUnavailable`,
+/// `retryable: true`), never `OutcomeUnknown`: this run's originating
+/// `CreateRun` operation is `Succeeded` (it dispatched and ran for real),
+/// and `OutcomeUnknown` requires that originating operation to itself be
+/// `OutcomeUnknown` (`validate_run_operation_coherence`) -- a word for "we
+/// never learned whether the dispatch worked", which is not true here.
+/// `Failed` is the coherent, truthful word: dispatch worked, the run will
+/// never deliver a result because its host is gone, and the work can be run
+/// again. Committed through the dedicated
+/// `HarnessService::commit_run_incarnation_settlement` path rather than
+/// reusing the Dispatching-phase transition -- this run is already
+/// `Running`/`Waiting`, not `Dispatching`, so it needs its own operation
+/// rather than a further transition of one the run already finished.
+/// Idempotent: re-derives the exact same operation id from
+/// `(run_id, node_id, bound_incarnation, current_incarnation)`, so calling
+/// this twice for the same stale binding commits once and replays clean the
+/// second time.
+fn apply_run_incarnation_settlement(
+    harness: &mut HarnessService,
+    run_id: &gate4agent_harness_protocol::HarnessRunId,
+    node_id: &NodeId,
+    bound_incarnation: NodeIncarnationId,
+    current_incarnation: NodeIncarnationId,
+    now_unix_ms: u64,
+) -> Result<(), HarnessRuntimeError> {
+    let run = harness.engine().run(run_id)
+        .ok_or(HarnessRuntimeError::DispatchPreparation("run is missing"))?.clone();
+    if !matches!(run.lifecycle, HarnessRunLifecycleV1::Running | HarnessRunLifecycleV1::Waiting) {
+        return Ok(());
+    }
+    let task = harness.engine().task(&run.task_id)
+        .ok_or(HarnessRuntimeError::DispatchPreparation("task is missing"))?.clone();
+    let ids = deterministic_incarnation_settlement_ids(
+        &run.run_id,
+        node_id,
+        &bound_incarnation,
+        &current_incarnation,
+    ).map_err(|_| HarnessRuntimeError::DispatchPreparation(
+        "incarnation settlement authority ids failed to derive for run",
+    ))?;
+    if harness.engine().operation(&ids.operation_id).is_some() {
+        return Ok(());
+    }
+    let committed_at = now_unix_ms.max(run.updated_at_unix_ms).max(task.updated_at_unix_ms);
+    let failure = HarnessFailureV1 {
+        category: HarnessFailureCategoryV1::TargetUnavailable,
+        retryable: true,
+    };
+    let mut next_run = run.clone();
+    next_run.revision = next_runtime_revision(run.revision)?;
+    next_run.updated_at_unix_ms = committed_at;
+    next_run.lifecycle = HarnessRunLifecycleV1::Failed;
+    next_run.binding = None;
+    next_run.result_disposition = Some(HarnessResultDispositionV1::Failed);
+    next_run.failure = Some(failure);
+    let mut next_task = task.clone();
+    next_task.revision = next_runtime_revision(task.revision)?;
+    next_task.updated_at_unix_ms = committed_at;
+    next_task.state = HarnessTaskStateV1::Failed;
+    let operation = HarnessOperationV1 {
+        operation_id: ids.operation_id,
+        revision: HarnessRevision::new(1)
+            .map_err(|_| HarnessRuntimeError::DispatchPreparation(
+                "new operation revision is zero",
+            ))?,
+        actor: HarnessActorV1::ParentRun { run_id: run.run_id.clone() },
+        kind: HarnessOperationKindV1::MutateRun,
+        state: HarnessOperationStateV1::Succeeded,
+        task_id: None,
+        run_id: Some(run.run_id.clone()),
+        grant_id: None,
+        reconciles_operation_id: None,
+        expected_revision: Some(run.revision),
+        request_digest: ids.request_digest,
+        idempotency_ref: ids.idempotency_ref,
+        failure: None,
+        outcome_unknown_reason: None,
+        reconciliation_outcome: None,
+        created_at_unix_ms: committed_at,
+        updated_at_unix_ms: committed_at,
+        dispatched_at_unix_ms: None,
+        finished_at_unix_ms: Some(committed_at),
+    };
+    harness.commit_run_incarnation_settlement(
+        operation,
+        run.revision,
+        next_run,
+        task.revision,
+        next_task,
+    ).map_err(HarnessRuntimeError::Harness)
+}
+
+/// Adapter-free core of `settle_runs_with_changed_host_incarnation`,
+/// factored out exactly the way `resolve_exact_route` is factored out of
+/// `HarnessC2Adapter::exact_route` (see `stale_incarnation_binding`'s own
+/// doc comment): so the selection rule and its idempotent-replay behavior
+/// are unit-testable without a live C2 connection. Reconciles every
+/// `Running`/`Waiting` run whose managed-session binding names a node
+/// incarnation `current_incarnation` proves is no longer current -- see
+/// `stale_incarnation_binding` for the exact selection rule and
+/// `apply_run_incarnation_settlement` for the mutation it commits. Cheap
+/// when nothing needs settling: one scan over the engine's runs building an
+/// ordinarily-empty `Vec`, no further engine call at all. Idempotent for the
+/// same underlying reason `apply_run_incarnation_settlement` is idempotent
+/// per run: a settled run leaves `{Running, Waiting}` the moment it commits,
+/// so a second pass over the same durable state finds nothing left to
+/// select.
+fn settle_stale_incarnation_bindings(
+    harness: &mut HarnessService,
+    current_incarnation: impl Fn(&NodeId) -> Option<NodeIncarnationId>,
+    now_unix_ms: u64,
+) -> Result<EngineTouch, HarnessRuntimeError> {
+    let stale = harness.engine().runs().filter_map(|run| {
+        stale_incarnation_binding(run, &current_incarnation).map(|(node_id, bound, current)| {
+            (run.run_id.clone(), run.task_id.clone(), node_id, bound, current)
+        })
+    }).collect::<Vec<_>>();
+    let mut touch = EngineTouch::default();
+    for (run_id, task_id, node_id, bound_incarnation, current_incarnation) in stale {
+        apply_run_incarnation_settlement(
+            harness,
+            &run_id,
+            &node_id,
+            bound_incarnation,
+            current_incarnation,
+            now_unix_ms,
+        )?;
+        tracing::warn!(
+            run = %run_id,
+            task = %task_id,
+            node = %node_id,
+            bound_incarnation = %bound_incarnation,
+            current_incarnation = %current_incarnation,
+            "run failed: its host incarnation changed while it was still running",
+        );
+        touch.run_ids.push(run_id);
+        touch.task_ids.push(task_id);
+    }
+    Ok(touch)
+}
+
+/// Reconciles every `Running`/`Waiting` run whose managed-session binding
+/// names a node incarnation the harness now proves is no longer current --
+/// see `settle_stale_incarnation_bindings` for the reconciliation itself;
+/// this is only the thin, non-unit-tested shim plugging in the live
+/// `HarnessC2Adapter` as the incarnation authority. Called once at harness
+/// startup (right after the initial observation recovery, repairing
+/// whatever an already-durable store accumulated across restarts the node
+/// itself did not survive) and once per live topology change (right after
+/// `ObservationSupportRegistry::reconcile_current_routes`, the point at
+/// which the harness learns a node came back with a new incarnation).
+fn settle_runs_with_changed_host_incarnation(
+    adapter: &HarnessC2Adapter,
+    harness: &mut HarnessService,
+    now_unix_ms: u64,
+) -> Result<EngineTouch, HarnessRuntimeError> {
+    settle_stale_incarnation_bindings(
+        harness,
+        |node_id| adapter.exact_route(node_id).ok().map(|route| route.expected_incarnation_id),
+        now_unix_ms,
+    )
 }
 
 fn start_dispatch_preflight(
@@ -5001,6 +5211,12 @@ pub async fn start_harness_host_with_operator_and_catalogs(
         &mut support,
         &mut runtime_inventory,
     ).await?;
+    // Boot repair: a run left `Running`/`Waiting` bound to an incarnation
+    // the node has since moved past cannot have a live session any more --
+    // settle it now rather than let it claim to run forever. No subscriber
+    // exists yet at this point in startup, so the touch set has nothing to
+    // notify.
+    settle_runs_with_changed_host_incarnation(&adapter, &mut harness, unix_time_ms())?;
     let mut pending_harness_mcp_aborts = durable_harness_mcp_abort_cleanup(&harness);
     let harness_mcp_actions = prepare_harness_mcp_reconcile(
         &mut harness,
@@ -7381,6 +7597,20 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                 })
                                 .count();
                             support.reconcile_current_routes(&routes);
+                            // The harness now knows every online node's
+                            // current incarnation -- settle any run still
+                            // bound to a node's PREVIOUS one before doing
+                            // anything else with this topology change. A
+                            // node merely dropping out of `routes` proves
+                            // nothing (its relay may just be reconnecting);
+                            // this only ever fires on a proven incarnation
+                            // change.
+                            let settlement_touch = settle_runs_with_changed_host_incarnation(
+                                &adapter,
+                                &mut harness,
+                                unix_time_ms(),
+                            )?;
+                            notify_touched(&mut subscribers, &harness, &settlement_touch);
                             tracing::info!(
                                 online_routes = routes.len(),
                                 marked_unhealthy = offline_known_routes,
@@ -13594,6 +13824,301 @@ mod tests {
         let other_routed = session_record_upserted(&route, 7, other_record);
         apply_live_context_pack_receipt(&mut harness, &route, &other_routed, 12).unwrap();
         assert_eq!(harness.engine().run(&run_id).unwrap().revision, revision_after_first);
+    }
+
+    /// Twin of `running_harness_fixture`, already terminal (`Failed`) but
+    /// keeping the exact same managed-session binding pointed at `node-a`'s
+    /// incarnation `[7; 16]` -- a run can fail while its session was still
+    /// live, so a terminal run carrying a binding is a legal state, and
+    /// `settle_stale_incarnation_bindings` must never touch it regardless of
+    /// what the node's current incarnation is.
+    fn terminal_bound_run_fixture() -> (
+        HarnessService,
+        HarnessTaskId,
+        HarnessRunId,
+        NodeRoute,
+    ) {
+        let task_id = HarnessTaskId::new(format!("htask_{}", "c".repeat(24))).unwrap();
+        let run_id = HarnessRunId::new(format!("hrun_{}", "c".repeat(24))).unwrap();
+        let create_operation_id = HarnessOperationId::new(format!(
+            "hop_{}",
+            "c".repeat(24),
+        )).unwrap();
+        let incarnation = NodeIncarnationId::from_bytes([7; 16]);
+        let actor = HarnessActorV1::User { actor_id: selector("operator") };
+        let failure = HarnessFailureV1 {
+            category: HarnessFailureCategoryV1::Internal,
+            retryable: false,
+        };
+        let task = HarnessTaskV1 {
+            task_id: task_id.clone(),
+            revision: HarnessRevision::new(1).unwrap(),
+            title: "Terminal task".to_owned(),
+            body: "Already-terminal run with a stale binding".to_owned(),
+            creator: actor.clone(),
+            parent_task_id: None,
+            dependencies: Vec::new(),
+            state: HarnessTaskStateV1::Failed,
+            run_ids: vec![run_id.clone()],
+            result_refs: Vec::new(),
+            artifact_refs: Vec::new(),
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 5,
+        };
+        let run = HarnessRunV1 {
+            run_id: run_id.clone(),
+            revision: HarnessRevision::new(1).unwrap(),
+            parent_run_id: None,
+            task_id: task_id.clone(),
+            operation_id: create_operation_id.clone(),
+            intent: HarnessRunIntentV1 {
+                node_id: selector("node-a"),
+                workspace_id: selector("workspace-a"),
+                worktree: HarnessWorktreeIntentV1::Existing,
+                provider_profile: selector("profile-a"),
+                mode: HarnessExecutionModeV1::Pty,
+                delivery_bundle: None,
+                continuation: None,
+            },
+            delivery_receipt: None,
+            continuation_receipt: None,
+            context_pack: None,
+            git_facts: None,
+            binding: Some(HarnessSessionBindingV1 {
+                node_id: selector("node-a"),
+                node_incarnation: selector(&incarnation.to_string()),
+                workspace_id: selector("workspace-a"),
+                session: HarnessSessionIdentityV1::Managed {
+                    record_id: selector("record-a"),
+                    active_session: Some(HarnessRuntimeIdentityV1 {
+                        instance_id: 7,
+                        generation: 3,
+                    }),
+                },
+            }),
+            lifecycle: HarnessRunLifecycleV1::Failed,
+            result_disposition: Some(HarnessResultDispositionV1::Failed),
+            failure: Some(failure.clone()),
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 5,
+        };
+        let create_operation = HarnessOperationV1 {
+            operation_id: create_operation_id,
+            revision: HarnessRevision::new(1).unwrap(),
+            actor,
+            kind: HarnessOperationKindV1::CreateRun,
+            state: HarnessOperationStateV1::Failed,
+            task_id: Some(task_id.clone()),
+            run_id: Some(run_id.clone()),
+            grant_id: None,
+            reconciles_operation_id: None,
+            expected_revision: Some(HarnessRevision::new(1).unwrap()),
+            request_digest: HarnessRequestDigest::new("c".repeat(64)).unwrap(),
+            idempotency_ref: HarnessIdempotencyRef::new(format!(
+                "hidem_{}",
+                "c".repeat(24),
+            )).unwrap(),
+            failure: Some(failure),
+            outcome_unknown_reason: None,
+            reconciliation_outcome: None,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 5,
+            dispatched_at_unix_ms: Some(4),
+            finished_at_unix_ms: Some(5),
+        };
+        let engine = HarnessEngine::restore(HarnessEngineCheckpointV1 {
+            version: HARNESS_ENGINE_CHECKPOINT_VERSION_V1,
+            tasks: vec![task],
+            runs: vec![run],
+            grants: Vec::new(),
+            operations: vec![create_operation],
+            execution_specs: Vec::new(),
+            issuances: Vec::new(),
+            execution_specs_v2: Vec::new(),
+            deliveries: Vec::new(),
+            continuations: Vec::new(),
+            mail_messages: Vec::new(),
+            mail_acks: Vec::new(),
+        }).unwrap();
+        let harness = HarnessService::from_engine_for_test(engine);
+        let route = NodeRoute {
+            node_id: NodeId::new("node-a").unwrap(),
+            expected_incarnation_id: incarnation,
+        };
+        (harness, task_id, run_id, route)
+    }
+
+    #[test]
+    fn settle_stale_incarnation_bindings_settles_running_run_bound_to_stale_incarnation() {
+        let (mut harness, task_id, run_id, route) = running_harness_fixture();
+        let bound_incarnation = route.expected_incarnation_id;
+        let current_incarnation = NodeIncarnationId::from_bytes([9; 16]);
+        let node_id = route.node_id.clone();
+        let touch = settle_stale_incarnation_bindings(
+            &mut harness,
+            move |candidate| (candidate == &node_id).then_some(current_incarnation),
+            10,
+        ).unwrap();
+
+        assert_eq!(touch.run_ids, vec![run_id.clone()]);
+        assert_eq!(touch.task_ids, vec![task_id.clone()]);
+
+        let run = harness.engine().run(&run_id).unwrap();
+        assert_eq!(run.lifecycle, HarnessRunLifecycleV1::Failed);
+        assert!(run.binding.is_none());
+        assert_eq!(run.revision, HarnessRevision::new(2).unwrap());
+        assert_eq!(run.updated_at_unix_ms, 10);
+        assert_eq!(run.result_disposition, Some(HarnessResultDispositionV1::Failed));
+        assert_eq!(
+            run.failure,
+            Some(HarnessFailureV1 {
+                category: HarnessFailureCategoryV1::TargetUnavailable,
+                retryable: true,
+            }),
+        );
+
+        let task = harness.engine().task(&task_id).unwrap();
+        assert_eq!(task.state, HarnessTaskStateV1::Failed);
+        assert_eq!(task.revision, HarnessRevision::new(2).unwrap());
+
+        let ids = deterministic_incarnation_settlement_ids(
+            &run_id,
+            &route.node_id,
+            &bound_incarnation,
+            &current_incarnation,
+        ).unwrap();
+        let operation = harness.engine().operation(&ids.operation_id)
+            .expect("settlement must journal its own MutateRun operation");
+        assert_eq!(operation.kind, HarnessOperationKindV1::MutateRun);
+        assert_eq!(operation.state, HarnessOperationStateV1::Succeeded);
+        assert_eq!(operation.failure, None);
+        assert_eq!(operation.outcome_unknown_reason, None);
+        assert_eq!(operation.run_id, Some(run_id));
+    }
+
+    /// The exact shape of the live failure this settlement had to fix:
+    /// `validate_run_operation_coherence` ties a run's lifecycle to its
+    /// immutable ORIGINATING `CreateRun` operation's state, never to the
+    /// settlement's own bookkeeping operation -- `running_harness_fixture`'s
+    /// `CreateRun` operation is `Succeeded` (the run genuinely dispatched
+    /// and ran for hours before its host's incarnation changed), and the
+    /// settlement must never touch it.
+    #[test]
+    fn settle_stale_incarnation_bindings_leaves_originating_operation_coherent() {
+        let (mut harness, task_id, run_id, route) = running_harness_fixture();
+        let current_incarnation = NodeIncarnationId::from_bytes([9; 16]);
+        let node_id = route.node_id.clone();
+        let originating_operation_id = harness.engine().run(&run_id).unwrap().operation_id.clone();
+
+        settle_stale_incarnation_bindings(
+            &mut harness,
+            move |candidate| (candidate == &node_id).then_some(current_incarnation),
+            10,
+        ).unwrap();
+
+        let originating_operation = harness.engine().operation(&originating_operation_id)
+            .expect("the run's original CreateRun operation must still be present");
+        assert_eq!(originating_operation.state, HarnessOperationStateV1::Succeeded);
+        assert_eq!(harness.engine().run(&run_id).unwrap().lifecycle, HarnessRunLifecycleV1::Failed);
+
+        // The strongest proof available: `HarnessEngine::restore` re-derives
+        // every invariant (`validate_links`, which calls
+        // `validate_run_operation_coherence` for every run against exactly
+        // this originating operation) from a fresh checkpoint round trip --
+        // the identical check the live harness makes at startup, and where
+        // the pre-fix `OutcomeUnknown` settlement failed with "run lifecycle
+        // OutcomeUnknown is incoherent with original operation state
+        // Succeeded".
+        let checkpoint = harness.engine().checkpoint();
+        HarnessEngine::restore(checkpoint)
+            .expect("a settled run must satisfy validate_run_operation_coherence on restore");
+
+        assert_eq!(harness.engine().task(&task_id).unwrap().state, HarnessTaskStateV1::Failed);
+    }
+
+    #[test]
+    fn settle_stale_incarnation_bindings_leaves_run_bound_to_current_incarnation_untouched() {
+        let (mut harness, task_id, run_id, route) = running_harness_fixture();
+        let current_incarnation = route.expected_incarnation_id;
+        let node_id = route.node_id.clone();
+        let touch = settle_stale_incarnation_bindings(
+            &mut harness,
+            move |candidate| (candidate == &node_id).then_some(current_incarnation),
+            10,
+        ).unwrap();
+
+        assert!(touch.run_ids.is_empty());
+        assert!(touch.task_ids.is_empty());
+        let run = harness.engine().run(&run_id).unwrap();
+        assert_eq!(run.lifecycle, HarnessRunLifecycleV1::Running);
+        assert_eq!(run.revision, HarnessRevision::new(1).unwrap());
+        assert!(run.binding.is_some());
+        let task = harness.engine().task(&task_id).unwrap();
+        assert_eq!(task.state, HarnessTaskStateV1::Running);
+        assert_eq!(task.revision, HarnessRevision::new(1).unwrap());
+    }
+
+    #[test]
+    fn settle_stale_incarnation_bindings_leaves_run_untouched_when_node_incarnation_is_unknown() {
+        // Pins the correctness boundary: `exact_route` cannot name a current
+        // incarnation for an offline/absent node or a reconnecting relay --
+        // that absence must never be read as proof the bound session died.
+        let (mut harness, task_id, run_id, _route) = running_harness_fixture();
+        let touch = settle_stale_incarnation_bindings(&mut harness, |_| None, 10).unwrap();
+
+        assert!(touch.run_ids.is_empty());
+        assert!(touch.task_ids.is_empty());
+        let run = harness.engine().run(&run_id).unwrap();
+        assert_eq!(run.lifecycle, HarnessRunLifecycleV1::Running);
+        assert_eq!(run.revision, HarnessRevision::new(1).unwrap());
+        assert!(run.binding.is_some());
+        let task = harness.engine().task(&task_id).unwrap();
+        assert_eq!(task.state, HarnessTaskStateV1::Running);
+        assert_eq!(task.revision, HarnessRevision::new(1).unwrap());
+    }
+
+    #[test]
+    fn settle_stale_incarnation_bindings_leaves_terminal_run_untouched() {
+        let (mut harness, task_id, run_id, route) = terminal_bound_run_fixture();
+        let current_incarnation = NodeIncarnationId::from_bytes([9; 16]);
+        let node_id = route.node_id.clone();
+        let touch = settle_stale_incarnation_bindings(
+            &mut harness,
+            move |candidate| (candidate == &node_id).then_some(current_incarnation),
+            10,
+        ).unwrap();
+
+        assert!(touch.run_ids.is_empty());
+        assert!(touch.task_ids.is_empty());
+        let run = harness.engine().run(&run_id).unwrap();
+        assert_eq!(run.lifecycle, HarnessRunLifecycleV1::Failed);
+        assert_eq!(run.revision, HarnessRevision::new(1).unwrap());
+        assert!(run.binding.is_some());
+        let task = harness.engine().task(&task_id).unwrap();
+        assert_eq!(task.state, HarnessTaskStateV1::Failed);
+        assert_eq!(task.revision, HarnessRevision::new(1).unwrap());
+    }
+
+    #[test]
+    fn settle_stale_incarnation_bindings_is_idempotent_on_a_second_pass() {
+        let (mut harness, task_id, run_id, route) = running_harness_fixture();
+        let current_incarnation = NodeIncarnationId::from_bytes([9; 16]);
+        let node_id = route.node_id.clone();
+        let lookup = move |candidate: &NodeId| {
+            (candidate == &node_id).then_some(current_incarnation)
+        };
+
+        let first = settle_stale_incarnation_bindings(&mut harness, lookup.clone(), 10).unwrap();
+        assert_eq!(first.run_ids, vec![run_id.clone()]);
+        assert_eq!(first.task_ids, vec![task_id.clone()]);
+        let run_after_first = harness.engine().run(&run_id).unwrap().clone();
+        let task_after_first = harness.engine().task(&task_id).unwrap().clone();
+
+        let second = settle_stale_incarnation_bindings(&mut harness, lookup, 20).unwrap();
+        assert!(second.run_ids.is_empty());
+        assert!(second.task_ids.is_empty());
+        assert_eq!(harness.engine().run(&run_id).unwrap(), &run_after_first);
+        assert_eq!(harness.engine().task(&task_id).unwrap(), &task_after_first);
     }
 
     #[test]

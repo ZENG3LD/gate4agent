@@ -2221,6 +2221,119 @@ impl HarnessEngine {
         next.finish(operation, HarnessApplyOutcome::Applied)
     }
 
+    /// Atomically settles one `Running`/`Waiting` run to the retryable
+    /// `Failed` lifecycle (`HarnessFailureCategoryV1::TargetUnavailable`,
+    /// `retryable: true`), its task to `Failed`, and drops the run's own
+    /// binding: the node incarnation the binding named is gone, so there is
+    /// nothing left to bind to and nothing further this run will ever
+    /// report. `OutcomeUnknown` is deliberately not this event's target --
+    /// that lifecycle names "we never learned whether the DISPATCH worked"
+    /// and ties to an originating operation that must itself be
+    /// `OutcomeUnknown` (`validate_run_operation_coherence`); a run reaching
+    /// this path already dispatched successfully and ran, so its
+    /// originating `CreateRun` operation is `Succeeded` and always will be,
+    /// making `Failed` (which `validate_run_operation_coherence` already
+    /// accepts against a `Succeeded` originating operation, the same way it
+    /// does for a rejected spawn) the coherent, truthful word for it. The
+    /// caller (`gate4agent-harness-service`'s runtime) is the sole authority
+    /// for WHEN this is legitimate -- this crate has no C2 client of its own
+    /// and never decides the trigger, only records the settlement once the
+    /// caller already knows the run's bound incarnation is provably stale.
+    ///
+    /// A dedicated function rather than a widening of
+    /// `prepare_run_event_commit`: this settlement's authority shape and its
+    /// task-side sibling (`validate_incarnation_settlement_task_projection`)
+    /// stay independent of that function's, even though both land the run on
+    /// `Failed` -- see `prepare_run_event_commit`'s own doc comment. Same
+    /// CAS/idempotent-replay discipline as that function otherwise.
+    pub fn prepare_run_incarnation_settlement(
+        &self,
+        operation: HarnessOperationV1,
+        expected_run_revision: HarnessRevision,
+        run: HarnessRunV1,
+        expected_task_revision: HarnessRevision,
+        task: HarnessTaskV1,
+    ) -> Result<PreparedHarnessMutation, HarnessEngineError> {
+        operation.validate()?;
+        run.validate()?;
+        task.validate()?;
+        if let Some(current_operation) = self.operations.get(&operation.operation_id) {
+            let exact_replay = current_operation == &operation
+                && self.runs.get(&run.run_id) == Some(&run)
+                && self.tasks.get(&task.task_id) == Some(&task)
+                && operation.expected_revision == Some(expected_run_revision)
+                && run.revision.get() == expected_run_revision.get().checked_add(1)
+                    .ok_or(HarnessEngineError::InvalidNextRevision { entity: "run" })?
+                && task.revision.get() == expected_task_revision.get().checked_add(1)
+                    .ok_or(HarnessEngineError::InvalidNextRevision { entity: "task" })?;
+            if exact_replay {
+                return Ok(PreparedHarnessMutation {
+                    next: self.clone(),
+                    outcome: HarnessApplyOutcome::Replayed,
+                    operation,
+                });
+            }
+            return Err(HarnessEngineError::OperationIdConflict {
+                operation_id: operation.operation_id,
+            });
+        }
+        require_first_revision(operation.revision, "operation")?;
+        require_kind(operation.kind, HarnessOperationKindV1::MutateRun)?;
+        // `Succeeded`, not `Failed`: this operation is the settlement's own
+        // bookkeeping record, and it succeeds at recording the run's
+        // failure -- the same convention `prepare_run_event_commit`'s
+        // callers already use for a `MutateRun` operation that lands a run
+        // on `Failed` (see `commit_lifecycle_projection` in
+        // `gate4agent-harness-service`'s runtime), where the substantive
+        // failure lives on the run (`run.failure`), never on this wrapper
+        // operation (`operation.failure` stays `None`, as `Succeeded`
+        // requires).
+        require_operation_state(operation.state, HarnessOperationStateV1::Succeeded)?;
+        require_operation_expected(&operation, expected_run_revision)?;
+        require_same_id(operation.run_id.as_ref(), &run.run_id, "run")?;
+        if operation.actor != (HarnessActorV1::ParentRun {
+            run_id: run.run_id.clone(),
+        })
+            || operation.grant_id.is_some()
+            || operation.reconciles_operation_id.is_some()
+            || run.task_id != task.task_id
+            || task.run_ids.binary_search(&run.run_id).is_err()
+            || task.updated_at_unix_ms != run.updated_at_unix_ms
+            || operation.updated_at_unix_ms != run.updated_at_unix_ms
+            || operation.finished_at_unix_ms != Some(run.updated_at_unix_ms)
+        {
+            return Err(HarnessEngineError::InvalidIncarnationSettlementAuthority);
+        }
+        let current_run = self.runs.get(&run.run_id)
+            .ok_or_else(|| HarnessEngineError::NotFound(run.run_id.to_string()))?;
+        let current_task = self.tasks.get(&task.task_id)
+            .ok_or_else(|| HarnessEngineError::NotFound(task.task_id.to_string()))?;
+        validate_replacement(
+            "run",
+            current_run.revision,
+            expected_run_revision,
+            run.revision,
+            current_run.created_at_unix_ms,
+            run.created_at_unix_ms,
+        )?;
+        validate_replacement(
+            "task",
+            current_task.revision,
+            expected_task_revision,
+            task.revision,
+            current_task.created_at_unix_ms,
+            task.created_at_unix_ms,
+        )?;
+        validate_run_immutable(current_run, &run)?;
+        validate_run_lifecycle_transition(current_run, &run)?;
+        validate_incarnation_settlement_task_projection(current_task, &task, &run)?;
+        let mut next = self.clone();
+        next.runs.insert(run.run_id.clone(), run);
+        next.tasks.insert(task.task_id.clone(), task);
+        next.operations.insert(operation.operation_id.clone(), operation.clone());
+        next.finish(operation, HarnessApplyOutcome::Applied)
+    }
+
     /// Narrow, single-entity, terminal-lifecycle-exempt mutation that records
     /// a durable ContextPack receipt a run's own session cleanly exported.
     /// Deliberately does not call `validate_run_lifecycle_transition` (that
@@ -3917,6 +4030,40 @@ fn validate_run_event_task_projection(
     Ok(())
 }
 
+/// `prepare_run_incarnation_settlement`'s task-side sibling of
+/// `validate_run_event_task_projection`. Kept separate rather than reused
+/// directly: the settlement projection has exactly one legal target
+/// (`Failed` -- the same task state `validate_run_event_task_projection`
+/// would derive for a `Failed` run, mirroring the existing rejected-spawn
+/// convention: the work still needs doing, so `HarnessService::
+/// operator_retry_task` is the actionable path back to `Ready`, the same
+/// path every other `Failed` task already uses) regardless of which of the
+/// two eligible source lifecycles (`Running`/`Waiting`) the run started in,
+/// and `prepare_run_incarnation_settlement` keeps its own authority/CAS
+/// discipline independent of `prepare_run_event_commit`'s.
+fn validate_incarnation_settlement_task_projection(
+    current: &HarnessTaskV1,
+    next: &HarnessTaskV1,
+    run: &HarnessRunV1,
+) -> Result<(), HarnessEngineError> {
+    if current.task_id != next.task_id
+        || current.title != next.title
+        || current.body != next.body
+        || current.creator != next.creator
+        || current.parent_task_id != next.parent_task_id
+        || current.dependencies != next.dependencies
+        || current.run_ids != next.run_ids
+        || current.result_refs != next.result_refs
+        || current.artifact_refs != next.artifact_refs
+        || !matches!(current.state, HarnessTaskStateV1::Running | HarnessTaskStateV1::Waiting)
+        || run.lifecycle != HarnessRunLifecycleV1::Failed
+        || next.state != HarnessTaskStateV1::Failed
+    {
+        return Err(HarnessEngineError::InvalidIncarnationSettlementProjection);
+    }
+    Ok(())
+}
+
 fn validate_dispatch_outcome_task_projection(
     current: &HarnessTaskV1,
     next: &HarnessTaskV1,
@@ -4412,6 +4559,10 @@ pub enum HarnessEngineError {
     InvalidRunEventAuthority,
     #[error("run lifecycle event does not have the exact atomic task projection")]
     InvalidRunEventTaskProjection,
+    #[error("host-incarnation settlement operation does not have exact single-run atomic authority")]
+    InvalidIncarnationSettlementAuthority,
+    #[error("host-incarnation settlement does not have the exact atomic run/task projection")]
+    InvalidIncarnationSettlementProjection,
     #[error("ContextPack record operation does not have exact single-run, task-free authority")]
     InvalidContextPackRecordAuthority,
     #[error("ContextPack record must not change any run field besides context_pack, revision, or updated_at_unix_ms")]

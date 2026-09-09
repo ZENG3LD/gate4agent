@@ -60,6 +60,12 @@ const HARNESS_GIT_FACTS_RECORD_IDEMPOTENCY_REF_DOMAIN: &[u8] =
     b"gate4agent-harness-git-facts-record-idempotency-ref-v1\0";
 const HARNESS_GIT_FACTS_RECORD_REQUEST_DIGEST_DOMAIN: &[u8] =
     b"gate4agent-harness-git-facts-record-request-digest-v1\0";
+const HARNESS_INCARNATION_SETTLEMENT_OPERATION_ID_DOMAIN: &[u8] =
+    b"gate4agent-harness-incarnation-settlement-operation-id-v1\0";
+const HARNESS_INCARNATION_SETTLEMENT_IDEMPOTENCY_REF_DOMAIN: &[u8] =
+    b"gate4agent-harness-incarnation-settlement-idempotency-ref-v1\0";
+const HARNESS_INCARNATION_SETTLEMENT_REQUEST_DIGEST_DOMAIN: &[u8] =
+    b"gate4agent-harness-incarnation-settlement-request-digest-v1\0";
 const HARNESS_RESULT_REF_RECORD_OPERATION_ID_DOMAIN: &[u8] =
     b"gate4agent-harness-result-ref-record-operation-id-v1\0";
 const HARNESS_RESULT_REF_RECORD_IDEMPOTENCY_REF_DOMAIN: &[u8] =
@@ -1392,6 +1398,62 @@ pub fn deterministic_run_git_facts_record_ids(
         request_digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
     )?;
     Ok(HarnessGitFactsRecordAuthorityIdsV1 {
+        operation_id,
+        idempotency_ref,
+        request_digest,
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HarnessIncarnationSettlementAuthorityIdsV1 {
+    pub operation_id: HarnessOperationId,
+    pub idempotency_ref: HarnessIdempotencyRef,
+    pub request_digest: HarnessRequestDigest,
+}
+
+/// Keyed by `(run_id, node_id, bound incarnation, current incarnation)`
+/// rather than an event sequence number: a host-incarnation settlement is a
+/// reconciliation fact the harness derives from its own topology knowledge,
+/// not a discrete node-reported event, so the exact same stale-binding
+/// observation reached from two call sites (boot repair and a live topology
+/// change) -- or a second pass over state a first pass already settled --
+/// must derive the identical operation identity and replay cleanly rather
+/// than conflicting.
+pub fn deterministic_incarnation_settlement_ids(
+    run_id: &HarnessRunId,
+    node_id: &NodeId,
+    bound_incarnation_id: &NodeIncarnationId,
+    current_incarnation_id: &NodeIncarnationId,
+) -> Result<HarnessIncarnationSettlementAuthorityIdsV1, HarnessDispatchError> {
+    run_id.validate()?;
+    let bound_incarnation = bound_incarnation_id.to_string();
+    let current_incarnation = current_incarnation_id.to_string();
+    let material = serde_json::to_vec(&(
+        run_id.as_str(),
+        node_id.as_str(),
+        bound_incarnation.as_str(),
+        current_incarnation.as_str(),
+    ))?;
+    let operation_id = derived_id_from_material(
+        HarnessOperationId::PREFIX,
+        HARNESS_INCARNATION_SETTLEMENT_OPERATION_ID_DOMAIN,
+        &material,
+        HarnessOperationId::new,
+    )?;
+    let idempotency_ref = derived_id_from_material(
+        HarnessIdempotencyRef::PREFIX,
+        HARNESS_INCARNATION_SETTLEMENT_IDEMPOTENCY_REF_DOMAIN,
+        &material,
+        HarnessIdempotencyRef::new,
+    )?;
+    let request_digest = local_hmac_sha256(
+        HARNESS_INCARNATION_SETTLEMENT_REQUEST_DIGEST_DOMAIN,
+        &material,
+    ).map_err(HarnessDispatchError::Digest)?;
+    let request_digest = HarnessRequestDigest::new(
+        request_digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+    )?;
+    Ok(HarnessIncarnationSettlementAuthorityIdsV1 {
         operation_id,
         idempotency_ref,
         request_digest,

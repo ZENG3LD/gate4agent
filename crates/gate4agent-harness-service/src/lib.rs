@@ -3452,6 +3452,33 @@ impl HarnessService {
         Ok(())
     }
 
+    /// Settles one `Running`/`Waiting` run to `Failed` because its bound
+    /// host incarnation is proven stale -- see
+    /// `HarnessEngine::prepare_run_incarnation_settlement`'s doc comment for
+    /// the mutation this commits. Structural twin of `commit_run_event`,
+    /// against the dedicated engine entry point rather than the generic one.
+    pub(crate) fn commit_run_incarnation_settlement(
+        &mut self,
+        operation: HarnessOperationV1,
+        expected_run_revision: HarnessRevision,
+        run: HarnessRunV1,
+        expected_task_revision: HarnessRevision,
+        task: HarnessTaskV1,
+    ) -> Result<(), HarnessServiceError> {
+        self.ensure_healthy()?;
+        let prepared = self.engine.prepare_run_incarnation_settlement(
+            operation,
+            expected_run_revision,
+            run,
+            expected_task_revision,
+            task,
+        )?;
+        if prepared.outcome() == HarnessApplyOutcome::Applied {
+            self.commit_prepared(prepared, self.dispatch_contexts.clone())?;
+        }
+        Ok(())
+    }
+
     /// Idempotently records a durable ContextPack receipt on `run_id`,
     /// reusing the run's own already-observed revision rather than requiring
     /// a caller-supplied CAS token. Never touches task state and stays legal

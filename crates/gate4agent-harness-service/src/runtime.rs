@@ -11620,15 +11620,47 @@ fn prepare_harness_mcp_read_call(
     // `execute_exact_binding_read` (via `mail_fetch`) would answer with;
     // every other request still goes through `execute_exact_binding_read`
     // exactly as before.
+    // Both steps below answer the agent with the same "harness read
+    // unavailable", and neither said which one failed: measured live
+    // 2026-09-09, a kimi call arrived with 2.4s of headroom against a valid
+    // grant and came back served=false with no other line in any log. Name
+    // the step.
     let dispatch = authorization.and_then(|binding| {
-        verify_observation_credential_binding(observation, support, &binding)?;
+        verify_observation_credential_binding(observation, support, &binding)
+            .map_err(|error| {
+                tracing::warn!(
+                    tool = tool_id,
+                    error = ?error,
+                    step = "verify-observation-credential-binding",
+                    "harness MCP read call could not be dispatched",
+                );
+                error
+            })?;
         if let gate4agent_harness_api::HarnessReadRequestV1::MailFetch { message_id, ref_index } = request {
             return crate::read::dispatch_mail_fetch(
                 harness, observation, support, &binding, message_id, ref_index,
-            );
+            )
+            .map_err(|error| {
+                tracing::warn!(
+                    tool = tool_id,
+                    error = ?error,
+                    step = "dispatch-mail-fetch",
+                    "harness MCP read call could not be dispatched",
+                );
+                error
+            });
         }
         execute_exact_binding_read(harness, observation, support, &binding, request, runtime_inventory)
             .map(ReadDispatch::Response)
+            .map_err(|error| {
+                tracing::warn!(
+                    tool = tool_id,
+                    error = ?error,
+                    step = "execute-exact-binding-read",
+                    "harness MCP read call could not be dispatched",
+                );
+                error
+            })
     });
     let prepared = match dispatch {
         Ok(ReadDispatch::Response(response)) => PreparedHarnessMcpRead::Ready(HarnessMcpRelayPlan {

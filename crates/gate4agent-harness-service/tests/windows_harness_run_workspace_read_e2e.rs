@@ -451,7 +451,7 @@ async fn tui_like_harness_client_reads_exact_run_workspace_and_rejects_stale_inc
         })).unwrap(),
         HarnessOperatorResponseV1::Mutation(HarnessOperatorMutationOutcomeV1::Applied),
     );
-    let task = tui.tasks_list(None, Some(HarnessTaskStateV1::Ready), 10).unwrap()
+    let task = tui.tasks_list(None, Some(HarnessTaskStateV1::Ready), None, 10).unwrap()
         .tasks.into_iter()
         .find(|task| task.title == "Run workspace read production E2E")
         .expect("Harness did not materialize the Ready task");

@@ -2408,6 +2408,14 @@ pub enum HarnessOperatorRequestV1 {
     TasksList {
         after_task_id: Option<HarnessTaskId>,
         state: Option<HarnessTaskStateV1>,
+        /// "What did this task spawn": restricts the page to tasks whose
+        /// own `parent_task_id` equals this one -- direct children only,
+        /// never deeper descendants. Additive over the original bare
+        /// `{ after_task_id, state, limit }` shape (`#[serde(default)]`
+        /// keeps an older caller decoding), mirrors `HarnessReadRequestV1::
+        /// TasksList`'s own addition of the same filter.
+        #[serde(default)]
+        parent_task_id: Option<HarnessTaskId>,
         limit: u16,
     },
     TaskGet { task_id: HarnessTaskId },
@@ -2422,6 +2430,11 @@ pub enum HarnessOperatorRequestV1 {
         task_id: Option<HarnessTaskId>,
         after_run_id: Option<HarnessRunId>,
         lifecycle: Option<HarnessRunLifecycleV1>,
+        /// "What did this run spawn": restricts the page to runs whose own
+        /// `parent_run_id` equals this one. Additive (`#[serde(default)]`),
+        /// mirrors `HarnessReadRequestV1::RunsList`'s own addition.
+        #[serde(default)]
+        parent_run_id: Option<HarnessRunId>,
         limit: u16,
     },
     RunGet { run_id: HarnessRunId },
@@ -2927,8 +2940,11 @@ impl HarnessOperatorRequestV1 {
                 }
                 validate_operator_timeline_limit(*limit)
             }
-            Self::TasksList { after_task_id, limit, .. } => {
+            Self::TasksList { after_task_id, parent_task_id, limit, .. } => {
                 if let Some(task_id) = after_task_id {
+                    task_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+                }
+                if let Some(task_id) = parent_task_id {
                     task_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
                 }
                 validate_operator_limit(*limit)
@@ -2940,11 +2956,14 @@ impl HarnessOperatorRequestV1 {
                 task_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
                 validate_operator_limit(*limit)
             }
-            Self::RunsList { task_id, after_run_id, limit, .. } => {
+            Self::RunsList { task_id, after_run_id, parent_run_id, limit, .. } => {
                 if let Some(task_id) = task_id {
                     task_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
                 }
                 if let Some(run_id) = after_run_id {
+                    run_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
+                }
+                if let Some(run_id) = parent_run_id {
                     run_id.validate().map_err(HarnessOperatorApiError::Protocol)?;
                 }
                 validate_operator_limit(*limit)
@@ -5986,6 +6005,15 @@ pub enum HarnessReadRequestV1 {
     TasksList {
         after_task_id: Option<HarnessTaskId>,
         state: Option<HarnessTaskStateV1>,
+        /// "What did this task spawn": restricts the page to tasks whose
+        /// own `parent_task_id` equals this one -- direct children only,
+        /// never deeper descendants. Additive over the original bare
+        /// `{ after_task_id, state, limit }` shape, so `#[serde(default)]`
+        /// keeps an older caller decoding. Composes with `state` (both
+        /// filters apply together) and pages the same way via
+        /// `after_task_id`.
+        #[serde(default)]
+        parent_task_id: Option<HarnessTaskId>,
         limit: u16,
     },
     TaskGet { task_id: HarnessTaskId },
@@ -5993,6 +6021,12 @@ pub enum HarnessReadRequestV1 {
         task_id: Option<HarnessTaskId>,
         after_run_id: Option<HarnessRunId>,
         lifecycle: Option<HarnessRunLifecycleV1>,
+        /// "What did this run spawn": restricts the page to runs whose own
+        /// `parent_run_id` equals this one -- direct children only. Additive
+        /// over the original shape (`#[serde(default)]`), composes with
+        /// `task_id`/`lifecycle`, pages the same way via `after_run_id`.
+        #[serde(default)]
+        parent_run_id: Option<HarnessRunId>,
         limit: u16,
     },
     RunGet { run_id: HarnessRunId },
@@ -6152,17 +6186,23 @@ impl HarnessReadRequestV1 {
                 }
                 validate_limit(*limit, HARNESS_TIMELINE_PAGE_LIMIT_MAX)
             }
-            Self::TasksList { after_task_id, limit, .. } => {
+            Self::TasksList { after_task_id, parent_task_id, limit, .. } => {
                 if let Some(task_id) = after_task_id {
+                    task_id.validate().map_err(HarnessReadApiError::Protocol)?;
+                }
+                if let Some(task_id) = parent_task_id {
                     task_id.validate().map_err(HarnessReadApiError::Protocol)?;
                 }
                 validate_limit(*limit, HARNESS_ENTITY_PAGE_LIMIT_MAX)
             }
-            Self::RunsList { task_id, after_run_id, limit, .. } => {
+            Self::RunsList { task_id, after_run_id, parent_run_id, limit, .. } => {
                 if let Some(task_id) = task_id {
                     task_id.validate().map_err(HarnessReadApiError::Protocol)?;
                 }
                 if let Some(run_id) = after_run_id {
+                    run_id.validate().map_err(HarnessReadApiError::Protocol)?;
+                }
+                if let Some(run_id) = parent_run_id {
                     run_id.validate().map_err(HarnessReadApiError::Protocol)?;
                 }
                 validate_limit(*limit, HARNESS_ENTITY_PAGE_LIMIT_MAX)
@@ -6585,8 +6625,27 @@ pub struct SessionContextV1 {
     pub sibling_runs: Vec<RedactedRunV1>,
     pub read_permissions: HarnessReadPermissionsV1,
     pub monitoring_visibility: HarnessMonitoringVisibilityV1,
-    pub maximum_child_count: u16,
-    pub maximum_child_depth: u16,
+    /// Observation, not a budget: the number of tasks parented directly
+    /// under the calling run's own task right now
+    /// (`HarnessEngine::task_child_count`), `0` if it has no children.
+    /// Unconditional -- computed from `actor_run`'s own task the same way
+    /// the retired `maximum_child_count` wire field it replaces was
+    /// (independent of whether `task` above is redacted to `None`). That
+    /// retired field stated a cap that was validated for range but compared
+    /// against no actual child count anywhere in the service -- a session
+    /// could read a limit here and still create children past it. The
+    /// owner's ruling: do not cap a session's children, detect them. Nothing
+    /// in this wire enforces an upper bound on this count.
+    pub child_task_count: u64,
+    /// Observation, not a budget: the depth of the deepest chain of tasks
+    /// parented (transitively) under the calling run's own task right now
+    /// (`HarnessEngine::task_subtree_depth`) -- `0` if it has no children,
+    /// `1` if it has children but no grandchildren, and so on. Unconditional
+    /// in the same sense as `child_task_count` above. Replaces the retired
+    /// `maximum_child_depth` wire field for the same reason `child_task_
+    /// count` replaces `maximum_child_count` (see that field's doc comment).
+    /// Nothing in this wire enforces an upper bound on this depth.
+    pub child_task_subtree_depth: u64,
     /// D1: whether this grant holds the mail permission -- the source
     /// `expected_allowed_tool_ids` reads to decide whether the four
     /// `g4a_mail_*` ids belong in `allowed_tool_ids`, the same way
@@ -6635,11 +6694,6 @@ impl SessionContextV1 {
             run.validate()?;
         }
         self.read_permissions.validate().map_err(HarnessReadApiError::Protocol)?;
-        if self.maximum_child_count > HARNESS_CHILD_COUNT_MAX
-            || self.maximum_child_depth > HARNESS_CHILD_DEPTH_MAX
-        {
-            return Err(HarnessReadApiError::InvalidChildLimits);
-        }
         if self.allowed_tool_ids.len() > HARNESS_READ_TOOL_IDS.len() + HARNESS_WRITE_TOOL_IDS.len()
             || self.allowed_tool_ids.windows(2).any(|pair| pair[0] >= pair[1])
             || self.allowed_tool_ids.iter().any(|id| {
@@ -7415,8 +7469,6 @@ pub enum HarnessReadApiError {
     InvalidMonitorCounts,
     #[error("harness monitor detail is inconsistent with visibility or availability")]
     InvalidMonitorDetail,
-    #[error("harness child limits are invalid")]
-    InvalidChildLimits,
     #[error("harness timeline entry is invalid")]
     InvalidTimelineEntry,
     #[error("harness read collection is not canonical or bounded")]
@@ -8095,11 +8147,13 @@ mod tests {
         assert!(HarnessOperatorRequestV1::TasksList {
             after_task_id: None,
             state: None,
+            parent_task_id: None,
             limit: HARNESS_ENTITY_PAGE_LIMIT_MAX,
         }.validate().is_ok());
         assert!(HarnessOperatorRequestV1::TasksList {
             after_task_id: None,
             state: None,
+            parent_task_id: None,
             limit: HARNESS_ENTITY_PAGE_LIMIT_MAX + 1,
         }.validate().is_err());
         let run_id = HarnessRunId::new(format!("hrun_{}", "a".repeat(24))).unwrap();
@@ -9138,8 +9192,12 @@ mod tests {
     fn unknown_request_fields_and_unbounded_limits_fail_closed() {
         let unknown = r#"{"kind":"tasks-list","limit":10,"cursor":"secret"}"#;
         assert!(serde_json::from_str::<HarnessReadRequestV1>(unknown).is_err());
-        assert!(HarnessReadRequestV1::TasksList { after_task_id: None, state: None, limit: 0 }.validate().is_err());
-        assert!(HarnessReadRequestV1::TasksList { after_task_id: None, state: None, limit: 65 }.validate().is_err());
+        assert!(HarnessReadRequestV1::TasksList {
+            after_task_id: None, state: None, parent_task_id: None, limit: 0,
+        }.validate().is_err());
+        assert!(HarnessReadRequestV1::TasksList {
+            after_task_id: None, state: None, parent_task_id: None, limit: 65,
+        }.validate().is_err());
     }
 
     #[test]
@@ -12207,6 +12265,78 @@ mod tests {
         decoded.validate().unwrap();
     }
 
+    /// `TasksList`/`RunsList` gain a parent filter ("what did this task/run
+    /// spawn") additive over the pre-existing shape, the same
+    /// `#[serde(default)]` discipline `MailSend`'s own `refs` field
+    /// established above: an old-shape request with no `parent_task_id`/
+    /// `parent_run_id` key still decodes (defaulting to `None`), and a set
+    /// value round-trips. A malformed id can never reach `parent_task_id`/
+    /// `parent_run_id` in the first place -- `HarnessTaskId::new`/
+    /// `HarnessRunId::new` are the validation, refusing a malformed string
+    /// before a request carrying one could ever be built (the CLI's own
+    /// rejection of a malformed `--parent`/`--parent-run` flag, tested in
+    /// `gate4agent-harnessctl`, goes through this exact constructor).
+    #[test]
+    fn parent_filters_default_on_old_shape_and_round_trip() {
+        let task_id = HarnessTaskId::new(format!("htask_{}", "a".repeat(24))).unwrap();
+        let tasks_request = HarnessReadRequestV1::TasksList {
+            after_task_id: None,
+            state: None,
+            parent_task_id: Some(task_id.clone()),
+            limit: 10,
+        };
+        tasks_request.validate().unwrap();
+        let encoded_tasks = serde_json::to_string(&tasks_request).unwrap();
+        assert_eq!(
+            serde_json::from_str::<HarnessReadRequestV1>(&encoded_tasks).unwrap(),
+            tasks_request,
+        );
+
+        let old_shape_tasks = serde_json::json!({
+            "kind": "tasks-list",
+            "after_task_id": null,
+            "state": null,
+            "limit": 10,
+        });
+        let decoded_tasks: HarnessReadRequestV1 = serde_json::from_value(old_shape_tasks).unwrap();
+        match &decoded_tasks {
+            HarnessReadRequestV1::TasksList { parent_task_id, .. } => assert!(parent_task_id.is_none()),
+            other => panic!("expected TasksList, got {other:?}"),
+        }
+        decoded_tasks.validate().unwrap();
+        assert!(HarnessTaskId::new("not-a-task-id").is_err());
+
+        let run_id = HarnessRunId::new(format!("hrun_{}", "b".repeat(24))).unwrap();
+        let runs_request = HarnessReadRequestV1::RunsList {
+            task_id: None,
+            after_run_id: None,
+            lifecycle: None,
+            parent_run_id: Some(run_id.clone()),
+            limit: 10,
+        };
+        runs_request.validate().unwrap();
+        let encoded_runs = serde_json::to_string(&runs_request).unwrap();
+        assert_eq!(
+            serde_json::from_str::<HarnessReadRequestV1>(&encoded_runs).unwrap(),
+            runs_request,
+        );
+
+        let old_shape_runs = serde_json::json!({
+            "kind": "runs-list",
+            "task_id": null,
+            "after_run_id": null,
+            "lifecycle": null,
+            "limit": 10,
+        });
+        let decoded_runs: HarnessReadRequestV1 = serde_json::from_value(old_shape_runs).unwrap();
+        match &decoded_runs {
+            HarnessReadRequestV1::RunsList { parent_run_id, .. } => assert!(parent_run_id.is_none()),
+            other => panic!("expected RunsList, got {other:?}"),
+        }
+        decoded_runs.validate().unwrap();
+        assert!(HarnessRunId::new("not-a-run-id").is_err());
+    }
+
     #[test]
     fn operator_agent_event_validate_rejects_malformed_chunks_or_sessions() {
         let session = session_address(1, 1);
@@ -12470,8 +12600,8 @@ mod tests {
                 operations: HarnessEntityReadScopeV1::None,
             },
             monitoring_visibility: HarnessMonitoringVisibilityV1::None,
-            maximum_child_count: 0,
-            maximum_child_depth: 0,
+            child_task_count: 0,
+            child_task_subtree_depth: 0,
             mail: false,
             task_create: false,
             task_mutate: false,
@@ -12529,5 +12659,36 @@ mod tests {
             create_only_claims_move.validate(),
             Err(HarnessReadApiError::InvalidAllowedTools),
         ));
+    }
+
+    /// The removed `maximum_child_count`/`maximum_child_depth` wire fields
+    /// stated a cap that was checked for range but never compared against an
+    /// actual child count anywhere -- this proves their replacements
+    /// (`child_task_count`/`child_task_subtree_depth`) carry whatever the
+    /// engine observed, with no ceiling of their own: a value far past the
+    /// old `HARNESS_CHILD_COUNT_MAX`/`HARNESS_CHILD_DEPTH_MAX` bounds still
+    /// validates and round-trips over the wire under the new field names.
+    #[test]
+    fn child_task_observations_carry_unbounded_values() {
+        let base = base_session_context();
+        let many_children = SessionContextV1 {
+            child_task_count: u64::from(HARNESS_CHILD_COUNT_MAX) * 1_000,
+            child_task_subtree_depth: u64::from(HARNESS_CHILD_DEPTH_MAX) * 1_000,
+            ..base
+        };
+        many_children.validate().unwrap();
+        let encoded = serde_json::to_value(&many_children).unwrap();
+        assert_eq!(
+            encoded.get("child_task_count").and_then(serde_json::Value::as_u64),
+            Some(u64::from(HARNESS_CHILD_COUNT_MAX) * 1_000),
+        );
+        assert_eq!(
+            encoded.get("child_task_subtree_depth").and_then(serde_json::Value::as_u64),
+            Some(u64::from(HARNESS_CHILD_DEPTH_MAX) * 1_000),
+        );
+        assert!(encoded.get("maximum_child_count").is_none());
+        assert!(encoded.get("maximum_child_depth").is_none());
+        let decoded: SessionContextV1 = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, many_children);
     }
 }

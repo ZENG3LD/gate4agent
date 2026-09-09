@@ -39,8 +39,8 @@ fn usage() -> &'static str {
      credential env: GATE4AGENT_HARNESS_OPERATOR_TOKEN\n\
      \n\
      commands:\n\
-     \x20 tasks list [--state STATE] [--after TASK_ID] [--limit N]\n\
-     \x20 runs list [--task TASK_ID] [--lifecycle LIFECYCLE] [--after RUN_ID] [--limit N]\n\
+     \x20 tasks list [--state STATE] [--after TASK_ID] [--parent TASK_ID] [--limit N]\n\
+     \x20 runs list [--task TASK_ID] [--lifecycle LIFECYCLE] [--after RUN_ID] [--parent-run RUN_ID] [--limit N]\n\
      \x20 task get TASK_ID\n\
      \x20 run get RUN_ID\n\
      \x20 results TASK_ID\n\
@@ -85,11 +85,17 @@ struct Invocation {
 
 #[derive(Debug)]
 enum Command {
-    TasksList { state: Option<HarnessTaskStateV1>, after: Option<HarnessTaskId>, limit: u16 },
+    TasksList {
+        state: Option<HarnessTaskStateV1>,
+        after: Option<HarnessTaskId>,
+        parent: Option<HarnessTaskId>,
+        limit: u16,
+    },
     RunsList {
         task: Option<HarnessTaskId>,
         lifecycle: Option<HarnessRunLifecycleV1>,
         after: Option<HarnessRunId>,
+        parent_run: Option<HarnessRunId>,
         limit: u16,
     },
     TaskGet { task_id: HarnessTaskId },
@@ -448,8 +454,9 @@ fn build_command(
                 .map(|value| parse_kebab::<HarnessTaskStateV1>(&value, "--state"))
                 .transpose()?;
             let after = take_flag(flags, "after").map(parse_task_id).transpose()?;
+            let parent = take_flag(flags, "parent").map(parse_task_id).transpose()?;
             let limit = parse_limit(flags, HARNESS_ENTITY_PAGE_LIMIT_MAX)?;
-            Ok(Command::TasksList { state, after, limit })
+            Ok(Command::TasksList { state, after, parent, limit })
         }
         Verb::RunsList => {
             expect_no_positionals(positionals, "runs list")?;
@@ -458,8 +465,9 @@ fn build_command(
                 .map(|value| parse_kebab::<HarnessRunLifecycleV1>(&value, "--lifecycle"))
                 .transpose()?;
             let after = take_flag(flags, "after").map(parse_run_id).transpose()?;
+            let parent_run = take_flag(flags, "parent-run").map(parse_run_id).transpose()?;
             let limit = parse_limit(flags, HARNESS_ENTITY_PAGE_LIMIT_MAX)?;
-            Ok(Command::RunsList { task, lifecycle, after, limit })
+            Ok(Command::RunsList { task, lifecycle, after, parent_run, limit })
         }
         Verb::TaskGet => {
             let task_id = expect_single_positional(positionals, "task-id").and_then(parse_task_id)?;
@@ -858,13 +866,15 @@ fn execute(invocation: Invocation) -> Result<String, String> {
     let client = HarnessOperatorClient::new(invocation.endpoint, invocation.credential)
         .map_err(|error| error.to_string())?;
     match invocation.command {
-        Command::TasksList { state, after, limit } => {
-            let page = client.tasks_list(after, state, limit).map_err(|error| error.to_string())?;
+        Command::TasksList { state, after, parent, limit } => {
+            let page = client
+                .tasks_list(after, state, parent, limit)
+                .map_err(|error| error.to_string())?;
             render(&page)
         }
-        Command::RunsList { task, lifecycle, after, limit } => {
+        Command::RunsList { task, lifecycle, after, parent_run, limit } => {
             let page = client
-                .runs_list(task, after, lifecycle, limit)
+                .runs_list(task, after, lifecycle, parent_run, limit)
                 .map_err(|error| error.to_string())?;
             render(&page)
         }
@@ -1520,7 +1530,7 @@ mod tests {
     }
 
     #[test]
-    fn tasks_list_parses_state_after_and_limit() {
+    fn tasks_list_parses_state_after_parent_and_limit() {
         let outcome = parse(
             &[
                 "gate4agent-harnessctl",
@@ -1530,6 +1540,8 @@ mod tests {
                 "ready",
                 "--after",
                 &format!("htask_{}", "a".repeat(24)),
+                "--parent",
+                &format!("htask_{}", "c".repeat(24)),
                 "--limit",
                 "5",
                 "--harness-operator",
@@ -1539,12 +1551,89 @@ mod tests {
         )
         .unwrap();
         let ParseOutcome::Run(invocation) = outcome else { panic!("expected run") };
-        let Command::TasksList { state, after, limit } = invocation.command else {
+        let Command::TasksList { state, after, parent, limit } = invocation.command else {
             panic!("expected tasks list")
         };
         assert_eq!(state, Some(HarnessTaskStateV1::Ready));
         assert_eq!(after, Some(HarnessTaskId::new(format!("htask_{}", "a".repeat(24))).unwrap()));
+        assert_eq!(parent, Some(HarnessTaskId::new(format!("htask_{}", "c".repeat(24))).unwrap()));
         assert_eq!(limit, 5);
+    }
+
+    /// `--parent`'s value is a `HarnessTaskId`, parsed the same way `--after`
+    /// already is (`parse_task_id`) -- a malformed id is refused before any
+    /// request is ever built, never sent to the host.
+    #[test]
+    fn tasks_list_rejects_a_malformed_parent_id() {
+        let error = parse(
+            &[
+                "gate4agent-harnessctl",
+                "tasks",
+                "list",
+                "--parent",
+                "not-a-task-id",
+                "--harness-operator",
+                "127.0.0.1:18080",
+            ],
+            &[(HARNESS_OPERATOR_TOKEN_ENV, &token())],
+        )
+        .unwrap_err();
+        assert_eq!(error, "invalid task id");
+    }
+
+    #[test]
+    fn runs_list_parses_task_lifecycle_after_parent_run_and_limit() {
+        let outcome = parse(
+            &[
+                "gate4agent-harnessctl",
+                "runs",
+                "list",
+                "--task",
+                &format!("htask_{}", "a".repeat(24)),
+                "--lifecycle",
+                "running",
+                "--after",
+                &format!("hrun_{}", "b".repeat(24)),
+                "--parent-run",
+                &format!("hrun_{}", "c".repeat(24)),
+                "--limit",
+                "5",
+                "--harness-operator",
+                "127.0.0.1:18080",
+            ],
+            &[(HARNESS_OPERATOR_TOKEN_ENV, &token())],
+        )
+        .unwrap();
+        let ParseOutcome::Run(invocation) = outcome else { panic!("expected run") };
+        let Command::RunsList { task, lifecycle, after, parent_run, limit } = invocation.command else {
+            panic!("expected runs list")
+        };
+        assert_eq!(task, Some(HarnessTaskId::new(format!("htask_{}", "a".repeat(24))).unwrap()));
+        assert_eq!(lifecycle, Some(HarnessRunLifecycleV1::Running));
+        assert_eq!(after, Some(HarnessRunId::new(format!("hrun_{}", "b".repeat(24))).unwrap()));
+        assert_eq!(parent_run, Some(HarnessRunId::new(format!("hrun_{}", "c".repeat(24))).unwrap()));
+        assert_eq!(limit, 5);
+    }
+
+    /// `--parent-run`'s value is a `HarnessRunId`, parsed the same way
+    /// `--after` already is (`parse_run_id`) -- a malformed id is refused
+    /// before any request is ever built.
+    #[test]
+    fn runs_list_rejects_a_malformed_parent_run_id() {
+        let error = parse(
+            &[
+                "gate4agent-harnessctl",
+                "runs",
+                "list",
+                "--parent-run",
+                "not-a-run-id",
+                "--harness-operator",
+                "127.0.0.1:18080",
+            ],
+            &[(HARNESS_OPERATOR_TOKEN_ENV, &token())],
+        )
+        .unwrap_err();
+        assert_eq!(error, "invalid run id");
     }
 
     #[test]

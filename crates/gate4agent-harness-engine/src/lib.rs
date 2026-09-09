@@ -3435,6 +3435,54 @@ impl HarnessEngine {
         task != root && self.task_subtree(root, HARNESS_CHILD_DEPTH_MAX).contains(task)
     }
 
+    /// The number of tasks parented directly under `root` right now --
+    /// `SessionContextV1::child_task_count`'s own live observation, backing
+    /// `g4a_context_get`. Recomputed by scanning `self.tasks` on every call,
+    /// never a stored counter denormalised onto the task record (the owner's
+    /// ruling behind that field's own doc comment: detect a session's
+    /// children, never cap them). Carries no upper bound of its own -- a
+    /// task can parent arbitrarily many children and this simply reports
+    /// how many exist.
+    pub fn task_child_count(&self, root: &HarnessTaskId) -> u64 {
+        self.tasks.values()
+            .filter(|task| task.parent_task_id.as_ref() == Some(root))
+            .count() as u64
+    }
+
+    /// The depth of the deepest chain of tasks parented (transitively)
+    /// under `root` right now -- `SessionContextV1::child_task_subtree_
+    /// depth`'s own live observation: `0` when `root` has no children, `1`
+    /// when it has children but none of those have children of their own,
+    /// and so on. Walks `parent_task_id` downward the same way
+    /// `task_subtree` does, but returns the depth actually reached instead
+    /// of the set of ids, and -- deliberately, unlike `task_subtree` -- is
+    /// not bounded by `HARNESS_CHILD_DEPTH_MAX` or any other ceiling:
+    /// termination comes from `self.tasks` being finite (each pass either
+    /// inserts at least one task new to `visible` or the loop stops, and
+    /// `visible` can never hold more entries than `self.tasks` does), backed
+    /// by `validate_task_cycles` keeping the task graph a forest on every
+    /// mutation, not from a policy bound.
+    pub fn task_subtree_depth(&self, root: &HarnessTaskId) -> u64 {
+        let mut visible = BTreeSet::from([root.clone()]);
+        let mut depth = 0_u64;
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for task in self.tasks.values() {
+                if !visible.contains(&task.task_id)
+                    && task.parent_task_id.as_ref().is_some_and(|parent| visible.contains(parent))
+                {
+                    visible.insert(task.task_id.clone());
+                    changed = true;
+                }
+            }
+            if changed {
+                depth += 1;
+            }
+        }
+        depth
+    }
+
     /// The task a run's own grant governs -- `engine.run(run_id)?.task_id`,
     /// named so a caller deciding "is this the caller's own task"
     /// (`HarnessTaskMoveResultV1::TaskIsOwn`, D5) reads its intent rather
@@ -9229,6 +9277,47 @@ mod tests {
             BTreeSet::from([root_id, child_id]),
             "a zero depth bound cuts the grandchild generation",
         );
+    }
+
+    /// `task_child_count`/`task_subtree_depth` back `SessionContextV1`'s own
+    /// `child_task_count`/`child_task_subtree_depth` observations. Reuses
+    /// the same three-level tree (root -> child -> grandchild, plus an
+    /// unrelated stranger) `harness_task_subtree_three_level_tree_and_depth_
+    /// bound_cuts` builds, so the depth assertion below exercises a genuine
+    /// two-level subtree beneath the root, not just a single generation.
+    #[test]
+    fn harness_task_child_count_and_subtree_depth_observe_two_level_tree() {
+        let root_id = numbered_task_id(30);
+        let child_id = numbered_task_id(20);
+        let grandchild_id = numbered_task_id(10);
+        let stranger_id = numbered_task_id(99);
+
+        let mut engine = HarnessEngine::new();
+        let root = task(root_id.clone(), 1, "root");
+        let mut child = task(child_id.clone(), 1, "child");
+        child.parent_task_id = Some(root_id.clone());
+        let mut grandchild = task(grandchild_id.clone(), 1, "grandchild");
+        grandchild.parent_task_id = Some(child_id.clone());
+        let stranger = task(stranger_id.clone(), 1, "stranger");
+        for record in [root, child, grandchild, stranger] {
+            engine.tasks.insert(record.task_id.clone(), record);
+        }
+
+        // A task with children: the root has exactly one direct child
+        // (`child`, not `grandchild` -- that one is parented under `child`)
+        // and its deepest chain reaches two generations down.
+        assert_eq!(engine.task_child_count(&root_id), 1);
+        assert_eq!(engine.task_subtree_depth(&root_id), 2);
+
+        assert_eq!(engine.task_child_count(&child_id), 1);
+        assert_eq!(engine.task_subtree_depth(&child_id), 1);
+
+        // A task without children: both observations are zero, never an
+        // error or a refusal -- there is no cap here to compare against.
+        assert_eq!(engine.task_child_count(&grandchild_id), 0);
+        assert_eq!(engine.task_subtree_depth(&grandchild_id), 0);
+        assert_eq!(engine.task_child_count(&stranger_id), 0);
+        assert_eq!(engine.task_subtree_depth(&stranger_id), 0);
     }
 
     #[test]

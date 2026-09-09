@@ -104,9 +104,12 @@ impl HarnessReadClient {
         &self,
         after_task_id: Option<HarnessTaskId>,
         state: Option<HarnessTaskStateV1>,
+        parent_task_id: Option<HarnessTaskId>,
         limit: u16,
     ) -> Result<TaskPageV1, HarnessReadClientError> {
-        match self.send(HarnessReadRequestV1::TasksList { after_task_id, state, limit })? {
+        match self.send(HarnessReadRequestV1::TasksList {
+            after_task_id, state, parent_task_id, limit,
+        })? {
             HarnessReadResponseV1::Tasks(value) => Ok(value),
             _ => Err(HarnessReadClientError::UnexpectedResponse),
         }
@@ -124,9 +127,12 @@ impl HarnessReadClient {
         task_id: Option<HarnessTaskId>,
         after_run_id: Option<HarnessRunId>,
         lifecycle: Option<HarnessRunLifecycleV1>,
+        parent_run_id: Option<HarnessRunId>,
         limit: u16,
     ) -> Result<RunPageV1, HarnessReadClientError> {
-        match self.send(HarnessReadRequestV1::RunsList { task_id, after_run_id, lifecycle, limit })? {
+        match self.send(HarnessReadRequestV1::RunsList {
+            task_id, after_run_id, lifecycle, parent_run_id, limit,
+        })? {
             HarnessReadResponseV1::Runs(value) => Ok(value),
             _ => Err(HarnessReadClientError::UnexpectedResponse),
         }
@@ -569,11 +575,13 @@ impl HarnessOperatorClient {
         &self,
         after_task_id: Option<HarnessTaskId>,
         state: Option<HarnessTaskStateV1>,
+        parent_task_id: Option<HarnessTaskId>,
         limit: u16,
     ) -> Result<TaskPageV1, HarnessOperatorClientError> {
         match self.send(HarnessOperatorRequestV1::TasksList {
             after_task_id,
             state,
+            parent_task_id,
             limit,
         })? {
             HarnessOperatorResponseV1::Tasks(value) => Ok(value),
@@ -609,12 +617,14 @@ impl HarnessOperatorClient {
         task_id: Option<HarnessTaskId>,
         after_run_id: Option<HarnessRunId>,
         lifecycle: Option<HarnessRunLifecycleV1>,
+        parent_run_id: Option<HarnessRunId>,
         limit: u16,
     ) -> Result<RunPageV1, HarnessOperatorClientError> {
         match self.send(HarnessOperatorRequestV1::RunsList {
             task_id,
             after_run_id,
             lifecycle,
+            parent_run_id,
             limit,
         })? {
             HarnessOperatorResponseV1::Runs(value) => Ok(value),
@@ -2096,7 +2106,7 @@ mod tests {
         let client = HarnessOperatorClient::new(endpoint, operator_credential())
             .expect("operator client");
         assert!(matches!(
-            client.tasks_list(None, None, 1),
+            client.tasks_list(None, None, None, 1),
             Err(HarnessOperatorClientError::Host(
                 HarnessOperatorHostErrorV1::Conflict,
             )),

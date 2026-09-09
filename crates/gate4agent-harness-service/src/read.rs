@@ -427,11 +427,17 @@ fn execute_exact_binding_read_only(
                 ObservationAudience::GrantBound,
             )
         }
-        HarnessReadRequestV1::TasksList { after_task_id, state, limit } => {
+        HarnessReadRequestV1::TasksList { after_task_id, state, parent_task_id, limit } => {
+            if parent_task_id.as_ref().is_some_and(|task_id| !visibility.task_visible(task_id)) {
+                return Err(HarnessReadHostErrorV1::NotFoundOrDenied);
+            }
             let mut values = visibility.task_ids()
                 .filter(|task_id| after_task_id.as_ref().map_or(true, |after| *task_id > after))
                 .filter_map(|task_id| engine.task(task_id))
                 .filter(|task| state.map_or(true, |state| task.state == state))
+                .filter(|task| {
+                    parent_task_id.as_ref().map_or(true, |parent| task.parent_task_id.as_ref() == Some(parent))
+                })
                 .map(|task| redact_task(task, visibility))
                 .take(usize::from(limit) + 1)
                 .collect::<Vec<_>>();
@@ -450,8 +456,11 @@ fn execute_exact_binding_read_only(
                 .ok_or(HarnessReadHostErrorV1::NotFoundOrDenied)?;
             Ok(HarnessReadResponseV1::Task(redact_task(task, visibility)))
         }
-        HarnessReadRequestV1::RunsList { task_id, after_run_id, lifecycle, limit } => {
+        HarnessReadRequestV1::RunsList { task_id, after_run_id, lifecycle, parent_run_id, limit } => {
             if task_id.as_ref().is_some_and(|task_id| !visibility.task_visible(task_id)) {
+                return Err(HarnessReadHostErrorV1::NotFoundOrDenied);
+            }
+            if parent_run_id.as_ref().is_some_and(|run_id| !visibility.run_visible(run_id)) {
                 return Err(HarnessReadHostErrorV1::NotFoundOrDenied);
             }
             let mut values = visibility.run_ids()
@@ -459,6 +468,9 @@ fn execute_exact_binding_read_only(
                 .filter_map(|run_id| engine.run(run_id))
                 .filter(|run| task_id.as_ref().map_or(true, |task_id| &run.task_id == task_id))
                 .filter(|run| lifecycle.map_or(true, |lifecycle| run.lifecycle == lifecycle))
+                .filter(|run| {
+                    parent_run_id.as_ref().map_or(true, |parent| run.parent_run_id.as_ref() == Some(parent))
+                })
                 .map(|run| redact_run(run, visibility))
                 .take(usize::from(limit) + 1)
                 .collect::<Vec<_>>();
@@ -807,8 +819,8 @@ fn context(
         sibling_runs,
         read_permissions: grant.read_permissions.clone(),
         monitoring_visibility: grant.monitoring_visibility,
-        maximum_child_count: grant.maximum_child_count,
-        maximum_child_depth: grant.maximum_child_depth,
+        child_task_count: engine.task_child_count(&run.task_id),
+        child_task_subtree_depth: engine.task_subtree_depth(&run.task_id),
         mail: grant.mail,
         task_create: grant.task_permissions.create,
         task_mutate: grant.task_permissions.mutate,
@@ -2010,6 +2022,7 @@ mod tests {
             HarnessReadRequestV1::TasksList {
                 after_task_id: None,
                 state: None,
+                parent_task_id: None,
                 limit: 1,
             },
             HarnessReadRequestV1::TaskGet { task_id },
@@ -2017,6 +2030,7 @@ mod tests {
                 task_id: None,
                 after_run_id: None,
                 lifecycle: None,
+                parent_run_id: None,
                 limit: 1,
             },
             HarnessReadRequestV1::RunGet { run_id },
@@ -2377,6 +2391,140 @@ mod tests {
         ] {
             assert!(!encoded.contains(&forbidden), "task-scoped context leaked {forbidden}");
         }
+        close_observation(observation, &path);
+    }
+
+    fn task_id_child_a() -> HarnessTaskId {
+        HarnessTaskId::new(format!("htask_{}", "e".repeat(24))).unwrap()
+    }
+
+    fn task_id_child_b() -> HarnessTaskId {
+        HarnessTaskId::new(format!("htask_{}", "f".repeat(24))).unwrap()
+    }
+
+    fn task_id_structural_child_outside_scope() -> HarnessTaskId {
+        HarnessTaskId::new(format!("htask_{}", "1".repeat(24))).unwrap()
+    }
+
+    fn task_id_decoy_grandchild() -> HarnessTaskId {
+        HarnessTaskId::new(format!("htask_{}", "2".repeat(24))).unwrap()
+    }
+
+    fn bare_task(task_id: HarnessTaskId, parent_task_id: Option<HarnessTaskId>, creator: HarnessActorV1) -> HarnessTaskV1 {
+        HarnessTaskV1 {
+            task_id,
+            revision: HarnessRevision::new(1).unwrap(),
+            title: "task".to_owned(),
+            body: String::new(),
+            creator,
+            parent_task_id,
+            dependencies: Vec::new(),
+            state: HarnessTaskStateV1::Backlog,
+            run_ids: Vec::new(),
+            result_refs: Vec::new(),
+            artifact_refs: Vec::new(),
+            created_at_unix_ms: 10,
+            updated_at_unix_ms: 10,
+        }
+    }
+
+    /// D-child-observation, scope test: `g4a_tasks_list`'s new
+    /// `parent_task_id` filter is a filter over the grant's EXISTING task
+    /// read scope, never a widening of it. Under `SelfOnly`, a grant already
+    /// sees every task created BY its own actor run (`tasks_attributed_to_
+    /// runs`'s own creator-attribution rule -- the same mechanism that
+    /// already makes a session's `g4a_task_create`d child visible to it) --
+    /// so the two tasks parented under `task_id_a()` AND created by the
+    /// actor's own run come back, but a third task that is a genuine
+    /// structural child of `task_id_a()` yet never attributed to the actor's
+    /// run does not, and neither does an unrelated task's own child. Naming
+    /// a parent the grant cannot see at all is refused outright, the same
+    /// `NotFoundOrDenied` `RunsList{task_id}` already gives for an
+    /// out-of-scope task.
+    #[test]
+    fn tasks_list_parent_filter_never_widens_the_grants_own_task_scope() {
+        let mut checkpoint = crate::credential::tests::engine(
+            1, SessionGrantStateV1::Active, 1, HarnessRunLifecycleV1::Running,
+        ).checkpoint();
+
+        checkpoint.tasks.push(bare_task(
+            task_id_child_a(),
+            Some(task_id_a()),
+            HarnessActorV1::ParentRun { run_id: run_id_1() },
+        ));
+        checkpoint.tasks.push(bare_task(
+            task_id_child_b(),
+            Some(task_id_a()),
+            HarnessActorV1::ParentRun { run_id: run_id_1() },
+        ));
+        checkpoint.tasks.push(bare_task(
+            task_id_structural_child_outside_scope(),
+            Some(task_id_a()),
+            HarnessActorV1::User { actor_id: selector("someone-else") },
+        ));
+        checkpoint.tasks.push(bare_task(
+            task_id_b(),
+            None,
+            HarnessActorV1::User { actor_id: selector("someone-else") },
+        ));
+        checkpoint.tasks.push(bare_task(
+            task_id_decoy_grandchild(),
+            Some(task_id_b()),
+            HarnessActorV1::User { actor_id: selector("someone-else") },
+        ));
+        checkpoint.grants[0].read_permissions.tasks = HarnessEntityReadScopeV1::SelfOnly;
+
+        let mut harness = HarnessService::from_engine_for_test(
+            gate4agent_harness_engine::HarnessEngine::restore(checkpoint).unwrap(),
+        );
+        let path = observation_path("tasks-list-parent-scope");
+        let observation = ObservationService::open(&path).unwrap();
+        let binding = crate::credential::tests::binding(1, 1);
+        let support = ObservationSupportRegistry::default();
+
+        let HarnessReadResponseV1::Tasks(page) = execute_exact_binding_read(
+            &mut harness,
+            &observation,
+            &support,
+            &binding,
+            HarnessReadRequestV1::TasksList {
+                after_task_id: None,
+                state: None,
+                parent_task_id: Some(task_id_a()),
+                limit: 10,
+            },
+            &crate::runtime::HarnessRuntimeInventoryCache::default(),
+        ).unwrap() else {
+            panic!("tasks page expected");
+        };
+        let mut returned: Vec<HarnessTaskId> =
+            page.tasks.iter().map(|task| task.task_id.clone()).collect();
+        returned.sort();
+        let mut expected = vec![task_id_child_a(), task_id_child_b()];
+        expected.sort();
+        assert_eq!(
+            returned, expected,
+            "only the actor's own children -- never a structurally-real child outside scope",
+        );
+
+        let denied = execute_exact_binding_read(
+            &mut harness,
+            &observation,
+            &support,
+            &binding,
+            HarnessReadRequestV1::TasksList {
+                after_task_id: None,
+                state: None,
+                parent_task_id: Some(task_id_b()),
+                limit: 10,
+            },
+            &crate::runtime::HarnessRuntimeInventoryCache::default(),
+        );
+        assert!(matches!(
+            denied,
+            Err(HarnessReadHostErrorV1::NotFoundOrDenied),
+        ), "a parent outside the grant's scope is refused, never silently empty");
+
         close_observation(observation, &path);
     }
 

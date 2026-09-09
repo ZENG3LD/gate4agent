@@ -51,14 +51,20 @@ impl HarnessMcpBackend for HarnessReadClient {
             HarnessMcpToolCall::TimelineRead { run_id, after_sequence, limit } => {
                 HarnessReadResponseV1::Timeline(self.timeline_read(run_id, after_sequence, limit).map_err(HarnessMcpBackendError::from)?)
             }
-            HarnessMcpToolCall::TasksList { after_task_id, state, limit } => {
-                HarnessReadResponseV1::Tasks(self.tasks_list(after_task_id, state, limit).map_err(HarnessMcpBackendError::from)?)
+            HarnessMcpToolCall::TasksList { after_task_id, state, parent_task_id, limit } => {
+                HarnessReadResponseV1::Tasks(
+                    self.tasks_list(after_task_id, state, parent_task_id, limit)
+                        .map_err(HarnessMcpBackendError::from)?,
+                )
             }
             HarnessMcpToolCall::TaskGet { task_id } => {
                 HarnessReadResponseV1::Task(self.task_get(task_id).map_err(HarnessMcpBackendError::from)?)
             }
-            HarnessMcpToolCall::RunsList { task_id, after_run_id, lifecycle, limit } => {
-                HarnessReadResponseV1::Runs(self.runs_list(task_id, after_run_id, lifecycle, limit).map_err(HarnessMcpBackendError::from)?)
+            HarnessMcpToolCall::RunsList { task_id, after_run_id, lifecycle, parent_run_id, limit } => {
+                HarnessReadResponseV1::Runs(
+                    self.runs_list(task_id, after_run_id, lifecycle, parent_run_id, limit)
+                        .map_err(HarnessMcpBackendError::from)?,
+                )
             }
             HarnessMcpToolCall::RunGet { run_id } => {
                 HarnessReadResponseV1::Run(self.run_get(run_id).map_err(HarnessMcpBackendError::from)?)
@@ -126,12 +132,12 @@ fn tool_call_request(call: HarnessMcpToolCall) -> HarnessReadRequestV1 {
         HarnessMcpToolCall::TimelineRead { run_id, after_sequence, limit } => {
             HarnessReadRequestV1::TimelineRead { run_id, after_sequence, limit }
         }
-        HarnessMcpToolCall::TasksList { after_task_id, state, limit } => {
-            HarnessReadRequestV1::TasksList { after_task_id, state, limit }
+        HarnessMcpToolCall::TasksList { after_task_id, state, parent_task_id, limit } => {
+            HarnessReadRequestV1::TasksList { after_task_id, state, parent_task_id, limit }
         }
         HarnessMcpToolCall::TaskGet { task_id } => HarnessReadRequestV1::TaskGet { task_id },
-        HarnessMcpToolCall::RunsList { task_id, after_run_id, lifecycle, limit } => {
-            HarnessReadRequestV1::RunsList { task_id, after_run_id, lifecycle, limit }
+        HarnessMcpToolCall::RunsList { task_id, after_run_id, lifecycle, parent_run_id, limit } => {
+            HarnessReadRequestV1::RunsList { task_id, after_run_id, lifecycle, parent_run_id, limit }
         }
         HarnessMcpToolCall::RunGet { run_id } => HarnessReadRequestV1::RunGet { run_id },
         HarnessMcpToolCall::OperationGet { operation_id } => {
@@ -164,12 +170,27 @@ pub enum HarnessMcpToolCall {
     ContextGet,
     MonitorGet { run_id: Option<HarnessRunId> },
     TimelineRead { run_id: Option<HarnessRunId>, after_sequence: Option<u64>, limit: u16 },
-    TasksList { after_task_id: Option<HarnessTaskId>, state: Option<HarnessTaskStateV1>, limit: u16 },
+    TasksList {
+        after_task_id: Option<HarnessTaskId>,
+        state: Option<HarnessTaskStateV1>,
+        /// "What did this task spawn": a session's own children, via a
+        /// session's own `g4a_tasks_list`. Carried straight through onto
+        /// `HarnessReadRequestV1::TasksList`'s own `parent_task_id`, which
+        /// enforces the caller's existing read scope service-side (see that
+        /// field's own doc comment) -- this tool call type adds no scope
+        /// logic of its own, the same way none of its other filters do.
+        parent_task_id: Option<HarnessTaskId>,
+        limit: u16,
+    },
     TaskGet { task_id: HarnessTaskId },
     RunsList {
         task_id: Option<HarnessTaskId>,
         after_run_id: Option<HarnessRunId>,
         lifecycle: Option<HarnessRunLifecycleV1>,
+        /// "What did this run spawn". Same wiring as `TasksList`'s own
+        /// `parent_task_id` above, over `HarnessReadRequestV1::RunsList`'s
+        /// `parent_run_id`.
+        parent_run_id: Option<HarnessRunId>,
         limit: u16,
     },
     RunGet { run_id: HarnessRunId },
@@ -732,7 +753,17 @@ struct TimelineArgs { run_id: Option<String>, after_sequence: Option<u64>, #[ser
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct TasksListArgs { after_task_id: Option<String>, state: Option<HarnessTaskStateV1>, #[serde(default = "default_limit")] limit: u16 }
+struct TasksListArgs {
+    after_task_id: Option<String>,
+    state: Option<HarnessTaskStateV1>,
+    /// "What did this task spawn" -- a session's own children. Additive
+    /// (`#[serde(default)]`) so a caller built before this field existed
+    /// still calls `g4a_tasks_list` unchanged.
+    #[serde(default)]
+    parent_task_id: Option<String>,
+    #[serde(default = "default_limit")]
+    limit: u16,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -744,6 +775,10 @@ struct RunsListArgs {
     task_id: Option<String>,
     after_run_id: Option<String>,
     lifecycle: Option<HarnessRunLifecycleV1>,
+    /// "What did this run spawn" -- additive (`#[serde(default)]`), mirrors
+    /// `TasksListArgs::parent_task_id` above.
+    #[serde(default)]
+    parent_run_id: Option<String>,
     #[serde(default = "default_limit")]
     limit: u16,
 }
@@ -863,6 +898,7 @@ fn parse_tool_call(name: &str, arguments: Value) -> Result<HarnessMcpToolCall, (
             Ok(HarnessMcpToolCall::TasksList {
                 after_task_id: parse_optional(args.after_task_id, HarnessTaskId::new)?,
                 state: args.state,
+                parent_task_id: parse_optional(args.parent_task_id, HarnessTaskId::new)?,
                 limit: args.limit,
             })
         }
@@ -877,6 +913,7 @@ fn parse_tool_call(name: &str, arguments: Value) -> Result<HarnessMcpToolCall, (
                 task_id: parse_optional(args.task_id, HarnessTaskId::new)?,
                 after_run_id: parse_optional(args.after_run_id, HarnessRunId::new)?,
                 lifecycle: args.lifecycle,
+                parent_run_id: parse_optional(args.parent_run_id, HarnessRunId::new)?,
                 limit: args.limit,
             })
         }
@@ -949,9 +986,9 @@ fn tool_definitions() -> Vec<Value> {
         tool("g4a_context_get", "Read the effective harness grant context.", object_schema(vec![], vec![])),
         tool("g4a_monitor_get", "Read the redacted monitoring projection.", object_schema(vec![("run_id", string_schema())], vec![])),
         tool("g4a_timeline_read", "Read a bounded redacted activity timeline.", object_schema(vec![("run_id", string_schema()), ("after_sequence", integer_schema(1, u64::MAX)), ("limit", integer_schema(1, 128))], vec![])),
-        tool("g4a_tasks_list", "List visible harness tasks.", object_schema(vec![("after_task_id", string_schema()), ("state", enum_schema(&["backlog","ready","running","waiting","review","done","failed","cancelled"])), ("limit", integer_schema(1, 64))], vec![])),
+        tool("g4a_tasks_list", "List visible harness tasks.", object_schema(vec![("after_task_id", string_schema()), ("state", enum_schema(&["backlog","ready","running","waiting","review","done","failed","cancelled"])), ("parent_task_id", string_schema()), ("limit", integer_schema(1, 64))], vec![])),
         tool("g4a_tasks_get", "Read one visible harness task.", object_schema(vec![("task_id", string_schema())], vec!["task_id"])),
-        tool("g4a_runs_list", "List visible harness runs.", object_schema(vec![("task_id", string_schema()), ("after_run_id", string_schema()), ("lifecycle", enum_schema(&["requested","preparing","dispatching","outcome-unknown","running","waiting","completed","failed","cancelled"])), ("limit", integer_schema(1, 64))], vec![])),
+        tool("g4a_runs_list", "List visible harness runs.", object_schema(vec![("task_id", string_schema()), ("after_run_id", string_schema()), ("lifecycle", enum_schema(&["requested","preparing","dispatching","outcome-unknown","running","waiting","completed","failed","cancelled"])), ("parent_run_id", string_schema()), ("limit", integer_schema(1, 64))], vec![])),
         tool("g4a_runs_get", "Read one visible harness run.", object_schema(vec![("run_id", string_schema())], vec!["run_id"])),
         tool("g4a_operation_get", "Read one visible harness operation.", object_schema(vec![("operation_id", string_schema())], vec!["operation_id"])),
         // Ordered to match `HARNESS_WRITE_TOOL_IDS` (alphabetical), the same
@@ -1278,8 +1315,8 @@ mod tests {
                     operations: HarnessEntityReadScopeV1::None,
                 },
                 monitoring_visibility: HarnessMonitoringVisibilityV1::None,
-                maximum_child_count: 0,
-                maximum_child_depth: 0,
+                child_task_count: 0,
+                child_task_subtree_depth: 0,
                 mail: self.mail_enabled.get(),
                 task_create: false,
                 task_mutate: false,

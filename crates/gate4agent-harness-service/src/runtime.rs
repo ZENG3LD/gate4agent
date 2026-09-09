@@ -9722,12 +9722,15 @@ fn execute_operator_request(
                 limit,
             ).map_err(map_operator_read_error)?,
         ),
-        HarnessOperatorRequestV1::TasksList { after_task_id, state, limit } => {
+        HarnessOperatorRequestV1::TasksList { after_task_id, state, parent_task_id, limit } => {
             let mut tasks = harness.engine().tasks()
                 .filter(|task| {
                     after_task_id.as_ref().map_or(true, |after| &task.task_id > after)
                 })
                 .filter(|task| state.map_or(true, |state| task.state == state))
+                .filter(|task| {
+                    parent_task_id.as_ref().map_or(true, |parent| task.parent_task_id.as_ref() == Some(parent))
+                })
                 .map(redact_operator_task)
                 .take(usize::from(limit) + 1)
                 .collect::<Vec<_>>();
@@ -9762,6 +9765,7 @@ fn execute_operator_request(
             task_id,
             after_run_id,
             lifecycle,
+            parent_run_id,
             limit,
         } => {
             let mut runs = harness.engine().runs()
@@ -9770,6 +9774,9 @@ fn execute_operator_request(
                 })
                 .filter(|run| task_id.as_ref().map_or(true, |task_id| &run.task_id == task_id))
                 .filter(|run| lifecycle.map_or(true, |lifecycle| run.lifecycle == lifecycle))
+                .filter(|run| {
+                    parent_run_id.as_ref().map_or(true, |parent| run.parent_run_id.as_ref() == Some(parent))
+                })
                 .map(redact_operator_run)
                 .take(usize::from(limit) + 1)
                 .collect::<Vec<_>>();
@@ -13884,6 +13891,266 @@ mod tests {
             node_id: route.node_id.clone(),
             cursor: NodeCursor { incarnation_id: route.expected_incarnation_id, sequence },
             event: C2NodeEvent::SessionRecordUpserted { record },
+        }
+    }
+
+    /// D-child-observation: `HarnessOperatorRequestV1::TasksList`'s new
+    /// `parent_task_id` filter -- a page filtered by a task returns exactly
+    /// its direct children, never the task itself, a deeper descendant, or
+    /// an unrelated task. Builds a four-generation-wide tree (root,
+    /// two direct children, one grandchild under the first child, and one
+    /// wholly unrelated task) directly via `HarnessEngine::restore`, the
+    /// same minimal-checkpoint shape `running_harness_fixture` uses.
+    #[test]
+    fn tasks_list_filtered_by_parent_returns_exactly_direct_children() {
+        let root_id = HarnessTaskId::new(format!("htask_{}", "1".repeat(24))).unwrap();
+        let child_a_id = HarnessTaskId::new(format!("htask_{}", "2".repeat(24))).unwrap();
+        let child_b_id = HarnessTaskId::new(format!("htask_{}", "3".repeat(24))).unwrap();
+        let grandchild_id = HarnessTaskId::new(format!("htask_{}", "4".repeat(24))).unwrap();
+        let unrelated_id = HarnessTaskId::new(format!("htask_{}", "5".repeat(24))).unwrap();
+        let actor = HarnessActorV1::User { actor_id: selector("operator") };
+        let build_task = |task_id: HarnessTaskId, parent_task_id: Option<HarnessTaskId>| {
+            HarnessTaskV1 {
+                task_id,
+                revision: HarnessRevision::new(1).unwrap(),
+                title: "task".to_owned(),
+                body: "body".to_owned(),
+                creator: actor.clone(),
+                parent_task_id,
+                dependencies: Vec::new(),
+                state: HarnessTaskStateV1::Backlog,
+                run_ids: Vec::new(),
+                result_refs: Vec::new(),
+                artifact_refs: Vec::new(),
+                created_at_unix_ms: 1,
+                updated_at_unix_ms: 1,
+            }
+        };
+        let tasks = vec![
+            build_task(root_id.clone(), None),
+            build_task(child_a_id.clone(), Some(root_id.clone())),
+            build_task(child_b_id.clone(), Some(root_id.clone())),
+            build_task(grandchild_id, Some(child_a_id.clone())),
+            build_task(unrelated_id, None),
+        ];
+        let engine = HarnessEngine::restore(HarnessEngineCheckpointV1 {
+            version: HARNESS_ENGINE_CHECKPOINT_VERSION_V1,
+            tasks,
+            runs: Vec::new(),
+            grants: Vec::new(),
+            operations: Vec::new(),
+            execution_specs: Vec::new(),
+            issuances: Vec::new(),
+            execution_specs_v2: Vec::new(),
+            deliveries: Vec::new(),
+            continuations: Vec::new(),
+            mail_messages: Vec::new(),
+            mail_acks: Vec::new(),
+        }).unwrap();
+        let mut harness = HarnessService::from_engine_for_test(engine);
+        let observation_path = database_path();
+        let observation = ObservationService::open(&observation_path).unwrap();
+        let response = execute_operator_request(
+            &mut harness,
+            &observation,
+            &ObservationSupportRegistry::default(),
+            &HarnessLaunchCatalog::default(),
+            &DeliveryCatalogV2::default(),
+            &HarnessRuntimeInventoryCache::default(),
+            &TerminalBufferRegistry::default(),
+            HarnessOperatorRequestV1::TasksList {
+                after_task_id: None,
+                state: None,
+                parent_task_id: Some(root_id.clone()),
+                limit: 10,
+            },
+        ).unwrap();
+        let HarnessOperatorResponseV1::Tasks(page) = response else {
+            panic!("tasks page expected");
+        };
+        let mut returned: Vec<HarnessTaskId> =
+            page.tasks.iter().map(|task| task.task_id.clone()).collect();
+        returned.sort();
+        let mut expected = vec![child_a_id, child_b_id];
+        expected.sort();
+        assert_eq!(returned, expected);
+        assert!(page.next_cursor.is_none());
+
+        observation.close().unwrap();
+        for candidate in [
+            observation_path.clone(),
+            PathBuf::from(format!("{}-wal", observation_path.display())),
+            PathBuf::from(format!("{}-shm", observation_path.display())),
+        ] {
+            let _ = fs::remove_file(candidate);
+        }
+    }
+
+    /// Same proof as `tasks_list_filtered_by_parent_returns_exactly_direct_
+    /// children`, over `HarnessOperatorRequestV1::RunsList`'s new
+    /// `parent_run_id` filter and the run graph instead of the task graph:
+    /// a parent run, two of its direct children, a grandchild run under the
+    /// first child, and one wholly unrelated run, all attributed to one
+    /// shared task (the filter is about `parent_run_id`, not the task
+    /// graph, so a single task suffices).
+    #[test]
+    fn runs_list_filtered_by_parent_run_returns_exactly_direct_children() {
+        let task_id = HarnessTaskId::new(format!("htask_{}", "6".repeat(24))).unwrap();
+        let actor = HarnessActorV1::User { actor_id: selector("operator") };
+        let task = HarnessTaskV1 {
+            task_id: task_id.clone(),
+            revision: HarnessRevision::new(1).unwrap(),
+            title: "shared task".to_owned(),
+            body: "body".to_owned(),
+            creator: actor.clone(),
+            parent_task_id: None,
+            dependencies: Vec::new(),
+            state: HarnessTaskStateV1::Running,
+            run_ids: Vec::new(),
+            result_refs: Vec::new(),
+            artifact_refs: Vec::new(),
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+        };
+
+        let parent_run_id = HarnessRunId::new(format!("hrun_{}", "1".repeat(24))).unwrap();
+        let child_a_run_id = HarnessRunId::new(format!("hrun_{}", "2".repeat(24))).unwrap();
+        let child_b_run_id = HarnessRunId::new(format!("hrun_{}", "3".repeat(24))).unwrap();
+        let grandchild_run_id = HarnessRunId::new(format!("hrun_{}", "4".repeat(24))).unwrap();
+        let unrelated_run_id = HarnessRunId::new(format!("hrun_{}", "5".repeat(24))).unwrap();
+
+        let build_run_and_operation = |
+            run_id: HarnessRunId,
+            parent_run_id: Option<HarnessRunId>,
+            digest_char: char,
+        | {
+            let operation_id = HarnessOperationId::new(format!(
+                "hop_{}", digest_char.to_string().repeat(24),
+            )).unwrap();
+            let run = HarnessRunV1 {
+                run_id: run_id.clone(),
+                revision: HarnessRevision::new(1).unwrap(),
+                parent_run_id,
+                task_id: task_id.clone(),
+                operation_id: operation_id.clone(),
+                intent: HarnessRunIntentV1 {
+                    node_id: selector("node-a"),
+                    workspace_id: selector("workspace-a"),
+                    worktree: HarnessWorktreeIntentV1::Existing,
+                    provider_profile: selector("profile-a"),
+                    mode: HarnessExecutionModeV1::Pty,
+                    delivery_bundle: None,
+                    continuation: None,
+                },
+                delivery_receipt: None,
+                continuation_receipt: None,
+                context_pack: None,
+                git_facts: None,
+                binding: None,
+                lifecycle: HarnessRunLifecycleV1::Running,
+                result_disposition: None,
+                failure: None,
+                created_at_unix_ms: 1,
+                updated_at_unix_ms: 1,
+            };
+            let operation = HarnessOperationV1 {
+                operation_id,
+                revision: HarnessRevision::new(1).unwrap(),
+                actor: actor.clone(),
+                kind: HarnessOperationKindV1::CreateRun,
+                state: HarnessOperationStateV1::Succeeded,
+                task_id: Some(task_id.clone()),
+                run_id: Some(run_id),
+                grant_id: None,
+                reconciles_operation_id: None,
+                expected_revision: Some(HarnessRevision::new(1).unwrap()),
+                request_digest: HarnessRequestDigest::new(
+                    digest_char.to_string().repeat(64),
+                ).unwrap(),
+                idempotency_ref: HarnessIdempotencyRef::new(format!(
+                    "hidem_{}", digest_char.to_string().repeat(24),
+                )).unwrap(),
+                failure: None,
+                outcome_unknown_reason: None,
+                reconciliation_outcome: None,
+                created_at_unix_ms: 1,
+                updated_at_unix_ms: 1,
+                dispatched_at_unix_ms: Some(1),
+                finished_at_unix_ms: Some(1),
+            };
+            (run, operation)
+        };
+
+        let (parent_run, parent_operation) = build_run_and_operation(
+            parent_run_id.clone(), None, '1',
+        );
+        let (child_a_run, child_a_operation) = build_run_and_operation(
+            child_a_run_id.clone(), Some(parent_run_id.clone()), '2',
+        );
+        let (child_b_run, child_b_operation) = build_run_and_operation(
+            child_b_run_id.clone(), Some(parent_run_id.clone()), '3',
+        );
+        let (grandchild_run, grandchild_operation) = build_run_and_operation(
+            grandchild_run_id, Some(child_a_run_id.clone()), '4',
+        );
+        let (unrelated_run, unrelated_operation) = build_run_and_operation(
+            unrelated_run_id, None, '5',
+        );
+
+        let engine = HarnessEngine::restore(HarnessEngineCheckpointV1 {
+            version: HARNESS_ENGINE_CHECKPOINT_VERSION_V1,
+            tasks: vec![task],
+            runs: vec![parent_run, child_a_run, child_b_run, grandchild_run, unrelated_run],
+            grants: Vec::new(),
+            operations: vec![
+                parent_operation, child_a_operation, child_b_operation,
+                grandchild_operation, unrelated_operation,
+            ],
+            execution_specs: Vec::new(),
+            issuances: Vec::new(),
+            execution_specs_v2: Vec::new(),
+            deliveries: Vec::new(),
+            continuations: Vec::new(),
+            mail_messages: Vec::new(),
+            mail_acks: Vec::new(),
+        }).unwrap();
+        let mut harness = HarnessService::from_engine_for_test(engine);
+        let observation_path = database_path();
+        let observation = ObservationService::open(&observation_path).unwrap();
+        let response = execute_operator_request(
+            &mut harness,
+            &observation,
+            &ObservationSupportRegistry::default(),
+            &HarnessLaunchCatalog::default(),
+            &DeliveryCatalogV2::default(),
+            &HarnessRuntimeInventoryCache::default(),
+            &TerminalBufferRegistry::default(),
+            HarnessOperatorRequestV1::RunsList {
+                task_id: None,
+                after_run_id: None,
+                lifecycle: None,
+                parent_run_id: Some(parent_run_id.clone()),
+                limit: 10,
+            },
+        ).unwrap();
+        let HarnessOperatorResponseV1::Runs(page) = response else {
+            panic!("runs page expected");
+        };
+        let mut returned: Vec<HarnessRunId> =
+            page.runs.iter().map(|run| run.run_id.clone()).collect();
+        returned.sort();
+        let mut expected = vec![child_a_run_id, child_b_run_id];
+        expected.sort();
+        assert_eq!(returned, expected);
+        assert!(page.next_cursor.is_none());
+
+        observation.close().unwrap();
+        for candidate in [
+            observation_path.clone(),
+            PathBuf::from(format!("{}-wal", observation_path.display())),
+            PathBuf::from(format!("{}-shm", observation_path.display())),
+        ] {
+            let _ = fs::remove_file(candidate);
         }
     }
 

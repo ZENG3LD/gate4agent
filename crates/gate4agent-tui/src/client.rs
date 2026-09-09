@@ -4450,6 +4450,12 @@ fn project_harness_read_failure(error: HarnessOperatorClientError) -> HarnessRea
                 "issued-execution-cas-mismatch"
             }
             HarnessOperatorHostErrorV1::TaskNotReady => "task-not-ready",
+            HarnessOperatorHostErrorV1::TaskDependenciesNotDone { .. } => {
+                "task-dependencies-not-done"
+            }
+            HarnessOperatorHostErrorV1::TaskStartBlockedByRun { .. } => {
+                "task-start-blocked-by-run"
+            }
             HarnessOperatorHostErrorV1::SchedulerResourceExhausted => {
                 "scheduler-resource-exhausted"
             }
@@ -4743,11 +4749,11 @@ fn load_harness_snapshot(
     client: &HarnessOperatorClient,
 ) -> Result<(Vec<RedactedTaskV1>, Vec<RedactedRunV1>), String> {
     let tasks = collect_harness_task_pages(|cursor| {
-        client.tasks_list(cursor, None, HARNESS_SNAPSHOT_PAGE_SIZE)
+        client.tasks_list(cursor, None, None, HARNESS_SNAPSHOT_PAGE_SIZE)
             .map_err(|error| error.to_string())
     })?;
     let runs = collect_harness_run_pages(|cursor| {
-        client.runs_list(None, cursor, None, HARNESS_SNAPSHOT_PAGE_SIZE)
+        client.runs_list(None, cursor, None, None, HARNESS_SNAPSHOT_PAGE_SIZE)
             .map_err(|error| error.to_string())
     })?;
     Ok((tasks, runs))

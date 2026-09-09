@@ -587,6 +587,7 @@ dependencies = [
  "gate4agent-observation-protocol",
  "serde",
  "thiserror 2.0.20",
+ "tracing",
 ]
 
 [[package]]

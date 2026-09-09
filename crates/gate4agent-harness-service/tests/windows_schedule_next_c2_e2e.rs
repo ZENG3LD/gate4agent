@@ -302,7 +302,7 @@ async fn schedule_next_replay_and_harness_restart_do_not_resend() {
     }).await.expect("provider did not create exact started marker");
     let run_id = timeout(Duration::from_secs(10), async {
         loop {
-            let tasks = client.tasks_list(None, None, 10).unwrap();
+            let tasks = client.tasks_list(None, None, None, 10).unwrap();
             let task = tasks.tasks.iter().find(|task| task.task_id == task_id).unwrap();
             if task.state == HarnessTaskStateV1::Running {
                 let run_id = task.run_ids.first().cloned().unwrap();
@@ -360,7 +360,7 @@ async fn schedule_next_replay_and_harness_restart_do_not_resend() {
             sleep(Duration::from_millis(20)).await;
         }
     }).await.expect("run/task did not become Completed/Review");
-    let runs = client.runs_list(Some(task_id.clone()), None, None, 10).unwrap();
+    let runs = client.runs_list(Some(task_id.clone()), None, None, None, 10).unwrap();
     assert_eq!(runs.runs.len(), 1);
     assert_eq!(client.task_get(task_id).unwrap().body, body);
 

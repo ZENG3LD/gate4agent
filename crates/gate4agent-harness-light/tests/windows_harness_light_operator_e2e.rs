@@ -369,7 +369,7 @@ async fn windows_harness_light_operator_session_verbs_and_typed_rejections() {
 
     // TasksList: light mode has no task kernel, so this is an honestly
     // empty page, not a typed rejection.
-    let tasks = client.tasks_list(None, None, 16).unwrap();
+    let tasks = client.tasks_list(None, None, None, 16).unwrap();
     assert!(tasks.tasks.is_empty());
     assert!(tasks.next_cursor.is_none());
 

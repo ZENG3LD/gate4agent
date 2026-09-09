@@ -442,6 +442,7 @@ async fn tui_skin_reconnect_preserves_harness_owned_c2_workflow() {
     let mut ready_tasks = tui.tasks_list(
         None,
         Some(HarnessTaskStateV1::Ready),
+        None,
         10,
     ).unwrap().tasks;
     ready_tasks.retain(|task| task.title.starts_with(task_title));

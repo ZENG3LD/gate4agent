@@ -6,7 +6,8 @@ use gate4agent_harness_client::{
     HarnessMailAddressV1, HarnessMailMessageId, HarnessMailRefV1, HarnessOperationId,
     HarnessReadClient,
     HarnessReadClientError, HarnessReadCredential, HarnessReadHostErrorV1, HarnessReadResponseV1,
-    HarnessRevision, HarnessRunId, HarnessRunLifecycleV1, HarnessSelectorV1, HarnessTaskId, HarnessTaskStateV1,
+    HarnessRevision, HarnessRunFinishOutcomeV1, HarnessRunId, HarnessRunLifecycleV1,
+    HarnessSelectorV1, HarnessTaskId, HarnessTaskStateV1,
     SessionContextV1, HARNESS_MAIL_REFS_MAX, HARNESS_READ_REQUEST_MAX_BYTES,
     HARNESS_READ_RESPONSE_MAX_BYTES,
     HARNESS_READ_TOOL_IDS, HARNESS_WRITE_TOOL_IDS,
@@ -93,6 +94,11 @@ impl HarnessMcpBackend for HarnessReadClient {
                     self.task_move(task_id, expected_revision, to).map_err(HarnessMcpBackendError::from)?,
                 )
             }
+            HarnessMcpToolCall::RunFinish { outcome, summary } => {
+                HarnessReadResponseV1::RunFinish(
+                    self.run_finish(outcome, summary).map_err(HarnessMcpBackendError::from)?,
+                )
+            }
         };
         Ok(response)
     }
@@ -147,6 +153,9 @@ fn tool_call_request(call: HarnessMcpToolCall) -> HarnessReadRequestV1 {
         HarnessMcpToolCall::TaskMove { task_id, expected_revision, to } => {
             HarnessReadRequestV1::TaskMove { task_id, expected_revision, to }
         }
+        HarnessMcpToolCall::RunFinish { outcome, summary } => {
+            HarnessReadRequestV1::RunFinish { outcome, summary }
+        }
     }
 }
 
@@ -184,6 +193,10 @@ pub enum HarnessMcpToolCall {
         task_id: HarnessTaskId,
         expected_revision: HarnessRevision,
         to: HarnessTaskStateV1,
+    },
+    RunFinish {
+        outcome: HarnessRunFinishOutcomeV1,
+        summary: Option<String>,
     },
 }
 
@@ -786,6 +799,13 @@ struct TaskMoveArgs {
     to: HarnessTaskStateV1,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunFinishArgs {
+    outcome: HarnessRunFinishOutcomeV1,
+    summary: Option<String>,
+}
+
 fn parse_mail_address(args: MailAddressArgs) -> Result<HarnessMailAddressV1, ()> {
     match (args.session, args.task) {
         (Some(record_id), None) => Ok(HarnessMailAddressV1::Session {
@@ -912,6 +932,10 @@ fn parse_tool_call(name: &str, arguments: Value) -> Result<HarnessMcpToolCall, (
                 to: args.to,
             })
         }
+        "g4a_run_finish" => {
+            let args: RunFinishArgs = serde_json::from_value(arguments).map_err(|_| ())?;
+            Ok(HarnessMcpToolCall::RunFinish { outcome: args.outcome, summary: args.summary })
+        }
         _ => Err(()),
     }
 }
@@ -970,6 +994,16 @@ fn tool_definitions() -> Vec<Value> {
                 ("reply_to", string_schema()),
                 ("refs", mail_refs_schema()),
             ], vec!["to", "subject", "body"]),
+            false,
+            false,
+        ),
+        tool_with_hints(
+            "g4a_run_finish",
+            "Report this session's OWN run finished -- there is no run-id argument, only the caller's own run. `done` moves the run to Completed and its task to Review (never Done -- an operator must still review it); `failed` moves both to Failed and records a retryable failure. Not idempotent: a second call against an already-finished run is refused by name as already-finished, not repeated as a no-op. `summary`, when given, is posted as mail to the task's own forum; a mail failure never undoes the finish.",
+            object_schema(vec![
+                ("outcome", enum_schema(&["done", "failed"])),
+                ("summary", body_schema()),
+            ], vec!["outcome"]),
             false,
             false,
         ),
@@ -1274,8 +1308,15 @@ mod tests {
 
     fn fixture() -> FixtureBackend {
         FixtureBackend {
+            // `g4a_run_finish` is unconditional (never gated by a grant
+            // permission, see `HARNESS_WRITE_TOOL_IDS`'s own doc comment),
+            // so it belongs in every fixture's `allowed_tool_ids` the same
+            // way `g4a_context_get` already does -- `SessionContextV1::
+            // validate` requires this list to equal exactly what
+            // `expected_allowed_tool_ids` derives.
             allowed: RefCell::new(vec![
                 "g4a_context_get".to_owned(),
+                "g4a_run_finish".to_owned(),
                 "g4a_tasks_get".to_owned(),
                 "g4a_tasks_list".to_owned(),
             ]),
@@ -1331,16 +1372,24 @@ mod tests {
         initialize(&mut server);
         let listed = request(&mut server, json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}));
         let tools = listed["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 3);
+        assert_eq!(tools.len(), 4);
         assert_eq!(tools[0]["name"], "g4a_context_get");
         assert_eq!(tools[1]["name"], "g4a_tasks_list");
         assert_eq!(tools[2]["name"], "g4a_tasks_get");
+        // `g4a_run_finish` is unconditional, so it survives even the
+        // narrowed re-list below -- last here because `tool_definitions()`
+        // enumerates every read before any write, and `g4a_run_finish` is
+        // the only write this narrowed grant still carries.
+        assert_eq!(tools[3]["name"], "g4a_run_finish");
         assert!(tools.iter().all(|tool| tool["inputSchema"]["additionalProperties"] == false));
 
-        server.backend.allowed.replace(vec!["g4a_context_get".to_owned()]);
+        server.backend.allowed.replace(vec!["g4a_context_get".to_owned(), "g4a_run_finish".to_owned()]);
         server.backend.tasks_enabled.set(false);
         let relisted = request(&mut server, json!({"jsonrpc":"2.0","id":3,"method":"tools/list"}));
-        assert_eq!(relisted["result"]["tools"].as_array().unwrap().len(), 1);
+        let relisted_tools = relisted["result"]["tools"].as_array().unwrap();
+        assert_eq!(relisted_tools.len(), 2);
+        assert_eq!(relisted_tools[0]["name"], "g4a_context_get");
+        assert_eq!(relisted_tools[1]["name"], "g4a_run_finish");
     }
 
     #[test]
@@ -1416,7 +1465,7 @@ mod tests {
     }
 
     #[test]
-    fn all_eight_tool_schemas_are_stable_and_closed() {
+    fn all_tool_schemas_are_stable_and_closed() {
         let tools = tool_definitions();
         assert_eq!(tools.len(), HARNESS_READ_TOOL_IDS.len() + HARNESS_WRITE_TOOL_IDS.len());
         let expected_names = HARNESS_READ_TOOL_IDS.iter().chain(HARNESS_WRITE_TOOL_IDS.iter());
@@ -1479,6 +1528,48 @@ mod tests {
         ).is_err());
     }
 
+    /// S10: `g4a_run_finish` is listed with a closed schema naming `outcome`
+    /// as the only required argument, its arguments parse into
+    /// `HarnessMcpToolCall::RunFinish` with `summary` defaulting to `None`
+    /// when omitted, and a bad `outcome` value is rejected at parse time
+    /// (invalid params) before it ever reaches the backend.
+    #[test]
+    fn run_finish_tool_is_listed_parses_and_rejects_a_bad_outcome_at_parse_time() {
+        let mut server = HarnessMcpServer::new(fixture());
+        initialize(&mut server);
+        let listed = request(&mut server, json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}));
+        let tools = listed["result"]["tools"].as_array().unwrap();
+        let run_finish = tools.iter()
+            .find(|tool| tool["name"] == "g4a_run_finish")
+            .expect("g4a_run_finish is listed");
+        assert_eq!(run_finish["inputSchema"]["required"], json!(["outcome"]));
+        assert_eq!(run_finish["inputSchema"]["properties"]["outcome"]["enum"], json!(["done", "failed"]));
+
+        let call = parse_tool_call(
+            "g4a_run_finish",
+            json!({ "outcome": "done", "summary": "handed off cleanly" }),
+        ).unwrap();
+        assert_eq!(call, HarnessMcpToolCall::RunFinish {
+            outcome: HarnessRunFinishOutcomeV1::Done,
+            summary: Some("handed off cleanly".to_owned()),
+        });
+
+        let without_summary = parse_tool_call("g4a_run_finish", json!({ "outcome": "failed" })).unwrap();
+        assert_eq!(without_summary, HarnessMcpToolCall::RunFinish {
+            outcome: HarnessRunFinishOutcomeV1::Failed,
+            summary: None,
+        });
+
+        assert!(parse_tool_call("g4a_run_finish", json!({ "outcome": "in-progress" })).is_err());
+
+        let rejected = request(&mut server, json!({
+            "jsonrpc":"2.0","id":3,"method":"tools/call",
+            "params":{"name":"g4a_run_finish","arguments":{"outcome":"in-progress"}}
+        }));
+        assert_eq!(rejected["error"]["code"], -32602);
+        assert_eq!(server.backend.calls.get(), 0);
+    }
+
     /// D7: "not an authority channel, by construction and by test." No
     /// catalog id resembles `ResolveInteraction` (the sole approval-answering
     /// verb, operator-wire only) and `tools/call` refuses that exact name by
@@ -1486,10 +1577,10 @@ mod tests {
     /// not_found_and_object_denial_is_generic` above already exercises for a
     /// legitimate-but-ungranted tool id.
     #[test]
-    fn d7_no_tool_reaches_resolve_interaction_and_write_tool_ids_are_exactly_mail_and_task() {
+    fn d7_no_tool_reaches_resolve_interaction_and_write_tool_ids_are_exactly_mail_task_and_run() {
         assert_eq!(HARNESS_WRITE_TOOL_IDS, [
             "g4a_mail_ack", "g4a_mail_fetch", "g4a_mail_inbox", "g4a_mail_send",
-            "g4a_task_create", "g4a_task_move",
+            "g4a_run_finish", "g4a_task_create", "g4a_task_move",
         ]);
         assert!(HARNESS_READ_TOOL_IDS.iter().chain(HARNESS_WRITE_TOOL_IDS.iter()).all(|id| {
             !id.contains("resolve_interaction") && !id.contains("resolve-interaction")
@@ -1538,6 +1629,7 @@ mod tests {
             "g4a_mail_fetch".to_owned(),
             "g4a_mail_inbox".to_owned(),
             "g4a_mail_send".to_owned(),
+            "g4a_run_finish".to_owned(),
         ]);
 
         // A bare id is unaffected -- codex/kimi/claude's own shape.

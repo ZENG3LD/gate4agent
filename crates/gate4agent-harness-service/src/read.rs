@@ -281,12 +281,12 @@ pub(crate) fn execute_exact_binding_read(
         .map_err(|_| HarnessReadHostErrorV1::Internal)?;
     authorize_request(grant, &request)?;
     // Everything below this line that mutates (`SendMail`/`AckMail`/
-    // `TaskCreate`/`TaskMove`) reads only owned values out of `grant`/
-    // `binding` first, then calls into `harness` -- never `engine`/`grant`/
-    // `visibility` again in that same arm -- so the immutable borrow of
-    // `harness` those two hold ends before the mutable one
-    // `HarnessService::send_mail`/`ack_mail`/`agent_create_task`/
-    // `agent_move_task` needs begins.
+    // `TaskCreate`/`TaskMove`/`RunFinish`) reads only owned values out of
+    // `grant`/`binding` first, then calls into `harness` -- never
+    // `engine`/`grant`/`visibility` again in that same arm -- so the
+    // immutable borrow of `harness` those two hold ends before the mutable
+    // one `HarnessService::send_mail`/`ack_mail`/`agent_create_task`/
+    // `agent_move_task`/`crate::runtime::agent_finish_run` needs begins.
     match request {
         HarnessReadRequestV1::MailSend { to, subject, body, reply_to, refs } => {
             let grant_id = grant.grant_id.clone();
@@ -331,8 +331,58 @@ pub(crate) fn execute_exact_binding_read(
             let now_unix_ms = unix_time_ms();
             let result = harness.agent_move_task(
                 actor_run_id, grant_id, task_id, expected_revision, to, now_unix_ms,
-            ).map_err(internal_naming("g4a_task_create"))?;
+            ).map_err(internal_naming("g4a_task_move"))?;
             Ok(HarnessReadResponseV1::TaskMove(result))
+        }
+        HarnessReadRequestV1::RunFinish { outcome, summary } => {
+            let grant_id = grant.grant_id.clone();
+            let actor_run_id = binding.actor_run_id.clone();
+            let now_unix_ms = unix_time_ms();
+            let node_id = gate4agent_observation_api::NodeId::new(binding.node_id.as_str())
+                .map_err(internal_naming("g4a_run_finish"))?;
+            let incarnation_id = binding.node_incarnation.as_str()
+                .parse::<gate4agent_observation_api::NodeIncarnationId>()
+                .map_err(internal_naming("g4a_run_finish"))?;
+            let result = crate::runtime::agent_finish_run(
+                harness, &actor_run_id, &node_id, incarnation_id, outcome, now_unix_ms,
+            ).map_err(internal_naming("g4a_run_finish"))?;
+            // D4/S10: the summary rides the proven mail channel, posted only
+            // once the finish is already committed -- a mail failure (a
+            // refusal, or a genuine send error) must never undo or block a
+            // finish that already happened, so it is logged and swallowed,
+            // never propagated as this call's own error.
+            if let HarnessRunFinishResultV1::Finished { task_id, .. } = &result {
+                if let Some(summary) = summary {
+                    let from = resolve_caller_record_ref(binding, runtime_inventory);
+                    let subject = run_finish_mail_subject(outcome);
+                    match harness.send_mail(
+                        grant_id,
+                        actor_run_id,
+                        from,
+                        HarnessMailAddressV1::Task { task_id: task_id.clone() },
+                        subject,
+                        summary,
+                        None,
+                        Vec::new(),
+                        now_unix_ms,
+                    ) {
+                        Ok(HarnessMailSendResultV1::Accepted { .. }) => {}
+                        Ok(HarnessMailSendResultV1::Refused { reason }) => {
+                            tracing::warn!(
+                                reason,
+                                "g4a_run_finish: summary mail refused; the run is already finished",
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                error = ?error,
+                                "g4a_run_finish: summary mail failed; the run is already finished",
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(HarnessReadResponseV1::RunFinish(result))
         }
         _ => execute_exact_binding_read_only(harness.engine(), observation, support, binding, grant, &visibility, request),
     }
@@ -438,15 +488,17 @@ fn execute_exact_binding_read_only(
         HarnessReadRequestV1::MailFetch { message_id, ref_index } => {
             mail_fetch(engine, observation, support, grant, binding, message_id, ref_index)
         }
-        // `MailSend`/`MailInbox`/`MailAck`/`TaskCreate`/`TaskMove` never
-        // reach this function -- `execute_exact_binding_read` dispatches all
-        // five itself, before ever delegating here. Never reached in
-        // practice; refused rather than panicking if it somehow were.
+        // `MailSend`/`MailInbox`/`MailAck`/`TaskCreate`/`TaskMove`/
+        // `RunFinish` never reach this function -- `execute_exact_binding_
+        // read` dispatches all six itself, before ever delegating here.
+        // Never reached in practice; refused rather than panicking if it
+        // somehow were.
         HarnessReadRequestV1::MailSend { .. }
         | HarnessReadRequestV1::MailInbox { .. }
         | HarnessReadRequestV1::MailAck { .. }
         | HarnessReadRequestV1::TaskCreate { .. }
-        | HarnessReadRequestV1::TaskMove { .. } => Err(HarnessReadHostErrorV1::InvalidRequest),
+        | HarnessReadRequestV1::TaskMove { .. }
+        | HarnessReadRequestV1::RunFinish { .. } => Err(HarnessReadHostErrorV1::InvalidRequest),
     }
 }
 
@@ -975,7 +1027,11 @@ fn observation_state(
 }
 
 pub(crate) fn allowed_tool_ids(grant: &SessionGrantV1) -> Vec<String> {
-    let mut tools = vec!["g4a_context_get"];
+    // S10: `g4a_run_finish` carries no grant-permission gate at all -- every
+    // session needs the ability to report its own work finished regardless
+    // of what else its grant allows, the same unconditional footing
+    // `g4a_context_get` already stands on.
+    let mut tools = vec!["g4a_context_get", "g4a_run_finish"];
     if grant.monitoring_visibility != HarnessMonitoringVisibilityV1::None {
         tools.push("g4a_monitor_get");
     }
@@ -1024,6 +1080,7 @@ pub(crate) fn harness_mcp_tool_id(request: &HarnessReadRequestV1) -> &'static st
         HarnessReadRequestV1::MailFetch { .. } => "g4a_mail_fetch",
         HarnessReadRequestV1::TaskCreate { .. } => "g4a_task_create",
         HarnessReadRequestV1::TaskMove { .. } => "g4a_task_move",
+        HarnessReadRequestV1::RunFinish { .. } => "g4a_run_finish",
     }
 }
 
@@ -1031,6 +1088,16 @@ fn unix_time_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
         .unwrap_or(1).max(1)
+}
+
+/// The short, fixed subject `g4a_run_finish`'s own summary mail carries --
+/// never caller-supplied prose (the summary itself is the body); just names
+/// which of the two outcomes this notice is about.
+fn run_finish_mail_subject(outcome: HarnessRunFinishOutcomeV1) -> String {
+    match outcome {
+        HarnessRunFinishOutcomeV1::Done => "run finished: done".to_owned(),
+        HarnessRunFinishOutcomeV1::Failed => "run finished: failed".to_owned(),
+    }
 }
 
 /// The sender identity a mail message's `from` carries -- read once, at send
@@ -3306,6 +3373,267 @@ mod tests {
             &inventory,
         );
         assert_eq!(gated, Err(HarnessReadHostErrorV1::NotFoundOrDenied));
+
+        close_observation(observation, &path);
+    }
+
+    /// Builds a second, wholly independent task/run/grant ("run B") on top
+    /// of `crate::credential::tests::engine`'s own base fixture ("run A" --
+    /// `htask_aaa.../hrun_aaa.../hgrant_aaa...`), for the authority test:
+    /// `g4a_run_finish` resolves its identity from the caller's OWN grant
+    /// binding alone, so a session bound to run A must never be able to
+    /// touch run B's state, and there is no argument that could even name
+    /// it.
+    fn push_other_run(
+        checkpoint: &mut gate4agent_harness_engine::HarnessEngineCheckpointV1,
+    ) -> (HarnessTaskId, HarnessRunId) {
+        let other_task_id = HarnessTaskId::new(format!("htask_{}", "b".repeat(24))).unwrap();
+        let other_run_id = HarnessRunId::new(format!("hrun_{}", "b".repeat(24))).unwrap();
+        let other_operation_id = HarnessOperationId::new(format!("hop_{}", "b".repeat(24))).unwrap();
+        checkpoint.tasks.push(HarnessTaskV1 {
+            task_id: other_task_id.clone(),
+            revision: HarnessRevision::new(1).unwrap(),
+            title: "a different session's own work".to_owned(),
+            body: String::new(),
+            creator: HarnessActorV1::User { actor_id: selector("operator") },
+            parent_task_id: None,
+            dependencies: Vec::new(),
+            state: HarnessTaskStateV1::Running,
+            run_ids: vec![other_run_id.clone()],
+            result_refs: Vec::new(),
+            artifact_refs: Vec::new(),
+            created_at_unix_ms: 10,
+            updated_at_unix_ms: 10,
+        });
+        checkpoint.runs.push(HarnessRunV1 {
+            run_id: other_run_id.clone(),
+            revision: HarnessRevision::new(1).unwrap(),
+            parent_run_id: None,
+            task_id: other_task_id.clone(),
+            operation_id: other_operation_id,
+            intent: HarnessRunIntentV1 {
+                node_id: selector("node-a"),
+                workspace_id: selector("workspace-a"),
+                worktree: HarnessWorktreeIntentV1::Existing,
+                provider_profile: selector("claude-default"),
+                mode: HarnessExecutionModeV1::Pty,
+                delivery_bundle: None,
+                continuation: None,
+            },
+            delivery_receipt: None,
+            continuation_receipt: None,
+            context_pack: None,
+            git_facts: None,
+            binding: None,
+            lifecycle: HarnessRunLifecycleV1::Running,
+            result_disposition: None,
+            failure: None,
+            created_at_unix_ms: 10,
+            updated_at_unix_ms: 10,
+        });
+        (other_task_id, other_run_id)
+    }
+
+    /// `done` moves the caller's OWN run to `Completed`/`Succeeded` and its
+    /// own task to `Review` -- never `Done`, the review gate a session
+    /// cannot skip. A second `g4a_run_finish` call against the now-terminal
+    /// run is refused by name (`AlreadyFinished`), never silently accepted
+    /// as if it were the first call. Run B -- a wholly different session's
+    /// task/run/grant -- is untouched throughout: this is the authority
+    /// test, since there is no run-id argument for a caller to misuse in
+    /// the first place.
+    #[test]
+    fn agent_run_finish_done_moves_own_run_to_review_never_done_and_a_repeat_is_refused_by_name() {
+        let path = observation_path("agent-run-finish-done");
+        let mut checkpoint = crate::credential::tests::engine(
+            1,
+            SessionGrantStateV1::Active,
+            1,
+            HarnessRunLifecycleV1::Running,
+        ).checkpoint();
+        let (other_task_id, other_run_id) = push_other_run(&mut checkpoint);
+
+        let mut harness = HarnessService::from_engine_for_test(
+            gate4agent_harness_engine::HarnessEngine::restore(checkpoint).unwrap(),
+        );
+        let observation = ObservationService::open(&path).unwrap();
+        let support = ObservationSupportRegistry::default();
+        let inventory = crate::runtime::HarnessRuntimeInventoryCache::default();
+        let own_binding = crate::credential::tests::binding(1, 1);
+        let own_run_id = HarnessRunId::new(format!("hrun_{}", "a".repeat(24))).unwrap();
+        let own_task_id = HarnessTaskId::new(format!("htask_{}", "a".repeat(24))).unwrap();
+
+        let finished = execute_exact_binding_read(
+            &mut harness, &observation, &support, &own_binding,
+            HarnessReadRequestV1::RunFinish { outcome: HarnessRunFinishOutcomeV1::Done, summary: None },
+            &inventory,
+        ).unwrap();
+        assert_eq!(
+            finished,
+            HarnessReadResponseV1::RunFinish(HarnessRunFinishResultV1::Finished {
+                run_id: own_run_id.clone(),
+                task_id: own_task_id.clone(),
+                result: HarnessRunFinishOutcomeV1::Done,
+            }),
+        );
+        let run = harness.engine().run(&own_run_id).unwrap();
+        assert_eq!(run.lifecycle, HarnessRunLifecycleV1::Completed);
+        assert_eq!(run.result_disposition, Some(HarnessResultDispositionV1::Succeeded));
+        let task = harness.engine().task(&own_task_id).unwrap();
+        assert_eq!(task.state, HarnessTaskStateV1::Review);
+        assert_ne!(task.state, HarnessTaskStateV1::Done);
+
+        let repeated = execute_exact_binding_read(
+            &mut harness, &observation, &support, &own_binding,
+            HarnessReadRequestV1::RunFinish { outcome: HarnessRunFinishOutcomeV1::Done, summary: None },
+            &inventory,
+        ).unwrap();
+        assert_eq!(
+            repeated,
+            HarnessReadResponseV1::RunFinish(HarnessRunFinishResultV1::AlreadyFinished {
+                run_id: own_run_id,
+                lifecycle: HarnessRunLifecycleV1::Completed,
+            }),
+        );
+
+        let other_run = harness.engine().run(&other_run_id).unwrap();
+        assert_eq!(other_run.lifecycle, HarnessRunLifecycleV1::Running);
+        assert!(other_run.result_disposition.is_none());
+        let other_task = harness.engine().task(&other_task_id).unwrap();
+        assert_eq!(other_task.state, HarnessTaskStateV1::Running);
+
+        close_observation(observation, &path);
+    }
+
+    /// `failed` moves the run to `Failed` and records a `Rejected`,
+    /// `retryable: true` failure -- a definitive self-report, never
+    /// `Internal`'s "the host hit an unexpected fault."
+    #[test]
+    fn agent_run_finish_failed_records_a_retryable_rejected_failure() {
+        let path = observation_path("agent-run-finish-failed");
+        let checkpoint = crate::credential::tests::engine(
+            1,
+            SessionGrantStateV1::Active,
+            1,
+            HarnessRunLifecycleV1::Running,
+        ).checkpoint();
+        let mut harness = HarnessService::from_engine_for_test(
+            gate4agent_harness_engine::HarnessEngine::restore(checkpoint).unwrap(),
+        );
+        let observation = ObservationService::open(&path).unwrap();
+        let support = ObservationSupportRegistry::default();
+        let inventory = crate::runtime::HarnessRuntimeInventoryCache::default();
+        let own_binding = crate::credential::tests::binding(1, 1);
+        let own_run_id = HarnessRunId::new(format!("hrun_{}", "a".repeat(24))).unwrap();
+        let own_task_id = HarnessTaskId::new(format!("htask_{}", "a".repeat(24))).unwrap();
+
+        let finished = execute_exact_binding_read(
+            &mut harness, &observation, &support, &own_binding,
+            HarnessReadRequestV1::RunFinish { outcome: HarnessRunFinishOutcomeV1::Failed, summary: None },
+            &inventory,
+        ).unwrap();
+        assert_eq!(
+            finished,
+            HarnessReadResponseV1::RunFinish(HarnessRunFinishResultV1::Finished {
+                run_id: own_run_id.clone(),
+                task_id: own_task_id.clone(),
+                result: HarnessRunFinishOutcomeV1::Failed,
+            }),
+        );
+        let run = harness.engine().run(&own_run_id).unwrap();
+        assert_eq!(run.lifecycle, HarnessRunLifecycleV1::Failed);
+        assert_eq!(run.result_disposition, Some(HarnessResultDispositionV1::Failed));
+        assert_eq!(
+            run.failure,
+            Some(HarnessFailureV1 { category: HarnessFailureCategoryV1::Rejected, retryable: true }),
+        );
+        let task = harness.engine().task(&own_task_id).unwrap();
+        assert_eq!(task.state, HarnessTaskStateV1::Failed);
+
+        close_observation(observation, &path);
+    }
+
+    /// A `summary` produces exactly one mail to the task's own forum when
+    /// the grant holds `mail`, addressed and worded as the finish demands.
+    #[test]
+    fn agent_run_finish_summary_posts_one_mail_to_the_task_forum() {
+        let path = observation_path("agent-run-finish-summary-mail");
+        let mut checkpoint = crate::credential::tests::engine(
+            1,
+            SessionGrantStateV1::Active,
+            1,
+            HarnessRunLifecycleV1::Running,
+        ).checkpoint();
+        checkpoint.grants[0].mail = true;
+        let mut harness = HarnessService::from_engine_for_test(
+            gate4agent_harness_engine::HarnessEngine::restore(checkpoint).unwrap(),
+        );
+        let observation = ObservationService::open(&path).unwrap();
+        let support = ObservationSupportRegistry::default();
+        let inventory = crate::runtime::HarnessRuntimeInventoryCache::default();
+        let own_binding = crate::credential::tests::binding(1, 1);
+        let own_task_id = HarnessTaskId::new(format!("htask_{}", "a".repeat(24))).unwrap();
+
+        let finished = execute_exact_binding_read(
+            &mut harness, &observation, &support, &own_binding,
+            HarnessReadRequestV1::RunFinish {
+                outcome: HarnessRunFinishOutcomeV1::Done,
+                summary: Some("handed off cleanly".to_owned()),
+            },
+            &inventory,
+        ).unwrap();
+        assert!(matches!(
+            finished,
+            HarnessReadResponseV1::RunFinish(HarnessRunFinishResultV1::Finished { .. }),
+        ));
+        let mail_messages = harness.engine().checkpoint().mail_messages;
+        assert_eq!(mail_messages.len(), 1);
+        assert_eq!(mail_messages[0].to, HarnessMailAddressV1::Task { task_id: own_task_id });
+        assert_eq!(mail_messages[0].body, "handed off cleanly");
+
+        close_observation(observation, &path);
+    }
+
+    /// A `summary` that cannot be posted (here: the grant holds no `mail`
+    /// permission at all, so the engine itself refuses the send) never
+    /// undoes or blocks the finish that already committed -- the run still
+    /// lands `Completed`/`Succeeded` and no mail is recorded, but the call
+    /// still reports `Finished`, not an error.
+    #[test]
+    fn agent_run_finish_survives_a_summary_mail_that_cannot_be_posted() {
+        let path = observation_path("agent-run-finish-summary-mail-refused");
+        let checkpoint = crate::credential::tests::engine(
+            1,
+            SessionGrantStateV1::Active,
+            1,
+            HarnessRunLifecycleV1::Running,
+        ).checkpoint();
+        assert!(!checkpoint.grants[0].mail, "fixture must start without mail permission");
+        let mut harness = HarnessService::from_engine_for_test(
+            gate4agent_harness_engine::HarnessEngine::restore(checkpoint).unwrap(),
+        );
+        let observation = ObservationService::open(&path).unwrap();
+        let support = ObservationSupportRegistry::default();
+        let inventory = crate::runtime::HarnessRuntimeInventoryCache::default();
+        let own_binding = crate::credential::tests::binding(1, 1);
+        let own_run_id = HarnessRunId::new(format!("hrun_{}", "a".repeat(24))).unwrap();
+
+        let finished = execute_exact_binding_read(
+            &mut harness, &observation, &support, &own_binding,
+            HarnessReadRequestV1::RunFinish {
+                outcome: HarnessRunFinishOutcomeV1::Done,
+                summary: Some("nobody will ever read this".to_owned()),
+            },
+            &inventory,
+        ).unwrap();
+        assert!(matches!(
+            finished,
+            HarnessReadResponseV1::RunFinish(HarnessRunFinishResultV1::Finished { .. }),
+        ));
+        let run = harness.engine().run(&own_run_id).unwrap();
+        assert_eq!(run.lifecycle, HarnessRunLifecycleV1::Completed);
+        assert_eq!(run.result_disposition, Some(HarnessResultDispositionV1::Succeeded));
+        assert!(harness.engine().checkpoint().mail_messages.is_empty());
 
         close_observation(observation, &path);
     }

@@ -104,6 +104,7 @@ use gate4agent_harness_protocol::{
     HarnessFailureV1, HarnessOperationId, HarnessOperationKindV1,
     HarnessOperationStateV1, HarnessOperationV1,
     HarnessOutcomeUnknownReasonV1, HarnessResultDispositionV1, HarnessResultRef, HarnessRevision,
+    HarnessRunFinishOutcomeV1, HarnessRunFinishResultV1,
     HarnessRunGitFactsOutcomeV1, HarnessRunGitFactsV1, HarnessRunGitCommitSummaryV1,
     HarnessRunGitStatusCodeV1, HarnessRunGitStatusEntryV1, HarnessRunGitSummaryV1,
     HarnessRunLifecycleV1, HarnessRunV1, HarnessSelectorV1, HarnessTaskStateV1, HarnessTaskV1,
@@ -2242,6 +2243,13 @@ fn delivery_needs_staging(
     }
 }
 
+/// `failure_override` lets a caller other than the control-event path
+/// (`g4a_run_finish`'s own `agent_finish_run`, below) name a different
+/// `HarnessFailureV1` than the `Internal`/non-retryable default a control
+/// event's own `Failed` projection always means -- an agent voluntarily
+/// reporting its own work failed is not the same fact as the host reporting
+/// an unexpected fault, and must not be recorded as one. `None` (every
+/// control-event call site below) reproduces the exact prior behaviour.
 fn commit_lifecycle_projection(
     harness: &mut HarnessService,
     run_id: &gate4agent_harness_protocol::HarnessRunId,
@@ -2250,6 +2258,7 @@ fn commit_lifecycle_projection(
     event_sequence: u64,
     kind: HarnessLifecycleEventKindV1,
     projection: HarnessLifecycleProjectionV1,
+    failure_override: Option<HarnessFailureV1>,
     now_unix_ms: u64,
 ) -> Result<(), HarnessRuntimeError> {
     let run = harness.engine().run(run_id)
@@ -2299,10 +2308,10 @@ fn commit_lifecycle_projection(
         }
         HarnessLifecycleProjectionV1::Failed => {
             next_run.result_disposition = Some(HarnessResultDispositionV1::Failed);
-            next_run.failure = Some(HarnessFailureV1 {
+            next_run.failure = Some(failure_override.clone().unwrap_or(HarnessFailureV1 {
                 category: HarnessFailureCategoryV1::Internal,
                 retryable: false,
-            });
+            }));
         }
         HarnessLifecycleProjectionV1::Cancelled => {
             next_run.result_disposition = Some(HarnessResultDispositionV1::Cancelled);
@@ -2346,6 +2355,89 @@ fn commit_lifecycle_projection(
     ).map_err(HarnessRuntimeError::Harness)
 }
 
+/// A fixed, synthetic `event_sequence` for `agent_finish_run`'s own call
+/// into `commit_lifecycle_projection` below. Every control-event call site
+/// derives this from a real per-(node, incarnation) cursor position because
+/// it needs one to stay exact-once across a redelivered event; an agent's
+/// own `g4a_run_finish` call has no such cursor to begin with, and does not
+/// need one for correctness -- `agent_finish_run`'s own `Running`/`Waiting`
+/// guard (checked before this constant is ever reached) is what makes a
+/// second call refuse by name instead of replaying, not the identity this
+/// feeds into `deterministic_lifecycle_authority_ids`. That identity is
+/// still namespaced by `run_id` (always distinct per call) and by `kind`
+/// (never a kind a real control event would pair with this exact
+/// `event_sequence` for the very first event this run's own node
+/// incarnation ever produces), so reusing one constant across every call
+/// carries no collision risk in practice.
+const HARNESS_RUN_FINISH_EVENT_SEQUENCE: u64 = 1;
+
+/// `g4a_run_finish`'s own state transition (`read.rs`'s `RunFinish` arm is
+/// the only caller): the caller has already resolved `run_id` to its OWN
+/// run via `binding.actor_run_id` -- there is no run-id argument on the
+/// wire, so this never touches a run any other session owns. Refuses by
+/// name (`AlreadyFinished`) rather than reaching
+/// `commit_lifecycle_projection`'s own silent `Ok(())` no-op on an
+/// already-terminal run, so a second call is distinguishable from the first
+/// one that actually closed it. `done` reuses the `ExitedSuccess` event kind
+/// and applies `CompletedReview` -- the task lands in `Review`, never
+/// `Done`, exactly like a process that exited 0 under control-event
+/// projection; `failed` reuses the `Failed` event kind (a definitive
+/// self-report, not an exit code) and applies `Failed` with a `Rejected`,
+/// retryable failure -- `Rejected` because an agent voluntarily declaring
+/// its own work failed is a decisive, named outcome from a participant, the
+/// same shape `Rejected` already carries for the node's own spawn refusals,
+/// not `Internal`'s "the host hit an unexpected fault." `retryable: true`
+/// because nothing here is fatal to the underlying request the way a spawn
+/// rejection is: an operator reviewing a `Failed` run remains free to retry
+/// the task. Also sweeps `reconcile_task_result_refs` afterward, the same
+/// as `apply_exact_control_lifecycle` does for every control-driven
+/// completion, so the task's own `result_refs` immediately carries this
+/// run's `HarnessResultRef` once its `result_disposition` is set.
+pub(crate) fn agent_finish_run(
+    harness: &mut HarnessService,
+    run_id: &gate4agent_harness_protocol::HarnessRunId,
+    node_id: &NodeId,
+    incarnation_id: NodeIncarnationId,
+    outcome: HarnessRunFinishOutcomeV1,
+    now_unix_ms: u64,
+) -> Result<HarnessRunFinishResultV1, HarnessRuntimeError> {
+    let run = harness.engine().run(run_id)
+        .ok_or(HarnessRuntimeError::DispatchPreparation("run is missing"))?
+        .clone();
+    if !matches!(run.lifecycle, HarnessRunLifecycleV1::Running | HarnessRunLifecycleV1::Waiting) {
+        return Ok(HarnessRunFinishResultV1::AlreadyFinished {
+            run_id: run_id.clone(),
+            lifecycle: run.lifecycle,
+        });
+    }
+    let task_id = run.task_id.clone();
+    let (kind, projection, failure_override) = match outcome {
+        HarnessRunFinishOutcomeV1::Done => (
+            HarnessLifecycleEventKindV1::ExitedSuccess,
+            HarnessLifecycleProjectionV1::CompletedReview,
+            None,
+        ),
+        HarnessRunFinishOutcomeV1::Failed => (
+            HarnessLifecycleEventKindV1::Failed,
+            HarnessLifecycleProjectionV1::Failed,
+            Some(HarnessFailureV1 { category: HarnessFailureCategoryV1::Rejected, retryable: true }),
+        ),
+    };
+    commit_lifecycle_projection(
+        harness,
+        run_id,
+        node_id,
+        incarnation_id,
+        HARNESS_RUN_FINISH_EVENT_SEQUENCE,
+        kind,
+        projection,
+        failure_override,
+        now_unix_ms,
+    )?;
+    reconcile_task_result_refs(harness, now_unix_ms)?;
+    Ok(HarnessRunFinishResultV1::Finished { run_id: run_id.clone(), task_id, result: outcome })
+}
+
 /// Returns every task/run id this call actually committed a lifecycle
 /// projection for, so a caller several frames away from the mutation
 /// (`apply_or_buffer_host_live_event`, `finish_observation_recovery`) can
@@ -2377,6 +2469,7 @@ fn apply_exact_control_lifecycle(
         sequence,
         kind,
         projection,
+        None,
         now_unix_ms,
     )?;
     let mut touch = EngineTouch { task_ids: vec![task_id], run_ids: vec![run_id] };
@@ -2413,6 +2506,7 @@ fn freeze_bound_route_waiting(
             event_sequence,
             HarnessLifecycleEventKindV1::GapWaiting,
             HarnessLifecycleProjectionV1::Waiting,
+            None,
             now_unix_ms,
         )?;
         touch.run_ids.push(run_id);
@@ -12723,6 +12817,7 @@ fn apply_snapshot_lifecycle(
             event_sequence,
             kind,
             projection,
+            None,
             received_at_ms,
         )?;
         touch.run_ids.push(run_id);

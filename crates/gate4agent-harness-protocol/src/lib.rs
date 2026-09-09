@@ -1960,6 +1960,60 @@ pub enum HarnessRunLifecycleV1 {
     Cancelled,
 }
 
+/// The two, and only two, outcomes `g4a_run_finish` accepts (measured
+/// 2026-09-09: the agent-facing surface has no verb a session can use to
+/// report its own work finished, so nothing it does ever reaches `Done` --
+/// see this type's own call site, `HarnessReadRequestV1::RunFinish`, for the
+/// full account). `Done` and `Failed` name a definitive self-report, never a
+/// partial or in-progress state -- there is no third value, by design: a
+/// session is either closing its own run as succeeded or as failed, not
+/// asking for anything in between.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessRunFinishOutcomeV1 {
+    Done,
+    Failed,
+}
+
+/// The outcome of one `g4a_run_finish` call: resolves the caller's OWN run
+/// from its grant binding (`actor_run_id`) -- there is no run-id argument,
+/// so a session can never finish another session's run. `Finished` names
+/// the run/task pair `commit_lifecycle_projection` (`gate4agent-harness-
+/// service`) actually transitioned and the outcome it recorded; `task_id`
+/// is the run's own task, landed in `Review` (never `Done` -- the review
+/// gate a session cannot skip) for `done`, or in `Failed` for `failed`.
+/// `AlreadyFinished` is the same "named refusal, never a silent no-op"
+/// discipline `HarnessTaskMoveResultV1::RevisionConflict` established for
+/// `g4a_task_move`: a second `g4a_run_finish` call against a run that is no
+/// longer `Running`/`Waiting` is refused by name, carrying the lifecycle it
+/// actually found, rather than answering with the same `Finished` shape a
+/// first, effective call gets.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "outcome", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum HarnessRunFinishResultV1 {
+    Finished {
+        run_id: HarnessRunId,
+        task_id: HarnessTaskId,
+        result: HarnessRunFinishOutcomeV1,
+    },
+    AlreadyFinished {
+        run_id: HarnessRunId,
+        lifecycle: HarnessRunLifecycleV1,
+    },
+}
+
+impl HarnessRunFinishResultV1 {
+    pub fn validate(&self) -> Result<(), HarnessValidationError> {
+        match self {
+            Self::Finished { run_id, task_id, .. } => {
+                run_id.validate()?;
+                task_id.validate()
+            }
+            Self::AlreadyFinished { run_id, .. } => run_id.validate(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HarnessResultDispositionV1 {
@@ -4674,5 +4728,51 @@ mod tests {
                 variant,
             );
         }
+    }
+
+    #[test]
+    fn harness_run_finish_outcome_and_result_round_trip() {
+        assert_eq!(serde_json::to_value(HarnessRunFinishOutcomeV1::Done).unwrap(), "done");
+        assert_eq!(serde_json::to_value(HarnessRunFinishOutcomeV1::Failed).unwrap(), "failed");
+        assert!(serde_json::from_value::<HarnessRunFinishOutcomeV1>(
+            serde_json::json!("in-progress")
+        ).is_err());
+
+        let finished = HarnessRunFinishResultV1::Finished {
+            run_id: run_id('1'),
+            task_id: task_id('2'),
+            result: HarnessRunFinishOutcomeV1::Done,
+        };
+        finished.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(&finished).unwrap(),
+            serde_json::json!({
+                "outcome": "finished",
+                "run_id": run_id('1').as_str(),
+                "task_id": task_id('2').as_str(),
+                "result": "done",
+            }),
+        );
+        let encoded = serde_json::to_vec(&finished).unwrap();
+        assert_eq!(serde_json::from_slice::<HarnessRunFinishResultV1>(&encoded).unwrap(), finished);
+
+        let already_finished = HarnessRunFinishResultV1::AlreadyFinished {
+            run_id: run_id('1'),
+            lifecycle: HarnessRunLifecycleV1::Completed,
+        };
+        already_finished.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(&already_finished).unwrap(),
+            serde_json::json!({
+                "outcome": "already-finished",
+                "run_id": run_id('1').as_str(),
+                "lifecycle": "completed",
+            }),
+        );
+        let encoded = serde_json::to_vec(&already_finished).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<HarnessRunFinishResultV1>(&encoded).unwrap(),
+            already_finished,
+        );
     }
 }

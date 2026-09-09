@@ -12831,6 +12831,7 @@ fn harness_mcp_read_request_tool_id(request: &HarnessReadRequestV1) -> &'static 
         HarnessReadRequestV1::MailFetch { .. } => "g4a_mail_fetch",
         HarnessReadRequestV1::TaskCreate { .. } => "g4a_task_create",
         HarnessReadRequestV1::TaskMove { .. } => "g4a_task_move",
+        HarnessReadRequestV1::RunFinish { .. } => "g4a_run_finish",
     }
 }
 

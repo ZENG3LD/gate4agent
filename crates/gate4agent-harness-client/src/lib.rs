@@ -228,6 +228,21 @@ impl HarnessReadClient {
         }
     }
 
+    /// S10: report the caller's OWN run finished. See
+    /// `HarnessReadRequestV1::RunFinish`'s own doc comment for why there is
+    /// no run-id argument (resolved from the caller's grant binding) and why
+    /// `done` can never reach the task's own `Done` state.
+    pub fn run_finish(
+        &self,
+        outcome: HarnessRunFinishOutcomeV1,
+        summary: Option<String>,
+    ) -> Result<HarnessRunFinishResultV1, HarnessReadClientError> {
+        match self.send(HarnessReadRequestV1::RunFinish { outcome, summary })? {
+            HarnessReadResponseV1::RunFinish(value) => Ok(value),
+            _ => Err(HarnessReadClientError::UnexpectedResponse),
+        }
+    }
+
     fn send(&self, request: HarnessReadRequestV1) -> Result<HarnessReadResponseV1, HarnessReadClientError> {
         request.validate()?;
         let envelope = HarnessReadEnvelopeV1::new(self.credential.clone(), request);

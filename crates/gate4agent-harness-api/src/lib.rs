@@ -37,6 +37,7 @@ pub use gate4agent_harness_protocol::{
     HarnessReadPermissionsV1, HarnessReconciliationOutcomeV1, HarnessResolvedContextPackReceiptV1,
     HarnessResultDispositionV1,
     HarnessInlineRef, HarnessReceiptRef, HarnessResultRef, HarnessRevision, HarnessRunId, HarnessRunIntentV1,
+    HarnessRunFinishOutcomeV1, HarnessRunFinishResultV1,
     HarnessRunGitFactsV1, HarnessRunLifecycleV1,
     HarnessRuntimeIdentityV1, HarnessSelectorV1, HarnessTaskId, HarnessTaskStateV1,
     HarnessTaskCreateResultV1, HarnessTaskMoveResultV1,
@@ -215,9 +216,9 @@ pub const HARNESS_READ_TOOL_IDS: [&str; 8] = [
 ];
 
 /// The mailbox arc's Slice B write allow-list (D1 + D7), joined by Slice C's
-/// `g4a_mail_fetch` and Slice D's `g4a_task_create`/`g4a_task_move` (D5).
-/// Kept separate from `HARNESS_READ_TOOL_IDS` rather than
-/// folded into it -- that array's own test
+/// `g4a_mail_fetch`, Slice D's `g4a_task_create`/`g4a_task_move` (D5), and
+/// S10's `g4a_run_finish`. Kept separate from `HARNESS_READ_TOOL_IDS` rather
+/// than folded into it -- that array's own test
 /// (`all_eight_tool_schemas_are_stable_and_closed`) pins it as exactly the
 /// eight read-only tools zipped in `tool_definitions()`'s declared order, and
 /// every mail tool here is gated by `grant.mail`, not by any of the three
@@ -229,15 +230,20 @@ pub const HARNESS_READ_TOOL_IDS: [&str; 8] = [
 /// share is the same one, not the eight reads' gate. `g4a_task_create`/
 /// `g4a_task_move` are gated by `grant.task_permissions.create`/`.mutate`
 /// respectively, the same wiring `mail` already establishes for its own four
-/// siblings here. D7: this array, and
-/// `HARNESS_READ_TOOL_IDS`, are the only two names `tools/call` ever admits;
-/// `ResolveInteraction` (or any other name) is refused by name regardless of
-/// what a grant's `allowed_tool_ids` claims.
-pub const HARNESS_WRITE_TOOL_IDS: [&str; 6] = [
+/// siblings here. `g4a_run_finish` is the one member of this array gated by
+/// no grant permission at all (`expected_allowed_tool_ids` carries it
+/// unconditionally, the same way it carries `g4a_context_get` out of
+/// `HARNESS_READ_TOOL_IDS`) -- every session needs the ability to report its
+/// own work finished regardless of what else its grant allows. D7: this
+/// array, and `HARNESS_READ_TOOL_IDS`, are the only two names `tools/call`
+/// ever admits; `ResolveInteraction` (or any other name) is refused by name
+/// regardless of what a grant's `allowed_tool_ids` claims.
+pub const HARNESS_WRITE_TOOL_IDS: [&str; 7] = [
     "g4a_mail_ack",
     "g4a_mail_fetch",
     "g4a_mail_inbox",
     "g4a_mail_send",
+    "g4a_run_finish",
     "g4a_task_create",
     "g4a_task_move",
 ];
@@ -6038,11 +6044,44 @@ pub enum HarnessReadRequestV1 {
         expected_revision: HarnessRevision,
         to: HarnessTaskStateV1,
     },
+    /// S10: a session reports its OWN run finished -- resolved from the
+    /// caller's own grant binding (`actor_run_id`), the same field every
+    /// other agent verb resolves its identity from; there is no run-id
+    /// argument, so a session can never finish another session's run.
+    /// `done` applies `HarnessLifecycleProjectionV1::CompletedReview`
+    /// (`gate4agent-harness-service`), landing the task in `Review` --
+    /// never `Done`, the review gate a session cannot skip. `failed`
+    /// applies `HarnessLifecycleProjectionV1::Failed` and records a
+    /// retryable `HarnessFailureV1`. Never gated by any grant permission
+    /// (unconditional in `allowed_tool_ids`, the same way `g4a_context_get`
+    /// is): every session needs the ability to report its own work
+    /// finished regardless of what else its grant allows, or nothing ever
+    /// closes -- the exact structural gap this verb exists to close.
+    /// `summary`, when given, is posted as mail to the task's own forum
+    /// (`HarnessMailAddressV1::Task`) through the existing mail-send path,
+    /// never a new free-text result field; a mail failure never undoes the
+    /// finish, which is already committed by the time the mail is
+    /// attempted. Not idempotent: a second call against an already-terminal
+    /// run is refused by name as `HarnessRunFinishResultV1::AlreadyFinished`,
+    /// never silently accepted.
+    RunFinish {
+        outcome: HarnessRunFinishOutcomeV1,
+        #[serde(default)]
+        summary: Option<String>,
+    },
 }
 
 impl HarnessReadRequestV1 {
     pub fn validate(&self) -> Result<(), HarnessReadApiError> {
         match self {
+            Self::RunFinish { summary, .. } => {
+                if let Some(summary) = summary {
+                    if summary.len() > HARNESS_BODY_MAX_BYTES {
+                        return Err(HarnessReadApiError::InvalidText("run finish summary"));
+                    }
+                }
+                Ok(())
+            }
             Self::TaskCreate { title, body, parent_task_id } => {
                 if title.is_empty()
                     || title.len() > HARNESS_TITLE_MAX_BYTES
@@ -6156,6 +6195,7 @@ pub enum HarnessReadResponseV1 {
     MailFetch(HarnessMailFetchResultV1),
     TaskCreate(HarnessTaskCreateResultV1),
     TaskMove(HarnessTaskMoveResultV1),
+    RunFinish(HarnessRunFinishResultV1),
 }
 
 impl HarnessReadResponseV1 {
@@ -6175,6 +6215,7 @@ impl HarnessReadResponseV1 {
             Self::MailFetch(value) => value.validate(),
             Self::TaskCreate(value) => value.validate().map_err(HarnessReadApiError::Protocol),
             Self::TaskMove(value) => value.validate().map_err(HarnessReadApiError::Protocol),
+            Self::RunFinish(value) => value.validate().map_err(HarnessReadApiError::Protocol),
         }
     }
 }
@@ -6593,7 +6634,10 @@ impl SessionContextV1 {
 }
 
 fn expected_allowed_tool_ids(context: &SessionContextV1) -> Vec<String> {
-    let mut tools = vec!["g4a_context_get"];
+    // S10: `g4a_run_finish` is unconditional, exactly like `g4a_context_get`
+    // -- see `HARNESS_WRITE_TOOL_IDS`'s own doc comment for why it carries
+    // no grant-permission gate at all.
+    let mut tools = vec!["g4a_context_get", "g4a_run_finish"];
     if context.monitoring_visibility != HarnessMonitoringVisibilityV1::None {
         tools.push("g4a_monitor_get");
     }
@@ -12254,6 +12298,60 @@ mod tests {
         assert_eq!(serde_json::from_str::<HarnessReadRequestV1>(&encoded).unwrap(), request);
     }
 
+    /// S10: `g4a_run_finish`'s wire request round-trips, `summary` defaults
+    /// to `None` for a caller that omits it, and an oversized summary is a
+    /// named validation failure the same bound `g4a_mail_send`'s own `body`
+    /// already enforces.
+    #[test]
+    fn run_finish_request_round_trips_and_bounds_summary() {
+        let request = HarnessReadRequestV1::RunFinish {
+            outcome: HarnessRunFinishOutcomeV1::Done,
+            summary: Some("handed off cleanly".to_owned()),
+        };
+        request.validate().unwrap();
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert_eq!(serde_json::from_str::<HarnessReadRequestV1>(&encoded).unwrap(), request);
+
+        let without_summary: HarnessReadRequestV1 = serde_json::from_value(serde_json::json!({
+            "kind": "run-finish",
+            "outcome": "failed",
+        })).unwrap();
+        assert_eq!(
+            without_summary,
+            HarnessReadRequestV1::RunFinish { outcome: HarnessRunFinishOutcomeV1::Failed, summary: None },
+        );
+        without_summary.validate().unwrap();
+
+        let oversized_summary = HarnessReadRequestV1::RunFinish {
+            outcome: HarnessRunFinishOutcomeV1::Done,
+            summary: Some("x".repeat(HARNESS_BODY_MAX_BYTES + 1)),
+        };
+        assert!(matches!(
+            oversized_summary.validate(),
+            Err(HarnessReadApiError::InvalidText("run finish summary")),
+        ));
+    }
+
+    /// S10: `HarnessRunFinishResultV1` round-trips through the read response
+    /// wire (`HarnessReadResponseV1::RunFinish`).
+    #[test]
+    fn run_finish_result_round_trips_through_the_response_wire() {
+        let finished = HarnessReadResponseV1::RunFinish(HarnessRunFinishResultV1::Finished {
+            run_id: HarnessRunId::new(format!("hrun_{}", "d".repeat(24))).unwrap(),
+            task_id: HarnessTaskId::new(format!("htask_{}", "d".repeat(24))).unwrap(),
+            result: HarnessRunFinishOutcomeV1::Done,
+        });
+        finished.validate().unwrap();
+        let encoded = serde_json::to_string(&finished).unwrap();
+        assert_eq!(serde_json::from_str::<HarnessReadResponseV1>(&encoded).unwrap(), finished);
+
+        let already_finished = HarnessReadResponseV1::RunFinish(HarnessRunFinishResultV1::AlreadyFinished {
+            run_id: HarnessRunId::new(format!("hrun_{}", "d".repeat(24))).unwrap(),
+            lifecycle: HarnessRunLifecycleV1::Failed,
+        });
+        already_finished.validate().unwrap();
+    }
+
     /// D5, Slice D: every `HarnessTaskCreateResultV1`/`HarnessTaskMoveResultV1`
     /// variant round-trips through the read response wire
     /// (`HarnessReadResponseV1::TaskCreate`/`TaskMove`).
@@ -12356,7 +12454,7 @@ mod tests {
             mail: false,
             task_create: false,
             task_mutate: false,
-            allowed_tool_ids: vec!["g4a_context_get".to_owned()],
+            allowed_tool_ids: vec!["g4a_context_get".to_owned(), "g4a_run_finish".to_owned()],
             history_message_count: None,
             completed_turn_count: None,
             total_tokens: None,
@@ -12375,7 +12473,11 @@ mod tests {
 
         let create_only = SessionContextV1 {
             task_create: true,
-            allowed_tool_ids: vec!["g4a_context_get".to_owned(), "g4a_task_create".to_owned()],
+            allowed_tool_ids: vec![
+                "g4a_context_get".to_owned(),
+                "g4a_run_finish".to_owned(),
+                "g4a_task_create".to_owned(),
+            ],
             ..base.clone()
         };
         create_only.validate().unwrap();
@@ -12385,6 +12487,7 @@ mod tests {
             task_mutate: true,
             allowed_tool_ids: vec![
                 "g4a_context_get".to_owned(),
+                "g4a_run_finish".to_owned(),
                 "g4a_task_create".to_owned(),
                 "g4a_task_move".to_owned(),
             ],

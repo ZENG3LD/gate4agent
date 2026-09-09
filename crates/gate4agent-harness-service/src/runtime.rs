@@ -11551,6 +11551,20 @@ fn prepare_harness_mcp_read_call(
     };
     let tool_id = crate::read::harness_mcp_tool_id(&request);
     let now = unix_time_ms();
+    // Arrival, not outcome. A read the harness never gets to in time leaves
+    // NO line at all today -- neither `served` nor `refused` -- so a call that
+    // died on the node proxy's 3s deadline is indistinguishable from one that
+    // never crossed C2. `headroom_ms` is what is left of the call's own
+    // deadline at the instant the harness picked it up: near the full budget
+    // means the transport was fine and the serve is what ran late; near zero
+    // or negative means it was already too late when it arrived.
+    tracing::info!(
+        tool = tool_id,
+        call_id = call_id.as_str(),
+        reservation_id = reservation_id.as_str(),
+        headroom_ms = deadline_unix_ms as i64 - now as i64,
+        "harness MCP read call arrived",
+    );
     let current_route = adapter.exact_route(&route.node_id)?;
     // Three unrelated conditions all answer the caller `Unauthorized`, and
     // the served line below can only report `grant_id="unauthorized"` for

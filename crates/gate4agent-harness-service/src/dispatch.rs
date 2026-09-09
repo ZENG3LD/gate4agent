@@ -704,9 +704,21 @@ const DERIVED_LAUNCH_PLAN_TERMINAL_SIZE: TerminalSize = TerminalSize { rows: 40,
 /// introduced.
 const DERIVED_LAUNCH_PLAN_DEADLINE_MS: u64 = 30_000;
 const DERIVED_LAUNCH_PLAN_ID_PREFIX: &str = "auto";
-/// Suffix appended to a derived plan id to name its harness-MCP sibling --
-/// see `derived_launch_plan`'s `harness_mcp` parameter.
+/// Suffix appended to a derived plan id to name its harness-MCP-over-ACP
+/// sibling -- see `derived_launch_plan`'s `shape` parameter
+/// ([`DerivedLaunchPlanShape::HarnessMcpAcp`]). Existing plan ids carrying
+/// this suffix MUST NOT change: they are used live.
 const DERIVED_LAUNCH_PLAN_HARNESS_MCP_SUFFIX: &str = "-harness-mcp";
+/// Suffix appended to a derived plan id to name its harness-MCP-over-PTY
+/// sibling -- see `derived_launch_plan`'s `shape` parameter
+/// ([`DerivedLaunchPlanShape::HarnessMcpPty`]). Added for kimi, whose
+/// `kimi acp` announces zero ACP session modes and takes no approval flags
+/// at all (measured 2026-09-09) -- the harness-MCP door reaches it only
+/// over PTY, where the Node already lands the door's env
+/// (`GATE4AGENT_HARNESS_SESSION_ENDPOINT`/`..._TOKEN`/the helper program
+/// path) in the child's environment for the provider's own MCP client to
+/// read.
+const DERIVED_LAUNCH_PLAN_HARNESS_MCP_PTY_SUFFIX: &str = "-harness-mcp-pty";
 /// Every approval level a derived plan set is synthesized for, in the order
 /// `derive_launch_plans_from_inventory` iterates them --
 /// [`ApprovalLevel::Unmanaged`] first (the level every provider always
@@ -735,40 +747,60 @@ fn approval_level_slug(level: ApprovalLevel) -> &'static str {
     }
 }
 
-/// Synthesizes one derived launch plan for a node/workspace/provider/spawn-
-/// profile/approval-level combination. `harness_mcp` selects which of the
-/// two shapes `derive_launch_plans_from_inventory` synthesizes per
+/// Which combination of transport (`mode`) and harness-MCP door
+/// (`harness_mcp`) a derived plan carries. `derived_launch_plan`'s `shape`
+/// parameter selects one of three per node/workspace/provider/profile/level
 /// combination:
 ///
-/// - `false`: the plain PTY plan -- existing-worktree, no-prompt-override,
-///   operator-grant dispatch with delivery, continuation, and harness MCP
-///   all disabled, the same shape `HarnessLaunchPlanV1::is_ordinary_dispatch`
-///   has always required.
-/// - `true`: its harness-MCP sibling -- same node/workspace/provider/
-///   profile/level, id suffixed with [`DERIVED_LAUNCH_PLAN_HARNESS_MCP_SUFFIX`],
-///   `mode: Acp`, `harness_mcp: GrantBound`. `grant` stays `Operator` for
-///   both shapes: `is_ordinary_dispatch` admits `GrantBound` exactly when
-///   paired with `Operator` (gate4agent-arc-mailbox-and-task-layer Slice
-///   A(i)/A(iii)), so the sibling is ordinary too and never needs an exact
-///   grant of its own -- the harness mints one at dispatch time
-///   (`runtime::resolve_harness_mcp_grant`).
+/// - [`Self::Plain`]: the plain PTY plan -- existing-worktree, no-prompt-
+///   override, operator-grant dispatch with delivery, continuation, and
+///   harness MCP all disabled, the same shape
+///   `HarnessLaunchPlanV1::is_ordinary_dispatch` has always required.
+///   Unsuffixed id -- MUST NOT change.
+/// - [`Self::HarnessMcpAcp`]: the harness-MCP-over-ACP sibling -- same
+///   node/workspace/provider/profile/level, id suffixed with
+///   [`DERIVED_LAUNCH_PLAN_HARNESS_MCP_SUFFIX`], `mode: Acp`, `harness_mcp:
+///   GrantBound`. Existing ids carrying this suffix MUST NOT change.
+/// - [`Self::HarnessMcpPty`]: the harness-MCP-over-PTY sibling -- same
+///   node/workspace/provider/profile/level, id suffixed with
+///   [`DERIVED_LAUNCH_PLAN_HARNESS_MCP_PTY_SUFFIX`], `mode: Pty`,
+///   `harness_mcp: GrantBound`. Reaches the door for a provider whose ACP
+///   transport has no working permission mechanism at all (kimi) by
+///   relying on the same PTY-env overlay the Node already installs for
+///   `SessionMode::Pty` (`gate4agent-node::server`).
 ///
-/// `prompt_source` differs between the two shapes for a runtime-admission
-/// reason, not a stylistic one:
+/// `grant` stays `Operator` for all three shapes: `is_ordinary_dispatch`
+/// admits `GrantBound` exactly when paired with `Operator`
+/// (gate4agent-arc-mailbox-and-task-layer Slice A(i)/A(iii)), so both door
+/// siblings are ordinary too and never need an exact grant of their own --
+/// the harness mints one at dispatch time
+/// (`runtime::resolve_harness_mcp_grant`).
 ///
-/// - Plain (`Pty`): deliberately `Clear`, not `TaskBody`. The Node's
-///   `ProviderRuntimeRequirement` derivation
+/// `prompt_source` differs by shape for a runtime-admission reason, not a
+/// stylistic one:
+///
+/// - `Plain` and `HarnessMcpPty` (both `Pty`): deliberately `Clear`, not
+///   `TaskBody`. The Node's `ProviderRuntimeRequirement` derivation
 ///   (`gate4agent-node::provider_runtime`) treats any resolved prompt in
 ///   `Pty` mode as `SemanticPrompt`, which only admits a provider whose
 ///   runtime probe verifies semantic/structured-prompt readiness -- a raw
 ///   PTY-only provider (no semantic adapter) is rejected outright and the
-///   spawn never starts. The advertised runtime inventory
-///   (`HarnessRuntimeSpawnProfileSummaryV1`) carries no signal for which
-///   providers clear that bar, so a derived plan cannot tell `TaskBody`
-///   would be safe for a given combination; `Clear` maps to `RawPty`
-///   admission, which every PTY-capable provider satisfies by construction
-///   -- the only prompt source guaranteed to actually launch.
-/// - Harness-MCP sibling (`Acp`): `TaskBody`. Under `Acp` mode the Node
+///   spawn never starts. The admission is keyed on `mode` alone
+///   (`gate4agent-node::server`'s `(SessionMode::Pty, has_prompt)` match),
+///   never on `harness_mcp`, so the door sibling carries exactly the same
+///   admission risk as the plain plan it shares a transport with. The
+///   advertised runtime inventory (`HarnessRuntimeSpawnProfileSummaryV1`)
+///   carries no signal for which providers clear that bar, so a derived
+///   plan cannot tell `TaskBody` would be safe for a given combination;
+///   `Clear` maps to `RawPty` admission, which every PTY-capable provider
+///   satisfies by construction -- the only prompt source guaranteed to
+///   actually launch. The real cost of this choice: a `HarnessMcpPty`
+///   session starts with no task text delivered to it at all, so its
+///   operator has to prompt the session by hand, over the PTY, before it
+///   can act on the grant it was just issued -- there is no equivalent of
+///   the ACP sibling's free ride here, because `Pty` has no second
+///   admission path to carry `TaskBody` safely.
+/// - `HarnessMcpAcp` (`Acp`): `TaskBody`. Under `Acp` mode the Node
 ///   resolves the SAME `ProviderRuntimeRequirement::Acp` regardless of
 ///   whether a prompt is present (`gate4agent-node::server::
 ///   spawn_session_with_deadline`'s `(SessionMode::Acp, _)` arm), so
@@ -776,6 +808,12 @@ fn approval_level_slug(level: ApprovalLevel) -> &'static str {
 ///   whole point of the sibling: an ACP session dispatched with harness MCP
 ///   access and nothing to act on would be a session an operator has to
 ///   prompt by hand before it can use the grant it was just issued.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DerivedLaunchPlanShape {
+    Plain,
+    HarnessMcpAcp,
+    HarnessMcpPty,
+}
 ///
 /// `level` becomes both the plan's own `approval_level` field and, via its
 /// [`approval_level_slug`], part of the synthesized plan id -- whether this
@@ -801,9 +839,13 @@ fn derived_launch_plan(
     profile_id: &str,
     include_node_id: bool,
     level: ApprovalLevel,
-    harness_mcp: bool,
+    shape: DerivedLaunchPlanShape,
 ) -> Option<HarnessLaunchPlanV1> {
-    let suffix = harness_mcp.then_some(DERIVED_LAUNCH_PLAN_HARNESS_MCP_SUFFIX).unwrap_or("");
+    let suffix = match shape {
+        DerivedLaunchPlanShape::Plain => "",
+        DerivedLaunchPlanShape::HarnessMcpAcp => DERIVED_LAUNCH_PLAN_HARNESS_MCP_SUFFIX,
+        DerivedLaunchPlanShape::HarnessMcpPty => DERIVED_LAUNCH_PLAN_HARNESS_MCP_PTY_SUFFIX,
+    };
     let level_slug = approval_level_slug(level);
     let raw_plan_id = if include_node_id {
         format!(
@@ -814,10 +856,16 @@ fn derived_launch_plan(
             "{DERIVED_LAUNCH_PLAN_ID_PREFIX}-{provider}-{workspace_id}-{profile_id}-{level_slug}{suffix}",
         )
     };
-    let (mode, prompt_source, harness_mcp_policy) = if harness_mcp {
-        (HarnessExecutionModeV1::Acp, HarnessPromptSourceV1::TaskBody, HarnessMcpPolicyV1::GrantBound)
-    } else {
-        (HarnessExecutionModeV1::Pty, HarnessPromptSourceV1::Clear, HarnessMcpPolicyV1::Disabled)
+    let (mode, prompt_source, harness_mcp_policy) = match shape {
+        DerivedLaunchPlanShape::Plain => {
+            (HarnessExecutionModeV1::Pty, HarnessPromptSourceV1::Clear, HarnessMcpPolicyV1::Disabled)
+        }
+        DerivedLaunchPlanShape::HarnessMcpAcp => {
+            (HarnessExecutionModeV1::Acp, HarnessPromptSourceV1::TaskBody, HarnessMcpPolicyV1::GrantBound)
+        }
+        DerivedLaunchPlanShape::HarnessMcpPty => {
+            (HarnessExecutionModeV1::Pty, HarnessPromptSourceV1::Clear, HarnessMcpPolicyV1::GrantBound)
+        }
     };
     Some(HarnessLaunchPlanV1 {
         plan_id: HarnessSelectorV1::new(raw_plan_id).ok()?,
@@ -840,8 +888,9 @@ fn derived_launch_plan(
 }
 
 /// Derives the harness's default ordinary launch plan set from the live
-/// runtime inventory: up to eight plans -- a plain PTY plan and its
-/// harness-MCP/ACP sibling (see `derived_launch_plan`), at each of
+/// runtime inventory: up to twelve plans -- a plain PTY plan and its two
+/// harness-MCP door siblings, one over ACP and one over PTY (see
+/// [`DerivedLaunchPlanShape`], `derived_launch_plan`), at each of
 /// [`DERIVED_LAUNCH_PLAN_APPROVAL_LEVELS`] the provider's catalog row
 /// actually supports -- per node x workspace x enabled provider x
 /// advertised spawn profile combination `nodes` currently reports. This is
@@ -850,37 +899,49 @@ fn derived_launch_plan(
 /// which composes this with the CLI catalog (CLI wins on plan id collision)
 /// and enforces `HARNESS_LAUNCH_CATALOG_MAX`.
 ///
-/// [`ApprovalLevel::Unmanaged`] is offered unconditionally for both shapes:
-/// `gate4agent_catalog::approval_level_resolution` resolves it `Supported`
-/// for every agent id, including one its own table does not recognize, by
-/// definition (it imposes nothing). Each of the three managed levels
-/// (`FullAuto`, `Moderate`, `ReadOnly`) is offered per shape independently,
-/// read from that SAME function rather than assumed or duplicated here:
+/// [`ApprovalLevel::Unmanaged`] is offered unconditionally for all three
+/// shapes: `gate4agent_catalog::approval_level_resolution` resolves it
+/// `Supported` for every agent id, including one its own table does not
+/// recognize, by definition (it imposes nothing). Each of the three managed
+/// levels (`FullAuto`, `Moderate`, `ReadOnly`) is offered per shape
+/// independently, read from that SAME function rather than assumed or
+/// duplicated here:
 ///
-/// - The plain PTY plan is offered at `level` when the row resolves
-///   `Supported` at all -- PTY has no host-side enforcement mechanism of
-///   its own (a human at the keyboard picks their own agent's permission
-///   flags; see `gate4agent-shell-native`'s `host_policy_for_approval_
-///   level` doc comment), so "this provider has a verified vendor mode for
-///   this level" is the whole gate, the same bar `approval_level_args`
-///   already holds itself to for any future PTY-adjacent caller.
-/// - The harness-MCP/ACP sibling is offered at `level` when the row ALSO
-///   carries a sourced `acp_mode_id: Some(_)` -- the ACP transport applies
-///   a level exclusively through `session/set_mode`
-///   (`gate4agent-shell-native`'s `required_acp_mode`), which has nothing
-///   to call without one, and would otherwise spawn silently at the
-///   vendor's own default -- the exact defect naming the mode id exists to
+/// - The plain PTY plan (`DerivedLaunchPlanShape::Plain`) is offered at
+///   `level` when the row resolves `Supported` at all -- PTY has no
+///   host-side enforcement mechanism of its own (a human at the keyboard
+///   picks their own agent's permission flags; see
+///   `gate4agent-shell-native`'s `host_policy_for_approval_level` doc
+///   comment), so "this provider has a verified vendor mode for this
+///   level" is the whole gate, the same bar `approval_level_args` already
+///   holds itself to for any future PTY-adjacent caller.
+/// - The harness-MCP-over-PTY sibling (`DerivedLaunchPlanShape::
+///   HarnessMcpPty`) is gated by the exact SAME rule as the plain plan --
+///   the door rides the same transport, so whatever admits the plain PTY
+///   plan admits its door sibling too. Never weakened relative to the
+///   plain plan's own gate.
+/// - The harness-MCP-over-ACP sibling (`DerivedLaunchPlanShape::
+///   HarnessMcpAcp`) is offered at `level` when the row ALSO carries a
+///   sourced `acp_mode_id: Some(_)`, OR a mode-less row still carries real
+///   `args` (`gate4agent-shell-native`'s `acp_approval_level_args` reaches
+///   an agent the Node spawns directly through its own argv even without a
+///   `session/set_mode` id) -- the ACP transport applies a level through
+///   whichever of the two mechanisms actually exists, and withholding the
+///   sibling wherever NEITHER does is the exact defect this gate exists to
 ///   prevent. [`ApprovalLevel::Unmanaged`] is the one exception: its row
-///   resolves `acp_mode_id: None` for every agent id BY DESIGN (it imposes
-///   nothing, so there is nothing to apply), not because no mechanism was
-///   sourced, so the sibling is still offered at `Unmanaged` regardless.
+///   resolves `acp_mode_id: None` and empty `args` for every agent id BY
+///   DESIGN (it imposes nothing, so there is nothing to apply), not
+///   because no mechanism was sourced, so the sibling is still offered at
+///   `Unmanaged` regardless.
 ///
 /// A provider with no verified mode at all for a given managed level
-/// (`grok` x `ReadOnly`, resolved `Unsupported`) or no sourced ACP mode id
-/// for it (`grok` x `FullAuto`/`Moderate`, and every one of
-/// `codex`/`grok`/`kimi`'s rows the catalog has not sourced an id for)
-/// simply gets no plan of that shape at that level -- never a fabricated
-/// one and never a silent fallback to a wider level, matching
+/// (`grok` x `ReadOnly`, resolved `Unsupported`) loses the plain PTY plan
+/// and both door siblings there; one with no sourced ACP mode id AND no
+/// `args` for a level (`kimi` x `Moderate`/`ReadOnly`, and every one of
+/// `codex`/`grok`/`kimi`'s rows the catalog has not sourced either for)
+/// loses only the ACP door sibling there, never the PTY one -- simply no
+/// plan of the withheld shape at that level, never a fabricated one and
+/// never a silent fallback to a wider level, matching
 /// `approval_level_resolution`'s own refusal-by-name posture.
 ///
 /// Pure and total: never touches storage, never fails, and reflects
@@ -949,8 +1010,19 @@ pub(crate) fn derive_launch_plans_from_inventory(
                                 ApprovalLevelResolution::Supported { acp_mode_id: None, args, .. }
                                     if !args.is_empty(),
                             );
-                        for harness_mcp in [false, true] {
-                            let supported = if harness_mcp { acp_supported } else { pty_supported };
+                        for shape in [
+                            DerivedLaunchPlanShape::Plain,
+                            DerivedLaunchPlanShape::HarnessMcpAcp,
+                            DerivedLaunchPlanShape::HarnessMcpPty,
+                        ] {
+                            // The PTY-door sibling rides the same transport
+                            // as the plain plan, so it is gated by the exact
+                            // same rule -- never weakened relative to it.
+                            let supported = match shape {
+                                DerivedLaunchPlanShape::HarnessMcpAcp => acp_supported,
+                                DerivedLaunchPlanShape::Plain
+                                | DerivedLaunchPlanShape::HarnessMcpPty => pty_supported,
+                            };
                             if !supported {
                                 continue;
                             }
@@ -961,7 +1033,7 @@ pub(crate) fn derive_launch_plans_from_inventory(
                                 profile.id.as_str(),
                                 include_node_id,
                                 level,
-                                harness_mcp,
+                                shape,
                             ) {
                                 plans.push(plan);
                             }
@@ -2033,10 +2105,10 @@ mod tests {
         let node_a = node_inventory("node-a", &["workspace-a"], &["codex"], &["codex-default"]);
         let node_b = node_inventory("node-b", &["workspace-a"], &["codex"], &["codex-default"]);
         let plans = derive_launch_plans_from_inventory(&[node_a, node_b]);
-        // Each node contributes the full 4-level x 2-shape cross product:
+        // Each node contributes the full 4-level x 3-shape cross product:
         // codex resolves `Supported` (with a sourced ACP mode id) at every
         // level, so nothing is gated away here.
-        assert_eq!(plans.len(), 2 * 4 * 2);
+        assert_eq!(plans.len(), 2 * 4 * 3);
         let mut ids = plans.iter().map(|plan| plan.plan_id.clone()).collect::<Vec<_>>();
         ids.sort();
         ids.dedup();
@@ -2050,17 +2122,19 @@ mod tests {
         }
         assert_eq!(
             plans.iter().filter(|plan| plan.node_id.as_str() == "node-a").count(),
-            4 * 2,
+            4 * 3,
         );
         assert_eq!(
             plans.iter().filter(|plan| plan.node_id.as_str() == "node-b").count(),
-            4 * 2,
+            4 * 3,
         );
+        // Both door siblings (ACP and PTY) are `GrantBound`, so this counts
+        // two per level per node.
         assert_eq!(
             plans.iter().filter(|plan| {
                 plan.harness_mcp == HarnessMcpPolicyV1::GrantBound
             }).count(),
-            2 * 4,
+            2 * 4 * 2,
         );
     }
 
@@ -2068,7 +2142,7 @@ mod tests {
     fn derive_launch_plans_single_node_omits_node_id_from_plan_id() {
         let node = node_inventory("node-a", &["workspace-a"], &["codex"], &["codex-default"]);
         let plans = derive_launch_plans_from_inventory(&[node]);
-        assert_eq!(plans.len(), 8);
+        assert_eq!(plans.len(), 12);
         for plan in &plans {
             assert!(!plan.plan_id.as_str().contains("node-a"));
         }
@@ -2081,12 +2155,16 @@ mod tests {
             [
                 "auto-codex-workspace-a-codex-default-full-auto",
                 "auto-codex-workspace-a-codex-default-full-auto-harness-mcp",
+                "auto-codex-workspace-a-codex-default-full-auto-harness-mcp-pty",
                 "auto-codex-workspace-a-codex-default-moderate",
                 "auto-codex-workspace-a-codex-default-moderate-harness-mcp",
+                "auto-codex-workspace-a-codex-default-moderate-harness-mcp-pty",
                 "auto-codex-workspace-a-codex-default-read-only",
                 "auto-codex-workspace-a-codex-default-read-only-harness-mcp",
+                "auto-codex-workspace-a-codex-default-read-only-harness-mcp-pty",
                 "auto-codex-workspace-a-codex-default-unmanaged",
                 "auto-codex-workspace-a-codex-default-unmanaged-harness-mcp",
+                "auto-codex-workspace-a-codex-default-unmanaged-harness-mcp-pty",
             ],
         );
     }
@@ -2102,8 +2180,8 @@ mod tests {
         let plans = derive_launch_plans_from_inventory(&[node]);
         // claude and codex both resolve `Supported` (with a sourced ACP mode
         // id) at every level, so every combination gets the full 4-level x
-        // 2-shape cross product.
-        assert_eq!(plans.len(), 2 * 2 * 2 * 4 * 2);
+        // 3-shape cross product.
+        assert_eq!(plans.len(), 2 * 2 * 2 * 4 * 3);
         let mut ids = plans.iter().map(|plan| plan.plan_id.clone()).collect::<Vec<_>>();
         ids.sort();
         ids.dedup();
@@ -2117,11 +2195,16 @@ mod tests {
             assert_eq!(plan.terminal_size, DERIVED_LAUNCH_PLAN_TERMINAL_SIZE);
             assert_eq!(plan.revision, HarnessRevision::new(1).unwrap());
             assert!(plan.plan_id.as_str().contains(approval_level_slug(plan.approval_level)));
-            if plan.harness_mcp == HarnessMcpPolicyV1::GrantBound {
-                assert!(plan.plan_id.as_str().ends_with("-harness-mcp"));
+            if plan.plan_id.as_str().ends_with("-harness-mcp-pty") {
+                assert_eq!(plan.harness_mcp, HarnessMcpPolicyV1::GrantBound);
+                assert_eq!(plan.mode, HarnessExecutionModeV1::Pty);
+                assert_eq!(plan.prompt_source, HarnessPromptSourceV1::Clear);
+            } else if plan.plan_id.as_str().ends_with("-harness-mcp") {
+                assert_eq!(plan.harness_mcp, HarnessMcpPolicyV1::GrantBound);
                 assert_eq!(plan.mode, HarnessExecutionModeV1::Acp);
                 assert_eq!(plan.prompt_source, HarnessPromptSourceV1::TaskBody);
             } else {
+                assert_eq!(plan.harness_mcp, HarnessMcpPolicyV1::Disabled);
                 assert_eq!(plan.mode, HarnessExecutionModeV1::Pty);
                 assert_eq!(plan.prompt_source, HarnessPromptSourceV1::Clear);
             }
@@ -2130,28 +2213,35 @@ mod tests {
             plans.iter().filter(|plan| {
                 plan.harness_mcp == HarnessMcpPolicyV1::GrantBound
             }).count(),
-            2 * 2 * 2 * 4,
+            2 * 2 * 2 * 4 * 2,
         );
     }
 
-    /// grok has no sourced ACP mode id for `FullAuto`/`Moderate` and
-    /// resolves `Unsupported` outright for `ReadOnly`. kimi resolves
-    /// `Supported` (a real vendor flag/behaviour exists) at every managed
-    /// level, but a 2026-09-05 live measurement found its own `session/new`
-    /// now offers no ACP modes at all, so every one of ITS managed levels
-    /// also carries `acp_mode_id: None` (see
-    /// `gate4agent_catalog::launch::approval_level_resolution`'s own doc
-    /// comment) -- `Unmanaged` is the only level that yields an ACP/
-    /// harness-MCP sibling for either of them. claude and codex each carry a
-    /// sourced ACP mode id for all three managed levels, so all four levels
-    /// yield a sibling for them.
+    /// The ACP door sibling (`mode: Acp`) is gated by
+    /// [`approval_level_resolution`]'s `acp_mode_id`, OR (since `ef3abe4`) a
+    /// mode-less row that still carries real `args` -- `acp_approval_level_
+    /// args` (`gate4agent-shell-native`) reaches an agent the Node spawns
+    /// directly through its own argv even with no `session/set_mode` id.
+    /// claude and codex each carry a sourced ACP mode id for all three
+    /// managed levels, so all four levels yield the sibling for them. grok
+    /// carries no mode id at any managed level but DOES carry real `args`
+    /// at `FullAuto` and `Moderate` (`--permission-mode bypassPermissions`/
+    /// `auto`), so those two plus `Unmanaged` yield the sibling; its
+    /// `ReadOnly` row is `Unsupported` outright. kimi carries no mode id at
+    /// any managed level either, and carries real `args` (`--auto`) only at
+    /// `FullAuto` -- its `Moderate`/`ReadOnly` rows are `Supported` but with
+    /// empty `args`, so `Unmanaged` and `FullAuto` are the only levels that
+    /// yield the sibling for it; `Moderate` in particular has NO ACP
+    /// mechanism at all (no mode id, no args) yet still resolves `Supported`
+    /// over PTY, so it yields the PTY-door sibling instead -- see
+    /// `derive_launch_plans_offers_the_pty_door_where_the_acp_sibling_has_no_mechanism`.
     #[test]
     fn derive_launch_plans_gates_the_acp_sibling_by_the_catalogs_acp_mode_support() {
         for provider in ["claude", "codex"] {
             let node = node_inventory("node-a", &["workspace-a"], &[provider], &["default"]);
             let plans = derive_launch_plans_from_inventory(&[node]);
             let mut acp_levels = plans.iter()
-                .filter(|plan| plan.harness_mcp == HarnessMcpPolicyV1::GrantBound)
+                .filter(|plan| plan.mode == HarnessExecutionModeV1::Acp)
                 .map(|plan| plan.approval_level)
                 .collect::<Vec<_>>();
             assert_eq!(acp_levels.len(), 4, "{provider}");
@@ -2161,22 +2251,37 @@ mod tests {
             assert_eq!(acp_levels, expected, "{provider}");
         }
 
-        for provider in ["grok", "kimi"] {
-            let node = node_inventory("node-a", &["workspace-a"], &[provider], &["default"]);
-            let plans = derive_launch_plans_from_inventory(&[node]);
-            let acp_levels = plans.iter()
-                .filter(|plan| plan.harness_mcp == HarnessMcpPolicyV1::GrantBound)
-                .map(|plan| plan.approval_level)
-                .collect::<Vec<_>>();
-            assert_eq!(acp_levels, [ApprovalLevel::Unmanaged], "{provider}");
-        }
-
-        // grok additionally has no verified `ReadOnly` mode at all
-        // (`Unsupported` outright), so it loses the PTY plan there too;
-        // kimi keeps a verified PTY flag/behaviour at every level -- only
-        // its ACP mode ids were lost in the 2026-09-05 measurement.
         let grok_node = node_inventory("node-a", &["workspace-a"], &["grok"], &["default"]);
         let grok_plans = derive_launch_plans_from_inventory(&[grok_node]);
+        let mut grok_acp_levels = grok_plans.iter()
+            .filter(|plan| plan.mode == HarnessExecutionModeV1::Acp)
+            .map(|plan| plan.approval_level)
+            .collect::<Vec<_>>();
+        grok_acp_levels.sort_by_key(|level| approval_level_slug(*level));
+        let mut expected_grok_acp = [
+            ApprovalLevel::Unmanaged,
+            ApprovalLevel::FullAuto,
+            ApprovalLevel::Moderate,
+        ];
+        expected_grok_acp.sort_by_key(|level| approval_level_slug(*level));
+        assert_eq!(grok_acp_levels, expected_grok_acp);
+
+        let kimi_node = node_inventory("node-a", &["workspace-a"], &["kimi"], &["default"]);
+        let kimi_plans = derive_launch_plans_from_inventory(&[kimi_node]);
+        let mut kimi_acp_levels = kimi_plans.iter()
+            .filter(|plan| plan.mode == HarnessExecutionModeV1::Acp)
+            .map(|plan| plan.approval_level)
+            .collect::<Vec<_>>();
+        kimi_acp_levels.sort_by_key(|level| approval_level_slug(*level));
+        let mut expected_kimi_acp = [ApprovalLevel::Unmanaged, ApprovalLevel::FullAuto];
+        expected_kimi_acp.sort_by_key(|level| approval_level_slug(*level));
+        assert_eq!(kimi_acp_levels, expected_kimi_acp);
+
+        // grok additionally has no verified `ReadOnly` mode at all
+        // (`Unsupported` outright), so it loses the plain PTY plan (and
+        // both its door siblings) there too; kimi keeps a verified PTY
+        // flag/behaviour at every level -- only its ACP mechanism is
+        // missing at `Moderate`/`ReadOnly`.
         let grok_pty_levels = grok_plans.iter()
             .filter(|plan| plan.harness_mcp == HarnessMcpPolicyV1::Disabled)
             .map(|plan| plan.approval_level)
@@ -2184,13 +2289,41 @@ mod tests {
         assert_eq!(grok_pty_levels.len(), 3);
         assert!(!grok_pty_levels.contains(&ApprovalLevel::ReadOnly));
 
-        let kimi_node = node_inventory("node-a", &["workspace-a"], &["kimi"], &["default"]);
-        let kimi_plans = derive_launch_plans_from_inventory(&[kimi_node]);
         let kimi_pty_levels = kimi_plans.iter()
             .filter(|plan| plan.harness_mcp == HarnessMcpPolicyV1::Disabled)
             .map(|plan| plan.approval_level)
             .collect::<Vec<_>>();
         assert_eq!(kimi_pty_levels.len(), 4);
+    }
+
+    /// The change this test names directly: kimi's `Moderate` row has NO
+    /// ACP mechanism at all (`acp_mode_id: None`, empty `args`), so it
+    /// yields no `-harness-mcp` id -- but it DOES resolve `Supported` over
+    /// PTY, so the harness-MCP door still reaches kimi at `Moderate`
+    /// through its `-harness-mcp-pty` sibling. This is the exact scenario
+    /// `HarnessMcpPty` was added for: the door reachable ONLY where the ACP
+    /// transport has no working permission mechanism to gate it.
+    #[test]
+    fn derive_launch_plans_offers_the_pty_door_where_the_acp_sibling_has_no_mechanism() {
+        let node = node_inventory("node-a", &["workspace-a"], &["kimi"], &["default"]);
+        let plans = derive_launch_plans_from_inventory(&[node]);
+        let moderate_ids = plans.iter()
+            .filter(|plan| plan.approval_level == ApprovalLevel::Moderate)
+            .map(|plan| plan.plan_id.as_str().to_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            !moderate_ids.iter().any(|id| id.ends_with("-harness-mcp")),
+            "{moderate_ids:?}",
+        );
+        let pty_door_id = "auto-kimi-workspace-a-default-moderate-harness-mcp-pty";
+        assert!(moderate_ids.iter().any(|id| id == pty_door_id), "{moderate_ids:?}");
+        let pty_door_plan = plans.iter()
+            .find(|plan| plan.plan_id.as_str() == pty_door_id)
+            .expect("pty door plan present");
+        assert_eq!(pty_door_plan.mode, HarnessExecutionModeV1::Pty);
+        assert_eq!(pty_door_plan.harness_mcp, HarnessMcpPolicyV1::GrantBound);
+        assert_eq!(pty_door_plan.prompt_source, HarnessPromptSourceV1::Clear);
+        assert!(moderate_ids.iter().any(|id| id == "auto-kimi-workspace-a-default-moderate"));
     }
 
     /// The regression this whole change closes: a derived plan's
@@ -2258,8 +2391,11 @@ mod tests {
             .find(|plan| plan.harness_mcp == HarnessMcpPolicyV1::GrantBound)
             .expect("derived catalog carries a harness-MCP sibling");
         // `HarnessLaunchCatalog` orders plans by id (`BTreeMap`); among the
-        // four ACP siblings this combination now derives, `full-auto` sorts
-        // first lexicographically.
+        // eight `GrantBound` siblings this combination now derives (four
+        // ACP, four PTY-door), `full-auto` sorts first lexicographically,
+        // and within that level the unsuffixed `-harness-mcp` id (the ACP
+        // sibling) sorts before `-harness-mcp-pty` since it is a strict
+        // string prefix of it.
         assert_eq!(
             mcp_plan.plan_id.as_str(),
             "auto-codex-workspace-a-codex-default-full-auto-harness-mcp",

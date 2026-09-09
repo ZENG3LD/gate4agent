@@ -63,6 +63,7 @@ fn usage() -> &'static str {
      \x20 session set-model NODE_ID INCARNATION_ID WORKSPACE_ID INSTANCE_ID GENERATION MODEL_ID\n\
      \x20 session set-config-option NODE_ID INCARNATION_ID WORKSPACE_ID INSTANCE_ID GENERATION OPTION_ID --value-json JSON\n\
      \x20 session prompt NODE_ID INCARNATION_ID WORKSPACE_ID INSTANCE_ID GENERATION TEXT (ACP/inline sessions only -- refused for a PTY session)\n\
+     \x20 session input NODE_ID INCARNATION_ID WORKSPACE_ID INSTANCE_ID GENERATION TEXT (raw terminal input; the PTY counterpart of prompt)\n\
      \x20 session subscribe NODE_ID INCARNATION_ID WORKSPACE_ID INSTANCE_ID GENERATION [...more session groups] [--verbose yes]"
 }
 
@@ -134,6 +135,7 @@ enum Command {
     },
     SessionSetMode { session: HarnessRuntimeSessionAddressV1, mode_id: String },
     SessionPrompt { session: HarnessRuntimeSessionAddressV1, text: String },
+    SessionInput { session: HarnessRuntimeSessionAddressV1, text: String },
     SessionSetConfigOption {
         session: HarnessRuntimeSessionAddressV1,
         option_id: String,
@@ -167,6 +169,7 @@ enum Verb {
     SessionResolveInteraction,
     SessionSetMode,
     SessionPrompt,
+    SessionInput,
     SessionSetConfigOption,
     SessionSetModel,
     SessionSubscribe,
@@ -203,6 +206,7 @@ fn resolve_verb(args: &[String]) -> Result<(Verb, usize), String> {
             Some("resolve-interaction") => Ok((Verb::SessionResolveInteraction, 2)),
             Some("set-mode") => Ok((Verb::SessionSetMode, 2)),
             Some("prompt") => Ok((Verb::SessionPrompt, 2)),
+            Some("input") => Ok((Verb::SessionInput, 2)),
             Some("set-config-option") => Ok((Verb::SessionSetConfigOption, 2)),
             Some("set-model") => Ok((Verb::SessionSetModel, 2)),
             Some("subscribe") => Ok((Verb::SessionSubscribe, 2)),
@@ -608,6 +612,11 @@ fn build_command(
             let text = expect_single_positional(positionals, "text")?;
             Ok(Command::SessionPrompt { session, text })
         }
+        Verb::SessionInput => {
+            let session = take_session_address_prefix(positionals)?;
+            let text = expect_single_positional(positionals, "text")?;
+            Ok(Command::SessionInput { session, text })
+        }
         Verb::SessionSetConfigOption => {
             let session = take_session_address_prefix(positionals)?;
             let option_id = expect_single_positional(positionals, "option-id")?;
@@ -995,6 +1004,10 @@ fn execute(invocation: Invocation) -> Result<String, String> {
         Command::SessionPrompt { session, text } => {
             client.prompt_session(session, text).map_err(|error| error.to_string())?;
             render(&serde_json::json!({ "prompted": true }))
+        }
+        Command::SessionInput { session, text } => {
+            client.write_session_input(session, text).map_err(|error| error.to_string())?;
+            render(&serde_json::json!({ "input_written": true }))
         }
         Command::SessionSetConfigOption { session, option_id, value_json } => {
             client

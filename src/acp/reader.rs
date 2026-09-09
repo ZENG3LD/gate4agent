@@ -30,6 +30,10 @@
 //!   `protocol::update_to_event`; unknown notifications become
 //!   `AgentEvent::RpcNotification`.
 //! - **Legacy / non-JSON line**: discarded silently (ACP is pure JSON-RPC 2.0).
+//! - **Every non-empty line, regardless of the above**: fires `turn_activity`
+//!   (a `tokio::sync::Notify`), the liveness signal `AcpSession::start_prompt`'s
+//!   idle watchdog resets its silence window on -- see `acp_reader_loop`'s own
+//!   doc comment.
 //! - **Process exit**: cancels all pending requests, emits `SessionEnd` (if
 //!   not yet received via `session_complete`) + `Exited`. Deferred
 //!   `session/request_permission` requests are NOT touched here — they are
@@ -42,7 +46,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Notify};
 
 use crate::core::types::{AgentEvent, HostDecisionAuthority, HostRequestDecision, HostRequestOutcome};
 use crate::rpc::message::{classify_line, IncomingMessage, RpcError, RpcId, RpcResponse};
@@ -61,6 +65,17 @@ use super::spawn::AcpProcess;
 /// The loop polls `AcpProcess::try_recv()` (non-blocking) every 10 ms when
 /// no line is available, checking `is_running()` to detect process exit.
 /// This mirrors the pattern in `rpc/session.rs::rpc_reader_loop`.
+///
+/// Every non-empty line read from the agent -- whatever it classifies as --
+/// also fires `turn_activity`, a liveness signal `AcpSession::start_prompt`'s
+/// idle watchdog (`session::run_prompt_watchdog`) resets its silence window
+/// on. This loop makes no attempt to scope that signal to "the current
+/// turn" specifically: a session has at most one `session/prompt` in flight
+/// at a time (`gate4agent-node`'s `TurnInFlight` precondition), so any line
+/// arriving while a turn is open is, in practice, that turn's own traffic --
+/// a streaming update, a tool-call permission request, or the eventual
+/// response -- and firing on every line rather than filtering by method
+/// keeps this loop's dispatch unchanged.
 pub(crate) fn acp_reader_loop(
     process: Arc<Mutex<AcpProcess>>,
     tx: broadcast::Sender<AgentEvent>,
@@ -69,6 +84,7 @@ pub(crate) fn acp_reader_loop(
     session_state: Arc<Mutex<SessionState>>,
     pending_host_requests: PendingHostRequests,
     permission_request_deadline: Duration,
+    turn_activity: Arc<Notify>,
 ) {
     let mut received_session_end = false;
     // Error handed to any still-pending request when the loop exits. Only
@@ -144,6 +160,12 @@ pub(crate) fn acp_reader_loop(
         if trimmed.is_empty() {
             continue;
         }
+
+        // Any well-formed line at all is proof the agent process is still
+        // producing output -- see this function's doc comment for why this
+        // fires unconditionally rather than only for lines this loop can
+        // attribute to a specific in-flight turn.
+        turn_activity.notify_one();
 
         match classify_line(trimmed) {
             IncomingMessage::Request { id, method, params } => {

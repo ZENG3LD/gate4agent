@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Notify};
 use tokio::task::JoinHandle;
 
 use crate::core::error::AgentError;
@@ -29,7 +29,7 @@ use crate::core::types::{
 };
 use crate::rpc::id::IdGen;
 use crate::rpc::message::{RpcId, RpcNotification, RpcRequest, RpcResponse};
-use crate::rpc::pending::PendingRequests;
+use crate::rpc::pending::{PendingRequests, RpcResult};
 
 use super::gate::DangerousCommandGate;
 use super::host::{AcpHostAdapter, HostPolicy, PermissionDeferral, PolicyHostHandler};
@@ -157,6 +157,37 @@ pub struct AcpSessionOptions {
     /// Timeout for `session/prompt` calls. Default: 120 s.
     pub prompt_timeout: Duration,
 
+    /// How long [`AcpSession::start_prompt`]'s watchdog will wait through
+    /// COMPLETE silence from the agent before deciding the turn itself --
+    /// not merely the process -- is dead. Unlike `prompt_timeout` above
+    /// (a fixed total-duration bound, still used everywhere else in this
+    /// type), this window is reset every time the reader loop observes ANY
+    /// line from the agent belonging to the live conversation -- a
+    /// streaming `session/update`, a tool-call permission request, or the
+    /// `session/prompt` response itself -- so a normal long-running coding
+    /// turn that keeps streaming tool calls is never interrupted purely for
+    /// running long. It only fires on genuine silence.
+    ///
+    /// Measured live 2026-09-09: a fixed 120 s `prompt_timeout` on this
+    /// watchdog fired on a healthy claude-agent-acp turn whose tools
+    /// (`Search`, `Task`, `Shell`) were still running and completing well
+    /// past that mark, and because the old watchdog only emitted a LOCAL
+    /// `TurnInterrupted` without telling the agent to stop, the real turn
+    /// kept running and the session was refused as `TurnInFlight` for the
+    /// rest of its life once its next tool event flipped node-side activity
+    /// back to `Working`. This field exists to fix both halves of that: it
+    /// measures silence rather than total duration, and firing it now also
+    /// sends the agent a real `session/cancel` before synthesizing the
+    /// event -- see [`AcpSession::start_prompt`]'s watchdog for the
+    /// mechanism.
+    ///
+    /// Default: 10 minutes -- generous for a coding agent that may run a
+    /// long tool (a build, a test suite, a multi-file edit) without
+    /// producing an intermediate `session/update` in between, while still
+    /// catching a genuinely wedged agent well inside an operator's
+    /// patience.
+    pub prompt_idle_timeout: Duration,
+
     /// The host authority mode for this session — governs both the
     /// `clientCapabilities` declared at `initialize` and how `session/
     /// request_permission` is answered. Default: [`HostPolicy::Auto`].
@@ -261,6 +292,7 @@ impl Default for AcpSessionOptions {
             channel_capacity: 256,
             handshake_timeout: Duration::from_secs(30),
             prompt_timeout: Duration::from_secs(120),
+            prompt_idle_timeout: Duration::from_secs(600),
             host_policy: HostPolicy::default(),
             dangerous_command_gate: DangerousCommandGate::default(),
             approval_level_args: Vec::new(),
@@ -421,6 +453,25 @@ pub struct AcpSession {
     id_gen: Arc<IdGen>,
     reader_task: JoinHandle<()>,
     prompt_timeout: Duration,
+    /// See [`AcpSessionOptions::prompt_idle_timeout`] -- consulted only by
+    /// [`start_prompt`](Self::start_prompt)'s idle watchdog, never by
+    /// `prompt_timeout` above's total-duration call sites.
+    prompt_idle_timeout: Duration,
+    /// Signalled once by the reader loop (`acp_reader_loop`, `acp/reader.rs`)
+    /// for every line it reads from the agent while this session is alive --
+    /// a `session/update` notification, a host → agent request such as
+    /// `session/request_permission`, or the eventual `session/prompt`
+    /// response itself. [`start_prompt`](Self::start_prompt)'s idle watchdog
+    /// is the sole reader: each signal resets its idle window, so it measures
+    /// silence from the agent rather than the total wall-clock length of a
+    /// turn. A `tokio::sync::Notify` rather than a shared `Instant` because
+    /// the reader loop runs on a blocking OS thread and firing a `Notify` is
+    /// a single non-blocking call from there, with no lock to hold and no
+    /// clock-skew arithmetic for the watchdog side to redo; `notify_one`'s
+    /// single-stored-permit semantics also mean a burst of lines between two
+    /// watchdog polls collapses to exactly the "still alive" fact the
+    /// watchdog needs, never a queue it would have to drain.
+    turn_activity: Arc<Notify>,
     /// The host authority mode this session was constructed with -- see
     /// [`AcpSessionOptions::host_policy`]. Kept as its own field (rather
     /// than read back out of the handler) so
@@ -532,6 +583,9 @@ impl AcpSession {
         let id_gen = Arc::new(IdGen::new());
         let session_state = Arc::new(Mutex::new(SessionState::default()));
         let pending_host_requests = PendingHostRequests::default();
+        // See `AcpSession::turn_activity`'s own doc comment -- the reader
+        // loop signals this, `start_prompt`'s idle watchdog waits on it.
+        let turn_activity = Arc::new(Notify::new());
 
         // Clones for the reader loop task.
         let reader_process = Arc::clone(&process);
@@ -539,6 +593,7 @@ impl AcpSession {
         let reader_pending = pending.clone();
         let reader_session_state = Arc::clone(&session_state);
         let reader_pending_host_requests = pending_host_requests.clone();
+        let reader_turn_activity = Arc::clone(&turn_activity);
         let permission_request_deadline = options.permission_request_deadline;
 
         let reader_task = tokio::task::spawn_blocking(move || {
@@ -550,6 +605,7 @@ impl AcpSession {
                 reader_session_state,
                 reader_pending_host_requests,
                 permission_request_deadline,
+                reader_turn_activity,
             );
         });
 
@@ -567,6 +623,8 @@ impl AcpSession {
             id_gen,
             reader_task,
             prompt_timeout: options.prompt_timeout,
+            prompt_idle_timeout: options.prompt_idle_timeout,
+            turn_activity,
             host_policy: options.host_policy,
             agent_caps: AgentCapabilities::default(),
             session_state,
@@ -664,13 +722,18 @@ impl AcpSession {
     /// Write a prompt request and complete immediately after the request is on
     /// stdin. The ACP response is awaited in a background task so streaming
     /// provider notifications remain observable while the turn runs.
+    ///
+    /// That background task is an IDLE watchdog, not a total-duration one --
+    /// see [`AcpSessionOptions::prompt_idle_timeout`] and
+    /// [`run_prompt_watchdog`] for the full mechanism and the live incident
+    /// that shaped it.
     pub async fn start_prompt(&self, text: &str) -> Result<(), AcpError> {
         let session_id = {
             let guard = self.acp_session_id.lock().await;
             guard.clone().ok_or(AcpError::NoSession)?
         };
         let params = SessionPromptParams {
-            session_id,
+            session_id: session_id.clone(),
             prompt: vec![ContentBlock::Text { text: text.to_owned() }],
         };
         let id = self.id_gen.next();
@@ -682,28 +745,16 @@ impl AcpSession {
             return Err(error);
         }
 
-        let tx = self.tx.clone();
-        let timeout = self.prompt_timeout;
-        tokio::spawn(async move {
-            match tokio::time::timeout(timeout, receiver).await {
-                Ok(Ok(Ok(result))) => emit_prompt_result(&tx, &result),
-                Ok(Ok(Err(error))) => {
-                    report_agent_rpc_error(&tx, &error);
-                }
-                Ok(Err(_)) => {
-                    interrupt_turn(
-                        &tx,
-                        "ACP session closed while awaiting prompt response".to_owned(),
-                    );
-                }
-                Err(_) => {
-                    interrupt_turn(
-                        &tx,
-                        format!("session/prompt timed out after {timeout:?} with no response from the agent"),
-                    );
-                }
-            }
-        });
+        tokio::spawn(run_prompt_watchdog(
+            self.tx.clone(),
+            self.pending.clone(),
+            id,
+            receiver,
+            Arc::clone(&self.turn_activity),
+            self.prompt_idle_timeout,
+            Arc::clone(&self.process),
+            session_id,
+        ));
         Ok(())
     }
 
@@ -1518,17 +1569,123 @@ fn permission_outcome_grants(outcome: &PermissionOutcome, options: &[PermissionO
         })
 }
 
+/// The idle-silence watchdog spawned by [`AcpSession::start_prompt`] for one
+/// `session/prompt` call.
+///
+/// Waits for exactly one of three things to happen first:
+///
+/// - `receiver` resolves -- the agent's real `session/prompt` response (or
+///   the session closing mid-call). The ordinary, expected outcome; ends the
+///   turn via [`emit_prompt_result`] / [`report_agent_rpc_error`] /
+///   [`interrupt_turn`] exactly as before this watchdog existed.
+/// - `turn_activity` fires -- the reader loop (`acp::reader::acp_reader_loop`)
+///   observed SOME line from the agent since this watchdog last checked: a
+///   streaming `session/update`, a tool-call permission request, or the
+///   `session/prompt` response arriving concurrently with other traffic.
+///   Resets the idle window and keeps waiting -- a turn that is still
+///   visibly working is never cut off purely for running long.
+/// - `idle_timeout` elapses with NEITHER of the above -- genuine silence,
+///   not merely a long turn. Only this branch sends the agent a real
+///   `session/cancel` ([`send_cancel_notification`]) and removes `id` from
+///   `pending` BEFORE synthesizing [`AgentEvent::TurnInterrupted`], so a
+///   response that arrives after the fact can neither resolve a receiver
+///   nobody is waiting on nor be mistaken for an answer to a request this
+///   session no longer considers open.
+///
+/// Measured live 2026-09-09 against claude-agent-acp: the watchdog this
+/// replaced used a fixed 120 s total-duration bound and, on firing, only
+/// emitted the local `TurnInterrupted` event below -- it never told the
+/// agent to stop. The real turn (tools `Search`, `Task`, `Shell`) kept
+/// running past that mark, and its next tool event flipped node-side
+/// activity back to `Working`, so every later prompt was refused as
+/// `TurnInFlight` for the rest of the session's life. This watchdog fixes
+/// both halves: it only fires on silence, and firing it actually ends the
+/// remote turn.
+async fn run_prompt_watchdog(
+    tx: broadcast::Sender<AgentEvent>,
+    pending: PendingRequests,
+    id: RpcId,
+    receiver: tokio::sync::oneshot::Receiver<RpcResult>,
+    turn_activity: Arc<Notify>,
+    idle_timeout: Duration,
+    process: Arc<Mutex<AcpProcess>>,
+    session_id: String,
+) {
+    tokio::pin!(receiver);
+    loop {
+        tokio::select! {
+            // Checked first: if the real response and an idle-timeout both
+            // happen to be ready in the same poll (the response arrives
+            // right as the window elapses), the real answer wins rather
+            // than a cancel racing it.
+            biased;
+
+            result = &mut receiver => {
+                match result {
+                    Ok(Ok(result)) => emit_prompt_result(&tx, &result),
+                    Ok(Err(error)) => report_agent_rpc_error(&tx, &error),
+                    Err(_) => interrupt_turn(
+                        &tx,
+                        "ACP session closed while awaiting prompt response".to_owned(),
+                    ),
+                }
+                return;
+            }
+
+            _ = turn_activity.notified() => {
+                continue;
+            }
+
+            _ = tokio::time::sleep(idle_timeout) => {
+                send_cancel_notification(&process, session_id);
+                pending.remove(&id);
+                interrupt_turn(
+                    &tx,
+                    format!(
+                        "session/prompt idle for {idle_timeout:?} with no activity from the agent -- turn cancelled"
+                    ),
+                );
+                return;
+            }
+        }
+    }
+}
+
+/// Send `session/cancel` for `session_id` straight to the process stdin --
+/// used by [`run_prompt_watchdog`] when its idle window elapses, which runs
+/// inside a detached `tokio::spawn` task with no `&AcpSession` through which
+/// to call the public [`AcpSession::cancel`] method. Builds the exact same
+/// wire shape `cancel()` sends (a `session/cancel` notification carrying
+/// [`SessionCancelParams`]), so the agent sees an ordinary cancel regardless
+/// of which path produced it. Best-effort, like every other write in this
+/// module: the process may already be gone by the time this runs, and a
+/// failed write here is not itself an error worth reporting -- the turn is
+/// being torn down either way.
+fn send_cancel_notification(process: &Arc<Mutex<AcpProcess>>, session_id: String) {
+    let notif = RpcNotification {
+        jsonrpc: "2.0".into(),
+        method: "session/cancel".into(),
+        params: Some(json!(SessionCancelParams { session_id })),
+    };
+    if let Ok(json) = serde_json::to_string(&notif) {
+        write_line_to_process(process, &format!("{}\n", json));
+    }
+}
+
 /// Report a `session/prompt` call started by [`AcpSession::start_prompt`]
 /// that ended WITHOUT a `session/prompt` success response -- an agent RPC
-/// error, the session closing mid-call, or `prompt_timeout` elapsing (see
-/// that method's three failure branches). Sends both `Error` (the failure
-/// text, for anything that only wants to display it) and `TurnInterrupted`
-/// (the signal that the turn itself is over) so a caller that only reads
-/// `Error` sees no change in behavior, while `TurnInterrupted` gives
-/// downstream turn-state tracking (`gate4agent-engine`'s snapshot reducer)
-/// something to reset `ProviderActivity` away from `Blocked` with -- see
-/// `AgentEvent::TurnInterrupted`'s own doc comment for the stuck-forever bug
-/// this closes.
+/// error, the session closing mid-call, or [`run_prompt_watchdog`]'s idle
+/// window elapsing on complete silence (see that function's three branches).
+/// The idle-window branch has already sent the agent a real `session/cancel`
+/// and de-registered the pending request by the time this runs -- this
+/// function only ever synthesizes the LOCAL event pair. Sends both `Error`
+/// (the failure text, for anything that only wants to display it) and
+/// `TurnInterrupted` (the signal that the turn itself is over) so a caller
+/// that only reads `Error` sees no change in behavior, while `TurnInterrupted`
+/// gives downstream turn-state tracking (`gate4agent-engine`'s snapshot
+/// reducer) something to reset `ProviderActivity` away from `Blocked` with --
+/// see `AgentEvent::TurnInterrupted`'s own doc comment for the stuck-forever
+/// bug this closes.
 fn interrupt_turn(tx: &broadcast::Sender<AgentEvent>, reason: String) {
     let _ = tx.send(AgentEvent::Error { message: reason.clone() });
     let _ = tx.send(AgentEvent::TurnInterrupted { reason });
@@ -1731,6 +1888,7 @@ mod tests {
         assert_eq!(opts.channel_capacity, 256);
         assert_eq!(opts.handshake_timeout, Duration::from_secs(30));
         assert_eq!(opts.prompt_timeout, Duration::from_secs(120));
+        assert_eq!(opts.prompt_idle_timeout, Duration::from_secs(600));
         assert_eq!(opts.host_policy, HostPolicy::Auto);
         assert!(opts.approval_level_args.is_empty());
         assert!(opts.additional_directories.is_empty());
@@ -1927,7 +2085,7 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // interrupt_turn -- the fix for a `session/prompt` failure (agent RPC
-    // error, session closed mid-call, or `prompt_timeout` elapsing) leaving
+    // error, session closed mid-call, or the idle watchdog firing) leaving
     // the turn stuck rather than ended. Measured live against codex-acp
     // 1.10.0 on 2026-09-05: an RPC error response landed within seconds, but
     // because `start_prompt`'s failure branches used to emit only `Error`
@@ -2154,5 +2312,113 @@ while True:
             "a process that ignores stdin EOF must be force-killed once the graceful bound elapses"
         );
         assert!(outcome.exit_code.is_none(), "outcome: {outcome:?}");
+    }
+
+    // -------------------------------------------------------------------
+    // run_prompt_watchdog -- idle-silence semantics for `start_prompt`.
+    //
+    // Replaces a fixed 120s TOTAL-DURATION bound (which fired on a healthy,
+    // still-working turn -- see `AcpSessionOptions::prompt_idle_timeout`'s
+    // doc comment for the live incident this closes) with an IDLE bound:
+    // the watchdog only fires on complete silence, and every signal on
+    // `turn_activity` resets its window. Both tests call the watchdog
+    // function directly (as `start_prompt` itself does via `tokio::spawn`)
+    // against a manually registered `pending` entry, rather than driving a
+    // full `session/prompt` round trip through a real agent -- the fixture
+    // process (`acp_ignore_eof_launch`) only needs to exist so
+    // `send_cancel_notification`'s write has a real process to target; it
+    // never needs to answer. Both use `tokio::time::pause`/`advance`, never
+    // a real sleep, per the task's own requirement.
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn start_prompt_watchdog_survives_activity_past_the_old_120s_mark() {
+        let session = spawn_fixture_acp_session(acp_ignore_eof_launch()).await;
+        let mut events = session.subscribe();
+        let id = RpcId::Number(9001);
+        let receiver = session.pending.register(id.clone());
+        let turn_activity = Arc::new(Notify::new());
+        let idle_timeout = Duration::from_secs(20);
+
+        tokio::time::pause();
+        let watchdog = tokio::spawn(run_prompt_watchdog(
+            session.tx.clone(),
+            session.pending.clone(),
+            id.clone(),
+            receiver,
+            Arc::clone(&turn_activity),
+            idle_timeout,
+            Arc::clone(&session.process),
+            "fixture-acp-session".to_owned(),
+        ));
+        // Let the watchdog register its first idle window before advancing.
+        tokio::task::yield_now().await;
+
+        // Nine 15s gaps, each well under the 20s idle window, total 135s --
+        // more than the old fixed 120s bound this watchdog replaced.
+        for _ in 0..9 {
+            tokio::time::advance(Duration::from_secs(15)).await;
+            turn_activity.notify_one();
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            events.try_recv().is_err(),
+            "activity that keeps resetting the idle window must never interrupt the turn"
+        );
+        assert_eq!(
+            session.pending.len(),
+            1,
+            "the request must still be pending -- the watchdog never fired"
+        );
+
+        watchdog.abort();
+        let _ = session.kill().await;
+    }
+
+    #[tokio::test]
+    async fn start_prompt_watchdog_fires_on_full_silence_and_deregisters_the_pending_request() {
+        let session = spawn_fixture_acp_session(acp_ignore_eof_launch()).await;
+        let mut events = session.subscribe();
+        let id = RpcId::Number(9002);
+        let receiver = session.pending.register(id.clone());
+        let turn_activity = Arc::new(Notify::new());
+        let idle_timeout = Duration::from_secs(10);
+
+        tokio::time::pause();
+        let _watchdog = tokio::spawn(run_prompt_watchdog(
+            session.tx.clone(),
+            session.pending.clone(),
+            id.clone(),
+            receiver,
+            Arc::clone(&turn_activity),
+            idle_timeout,
+            Arc::clone(&session.process),
+            "fixture-acp-session".to_owned(),
+        ));
+        tokio::task::yield_now().await;
+
+        // No activity at all for the entire idle window.
+        tokio::time::advance(idle_timeout).await;
+        tokio::task::yield_now().await;
+
+        match events.try_recv().expect("Error event") {
+            AgentEvent::Error { message } => {
+                assert!(message.contains("idle"), "message was: {message}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        match events.try_recv().expect("TurnInterrupted event") {
+            AgentEvent::TurnInterrupted { reason } => {
+                assert!(reason.contains("idle"), "reason was: {reason}");
+            }
+            other => panic!("expected TurnInterrupted, got {other:?}"),
+        }
+        assert!(
+            session.pending.is_empty(),
+            "the pending request must be de-registered once the watchdog fires"
+        );
+
+        let _ = session.kill().await;
     }
 }

@@ -571,9 +571,28 @@ pub enum AgentEvent {
     /// produce one: the agent answered with a JSON-RPC error (e.g. codex-acp
     /// 1.10.0's `-32603 usageLimitExceeded` when the account's quota is
     /// exhausted, measured live), the pending call was cancelled because the
-    /// session closed mid-turn, or `AcpSessionOptions::prompt_timeout`
-    /// elapsed with no response at all. `reason` is the bounded, human-
-    /// readable text explaining which of those three happened.
+    /// session closed mid-turn, or the idle watchdog
+    /// (`acp::session::run_prompt_watchdog`,
+    /// `AcpSessionOptions::prompt_idle_timeout`) firing on complete silence
+    /// from the agent. `reason` is the bounded, human-readable text
+    /// explaining which of those three happened.
+    ///
+    /// The idle-watchdog case is not a fixed total-duration bound on the
+    /// turn -- it measures SILENCE, reset by every line the agent produces
+    /// (a streaming `session/update`, a tool-call permission request, the
+    /// response itself), and only fires after a full window with none at
+    /// all. When it fires it first sends the agent a real `session/cancel`
+    /// and de-registers the pending request, so this event reports a turn
+    /// that has actually been told to stop, not merely one this host gave up
+    /// waiting on. This closes a live bug measured 2026-09-09 against
+    /// claude-agent-acp: an earlier version of this watchdog used a fixed
+    /// 120s TOTAL-DURATION bound and, on firing, only ever synthesized this
+    /// event locally -- it fired on a healthy turn whose tools (`Search`,
+    /// `Task`, `Shell`) were still running and completing well past that
+    /// mark, and because it never told the agent to stop, the real turn kept
+    /// running; its next tool event flipped node-side activity back to
+    /// `Working`, and every later prompt was refused as `TurnInFlight` for
+    /// the rest of the session's life.
     ///
     /// This is a DISTINCT signal from `Error`, not a replacement for it:
     /// `Error` still carries the same failure text for anything that only

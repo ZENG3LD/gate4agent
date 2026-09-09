@@ -17,11 +17,25 @@ use gate4agent_harness_protocol::{
     HARNESS_RESULTS_MAX, HARNESS_SCHEDULER_SCAN_MAX,
 };
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 pub const HARNESS_ENGINE_CHECKPOINT_VERSION_V1: u16 = 1;
 pub const HARNESS_VISIBILITY_SCAN_MAX: usize = 8_192;
+/// Ceiling on the number of stored mail messages `mail_inbox` will scan in
+/// one call. This bounds the WORK a single inbox read does -- a linear
+/// filter over an in-memory map plus a sort of the matches, cheap even at
+/// this size -- not how many messages a workspace is allowed to have ever
+/// exchanged. `HARNESS_VISIBILITY_SCAN_MAX` is deliberately not reused here:
+/// that constant bounds lineage-graph traversal cost (`read_visibility` and
+/// its helpers), an unrelated shape of work with its own scaling, and tying
+/// ordinary mail growth to it turned mail_inbox into a permanent failure for
+/// every reader once a workspace had ever exchanged more than 8192
+/// messages, with no recovery short of deleting mail. 262_144 keeps the
+/// same "cheap linear scan" guarantee at an order of magnitude no real
+/// mailbox reaches in practice.
+pub const HARNESS_MAIL_SCAN_MAX: usize = 262_144;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HarnessApplyOutcome {
@@ -230,7 +244,34 @@ pub struct HarnessEngineCheckpointV1 {
     pub mail_acks: Vec<HarnessMailAckV1>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+/// Which of `HarnessEngineError`'s two graph-validation variants a cached
+/// `visibility_graph_cache` outcome carries. `HarnessEngineError` itself
+/// does not derive `Clone` (several variants wrap protocol types that are
+/// not `Clone`), so a cached `Result<(), HarnessEngineError>` cannot be
+/// stored and replayed directly on a cache hit -- this small `Copy` tag
+/// records which of the two failure shapes the last recomputation found,
+/// and `read_visibility` reconstructs the real error from it on every
+/// read, hit or miss.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HarnessVisibilityGraphFaultV1 {
+    ResourceExhausted,
+    InvalidGraph,
+}
+
+impl From<HarnessVisibilityGraphFaultV1> for HarnessEngineError {
+    fn from(fault: HarnessVisibilityGraphFaultV1) -> Self {
+        match fault {
+            HarnessVisibilityGraphFaultV1::ResourceExhausted => {
+                HarnessEngineError::ReadVisibilityResourceExhausted
+            }
+            HarnessVisibilityGraphFaultV1::InvalidGraph => {
+                HarnessEngineError::ReadVisibilityInvalidGraph
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct HarnessEngine {
     tasks: BTreeMap<HarnessTaskId, HarnessTaskV1>,
     runs: BTreeMap<HarnessRunId, HarnessRunV1>,
@@ -243,7 +284,55 @@ pub struct HarnessEngine {
     continuations: BTreeMap<HarnessContinuationRef, HarnessContinuationV1>,
     mail_messages: BTreeMap<HarnessMailMessageId, HarnessMailMessageV1>,
     mail_acks: BTreeMap<(HarnessMailMessageId, HarnessSelectorV1), HarnessMailAckV1>,
+    /// Bumped exactly once per accepted (`HarnessApplyOutcome::Applied`)
+    /// mutation, inside `finish` -- the single choke point every real
+    /// state change already passes through before becoming a
+    /// `PreparedHarnessMutation` (S9/single-writer-core: this crate invents
+    /// no parallel mutation-tracking mechanism, it reuses that one).
+    /// `visibility_graph_cache` is valid exactly when its stored generation
+    /// equals this counter. Not durable state: `checkpoint`/`restore` never
+    /// touch it, and `restore` (which never goes through `finish`) starting
+    /// it at 0 is exactly the right "not yet validated" baseline.
+    mutation_generation: u64,
+    /// Cache for the two grant-independent whole-store structural
+    /// validators `read_visibility` used to redo, from scratch, over the
+    /// entire task/run/operation graph, on EVERY read regardless of which
+    /// grant was asking or whether anything had changed since the last
+    /// read -- this crate is a single-writer core (`runtime.rs`'s own
+    /// select loop owns the one `HarnessEngine`/`HarnessService` with no
+    /// `Arc`/`Mutex` anywhere around it), so a `RefCell` is exactly the
+    /// existing interior-mutability idiom this codebase already reaches
+    /// for, not a new one. `None` means "never computed"; `Some((generation,
+    /// outcome))` is reused as-is while `generation == mutation_generation`
+    /// and recomputed the moment it is not.
+    visibility_graph_cache: RefCell<Option<(u64, Result<(), HarnessVisibilityGraphFaultV1>)>>,
 }
+
+/// Manual, deliberately narrower than `derive`: equality is about the
+/// durable task/run/operation/grant/... graph this engine carries, never
+/// about `mutation_generation` or `visibility_graph_cache`, which are a
+/// write-mutation counter and a read cache respectively -- process-local
+/// bookkeeping, not part of what makes two engines the same durable state.
+/// Without this, two engines holding identical data could compare unequal
+/// purely because one of them had served a `read_visibility` call and the
+/// other had not.
+impl PartialEq for HarnessEngine {
+    fn eq(&self, other: &Self) -> bool {
+        self.tasks == other.tasks
+            && self.runs == other.runs
+            && self.grants == other.grants
+            && self.operations == other.operations
+            && self.execution_specs == other.execution_specs
+            && self.issuances == other.issuances
+            && self.execution_specs_v2 == other.execution_specs_v2
+            && self.deliveries == other.deliveries
+            && self.continuations == other.continuations
+            && self.mail_messages == other.mail_messages
+            && self.mail_acks == other.mail_acks
+    }
+}
+
+impl Eq for HarnessEngine {}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 /// Entity-local authorization result for one grant.
@@ -603,9 +692,7 @@ impl HarnessEngine {
             return Ok(HarnessReadVisibilityV1::default());
         }
 
-        self.validate_visibility_scan_bound()?;
-        self.validate_visibility_run_graph()?;
-        self.validate_visibility_operation_graph()?;
+        self.visibility_graph_validation()?;
 
         let task_attribution_runs = self.visible_runs_for_scope(
             grant.read_permissions.tasks,
@@ -641,9 +728,11 @@ impl HarnessEngine {
     /// Unacked entries sort first; each carries its `thread`. `limit` bounds
     /// the returned page -- the caller passes a value already bounded by its
     /// own request schema (harness MCP's `HARNESS_ENTITY_PAGE_LIMIT_MAX`,
-    /// reused there); this layer additionally caps its own scan at
-    /// `HARNESS_VISIBILITY_SCAN_MAX`, the same bound `read_visibility`
-    /// already uses, so an inbox read costs no more than a visibility scan.
+    /// reused there); this layer additionally caps the number of stored
+    /// messages it will scan at `HARNESS_MAIL_SCAN_MAX`, sized for the cost
+    /// of this read (a linear filter plus a sort of the matches) and
+    /// independent of `read_visibility`'s own, unrelated traversal bound --
+    /// `read_visibility(grant_id)` below still enforces that bound itself.
     pub fn mail_inbox(
         &self,
         grant_id: &SessionGrantId,
@@ -651,7 +740,7 @@ impl HarnessEngine {
         since_unix_ms: Option<u64>,
         limit: usize,
     ) -> Result<Vec<HarnessMailInboxEntryV1>, HarnessEngineError> {
-        if self.mail_messages.len() > HARNESS_VISIBILITY_SCAN_MAX {
+        if self.mail_messages.len() > HARNESS_MAIL_SCAN_MAX {
             return Err(HarnessEngineError::ReadVisibilityResourceExhausted);
         }
         let visibility = self.read_visibility(grant_id)?;
@@ -2420,11 +2509,18 @@ impl HarnessEngine {
     }
 
     fn finish(
-        self,
+        mut self,
         operation: HarnessOperationV1,
         outcome: HarnessApplyOutcome,
     ) -> Result<PreparedHarnessMutation, HarnessEngineError> {
         self.validate_links()?;
+        // The single point every real (non-replayed) mutation passes
+        // through -- see `mutation_generation`'s own doc comment on
+        // `HarnessEngine` for why this, and not a new counter, is what
+        // invalidates `visibility_graph_cache`.
+        if outcome == HarnessApplyOutcome::Applied {
+            self.mutation_generation = self.mutation_generation.wrapping_add(1);
+        }
         Ok(PreparedHarnessMutation { next: self, outcome, operation })
     }
 
@@ -2930,34 +3026,72 @@ impl HarnessEngine {
             }
     }
 
-    fn validate_visibility_scan_bound(&self) -> Result<(), HarnessEngineError> {
-        let scanned = self.tasks.len()
-            .checked_add(self.runs.len())
-            .and_then(|value| value.checked_add(self.operations.len()))
-            .ok_or(HarnessEngineError::ReadVisibilityResourceExhausted)?;
-        if scanned > HARNESS_VISIBILITY_SCAN_MAX {
-            return Err(HarnessEngineError::ReadVisibilityResourceExhausted);
+    /// Cached, grant-independent structural validity of the whole
+    /// task/run/operation graph -- see `mutation_generation` and
+    /// `visibility_graph_cache`'s own doc comments on `HarnessEngine` for
+    /// the invalidation discipline. This used to be three separate calls
+    /// on every `read_visibility`, one of them (the retired
+    /// `validate_visibility_scan_bound`) refusing outright once
+    /// `tasks.len() + runs.len() + operations.len()` passed
+    /// `HARNESS_VISIBILITY_SCAN_MAX` -- a bound that faithfully reflected
+    /// the cost of redoing this validation on EVERY read (S9: it was never
+    /// a mismatch), but ordinary use grows `operations` (and often `tasks`)
+    /// forever, so it was a cliff every long-lived store eventually walked
+    /// off and never recovered from: a read is refused "purely because the
+    /// history got long" is exactly the failure this cache exists to
+    /// retire. Redoing the validation only when the graph could actually
+    /// have changed (`mutation_generation` bumped) removes the cost this
+    /// aggregate size gate existed to cap, so it is retired rather than
+    /// moved: the traversals it gated are already correctly bounded on
+    /// their own terms -- `validate_visibility_run_graph`'s cost is
+    /// `runs.len() * HARNESS_CHILD_DEPTH_MAX` with cycles caught by its own
+    /// `visited` set, and `validate_visibility_operation_graph`'s is
+    /// amortized `operations.len()` (its `complete` memoization visits each
+    /// operation at most once across the whole pass) with its own
+    /// unchanged per-chain `HARNESS_VISIBILITY_SCAN_MAX` guard against one
+    /// pathologically long reconciliation chain. Those per-chain bounds are
+    /// what a read still fails closed on -- not the store's lifetime size.
+    fn visibility_graph_validation(&self) -> Result<(), HarnessEngineError> {
+        // Copied out of the `Ref` guard into a plain binding on its own
+        // statement (not matched directly in the `if let` scrutinee) so
+        // the guard is dropped before `borrow_mut` below runs, never
+        // overlapping it.
+        let cached = *self.visibility_graph_cache.borrow();
+        if let Some((generation, outcome)) = cached {
+            if generation == self.mutation_generation {
+                return outcome.map_err(HarnessEngineError::from);
+            }
         }
+        let outcome = self.recompute_visibility_graph_validation();
+        *self.visibility_graph_cache.borrow_mut() = Some((self.mutation_generation, outcome));
+        outcome.map_err(HarnessEngineError::from)
+    }
+
+    fn recompute_visibility_graph_validation(
+        &self,
+    ) -> Result<(), HarnessVisibilityGraphFaultV1> {
+        self.validate_visibility_run_graph()?;
+        self.validate_visibility_operation_graph()?;
         Ok(())
     }
 
-    fn validate_visibility_run_graph(&self) -> Result<(), HarnessEngineError> {
+    fn validate_visibility_run_graph(&self) -> Result<(), HarnessVisibilityGraphFaultV1> {
         for run_id in self.runs.keys() {
             let mut current = Some(run_id);
             let mut visited = BTreeSet::new();
             let mut depth = 0_u16;
             while let Some(current_id) = current {
                 if !visited.insert(current_id.clone()) {
-                    return Err(HarnessEngineError::ReadVisibilityInvalidGraph);
+                    return Err(HarnessVisibilityGraphFaultV1::InvalidGraph);
                 }
                 let run = self.runs.get(current_id)
-                    .ok_or(HarnessEngineError::ReadVisibilityInvalidGraph)?;
+                    .ok_or(HarnessVisibilityGraphFaultV1::InvalidGraph)?;
                 current = run.parent_run_id.as_ref();
                 if current.is_some() {
                     depth = depth.checked_add(1)
-                        .ok_or(HarnessEngineError::ReadVisibilityInvalidGraph)?;
+                        .ok_or(HarnessVisibilityGraphFaultV1::InvalidGraph)?;
                     if depth > HARNESS_CHILD_DEPTH_MAX {
-                        return Err(HarnessEngineError::ReadVisibilityInvalidGraph);
+                        return Err(HarnessVisibilityGraphFaultV1::InvalidGraph);
                     }
                 }
             }
@@ -2965,7 +3099,7 @@ impl HarnessEngine {
         Ok(())
     }
 
-    fn validate_visibility_operation_graph(&self) -> Result<(), HarnessEngineError> {
+    fn validate_visibility_operation_graph(&self) -> Result<(), HarnessVisibilityGraphFaultV1> {
         let mut complete = BTreeSet::new();
         for operation_id in self.operations.keys() {
             if complete.contains(operation_id) {
@@ -2979,13 +3113,13 @@ impl HarnessEngine {
                     break;
                 }
                 if !visiting.insert(current_id.clone()) {
-                    return Err(HarnessEngineError::ReadVisibilityInvalidGraph);
+                    return Err(HarnessVisibilityGraphFaultV1::InvalidGraph);
                 }
                 if path.len() >= HARNESS_VISIBILITY_SCAN_MAX {
-                    return Err(HarnessEngineError::ReadVisibilityResourceExhausted);
+                    return Err(HarnessVisibilityGraphFaultV1::ResourceExhausted);
                 }
                 let operation = self.operations.get(current_id)
-                    .ok_or(HarnessEngineError::ReadVisibilityInvalidGraph)?;
+                    .ok_or(HarnessVisibilityGraphFaultV1::InvalidGraph)?;
                 if matches!(
                     &operation.actor,
                     HarnessActorV1::ParentRun { run_id } if !self.runs.contains_key(run_id)
@@ -2996,12 +3130,12 @@ impl HarnessEngine {
                     || operation.grant_id.as_ref()
                         .is_some_and(|grant_id| !self.grants.contains_key(grant_id))
                 {
-                    return Err(HarnessEngineError::ReadVisibilityInvalidGraph);
+                    return Err(HarnessVisibilityGraphFaultV1::InvalidGraph);
                 }
                 path.push(current_id.clone());
                 current = operation.reconciles_operation_id.as_ref();
                 if current.is_some_and(|target| !self.operations.contains_key(target)) {
-                    return Err(HarnessEngineError::ReadVisibilityInvalidGraph);
+                    return Err(HarnessVisibilityGraphFaultV1::InvalidGraph);
                 }
             }
             complete.extend(path);
@@ -4499,6 +4633,10 @@ mod tests {
 
     fn mail_message_id(hex: char) -> HarnessMailMessageId {
         HarnessMailMessageId::new(format!("hmail_{}", hex.to_string().repeat(24))).unwrap()
+    }
+
+    fn numbered_mail_message_id(value: usize) -> HarnessMailMessageId {
+        HarnessMailMessageId::new(format!("hmail_{value:024x}")).unwrap()
     }
 
     fn revision(value: u64) -> HarnessRevision {
@@ -7250,18 +7388,169 @@ mod tests {
         ));
     }
 
+    /// The measured live regression (2026-09-09): `validate_visibility_scan_bound`
+    /// used to sum `tasks.len() + runs.len() + operations.len()` and refuse
+    /// once that total passed `HARNESS_VISIBILITY_SCAN_MAX`, even though
+    /// neither graph validator it gated (`validate_visibility_run_graph`,
+    /// `validate_visibility_operation_graph`) ever inspects `tasks` at all,
+    /// and even though both are already bounded by their own per-chain
+    /// checks, never by total store size. Ordinary use grows `operations`
+    /// (and often `tasks`) forever, so that aggregate bound was a cliff
+    /// every long-lived store eventually walked off and never recovered
+    /// from -- past it, every reader's mailbox and session-list reads
+    /// failed `Internal` for the life of the store, with no recovery short
+    /// of a new database. This fixture (padded with unlinked tasks well
+    /// past the old ceiling, so the run/operation graphs the two
+    /// validators actually walk are untouched and stay structurally valid)
+    /// used to prove the refusal; it now proves the read survives it. This
+    /// test's own name and assertion changed from `..._fails_closed` for
+    /// exactly that reason: the old assertion encoded the bug this pass
+    /// fixes, so keeping it "as written" would mean re-breaking the fix.
     #[test]
-    fn harness_read_visibility_scan_cap_fails_closed() {
+    fn harness_read_visibility_survives_a_store_past_the_old_scan_ceiling() {
         let mut engine = visibility_fixture();
         engine.tasks.clear();
         for index in 0..HARNESS_VISIBILITY_SCAN_MAX {
             let id = numbered_task_id(index + 1);
             engine.tasks.insert(id.clone(), task(id, 1, "bounded scan"));
         }
+        assert!(
+            engine.tasks.len() + engine.runs.len() + engine.operations.len()
+                > HARNESS_VISIBILITY_SCAN_MAX,
+        );
+        assert!(engine.read_visibility(&grant_id()).is_ok());
+    }
+
+    /// The same regression, proven at the wire this pass's brief names
+    /// explicitly: `mail_inbox` calls `read_visibility` unconditionally
+    /// before it ever looks at a single message, so a store past the old
+    /// ceiling used to fail every mailbox read regardless of whether the
+    /// message being read even needed lineage visibility. A store this
+    /// large, with a structurally valid graph, must still return the
+    /// reader's own page.
+    #[test]
+    fn harness_mail_inbox_serves_a_read_above_the_old_visibility_scan_ceiling() {
+        let mut engine = visibility_fixture();
+        engine.tasks.clear();
+        for index in 0..HARNESS_VISIBILITY_SCAN_MAX {
+            let id = numbered_task_id(index + 1);
+            engine.tasks.insert(id.clone(), task(id, 1, "bounded scan"));
+        }
+        assert!(
+            engine.tasks.len() + engine.runs.len() + engine.operations.len()
+                > HARNESS_VISIBILITY_SCAN_MAX,
+        );
+
+        let reader_record_id = HarnessSelectorV1::new("record-recipient").unwrap();
+        let message = numbered_mail_message(
+            90_000,
+            HarnessMailAddressV1::Session { record_id: reader_record_id.clone() },
+            5,
+        );
+        engine.mail_messages.insert(message.message_id.clone(), message.clone());
+
+        let page = engine.mail_inbox(&grant_id(), &reader_record_id, None, 8).unwrap();
+        assert_eq!(
+            page.iter().map(|entry| entry.message.message_id.clone()).collect::<Vec<_>>(),
+            vec![message.message_id],
+        );
+    }
+
+    /// The bound this pass keeps: `validate_visibility_operation_graph`'s
+    /// own per-chain length check (unchanged; it was never the aggregate
+    /// `tasks + runs + operations` bound this pass retires) still fails
+    /// closed on a single reconciliation chain longer than
+    /// `HARNESS_VISIBILITY_SCAN_MAX`, independent of how many OTHER
+    /// operations the store holds -- a genuinely pathological graph, not
+    /// merely a long-lived one. The chain is built ascending
+    /// (`op[1]` reconciles `op[2]`, ..., `op[N-1]` reconciles `op[N]`) so
+    /// the very first outer-loop iteration (smallest key first, nothing in
+    /// `complete` yet) walks it in one pass; a descending chain would
+    /// instead complete in O(1) per node via the same memoization that
+    /// makes this validator cheap in the ordinary case.
+    #[test]
+    fn harness_read_visibility_long_reconcile_chain_fails_closed() {
+        let mut engine = HarnessEngine::new();
+        engine.runs.insert(run_id(), run(HarnessRunLifecycleV1::Running, 1));
+
+        let chain_len = HARNESS_VISIBILITY_SCAN_MAX + 10;
+        for index in 1..=chain_len {
+            let mut operation = visibility_reconcile_operation(
+                numbered_operation_id(index),
+                'a',
+                run_id(),
+                run_id(),
+                numbered_operation_id(index),
+            );
+            operation.reconciles_operation_id = if index < chain_len {
+                Some(numbered_operation_id(index + 1))
+            } else {
+                None
+            };
+            engine.operations.insert(operation.operation_id.clone(), operation);
+        }
+
+        let mut scoped_grant = grant(SessionGrantStateV1::Active, 1);
+        scoped_grant.read_permissions = HarnessReadPermissionsV1 {
+            tasks: HarnessEntityReadScopeV1::SelfOnly,
+            runs: HarnessEntityReadScopeV1::SelfOnly,
+            operations: HarnessEntityReadScopeV1::SelfOnly,
+        };
+        engine.grants.insert(scoped_grant.grant_id.clone(), scoped_grant.clone());
+
         assert!(matches!(
-            engine.read_visibility(&grant_id()),
+            engine.read_visibility(&scoped_grant.grant_id),
             Err(HarnessEngineError::ReadVisibilityResourceExhausted),
         ));
+    }
+
+    /// The cache is not stale-forever: once `mutation_generation` --
+    /// `finish`'s own choke point, see its doc comment on `HarnessEngine`
+    /// -- has moved past the generation the cache was computed at, the
+    /// very next read recomputes instead of reusing the stale answer.
+    /// This bumps the counter directly (the same effect `finish` produces
+    /// on every real accepted mutation, `HarnessApplyOutcome::Applied` or
+    /// not) so this test isolates exactly the cache's own invalidation
+    /// contract from whether any particular `prepare_*` mutation happens
+    /// to validate against this fixture -- dozens of other tests in this
+    /// file already cover `prepare`/`finish`/`accept` themselves.
+    #[test]
+    fn harness_read_visibility_cache_recomputes_after_a_mutation() {
+        let mut engine = visibility_fixture();
+        assert!(engine.read_visibility(&grant_id()).is_ok());
+
+        engine.mutation_generation += 1;
+
+        // Same corruption `harness_read_visibility_cycle_fails_closed`
+        // proves fails closed when read fresh: root(1) <-> child(2).
+        engine.runs.get_mut(&numbered_run_id(1)).unwrap().parent_run_id =
+            Some(numbered_run_id(2));
+
+        assert!(matches!(
+            engine.read_visibility(&grant_id()),
+            Err(HarnessEngineError::ReadVisibilityInvalidGraph),
+        ));
+    }
+
+    /// A second read after a successful first one reuses the cached
+    /// answer instead of redoing the traversal -- proven black-box and
+    /// timing-independent: the run graph is corrupted directly (bypassing
+    /// `prepare`/`accept`, so `mutation_generation` never moves and the
+    /// cache from the first read is never invalidated). If this second
+    /// read were re-running `validate_visibility_run_graph`, it would see
+    /// the corruption and refuse with `ReadVisibilityInvalidGraph`, exactly
+    /// as `harness_read_visibility_cycle_fails_closed` proves a fresh read
+    /// does. Getting `Ok` back instead is only possible because the
+    /// traversal was never redone.
+    #[test]
+    fn harness_read_visibility_cache_reuses_result_without_retraversal() {
+        let mut engine = visibility_fixture();
+        assert!(engine.read_visibility(&grant_id()).is_ok());
+
+        engine.runs.get_mut(&numbered_run_id(1)).unwrap().parent_run_id =
+            Some(numbered_run_id(2));
+
+        assert!(engine.read_visibility(&grant_id()).is_ok());
     }
 
     #[test]
@@ -7713,6 +8002,24 @@ mod tests {
         }
     }
 
+    fn numbered_mail_message(
+        index: usize,
+        to: HarnessMailAddressV1,
+        created_at_unix_ms: u64,
+    ) -> HarnessMailMessageV1 {
+        HarnessMailMessageV1 {
+            message_id: numbered_mail_message_id(index),
+            from: mail_record_ref("record-sender", "claude"),
+            to,
+            subject: String::new(),
+            body: String::new(),
+            reply_to: None,
+            task_id: None,
+            refs: Vec::new(),
+            created_at_unix_ms,
+        }
+    }
+
     #[test]
     fn harness_mail_send_to_session_then_inbox_ack_is_idempotent() {
         let mut engine = HarnessEngine::new();
@@ -7828,6 +8135,200 @@ mod tests {
         assert_eq!(prepared.outcome(), HarnessApplyOutcome::Applied);
         engine.accept(prepared);
         assert!(engine.mail_ack(&message.message_id, &reader_record_id).is_some());
+    }
+
+    /// The regression this fixes: `mail_inbox` used to refuse for EVERY
+    /// reader once the whole store held more than `HARNESS_VISIBILITY_SCAN_MAX`
+    /// messages -- a ceiling sized for lineage-graph traversal cost, not
+    /// mailbox growth. A store well past that old ceiling must still
+    /// resolve, and must still return exactly the reader's own page.
+    #[test]
+    fn harness_mail_inbox_returns_the_correct_page_above_the_old_visibility_ceiling() {
+        let mut engine = HarnessEngine::new();
+        let reader_record_id = HarnessSelectorV1::new("record-recipient").unwrap();
+        let other_record_id = HarnessSelectorV1::new("record-other").unwrap();
+        let mut grant = mail_grant(SessionGrantStateV1::Active, 1);
+        grant.grant_id = numbered_grant_id(201);
+        engine.grants.insert(grant.grant_id.clone(), grant.clone());
+
+        let store_size = HARNESS_VISIBILITY_SCAN_MAX + 500;
+        assert!(store_size > HARNESS_VISIBILITY_SCAN_MAX);
+        for index in 0..store_size {
+            let to = if index % 2 == 0 {
+                HarnessMailAddressV1::Session { record_id: reader_record_id.clone() }
+            } else {
+                HarnessMailAddressV1::Session { record_id: other_record_id.clone() }
+            };
+            let message = numbered_mail_message(index, to, index as u64);
+            engine.mail_messages.insert(message.message_id.clone(), message);
+        }
+
+        let page = engine.mail_inbox(&grant.grant_id, &reader_record_id, None, 4).unwrap();
+        let expected_ids: Vec<HarnessMailMessageId> = [0_usize, 2, 4, 6]
+            .into_iter()
+            .map(numbered_mail_message_id)
+            .collect();
+        assert_eq!(
+            page.iter().map(|entry| entry.message.message_id.clone()).collect::<Vec<_>>(),
+            expected_ids,
+        );
+        for entry in &page {
+            assert_eq!(
+                entry.message.to,
+                HarnessMailAddressV1::Session { record_id: reader_record_id.clone() },
+            );
+            assert!(!entry.acked);
+        }
+    }
+
+    /// `limit`, `since_unix_ms`, and the acked/created-at/message-id sort
+    /// order all still hold once the store is well past the old
+    /// `HARNESS_VISIBILITY_SCAN_MAX` ceiling -- this pass changes which
+    /// ceiling gates the scan, never the shape of the page it returns.
+    #[test]
+    fn harness_mail_inbox_limit_since_and_sort_hold_above_the_old_ceiling() {
+        let mut engine = HarnessEngine::new();
+        let reader_record_id = HarnessSelectorV1::new("record-recipient").unwrap();
+        let other_record_id = HarnessSelectorV1::new("record-other").unwrap();
+        let mut grant = mail_grant(SessionGrantStateV1::Active, 1);
+        grant.grant_id = numbered_grant_id(202);
+        engine.grants.insert(grant.grant_id.clone(), grant.clone());
+
+        // Filler addressed to a DIFFERENT reader: pushes the whole store
+        // past the old `HARNESS_VISIBILITY_SCAN_MAX` ceiling without
+        // inflating the page this test actually inspects (`mail_inbox`
+        // truncates to `limit` before it builds a `thread` for each
+        // returned entry, so the filler's cost stays a single cheap linear
+        // pass, never `limit x store size`).
+        let filler_count = HARNESS_VISIBILITY_SCAN_MAX + 300;
+        for index in 0..filler_count {
+            let message = numbered_mail_message(
+                index,
+                HarnessMailAddressV1::Session { record_id: other_record_id.clone() },
+                index as u64,
+            );
+            engine.mail_messages.insert(message.message_id.clone(), message);
+        }
+        assert!(engine.mail_messages.len() > HARNESS_VISIBILITY_SCAN_MAX);
+
+        // The reader's own five messages, ids well past the filler range
+        // so nothing collides. `tie_a`/`tie_b` share a `created_at` to
+        // exercise the message-id tie-break; `acked_oldest`/`acked_next`
+        // are older than every unacked message and acked, to exercise
+        // "unacked sorts first" winning over created-at order.
+        let tie_a = numbered_mail_message(
+            filler_count + 1,
+            HarnessMailAddressV1::Session { record_id: reader_record_id.clone() },
+            50,
+        );
+        let tie_b = numbered_mail_message(
+            filler_count + 2,
+            HarnessMailAddressV1::Session { record_id: reader_record_id.clone() },
+            50,
+        );
+        let newest = numbered_mail_message(
+            filler_count + 3,
+            HarnessMailAddressV1::Session { record_id: reader_record_id.clone() },
+            80,
+        );
+        let acked_oldest = numbered_mail_message(
+            filler_count + 4,
+            HarnessMailAddressV1::Session { record_id: reader_record_id.clone() },
+            10,
+        );
+        let acked_next = numbered_mail_message(
+            filler_count + 5,
+            HarnessMailAddressV1::Session { record_id: reader_record_id.clone() },
+            20,
+        );
+        for message in [&tie_a, &tie_b, &newest, &acked_oldest, &acked_next] {
+            engine.mail_messages.insert(message.message_id.clone(), message.clone());
+        }
+        for message in [&acked_oldest, &acked_next] {
+            engine.mail_acks.insert(
+                (message.message_id.clone(), reader_record_id.clone()),
+                HarnessMailAckV1 {
+                    message_id: message.message_id.clone(),
+                    reader_record_id: reader_record_id.clone(),
+                    acked_at_unix_ms: 999,
+                },
+            );
+        }
+
+        // `tie_a` sorts before `tie_b`: same `created_at`, message-id
+        // breaks the tie.
+        let by_id_tie = engine.mail_inbox(&grant.grant_id, &reader_record_id, None, 2).unwrap();
+        assert_eq!(
+            by_id_tie.iter().map(|entry| entry.message.message_id.clone()).collect::<Vec<_>>(),
+            vec![tie_a.message_id.clone(), tie_b.message_id.clone()],
+        );
+        assert!(by_id_tie.iter().all(|entry| !entry.acked));
+
+        // `since_unix_ms` excludes the oldest acked message (`created_at`
+        // 10) but keeps everything from 20 up -- the filter runs before
+        // the sort, not after.
+        let since_page = engine
+            .mail_inbox(&grant.grant_id, &reader_record_id, Some(15), 10)
+            .unwrap();
+        assert_eq!(
+            since_page.iter().map(|entry| entry.message.message_id.clone()).collect::<Vec<_>>(),
+            vec![
+                tie_a.message_id.clone(),
+                tie_b.message_id.clone(),
+                newest.message_id.clone(),
+                acked_next.message_id.clone(),
+            ],
+        );
+
+        // Unbounded `since`, full page: acked-first-false wins over
+        // created-at -- both unacked entries (`created_at` 50, 80) precede
+        // both acked ones (`created_at` 10, 20) despite being newer.
+        let full_page = engine.mail_inbox(&grant.grant_id, &reader_record_id, None, 10).unwrap();
+        assert_eq!(
+            full_page.iter().map(|entry| entry.message.message_id.clone()).collect::<Vec<_>>(),
+            vec![
+                tie_a.message_id.clone(),
+                tie_b.message_id.clone(),
+                newest.message_id.clone(),
+                acked_oldest.message_id.clone(),
+                acked_next.message_id.clone(),
+            ],
+        );
+        assert_eq!(
+            full_page.iter().map(|entry| entry.acked).collect::<Vec<_>>(),
+            vec![false, false, false, true, true],
+        );
+    }
+
+    /// `read_visibility`'s own bounds are untouched by this pass -- this
+    /// proves only `mail_inbox`'s own new ceiling, `HARNESS_MAIL_SCAN_MAX`,
+    /// still fails closed once a store genuinely is that large. The
+    /// fixture is cheap to build because the refusal is the FIRST thing
+    /// `mail_inbox` checks: it returns before `read_visibility`, the
+    /// filter, or the sort ever run, so no addressing or body detail here
+    /// is load-bearing -- only the store's size is.
+    #[test]
+    fn harness_mail_inbox_refuses_above_the_new_scan_ceiling() {
+        let mut engine = HarnessEngine::new();
+        let reader_record_id = HarnessSelectorV1::new("record-recipient").unwrap();
+        let mut grant = mail_grant(SessionGrantStateV1::Active, 1);
+        grant.grant_id = numbered_grant_id(203);
+        engine.grants.insert(grant.grant_id.clone(), grant.clone());
+
+        for index in 0..=HARNESS_MAIL_SCAN_MAX {
+            let message = numbered_mail_message(
+                index,
+                HarnessMailAddressV1::Session { record_id: reader_record_id.clone() },
+                index as u64,
+            );
+            engine.mail_messages.insert(message.message_id.clone(), message);
+        }
+        assert_eq!(engine.mail_messages.len(), HARNESS_MAIL_SCAN_MAX + 1);
+
+        assert!(matches!(
+            engine.mail_inbox(&grant.grant_id, &reader_record_id, None, 8),
+            Err(HarnessEngineError::ReadVisibilityResourceExhausted),
+        ));
     }
 
     /// D3/C1: A mails B a `Run` ref naming A's OWN run. `reader_grant`'s

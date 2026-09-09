@@ -84,29 +84,116 @@ fn verify_observation_binding(
     verify_observation_credential_binding(observation, support, &claims.binding)
 }
 
+/// Verify a decoded credential binding against the observation engine's
+/// current view of the node incarnation, managed runtime and projection.
+///
+/// This folds five distinct causes into one `Unauthorized` on the wire (the
+/// wire contract and agent-visible behaviour are unchanged), but each
+/// failing branch names precisely which check failed via `tracing::warn!`
+/// before returning. Measured live 2026-09-09: a kimi PTY session's first
+/// `g4a_context_get` call was refused here and the immediate retry
+/// succeeded, with no way to tell which of the five checks was transiently
+/// false -- this is that missing signal.
 pub(crate) fn verify_observation_credential_binding(
     observation: &ObservationService,
     support: &ObservationSupportRegistry,
     binding: &crate::credential::CredentialBindingV1,
 ) -> Result<(), HarnessReadHostErrorV1> {
-    let node_id = gate4agent_observation_api::NodeId::new(binding.node_id.as_str())
-        .map_err(|_| HarnessReadHostErrorV1::Unauthorized)?;
-    let incarnation_id = binding.node_incarnation.as_str().parse()
-        .map_err(|_| HarnessReadHostErrorV1::Unauthorized)?;
-    let record_id = gate4agent_observation_api::SessionRecordId::new(
-        binding.record_id.as_str(),
-    ).map_err(|_| HarnessReadHostErrorV1::Unauthorized)?;
+    let node_id = match gate4agent_observation_api::NodeId::new(binding.node_id.as_str()) {
+        Ok(node_id) => node_id,
+        Err(_) => {
+            tracing::warn!(
+                check = "parse-node-id",
+                node_id = binding.node_id.as_str(),
+                "harness MCP read call binding check failed",
+            );
+            return Err(HarnessReadHostErrorV1::Unauthorized);
+        }
+    };
+    let incarnation_id = match binding
+        .node_incarnation
+        .as_str()
+        .parse::<gate4agent_observation_api::NodeIncarnationId>()
+    {
+        Ok(incarnation_id) => incarnation_id,
+        Err(_) => {
+            tracing::warn!(
+                check = "parse-node-incarnation",
+                node_incarnation = binding.node_incarnation.as_str(),
+                "harness MCP read call binding check failed",
+            );
+            return Err(HarnessReadHostErrorV1::Unauthorized);
+        }
+    };
+    let record_id = match gate4agent_observation_api::SessionRecordId::new(binding.record_id.as_str()) {
+        Ok(record_id) => record_id,
+        Err(_) => {
+            tracing::warn!(
+                check = "parse-record-id",
+                record_id = binding.record_id.as_str(),
+                "harness MCP read call binding check failed",
+            );
+            return Err(HarnessReadHostErrorV1::Unauthorized);
+        }
+    };
     let key = ManagedSessionKey { node_id, incarnation_id, record_id };
-    if !support.is_authoritative(&key.node_id, key.incarnation_id) {
+    if !support.is_current(&key.node_id, key.incarnation_id) {
+        tracing::warn!(
+            check = "node-incarnation-not-current",
+            node_id = %key.node_id,
+            node_incarnation = %key.incarnation_id,
+            "harness MCP read call binding check failed",
+        );
         return Err(HarnessReadHostErrorV1::Unauthorized);
     }
-    let runtime = observation.engine().managed_runtime(&key)
-        .ok_or(HarnessReadHostErrorV1::Unauthorized)?;
-    if runtime.workspace_id.as_str() != binding.workspace_id.as_str()
-        || runtime.instance_id.0 != binding.instance_id
-        || runtime.generation.0 != binding.generation
-        || observation.projection(&ObservationTarget::Managed { key }).is_none()
+    let Some(runtime) = observation.engine().managed_runtime(&key) else {
+        tracing::warn!(
+            check = "managed-runtime-absent",
+            node_id = %key.node_id,
+            node_incarnation = %key.incarnation_id,
+            record_id = %key.record_id,
+            "harness MCP read call binding check failed",
+        );
+        return Err(HarnessReadHostErrorV1::Unauthorized);
+    };
+    if runtime.workspace_id.as_str() != binding.workspace_id.as_str() {
+        tracing::warn!(
+            check = "runtime-workspace-mismatch",
+            runtime_workspace = runtime.workspace_id.as_str(),
+            binding_workspace = binding.workspace_id.as_str(),
+            "harness MCP read call binding check failed",
+        );
+        return Err(HarnessReadHostErrorV1::Unauthorized);
+    }
+    if runtime.instance_id.0 != binding.instance_id {
+        tracing::warn!(
+            check = "runtime-instance-mismatch",
+            runtime_instance = runtime.instance_id.0,
+            binding_instance = binding.instance_id,
+            "harness MCP read call binding check failed",
+        );
+        return Err(HarnessReadHostErrorV1::Unauthorized);
+    }
+    if runtime.generation.0 != binding.generation {
+        tracing::warn!(
+            check = "runtime-generation-mismatch",
+            runtime_generation = runtime.generation.0,
+            binding_generation = binding.generation,
+            "harness MCP read call binding check failed",
+        );
+        return Err(HarnessReadHostErrorV1::Unauthorized);
+    }
+    if observation
+        .projection(&ObservationTarget::Managed { key: key.clone() })
+        .is_none()
     {
+        tracing::warn!(
+            check = "projection-absent",
+            node_id = %key.node_id,
+            node_incarnation = %key.incarnation_id,
+            record_id = %key.record_id,
+            "harness MCP read call binding check failed",
+        );
         return Err(HarnessReadHostErrorV1::Unauthorized);
     }
     Ok(())
@@ -991,8 +1078,12 @@ fn mail_inbox_page(
     since_unix_ms: Option<u64>,
     limit: u16,
 ) -> Result<HarnessMailInboxPageV1, HarnessReadHostErrorV1> {
+    // Shared by the operator wire and by every agent's own `g4a_mail_inbox`, so
+    // a swallowed error here reads as an unexplained `Internal` on both. Seen
+    // live 2026-09-09: `mail inbox` refused every record on a stack whose
+    // agents were simultaneously failing to read their own mail.
     let entries = engine.mail_inbox(grant_id, reader_record_id, since_unix_ms, usize::from(limit))
-        .map_err(|_| HarnessReadHostErrorV1::Internal)?;
+        .map_err(internal_naming("mail-inbox-page"))?;
     let unacked = entries.iter().filter(|entry| !entry.acked).count() as u64;
     let messages = entries.into_iter().map(|entry| HarnessMailInboxEntryV1 {
         message_id: entry.message.message_id,

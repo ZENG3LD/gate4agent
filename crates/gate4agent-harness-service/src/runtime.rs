@@ -7361,11 +7361,41 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                 changed = topology.changed(), if topology_open => {
                     match changed {
                         Ok(routes) => {
-                            support.mark_all_unhealthy();
                             let routes = routes.into_iter()
                                 .map(|observation_route| observation_route.route().clone())
                                 .collect::<Vec<_>>();
+                            // Only revoke authority for routes that dropped
+                            // out of the current online set -- a route that
+                            // is still online with an unchanged incarnation
+                            // keeps its read authority across this topology
+                            // event. See `ObservationSupportRegistry::
+                            // reconcile_current_routes`.
+                            let offline_known_routes = support
+                                .routes
+                                .keys()
+                                .filter(|(node_id, incarnation_id)| {
+                                    !routes.iter().any(|route| {
+                                        &route.node_id == node_id
+                                            && route.expected_incarnation_id == *incarnation_id
+                                    })
+                                })
+                                .count();
+                            support.reconcile_current_routes(&routes);
+                            tracing::info!(
+                                online_routes = routes.len(),
+                                marked_unhealthy = offline_known_routes,
+                                "observation route topology reconciled",
+                            );
                             observation_recovery.reconcile_topology(&routes);
+                            // Topology churn still forces a resync for every
+                            // online route even though it no longer loses
+                            // read authority above -- the event stream can
+                            // have gaps across a relay reconnect, and
+                            // `start_pending_observation_recoveries` does not
+                            // gate on `is_authoritative`.
+                            for route in &routes {
+                                observation_recovery.ensure_route(route.clone());
+                            }
                             // Read back off the same watch the `changed()`
                             // above just woke on -- `routes` is only the
                             // online subset, and departure cannot be read
@@ -7383,12 +7413,6 @@ pub async fn start_harness_host_with_operator_and_catalogs(
                                 });
                             }
                             terminal_buffers.reconcile_topology(&routes);
-                            for route in &routes {
-                                support.mark_unhealthy(
-                                    &route.node_id,
-                                    route.expected_incarnation_id,
-                                );
-                            }
                             if active_dispatch.is_none() {
                                 if let Some(intent) = harness.pending_scheduled_dispatch()? {
                                     active_dispatch = start_or_terminalize_dispatch_job(
@@ -10987,6 +11011,20 @@ pub(crate) struct ObservationSupportRegistry {
 struct RouteObservationAuthority {
     support: Option<C2ObservationSupport>,
     healthy: bool,
+    /// Whether the harness has successfully resynced this exact
+    /// `(node_id, incarnation_id)` route at least once and the route is
+    /// still present in the current topology. This is NOT cursor
+    /// freshness -- `healthy` already carries that meaning, and every
+    /// existing writer of `healthy` keeps writing it exactly as before.
+    /// `current` only ever goes false on a real loss of route ownership
+    /// (the route left the topology, or the event stream was lost
+    /// entirely), never on a follow-up recovery pass or a cursor gap.
+    /// The harness-MCP read path (`verify_observation_credential_binding`
+    /// in `read.rs`) is its only consumer: gating that path on `healthy`
+    /// instead caused 149 live refusals in one stack run on 2026-09-09,
+    /// 101 of them from `mark_unhealthy` calls that were only reporting a
+    /// cursor gap, not a loss of authority.
+    current: bool,
 }
 
 impl ObservationSupportRegistry {
@@ -11007,6 +11045,20 @@ impl ObservationSupportRegistry {
             .is_some_and(|route| route.healthy)
     }
 
+    /// Whether this route has ever completed a resync and has not since
+    /// left the topology or lost its event stream entirely. See the
+    /// `current` field's doc comment on [`RouteObservationAuthority`] for
+    /// why this is deliberately not the same predicate as
+    /// [`Self::is_authoritative`].
+    pub(crate) fn is_current(
+        &self,
+        node_id: &NodeId,
+        incarnation_id: NodeIncarnationId,
+    ) -> bool {
+        self.routes.get(&(node_id.clone(), incarnation_id))
+            .is_some_and(|route| route.current)
+    }
+
     fn replace(
         &mut self,
         node_id: NodeId,
@@ -11015,19 +11067,38 @@ impl ObservationSupportRegistry {
     ) {
         self.routes.insert(
             (node_id, incarnation_id),
-            RouteObservationAuthority { support, healthy: true },
+            RouteObservationAuthority { support, healthy: true, current: true },
         );
     }
 
+    /// Revoking read authority is what makes the harness-MCP door refuse a
+    /// call as `node-incarnation-not-authoritative`, and a dozen call sites
+    /// can do it -- several of them inside recovery paths that swallow their
+    /// own C2 errors. `#[track_caller]` makes each revocation name the line
+    /// that asked for it, without threading a reason argument through every
+    /// one of them.
+    #[track_caller]
     fn mark_unhealthy(&mut self, node_id: &NodeId, incarnation_id: NodeIncarnationId) {
+        let was_healthy = self.routes
+            .get(&(node_id.clone(), incarnation_id))
+            .is_some_and(|route| route.healthy);
+        if was_healthy {
+            tracing::warn!(
+                node_id = %node_id,
+                node_incarnation = %incarnation_id,
+                caller = %std::panic::Location::caller(),
+                "observation route read authority revoked",
+            );
+        }
         self.routes.entry((node_id.clone(), incarnation_id))
             .and_modify(|route| route.healthy = false)
-            .or_insert(RouteObservationAuthority { support: None, healthy: false });
+            .or_insert(RouteObservationAuthority { support: None, healthy: false, current: false });
     }
 
     fn mark_all_unhealthy(&mut self) {
         for route in self.routes.values_mut() {
             route.healthy = false;
+            route.current = false;
         }
     }
 
@@ -11038,6 +11109,7 @@ impl ObservationSupportRegistry {
                     && route.expected_incarnation_id == *incarnation_id
             }) {
                 authority.healthy = false;
+                authority.current = false;
             }
         }
     }
@@ -15830,6 +15902,111 @@ mod tests {
         support.replace(node_a.clone(), incarnation_a, None);
         assert!(support.is_authoritative(&node_a, incarnation_a));
         assert!(!support.is_authoritative(&node_b, incarnation_b));
+    }
+
+    #[test]
+    fn reconcile_current_routes_keeps_authority_for_a_route_still_online() {
+        let node_a = NodeId::new("node-a").unwrap();
+        let incarnation_a = NodeIncarnationId::from_bytes([1; 16]);
+        let mut support = ObservationSupportRegistry::default();
+        support.replace(node_a.clone(), incarnation_a, None);
+        assert!(support.is_authoritative(&node_a, incarnation_a));
+
+        support.reconcile_current_routes(&[NodeRoute {
+            node_id: node_a.clone(),
+            expected_incarnation_id: incarnation_a,
+        }]);
+
+        assert!(support.is_authoritative(&node_a, incarnation_a));
+    }
+
+    #[test]
+    fn reconcile_current_routes_revokes_authority_for_a_route_that_dropped_offline() {
+        let node_a = NodeId::new("node-a").unwrap();
+        let incarnation_a = NodeIncarnationId::from_bytes([1; 16]);
+        let mut support = ObservationSupportRegistry::default();
+        support.replace(node_a.clone(), incarnation_a, None);
+        assert!(support.is_authoritative(&node_a, incarnation_a));
+
+        support.reconcile_current_routes(&[]);
+
+        assert!(!support.is_authoritative(&node_a, incarnation_a));
+    }
+
+    #[test]
+    fn reconcile_current_routes_does_not_grant_authority_to_a_never_seen_route() {
+        let node_a = NodeId::new("node-a").unwrap();
+        let incarnation_a = NodeIncarnationId::from_bytes([1; 16]);
+        let mut support = ObservationSupportRegistry::default();
+
+        support.reconcile_current_routes(&[NodeRoute {
+            node_id: node_a.clone(),
+            expected_incarnation_id: incarnation_a,
+        }]);
+
+        assert!(!support.is_authoritative(&node_a, incarnation_a));
+        assert!(support.get(&node_a, incarnation_a).is_none());
+    }
+
+    #[test]
+    fn replace_grants_both_authority_and_currency() {
+        let node_a = NodeId::new("node-a").unwrap();
+        let incarnation_a = NodeIncarnationId::from_bytes([1; 16]);
+        let mut support = ObservationSupportRegistry::default();
+
+        support.replace(node_a.clone(), incarnation_a, None);
+
+        assert!(support.is_authoritative(&node_a, incarnation_a));
+        assert!(support.is_current(&node_a, incarnation_a));
+    }
+
+    #[test]
+    fn mark_unhealthy_revokes_authority_but_keeps_currency() {
+        let node_a = NodeId::new("node-a").unwrap();
+        let incarnation_a = NodeIncarnationId::from_bytes([1; 16]);
+        let mut support = ObservationSupportRegistry::default();
+        support.replace(node_a.clone(), incarnation_a, None);
+
+        support.mark_unhealthy(&node_a, incarnation_a);
+
+        assert!(!support.is_authoritative(&node_a, incarnation_a));
+        assert!(support.is_current(&node_a, incarnation_a));
+    }
+
+    #[test]
+    fn reconcile_current_routes_revokes_both_authority_and_currency_for_offline_routes() {
+        let node_a = NodeId::new("node-a").unwrap();
+        let incarnation_a = NodeIncarnationId::from_bytes([1; 16]);
+        let mut support = ObservationSupportRegistry::default();
+        support.replace(node_a.clone(), incarnation_a, None);
+
+        support.reconcile_current_routes(&[]);
+
+        assert!(!support.is_authoritative(&node_a, incarnation_a));
+        assert!(!support.is_current(&node_a, incarnation_a));
+    }
+
+    #[test]
+    fn mark_all_unhealthy_revokes_both_authority_and_currency() {
+        let node_a = NodeId::new("node-a").unwrap();
+        let incarnation_a = NodeIncarnationId::from_bytes([1; 16]);
+        let mut support = ObservationSupportRegistry::default();
+        support.replace(node_a.clone(), incarnation_a, None);
+
+        support.mark_all_unhealthy();
+
+        assert!(!support.is_authoritative(&node_a, incarnation_a));
+        assert!(!support.is_current(&node_a, incarnation_a));
+    }
+
+    #[test]
+    fn a_never_seen_route_is_neither_authoritative_nor_current() {
+        let node_a = NodeId::new("node-a").unwrap();
+        let incarnation_a = NodeIncarnationId::from_bytes([1; 16]);
+        let support = ObservationSupportRegistry::default();
+
+        assert!(!support.is_authoritative(&node_a, incarnation_a));
+        assert!(!support.is_current(&node_a, incarnation_a));
     }
 
     #[test]

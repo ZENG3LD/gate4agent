@@ -107,15 +107,30 @@ pub(crate) fn acp_command(tool: CliTool) -> Result<AcpSpawnSpec, std::io::Error>
 /// from whether the resulting session actually landed in the requested
 /// mode.
 ///
-/// Kept as a real function (not simply inlined at the one call site,
-/// `AcpProcess::spawn`) so the intent -- and the reason it changed -- has
-/// somewhere to live, and so a caller that later has a real, argv-shaped use
-/// for `AcpSpawnSpec`/`approval_args` again finds the seam already there.
+/// That reasoning held for as long as EVERY provider had an `acp_mode_id`
+/// to be driven through. Measured 2026-09-09, kimi does not: every one of
+/// its `approval_level_resolution` rows carries `acp_mode_id: None`
+/// (kimi.exe 0.29.0's `session/new` announces no modes at all), so
+/// `session/set_mode` has nothing to call for it and an empty argv left the
+/// session at the vendor's own default with its internal approval gate ON.
+/// Live proof: kimi answered every `g4a_*` MCP tool call with "rejected at
+/// the approval prompt" while never sending the host a
+/// `session/request_permission` at all -- its own gate, not ours, and
+/// nothing on the ACP wire could reach it. For an agent in that shape argv
+/// is the ONLY lever left, which is why this is no longer unconditionally
+/// empty.
+///
+/// The decision itself does NOT live here: the caller
+/// (`gate4agent-shell-native`'s ACP spawn branch) passes flags only for an
+/// agent whose level resolved no `acp_mode_id`, and passes none for one
+/// that did -- so the wrapper-fronted providers keep the clean argv the
+/// paragraphs above describe. This function stays the seam that carries
+/// whatever that caller decided.
 pub(crate) fn applicable_approval_args<'a>(
     _spec: &AcpSpawnSpec,
-    _approval_args: &'a [String],
+    approval_args: &'a [String],
 ) -> &'a [String] {
-    &[]
+    approval_args
 }
 
 // ---------------------------------------------------------------------------

@@ -923,10 +923,32 @@ pub(crate) fn derive_launch_plans_from_inventory(
                         // other level's `None` means the opposite: no
                         // sourced mechanism exists at all, so the ACP
                         // sibling is withheld.
-                        let acp_supported = level == ApprovalLevel::Unmanaged || matches!(
-                            resolution,
-                            ApprovalLevelResolution::Supported { acp_mode_id: Some(_), .. },
-                        );
+                        // A level is applicable over ACP when SOME mechanism
+                        // can carry it. `session/set_mode` is one, and used
+                        // to be the only one -- but an agent the node spawns
+                        // directly also reads its own argv, and
+                        // `gate4agent-shell-native`'s `acp_approval_level_args`
+                        // now passes a mode-less level's flags there. So a
+                        // row with no `acp_mode_id` but real `args` is
+                        // applicable too, and withholding its ACP sibling
+                        // withheld the only shape that could turn some
+                        // vendors' own approval gate off: measured
+                        // 2026-09-09, every kimi row is mode-less, so the
+                        // harness-MCP door existed for kimi ONLY at
+                        // `Unmanaged` -- the one level that imposes nothing
+                        // -- and kimi refused every `g4a_*` tool call at its
+                        // internal prompt while its own `--yolo` sat unused
+                        // in the `FullAuto` row.
+                        let acp_supported = level == ApprovalLevel::Unmanaged
+                            || matches!(
+                                &resolution,
+                                ApprovalLevelResolution::Supported { acp_mode_id: Some(_), .. },
+                            )
+                            || matches!(
+                                &resolution,
+                                ApprovalLevelResolution::Supported { acp_mode_id: None, args, .. }
+                                    if !args.is_empty(),
+                            );
                         for harness_mcp in [false, true] {
                             let supported = if harness_mcp { acp_supported } else { pty_supported };
                             if !supported {

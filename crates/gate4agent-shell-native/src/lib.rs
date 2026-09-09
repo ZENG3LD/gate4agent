@@ -1287,12 +1287,23 @@ impl NativeEffectShell {
                 }
                 let acp_options = AcpSessionOptions {
                     host_policy: host_policy_for_approval_level(request.approval_level),
-                    // Never populated for ACP any more -- see this branch's
-                    // own comment above and `applicable_approval_args`
-                    // (`src/acp/spawn.rs`): the level is applied exclusively
-                    // through `session/set_mode`, below, once the handshake
-                    // is up.
-                    approval_level_args: Vec::new(),
+                    // Empty for an agent that announced an `acp_mode_id` for
+                    // this level: that one is applied through
+                    // `session/set_mode` below, once the handshake is up,
+                    // and its argv stays clean (see this branch's own
+                    // comment above and `applicable_approval_args`,
+                    // `src/acp/spawn.rs`). An agent that announced NO mode
+                    // has no such mechanism -- measured 2026-09-09, kimi
+                    // announces none at any level, so an empty argv left it
+                    // running at the vendor's own default and it refused
+                    // every `g4a_*` MCP tool call at its OWN approval
+                    // prompt without ever sending the host a
+                    // `session/request_permission`. For that shape argv is
+                    // the only lever there is.
+                    approval_level_args: acp_approval_level_args(
+                        &agent_id,
+                        request.approval_level,
+                    ),
                     defer_permission_requests: defers_permission_requests(
                         &agent_id,
                         request.approval_level,
@@ -2107,6 +2118,30 @@ fn required_acp_mode(agent_id: &AgentId, level: ApprovalLevel) -> Result<Option<
             "agent '{agent_id}' has no verified ACP mode for {level:?}; refusing rather than \
              launching at the vendor's own (wider-authority) default"
         )),
+    }
+}
+
+/// The vendor approval flags an ACP-spawned agent needs in its own argv.
+///
+/// Exactly the complement of [`required_acp_mode`]: a level that resolved an
+/// `acp_mode_id` is applied over the wire by `session/set_mode`, so that
+/// agent's argv stays clean and this returns nothing. A level that resolved
+/// NO mode has no wire mechanism at all, and returning nothing there means
+/// launching at the vendor's own default -- the exact wider-authority defect
+/// the mode machinery exists to close, just reached from the other side.
+///
+/// Measured 2026-09-09: every kimi row carries `acp_mode_id: None` (kimi.exe
+/// 0.29.0 announces no modes), so kimi ran at its own default and refused
+/// every `g4a_*` MCP tool call at its internal approval prompt without ever
+/// sending the host a `session/request_permission` -- unreachable by policy,
+/// by deferral, and by `set_mode` alike. Its `FullAuto` row already carries
+/// the flag that turns that gate off (`--yolo`); it simply never reached the
+/// process.
+fn acp_approval_level_args(agent_id: &AgentId, level: ApprovalLevel) -> Vec<String> {
+    match approval_level_resolution(agent_id, level) {
+        ApprovalLevelResolution::Supported { args, acp_mode_id: None, .. } => args,
+        ApprovalLevelResolution::Supported { acp_mode_id: Some(_), .. } => Vec::new(),
+        ApprovalLevelResolution::Unsupported => Vec::new(),
     }
 }
 

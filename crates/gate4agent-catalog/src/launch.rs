@@ -342,11 +342,19 @@ pub fn approval_level_resolution(agent_id: &AgentId, level: ApprovalLevel) -> Ap
 
         // kimi (Kimi Code) -- see this function's own doc comment.
         ("kimi", ApprovalLevel::FullAuto) => Supported {
-            args: vec!["--yolo".to_owned()],
-            // Flag confirmed to exist (Kimi Code release notes). "Skips
-            // everything" semantics inferred from the universal industry
-            // meaning of "yolo mode", not read directly from a Kimi
-            // permissions doc -- UNCONFIRMED at the source, high confidence.
+            // `--auto`, not `--yolo`. Both are real top-level options, read
+            // from `kimi --help` 2026-09-09, and they differ exactly where
+            // this level cares: `-y, --yolo` is "Auto-approve regular tool
+            // calls; the agent MAY STILL ASK QUESTIONS", while `--auto` is
+            // "Start in auto permission mode: fully autonomous, the agent
+            // WILL NOT ASK QUESTIONS". Measured live under `--yolo`, kimi
+            // still answered every `g4a_*` MCP call "rejected at the approval
+            // prompt" without ever asking the host -- the question it was
+            // still allowed to raise. `--auto` is what `FullAuto` means.
+            // Both are top-level, so they precede the `acp` subcommand (see
+            // `direct_command`, `src/acp/spawn.rs`); `kimi acp` itself takes
+            // only `--login`/`--help`.
+            args: vec!["--auto".to_owned()],
             asks_for_permission: false,
             // measured 2026-09-05: kimi.exe 0.29.0 session/new offers no
             // modes; the 2026-09-02 yolo/auto/plan measurement was the npm
@@ -971,7 +979,7 @@ mod tests {
         assert!(approval_level_args(&grok, ApprovalLevel::Unmanaged).is_empty());
 
         let kimi = AgentId::new("kimi").unwrap();
-        assert_eq!(approval_level_args(&kimi, ApprovalLevel::FullAuto), ["--yolo"]);
+        assert_eq!(approval_level_args(&kimi, ApprovalLevel::FullAuto), ["--auto"]);
         assert!(approval_level_args(&kimi, ApprovalLevel::Unmanaged).is_empty());
     }
 
@@ -1117,7 +1125,7 @@ mod tests {
         let kimi = AgentId::new("kimi").unwrap();
         assert_eq!(
             approval_level_resolution(&kimi, ApprovalLevel::FullAuto),
-            supported(&["--yolo"], false, None)
+            supported(&["--auto"], false, None)
         );
         assert_eq!(
             approval_level_resolution(&kimi, ApprovalLevel::Moderate),

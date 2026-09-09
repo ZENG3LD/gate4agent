@@ -6903,7 +6903,7 @@ mod tests {
         assert_eq!(required_acp_mode(&kimi, ApprovalLevel::FullAuto), Ok(None));
         assert_eq!(
             acp_approval_level_args(&kimi, ApprovalLevel::FullAuto),
-            vec!["--yolo".to_owned()],
+            vec!["--auto".to_owned()],
             "kimi's FullAuto must reach the process through argv, since it has no ACP mode"
         );
         for level in [ApprovalLevel::Moderate, ApprovalLevel::ReadOnly] {

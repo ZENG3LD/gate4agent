@@ -24,7 +24,11 @@ use tokio::time::{timeout, Duration};
 const MAX_RESERVATIONS: usize = 128;
 const LOCAL_READ_TIMEOUT: Duration = Duration::from_secs(3);
 
-type EventSink = Arc<dyn Fn(NodeEvent) + Send + Sync>;
+/// Returns whether the event reached at least one subscriber -- see
+/// `NodeShared::publish_transient`'s own doc for what a `false` return
+/// means and why `begin_call` reacts to it immediately rather than letting
+/// the caller wait out `LOCAL_READ_TIMEOUT`/`MAX_HARNESS_MCP_CALL_DEADLINE_MS`.
+type EventSink = Arc<dyn Fn(NodeEvent) -> bool + Send + Sync>;
 
 #[derive(Clone)]
 pub(crate) struct HarnessMcpProxyRegistry {
@@ -671,8 +675,40 @@ impl HarnessMcpProxyRegistry {
             };
             (call_id, event)
         };
-        sink(event);
+        if !sink(event) {
+            // The call is already registered (`reservation.calls` above) --
+            // completing it here, against that same registration, rather
+            // than inventing a second bookkeeping map. The receiver already
+            // holds the terminal reply by the time the caller starts
+            // waiting on it, so `serve_local_connection`'s `timeout(...)`
+            // resolves on its very first poll instead of waiting out
+            // `LOCAL_READ_TIMEOUT`/`MAX_HARNESS_MCP_CALL_DEADLINE_MS`.
+            self.fail_registered_call(reservation_id, &call_id, HarnessMcpRejectReasonV1::Internal);
+        }
         Ok((call_id, receiver, deadline_unix_ms))
+    }
+
+    /// Completes a just-registered pending call immediately with a named
+    /// error instead of leaving it to expire naturally -- used only when
+    /// `publish_transient` itself could not deliver the
+    /// `NodeEvent::HarnessMcpReadCall` to any subscriber. Mirrors
+    /// `reject_call`'s own terminal-send/bookkeeping shape, but skips its
+    /// binding/activation revalidation: `begin_call` just created this
+    /// exact entry under the same lock scope, so there is nothing left to
+    /// validate against.
+    fn fail_registered_call(
+        &self,
+        reservation_id: &HarnessMcpReservationId,
+        call_id: &HarnessMcpCallId,
+        reason: HarnessMcpRejectReasonV1,
+    ) {
+        let mut state = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(reservation) = state.reservations.get_mut(reservation_id) else { return };
+        let Some(mut call) = reservation.calls.remove(call_id) else { return };
+        state.pending_calls = state.pending_calls.saturating_sub(1);
+        if let Some(terminal) = call.terminal.take() {
+            let _ = terminal.send(HarnessMcpLocalReplyV1::Error { error: reject_error(reason) });
+        }
     }
 
     fn reservation_expiry(&self, reservation_id: &HarnessMcpReservationId) -> Option<u64> {

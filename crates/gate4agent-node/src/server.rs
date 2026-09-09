@@ -86,6 +86,7 @@ use crate::protocol::{
     GitCommitDetails, GitDiff, GitDiffMode, GitDiffRequest, GitHistoryPage,
     GitObjectId, GitCommitSummary, GitSignatureStatus, GitSnapshot, GitStatusEntry,
     GitWorktreeSnapshot, HarnessMcpActivationDigest, HarnessMcpReservationId,
+    HarnessReadRequestV1,
     HostDirectoryListing,
     NodeCompatibilitySupport, NodeEvent,
     NodeEventEnvelope, NodeFailure, NodeFailureCode, NodeHello, NodeId, NodeIncarnationId,
@@ -152,6 +153,7 @@ use crate::protocol::{
     MAX_NODE_TERMINAL_BYTES, MAX_NODE_TEXT_BYTES,
     MAX_REPOSITORY_PATH_BYTES,
     MAX_GIT_DIFF_BYTES, MAX_GIT_HISTORY_COMMITS, MAX_WORKSPACE_FILE_BYTES,
+    MAX_HARNESS_MCP_PENDING_CALLS_PER_NODE,
     MAX_WORKSPACE_ROOT_BYTES, NODE_STATE_SCHEMA_V1, NODE_STATE_SCHEMA_V10,
     SPAWN_RUNTIME_PROVIDER_SESSION_IDENTITY, SPAWN_RUNTIME_RAW_PTY_LIFECYCLE,
     SPAWN_RUNTIME_SEMANTIC_READINESS, SPAWN_RUNTIME_SEMANTIC_RESUME,
@@ -233,6 +235,13 @@ const NODE_TERMINAL_BROADCAST_CAPACITY: usize = 1;
 /// two pending sends into one would silently drop content a subscriber can
 /// never recover. This needs headroom for a burst instead.
 const NODE_AGENT_STREAM_BROADCAST_CAPACITY: usize = 256;
+/// The node never has more than `MAX_HARNESS_MCP_PENDING_CALLS_PER_NODE`
+/// `NodeEvent::HarnessMcpReadCall`s in flight at once (`begin_call`'s own
+/// admission check), and `publish_transient` sends each exactly once as a
+/// single-envelope batch -- so this many slots covers the entire pending
+/// set without ever lagging the one subscriber that matters, the harness's
+/// own connection, the way sharing the durable `event_tx`'s bus could.
+const NODE_HARNESS_MCP_PROXY_BROADCAST_CAPACITY: usize = MAX_HARNESS_MCP_PENDING_CALLS_PER_NODE;
 const NODE_CONNECTION_EVENT_BURST_MAX: usize = 16;
 const CONTROL_EVENT_SUBSCRIPTION_CAPACITY: usize = 1_024;
 const MAX_PREAUTH_CONNECTIONS: usize = 32;
@@ -2976,10 +2985,9 @@ try { $contextHash = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadA
         let shared = Arc::new(shared);
         if let Some(registry) = harness_mcp_registry {
             let weak = Arc::downgrade(&shared);
-            registry.set_event_sink(Arc::new(move |event| {
-                if let Some(shared) = weak.upgrade() {
-                    shared.publish_transient(event);
-                }
+            registry.set_event_sink(Arc::new(move |event| match weak.upgrade() {
+                Some(shared) => shared.publish_transient(event),
+                None => false,
             }));
         }
         if shared.persistence_error().is_none() {
@@ -3726,6 +3734,15 @@ struct NodeShared {
     /// these, the same guarantee `include_terminal_frame_events` already
     /// gives terminal frames.
     agent_stream_event_tx: broadcast::Sender<Arc<Vec<NodeEventEnvelope>>>,
+    /// The outbound `NodeEvent::HarnessMcpReadCall` push channel -- mirrors
+    /// `agent_stream_event_tx` exactly, its own dedicated, capability-gated
+    /// broadcast rather than a ride on the durable `event_tx` history. A
+    /// `HarnessMcpReadCall` is a request/response call a live proxy call is
+    /// waiting on (`harness_mcp_proxy.rs`'s `begin_call`); the shared bus's
+    /// finite capacity and its willingness to silently evict a lagging
+    /// subscriber's backlog is exactly how the call vanished with neither
+    /// side ever logging it (see `publish_transient`'s own doc).
+    harness_mcp_proxy_event_tx: broadcast::Sender<Arc<Vec<NodeEventEnvelope>>>,
     terminal_frame_watermarks:
         Mutex<BTreeMap<AgentInstanceId, (SessionAddress, u64)>>,
     next_connection_id: AtomicU64,
@@ -4055,6 +4072,8 @@ impl NodeShared {
         let (event_tx, _) = broadcast::channel(NODE_BROADCAST_CAPACITY);
         let (terminal_event_tx, _) = broadcast::channel(NODE_TERMINAL_BROADCAST_CAPACITY);
         let (agent_stream_event_tx, _) = broadcast::channel(NODE_AGENT_STREAM_BROADCAST_CAPACITY);
+        let (harness_mcp_proxy_event_tx, _) =
+            broadcast::channel(NODE_HARNESS_MCP_PROXY_BROADCAST_CAPACITY);
         let record_providers = records
             .iter()
             .map(|record| (record.record_id.clone(), record.provider.clone()))
@@ -4134,6 +4153,7 @@ impl NodeShared {
             event_tx,
             terminal_event_tx,
             agent_stream_event_tx,
+            harness_mcp_proxy_event_tx,
             terminal_frame_watermarks: Mutex::new(BTreeMap::new()),
             next_connection_id: AtomicU64::new(1),
             next_instance_id: AtomicU64::new(1),
@@ -10830,10 +10850,37 @@ impl NodeShared {
         envelope
     }
 
-    fn publish_transient(&self, event: NodeEvent) {
+    /// Publishes a transient (never durable) `NodeEvent` -- today only
+    /// `NodeEvent::HarnessMcpReadCall` -- onto the dedicated
+    /// `harness_mcp_proxy_event_tx` broadcast (see that field's own doc for
+    /// why this must never ride the shared `event_tx` bus). Returns whether
+    /// the send reached at least one subscriber: `broadcast::Sender::send`
+    /// fails in exactly one way, no active receiver at that instant, and
+    /// the caller (`HarnessMcpProxyRegistry::begin_call`) uses a `false`
+    /// return to fail the pending call immediately rather than leave it to
+    /// expire silently at `LOCAL_READ_TIMEOUT`/
+    /// `MAX_HARNESS_MCP_CALL_DEADLINE_MS`.
+    fn publish_transient(&self, event: NodeEvent) -> bool {
         assert!(event.requires_harness_mcp_proxy_capability());
         assert!(event.harness_mcp_contract_is_valid_at(unix_time_ms()));
-        let _ = self.event_tx.send(NodeEventEnvelope { sequence: 0, event });
+        let envelope = NodeEventEnvelope { sequence: 0, event };
+        match self.harness_mcp_proxy_event_tx.send(Arc::new(vec![envelope])) {
+            Ok(_) => true,
+            Err(broadcast::error::SendError(undelivered)) => {
+                if let Some(NodeEventEnvelope {
+                    event: NodeEvent::HarnessMcpReadCall { call_id, request, .. },
+                    ..
+                }) = undelivered.first() {
+                    tracing::warn!(
+                        call_id = call_id.as_str(),
+                        tool_id = harness_mcp_read_request_tool_id(request),
+                        cause = "no-subscribers",
+                        "harness MCP proxy event could not be published",
+                    );
+                }
+                false
+            }
+        }
     }
 
     fn publish_terminal_frames(&self) {
@@ -12763,6 +12810,30 @@ fn agent_stream_chunk_kind_label(kind: &AgentStreamChunkKindV1) -> &'static str 
     }
 }
 
+/// The tool id a `HarnessReadRequestV1` corresponds to, for naming which
+/// call `publish_transient` failed to deliver. A small copy of
+/// `gate4agent-harness-service::read::harness_mcp_tool_id`'s own naming --
+/// this crate does not depend on that one, and this is logging only, never
+/// dispatch.
+fn harness_mcp_read_request_tool_id(request: &HarnessReadRequestV1) -> &'static str {
+    match request {
+        HarnessReadRequestV1::ContextGet => "g4a_context_get",
+        HarnessReadRequestV1::MonitorGet { .. } => "g4a_monitor_get",
+        HarnessReadRequestV1::TimelineRead { .. } => "g4a_timeline_read",
+        HarnessReadRequestV1::TasksList { .. } => "g4a_tasks_list",
+        HarnessReadRequestV1::TaskGet { .. } => "g4a_tasks_get",
+        HarnessReadRequestV1::RunsList { .. } => "g4a_runs_list",
+        HarnessReadRequestV1::RunGet { .. } => "g4a_runs_get",
+        HarnessReadRequestV1::OperationGet { .. } => "g4a_operation_get",
+        HarnessReadRequestV1::MailSend { .. } => "g4a_mail_send",
+        HarnessReadRequestV1::MailInbox { .. } => "g4a_mail_inbox",
+        HarnessReadRequestV1::MailAck { .. } => "g4a_mail_ack",
+        HarnessReadRequestV1::MailFetch { .. } => "g4a_mail_fetch",
+        HarnessReadRequestV1::TaskCreate { .. } => "g4a_task_create",
+        HarnessReadRequestV1::TaskMove { .. } => "g4a_task_move",
+    }
+}
+
 /// Serves this wire on the local endpoint, and -- when `call_home` names a
 /// relay -- over an outbound connection to it as well.
 ///
@@ -13105,6 +13176,10 @@ where
         &shared,
         include_agent_stream_events,
     );
+    let mut harness_mcp_proxy_event_rx = harness_mcp_proxy_event_subscription(
+        &shared,
+        include_harness_mcp_proxy,
+    );
     write_json_frame(
         &mut pipe,
         &ServerFrame::Hello(NodeHello {
@@ -13212,6 +13287,35 @@ where
                             connection_id,
                             dropped,
                             "agent stream event subscription lagged; forcing a resync",
+                        );
+                        resync_required = true;
+                        break;
+                    }
+                    Err(broadcast::error::TryRecvError::Closed) => return Ok(()),
+                }
+            }
+        }
+        if let Some(receiver) = harness_mcp_proxy_event_rx.as_mut() {
+            // Mirrors the agent-stream drain immediately above: each
+            // successful receive is one single-envelope batch
+            // (`publish_transient` always sends `vec![envelope]`), so this
+            // loops up to the same remaining-room budget rather than
+            // stopping after one `try_recv`.
+            let harness_mcp_proxy_drain_budget = NODE_CONNECTION_EVENT_BURST_MAX
+                .saturating_sub(pending_events.len().min(NODE_CONNECTION_EVENT_BURST_MAX));
+            for _ in 0..harness_mcp_proxy_drain_budget {
+                match receiver.try_recv() {
+                    Ok(events) => queue_connection_event_batch(
+                        &mut pending_events,
+                        &events,
+                        discard_events_through,
+                    ),
+                    Err(broadcast::error::TryRecvError::Empty) => break,
+                    Err(broadcast::error::TryRecvError::Lagged(dropped)) => {
+                        tracing::warn!(
+                            connection_id,
+                            dropped,
+                            "harness MCP proxy event subscription lagged; forcing a resync",
                         );
                         resync_required = true;
                         break;
@@ -13458,6 +13562,17 @@ where
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
+            events = receive_terminal_event_batch(&mut harness_mcp_proxy_event_rx) => {
+                match events {
+                    Ok(events) => queue_connection_event_batch(
+                        &mut pending_events,
+                        &events,
+                        discard_events_through,
+                    ),
+                    Err(broadcast::error::RecvError::Lagged(_)) => resync_required = true,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
             _ = shared.shutdown_notify.notified() => break,
         }
     }
@@ -13488,6 +13603,17 @@ fn agent_stream_event_subscription(
     enabled: bool,
 ) -> Option<broadcast::Receiver<Arc<Vec<NodeEventEnvelope>>>> {
     enabled.then(|| shared.agent_stream_event_tx.subscribe())
+}
+
+/// Mirrors `agent_stream_event_subscription` exactly, over the harness MCP
+/// proxy's own channel -- see `NodeShared::harness_mcp_proxy_event_tx`'s
+/// own doc for why this needs a dedicated channel rather than a ride on
+/// the durable `event_tx`.
+fn harness_mcp_proxy_event_subscription(
+    shared: &NodeShared,
+    enabled: bool,
+) -> Option<broadcast::Receiver<Arc<Vec<NodeEventEnvelope>>>> {
+    enabled.then(|| shared.harness_mcp_proxy_event_tx.subscribe())
 }
 
 fn queue_connection_event(

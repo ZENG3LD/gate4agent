@@ -27,7 +27,8 @@ use gate4agent_harness_client::{
 use gate4agent_harness_api::{
     HarnessAgentStreamChunkKindV1, HarnessAgentStreamNamedIdV1, HarnessApprovalLevelV1,
     HarnessBlockAuthorityV1, HarnessExecutionModeV1,
-    HarnessOperatorAgentEventV1, HarnessProviderInteractionResponseV1, HarnessRuntimeSessionAddressV1,
+    HarnessOperatorAgentEventV1, HarnessOperatorTerminalEventV1, HarnessProviderInteractionResponseV1,
+    HarnessRuntimeSessionAddressV1,
     HarnessRuntimeTerminalSizeV1, HarnessTerminalControlV1,
 };
 
@@ -65,6 +66,7 @@ fn usage() -> &'static str {
      \x20 session prompt NODE_ID INCARNATION_ID WORKSPACE_ID INSTANCE_ID GENERATION TEXT (ACP/inline sessions only -- refused for a PTY session)\n\
      \x20 session input NODE_ID INCARNATION_ID WORKSPACE_ID INSTANCE_ID GENERATION TEXT (raw terminal input; the PTY counterpart of prompt)\n\
      \x20 session control NODE_ID INCARNATION_ID WORKSPACE_ID INSTANCE_ID GENERATION CONTROL (enter|interrupt|eof -- submit a typed PTY line)\n\
+     \x20 session terminal NODE_ID INCARNATION_ID WORKSPACE_ID INSTANCE_ID GENERATION [...more session groups] (stream the PTY screen)\n\
      \x20 session subscribe NODE_ID INCARNATION_ID WORKSPACE_ID INSTANCE_ID GENERATION [...more session groups] [--verbose yes]"
 }
 
@@ -138,6 +140,7 @@ enum Command {
     SessionPrompt { session: HarnessRuntimeSessionAddressV1, text: String },
     SessionInput { session: HarnessRuntimeSessionAddressV1, text: String },
     SessionControl { session: HarnessRuntimeSessionAddressV1, control: HarnessTerminalControlV1 },
+    SessionTerminal { sessions: Vec<HarnessRuntimeSessionAddressV1> },
     SessionSetConfigOption {
         session: HarnessRuntimeSessionAddressV1,
         option_id: String,
@@ -173,6 +176,7 @@ enum Verb {
     SessionPrompt,
     SessionInput,
     SessionControl,
+    SessionTerminal,
     SessionSetConfigOption,
     SessionSetModel,
     SessionSubscribe,
@@ -211,6 +215,7 @@ fn resolve_verb(args: &[String]) -> Result<(Verb, usize), String> {
             Some("prompt") => Ok((Verb::SessionPrompt, 2)),
             Some("input") => Ok((Verb::SessionInput, 2)),
             Some("control") => Ok((Verb::SessionControl, 2)),
+            Some("terminal") => Ok((Verb::SessionTerminal, 2)),
             Some("set-config-option") => Ok((Verb::SessionSetConfigOption, 2)),
             Some("set-model") => Ok((Verb::SessionSetModel, 2)),
             Some("subscribe") => Ok((Verb::SessionSubscribe, 2)),
@@ -669,6 +674,20 @@ fn build_command(
             let verbose = take_flag(flags, "verbose").is_some();
             Ok(Command::SessionSubscribe { sessions, verbose })
         }
+        Verb::SessionTerminal => {
+            if positionals.is_empty() || positionals.len() % 5 != 0 {
+                return Err(
+                    "session terminal expects one or more NODE_ID INCARNATION_ID WORKSPACE_ID \
+                     INSTANCE_ID GENERATION groups"
+                        .to_owned(),
+                );
+            }
+            let mut sessions = Vec::new();
+            while !positionals.is_empty() {
+                sessions.push(take_session_address_prefix(positionals)?);
+            }
+            Ok(Command::SessionTerminal { sessions })
+        }
     }
 }
 
@@ -1058,6 +1077,39 @@ fn execute(invocation: Invocation) -> Result<String, String> {
                 print_agent_stream_event(&event, verbose);
             }
         }
+        Command::SessionTerminal { sessions } => {
+            let mut subscription = client
+                .subscribe_terminal(sessions)
+                .map_err(|error| error.to_string())?;
+            loop {
+                let event = subscription.next_event().map_err(|error| error.to_string())?;
+                print_terminal_event(&event);
+            }
+        }
+    }
+}
+
+/// Renders a terminal subscription event as the screen itself. A
+/// `TerminalFrame` is always a FULL screen (never a delta), so printing
+/// `formatted` verbatim is the whole picture -- which is the point: driving a
+/// PTY agent blind, by `session input` and `session control` with no way to
+/// read what the pane actually shows, is how a swallowed keystroke or an
+/// unexpected onboarding screen stays invisible.
+fn print_terminal_event(event: &HarnessOperatorTerminalEventV1) {
+    match event {
+        HarnessOperatorTerminalEventV1::TerminalFrame { sequence, session, frame, coalesced_since_last } => {
+            println!(
+                "--- frame seq={sequence} session={} cursor={},{} size={}x{} alt={} coalesced={coalesced_since_last}",
+                format_session_address(session),
+                frame.cursor_row,
+                frame.cursor_column,
+                frame.size.rows,
+                frame.size.columns,
+                frame.alternate_screen,
+            );
+            println!("{}", String::from_utf8_lossy(&frame.formatted));
+        }
+        HarnessOperatorTerminalEventV1::Ping { sequence } => println!("ping seq={sequence}"),
     }
 }
 

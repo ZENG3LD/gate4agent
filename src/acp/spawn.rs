@@ -83,8 +83,8 @@ pub(crate) fn acp_command(tool: CliTool) -> Result<AcpSpawnSpec, std::io::Error>
     Ok(spec)
 }
 
-/// Argv approval flags reaching an ACP-spawned process, for ANY spec --
-/// always empty, unconditionally.
+/// The argv approval flags that reach an ACP-spawned process: exactly the
+/// ones the caller handed in, carried through unchanged.
 ///
 /// This used to depend on `spec.npm_tool`: `grok` and `kimi` (`npm_tool:
 /// false`) spawn the vendor's own binary directly, so `approval_args` reached
@@ -403,10 +403,18 @@ fn build_command_windows(spec: &AcpSpawnSpec, extra_args: &[String]) -> Command 
 fn direct_command(program: &str, args: &[&str], extra_args: &[String]) -> Command {
     let mut cmd = Command::new(program);
     crate::utils::hide_console_window(&mut cmd);
-    for arg in args {
+    // `extra_args` (the approval flags) go BEFORE `args`, because `args` ends
+    // in the vendor's ACP SUBCOMMAND and both directly-spawned CLIs take
+    // their options ahead of it, not after: `kimi [options] [command]` and
+    // `grok [OPTIONS] [PROMPT] [COMMAND]` (measured 2026-09-09 from their own
+    // `--help`). Appending instead produced `kimi acp --yolo`, which `kimi
+    // acp` -- whose only options are `--login` and `--help` -- does not
+    // accept, and the session then died on `Handshake timed out
+    // (step=initialize)`. `kimi --yolo acp` is accepted.
+    for arg in extra_args {
         cmd.arg(arg);
     }
-    for arg in extra_args {
+    for arg in args {
         cmd.arg(arg);
     }
     cmd
@@ -514,34 +522,41 @@ mod tests {
     // applicable_approval_args -- always empty, for every spec, over ACP
     // -----------------------------------------------------------------------
 
+    /// `grok`/`kimi` spawn the vendor's own binary directly, and for them
+    /// argv is the ONLY lever: neither announces an ACP mode, so
+    /// `session/set_mode` has nothing to apply (measured 2026-09-09). A flag
+    /// the caller decided on therefore has to reach that binary, ahead of the
+    /// spec's own subcommand.
     #[test]
-    fn direct_binary_specs_no_longer_receive_approval_args_over_acp_argv() {
-        // `grok`/`kimi` spawn the vendor's own binary directly -- this used
-        // to mean `approval_args` reached its real argv unchanged. That
-        // mechanism is retired: ACP applies a level exclusively through
-        // `session/set_mode` now, for every provider, so even a
-        // non-adapter-wrapped spec gets nothing here any more.
+    fn direct_binary_specs_receive_the_approval_flag_ahead_of_their_subcommand() {
         for tool in [CliTool::Grok, CliTool::KimiCode] {
             let spec = acp_command(tool).unwrap();
             assert!(!spec.npm_tool, "{tool}");
             let args = vec!["--some-flag".to_owned(), "value".to_owned()];
-            assert!(
-                applicable_approval_args(&spec, &args).is_empty(),
-                "{tool}: a direct-binary spec must not receive an approval flag over ACP argv any more"
+            assert_eq!(
+                applicable_approval_args(&spec, &args),
+                args.as_slice(),
+                "{tool}: a direct-binary spec must receive the flag the caller handed it"
             );
+            let argv = command_args(&build_command_unix(&spec, &args));
+            assert_eq!(&argv[..2], ["--some-flag", "value"], "{tool}: flags come first");
+            assert_eq!(&argv[2..], spec.args, "{tool}: the subcommand follows them");
         }
     }
 
+    /// The wrapper-fronted specs are the ones argv was measured NOT to reach,
+    /// and they are also the ones that DO announce ACP modes -- so the caller
+    /// (`gate4agent-shell-native`'s `acp_approval_level_args`) hands them
+    /// nothing and `session/set_mode` carries their level instead. What this
+    /// pins is the shape that makes that safe: they stay npm-wrapped, and with
+    /// nothing handed in their argv is exactly the package spec.
     #[test]
-    fn adapter_wrapped_specs_never_receive_approval_args() {
+    fn adapter_wrapped_specs_stay_wrapped_and_take_no_flags_when_handed_none() {
         for tool in [CliTool::ClaudeCode, CliTool::Codex] {
             let spec = acp_command(tool).unwrap();
             assert!(spec.npm_tool, "{tool}");
-            let args = vec!["--some-flag".to_owned(), "value".to_owned()];
-            assert!(
-                applicable_approval_args(&spec, &args).is_empty(),
-                "{tool}: adapter-wrapped spec must never receive an approval flag"
-            );
+            assert!(applicable_approval_args(&spec, &[]).is_empty(), "{tool}");
+            assert_eq!(command_args(&build_command_windows(&spec, &[]))[..2], ["/C", "npx.cmd"]);
         }
     }
 
@@ -555,35 +570,33 @@ mod tests {
     /// the level is applied through `session/set_mode` instead
     /// (`gate4agent-shell-native`'s `apply_acp_approval_mode`), one
     /// mechanism per transport.
+    /// `applicable_approval_args` is now the seam that CARRIES whatever the
+    /// caller decided, not an unconditional discard: the decision moved to
+    /// `gate4agent-shell-native`'s `acp_approval_level_args`, which passes a
+    /// level's flags only when that level resolved no `acp_mode_id` (nothing
+    /// for `session/set_mode` to apply) and nothing when it resolved one. So
+    /// what this guards now is that the seam is transparent -- it neither
+    /// invents flags nor drops the ones it was handed.
     #[test]
-    fn approval_flags_never_reach_acp_argv_for_any_provider_at_any_level() {
-        use gate4agent_catalog::{approval_level_args, AgentId};
-        use gate4agent_types::ApprovalLevel;
-
-        let providers: [(&str, CliTool); 4] = [
-            ("claude", CliTool::ClaudeCode),
-            ("codex", CliTool::Codex),
-            ("grok", CliTool::Grok),
-            ("kimi", CliTool::KimiCode),
+    fn applicable_approval_args_carries_exactly_what_it_was_handed() {
+        let providers: [CliTool; 4] = [
+            CliTool::ClaudeCode,
+            CliTool::Codex,
+            CliTool::Grok,
+            CliTool::KimiCode,
         ];
-        let levels = [
-            ApprovalLevel::FullAuto,
-            ApprovalLevel::Moderate,
-            ApprovalLevel::ReadOnly,
-            ApprovalLevel::Unmanaged,
-        ];
-        for (provider_id, tool) in providers {
-            let agent = AgentId::new(provider_id).unwrap();
+        for tool in providers {
             let spec = acp_command(tool).unwrap();
-            for level in levels {
-                let table_args = approval_level_args(&agent, level);
-                let applied = applicable_approval_args(&spec, &table_args);
-                assert!(
-                    applied.is_empty(),
-                    "{provider_id} at {level:?} must never see an ACP argv approval flag, \
-                     even though the catalog's own table has one: {table_args:?}"
-                );
-            }
+            assert!(
+                applicable_approval_args(&spec, &[]).is_empty(),
+                "no flags handed in must stay no flags out"
+            );
+            let handed = vec!["--yolo".to_owned()];
+            assert_eq!(
+                applicable_approval_args(&spec, &handed),
+                ["--yolo".to_owned()],
+                "a flag the caller decided on must reach argv unchanged"
+            );
         }
     }
 
@@ -595,16 +608,27 @@ mod tests {
         cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect()
     }
 
+    /// Approval flags precede the spec's args, because those args END in the
+    /// vendor's ACP subcommand and both directly-spawned CLIs take options
+    /// ahead of it: `grok [OPTIONS] [PROMPT] [COMMAND]`, `kimi [options]
+    /// [command]` (their own `--help`, measured 2026-09-09). The appended
+    /// order this test used to pin produced `kimi acp --yolo`, which `kimi
+    /// acp` rejects -- its only options are `--login`/`--help` -- and the
+    /// session died on `Handshake timed out (step=initialize)`.
     #[test]
-    fn build_command_unix_appends_extra_args_after_spec_args() {
+    fn build_command_unix_puts_extra_args_before_the_spec_subcommand() {
         let spec = acp_command(CliTool::Grok).unwrap();
         let extra = vec!["--permission-mode".to_owned(), "bypassPermissions".to_owned()];
         let cmd = build_command_unix(&spec, &extra);
         assert_eq!(cmd.get_program(), std::ffi::OsStr::new("grok"));
         assert_eq!(
             command_args(&cmd),
-            ["agent", "stdio", "--permission-mode", "bypassPermissions"]
+            ["--permission-mode", "bypassPermissions", "agent", "stdio"]
         );
+
+        let kimi = acp_command(CliTool::KimiCode).unwrap();
+        let yolo = vec!["--yolo".to_owned()];
+        assert_eq!(command_args(&build_command_unix(&kimi, &yolo)), ["--yolo", "acp"]);
     }
 
     #[test]
@@ -669,14 +693,14 @@ mod tests {
     }
 
     #[test]
-    fn build_command_windows_appends_extra_args_for_a_direct_non_npm_tool() {
+    fn build_command_windows_puts_extra_args_before_the_subcommand_for_a_direct_tool() {
         let spec = acp_command(CliTool::Grok).unwrap();
         let extra = vec!["--permission-mode".to_owned(), "bypassPermissions".to_owned()];
         let cmd = build_command_windows(&spec, &extra);
         assert_eq!(cmd.get_program(), std::ffi::OsStr::new("grok"));
         assert_eq!(
             command_args(&cmd),
-            ["agent", "stdio", "--permission-mode", "bypassPermissions"]
+            ["--permission-mode", "bypassPermissions", "agent", "stdio"]
         );
     }
 

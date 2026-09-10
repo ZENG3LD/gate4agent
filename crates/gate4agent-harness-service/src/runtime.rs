@@ -2285,6 +2285,28 @@ fn commit_lifecycle_projection(
     if run.lifecycle == projected_run_lifecycle && task.state == projected_task_state {
         return Ok(());
     }
+    // The engine's `validate_run_event_task_projection` requires the task to
+    // be in `Running` or `Waiting` for a run lifecycle event to project onto
+    // it, and rejects the mutation otherwise. That rejection used to travel
+    // all the way out of the runtime loop and take the operator wire -- and
+    // the process -- down with it. Measured live 2026-09-10: a coordinator
+    // session legally moved a strict descendant's task while that task's own
+    // run was still live, and the next control event for that run killed the
+    // harness; the store then refused to boot at all. A task that has moved
+    // out from under a live run is a real inconsistency and it is named here,
+    // but it is not this event's to repair and it must never be fatal: the
+    // event is dropped, the run keeps its lifecycle, and the harness stays up.
+    if !matches!(task.state, HarnessTaskStateV1::Running | HarnessTaskStateV1::Waiting) {
+        tracing::warn!(
+            run = %run.run_id,
+            task = %task.task_id,
+            task_state = ?task.state,
+            run_lifecycle = ?run.lifecycle,
+            projection = ?projection,
+            "run lifecycle event dropped: its task has moved out from under the live run",
+        );
+        return Ok(());
+    }
     let ids = deterministic_lifecycle_authority_ids(
         &run.run_id,
         node_id,
@@ -2681,14 +2703,36 @@ fn settle_stale_incarnation_bindings(
     }).collect::<Vec<_>>();
     let mut touch = EngineTouch::default();
     for (run_id, task_id, node_id, bound_incarnation, current_incarnation) in stale {
-        apply_run_incarnation_settlement(
+        // A run this pass cannot settle must never stop the pass, and above
+        // all must never stop the harness from starting: this runs at boot
+        // precisely to repair a store, so making it fatal turns one
+        // unsettleable run into a store nobody can open. Measured live
+        // 2026-09-10: an agent legally moved a strict descendant's task out
+        // of `Running` while that task's own run was still live, which is
+        // exactly the shape `validate_incarnation_settlement_task_projection`
+        // refuses -- and the refusal took the whole boot down with it. Name
+        // the run and carry on; it keeps its stale lifecycle, which is
+        // visibly wrong rather than invisibly fatal.
+        if let Err(error) = apply_run_incarnation_settlement(
             harness,
             &run_id,
             &node_id,
             bound_incarnation,
             current_incarnation,
             now_unix_ms,
-        )?;
+        ) {
+            tracing::warn!(
+                run = %run_id,
+                task = %task_id,
+                node = %node_id,
+                bound_incarnation = %bound_incarnation,
+                current_incarnation = %current_incarnation,
+                error = %error,
+                "run could not be settled after its host incarnation changed; \
+                 leaving it as it is and continuing",
+            );
+            continue;
+        }
         tracing::warn!(
             run = %run_id,
             task = %task_id,

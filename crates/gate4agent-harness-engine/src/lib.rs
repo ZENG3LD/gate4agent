@@ -641,13 +641,18 @@ impl HarnessEngine {
     }
 
     /// Walks one task's own `run_ids` looking for a run that has not reached
-    /// a terminal lifecycle. The cost is that task's own `run_ids.len()`,
-    /// never the size of the store, so this does not consult any store-wide
-    /// scan bound.
-    pub fn task_has_nonterminal_run(
+    /// a terminal lifecycle, returning its id -- the run whose lifecycle
+    /// projection owns the task's own state for as long as this keeps
+    /// returning `Some` (`HarnessTaskMoveResultV1::TaskOwnedByLiveRun`, D5:
+    /// while a run is non-terminal, a caller-initiated move that would change
+    /// its task's state races the run's own projection and never wins it
+    /// cleanly, so it is refused by name instead, naming this run). The cost
+    /// is that task's own `run_ids.len()`, never the size of the store, so
+    /// this does not consult any store-wide scan bound.
+    pub fn task_nonterminal_run_id(
         &self,
         task: &HarnessTaskV1,
-    ) -> Result<bool, HarnessEngineError> {
+    ) -> Result<Option<HarnessRunId>, HarnessEngineError> {
         for run_id in &task.run_ids {
             let run = self.runs.get(run_id).ok_or(HarnessEngineError::SchedulerInvalidGraph)?;
             if run.task_id != task.task_id {
@@ -659,10 +664,21 @@ impl HarnessEngine {
                     | HarnessRunLifecycleV1::Failed
                     | HarnessRunLifecycleV1::Cancelled
             ) {
-                return Ok(true);
+                return Ok(Some(run_id.clone()));
             }
         }
-        Ok(false)
+        Ok(None)
+    }
+
+    /// Bare presence check built on `task_nonterminal_run_id` -- most callers
+    /// (the scheduler's own admission checks, `operator_cancel_task`/
+    /// `operator_retry_task`) only need to know whether a nonterminal run
+    /// exists, not which one.
+    pub fn task_has_nonterminal_run(
+        &self,
+        task: &HarnessTaskV1,
+    ) -> Result<bool, HarnessEngineError> {
+        Ok(self.task_nonterminal_run_id(task)?.is_some())
     }
 
     /// The subset of `task.dependencies` that `scheduler_task_is_eligible`'s

@@ -3525,6 +3525,332 @@ mod tests {
         close_observation(observation, &path);
     }
 
+    /// Builds a child task strictly inside `own_task_id`'s own subtree, with
+    /// its own run and grant keyed off `marker` (so several children can
+    /// coexist in one checkpoint without id collisions) -- shared by the
+    /// `TaskOwnedByLiveRun` tests below, which need a task that is both a
+    /// strict descendant of the coordinator's own task (D5 subtree scope)
+    /// AND separately addressable as its own caller identity (to drive its
+    /// own run through `g4a_run_finish` in the review-gate test).
+    fn push_child_task(
+        checkpoint: &mut gate4agent_harness_engine::HarnessEngineCheckpointV1,
+        own_task_id: &HarnessTaskId,
+        marker: char,
+        task_state: HarnessTaskStateV1,
+        run_lifecycle: HarnessRunLifecycleV1,
+    ) -> (HarnessTaskId, HarnessRunId, SessionGrantId) {
+        let id_material = marker.to_string().repeat(24);
+        let child_task_id = HarnessTaskId::new(format!("htask_{id_material}")).unwrap();
+        let child_run_id = HarnessRunId::new(format!("hrun_{id_material}")).unwrap();
+        let child_grant_id = SessionGrantId::new(format!("hgrant_{id_material}")).unwrap();
+        let child_operation_id = HarnessOperationId::new(format!("hop_{id_material}")).unwrap();
+        checkpoint.tasks.push(HarnessTaskV1 {
+            task_id: child_task_id.clone(),
+            revision: HarnessRevision::new(1).unwrap(),
+            title: "child work".to_owned(),
+            body: String::new(),
+            creator: HarnessActorV1::User { actor_id: selector("operator") },
+            parent_task_id: Some(own_task_id.clone()),
+            dependencies: Vec::new(),
+            state: task_state,
+            run_ids: vec![child_run_id.clone()],
+            result_refs: Vec::new(),
+            artifact_refs: Vec::new(),
+            created_at_unix_ms: 10,
+            updated_at_unix_ms: 10,
+        });
+        let result_disposition = (run_lifecycle == HarnessRunLifecycleV1::Completed)
+            .then_some(HarnessResultDispositionV1::Succeeded);
+        checkpoint.runs.push(HarnessRunV1 {
+            run_id: child_run_id.clone(),
+            revision: HarnessRevision::new(1).unwrap(),
+            parent_run_id: None,
+            task_id: child_task_id.clone(),
+            operation_id: child_operation_id.clone(),
+            intent: HarnessRunIntentV1 {
+                node_id: selector("node-a"),
+                workspace_id: selector("workspace-a"),
+                worktree: HarnessWorktreeIntentV1::Existing,
+                provider_profile: selector("claude-default"),
+                mode: HarnessExecutionModeV1::Pty,
+                delivery_bundle: None,
+                continuation: None,
+            },
+            delivery_receipt: None,
+            continuation_receipt: None,
+            context_pack: None,
+            git_facts: None,
+            binding: None,
+            lifecycle: run_lifecycle,
+            result_disposition,
+            failure: None,
+            created_at_unix_ms: 10,
+            updated_at_unix_ms: 10,
+        });
+        checkpoint.grants.push(SessionGrantV1 {
+            grant_id: child_grant_id.clone(),
+            revision: HarnessRevision::new(1).unwrap(),
+            actor_run_id: child_run_id.clone(),
+            allowed_targets: vec![HarnessGrantTargetV1 {
+                node_id: selector("node-a"),
+                workspace_id: selector("workspace-a"),
+                provider_profile: selector("claude-default"),
+                mode: HarnessExecutionModeV1::Pty,
+            }],
+            allowed_delivery_bundles: Vec::new(),
+            maximum_child_count: 0,
+            maximum_child_depth: 0,
+            operation_timeouts: HarnessOperationTimeoutsV1 {
+                dispatch_ms: 1_000,
+                wait_ms: 1_000,
+                reconciliation_ms: 1_000,
+            },
+            task_permissions: HarnessTaskPermissionsV1 {
+                read: true,
+                create: false,
+                mutate: false,
+                request_run: false,
+            },
+            read_permissions: HarnessReadPermissionsV1::default(),
+            monitoring_visibility: HarnessMonitoringVisibilityV1::None,
+            context_permissions: HarnessContextPermissionsV1 { export: false, restore: false },
+            mail: false,
+            state: SessionGrantStateV1::Active,
+            created_at_unix_ms: 10,
+            updated_at_unix_ms: 10,
+        });
+        checkpoint.operations.push(HarnessOperationV1 {
+            operation_id: child_operation_id,
+            revision: HarnessRevision::new(1).unwrap(),
+            actor: HarnessActorV1::User { actor_id: selector("operator") },
+            kind: HarnessOperationKindV1::CreateRun,
+            state: HarnessOperationStateV1::Succeeded,
+            task_id: Some(child_task_id.clone()),
+            run_id: Some(child_run_id.clone()),
+            grant_id: None,
+            reconciles_operation_id: None,
+            expected_revision: Some(HarnessRevision::new(1).unwrap()),
+            request_digest: HarnessRequestDigest::new(marker.to_string().repeat(64)).unwrap(),
+            idempotency_ref: HarnessIdempotencyRef::new(format!(
+                "hidem_{}", marker.to_string().repeat(24),
+            )).unwrap(),
+            failure: None,
+            outcome_unknown_reason: None,
+            reconciliation_outcome: None,
+            created_at_unix_ms: 10,
+            updated_at_unix_ms: 10,
+            dispatched_at_unix_ms: Some(10),
+            finished_at_unix_ms: Some(10),
+        });
+        (child_task_id, child_run_id, child_grant_id)
+    }
+
+    /// D5's `TaskOwnedByLiveRun` (commit 7799812's incident): a strict
+    /// descendant whose own run is still non-terminal is refused by name,
+    /// naming the run that holds it -- proven twice over, once with the
+    /// task's real revision and once with a revision the caller could never
+    /// have (999), to show the ownership check runs before the CAS
+    /// comparison rather than racing it. Neither call mutates the task: its
+    /// revision and state both hold across both refusals.
+    #[test]
+    fn agent_move_task_refuses_a_strict_descendant_whose_run_is_live_and_names_the_run() {
+        let path = observation_path("agent-move-live-run");
+        let mut checkpoint = crate::credential::tests::engine(
+            1, SessionGrantStateV1::Active, 1, HarnessRunLifecycleV1::Running,
+        ).checkpoint();
+        checkpoint.grants[0].task_permissions.mutate = true;
+        let own_task_id = HarnessTaskId::new(format!("htask_{}", "a".repeat(24))).unwrap();
+        let (child_task_id, child_run_id, _child_grant_id) = push_child_task(
+            &mut checkpoint,
+            &own_task_id,
+            'c',
+            HarnessTaskStateV1::Running,
+            HarnessRunLifecycleV1::Running,
+        );
+
+        let mut harness = HarnessService::from_engine_for_test(
+            gate4agent_harness_engine::HarnessEngine::restore(checkpoint).unwrap(),
+        );
+        let observation = ObservationService::open(&path).unwrap();
+        let support = ObservationSupportRegistry::default();
+        let inventory = crate::runtime::HarnessRuntimeInventoryCache::default();
+        let own_binding = crate::credential::tests::binding(1, 1);
+
+        let refused = execute_exact_binding_read(
+            &mut harness, &observation, &support, &own_binding,
+            HarnessReadRequestV1::TaskMove {
+                task_id: child_task_id.clone(),
+                expected_revision: HarnessRevision::new(1).unwrap(),
+                to: HarnessTaskStateV1::Review,
+            },
+            &inventory,
+        ).unwrap();
+        assert_eq!(
+            refused,
+            HarnessReadResponseV1::TaskMove(HarnessTaskMoveResultV1::TaskOwnedByLiveRun {
+                task_id: child_task_id.clone(),
+                run_id: child_run_id.clone(),
+            }),
+        );
+
+        // A stale `expected_revision` (the real one is 1) gets the identical
+        // refusal, not `RevisionConflict` -- the ownership check runs first.
+        let refused_with_stale_revision = execute_exact_binding_read(
+            &mut harness, &observation, &support, &own_binding,
+            HarnessReadRequestV1::TaskMove {
+                task_id: child_task_id.clone(),
+                expected_revision: HarnessRevision::new(999).unwrap(),
+                to: HarnessTaskStateV1::Review,
+            },
+            &inventory,
+        ).unwrap();
+        assert_eq!(
+            refused_with_stale_revision,
+            HarnessReadResponseV1::TaskMove(HarnessTaskMoveResultV1::TaskOwnedByLiveRun {
+                task_id: child_task_id.clone(),
+                run_id: child_run_id,
+            }),
+        );
+
+        let untouched = harness.engine().task(&child_task_id).unwrap();
+        assert_eq!(untouched.revision, HarnessRevision::new(1).unwrap());
+        assert_eq!(untouched.state, HarnessTaskStateV1::Running);
+
+        close_observation(observation, &path);
+    }
+
+    /// `TaskIsOwn` still refuses first, live run or not: the caller's own
+    /// task is governed by the caller's own run (`hrun_aaa...`, `Running`
+    /// per this fixture), and the check still fires before
+    /// `TaskOwnedByLiveRun` ever gets a chance to -- it is not reached at
+    /// all, because `TaskIsOwn` is decided before the task's current state
+    /// or run is even looked up.
+    #[test]
+    fn agent_move_task_task_is_own_refuses_before_the_live_run_check() {
+        let path = observation_path("agent-move-task-is-own-live");
+        let mut checkpoint = crate::credential::tests::engine(
+            1, SessionGrantStateV1::Active, 1, HarnessRunLifecycleV1::Running,
+        ).checkpoint();
+        checkpoint.grants[0].task_permissions.mutate = true;
+        let own_task_id = HarnessTaskId::new(format!("htask_{}", "a".repeat(24))).unwrap();
+        let own_run_id = HarnessRunId::new(format!("hrun_{}", "a".repeat(24))).unwrap();
+
+        let mut harness = HarnessService::from_engine_for_test(
+            gate4agent_harness_engine::HarnessEngine::restore(checkpoint).unwrap(),
+        );
+        assert_eq!(
+            harness.engine().run(&own_run_id).unwrap().lifecycle,
+            HarnessRunLifecycleV1::Running,
+        );
+        let observation = ObservationService::open(&path).unwrap();
+        let support = ObservationSupportRegistry::default();
+        let inventory = crate::runtime::HarnessRuntimeInventoryCache::default();
+        let own_binding = crate::credential::tests::binding(1, 1);
+
+        let refused = execute_exact_binding_read(
+            &mut harness, &observation, &support, &own_binding,
+            HarnessReadRequestV1::TaskMove {
+                task_id: own_task_id.clone(),
+                expected_revision: HarnessRevision::new(1).unwrap(),
+                to: HarnessTaskStateV1::Ready,
+            },
+            &inventory,
+        ).unwrap();
+        assert_eq!(
+            refused,
+            HarnessReadResponseV1::TaskMove(HarnessTaskMoveResultV1::TaskIsOwn { task_id: own_task_id }),
+        );
+
+        close_observation(observation, &path);
+    }
+
+    /// The designed path past `TaskOwnedByLiveRun`, end to end: the worker
+    /// (bound to the child's own run/grant) calls `g4a_run_finish`, which
+    /// drives its own run to `Completed` and its task to `Review` through
+    /// the lifecycle projection; the coordinator (`own_binding`) then moves
+    /// that task `Review -> Done`. The run is terminal by then, so the new
+    /// rule does not refuse it -- this is the flow the whole fix exists not
+    /// to break.
+    #[test]
+    fn agent_move_task_review_to_done_succeeds_once_the_owning_run_is_terminal() {
+        let path = observation_path("agent-move-review-to-done");
+        let mut checkpoint = crate::credential::tests::engine(
+            1, SessionGrantStateV1::Active, 1, HarnessRunLifecycleV1::Running,
+        ).checkpoint();
+        checkpoint.grants[0].task_permissions.mutate = true;
+        let own_task_id = HarnessTaskId::new(format!("htask_{}", "a".repeat(24))).unwrap();
+        let (child_task_id, child_run_id, child_grant_id) = push_child_task(
+            &mut checkpoint,
+            &own_task_id,
+            'e',
+            HarnessTaskStateV1::Running,
+            HarnessRunLifecycleV1::Running,
+        );
+
+        let mut harness = HarnessService::from_engine_for_test(
+            gate4agent_harness_engine::HarnessEngine::restore(checkpoint).unwrap(),
+        );
+        let observation = ObservationService::open(&path).unwrap();
+        let support = ObservationSupportRegistry::default();
+        let inventory = crate::runtime::HarnessRuntimeInventoryCache::default();
+        let own_binding = crate::credential::tests::binding(1, 1);
+        let child_binding = CredentialBindingV1 {
+            grant_id: child_grant_id,
+            grant_revision: HarnessRevision::new(1).unwrap(),
+            actor_run_id: child_run_id.clone(),
+            node_id: selector("node-a"),
+            workspace_id: selector("workspace-a"),
+            node_incarnation: selector(
+                &gate4agent_node_protocol::NodeIncarnationId::from_bytes([4; 16]).to_string(),
+            ),
+            record_id: selector("record-c"),
+            instance_id: 7,
+            generation: 1,
+        };
+
+        let finished = execute_exact_binding_read(
+            &mut harness, &observation, &support, &child_binding,
+            HarnessReadRequestV1::RunFinish { outcome: HarnessRunFinishOutcomeV1::Done, summary: None },
+            &inventory,
+        ).unwrap();
+        assert_eq!(
+            finished,
+            HarnessReadResponseV1::RunFinish(HarnessRunFinishResultV1::Finished {
+                run_id: child_run_id.clone(),
+                task_id: child_task_id.clone(),
+                result: HarnessRunFinishOutcomeV1::Done,
+            }),
+        );
+        assert_eq!(
+            harness.engine().run(&child_run_id).unwrap().lifecycle,
+            HarnessRunLifecycleV1::Completed,
+        );
+        let review_task = harness.engine().task(&child_task_id).unwrap();
+        assert_eq!(review_task.state, HarnessTaskStateV1::Review);
+        let review_revision = review_task.revision;
+
+        let moved = execute_exact_binding_read(
+            &mut harness, &observation, &support, &own_binding,
+            HarnessReadRequestV1::TaskMove {
+                task_id: child_task_id.clone(),
+                expected_revision: review_revision,
+                to: HarnessTaskStateV1::Done,
+            },
+            &inventory,
+        ).unwrap();
+        assert_eq!(
+            moved,
+            HarnessReadResponseV1::TaskMove(HarnessTaskMoveResultV1::Moved {
+                task_id: child_task_id,
+                revision: HarnessRevision::new(review_revision.get() + 1).unwrap(),
+                from: HarnessTaskStateV1::Review,
+                to: HarnessTaskStateV1::Done,
+            }),
+        );
+
+        close_observation(observation, &path);
+    }
+
     /// Builds a second, wholly independent task/run/grant ("run B") on top
     /// of `crate::credential::tests::engine`'s own base fixture ("run A" --
     /// `htask_aaa.../hrun_aaa.../hgrant_aaa...`), for the authority test:

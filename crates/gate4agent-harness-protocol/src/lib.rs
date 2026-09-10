@@ -457,6 +457,14 @@ impl HarnessTaskCreateResultV1 {
 /// `from != to`, no move out of a terminal state, `Done` only from
 /// `Review` -- without duplicating that function here: the service applies
 /// its own agent-scoped rule and reports the two states it rejected.
+///
+/// `TaskOwnedByLiveRun` names the rule commit 7799812's incident exposed:
+/// while a run is non-terminal, its lifecycle projection owns its task's
+/// state, and a caller-initiated move that would change it races a
+/// projection it cannot win cleanly rather than being told plainly it was
+/// never going to be allowed -- so it is refused by name, carrying the id
+/// of the run that holds the task, instead of racing `RevisionConflict` on
+/// a revision the run's own churn keeps moving out from under the caller.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "outcome", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum HarnessTaskMoveResultV1 {
@@ -469,6 +477,7 @@ pub enum HarnessTaskMoveResultV1 {
     TaskIsOwn { task_id: HarnessTaskId },
     TaskOutsideOwnSubtree { task_id: HarnessTaskId, own_task_id: HarnessTaskId },
     IllegalTransition { task_id: HarnessTaskId, from: HarnessTaskStateV1, to: HarnessTaskStateV1 },
+    TaskOwnedByLiveRun { task_id: HarnessTaskId, run_id: HarnessRunId },
     RevisionConflict { task_id: HarnessTaskId, expected: HarnessRevision, current: HarnessRevision },
 }
 
@@ -485,6 +494,10 @@ impl HarnessTaskMoveResultV1 {
                 own_task_id.validate()
             }
             Self::IllegalTransition { task_id, .. } => task_id.validate(),
+            Self::TaskOwnedByLiveRun { task_id, run_id } => {
+                task_id.validate()?;
+                run_id.validate()
+            }
             Self::RevisionConflict { task_id, expected, current } => {
                 task_id.validate()?;
                 expected.validate()?;
@@ -4707,6 +4720,20 @@ mod tests {
             }),
         );
 
+        let task_owned_by_live_run = HarnessTaskMoveResultV1::TaskOwnedByLiveRun {
+            task_id: task_id('1'),
+            run_id: run_id('2'),
+        };
+        task_owned_by_live_run.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(&task_owned_by_live_run).unwrap(),
+            serde_json::json!({
+                "outcome": "task-owned-by-live-run",
+                "task_id": task_id('1').as_str(),
+                "run_id": run_id('2').as_str(),
+            }),
+        );
+
         let variants = [
             HarnessTaskMoveResultV1::TaskIsOwn { task_id: task_id('1') },
             HarnessTaskMoveResultV1::TaskOutsideOwnSubtree {
@@ -4718,6 +4745,7 @@ mod tests {
                 from: HarnessTaskStateV1::Done,
                 to: HarnessTaskStateV1::Running,
             },
+            task_owned_by_live_run,
             revision_conflict,
         ];
         for variant in variants {

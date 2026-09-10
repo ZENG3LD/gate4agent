@@ -677,6 +677,25 @@ impl HarnessService {
         )
     }
 
+    /// Already carries D5's `TaskOwnedByLiveRun` rule in its own shape and
+    /// has since this function was first written: a nonterminal run blocks
+    /// every target state except `Waiting`, checked here BEFORE
+    /// `operator_replace_task_state` ever reaches the revision CAS deep in
+    /// `commit_operator_mutation`/`engine.prepare`, so the ordering
+    /// `agent_move_task` now mirrors was already correct on this path. The
+    /// `Waiting` carve-out is not a gap of the same shape: `Waiting` is one
+    /// of the exact two states (`Running`/`Waiting`) `validate_run_event_
+    /// task_projection` requires the task to already be in before a run's
+    /// own lifecycle event may project onto it, so an operator setting the
+    /// task to `Waiting` while its run is live can never produce the
+    /// out-of-band state that projection rejects the way any OTHER target
+    /// would; the next control event still finds the task in `Waiting` (or
+    /// self-corrects it back to `Running`) and commits normally. Refused
+    /// with the bare `TaskHasActiveRun` error rather than a named outcome
+    /// carrying the run id, because this is a transport-level `Result`, not
+    /// `HarnessTaskMoveResultV1` -- that shape difference is a return-type
+    /// mismatch the operator caller already handles, not something this fix
+    /// needed to change.
     pub fn operator_move_task(
         &mut self,
         request: HarnessMoveTaskRequestV1,
@@ -708,6 +727,16 @@ impl HarnessService {
         )
     }
 
+    /// Already consistent with D5's `TaskOwnedByLiveRun` rule: `Cancelled`
+    /// is never one of the two states (`Running`/`Waiting`) a live run's
+    /// lifecycle projection tolerates for its own task, so this has no
+    /// `operator_move_task`-style carve-out and refuses `TaskHasActiveRun`
+    /// unconditionally whenever a nonterminal run is attached. There is no
+    /// "cancel the task out from under its live run" path in this service
+    /// today -- the only way past this refusal is for that run to reach a
+    /// terminal lifecycle first (success, failure, or a future run-level
+    /// cancellation this crate does not yet model), never a direct
+    /// task-state override. Left unchanged.
     pub fn operator_cancel_task(
         &mut self,
         request: HarnessCancelTaskRequestV1,
@@ -742,6 +771,16 @@ impl HarnessService {
         )
     }
 
+    /// Same consistency as `operator_cancel_task`: its target, `Ready`, is
+    /// also never `Running`/`Waiting`, so a nonterminal run refuses
+    /// unconditionally here too. In today's state machine a task only
+    /// reaches `Failed`/`Cancelled` (the states this requires) once its own
+    /// run has already gone terminal, so this guard is defensive rather
+    /// than reachable through the ordinary flow -- pinned by
+    /// `harness_operator_retry_rejects_active_linked_run` against a
+    /// deliberately inconsistent fixture (a `Failed` task with a stale
+    /// `run_ids` entry still pointing at a nonterminal run) rather than a
+    /// path any current caller can reach unaided. Left unchanged.
     pub fn operator_retry_task(
         &mut self,
         request: HarnessRetryTaskRequestV1,
@@ -2931,6 +2970,24 @@ impl HarnessService {
     /// dependencies are carried forward verbatim from the current task, so
     /// no title/body validation failure is reachable here the way it is in
     /// `agent_create_task`).
+    ///
+    /// `TaskOwnedByLiveRun` (commit 7799812's incident): while a run is
+    /// non-terminal, its lifecycle projection owns its task's state, and a
+    /// move that would change it races that projection rather than ever
+    /// winning cleanly against it -- the task's revision keeps climbing as
+    /// the run's own control events flip it between `Running`/`Waiting`, so
+    /// a stale `expected_revision` here is never the real reason a move
+    /// fails. This check runs AFTER `IllegalTransition` (a transition that
+    /// is never legal in any circumstance stays the more fundamental
+    /// refusal) but BEFORE the revision comparison (today the CAS is
+    /// consulted before anything could tell the caller the move was never
+    /// going to be allowed) -- so a caller in this situation is told the
+    /// truth, "this task is owned by a live run", instead of a misleading
+    /// "your revision is stale" that invites an unwinnable retry. Once the
+    /// run reaches a terminal lifecycle (the designed path: the run's own
+    /// `g4a_run_finish` drives it there, and its task to `Review` through
+    /// the projection), this no-ops and the intended `Review -> Done` move
+    /// proceeds exactly as before.
     pub(crate) fn agent_move_task(
         &mut self,
         actor_run_id: HarnessRunId,
@@ -2954,6 +3011,9 @@ impl HarnessService {
             .clone();
         if validate_operator_move(current.state, to).is_err() {
             return Ok(HarnessTaskMoveResultV1::IllegalTransition { task_id, from: current.state, to });
+        }
+        if let Some(run_id) = self.scheduler_task_nonterminal_run_id(&current)? {
+            return Ok(HarnessTaskMoveResultV1::TaskOwnedByLiveRun { task_id, run_id });
         }
         if current.revision != expected_revision {
             return Ok(HarnessTaskMoveResultV1::RevisionConflict {
@@ -5105,6 +5165,16 @@ impl HarnessService {
         task: &HarnessTaskV1,
     ) -> Result<bool, HarnessServiceError> {
         self.engine.task_has_nonterminal_run(task).map_err(map_scheduler_error)
+    }
+
+    /// `scheduler_task_has_nonterminal_run`'s own sibling for callers that
+    /// need to name the holding run, not just know one exists
+    /// (`agent_move_task`'s `TaskOwnedByLiveRun`).
+    fn scheduler_task_nonterminal_run_id(
+        &self,
+        task: &HarnessTaskV1,
+    ) -> Result<Option<HarnessRunId>, HarnessServiceError> {
+        self.engine.task_nonterminal_run_id(task).map_err(map_scheduler_error)
     }
 
     /// Names why `scheduler_ready_task_by_id` refused `task_id` on the
@@ -9929,6 +9999,76 @@ mod tests {
         );
         service.close().unwrap();
         remove_database(&path);
+    }
+
+    /// `operator_retry_task`'s own nonterminal-run guard, pinned the same
+    /// way `harness_operator_cancel_rejects_active_linked_run` pins
+    /// cancel's: unlike that test, there is no ordinary sequence of calls
+    /// that reaches this state (a task only becomes `Failed`/`Cancelled` once
+    /// its run has already gone terminal), so the fixture builds it directly
+    /// -- a `Failed` task whose `run_ids` still names a `Running` run, the
+    /// shape `task_nonterminal_run_id` exists to catch regardless of how the
+    /// store got there.
+    #[test]
+    fn harness_operator_retry_rejects_active_linked_run() {
+        let mut retry_task = task();
+        retry_task.state = HarnessTaskStateV1::Failed;
+        retry_task.run_ids = vec![run_id()];
+        let run = HarnessRunV1 {
+            run_id: run_id(),
+            revision: HarnessRevision::new(1).unwrap(),
+            parent_run_id: None,
+            task_id: task_id(),
+            operation_id: run_operation_id(),
+            intent: HarnessRunIntentV1 {
+                node_id: HarnessSelectorV1::new("node-a").unwrap(),
+                workspace_id: HarnessSelectorV1::new("workspace-a").unwrap(),
+                worktree: HarnessWorktreeIntentV1::Existing,
+                provider_profile: HarnessSelectorV1::new("claude-default").unwrap(),
+                mode: HarnessExecutionModeV1::Pty,
+                delivery_bundle: None,
+                continuation: None,
+            },
+            delivery_receipt: None,
+            continuation_receipt: None,
+            context_pack: None,
+            git_facts: None,
+            binding: None,
+            lifecycle: HarnessRunLifecycleV1::Running,
+            result_disposition: None,
+            failure: None,
+            created_at_unix_ms: 10,
+            updated_at_unix_ms: 10,
+        };
+        let engine = HarnessEngine::restore(HarnessEngineCheckpointV1 {
+            version: gate4agent_harness_engine::HARNESS_ENGINE_CHECKPOINT_VERSION_V1,
+            tasks: vec![retry_task],
+            runs: vec![run],
+            grants: Vec::new(),
+            operations: Vec::new(),
+            execution_specs: Vec::new(),
+            issuances: Vec::new(),
+            execution_specs_v2: Vec::new(),
+            deliveries: Vec::new(),
+            continuations: Vec::new(),
+            mail_messages: Vec::new(),
+            mail_acks: Vec::new(),
+        }).unwrap();
+        let mut service = HarnessService::from_engine_for_test(engine);
+
+        let request = HarnessRetryTaskRequestV1 {
+            authority: operator_authority('3', 30),
+            task_id: task_id(),
+            expected_revision: HarnessRevision::new(1).unwrap(),
+        };
+        assert!(matches!(
+            service.operator_retry_task(request),
+            Err(HarnessServiceError::TaskHasActiveRun),
+        ));
+        assert_eq!(
+            service.engine().task(&task_id()).unwrap().state,
+            HarnessTaskStateV1::Failed,
+        );
     }
 
     #[test]

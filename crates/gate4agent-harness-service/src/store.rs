@@ -59,7 +59,6 @@ pub struct PersistedHarnessState {
     pub continuations: Vec<PersistedEntity>,
     pub dispatches: Vec<PersistedEntity>,
     pub harness_mcp_reservations: Vec<PersistedEntity>,
-    pub operations: Vec<PersistedOperation>,
     pub mail_messages: Vec<PersistedMailMessage>,
     pub mail_acks: Vec<PersistedMailAck>,
 }
@@ -111,13 +110,18 @@ impl HarnessStore {
                 revision INTEGER NOT NULL,
                 payload BLOB NOT NULL
              );
-             CREATE TABLE IF NOT EXISTS harness_operations (
-                operation_id TEXT PRIMARY KEY,
-                revision INTEGER NOT NULL,
-                request_digest TEXT NOT NULL,
-                state TEXT NOT NULL,
-                payload BLOB NOT NULL
-             );
+             -- `harness_operations` used to mirror the engine's whole
+             -- operation history, one row per operation, rewritten wholesale
+             -- (DELETE + re-INSERT every row) on every single commit. Nothing
+             -- in this crate or any consumer ever SELECTed from it -- the
+             -- authoritative history lives in the `harness_checkpoint`
+             -- payload blob (`HarnessEngineCheckpointV1::operations`, wholly
+             -- serialized into `checkpoint.payload`), and bounded
+             -- introspection is already served by `harness_operation_tail`.
+             -- Dropping it here is safe on both a fresh database (the table
+             -- never existed) and an existing one (its rows duplicate the
+             -- checkpoint and were never read).
+             DROP TABLE IF EXISTS harness_operations;
              CREATE TABLE IF NOT EXISTS harness_deliveries (
                 entity_id TEXT PRIMARY KEY,
                 revision INTEGER NOT NULL,
@@ -254,21 +258,6 @@ impl HarnessStore {
             )?;
             replace_mail_messages(&transaction, &state.mail_messages)?;
             replace_mail_acks(&transaction, &state.mail_acks)?;
-            transaction.execute("DELETE FROM harness_operations", [])?;
-            for operation in &state.operations {
-                transaction.execute(
-                    "INSERT INTO harness_operations(
-                        operation_id, revision, request_digest, state, payload
-                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![
-                        &operation.id,
-                        operation.revision,
-                        &operation.request_digest,
-                        &operation.state,
-                        &operation.payload,
-                    ],
-                )?;
-            }
             transaction.execute(
                 "INSERT INTO harness_operation_tail(
                     operation_id, revision, request_digest, state, payload
@@ -385,7 +374,6 @@ impl PersistedHarnessState {
         validate_entities("continuations", &self.continuations)?;
         validate_entities("dispatches", &self.dispatches)?;
         validate_entities("harness_mcp_reservations", &self.harness_mcp_reservations)?;
-        validate_operations(&self.operations)?;
         validate_mail_messages(&self.mail_messages)?;
         validate_mail_acks(&self.mail_acks)?;
         Ok(())
@@ -450,24 +438,6 @@ fn validate_entities(
         row.validate()?;
         if !ids.insert(&row.id) {
             return Err(HarnessStoreError::DuplicateId { kind });
-        }
-    }
-    Ok(())
-}
-
-fn validate_operations(rows: &[PersistedOperation]) -> Result<(), HarnessStoreError> {
-    if rows.len() > HARNESS_ENTITY_ROWS_MAX {
-        return Err(HarnessStoreError::RowsTooMany {
-            kind: "operations",
-            actual: rows.len(),
-            max: HARNESS_ENTITY_ROWS_MAX,
-        });
-    }
-    let mut ids = std::collections::BTreeSet::new();
-    for row in rows {
-        row.validate()?;
-        if !ids.insert(&row.id) {
-            return Err(HarnessStoreError::DuplicateId { kind: "operations" });
         }
     }
     Ok(())
@@ -638,6 +608,140 @@ mod tests {
         ).unwrap();
         assert_eq!(ack_count, 1);
         connection.close().unwrap();
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{}-wal", path.display()));
+        let _ = fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn existing_harness_operations_table_is_dropped_on_open_and_store_still_commits() {
+        // Simulates a database written by a binary that still had the
+        // write-only `harness_operations` mirror: create it by hand with
+        // rows, exactly as an old `commit` would have left it, then open it
+        // through `HarnessStore::open` and confirm the table is gone and the
+        // store still commits afterward.
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "gate4agent-harness-drop-operations-{}-{nonce}.sqlite",
+            std::process::id(),
+        ));
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection.execute_batch(
+                "CREATE TABLE harness_operations (
+                    operation_id TEXT PRIMARY KEY,
+                    revision INTEGER NOT NULL,
+                    request_digest TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    payload BLOB NOT NULL
+                 );",
+            ).unwrap();
+            for position in 0..32 {
+                connection.execute(
+                    "INSERT INTO harness_operations(
+                        operation_id, revision, request_digest, state, payload
+                     ) VALUES (?1, 1, ?2, 'Succeeded', X'01')",
+                    params![format!("hop_{position:024x}"), format!("{position:064x}")],
+                ).unwrap();
+            }
+            connection.close().unwrap();
+        }
+
+        let mut store = HarnessStore::open(&path).unwrap();
+        let state = PersistedHarnessState {
+            checkpoint: vec![1],
+            ..PersistedHarnessState::default()
+        };
+        let tail = PersistedOperation {
+            id: format!("hop_{}", "c".repeat(24)),
+            revision: 1,
+            request_digest: "d".repeat(64),
+            state: "Succeeded".to_owned(),
+            payload: vec![1],
+        };
+        store.commit(&state, &tail).unwrap();
+        store.close().unwrap();
+
+        let connection = Connection::open(&path).unwrap();
+        let table_count: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'harness_operations'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(table_count, 0);
+        connection.close().unwrap();
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{}-wal", path.display()));
+        let _ = fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn commit_does_not_create_or_write_harness_operations_table() {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "gate4agent-harness-no-operations-{}-{nonce}.sqlite",
+            std::process::id(),
+        ));
+        let mut store = HarnessStore::open(&path).unwrap();
+        let state = PersistedHarnessState {
+            checkpoint: vec![1],
+            ..PersistedHarnessState::default()
+        };
+        let tail = PersistedOperation {
+            id: format!("hop_{}", "e".repeat(24)),
+            revision: 1,
+            request_digest: "f".repeat(64),
+            state: "Succeeded".to_owned(),
+            payload: vec![1],
+        };
+        store.commit(&state, &tail).unwrap();
+        store.close().unwrap();
+
+        let connection = Connection::open(&path).unwrap();
+        let table_count: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'harness_operations'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(table_count, 0);
+        connection.close().unwrap();
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{}-wal", path.display()));
+        let _ = fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn operation_history_far_exceeding_the_old_row_cap_now_commits() {
+        // Before this change, operation history was ALSO mirrored row-per-
+        // operation into `PersistedHarnessState::operations`, and
+        // `validate_operations` refused the commit once that count passed
+        // `HARNESS_ENTITY_ROWS_MAX`. Operation history now lives only inside
+        // the `checkpoint` blob, which is bounded by `MAX_CHECKPOINT_BYTES`
+        // (bytes), not by a row count -- so a checkpoint sized as if it held
+        // far more than `HARNESS_ENTITY_ROWS_MAX` operations must still
+        // commit, where the old row-count gate would have rejected it.
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "gate4agent-harness-operations-uncapped-{}-{nonce}.sqlite",
+            std::process::id(),
+        ));
+        let mut store = HarnessStore::open(&path).unwrap();
+        let synthetic_operation_count = HARNESS_ENTITY_ROWS_MAX + 1;
+        let checkpoint = vec![7u8; synthetic_operation_count * 64];
+        assert!(checkpoint.len() < MAX_CHECKPOINT_BYTES);
+        let state = PersistedHarnessState {
+            checkpoint,
+            ..PersistedHarnessState::default()
+        };
+        let tail = PersistedOperation {
+            id: format!("hop_{}", "1".repeat(24)),
+            revision: 1,
+            request_digest: "2".repeat(64),
+            state: "Succeeded".to_owned(),
+            payload: vec![1],
+        };
+        store.commit(&state, &tail).unwrap();
+        store.close().unwrap();
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(format!("{}-wal", path.display()));
         let _ = fs::remove_file(format!("{}-shm", path.display()));

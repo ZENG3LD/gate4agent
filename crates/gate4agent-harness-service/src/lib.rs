@@ -7264,9 +7264,6 @@ fn encode_persisted_state(
             continuation,
         ))
         .collect::<Result<Vec<_>, _>>()?;
-    let operations = checkpoint.engine.operations.iter()
-        .map(encode_operation)
-        .collect::<Result<Vec<_>, _>>()?;
     let harness_mcp_reservations = checkpoint.harness_mcp_reservations.iter()
         .map(|reservation| encode_entity(
             reservation.reservation_id.as_str().to_owned(),
@@ -7289,7 +7286,6 @@ fn encode_persisted_state(
         continuations,
         dispatches,
         harness_mcp_reservations,
-        operations,
         mail_messages,
         mail_acks,
     })

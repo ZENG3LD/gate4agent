@@ -560,9 +560,15 @@ impl HarnessEngine {
         &self,
         operation_ids: Option<&BTreeSet<HarnessOperationId>>,
     ) -> Result<Vec<(&HarnessTaskV1, &HarnessRunV1, &HarnessOperationV1)>, HarnessEngineError> {
-        self.validate_scheduler_bound()?;
+        // This walks every stored run (there is no index by lifecycle or by
+        // operation id), so the cost is the number of runs actually visited,
+        // not the size of the store as a whole. Refuse only once the walk
+        // itself has examined `HARNESS_SCHEDULER_SCAN_MAX` runs.
         let mut pending = Vec::new();
-        for run in self.runs.values() {
+        for (scanned, run) in self.runs.values().enumerate() {
+            if scanned >= HARNESS_SCHEDULER_SCAN_MAX {
+                return Err(HarnessEngineError::SchedulerResourceExhausted);
+            }
             if run.lifecycle != HarnessRunLifecycleV1::Requested
                 || operation_ids.map(|ids| !ids.contains(&run.operation_id)).unwrap_or(false)
             {
@@ -589,21 +595,31 @@ impl HarnessEngine {
         Ok(pending)
     }
 
+    /// Finds the first `Ready`, dependency-satisfied task by walking every
+    /// stored task in order -- there is no index by state, so this genuinely
+    /// scans. Refuses only once the walk itself has examined
+    /// `HARNESS_SCHEDULER_SCAN_MAX` tasks without returning; an eligible task
+    /// found earlier in the walk is returned regardless of how large the
+    /// store has grown.
     pub fn scheduler_ready_task(&self) -> Result<Option<&HarnessTaskV1>, HarnessEngineError> {
-        self.validate_scheduler_bound()?;
-        for task in self.tasks.values().filter(|task| task.state == HarnessTaskStateV1::Ready) {
-            if self.scheduler_task_is_eligible(task)? {
+        for (scanned, task) in self.tasks.values().enumerate() {
+            if scanned >= HARNESS_SCHEDULER_SCAN_MAX {
+                return Err(HarnessEngineError::SchedulerResourceExhausted);
+            }
+            if task.state == HarnessTaskStateV1::Ready && self.scheduler_task_is_eligible(task)? {
                 return Ok(Some(task));
             }
         }
         Ok(None)
     }
 
+    /// Looks up one task by id and checks its own eligibility. The cost is
+    /// that task's own `dependencies` and `run_ids`, never the size of the
+    /// store, so this does not consult any store-wide scan bound.
     pub fn scheduler_ready_task_by_id(
         &self,
         task_id: &HarnessTaskId,
     ) -> Result<Option<&HarnessTaskV1>, HarnessEngineError> {
-        self.validate_scheduler_bound()?;
         let task = self.tasks.get(task_id)
             .ok_or_else(|| HarnessEngineError::NotFound(task_id.to_string()))?;
         if task.state != HarnessTaskStateV1::Ready || !self.scheduler_task_is_eligible(task)? {
@@ -624,11 +640,14 @@ impl HarnessEngine {
         Ok(dependencies_done && !self.task_has_nonterminal_run(task)?)
     }
 
+    /// Walks one task's own `run_ids` looking for a run that has not reached
+    /// a terminal lifecycle. The cost is that task's own `run_ids.len()`,
+    /// never the size of the store, so this does not consult any store-wide
+    /// scan bound.
     pub fn task_has_nonterminal_run(
         &self,
         task: &HarnessTaskV1,
     ) -> Result<bool, HarnessEngineError> {
-        self.validate_scheduler_bound()?;
         for run_id in &task.run_ids {
             let run = self.runs.get(run_id).ok_or(HarnessEngineError::SchedulerInvalidGraph)?;
             if run.task_id != task.task_id {
@@ -664,15 +683,6 @@ impl HarnessEngine {
             })
             .cloned()
             .collect()
-    }
-
-    fn validate_scheduler_bound(&self) -> Result<(), HarnessEngineError> {
-        let scanned = self.tasks.len().checked_add(self.runs.len())
-            .ok_or(HarnessEngineError::SchedulerResourceExhausted)?;
-        if scanned > HARNESS_SCHEDULER_SCAN_MAX {
-            return Err(HarnessEngineError::SchedulerResourceExhausted);
-        }
-        Ok(())
     }
 
     pub fn restore_deliveries(
@@ -5970,21 +5980,175 @@ mod tests {
         );
     }
 
+    // `harness_scheduler_scan_bound_is_categorical` used to assert that a
+    // store holding more than `HARNESS_SCHEDULER_SCAN_MAX` tasks refuses
+    // BOTH `scheduler_ready_task` and `scheduler_pending_dispatch` -- but
+    // `scheduler_pending_dispatch` walks `self.runs`, not `self.tasks`, so
+    // that second assertion was pinning the exact cliff this change removes:
+    // ordinary task-history growth blocking a call whose real cost is the
+    // number of runs. It is inverted below as
+    // `harness_scheduler_pending_dispatch_not_bound_by_task_count`, and the
+    // surviving half (a genuinely oversized `scheduler_ready_task` walk still
+    // refuses) is kept, renamed to name what it actually tests.
     #[test]
-    fn harness_scheduler_scan_bound_is_categorical() {
+    fn harness_scheduler_ready_task_scan_bound_is_categorical() {
         let mut engine = HarnessEngine::new();
         for index in 0..=HARNESS_SCHEDULER_SCAN_MAX {
             let item = task(numbered_task_id(index + 1), 1, "bounded");
             engine.tasks.insert(item.task_id.clone(), item);
         }
+        // Every inserted task stays `Backlog`, so the walk never finds an
+        // eligible `Ready` task and must examine the whole table -- a
+        // genuinely large scan, not merely a large store.
         assert!(matches!(
             engine.scheduler_ready_task(),
             Err(HarnessEngineError::SchedulerResourceExhausted),
         ));
+    }
+
+    #[test]
+    fn harness_scheduler_pending_dispatch_not_bound_by_task_count() {
+        let mut engine = HarnessEngine::new();
+        for index in 0..=HARNESS_SCHEDULER_SCAN_MAX {
+            let item = task(numbered_task_id(index + 1), 1, "bounded");
+            engine.tasks.insert(item.task_id.clone(), item);
+        }
+        // `scheduler_pending_dispatch` walks `self.runs`, which is empty
+        // here. A task-only store this large must not refuse a call whose
+        // cost has nothing to do with how many tasks are stored.
+        assert_eq!(engine.scheduler_pending_dispatch().unwrap(), None);
+    }
+
+    #[test]
+    fn harness_scheduler_pending_dispatch_scan_bound_is_categorical() {
+        let mut engine = HarnessEngine::new();
+        for index in 0..=HARNESS_SCHEDULER_SCAN_MAX {
+            let mut item = run(HarnessRunLifecycleV1::Failed, 1);
+            item.run_id = numbered_run_id(index + 1);
+            engine.runs.insert(item.run_id.clone(), item);
+        }
+        // Every inserted run is terminal and skipped on sight, but the walk
+        // still has to visit each one to know that -- a genuinely oversized
+        // run scan still refuses.
         assert!(matches!(
             engine.scheduler_pending_dispatch(),
             Err(HarnessEngineError::SchedulerResourceExhausted),
         ));
+    }
+
+    #[test]
+    fn harness_scheduler_ready_task_by_id_survives_oversized_store() {
+        let mut engine = HarnessEngine::new();
+        let filler_tasks = HARNESS_SCHEDULER_SCAN_MAX / 2 + 100;
+        let filler_runs = HARNESS_SCHEDULER_SCAN_MAX / 2 + 100;
+        assert!(filler_tasks + filler_runs > HARNESS_SCHEDULER_SCAN_MAX);
+        for index in 0..filler_tasks {
+            let item = task(numbered_task_id(index + 1_000), 1, "filler");
+            engine.tasks.insert(item.task_id.clone(), item);
+        }
+        for index in 0..filler_runs {
+            let mut item = run(HarnessRunLifecycleV1::Failed, 1);
+            item.run_id = numbered_run_id(index + 1_000);
+            engine.runs.insert(item.run_id.clone(), item);
+        }
+
+        let eligible_task_id = numbered_task_id(1);
+        let eligible_run_id = numbered_run_id(1);
+        let mut eligible_run = run(HarnessRunLifecycleV1::Completed, 1);
+        eligible_run.run_id = eligible_run_id.clone();
+        eligible_run.task_id = eligible_task_id.clone();
+        engine.runs.insert(eligible_run_id.clone(), eligible_run);
+
+        let mut eligible_task = task(eligible_task_id.clone(), 1, "eligible");
+        eligible_task.state = HarnessTaskStateV1::Ready;
+        eligible_task.run_ids = vec![eligible_run_id];
+        engine.tasks.insert(eligible_task_id.clone(), eligible_task);
+
+        // This is the live cliff: lifetime tasks+runs is well past the old
+        // ceiling, yet the one eligible task named by id is still admitted.
+        assert_eq!(
+            engine.scheduler_ready_task_by_id(&eligible_task_id)
+                .unwrap()
+                .map(|task| task.task_id.clone()),
+            Some(eligible_task_id),
+        );
+    }
+
+    #[test]
+    fn harness_scheduler_ready_task_by_id_still_refuses_ineligible_in_oversized_store() {
+        let mut engine = HarnessEngine::new();
+        let filler_tasks = HARNESS_SCHEDULER_SCAN_MAX / 2 + 100;
+        let filler_runs = HARNESS_SCHEDULER_SCAN_MAX / 2 + 100;
+        assert!(filler_tasks + filler_runs > HARNESS_SCHEDULER_SCAN_MAX);
+        for index in 0..filler_tasks {
+            let item = task(numbered_task_id(index + 1_000), 1, "filler");
+            engine.tasks.insert(item.task_id.clone(), item);
+        }
+        for index in 0..filler_runs {
+            let mut item = run(HarnessRunLifecycleV1::Failed, 1);
+            item.run_id = numbered_run_id(index + 1_000);
+            engine.runs.insert(item.run_id.clone(), item);
+        }
+
+        // Ineligible: not `Ready` at all.
+        let backlog_task_id = numbered_task_id(1);
+        let backlog_task = task(backlog_task_id.clone(), 1, "still-backlog");
+        engine.tasks.insert(backlog_task_id.clone(), backlog_task);
+        assert_eq!(engine.scheduler_ready_task_by_id(&backlog_task_id).unwrap(), None);
+
+        // Ineligible: `Ready` with an unmet dependency.
+        let unmet_task_id = numbered_task_id(2);
+        let mut unmet_task = task(unmet_task_id.clone(), 1, "unmet-dependency");
+        unmet_task.state = HarnessTaskStateV1::Ready;
+        unmet_task.dependencies = vec![numbered_task_id(3)];
+        engine.tasks.insert(unmet_task_id.clone(), unmet_task);
+        assert_eq!(engine.scheduler_ready_task_by_id(&unmet_task_id).unwrap(), None);
+
+        // Ineligible: `Ready` but still holding a nonterminal run.
+        let running_task_id = numbered_task_id(4);
+        let running_run_id = numbered_run_id(4);
+        let mut running_run = run(HarnessRunLifecycleV1::Running, 1);
+        running_run.run_id = running_run_id.clone();
+        running_run.task_id = running_task_id.clone();
+        engine.runs.insert(running_run_id.clone(), running_run);
+        let mut running_task = task(running_task_id.clone(), 1, "nonterminal-run");
+        running_task.state = HarnessTaskStateV1::Ready;
+        running_task.run_ids = vec![running_run_id];
+        engine.tasks.insert(running_task_id.clone(), running_task);
+        assert_eq!(engine.scheduler_ready_task_by_id(&running_task_id).unwrap(), None);
+    }
+
+    #[test]
+    fn harness_task_has_nonterminal_run_not_bound_by_store_size() {
+        let mut engine = HarnessEngine::new();
+        let filler_tasks = HARNESS_SCHEDULER_SCAN_MAX / 2 + 100;
+        let filler_runs = HARNESS_SCHEDULER_SCAN_MAX / 2 + 100;
+        assert!(filler_tasks + filler_runs > HARNESS_SCHEDULER_SCAN_MAX);
+        for index in 0..filler_tasks {
+            let item = task(numbered_task_id(index + 1_000), 1, "filler");
+            engine.tasks.insert(item.task_id.clone(), item);
+        }
+        for index in 0..filler_runs {
+            let mut item = run(HarnessRunLifecycleV1::Failed, 1);
+            item.run_id = numbered_run_id(index + 1_000);
+            engine.runs.insert(item.run_id.clone(), item);
+        }
+
+        let owner_task_id = numbered_task_id(1);
+        let owned_run_id = numbered_run_id(1);
+        let mut owned_run = run(HarnessRunLifecycleV1::Running, 1);
+        owned_run.run_id = owned_run_id.clone();
+        owned_run.task_id = owner_task_id.clone();
+        engine.runs.insert(owned_run_id.clone(), owned_run);
+
+        let mut owner = task(owner_task_id.clone(), 1, "owner");
+        owner.run_ids = vec![owned_run_id.clone()];
+
+        // Cost here is `owner.run_ids.len()`, not the store's total size.
+        assert!(engine.task_has_nonterminal_run(&owner).unwrap());
+
+        engine.runs.get_mut(&owned_run_id).unwrap().lifecycle = HarnessRunLifecycleV1::Completed;
+        assert!(!engine.task_has_nonterminal_run(&owner).unwrap());
     }
 
     #[test]

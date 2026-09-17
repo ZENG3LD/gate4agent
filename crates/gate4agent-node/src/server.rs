@@ -86,7 +86,6 @@ use crate::protocol::{
     GitCommitDetails, GitDiff, GitDiffMode, GitDiffRequest, GitHistoryPage,
     GitObjectId, GitCommitSummary, GitSignatureStatus, GitSnapshot, GitStatusEntry,
     GitWorktreeSnapshot, HarnessMcpActivationDigest, HarnessMcpReservationId,
-    HarnessReadRequestV1,
     HostDirectoryListing,
     NodeCompatibilitySupport, NodeEvent,
     NodeEventEnvelope, NodeFailure, NodeFailureCode, NodeHello, NodeId, NodeIncarnationId,
@@ -10871,9 +10870,14 @@ impl NodeShared {
                     event: NodeEvent::HarnessMcpReadCall { call_id, request, .. },
                     ..
                 }) = undelivered.first() {
+                    // `request.content_type` only, never a per-tool label --
+                    // this crate does not decode `request.body` and does not
+                    // hold `gate4agent-harness-api` (Nested Control Plane
+                    // doctrine, Law 3; see this crate's dependency on
+                    // `gate4agent-node-protocol`'s own `Forbidden:` line).
                     tracing::warn!(
                         call_id = call_id.as_str(),
-                        tool_id = harness_mcp_read_request_tool_id(request),
+                        content_type = ?request.content_type,
                         cause = "no-subscribers",
                         "harness MCP proxy event could not be published",
                     );
@@ -12807,31 +12811,6 @@ fn agent_stream_chunk_kind_label(kind: &AgentStreamChunkKindV1) -> &'static str 
         AgentStreamChunkKindV1::ConfigOptions { .. } => "config-options",
         AgentStreamChunkKindV1::ModelCatalog { .. } => "model-catalog",
         AgentStreamChunkKindV1::Blocked { .. } => "blocked",
-    }
-}
-
-/// The tool id a `HarnessReadRequestV1` corresponds to, for naming which
-/// call `publish_transient` failed to deliver. A small copy of
-/// `gate4agent-harness-service::read::harness_mcp_tool_id`'s own naming --
-/// this crate does not depend on that one, and this is logging only, never
-/// dispatch.
-fn harness_mcp_read_request_tool_id(request: &HarnessReadRequestV1) -> &'static str {
-    match request {
-        HarnessReadRequestV1::ContextGet => "g4a_context_get",
-        HarnessReadRequestV1::MonitorGet { .. } => "g4a_monitor_get",
-        HarnessReadRequestV1::TimelineRead { .. } => "g4a_timeline_read",
-        HarnessReadRequestV1::TasksList { .. } => "g4a_tasks_list",
-        HarnessReadRequestV1::TaskGet { .. } => "g4a_tasks_get",
-        HarnessReadRequestV1::RunsList { .. } => "g4a_runs_list",
-        HarnessReadRequestV1::RunGet { .. } => "g4a_runs_get",
-        HarnessReadRequestV1::OperationGet { .. } => "g4a_operation_get",
-        HarnessReadRequestV1::MailSend { .. } => "g4a_mail_send",
-        HarnessReadRequestV1::MailInbox { .. } => "g4a_mail_inbox",
-        HarnessReadRequestV1::MailAck { .. } => "g4a_mail_ack",
-        HarnessReadRequestV1::MailFetch { .. } => "g4a_mail_fetch",
-        HarnessReadRequestV1::TaskCreate { .. } => "g4a_task_create",
-        HarnessReadRequestV1::TaskMove { .. } => "g4a_task_move",
-        HarnessReadRequestV1::RunFinish { .. } => "g4a_run_finish",
     }
 }
 

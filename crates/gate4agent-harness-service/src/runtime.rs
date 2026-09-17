@@ -116,7 +116,8 @@ use gate4agent_harness_protocol::{
 };
 use gate4agent_node_wire::{local_hmac_sha256, proofs_match};
 use gate4agent_node_protocol::{
-    HarnessMcpActivationDigest, HarnessMcpCallId, HarnessMcpLocalReplyV1,
+    HarnessMcpActivationDigest, HarnessMcpCallId, HarnessMcpContentTypeV1,
+    HarnessMcpLocalReplyV1, HarnessMcpOpaquePayloadV1,
     HarnessMcpRejectReasonV1, HarnessMcpReplyChunkHexV1, HarnessMcpReservationId,
     NodeFailureCode, SessionAddress,
     SessionRecordId, SpawnBundleId, SpawnContextId, SpawnProfileId, WorkspaceFileContent,
@@ -11980,7 +11981,11 @@ enum DeferredHarnessMcpFetchIntent {
 fn encode_mcp_outcome(
     response: HarnessReadResponseV1,
 ) -> Result<Vec<u8>, HarnessMcpRejectReasonV1> {
-    let reply = HarnessMcpLocalReplyV1::Ok { response };
+    let opaque = HarnessMcpOpaquePayloadV1 {
+        content_type: HarnessMcpContentTypeV1::HarnessReadResponseJsonV1,
+        body: serde_json::to_vec(&response).map_err(|_| HarnessMcpRejectReasonV1::Internal)?,
+    };
+    let reply = HarnessMcpLocalReplyV1::Ok { response: opaque };
     if reply.validate().is_err() {
         return Err(HarnessMcpRejectReasonV1::ResponseTooLarge);
     }
@@ -11989,6 +11994,21 @@ fn encode_mcp_outcome(
         return Err(HarnessMcpRejectReasonV1::ResponseTooLarge);
     }
     Ok(encoded)
+}
+
+/// Decodes the opaque `C2NodeEvent::HarnessMcpReadCall::request` payload
+/// back into the harness's own typed request. The harness is one of this
+/// carriage's two real endpoints -- see `HarnessMcpOpaquePayloadV1`'s own
+/// doc in `gate4agent-node-protocol` -- so it is the side that knows the
+/// shape; `node` and `c2` between here and the reviewed local helper
+/// program that originated it never look inside `body`.
+fn decode_mcp_request(
+    payload: &HarnessMcpOpaquePayloadV1,
+) -> Result<gate4agent_harness_api::HarnessReadRequestV1, ()> {
+    if payload.content_type != HarnessMcpContentTypeV1::HarnessReadRequestJsonV1 {
+        return Err(());
+    }
+    serde_json::from_slice(&payload.body).map_err(|_| ())
 }
 
 fn prepare_harness_mcp_read_call(
@@ -12013,6 +12033,27 @@ fn prepare_harness_mcp_read_call(
         deadline_unix_ms,
     } = routed.event else {
         return Err(HarnessRuntimeError::InvalidHarnessMcpEvent);
+    };
+    let request = match decode_mcp_request(&request) {
+        Ok(request) => request,
+        Err(()) => {
+            tracing::warn!(
+                reservation_id = reservation_id.as_str(),
+                call_id = call_id.as_str(),
+                reason = "opaque request payload did not decode as a harness read request",
+                "harness MCP read call refused",
+            );
+            return Ok(PreparedHarnessMcpRead::Ready(HarnessMcpRelayPlan {
+                route,
+                reservation_id,
+                activation_digest,
+                record_id,
+                session,
+                call_id,
+                deadline_unix_ms,
+                outcome: Err(HarnessMcpRejectReasonV1::InvalidRequest),
+            }));
+        }
     };
     let tool_id = crate::read::harness_mcp_tool_id(&request);
     let now = unix_time_ms();
@@ -17750,8 +17791,15 @@ mod tests {
         let response = HarnessReadResponseV1::MailFetch(HarnessMailFetchResultV1::Refused {
             reason: "no such message".to_owned(),
         });
+        // The reply carries the response as opaque bytes plus a content
+        // type, not as the harness's own typed enum: everything between this
+        // encode and the reviewed local helper program that decodes it is a
+        // relay, and a relay must not be able to read what it carries.
         let expected = serde_json::to_vec(&HarnessMcpLocalReplyV1::Ok {
-            response: response.clone(),
+            response: HarnessMcpOpaquePayloadV1 {
+                content_type: HarnessMcpContentTypeV1::HarnessReadResponseJsonV1,
+                body: serde_json::to_vec(&response).unwrap(),
+            },
         }).unwrap();
         assert_eq!(encode_mcp_outcome(response), Ok(expected));
     }
@@ -18340,7 +18388,11 @@ mod tests {
                 call_id: gate4agent_node_protocol::HarnessMcpCallId::new(
                     format!("hmcpcall_{:024x}", 1),
                 ).unwrap(),
-                request: gate4agent_node_protocol::HarnessReadRequestV1::ContextGet,
+                request: gate4agent_node_protocol::HarnessMcpOpaquePayloadV1 {
+                    content_type:
+                        gate4agent_node_protocol::HarnessMcpContentTypeV1::HarnessReadRequestJsonV1,
+                    body: br#"{"kind":"context-get"}"#.to_vec(),
+                },
                 deadline_unix_ms: u64::MAX,
             },
         }).await.unwrap();

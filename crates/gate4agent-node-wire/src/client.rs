@@ -5,7 +5,7 @@ use gate4agent_node_protocol::{
     write_json_frame_limited, CapabilityId,
     ClientAuthentication, ClientCompatibilityOffer, ClientFrame, ClientHello, ClientRole,
     FrameError, HarnessMcpLocalReplyV1, HarnessMcpLocalRequestV1, HarnessMcpLocalToken,
-    HarnessReadHostErrorV1, HarnessReadRequestV1, HarnessReadResponseV1,
+    HarnessMcpOpaquePayloadV1, HarnessMcpRejectReasonV1,
     NegotiatedNodeCompatibility, NodeEvent, NodeEventEnvelope, NodeFailure,
     NodeFailureCode, NodeHello, NodeId, NodeRequest, NodeResponse, NodeSnapshot, RequestEnvelope,
     WorkspaceSnapshot,
@@ -95,9 +95,8 @@ impl LocalSessionHarnessMcpClient {
 
     pub fn send(
         &self,
-        request: HarnessReadRequestV1,
-    ) -> Result<HarnessReadResponseV1, LocalSessionHarnessMcpError> {
-        request.validate().map_err(|_| LocalSessionHarnessMcpError::InvalidRequest)?;
+        request: HarnessMcpOpaquePayloadV1,
+    ) -> Result<HarnessMcpOpaquePayloadV1, LocalSessionHarnessMcpError> {
         let envelope = HarnessMcpLocalRequestV1 {
             version: 1,
             token: self.token.clone(),
@@ -129,11 +128,11 @@ impl LocalSessionHarnessMcpClient {
                 reply.validate().map_err(|_| LocalSessionHarnessMcpError::InvalidResponse)?;
                 match reply {
                     HarnessMcpLocalReplyV1::Ok { response } => Ok(response),
-                    HarnessMcpLocalReplyV1::Error {
-                        error: HarnessReadHostErrorV1::Unauthorized,
+                    HarnessMcpLocalReplyV1::Rejected {
+                        reason: HarnessMcpRejectReasonV1::Unauthorized,
                     } => Err(LocalSessionHarnessMcpError::Unauthorized),
-                    HarnessMcpLocalReplyV1::Error { error } => {
-                        Err(LocalSessionHarnessMcpError::Host(error))
+                    HarnessMcpLocalReplyV1::Rejected { reason } => {
+                        Err(LocalSessionHarnessMcpError::Rejected(reason))
                     }
                 }
             }).await.map_err(|_| LocalSessionHarnessMcpError::Deadline)?
@@ -171,7 +170,7 @@ pub enum LocalSessionHarnessMcpError {
     #[error("local session harness MCP deadline exceeded")]
     Deadline,
     #[error("local session harness MCP host rejected the request: {0:?}")]
-    Host(HarnessReadHostErrorV1),
+    Rejected(HarnessMcpRejectReasonV1),
 }
 
 /// Any byte stream this wire's CLIENT side can run on.

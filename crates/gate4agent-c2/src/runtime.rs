@@ -2694,8 +2694,8 @@ mod tests {
     use gate4agent_node_protocol::{
         AgentId, AgentStreamChunkKindV1, AgentStreamChunkV1, CapabilityId, SessionAddress,
         SessionKey, SessionMode, SessionRecordId,
-        HarnessMcpActivationDigest, HarnessMcpCallId, HarnessMcpReservationId,
-        HarnessReadRequestV1,
+        HarnessMcpActivationDigest, HarnessMcpCallId, HarnessMcpContentTypeV1,
+        HarnessMcpOpaquePayloadV1, HarnessMcpReservationId,
         SpawnDeadlineMs, SpawnFieldProvenance, SpawnIdempotencyKey, SpawnOverrides,
         SpawnProfileId, SpawnProfileRevision, SpawnPrompt, SpawnPromptMetadata,
         SpawnRequiredCapabilities, SpawnResolutionProvenance, SpawnTarget, WorkspaceId,
@@ -3468,7 +3468,10 @@ mod tests {
                 call_id: HarnessMcpCallId::new(
                     format!("hmcpcall_{}", "c".repeat(24)),
                 ).unwrap(),
-                request: HarnessReadRequestV1::ContextGet,
+                request: HarnessMcpOpaquePayloadV1 {
+                    content_type: HarnessMcpContentTypeV1::HarnessReadRequestJsonV1,
+                    body: br#"{"kind":"context-get"}"#.to_vec(),
+                },
                 deadline_unix_ms: u64::MAX,
             },
         };

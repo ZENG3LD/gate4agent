@@ -3370,7 +3370,11 @@ mod tests {
                 call_id: gate4agent_node_protocol::HarnessMcpCallId::new(
                     format!("hmcpcall_{call_index:024x}"),
                 ).unwrap(),
-                request: gate4agent_node_protocol::HarnessReadRequestV1::ContextGet,
+                request: gate4agent_node_protocol::HarnessMcpOpaquePayloadV1 {
+                    content_type:
+                        gate4agent_node_protocol::HarnessMcpContentTypeV1::HarnessReadRequestJsonV1,
+                    body: br#"{"kind":"context-get"}"#.to_vec(),
+                },
                 deadline_unix_ms,
             },
         }))

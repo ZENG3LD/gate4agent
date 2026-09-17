@@ -60,8 +60,9 @@ pub use gate4agent_node_protocol::{
     DeliveryBundleManifestV2, DeliveryCommitReceiptV1, DeliveryManifestDigestV2,
     DeliveryStageId,
     NODE_DELIVERY_BUNDLE_V2_STAGE_COMMIT_CAPABILITY,
-    HarnessMcpActivationDigest, HarnessMcpCallId, HarnessMcpRejectReasonV1,
-    HarnessMcpReplyChunkHexV1, HarnessMcpReservationId, HarnessReadRequestV1,
+    HarnessMcpActivationDigest, HarnessMcpCallId, HarnessMcpContentTypeV1,
+    HarnessMcpOpaquePayloadV1, HarnessMcpRejectReasonV1,
+    HarnessMcpReplyChunkHexV1, HarnessMcpReservationId,
     ResolvedHarnessMcpProxyReceiptV1,
     NODE_HARNESS_MCP_READ_PROXY_CAPABILITY,
     ProtocolNegotiationError, ProtocolRange,
@@ -1063,7 +1064,7 @@ pub enum C2NodeEvent {
         record_id: SessionRecordId,
         session: SessionAddress,
         call_id: HarnessMcpCallId,
-        request: HarnessReadRequestV1,
+        request: HarnessMcpOpaquePayloadV1,
         deadline_unix_ms: u64,
     },
     Control {
@@ -3251,7 +3252,10 @@ mod tests {
             record_id: SessionRecordId::new("record-a").unwrap(),
             session: session.clone(),
             call_id: call_id.clone(),
-            request: HarnessReadRequestV1::ContextGet,
+            request: HarnessMcpOpaquePayloadV1 {
+                content_type: HarnessMcpContentTypeV1::HarnessReadRequestJsonV1,
+                body: br#"{"kind":"context-get"}"#.to_vec(),
+            },
             deadline_unix_ms: 4_000,
         };
         let projected = C2NodeEvent::from(&source);

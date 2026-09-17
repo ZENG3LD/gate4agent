@@ -17,9 +17,6 @@ pub use gate4agent_observation_protocol::{
     OBSERVATION_ACTION_BLOCKED_HELP_MAX_BYTES, OBSERVATION_ACTION_BLOCKED_REASON_MAX_BYTES,
     OBSERVATION_DETAIL_MAX_BYTES,
 };
-pub use gate4agent_harness_api::{
-    HarnessReadHostErrorV1, HarnessReadRequestV1, HarnessReadResponseV1,
-};
 pub use gate4agent_build_stamp::BUILD_STAMP;
 use gate4agent_types::{
     AgentInstanceId, ApprovalLevel, ControlEvent, ProviderActivity, ProviderSessionIdentity,
@@ -166,10 +163,14 @@ pub const MAX_DELIVERY_TOTAL_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_DELIVERY_RELATIVE_PATH_BYTES: usize = 512;
 pub const MAX_DELIVERY_CHUNK_RAW_BYTES: usize = 48 * 1024;
 pub const MAX_HARNESS_MCP_REPLY_CHUNK_RAW_BYTES: usize = MAX_DELIVERY_CHUNK_RAW_BYTES;
-pub const MAX_HARNESS_MCP_LOCAL_REQUEST_BYTES: usize =
-    gate4agent_harness_api::HARNESS_READ_REQUEST_MAX_BYTES;
-pub const MAX_HARNESS_MCP_AGGREGATE_REPLY_BYTES: usize =
-    gate4agent_harness_api::HARNESS_READ_RESPONSE_MAX_BYTES;
+// Owned independently of `gate4agent-harness-api::HARNESS_READ_REQUEST_MAX_
+// BYTES`/`HARNESS_READ_RESPONSE_MAX_BYTES` -- this crate must not depend on
+// the harness's crate at all (Nested Control Plane doctrine, Law 3; see this
+// crate's own CLAUDE.md `Forbidden:` line). The values are chosen to match
+// today; a future change to either side's budget is a deliberate edit on
+// both, not a shared constant.
+pub const MAX_HARNESS_MCP_LOCAL_REQUEST_BYTES: usize = 64 * 1024;
+pub const MAX_HARNESS_MCP_AGGREGATE_REPLY_BYTES: usize = 1024 * 1024;
 pub const MAX_HARNESS_MCP_PENDING_CALLS_PER_SESSION: usize = 32;
 pub const MAX_HARNESS_MCP_PENDING_CALLS_PER_NODE: usize = 128;
 pub const MAX_HARNESS_MCP_RESERVATION_TTL_MS: u64 = 120_000;
@@ -1785,18 +1786,59 @@ impl<'de> Deserialize<'de> for HarnessMcpLocalToken {
     }
 }
 
+/// Names what shape an opaque harness-MCP payload's `body` holds.
+///
+/// Neither `node` nor `c2` ever inspect `body` -- see `HarnessMcpOpaquePayloadV1`
+/// -- so this tag exists only so the two real endpoints (the reviewed local
+/// helper program, which originates a request and decodes a reply; the
+/// harness, which decodes a request and originates a reply) can tell a
+/// version-skewed or misdirected payload from a well-formed one, without the
+/// carrier needing to know either shape.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessMcpContentTypeV1 {
+    HarnessReadRequestJsonV1,
+    HarnessReadResponseJsonV1,
+}
+
+/// An opaque harness-MCP payload.
+///
+/// This is the carriage this crate's wire types actually move end to end
+/// (`HarnessMcpLocalRequestV1::request`, `HarnessMcpLocalReplyV1::Ok::
+/// response`, `NodeEvent::HarnessMcpReadCall::request`): `body` is whatever
+/// bytes the originating endpoint encoded, and this crate never decodes it.
+/// Only `gate4agent-harness-mcp` (the reviewed local helper program spawned
+/// by the node, which holds `gate4agent-harness-api` types via `gate4agent-
+/// harness-client` directly) and `gate4agent-harness-service` (the harness
+/// itself) know what `body` actually contains.
+///
+/// This is the Nested Control Plane doctrine's Law 3 made mechanical
+/// (`docs/architecture/nested-control-plane.md`): a lower tier (`node`,
+/// wrapped by `c2`) must never import a higher tier's (the harness's) crate.
+/// Before this type existed, `HarnessMcpLocalRequestV1`/`HarnessMcpLocalReplyV1`
+/// carried the harness's own `HarnessReadRequestV1`/`HarnessReadResponseV1`
+/// typed, which pulled `gate4agent-harness-api` into this crate's dependency
+/// graph and, through it, into every crate that re-exports this one --
+/// `node`, `node-wire`, `c2`, `c2-client`, `observation-api`. A relay that
+/// cannot read what it relays is a relay done right.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessMcpOpaquePayloadV1 {
+    pub content_type: HarnessMcpContentTypeV1,
+    pub body: Vec<u8>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HarnessMcpLocalRequestV1 {
     pub version: u16,
     pub token: HarnessMcpLocalToken,
-    pub request: HarnessReadRequestV1,
+    pub request: HarnessMcpOpaquePayloadV1,
 }
 
 impl HarnessMcpLocalRequestV1 {
     pub fn validate(&self) -> Result<(), HarnessMcpContractError> {
         if self.version != 1
-            || self.request.validate().is_err()
             || serde_json::to_vec(self)
                 .map_or(true, |wire| wire.len() > MAX_HARNESS_MCP_LOCAL_REQUEST_BYTES)
         {
@@ -1806,22 +1848,28 @@ impl HarnessMcpLocalRequestV1 {
     }
 }
 
+/// The proxy's terminal reply to a local session's harness-MCP call.
+///
+/// `Ok`'s `response` is opaque (see `HarnessMcpOpaquePayloadV1`) -- only the
+/// harness that computed it and the local helper program that decodes it
+/// know its shape. `Rejected` carries this crate's own coarse reason, used
+/// uniformly whether the node decided it locally (an unmatched local token,
+/// a caller that is not a descendant of the provider process, a deadline
+/// that expired waiting on the harness) or the harness decided it and
+/// relayed the reason back over `NodeRequest::RejectHarnessMcpCall` -- in
+/// neither case does the harness's own richer `HarnessReadHostErrorV1` ever
+/// need to cross into this crate.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "status", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum HarnessMcpLocalReplyV1 {
-    Ok { response: HarnessReadResponseV1 },
-    Error { error: HarnessReadHostErrorV1 },
+    Ok { response: HarnessMcpOpaquePayloadV1 },
+    Rejected { reason: HarnessMcpRejectReasonV1 },
 }
 
 impl HarnessMcpLocalReplyV1 {
     pub fn validate(&self) -> Result<(), HarnessMcpContractError> {
-        let content_is_valid = match self {
-            Self::Ok { response } => response.validate().is_ok(),
-            Self::Error { .. } => true,
-        };
-        if !content_is_valid
-            || serde_json::to_vec(self)
-                .map_or(true, |wire| wire.len() > MAX_HARNESS_MCP_AGGREGATE_REPLY_BYTES)
+        if serde_json::to_vec(self)
+            .map_or(true, |wire| wire.len() > MAX_HARNESS_MCP_AGGREGATE_REPLY_BYTES)
         {
             return Err(HarnessMcpContractError::InvalidLocalReply);
         }
@@ -7349,7 +7397,7 @@ pub enum NodeEvent {
         record_id: SessionRecordId,
         session: SessionAddress,
         call_id: HarnessMcpCallId,
-        request: HarnessReadRequestV1,
+        request: HarnessMcpOpaquePayloadV1,
         deadline_unix_ms: u64,
     },
     Control { address: SessionAddress, event: ControlEvent },
@@ -7375,9 +7423,8 @@ impl NodeEvent {
     pub fn harness_mcp_contract_is_valid_at(&self, now_unix_ms: u64) -> bool {
         match self {
             Self::HarnessMcpReadCall { request, deadline_unix_ms, .. } => {
-                request.validate().is_ok()
-                    && serde_json::to_vec(request)
-                        .is_ok_and(|wire| wire.len() <= MAX_HARNESS_MCP_LOCAL_REQUEST_BYTES)
+                serde_json::to_vec(request)
+                    .is_ok_and(|wire| wire.len() <= MAX_HARNESS_MCP_LOCAL_REQUEST_BYTES)
                     && *deadline_unix_ms > now_unix_ms
                     && deadline_unix_ms.saturating_sub(now_unix_ms)
                         <= MAX_HARNESS_MCP_CALL_DEADLINE_MS
@@ -7644,7 +7691,10 @@ mod tests {
         let local = HarnessMcpLocalRequestV1 {
             version: 1,
             token,
-            request: HarnessReadRequestV1::ContextGet,
+            request: HarnessMcpOpaquePayloadV1 {
+                content_type: HarnessMcpContentTypeV1::HarnessReadRequestJsonV1,
+                body: br#"{"kind":"context-get"}"#.to_vec(),
+            },
         };
         local.validate().unwrap();
         let mut unknown = serde_json::to_value(&local).unwrap();
@@ -7663,7 +7713,10 @@ mod tests {
             record_id: SessionRecordId::new("record-a").unwrap(),
             session: session_address("primary", 1),
             call_id,
-            request: HarnessReadRequestV1::ContextGet,
+            request: HarnessMcpOpaquePayloadV1 {
+                content_type: HarnessMcpContentTypeV1::HarnessReadRequestJsonV1,
+                body: br#"{"kind":"context-get"}"#.to_vec(),
+            },
             deadline_unix_ms: 4_000,
         };
         assert!(event.harness_mcp_contract_is_valid_at(1_000));

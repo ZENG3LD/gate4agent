@@ -1,7 +1,7 @@
 use crate::protocol::{
     HarnessMcpActivationDigest, HarnessMcpCallId, HarnessMcpLocalReplyV1,
-    HarnessMcpLocalRequestV1, HarnessMcpLocalToken, HarnessMcpRejectReasonV1,
-    HarnessMcpReplyChunkHexV1, HarnessMcpReservationId, HarnessReadHostErrorV1,
+    HarnessMcpLocalRequestV1, HarnessMcpLocalToken, HarnessMcpOpaquePayloadV1,
+    HarnessMcpRejectReasonV1, HarnessMcpReplyChunkHexV1, HarnessMcpReservationId,
     NodeEvent, ResolvedSpawnReceipt, SessionAddress, SessionRecordId, SpawnSpec,
     read_json_frame_limited_body_timeout, write_json_frame_limited,
     MAX_HARNESS_MCP_AGGREGATE_REPLY_BYTES, MAX_HARNESS_MCP_CALL_DEADLINE_MS,
@@ -513,7 +513,7 @@ impl HarnessMcpProxyRegistry {
         let mut call = reservation.calls.remove(call_id).ok_or(HarnessMcpProxyError::CallNotFound)?;
         state.pending_calls = state.pending_calls.saturating_sub(1);
         let terminal = call.terminal.take().ok_or(HarnessMcpProxyError::CallNotFound)?;
-        let _ = terminal.send(HarnessMcpLocalReplyV1::Error { error: reject_error(reason) });
+        let _ = terminal.send(HarnessMcpLocalReplyV1::Rejected { reason });
         Ok(())
     }
 
@@ -585,8 +585,8 @@ impl HarnessMcpProxyRegistry {
         ).await.map_err(|_| ())?.map_err(|_| ())?;
         request.validate().map_err(|_| ())?;
         if !constant_time_equal(request.token.expose().as_bytes(), token.expose().as_bytes()) {
-            write_local_reply(&mut stream, HarnessMcpLocalReplyV1::Error {
-                error: HarnessReadHostErrorV1::Unauthorized,
+            write_local_reply(&mut stream, HarnessMcpLocalReplyV1::Rejected {
+                reason: HarnessMcpRejectReasonV1::Unauthorized,
             }).await.map_err(|_| ())?;
             return Ok(());
         }
@@ -608,8 +608,8 @@ impl HarnessMcpProxyRegistry {
             activation_wait,
         ).await.map_err(|_| ())??;
         if !client_is_provider_descendant(&stream, activation.provider_root_pid) {
-            write_local_reply(&mut stream, HarnessMcpLocalReplyV1::Error {
-                error: HarnessReadHostErrorV1::Unauthorized,
+            write_local_reply(&mut stream, HarnessMcpLocalReplyV1::Rejected {
+                reason: HarnessMcpRejectReasonV1::Unauthorized,
             }).await.map_err(|_| ())?;
             return Ok(());
         }
@@ -623,7 +623,7 @@ impl HarnessMcpProxyRegistry {
             Ok(Ok(reply)) => reply,
             _ => {
                 self.drop_call(&reservation_id, &call_id);
-                HarnessMcpLocalReplyV1::Error { error: HarnessReadHostErrorV1::Deadline }
+                HarnessMcpLocalReplyV1::Rejected { reason: HarnessMcpRejectReasonV1::Deadline }
             }
         };
         write_local_reply(&mut stream, reply).await.map_err(|_| ())
@@ -633,7 +633,7 @@ impl HarnessMcpProxyRegistry {
         &self,
         reservation_id: &HarnessMcpReservationId,
         activation: &ActivationBinding,
-        request: crate::protocol::HarnessReadRequestV1,
+        request: HarnessMcpOpaquePayloadV1,
     ) -> Result<(HarnessMcpCallId, oneshot::Receiver<HarnessMcpLocalReplyV1>, u64), HarnessMcpProxyError> {
         let sink = self.event_sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
             .ok_or(HarnessMcpProxyError::Unavailable)?;
@@ -707,7 +707,7 @@ impl HarnessMcpProxyRegistry {
         let Some(mut call) = reservation.calls.remove(call_id) else { return };
         state.pending_calls = state.pending_calls.saturating_sub(1);
         if let Some(terminal) = call.terminal.take() {
-            let _ = terminal.send(HarnessMcpLocalReplyV1::Error { error: reject_error(reason) });
+            let _ = terminal.send(HarnessMcpLocalReplyV1::Rejected { reason });
         }
     }
 
@@ -818,19 +818,6 @@ async fn write_local_reply(
     write_json_frame_limited(stream, &reply, MAX_HARNESS_MCP_AGGREGATE_REPLY_BYTES)
         .await
         .map_err(io::Error::other)
-}
-
-fn reject_error(reason: HarnessMcpRejectReasonV1) -> HarnessReadHostErrorV1 {
-    match reason {
-        HarnessMcpRejectReasonV1::Unauthorized => HarnessReadHostErrorV1::Unauthorized,
-        HarnessMcpRejectReasonV1::Unavailable | HarnessMcpRejectReasonV1::Internal => {
-            HarnessReadHostErrorV1::Internal
-        }
-        HarnessMcpRejectReasonV1::InvalidRequest => HarnessReadHostErrorV1::InvalidRequest,
-        HarnessMcpRejectReasonV1::NotFoundOrDenied => HarnessReadHostErrorV1::NotFoundOrDenied,
-        HarnessMcpRejectReasonV1::ResponseTooLarge => HarnessReadHostErrorV1::TooLarge,
-        HarnessMcpRejectReasonV1::Deadline => HarnessReadHostErrorV1::Deadline,
-    }
 }
 
 fn decode_hex(value: &str) -> Option<Vec<u8>> {
@@ -1057,7 +1044,10 @@ mod tests {
         let request = HarnessMcpLocalRequestV1 {
             version: 1,
             token: token_a,
-            request: crate::protocol::HarnessReadRequestV1::ContextGet,
+            request: HarnessMcpOpaquePayloadV1 {
+                content_type: crate::protocol::HarnessMcpContentTypeV1::HarnessReadRequestJsonV1,
+                body: br#"{"kind":"context-get"}"#.to_vec(),
+            },
         };
         let mut stream = connect_local_stream(&endpoint_b).await.unwrap();
         write_json_frame_limited(&mut stream, &request, MAX_HARNESS_MCP_LOCAL_REQUEST_BYTES)
@@ -1068,8 +1058,8 @@ mod tests {
             MAX_HARNESS_MCP_AGGREGATE_REPLY_BYTES,
             LOCAL_READ_TIMEOUT,
         ).await.unwrap();
-        assert_eq!(reply, HarnessMcpLocalReplyV1::Error {
-            error: HarnessReadHostErrorV1::Unauthorized,
+        assert_eq!(reply, HarnessMcpLocalReplyV1::Rejected {
+            reason: HarnessMcpRejectReasonV1::Unauthorized,
         });
 
         let state = registry.inner.lock().unwrap();

@@ -5,14 +5,17 @@ use std::{io::{BufRead, Write}, net::SocketAddr};
 use gate4agent_harness_client::{
     HarnessMailAddressV1, HarnessMailMessageId, HarnessMailRefV1, HarnessOperationId,
     HarnessReadClient,
-    HarnessReadClientError, HarnessReadCredential, HarnessReadHostErrorV1, HarnessReadResponseV1,
+    HarnessReadClientError, HarnessReadCredential, HarnessReadHostErrorV1, HarnessReadRequestV1,
+    HarnessReadResponseV1,
     HarnessRevision, HarnessRunFinishOutcomeV1, HarnessRunId, HarnessRunLifecycleV1,
     HarnessSelectorV1, HarnessTaskId, HarnessTaskStateV1,
     SessionContextV1, HARNESS_MAIL_REFS_MAX, HARNESS_READ_REQUEST_MAX_BYTES,
     HARNESS_READ_RESPONSE_MAX_BYTES,
     HARNESS_READ_TOOL_IDS, HARNESS_WRITE_TOOL_IDS,
 };
-use gate4agent_node_protocol::HarnessReadRequestV1;
+use gate4agent_node_protocol::{
+    HarnessMcpContentTypeV1, HarnessMcpOpaquePayloadV1, HarnessMcpRejectReasonV1,
+};
 use gate4agent_node_wire::{LocalSessionHarnessMcpClient, LocalSessionHarnessMcpError};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -112,8 +115,9 @@ impl HarnessMcpBackend for HarnessReadClient {
 
 impl HarnessMcpBackend for LocalSessionHarnessMcpClient {
     fn context_get(&self) -> Result<SessionContextV1, HarnessMcpBackendError> {
-        self.send(HarnessReadRequestV1::ContextGet)
+        self.send(encode_harness_read_request(&HarnessReadRequestV1::ContextGet))
             .map_err(HarnessMcpBackendError::from)
+            .and_then(|payload| decode_harness_read_response(&payload))
             .and_then(|response| match response {
                 HarnessReadResponseV1::Context(context) => Ok(context),
                 _ => Err(HarnessMcpBackendError::Unavailable),
@@ -121,8 +125,34 @@ impl HarnessMcpBackend for LocalSessionHarnessMcpClient {
     }
 
     fn call(&self, call: HarnessMcpToolCall) -> Result<HarnessReadResponseV1, HarnessMcpBackendError> {
-        self.send(tool_call_request(call)).map_err(HarnessMcpBackendError::from)
+        let payload = self.send(encode_harness_read_request(&tool_call_request(call)))
+            .map_err(HarnessMcpBackendError::from)?;
+        decode_harness_read_response(&payload)
     }
+}
+
+/// Encodes a typed `HarnessReadRequestV1` into the opaque payload the node's
+/// wire contract (`gate4agent-node-protocol`) carries without decoding --
+/// this crate is one of the two real endpoints (see `HarnessMcpOpaquePayloadV1`'s
+/// own doc), so it is the one that knows the shape going in.
+fn encode_harness_read_request(request: &HarnessReadRequestV1) -> HarnessMcpOpaquePayloadV1 {
+    HarnessMcpOpaquePayloadV1 {
+        content_type: HarnessMcpContentTypeV1::HarnessReadRequestJsonV1,
+        body: serde_json::to_vec(request)
+            .expect("HarnessReadRequestV1 has no map keys and always serializes to JSON"),
+    }
+}
+
+/// Decodes the opaque reply payload the node's wire contract carried back --
+/// this crate is the other real endpoint, the one that knows the shape
+/// coming out.
+fn decode_harness_read_response(
+    payload: &HarnessMcpOpaquePayloadV1,
+) -> Result<HarnessReadResponseV1, HarnessMcpBackendError> {
+    if payload.content_type != HarnessMcpContentTypeV1::HarnessReadResponseJsonV1 {
+        return Err(HarnessMcpBackendError::Unavailable);
+    }
+    serde_json::from_slice(&payload.body).map_err(|_| HarnessMcpBackendError::Unavailable)
 }
 
 fn tool_call_request(call: HarnessMcpToolCall) -> HarnessReadRequestV1 {
@@ -245,14 +275,14 @@ impl From<LocalSessionHarnessMcpError> for HarnessMcpBackendError {
     fn from(error: LocalSessionHarnessMcpError) -> Self {
         match error {
             LocalSessionHarnessMcpError::Unauthorized
-            | LocalSessionHarnessMcpError::Host(HarnessReadHostErrorV1::Unauthorized) => {
+            | LocalSessionHarnessMcpError::Rejected(HarnessMcpRejectReasonV1::Unauthorized) => {
                 Self::Unauthorized
             }
             LocalSessionHarnessMcpError::InvalidRequest
-            | LocalSessionHarnessMcpError::Host(HarnessReadHostErrorV1::InvalidRequest) => {
+            | LocalSessionHarnessMcpError::Rejected(HarnessMcpRejectReasonV1::InvalidRequest) => {
                 Self::InvalidRequest
             }
-            LocalSessionHarnessMcpError::Host(HarnessReadHostErrorV1::NotFoundOrDenied) => {
+            LocalSessionHarnessMcpError::Rejected(HarnessMcpRejectReasonV1::NotFoundOrDenied) => {
                 Self::NotFoundOrDenied
             }
             _ => Self::Unavailable,
